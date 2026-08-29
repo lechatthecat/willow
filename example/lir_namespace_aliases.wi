@@ -1,0 +1,99 @@
+// lir_namespace_aliases.wi — builtin namespaces reached through an `import`
+// alias, compiled from Lowered IR (willow-nswv).
+//
+// `import std::fs as files;` makes `files::exists(..)` the SAME call as
+// `fs::exists(..)`. The AST emitter never sees the alias: a normalization pass
+// rewrites the whole program before codegen, so by the time it dispatches, only
+// canonical names are left. The walker lowers to HIR from the RAW frontend
+// program and so does see the alias, and canonicalizes at the point of dispatch
+// instead — before the gate that lets a user module of the same name win, which
+// is the order the normalization pass and the AST dispatch apply between them.
+// Without that, a call spelled through an alias sent its whole function back to
+// the AST emitter: the walker's coverage depended on how the `import` was
+// written.
+//
+// One file mixes both spellings. `net` is imported plainly while `fs`, `env`
+// and `parallel` are aliased, so both dispatch paths meet in the same program.
+//
+// Every function declared here is compiled by the walker. Run under
+// `WILLOW_LIR_LOG=1` to watch each one being claimed, or under
+// `WILLOW_LIR_REQUIRE=1` to make a fallback a hard error.
+
+import std::collections::Array;
+import std::fs as files;
+import std::env as sys;
+import std::parallel as par;
+import std::net;
+
+fn square(value: i64) -> i64 {
+    return value * value;
+}
+
+// `?` on the aliased namespace's `Result<void, IoError>`, twice, plus the read
+// that carries a payload back.
+fn roundtrip(path: String, text: String) -> Result<String, IoError> {
+    files::write_string(path, text)?;
+    let back = files::read_to_string(path)?;
+    files::remove_file(path)?;
+    return Ok(back);
+}
+
+fn is_failure(error: IoError) -> bool {
+    return match error {
+        Failed(message) => message != "",
+    };
+}
+
+// The `_async` entries carry the alias too, and each one parks the task.
+async fn async_roundtrip(path: String, text: String) -> Result<String, IoError> {
+    (await files::write_string_async(path, text))?;
+    let back = (await files::read_to_string_async(path))?;
+    (await files::remove_file_async(path))?;
+    return Ok(back);
+}
+
+// `env` under an alias. The count is zero when the program is run without
+// arguments, which is how the example is run.
+fn arg_count() -> i64 {
+    return sys::args_len();
+}
+
+// `parallel::map` under an alias: a frozen array and a bare function address.
+async fn squares(values: FrozenArray<i64>) -> String {
+    let mapped = await par::map(values, square);
+    return mapped.toString();
+}
+
+// `net` is NOT aliased in this file, so the same dispatch answers a canonical
+// name in a program that has aliases in it.
+fn bound() -> Result<bool, IoError> {
+    let listener = net::bind("127.0.0.1:0")?;
+    let address = net::local_addr(listener)?;
+    return Ok(address != "");
+}
+
+async fn main() {
+    let path = files::temp_path("willow_lir_alias");
+
+    match roundtrip(path, "aliased on disk") {
+        Ok(text) => println(text),
+        Err(error) => println(is_failure(error)),
+    }
+    println(files::exists(path));
+
+    match await async_roundtrip(path, "aliased by a task") {
+        Ok(text) => println(text),
+        Err(error) => println(is_failure(error)),
+    }
+    println(await files::exists_async(path));
+
+    println(arg_count().toString());
+
+    let values: Array<i64> = [4, 2, 3];
+    println(await squares(values.freeze()));
+
+    match bound() {
+        Ok(reachable) => println(reachable),
+        Err(error) => println(is_failure(error)),
+    }
+}

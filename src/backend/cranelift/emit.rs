@@ -164,10 +164,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn channel_element_of(&self, s: &StaticCallExpr) -> Type {
         self.expr_types
             .get(&s.span)
-            .and_then(|ty| match ty {
-                Type::Generic(name, args) if name == "Channel" => args.first(),
-                _ => None,
-            })
+            .and_then(|ty| builtin_types::unary_arg(ty, B::Channel))
             .filter(|elem| !matches!(elem, Type::Void))
             .or_else(|| s.type_args.first())
             .cloned()
@@ -432,12 +429,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let modes = self.func_param_modes.get(&mangled).cloned();
             let param_debug = self.func_param_debug.get(&mangled).cloned();
+            let param_types = self.fn_param_types(&mangled);
             let has_reference_args = has_reference_args(modes.as_deref(), &s.args);
             let user_callee = format!("{}::{}", class_name, s.method);
-            let (args, temp_roots) = self.emit_call_args_rooted(
+            let (args, temp_roots) = self.emit_call_args_rooted_coerced(
                 Some(&user_callee),
                 modes.as_deref(),
                 param_debug.as_deref(),
+                param_types.as_deref(),
                 &s.args,
             );
             let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
@@ -465,12 +464,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let dummy_self = self.builder.ins().iconst(types::I64, 0);
             let modes = self.func_param_modes.get(&mangled).cloned();
             let param_debug = self.func_param_debug.get(&mangled).cloned();
+            // Drops the hidden `self`; static-call syntax has no receiver argument.
+            let param_types = self.method_param_types(&mangled);
             let has_reference_args = has_reference_args(modes.as_deref(), &s.args);
             let user_callee = format!("{}::{}", class_name, s.method);
-            let (arg_vals, temp_roots) = self.emit_call_args_rooted(
+            let (arg_vals, temp_roots) = self.emit_call_args_rooted_coerced(
                 Some(&user_callee),
                 modes.as_deref(),
                 param_debug.as_deref(),
+                param_types.as_deref(),
                 &s.args,
             );
             let mut args = vec![dummy_self];

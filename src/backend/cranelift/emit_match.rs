@@ -498,7 +498,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     {
                         let clif_ty = clif_type(payload_ty);
                         let raw = if i == 0
-                            && enum_name == "Option"
+                            && builtin_types::is(&scrutinee_ast_type, B::Option)
                             && option_repr(&scrutinee_ast_type, self.enum_infos)
                                 == Some(OptionRepr::NullableGcPointer)
                         {
@@ -654,7 +654,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 enum_name, variant, ..
             } => {
                 let tag = self.enum_variant_tag(enum_name, variant);
-                if enum_name == "Option"
+                if builtin_types::is(scrutinee_ty, B::Option)
                     && option_repr(scrutinee_ty, self.enum_infos)
                         == Some(OptionRepr::NullableGcPointer)
                 {
@@ -676,7 +676,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 enum_name, variant, ..
             } => {
                 let tag = self.enum_variant_tag(enum_name, variant);
-                if enum_name == "Option"
+                if builtin_types::is(scrutinee_ty, B::Option)
                     && option_repr(scrutinee_ty, self.enum_infos)
                         == Some(OptionRepr::NullableGcPointer)
                 {

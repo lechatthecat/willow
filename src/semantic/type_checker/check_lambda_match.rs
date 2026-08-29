@@ -313,7 +313,17 @@ impl TypeChecker {
                     for stmt in &b.stmts {
                         self.check_stmt(stmt);
                     }
-                    ann.clone()
+                    // A block-bodied lambda returns only through `return`, so
+                    // one that owes a value has the same obligation a named
+                    // function has (willow-x8sj).
+                    let annotation = ann.clone();
+                    self.check_all_paths_return(
+                        b,
+                        &annotation,
+                        l.span,
+                        ReturnSite::Lambda { inferred: false },
+                    );
+                    annotation
                 } else {
                     // No annotation: collect the return type via the lambda stack.
                     self.lambda_return_stack.push(None);
@@ -321,10 +331,24 @@ impl TypeChecker {
                         self.check_stmt(stmt);
                     }
 
-                    self.lambda_return_stack
+                    let inferred = self
+                        .lambda_return_stack
                         .pop()
                         .flatten()
-                        .unwrap_or(Type::Void)
+                        .unwrap_or(Type::Void);
+                    // The obligation is the same one an annotated lambda has;
+                    // only the moment differs. The type is the RESULT of the
+                    // walk above, so the check has to run here rather than
+                    // before the body, and it is skipped for the inferred
+                    // `void` that a lambda returning nothing lands on
+                    // (willow-x8sj).
+                    self.check_all_paths_return(
+                        b,
+                        &inferred,
+                        l.span,
+                        ReturnSite::Lambda { inferred: true },
+                    );
+                    inferred
                 }
             }
         };
@@ -955,7 +979,7 @@ impl TypeChecker {
                 return false;
             };
             match m.method.as_str() {
-                "recv" => matches!(recv_ty, Type::Generic(n, _) if n == "Channel"),
+                "recv" => builtin_types::unary_arg(recv_ty, B::Channel).is_some(),
                 _ => false,
             }
         };

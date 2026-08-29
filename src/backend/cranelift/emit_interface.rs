@@ -75,7 +75,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         iface: &InterfaceInfo,
         m: &MethodCallExpr,
     ) -> cranelift_codegen::ir::Value {
-        let Some(slot) = iface.method_order.iter().position(|n| n == &m.method) else {
+        let Some(slot) =
+            super::vtable_layout::slot_of(self.interface_infos, &iface.name, &m.method)
+        else {
             panic!(
                 "compiler invariant violated: checked interface method `{}` has no vtable slot",
                 m.method
@@ -183,6 +185,49 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_pop_roots_n(1);
         self.gc_root_count -= 1;
         box_ptr
+    }
+
+    /// Widen an interface box to a SUPER-interface whose vtable is embedded
+    /// `slot_offset` slots into the source's (willow-1fc6).
+    ///
+    /// The object word is carried over unchanged — widening never changes which
+    /// object a value denotes — and the vtable pointer is advanced to the
+    /// embedded region, which is a byte-identical copy of the target
+    /// interface's own vtable for that class. See [`super::vtable_layout`] for
+    /// why the region is there and why the copy cannot drift.
+    ///
+    /// Only called with a non-zero offset: an offset of 0 means the source box
+    /// already answers the target's slot numbering, so there is nothing to do.
+    ///
+    /// Deliberately no [`Self::emit_interface_dispatch_nil_check`]. A widening
+    /// cannot produce a nil box that its input did not already carry, and the
+    /// only thing that dereferences a box is dispatch, which checks it before
+    /// the first load — at the call sites of
+    /// [`Self::emit_interface_dispatch`], and in `emit_lir_interface_call` on
+    /// the LIR path, since that is where a span for the diagnostic exists.
+    /// Guarding here would only move an identical panic earlier, at the cost of
+    /// a branch on every coercion and of threading a span through
+    /// `coerce_to_target`.
+    pub(super) fn emit_interface_rewiden(
+        &mut self,
+        box_ptr: cranelift_codegen::ir::Value,
+        slot_offset: usize,
+    ) -> cranelift_codegen::ir::Value {
+        let object = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), box_ptr, 0i32);
+        let vtable = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), box_ptr, 8i32);
+        // Interior pointer into a static data symbol, not into the GC heap, so
+        // it needs no rooting and the collector never sees it as a reference.
+        let target_vtable = self
+            .builder
+            .ins()
+            .iadd_imm_s(vtable, (slot_offset * 8) as i64);
+        self.emit_box_with_vtable(object, target_vtable)
     }
 
     /// Lower a builtin method call whose identity `intrinsics::resolve` has
@@ -322,7 +367,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             | Intrinsic::AtomicSwap
             | Intrinsic::AtomicAdd
             | Intrinsic::AtomicSub => {
-                let is_i64 = matches!(obj_type, Type::Named(n) if n == "AtomicI64");
+                let is_i64 = builtin_types::is(obj_type, B::AtomicI64);
                 self.emit_atomic_method_call(self_ptr, is_i64, intrinsic, m)
             }
 

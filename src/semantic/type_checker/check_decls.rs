@@ -106,6 +106,15 @@ impl TypeChecker {
             );
         }
         self.check_block(body);
+        self.check_all_paths_return(
+            body,
+            &self.current_return_type.clone(),
+            m.span,
+            ReturnSite::Method {
+                class: iface_name,
+                name: m.name.as_str(),
+            },
+        );
         self.symbols.pop_scope();
         self.current_class = previous_class;
         self.current_effect_callable = previous_effect_callable;
@@ -1264,6 +1273,15 @@ impl TypeChecker {
         }
 
         self.check_block(&m.body);
+        self.check_all_paths_return(
+            &m.body,
+            &return_type,
+            m.span,
+            ReturnSite::Method {
+                class: class_name,
+                name: m.name.as_str(),
+            },
+        );
         if m.is_async {
             let task_params = if m.is_static {
                 param_types.clone()
@@ -1340,6 +1358,12 @@ impl TypeChecker {
             );
         }
         self.check_block(&f.body);
+        self.check_all_paths_return(
+            &f.body,
+            &return_type,
+            f.span,
+            ReturnSite::Function(f.name.as_str()),
+        );
         if f.is_async {
             let locals = self
                 .async_local_types

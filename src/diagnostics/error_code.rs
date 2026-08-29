@@ -47,6 +47,7 @@ error_codes! {
     E0202,
     E0203,
     E0204, // negative exponent literal in an integer `**` (willow-n5yv.3)
+    E0205, // control reaches the end of a body that owes its caller a value
     // Mutability E030x
     E0301,
     E0302,

@@ -831,16 +831,15 @@ impl TypeChecker {
         call: &MethodCallExpr,
     ) -> Option<Type> {
         // Atomic primitives (willow-dgwo.3).
-        if let Type::Named(n) = obj_ty
-            && (n == "AtomicI64" || n == "AtomicBool")
+        if let Some(id @ (B::AtomicI64 | B::AtomicBool)) =
+            builtin_types::resolve(obj_ty).map(|resolved| resolved.id)
         {
-            return Some(self.check_atomic_method_call(n, call));
+            return Some(self.check_atomic_method_call(id.source_name(), call));
         }
-        if matches!(obj_ty, Type::Named(name) if name == "CancellationToken" || name == "TaskScope")
+        if let Some(kind_id @ (B::CancellationToken | B::TaskScope)) =
+            builtin_types::resolve(obj_ty).map(|resolved| resolved.id)
         {
-            let Type::Named(kind) = obj_ty else {
-                unreachable!()
-            };
+            let kind = kind_id.source_name();
             for arg in &call.args {
                 if matches!(arg.mode, CallArgMode::Reference { .. }) {
                     self.push(
@@ -878,14 +877,10 @@ impl TypeChecker {
                     match call.method.as_str() {
                         "cancel" => Type::Void,
                         "is_cancelled" => Type::Bool,
-                        "child" => Type::Named(kind.clone()),
-                        "finish" if kind == "TaskScope" => Type::Generic(
-                            "Task".to_string(),
-                            vec![Type::Generic(
-                                "Result".to_string(),
-                                vec![Type::Void, Type::Named("Cancelled".to_string())],
-                            )],
-                        ),
+                        "child" => Type::Named(kind.to_string()),
+                        "finish" if kind_id == B::TaskScope => B::Task.apply(vec![
+                            B::Result.apply(vec![Type::Void, Type::Named("Cancelled".to_string())]),
+                        ]),
                         "finish" => {
                             self.push(
                                 Diagnostic::new(
@@ -901,8 +896,8 @@ impl TypeChecker {
                     }
                 }
                 "attach" | "add" => {
-                    let valid_name = (kind == "CancellationToken" && call.method == "attach")
-                        || (kind == "TaskScope" && call.method == "add");
+                    let valid_name = (kind_id == B::CancellationToken && call.method == "attach")
+                        || (kind_id == B::TaskScope && call.method == "add");
                     if !valid_name {
                         for arg in &call.args {
                             self.check_expr(&arg.expr);

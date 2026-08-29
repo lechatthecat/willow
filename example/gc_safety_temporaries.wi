@@ -4,9 +4,15 @@
 // reachable from the GC root graph during that allocation. This example
 // exercises the cases where the live value is only a *temporary* (no named
 // binding holds it): a temporary method receiver, function/method call argument
-// temporaries, map key/value temporaries, and chained concatenation. Every line
-// here also runs correctly under WILLOW_GC_STRESS=alloc (collect on every
-// allocation), which is what the regression tests assert.
+// temporaries, map key/value temporaries, chained concatenation, and enum
+// variant payloads. Every line here also runs correctly under
+// WILLOW_GC_STRESS=alloc (collect on every allocation), which is what the
+// regression tests assert.
+//
+// The enum cases are the same invariant seen from the other side: building
+// `Note::Text(s)` allocates the `[tag | payload]` object AFTER `s` exists, and
+// `map`/`map_err` rewrap a value that lives only in a register, so the payload
+// has to be rooted across that allocation (willow-vz5f).
 
 import std::collections::Map;
 
@@ -23,6 +29,17 @@ fn make_holder(s: String) -> Holder {
 
 fn tag(s: String) -> String {
     return s + "!";
+}
+
+// A payload-carrying enum: because ONE variant carries something, every value
+// of this enum is a `[tag | payload]` GC object.
+enum Note {
+    Text(String),
+    Code(i64),
+}
+
+fn stamp(n: i64) -> String {
+    return n.toString() + "!";
 }
 
 fn combine(a: String, b: String) -> String {
@@ -46,4 +63,27 @@ fn main() {
     // Chained concatenation: each `+` allocates a fresh String; earlier
     // operands must survive later allocations.
     println(tag("p") + tag("q") + tag("r"));
+
+    // An enum variant payload is live but unnamed across the allocation of the
+    // variant object that is about to hold it.
+    println(match Note::Text(tag("n")) {
+        Note::Text(s) => s,
+        Note::Code(c) => c.toString(),
+    });
+
+    // `map_err` runs the function, then allocates a fresh `Err` to rewrap the
+    // result: the mapped String exists only in a register in between.
+    let failed: Result<i64, String> = Err("bad");
+    println(match failed.map_err(tag) {
+        Ok(v) => v.toString(),
+        Err(msg) => msg,
+    });
+
+    // The `Ok` side of the same shape, and a payload the mapping function
+    // allocates rather than one that was already on the heap.
+    let fine: Result<i64, String> = Ok(7);
+    println(match fine.map(stamp) {
+        Ok(s) => s,
+        Err(msg) => msg,
+    });
 }

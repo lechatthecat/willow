@@ -51,13 +51,13 @@ pub type RuntimeCancelFn = unsafe extern "C" fn(frame: *mut c_void);
 /// and differ only diagnostically: `Yield` is voluntary, `Preempted` is forced
 /// by the runtime at a safepoint. They are emitted once compiler-inserted
 /// safepoints land (willow-0a6k.2); the scheduler already honors them.
-pub const RUNTIME_POLL_PENDING: i32 = 0;
-pub const RUNTIME_POLL_READY: i32 = 1;
-pub const RUNTIME_POLL_YIELD: i32 = 2;
-pub const RUNTIME_POLL_PREEMPTED: i32 = 3;
-pub const RUNTIME_POLL_PANICKED: i32 = 4;
+pub const RUNTIME_POLL_PENDING: i32 = willow_abi::RuntimePollResult::Pending as i32;
+pub const RUNTIME_POLL_READY: i32 = willow_abi::RuntimePollResult::Ready as i32;
+pub const RUNTIME_POLL_YIELD: i32 = willow_abi::RuntimePollResult::Yield as i32;
+pub const RUNTIME_POLL_PREEMPTED: i32 = willow_abi::RuntimePollResult::Preempted as i32;
+pub const RUNTIME_POLL_PANICKED: i32 = willow_abi::RuntimePollResult::Panicked as i32;
 /// The task submitted native blocking work and detached from this worker.
-pub const RUNTIME_POLL_BLOCKED_SYSCALL: i32 = 5;
+pub const RUNTIME_POLL_BLOCKED_SYSCALL: i32 = willow_abi::RuntimePollResult::BlockedSyscall as i32;
 
 /// Wait relationships a task only owns while it is actually waiting on
 /// something (willow-ezs.3). The overwhelmingly common case — a ready or

@@ -42,6 +42,7 @@ mod panic_effect;
 mod std_collection;
 mod symbols;
 mod type_helpers;
+mod vtable_layout;
 use ast_passes::*;
 use coop::*;
 use gc_codegen::*;
@@ -59,8 +60,8 @@ const OBJECT_FIELD_MASK_CAPACITY: usize = GC_REF_MASK_BITS - 1;
 const ASYNC_FRAME_HEADER_WORDS: usize = willow_abi::async_frame::HEADER_WORDS as usize;
 const ASYNC_FRAME_GC_SLOT_CAPACITY: usize = GC_REF_MASK_BITS - ASYNC_FRAME_HEADER_WORDS;
 const ASYNC_FRAME_LARGE_WARNING_BYTES: usize = 8 * 1024;
-const COOP_POLL_PREEMPTED: i64 = 3;
-const COOP_POLL_PANICKED: i64 = 4;
+const COOP_POLL_PREEMPTED: i64 = willow_abi::RuntimePollResult::Preempted as i64;
+const COOP_POLL_PANICKED: i64 = willow_abi::RuntimePollResult::Panicked as i64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AsyncFrameSizeWarning {
@@ -172,6 +173,12 @@ pub struct Codegen {
     function_may_panic: FunctionMap<bool>,
     /// Imported module access name -> canonical symbol prefix.
     known_modules: HashMap<String, String>,
+    /// Local alias -> canonical builtin schema module (`import std::fs as
+    /// files;` records `files -> fs`), for the file currently being compiled.
+    /// The AST path never needs it because `normalize_std_collection_program`
+    /// has already folded it into the program; the LIR path lowers from the raw
+    /// frontend program and canonicalizes here (willow-nswv).
+    builtin_module_aliases: HashMap<String, String>,
     /// Maps each lambda's source span to its generated private function name.
     lambda_names: HashMap<crate::diagnostics::Span, String>,
     /// Source names of async fns lowered as cooperative tasks (constructor +
@@ -439,6 +446,7 @@ impl Codegen {
             func_param_debug: FunctionMap::default(),
             function_may_panic: FunctionMap::default(),
             known_modules: HashMap::new(),
+            builtin_module_aliases: HashMap::new(),
             lambda_names: HashMap::new(),
             cooperative_leaves: std::collections::HashSet::new(),
             string_literals: HashMap::new(),
@@ -1727,6 +1735,9 @@ struct FuncGen<'a, 'b> {
     func_param_debug: &'a FunctionMap<Vec<ParamDebug>>,
     function_may_panic: &'a FunctionMap<bool>,
     known_modules: &'a HashMap<String, String>,
+    /// Local alias -> canonical builtin schema module, for the file being
+    /// compiled (willow-nswv). Only the LIR path reads it.
+    builtin_module_aliases: &'a HashMap<String, String>,
     lambda_names: &'a HashMap<crate::diagnostics::Span, String>,
     cooperative_leaves: &'a std::collections::HashSet<FunctionId>,
     string_literals: &'a HashMap<String, DataId>,
@@ -1879,8 +1890,8 @@ const FRAME_SLOT_TASK_ID: usize = 1;
 /// constants in `crates/willow_runtime/src/async_frame.rs` (willow-ezs.1.3).
 /// Bits 0..2 are the terminal code (0 pending, 1 completed, 2 cancelled,
 /// 3 panicked); higher bits carry sticky flags such as cancel-requested.
-const WILLOW_FRAME_STATUS_TERMINAL_MASK: i64 = 0b111;
-const WILLOW_FRAME_STATUS_CANCELLED: i64 = 2;
+const WILLOW_FRAME_STATUS_TERMINAL_MASK: i64 = willow_abi::frame_status::TERMINAL_MASK;
+const WILLOW_FRAME_STATUS_CANCELLED: i64 = willow_abi::FrameTerminalStatus::Cancelled as i64;
 
 fn async_frame_slot_offset(n: usize) -> i32 {
     ASYNC_FRAME_HEADER_BYTES + (n as i32) * 8
@@ -2238,6 +2249,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         {
             return value;
         }
+        // Interface → SUPER-interface. The concrete class is not known here, so
+        // the target vtable can only come from the source's: the layout embeds
+        // each super's table as a contiguous run, and widening advances the
+        // vtable pointer to that run (see `vtable_layout`). Offset 0 — the
+        // single-`extends` chain, where the super's table is a plain prefix —
+        // needs no new box at all. A target that is not a super leaves the value
+        // alone; the checker has already rejected that program (willow-1fc6).
+        if let Type::Named(vn) | Type::Generic(vn, _) = value_ty
+            && self.interface_infos.contains_key(vn)
+        {
+            return match vtable_layout::super_offset(self.interface_infos, vn, iface_name) {
+                Some(0) | None => value,
+                Some(offset) => self.emit_interface_rewiden(value, offset),
+            };
+        }
         if let Type::Named(class_name) = value_ty
             && self.class_layouts.contains_key(class_name)
         {
@@ -2246,8 +2272,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         value
     }
 
-    /// Explicit parameter types (aligned with call arguments, no `self`) for a
-    /// declared function/lambda mangled name. `None` if not a known function.
+    /// The declared parameter types of a mangled function/lambda name, exactly
+    /// as recorded — for a class method that INCLUDES the hidden leading
+    /// `self`, so the result aligns with call arguments only for free
+    /// functions. Use [`Self::method_param_types`] to align with a method
+    /// call's explicit arguments. `None` if not a known function.
     fn fn_param_types(&self, mangled: &str) -> Option<Vec<Type>> {
         match self.fn_types.get(mangled) {
             Some(Type::Fn(params, _)) => Some(params.clone()),
@@ -3068,35 +3097,29 @@ fn ast_type_of_expr_structural(
                     "len" => return Type::I64,
                     "pop" => return (**elem).clone(),
                     "push" => return Type::Void,
-                    "freeze" => {
-                        return Type::Generic("FrozenArray".to_string(), vec![(**elem).clone()]);
-                    }
+                    "freeze" => return B::FrozenArray.apply(vec![(**elem).clone()]),
                     _ => {}
                 }
             }
-            if let Type::Generic(name, fargs) = &obj_ty
-                && name == "FrozenArray"
-                && fargs.len() == 1
-                && m.method == "len"
-            {
+            if builtin_types::unary_arg(&obj_ty, B::FrozenArray).is_some() && m.method == "len" {
                 return Type::I64;
             }
-            if let Type::Generic(name, margs) = &obj_ty {
-                if name == "Map" && margs.len() == 2 {
+            if let Type::Generic(_, margs) = &obj_ty {
+                if builtin_types::binary_args(&obj_ty, B::Map).is_some() {
                     match m.method.as_str() {
                         "get" => {
-                            return Type::Generic("Option".to_string(), vec![margs[1].clone()]);
+                            return B::Option.apply(vec![margs[1].clone()]);
                         }
                         "len" => return Type::I64,
                         "contains" => return Type::Bool,
-                        "freeze" => return Type::Generic("FrozenMap".to_string(), margs.clone()),
+                        "freeze" => return B::FrozenMap.apply(margs.clone()),
                         _ => return Type::Void,
                     }
                 }
-                if name == "FrozenMap" && margs.len() == 2 {
+                if builtin_types::binary_args(&obj_ty, B::FrozenMap).is_some() {
                     match m.method.as_str() {
                         "get" => {
-                            return Type::Generic("Option".to_string(), vec![margs[1].clone()]);
+                            return B::Option.apply(vec![margs[1].clone()]);
                         }
                         "contains" => return Type::Bool,
                         "len" => return Type::I64,
@@ -3165,11 +3188,11 @@ fn ast_type_of_expr_structural(
         Expr::TryPropagate(inner, _) => {
             // ? extracts the Ok/Some payload from Result<T,E> or Option<T> → type T
             let inner_ty = ast_type_of_expr(inner, vars, frt, et);
-            if let Type::Generic(name, args) = &inner_ty
-                && (name == "Result" || name == "Option")
-                && !args.is_empty()
-            {
-                return args[0].clone();
+            if let Some(payload) = builtin_types::unary_arg(&inner_ty, B::Option) {
+                return payload.clone();
+            }
+            if let Some((payload, _)) = builtin_types::binary_args(&inner_ty, B::Result) {
+                return payload.clone();
             }
             Type::I64
         }
@@ -3182,9 +3205,9 @@ fn ast_type_of_expr_structural(
         }
         Expr::Index(arr, _, _) => match ast_type_of_expr(arr, vars, frt, et) {
             Type::Array(elem) => *elem,
-            Type::Generic(name, args) if name == "FrozenArray" && args.len() == 1 => {
-                args.into_iter().next().unwrap()
-            }
+            ty @ Type::Generic(_, _) => builtin_types::unary_arg(&ty, B::FrozenArray)
+                .cloned()
+                .unwrap_or(Type::I64),
             _ => Type::I64,
         },
     }

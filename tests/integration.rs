@@ -29,6 +29,10 @@ mod codegen;
 mod codegen_invariants;
 #[path = "integration/defer_panic_termination.rs"]
 mod defer_panic_termination;
+#[path = "integration/gc_enum_payload_roots.rs"]
+mod gc_enum_payload_roots;
+#[path = "integration/interface_super_coercion.rs"]
+mod interface_super_coercion;
 #[path = "integration/lambda_shadowing.rs"]
 mod lambda_shadowing;
 #[path = "integration/lir_async.rs"]
@@ -37,12 +41,20 @@ mod lir_async;
 mod lir_atomics;
 #[path = "integration/lir_class_inheritance.rs"]
 mod lir_class_inheritance;
+#[path = "integration/lir_defer_block_order.rs"]
+mod lir_defer_block_order;
+#[path = "integration/lir_defer_scopes.rs"]
+mod lir_defer_scopes;
 #[path = "integration/lir_io.rs"]
 mod lir_io;
 #[path = "integration/lir_locks.rs"]
 mod lir_locks;
 #[path = "integration/lir_main_result.rs"]
 mod lir_main_result;
+#[path = "integration/lir_namespace_aliases.rs"]
+mod lir_namespace_aliases;
+#[path = "integration/missing_return.rs"]
+mod missing_return;
 
 #[path = "integration/lir_match_bodies.rs"]
 mod lir_match_bodies;

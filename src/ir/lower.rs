@@ -1120,12 +1120,9 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                 let kind = match &case.kind {
                     SelectCaseKind::Recv { binding, channel } => {
                         let channel = lower_expr(channel, ctx)?;
-                        let binding_ty = match &channel.ty {
-                            Type::Generic(name, args) if name == "Channel" && args.len() == 1 => {
-                                args[0].clone()
-                            }
-                            _ => return Err(unsupported(case.span, "select receive channel")),
-                        };
+                        let binding_ty = builtin_types::unary_arg(&channel.ty, B::Channel)
+                            .ok_or_else(|| unsupported(case.span, "select receive channel"))?
+                            .clone();
                         ctx.push_scope();
                         let binding = ctx.bind(binding.clone(), binding_ty);
                         let mut body = Vec::with_capacity(case.body.stmts.len());
@@ -1585,40 +1582,34 @@ fn builtin_method_type(receiver: &Type, method: &str) -> Option<Type> {
             "toString" => Some(Type::String),
             "push" => Some(Type::Void),
             "pop" => Some((**elem).clone()),
-            "freeze" => Some(Type::Generic(
-                "FrozenArray".to_string(),
-                vec![(**elem).clone()],
-            )),
+            "freeze" => Some(B::FrozenArray.apply(vec![(**elem).clone()])),
             _ => None,
         },
-        Type::Generic(name, args) => match (name.as_str(), args.as_slice(), method) {
-            ("Map", [k, v], _) => match method {
+        Type::Generic(_, args) => match (
+            builtin_types::resolve(receiver)?.id,
+            args.as_slice(),
+            method,
+        ) {
+            (B::Map, [k, v], _) => match method {
                 "insert" => Some(Type::Void),
                 "toString" => Some(Type::String),
-                "get" => Some(Type::Generic("Option".to_string(), vec![v.clone()])),
+                "get" => Some(B::Option.apply(vec![v.clone()])),
                 "contains" => Some(Type::Bool),
                 "len" => Some(Type::I64),
-                "freeze" => Some(Type::Generic(
-                    "FrozenMap".to_string(),
-                    vec![k.clone(), v.clone()],
-                )),
+                "freeze" => Some(B::FrozenMap.apply(vec![k.clone(), v.clone()])),
                 _ => None,
             },
-            ("FrozenArray", [_], "len") | ("FrozenMap", [_, _], "len") => Some(Type::I64),
-            ("FrozenMap", [_, v], "get") => {
-                Some(Type::Generic("Option".to_string(), vec![v.clone()]))
-            }
-            ("FrozenMap", [_, _], "contains") => Some(Type::Bool),
-            ("Task" | "JoinHandle", [_], "cancel") => Some(Type::Void),
+            (B::FrozenArray, [_], "len") | (B::FrozenMap, [_, _], "len") => Some(Type::I64),
+            (B::FrozenMap, [_, v], "get") => Some(B::Option.apply(vec![v.clone()])),
+            (B::FrozenMap, [_, _], "contains") => Some(Type::Bool),
+            (B::Task | B::JoinHandle, [_], "cancel") => Some(Type::Void),
             // Cancellation-aware awaitable view of the same frame.
-            ("Task" | "JoinHandle", [t], "result") => {
-                Some(Type::Generic("TaskResult".to_string(), vec![t.clone()]))
-            }
-            ("Task" | "JoinHandle", [_], "is_cancelled") => Some(Type::Bool),
-            ("BlockingCell", [t], "get") => Some(t.clone()),
-            ("BlockingCell", [_], "set") => Some(Type::Void),
-            ("BlockingRwCell", [t], "read") => Some(t.clone()),
-            ("BlockingRwCell", [_], "write") => Some(Type::Void),
+            (B::Task | B::JoinHandle, [t], "result") => Some(B::TaskResult.apply(vec![t.clone()])),
+            (B::Task | B::JoinHandle, [_], "is_cancelled") => Some(Type::Bool),
+            (B::BlockingCell, [t], "get") => Some(t.clone()),
+            (B::BlockingCell, [_], "set") => Some(Type::Void),
+            (B::BlockingRwCell, [t], "read") => Some(t.clone()),
+            (B::BlockingRwCell, [_], "write") => Some(Type::Void),
             _ => None,
         },
         _ => None,

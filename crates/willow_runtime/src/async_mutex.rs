@@ -419,15 +419,15 @@ fn finish_lock_wait_purge(link: Option<LockWaitLink>, outcome: LockCancelOutcome
 // frame branches on one convention. Negative values are failures.
 
 /// Ownership is the caller's; the frame may load the protected value.
-pub const MUTEX_STATUS_ACQUIRED: i32 = 1;
+pub const MUTEX_STATUS_ACQUIRED: i32 = willow_abi::LockAcquireStatus::Acquired as i32;
 /// Registered and parked; the frame returns `Pending`.
-pub const MUTEX_STATUS_PENDING: i32 = 0;
+pub const MUTEX_STATUS_PENDING: i32 = willow_abi::LockAcquireStatus::Pending as i32;
 /// Same task, same mutex: non-reentrant (§11).
-pub const MUTEX_STATUS_RECURSIVE: i32 = -1;
+pub const MUTEX_STATUS_RECURSIVE: i32 = willow_abi::LockAcquireStatus::Recursive as i32;
 /// This acquisition's generation is gone (a revoked reservation, a stale
 /// token). Recovery is a brand-new acquire, which either takes an uncontended
 /// lock or joins the queue.
-pub const MUTEX_STATUS_LOST: i32 = -2;
+pub const MUTEX_STATUS_LOST: i32 = willow_abi::LockAcquireStatus::Lost as i32;
 /// No registration was published because the task may not park: it is
 /// cancel-requested, already `Cancelling`, or terminal.
 ///
@@ -437,12 +437,12 @@ pub const MUTEX_STATUS_LOST: i32 = -2;
 /// therefore returns `Pending` and gives the worker back instead of re-arming
 /// the acquire, which would spin on this status for as long as the current
 /// owner holds the lock, and forever when that owner needs this worker.
-pub const MUTEX_STATUS_CANCELLED: i32 = -3;
+pub const MUTEX_STATUS_CANCELLED: i32 = willow_abi::LockAcquireStatus::Cancelled as i32;
 
 /// Call-site discriminator for a fatal unknown status. These are wire values
 /// shared with generated code so the diagnostic can name the broken ABI edge.
-pub const MUTEX_STATUS_PHASE_ACQUIRE: i32 = 0;
-pub const MUTEX_STATUS_PHASE_POLL: i32 = 1;
+pub const MUTEX_STATUS_PHASE_ACQUIRE: i32 = willow_abi::LockStatusPhase::Acquire as i32;
+pub const MUTEX_STATUS_PHASE_POLL: i32 = willow_abi::LockStatusPhase::Poll as i32;
 
 unsafe fn trace_async_mutex(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     let mutex = unsafe { &*(payload as *const AsyncMutex) };

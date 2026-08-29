@@ -1,5 +1,6 @@
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
+use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 
 use super::*;
 
@@ -100,8 +101,10 @@ impl TypeChecker {
         match &arr_ty {
             Type::Array(elem) => (**elem).clone(),
             // Read-only indexing of an immutable `FrozenArray<T>` (willow-dgwo.7).
-            Type::Generic(name, args) if name == "FrozenArray" && args.len() == 1 => {
-                args[0].clone()
+            Type::Generic(_, _)
+                if let Some(elem) = builtin_types::unary_arg(&arr_ty, B::FrozenArray) =>
+            {
+                elem.clone()
             }
             // Recover quietly from an earlier error that produced Void.
             Type::Void => Type::Void,
@@ -258,12 +261,7 @@ impl TypeChecker {
         obj_ty: &Type,
         m: &MethodCallExpr,
     ) -> Option<Type> {
-        let Type::Generic(name, args) = obj_ty else {
-            return None;
-        };
-        if name != "FrozenArray" || args.len() != 1 {
-            return None;
-        }
+        let elem_ty = builtin_types::unary_arg(obj_ty, B::FrozenArray)?;
         match m.method.as_str() {
             "len" => Some(Type::I64),
             "push" | "pop" | "set" => {
@@ -287,7 +285,7 @@ impl TypeChecker {
                         ErrorCode::E0201,
                         format!(
                             "no method `{other}` on `FrozenArray<{}>`",
-                            type_name(&args[0])
+                            type_name(elem_ty)
                         ),
                     )
                     .with_label(Label::primary(m.span, "unknown method"))
@@ -306,14 +304,9 @@ impl TypeChecker {
         obj_ty: &Type,
         m: &MethodCallExpr,
     ) -> Option<Type> {
-        let Type::Generic(name, args) = obj_ty else {
-            return None;
-        };
-        if name != "Map" || args.len() != 2 {
-            return None;
-        }
-        let key_ty = args[0].clone();
-        let val_ty = args[1].clone();
+        let (key_ty, val_ty) = builtin_types::binary_args(obj_ty, B::Map)?;
+        let key_ty = key_ty.clone();
+        let val_ty = val_ty.clone();
 
         let check_key = |checker: &mut Self, arg: &CallArg| {
             let k = checker.check_expr(&arg.expr);
@@ -377,7 +370,7 @@ impl TypeChecker {
                 } else {
                     check_key(self, &m.args[0]);
                 }
-                Some(Type::Generic("Option".to_string(), vec![val_ty]))
+                Some(B::Option.apply(vec![val_ty]))
             }
             "contains" => {
                 if m.args.len() != 1 {
@@ -446,7 +439,7 @@ impl TypeChecker {
                         .with_label(Label::primary(m.span, "unexpected arguments")),
                     );
                 }
-                Some(Type::Generic("FrozenMap".to_string(), vec![key_ty, val_ty]))
+                Some(B::FrozenMap.apply(vec![key_ty, val_ty]))
             }
             other => {
                 self.push(
@@ -478,14 +471,9 @@ impl TypeChecker {
         obj_ty: &Type,
         m: &MethodCallExpr,
     ) -> Option<Type> {
-        let Type::Generic(name, args) = obj_ty else {
-            return None;
-        };
-        if name != "FrozenMap" || args.len() != 2 {
-            return None;
-        }
-        let key_ty = args[0].clone();
-        let val_ty = args[1].clone();
+        let (key_ty, val_ty) = builtin_types::binary_args(obj_ty, B::FrozenMap)?;
+        let key_ty = key_ty.clone();
+        let val_ty = val_ty.clone();
         if let Some(arg) = m.args.first() {
             let k = self.check_expr(&arg.expr);
             if matches!(m.method.as_str(), "get" | "contains")
@@ -507,7 +495,7 @@ impl TypeChecker {
             }
         }
         match m.method.as_str() {
-            "get" => Some(Type::Generic("Option".to_string(), vec![val_ty])),
+            "get" => Some(B::Option.apply(vec![val_ty])),
             "contains" => Some(Type::Bool),
             "len" => Some(Type::I64),
             "insert" | "remove" => {

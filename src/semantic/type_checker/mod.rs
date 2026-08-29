@@ -8,6 +8,7 @@ mod check_lambda_match;
 mod check_ops;
 mod diagnostics;
 mod resolve;
+mod returns;
 mod send_sync;
 pub(crate) mod types;
 pub(crate) use analysis::*;
@@ -15,12 +16,14 @@ pub(crate) use analysis::*;
 use check::check_source;
 pub(crate) use check::defer_body_contains_direct_recover;
 use diagnostics::*;
+use returns::ReturnSite;
 pub(crate) use types::*;
 
 use super::symbols::{ClassInfo, FieldInfo, MethodInfo, ParamInfo, StaticPropInfo, SymbolTable};
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::module::std_registry;
 use crate::parser::ast::*;
+use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::call_graph::ClassHierarchy;
 use crate::semantic::concurrency::{NonpreemptibleHelper, NonpreemptibleReason};
 use crate::semantic::effects::RuntimeEffects;
@@ -861,8 +864,8 @@ impl TypeChecker {
                 self.check_collection_type_imported("Array", span);
                 self.validate_type(element, span);
             }
-            Type::Generic(name, args) => {
-                if name == "Map" {
+            Type::Generic(_, args) => {
+                if builtin_types::is(ty, B::Map) {
                     self.check_collection_type_imported("Map", span);
                 }
                 for arg in args {
@@ -1020,10 +1023,9 @@ impl TypeChecker {
             || matches!((expected, actual),
                 (Type::Array(e), Type::Array(a)) if **e == Type::Void || **a == Type::Void)
             // `Map::new()` produces `Map<Void, Void>`, resolved by the annotation.
-            || matches!((expected, actual),
-                (Type::Generic(en, eargs), Type::Generic(an, aargs))
-                    if en == "Map" && an == "Map" && eargs.len() == 2 && aargs.len() == 2
-                        && aargs.iter().all(|a| *a == Type::Void))
+            || (builtin_types::binary_args(expected, B::Map).is_some()
+                && builtin_types::binary_args(actual, B::Map)
+                    .is_some_and(|(key, value)| *key == Type::Void && *value == Type::Void))
             || self.is_subtype(actual, expected)
     }
 

@@ -20,6 +20,7 @@
 
 use crate::diagnostics::Span;
 use crate::parser::ast::{LockMode, Type};
+use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::type_checker::types::{await_output_type, awaitable_task_type};
 
 use super::typed_ast::{
@@ -730,7 +731,7 @@ fn expr_suspends_here(expr: &HirExpr) -> bool {
     match &expr.kind {
         HirExprKind::Await { .. } | HirExprKind::Select { .. } => true,
         HirExprKind::MethodCall { object, method, .. } => {
-            matches!(&object.ty, Type::Generic(name, _) if name == "Channel")
+            builtin_types::unary_arg(&object.ty, B::Channel).is_some()
                 && matches!(method.as_str(), "send" | "recv")
         }
         _ => false,
@@ -1233,7 +1234,7 @@ impl Builder {
                 object,
                 method,
                 args,
-            } if matches!(&object.ty, Type::Generic(name, _) if name == "Channel") => {
+            } if builtin_types::unary_arg(&object.ty, B::Channel).is_some() => {
                 let channel_name = self.synthetic_name("channel");
                 let channel = self.push_synth_let(&channel_name, false, (**object).clone());
                 match (method.as_str(), args.as_slice()) {
@@ -1576,10 +1577,9 @@ impl Builder {
                 HirSelectCaseKind::Recv { binding, channel } => {
                     let name = self.synthetic_name("select_channel");
                     let channel_local = self.push_synth_let(&name, false, channel.clone());
-                    let elem_ty = match &channel.ty {
-                        Type::Generic(name, args) if name == "Channel" => args[0].clone(),
-                        _ => unreachable!("select recv channel was type checked"),
-                    };
+                    let elem_ty = builtin_types::unary_arg(&channel.ty, B::Channel)
+                        .expect("select recv channel was type checked")
+                        .clone();
                     let binding = (binding != "_").then(|| {
                         self.declare_local(
                             binding.clone(),
@@ -1600,10 +1600,9 @@ impl Builder {
                     let channel_local = self.push_synth_let(&channel_name, false, channel.clone());
                     let value_name = self.synthetic_name("select_value");
                     let value_local = self.push_synth_let(&value_name, false, value.clone());
-                    let elem_ty = match &channel.ty {
-                        Type::Generic(name, args) if name == "Channel" => args[0].clone(),
-                        _ => unreachable!("select send channel was type checked"),
-                    };
+                    let elem_ty = builtin_types::unary_arg(&channel.ty, B::Channel)
+                        .expect("select send channel was type checked")
+                        .clone();
                     LirSelectOp::Send {
                         channel: channel_local,
                         value: value_local,

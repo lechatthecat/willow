@@ -1,0 +1,100 @@
+// Sound interface-to-super-interface coercion (willow-1fc6).
+//
+// `All extends Alpha, Beta, Gamma`, so Beta and Gamma do not begin at slot 0
+// of All's vtable. Converting an All value to either interface must adjust its
+// vtable pointer; reusing the All box would call Alpha's methods instead.
+// Build with WILLOW_LIR_BACKEND=0 and with
+// WILLOW_LIR_BACKEND=1 WILLOW_LIR_REQUIRE=1: both must print the same 19 lines.
+
+import std::collections::Array;
+
+interface Alpha {
+    fn alpha(self) -> i64;
+    fn alpha2(self) -> i64;
+}
+
+interface Beta {
+    fn beta(self) -> i64;
+    fn beta2(self) -> i64;
+}
+
+interface Gamma {
+    fn gamma(self) -> i64;
+}
+
+interface All extends Alpha, Beta, Gamma {
+    fn all(self) -> i64;
+}
+
+class Impl implements All {
+    pub fn alpha(self) -> i64 { return 11; }
+    pub fn alpha2(self) -> i64 { return 12; }
+    pub fn beta(self) -> i64 { return 21; }
+    pub fn beta2(self) -> i64 { return 22; }
+    pub fn gamma(self) -> i64 { return 31; }
+    pub fn all(self) -> i64 { return 41; }
+}
+
+class Holder {
+    pub value: Beta;
+}
+
+class Sink {
+    pub static fn via_static(value: Beta) -> i64 { return value.beta(); }
+    pub fn via_method(self, value: Beta) -> i64 { return value.beta2(); }
+}
+
+fn via_argument(value: Beta) -> i64 { return value.beta(); }
+fn via_return(value: All) -> Beta { return value; }
+
+fn main() {
+    let value: All = new Impl();
+
+    // Direct child dispatch still uses the child's own slot numbering.
+    println(value.alpha());
+    println(value.beta());
+    println(value.all());
+
+    // Function argument and return positions.
+    println(via_argument(value));
+    println(via_return(value).beta2());
+
+    // Local initialization and assignment.
+    let local: Beta = value;
+    println(local.beta());
+    let mut assigned: Beta = local;
+    assigned = value;
+    println(assigned.beta2());
+
+    // Array literal, push, and indexed assignment.
+    let items: Array<Beta> = [value];
+    println(items[0].beta());
+    items.push(value);
+    println(items[1].beta2());
+    items[0] = value;
+    println(items[0].beta2());
+
+    // Field construction and assignment.
+    let holder = new Holder(value);
+    println(holder.value.beta());
+    holder.value = value;
+    println(holder.value.beta2());
+
+    // Static and instance method arguments.
+    println(Sink::via_static(value));
+    println(new Sink().via_method(value));
+
+    // The third super starts after both Alpha and Beta.
+    let gamma: Gamma = value;
+    println(gamma.gamma());
+
+    // The first super remains a zero-offset conversion.
+    let alpha: Alpha = value;
+    println(alpha.alpha());
+    println(alpha.alpha2());
+
+    // Reusing an already widened value is identity.
+    let same: Beta = local;
+    println(same.beta());
+    println(same.beta2());
+}

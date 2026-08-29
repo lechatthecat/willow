@@ -2404,10 +2404,9 @@ fn lock_suspend_operation(
             ))
         }
         Expr::MethodCall(call) if matches!(call.method.as_str(), "get" | "set") => {
-            let on_blocking_cell = matches!(
-                expr_types.get(&call.object.span()),
-                Some(Type::Generic(name, _)) if name == "BlockingCell"
-            );
+            let on_blocking_cell = expr_types
+                .get(&call.object.span())
+                .is_some_and(|ty| builtin_types::unary_arg(ty, B::BlockingCell).is_some());
             on_blocking_cell.then_some((
                 if call.method == "get" {
                     "BlockingCell.get"
@@ -2418,10 +2417,9 @@ fn lock_suspend_operation(
             ))
         }
         Expr::MethodCall(call) if matches!(call.method.as_str(), "read" | "write") => {
-            let on_rwlock = matches!(
-                expr_types.get(&call.object.span()),
-                Some(Type::Generic(name, _)) if name == "BlockingRwCell"
-            );
+            let on_rwlock = expr_types
+                .get(&call.object.span())
+                .is_some_and(|ty| builtin_types::unary_arg(ty, B::BlockingRwCell).is_some());
             on_rwlock.then_some((
                 if call.method == "read" {
                     "BlockingRwCell.read"

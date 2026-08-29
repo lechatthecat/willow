@@ -74,17 +74,17 @@ pub const ASYNC_FRAME_STATUS_OFFSET: usize =
 // on the heavy `RuntimeTask` record still existing.
 
 /// Not finished: still ready/running/parked.
-pub const WILLOW_FRAME_STATUS_PENDING: i64 = 0;
+pub const WILLOW_FRAME_STATUS_PENDING: i64 = willow_abi::FrameTerminalStatus::Pending as i64;
 /// Ran to completion; the result slot holds the value.
-pub const WILLOW_FRAME_STATUS_COMPLETED: i64 = 1;
+pub const WILLOW_FRAME_STATUS_COMPLETED: i64 = willow_abi::FrameTerminalStatus::Completed as i64;
 /// Cooperatively cancelled; there is NO result to read.
-pub const WILLOW_FRAME_STATUS_CANCELLED: i64 = 2;
+pub const WILLOW_FRAME_STATUS_CANCELLED: i64 = willow_abi::FrameTerminalStatus::Cancelled as i64;
 /// Terminated by a panic.
-pub const WILLOW_FRAME_STATUS_PANICKED: i64 = 3;
+pub const WILLOW_FRAME_STATUS_PANICKED: i64 = willow_abi::FrameTerminalStatus::Panicked as i64;
 /// Mask selecting the terminal code out of the status word.
-pub const WILLOW_FRAME_STATUS_TERMINAL_MASK: i64 = 0b111;
+pub const WILLOW_FRAME_STATUS_TERMINAL_MASK: i64 = willow_abi::frame_status::TERMINAL_MASK;
 /// Cancellation was requested but the task has not reached the boundary yet.
-pub const WILLOW_FRAME_STATUS_CANCEL_REQUESTED: i64 = 1 << 8;
+pub const WILLOW_FRAME_STATUS_CANCEL_REQUESTED: i64 = willow_abi::frame_status::CANCEL_REQUESTED;
 
 /// The status word of `frame` as an atomic, or `None` for a null frame.
 ///

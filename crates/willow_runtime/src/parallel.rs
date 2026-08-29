@@ -61,7 +61,7 @@ unsafe fn coordinator_frame(frame: *mut c_void) -> NativeTaskFrame<CoordinatorFr
 /// active or a future preemption policy is accidentally disabled.
 const MAX_ELEMENTS_PER_POLL: i64 = 256;
 
-type I64Mapper = unsafe extern "C" fn(i64) -> i64;
+pub type I64Mapper = unsafe extern "C" fn(i64) -> i64;
 
 struct ChunkState {
     mapper: I64Mapper,
@@ -232,8 +232,17 @@ unsafe extern "C" fn cancel_coordinator(frame: *mut c_void) {
 /// is a plain non-capturing function pointer; captured lambdas are rejected by
 /// the compiler before this ABI is reached.
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_parallel_map_i64(input: *mut u8, mapper: i64) -> *mut c_void {
-    if input.is_null() || mapper == 0 {
+pub extern "C" fn willow_parallel_map_i64(
+    input: *mut u8,
+    mapper: Option<I64Mapper>,
+) -> *mut c_void {
+    let Some(mapper) = mapper else {
+        crate::panic_context::raise_language_message(
+            "parallel::map requires a FrozenArray<i64> and a valid mapper",
+        );
+        return std::ptr::null_mut();
+    };
+    if input.is_null() {
         crate::panic_context::raise_language_message(
             "parallel::map requires a FrozenArray<i64> and a valid mapper",
         );
@@ -264,7 +273,6 @@ pub extern "C" fn willow_parallel_map_i64(input: *mut u8, mapper: i64) -> *mut c
     // Root it explicitly while child-frame allocations may collect.
     let mut rooted_frame = frame.as_raw().cast::<u8>();
     willow_push_root(&mut rooted_frame as *mut *mut u8);
-    let mapper: I64Mapper = unsafe { std::mem::transmute(mapper as usize) };
     let worker_count = crate::scheduler::willow_sched_active_workers().max(1) as usize;
     let ranges = chunk_ranges(len, worker_count);
     let mut children = Vec::with_capacity(ranges.len());

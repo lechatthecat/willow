@@ -62,6 +62,17 @@ pub(crate) fn std_collection_imports(program: &Program) -> StdCollectionImports 
     }
 }
 
+/// The local aliases of the builtin schema namespaces declared by `program`
+/// (`import std::fs as files;` records `files -> fs`), on their own.
+///
+/// [`normalize_std_collection_program`] folds these into the AST it hands the
+/// emitter, so the AST path never sees an alias. The LIR path lowers to HIR
+/// from the RAW frontend program and so does see them, and canonicalizes at the
+/// point of use instead (willow-nswv).
+pub(crate) fn builtin_module_aliases(program: &Program) -> HashMap<String, String> {
+    std_collection_imports(program).builtin_module_aliases
+}
+
 pub(crate) fn normalize_std_collection_item(item: &mut Item, imports: &StdCollectionImports) {
     match item {
         Item::Function(function) => normalize_std_collection_function(function, imports),

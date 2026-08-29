@@ -28,12 +28,13 @@
 //! Class layouts include inherited fields in declaration order, while method
 //! calls on a hierarchy use the same vtable slots as the AST emitter. Canonical
 //! nullable values are supported through `Option<T>`. A `defer` body must be an
-//! effect-only match or straight-line HIR block. In a SYNCHRONOUS function its
-//! scope additionally has to open and close inside one LIR block, and an early
-//! exit out of one still falls back, because the Rust-side scope stack the AST
-//! path keeps is not yet nesting-aware; an async function has no such
-//! restriction — its scopes are frame flags and its recovery continuation is a
-//! real LIR block.
+//! effect-only match or straight-line HIR block, but its scope may span blocks
+//! and be left by an early exit. A SYNCHRONOUS function keeps that scope stack
+//! on the Rust side, so the emitter hands each LIR block the state its
+//! predecessor exited with and emits blocks in an order the edges permit rather
+//! than in LIR index order; a function whose blocks disagree about what is open
+//! falls back. An async function has no such bookkeeping — its scopes are frame
+//! flags and its recovery continuation is a real LIR block.
 //!
 //! An async function walks LIR inside the cooperative poll ABI: LIR-owned frame
 //! layout and liveness, compiler preemption/cancellation safepoints, and
@@ -396,6 +397,7 @@ struct NamespaceBuiltin {
 /// `f64` does not displace either one.
 fn namespace_builtin_call(
     known_modules: &HashMap<String, String>,
+    builtin_module_aliases: &HashMap<String, String>,
     class: &str,
     method: &str,
 ) -> Option<NamespaceBuiltin> {
@@ -419,6 +421,16 @@ fn namespace_builtin_call(
             _ => None,
         };
     }
+    // `files::exists(..)` under `import std::fs as files;` is the same call as
+    // `fs::exists(..)`. The AST path reaches this dispatch with the alias
+    // already rewritten by `normalize_std_collection_program`, so resolving it
+    // here — BEFORE the user-module gate below, which is the order that pass
+    // and `emit_static_method_call` apply between them — is what makes the two
+    // paths admit the same set of calls (willow-nswv).
+    let class = builtin_module_aliases
+        .get(class)
+        .map(String::as_str)
+        .unwrap_or(class);
     if known_modules.contains_key(class) {
         return None;
     }
@@ -635,19 +647,12 @@ pub(super) struct LirTypeCtx<'x> {
     /// — the AST emitter answers such a call with a constant `0`, so a walker
     /// that admitted it would silently miscompile (willow-0g8j.6).
     pub iface_method: &'x dyn Fn(&Type, &str) -> Option<IfaceMethodSig>,
-    /// Whether interface `target`'s vtable slots are a PREFIX of interface
-    /// `source`'s — the precondition under which a `source` box may be used as
-    /// a `target` box unchanged, which is the coercion
-    /// [`FuncGen::coerce_to_target`] applies (namely: none at all).
-    ///
-    /// `interface Pet extends Named` composes Named's methods first and its own
-    /// after, so every `Named` slot index still names the same method in a
-    /// `Pet` vtable. A prefix TEST rather than an ancestry test because
-    /// composition puts a second super-interface's methods AFTER the first's:
-    /// `interface C extends A, B` leaves `B`'s slots at different indices in a
-    /// `C` vtable, and reinterpreting a `C` box as a `B` box would then dispatch
-    /// to the wrong method (willow-1fc6).
-    pub iface_slot_prefix: &'x dyn Fn(&str, &str) -> bool,
+    /// The slot offset at which interface `target`'s vtable is embedded in
+    /// interface `source`'s, or `None` when `target` is not a super-interface.
+    /// Offset zero is representation-compatible; a non-zero offset makes
+    /// [`FuncGen::coerce_to_target`] allocate a box whose vtable pointer is
+    /// advanced to the embedded target region (willow-1fc6).
+    pub iface_widen_offset: &'x dyn Fn(&str, &str) -> Option<usize>,
     /// The declared type of the static property `(class, field)`, resolved
     /// through the class hierarchy exactly as
     /// [`FuncGen::emit_static_field_read`] resolves the storage it loads from —
@@ -658,6 +663,12 @@ pub(super) struct LirTypeCtx<'x> {
     pub fn_types: &'x FunctionMap<Type>,
     pub func_param_modes: &'x FunctionMap<Vec<ParamMode>>,
     pub known_modules: &'x HashMap<String, String>,
+    /// Local alias -> canonical builtin schema module, for the file being
+    /// compiled (`import std::fs as files;` records `files -> fs`). The AST
+    /// path has these folded out of its program before it ever runs; the LIR
+    /// path lowers from the raw frontend program, so a namespace call still
+    /// carries whatever name the `import` spelled (willow-nswv).
+    pub builtin_module_aliases: &'x HashMap<String, String>,
     /// The `$lambda.N` symbol a lambda expression was lifted to, by the span of
     /// the lambda (willow-0g8j.2.2). `None` for a lambda the backend never
     /// declared — a lambda inside an imported module, which is not lifted at
@@ -827,7 +838,7 @@ impl LirTypeCtx<'_> {
                         !matches!(arg, Type::Void) && self.supported_type_inner(arg, open)
                     })
             }
-            Type::Generic(name, args) if name == "Channel" => {
+            Type::Generic(_, args) if builtin_types::unary_arg(ty, B::Channel).is_some() => {
                 matches!(args.as_slice(), [elem]
                     if !matches!(elem, Type::Void) && self.supported_type_inner(elem, open))
             }
@@ -835,8 +846,10 @@ impl LirTypeCtx<'_> {
             // is the identity on the async frame pointer, and only the static
             // type distinguishes `await t` from `await t.result()`
             // (willow-0g8j.2.11).
-            Type::Generic(name, args)
-                if matches!(name.as_str(), "Task" | "JoinHandle" | "TaskResult") =>
+            Type::Generic(_, args)
+                if builtin_types::resolve(ty).is_some_and(|resolved| {
+                    matches!(resolved.id, B::Task | B::JoinHandle | B::TaskResult)
+                }) =>
             {
                 matches!(args.as_slice(), [result] if self.supported_type_inner(result, open))
             }
@@ -887,6 +900,7 @@ impl LirTypeCtx<'_> {
     /// bare [`assignable_repr`] everywhere else.
     fn storable(&self, target: &Type, value: &Type) -> bool {
         self.repr_compatible(target, value)
+            || self.iface_widen_offset(target, value).is_some()
             || self.boxable(target, value)
             // A fresh empty map fits any admitted map slot: it is one
             // representation with nothing recorded in it yet (see
@@ -1048,26 +1062,21 @@ impl LirTypeCtx<'_> {
     fn repr_compatible(&self, target: &Type, value: &Type) -> bool {
         assignable_repr(target, value)
             || self.class_widening(target, value)
-            || self.iface_widening(target, value)
+            || self.iface_widen_offset(target, value) == Some(0)
     }
 
-    /// Whether `value` is an interface box that already IS a `target` box:
-    /// `target` is a super-interface of `value` whose slots sit at the same
-    /// indices. See [`LirTypeCtx::iface_slot_prefix`] for why this is a prefix
-    /// test and not an ancestry test.
-    ///
-    /// The emitter applies no conversion here — [`FuncGen::coerce_to_target`]
-    /// returns an interface value unchanged when the target is another
-    /// interface — so this belongs with the representation rules rather than
-    /// with [`Self::boxable`].
-    fn iface_widening(&self, target: &Type, value: &Type) -> bool {
+    /// The vtable-slot adjustment required to widen `value` to `target`.
+    /// Identity is handled by [`assignable_repr`], so this answers only a
+    /// strict interface-to-super-interface conversion.
+    fn iface_widen_offset(&self, target: &Type, value: &Type) -> Option<usize> {
         let (Type::Named(target_iface), Type::Named(value_iface)) = (target, value) else {
-            return false;
+            return None;
         };
-        target_iface != value_iface
+        (target_iface != value_iface
             && (self.is_interface)(target_iface)
-            && (self.is_interface)(value_iface)
-            && (self.iface_slot_prefix)(target_iface, value_iface)
+            && (self.is_interface)(value_iface))
+        .then(|| (self.iface_widen_offset)(target_iface, value_iface))
+        .flatten()
     }
 
     /// The mangled symbol of the implementation a call to `class::method`
@@ -1258,6 +1267,14 @@ fn lir_block_successors(block: &LirBlock) -> Vec<usize> {
 /// unwinds are exactly the innermost run of open scopes whose own registrations
 /// are all in that list. A scope only partly named is not being left, which
 /// stops the count.
+/// The scope identities a synchronous defer state holds open, outermost first.
+///
+/// The frames themselves carry Cranelift blocks and stack slots, so two states
+/// are only ever compared by identity (willow-0g8j.2.15).
+fn lir_scope_ids(state: &LirDeferState) -> Vec<LirScopeId> {
+    state.scopes.iter().map(|frame| frame.id).collect()
+}
+
 fn lir_flushed_scope_count(
     sites: &[crate::ir::lowered::LirDeferId],
     open_sites: &[Vec<crate::ir::lowered::LirDeferId>],
@@ -1747,7 +1764,7 @@ fn lir_suspends_here(expr: &HirExpr) -> bool {
     match &expr.kind {
         HirExprKind::Await { .. } | HirExprKind::Select { .. } => true,
         HirExprKind::MethodCall { object, method, .. } => {
-            matches!(&object.ty, Type::Generic(name, _) if name == "Channel")
+            builtin_types::unary_arg(&object.ty, B::Channel).is_some()
                 && matches!(method.as_str(), "send" | "recv")
         }
         _ => false,
@@ -1975,8 +1992,8 @@ fn lir_builtin_await(expr: &HirExpr) -> Option<LirAwaitSite<'_>> {
         return None;
     };
     if expr.ty != Type::Void
-        || !matches!(&inner.ty, Type::Generic(name, args)
-            if name == "Future" && args.as_slice() == [Type::Void])
+        || !builtin_types::unary_arg(&inner.ty, B::Future)
+            .is_some_and(|output| *output == Type::Void)
     {
         return None;
     }
@@ -2902,10 +2919,7 @@ fn supported_select<'n>(
 }
 
 fn channel_element_type_ref(ty: &Type) -> Option<&Type> {
-    match ty {
-        Type::Generic(name, args) if name == "Channel" => args.first(),
-        _ => None,
-    }
+    builtin_types::unary_arg(ty, B::Channel)
 }
 
 /// Shallow: this arm ends by leaving the function or by unwinding, so it hands
@@ -3080,9 +3094,8 @@ fn supported_expr<'n>(
             }
             if callee == "recover" {
                 return args.is_empty()
-                    && matches!(&e.ty, Type::Generic(name, args)
-                        if name == "Option"
-                            && args.as_slice() == [Type::Named("PanicInfo".to_string())]);
+                    && builtin_types::unary_arg(&e.ty, B::Option)
+                        .is_some_and(|payload| payload == &Type::Named("PanicInfo".to_string()));
             }
             // These compiler-known control-flow operations require the AST
             // backend's lexical panic-scope metadata (willow-s9ej.3).
@@ -3216,7 +3229,9 @@ fn supported_expr<'n>(
                     && supported_expr(object, ctx, names)
                     && args.iter().all(|a| supported_expr(a, ctx, names))
             }
-            Type::Generic(name, type_args) if name == "Channel" => {
+            Type::Generic(_, type_args)
+                if builtin_types::unary_arg(&object.ty, B::Channel).is_some() =>
+            {
                 let [elem] = type_args.as_slice() else {
                     return false;
                 };
@@ -3235,8 +3250,9 @@ fn supported_expr<'n>(
             // `Task<T>`/`JoinHandle<T>` cancellation (willow-0g8j.2.11). Both
             // read only the frame header the handle already points at, so
             // there is nothing to vet beyond the receiver and the result type.
-            Type::Generic(name, _)
-                if matches!(name.as_str(), "Task" | "JoinHandle")
+            Type::Generic(_, _)
+                if builtin_types::resolve(&object.ty)
+                    .is_some_and(|resolved| matches!(resolved.id, B::Task | B::JoinHandle))
                     && task_handle_method(&object.ty, method, args.len())
                         .is_some_and(|ret| assignable_repr(&ret, &e.ty)) =>
             {
@@ -3468,8 +3484,8 @@ fn supported_expr<'n>(
             }
             if class == "Channel"
                 && matches!(method.as_str(), "new" | "with_capacity")
-                && matches!(&e.ty, Type::Generic(name, type_args)
-                    if name == "Channel" && type_args.len() == 1 && ctx.supported_type(&e.ty))
+                && builtin_types::unary_arg(&e.ty, B::Channel).is_some()
+                && ctx.supported_type(&e.ty)
             {
                 return (method == "new" && args.is_empty())
                     || (method == "with_capacity"
@@ -3530,7 +3546,9 @@ fn supported_expr<'n>(
             // calls (willow-0g8j.2.10, willow-0g8j.2.13): fixed-signature
             // runtime calls, admitted from the same table the emitter
             // dispatches on, so a call the walker accepts is one it can emit.
-            if let Some(entry) = namespace_builtin_call(ctx.known_modules, class, method) {
+            if let Some(entry) =
+                namespace_builtin_call(ctx.known_modules, ctx.builtin_module_aliases, class, method)
+            {
                 return entry.params.len() == args.len()
                     && entry
                         .params
@@ -3855,7 +3873,43 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if sync_defers {
             block_state[0] = Some(LirDeferState::default());
         }
-        for (i, block) in f.blocks.iter().enumerate() {
+        // Emission ORDER. A LIR block index is not a position in any order
+        // control can flow in: `if/else` lowers the merge block before the
+        // `else` arm, so index order emits the merge before the only
+        // predecessor that reaches it. The synchronous emitter carries its
+        // defer scopes along the edges, so a block emitted before any
+        // predecessor starts with no open scope at all — and its `flush
+        // defers` then unwinds nothing, silently skipping every `defer` on
+        // that path. So a block is emitted only once an edge has handed it a
+        // state; any such order works. A block no edge ever reaches is emitted
+        // last, with none (willow-fvt4).
+        let mut ready = vec![0usize];
+        let mut emitted = vec![false; f.blocks.len()];
+        // Which entry states arrived along a normal CFG edge. A recovery
+        // continuation legitimately reaches its resume block with the scopes it
+        // unwound already gone, so only edge-provided states are held to the
+        // agreement `lir_sync_defer_stacks_agree` vetted.
+        let mut state_from_edge = vec![false; f.blocks.len()];
+        let mut unreached = 0usize;
+        loop {
+            // Without sync defers there is no state to thread, so the worklist
+            // is left unused and every block is taken in index order below.
+            let next_ready = if sync_defers { ready.pop() } else { None };
+            let i = match next_ready {
+                Some(i) if emitted[i] => continue,
+                Some(i) => i,
+                None => {
+                    while unreached < f.blocks.len() && emitted[unreached] {
+                        unreached += 1;
+                    }
+                    if unreached == f.blocks.len() {
+                        break;
+                    }
+                    unreached
+                }
+            };
+            emitted[i] = true;
+            let block = &f.blocks[i];
             if i > 0 {
                 self.builder.switch_to_block(blocks[i]);
             }
@@ -3894,10 +3948,28 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     flags: self.sync_defer_flags.clone(),
                 };
                 for (target, state) in recovery_states {
-                    block_state[target].get_or_insert(state);
+                    if block_state[target].is_none() {
+                        block_state[target] = Some(state);
+                        ready.push(target);
+                    }
                 }
                 for target in lir_block_successors(block) {
-                    block_state[target].get_or_insert_with(|| exit.clone());
+                    match &block_state[target] {
+                        Some(existing) if state_from_edge[target] => debug_assert!(
+                            lir_scope_ids(existing) == lir_scope_ids(&exit),
+                            "LIR block bb{target} of `{}` is reached with two different \
+                             defer scope stacks: {:?} and {:?}",
+                            f.name,
+                            lir_scope_ids(existing),
+                            lir_scope_ids(&exit),
+                        ),
+                        Some(_) => {}
+                        None => {
+                            block_state[target] = Some(exit.clone());
+                            state_from_edge[target] = true;
+                            ready.push(target);
+                        }
+                    }
                 }
             }
         }
@@ -5623,11 +5695,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 Type::Generic(n, _) if self.interface_infos.contains_key(n) => {
                     self.emit_lir_interface_call(object, method, args, e.span)
                 }
-                Type::Generic(name, type_args) if name == "Channel" => {
+                Type::Generic(_, type_args)
+                    if builtin_types::unary_arg(&object.ty, B::Channel).is_some() =>
+                {
                     self.emit_lir_channel_method(object, method, args, &type_args[0])
                 }
-                Type::Generic(name, _)
-                    if matches!(name.as_str(), "Task" | "JoinHandle")
+                Type::Generic(_, _)
+                    if builtin_types::resolve(&object.ty)
+                        .is_some_and(|resolved| matches!(resolved.id, B::Task | B::JoinHandle))
                         && task_handle_method(&object.ty, method, args.len()).is_some() =>
                 {
                     self.emit_lir_task_handle_method(object, method, args.len())
@@ -6592,7 +6667,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let tag = self.enum_variant_tag(enum_name, variant);
                 // The `Option` pointer niche carries no tag word: `Some` is any
                 // non-null payload and `None` is null (willow-0g8j.2.1).
-                if enum_name == "Option"
+                if builtin_types::is(scrutinee_ty, B::Option)
                     && option_repr(scrutinee_ty, self.enum_infos)
                         == Some(OptionRepr::NullableGcPointer)
                 {
@@ -6686,7 +6761,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let mut payload_types =
                     self.resolve_variant_payload_types(enum_name, variant, scrutinee_ty);
                 normalize_void_payloads(&mut payload_types);
-                let niche = enum_name == "Option"
+                let niche = builtin_types::is(scrutinee_ty, B::Option)
                     && option_repr(scrutinee_ty, self.enum_infos)
                         == Some(OptionRepr::NullableGcPointer);
                 let mut out = Vec::with_capacity(payload_types.len());
@@ -6867,6 +6942,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Type::Named(name) | Type::Generic(name, _) => name,
             _ => return false,
         };
+        if let Type::Named(source) | Type::Generic(source, _) = value_ty
+            && self.interface_infos.contains_key(source)
+        {
+            return matches!(
+                super::vtable_layout::super_offset(self.interface_infos, source, iface),
+                Some(offset) if offset > 0
+            );
+        }
         let Type::Named(class) = value_ty else {
             return false;
         };
@@ -7228,10 +7311,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .get(&iface_name)
             .cloned()
             .expect("interface info vetted by LIR eligibility");
-        let slot = info
-            .method_order
-            .iter()
-            .position(|n| n == method)
+        // The embedded-region layout the vtables are emitted from, which is
+        // what `emit_interface_dispatch` indexes too (willow-1fc6).
+        let slot = super::vtable_layout::slot_of(self.interface_infos, &info.name, method)
             .expect("interface method slot vetted by LIR eligibility");
         let sig_info = info.methods[method].clone();
         let type_args = match &object.ty {
@@ -7435,7 +7517,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // calls (willow-0g8j.2.10, willow-0g8j.2.13). Same dispatch the AST
         // path does in `emit_static_method_call`: a plain runtime call, with a
         // user module of the same name winning over the builtin.
-        if let Some(entry) = namespace_builtin_call(self.known_modules, class, method) {
+        if let Some(entry) = namespace_builtin_call(
+            self.known_modules,
+            self.builtin_module_aliases,
+            class,
+            method,
+        ) {
             let (arg_vals, arg_roots) = self.emit_lir_args_rooted(args, Some(&entry.params), None);
             let result = self
                 .emit_runtime_call_with_cleanup(entry.runtime, &arg_vals, |this| {
@@ -8291,6 +8378,10 @@ mod tests {
         class_type_ids: HashMap<String, i64>,
         interfaces: HashSet<String>,
         iface_type_params: HashMap<String, Vec<String>>,
+        /// Direct super-interfaces, in declaration order. The real backend
+        /// keeps this on `InterfaceInfo::extends`; tests retain it separately
+        /// so their widening offsets use the same layout algorithm.
+        iface_supers: HashMap<String, Vec<String>>,
         /// Declared methods per interface, in declaration order — the order the
         /// backend turns into vtable slots. Inherited (`extends`) methods appear
         /// here only when the caller DESUGARED first, since composing them into
@@ -8307,6 +8398,9 @@ mod tests {
         fn_types: FunctionMap<Type>,
         param_modes: FunctionMap<Vec<ParamMode>>,
         known_modules: HashMap<String, String>,
+        /// Builtin namespace aliases declared by the test program's own
+        /// `import`s, standing in for the backend's per-file map (willow-nswv).
+        builtin_module_aliases: HashMap<String, String>,
         /// Stands in for the per-function `LirTypeCtx::return_type`. Every
         /// entry point that takes a `LirFunction` rebinds it from that
         /// function, so this default is only what a direct `supported_expr`
@@ -8322,6 +8416,23 @@ mod tests {
         /// `async fn` the test program declares, which is what
         /// `compile_program` compiles as a cooperative leaf.
         cooperative_leaves: HashSet<FunctionId>,
+    }
+
+    impl crate::backend::cranelift::vtable_layout::IfaceShapes for TestTables {
+        fn canonical(&self, iface: &str) -> String {
+            iface.to_string()
+        }
+
+        fn supers(&self, iface: &str) -> Vec<String> {
+            self.iface_supers.get(iface).cloned().unwrap_or_default()
+        }
+
+        fn methods(&self, iface: &str) -> Vec<String> {
+            self.iface_methods
+                .get(iface)
+                .map(|methods| methods.iter().map(|(name, ..)| name.clone()).collect())
+                .unwrap_or_default()
+        }
     }
 
     impl TestTables {
@@ -8340,12 +8451,15 @@ mod tests {
                 class_type_ids: HashMap::new(),
                 interfaces: HashSet::new(),
                 iface_type_params: HashMap::new(),
+                iface_supers: HashMap::new(),
                 iface_methods: HashMap::new(),
                 vtables: HashSet::new(),
                 enums: HashMap::new(),
                 fn_types: FunctionMap::default(),
                 param_modes: FunctionMap::default(),
                 known_modules: HashMap::new(),
+                builtin_module_aliases:
+                    crate::backend::cranelift::std_collection::builtin_module_aliases(program),
                 ret: Type::Void,
                 lambdas: HashMap::new(),
             };
@@ -8413,6 +8527,7 @@ mod tests {
                         t.interfaces.insert(i.name.clone());
                         t.iface_type_params
                             .insert(i.name.clone(), i.type_params.clone());
+                        t.iface_supers.insert(i.name.clone(), i.extends.clone());
                         t.iface_methods.insert(
                             i.name.clone(),
                             i.methods
@@ -8585,18 +8700,13 @@ mod tests {
                     }
                     None
                 },
-                iface_slot_prefix: &|target, source| {
-                    let (Some(t), Some(s)) = (
-                        self.iface_methods.get(target),
-                        self.iface_methods.get(source),
-                    ) else {
-                        return false;
-                    };
-                    t.len() <= s.len() && t.iter().zip(s).all(|((a, ..), (b, ..))| a == b)
+                iface_widen_offset: &|target, source| {
+                    crate::backend::cranelift::vtable_layout::super_offset(self, source, target)
                 },
                 fn_types: &self.fn_types,
                 func_param_modes: &self.param_modes,
                 known_modules: &self.known_modules,
+                builtin_module_aliases: &self.builtin_module_aliases,
                 return_type: &self.ret,
             })
         }
@@ -9200,6 +9310,103 @@ mod tests {
         for src in cases {
             assert!(eligible_checked(src, "main", &["main"]), "{src}");
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // willow-nswv — a builtin namespace reached through an `import` alias.
+    //
+    // The AST path never sees an alias: `normalize_std_collection_program`
+    // rewrites the program before codegen. The walker lowers to HIR from the
+    // RAW frontend program, so it does, and resolves the alias at the point of
+    // dispatch — before the gate that lets a user module of the same name win,
+    // which is the order those two passes apply between them.
+    //
+    //  na1 every aliasable namespace is admitted through its alias
+    //  na2 an alias nobody declared is not invented
+    //  na3 a self-alias resolves to itself
+    //  na4 the alias reaches the same table entry as the canonical name
+    //  na5 a user module of the canonical name still wins
+    //  na6 `f64::` is answered before the alias map
+
+    #[test]
+    fn na1_aliased_namespace_calls_are_eligible() {
+        let cases = [
+            "import std::fs as files; fn f(p: String) -> bool { return files::exists(p); }",
+            "import std::env as sys; fn f() -> i64 { return sys::args_len(); }",
+            "import std::env as sys; fn f() -> String { return sys::program_name(); }",
+            "import std::net as sock; fn f(a: String) -> Result<TcpListener, IoError> { return sock::bind(a); }",
+        ];
+        for src in cases {
+            assert!(eligible_checked(src, "f", &["f"]), "{src}");
+        }
+    }
+
+    #[test]
+    fn na2_an_undeclared_alias_is_not_a_namespace() {
+        // No `import` records `files`, so the call is an ordinary static call
+        // to a module that does not exist. Admitting it would mean emitting a
+        // runtime call the program never asked for.
+        let src = "fn f(p: String) -> bool { return files::exists(p); }";
+        assert!(!eligible_lenient(src, "f", &["f"]), "{src}");
+    }
+
+    #[test]
+    fn na3_a_self_alias_resolves_to_itself() {
+        let src = "import std::fs as fs; fn f(p: String) -> bool { return fs::exists(p); }";
+        assert!(eligible_checked(src, "f", &["f"]), "{src}");
+    }
+
+    #[test]
+    fn na4_an_alias_reaches_the_same_entry_as_the_canonical_name() {
+        let mut aliases = HashMap::new();
+        aliases.insert("files".to_string(), "fs".to_string());
+        aliases.insert("par".to_string(), "parallel".to_string());
+        let empty = HashMap::new();
+        for (alias, canonical, method) in [
+            ("files", "fs", "exists"),
+            ("files", "fs", "read_to_string"),
+            ("par", "parallel", "map"),
+        ] {
+            let through = namespace_builtin_call(&empty, &aliases, alias, method)
+                .unwrap_or_else(|| panic!("{alias}::{method} has no entry"));
+            let direct = namespace_builtin_call(&empty, &empty, canonical, method)
+                .unwrap_or_else(|| panic!("{canonical}::{method} has no entry"));
+            assert_eq!(through.runtime, direct.runtime, "{alias}::{method}");
+            assert_eq!(through.params, direct.params, "{alias}::{method}");
+            assert_eq!(through.ret, direct.ret, "{alias}::{method}");
+            assert_eq!(
+                through.narrow_to_bool, direct.narrow_to_bool,
+                "{alias}::{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn na5_a_user_module_of_the_canonical_name_still_wins() {
+        // `normalize_std_collection_program` rewrites the alias FIRST and the
+        // AST dispatch consults `known_modules` after it, so a program with its
+        // own `fs` module keeps the builtin out of both paths (willow-2s3).
+        let mut known = HashMap::new();
+        known.insert("fs".to_string(), "fs__".to_string());
+        let mut aliases = HashMap::new();
+        aliases.insert("files".to_string(), "fs".to_string());
+        assert!(namespace_builtin_call(&known, &aliases, "files", "exists").is_none());
+        assert!(namespace_builtin_call(&known, &aliases, "fs", "exists").is_none());
+        // Without the user module the same call IS the builtin.
+        assert!(namespace_builtin_call(&HashMap::new(), &aliases, "files", "exists").is_some());
+    }
+
+    #[test]
+    fn na6_f64_is_answered_before_the_alias_map() {
+        // `f64::` reaches no module and is not in the stdlib schema, so it is
+        // answered ahead of everything an `import` could have renamed.
+        let mut aliases = HashMap::new();
+        aliases.insert("f64".to_string(), "fs".to_string());
+        let empty = HashMap::new();
+        let entry = namespace_builtin_call(&empty, &aliases, "f64", "to_string")
+            .expect("f64::to_string has an entry");
+        assert_eq!(entry.runtime, "willow_f64_to_string");
+        assert!(namespace_builtin_call(&empty, &aliases, "f64", "exists").is_none());
     }
 
     // ---------------------------------------------------------------------
@@ -9952,18 +10159,16 @@ mod tests {
         assert!(eligible_checked(narrowing, "g", &["f", "g"]));
     }
 
-    // j17b. with TWO supers the prefix breaks: `interface C extends A, B`
-    // composes `A`'s methods then `B`'s, so `B`'s slots sit at different
-    // indices in a `C` vtable and reusing a `C` box as a `B` box would dispatch
-    // through the wrong slot. The walker refuses that rather than emit it; the
-    // AST path still performs the identity coercion (willow-1fc6).
+    // j17b. with TWO supers the second one's table starts at a non-zero offset.
+    // The walker admits it now that `coerce_to_target` allocates a rewidened
+    // box pointing at that embedded region (willow-1fc6).
     #[test]
-    fn j17b_interface_to_second_super_rejected() {
+    fn j17b_interface_to_second_super_eligible() {
         let decls = "interface A { fn a(self) -> i64; } \
                      interface B { fn b(self) -> i64; } \
                      interface C extends A, B { fn c(self) -> i64; } ";
         let second = format!("{decls} fn f(x: C) -> B {{ return x; }}");
-        assert!(!eligible_checked(&second, "f", &["f"]));
+        assert!(eligible_checked(&second, "f", &["f"]));
 
         // ... while widening the same `C` to its FIRST super stays in, so this
         // does not pass by rejecting multi-super interfaces wholesale.
@@ -12223,6 +12428,115 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
     fn r11b_cross_block_defer_with_early_return_is_eligible() {
         let src = "fn f(n: i64) -> i64 { defer print(n); if n > 0 { return 1; } return 0; }";
         assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // r11d. `break` leaves a loop body's defer scope with a `FlushDefers` and no
+    // matching `LeaveDeferScope`, and the block it jumps to is also reached from
+    // the loop header with the scope closed. Both edges agree only once the
+    // flush is read as closing the scope on its own path.
+    #[test]
+    fn r11d_break_out_of_a_defer_scope_is_eligible() {
+        let src = "fn f(n: i64) -> i64 {
+    let mut t = 0;
+    for i in 0..n { defer print(i); if i == 2 { break; } t = t + i; }
+    return t;
+}";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // r11e. `continue` is the same exit against the loop latch, which the LIR
+    // emits BEFORE the body that jumps to it.
+    #[test]
+    fn r11e_continue_out_of_a_defer_scope_is_eligible() {
+        let src = "fn f(n: i64) -> i64 {
+    let mut t = 0;
+    for i in 0..n { defer print(i); if i == 1 { continue; } t = t + i; }
+    return t;
+}";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // r11f. `defer` combined with `?` was rejected outright, because the
+    // walker's propagating exit had no unwinding. It emits one now.
+    #[test]
+    fn r11f_defer_combined_with_try_is_eligible() {
+        let src = "fn g(n: i64) -> Result<i64, String> { return Ok(n); }
+fn f(n: i64) -> Result<i64, String> {
+    defer print(n);
+    let v = g(n)?;
+    return Ok(v);
+}";
+        assert!(eligible_checked(src, "f", &["f", "g"]));
+    }
+
+    // r11g. Three scopes deep with the exit in the innermost: the flush names
+    // every open scope at once, and the block that closes the middle one is
+    // emitted before the block that closes the inner one.
+    #[test]
+    fn r11g_three_defer_scopes_with_an_inner_return_are_eligible() {
+        let src = "fn f(n: i64) -> i64 {
+    defer print(0);
+    for i in 0..n {
+        defer print(i);
+        if i > 0 { defer print(9); if i == 2 { return i; } }
+    }
+    return -1;
+}";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // r11h. A scope opened on only ONE side of a branch leaves the two edges
+    // into the join disagreeing about what is open. No source program lowers to
+    // this — `defer` is lexical — so it is built by hand, and it is what the
+    // agreement check exists to catch: a fallback, not a miscompile. The blocks
+    // are all reachable, so this is the disagreement and not the separate
+    // unreachable-block rejection.
+    #[test]
+    fn r11h_unbalanced_defer_scopes_across_a_join_fall_back() {
+        let block = |id: usize, instrs: Vec<LirInst>, terminator: Terminator| LirBlock {
+            id: BlockId(id),
+            instrs,
+            terminator,
+            recovery: Vec::new(),
+        };
+        let enter = LirInst::EnterDeferScope {
+            sites: vec![(crate::ir::lowered::LirDeferId(0), Span::dummy())],
+            resume: None,
+            lock: None,
+        };
+        let f = LirFunction {
+            name: "f".to_string(),
+            params: Vec::new(),
+            return_type: Type::Void,
+            is_async: false,
+            locals: Vec::new(),
+            async_frame: Default::default(),
+            blocks: vec![
+                block(
+                    0,
+                    Vec::new(),
+                    Terminator::Branch {
+                        cond: HirExpr {
+                            kind: HirExprKind::Bool(true),
+                            ty: Type::Bool,
+                            span: Span::dummy(),
+                        },
+                        then_block: BlockId(1),
+                        else_block: BlockId(2),
+                    },
+                ),
+                block(1, vec![enter], Terminator::Jump(BlockId(3))),
+                block(2, Vec::new(), Terminator::Jump(BlockId(3))),
+                block(3, Vec::new(), Terminator::Return(None)),
+            ],
+        };
+        assert!(!lir_sync_defer_stacks_agree(&f));
+
+        // The same graph with the scope opened before the branch instead — the
+        // edges agree, and it is accepted.
+        let mut balanced = f;
+        balanced.blocks[0].instrs = std::mem::take(&mut balanced.blocks[1].instrs);
+        assert!(lir_sync_defer_stacks_agree(&balanced));
     }
 
     // r11c. A synchronous recover-capable scope needs an explicit LIR resume

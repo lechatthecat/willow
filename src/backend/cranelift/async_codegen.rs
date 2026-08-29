@@ -11,13 +11,10 @@ use cranelift_module::Module;
 
 use super::*;
 
-/// C-ABI status codes returned by `willow_async_mutex_acquire` /
-/// `willow_async_mutex_poll`, mirrored from `willow_runtime::async_mutex`
-/// (willow-38w.1.4). The compiler crate does not link the runtime crate, so
-/// these are wire values: `requirements/willow_rust_runtime_abi_inventory.md`
-/// records them, and both sides assert them in tests.
-const MUTEX_STATUS_ACQUIRED: i64 = 1;
-const MUTEX_STATUS_PENDING: i64 = 0;
+/// C-ABI status codes returned by the scheduler-aware lock entry points. Both
+/// compiler and runtime derive them from `willow_abi`.
+const MUTEX_STATUS_ACQUIRED: i64 = willow_abi::LockAcquireStatus::Acquired as i64;
+const MUTEX_STATUS_PENDING: i64 = willow_abi::LockAcquireStatus::Pending as i64;
 
 /// Body-specific inputs to the shared cooperative poll-function builder.
 struct CoopPollBody<'a> {
@@ -41,18 +38,18 @@ type LirAsyncLayoutPlan = (
     HashMap<LirLocalId, i32>,
     HashMap<LirDeferId, i32>,
 );
-const MUTEX_STATUS_RECURSIVE: i64 = -1;
+const MUTEX_STATUS_RECURSIVE: i64 = willow_abi::LockAcquireStatus::Recursive as i64;
 /// This acquisition's generation is dead; the caller must acquire again.
 #[cfg_attr(not(test), allow(dead_code))]
-const MUTEX_STATUS_LOST: i64 = -2;
+const MUTEX_STATUS_LOST: i64 = willow_abi::LockAcquireStatus::Lost as i64;
 /// The task may not park, so nothing was registered. Only the scheduler can
 /// clear this, by running the task's cancellation entry.
-const MUTEX_STATUS_CANCELLED: i64 = -3;
-const MUTEX_STATUS_PHASE_ACQUIRE: i64 = 0;
-const MUTEX_STATUS_PHASE_POLL: i64 = 1;
+const MUTEX_STATUS_CANCELLED: i64 = willow_abi::LockAcquireStatus::Cancelled as i64;
+const MUTEX_STATUS_PHASE_ACQUIRE: i64 = willow_abi::LockStatusPhase::Acquire as i64;
+const MUTEX_STATUS_PHASE_POLL: i64 = willow_abi::LockStatusPhase::Poll as i64;
 
 /// Poll-function return codes (`fn(frame) -> i32`).
-const RUNTIME_POLL_PENDING: i64 = 0;
+const RUNTIME_POLL_PENDING: i64 = willow_abi::RuntimePollResult::Pending as i64;
 
 /// One `await <task>` / `await <task>.result()` site in a cooperative poll fn
 /// (willow-qrj9). Both forms wait on the SAME task and the same frame; only
@@ -862,6 +859,7 @@ impl Codegen {
                 func_param_debug: &self.func_param_debug,
                 function_may_panic: &self.function_may_panic,
                 known_modules: &self.known_modules,
+                builtin_module_aliases: &self.builtin_module_aliases,
                 lambda_names: &self.lambda_names,
                 cooperative_leaves: &self.cooperative_leaves,
                 string_literals: &self.string_literals,
@@ -1107,6 +1105,7 @@ impl Codegen {
                 func_param_debug: &self.func_param_debug,
                 function_may_panic: &self.function_may_panic,
                 known_modules: &self.known_modules,
+                builtin_module_aliases: &self.builtin_module_aliases,
                 lambda_names: &self.lambda_names,
                 cooperative_leaves: &self.cooperative_leaves,
                 string_literals: &self.string_literals,
@@ -4470,48 +4469,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 mod async_mutex_abi_tests {
     use super::*;
 
-    /// The runtime's async-mutex source, embedded at compile time. The compiler
-    /// deliberately does NOT depend on `willow_runtime`: that crate exports a C
-    /// `main` for generated binaries, so linking it into the compiler's own test
-    /// binary is a duplicate-symbol error. Reading the source text instead still
-    /// makes a drift in either direction a build-time failure here.
-    const RUNTIME_ASYNC_MUTEX: &str =
-        include_str!("../../../crates/willow_runtime/src/async_mutex.rs");
-    const RUNTIME_TASK: &str = include_str!("../../../crates/willow_runtime/src/task.rs");
-
-    /// Extract `pub const <name>: i32 = <value>;` from runtime source.
-    fn runtime_const(source: &str, name: &str) -> i64 {
-        let needle = format!("pub const {name}: i32 = ");
-        let line = source
-            .lines()
-            .find(|line| line.trim_start().starts_with(&needle))
-            .unwrap_or_else(|| panic!("runtime no longer defines `{name}`"));
-        line.trim_start()[needle.len()..]
-            .trim_end()
-            .trim_end_matches(';')
-            .parse()
-            .unwrap_or_else(|e| panic!("cannot parse `{name}`: {e}"))
-    }
-
-    /// Perspective 1: the mirrored status codes are wire values shared with a
-    /// crate the compiler never links, so nothing in the type system keeps them
-    /// in step. A silent drift would make the generated branch chain take the
-    /// wrong arm — a PENDING read as ACQUIRED touches a value it does not own.
+    /// Perspective 1: the values codegen compares against are the WIRE values
+    /// the runtime returns. Asserting the literals rather than re-deriving them
+    /// from `LockAcquireStatus` is the whole point: the constants are defined
+    /// as those enum casts, so comparing them to the same casts would hold for
+    /// any renumbering. Change a discriminant and this fails here and in
+    /// `willow_abi`'s own test, which is what forces the runtime to be updated
+    /// with it.
     #[test]
-    fn status_constants_match_the_runtime() {
-        for (mirrored, name) in [
-            (MUTEX_STATUS_ACQUIRED, "MUTEX_STATUS_ACQUIRED"),
-            (MUTEX_STATUS_PENDING, "MUTEX_STATUS_PENDING"),
-            (MUTEX_STATUS_RECURSIVE, "MUTEX_STATUS_RECURSIVE"),
-            (MUTEX_STATUS_LOST, "MUTEX_STATUS_LOST"),
-            (MUTEX_STATUS_CANCELLED, "MUTEX_STATUS_CANCELLED"),
-        ] {
-            assert_eq!(
-                mirrored,
-                runtime_const(RUNTIME_ASYNC_MUTEX, name),
-                "`{name}` drifted from crates/willow_runtime/src/async_mutex.rs"
-            );
-        }
+    fn status_constants_are_the_documented_wire_values() {
+        assert_eq!(MUTEX_STATUS_ACQUIRED, 1);
+        assert_eq!(MUTEX_STATUS_PENDING, 0);
+        assert_eq!(MUTEX_STATUS_RECURSIVE, -1);
+        assert_eq!(MUTEX_STATUS_LOST, -2);
+        assert_eq!(MUTEX_STATUS_CANCELLED, -3);
     }
 
     /// Perspective 2: the five statuses must stay mutually distinct, or the
@@ -4532,16 +4503,11 @@ mod async_mutex_abi_tests {
         }
     }
 
-    /// Perspective 3: `park_b` returns `RUNTIME_POLL_PENDING` and the scheduler
-    /// reads it as "not done". Pin it against the runtime's own definition so a
-    /// change to the poll protocol cannot make a parked lock look complete.
+    /// Perspective 3: `park_b` returns the scheduler's Pending code, whose wire
+    /// value is 0. Pinned as a literal for the reason perspective 1 gives.
     #[test]
-    fn poll_pending_matches_the_runtime() {
-        assert_eq!(
-            RUNTIME_POLL_PENDING,
-            runtime_const(RUNTIME_TASK, "RUNTIME_POLL_PENDING"),
-            "`RUNTIME_POLL_PENDING` drifted from crates/willow_runtime/src/task.rs"
-        );
+    fn poll_pending_is_the_documented_wire_value() {
+        assert_eq!(RUNTIME_POLL_PENDING, 0);
     }
 
     /// Perspective 4: PENDING is shared by both protocols — the acquisition
@@ -4552,21 +4518,13 @@ mod async_mutex_abi_tests {
         assert_eq!(MUTEX_STATUS_PENDING, RUNTIME_POLL_PENDING);
     }
 
-    /// Perspective 5: the fail-closed diagnostic's phase tag is also a wire
-    /// value. A drift would not change control flow, but it would misidentify
-    /// the ABI edge that produced the unknown status.
+    /// Perspective 5: the fail-closed phase tags a bad status is reported with.
+    /// Pinned as literals for the reason perspective 1 gives — the runtime
+    /// prints these, so renumbering them silently changes a diagnostic.
     #[test]
-    fn invalid_status_phase_constants_match_the_runtime() {
-        for (mirrored, name) in [
-            (MUTEX_STATUS_PHASE_ACQUIRE, "MUTEX_STATUS_PHASE_ACQUIRE"),
-            (MUTEX_STATUS_PHASE_POLL, "MUTEX_STATUS_PHASE_POLL"),
-        ] {
-            assert_eq!(
-                mirrored,
-                runtime_const(RUNTIME_ASYNC_MUTEX, name),
-                "`{name}` drifted from crates/willow_runtime/src/async_mutex.rs"
-            );
-        }
+    fn invalid_status_phase_constants_are_the_documented_wire_values() {
+        assert_eq!(MUTEX_STATUS_PHASE_ACQUIRE, 0);
+        assert_eq!(MUTEX_STATUS_PHASE_POLL, 1);
     }
 
     /// Perspective 6: acquire and poll diagnostics must remain distinguishable.

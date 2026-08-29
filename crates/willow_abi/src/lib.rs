@@ -92,6 +92,63 @@ impl RuntimeEffects {
     }
 }
 
+/// Result returned by every scheduler poll entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(i32)]
+pub enum RuntimePollResult {
+    Pending = 0,
+    Ready = 1,
+    Yield = 2,
+    Preempted = 3,
+    Panicked = 4,
+    BlockedSyscall = 5,
+}
+
+impl RuntimePollResult {
+    pub const fn as_i32(self) -> i32 {
+        self as i32
+    }
+}
+
+/// Terminal code stored in the low bits of an async frame status word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(i64)]
+pub enum FrameTerminalStatus {
+    Pending = 0,
+    Completed = 1,
+    Cancelled = 2,
+    Panicked = 3,
+}
+
+pub mod frame_status {
+    pub const TERMINAL_MASK: i64 = 0b111;
+    pub const CANCEL_REQUESTED: i64 = 1 << 8;
+}
+
+/// Status returned by scheduler-aware lock acquisition and polling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(i32)]
+pub enum LockAcquireStatus {
+    Cancelled = -3,
+    Lost = -2,
+    Recursive = -1,
+    Pending = 0,
+    Acquired = 1,
+}
+
+impl LockAcquireStatus {
+    pub const fn as_i32(self) -> i32 {
+        self as i32
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(i32)]
+pub enum LockStatusPhase {
+    Acquire = 0,
+    Poll = 1,
+}
+
 /// Cross-ABI object-shape categories used to derive opaque layout ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u64)]
@@ -355,5 +412,12 @@ mod tests {
         assert_eq!(GcObjectKind::LockHandle as u64, 12);
         assert_eq!(GcStoreDestination::ObjectField as i64, 1);
         assert_eq!(GcStoreDestination::AsyncRwLockCell as i64, 11);
+        assert_eq!(RuntimePollResult::Pending as i32, 0);
+        assert_eq!(RuntimePollResult::BlockedSyscall as i32, 5);
+        assert_eq!(FrameTerminalStatus::Cancelled as i64, 2);
+        assert_eq!(frame_status::CANCEL_REQUESTED, 1 << 8);
+        assert_eq!(LockAcquireStatus::Cancelled as i32, -3);
+        assert_eq!(LockAcquireStatus::Acquired as i32, 1);
+        assert_eq!(LockStatusPhase::Poll as i32, 1);
     }
 }

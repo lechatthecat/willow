@@ -1,0 +1,214 @@
+// Every path out of a value-returning body has to leave through a `return`
+// (willow-x8sj). Willow has no implicit tail expression, so a body that just
+// ends is not "returning its last value" — it used to hand the caller the zero
+// of the return type instead, silently. E0205 now rejects that, and this file
+// is the other side of the rule: every shape below is a body the check accepts,
+// because control provably never reaches the closing brace.
+//
+// The interesting ones are the endings that are not a literal `return`
+// statement: a `panic`, a statement `match` where every arm leaves, and a
+// `while true` nothing can break out of.
+//
+// Lambdas are held to the rule whether or not they carry a `->`: an inferred
+// return type is still a return type.
+
+import std::collections::Array;
+
+enum Shape {
+    Square(i64),
+    Circle(i64),
+}
+
+interface Sized {
+    fn area(self) -> i64;
+    // A default body owes its caller a value on the same terms as a named
+    // method does.
+    fn doubled(self) -> i64 {
+        return self.area() * 2;
+    }
+}
+
+class Box implements Sized {
+    pub side: i64;
+    pub init(self, side: i64) {
+        self.side = side;
+    }
+    pub fn area(self) -> i64 {
+        return self.side * self.side;
+    }
+    // A static method is checked the same way.
+    pub static fn unit() -> i64 {
+        return 1;
+    }
+}
+
+// Both arms return, so nothing follows the `if`.
+fn sign(n: i64) -> i64 {
+    if n > 0 {
+        return 1;
+    } else {
+        if n < 0 {
+            return 0 - 1;
+        } else {
+            return 0;
+        }
+    }
+}
+
+// A statement `match` is an ending when EVERY arm is: a non-exhaustive match is
+// already an error, so the arms listed are the only ways through.
+fn measure(s: Shape) -> i64 {
+    match s {
+        Shape::Square(side) => {
+            return side * side;
+        }
+        Shape::Circle(r) => {
+            return 3 * r * r;
+        }
+    }
+}
+
+// An arm body is a block like any other: this one leaves through a `panic` on
+// the rejected path and a `return` on the other.
+fn measure_checked(s: Shape) -> i64 {
+    match s {
+        Shape::Square(side) => {
+            if side <= 0 {
+                panic("a square needs a positive side");
+            }
+            return side * side;
+        }
+        Shape::Circle(r) => {
+            if r <= 0 {
+                panic("a circle needs a positive radius");
+            }
+            return 3 * r * r;
+        }
+    }
+}
+
+// `panic` is typed `!`, so an arm that calls it leaves too: a body whose every
+// arm panics has no `return` in it at all and is still complete. Nothing calls
+// this one — calling it is exactly what it refuses to survive — but it has to
+// compile, which is the point.
+fn reject(kind: i64) -> i64 {
+    match kind {
+        0 => panic("kind 0 is not supported"),
+        _ => panic("unknown kind"),
+    }
+}
+
+// A `return` under a condition, and a `panic` for the path that has none.
+fn only_even(n: i64) -> i64 {
+    if n % 2 == 0 {
+        return n / 2;
+    }
+    panic("expected an even number");
+}
+
+// `while true` with no way out never finishes, so the function genuinely never
+// returns and owes nothing. Rejecting this shape would outlaw the ordinary way
+// to write a loop that only ever exits by returning.
+fn first_multiple(step: i64) -> i64 {
+    let mut n = step;
+    while true {
+        if n % 7 == 0 {
+            return n;
+        }
+        n = n + step;
+    }
+}
+
+// A `break` in the loop body means the loop CAN finish, so the code after it is
+// reachable and has to end the function itself.
+fn count_to(limit: i64) -> i64 {
+    let mut n = 0;
+    while true {
+        if n >= limit {
+            break;
+        }
+        n = n + 1;
+    }
+    return n;
+}
+
+// A `break` belongs to the innermost loop, so the inner one here does not make
+// the outer one escapable.
+fn grid(rows: i64) -> i64 {
+    let mut total = 0;
+    while true {
+        for col in 0..3 {
+            if col == 2 {
+                break;
+            }
+            total = total + 1;
+        }
+        if total >= rows {
+            return total;
+        }
+    }
+}
+
+// A `for` head is never an ending on its own: an empty range runs its body zero
+// times, so `first` needs a value for the case where the loop never ran.
+fn first_over(values: Array<i64>, floor: i64) -> i64 {
+    for v in values {
+        if v > floor {
+            return v;
+        }
+    }
+    return 0 - 1;
+}
+
+// A block-bodied lambda returns only through `return`, exactly like a function.
+fn apply(f: fn(i64) -> i64, v: i64) -> i64 {
+    return f(v);
+}
+
+fn main() {
+    println(sign(5));
+    println(sign(0 - 5));
+    println(sign(0));
+
+    println(measure(Shape::Square(4)));
+    println(measure(Shape::Circle(2)));
+
+    println(measure_checked(Shape::Square(4)));
+    println(measure_checked(Shape::Circle(2)));
+    println(only_even(10));
+
+    println(first_multiple(3));
+    println(count_to(4));
+    println(grid(5));
+
+    let mut values = [1];
+    values.push(8);
+    values.push(3);
+    println(first_over(values, 5));
+    println(first_over([1], 5));
+
+    let scaled = |n: i64| -> i64 {
+        if n < 0 {
+            return 0;
+        }
+        return n * 10;
+    };
+    println(apply(scaled, 4));
+    println(apply(scaled, 0 - 4));
+
+    // No `->`: the return type is whatever the `return`s produced, and the rule
+    // applies on exactly the same terms. Dropping the `return n` below is the
+    // error, annotation or not.
+    let halved = |n: i64| {
+        if n < 0 {
+            return 0;
+        }
+        return n / 2;
+    };
+    println(apply(halved, 9));
+
+    let b = new Box(3);
+    println(b.area());
+    println(b.doubled());
+    println(Box::unit());
+}

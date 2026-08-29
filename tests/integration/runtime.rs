@@ -839,6 +839,10 @@ fn test_runnable_example_files_compile_and_run() {
             "Rex / Sam\n<Rex>\n<Rex>\n",
         ),
         (
+            "example/interface_super_coercion.wi",
+            "11\n21\n41\n21\n22\n21\n22\n21\n22\n22\n21\n22\n21\n22\n31\n11\n12\n21\n22\n",
+        ),
+        (
             "example/interface_downcast.wi",
             "woof\nmeow\nNemo is quiet\n",
         ),
@@ -960,7 +964,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/super_class.wi", "3 cats:\nann\njohn\nben\n"),
         (
             "example/gc_safety_temporaries.wi",
-            "Hx!\na!b!\nv!\np!q!r!\n",
+            "Hx!\na!b!\nv!\np!q!r!\nn!\nbad!\n7!\n",
         ),
         ("example/comments.wi", "30\n9223372036854775807\n"),
         ("example/hir_demo.wi", "55\n"),
@@ -1065,16 +1069,29 @@ fn test_runnable_example_files_compile_and_run() {
             "on disk\nfalse\ntrue\nwritten by a task\nfalse\nhello over loopback\n",
         ),
         (
+            "example/lir_namespace_aliases.wi",
+            "aliased on disk\nfalse\naliased by a task\nfalse\n0\n[16, 4, 9]\ntrue\n",
+        ),
+        (
             "example/lir_match_bodies.wi",
             "halt\nstep 6\nlabel x\n101\n12\nlabelled here!\n0\n33 20!50!\n\
              step(2)\nstep\nstep/9\nasync step 12\nok\nrecovered: bad input\n\
              nothing queued\ngot 21\n",
         ),
         (
+            "example/return_paths.wi",
+            "1\n-1\n0\n16\n12\n16\n12\n5\n21\n4\n6\n8\n-1\n40\n0\n4\n9\n18\n1\n",
+        ),
+        (
             "example/lir_defer_scopes.wi",
             "leave doubled\n6\nleave positive\nleave pick\n1\nleave pick\n0\n0\n1\n2\n3\n\
-             leave first_big\n3\n0\n100\n200\n300\n2\nleave parse\nleave parse\n\
-             leave scaled\n30\nleave parse\nleave parse\nleave scaled\nnegative\nbye\n",
+             leave first_big\n3\n0\nleave inner\n1\nleave inner\n2\nleave deep\n2\n\
+             0\n100\n200\n300\n2\n\
+             else\nleave merged\n2\nleave merged\n1\n\
+             scoped else\n70\nleave merged_scope\n2\n70\nleave merged_scope\n1\n\
+             0\n10\n20\nleave merged_loop\n1\n\
+             leave parse\nleave parse\nleave scaled\n30\n\
+             leave parse\nleave parse\nleave scaled\nnegative\nbye\n",
         ),
         (
             "example/lir_main_result.wi",

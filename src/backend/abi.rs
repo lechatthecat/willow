@@ -337,11 +337,10 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_task_scope_is_cancelled" => ([Word] -> Some(I64));
     ALLOC; "willow_task_scope_finish" => ([Word] -> Some(Word));
     // --- bounded parallel collection mapping ---
-    // The mapper is `i64` on both sides, not `Ptr`: the runtime declares
-    // `mapper: i64` and transmutes, and a Willow function value is materialized
-    // by `func_addr(type_helpers::FN_ADDR_TYPE, ..)` — a fixed 64-bit word on
-    // every target the backend accepts.
-    PANIC_ALLOC; "willow_parallel_map_i64" => ([Word, I64] -> Some(Word));
+    // The mapper is a native function pointer. Generated Willow function
+    // values are 64-bit on every accepted target, but the ABI classification
+    // still distinguishes an address the runtime calls from an integer.
+    PANIC_ALLOC; "willow_parallel_map_i64" => ([Word, Ptr] -> Some(Word));
     NONE; "willow_blocking_active_jobs" => ([] -> Some(I64));
     NONE; "willow_blocking_completed_jobs" => ([] -> Some(I64));
     NONE; "willow_sched_current_task" => ([] -> Some(I64));
@@ -551,13 +550,46 @@ mod tests {
     }
 
     #[test]
-    fn parallel_mapper_abi_is_an_i64_function_address_word() {
+    fn parallel_mapper_abi_is_a_native_function_pointer() {
         let symbol = runtime_symbol("willow_parallel_map_i64").expect("parallel ABI");
-        // The input array is a GC handle word; the mapper is a function address
-        // carried as a fixed 64-bit word, NOT a target-width `Ptr` — the backend
-        // emits it with `func_addr(type_helpers::FN_ADDR_TYPE, ..)` and the
-        // runtime receives it as `mapper: i64`.
-        assert_eq!(symbol.params, &[AbiTy::Word, AbiTy::I64]);
+        assert_eq!(symbol.params, &[AbiTy::Word, AbiTy::Ptr]);
         assert_eq!(symbol.ret, Some(AbiTy::Word));
+    }
+
+    #[test]
+    fn word_pointer_and_integer_classes_remain_distinct() {
+        let signature = |name| {
+            let symbol = runtime_symbol(name).unwrap_or_else(|| panic!("missing {name}"));
+            (symbol.params, symbol.ret)
+        };
+
+        // Opaque Willow values stay words even though the Rust exports spell
+        // them as `*mut u8`/`*mut c_void`.
+        assert_eq!(
+            signature("willow_channel_try_send_ptr"),
+            (&[AbiTy::Word, AbiTy::Word][..], Some(AbiTy::I32))
+        );
+        assert_eq!(
+            signature("willow_frame_await"),
+            (&[AbiTy::Word, AbiTy::I64][..], Some(AbiTy::I32))
+        );
+
+        // Slot addresses and callbacks are native pointers.
+        assert_eq!(
+            signature("willow_async_mutex_acquire"),
+            (&[AbiTy::Word, AbiTy::Ptr][..], Some(AbiTy::I32))
+        );
+        assert_eq!(
+            signature("willow_sched_spawn"),
+            (&[AbiTy::Ptr, AbiTy::Word][..], Some(AbiTy::I64))
+        );
+
+        // Task ids and netpoll's cross-platform native-handle integer are
+        // explicitly 64-bit numbers, not dereferenceable pointers.
+        assert_eq!(signature("willow_sched_wake"), (&[AbiTy::I64][..], None));
+        assert_eq!(
+            signature("willow_netpoll_register"),
+            (&[AbiTy::I64, AbiTy::I32][..], Some(AbiTy::I32))
+        );
     }
 }

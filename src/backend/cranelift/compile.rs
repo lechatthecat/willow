@@ -21,6 +21,9 @@ impl Codegen {
         program: &Program,
         source_file: &str,
     ) -> Result<()> {
+        // Recorded from the RAW program, because the normalization on the next
+        // line is what erases the aliases from it (willow-nswv).
+        self.builtin_module_aliases = builtin_module_aliases(program);
         let normalized_program = normalize_std_collection_program(program);
         let normalized_program = normalize_coop_suspensions(&normalized_program, &self.expr_types);
         let program = &normalized_program;
@@ -201,6 +204,9 @@ impl Codegen {
     }
 
     pub fn compile_program(&mut self, program: &Program, source_file: &str) -> Result<()> {
+        // Recorded from the RAW program, because the normalization on the next
+        // line is what erases the aliases from it (willow-nswv).
+        self.builtin_module_aliases = builtin_module_aliases(program);
         let normalized_program = normalize_std_collection_program(program);
         let normalized_program = normalize_coop_suspensions(&normalized_program, &self.expr_types);
         let program = &normalized_program;
@@ -656,7 +662,7 @@ impl Codegen {
                     if info.type_params.len() != args.len() {
                         return None;
                     }
-                    info.method_order.iter().position(|n| n == method)?;
+                    super::vtable_layout::slot_of(&self.interface_infos, iface, method)?;
                     let sig = info.methods.get(method)?;
                     let mut substitutions: HashMap<String, Type> = info
                         .type_params
@@ -690,25 +696,15 @@ impl Codegen {
                     )
                     .map(|info| info.ty)
                 },
-                // The composed order the vtable is BUILT from
-                // (`emit_interface_vtables` walks `method_order`), so a prefix
-                // here is a prefix of the emitted slots.
-                iface_slot_prefix: &|target, source| {
-                    let (Some(t), Some(s)) = (
-                        self.interface_infos.get(target),
-                        self.interface_infos.get(source),
-                    ) else {
-                        return false;
-                    };
-                    t.method_order.len() <= s.method_order.len()
-                        && t.method_order
-                            .iter()
-                            .zip(&s.method_order)
-                            .all(|(a, b)| a == b)
+                // The same layout `declare_one_vtable` emits from, so the
+                // offset eligibility vets is the offset the widening adds.
+                iface_widen_offset: &|target, source| {
+                    super::vtable_layout::super_offset(&self.interface_infos, source, target)
                 },
                 fn_types: &self.fn_types,
                 func_param_modes: &self.func_param_modes,
                 known_modules: &self.known_modules,
+                builtin_module_aliases: &self.builtin_module_aliases,
                 return_type: &f.return_type,
                 // The same table `emit_expr` reads for a lambda's address, so
                 // the symbol eligibility vets is the symbol emission takes the
@@ -849,6 +845,7 @@ impl Codegen {
             func_param_debug: &self.func_param_debug,
             function_may_panic: &self.function_may_panic,
             known_modules: &self.known_modules,
+            builtin_module_aliases: &self.builtin_module_aliases,
             lambda_names: &self.lambda_names,
             cooperative_leaves: &self.cooperative_leaves,
             string_literals: &self.string_literals,
@@ -1115,6 +1112,7 @@ impl Codegen {
             func_param_debug: &self.func_param_debug,
             function_may_panic: &self.function_may_panic,
             known_modules: &self.known_modules,
+            builtin_module_aliases: &self.builtin_module_aliases,
             lambda_names: &self.lambda_names,
             cooperative_leaves: &self.cooperative_leaves,
             string_literals: &self.string_literals,
@@ -1237,7 +1235,11 @@ impl Codegen {
         if self.vtable_ids.contains_key(&key) {
             return Ok(());
         }
-        let slot_count = iface.method_order.len().max(1);
+        // The EMBEDDED-region layout, not the composed `method_order`: a
+        // super-interface's table must stay contiguous inside this one so a
+        // widening can reach it by pointer arithmetic (willow-1fc6).
+        let slots = super::vtable_layout::slots(&self.interface_infos, &iface.name);
+        let slot_count = slots.len().max(1);
         let symbol = vtable_symbol(class_name, &iface.name);
         // A vtable is data, not a function, but it shares the one linker
         // namespace with every other symbol the backend hands out, so it is
@@ -1254,7 +1256,9 @@ impl Codegen {
         // Explicit zeroed bytes (not `define_zeroinit`, which is BSS and cannot
         // carry the function-address relocations written below).
         data.define(vec![0u8; slot_count * 8].into_boxed_slice());
-        for (slot, method_name) in iface.method_order.iter().enumerate() {
+        // Filled BY NAME, which is what lets one method occupy several slots
+        // (a diamond's shared grandparent) without the copies disagreeing.
+        for (slot, method_name) in slots.iter().enumerate() {
             if let Some(func_id) = self.resolve_class_method_func_id(class_name, method_name) {
                 let func_ref = self.module.declare_func_in_data(func_id, &mut data);
                 data.write_function_addr((slot * 8) as u32, func_ref);
@@ -1436,6 +1440,7 @@ impl Codegen {
             func_param_debug: &self.func_param_debug,
             function_may_panic: &self.function_may_panic,
             known_modules: &self.known_modules,
+            builtin_module_aliases: &self.builtin_module_aliases,
             lambda_names: &self.lambda_names,
             cooperative_leaves: &self.cooperative_leaves,
             string_literals: &self.string_literals,

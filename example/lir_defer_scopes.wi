@@ -8,6 +8,13 @@
 // only checked that a block's own scope pushes and pops balanced — so any
 // function with an early exit out of a `defer` scope fell back to the AST
 // backend. Every function below now compiles from the lowered IR.
+//
+// The `merged_*` functions below pin the second half of that: the scope stack
+// travels along the CFG edges, and a LIR block index is not a position in that
+// graph. An `if/else` lowers as then -> merge -> else, so the merge block has a
+// LOWER index than the `else` arm that is its only live predecessor, and an
+// emitter walking indices would reach it before anything had told it which
+// scopes are open (willow-fvt4).
 
 fn doubled(n: i64) -> i64 {
     defer println("leave doubled");
@@ -35,6 +42,20 @@ fn first_big(limit: i64) -> i64 {
     return -1;
 }
 
+fn deep(limit: i64) -> i64 {
+    defer println("leave deep");
+    for i in 0..limit {
+        defer println(i);
+        if i > 0 {
+            defer println("leave inner");
+            if i == 2 {
+                return i; // three scopes at once, innermost first
+            }
+        }
+    }
+    return -1;
+}
+
 fn scan(limit: i64) -> i64 {
     let mut total = 0;
     for i in 0..limit {
@@ -46,6 +67,46 @@ fn scan(limit: i64) -> i64 {
             break; // the loop body's scope, then out of the loop
         }
         total = total + i;
+    }
+    return total;
+}
+
+fn merged(flag: bool) -> i64 {
+    defer println("leave merged");
+    if flag {
+        return 1; // the `then` arm exits, so it never reaches the merge
+    } else {
+        println("else");
+    }
+    return 2; // merge block: its only live predecessor is the `else` arm
+}
+
+fn merged_scope(flag: bool) -> i64 {
+    defer println("leave merged_scope");
+    for i in 0..1 {
+        defer println(i + 70);
+        if flag {
+            return 1;
+        } else {
+            println("scoped else");
+        }
+        // The loop body's own scope is left by fallthrough, and the block that
+        // does the leaving is that same merge — so the state it unwinds has to
+        // have arrived from the `else` arm, not from a default.
+    }
+    return 2;
+}
+
+fn merged_loop(limit: i64) -> i64 {
+    defer println("leave merged_loop");
+    let mut total = 0;
+    for i in 0..limit {
+        defer println(i * 10);
+        if i == 2 {
+            break; // out of the body scope and the loop
+        } else {
+            total = total + i;
+        }
     }
     return total;
 }
@@ -72,7 +133,13 @@ fn main() {
     println(pick(5));
     println(pick(-1));
     println(first_big(9));
+    println(deep(5));
     println(scan(6));
+    println(merged(false));
+    println(merged(true));
+    println(merged_scope(false));
+    println(merged_scope(true));
+    println(merged_loop(5));
 
     match scaled(1, 2) {
         Ok(n) => println(n),
