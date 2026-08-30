@@ -1,0 +1,25 @@
+// Imports are scoped to the file that writes them: `import pricing::rules;`
+// binds `rules` alone, and `import sales::discount;` binds one function of
+// `sales` under that local name -- not the same `discount` module `totals`
+// imported.
+import pricing::rules;
+import sales;
+import sales::discount;
+import totals;
+
+fn subtotal() -> i64 {
+    let a = sales::amount(5);
+    return sales::value_of(a) + rules::markup(1);
+}
+
+fn labelled() -> String {
+    let a = sales::amount(3);
+    return sales::describe(a);
+}
+
+fn main() {
+    println(subtotal());
+    println(labelled());
+    println(discount(10));
+    println(totals::net(10));
+}

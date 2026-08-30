@@ -1,0 +1,48 @@
+// Matching an enum that was declared in ANOTHER file, under each name an
+// import can give it: module-qualified (`palette::Color`), aliased
+// (`import palette::Color as Hue;`), and bare through a direct type import of
+// a child module's enum (`Shade`) — willow-28h8.
+import palette;
+import palette::shades::Shade;
+import palette::Color as Hue;
+import theme;
+
+fn code(c: palette::Color) -> i64 {
+    return match c {
+        palette::Color::Red => 1,
+        palette::Color::Green => 2,
+        palette::Color::Custom(v) => v,
+    };
+}
+
+fn hue_code(h: Hue) -> i64 {
+    return match h {
+        Hue::Red => 100,
+        Hue::Green => 200,
+        Hue::Custom(v) => v + 1,
+    };
+}
+
+fn shade_code(s: Shade) -> i64 {
+    return match s {
+        Shade::Light => 7,
+        Shade::Dark => 8,
+    };
+}
+
+fn sample_text(s: palette::Sample) -> String {
+    return match s {
+        palette::Sample::Empty => "none",
+        palette::Sample::Filled(t) => t,
+    };
+}
+
+fn main() {
+    println(code(palette::Color::Red));           // 1
+    println(code(palette::Color::Custom(42)));    // 42
+    println(hue_code(Hue::Green));                // 200
+    println(shade_code(Shade::Dark));             // 8
+    println(sample_text(palette::Sample::Filled("ink")));
+    println(theme::cool_rank());                  // 2
+    println(theme::palette_rank(palette::Color::Green)); // 20
+}

@@ -1,0 +1,10 @@
+// This module binds the local name `discount` to `pricing`'s function. The
+// entry file binds the SAME local name to `sales`' one, and each file calls
+// the function it imported.
+module totals;
+
+import pricing::discount;
+
+pub fn net(n: i64) -> i64 {
+    return discount(n);
+}

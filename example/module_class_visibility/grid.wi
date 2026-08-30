@@ -1,0 +1,25 @@
+module grid;
+
+// The other `Point`: a different class with a different layout, in a module the
+// entry file never imports. It reaches the build only through `report`.
+pub class Point {
+    pub row: i64;
+    pub col: i64;
+    pub tag: String;
+
+    pub fn label(self) -> String {
+        return self.tag + ":" + self.row.toString() + "," + self.col.toString();
+    }
+}
+
+pub fn cell(row: i64, col: i64) -> Point {
+    return new Point(row, col, "cell");
+}
+
+pub fn label_of(p: Point) -> String {
+    return p.label();
+}
+
+pub fn row_of(p: Point) -> i64 {
+    return p.row;
+}

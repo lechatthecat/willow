@@ -1,0 +1,7 @@
+// A CHILD module. `import pricing::rules;` binds `rules` and nothing else --
+// the parent `pricing` is not a name the importing file can write.
+module pricing::rules;
+
+pub fn markup(n: i64) -> i64 {
+    return n * 2;
+}

@@ -1,0 +1,15 @@
+// A module whose enums are matched from other files. Nothing here is special:
+// the enums are ordinary `pub enum` declarations. What the entry and `theme`
+// do with them is the point (willow-28h8).
+module palette;
+
+pub enum Color {
+    Red,
+    Green,
+    Custom(i64),
+}
+
+pub enum Sample {
+    Empty,
+    Filled(String),
+}

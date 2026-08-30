@@ -287,7 +287,6 @@ fn register_prelude(checker: &mut semantic::TypeChecker) -> Result<()> {
 struct Frontend {
     program: parser::ast::Program,
     module_graph: module::ModuleGraph,
-    item_imports: Vec<module::resolver::ItemImport>,
     checker: semantic::TypeChecker,
     /// One run type checker per imported module, in `module_graph.files` order.
     /// The back-end lowers each module's bodies to LIR with its OWN tables
@@ -469,7 +468,6 @@ fn run_frontend(
     Ok(Frontend {
         program,
         module_graph: graph,
-        item_imports,
         checker,
         module_checkers,
     })
@@ -829,6 +827,40 @@ fn source_maps(
     maps
 }
 
+/// One unit's imports in the shape the back end wants them, from the module
+/// resolver's own classification (willow-vtlr, willow-28h8).
+///
+/// Only the resolver knows whether `import a::b;` named a module file or an
+/// item of `a`, and the difference decides both halves: an item import leaves
+/// `a` unnameable in this file, and binds a local name that another file may
+/// bind to a different module's function.
+fn backend_unit_imports(
+    program: &parser::ast::Program,
+    modules: &[module::ResolvedModule],
+) -> backend::cranelift::UnitImports {
+    let classified = module::resolver::classify_unit_imports(program, modules);
+    let mut visible_modules = std::collections::HashSet::new();
+    for binding in &classified.modules {
+        // Both spellings: this file writes `access`, while the back end's
+        // module tables are keyed by the name the graph registered, which is
+        // the first importer's alias when that was another file.
+        visible_modules.insert(binding.access.clone());
+        visible_modules.insert(binding.graph_name.clone());
+    }
+    backend::cranelift::UnitImports {
+        visible_modules,
+        item_imports: classified
+            .items
+            .iter()
+            .map(|item| backend::cranelift::ItemBinding {
+                local: item.local.clone(),
+                module: item.canonical_module.clone(),
+                item: item.item.clone(),
+            })
+            .collect(),
+    }
+}
+
 /// Back-end phases: drive Cranelift codegen over the modules and entry program,
 /// emit the object file, resolve the runtime library, link the native
 /// executable, and write debug/source-map artifacts.
@@ -843,10 +875,11 @@ fn run_backend(
     use diagnostics::{Diagnostic, ErrorCode, Severity};
     use toolchain::{HostToolchain, Toolchain};
 
+    // The entry file's item imports are not carried here: the back end gets
+    // them from `backend_unit_imports` below, the same way every module's are.
     let Frontend {
         program,
         module_graph,
-        item_imports,
         checker,
         module_checkers,
     } = frontend;
@@ -905,6 +938,23 @@ fn run_backend(
     // entry file had not contributed yet.
     let mut declared_modules = Vec::with_capacity(modules.len());
     for m in &modules {
+        let module_checker = module_checkers
+            .iter()
+            .find(|c| c.canonical_path == m.canonical_path);
+        // The module's own checker tables go in BEFORE its declaration phase
+        // (willow-9vvn). The span-keyed maps registered above hold the entry
+        // file's entries alone, and a module is checked in its own scope, so
+        // without this an unqualified enum pattern in a module body reached
+        // `emit_match` unresolved and took the wrong arm — and `declare_lambda`
+        // read no type for a module lambda, declaring it `fn(i64) -> i64`
+        // whatever it really was. Merging is safe because a span carries its
+        // file_id, so no two files' keys collide.
+        if let Some(m_checker) = module_checker {
+            codegen.merge_module_checker_tables(&m_checker.checker);
+        }
+        // What THIS module's own imports bind (willow-vtlr, willow-28h8): the
+        // modules it can name, and the single items it bound to local names.
+        codegen.set_unit_imports(backend_unit_imports(&m.program, &modules));
         match codegen.declare_module(
             &m.name,
             &m.canonical_path,
@@ -918,16 +968,7 @@ fn run_backend(
                 // program alone. The tables are the module's own — a module is
                 // checked in its own scope, and lowering it against the entry
                 // file's would resolve names it never imported.
-                if let Some(m_checker) = module_checkers
-                    .iter()
-                    .find(|c| c.canonical_path == m.canonical_path)
-                {
-                    // The AST emitter needs the same tables (willow-9vvn): the
-                    // span-keyed resolution maps above hold the entry file's
-                    // entries alone, so an unqualified enum pattern in a module
-                    // body reached `emit_match` unresolved and took the wrong
-                    // arm. Merging is safe because a span carries its file_id.
-                    codegen.merge_module_checker_tables(&m_checker.checker);
+                if let Some(m_checker) = module_checker {
                     let tables = ir::lower::CheckerTables::from_checker(&m_checker.checker);
                     let (hir, _hir_gaps) = ir::lower::lower_program_with(&m.program, &tables);
                     codegen.register_module_lir(&unit, ir::lowered::lower_program(&hir));
@@ -945,11 +986,11 @@ fn run_backend(
             }
         }
     }
-    // Bind the entry file's single-item imports to the module functions they
-    // name, after all modules are declared (so the mangled symbols exist).
-    for item in &item_imports {
-        codegen.register_item_import(&item.local, &item.canonical_module, &item.item);
-    }
+    // The entry file's own imports, in the same shape every module got. Its
+    // single-item imports bind here, after all modules are declared (so the
+    // mangled symbols exist), and rebind before the entry bodies: a module's
+    // body phase runs in between and may hold the same local name.
+    codegen.set_unit_imports(backend_unit_imports(&program, &modules));
     let entry_unit = match codegen.declare_program(&program, src) {
         Ok(unit) => unit,
         Err(error) => {

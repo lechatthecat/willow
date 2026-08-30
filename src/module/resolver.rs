@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity};
 use crate::lexer::Lexer;
+use crate::module::source_file::SourceFile;
 use crate::module::{ModuleGraph, std_registry};
 use crate::parser::{Parser, ast::Program};
 
@@ -18,6 +19,74 @@ pub struct ItemImport {
     /// The item's own name in that module (e.g. `add`).
     pub item: String,
     pub span: crate::diagnostics::Span,
+}
+
+/// One `import module;` binding, as seen from a single file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleBinding {
+    /// The name this file calls the module by: its alias, or the last segment
+    /// of the path.
+    pub access: String,
+    /// The name the module graph registered this module under, which is the
+    /// FIRST importer's spelling. Equal to `access` unless another file got
+    /// there first with a different alias.
+    pub graph_name: String,
+    /// Canonical `::`-separated module identity.
+    pub canonical_path: String,
+}
+
+/// What one file's `import` lines bind, classified the same way
+/// [`resolve_import`] classified them when it loaded the files.
+#[derive(Debug, Clone, Default)]
+pub struct UnitImports {
+    pub modules: Vec<ModuleBinding>,
+    pub items: Vec<ItemImport>,
+}
+
+/// Classify `program`'s imports against the modules the resolver loaded.
+///
+/// `import a::b;` is a MODULE import when `a::b` is itself a loaded module, and
+/// an ITEM import of module `a` otherwise — the same module-first precedence
+/// [`resolve_import`] applies against the file system, replayed here against
+/// what it loaded. `std` paths bind neither and are skipped.
+///
+/// The back end needs the distinction for two things it cannot get from the
+/// import path alone. An item import binds the ITEM, so the module it came from
+/// is not a name this file can write, and letting it count as visible makes an
+/// unrelated class of the same bare name ambiguous (willow-vtlr). And the local
+/// name an item import does bind has to be wired to that module's mangled
+/// symbol per file: two files can bind the same local name to different
+/// modules' functions (willow-28h8).
+pub fn classify_unit_imports(program: &Program, modules: &[SourceFile]) -> UnitImports {
+    let find = |path: &str| modules.iter().find(|m| m.canonical_path == path);
+    let mut out = UnitImports::default();
+    for import in &program.imports {
+        if std_registry::is_std_path(&import.path) {
+            continue;
+        }
+        if let Some(dependency) = find(&import.path) {
+            out.modules.push(ModuleBinding {
+                access: import
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| module_access_name(&import.path).to_string()),
+                graph_name: dependency.name.clone(),
+                canonical_path: dependency.canonical_path.clone(),
+            });
+            continue;
+        }
+        if let Some((parent, item)) = import.path.rsplit_once("::")
+            && let Some(dependency) = find(parent)
+        {
+            out.items.push(ItemImport {
+                local: import.alias.clone().unwrap_or_else(|| item.to_string()),
+                canonical_module: dependency.canonical_path.clone(),
+                item: item.to_string(),
+                span: import.span,
+            });
+        }
+    }
+    out
 }
 
 #[derive(Debug)]
@@ -411,6 +480,140 @@ mod tests {
         let (program, diagnostics) = Parser::new(tokens).parse();
         assert!(diagnostics.is_empty());
         program
+    }
+
+    // willow-vtlr / willow-28h8 — what one file's imports bind, as the back end
+    // has to be told rather than guess from the path shape.
+
+    /// The classification of `entry`'s imports against a project's modules.
+    fn classify(files: &[(&str, &str)], entry_source: &str) -> (UnitImports, TempProject) {
+        let project = TempProject::new(files);
+        let entry = parse(entry_source);
+        let resolution = resolve_imports(&entry, &project.0);
+        assert!(
+            resolution.diagnostics.is_empty(),
+            "{:?}",
+            resolution.diagnostics
+        );
+        let imports = classify_unit_imports(&entry, &resolution.graph.files);
+        (imports, project)
+    }
+
+    #[test]
+    fn classify_p1_a_module_import_binds_the_module() {
+        let (imports, _project) = classify(
+            &[("sales.wi", "module sales; pub fn v() -> i64 { return 1; }")],
+            "import sales; fn main() {}",
+        );
+        assert!(imports.items.is_empty());
+        assert_eq!(imports.modules.len(), 1);
+        assert_eq!(imports.modules[0].access, "sales");
+        assert_eq!(imports.modules[0].canonical_path, "sales");
+    }
+
+    #[test]
+    fn classify_p2_a_child_module_import_binds_the_child_alone() {
+        // The parent is a module of this build, and importing the child is
+        // still not a way to name it.
+        let (imports, _project) = classify(
+            &[
+                (
+                    "pricing.wi",
+                    "module pricing; pub fn v() -> i64 { return 1; }",
+                ),
+                (
+                    "pricing/rules.wi",
+                    "module pricing::rules; pub fn markup(n: i64) -> i64 { return n; }",
+                ),
+            ],
+            "import pricing::rules; fn main() {}",
+        );
+        assert!(imports.items.is_empty());
+        assert_eq!(
+            imports
+                .modules
+                .iter()
+                .map(|m| m.access.as_str())
+                .collect::<Vec<_>>(),
+            ["rules"]
+        );
+        assert_eq!(imports.modules[0].canonical_path, "pricing::rules");
+    }
+
+    #[test]
+    fn classify_p3_an_item_import_binds_the_item_and_no_module() {
+        let (imports, _project) = classify(
+            &[(
+                "calc.wi",
+                "module calc; pub fn add(n: i64) -> i64 { return n; }",
+            )],
+            "import calc::add; fn main() {}",
+        );
+        assert!(imports.modules.is_empty(), "{:?}", imports.modules);
+        assert_eq!(imports.items.len(), 1);
+        assert_eq!(imports.items[0].local, "add");
+        assert_eq!(imports.items[0].canonical_module, "calc");
+        assert_eq!(imports.items[0].item, "add");
+    }
+
+    #[test]
+    fn classify_p4_aliases_are_the_local_names() {
+        let (imports, _project) = classify(
+            &[
+                ("sales.wi", "module sales; pub fn v() -> i64 { return 1; }"),
+                (
+                    "calc.wi",
+                    "module calc; pub fn add(n: i64) -> i64 { return n; }",
+                ),
+            ],
+            "import sales as market; import calc::add as plus; fn main() {}",
+        );
+        assert_eq!(imports.modules[0].access, "market");
+        assert_eq!(imports.modules[0].canonical_path, "sales");
+        assert_eq!(imports.items[0].local, "plus");
+        assert_eq!(imports.items[0].item, "add");
+    }
+
+    #[test]
+    fn classify_p5_a_std_import_binds_neither() {
+        let (imports, _project) = classify(&[], "import std::collections::Array; fn main() {}");
+        assert!(imports.modules.is_empty());
+        assert!(imports.items.is_empty());
+    }
+
+    #[test]
+    fn classify_p6_the_graph_name_is_the_first_importers_spelling() {
+        // `sales` reaches the graph under the entry's alias, so a module that
+        // imports it plainly has to be told both spellings: the back end's
+        // module tables are keyed by the graph's.
+        let project = TempProject::new(&[
+            ("sales.wi", "module sales; pub fn v() -> i64 { return 1; }"),
+            (
+                "ledger.wi",
+                "module ledger; import sales; pub fn t() -> i64 { return sales::v(); }",
+            ),
+        ]);
+        let entry = parse("import sales as market; import ledger; fn main() {}");
+        let resolution = resolve_imports(&entry, &project.0);
+        assert!(
+            resolution.diagnostics.is_empty(),
+            "{:?}",
+            resolution.diagnostics
+        );
+        let ledger = resolution
+            .graph
+            .files
+            .iter()
+            .find(|file| file.canonical_path == "ledger")
+            .expect("ledger module");
+        let imports = classify_unit_imports(&ledger.program, &resolution.graph.files);
+        let binding = imports
+            .modules
+            .iter()
+            .find(|m| m.canonical_path == "sales")
+            .expect("sales binding");
+        assert_eq!(binding.access, "sales");
+        assert_eq!(binding.graph_name, "market");
     }
 
     #[test]

@@ -1,0 +1,28 @@
+// The module the entry file really imports. Its `Amount` is a different class
+// from `pricing`'s, and a bare `Amount` in the entry file means this one.
+module sales;
+
+pub class Amount {
+    pub value: i64;
+    pub label: String;
+
+    pub fn describe(self) -> String {
+        return self.label + ":" + self.value.toString();
+    }
+}
+
+pub fn amount(value: i64) -> Amount {
+    return new Amount(value, "sale");
+}
+
+pub fn value_of(a: Amount) -> i64 {
+    return a.value;
+}
+
+pub fn describe(a: Amount) -> String {
+    return a.describe();
+}
+
+pub fn discount(n: i64) -> i64 {
+    return n - 1;
+}

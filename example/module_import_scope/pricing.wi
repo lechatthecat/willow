@@ -1,0 +1,24 @@
+// Loaded only because another file imports ONE of its items. Its `Amount` is
+// still a class of this build, and its `discount` is a different function from
+// the one the entry file imported under the same local name.
+module pricing;
+
+pub class Amount {
+    pub cents: i64;
+
+    pub fn doubled(self) -> i64 {
+        return self.cents * 2;
+    }
+}
+
+pub fn amount(cents: i64) -> Amount {
+    return new Amount(cents);
+}
+
+pub fn doubled_cents(a: Amount) -> i64 {
+    return a.doubled();
+}
+
+pub fn discount(n: i64) -> i64 {
+    return n * 10;
+}

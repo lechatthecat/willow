@@ -732,5 +732,8 @@ fn module_lir_bodies_example_runs() {
         ok,
         "example/module_lir_bodies/main.wi failed to compile or run"
     );
-    assert_eq!(out, "12\n10\n7\nwin:rect\n1\n9\n30\n90\n12\n12\n");
+    assert_eq!(
+        out,
+        "12\n10\n7\nwin:rect\n1\n9\n30\n90\n12\n12\n12\n20\n13\n"
+    );
 }

@@ -1,0 +1,22 @@
+import shapes;
+import report;
+
+// A bare `Point` in this file is `shapes::Point`. Another module in the build
+// declares a class of the same name, but this file cannot see it, so it must
+// not make the name ambiguous here (willow-vtlr).
+fn total() -> i64 {
+    let p = shapes::make(3, 4);
+    return shapes::sum_of(p);
+}
+
+fn shifted_total() -> i64 {
+    let p = shapes::shifted(shapes::make(1, 2), 10);
+    return shapes::sum_of(p);
+}
+
+fn main() {
+    println(total());
+    println(shifted_total());
+    println(report::cell_label(2, 5));
+    println(report::cell_row(7, 8));
+}

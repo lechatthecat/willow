@@ -1,0 +1,8 @@
+// A child module. Its `Shade` reaches the entry through a direct type import,
+// so the entry writes the bare name `Shade`.
+module palette::shades;
+
+pub enum Shade {
+    Light,
+    Dark,
+}

@@ -162,6 +162,17 @@ pub(crate) fn lambda_symbol(index: usize) -> String {
     symbol_path(&[&format!("{ROLE_SEP}lambda"), &index.to_string()])
 }
 
+/// `{module_prefix}.$lambda.{n}` — the lifted function for a lambda in an
+/// imported module's body (willow-9yhi).
+///
+/// The module prefix is what keeps two modules apart: `collect_lambdas_in_program`
+/// numbers from zero for every unit it is handed, so a bare `$lambda.0` would
+/// name a different function in each module and the second declaration would
+/// collide with the first.
+pub(crate) fn module_lambda_symbol(module_prefix: &str, index: usize) -> String {
+    module_item_symbol(module_prefix, &lambda_symbol(index))
+}
+
 /// Synthesize the `init` method that a constructor lowers to (willow-scq2): a
 /// non-static instance method with a hidden `self` receiver and void return.
 pub(crate) fn constructor_to_method(ctor: &ConstructorDecl) -> MethodDecl {
@@ -512,6 +523,11 @@ mod mangling_tests {
     #[test]
     fn unit_mangle_45_lambda_symbols_are_unspellable_and_unique() {
         assert_eq!(lambda_symbol(0), "$lambda.0");
+        assert_eq!(module_lambda_symbol("geom", 0), "geom.$lambda.0");
+        assert_ne!(
+            module_lambda_symbol("left", 0),
+            module_lambda_symbol("right", 0)
+        );
         assert_ne!(lambda_symbol(0), lambda_symbol(1));
         assert!(lambda_symbol(7).contains(ROLE_SEP));
     }

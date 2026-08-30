@@ -1,0 +1,30 @@
+// A module that matches BOTH its own enum and another module's. Its `Color` is
+// a different enum from `palette::Color` despite the shared bare name; inside
+// this file `Color` means this one.
+module theme;
+
+import palette;
+
+pub enum Color {
+    Warm,
+    Cool,
+}
+
+fn rank(c: Color) -> i64 {
+    return match c {
+        Color::Warm => 1,
+        Color::Cool => 2,
+    };
+}
+
+pub fn cool_rank() -> i64 {
+    return rank(Color::Cool);
+}
+
+pub fn palette_rank(c: palette::Color) -> i64 {
+    return match c {
+        palette::Color::Red => 10,
+        palette::Color::Green => 20,
+        palette::Color::Custom(v) => v,
+    };
+}

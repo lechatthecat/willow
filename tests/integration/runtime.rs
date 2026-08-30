@@ -901,7 +901,16 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/module_enum_demo/main.wi", "1\n2\n42\n"),
         (
             "example/module_lir_bodies/main.wi",
-            "12\n10\n7\nwin:rect\n1\n9\n30\n90\n12\n12\n",
+            "12\n10\n7\nwin:rect\n1\n9\n30\n90\n12\n12\n12\n20\n13\n",
+        ),
+        (
+            "example/module_class_visibility/main.wi",
+            "7\n23\ncell:2,5\n7\n",
+        ),
+        ("example/module_import_scope/main.wi", "7\nsale:3\n9\n100\n"),
+        (
+            "example/imported_enum_match/main.wi",
+            "1\n42\n200\n8\nink\n2\n20\n",
         ),
         ("example/direct_import_demo/main.wi", "7\n1\n99\n"),
         (

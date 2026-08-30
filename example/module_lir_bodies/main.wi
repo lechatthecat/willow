@@ -14,7 +14,9 @@
 // shapes.wi: virtual dispatch, subclass widening, a class-typed field, an
 // array field, a `defer` observed through a reference parameter, a match on
 // the module's own enum, and recursion. None of it is expressible from the
-// entry file, which cannot even name `Rect`.
+// entry file, which cannot even name `Rect`. Its lambdas are lifted here too
+// (willow-9yhi): a module never got a lambda-lifting pass, so any lambda in a
+// module body used to ICE the compiler.
 //
 // Build it with fallback made fatal — the whole project, module included:
 //   WILLOW_LIR_REQUIRE=1 willowc build example/module_lir_bodies/main.wi -o /tmp/a
@@ -39,4 +41,8 @@ fn main() {
     let mut total = 0;
     println(shapes::tally(3, 4, &total));
     println(total);
+
+    println(shapes::scaled(4));
+    println(shapes::quadrupled(5));
+    println(shapes::boosted(3, 4));
 }

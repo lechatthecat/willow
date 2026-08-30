@@ -27,8 +27,22 @@ pub struct DeclaredModule {
     program: Program,
     module_prefix: String,
     module_classes: Vec<(String, ClassDecl)>,
+    /// Lambdas collected and declared by this module's declaration phase, under
+    /// module-qualified symbols (willow-9yhi). The body phase compiles these
+    /// same symbols; the collector numbers from zero per unit, so the names
+    /// cannot be re-derived later without renumbering.
+    lambdas: Vec<(String, LambdaExpr)>,
     source_file: String,
     builtin_module_aliases: HashMap<String, String>,
+    /// The module access names this unit's own `import`s name, plus the module
+    /// itself (willow-vtlr). Like `builtin_module_aliases`, a later unit's
+    /// declaration phase overwrites the backend's copy, so each unit carries
+    /// its own to reinstall before its bodies are lowered.
+    visible_modules: HashSet<String>,
+    /// This module's own single-item imports (willow-28h8). They bind a LOCAL
+    /// name to another module's symbol, and two units can bind the same local
+    /// name to different modules, so they are rebound before these bodies.
+    item_imports: Vec<ItemBinding>,
 }
 
 /// The entry program's counterpart to [`DeclaredModule`].
@@ -40,6 +54,44 @@ pub struct DeclaredProgram {
     lambdas: Vec<(String, LambdaExpr)>,
     source_file: String,
     builtin_module_aliases: HashMap<String, String>,
+    /// The module access names the entry file imports (willow-vtlr).
+    visible_modules: HashSet<String>,
+    /// The entry file's own single-item imports (willow-28h8), rebound before
+    /// its bodies because a module's body phase runs in between and may have
+    /// bound the same local name to its own module's symbol.
+    item_imports: Vec<ItemBinding>,
+}
+
+/// A single-item import (`import calc::add;`) as the resolver classified it for
+/// one unit: the local name this file calls it by, the module it comes from,
+/// and the item's own name there.
+#[derive(Debug, Clone)]
+pub struct ItemBinding {
+    pub local: String,
+    pub module: String,
+    pub item: String,
+}
+
+/// What one source unit's own `import` lines bind, as the module resolver
+/// classified them.
+///
+/// The back end cannot classify them itself: `import a::b;` is a module import
+/// when `a::b` is a module file and an item import of `a` otherwise, and only
+/// the resolver knows which files it loaded. Guessing from the path shape marks
+/// the parent of an item import visible, which is a module this file cannot
+/// name at all (willow-vtlr).
+///
+/// Installed per unit with [`Codegen::set_unit_imports`] before that unit's
+/// declaration phase, and reinstalled before its bodies: another unit's
+/// declaration phase overwrites both halves.
+#[derive(Debug, Clone, Default)]
+pub struct UnitImports {
+    /// Module access names this file can write. Both spellings of an aliased
+    /// import are here, since the back end's tables are keyed by whichever
+    /// spelling reached the module graph first.
+    pub visible_modules: HashSet<String>,
+    /// The single items this file bound, in import order.
+    pub item_imports: Vec<ItemBinding>,
 }
 
 /// The type/layout environment the LIR eligibility walker and the LIR emitter
@@ -129,6 +181,10 @@ macro_rules! lir_type_ctx {
             fn_types: &$me.fn_types,
             func_param_modes: &$me.func_param_modes,
             known_modules: &$me.known_modules,
+            // The same set emission resolves a bare module class name from
+            // (willow-vtlr), so eligibility and emission cannot disagree about
+            // which module a name means.
+            visible_modules: &$me.visible_modules,
             builtin_module_aliases: &$me.builtin_module_aliases,
             return_type: $return_type,
             // Per-FUNCTION, like `return_type`: `lir_rejection_reason` sets it
@@ -176,6 +232,18 @@ impl Codegen {
         // Recorded from the RAW program, because the normalization on the next
         // line is what erases the aliases from it (willow-nswv).
         self.builtin_module_aliases = builtin_module_aliases(program);
+        // The imports the resolver classified for THIS file. A module sees what
+        // it imports, plus itself: its own classes are keyed
+        // `{mod_name}::{Class}` by the tables below (willow-vtlr).
+        let unit_imports = std::mem::take(&mut self.unit_imports);
+        self.visible_modules = unit_imports.visible_modules;
+        self.visible_modules.insert(mod_name.to_string());
+        // The item half is not bound here: the modules this one imports are
+        // declared, but a direct TYPE import aliases whole compiled tables and
+        // doing that per module changes what the classes declared after it are
+        // compiled against. Only the function half is rebound, before this
+        // unit's bodies (willow-28h8).
+        let item_imports = unit_imports.item_imports;
         let normalized_program = normalize_std_collection_program(program);
         let normalized_program = normalize_coop_suspensions(&normalized_program, &self.expr_types);
         let program = &normalized_program;
@@ -304,6 +372,23 @@ impl Codegen {
         self.finalize_class_vslots();
         self.declare_class_descriptors_for(&qualified_classes)?;
 
+        // Collect and declare this module's lambdas, exactly as
+        // `declare_program` does for the entry file (willow-9yhi). Lifting a
+        // lambda is a DECLARATION-phase job: `lambda_names` is what both
+        // emitters read to find the lifted symbol for a lambda expression, so
+        // without this pass a module body's lambda reaches codegen with no name
+        // at all. The symbols carry the module prefix because the collector
+        // restarts its numbering for every unit it is given.
+        let lambdas: Vec<(String, LambdaExpr)> = collect_lambdas_in_program(program)
+            .into_iter()
+            .enumerate()
+            .map(|(index, (_, lambda))| (module_lambda_symbol(&module_prefix, index), lambda))
+            .collect();
+        for (name, lambda) in &lambdas {
+            self.declare_lambda(name, lambda)?;
+            self.lambda_names.insert(lambda.span, name.clone());
+        }
+
         // Analyze under canonical backend names before installing the module's
         // temporary local aliases. Imported/unknown callees remain conservative
         // unless an earlier module already published an explicit summary.
@@ -312,7 +397,7 @@ impl Codegen {
             super::panic_effect::UnitNaming {
                 module_prefix: Some(&module_prefix),
             },
-            &[],
+            &lambdas,
         );
 
         Ok(DeclaredModule {
@@ -320,8 +405,11 @@ impl Codegen {
             program: normalized_program,
             module_prefix,
             module_classes,
+            lambdas,
             source_file: source_file.to_string(),
             builtin_module_aliases: std::mem::take(&mut self.builtin_module_aliases),
+            visible_modules: std::mem::take(&mut self.visible_modules),
+            item_imports,
         })
     }
 
@@ -371,7 +459,22 @@ impl Codegen {
             self.lir_functions.insert(key, f);
         }
         for l in lir.lambdas {
-            self.lir_lambdas.insert(l.span, l.function);
+            // `declare_module` already named this lambda, so unlike the entry
+            // program's flow (where lowering runs BEFORE declaration) the
+            // symbol is known here and the body can go straight into
+            // `lir_functions`. A span with no name is left in `lir_lambdas` for
+            // whichever unit does declare it.
+            match self.lambda_names.get(&l.span) {
+                Some(name) => {
+                    let name = name.clone();
+                    let mut f = l.function;
+                    f.name = name.clone();
+                    self.lir_functions.insert(name, f);
+                }
+                None => {
+                    self.lir_lambdas.insert(l.span, l.function);
+                }
+            }
         }
     }
 
@@ -380,6 +483,11 @@ impl Codegen {
         // these, so this module's own view has to be reinstalled before its
         // bodies are lowered (willow-4zt8).
         self.builtin_module_aliases = unit.builtin_module_aliases.clone();
+        self.visible_modules = unit.visible_modules.clone();
+        // An item import binds a LOCAL name globally, so the last unit to bind
+        // it owns it; this module's bodies have to call the module IT imported
+        // (willow-28h8).
+        self.rebind_item_import_functions(&unit.item_imports);
         self.source_file = unit.source_file.clone();
         // `cooperative_leaves` holds the ENTRY program's eager-task functions,
         // which are not this module's: a module body has always been lowered
@@ -409,6 +517,12 @@ impl Codegen {
         }
 
         let result = (|| -> Result<()> {
+            // Lambdas first, and inside the alias scope, so a lambda body that
+            // calls one of this module's own functions by its bare name
+            // resolves to the mangled symbol (willow-9yhi).
+            for (name, lambda) in &unit.lambdas {
+                self.compile_lambda(name, lambda)?;
+            }
             // Compile bodies.
             for item in &program.items {
                 match item {
@@ -448,6 +562,17 @@ impl Codegen {
         // Recorded from the RAW program, because the normalization on the next
         // line is what erases the aliases from it (willow-nswv).
         self.builtin_module_aliases = builtin_module_aliases(program);
+        // The entry file's own classified imports (willow-vtlr, willow-28h8).
+        // Every module is declared by now, so the entry's single-item imports
+        // bind here, function and directly imported type alike — the entry is
+        // the last unit declared, so nothing is compiled against these tables
+        // before they are aliased.
+        let unit_imports = std::mem::take(&mut self.unit_imports);
+        self.visible_modules = unit_imports.visible_modules;
+        let item_imports = unit_imports.item_imports;
+        for item in &item_imports {
+            self.register_item_import(&item.local, &item.module, &item.item);
+        }
         let normalized_program = normalize_std_collection_program(program);
         let normalized_program = normalize_coop_suspensions(&normalized_program, &self.expr_types);
         let program = &normalized_program;
@@ -558,6 +683,8 @@ impl Codegen {
             lambdas,
             source_file: source_file.to_string(),
             builtin_module_aliases: std::mem::take(&mut self.builtin_module_aliases),
+            visible_modules: std::mem::take(&mut self.visible_modules),
+            item_imports,
         })
     }
 
@@ -568,6 +695,8 @@ impl Codegen {
         // A module's body phase runs between the two entry phases and installs
         // its own view of both (willow-4zt8).
         self.builtin_module_aliases = unit.builtin_module_aliases.clone();
+        self.visible_modules = unit.visible_modules.clone();
+        self.rebind_item_import_functions(&unit.item_imports);
         self.source_file = unit.source_file.clone();
         let program = &unit.program;
 
@@ -1009,6 +1138,7 @@ impl Codegen {
             func_param_debug: &self.func_param_debug,
             function_may_panic: &self.function_may_panic,
             known_modules: &self.known_modules,
+            visible_modules: &self.visible_modules,
             builtin_module_aliases: &self.builtin_module_aliases,
             lambda_names: &self.lambda_names,
             cooperative_leaves: &self.cooperative_leaves,
@@ -1277,6 +1407,7 @@ impl Codegen {
             func_param_debug: &self.func_param_debug,
             function_may_panic: &self.function_may_panic,
             known_modules: &self.known_modules,
+            visible_modules: &self.visible_modules,
             builtin_module_aliases: &self.builtin_module_aliases,
             lambda_names: &self.lambda_names,
             cooperative_leaves: &self.cooperative_leaves,
@@ -1668,6 +1799,7 @@ impl Codegen {
             func_param_debug: &self.func_param_debug,
             function_may_panic: &self.function_may_panic,
             known_modules: &self.known_modules,
+            visible_modules: &self.visible_modules,
             builtin_module_aliases: &self.builtin_module_aliases,
             lambda_names: &self.lambda_names,
             cooperative_leaves: &self.cooperative_leaves,

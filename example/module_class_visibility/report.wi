@@ -1,0 +1,16 @@
+module report;
+
+import grid;
+
+// `grid` is visible HERE, so a bare `Point` in this file is grid's.
+pub fn cell_label(row: i64, col: i64) -> String {
+    let p = grid::cell(row, col);
+    return grid::label_of(p);
+}
+
+pub fn cell_row(row: i64, col: i64) -> i64 {
+    // A bare `Point` local, typed by inference, in a file that sees `grid` and
+    // not `shapes`.
+    let p = grid::cell(row, col);
+    return grid::row_of(p);
+}

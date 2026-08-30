@@ -29,6 +29,7 @@ use crate::parser::ast::{
     SelectCaseKind, Stmt, Type, UnaryOp,
 };
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
+use crate::semantic::symbols;
 use crate::semantic::type_checker::types::await_output_type;
 
 use super::typed_ast::{
@@ -53,6 +54,14 @@ pub struct CheckerTables<'a> {
     /// span — the final fallback when the structural lowering cannot derive a
     /// type (generic constructions, `Self::` calls, module-qualified items).
     pub expr_types: Option<&'a HashMap<Span, Type>>,
+    /// Every enum the checker registered, under every name it registered it
+    /// by: a program's own `Color`, an imported module's `palette::Color`, and
+    /// the bare local name a direct type import binds (`Kind` for
+    /// `import shapes::Kind;`). The lowering's own sweep only sees THIS unit's
+    /// `enum` items, so without this table a `match` on any enum that came
+    /// from another file decides its scrutinee is not an enum at all
+    /// (willow-28h8 case B).
+    pub enums: Option<&'a HashMap<crate::semantic::ids::TypeId, symbols::EnumInfo>>,
 }
 
 impl<'a> CheckerTables<'a> {
@@ -62,6 +71,7 @@ impl<'a> CheckerTables<'a> {
             lambda_fn_types: Some(&checker.lambda_fn_types),
             enum_variant_resolutions: Some(&checker.enum_variant_resolutions),
             expr_types: Some(&checker.expr_types),
+            enums: Some(&checker.symbols.enums),
         }
     }
 
@@ -75,6 +85,26 @@ impl<'a> CheckerTables<'a> {
 
     fn expr_type(&self, span: &Span) -> Option<Type> {
         self.expr_types.and_then(|m| m.get(span).cloned())
+    }
+
+    /// The checker's enums, re-keyed by the name they are WRITTEN with —
+    /// `TypeId`'s own rendering, so `palette::Color` stays qualified and a
+    /// direct type import's local `Kind` stays bare. Those are exactly the
+    /// names a scrutinee's `Type::Named` carries (willow-28h8 case B).
+    fn declared_enums(&self) -> impl Iterator<Item = (String, EnumInfo)> + '_ {
+        self.enums.into_iter().flatten().map(|(id, info)| {
+            (
+                id.to_string(),
+                EnumInfo {
+                    type_params: info.type_params.clone(),
+                    variants: info
+                        .variants
+                        .iter()
+                        .map(|v| (v.name.clone(), v.payload_types.clone()))
+                        .collect(),
+                },
+            )
+        })
     }
 }
 
@@ -140,6 +170,11 @@ pub fn lower_program_with(
     ]);
     let mut classes = Classes::default();
     let mut enums = Enums::with_prelude();
+    // Before this unit's own items, so a locally declared enum still shadows
+    // an imported one of the same name below (willow-28h8 case B).
+    for (name, info) in tables.declared_enums() {
+        enums.map.insert(name, info);
+    }
     for item in &program.items {
         match item {
             Item::Function(f) => {
@@ -896,6 +931,16 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
             let ty = indirect
                 .map(|(_, ret)| ret)
                 .or_else(|| ctx.fn_returns.get(&c.callee).cloned())
+                // A function bound by an ITEM import (`import calc::add;`) is a
+                // plain unqualified call in this file, but it is not one of the
+                // program's own items, so `fn_returns` has never heard of it
+                // (willow-28h8). The checker did resolve the import and typed
+                // the call, so its type is what makes the call lowerable at
+                // all. The back end binds this same local name to the mangled
+                // symbol of the module THIS unit imported, rebinding it before
+                // each unit's bodies, so the call the type came from is the
+                // call that gets emitted (willow-28h8).
+                .or_else(|| ctx.tables.expr_type(&c.span))
                 .ok_or_else(|| {
                     internal(
                         c.span,

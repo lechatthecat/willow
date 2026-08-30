@@ -680,6 +680,11 @@ pub(super) struct LirTypeCtx<'x> {
     pub fn_types: &'x FunctionMap<Type>,
     pub func_param_modes: &'x FunctionMap<Vec<ParamMode>>,
     pub known_modules: &'x HashMap<String, String>,
+    /// The module access names the file being vetted imports (willow-vtlr).
+    /// `known_modules` is every module the build declared, so a bare class name
+    /// is looked for in THESE first: an unrelated module that happens to
+    /// declare the same class name must not make the name ambiguous.
+    pub visible_modules: &'x HashSet<String>,
     /// Local alias -> canonical builtin schema module, for the file being
     /// compiled (`import std::fs as files;` records `files -> fs`). The AST
     /// path has these folded out of its program before it ever runs; the LIR
@@ -687,9 +692,10 @@ pub(super) struct LirTypeCtx<'x> {
     /// carries whatever name the `import` spelled (willow-nswv).
     pub builtin_module_aliases: &'x HashMap<String, String>,
     /// The `$lambda.N` symbol a lambda expression was lifted to, by the span of
-    /// the lambda (willow-0g8j.2.2). `None` for a lambda the backend never
-    /// declared — a lambda inside an imported module, which is not lifted at
-    /// all — so the walker refuses rather than emitting the address of nothing.
+    /// the lambda (willow-0g8j.2.2) — `{module}.$lambda.N` for one lifted by a
+    /// module's own declaration phase (willow-9yhi). `None` for a lambda the
+    /// backend never declared, so the walker refuses rather than emitting the
+    /// address of nothing.
     pub lambda_symbol: &'x dyn Fn(Span) -> Option<String>,
     /// The declared return type of the function being vetted. Unlike every
     /// other field this one is per-FUNCTION, and it is here because a `return`
@@ -754,10 +760,19 @@ fn normalize_void_payloads(payloads: &mut Vec<Type>) {
 /// imported under two access names registers `c::Point` and `checks::Point`,
 /// and they share a `type_id` because they are one runtime class, exactly as
 /// `LirTypeCtx::class_widening` relies on.
+///
+/// `known_modules` is every module the whole build declared, so the retry runs
+/// over the modules this unit can actually SEE first (willow-vtlr): a module
+/// the file never imported must not make its class name ambiguous here, since
+/// the only effect of that ambiguity is to cost an eligible body its lowering.
+/// The all-modules scan is still what answers when the visible ones say
+/// nothing, so no name that resolves today stops resolving — a class reached
+/// through a module that only another module imports keeps working.
 fn resolve_class_key(
     class_layouts: &HashMap<String, Vec<(String, Type)>>,
     class_type_ids: &HashMap<String, i64>,
     known_modules: &HashMap<String, String>,
+    visible_modules: &HashSet<String>,
     name: &str,
 ) -> Option<String> {
     if class_layouts.contains_key(name) {
@@ -769,19 +784,32 @@ fn resolve_class_key(
         (Some(x), Some(y)) => x == y,
         _ => false,
     };
-    let mut found: Option<String> = None;
-    for module in known_modules.keys() {
-        let qualified = format!("{module}::{name}");
-        if !class_layouts.contains_key(&qualified) {
-            continue;
+    // `Err` is "these modules disagree", which is not the same answer as `None`
+    // ("none of them has such a class") — only the first makes the name
+    // genuinely ambiguous at this site.
+    let scan = |visible_only: bool| -> Result<Option<String>, ()> {
+        let mut found: Option<String> = None;
+        for module in known_modules.keys() {
+            if visible_only && !visible_modules.contains(module) {
+                continue;
+            }
+            let qualified = format!("{module}::{name}");
+            if !class_layouts.contains_key(&qualified) {
+                continue;
+            }
+            match &found {
+                Some(prev) if !same_class(prev, &qualified) => return Err(()),
+                Some(_) => {}
+                None => found = Some(qualified),
+            }
         }
-        match &found {
-            Some(prev) if !same_class(prev, &qualified) => return None,
-            Some(_) => {}
-            None => found = Some(qualified),
-        }
+        Ok(found)
+    };
+    match scan(true) {
+        Err(()) => None,
+        Ok(Some(key)) => Some(key),
+        Ok(None) => scan(false).unwrap_or(None),
     }
-    found
 }
 
 impl LirTypeCtx<'_> {
@@ -1092,6 +1120,7 @@ impl LirTypeCtx<'_> {
             self.class_layouts,
             self.class_type_ids,
             self.known_modules,
+            self.visible_modules,
             name,
         )
     }
@@ -7724,6 +7753,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.class_layouts,
             self.class_type_ids,
             self.known_modules,
+            self.visible_modules,
             &class,
         )
         .expect("class layout vetted by LIR eligibility");
@@ -9340,6 +9370,11 @@ mod tests {
         fn_types: FunctionMap<Type>,
         param_modes: FunctionMap<Vec<ParamMode>>,
         known_modules: HashMap<String, String>,
+        /// The module access names the unit under test imports (willow-vtlr).
+        /// `TestTables::build` leaves it empty because the plain test programs
+        /// declare no modules; a test that populates `known_modules` says here
+        /// which of them the importing file can see.
+        visible_modules: HashSet<String>,
         /// Builtin namespace aliases declared by the test program's own
         /// `import`s, standing in for the backend's per-file map (willow-nswv).
         builtin_module_aliases: HashMap<String, String>,
@@ -9400,6 +9435,7 @@ mod tests {
                 fn_types: FunctionMap::default(),
                 param_modes: FunctionMap::default(),
                 known_modules: HashMap::new(),
+                visible_modules: HashSet::new(),
                 builtin_module_aliases:
                     crate::backend::cranelift::std_collection::builtin_module_aliases(program),
                 ret: Type::Void,
@@ -9647,6 +9683,7 @@ mod tests {
                 fn_types: &self.fn_types,
                 func_param_modes: &self.param_modes,
                 known_modules: &self.known_modules,
+                visible_modules: &self.visible_modules,
                 builtin_module_aliases: &self.builtin_module_aliases,
                 return_type: &self.ret,
                 self_class: None,
@@ -10349,6 +10386,196 @@ mod tests {
             .expect("f64::to_string has an entry");
         assert_eq!(entry.runtime, "willow_f64_to_string");
         assert!(namespace_builtin_call(&empty, &aliases, "f64", "exists").is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // willow-vtlr — a bare module class name resolves against the modules the
+    // unit being compiled can SEE, and only then against every module the
+    // build declared.
+    //
+    // Perspectives 1-10:
+    //  1. a name the unit's own tables answer is never re-resolved
+    //  2. the one visible module that declares it answers
+    //  3. an unrelated INVISIBLE module of the same name no longer blocks it
+    //  4. two VISIBLE modules with different classes of that name: ambiguous
+    //  5. two spellings of ONE class (same type_id) are one answer
+    //  6. nothing visible declares it: the all-modules scan still answers
+    //  7. nothing visible, and the invisible ones disagree: ambiguous
+    //  8. a class no module declares at all
+    //  9. a candidate with no type_id is never merged by name
+    // 10. a visible name that is not a module is ignored
+
+    /// The two tables [`resolve_class_key`] reads: layouts by class key, and
+    /// the runtime type id of each (a negative id in the fixture means the
+    /// class has none).
+    type ClassTables = (HashMap<String, Vec<(String, Type)>>, HashMap<String, i64>);
+
+    /// `class_layouts` and `class_type_ids` holding one empty class per entry.
+    fn class_tables(classes: &[(&str, i64)]) -> ClassTables {
+        let mut layouts = HashMap::new();
+        let mut ids = HashMap::new();
+        for (name, id) in classes {
+            layouts.insert((*name).to_string(), Vec::new());
+            if *id >= 0 {
+                ids.insert((*name).to_string(), *id);
+            }
+        }
+        (layouts, ids)
+    }
+
+    fn modules(names: &[&str]) -> HashMap<String, String> {
+        names
+            .iter()
+            .map(|n| ((*n).to_string(), format!("{n}.")))
+            .collect()
+    }
+
+    fn visible(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    #[test]
+    fn vm1_an_own_class_is_never_re_resolved() {
+        let (layouts, ids) = class_tables(&[("Point", 1), ("a::Point", 2)]);
+        assert_eq!(
+            resolve_class_key(&layouts, &ids, &modules(&["a"]), &visible(&["a"]), "Point"),
+            Some("Point".to_string())
+        );
+    }
+
+    #[test]
+    fn vm2_the_visible_module_answers() {
+        let (layouts, ids) = class_tables(&[("a::Point", 1)]);
+        assert_eq!(
+            resolve_class_key(&layouts, &ids, &modules(&["a"]), &visible(&["a"]), "Point"),
+            Some("a::Point".to_string())
+        );
+    }
+
+    #[test]
+    fn vm3_an_unimported_module_of_the_same_name_does_not_block() {
+        // The bug this fixes: `b` is a module the entry never imported, and its
+        // unrelated `Point` used to make the name ambiguous and cost the body
+        // its lowering.
+        let (layouts, ids) = class_tables(&[("a::Point", 1), ("b::Point", 2)]);
+        assert_eq!(
+            resolve_class_key(
+                &layouts,
+                &ids,
+                &modules(&["a", "b"]),
+                &visible(&["a"]),
+                "Point"
+            ),
+            Some("a::Point".to_string())
+        );
+    }
+
+    #[test]
+    fn vm4_two_visible_modules_of_the_same_name_are_ambiguous() {
+        // Both are in scope at this site, so nothing here can say which layout
+        // the name means: refuse, rather than pick one.
+        let (layouts, ids) = class_tables(&[("a::Point", 1), ("b::Point", 2)]);
+        assert_eq!(
+            resolve_class_key(
+                &layouts,
+                &ids,
+                &modules(&["a", "b"]),
+                &visible(&["a", "b"]),
+                "Point"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn vm5_two_spellings_of_one_class_are_one_answer() {
+        // One module imported under two access names is one runtime class, so
+        // the shared type_id makes the two keys agree.
+        let (layouts, ids) = class_tables(&[("c::Point", 7), ("checks::Point", 7)]);
+        let key = resolve_class_key(
+            &layouts,
+            &ids,
+            &modules(&["c", "checks"]),
+            &visible(&["c", "checks"]),
+            "Point",
+        )
+        .expect("one class, two spellings");
+        assert!(key == "c::Point" || key == "checks::Point", "{key}");
+    }
+
+    #[test]
+    fn vm6_an_invisible_module_still_answers_when_nothing_visible_does() {
+        // A class reached through a module only ANOTHER module imports keeps
+        // resolving: the visible pass is a preference, not a filter.
+        let (layouts, ids) = class_tables(&[("deep::Point", 1)]);
+        assert_eq!(
+            resolve_class_key(
+                &layouts,
+                &ids,
+                &modules(&["deep"]),
+                &visible(&["shallow"]),
+                "Point"
+            ),
+            Some("deep::Point".to_string())
+        );
+    }
+
+    #[test]
+    fn vm7_invisible_modules_that_disagree_are_still_ambiguous() {
+        let (layouts, ids) = class_tables(&[("a::Point", 1), ("b::Point", 2)]);
+        assert_eq!(
+            resolve_class_key(
+                &layouts,
+                &ids,
+                &modules(&["a", "b"]),
+                &HashSet::new(),
+                "Point"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn vm8_a_class_no_module_declares_resolves_to_nothing() {
+        let (layouts, ids) = class_tables(&[("a::Point", 1)]);
+        assert_eq!(
+            resolve_class_key(&layouts, &ids, &modules(&["a"]), &visible(&["a"]), "Rect"),
+            None
+        );
+    }
+
+    #[test]
+    fn vm9_a_candidate_without_a_type_id_is_never_merged() {
+        // No id means no proof the two names are one class, so they cannot be
+        // merged even when they are both visible.
+        let (layouts, ids) = class_tables(&[("a::Point", -1), ("b::Point", -1)]);
+        assert_eq!(
+            resolve_class_key(
+                &layouts,
+                &ids,
+                &modules(&["a", "b"]),
+                &visible(&["a", "b"]),
+                "Point"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn vm10_a_visible_name_that_is_not_a_module_is_ignored() {
+        // A unit's visible set can hold names that are not modules of this
+        // build at all; only the ones `known_modules` knows select a candidate.
+        let (layouts, ids) = class_tables(&[("a::Point", 1)]);
+        assert_eq!(
+            resolve_class_key(
+                &layouts,
+                &ids,
+                &modules(&["a"]),
+                &visible(&["fs", "Point", "a"]),
+                "Point"
+            ),
+            Some("a::Point".to_string())
+        );
     }
 
     // ---------------------------------------------------------------------

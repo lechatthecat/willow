@@ -22,7 +22,7 @@ mod ast_passes;
 mod async_codegen;
 mod async_liveness;
 mod compile;
-pub use compile::{DeclaredModule, DeclaredProgram};
+pub use compile::{DeclaredModule, DeclaredProgram, ItemBinding, UnitImports};
 mod coop;
 mod coop_anf;
 mod emit;
@@ -172,8 +172,21 @@ pub struct Codegen {
     /// Missing entries are `MAY_PANIC`; only an explicit `false` may remove a
     /// generated depth check or panic-return path (willow-s9ej.8).
     function_may_panic: FunctionMap<bool>,
-    /// Imported module access name -> canonical symbol prefix.
+    /// Imported module access name -> canonical symbol prefix. Every module
+    /// the whole build declared, whether or not the unit being compiled
+    /// imported it.
     known_modules: HashMap<String, String>,
+    /// The module access names the file currently being compiled can actually
+    /// see, i.e. the ones its own `import`s name (willow-vtlr). `known_modules`
+    /// is the whole build, so an unrelated module declaring a class of the same
+    /// bare name used to make that name ambiguous and cost the body its
+    /// eligibility; resolution consults these first. Installed per unit exactly
+    /// like `builtin_module_aliases`.
+    visible_modules: HashSet<String>,
+    /// The imports the resolver classified for the unit about to be declared,
+    /// handed over by `set_unit_imports` (willow-vtlr, willow-28h8). Taken by
+    /// the declaration phase, which installs each half where it belongs.
+    unit_imports: compile::UnitImports,
     /// Local alias -> canonical builtin schema module (`import std::fs as
     /// files;` records `files -> fs`), for the file currently being compiled.
     /// The AST path never needs it because `normalize_std_collection_program`
@@ -447,6 +460,8 @@ impl Codegen {
             func_param_debug: FunctionMap::default(),
             function_may_panic: FunctionMap::default(),
             known_modules: HashMap::new(),
+            visible_modules: HashSet::new(),
+            unit_imports: compile::UnitImports::default(),
             builtin_module_aliases: HashMap::new(),
             lambda_names: HashMap::new(),
             cooperative_leaves: std::collections::HashSet::new(),
@@ -641,6 +656,12 @@ impl Codegen {
     /// entry file's or with another module's. That is why this extends the maps
     /// instead of replacing them, and why it must run after the entry
     /// registrations.
+    ///
+    /// It must also run BEFORE that module's `declare_module`, not just before
+    /// its bodies: `declare_lambda` reads `lambda_fn_types` to give a lifted
+    /// lambda its signature, so a module lambda declared ahead of the merge is
+    /// declared `fn(i64) -> i64` whatever it really is, and every use of it is
+    /// then refused for a signature mismatch (willow-9yhi).
     pub fn merge_module_checker_tables(&mut self, checker: &crate::semantic::TypeChecker) {
         self.expr_types
             .extend(checker.expr_types.iter().map(|(k, v)| (*k, v.clone())));
@@ -676,37 +697,49 @@ impl Codegen {
     /// prelude, exactly like user-defined enums.  Kept for call-site compatibility.
     pub fn register_builtin_generic_enums(&mut self) {}
 
+    /// Hand the back end the imports the module resolver classified for the
+    /// next unit to be declared (willow-vtlr, willow-28h8).
+    ///
+    /// Must be called before that unit's `declare_module`/`declare_program`,
+    /// which takes them: the visible-module half decides which module a bare
+    /// class name in this file may come from, and the item half is bound now
+    /// and rebound before this unit's bodies.
+    pub fn set_unit_imports(&mut self, imports: compile::UnitImports) {
+        self.unit_imports = imports;
+    }
+
+    /// Rebind the FUNCTION half of one unit's single-item imports, in import
+    /// order.
+    ///
+    /// `func_ids` is global and keyed by the local name, so the binding that
+    /// stands is whichever unit bound it last: two files that both say
+    /// `import <module>::add;` for different modules share the name `add`, and
+    /// the unit whose bodies are being lowered has to hold it (willow-28h8).
+    ///
+    /// Only the function half is rebound. A direct TYPE import aliases whole
+    /// compiled tables — layouts, vtables, interface info — that the classes
+    /// declared against them are already compiled to, and re-aliasing those
+    /// between two units' bodies changes dispatch under compiled code.
+    fn rebind_item_import_functions(&mut self, items: &[compile::ItemBinding]) {
+        for item in items {
+            self.bind_item_import_function(&item.local, &item.module, &item.item);
+        }
+    }
+
     /// Bind a single-item import: the local name aliases the module function's
     /// mangled symbol (`{module}__{item}`), so an unqualified call to `local`
     /// lowers to the module function. Must be called after the module is
     /// compiled. No-op if the symbol is absent (the type checker already
     /// reported the error).
     pub fn register_item_import(&mut self, local: &str, module: &str, item: &str) {
+        if self.bind_item_import_function(local, module, item) {
+            return;
+        }
         let module_prefix = self
             .known_modules
             .get(module)
             .cloned()
             .unwrap_or_else(|| module_symbol_prefix(module));
-        let mangled = module_item_symbol(&module_prefix, item);
-        if let Some(&id) = self.func_ids.get(&mangled) {
-            self.func_ids.insert(local, id);
-            if let Some(rt) = self.func_return_types.get(&mangled).cloned() {
-                self.func_return_types.insert(local, rt);
-            }
-            if let Some(ft) = self.fn_types.get(&mangled).cloned() {
-                self.fn_types.insert(local, ft);
-            }
-            if let Some(modes) = self.func_param_modes.get(&mangled).cloned() {
-                self.func_param_modes.insert(local, modes);
-            }
-            if let Some(params) = self.func_param_debug.get(&mangled).cloned() {
-                self.func_param_debug.insert(local, params);
-            }
-            if let Some(may_panic) = self.function_may_panic.get(&mangled).copied() {
-                self.function_may_panic.insert(local, may_panic);
-            }
-            return;
-        }
 
         // Direct TYPE import (willow-64gs): alias the compiled tables of the
         // module-qualified type (`module::Item`) under the unqualified `local`
@@ -787,6 +820,39 @@ impl Codegen {
         if let Some(info) = self.enum_infos.get(&qualified).cloned() {
             self.enum_infos.insert(local.to_string(), info);
         }
+    }
+
+    /// The function half of [`Codegen::register_item_import`]: bind `local` to
+    /// the mangled symbol of `module`'s `item`, with the signature tables that
+    /// travel with it. Returns whether such a function exists.
+    fn bind_item_import_function(&mut self, local: &str, module: &str, item: &str) -> bool {
+        let module_prefix = self
+            .known_modules
+            .get(module)
+            .cloned()
+            .unwrap_or_else(|| module_symbol_prefix(module));
+        let mangled = module_item_symbol(&module_prefix, item);
+        if let Some(&id) = self.func_ids.get(&mangled) {
+            self.func_ids.insert(local, id);
+            if let Some(rt) = self.func_return_types.get(&mangled).cloned() {
+                self.func_return_types.insert(local, rt);
+            }
+            if let Some(ft) = self.fn_types.get(&mangled).cloned() {
+                self.fn_types.insert(local, ft);
+            }
+            if let Some(modes) = self.func_param_modes.get(&mangled).cloned() {
+                self.func_param_modes.insert(local, modes);
+            }
+            if let Some(params) = self.func_param_debug.get(&mangled).cloned() {
+                self.func_param_debug.insert(local, params);
+            }
+            if let Some(may_panic) = self.function_may_panic.get(&mangled).copied() {
+                self.function_may_panic.insert(local, may_panic);
+            }
+            return true;
+        }
+
+        false
     }
 
     fn alias_function_symbol(
@@ -1794,6 +1860,10 @@ struct FuncGen<'a, 'b> {
     func_param_debug: &'a FunctionMap<Vec<ParamDebug>>,
     function_may_panic: &'a FunctionMap<bool>,
     known_modules: &'a HashMap<String, String>,
+    /// The module access names the file being compiled imports (willow-vtlr).
+    /// Read only to resolve a bare module class name, and read there because
+    /// eligibility resolves it from the same set.
+    visible_modules: &'a HashSet<String>,
     /// Local alias -> canonical builtin schema module, for the file being
     /// compiled (willow-nswv). Only the LIR path reads it.
     builtin_module_aliases: &'a HashMap<String, String>,

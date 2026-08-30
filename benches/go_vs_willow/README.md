@@ -1,4 +1,6 @@
-# Willow vs Go scheduler benchmarks
+# Willow vs Go benchmarks
+
+## Scheduler benchmarks
 
 This suite compares equivalent scheduler operations with Willow and Go 1.27.0.
 It uses 8 workers (`WILLOW_WORKERS=8`, `GOMAXPROCS=8`) to match the machine's
@@ -36,3 +38,33 @@ python3 benches/go_vs_willow/run.py gc_scheduler 10000 100 --trials 5 --no-build
 Do not run the 1M-task case until the 100k-task RSS result confirms that it is
 safe on the test machine. These numbers are machine-specific; avoid comparing
 runs made under different worker counts, power profiles, or background load.
+
+## Synchronous benchmarks
+
+`run_sync.py` follows the whole-program method in the
+[referenced Qiita article](https://qiita.com/hanaata/items/c91788bcac2a40f1bb05)
+and compares five equivalent, single-main-thread workloads using release-built
+Willow and Go binaries:
+
+- `leibniz_pow`: the Qiita article's Leibniz-series expression, including terms
+  0 through 100,000,000 and computing the alternating sign with exponentiation.
+- `leibniz_reduced`: the same terms with exponentiation strength-reduced to a
+  sign flip, isolating loop and floating-point arithmetic throughput.
+- `fibonacci`: naive recursive `fib(40)`.
+- `array_sum`: append five million `i64` values, then traverse and sum them.
+- `linked_list`: allocate and traverse a one-million-node linked list.
+
+The harness validates every result, alternates language launch order, and uses
+five fresh-process trials by default. Python's monotonic clock measures wall
+time; GNU `time` supplies process user/system time and peak RSS. Both runtimes
+receive a worker limit of eight for consistency with the scheduler suite,
+although the benchmark body itself is synchronous.
+
+```sh
+python3 benches/go_vs_willow/run_sync.py
+python3 benches/go_vs_willow/run_sync.py fibonacci array_sum --trials 3 --no-build
+```
+
+Build time is intentionally excluded. The reported wall time includes process
+startup and shutdown, as in the linked Qiita article. See `SYNC_RESULTS.md` for
+the checked-in machine-specific run.

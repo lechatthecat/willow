@@ -29,6 +29,12 @@ pub class Rect extends Shape {
     pub override fn area(self) -> i64 {
         return self.w * self.h;
     }
+
+    // A lambda inside a METHOD is lifted the same way a free function's is.
+    pub fn boosted(self) -> i64 {
+        let bump: fn(i64) -> i64 = |x| x + 1;
+        return bump(self.area());
+    }
 }
 
 // A field of a class type is where the two spellings of one module class meet:
@@ -118,6 +124,28 @@ pub fn measure_boxy(n: i64) -> i64 {
 
 pub fn grow(r: Rect, by: i64) -> Rect {
     return new Rect(r.name, r.w + by, r.h + by);
+}
+
+// Lambda lifting is a DECLARATION-phase job, and until willow-9yhi a module
+// never had one: `lambda_names` held entry-file spans alone, so a lambda here
+// reached codegen with no lifted symbol and ICEd the compiler on BOTH backends.
+// The lifted functions are module-qualified (`shapes.$lambda.0`) because the
+// collector numbers from zero for every unit it walks.
+pub fn scaled(n: i64) -> i64 {
+    let triple: fn(i64) -> i64 = |x| x * 3;
+    return triple(n);
+}
+
+pub fn apply_twice(f: fn(i64) -> i64, n: i64) -> i64 {
+    return f(f(n));
+}
+
+pub fn quadrupled(n: i64) -> i64 {
+    return apply_twice(|x| x * 2, n);
+}
+
+pub fn boosted(w: i64, h: i64) -> i64 {
+    return rect(w, h).boosted();
 }
 
 // Recursion inside a module body, so the walker's call resolution has to find
