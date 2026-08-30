@@ -1,0 +1,187 @@
+// A `match` binding is a GC root of its own (willow-10zt).
+//
+// Willow's collector is generational: the old generation never moves, but a
+// young object that survives a minor collection is COPIED into the old one and
+// the slot that pointed at it is fixed up behind it. A rooted local is promoted
+// in place, so an ordinary variable keeps naming the right object -- but an enum
+// payload and the object inside an interface box are reached through the heap,
+// so they really do move.
+//
+// A pattern binding therefore cannot be a plain register copy of the payload
+// pointer: after the arm's first allocation it would name freed memory. Each of
+// these functions mutates through the binding after a collection and then reads
+// the value back through the scrutinee, so a stale binding shows up as the old
+// number rather than the new one.
+
+class Node {
+    pub v: i64;
+}
+
+class Cell {
+    pub n: Node;
+}
+
+enum Boxed {
+    One(Node),
+    Pair(Node, i64),
+    Empty,
+}
+
+enum Wrap {
+    Inner(Boxed),
+    Nil,
+}
+
+enum Note {
+    Text(String),
+    Num(i64),
+}
+
+interface Shape {
+    fn area(self) -> i64;
+}
+
+class Square implements Shape {
+    pub side: i64;
+    pub fn area(self) -> i64 { return self.side * self.side; }
+}
+
+class Circle implements Shape {
+    pub r: i64;
+    pub fn area(self) -> i64 { return 3 * self.r * self.r; }
+}
+
+fn bump(n: Node, v: i64) -> i64 {
+    n.v = v;
+    return 0;
+}
+
+fn set_side(q: Square, v: i64) -> i64 {
+    q.side = v;
+    return 0;
+}
+
+// Reads the payload through the scrutinee, which the collector does fix up.
+fn peek(x: Boxed) -> i64 {
+    match x {
+        Boxed::One(n) => { return n.v; }
+        Boxed::Pair(n, k) => { return n.v + k; }
+        Boxed::Empty => { return -1; }
+    }
+}
+
+fn side_of(s: Shape) -> i64 {
+    match s {
+        Square(q) => { return q.side; }
+        Circle(c) => { return c.r; }
+    }
+}
+
+// An enum payload written through the binding after the payload has moved.
+fn relabel(x: Boxed) -> i64 {
+    match x {
+        Boxed::One(n) => {
+            gc_minor_collect();
+            bump(n, 99);
+        }
+        Boxed::Pair(n, k) => { bump(n, k); }
+        Boxed::Empty => {}
+    }
+    return peek(x);
+}
+
+// Two allocations between the binding and the read.
+fn allocate_then_read(x: Boxed) -> i64 {
+    match x {
+        Boxed::One(n) => {
+            let a = new Node(1);
+            let b = new Node(2);
+            gc_minor_collect();
+            return n.v + a.v + b.v;
+        }
+        Boxed::Pair(n, k) => { return -2; }
+        Boxed::Empty => { return -1; }
+    }
+}
+
+// A payload that is itself an enum: the outer and the inner binding are both
+// roots, and the inner one moves out from under the outer one.
+fn nested(w: Wrap) -> i64 {
+    match w {
+        Wrap::Inner(b) => {
+            gc_minor_collect();
+            match b {
+                Boxed::One(n) => { gc_minor_collect(); bump(n, 55); }
+                Boxed::Pair(n, k) => { bump(n, k); }
+                Boxed::Empty => {}
+            }
+            return peek(b);
+        }
+        Wrap::Nil => { return -1; }
+    }
+}
+
+// The same hazard through an interface box rather than an enum.
+fn regrow(s: Shape) -> i64 {
+    match s {
+        Square(q) => {
+            gc_minor_collect();
+            set_side(q, 9);
+            return side_of(s);
+        }
+        Circle(c) => { return c.r; }
+    }
+}
+
+// A String payload, held across two allocations.
+fn caption(note: Note) -> String {
+    match note {
+        Note::Text(s) => {
+            let head = "[" + "note] ";
+            gc_minor_collect();
+            let tail = "!" + "";
+            return head + s + tail;
+        }
+        Note::Num(k) => { return "none"; }
+    }
+}
+
+// A binding inside a loop: every iteration collects, and the arm's root has to
+// come back off the stack again or the root depth would grow without bound.
+fn total(x: Boxed) -> i64 {
+    let mut sum = 0;
+    let mut i = 0;
+    while i < 100 {
+        match x {
+            Boxed::One(n) => { gc_minor_collect(); sum = sum + n.v; }
+            Boxed::Pair(n, k) => { sum = sum + k; }
+            Boxed::Empty => {}
+        }
+        i = i + 1;
+    }
+    return sum;
+}
+
+// The binding is still live after it is handed to a function that allocates.
+fn keep(n: Node) -> i64 {
+    let c = new Cell(n);
+    gc_minor_collect();
+    return c.n.v;
+}
+
+fn handed_off(x: Boxed) -> i64 {
+    match x {
+        Boxed::One(n) => { gc_minor_collect(); return keep(n); }
+        _ => { return -1; }
+    }
+}
+
+fn main() {
+    println(relabel(Boxed::One(new Node(7))));
+    println(allocate_then_read(Boxed::One(new Node(7))));
+    println(nested(Wrap::Inner(Boxed::One(new Node(7)))));
+    println(regrow(new Square(2)));
+    println(caption(Note::Text("kept")));
+    println(total(Boxed::One(new Node(3))));
+    println(handed_off(Boxed::One(new Node(7))));
+}

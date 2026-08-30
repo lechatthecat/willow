@@ -43,6 +43,8 @@ mod lir_async;
 mod lir_atomics;
 #[path = "integration/lir_class_inheritance.rs"]
 mod lir_class_inheritance;
+#[path = "integration/lir_class_methods.rs"]
+mod lir_class_methods;
 #[path = "integration/lir_defer_block_order.rs"]
 mod lir_defer_block_order;
 #[path = "integration/lir_defer_scopes.rs"]
@@ -68,12 +70,17 @@ mod module_virtual_dispatch;
 
 #[path = "integration/lir_match_arm_control_flow.rs"]
 mod lir_match_arm_control_flow;
+
+#[path = "integration/constructor_reference_args.rs"]
+mod constructor_reference_args;
 #[path = "integration/lir_match_bodies.rs"]
 mod lir_match_bodies;
 #[path = "integration/lir_match_suspend.rs"]
 mod lir_match_suspend;
 #[path = "integration/lir_parallel_map.rs"]
 mod lir_parallel_map;
+#[path = "integration/match_binding_gc_roots.rs"]
+mod match_binding_gc_roots;
 
 #[path = "integration/lir_reference_args.rs"]
 mod lir_reference_args;

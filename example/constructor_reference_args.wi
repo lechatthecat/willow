@@ -1,0 +1,142 @@
+// `new` and `super.init(...)` under the reference-argument ABI (willow-0g8j.10,
+// willow-dssc).
+//
+// A constructor parameter can be declared `&` or `&mut` just like any other
+// parameter, and `init` has no other way to be called -- so `new C(&place)` and
+// `super.init(&place)` are the only spellings that reach it. Both pass the
+// ADDRESS of the place; the constructor's writes have to land in the caller's
+// own local, field or array element, and the value the caller reads back
+// afterwards is the one the constructor left behind.
+//
+// The argument MODES are checked at the call, too: `&` on a by-value parameter
+// is an error (E1703), a missing `&` on a reference parameter is an error
+// (E1702), an immutable place cannot be passed as `&mut` (E1701), and two
+// `&mut` arguments cannot name the same place (E1706). This file only exercises
+// the accepted forms; the rejected ones live in the test suite.
+
+import std::collections::Array;
+
+class Counter {
+    pub start: i64;
+
+    // Reads AND writes through the pointer: the caller's `seed` moves on.
+    pub init(self, seed: &mut i64) {
+        seed = seed + 1;
+        self.start = seed;
+    }
+}
+
+class Tally {
+    pub total: i64;
+    pub step: i64;
+
+    // A reference parameter and a value parameter in one signature.
+    pub init(self, running: &mut i64, step: i64) {
+        running = running + step;
+        self.total = running;
+        self.step = step;
+    }
+}
+
+class Banner {
+    pub text: String;
+
+    // A GC-managed place: the caller's `String` local is rebound by the
+    // constructor, and both sides must see the same new string.
+    pub init(self, caption: &mut String) {
+        caption = caption + "!";
+        self.text = caption;
+    }
+}
+
+open class Ledger {
+    pub opening: i64;
+
+    pub init(self, balance: &mut i64) {
+        balance = balance * 2;
+        self.opening = balance;
+    }
+}
+
+class Journal extends Ledger {
+    pub entries: i64;
+
+    // `super.init` forwards the reference on: `balance` is already a pointer
+    // here, and `&balance` hands the SAME place to the base constructor.
+    pub init(self, balance: &mut i64, entries: i64) {
+        super.init(&balance);
+        self.entries = entries;
+    }
+}
+
+class Box {
+    pub v: i64;
+}
+
+// A constructor call whose argument is an ordinary local.
+fn from_local(seed: i64) -> i64 {
+    let mut n = seed;
+    let c = new Counter(&n);
+    // `c.start` and `n` agree, because the write landed in this frame.
+    return c.start + n;
+}
+
+// The place is a field of another object.
+fn from_field() -> i64 {
+    let b = new Box(10);
+    let c = new Counter(&b.v);
+    return c.start + b.v;
+}
+
+// The place is an array element.
+fn from_element() -> i64 {
+    let xs: Array<i64> = [1, 2, 3];
+    let c = new Counter(&xs[1]);
+    return c.start + xs[1];
+}
+
+// The same local is handed to a constructor on every iteration, so the address
+// has to be stable across the loop rather than re-derived inside it.
+fn accumulate(rounds: i64) -> i64 {
+    let mut running = 0;
+    let mut i = 0;
+    while i < rounds {
+        let t = new Tally(&running, 5);
+        i = i + 1;
+    }
+    return running;
+}
+
+// A GC-managed reference argument.
+fn shout(word: String) -> String {
+    let mut caption = word;
+    let b = new Banner(&caption);
+    return b.text + "/" + caption;
+}
+
+// The reference travels one level further, into the base constructor.
+fn open_journal(start: i64) -> i64 {
+    let mut balance = start;
+    let j = new Journal(&balance, 3);
+    return j.opening + j.entries + balance;
+}
+
+// A constructor call inside a lambda body.
+fn in_lambda(seed: i64) -> i64 {
+    let bump = |x: i64| -> i64 {
+        let mut v = x;
+        let c = new Counter(&v);
+        return c.start;
+    };
+    return bump(seed);
+}
+
+fn main() {
+    println(from_local(20));
+    println(from_field());
+    println(from_element());
+    println(accumulate(4));
+    println(shout("hi"));
+    println(open_journal(7));
+    println(in_lambda(5));
+}

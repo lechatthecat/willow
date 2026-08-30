@@ -861,6 +861,14 @@ fn test_runnable_example_files_compile_and_run() {
              odd sample\nrising batch\n?\nno reading\n6\n7\n5\n6\n9\n",
         ),
         ("example/lambda_context.wi", "20\n12\n12\nyes\n"),
+        (
+            "example/match_binding_gc_roots.wi",
+            "99\n10\n55\n9\n[note] kept!\n300\n7\n",
+        ),
+        (
+            "example/constructor_reference_args.wi",
+            "42\n22\n6\n20\nhi!/hi!\n31\n6\n",
+        ),
         ("example/maps.wi", "2\n31\n25\n-1\ntrue\nfalse\ntwo\n"),
         ("example/module_alias_demo/main.wi", "5\n16\n"),
         (
@@ -1075,6 +1083,15 @@ fn test_runnable_example_files_compile_and_run() {
             "example/lir_class_inheritance.wi",
             "5\n25\n25\n75\nshape=9u\nshape=9u\ncircle=27u\n16\n9\n23\n4\n\
              36\n36\n6\nC:circle/circle2\nB:hi\nu\nu\nu\n",
+        ),
+        (
+            "example/lir_class_methods.wi",
+            "12\n12\n- left ops\nops:12\n30\n60\nmany\n- left pay\npay:30\n\
+             - left void\nvoid:empty\nops+pay\n42\n*seal7*\n112\n24\n11\n",
+        ),
+        (
+            "example/lir_self_statics.wi",
+            "1\n2\n2\nseat 2\n12\nseat\nrow\nclosed 2\n2\n42\n4\n3\n103\nseat 9\n",
         ),
         (
             "example/interface_reference_params.wi",

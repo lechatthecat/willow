@@ -115,6 +115,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         // Root the concrete object across argument evaluation (args may allocate).
         self.emit_push_root(obj);
+        let has_reference_args = has_reference_args(Some(&param_modes), &m.args);
         let (arg_vals, temp_roots) = self.emit_call_args_rooted_coerced(
             Some(&m.method),
             Some(&param_modes),
@@ -146,6 +147,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             self.builder.ins().iconst(types::I64, 0)
         };
+
+        // The record naming this call's `&place` must not outlive the call: a
+        // LATER, unrelated panic in this function would otherwise be reported as
+        // if it happened inside the callee, under a reference that has already
+        // been given back (willow-0g8j.11).
+        if has_reference_args {
+            self.emit_debug_reference_call_clear();
+        }
 
         // Pop arg roots + the object root.
         self.emit_pop_roots_n(temp_roots + 1);

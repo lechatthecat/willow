@@ -399,7 +399,14 @@ fn lower_method(
 ) -> Result<HirFunction, Diagnostic> {
     let mut ctx = LowerCtx::new(fn_returns, classes, enums, tables);
     let mut params = Vec::with_capacity(m.params.len() + 1);
-    if m.has_self {
+    // Every instance method has a receiver, whether or not the declaration
+    // spells `self` out: `MethodDecl::has_self` records only the explicit
+    // (legacy) form, and `is_static` is what decides whether there is a
+    // receiver at all -- which is what the backend's own signatures do. Keying
+    // this on `has_self` left `self` unbound in the body of an implicit-self
+    // method, so lowering failed and the method had no lowered IR to compile
+    // from (willow-0g8j.14).
+    if !m.is_static {
         let self_ty = Type::Named(class_name.to_string());
         ctx.bind("self".to_string(), self_ty.clone());
         params.push(HirParam {
@@ -1067,6 +1074,11 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
             let variant_ty = enum_variant_value_type(ctx.enums, &s.class, &s.field, true);
             let ty = variant_ty
                 .or_else(|| ctx.classes.static_field_type(&s.class, &s.field))
+                // Checker authority, exactly as the static-CALL arm below uses
+                // it: `Self::prop` inside a class body names a class the
+                // registry has no entry for, and the checker has already
+                // resolved and typed the read (willow-0g8j.13).
+                .or_else(|| ctx.tables.expr_type(&s.span))
                 .ok_or_else(|| unsupported(s.span, "static property not found"))?;
             Ok(HirExpr {
                 kind: HirExprKind::StaticField {

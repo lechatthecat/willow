@@ -307,6 +307,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_fault_site_set" => ([Ptr, I64, I64, I64] -> None);
     NONE; "willow_fault_site_clear" => ([] -> None);
     // --- reference debug metadata ---
+    NONE; "willow_debug_reference_call_scope_push" => ([] -> None);
     NONE; "willow_debug_reference_call" => ([Ptr, I32, I32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr] -> None);
     NONE; "willow_debug_reference_call_clear" => ([] -> None);
     // Async frame allocator + cooperative scheduler (willow-lpn.5 / willow-fqg.1).
@@ -859,6 +860,7 @@ mod alloc_effects_tests {
     fn a11_reading_a_runtime_string_is_not_an_allocation() {
         // `willow_debug_reference_call` copies its arguments into a Rust
         // `String` for a thread-local; it never asks the GC for anything.
+        assert!(!allocates("willow_debug_reference_call_scope_push"));
         assert!(!allocates("willow_debug_reference_call"));
         assert!(!allocates("willow_debug_reference_call_clear"));
         assert!(!allocates("willow_string_eq"));

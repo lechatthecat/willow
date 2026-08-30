@@ -693,6 +693,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         param_types: Option<&[Type]>,
         args: &[CallArg],
     ) -> (Vec<cranelift_codegen::ir::Value>, usize) {
+        if has_reference_args(modes, args) {
+            self.emit_debug_reference_call_scope_push();
+        }
         let mut values = Vec::with_capacity(args.len());
         let mut temp_roots = 0usize;
 
@@ -797,6 +800,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 place_name_ptr,
             ],
         );
+    }
+
+    pub(super) fn emit_debug_reference_call_scope_push(&mut self) {
+        if self.build_mode != BuildMode::Debug {
+            return;
+        }
+        let push_id = self.func_id("willow_debug_reference_call_scope_push");
+        let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
+        self.builder.ins().call(push_ref, &[]);
     }
 
     pub(super) fn emit_debug_reference_call_clear(&mut self) {

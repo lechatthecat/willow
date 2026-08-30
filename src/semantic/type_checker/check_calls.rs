@@ -73,57 +73,74 @@ impl TypeChecker {
             }
             (ParamMode::Value, CallArgMode::Reference { .. }) => {
                 let arg_ty = self.check_expr(&arg.expr);
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E1703,
-                        "unexpected reference argument",
-                    )
-                    .with_label(Label::primary(
-                        arg.span,
-                        format!(
-                            "parameter expects `{}`, not `& {}`",
-                            type_name(&param.ty),
-                            type_name(&arg_ty)
-                        ),
-                    )),
-                );
+                self.push_unexpected_reference_arg(&param.ty, &arg_ty, arg.span);
             }
             (ParamMode::Reference { .. }, CallArgMode::Value) => {
                 self.check_expr(&arg.expr);
-                let expr_span = arg.expr.span();
-                let mut diagnostic = Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E1702,
-                    "expected reference argument for reference parameter",
-                )
-                .with_label(Label::primary(
-                    expr_span,
-                    "expected `&` before this argument",
-                ))
-                .with_help("pass the mutable place by reference");
-
-                if let Expr::Var(name, _) = &arg.expr {
-                    diagnostic = diagnostic.with_help(format!("write `&{}`", name));
-                    diagnostic = diagnostic.with_fix(FixSuggestion::insertion(
-                        Span::in_file(
-                            expr_span.file_id,
-                            expr_span.start,
-                            expr_span.start,
-                            expr_span.line,
-                            expr_span.col,
-                        ),
-                        "&",
-                        "pass the variable by reference",
-                    ));
-                }
-
-                self.push(diagnostic);
+                self.push_missing_reference_arg(arg);
             }
             (ParamMode::Reference { mutable, .. }, CallArgMode::Reference { .. }) => {
                 self.check_reference_argument(param, arg, *mutable);
             }
         }
+    }
+
+    /// `&place` written for a by-value parameter. Shared by the ordinary call
+    /// path and by `new` (willow-dssc), which checks argument modes without
+    /// re-checking the argument expression.
+    pub(super) fn push_unexpected_reference_arg(
+        &mut self,
+        param_ty: &Type,
+        arg_ty: &Type,
+        span: Span,
+    ) {
+        self.push(
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E1703,
+                "unexpected reference argument",
+            )
+            .with_label(Label::primary(
+                span,
+                format!(
+                    "parameter expects `{}`, not `& {}`",
+                    type_name(param_ty),
+                    type_name(arg_ty)
+                ),
+            )),
+        );
+    }
+
+    /// A `&`/`&mut` parameter given a plain value argument.
+    pub(super) fn push_missing_reference_arg(&mut self, arg: &CallArg) {
+        let expr_span = arg.expr.span();
+        let mut diagnostic = Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E1702,
+            "expected reference argument for reference parameter",
+        )
+        .with_label(Label::primary(
+            expr_span,
+            "expected `&` before this argument",
+        ))
+        .with_help("pass the mutable place by reference");
+
+        if let Expr::Var(name, _) = &arg.expr {
+            diagnostic = diagnostic.with_help(format!("write `&{}`", name));
+            diagnostic = diagnostic.with_fix(FixSuggestion::insertion(
+                Span::in_file(
+                    expr_span.file_id,
+                    expr_span.start,
+                    expr_span.start,
+                    expr_span.line,
+                    expr_span.col,
+                ),
+                "&",
+                "pass the variable by reference",
+            ));
+        }
+
+        self.push(diagnostic);
     }
 
     pub(super) fn check_value_arg_type(&mut self, param_ty: &Type, arg: &CallArg) {

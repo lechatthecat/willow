@@ -441,6 +441,10 @@ pub enum LirInst {
     },
     SuperInit {
         args: Vec<HirExpr>,
+        /// The `super.init(...)` statement's own span. A zero-argument call has
+        /// no expression to borrow a position from, and the emitted call still
+        /// needs one for its panic call-chain frame (willow-0g8j.2.18).
+        span: Span,
     },
     SelectInit {
         operations: Vec<LirSelectOp>,
@@ -2073,7 +2077,10 @@ impl Builder {
                 field: field.clone(),
                 value: value.clone(),
             }),
-            HirStmt::SuperInit { args, .. } => self.push(LirInst::SuperInit { args: args.clone() }),
+            HirStmt::SuperInit { args, span } => self.push(LirInst::SuperInit {
+                args: args.clone(),
+                span: *span,
+            }),
             HirStmt::Expr(e) => {
                 if let HirExprKind::Select { cases } = &e.kind
                     && self.is_async
@@ -2743,7 +2750,7 @@ fn format_inst(inst: &LirInst) -> String {
             field,
             value,
         } => format!("{class}::{field} = {};", e(value)),
-        LirInst::SuperInit { args } => {
+        LirInst::SuperInit { args, .. } => {
             let args = args.iter().map(e).collect::<Vec<_>>().join(", ");
             format!("super.init({args});")
         }

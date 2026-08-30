@@ -1,0 +1,188 @@
+// Class METHOD bodies on the LIR-walking backend (willow-0g8j.2.18).
+//
+// The walker used to be a free-function backend by accident. Eligibility knew
+// how to vet a method body, lowering already produced one under `Class::method`,
+// and the emitter already knew how to emit it -- but the compile path for a
+// method went straight to the AST emitter and never asked. So a program could
+// be 90% methods and `WILLOW_LIR_REQUIRE=1` would still pass, having checked
+// almost nothing.
+//
+// Everything below is a method body, and each one is a way the two emitters
+// could disagree about what a method IS:
+//
+//   * THE RECEIVER. `self` is parameter 0 of the lowered function and the
+//     first argument of the method ABI. An emitter that numbered the lowered
+//     parameters from zero while the ABI reserved slot 0 for the receiver would
+//     read every argument one slot late -- silently, and only in async methods,
+//     where the parameters live in a heap frame rather than in registers.
+//
+//   * THE CONSTRUCTOR. `init` is a method like any other, so a constructor body
+//     is walked too, including its `super.init(...)`: the base's own `init`
+//     when it declares one, and otherwise a store into the base's memberwise
+//     field slots.
+//
+//   * REFERENCE PARAMETERS. A `&mut` parameter of a method is passed by
+//     address, so the callee's writes land in the caller's storage.
+//
+//   * THE REST OF THE LANGUAGE. `defer`, `match`, loops, allocation, virtual
+//     self-calls and `await` do not become different constructs because they
+//     are inside a method, and this file exercises each of them there.
+//
+// Built with WILLOW_LIR_BACKEND=0 this must print exactly the same thing, and
+// built with WILLOW_LIR_REQUIRE=1 it must compile -- the proof that every body
+// here took the walker path rather than falling back to the emitter it is
+// being compared against.
+
+import std::collections::Array;
+
+open class Ledger {
+    pub name: String;
+    pub total: i64;
+
+    // An explicit constructor: a method named `init` whose body runs on an
+    // object the caller already allocated.
+    pub init(self, name: String) {
+        self.name = name;
+        self.total = 0;
+    }
+
+    // A loop and a field write inside a method. It is `async` because a
+    // synchronous loop helper is not preemptible in task context (E0810), not
+    // because the loop needs it -- which makes it a loop inside an async method
+    // body, where the induction variable lives in the heap frame.
+    pub async fn add_all(self, amounts: Array<i64>) {
+        let mut i = 0;
+        while i < amounts.len() {
+            self.total = self.total + amounts[i];
+            i = i + 1;
+        }
+    }
+
+    // A virtual self-call from a non-virtual method: the subclass's `rate`
+    // runs even though this body was compiled once, for `Ledger`.
+    pub fn charged(self) -> i64 {
+        return self.total * self.rate();
+    }
+
+    pub open fn rate(self) -> i64 { return 1; }
+
+    // `defer` inside a method body, including one that the early `return`
+    // has to flush.
+    pub fn describe(self) -> String {
+        defer println("- left " + self.name);
+        if self.total == 0 {
+            return self.name + ":empty";
+        }
+        return self.name + ":" + self.total.toString();
+    }
+
+    // A static method: the ABI still reserves the receiver slot, but there is
+    // no receiver to bind and the body cannot name one.
+    pub static fn merge(a: Ledger, b: Ledger) -> Ledger {
+        let out = new Ledger(a.name + "+" + b.name);
+        out.total = a.total + b.total;
+        return out;
+    }
+}
+
+class Payroll extends Ledger {
+    pub headcount: i64;
+
+    // A constructor that delegates to the base's DECLARED `init`, then
+    // initialises its own field.
+    pub init(self, name: String, headcount: i64) {
+        super.init(name);
+        self.headcount = headcount;
+    }
+
+    pub override fn rate(self) -> i64 { return 2; }
+
+    // A `match` inside a method, over a value derived from `self`.
+    pub fn size(self) -> String {
+        return match self.headcount {
+            0 => "none",
+            1 => "one",
+            _ => "many",
+        };
+    }
+}
+
+// A base with no declared constructor: `super.init` stores straight into its
+// memberwise field slots.
+open class Tag {
+    pub text: String;
+    pub weight: i64;
+}
+
+class Stamp extends Tag {
+    pub seal: String;
+
+    pub init(self, text: String, weight: i64) {
+        super.init(text, weight);
+        self.seal = "*";
+    }
+
+    pub fn render(self) -> String {
+        return self.seal + self.text + self.weight.toString() + self.seal;
+    }
+}
+
+class Counter {
+    pub value: i64;
+
+    // A `&mut` parameter of a METHOD: the write goes to the caller's storage,
+    // not to a copy.
+    pub fn bump(self, slot: &mut i64) {
+        slot = slot + self.value;
+    }
+
+    // A `&` parameter: read-only, still passed by address.
+    pub fn scaled(self, factor: &i64) -> i64 {
+        return self.value * factor;
+    }
+
+    // An async method. Its parameters live in the heap frame the poll function
+    // resumes from, with the receiver in the slot ahead of them.
+    pub async fn delayed(self, extra: i64) -> i64 {
+        await sleep(1);
+        return self.value + extra;
+    }
+}
+
+async fn main() {
+    let ledger = new Ledger("ops");
+    await ledger.add_all([3, 4, 5]);
+    println(ledger.total);              // 12
+    println(ledger.charged());          // 12 * 1
+    println(ledger.describe());         // ops:12, after the deferred line
+
+    let payroll = new Payroll("pay", 3);
+    await payroll.add_all([10, 20]);
+    println(payroll.total);             // 30, the inherited field
+    println(payroll.charged());         // 60: the override's rate
+    println(payroll.size());            // many
+    println(payroll.describe());        // pay:30
+
+    let empty = new Ledger("void");
+    println(empty.describe());          // void:empty
+
+    // A static method, called through the class name.
+    let merged = Ledger::merge(ledger, payroll);
+    println(merged.name);               // ops+pay
+    println(merged.total);              // 42
+
+    // `super.init` into a memberwise base.
+    println(new Stamp("seal", 7).render());  // *seal7*
+
+    // Reference parameters on methods.
+    let counter = new Counter(6);
+    let mut running = 100;
+    counter.bump(&running);
+    counter.bump(&running);
+    println(running);                   // 112
+    let factor = 4;
+    println(counter.scaled(&factor));   // 24
+
+    // An async method: the receiver and the parameter both survive the park.
+    println(await counter.delayed(5));  // 11
+}

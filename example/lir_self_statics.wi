@@ -1,0 +1,123 @@
+// `Self::` inside a class body, and instance methods that take their receiver
+// implicitly (willow-0g8j.13, willow-0g8j.14, willow-h7hv).
+//
+//   Self::name   -> the class the BODY is declared in: a static method, a
+//                   static property, read or assigned.
+//   fn name()    -> an instance method whose receiver is not written out.
+//                   `self` is still bound, and the method still dispatches
+//                   virtually when it is `open`/`override`.
+
+interface Describes {
+    fn describe(self) -> String;
+}
+
+class Ticket implements Describes {
+    pub seat: i64;
+
+    // A static property, read and written through `Self::`.
+    pub static mut issued: i64 = 0;
+
+    pub static fn prefix() -> String {
+        return "seat";
+    }
+
+    // `Self::` resolves to `Ticket` here, so this reads and writes the very
+    // property declared above.
+    pub static fn take_number() -> i64 {
+        Self::issued = Self::issued + 1;
+        return Self::issued;
+    }
+
+    // A static factory that calls another static of the same class.
+    pub static fn next() -> Ticket {
+        return new Ticket(Self::take_number());
+    }
+
+    // Instance methods below take `self` implicitly.
+    pub fn describe() -> String {
+        return Self::prefix() + " " + self.seat.toString();
+    }
+
+    // `Self::` in a loop body, in a match arm and in a `defer` body — the
+    // enclosing class is the same in all three.
+    pub async fn total(rounds: i64) -> i64 {
+        let mut sum = 0;
+        let mut i = 0;
+        while i < rounds {
+            sum = sum + Self::weigh(i);
+            i = i + 1;
+        }
+        return sum;
+    }
+
+    pub static fn weigh(n: i64) -> i64 {
+        return n * 2;
+    }
+
+    pub fn graded(kind: i64) -> String {
+        match kind {
+            0 => { return Self::prefix(); }
+            _ => { return "row"; }
+        }
+    }
+
+    pub fn announced() -> i64 {
+        defer { println("closed " + Self::weigh(1).toString()); }
+        return self.seat;
+    }
+
+    // An implicit receiver and a reference parameter in the same signature.
+    pub fn add_to(slot: &mut i64) {
+        slot = slot + self.seat;
+    }
+
+    pub async fn doubled() -> i64 {
+        return self.seat * 2;
+    }
+}
+
+// `open`/`override` with an implicit receiver still gets a vtable slot, so the
+// call below dispatches on the runtime class.
+open class Row {
+    pub index: i64;
+
+    pub open fn width() -> i64 {
+        return self.index;
+    }
+}
+
+class WideRow extends Row {
+    pub override fn width() -> i64 {
+        return self.index + 100;
+    }
+}
+
+fn boxed_description() -> String {
+    let d: Describes = new Ticket(9);
+    return d.describe();
+}
+
+async fn main() {
+    let a = Ticket::next();
+    let b = Ticket::next();
+    println(a.seat);
+    println(b.seat);
+    println(Ticket::issued);
+    println(b.describe());
+    println(await b.total(4));
+    println(b.graded(0));
+    println(b.graded(1));
+    println(b.announced());
+
+    let mut running = 40;
+    b.add_to(&running);
+    println(running);
+    println(await b.doubled());
+
+    let plain: Row = new Row(3);
+    let wide: Row = new WideRow(3);
+    println(plain.width());
+    println(wide.width());
+
+    println(boxed_description());
+}

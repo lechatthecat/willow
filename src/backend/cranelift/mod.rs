@@ -1415,7 +1415,13 @@ impl Codegen {
         let own: Vec<String> = c
             .methods
             .iter()
-            .filter(|m| !m.is_static && m.has_self && (m.is_open || m.is_override))
+            // `!is_static` is the receiver test: `has_self` records only the
+            // explicit (legacy) `self` spelling, and an implicit-self
+            // `open`/`override` method has a receiver just the same. Requiring
+            // it here left that method with no slot, and virtual dispatch then
+            // found two implementations and nowhere to dispatch through
+            // (willow-h7hv).
+            .filter(|m| !m.is_static && (m.is_open || m.is_override))
             .map(|m| m.name.clone())
             .collect();
         self.class_own_vmethods.insert(c.name.clone(), own);

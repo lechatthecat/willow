@@ -88,13 +88,18 @@
 //! [`body_diverges`], which reads the arm's tail and sees through an `if` both
 //! of whose branches leave.
 //!
-//! Pattern bindings are plain Cranelift variables rather than rooted slots,
-//! which is safe for exactly one reason and is worth stating: the SCRUTINEE is
-//! rooted across every arm, Willow's collector is non-moving, and a payload is
-//! reachable from the scrutinee — so a binding cannot be reclaimed and its
-//! address cannot change while the arm runs. This is the same argument the AST
-//! path relies on; if the collector ever moves objects, both emitters change
-//! together.
+//! A GC-managed pattern binding gets a rooted stack slot of its own, and the
+//! reason is worth stating because the obvious cheaper rule is wrong
+//! (willow-10zt). Rooting the SCRUTINEE across the arm keeps the payload
+//! REACHABLE, but reachable is not the same as fixed: Willow's minor collector
+//! promotes a direct root in place — that is what lets generated code keep an
+//! SSA alias of an ordinary rooted local — while a young object it reaches only
+//! through a heap slot is copied to the old generation and the owning slot is
+//! fixed up behind it. An enum payload and the object inside an interface box
+//! are that second case, so a binding that merely copied the payload word would
+//! name freed memory as soon as the arm allocated. Rooting the binding makes it
+//! a direct root too, which the collector pins. The AST path does the same
+//! thing, in [`FuncGen::bind_match_binding`].
 //!
 //! Interface boxing (willow-j260): an interface-typed slot holds a 16-byte
 //! `[object | vtable]` GC box, so storing a class value into one is a real
@@ -691,6 +696,13 @@ pub(super) struct LirTypeCtx<'x> {
     /// inside a `match` arm is checked deep inside `supported_expr`, where the
     /// enclosing [`LirFunction`] is out of reach (willow-0g8j.2.5).
     pub return_type: &'x Type,
+    /// The class whose body is being vetted, or `None` outside a class. The
+    /// second per-FUNCTION field, set the same way `return_type` is, and it is
+    /// what resolves `Self::` — `Self::twice(..)`, `Self::count`,
+    /// `Self::count = ..` — to the class the emitter will resolve it to
+    /// (willow-0g8j.13). `None` leaves `Self` unresolved, every lookup on it
+    /// misses and the function falls back, rather than the walker guessing.
+    pub self_class: Option<&'x str>,
     /// The async functions compiled as cooperative LEAVES in this module —
     /// exactly the set [`await_coop_call`] consults on the AST path. `await
     /// f(..)` on one of them is a direct constructor call plus a suspension, so
@@ -721,6 +733,19 @@ fn normalize_void_payloads(payloads: &mut Vec<Type>) {
 }
 
 impl LirTypeCtx<'_> {
+    /// `class` with `Self` resolved against the enclosing class body, exactly
+    /// as [`FuncGen::static_call_class_name`] resolves it at emission time
+    /// (willow-0g8j.13) — so a `Self::` form is admitted under the very symbol
+    /// the emitter will go on to resolve it to. Outside a class body, and in
+    /// any other spelling, the name is returned unchanged.
+    fn resolved_class<'n>(&'n self, class: &'n str) -> &'n str {
+        if class == "Self" {
+            self.self_class.unwrap_or(class)
+        } else {
+            class
+        }
+    }
+
     /// Whether `name` is a declared enum. Answered from [`Self::enum_def`], so
     /// there is exactly one table deciding it.
     fn is_enum(&self, name: &str) -> bool {
@@ -1395,11 +1420,15 @@ fn lir_sync_defer_stacks_agree(f: &LirFunction) -> bool {
 /// the difference between "something in this function is unsupported" and a
 /// construct, a type and a line to go and fix.
 pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Option<String> {
-    // The one per-function field, taken from the function under test rather
+    // The two per-function fields, taken from the function under test rather
     // than from the caller, so a `return` inside a `match` arm is checked
     // against this function's declared type and no caller can get it wrong.
+    // The enclosing class comes from the lowered name (`Class::method`), which
+    // is the same string `compile_class_method_inner` looks the body up under
+    // and the same class the emitter sets as `FuncGen::current_class`.
     let ctx = &LirTypeCtx {
         return_type: &f.return_type,
+        self_class: f.name.split_once("::").map(|(class, _)| class),
         ..*ctx
     };
     if !ctx.supported_type(&f.return_type) {
@@ -1590,7 +1619,10 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                     field,
                     value,
                 } => {
-                    let Some(field_ty) = (ctx.static_field)(class, field) else {
+                    // `Self::prop = ..` resolves against the enclosing class,
+                    // as `emit_lir_static_field_assign` does (willow-0g8j.13).
+                    let Some(field_ty) = (ctx.static_field)(ctx.resolved_class(class), field)
+                    else {
                         return Some(format!(
                             "the static store `{class}::{field} = ...` at line {} targets \
                              storage the walker cannot resolve",
@@ -1616,8 +1648,15 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                         return Some(reason);
                     }
                 }
-                LirInst::SuperInit { .. } => {
-                    return Some("it calls `super.init(...)`".to_string());
+                // `super.init(args)` in a constructor (willow-0g8j.2.18). The
+                // emitter resolves the base from the constructor's OWN class,
+                // so eligibility resolves it the same way -- out of the lowered
+                // `Class::init` name -- and then vets the call exactly as
+                // `new Base(args)` is vetted.
+                LirInst::SuperInit { args, .. } => {
+                    if let Some(reason) = super_init_rejection(f, args, ctx, &names) {
+                        return Some(reason);
+                    }
                 }
                 // A `match` lowering split into blocks (willow-0g8j.2.11.1).
                 // The pattern is vetted here rather than through
@@ -1736,7 +1775,7 @@ pub(super) fn lir_async_rejection_reason(f: &LirFunction) -> Option<String> {
                     index,
                     value,
                 } => suspends(array) || suspends(index) || suspends(value),
-                LirInst::SuperInit { args } => args.iter().any(suspends),
+                LirInst::SuperInit { args, .. } => args.iter().any(suspends),
                 // A pattern test and its bindings hold no expression at all:
                 // the scrutinee is a local, and lowering split the arm bodies
                 // into blocks of their own (willow-0g8j.2.11.1).
@@ -2036,6 +2075,89 @@ fn store_reason(what: &str, from: &Type, to: &Type, span: Span) -> String {
 /// sub-expression that is not. `supported_expr` is the oracle for the decision;
 /// this only walks down to find where it first goes wrong, so the two can never
 /// disagree about whether the expression is eligible.
+/// Why `super.init(args)` in `f` is outside the walker's subset, or `None`.
+///
+/// The enclosing class comes from the lowered function's own name, which
+/// `lower_program` builds as `Class::init` -- the same string
+/// `compile_class_method_inner` looks the body up under. That is what lets this
+/// resolve the base class the emitter will resolve at emission time from
+/// `FuncGen::current_class`.
+fn super_init_rejection<'e>(
+    f: &'e LirFunction,
+    args: &'e [HirExpr],
+    ctx: &LirTypeCtx<'_>,
+    names: &HashMap<&'e str, Cow<'e, Type>>,
+) -> Option<String> {
+    let class = match f.name.split_once("::") {
+        Some((class, _)) => class,
+        // Not a method at all: the emitter's `current_class` would be `None`
+        // and it would evaluate the arguments and store nothing.
+        None => return Some("it calls `super.init(...)` outside a class body".to_string()),
+    };
+    let Some(base) = ctx.class_base.get(class) else {
+        return Some(format!(
+            "it calls `super.init(...)`, but class `{class}` has no base class"
+        ));
+    };
+    for arg in args {
+        if let Some(reason) = expr_rejection(arg, ctx, names) {
+            return Some(reason);
+        }
+    }
+    let mangled = class_method_symbol_name(ctx.known_modules, base, "init");
+    if (ctx.known_fn)(&mangled) {
+        // An explicit base constructor is an ordinary `init` method call with
+        // the receiver already in hand, so it is vetted like one.
+        if !ctx.callable(&mangled, args, true) {
+            return Some(format!(
+                "the base constructor `{base}::init` called by `super.init(...)` takes arguments \
+                 outside the walker's subset"
+            ));
+        }
+        return None;
+    }
+    // No declared base constructor: the emitter stores the arguments straight
+    // into the base's memberwise field slots, so those slots must line up with
+    // the arguments one for one.
+    let Some(layout) = ctx.class_layouts.get(base.as_str()) else {
+        return Some(format!(
+            "`super.init(...)` targets base class `{base}`, whose layout the walker cannot resolve"
+        ));
+    };
+    if layout.len() != args.len() {
+        return Some(format!(
+            "`super.init(...)` passes {} argument(s) to the memberwise constructor of base class \
+             `{base}`, which has {} field(s)",
+            args.len(),
+            layout.len()
+        ));
+    }
+    for ((field, field_ty), arg) in layout.iter().zip(args) {
+        if matches!(arg.kind, HirExprKind::ReferenceArg { .. }) {
+            return Some(format!(
+                "`super.init(...)` passes a reference argument to memberwise field \
+                 `{base}::{field}`"
+            ));
+        }
+        if !ctx.supported_type(field_ty) {
+            return Some(format!(
+                "`super.init(...)` stores memberwise field `{base}::{field}` of type `{}`, outside \
+                 the walker's subset",
+                type_name(field_ty)
+            ));
+        }
+        if !ctx.storable(field_ty, &arg.ty) {
+            return Some(store_reason(
+                &format!("`super.init(...)`'s store to `{base}::{field}`"),
+                &arg.ty,
+                field_ty,
+                arg.span,
+            ));
+        }
+    }
+    None
+}
+
 fn expr_rejection<'e>(
     e: &'e HirExpr,
     ctx: &LirTypeCtx<'_>,
@@ -3200,9 +3322,11 @@ fn supported_expr<'n>(
                     });
             }
             // `references.wi` deliberately collects inside reference-taking
-            // functions to prove pointed-to GC values stay alive. This builtin
-            // is a zero-argument runtime call and needs no AST-only metadata.
-            if callee == "gc_collect" {
+            // functions to prove pointed-to GC values stay alive. These builtins
+            // are zero-argument runtime calls and need no AST-only metadata.
+            // `gc_minor_collect` is the MOVING one, and is what a test has to
+            // reach to prove a binding survives evacuation (willow-10zt).
+            if callee == "gc_collect" || callee == "gc_minor_collect" {
                 return args.is_empty() && e.ty == Type::Void;
             }
             if callee == "recover" {
@@ -3572,9 +3696,9 @@ fn supported_expr<'n>(
                     });
             }
             // `Self::prop` inside a method resolves against the enclosing
-            // class, which this context does not carry — the lookup then misses
-            // and the function falls back, rather than the walker guessing.
-            (ctx.static_field)(class, field)
+            // class, exactly as `emit_static_field_read` resolves it
+            // (willow-0g8j.13).
+            (ctx.static_field)(ctx.resolved_class(class), field)
                 .is_some_and(|ty| ctx.supported_type(&ty) && ctx.repr_compatible(&e.ty, &ty))
         }
         // `Class::method(args)` — a static method of a simple class, or an enum
@@ -3586,6 +3710,12 @@ fn supported_expr<'n>(
             method,
             args,
         } => {
+            // `Self::method(..)` inside a class body names the class the body
+            // is DECLARED in, which is what the emitter resolves it to as well
+            // (willow-0g8j.13). Resolved once, here, so every test below —
+            // the builtin spellings, the enum path, the class path and the
+            // symbol they mangle — sees the one name.
+            let class = ctx.resolved_class(class);
             // `Map::new()` is the one builtin constructor in the subset. The
             // result type decides, not the spelling, so a user class called
             // `Map` cannot reach `willow_map_new`: it would have a `Named` type
@@ -3641,7 +3771,7 @@ fn supported_expr<'n>(
             // way, on the class as well as the result type.
             if let Some((_, protected)) = scheduler_lock(&e.ty)
                 && method == "new"
-                && matches!(class.as_str(), "Mutex" | "RwLock")
+                && matches!(class, "Mutex" | "RwLock")
             {
                 return matches!(args.as_slice(), [a] if assignable_repr(protected, &a.ty))
                     && supported_expr(&args[0], ctx, names);
@@ -3889,7 +4019,7 @@ fn lir_inst_span(inst: &LirInst) -> Option<crate::diagnostics::Span> {
         | LirInst::FieldAssign { value, .. }
         | LirInst::StaticFieldAssign { value, .. } => Some(value.span),
         LirInst::IndexAssign { array, .. } => Some(array.span),
-        LirInst::SuperInit { args } => args.first().map(|a| a.span),
+        LirInst::SuperInit { span, .. } => Some(*span),
         LirInst::MatchTest { span, .. } | LirInst::MatchBind { span, .. } => Some(*span),
         LirInst::SelectInit { .. }
         | LirInst::SelectProbe { .. }
@@ -4619,8 +4749,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let params = self.fn_param_types(callee);
                 let modes = self.func_param_modes.get(callee).cloned();
                 // The AST twin records no parameter debug for a leaf-call
-                // constructor and clears no reference context afterwards; this
-                // mirrors it so a trace does not depend on the emitter.
+                // constructor; this mirrors it so a trace does not depend on
+                // the emitter.
+                let has_reference_args = lir_has_reference_args(modes.as_deref(), args);
                 let (arg_vals, arg_roots) = self.emit_lir_args_rooted(
                     args,
                     params.as_deref(),
@@ -4634,6 +4765,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .declare_func_in_func(ctor_fid, self.builder.func);
                 let call = self.builder.ins().call(ctor_ref, &arg_vals);
                 let callee_frame = self.builder.inst_results(call)[0];
+                // Cleared for the same reason the AST twin clears, and
+                // unreachable for the same reason: E1707 refuses a reference
+                // parameter on an async function (willow-0g8j.11).
+                if has_reference_args {
+                    self.emit_debug_reference_call_clear();
+                }
                 if arg_roots > 0 {
                     self.emit_pop_roots_n(arg_roots);
                     self.gc_root_count -= arg_roots;
@@ -5238,13 +5375,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         self.store_lir_local(function, *local, val);
                     }
                 }
+                LirInst::SuperInit { args, span } => self.emit_lir_super_init(args, *span),
                 LirInst::SelectInit { .. }
                 | LirInst::SelectProbe { .. }
                 | LirInst::SelectPick { .. }
                 | LirInst::SelectUnregister { .. }
                 | LirInst::SelectCommit { .. } => self.emit_lir_select_instruction(function, inst),
-                // Filtered out by eligibility.
-                _ => unreachable!("unsupported LIR instruction reached emission"),
             }
         }
         if self.terminated {
@@ -5817,10 +5953,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     (this.emit_lir_expr(&operands[i]), operands[i].ty.clone())
                 })
             }
-            HirExprKind::Call { callee, args } if callee == "gc_collect" => {
+            HirExprKind::Call { callee, args }
+                if callee == "gc_collect" || callee == "gc_minor_collect" =>
+            {
                 debug_assert!(args.is_empty());
                 let runtime = builtin_call_runtime_name(callee)
-                    .expect("gc_collect runtime mapping is part of the backend ABI");
+                    .expect("the gc collect builtins are part of the backend ABI");
                 self.emit_runtime_call_with_cleanup(runtime, &[], |_| {});
                 self.builder.ins().iconst(types::I8, 0)
             }
@@ -6718,7 +6856,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // ternary, so an arm's value already has the result variable's
                 // representation.
                 Some(arm_val) => {
-                    if let Some(arm_val) = arm_val {
+                    // A `match` in statement position has no merge value, and
+                    // an arm of one may still end in an expression that has one
+                    // — `Some(n) => { helper(n); }` where `helper` returns an
+                    // `i64`. Handing that word to the result variable, which a
+                    // Void match declares `I8`, is a Cranelift type error and
+                    // aborts the compiler, so drop it the way the AST emitter's
+                    // `emit_match_body` drops a block arm's last value
+                    // (willow-vdfj).
+                    if let Some(arm_val) = arm_val
+                        && *result_ty != Type::Void
+                    {
                         self.builder.def_var(result_var, arm_val);
                     }
                     // Before the jump: the merge block continues at the depth
@@ -6995,10 +7143,24 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// may declare a local whether or not the pattern binds anything
     /// (willow-0g8j.2.13).
     ///
-    /// Bindings are plain Cranelift variables, not rooted slots. That is safe
-    /// because the scrutinee is rooted across the arm, Willow's collector is
-    /// non-moving, and every payload is reachable from the scrutinee — the same
-    /// argument the AST path relies on.
+    /// A GC-managed binding gets a ROOTED STACK SLOT; anything else keeps a
+    /// plain Cranelift variable.
+    ///
+    /// Rooting the scrutinee is not enough (willow-10zt). The minor collector
+    /// promotes a DIRECT root in place, which is what makes an SSA alias of one
+    /// safe, but it EVACUATES a young object it reaches only through a heap
+    /// slot: the object is copied to an old region, the owning slot is fixed up,
+    /// and the source is reclaimed. An enum payload and the object inside an
+    /// interface box are exactly that — the scrutinee stays put while its child
+    /// moves — so a binding that copied the payload address would be left
+    /// naming freed memory after the arm's first allocation. A rooted binding is
+    /// a direct root of its own, so the collector pins it too.
+    ///
+    /// Rooting a non-GC binding would be wrong, not merely wasteful: the
+    /// collector would trace the scalar word as an object pointer.
+    ///
+    /// [`FuncGen::emit_lir_match`] pops what this pushes when it closes the
+    /// arm's bracket.
     fn bind_lir_pattern(
         &mut self,
         scrutinee: cranelift_codegen::ir::Value,
@@ -7006,9 +7168,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         pattern: &HirPattern,
     ) {
         for (name, ty, val) in self.lir_pattern_binding_values(scrutinee, scrutinee_ty, pattern) {
-            let var = self.builder.declare_var(clif_type(&ty));
-            self.builder.def_var(var, val);
-            self.vars.insert(name, VarStorage::Value { var, ty });
+            let storage = if is_gc_managed(&ty, self.enum_infos) {
+                let storage = self.create_local_stack_slot(&ty, val);
+                if let VarStorage::Stack { slot, .. } = &storage {
+                    self.emit_push_root_slot(*slot);
+                }
+                storage
+            } else {
+                let var = self.builder.declare_var(clif_type(&ty));
+                self.builder.def_var(var, val);
+                VarStorage::Value { var, ty }
+            };
+            self.vars.insert(name, storage);
         }
     }
 
@@ -7118,6 +7289,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         callee: Option<&str>,
         param_debug: Option<&[ParamDebug]>,
     ) -> (Vec<cranelift_codegen::ir::Value>, usize) {
+        if lir_has_reference_args(modes, args) {
+            self.emit_debug_reference_call_scope_push();
+        }
         let mut vals = Vec::with_capacity(args.len());
         let mut temp_roots = 0usize;
         for (i, a) in args.iter().enumerate() {
@@ -7373,14 +7547,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Some(&init_fid) = self.func_ids.get(&mangled) {
             let params = self.method_param_types(&mangled);
             let modes = self.func_param_modes.get(&mangled).cloned();
-            // `emit_new` on the AST path passes no parameter debug for `init`,
-            // so no reference-call hook is recorded there and none is here.
+            // The AST path passes the same parameter debug (willow-0g8j.10), so
+            // a trace names the constructor's parameter rather than `<unknown>`.
+            let param_debug = self.func_param_debug.get(&mangled).cloned();
+            let has_reference_args = lir_has_reference_args(modes.as_deref(), args);
             let (arg_vals, arg_roots) = self.emit_lir_args_rooted(
                 args,
                 params.as_deref(),
                 modes.as_deref(),
                 Some(&mangled),
-                None,
+                param_debug.as_deref(),
             );
             let init_ref = self
                 .module
@@ -7395,6 +7571,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.ins().call(init_ref, &call_args);
             if pushed {
                 self.emit_callstack_pop();
+            }
+            // A record left standing would name this constructor's `&place` in a
+            // LATER, unrelated panic in the same function (willow-0g8j.11).
+            if has_reference_args {
+                self.emit_debug_reference_call_clear();
             }
             if arg_roots > 0 {
                 self.emit_pop_roots_n(arg_roots);
@@ -7420,6 +7601,84 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_pop_roots_n(1);
         self.gc_root_count -= 1;
         ptr
+    }
+
+    /// `super.init(args)` inside a constructor: run the base class's `init` on
+    /// the already-allocated receiver, or -- when the base declares no
+    /// constructor -- store the arguments into its memberwise field slots.
+    ///
+    /// The twin of [`FuncGen::emit_super_init`], step for step, so a
+    /// constructor compiled from lowered IR builds the same base state as one
+    /// compiled from the AST (willow-0g8j.2.18).
+    fn emit_lir_super_init(&mut self, args: &[HirExpr], span: Span) {
+        let current_class = self
+            .current_class
+            .expect("eligibility admits `super.init` only inside a class body");
+        let base_name = self
+            .class_base
+            .get(current_class)
+            .cloned()
+            .expect("eligibility admits `super.init` only with a resolved base class");
+        let self_storage = self
+            .vars
+            .get("self")
+            .cloned()
+            .expect("a constructor binds its receiver before its body is emitted");
+        let self_ptr = self.load_var(&self_storage);
+
+        let mangled = class_method_symbol_name(self.known_modules, &base_name, "init");
+        if let Some(&init_fid) = self.func_ids.get(&mangled) {
+            let params = self.method_param_types(&mangled);
+            let modes = self.func_param_modes.get(&mangled).cloned();
+            let param_debug = self.func_param_debug.get(&mangled).cloned();
+            let has_reference_args = lir_has_reference_args(modes.as_deref(), args);
+            let (arg_vals, arg_roots) = self.emit_lir_args_rooted(
+                args,
+                params.as_deref(),
+                modes.as_deref(),
+                Some(&mangled),
+                param_debug.as_deref(),
+            );
+            let init_ref = self
+                .module
+                .declare_func_in_func(init_fid, self.builder.func);
+            let mut call_args = vec![self_ptr];
+            call_args.extend(arg_vals);
+            let pushed = self.emit_callstack_push("init", span);
+            let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
+            self.builder.ins().call(init_ref, &call_args);
+            if pushed {
+                self.emit_callstack_pop();
+            }
+            if has_reference_args {
+                self.emit_debug_reference_call_clear();
+            }
+            if arg_roots > 0 {
+                self.emit_pop_roots_n(arg_roots);
+                self.gc_root_count -= arg_roots;
+            }
+            self.emit_post_willow_call_panic_check(panic_depth);
+            return;
+        }
+
+        // Implicit memberwise base constructor: positional arguments fill the
+        // base's declared fields, which occupy the object's leading slots.
+        let layout = self
+            .class_layouts
+            .get(&base_name)
+            .cloned()
+            .expect("eligibility admits `super.init` only with a resolved base layout");
+        for (i, arg) in args.iter().enumerate() {
+            let field_ty = layout[i].1.clone();
+            let val = self.emit_lir_store_value(arg, &field_ty);
+            self.emit_gc_heap_store(
+                self_ptr,
+                (i as i32 + 1) * 8,
+                val,
+                &field_ty,
+                GcStoreDestination::ObjectField,
+            );
+        }
     }
 
     /// `Class { field: value, ... }`: the same allocation as `new`, with the
@@ -7742,8 +8001,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // through arguments, matching the AST instance-method path.
         self.emit_push_root(obj);
         // `emit_interface_dispatch` on the AST path names the callee by its
-        // bare method name, records no parameter debug, and clears no context
-        // after the call; this mirrors all three.
+        // bare method name and records no parameter debug; this mirrors both.
+        let has_reference_args = lir_has_reference_args(Some(&param_modes), args);
         let (arg_vals, arg_roots) = self.emit_lir_args_rooted(
             args,
             Some(&param_types),
@@ -7782,6 +8041,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if pushed {
             self.emit_callstack_pop();
         }
+        // The record naming this call's `&place` must not outlive the call
+        // (willow-0g8j.11); the AST twin clears here too.
+        if has_reference_args {
+            self.emit_debug_reference_call_clear();
+        }
         self.emit_pop_roots_n(arg_roots + 1);
         self.gc_root_count -= arg_roots + 1;
         self.emit_post_willow_call_panic_check(panic_depth);
@@ -7804,6 +8068,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ret_ty: &Type,
         span: crate::diagnostics::Span,
     ) -> cranelift_codegen::ir::Value {
+        // `Self::method(..)` names the class this body is declared in
+        // (willow-0g8j.13). Resolved once, before any dispatch, so the symbol
+        // emitted here is the symbol eligibility vetted — which resolves `Self`
+        // the same way, through `LirTypeCtx::resolved_class`.
+        let resolved_class = self.static_call_class_name(class);
+        let class = resolved_class.as_str();
         // The one builtin constructor in the subset (willow-0g8j.7). It takes
         // no arguments and allocates nothing that needs rooting first.
         if class == "Map" && method == "new" {
@@ -9153,6 +9423,7 @@ mod tests {
                 known_modules: &self.known_modules,
                 builtin_module_aliases: &self.builtin_module_aliases,
                 return_type: &self.ret,
+                self_class: None,
             })
         }
     }
@@ -13033,12 +13304,13 @@ fn f() {
         assert!(reason.contains("Counter::total"), "{reason}");
     }
 
-    // r13. `super.init(...)` is reported as itself. Built by hand: from source
-    // a constructor with a `super.init` is in a subclass, so its `self`
-    // parameter is rejected first and this arm is never reached. It still has
-    // to be right for the day inheritance becomes supported.
+    // r13. `super.init(...)` in a class with no registered base is reported as
+    // that, rather than admitted. Built by hand because the front end cannot
+    // produce it: `super.init` outside a subclass is a type error, and this arm
+    // guards the emitter, which would evaluate the arguments and store nothing
+    // (willow-0g8j.2.18).
     #[test]
-    fn r13_super_init_reason() {
+    fn r13_super_init_without_a_base_class_reason() {
         let f = LirFunction {
             name: "Child::init".to_string(),
             is_async: false,
@@ -13046,7 +13318,10 @@ fn f() {
             return_type: Type::Void,
             blocks: vec![LirBlock {
                 id: crate::ir::lowered::BlockId(0),
-                instrs: vec![LirInst::SuperInit { args: Vec::new() }],
+                instrs: vec![LirInst::SuperInit {
+                    args: Vec::new(),
+                    span: Span::new(0, 0, 1, 1),
+                }],
                 terminator: Terminator::Return(None),
                 recovery: Vec::new(),
             }],
@@ -13058,7 +13333,7 @@ fn f() {
         let tables = TestTables::build(&program, &[], &[]);
         assert_eq!(
             tables.with_ctx(|ctx| lir_rejection_reason(&f, ctx)),
-            Some("it calls `super.init(...)`".to_string())
+            Some("it calls `super.init(...)`, but class `Child` has no base class".to_string())
         );
     }
 

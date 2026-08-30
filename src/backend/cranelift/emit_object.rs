@@ -319,10 +319,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 Some(Type::Fn(ps, _)) => ps.iter().skip(1).cloned().collect(),
                 _ => Vec::new(),
             };
+            // A constructor parameter may be `&`/`&mut`, and `init` has no
+            // other way to be called, so the modes have to reach the argument
+            // emitter or a `&place` argument is passed as a VALUE that the
+            // callee then dereferences as a pointer (willow-0g8j.10). The modes
+            // recorded for a method exclude the `self` receiver, so they line up
+            // with `n.args` directly.
+            let modes = self.func_param_modes.get(&mangled).cloned();
+            let param_debug = self.func_param_debug.get(&mangled).cloned();
+            let has_reference_args = has_reference_args(modes.as_deref(), &n.args);
             let (arg_vals, arg_roots) = self.emit_call_args_rooted_coerced(
                 Some(&mangled),
-                None,
-                None,
+                modes.as_deref(),
+                param_debug.as_deref(),
                 Some(&param_types),
                 &n.args,
             );
@@ -336,6 +345,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.ins().call(init_ref, &call_args);
             if pushed {
                 self.emit_callstack_pop();
+            }
+            // The reference-call record names the `&place` this call passed;
+            // leaving it set would attribute a LATER panic in this function to a
+            // constructor call that already returned (willow-0g8j.11).
+            if has_reference_args {
+                self.emit_debug_reference_call_clear();
             }
             if arg_roots > 0 {
                 self.emit_pop_roots_n(arg_roots);
@@ -397,10 +412,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 Some(Type::Fn(ps, _)) => ps.iter().skip(1).cloned().collect(),
                 _ => Vec::new(),
             };
+            // Same as `emit_new`: a base constructor's reference parameters
+            // have to reach the argument emitter (willow-0g8j.10).
+            let modes = self.func_param_modes.get(&mangled).cloned();
+            let param_debug = self.func_param_debug.get(&mangled).cloned();
+            let has_reference_args = has_reference_args(modes.as_deref(), &s.args);
             let (arg_vals, arg_roots) = self.emit_call_args_rooted_coerced(
                 Some(&mangled),
-                None,
-                None,
+                modes.as_deref(),
+                param_debug.as_deref(),
                 Some(&param_types),
                 &s.args,
             );
@@ -414,6 +434,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.ins().call(init_ref, &call_args);
             if pushed {
                 self.emit_callstack_pop();
+            }
+            if has_reference_args {
+                self.emit_debug_reference_call_clear();
             }
             if arg_roots > 0 {
                 self.emit_pop_roots_n(arg_roots);

@@ -492,9 +492,21 @@ impl Codegen {
             });
         }
 
+        // The LOWERED parameter list of an instance method starts with the
+        // `self` receiver (`lower_method` pushes it first), and that receiver
+        // already owns the frame slot just before the declared parameters -- so
+        // the lowered parameters start one slot earlier than `m.params` does.
+        // Handing `first_param_slot` straight to the LIR layout would map `self`
+        // onto the first declared parameter's slot and shift every parameter by
+        // one (willow-0g8j.2.18).
+        let lir_first_param_slot = if m.is_static {
+            first_param_slot
+        } else {
+            first_param_slot - 1
+        };
         let (layout, offsets, lir_offsets, lir_defer_offsets) = if let Some(lir) = lir.as_ref() {
             let (layout, offsets, defer_offsets) =
-                self.lir_async_layout(lir, slots, first_param_slot)?;
+                self.lir_async_layout(lir, slots, lir_first_param_slot)?;
             (layout, HashMap::new(), offsets, defer_offsets)
         } else {
             let mut seen: HashSet<crate::diagnostics::Span> = HashSet::new();
@@ -1605,6 +1617,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // way a plain call coerces them; without this a class argument reaches
         // an interface-typed parameter un-boxed.
         let param_types = self.fn_param_types(&call.callee);
+        let has_reference_args = has_reference_args(modes.as_deref(), &call.args);
         let (arg_vals, arg_roots) = self.emit_call_args_rooted_coerced(
             Some(&call.callee),
             modes.as_deref(),
@@ -1618,6 +1631,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .declare_func_in_func(ctor_fid, self.builder.func);
         let c = self.builder.ins().call(ctor_ref, &arg_vals);
         let callee_frame = self.builder.inst_results(c)[0];
+        // The record naming an `&place` must not outlive the call that made it,
+        // or a later panic in this function is reported under a reference the
+        // callee has already given back (willow-0g8j.11). E1707 refuses a
+        // reference parameter on an async function, so no call reaching here
+        // has one today; the site is kept correct for when they land
+        // (willow-7ol.12).
+        if has_reference_args {
+            self.emit_debug_reference_call_clear();
+        }
         if arg_roots > 0 {
             self.emit_pop_roots_n(arg_roots);
             self.gc_root_count -= arg_roots;

@@ -200,7 +200,7 @@ fn block_use_def(
                 read!(value);
             }
             LirInst::StaticFieldAssign { value, .. } | LirInst::Expr(value) => read!(value),
-            LirInst::SuperInit { args } => {
+            LirInst::SuperInit { args, .. } => {
                 for arg in args {
                     read!(arg);
                 }

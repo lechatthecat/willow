@@ -28,22 +28,29 @@
 //! fallback into a compile error so a coverage regression cannot pass by
 //! comparing the AST path against itself.
 //!
-//! 29 perspectives:
-//!   1 `&mut i64` writes back            16 a reference call in a loop
-//!   2 `&` reads without writing         17 a reference call in one arm
-//!   3 `&mut bool`                       18 a String reference under GC
-//!   4 `&mut String` (GC-managed)        19 `&` of a value parameter
-//!   5 `& String` returns a new one      20 a panic under the call
-//!   6 a field place                     21 a panic after the call
-//!   7 the whole object rebound          22 an f64 reference in a loop
-//!   8 an array element, literal index    23 a reference call in a lambda
-//!   9 an array element, variable index   24 a nested field place in a loop
-//!  10 two reference parameters          25 a reference call in a ternary
-//!  11 reference and value mixed         26 a recursive reference parameter
-//!  12 an instance method                27 a local declared in the loop body
-//!  13 a class static                    28 one local per branch
-//!  14 interface dispatch                29 the example is fully LIR
-//!  15 virtual dispatch
+//! An indirect call had the same half-record for longer still: interface
+//! dispatch wrote the reference-call context and never cleared it, on BOTH
+//! emitters, so a panic anywhere later in the same function was reported under
+//! a place the callee had already given back. Perspectives 30, 31 and 32 are
+//! that fix (willow-0g8j.11).
+//!
+//! 32 perspectives:
+//!   1 `&mut i64` writes back            17 a reference call in one arm
+//!   2 `&` reads without writing         18 a String reference under GC
+//!   3 `&mut bool`                       19 `&` of a value parameter
+//!   4 `&mut String` (GC-managed)        20 a panic under the call
+//!   5 `& String` returns a new one      21 a panic after the call
+//!   6 a field place                     22 an f64 reference in a loop
+//!   7 the whole object rebound          23 a reference call in a lambda
+//!   8 an array element, literal index   24 a nested field place in a loop
+//!   9 an array element, variable index  25 a reference call in a ternary
+//!  10 two reference parameters          26 a recursive reference parameter
+//!  11 reference and value mixed         27 a local declared in the loop body
+//!  12 an instance method                28 one local per branch
+//!  13 a class static                    29 the example is fully LIR
+//!  14 interface dispatch                30 a panic under interface dispatch
+//!  15 virtual dispatch                  31 a panic after interface dispatch
+//!  16 a reference call in a loop        32 a panic after virtual dispatch
 
 use super::support::{compile_and_run_with_env, compile_with_compiler_env};
 
@@ -674,4 +681,94 @@ fn reference_args_29_the_example_is_fully_lir() {
         "10\n15\n12\n14\n3\n9\n",
         &["main", "add", "halve", "restock"],
     );
+}
+
+// 30. Interface dispatch writes the record through an indirect call, where the
+//     callee is unknown until run time: the parameter's name and type are
+//     `<unknown>` on both paths, and a panic inside the callee still names the
+//     ampersand's position and the caller's place.
+#[test]
+fn reference_args_30_a_panic_under_interface_dispatch_reports_the_reference() {
+    assert_same_panic(
+        "interface Scale {\n\
+        \x20   fn nudge(self, v: &mut i64);\n\
+         }\n\
+         class Step implements Scale {\n\
+        \x20   pub by: i64;\n\
+        \x20   pub fn nudge(self, v: &mut i64) {\n\
+        \x20       v = v + self.by;\n\
+        \x20       panic(\"inside\");\n\
+        \x20   }\n\
+         }\n\
+         fn main() {\n\
+        \x20   let step: Scale = new Step(5);\n\
+        \x20   let mut n = 10;\n\
+        \x20   step.nudge(&n);\n\
+        \x20   println(n);\n\
+         }\n",
+        &[
+            "runtime panic: inside",
+            "reference call: nudge parameter `<unknown>` &mut <unknown> at <src>.wi:14:16 using local `n`",
+        ],
+    );
+}
+
+// 31. The half of perspective 30 that neither emitter used to do
+//     (willow-0g8j.11): interface dispatch recorded the reference call and
+//     never cleared it, so a later, unrelated panic in the SAME function was
+//     reported as if it had happened inside the callee, under a place the
+//     callee had already given back. Both emitters clear it now.
+#[test]
+fn reference_args_31_a_panic_after_interface_dispatch_reports_no_reference() {
+    let source = "interface Scale {\n\
+                 \x20   fn nudge(self, v: &mut i64);\n\
+                  }\n\
+                  class Step implements Scale {\n\
+                 \x20   pub by: i64;\n\
+                 \x20   pub fn nudge(self, v: &mut i64) { v = v + self.by; }\n\
+                  }\n\
+                  fn main() {\n\
+                 \x20   let step: Scale = new Step(5);\n\
+                 \x20   let mut n = 10;\n\
+                 \x20   step.nudge(&n);\n\
+                 \x20   println(n);\n\
+                 \x20   panic(\"after\");\n\
+                  }\n";
+    assert_same_panic(source, &["15", "runtime panic: after"]);
+    for env in [&AST[..], &LIR[..]] {
+        let (out, _) = compile_and_run_with_env(source, env);
+        assert!(
+            !out.contains("reference call:"),
+            "the reference context outlived the interface call it described:\n{out}"
+        );
+    }
+}
+
+// 32. The sibling indirect path: a virtual call through a base-class handle
+//     goes out through a vtable slot rather than an interface table, and it
+//     must clear the record on return for the same reason.
+#[test]
+fn reference_args_32_a_panic_after_virtual_dispatch_reports_no_reference() {
+    let source = "open class Base {\n\
+                 \x20   pub by: i64;\n\
+                 \x20   pub open fn nudge(self, v: &mut i64) { v = v + self.by; }\n\
+                  }\n\
+                  class Child extends Base {\n\
+                 \x20   pub override fn nudge(self, v: &mut i64) { v = v * self.by; }\n\
+                  }\n\
+                  fn main() {\n\
+                 \x20   let c: Base = new Child(3);\n\
+                 \x20   let mut n = 10;\n\
+                 \x20   c.nudge(&n);\n\
+                 \x20   println(n);\n\
+                 \x20   panic(\"after\");\n\
+                  }\n";
+    assert_same_panic(source, &["30", "runtime panic: after"]);
+    for env in [&AST[..], &LIR[..]] {
+        let (out, _) = compile_and_run_with_env(source, env);
+        assert!(
+            !out.contains("reference call:"),
+            "the reference context outlived the virtual call it described:\n{out}"
+        );
+    }
 }

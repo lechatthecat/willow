@@ -337,6 +337,48 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .unwrap_or_else(|| arm.pattern.clone())
     }
 
+    /// Bring one `match` pattern binding into scope.
+    ///
+    /// A GC-managed binding gets a ROOTED STACK SLOT, not a Cranelift variable
+    /// (willow-10zt). The minor collector promotes a direct root in place, so an
+    /// SSA copy of one keeps naming the right object; but a young object it
+    /// reaches only through a heap slot is EVACUATED — copied to an old region,
+    /// the owning slot fixed up, the source reclaimed. An enum payload and the
+    /// object inside an interface box are that second case: the scrutinee is
+    /// rooted and stays put while its child moves out from under a binding that
+    /// copied the old address. Rooting the binding makes it a direct root of its
+    /// own, which the collector pins.
+    ///
+    /// The slot IS the root slot, exactly as a GC-managed `let` gets in
+    /// [`FuncGen::emit_stmt`], so an assignment through the binding cannot leave
+    /// the root behind. Non-GC bindings keep their Cranelift variable: rooting a
+    /// scalar word would have the collector trace it as an object pointer.
+    ///
+    /// The caller pops what this pushed when it closes the arm's bracket.
+    fn bind_match_binding(&mut self, name: &str, ty: &Type, val: cranelift_codegen::ir::Value) {
+        let storage = if is_gc_managed(ty, self.enum_infos) {
+            let storage = self.create_local_stack_slot(ty, val);
+            if let VarStorage::Stack { slot, .. } = &storage {
+                self.emit_push_root_slot(*slot);
+                // An arm body in an async fn may suspend, and a poll return
+                // pops every ACTIVE binding root and re-registers it on re-poll.
+                // A root the shadow list does not know about would be left
+                // pointing into the dead native frame — and
+                // `emit_coop_unwind_poll_roots` asserts the two depths agree.
+                self.track_coop_binding_root(*slot);
+            }
+            storage
+        } else {
+            let var = self.builder.declare_var(clif_type(ty));
+            self.builder.def_var(var, val);
+            VarStorage::Value {
+                var,
+                ty: ty.clone(),
+            }
+        };
+        self.vars.insert(name.to_string(), storage);
+    }
+
     pub(super) fn emit_match(&mut self, m: &MatchExpr) -> cranelift_codegen::ir::Value {
         let scrutinee = self.emit_expr(&m.scrutinee);
         let scrutinee_ast_type = self.ast_type_of(&m.scrutinee);
@@ -469,8 +511,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.switch_to_block(arm_block);
             self.builder.seal_block(arm_block);
 
-            // For binding patterns, define the variable
+            // For binding patterns, define the variable. A GC-managed one
+            // pushes a rooted slot that has to be popped again before this arm
+            // reaches the merge block, so that sibling arms and the merge all
+            // agree on the root depth (willow-10zt).
+            let arm_roots_before = self.gc_root_count;
+            let arm_coop_roots_before = self.coop_shadow_roots.as_ref().map(|r| r.active.len());
             let saved_vars = match &pat {
+                // Binds the scrutinee itself, which `rooted_scrutinee` already
+                // holds as a direct root for the whole `match` — and the
+                // collector pins a direct root in place, so this alias cannot go
+                // stale the way a payload binding can.
                 Pattern::Binding { name, .. } => {
                     let var = self.builder.declare_var(types::I64);
                     self.builder.def_var(var, scrutinee);
@@ -521,15 +572,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         } else {
                             raw
                         };
-                        let var = self.builder.declare_var(clif_ty);
-                        self.builder.def_var(var, val);
-                        self.vars.insert(
-                            binding.clone(),
-                            VarStorage::Value {
-                                var,
-                                ty: payload_ty.clone(),
-                            },
-                        );
+                        self.bind_match_binding(binding, payload_ty, val);
                     }
                     Some(saved)
                 }
@@ -545,15 +588,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         self.builder
                             .ins()
                             .load(types::I64, MemFlagsData::new(), scrutinee, 0i32);
-                    let var = self.builder.declare_var(types::I64);
-                    self.builder.def_var(var, obj);
-                    self.vars.insert(
-                        binding.clone(),
-                        VarStorage::Value {
-                            var,
-                            ty: Type::Named(class_name.clone()),
-                        },
-                    );
+                    self.bind_match_binding(binding, &Type::Named(class_name.clone()), obj);
                     Some(saved)
                 }
                 _ => None,
@@ -563,14 +598,28 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.terminated = false;
             let arm_val = self.emit_match_body(&arm.body, result_clif_type);
 
-            if !self.terminated
-                && let Some(arm_val) = arm_val
-            {
-                self.builder.def_var(result_var, arm_val);
-                self.builder.ins().jump(merge_block, &[]);
-                any_arm_merges = true;
+            if !self.terminated {
+                // The arm falls through to the merge. Drop its binding roots
+                // first; a `return` or a `panic` arm needs no pop here, having
+                // already unwound the whole root depth itself.
+                self.emit_pop_roots_n(self.gc_root_count - arm_roots_before);
+                if let Some(arm_val) = arm_val {
+                    self.builder.def_var(result_var, arm_val);
+                    self.builder.ins().jump(merge_block, &[]);
+                    any_arm_merges = true;
+                }
             }
             self.terminated = outer_terminated;
+            self.gc_root_count = arm_roots_before;
+            if let (Some(depth), Some(roots)) =
+                (arm_coop_roots_before, self.coop_shadow_roots.as_mut())
+            {
+                assert!(
+                    roots.active.len() >= depth,
+                    "cooperative match arm root scope underflow"
+                );
+                roots.active.truncate(depth);
+            }
 
             if let Some(saved) = saved_vars {
                 self.vars = saved;

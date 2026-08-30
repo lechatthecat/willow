@@ -14,9 +14,18 @@ pub struct ReferenceCallContext {
     pub place_name: String,
 }
 
+#[derive(Debug, Default)]
+struct ReferenceCallState {
+    current: Option<ReferenceCallContext>,
+    parents: Vec<Option<ReferenceCallContext>>,
+}
+
 std::thread_local! {
-    static CURRENT_REFERENCE_CALL: RefCell<Option<ReferenceCallContext>> =
-        const { RefCell::new(None) };
+    static REFERENCE_CALL_STATE: RefCell<ReferenceCallState> =
+        const { RefCell::new(ReferenceCallState {
+            current: None,
+            parents: Vec::new(),
+        }) };
 }
 
 fn ws(ptr: *const u8) -> String {
@@ -24,12 +33,13 @@ fn ws(ptr: *const u8) -> String {
 }
 
 pub fn current_reference_call() -> Option<ReferenceCallContext> {
-    CURRENT_REFERENCE_CALL.with(|current| current.borrow().clone())
+    REFERENCE_CALL_STATE.with(|state| state.borrow().current.clone())
 }
 
 pub fn clear_current_reference_call() {
-    CURRENT_REFERENCE_CALL.with(|current| {
-        *current.borrow_mut() = None;
+    REFERENCE_CALL_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.current = state.parents.pop().unwrap_or(None);
     });
 }
 
@@ -54,6 +64,18 @@ pub fn print_current_reference_call_context() {
     }
 }
 
+/// Save the caller's reference metadata before argument hooks replace it.
+/// One scope covers the whole call, so multiple reference arguments still
+/// select the last argument while a nested call can restore its parent.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_debug_reference_call_scope_push() {
+    REFERENCE_CALL_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let parent = state.current.clone();
+        state.parents.push(parent);
+    });
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_debug_reference_call(
     file: *const u8,
@@ -66,8 +88,8 @@ pub extern "C" fn willow_debug_reference_call(
     place_kind: *const u8,
     place_name: *const u8,
 ) {
-    CURRENT_REFERENCE_CALL.with(|current| {
-        *current.borrow_mut() = Some(ReferenceCallContext {
+    REFERENCE_CALL_STATE.with(|state| {
+        state.borrow_mut().current = Some(ReferenceCallContext {
             file: ws(file),
             line,
             col,
@@ -120,6 +142,44 @@ mod tests {
             "  reference call: increment parameter `x` &mut i64 at main.wi:7:13 using local `n`"
         );
 
+        willow_debug_reference_call_clear();
+        assert!(current_reference_call().is_none());
+    }
+
+    #[test]
+    fn reference_debug_unit_02_nested_scope_restores_parent_context() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        willow_debug_reference_call_scope_push();
+        willow_debug_reference_call(
+            ws_ptr("main.wi"),
+            3,
+            9,
+            ws_ptr("Outer::init"),
+            ws_ptr("seed"),
+            ws_ptr("i64"),
+            ws_ptr("&mut"),
+            ws_ptr("local"),
+            ws_ptr("n"),
+        );
+        willow_debug_reference_call_scope_push();
+        willow_debug_reference_call(
+            ws_ptr("main.wi"),
+            8,
+            17,
+            ws_ptr("Inner::init"),
+            ws_ptr("seed"),
+            ws_ptr("i64"),
+            ws_ptr("&mut"),
+            ws_ptr("local"),
+            ws_ptr("seed"),
+        );
+
+        willow_debug_reference_call_clear();
+        assert_eq!(
+            current_reference_call().map(|ctx| ctx.callee),
+            Some("Outer::init".to_string())
+        );
         willow_debug_reference_call_clear();
         assert!(current_reference_call().is_none());
     }

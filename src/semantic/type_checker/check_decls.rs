@@ -479,7 +479,7 @@ impl TypeChecker {
         // Constructor signature: explicit `init`, else implicit memberwise
         // (inherited fields first, then this class's fields in declaration
         // order, matching the runtime object layout).
-        let params: Vec<Type> = match &class.constructor {
+        let param_infos: Vec<ParamInfo> = match &class.constructor {
             Some(ci) => {
                 // Visibility of an explicit constructor (willow-scq2 §9).
                 if !ci.public {
@@ -500,17 +500,21 @@ impl TypeChecker {
                         );
                     }
                 }
-                ci.params.clone()
+                ci.param_infos.clone()
             }
             None => {
                 let fields = self.implicit_constructor_field_infos(&resolved);
                 self.check_implicit_constructor_field_visibility(&fields, &n.args, n.span);
-                fields
+                // A memberwise constructor stores every field by value: there is
+                // no declaration that could mark one `&`/`&mut`.
+                let field_types: Vec<Type> = fields
                     .iter()
                     .map(|(_, _, field)| field.ty.clone())
-                    .collect()
+                    .collect();
+                value_param_infos(&field_types)
             }
         };
+        let params: Vec<Type> = param_infos.iter().map(|p| p.ty.clone()).collect();
 
         // A constructor is a typed call like any other call. Propagate each
         // declared parameter/field type into its argument so contextual enum
@@ -543,27 +547,49 @@ impl TypeChecker {
                 .with_label(Label::primary(n.span, "wrong number of arguments")),
             );
         } else {
-            for (i, (aty, pty)) in arg_types.iter().zip(params.iter()).enumerate() {
-                if !self.types_compatible(pty, aty) {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            self.type_mismatch_error_code(pty, aty),
-                            format!(
-                                "constructor argument {} of `{}` expects `{}`, found `{}`",
-                                i + 1,
-                                resolved,
-                                type_name(pty),
-                                type_name(aty)
-                            ),
-                        )
-                        .with_label(Label::primary(
-                            n.args[i].expr.span(),
-                            format!("expected `{}`", type_name(pty)),
-                        )),
-                    );
+            // A constructor call obeys the same reference ABI as any other call,
+            // so the argument MODES are checked here too. Without this, `&x` on
+            // a by-value parameter is silently dropped, and a missing `&` on a
+            // `&mut` parameter passes a value where `init` dereferences a
+            // pointer (willow-dssc).
+            for (i, (aty, param)) in arg_types.iter().zip(param_infos.iter()).enumerate() {
+                let arg = &n.args[i];
+                match (&param.mode, &arg.mode) {
+                    (ParamMode::Value, CallArgMode::Value) => {
+                        if !self.types_compatible(&param.ty, aty) {
+                            self.push(
+                                Diagnostic::new(
+                                    Severity::Error,
+                                    self.type_mismatch_error_code(&param.ty, aty),
+                                    format!(
+                                        "constructor argument {} of `{}` expects `{}`, found `{}`",
+                                        i + 1,
+                                        resolved,
+                                        type_name(&param.ty),
+                                        type_name(aty)
+                                    ),
+                                )
+                                .with_label(Label::primary(
+                                    arg.expr.span(),
+                                    format!("expected `{}`", type_name(&param.ty)),
+                                )),
+                            );
+                        }
+                    }
+                    (ParamMode::Value, CallArgMode::Reference { .. }) => {
+                        self.push_unexpected_reference_arg(&param.ty, aty, arg.span);
+                    }
+                    (ParamMode::Reference { .. }, CallArgMode::Value) => {
+                        self.push_missing_reference_arg(arg);
+                    }
+                    (ParamMode::Reference { mutable, .. }, CallArgMode::Reference { .. }) => {
+                        // Reports the reference-specific mismatch (E1705) itself,
+                        // so the by-value comparison above is deliberately skipped.
+                        self.check_reference_argument(param, arg, *mutable);
+                    }
                 }
             }
+            self.check_mut_reference_aliases(&param_infos, &n.args);
         }
 
         Type::Named(resolved)

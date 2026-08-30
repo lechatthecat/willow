@@ -42,6 +42,108 @@ pub struct DeclaredProgram {
     builtin_module_aliases: HashMap<String, String>,
 }
 
+/// The type/layout environment the LIR eligibility walker and the LIR emitter
+/// read, built from the compiler's own tables so a form is admitted exactly
+/// when emission can produce it.
+///
+/// This is a macro rather than a method because every field is a reference to a
+/// closure temporary: returning the struct from a function would drop those
+/// closures at the return. Expanded in place, they live as long as the `let`
+/// that binds the context (willow-0g8j.2.18).
+macro_rules! lir_type_ctx {
+    ($me:expr, $return_type:expr) => {
+        super::lir_gen::LirTypeCtx {
+            known_fn: &|n| $me.func_ids.contains_key(n),
+            class_layouts: &$me.class_layouts,
+            class_base: &$me.class_base,
+            class_type_ids: &$me.class_type_ids,
+            is_interface: &|n| $me.interface_infos.contains_key(n),
+            can_box: &|class, iface| {
+                super::emit::resolve_vtable_id(&$me.vtable_ids, &$me.interface_infos, class, iface)
+                    .is_some()
+            },
+            // The same `enum_infos` table `enum_variant_tag` and
+            // `enum_is_gc_object_type` answer from, so the tags and the
+            // representation eligibility vets are the ones emission uses
+            // (willow-0g8j.8).
+            enum_def: &|n| {
+                let info = $me.enum_infos.get(n)?;
+                Some(super::lir_gen::LirEnumDef {
+                    type_params: info.type_params.clone(),
+                    variants: info
+                        .variants
+                        .iter()
+                        .map(|v| super::lir_gen::LirEnumVariant {
+                            name: v.name.clone(),
+                            payloads: v.payload_types.clone(),
+                        })
+                        .collect(),
+                })
+            },
+            // Straight from the same table `emit_interface_dispatch` reads,
+            // so the slot the walker vets is the slot it will index.
+            iface_method: &|iface_ty, method| {
+                let (iface, args): (&str, &[Type]) = match iface_ty {
+                    Type::Named(name) => (name, &[]),
+                    Type::Generic(name, args) => (name, args),
+                    _ => return None,
+                };
+                let info = $me.interface_infos.get(iface)?;
+                if info.type_params.len() != args.len() {
+                    return None;
+                }
+                super::vtable_layout::slot_of(&$me.interface_infos, iface, method)?;
+                let sig = info.methods.get(method)?;
+                let mut substitutions: HashMap<String, Type> = info
+                    .type_params
+                    .iter()
+                    .cloned()
+                    .zip(args.iter().cloned())
+                    .collect();
+                substitutions.insert("Self".to_string(), iface_ty.clone());
+                Some(super::lir_gen::IfaceMethodSig {
+                    params: sig
+                        .params
+                        .iter()
+                        .map(|ty| crate::semantic::symbols::substitute_type(ty, &substitutions))
+                        .collect(),
+                    modes: sig.param_infos.iter().map(|p| p.mode.clone()).collect(),
+                    ret: crate::semantic::symbols::substitute_type(
+                        &sig.return_type,
+                        &substitutions,
+                    ),
+                })
+            },
+            // Resolved through the same hierarchy walk
+            // `emit_static_field_read` uses, so an inherited static is
+            // admitted iff the emitter can find its data slot.
+            static_field: &|class, field| {
+                super::lookup_static_storage_in(&$me.static_storage, &$me.class_base, class, field)
+                    .map(|info| info.ty)
+            },
+            // The same layout `declare_one_vtable` emits from, so the
+            // offset eligibility vets is the offset the widening adds.
+            iface_widen_offset: &|target, source| {
+                super::vtable_layout::super_offset(&$me.interface_infos, source, target)
+            },
+            fn_types: &$me.fn_types,
+            func_param_modes: &$me.func_param_modes,
+            known_modules: &$me.known_modules,
+            builtin_module_aliases: &$me.builtin_module_aliases,
+            return_type: $return_type,
+            // Per-FUNCTION, like `return_type`: `lir_rejection_reason` sets it
+            // from the function it is vetting, so nothing here can get it
+            // wrong (willow-0g8j.13).
+            self_class: None,
+            // The same table `emit_expr` reads for a lambda's address, so
+            // the symbol eligibility vets is the symbol emission takes the
+            // address of (willow-0g8j.2.2).
+            lambda_symbol: &|span| $me.lambda_names.get(&span).cloned(),
+            cooperative_leaves: &$me.cooperative_leaves,
+        }
+    };
+}
+
 impl Codegen {
     /// Compile an imported module. Functions are given the mangled name
     /// `{canonical_module_path}__{fn}` with `::` normalized to `__`.
@@ -726,101 +828,7 @@ impl Codegen {
         // error below. Filled in only on the path that actually asked.
         let mut lir_reject: Option<String> = None;
         let lir_fn = if (!is_main || supported_main) && super::lir_gen::lir_backend_enabled() {
-            let ctx = super::lir_gen::LirTypeCtx {
-                known_fn: &|n| self.func_ids.contains_key(n),
-                class_layouts: &self.class_layouts,
-                class_base: &self.class_base,
-                class_type_ids: &self.class_type_ids,
-                is_interface: &|n| self.interface_infos.contains_key(n),
-                can_box: &|class, iface| {
-                    super::emit::resolve_vtable_id(
-                        &self.vtable_ids,
-                        &self.interface_infos,
-                        class,
-                        iface,
-                    )
-                    .is_some()
-                },
-                // The same `enum_infos` table `enum_variant_tag` and
-                // `enum_is_gc_object_type` answer from, so the tags and the
-                // representation eligibility vets are the ones emission uses
-                // (willow-0g8j.8).
-                enum_def: &|n| {
-                    let info = self.enum_infos.get(n)?;
-                    Some(super::lir_gen::LirEnumDef {
-                        type_params: info.type_params.clone(),
-                        variants: info
-                            .variants
-                            .iter()
-                            .map(|v| super::lir_gen::LirEnumVariant {
-                                name: v.name.clone(),
-                                payloads: v.payload_types.clone(),
-                            })
-                            .collect(),
-                    })
-                },
-                // Straight from the same table `emit_interface_dispatch` reads,
-                // so the slot the walker vets is the slot it will index.
-                iface_method: &|iface_ty, method| {
-                    let (iface, args): (&str, &[Type]) = match iface_ty {
-                        Type::Named(name) => (name, &[]),
-                        Type::Generic(name, args) => (name, args),
-                        _ => return None,
-                    };
-                    let info = self.interface_infos.get(iface)?;
-                    if info.type_params.len() != args.len() {
-                        return None;
-                    }
-                    super::vtable_layout::slot_of(&self.interface_infos, iface, method)?;
-                    let sig = info.methods.get(method)?;
-                    let mut substitutions: HashMap<String, Type> = info
-                        .type_params
-                        .iter()
-                        .cloned()
-                        .zip(args.iter().cloned())
-                        .collect();
-                    substitutions.insert("Self".to_string(), iface_ty.clone());
-                    Some(super::lir_gen::IfaceMethodSig {
-                        params: sig
-                            .params
-                            .iter()
-                            .map(|ty| crate::semantic::symbols::substitute_type(ty, &substitutions))
-                            .collect(),
-                        modes: sig.param_infos.iter().map(|p| p.mode.clone()).collect(),
-                        ret: crate::semantic::symbols::substitute_type(
-                            &sig.return_type,
-                            &substitutions,
-                        ),
-                    })
-                },
-                // Resolved through the same hierarchy walk
-                // `emit_static_field_read` uses, so an inherited static is
-                // admitted iff the emitter can find its data slot.
-                static_field: &|class, field| {
-                    super::lookup_static_storage_in(
-                        &self.static_storage,
-                        &self.class_base,
-                        class,
-                        field,
-                    )
-                    .map(|info| info.ty)
-                },
-                // The same layout `declare_one_vtable` emits from, so the
-                // offset eligibility vets is the offset the widening adds.
-                iface_widen_offset: &|target, source| {
-                    super::vtable_layout::super_offset(&self.interface_infos, source, target)
-                },
-                fn_types: &self.fn_types,
-                func_param_modes: &self.func_param_modes,
-                known_modules: &self.known_modules,
-                builtin_module_aliases: &self.builtin_module_aliases,
-                return_type: &f.return_type,
-                // The same table `emit_expr` reads for a lambda's address, so
-                // the symbol eligibility vets is the symbol emission takes the
-                // address of (willow-0g8j.2.2).
-                lambda_symbol: &|span| self.lambda_names.get(&span).cloned(),
-                cooperative_leaves: &self.cooperative_leaves,
-            };
+            let ctx = lir_type_ctx!(self, &f.return_type);
             match self.lir_functions.get(name) {
                 Some(lf) => match super::lir_gen::lir_rejection_reason(lf, &ctx).or_else(|| {
                     f.is_async
@@ -1493,8 +1501,69 @@ impl Codegen {
 
     fn compile_class_method_inner(&mut self, c: &ClassDecl, m: &MethodDecl) -> Result<()> {
         let mangled = self.class_method_symbol(&c.name, &m.name);
+        // LIR-walking path for a method body (willow-0g8j.2.18). `lower_program`
+        // lowers every method under `Class::method` -- the key
+        // `register_lir_functions` stored it under, which is not the mangled
+        // symbol -- and puts the `self` receiver first in the lowered parameter
+        // list, exactly where the method ABI passes it. So the receiver and
+        // parameter bindings below are what the walker's body reads.
+        let lir_name = format!("{}::{}", c.name, m.name);
+        // Why the walker turned this body down, for the `WILLOW_LIR_REQUIRE`
+        // error below. Filled in only on the path that actually asked.
+        let mut lir_reject: Option<String> = None;
+        let lir_fn = if super::lir_gen::lir_backend_enabled() {
+            let ctx = lir_type_ctx!(self, &m.return_type);
+            match self.lir_functions.get(&lir_name) {
+                Some(lf) => match super::lir_gen::lir_rejection_reason(lf, &ctx).or_else(|| {
+                    m.is_async
+                        .then(|| super::lir_gen::lir_async_rejection_reason(lf))
+                        .flatten()
+                }) {
+                    None => Some(lf.clone()),
+                    Some(why) => {
+                        lir_reject = Some(why);
+                        None
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+        // `WILLOW_LIR_REQUIRE=1` polices a method exactly as it polices a free
+        // function, so a test can prove a method body came from the walker.
+        if lir_fn.is_none()
+            && super::lir_gen::lir_backend_enabled()
+            && super::lir_gen::lir_required()
+        {
+            let reason = if !self.lir_functions.contains_key(&lir_name) {
+                "it has no lowered IR".to_string()
+            } else {
+                lir_reject.unwrap_or_else(|| {
+                    "it is outside the LIR walker's supported subset".to_string()
+                })
+            };
+            anyhow::bail!(
+                "WILLOW_LIR_REQUIRE is set, but method `{lir_name}` fell back to the AST backend: {reason}"
+            );
+        }
         if m.is_async {
-            return self.compile_cooperative_method(&c.name, &mangled, m, None);
+            if std::env::var("WILLOW_LIR_LOG").is_ok() {
+                match &lir_fn {
+                    Some(_) => eprintln!("[lir] compiling async `{lir_name}` from lowered IR"),
+                    None => {
+                        let reason = lir_reject.as_deref().unwrap_or(
+                            if self.lir_functions.contains_key(&lir_name) {
+                                "it is outside the LIR walker's supported subset"
+                            } else {
+                                "it has no lowered IR"
+                            },
+                        );
+                        eprintln!("[lir] async `{lir_name}` stays on the AST backend: {reason}");
+                    }
+                }
+            }
+            return self.compile_cooperative_method(&c.name, &mangled, m, lir_fn);
         }
         let func_id = self.func_ids[&mangled];
 
@@ -1635,7 +1704,14 @@ impl Codegen {
             fg.bind_param(&p.name, &p.ty, &p.mode, val);
         }
 
-        fg.emit_block(&m.body);
+        if let Some(lir_fn) = &lir_fn {
+            if std::env::var("WILLOW_LIR_LOG").is_ok() {
+                eprintln!("[lir] compiling `{lir_name}` from lowered IR");
+            }
+            fg.emit_lir_function(lir_fn);
+        } else {
+            fg.emit_block(&m.body);
+        }
 
         if !fg.terminated {
             // Pop any GC roots (self, params) before the implicit void return.
@@ -1659,6 +1735,7 @@ impl Codegen {
             }
         }
         fg.emit_panic_return(&call_return_type, false);
+        fg.builder.seal_all_blocks();
 
         builder.finalize(self.module.target_config());
         self.module
