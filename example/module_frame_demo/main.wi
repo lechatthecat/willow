@@ -1,0 +1,115 @@
+// module_frame_demo — a panic inside an imported module reports a call stack
+// (willow-0g8j.2.20).
+//
+// Every other user call emits a debug call-stack frame around itself: a name
+// and a call-site location pushed before the call and popped when it returns.
+// A call into an imported module pushed none, so a panic raised in module code
+// printed its location and then nothing — the entry file that called in was
+// missing from the report, and with it the only line the reader could act on.
+//
+// A module frame is named as the source spells the call: the whole path,
+// `trace::checked`, under whatever name the import bound (`import trace as t;`
+// makes it `t::checked`). The bare item name would say nothing about which
+// module it came from. A class static keeps the bare-method convention it
+// already had, because a static is reached through its class.
+//
+// Both backends emit the same frame, so a trace never depends on which emitter
+// compiled the caller:
+//   WILLOW_LIR_BACKEND=0 willowc build example/module_frame_demo/main.wi -o /tmp/a
+//   WILLOW_LIR_BACKEND=1 willowc build example/module_frame_demo/main.wi -o /tmp/b
+//
+// The frames go to stderr with the panic report, so this program recovers what
+// it raises and its stdout stays deterministic. Delete the `recover` guarding
+// the `relay::forward(0)` call below and the report reads:
+//
+//     runtime panic: empty reading at trace.wi:48:9
+//     call stack (most recent call first):
+//       0: inner at trace.wi:43:12
+//       1: trace::deep at relay.wi:11:12
+//       2: relay::forward at main.wi:65:17
+//
+// — the module→module hop included, most recent call first.
+import trace;
+import relay;
+import trace::Meter;
+
+// Each `if true { .. }` below is a guarded scope: the `defer`red `recover`
+// catches whatever that block panics with, which is what keeps this program's
+// stdout deterministic. `PanicInfo` carries the message and the location, not
+// the call stack — the frames are the part that goes to stderr.
+fn main() {
+    // Calls that return normally: the frame each one pushed is popped again,
+    // so nothing accumulates.
+    println(trace::checked(5));
+    println(trace::deep(3));
+    println(relay::forward(4));
+
+    // A module free function panics. The frame names `trace::checked` and
+    // points at the call below.
+    if true {
+        defer match recover() {
+            Some(info) => println("negative: " + info.message),
+            None => {}
+        }
+        println(trace::checked(-1));
+        println("not reached");
+    }
+
+    // A module calling a module: two frames, `trace::deep` in relay.wi and
+    // `relay::forward` in this file.
+    if true {
+        defer match recover() {
+            Some(info) => println("empty: " + info.message),
+            None => {}
+        }
+        println(relay::forward(0));
+        println("not reached");
+    }
+
+    // A module class: the static's frame is the bare `of`, the instance
+    // method's is the bare `area`.
+    let m: Meter = trace::Meter::of(3);
+    println(m.area());
+    if true {
+        defer match recover() {
+            Some(info) => println("side: " + info.message),
+            None => {}
+        }
+        let bad: Meter = Meter::of(-2);
+        println(bad.side);
+    }
+    if true {
+        defer match recover() {
+            Some(info) => println("zero: " + info.message),
+            None => {}
+        }
+        let flat: Meter = new Meter(0);
+        println(flat.area());
+    }
+
+    // A reference argument through a module call reports BOTH the reference it
+    // was passed and the frame it was called from.
+    let mut n = 0;
+    trace::bump(&n);
+    println(n);
+    trace::bump(&n);
+    println(n);
+    if true {
+        defer match recover() {
+            Some(info) => println("bump: " + info.message),
+            None => {}
+        }
+        trace::bump(&n);
+        println("not reached");
+    }
+
+    // A loop of module calls: three pushes, three pops. Frames record the call
+    // that is running, not the calls that have been.
+    let mut i = 0;
+    let mut total = 0;
+    while i < 3 {
+        total = total + trace::checked(i);
+        i = i + 1;
+    }
+    println(total);
+}

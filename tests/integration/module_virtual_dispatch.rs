@@ -16,7 +16,7 @@
 //! (each module AND the entry program) is declared before any body is lowered,
 //! so the candidate set is computed against the complete class hierarchy.
 //!
-//! 21 perspectives:
+//! 22 perspectives:
 //!   1 the base case: a module method sees an entry-file override
 //!   2 control: with no override the module still runs its own body
 //!   3 a module FREE function dispatches to an entry override
@@ -38,6 +38,7 @@
 //!  20 an override calling a second `open` method dispatches both
 //!  21 the override is reached through a base-typed local in the module
 //!  22 a four-level chain spanning two modules and the entry file
+//!  23 a qualified module base contributes its inherited field layout
 
 use super::support::compile_temp_project_and_run;
 
@@ -925,6 +926,7 @@ pub open class Level {
         return self.depth() * 1000 + self.side;
     }
 }
+
 "#,
             ),
             (
@@ -972,5 +974,29 @@ fn main() {
             ),
         ],
         "1007\n2007\n3007\n4007\n",
+    );
+}
+
+#[test]
+fn module_dispatch_23_qualified_base_inherits_its_fields() {
+    assert_output(
+        &[
+            ("lib.wi", PARCEL),
+            (
+                "app.wi",
+                r#"
+import lib;
+
+class EntryParcel extends lib::Parcel {
+    pub override fn size(self) -> i64 {
+        return self.side * 5;
+    }
+}
+
+fn main() { println(new EntryParcel(3).label()); }
+"#,
+            ),
+        ],
+        "150\n",
     );
 }

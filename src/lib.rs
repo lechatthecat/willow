@@ -289,6 +289,11 @@ struct Frontend {
     module_graph: module::ModuleGraph,
     item_imports: Vec<module::resolver::ItemImport>,
     checker: semantic::TypeChecker,
+    /// One run type checker per imported module, in `module_graph.files` order.
+    /// The back-end lowers each module's bodies to LIR with its OWN tables
+    /// (willow-0g8j.16); nothing else in the pipeline may read these, because a
+    /// module's scope is not the entry file's.
+    module_checkers: Vec<CheckedModule>,
 }
 
 /// A single compilation request. Owns the shared context (paths, options,
@@ -372,7 +377,18 @@ struct ImportPhase {
 struct TypecheckPhase {
     checker: semantic::TypeChecker,
     module_diagnostics: Vec<ModulePhaseDiagnostics>,
+    module_checkers: Vec<CheckedModule>,
     error_count: usize,
+}
+
+/// An imported module's own run type checker, kept past the diagnostics it
+/// produced so the back-end can lower that module's bodies with the tables the
+/// module was checked against (willow-0g8j.16).
+struct CheckedModule {
+    /// The module's canonical `a::b` path, which is what a `ResolvedModule` is
+    /// matched on everywhere else in the driver.
+    canonical_path: String,
+    checker: semantic::TypeChecker,
 }
 
 struct ModulePhaseDiagnostics {
@@ -423,6 +439,7 @@ fn run_frontend(
     let TypecheckPhase {
         checker,
         module_diagnostics: typecheck_module_diagnostics,
+        module_checkers,
         error_count: typecheck_error_count,
     } = typecheck_phase(&program, &graph.files, &item_imports, options)?;
     diagnostics::emit_all_multi(&checker.errors, &source_maps);
@@ -454,6 +471,7 @@ fn run_frontend(
         module_graph: graph,
         item_imports,
         checker,
+        module_checkers,
     })
 }
 
@@ -572,13 +590,14 @@ fn typecheck_phase(
     checker.check_program(program);
     let mut error_count = diagnostic_error_count(&checker.errors);
 
-    let module_diagnostics = typecheck_modules(modules, options)?;
+    let (module_diagnostics, module_checkers) = typecheck_modules(modules, options)?;
     for module in &module_diagnostics {
         error_count += diagnostic_error_count(&module.diagnostics);
     }
     Ok(TypecheckPhase {
         checker,
         module_diagnostics,
+        module_checkers,
         error_count,
     })
 }
@@ -601,8 +620,9 @@ fn typecheck_phase(
 fn typecheck_modules(
     modules: &[module::ResolvedModule],
     options: &CompilerOptions,
-) -> Result<Vec<ModulePhaseDiagnostics>> {
+) -> Result<(Vec<ModulePhaseDiagnostics>, Vec<CheckedModule>)> {
     let mut out = Vec::new();
+    let mut checked = Vec::with_capacity(modules.len());
     for m in modules {
         let mut checker = semantic::TypeChecker::new();
         if options.enforce_send_sync {
@@ -614,13 +634,21 @@ fn typecheck_modules(
             &m.program, modules,
         ));
         checker.check_module_program(&m.program);
-        if !checker.errors.is_empty() {
+        // The errors are taken out rather than read from the checker, which
+        // outlives them: this pass is also where the back-end's per-module
+        // lowering tables come from (willow-0g8j.16), so the checker is kept.
+        let errors = std::mem::take(&mut checker.errors);
+        if !errors.is_empty() {
             out.push(ModulePhaseDiagnostics {
-                diagnostics: checker.errors,
+                diagnostics: errors,
             });
         }
+        checked.push(CheckedModule {
+            canonical_path: m.canonical_path.clone(),
+            checker,
+        });
     }
-    Ok(out)
+    Ok((out, checked))
 }
 
 /// Bring the modules `program` itself imports into `checker`'s scope.
@@ -820,6 +848,7 @@ fn run_backend(
         module_graph,
         item_imports,
         checker,
+        module_checkers,
     } = frontend;
     let modules = module_graph.files;
 
@@ -882,7 +911,29 @@ fn run_backend(
             &m.program,
             &m.path.to_string_lossy(),
         ) {
-            Ok(unit) => declared_modules.push((m.name.clone(), unit)),
+            Ok(unit) => {
+                // Lowered IR of THIS module's bodies (willow-0g8j.16). Without
+                // it every cross-module body is AST-emitted no matter what the
+                // walker could handle, because `lir_functions` holds the entry
+                // program alone. The tables are the module's own — a module is
+                // checked in its own scope, and lowering it against the entry
+                // file's would resolve names it never imported.
+                if let Some(m_checker) = module_checkers
+                    .iter()
+                    .find(|c| c.canonical_path == m.canonical_path)
+                {
+                    // The AST emitter needs the same tables (willow-9vvn): the
+                    // span-keyed resolution maps above hold the entry file's
+                    // entries alone, so an unqualified enum pattern in a module
+                    // body reached `emit_match` unresolved and took the wrong
+                    // arm. Merging is safe because a span carries its file_id.
+                    codegen.merge_module_checker_tables(&m_checker.checker);
+                    let tables = ir::lower::CheckerTables::from_checker(&m_checker.checker);
+                    let (hir, _hir_gaps) = ir::lower::lower_program_with(&m.program, &tables);
+                    codegen.register_module_lir(&unit, ir::lowered::lower_program(&hir));
+                }
+                declared_modules.push((m.name.clone(), unit));
+            }
             Err(error) => {
                 return Err(report_backend_failure(
                     &mut codegen,

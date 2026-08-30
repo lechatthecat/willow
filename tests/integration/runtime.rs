@@ -875,7 +875,16 @@ fn test_runnable_example_files_compile_and_run() {
             "example/module_call_demo/main.wi",
             "5\n11\n12\nAlice: 12\n7\nBob=7\n=0\ntwo\n5\nrecovered: negative score\ntotal: 12\n",
         ),
+        (
+            "example/module_frame_demo/main.wi",
+            "10\n3\n4\nnegative: negative reading\nempty: empty reading\n9\n\
+             side: negative side\nzero: zero side\n1\n2\nbump: bumped past the limit\n6\n",
+        ),
         ("example/module_class_demo/main.wi", "42\n12\n"),
+        (
+            "example/module_class_values/main.wi",
+            "7\n12\n10\n12\n(2, 2) -> (10, 10)\norigin\n7\n12\n",
+        ),
         (
             "example/module_class_inheritance_demo/main.wi",
             "1005\n6\n1005\n",
@@ -890,6 +899,10 @@ fn test_runnable_example_files_compile_and_run() {
             "3\n30\n6\n60\n60\n13\n",
         ),
         ("example/module_enum_demo/main.wi", "1\n2\n42\n"),
+        (
+            "example/module_lir_bodies/main.wi",
+            "12\n10\n7\nwin:rect\n1\n9\n30\n90\n12\n12\n",
+        ),
         ("example/direct_import_demo/main.wi", "7\n1\n99\n"),
         (
             "example/direct_import_iface_enum_demo/main.wi",
@@ -1092,6 +1105,10 @@ fn test_runnable_example_files_compile_and_run() {
         (
             "example/lir_self_statics.wi",
             "1\n2\n2\nseat 2\n12\nseat\nrow\nclosed 2\n2\n42\n4\n3\n103\nseat 9\n",
+        ),
+        (
+            "example/lir_static_property_bodies.wi",
+            "6\n3\n20\nbig\none\nmany\n2\n5\n0\n10\n7\n9\n10\n",
         ),
         (
             "example/interface_reference_params.wi",

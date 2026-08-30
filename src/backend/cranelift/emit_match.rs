@@ -340,7 +340,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// Bring one `match` pattern binding into scope.
     ///
     /// A GC-managed binding gets a ROOTED STACK SLOT, not a Cranelift variable
-    /// (willow-10zt). The minor collector promotes a direct root in place, so an
+    /// (willow-10zt). An address-taken scalar gets an unrooted slot too, created
+    /// here at the binding rather than lazily at one `&` use (willow-0g8j.12).
+    /// The minor collector promotes a direct root in place, so an
     /// SSA copy of one keeps naming the right object; but a young object it
     /// reaches only through a heap slot is EVACUATED — copied to an old region,
     /// the owning slot fixed up, the source reclaimed. An enum payload and the
@@ -356,9 +358,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ///
     /// The caller pops what this pushed when it closes the arm's bracket.
     fn bind_match_binding(&mut self, name: &str, ty: &Type, val: cranelift_codegen::ir::Value) {
-        let storage = if is_gc_managed(ty, self.enum_infos) {
+        let rooted = is_gc_managed(ty, self.enum_infos);
+        let storage = if rooted || self.address_taken.contains(name) {
             let storage = self.create_local_stack_slot(ty, val);
-            if let VarStorage::Stack { slot, .. } = &storage {
+            if rooted && let VarStorage::Stack { slot, .. } = &storage {
                 self.emit_push_root_slot(*slot);
                 // An arm body in an async fn may suspend, and a poll return
                 // pops every ACTIVE binding root and re-registers it on re-poll.
@@ -523,16 +526,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // collector pins a direct root in place, so this alias cannot go
                 // stale the way a payload binding can.
                 Pattern::Binding { name, .. } => {
-                    let var = self.builder.declare_var(types::I64);
-                    self.builder.def_var(var, scrutinee);
                     let saved = self.vars.clone();
-                    self.vars.insert(
-                        name.clone(),
-                        VarStorage::Value {
-                            var,
-                            ty: result_ast_type.clone(),
-                        },
-                    );
+                    // A whole-value binding has the SCRUTINEE'S type. In
+                    // particular an f64 must not be declared as an i64 while
+                    // carrying the match expression's (often void) type.
+                    self.bind_match_binding(name, &scrutinee_ast_type, scrutinee);
                     Some(saved)
                 }
                 Pattern::EnumVariantTuple {

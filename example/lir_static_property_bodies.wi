@@ -1,0 +1,135 @@
+// lir_static_property_bodies — a class's static property, assigned from inside
+// a bracketed or deferred body, through the LIR-walking backend
+// (willow-0g8j.15).
+//
+// A `defer { .. }` block, a `match` arm and a `select` case are not lowered
+// into the LIR block graph: the walker keeps each one as an HIR island and
+// emits it statement by statement. That island had a smaller statement subset
+// than the function around it — an expression, an assignment to a local, a
+// `let`, an `if` — and a store into a class's static property was not on the
+// list. So this:
+//
+//     defer { Registry::count = Registry::count + n; }
+//
+// sent the WHOLE enclosing function back to the AST emitter, with the reason
+// "it registers an unsupported `defer` body", even though the identical
+// statement one level up compiles from lowered IR. Nothing was miscompiled;
+// the fallback simply hid a subset gap.
+//
+// The store is admitted in both island scopes now. Its destination is a data
+// segment, so — unlike a `let`, which a deferred body still refuses — it needs
+// no storage of its own, and a `defer` replayed by the unwinder with no root
+// bracket can run it safely.
+//
+// Run it under the walker with fallback made fatal:
+//   WILLOW_LIR_REQUIRE=1 willowc build example/lir_static_property_bodies.wi -o /tmp/a
+import std::collections::Array;
+
+class Registry {
+    pub static mut count: i64 = 0;
+    pub static mut label: String = "none";
+    pub static mut seen: Array<i64> = [];
+
+    // `Self::` inside a deferred body resolves to the declaring class, and the
+    // store is the same store.
+    pub static fn arm(n: i64) -> i64 {
+        defer {
+            Self::count = Self::count + n;
+        }
+        return n;
+    }
+}
+
+// The bead's own repro: the store is the deferred body's only statement.
+fn bump(n: i64) -> i64 {
+    defer {
+        Registry::count = Registry::count + n;
+    }
+    return n * 2;
+}
+
+// An `if` inside the deferred body picks which value the store writes. Both
+// branches were already emittable; only the store was not.
+fn classify(n: i64) -> i64 {
+    defer {
+        if n > 10 {
+            Registry::label = "big";
+        } else {
+            Registry::label = "small";
+        }
+    }
+    return n;
+}
+
+// A `match` arm is the other island shape, and the property here is a heap
+// value: the store goes through the write barrier a global static needs.
+fn name(n: i64) -> String {
+    match n {
+        0 => {
+            Registry::label = "zero";
+        }
+        1 => {
+            Registry::label = "one";
+        }
+        _ => {
+            Registry::label = "many";
+        }
+    }
+    return Registry::label;
+}
+
+// Deferred bodies run last-in-first-out, so the second store is the one that
+// survives — the ordering is the emitter's, not the walker's, and it must not
+// change with the statement's admission.
+fn ordered() -> i64 {
+    defer {
+        Registry::count = Registry::count * 2;
+    }
+    defer {
+        Registry::count = 5;
+    }
+    return 0;
+}
+
+// A `select` case body is bracketed like a `match` arm.
+fn selected() -> i64 {
+    let ch = Channel<i64>::with_capacity(1);
+    ch.send(7);
+    select {
+        let v = ch.recv() => {
+            Registry::count = v;
+        }
+    }
+    return Registry::count;
+}
+
+fn main() {
+    println(bump(3));
+    println(Registry::count);
+
+    println(classify(20));
+    println(Registry::label);
+
+    println(name(1));
+    println(name(4));
+
+    println(Registry::arm(2));
+    println(Registry::count);
+
+    println(ordered());
+    println(Registry::count);
+
+    println(selected());
+
+    // The array-typed property, stored from a deferred body and read after the
+    // function it was deferred in has returned.
+    println(pushed());
+    println(Registry::seen[0] + Registry::seen[1]);
+}
+
+fn pushed() -> i64 {
+    defer {
+        Registry::seen = [4, 6];
+    }
+    return 9;
+}

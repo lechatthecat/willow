@@ -1,0 +1,58 @@
+// trace.wi — the module whose bodies panic (willow-0g8j.2.20).
+//
+// Nothing here is aware of call frames. What matters is that these bodies live
+// in a DIFFERENT file from the caller: when one of them panics, the report can
+// only point at this file, and the caller's own file is named by the debug call
+// stack the caller pushed before it called in.
+module trace;
+
+pub class Meter {
+    pub side: i64;
+
+    pub init(self, side: i64) {
+        self.side = side;
+    }
+
+    // A module class STATIC. Its frame is named by the bare method — a static
+    // is reached through the class, and the class's own unit spells the name.
+    pub static fn of(side: i64) -> Meter {
+        if side < 0 {
+            panic("negative side");
+        }
+        return new Meter(side);
+    }
+
+    pub fn area(self) -> i64 {
+        if self.side == 0 {
+            panic("zero side");
+        }
+        return self.side * self.side;
+    }
+}
+
+pub fn checked(n: i64) -> i64 {
+    if n < 0 {
+        panic("negative reading");
+    }
+    return n * 2;
+}
+
+// Calls a private function of its own module: the frame for THAT call is named
+// by the bare `inner`, and its location is a line in this file.
+pub fn deep(n: i64) -> i64 {
+    return inner(n);
+}
+
+fn inner(n: i64) -> i64 {
+    if n == 0 {
+        panic("empty reading");
+    }
+    return n;
+}
+
+pub fn bump(slot: &mut i64) {
+    slot = slot + 1;
+    if slot > 2 {
+        panic("bumped past the limit");
+    }
+}

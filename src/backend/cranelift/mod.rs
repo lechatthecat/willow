@@ -628,6 +628,50 @@ impl Codegen {
         self.lambda_fn_types = types;
     }
 
+    /// Merge one module's own checker tables into the backend (willow-9vvn).
+    ///
+    /// Every `register_*` above installs the ENTRY file's tables wholesale, but
+    /// a module is type-checked in its own scope, so the entry checker resolved
+    /// nothing inside a module body. Without this, an unqualified `Boxy(n)`
+    /// pattern in a module reaches `emit_match` unresolved: it stays a
+    /// `ClassDowncast`, which takes the wrong arm or panics outright.
+    ///
+    /// These tables are all keyed by `Span`, and a span carries the `file_id`
+    /// of the file it came from, so a module's keys cannot collide with the
+    /// entry file's or with another module's. That is why this extends the maps
+    /// instead of replacing them, and why it must run after the entry
+    /// registrations.
+    pub fn merge_module_checker_tables(&mut self, checker: &crate::semantic::TypeChecker) {
+        self.expr_types
+            .extend(checker.expr_types.iter().map(|(k, v)| (*k, v.clone())));
+        self.async_local_types.extend(
+            checker
+                .async_local_types
+                .iter()
+                .map(|(k, v)| (*k, v.clone())),
+        );
+        self.enum_variant_resolutions.extend(
+            checker
+                .enum_variant_resolutions
+                .iter()
+                .map(|(k, v)| (*k, v.clone())),
+        );
+        self.pattern_resolutions.extend(
+            checker
+                .pattern_resolutions
+                .iter()
+                .map(|(k, v)| (*k, v.clone())),
+        );
+        self.lambda_return_types.extend(
+            checker
+                .lambda_return_types
+                .iter()
+                .map(|(k, v)| (*k, v.clone())),
+        );
+        self.lambda_fn_types
+            .extend(checker.lambda_fn_types.iter().map(|(k, v)| (*k, v.clone())));
+    }
+
     /// No-op: generic enums are now registered via `register_enum_info` from the
     /// prelude, exactly like user-defined enums.  Kept for call-site compatibility.
     pub fn register_builtin_generic_enums(&mut self) {}
@@ -1393,8 +1437,16 @@ impl Codegen {
         self.class_layouts.insert(c.name.clone(), own.clone());
         self.class_own_fields.insert(c.name.clone(), own);
         if let Some(base_path) = &c.base_class {
-            self.class_base
-                .insert(c.name.clone(), base_path.name().to_string());
+            // `TypePath::name()` deliberately returns only the final segment,
+            // which is right for diagnostics but not for backend identity. A
+            // qualified base must keep its module/alias prefix so it matches
+            // the key `declare_module` registered (`lib::Parcel`), otherwise
+            // `finalize_class_layouts` drops every inherited field (willow-b929).
+            let base_name = match base_path {
+                TypePath::Local(name) => name.clone(),
+                TypePath::Qualified(parts) => parts.join("::"),
+            };
+            self.class_base.insert(c.name.clone(), base_name);
         }
         // Assign a unique type_id for runtime dynamic dispatch. It lives at
         // offset 0 of the class DESCRIPTOR, which word 0 of every object of the

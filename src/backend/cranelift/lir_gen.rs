@@ -732,6 +732,58 @@ fn normalize_void_payloads(payloads: &mut Vec<Type>) {
     }
 }
 
+/// The name the class tables are keyed on for `name`, or `None` when nothing
+/// this compilation unit registered answers to it.
+///
+/// An entry program that says only `import shapes;` sees a module class by the
+/// BARE name the module declared — `shapes::make(1, 2)` is typed `Point` —
+/// while the tables the module unit contributed are keyed on the canonical
+/// `shapes::Point`; only an item import (`import shapes::Point;`) copies them
+/// under the short name (see `Codegen::register_item_import`). So a bare name
+/// no table answers to is retried once per known module, which is how the AST
+/// emitter has always resolved the same name (willow-0g8j.2.19). Without this
+/// the walker refused every entry function that so much as bound a module
+/// class, and the fallback was silent.
+///
+/// A name the tables already carry is never re-resolved: an entry program that
+/// declares its own `Point` means its own, whatever it imports.
+///
+/// Two DIFFERENT imported classes of the same bare name resolve to nothing,
+/// keeping the body out of the subset rather than compiling it against the
+/// wrong layout. Two spellings of the SAME class do not collide — one module
+/// imported under two access names registers `c::Point` and `checks::Point`,
+/// and they share a `type_id` because they are one runtime class, exactly as
+/// `LirTypeCtx::class_widening` relies on.
+fn resolve_class_key(
+    class_layouts: &HashMap<String, Vec<(String, Type)>>,
+    class_type_ids: &HashMap<String, i64>,
+    known_modules: &HashMap<String, String>,
+    name: &str,
+) -> Option<String> {
+    if class_layouts.contains_key(name) {
+        return Some(name.to_string());
+    }
+    // One runtime class is one `type_id`, so two spellings that carry the same
+    // id are one answer; a class with no id at all is never merged by name.
+    let same_class = |a: &str, b: &str| match (class_type_ids.get(a), class_type_ids.get(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    };
+    let mut found: Option<String> = None;
+    for module in known_modules.keys() {
+        let qualified = format!("{module}::{name}");
+        if !class_layouts.contains_key(&qualified) {
+            continue;
+        }
+        match &found {
+            Some(prev) if !same_class(prev, &qualified) => return None,
+            Some(_) => {}
+            None => found = Some(qualified),
+        }
+    }
+    found
+}
+
 impl LirTypeCtx<'_> {
     /// `class` with `Self` resolved against the enclosing class body, exactly
     /// as [`FuncGen::static_call_class_name`] resolves it at emission time
@@ -1031,16 +1083,34 @@ impl LirTypeCtx<'_> {
         self.supported_class_inner(name, &mut open)
     }
 
+    /// The name the class tables are keyed on for `name`, or `None` when
+    /// nothing this compilation unit registered answers to it. See
+    /// [`resolve_class_key`] — eligibility and emission must resolve a name the
+    /// same way or the walker admits a body the emitter then cannot key.
+    fn class_key(&self, name: &str) -> Option<String> {
+        resolve_class_key(
+            self.class_layouts,
+            self.class_type_ids,
+            self.known_modules,
+            name,
+        )
+    }
+
     fn supported_class_inner(&self, name: &str, open: &mut HashSet<String>) -> bool {
         if (self.is_interface)(name) || self.is_enum(name) {
             return false;
         }
-        let Some(layout) = self.class_layouts.get(name) else {
+        let Some(key) = self.class_key(name) else {
+            return false;
+        };
+        let Some(layout) = self.class_layouts.get(&key) else {
             return false;
         };
         // A self- or mutually-referential field (`class Node { next: Node; }`)
-        // is fine — it is the same layout — but must not recurse forever.
-        if !open.insert(name.to_string()) {
+        // is fine — it is the same layout — but must not recurse forever. Keyed
+        // on the resolved name, so the bare and qualified spellings of one
+        // class close the same cycle.
+        if !open.insert(key) {
             return true;
         }
         layout
@@ -1051,7 +1121,7 @@ impl LirTypeCtx<'_> {
     /// Whether `name` names a class — as opposed to an interface, an enum, or
     /// nothing this compilation unit registered.
     fn is_class(&self, name: &str) -> bool {
-        !(self.is_interface)(name) && !self.is_enum(name) && self.class_layouts.contains_key(name)
+        !(self.is_interface)(name) && !self.is_enum(name) && self.class_key(name).is_some()
     }
 
     /// Whether a value of class type `value` may be stored where class `target`
@@ -1077,9 +1147,12 @@ impl LirTypeCtx<'_> {
         if !self.is_class(base) || !self.is_class(sub) {
             return false;
         }
+        let (Some(base_key), Some(sub_key)) = (self.class_key(base), self.class_key(sub)) else {
+            return false;
+        };
         let (Some(base_id), Some(sub_id)) = (
-            self.class_type_ids.get(base).copied(),
-            self.class_type_ids.get(sub).copied(),
+            self.class_type_ids.get(&base_key).copied(),
+            self.class_type_ids.get(&sub_key).copied(),
         ) else {
             return false;
         };
@@ -1093,11 +1166,53 @@ impl LirTypeCtx<'_> {
             )
     }
 
-    /// [`assignable_repr`] widened by class subtyping. Use it wherever a value
+    /// [`assignable_repr`], plus the one identity a string comparison cannot
+    /// see: two spellings of the SAME class (willow-0g8j.16).
+    ///
+    /// A module's classes are keyed canonically — `declare_module` qualifies
+    /// `Point` to `geom::Point`, fields and all — and aliased back under their
+    /// bare local names while that module's bodies are compiled. So a field
+    /// declared `at: Point` reaches the walker as `geom::Point` from the layout
+    /// and as `Point` from the lowered body, and those are one type. Anything
+    /// else defers to [`assignable_repr`], including the deliberate exactness
+    /// of the collection generics.
+    fn same_repr(&self, target: &Type, value: &Type) -> bool {
+        match (target, value) {
+            (Type::Named(a), Type::Named(b)) => a == b || self.same_class(a, b),
+            (Type::Array(a), Type::Array(b)) => self.same_repr(a, b),
+            (Type::Generic(a, ta), Type::Generic(b, tb)) => {
+                a == b
+                    && ta.len() == tb.len()
+                    && ta.iter().zip(tb).all(|(x, y)| self.same_repr(x, y))
+            }
+            _ => assignable_repr(target, value),
+        }
+    }
+
+    /// Whether two class names name one runtime class. One class is one
+    /// `type_id`, which is what the bare alias copies from the canonical entry,
+    /// so the ids answer this even though the strings differ.
+    fn same_class(&self, a: &str, b: &str) -> bool {
+        if !self.is_class(a) || !self.is_class(b) {
+            return false;
+        }
+        let (Some(ka), Some(kb)) = (self.class_key(a), self.class_key(b)) else {
+            return false;
+        };
+        if ka == kb {
+            return true;
+        }
+        matches!(
+            (self.class_type_ids.get(&ka), self.class_type_ids.get(&kb)),
+            (Some(x), Some(y)) if x == y
+        )
+    }
+
+    /// [`Self::same_repr`] widened by class subtyping. Use it wherever a value
     /// flows into a declared slot whose type the emitter does NOT coerce to —
     /// an array element, a `return`, a field store, a branch of an `if`.
     fn repr_compatible(&self, target: &Type, value: &Type) -> bool {
-        assignable_repr(target, value)
+        self.same_repr(target, value)
             || self.class_widening(target, value)
             || self.iface_widen_offset(target, value) == Some(0)
     }
@@ -1125,6 +1240,14 @@ impl LirTypeCtx<'_> {
     /// uses through [`FuncGen::plan_virtual_call`]; answering `None` here is
     /// what keeps a call the emitter could not resolve out of the subset.
     fn resolve_class_method(&self, class: &str, method: &str) -> Option<String> {
+        // Deliberately NOT run through [`resolve_class_key`]: emission resolves
+        // a method through `FuncGen::resolve_defining_class` and
+        // `plan_virtual_call`, which key on the class name AS WRITTEN, so
+        // admitting a bare module-class receiver here would promise a dispatch
+        // the emitter cannot resolve. Nothing is lost — the checker rejects
+        // `p.m()` on a module class the entry file never item-imported
+        // (E0350), and an item import puts the short name in the tables
+        // (willow-0g8j.2.19).
         let mut search = Some(class.to_string());
         let mut seen: HashSet<String> = HashSet::new();
         while let Some(name) = search {
@@ -1146,7 +1269,7 @@ impl LirTypeCtx<'_> {
         if !self.supported_class(name) {
             return None;
         }
-        self.class_layouts.get(name)
+        self.class_layouts.get(&self.class_key(name)?)
     }
 
     /// The declared `fn(...) -> ...` type of a symbol that is about to be used
@@ -1428,7 +1551,10 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
     // and the same class the emitter sets as `FuncGen::current_class`.
     let ctx = &LirTypeCtx {
         return_type: &f.return_type,
-        self_class: f.name.split_once("::").map(|(class, _)| class),
+        // `rsplit`, not `split`: a module class is keyed by its qualified
+        // name, so the method `shapes::Point::area` has `shapes::Point` as its
+        // class and only the LAST separator divides the two (willow-0g8j.16).
+        self_class: f.name.rsplit_once("::").map(|(class, _)| class),
         ..*ctx
     };
     if !ctx.supported_type(&f.return_type) {
@@ -2088,7 +2214,9 @@ fn super_init_rejection<'e>(
     ctx: &LirTypeCtx<'_>,
     names: &HashMap<&'e str, Cow<'e, Type>>,
 ) -> Option<String> {
-    let class = match f.name.split_once("::") {
+    // The last separator divides class from method: a module class carries its
+    // own `module::` qualification (willow-0g8j.16).
+    let class = match f.name.rsplit_once("::") {
         Some((class, _)) => class,
         // Not a method at all: the emitter's `current_class` would be `None`
         // and it would evaluate the arguments and store nothing.
@@ -2309,7 +2437,7 @@ fn supported_pattern<'n>(
         HirPattern::Binding { name, ty } => {
             // The binding aliases the whole scrutinee, so it must hold the same
             // machine representation — no widening, no boxing.
-            if !assignable_repr(ty, scrutinee_ty) || !ctx.supported_type(ty) {
+            if !ctx.same_repr(ty, scrutinee_ty) || !ctx.supported_type(ty) {
                 return false;
             }
             names.insert(name.as_str(), Cow::Borrowed(ty));
@@ -2352,7 +2480,7 @@ fn supported_pattern<'n>(
             // to match the slot's representation rather than merely be
             // storable into it.
             for (slot, (name, ty)) in v.payloads.iter().zip(bindings) {
-                if !assignable_repr(ty, slot) || !ctx.supported_type(ty) {
+                if !ctx.same_repr(ty, slot) || !ctx.supported_type(ty) {
                     return false;
                 }
                 names.insert(name.as_str(), Cow::Borrowed(ty));
@@ -2929,7 +3057,7 @@ fn supported_match<'n>(
         let [HirStmt::Expr(value)] = arm.body.as_slice() else {
             return false;
         };
-        assignable_repr(&e.ty, &value.ty) && supported_expr(value, ctx, &arm_names)
+        ctx.same_repr(&e.ty, &value.ty) && supported_expr(value, ctx, &arm_names)
     })
 }
 
@@ -2988,6 +3116,54 @@ fn supported_body_stmt<'n>(
             };
             !lir_expr_suspends(value)
                 && ctx.storable(&declared, &value.ty)
+                && supported_expr(value, ctx, names)
+        }
+        // The same checked heap store as a function-level
+        // `LirInst::FieldAssign`. Bracketed HIR islands can mutate an object
+        // without forcing the whole function back to the AST emitter
+        // (willow-wene). Deferred bodies retain their existing restricted
+        // statement subset.
+        HirStmt::FieldAssign {
+            object,
+            field,
+            value,
+            ..
+        } => {
+            let Some(field_ty) = ctx
+                .class_layout_of(&object.ty)
+                .and_then(|layout| layout.iter().find(|(name, _)| name == field))
+                .map(|(_, ty)| ty)
+            else {
+                return false;
+            };
+            scope == BodyScope::Bracketed
+                && !lir_expr_suspends(object)
+                && !lir_expr_suspends(value)
+                && ctx.storable(field_ty, &value.ty)
+                && supported_expr(object, ctx, names)
+                && supported_expr(value, ctx, names)
+        }
+        // `Class::prop = value;` inside a body the walker keeps as an HIR
+        // island — a `defer` block, a `match` arm, a `select` case
+        // (willow-0g8j.15). Vetted exactly as the function-level
+        // `LirInst::StaticFieldAssign` is, and admitted in EITHER scope: the
+        // store's destination is a data segment, so unlike a `let` it needs no
+        // storage of its own, which is the only thing a deferred body cannot
+        // give a statement.
+        HirStmt::StaticFieldAssign {
+            class,
+            field,
+            value,
+            ..
+        } => {
+            // `Self::prop` resolves against the enclosing class, as
+            // `emit_lir_static_field_assign` resolves it (willow-0g8j.13).
+            let Some(field_ty) = (ctx.static_field)(ctx.resolved_class(class), field) else {
+                return false;
+            };
+            !lir_expr_suspends(value)
+                && ctx.supported_type(&field_ty)
+                && ctx.storable(&field_ty, &value.ty)
                 && supported_expr(value, ctx, names)
         }
         HirStmt::Let {
@@ -3236,7 +3412,7 @@ fn supported_expr<'n>(
         HirExprKind::Str(_) => true,
         HirExprKind::Var(name) => names.contains_key(name.as_str()),
         HirExprKind::ReferenceArg { place } => {
-            assignable_repr(&place.ty, &e.ty) && supported_reference_place(place, ctx, names)
+            ctx.same_repr(&place.ty, &e.ty) && supported_reference_place(place, ctx, names)
         }
         // A named function used as a value (willow-0g8j.2.2). The declared
         // signature must be the type this expression carries: the pointer is
@@ -3279,8 +3455,8 @@ fn supported_expr<'n>(
             then_expr,
             else_expr,
         } => {
-            assignable_repr(&e.ty, &then_expr.ty)
-                && assignable_repr(&e.ty, &else_expr.ty)
+            ctx.same_repr(&e.ty, &then_expr.ty)
+                && ctx.same_repr(&e.ty, &else_expr.ty)
                 && supported_expr(condition, ctx, names)
                 && supported_expr(then_expr, ctx, names)
                 && supported_expr(else_expr, ctx, names)
@@ -3302,7 +3478,7 @@ fn supported_expr<'n>(
                 let Type::Fn(params, ret) = local.as_ref() else {
                     return false;
                 };
-                return assignable_repr(ret, &e.ty)
+                return ctx.same_repr(ret, &e.ty)
                     && params.len() == args.len()
                     && args
                         .iter()
@@ -3360,7 +3536,7 @@ fn supported_expr<'n>(
                     Some((LirCollection::FrozenArray, _))
                 );
             indexable
-                && assignable_repr(&array_element_type(&array.ty), &e.ty)
+                && ctx.same_repr(&array_element_type(&array.ty), &e.ty)
                 && supported_expr(array, ctx, names)
                 && supported_expr(index, ctx, names)
         }
@@ -3422,7 +3598,7 @@ fn supported_expr<'n>(
             }
             ctx.class_layout_of(&object.ty)
                 .and_then(|l| l.iter().find(|(n, _)| n == field))
-                .is_some_and(|(_, fty)| assignable_repr(fty, &e.ty))
+                .is_some_and(|(_, fty)| ctx.same_repr(fty, &e.ty))
                 && supported_expr(object, ctx, names)
         }
         // The builtin array methods the walker emits, plus a direct call to a
@@ -3462,7 +3638,7 @@ fn supported_expr<'n>(
             Type::Generic(..) if ctx.supported_enum_type(&object.ty) => {
                 let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
                 option_result_method(&object.ty, method, &arg_tys)
-                    .is_some_and(|ret| assignable_repr(&ret, &e.ty))
+                    .is_some_and(|ret| ctx.same_repr(&ret, &e.ty))
                     && supported_expr(object, ctx, names)
                     && args.iter().all(|a| supported_expr(a, ctx, names))
             }
@@ -3491,7 +3667,7 @@ fn supported_expr<'n>(
                 if builtin_types::resolve(&object.ty)
                     .is_some_and(|resolved| matches!(resolved.id, B::Task | B::JoinHandle))
                     && task_handle_method(&object.ty, method, args.len())
-                        .is_some_and(|ret| assignable_repr(&ret, &e.ty)) =>
+                        .is_some_and(|ret| ctx.same_repr(&ret, &e.ty)) =>
             {
                 args.is_empty() && supported_expr(object, ctx, names)
             }
@@ -3505,8 +3681,8 @@ fn supported_expr<'n>(
                 let Some((_, ret)) = blocking_cell_method(&object.ty, method, args.len()) else {
                     return false;
                 };
-                assignable_repr(&ret, &e.ty)
-                    && args.iter().all(|a| assignable_repr(elem, &a.ty))
+                ctx.same_repr(&ret, &e.ty)
+                    && args.iter().all(|a| ctx.same_repr(elem, &a.ty))
                     && supported_expr(object, ctx, names)
                     && args.iter().all(|a| supported_expr(a, ctx, names))
             }
@@ -3526,7 +3702,7 @@ fn supported_expr<'n>(
                     (LirCollection::Map | LirCollection::FrozenMap, "contains") => {
                         args.len() == 1
                             && e.ty == Type::Bool
-                            && assignable_repr(&targs[0], &args[0].ty)
+                            && ctx.same_repr(&targs[0], &args[0].ty)
                     }
                     // `get` yields `Option<V>` over the map's OWN value type —
                     // checked rather than assumed, because the runtime picks
@@ -3534,14 +3710,14 @@ fn supported_expr<'n>(
                     // passes the choice across the ABI (willow-0g8j.2.1).
                     (LirCollection::Map | LirCollection::FrozenMap, "get") => {
                         args.len() == 1
-                            && assignable_repr(&targs[0], &args[0].ty)
+                            && ctx.same_repr(&targs[0], &args[0].ty)
                             && matches!(&e.ty, Type::Generic(..)
                                 if builtin_types::unary_arg(&e.ty, B::Option) == Some(&targs[1]))
                             && ctx.supported_type(&e.ty)
                     }
                     (LirCollection::Map, "insert") => {
                         args.len() == 2
-                            && assignable_repr(&targs[0], &args[0].ty)
+                            && ctx.same_repr(&targs[0], &args[0].ty)
                             && ctx.storable(&targs[1], &args[1].ty)
                     }
                     // Rendered in the runtime, which knows only the four
@@ -3573,7 +3749,7 @@ fn supported_expr<'n>(
                 let Some((_, ret)) = cancellation_method(&object.ty, method, args) else {
                     return false;
                 };
-                assignable_repr(&ret, &e.ty)
+                ctx.same_repr(&ret, &e.ty)
                     && supported_expr(object, ctx, names)
                     && args.iter().all(|a| supported_expr(a, ctx, names))
             }
@@ -3587,7 +3763,7 @@ fn supported_expr<'n>(
                 let Some((_, ret)) = atomic_method(&object.ty, method, args.len()) else {
                     return false;
                 };
-                assignable_repr(&ret, &e.ty)
+                ctx.same_repr(&ret, &e.ty)
                     && args.iter().all(|a| a.ty == cell.word())
                     && supported_expr(object, ctx, names)
                     && args.iter().all(|a| supported_expr(a, ctx, names))
@@ -3607,7 +3783,7 @@ fn supported_expr<'n>(
                 let ret_ok = if matches!(&sig.ret, Type::Named(n) if n == "Self") {
                     matches!(&e.ty, Type::Named(n) if n == iface)
                 } else {
-                    assignable_repr(&sig.ret, &e.ty)
+                    ctx.same_repr(&sig.ret, &e.ty)
                 };
                 ret_ok
                     && sig.params.len() == args.len()
@@ -3632,7 +3808,7 @@ fn supported_expr<'n>(
                 let ret_ok = if matches!(&sig.ret, Type::Named(n) if n == "Self") {
                     sig.ret == e.ty
                 } else {
-                    assignable_repr(&sig.ret, &e.ty)
+                    ctx.same_repr(&sig.ret, &e.ty)
                 };
                 ret_ok
                     && sig.params.len() == args.len()
@@ -3762,7 +3938,7 @@ fn supported_expr<'n>(
                 && method == "new"
                 && class == kind.class_name()
             {
-                return matches!(args.as_slice(), [a] if assignable_repr(elem, &a.ty))
+                return matches!(args.as_slice(), [a] if ctx.same_repr(elem, &a.ty))
                     && supported_expr(&args[0], ctx, names);
             }
             // `Mutex<T>::new(v)` / `RwLock<T>::new(v)` (willow-0g8j.2.13).
@@ -3773,7 +3949,7 @@ fn supported_expr<'n>(
                 && method == "new"
                 && matches!(class, "Mutex" | "RwLock")
             {
-                return matches!(args.as_slice(), [a] if assignable_repr(protected, &a.ty))
+                return matches!(args.as_slice(), [a] if ctx.same_repr(protected, &a.ty))
                     && supported_expr(&args[0], ctx, names);
             }
             // `CancellationToken::new()` / `TaskScope::new()`
@@ -3812,7 +3988,7 @@ fn supported_expr<'n>(
                 let mangled = module_item_symbol(module_prefix, method);
                 return ctx.callable(&mangled, args, false)
                     && ctx.fn_types.get(&mangled).is_some_and(
-                        |t| matches!(t, Type::Fn(_, ret) if assignable_repr(ret, &e.ty)),
+                        |t| matches!(t, Type::Fn(_, ret) if ctx.same_repr(ret, &e.ty)),
                     )
                     && args.iter().all(|a| supported_expr(a, ctx, names));
             }
@@ -3851,7 +4027,7 @@ fn supported_expr<'n>(
                 && ctx
                     .fn_types
                     .get(&mangled)
-                    .is_some_and(|t| matches!(t, Type::Fn(_, ret) if assignable_repr(ret, &e.ty)))
+                    .is_some_and(|t| matches!(t, Type::Fn(_, ret) if ctx.same_repr(ret, &e.ty)))
                 && args.iter().all(|a| supported_expr(a, ctx, names))
         }
         // `start..end` as a VALUE (willow-0g8j.2.10). The bounds are the two
@@ -3893,7 +4069,7 @@ fn supported_expr<'n>(
                     // read past it. The emitter loads nothing in that case, and
                     // the node's own `void` type is what says so.
                     Type::Void => resolved.id == B::Result && e.ty == Type::Void,
-                    _ => assignable_repr(payload, &e.ty),
+                    _ => ctx.same_repr(payload, &e.ty),
                 })
                 && supported_expr(inner, ctx, names)
         }
@@ -3985,15 +4161,15 @@ fn supported_reference_place<'n>(
     match &place.kind {
         HirExprKind::Var(name) => names
             .get(name.as_str())
-            .is_some_and(|bound| assignable_repr(bound, &place.ty)),
+            .is_some_and(|bound| ctx.same_repr(bound, &place.ty)),
         HirExprKind::FieldAccess { object, field } => {
             ctx.class_layout_of(&object.ty)
                 .and_then(|layout| layout.iter().find(|(name, _)| name == field))
-                .is_some_and(|(_, ty)| assignable_repr(ty, &place.ty))
+                .is_some_and(|(_, ty)| ctx.same_repr(ty, &place.ty))
                 && supported_expr(object, ctx, names)
         }
         HirExprKind::Index { array, index } => {
-            matches!(&array.ty, Type::Array(elem) if assignable_repr(elem, &place.ty))
+            matches!(&array.ty, Type::Array(elem) if ctx.same_repr(elem, &place.ty))
                 && index.ty == Type::I64
                 && supported_expr(array, ctx, names)
                 && supported_expr(index, ctx, names)
@@ -4941,6 +5117,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             if is_gc_managed(&local.ty, self.enum_infos) {
                 self.bind_lir_rooted_slot(&local.name, &local.ty, &mut null);
+                continue;
+            }
+            if self.address_taken.contains(local.name.as_str()) {
+                // Pattern/merge locals are written later by `MatchBind` or an
+                // assignment. Give an address-taken one its definitive slot at
+                // function entry so no `&` use inserts path-local promotion.
+                let clif = clif_type(&local.ty);
+                let zero = if clif == types::F64 {
+                    self.builder.ins().f64const(0.0)
+                } else {
+                    self.builder.ins().iconst(clif, 0)
+                };
+                let storage = self.create_local_stack_slot(&local.ty, zero);
+                self.vars.insert(local.name.clone(), storage);
                 continue;
             }
             // Seeded so a path that reads the local without having run its
@@ -6121,9 +6311,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             // Assignment to an enclosing name needs no storage of its own, so
             // it is emittable even where nothing brackets the root depth, and an
-            // `if` around one is too. A `let` is not, which is what
-            // [`BodyScope::Deferred`] refuses.
-            HirStmt::Assign { .. } | HirStmt::If { .. } => self.emit_lir_body_stmt(stmt),
+            // `if` around one is too. So is a store into a class's static
+            // property, whose destination is a data segment (willow-0g8j.15).
+            // A `let` is not, which is what [`BodyScope::Deferred`] refuses.
+            HirStmt::Assign { .. } | HirStmt::If { .. } | HirStmt::StaticFieldAssign { .. } => {
+                self.emit_lir_body_stmt(stmt)
+            }
             _ => unreachable!("unsupported deferred HIR statement reached emission"),
         }
     }
@@ -6998,6 +7191,24 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let val = self.emit_lir_store_value(value, &target);
                 self.store_var(&storage, val);
             }
+            HirStmt::FieldAssign {
+                object,
+                field,
+                value,
+                ..
+            } => {
+                self.fault_site_span = Some(value.span);
+                self.emit_lir_field_assign(object, field, value);
+            }
+            HirStmt::StaticFieldAssign {
+                class,
+                field,
+                value,
+                ..
+            } => {
+                self.fault_site_span = Some(value.span);
+                self.emit_lir_static_field_assign(class, field, value);
+            }
             HirStmt::If {
                 cond,
                 then_branch,
@@ -7143,8 +7354,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// may declare a local whether or not the pattern binds anything
     /// (willow-0g8j.2.13).
     ///
-    /// A GC-managed binding gets a ROOTED STACK SLOT; anything else keeps a
-    /// plain Cranelift variable.
+    /// A GC-managed binding gets a ROOTED STACK SLOT. An address-taken scalar
+    /// gets an unrooted slot at the binding; anything else keeps a plain
+    /// Cranelift variable (willow-0g8j.12).
     ///
     /// Rooting the scrutinee is not enough (willow-10zt). The minor collector
     /// promotes a DIRECT root in place, which is what makes an SSA alias of one
@@ -7168,9 +7380,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         pattern: &HirPattern,
     ) {
         for (name, ty, val) in self.lir_pattern_binding_values(scrutinee, scrutinee_ty, pattern) {
-            let storage = if is_gc_managed(&ty, self.enum_infos) {
+            let rooted = is_gc_managed(&ty, self.enum_infos);
+            let storage = if rooted || self.address_taken.contains(name.as_str()) {
                 let storage = self.create_local_stack_slot(&ty, val);
-                if let VarStorage::Stack { slot, .. } = &storage {
+                if rooted && let VarStorage::Stack { slot, .. } = &storage {
                     self.emit_push_root_slot(*slot);
                 }
                 storage
@@ -7505,8 +7718,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn lir_class_layout(&self, ty: &Type) -> Vec<(String, Type)> {
         let class =
             class_name_for_object_type(ty).expect("class receiver type vetted by LIR eligibility");
+        // Resolved exactly as eligibility resolved it, so a bare module class
+        // name reaches the layout the module registered (willow-0g8j.2.19).
+        let key = resolve_class_key(
+            self.class_layouts,
+            self.class_type_ids,
+            self.known_modules,
+            &class,
+        )
+        .expect("class layout vetted by LIR eligibility");
         self.class_layouts
-            .get(&class)
+            .get(&key)
             .cloned()
             .expect("class layout vetted by LIR eligibility")
     }
@@ -8222,9 +8444,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 panic!("eligible LIR module call `{class}::{method}` has no declared function")
             });
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            // No call-stack frame is pushed here, because the AST path's module
-            // branch pushes none either (willow-0g8j.2.20): a debug panic trace must
-            // not depend on which emitter compiled the caller.
+            // Named as the source spells the call, exactly as the AST path's
+            // module branch names it: a debug panic trace must not depend on
+            // which emitter compiled the caller (willow-0g8j.2.20).
+            let pushed = self.emit_callstack_push(&user_callee, span);
             let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
             let call = self.builder.ins().call(fref, &arg_vals);
             let result = self
@@ -8233,6 +8456,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .first()
                 .copied()
                 .unwrap_or_else(|| self.builder.ins().iconst(clif_type(ret_ty), 0));
+            if pushed {
+                self.emit_callstack_pop();
+            }
             if has_reference_args {
                 self.emit_debug_reference_call_clear();
             }

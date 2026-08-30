@@ -737,9 +737,10 @@ fn main() {
         ),
     ];
     // A debug panic report must not depend on which emitter compiled the
-    // caller. The AST path pushes no call-stack frame for a module call
-    // (willow-0g8j.2.20), so the walker pushes none either; when that is fixed
-    // both sides gain the frame together and this still holds.
+    // caller. Both paths now push a call-stack frame naming the module call as
+    // the source spells it (willow-0g8j.2.20); the frames themselves are
+    // covered in `module_call_frames.rs`, and what this asserts is that the two
+    // emitters produce one report.
     let mut reports = Vec::new();
     for env in [&AST[..], &LIR[..]] {
         let (ok, stderr) = compile_temp_project_with_env_run_stderr(&files, "main.wi", env);

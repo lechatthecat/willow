@@ -59,9 +59,23 @@ mod lir_main_result;
 mod lir_module_calls;
 #[path = "integration/lir_namespace_aliases.rs"]
 mod lir_namespace_aliases;
+#[path = "integration/lir_self_statics.rs"]
+mod lir_self_statics;
+#[path = "integration/lir_static_property_bodies.rs"]
+mod lir_static_property_bodies;
+
+#[path = "integration/module_lir_bodies.rs"]
+mod module_lir_bodies;
+
 #[path = "integration/missing_return.rs"]
 mod missing_return;
+#[path = "integration/module_checker_tables.rs"]
+mod module_checker_tables;
 
+#[path = "integration/module_call_frames.rs"]
+mod module_call_frames;
+#[path = "integration/module_class_values.rs"]
+mod module_class_values;
 #[path = "integration/module_typecheck.rs"]
 mod module_typecheck;
 

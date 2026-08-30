@@ -706,10 +706,36 @@ impl TestProject {
         command.output().expect("failed to run compiler")
     }
 
+    /// [`Self::compile`] with `--release`, for a perspective that must hold in
+    /// the build mode carrying none of the debug instrumentation.
+    pub(super) fn compile_release(&self, entry: &str) -> std::process::Output {
+        let src_path = self.root.join(entry);
+        Command::new(env!("CARGO_BIN_EXE_willowc"))
+            .args([
+                "build",
+                path_str(&src_path),
+                "-o",
+                path_str(&self.bin_path),
+                "--release",
+            ])
+            .output()
+            .expect("failed to run compiler")
+    }
+
     pub(super) fn run(&self) -> std::process::Output {
         Command::new(&self.bin_path)
             .output()
             .expect("failed to run binary")
+    }
+
+    /// [`TestProject::run`] with extra environment variables on the child, for
+    /// a runtime-only setting such as `WILLOW_GC_STRESS`.
+    pub(super) fn run_with_env(&self, env: &[(&str, &str)]) -> std::process::Output {
+        let mut command = Command::new(&self.bin_path);
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        command.output().expect("failed to run binary")
     }
 
     /// Size in bytes of the executable the last compile produced.
@@ -774,6 +800,31 @@ pub(super) fn compile_temp_project_with_env_and_run(
     (String::from_utf8_lossy(&out.stdout).into_owned(), true)
 }
 
+/// [`compile_temp_project_with_env_and_run`] that also passes environment
+/// variables to the RUN. A project's binary inherits the test process's
+/// environment, so a runtime-only variable (`WILLOW_GC_STRESS`) has to be set
+/// on the child itself; passing it to the compiler alone stresses nothing.
+pub(super) fn compile_temp_project_with_env_and_run_under(
+    files: &[(&str, &str)],
+    entry: &str,
+    compile_env: &[(&str, &str)],
+    run_env: &[(&str, &str)],
+) -> (String, bool) {
+    let project = TestProject::new("project_under_test", files);
+    let output = project.compile_with_env(entry, compile_env);
+
+    if !output.status.success() {
+        return (String::from_utf8_lossy(&output.stderr).into_owned(), false);
+    }
+
+    let out = project.run_with_env(run_env);
+
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.success(),
+    )
+}
+
 /// [`compile_temp_project_with_env_and_run`] for tests that read the COMPILER's
 /// stderr on a SUCCESSFUL build — a `WILLOW_LIR_LOG=1` coverage assertion, where
 /// the interesting output is the backend's selection log rather than the
@@ -802,6 +853,24 @@ pub(super) fn compile_temp_project_with_env_run_stderr(
 ) -> (bool, String) {
     let project = TestProject::new("project_run_err_test", files);
     let output = project.compile_with_env(entry, env);
+    if !output.status.success() {
+        return (false, String::from_utf8_lossy(&output.stderr).into_owned());
+    }
+
+    let out = project.run();
+
+    (true, String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// [`compile_temp_project_with_env_run_stderr`] for a `--release` build.
+/// Returns `(ran_ok, the program's STDERR)`, which is where a panic report is
+/// written — with none of the instrumentation a debug build adds to it.
+pub(super) fn compile_temp_project_release_run_stderr(
+    files: &[(&str, &str)],
+    entry: &str,
+) -> (bool, String) {
+    let project = TestProject::new("project_release_err_test", files);
+    let output = project.compile_release(entry);
     if !output.status.success() {
         return (false, String::from_utf8_lossy(&output.stderr).into_owned());
     }

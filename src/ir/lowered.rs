@@ -768,6 +768,48 @@ fn body_suspends(body: &[HirStmt]) -> bool {
     })
 }
 
+/// Does this body contain a statement that cannot remain inside a match arm's
+/// HIR island? Lowering the enclosing match into the LIR graph lets the normal
+/// statement path own place stores and defer scopes as well as loop blocks,
+/// resolving `break`/`continue` against the loop stack active at the match site
+/// (willow-o3xi).
+fn body_needs_match_cfg(body: &[HirStmt]) -> bool {
+    body.iter().any(stmt_needs_match_cfg)
+}
+
+fn stmt_needs_match_cfg(stmt: &HirStmt) -> bool {
+    match stmt {
+        HirStmt::While { .. }
+        | HirStmt::For { .. }
+        | HirStmt::Break { .. }
+        | HirStmt::Continue { .. }
+        | HirStmt::Defer { .. }
+        | HirStmt::IndexAssign { .. }
+        | HirStmt::StaticFieldAssign { .. } => true,
+        HirStmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            body_needs_match_cfg(then_branch)
+                || else_branch.as_deref().is_some_and(body_needs_match_cfg)
+        }
+        HirStmt::Lock { body, .. } => body_needs_match_cfg(body),
+        _ => stmt.child_exprs().into_iter().any(expr_needs_match_cfg),
+    }
+}
+
+fn expr_needs_match_cfg(expr: &HirExpr) -> bool {
+    match &expr.kind {
+        HirExprKind::Match { scrutinee, arms } => {
+            expr_needs_match_cfg(scrutinee)
+                || arms.iter().any(|arm| body_needs_match_cfg(&arm.body))
+        }
+        HirExprKind::Lambda { .. } => false,
+        _ => expr.children().into_iter().any(expr_needs_match_cfg),
+    }
+}
+
 /// The names a pattern binds, with the type each is bound at, in the order the
 /// emitter destructures them (willow-0g8j.2.11.1).
 ///
@@ -1192,11 +1234,11 @@ impl Builder {
         value: &HirExpr,
         destination: Option<LirLocalId>,
     ) -> Option<Option<HirExpr>> {
+        if let Some(lowered) = self.lower_match_arms_cfg(value, destination) {
+            return Some(lowered);
+        }
         if !self.is_async {
             return None;
-        }
-        if let Some(lowered) = self.lower_match_arms_suspend(value, destination) {
-            return Some(lowered);
         }
         let operation = match &value.kind {
             HirExprKind::Await { inner } => {
@@ -1274,8 +1316,9 @@ impl Builder {
         Some(destination.map(|local| self.local_expr(local, value.span)))
     }
 
-    /// Split a `match` whose arm suspends into an explicit dispatch chain
-    /// (willow-0g8j.2.11.1).
+    /// Split a `match` whose arm suspends or needs structural statement
+    /// lowering into an explicit dispatch chain (willow-0g8j.2.11.1,
+    /// willow-o3xi).
     ///
     /// `match` is an HIR EXPRESSION and stays a tree through lowering, so an
     /// `await`, a channel operation or a `select` written inside an arm would
@@ -1284,13 +1327,14 @@ impl Builder {
     /// per arm body, and a merge — so the arm body is lowered by the ordinary
     /// statement path and its suspension splits like any other.
     ///
-    /// Deliberately narrow: a `match` no arm of which suspends stays a tree and
-    /// keeps the existing emission. This is the same shape
-    /// [`Builder::lower_conditional_branches`] gives a ternary, one arm wider.
+    /// Deliberately narrow: a `match` whose arms neither suspend nor need this
+    /// structural path stays a tree and keeps the existing emission. This is
+    /// the same shape [`Builder::lower_conditional_branches`] gives a ternary,
+    /// one arm wider.
     ///
     /// `None` when this is not such a `match`; otherwise the value the caller
     /// should use, which is `None` for a `void` match.
-    fn lower_match_arms_suspend(
+    fn lower_match_arms_cfg(
         &mut self,
         value: &HirExpr,
         destination: Option<LirLocalId>,
@@ -1298,7 +1342,9 @@ impl Builder {
         let HirExprKind::Match { scrutinee, arms } = &value.kind else {
             return None;
         };
-        if !arms.iter().any(|arm| body_suspends(&arm.body)) {
+        if !arms.iter().any(|arm| {
+            body_needs_match_cfg(&arm.body) || (self.is_async && body_suspends(&arm.body))
+        }) {
             return None;
         }
 

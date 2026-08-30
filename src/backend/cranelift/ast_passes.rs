@@ -650,6 +650,11 @@ pub(crate) fn collect_lambdas_in_expr(
     }
 }
 
+/// Every member name a debug build may have to name at runtime: the field and
+/// method names a nil check reports, plus the callee names a call-stack frame
+/// carries. Both are emitted as static bytes, so a name missing from this set
+/// has no data segment to point at and the site that wanted it is silently
+/// skipped.
 pub(crate) fn collect_nil_check_names(program: &Program) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     for item in &program.items {
@@ -777,6 +782,15 @@ pub(crate) fn collect_nil_check_names_in_expr(
         Expr::Print(e, _, _) => collect_nil_check_names_in_expr(e, out),
         Expr::Await(a) => collect_nil_check_names_in_expr(&a.expr, out),
         Expr::StaticCall(s) => {
+            // A module call's call-stack frame is named as the source spells
+            // it — `checks::checked`, the whole path — and no declaration walk
+            // produces that string: the module declares `checked`, the caller
+            // declares its own items, and nothing spells the pair. Without it
+            // the frame was silently dropped and a panic inside an imported
+            // function reported nothing (willow-0g8j.2.20). A class static's
+            // frame is named by the bare method, which the class's own unit
+            // already declares.
+            out.insert(format!("{}::{}", s.class, s.method));
             for arg in &s.args {
                 collect_nil_check_names_in_expr(&arg.expr, out);
             }

@@ -34,7 +34,7 @@
 //! a place the callee had already given back. Perspectives 30, 31 and 32 are
 //! that fix (willow-0g8j.11).
 //!
-//! 32 perspectives:
+//! 34 perspectives:
 //!   1 `&mut i64` writes back            17 a reference call in one arm
 //!   2 `&` reads without writing         18 a String reference under GC
 //!   3 `&mut bool`                       19 `&` of a value parameter
@@ -51,6 +51,8 @@
 //!  14 interface dispatch                30 a panic under interface dispatch
 //!  15 virtual dispatch                  31 a panic after interface dispatch
 //!  16 a reference call in a loop        32 a panic after virtual dispatch
+//!                                        33 an enum binding reference after a loop
+//!                                        34 a whole binding reference in a branch
 
 use super::support::{compile_and_run_with_env, compile_with_compiler_env};
 
@@ -771,4 +773,50 @@ fn reference_args_32_a_panic_after_virtual_dispatch_reports_no_reference() {
             "the reference context outlived the virtual call it described:\n{out}"
         );
     }
+}
+
+// 33. A payload binding is declared at arm entry. The loop makes this match use
+//     structural LIR lowering; the two branches then prove its slot was
+//     initialised before either reference site rather than inside the first one.
+#[test]
+fn reference_args_33_an_enum_binding_reference_in_a_loop() {
+    assert_reference_args(
+        "enum Number { One(i64), Empty }\n\
+         fn read(value: & i64) -> i64 { return value; }\n\
+         fn update(number: Number, first: bool) -> i64 {\n\
+        \x20   match number {\n\
+        \x20       Number::One(n) => {\n\
+        \x20           let mut i = 0;\n\
+        \x20           while i < 1 { i = i + 1; }\n\
+        \x20           let mut out = 0;\n\
+        \x20           if first { out = read(&n); } else { out = read(&n) + read(&n); }\n\
+        \x20           return out;\n\
+        \x20       }\n\
+        \x20       Number::Empty => { return -1; }\n\
+        \x20   }\n\
+         }\n\
+         fn main() { println(update(Number::One(7), true)); println(update(Number::One(7), false)); }\n",
+        "7\n14\n",
+        &["update", "read", "main"],
+    );
+}
+
+// 34. A whole-value binding carries the scrutinee's real type. The two branch
+//     emitters must see one slot created at that binding, rather than whichever
+//     branch containing `&value` happened to be emitted first.
+#[test]
+fn reference_args_34_a_whole_binding_reference_in_a_branch() {
+    assert_reference_args(
+        "fn read(value: & bool) -> bool { return value; }\n\
+         fn update(start: bool, once: bool) -> bool {\n\
+        \x20   match start {\n\
+        \x20       value => {\n\
+        \x20           if once { return read(&value); } else { return read(&value) && read(&value); }\n\
+        \x20       }\n\
+        \x20   }\n\
+         }\n\
+         fn main() { println(update(true, true)); println(update(true, false)); }\n",
+        "true\ntrue\n",
+        &["update", "read", "main"],
+    );
 }

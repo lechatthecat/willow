@@ -1,0 +1,130 @@
+// The module half of module_lir_bodies. Every body in this file compiles from
+// lowered IR (willow-0g8j.16); before that, an imported module's bodies were
+// AST-emitted unconditionally, because only the entry program was ever lowered.
+module shapes;
+
+import std::collections::Array;
+
+pub enum Kind {
+    Round,
+    Boxy(i64),
+}
+
+pub open class Shape {
+    pub name: String;
+
+    pub open fn area(self) -> i64 {
+        return 0;
+    }
+
+    pub fn label(self) -> String {
+        return self.name;
+    }
+}
+
+pub class Rect extends Shape {
+    pub w: i64;
+    pub h: i64;
+
+    pub override fn area(self) -> i64 {
+        return self.w * self.h;
+    }
+}
+
+// A field of a class type is where the two spellings of one module class meet:
+// the declared layout says `shapes::Rect`, this module's own bodies say `Rect`.
+pub class Frame {
+    pub title: String;
+    pub inner: Rect;
+    pub marks: Array<i64>;
+}
+
+pub fn rect(w: i64, h: i64) -> Rect {
+    return new Rect("rect", w, h);
+}
+
+// A `defer` in a module body, made observable through a reference parameter:
+// the tally lands after the body has already returned.
+pub fn tally(w: i64, h: i64, total: &mut i64) -> i64 {
+    defer {
+        total = total + w * h;
+    }
+    return w * h;
+}
+
+// A virtual call inside a module body: the vtable slot resolves against the
+// module's own class hierarchy.
+pub fn area_of(s: Shape) -> i64 {
+    return s.area();
+}
+
+// Widening a subclass to its base is a MODULE-side operation: the entry file
+// cannot spell either class, and the checker refuses the conversion across the
+// module boundary (E0201).
+pub fn area_of_rect(r: Rect) -> i64 {
+    return area_of(r);
+}
+
+pub fn round() -> Kind {
+    return Kind::Round;
+}
+
+pub fn boxy(n: i64) -> Kind {
+    return Kind::Boxy(n);
+}
+
+pub fn framed(title: String, w: i64, h: i64) -> Frame {
+    return new Frame(title, rect(w, h), [w, h]);
+}
+
+pub fn frame_area(f: Frame) -> i64 {
+    return f.inner.area();
+}
+
+pub fn frame_marks(f: Frame) -> i64 {
+    let mut total = 0;
+    let mut i = 0;
+    while i < f.marks.len() {
+        total = total + f.marks[i];
+        i = i + 1;
+    }
+    return total;
+}
+
+pub fn describe(f: Frame) -> String {
+    return f.title + ":" + f.inner.label();
+}
+
+pub fn measure(k: Kind) -> i64 {
+    match k {
+        Round => {
+            return 1;
+        }
+        Boxy(n) => {
+            return n;
+        }
+    }
+}
+
+// The entry file cannot hold a value of this module's enum, so the enum round
+// trip stays module-side: build a `Kind`, then match it.
+pub fn measure_round() -> i64 {
+    return measure(round());
+}
+
+pub fn measure_boxy(n: i64) -> i64 {
+    return measure(boxy(n));
+}
+
+pub fn grow(r: Rect, by: i64) -> Rect {
+    return new Rect(r.name, r.w + by, r.h + by);
+}
+
+// Recursion inside a module body, so the walker's call resolution has to find
+// this module's own mangled symbol.
+pub fn stack_area(r: Rect, times: i64) -> i64 {
+    if times <= 0 {
+        return 0;
+    }
+    return r.area() + stack_area(r, times - 1);
+}

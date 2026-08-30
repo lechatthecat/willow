@@ -1,0 +1,41 @@
+// The module half of module_class_values: it declares a class, and every
+// operation ON that class lives here, where the class's own name is in scope.
+module geom;
+
+pub class Point {
+    pub x: i64;
+    pub y: i64;
+}
+
+pub class Tagged {
+    pub label: String;
+    pub at: Point;
+}
+
+pub fn point(x: i64, y: i64) -> Point {
+    return new Point(x, y);
+}
+
+pub fn sum(p: Point) -> i64 {
+    return p.x + p.y;
+}
+
+pub fn shift(p: Point, by: i64) -> Point {
+    return new Point(p.x + by, p.y + by);
+}
+
+pub fn describe(p: Point) -> String {
+    return "(" + p.x.toString() + ", " + p.y.toString() + ")";
+}
+
+pub fn tagged(label: String, x: i64, y: i64) -> Tagged {
+    return new Tagged(label, new Point(x, y));
+}
+
+pub fn label_of(t: Tagged) -> String {
+    return t.label;
+}
+
+pub fn at_of(t: Tagged) -> Point {
+    return t.at;
+}

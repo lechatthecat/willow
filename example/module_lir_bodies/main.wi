@@ -1,0 +1,42 @@
+// module_lir_bodies — an imported module whose every body compiles from
+// lowered IR (willow-0g8j.16).
+//
+// src/lib.rs used to lower ONLY the entry program: `register_lir_functions`
+// was called once, for `main.wi`, and the loop that compiles each imported
+// module never lowered that module's HIR at all. So `lir_functions` held no
+// module symbol, the backend took its "it has no lowered IR" branch, and the
+// AST emitter owned every cross-module body — no matter what the walker could
+// have handled. Each module is now lowered with its OWN checker's tables (a
+// module is type-checked in its own scope) and registered under the symbols
+// its bodies are compiled by.
+//
+// The entry file here is deliberately thin. Everything interesting is in
+// shapes.wi: virtual dispatch, subclass widening, a class-typed field, an
+// array field, a `defer` observed through a reference parameter, a match on
+// the module's own enum, and recursion. None of it is expressible from the
+// entry file, which cannot even name `Rect`.
+//
+// Build it with fallback made fatal — the whole project, module included:
+//   WILLOW_LIR_REQUIRE=1 willowc build example/module_lir_bodies/main.wi -o /tmp/a
+import shapes;
+
+fn main() {
+    let r = shapes::rect(3, 4);
+    println(shapes::area_of_rect(r));
+
+    let f = shapes::framed("win", 2, 5);
+    println(shapes::frame_area(f));
+    println(shapes::frame_marks(f));
+    println(shapes::describe(f));
+
+    println(shapes::measure_round());
+    println(shapes::measure_boxy(9));
+
+    let bigger = shapes::grow(r, 2);
+    println(shapes::area_of_rect(bigger));
+    println(shapes::stack_area(bigger, 3));
+
+    let mut total = 0;
+    println(shapes::tally(3, 4, &total));
+    println(total);
+}

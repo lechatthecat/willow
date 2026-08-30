@@ -1,0 +1,76 @@
+// module_class_values — values of an imported module's class, in a file that
+// never imports the class itself (willow-0g8j.2.19).
+//
+// `import geom;` names the module. It does NOT bring `Point` into this file:
+// the type cannot be written here, so a parameter cannot be annotated with it,
+// a field cannot be read from it, and a method cannot be called on it. What a
+// value of it CAN do is flow — be bound, reassigned, put in an array, returned
+// from a lambda, and handed back to the module functions that do know its
+// name. That is the whole surface this file exercises.
+//
+// The defect: every one of those flows used to force the entry function onto
+// the AST emitter. `geom::point(3, 4)` is typed `Point` — the bare name the
+// module declared — while the class tables the module contributed are keyed on
+// the canonical `geom::Point`; only `import geom::Point;` copies them under
+// the short name. The LIR walker looked the bare name up, found nothing, and
+// refused the body, so a single module-class binding anywhere in `main` sent
+// the whole function back to the AST emitter with no diagnostic. The walker
+// now resolves a bare class name through the imported modules, exactly as the
+// AST emitter always has.
+//
+// Build it twice to see that the two backends agree, and once more with the
+// selection log to see the walker take every function:
+//   WILLOW_LIR_BACKEND=0 willowc build example/module_class_values/main.wi -o /tmp/a
+//   WILLOW_LIR_BACKEND=1 willowc build example/module_class_values/main.wi -o /tmp/b
+//   WILLOW_LIR_LOG=1 willowc build example/module_class_values/main.wi -o /tmp/c
+import geom;
+
+// A module class value is fine as a LOCAL in any entry function; it is only
+// its NAME that is missing here, so this returns the i64 the module computes
+// rather than the object itself.
+fn ladder(steps: i64) -> i64 {
+    let mut p = geom::point(0, 0);
+    let mut i = 0;
+    while i < steps {
+        p = geom::shift(p, i);
+        i = i + 1;
+    }
+    return geom::sum(p);
+}
+
+fn main() {
+    // Bound, then handed straight back to the module.
+    let p = geom::point(3, 4);
+    println(geom::sum(p));
+
+    // Reassigned: the second object replaces the first in the same slot.
+    let mut q = geom::point(1, 1);
+    q = geom::shift(q, 5);
+    println(geom::sum(q));
+
+    // An array of them, indexed. The element type is the same bare name, so
+    // the array's element type had to resolve too.
+    let all = [geom::point(1, 2), geom::point(3, 4)];
+    println(geom::sum(all[0]) + geom::sum(all[1]));
+
+    // Returned from a lambda, which is compiled as its own function and so
+    // had to resolve the name on its own terms.
+    let make = || geom::point(6, 6);
+    println(geom::sum(make()));
+
+    // Two of them live at once, across a call that allocates: both are GC
+    // roots for as long as the entry function can still reach them.
+    let a = geom::point(2, 2);
+    let b = geom::shift(a, 8);
+    println(geom::describe(a) + " -> " + geom::describe(b));
+
+    // A class whose fields are a String and ANOTHER module class: resolving
+    // the outer name is only the start, since the walker then walks the field
+    // types it found.
+    let t = geom::tagged("origin", 0, 7);
+    println(geom::label_of(t));
+    println(geom::sum(geom::at_of(t)));
+
+    // A second entry function, with the loop that reassigns across iterations.
+    println(ladder(4));
+}

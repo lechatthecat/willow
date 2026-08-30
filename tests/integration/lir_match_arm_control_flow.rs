@@ -21,7 +21,7 @@
 //! fallback into a compile error, so a coverage regression cannot pass by
 //! comparing the AST path against itself.
 //!
-//! 25 perspectives:
+//! 31 perspectives:
 //!   1 a guard before the arm's return    14 an arm-local String under GC
 //!   2 the guarded panic actually fires   15 every arm returns
 //!   3 both branches return               16 return and panic mixed
@@ -34,7 +34,12 @@
 //!  10 the guard reads the binding        23 an `if` inside a `defer` block
 //!  11 an arm inside a `while`            24 an `if` inside a `select` case
 //!  12 an arm inside a `for`              25 both examples are fully LIR
-//!  13 an arm inside a lambda
+//!  13 an arm inside a lambda             26 a while inside an arm
+//!                                        27 an arm breaks an outer loop
+//!                                        28 an arm continues an outer loop
+//!                                        29 a for inside an arm
+//!                                        30 array/static stores in an arm
+//!                                        31 a nested defer in an arm
 
 use super::support::{compile_and_run_with_env, compile_with_compiler_env};
 
@@ -721,4 +726,150 @@ fn arm_flow_25_the_examples_are_fully_lir() {
             "{example} fell back: {stderr}"
         );
     }
+}
+
+// 26. A loop inside an arm needs its own header, body, back edge and exit in
+//     the LIR graph. Keeping the arm as an HIR island used to refuse the whole
+//     function before codegen.
+#[test]
+fn arm_flow_26_a_while_inside_an_arm() {
+    assert_arm_control_flow(
+        &format!(
+            "{SHAPE}\
+             fn measure(s: Shape) -> i64 {{\n\
+             \x20   let mut n = 0;\n\
+             \x20   match s {{\n\
+             \x20       Shape::Square(side) => {{ while n < side {{ n = n + 1; }} }}\n\
+             \x20       Shape::Circle(r) => {{ n = r; }}\n\
+             \x20   }}\n\
+             \x20   return n;\n\
+             }}\n\
+             fn main() {{ println(measure(Shape::Square(4))); println(measure(Shape::Circle(3))); }}\n"
+        ),
+        "4\n3\n",
+        &["measure", "main"],
+    );
+}
+
+// 27. This `break` belongs to the enclosing function-level loop, not to a loop
+//     invented inside the arm. Structural arm lowering preserves that target.
+#[test]
+fn arm_flow_27_an_arm_breaks_an_outer_loop() {
+    assert_arm_control_flow(
+        &format!(
+            "{SHAPE}\
+             fn stop_at(s: Shape) -> i64 {{\n\
+             \x20   let mut n = 0;\n\
+             \x20   while n < 6 {{\n\
+             \x20       n = n + 1;\n\
+             \x20       match s {{\n\
+             \x20           Shape::Square(limit) => {{ if n == limit {{ break; }} }}\n\
+             \x20           Shape::Circle(r) => {{}}\n\
+             \x20       }}\n\
+             \x20   }}\n\
+             \x20   return n;\n\
+             }}\n\
+             fn main() {{ println(stop_at(Shape::Square(3))); }}\n"
+        ),
+        "3\n",
+        &["stop_at", "main"],
+    );
+}
+
+// 28. `continue` has the same cross-boundary target problem as `break`; code
+//     after the match must be skipped only on the selected iteration.
+#[test]
+fn arm_flow_28_an_arm_continues_an_outer_loop() {
+    assert_arm_control_flow(
+        &format!(
+            "{SHAPE}\
+             fn skip(s: Shape) -> i64 {{\n\
+             \x20   let mut i = 0;\n\
+             \x20   let mut total = 0;\n\
+             \x20   while i < 5 {{\n\
+             \x20       i = i + 1;\n\
+             \x20       match s {{\n\
+             \x20           Shape::Square(ignored) => {{ if i == 3 {{ continue; }} }}\n\
+             \x20           Shape::Circle(r) => {{}}\n\
+             \x20       }}\n\
+             \x20       total = total + i;\n\
+             \x20   }}\n\
+             \x20   return total;\n\
+             }}\n\
+             fn main() {{ println(skip(Shape::Square(0))); }}\n"
+        ),
+        "12\n",
+        &["skip", "main"],
+    );
+}
+
+// 29. `for` owns an induction local and a distinct continue target, so it is
+//     covered separately from the simpler `while` graph above.
+#[test]
+fn arm_flow_29_a_for_inside_an_arm() {
+    assert_arm_control_flow(
+        &format!(
+            "{SHAPE}\
+             fn sum_to(s: Shape) -> i64 {{\n\
+             \x20   let mut total = 0;\n\
+             \x20   match s {{\n\
+             \x20       Shape::Square(limit) => {{ for i in 0..limit {{ total = total + i; }} }}\n\
+             \x20       Shape::Circle(r) => {{ total = r; }}\n\
+             \x20   }}\n\
+             \x20   return total;\n\
+             }}\n\
+             fn main() {{ println(sum_to(Shape::Square(4))); }}\n"
+        ),
+        "6\n",
+        &["sum_to", "main"],
+    );
+}
+
+// 30. These place stores already have LIR instructions and emitters. A
+//     structurally lowered arm routes through them instead of extending the
+//     HIR-island dispatcher with another copy of each rule.
+#[test]
+fn arm_flow_30_array_and_static_stores_inside_an_arm() {
+    assert_arm_control_flow(
+        &format!(
+            "import std::collections::Array;\n\
+             {SHAPE}\
+             class State {{ pub static mut total: i64 = 0; }}\n\
+             fn update(s: Shape, values: Array<i64>) -> i64 {{\n\
+             \x20   match s {{\n\
+             \x20       Shape::Square(value) => {{ values[0] = value; State::total = value + 1; }}\n\
+             \x20       Shape::Circle(r) => {{ values[0] = r; State::total = r; }}\n\
+             \x20   }}\n\
+             \x20   return values[0] + State::total;\n\
+             }}\n\
+             fn main() {{ println(update(Shape::Square(4), [0])); }}\n"
+        ),
+        "9\n",
+        &["update", "main"],
+    );
+}
+
+// 31. A nested defer needs lexical scope instructions around the selected arm;
+//     ordinary LIR statement lowering already owns that bracket and cleanup.
+#[test]
+fn arm_flow_31_a_nested_defer_inside_an_arm() {
+    assert_arm_control_flow(
+        &format!(
+            "{SHAPE}\
+             fn update(s: Shape) -> i64 {{\n\
+             \x20   let mut value = 0;\n\
+             \x20   match s {{\n\
+             \x20       Shape::Square(side) => {{\n\
+             \x20           defer {{ value = value + 10; }}\n\
+             \x20           value = side;\n\
+             \x20       }}\n\
+             \x20       Shape::Circle(r) => {{ value = r; }}\n\
+             \x20   }}\n\
+             \x20   return value;\n\
+             }}\n\
+             fn main() {{ println(update(Shape::Square(3))); }}\n"
+        ),
+        "13\n",
+        &["update", "main"],
+    );
 }

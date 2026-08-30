@@ -439,6 +439,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 param_types.as_deref(),
                 &s.args,
             );
+            // A module call earns a debug call-stack frame like every other
+            // user call: without one, a panic inside an imported function
+            // reported no call stack at all (willow-0g8j.2.20). The frame is
+            // named as the source spells the call — `checks::checked`, the
+            // whole path — because the bare item name says nothing about which
+            // module it came from.
+            let pushed = self.emit_callstack_push(&user_callee, s.span);
             let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
@@ -447,6 +454,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             } else {
                 results[0]
             };
+            if pushed {
+                self.emit_callstack_pop();
+            }
             if has_reference_args {
                 self.emit_debug_reference_call_clear();
             }

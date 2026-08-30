@@ -328,6 +328,53 @@ impl Codegen {
     /// Lower the bodies of a module already passed through
     /// [`Codegen::declare_module`], under that module's temporary unqualified
     /// aliases.
+    /// Register an imported module's lowered IR under the names its bodies are
+    /// compiled by (willow-0g8j.16).
+    ///
+    /// Lowering produces the names the MODULE declares — `rank`, `Point::area`
+    /// — while [`Codegen::compile_module_bodies`] compiles a free function
+    /// under its mangled module symbol (`shapes.rank`) and a method under the
+    /// QUALIFIED class decl the declaration phase built (`shapes::Point::area`).
+    /// Re-keying here is what lets `compile_function_named` and
+    /// `compile_class_method_inner` find a module body's IR with the same
+    /// lookup they already do for the entry program.
+    ///
+    /// The registrations MERGE into the entry program's rather than replacing
+    /// them: every unit's functions have to be resolvable at once, and the key
+    /// spaces cannot collide — an entry key is a bare identifier or
+    /// `Class::method` with an unqualified head, a module key is a mangled
+    /// symbol path or a `::`-qualified class. Lambdas are keyed by span, and a
+    /// span carries the `FileId` of the unit it came from.
+    ///
+    /// A method of a class this module does not declare is dropped: it has no
+    /// qualified decl to be compiled under, so no lookup would ever reach it.
+    pub fn register_module_lir(
+        &mut self,
+        unit: &DeclaredModule,
+        lir: crate::ir::lowered::LirProgram,
+    ) {
+        for mut f in lir.functions {
+            let key = match f.name.rsplit_once("::") {
+                Some((class, method)) => {
+                    let Some((_, qualified)) =
+                        unit.module_classes.iter().find(|(local, _)| local == class)
+                    else {
+                        continue;
+                    };
+                    format!("{}::{}", qualified.name, method)
+                }
+                None => module_item_symbol(&unit.module_prefix, &f.name),
+            };
+            // The name travels with the key: the walker reads it back to find a
+            // method's enclosing class.
+            f.name = key.clone();
+            self.lir_functions.insert(key, f);
+        }
+        for l in lir.lambdas {
+            self.lir_lambdas.insert(l.span, l.function);
+        }
+    }
+
     pub fn compile_module_bodies(&mut self, unit: &DeclaredModule) -> Result<()> {
         // The declaration phase of a LATER unit has overwritten all three of
         // these, so this module's own view has to be reinstalled before its

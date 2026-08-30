@@ -23,7 +23,7 @@
 //! confirms the walker is the path that ran — otherwise a coverage regression
 //! would pass vacuously by comparing the AST path against itself.
 //!
-//! 24 perspectives:
+//! 25 perspectives:
 //!   1 arm assigns an i64 outward         13 arm-local holds a new object
 //!   2 arm assigns a String outward       14 payload binding feeds the next stmt
 //!   3 arm declares and uses a local      15 arm-local under GC stress
@@ -36,6 +36,7 @@
 //!  10 nested match inside an arm         22 wildcard arm with statements
 //!  11 arm assigns to a block-scoped name  23 one arm assigns, another returns
 //!  12 arm assigns through an interface   24 the example is fully LIR
+//!  25 field stores inside match arms
 
 use super::support::{compile_and_run_with_env, compile_with_compiler_env};
 
@@ -872,4 +873,39 @@ fn lir_bodies_24_the_example_is_fully_lir() {
             "`{function}` did not use the LIR walker: {stderr}"
         );
     }
+}
+
+// 25. A field store is an ordinary effect statement inside an arm. Cover both
+//     binding shapes that used to reject it: an enum payload and an interface
+//     downcast. `WILLOW_LIR_REQUIRE=1` makes either fallback fail the test.
+#[test]
+fn lir_bodies_25_field_stores_inside_match_arms() {
+    assert_bodies(
+        "class Node { pub value: i64; }
+enum Boxed { One(Node), Empty }
+interface Shape { fn area(self) -> i64; }
+class Square implements Shape {
+    pub side: i64;
+    pub fn area(self) -> i64 { return self.side * self.side; }
+}
+fn update_box(x: Boxed) -> i64 {
+    match x {
+        Boxed::One(n) => { n.value = 5; return n.value; }
+        Boxed::Empty => { return -1; }
+    }
+}
+fn update_shape(shape: Shape) -> i64 {
+    match shape {
+        Square(square) => { square.side = 9; return square.side; }
+        _ => { return -1; }
+    }
+}
+fn main() {
+    println(update_box(Boxed::One(new Node(1))).toString());
+    println(update_shape(new Square(2)).toString());
+}
+",
+        "5\n9\n",
+        &["update_box", "update_shape", "main"],
+    );
 }
