@@ -1,0 +1,127 @@
+// The GC statistic builtins through the LIR-walking backend.
+//
+// `gc_allocated_bytes()` and its twenty-one siblings are zero-argument reads of
+// a runtime counter: `() -> i64`, no panic path, no preemption point. The void
+// pair beside them, `gc_collect()` and `gc_minor_collect()`, was already inside
+// the walker's subset; these are (willow-0g8j.3.1).
+//
+// Every counter's VALUE depends on the allocator's schedule, so this program
+// prints only what holds on every platform and under every collection schedule:
+// a counter is never negative, a cumulative counter never goes backwards, and
+// two reads with nothing between them agree. Building with
+// WILLOW_LIR_BACKEND=0 must print exactly the same thing, including under
+// WILLOW_GC_STRESS=alloc and WILLOW_GC_STRESS=minor. Building with
+// WILLOW_LIR_REQUIRE=1 must succeed: that mode rejects any function that falls
+// back to the AST emitter, so it is the proof that the walker compiled every
+// function below.
+
+import std::collections::Array;
+
+// All twenty-two counters, read in one expression. A counter is a count or a
+// byte total, so none of them can be negative.
+fn all_non_negative() -> bool {
+    return gc_allocated_bytes() >= 0
+        && gc_tlab_fast_allocations() >= 0
+        && gc_tlab_slow_allocations() >= 0
+        && gc_tlab_refills() >= 0
+        && gc_tlab_large_allocations() >= 0
+        && gc_tlab_reserved_bytes() >= 0
+        && gc_minor_collections() >= 0
+        && gc_promoted_objects() >= 0
+        && gc_moved_objects() >= 0
+        && gc_remembered_set_size() >= 0
+        && gc_dirty_card_count() >= 0
+        && gc_write_barrier_hits() >= 0
+        && gc_old_region_count() >= 0
+        && gc_old_region_reserved_bytes() >= 0
+        && gc_old_region_live_bytes() >= 0
+        && gc_old_region_fragmentation_bytes() >= 0
+        && gc_large_object_region_count() >= 0
+        && gc_pinned_region_count() >= 0
+        && gc_old_region_allocations() >= 0
+        && gc_old_region_reuses() >= 0
+        && gc_old_regions_released() >= 0
+        && gc_major_collections() >= 0;
+}
+
+// Nothing allocates or collects between the two reads, so they agree. This is
+// what makes the counter a READ and not a call with effects of its own.
+fn repeat_read_is_stable() -> bool {
+    let first: i64 = gc_allocated_bytes();
+    let second: i64 = gc_allocated_bytes();
+    return first == second;
+}
+
+// A minor collection is counted, so the counter moves across `gc_minor_collect`
+// and never moves backwards.
+fn minor_collection_is_counted() -> bool {
+    let before: i64 = gc_minor_collections();
+    gc_minor_collect();
+    return gc_minor_collections() > before;
+}
+
+// A full collection is counted the same way, by its own counter.
+fn major_collection_is_counted() -> bool {
+    let before: i64 = gc_major_collections();
+    gc_collect();
+    return gc_major_collections() > before;
+}
+
+// The TLAB allocation counters are cumulative: allocating raises their sum, and
+// a collection in the middle cannot lower it.
+fn allocation_is_counted() -> bool {
+    let before: i64 = gc_tlab_fast_allocations() + gc_tlab_slow_allocations();
+    let xs: Array<i64> = [];
+    let mut i: i64 = 0;
+    while i < 64 {
+        xs.push(i * 2);
+        i = i + 1;
+    }
+    let after: i64 = gc_tlab_fast_allocations() + gc_tlab_slow_allocations();
+    return after > before && xs.len() == 64;
+}
+
+// A counter read is an ordinary `i64` operand: it drives a condition, indexes
+// arithmetic, and survives a `while` guard.
+fn counter_drives_control_flow() -> i64 {
+    let mut seen: i64 = 0;
+    let mut spins: i64 = 0;
+    while spins < 3 {
+        if gc_allocated_bytes() >= 0 {
+            seen = seen + 1;
+        }
+        spins = spins + 1;
+    }
+    return seen;
+}
+
+class Meter {
+    pub floor: i64;
+
+    // The same read inside a method body, where the receiver is live across it.
+    pub fn above_floor(self) -> bool {
+        return gc_allocated_bytes() >= self.floor;
+    }
+}
+
+// A read whose result is passed straight to another function, and one held in a
+// GC-rooted frame alongside a String local.
+fn measured(label: String) -> String {
+    let bytes: i64 = gc_allocated_bytes();
+    gc_collect();
+    if bytes >= 0 {
+        return label + ": ok";
+    }
+    return label + ": impossible";
+}
+
+fn main() {
+    println(all_non_negative());
+    println(repeat_read_is_stable());
+    println(minor_collection_is_counted());
+    println(major_collection_is_counted());
+    println(allocation_is_counted());
+    println(counter_drives_control_flow());
+    println(new Meter(0).above_floor());
+    println(measured("heap"));
+}

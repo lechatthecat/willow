@@ -1,0 +1,23 @@
+// A module the ENTRY file never imports -- only `relay` does. Its enums reach
+// the back end through `relay`'s checker alone, so before willow-nm0g the enum
+// table held neither `Deep` nor `depth::Deep` under any name.
+module depth;
+
+pub enum Deep {
+    Near,
+    Far,
+}
+
+pub fn pick(n: i64) -> Deep {
+    if n > 1 {
+        return Deep::Far;
+    }
+    return Deep::Near;
+}
+
+pub fn name(d: Deep) -> String {
+    return match d {
+        Near => "near",
+        Far => "far",
+    };
+}

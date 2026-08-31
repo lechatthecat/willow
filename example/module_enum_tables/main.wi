@@ -1,0 +1,33 @@
+// Enums declared in a module, seen from every unit that can see them: the
+// declaring module's own body, a second module that imports it, and this entry
+// file. The back end keeps ONE flat enum table for the whole build, and each
+// unit spells the same declaration differently -- bare inside the module,
+// qualified everywhere else -- so the table has to answer to both names
+// (willow-nm0g), and the LIR walker has to treat the two names as one
+// representation (willow-0g8j.3.2).
+//
+// Run it under `WILLOW_GC_STRESS=alloc` too: a fieldless enum is a tag integer,
+// and a back end that does not recognise the name assumes a pointer and roots
+// the tag.
+import relay;
+import signal;
+
+fn main() {
+    // Through a second module, whose locals hold the value bare.
+    println(relay::label(1));
+    println(relay::label(0));
+    println(relay::note(1));
+    println(relay::note(0));
+    println(relay::deep(2));
+    println(relay::repeated(0));
+
+    // Inside the declaring module: its own class, its own enum.
+    println(signal::own_bump(1));
+    println(signal::own_bump(0));
+    println(signal::own_worded(1));
+    println(signal::top_is_high());
+
+    // From the entry file, which only ever knows the qualified spelling.
+    println(signal::describe(signal::read(0)));
+    println(signal::note_text(signal::note_of(signal::read(1))));
+}

@@ -397,6 +397,26 @@ pub enum LirInst {
     FlushDefers {
         sites: Vec<LirDeferId>,
     },
+    /// The end of the lexical scope that declared `locals` (willow-0g8j.3.3).
+    ///
+    /// A GC-managed local gets ONE slot for the whole function and that slot is
+    /// its root, so nothing stops a loop body's binding from keeping the last
+    /// iteration's object reachable until the function returns — where the AST
+    /// emitter drops that root when the scope ends. This marks the boundary so
+    /// the emitter can clear the slots back to null.
+    ///
+    /// Every SOURCE local the scope declared is listed, nested scopes included:
+    /// which of them actually hold a GC root is a back-end question — it needs
+    /// the enum table — and clearing an already-cleared slot is a dead store.
+    /// Compiler-generated temporaries are deliberately left out; some of them
+    /// carry a value out of the scope that declared them.
+    ///
+    /// Fallthrough only, exactly like [`LirInst::LeaveDeferScope`]: a `break`,
+    /// `continue` or `return` leaves without passing this instruction, and a
+    /// `return` pops every root anyway.
+    ClearScopeRoots {
+        locals: Vec<LirLocalId>,
+    },
     /// `defer` registration (willow-vynv.2). `span` is the `defer` statement's
     /// own span — the key its scope's cleanup flag is registered under, so it
     /// must match the entry in the enclosing `EnterDeferScope::sites`.
@@ -682,6 +702,45 @@ fn lower_function(f: &HirFunction, class: Option<&str>) -> LirFunction {
     function
 }
 
+/// One enclosing loop, for the early exits that jump out of it: where `break`
+/// and `continue` go, and how much nesting they leave on the way. The two
+/// depths are what an early exit needs and a fallthrough does not: how many
+/// defer scopes to flush (willow-0g8j.2.3) and how many lexical scopes' GC
+/// roots to drop (willow-0g8j.3.3) — the ones opened inside the loop body, not
+/// the ones that were already open when the loop started.
+#[derive(Debug, Clone, Copy)]
+struct LirLoopFrame {
+    exit: BlockId,
+    next: BlockId,
+    defer_depth: usize,
+    scope_depth: usize,
+}
+
+/// One open lexical scope, for the GC-root close at its end (willow-0g8j.3.3).
+#[derive(Debug, Clone)]
+struct LirScopeMark {
+    /// Where this scope's locals begin in [`Builder::locals`]. Locals are handed
+    /// out from one growing table, so its own bindings — and those of every
+    /// scope nested in it — are exactly the entries from here to the end.
+    first_local: usize,
+    /// Locals the scope owns that the sweep from `first_local` skips. That sweep
+    /// drops synthetic locals, because lowering declares them for values that
+    /// cross block boundaries and are read after the scope that declared them
+    /// ends; a `for` loop's element binding is flagged synthetic for a different
+    /// reason — lowering synthesizes its `let` from the iteration protocol — and
+    /// it really does end with the body.
+    adopted: Vec<LirLocalId>,
+}
+
+impl LirScopeMark {
+    fn opening_at(first_local: usize) -> Self {
+        Self {
+            first_local,
+            adopted: Vec::new(),
+        }
+    }
+}
+
 /// Block-graph builder: appends instructions to a current block and seals
 /// blocks with terminators as control flow branches and rejoins.
 struct Builder {
@@ -693,12 +752,9 @@ struct Builder {
     /// Counter for synthesized `for` induction variables, unique per function
     /// so nested loops do not collide.
     for_counter: usize,
-    /// Innermost-first (exit, continue_target, defer_depth_at_entry) loop
-    /// context for break/continue lowering (willow-kzka). The depth is what
-    /// tells `break`/`continue` how many defer scopes they are leaving
-    /// (willow-0g8j.2.3) — the ones opened inside the loop body, not the ones
-    /// that were already open when the loop started.
-    loop_stack: Vec<(BlockId, BlockId, usize)>,
+    /// Innermost-first loop context for break/continue lowering
+    /// (willow-kzka).
+    loop_stack: Vec<LirLoopFrame>,
     /// How many defer scopes are currently open. `return` flushes all of them.
     defer_depth: usize,
     defer_counter: u32,
@@ -706,6 +762,8 @@ struct Builder {
     is_async: bool,
     suspend_counter: usize,
     locals: Vec<LirLocal>,
+    /// The currently open lexical scopes, outermost first (willow-0g8j.3.3).
+    scope_starts: Vec<LirScopeMark>,
     /// Flat rather than a scope stack, because HIR names are already unique
     /// within a function: `LowerCtx::bind` alpha-renames every shadowing
     /// binding to `name$n` before lowering runs. That invariant is what lets a
@@ -1066,6 +1124,7 @@ fn instruction_executes_call(inst: &LirInst) -> bool {
         | LirInst::EnterDeferScope { .. }
         | LirInst::LeaveDeferScope { .. }
         | LirInst::FlushDefers { .. }
+        | LirInst::ClearScopeRoots { .. }
         | LirInst::MatchTest { .. }
         | LirInst::MatchBind { .. }
         | LirInst::SelectInit { .. }
@@ -1091,6 +1150,7 @@ impl Builder {
             is_async,
             suspend_counter: 0,
             locals: Vec::new(),
+            scope_starts: Vec::new(),
             local_by_name: std::collections::HashMap::new(),
         };
         for param in params {
@@ -1350,9 +1410,17 @@ impl Builder {
 
         // Evaluated once, before any test. A suspension in the scrutinee itself
         // splits here, in front of the whole dispatch.
+        // The whole `match` is a scope of its own (willow-0g8j.3.3). The
+        // scrutinee is held in a temp that outlives every arm and that no source
+        // scope declared, so — like a `for` loop's hoisted iterable — the
+        // construct has to drop its root itself, at the merge every arm reaches.
+        let construct = self.scope_starts.len();
+        self.scope_starts
+            .push(LirScopeMark::opening_at(self.locals.len()));
         let scrutinee_name = self.synthetic_name("match_scrutinee");
         let scrutinee_local =
             self.declare_local(scrutinee_name, scrutinee.ty.clone(), None, true, false);
+        self.scope_starts[construct].adopted.push(scrutinee_local);
         self.lower_value_into(scrutinee_local, scrutinee);
 
         let merge = self.new_block();
@@ -1388,6 +1456,12 @@ impl Builder {
             }
 
             self.switch_to(arm_block);
+            // The arm is a scope, and its pattern bindings belong to it: they
+            // are declared HERE, ahead of the body's own scope, so the body's
+            // close does not reach them (willow-0g8j.3.3).
+            let arm_scope = self.scope_starts.len();
+            self.scope_starts
+                .push(LirScopeMark::opening_at(self.locals.len()));
             let bindings: Vec<_> = pattern_bindings(&arm.pattern)
                 .into_iter()
                 .map(|(name, ty)| self.declare_local(name, ty, Some(arm.span), false, false))
@@ -1401,6 +1475,10 @@ impl Builder {
                 });
             }
             self.lower_match_arm_body(&arm.body, destination);
+            // After the body: an arm that produces a value has already copied it
+            // into `destination`, which has a rooted slot of its own.
+            self.push_scope_root_clears(arm_scope);
+            self.scope_starts.pop();
             self.terminate(Terminator::Jump(merge));
 
             if let Some(next) = next {
@@ -1412,6 +1490,8 @@ impl Builder {
         }
 
         self.switch_to(merge);
+        self.push_scope_root_clears(construct);
+        self.scope_starts.pop();
         Some(destination.map(|local| self.local_expr(local, value.span)))
     }
 
@@ -1933,6 +2013,12 @@ impl Builder {
     /// section has to release the lock on its way out even when the section
     /// defers nothing.
     fn lower_scope_inner(&mut self, stmts: &[HirStmt], lock: Option<LirLockSlots>) {
+        // Locals are handed out from one growing table, so everything this
+        // scope declares — its own bindings and those of any scope nested in it
+        // — sits in the range that opens here (willow-0g8j.3.3).
+        let lexical_scope = self.scope_starts.len();
+        self.scope_starts
+            .push(LirScopeMark::opening_at(self.locals.len()));
         let sites: Vec<(LirDeferId, Span)> = stmts
             .iter()
             .filter_map(|s| match s {
@@ -1946,6 +2032,8 @@ impl Builder {
             .collect();
         if sites.is_empty() && lock.is_none() {
             self.lower_stmts(stmts);
+            self.push_scope_root_clears(lexical_scope);
+            self.scope_starts.pop();
             return;
         }
         let scope = sites.iter().map(|(id, span)| (*span, *id)).collect();
@@ -2005,7 +2093,57 @@ impl Builder {
                 }
             }
             self.switch_to(resume);
+            // In the resume block, not before the jump: a recovered panic
+            // branches straight here from wherever it was raised, so a clear on
+            // the fallthrough path alone would leave the scope's roots standing
+            // on the recovery path (willow-0g8j.3.3). Both paths have run the
+            // scope's `defer`s by the time they arrive, which is what the clear
+            // has to come after — a deferred body may read the bindings.
+            self.push_scope_root_clears(lexical_scope);
+        } else {
+            // After the scope's own `defer`s have run: they may read the
+            // bindings this drops the roots of.
+            self.push_scope_root_clears(lexical_scope);
         }
+        self.scope_starts.pop();
+    }
+
+    /// Close the GC roots of the scope at `scope` and of every scope nested
+    /// inside it (willow-0g8j.3.3): name the source locals they declared, so the
+    /// emitter can null the slots that hold one.
+    ///
+    /// One instruction covers the whole nest, because the marks nest too: the
+    /// outermost one's sweep already spans every local an inner scope declared.
+    /// Only their adopted locals have to be gathered scope by scope.
+    fn push_scope_root_clears(&mut self, scope: usize) {
+        let Some(mark) = self.scope_starts.get(scope) else {
+            return;
+        };
+        let mut locals: Vec<LirLocalId> = self.locals[mark.first_local..]
+            .iter()
+            .filter(|local| !local.synthetic && !local.parameter)
+            .map(|local| local.id)
+            .collect();
+        for mark in &self.scope_starts[scope..] {
+            locals.extend(mark.adopted.iter().copied());
+        }
+        locals.sort_unstable();
+        locals.dedup();
+        if !locals.is_empty() {
+            self.push(LirInst::ClearScopeRoots { locals });
+        }
+    }
+
+    /// Drop the GC roots of every lexical scope an early exit is about to leave
+    /// (willow-0g8j.3.3).
+    ///
+    /// `break` and `continue` jump out without passing the fallthrough close,
+    /// so the boundary that close marks has to be re-stated here — the same
+    /// reason [`LirInst::FlushDefers`] exists beside
+    /// [`LirInst::LeaveDeferScope`]. `return` needs nothing, because the emitter
+    /// pops every root there.
+    fn clear_scope_roots_down_to(&mut self, depth: usize) {
+        self.push_scope_root_clears(depth);
     }
 
     /// Flush every defer scope an early exit is about to leave, releasing the
@@ -2201,9 +2339,10 @@ impl Builder {
                 self.switch_to(dead);
             }
             HirStmt::Break { .. } => {
-                let (exit, _, depth) = *self.loop_stack.last().expect("break outside loop");
-                self.flush_defers_down_to(depth);
-                self.terminate(Terminator::Jump(exit));
+                let frame = *self.loop_stack.last().expect("break outside loop");
+                self.flush_defers_down_to(frame.defer_depth);
+                self.clear_scope_roots_down_to(frame.scope_depth);
+                self.terminate(Terminator::Jump(frame.exit));
                 let dead = self.new_block();
                 self.switch_to(dead);
             }
@@ -2225,9 +2364,10 @@ impl Builder {
                 });
             }
             HirStmt::Continue { .. } => {
-                let (_, cont, depth) = *self.loop_stack.last().expect("continue outside loop");
-                self.flush_defers_down_to(depth);
-                self.terminate(Terminator::Jump(cont));
+                let frame = *self.loop_stack.last().expect("continue outside loop");
+                self.flush_defers_down_to(frame.defer_depth);
+                self.clear_scope_roots_down_to(frame.scope_depth);
+                self.terminate(Terminator::Jump(frame.next));
                 let dead = self.new_block();
                 self.switch_to(dead);
             }
@@ -2290,7 +2430,12 @@ impl Builder {
                 });
 
                 self.switch_to(body_block);
-                self.loop_stack.push((exit, backedge, self.defer_depth));
+                self.loop_stack.push(LirLoopFrame {
+                    exit,
+                    next: backedge,
+                    defer_depth: self.defer_depth,
+                    scope_depth: self.scope_starts.len(),
+                });
                 self.lower_scope(body);
                 self.loop_stack.pop();
                 self.terminate(Terminator::Jump(backedge));
@@ -2436,6 +2581,14 @@ impl Builder {
         let n = self.for_counter;
         self.for_counter += 1;
         let i_name = format!("__for{n}_i");
+        // The whole `for` construct is a scope of its own (willow-0g8j.3.3).
+        // The desugaring hoists the iterable into a synthetic `let` that lives
+        // as long as the loop does; nothing in the source scope holds it, so
+        // without a close of its own that temp keeps the array — and everything
+        // in it — reachable until the function returns.
+        let construct = self.scope_starts.len();
+        self.scope_starts
+            .push(LirScopeMark::opening_at(self.locals.len()));
         let i64_var = |name: &str| HirExpr {
             kind: HirExprKind::Var(name.to_string()),
             ty: Type::I64,
@@ -2491,7 +2644,8 @@ impl Builder {
                     ty: iterable.ty.clone(),
                     span,
                 };
-                self.push_synth_let(&arr_name, false, iterable.clone());
+                let arr_local = self.push_synth_let(&arr_name, false, iterable.clone());
+                self.scope_starts[construct].adopted.push(arr_local);
                 self.push_synth_let(
                     &i_name,
                     true,
@@ -2534,7 +2688,8 @@ impl Builder {
             (_, Type::Generic(g, args)) if g == "Range" && args.first() == Some(&Type::I64) => {
                 let range_name = format!("__for{n}_range");
                 let bound_name = format!("__for{n}_end");
-                self.push_synth_let(&range_name, false, iterable.clone());
+                let range_local = self.push_synth_let(&range_name, false, iterable.clone());
+                self.scope_starts[construct].adopted.push(range_local);
                 let bound = |field: &str| HirExpr {
                     kind: HirExprKind::FieldAccess {
                         object: Box::new(HirExpr {
@@ -2578,10 +2733,26 @@ impl Builder {
         });
 
         self.switch_to(body_block);
-        self.push_synth_let(name, false, element_binding);
-        self.loop_stack.push((exit, inc_block, self.defer_depth));
+        // One iteration is a scope of its own, opened around the element
+        // binding: lowering emits that `let` ahead of the body's own scope, and
+        // flags it synthetic because it synthesized it from the iteration
+        // protocol, but the binding is the source loop variable and its root
+        // ends with the iteration like any other (willow-0g8j.3.3).
+        let iteration = self.scope_starts.len();
+        self.scope_starts
+            .push(LirScopeMark::opening_at(self.locals.len()));
+        let element = self.push_synth_let(name, false, element_binding);
+        self.scope_starts[iteration].adopted.push(element);
+        self.loop_stack.push(LirLoopFrame {
+            exit,
+            next: inc_block,
+            defer_depth: self.defer_depth,
+            scope_depth: iteration,
+        });
         self.lower_scope(body);
         self.loop_stack.pop();
+        self.push_scope_root_clears(iteration);
+        self.scope_starts.pop();
         self.terminate(Terminator::Jump(inc_block));
 
         self.switch_to(inc_block);
@@ -2601,6 +2772,11 @@ impl Builder {
         }
 
         self.switch_to(exit);
+        // Both ways out of the loop land here — fallthrough from the header and
+        // every `break` — so the iterable temp's root is dropped once, on the
+        // one path that leaves the construct.
+        self.push_scope_root_clears(construct);
+        self.scope_starts.pop();
     }
 }
 
@@ -2755,6 +2931,14 @@ fn format_inst(inst: &LirInst) -> String {
             format!("leave defer scope ({} sites);", sites.len())
         }
         LirInst::FlushDefers { sites } => format!("flush defers ({} sites);", sites.len()),
+        LirInst::ClearScopeRoots { locals } => {
+            let names = locals
+                .iter()
+                .map(|l| format!("l{}", l.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("clear scope roots ({names});")
+        }
         LirInst::ReleaseLock(slots) => format!("release {};", slots.mode.keyword()),
         LirInst::Defer { body, .. } => match body {
             LirDeferBody::Expr(call) => format!("defer {};", e(call)),
@@ -2869,7 +3053,9 @@ mod tests {
     fn l01_straight_line_single_block() {
         let p = lir("fn f() { let a = 1; print(a); }");
         let f = func(&p, "f");
-        assert_eq!(f.blocks[0].instrs.len(), 2);
+        // The two statements, plus the body scope's root close
+        // (willow-0g8j.3.3).
+        assert_eq!(f.blocks[0].instrs.len(), 3);
         assert_eq!(f.blocks[0].terminator, Terminator::Return(None));
     }
 
@@ -3138,10 +3324,11 @@ mod tests {
             .map(|i| match i {
                 LirInst::Let { name, .. } => format!("let {name}"),
                 LirInst::Expr(_) => "expr".to_string(),
+                LirInst::ClearScopeRoots { .. } => "clear roots".to_string(),
                 _ => "other".to_string(),
             })
             .collect();
-        assert_eq!(kinds, ["let a", "let b", "expr"]);
+        assert_eq!(kinds, ["let a", "let b", "expr", "clear roots"]);
     }
 
     // 16. field/index/static assignments lower to their instructions

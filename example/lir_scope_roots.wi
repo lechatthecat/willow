@@ -1,0 +1,274 @@
+// lir_scope_roots.wi — a lexical scope's GC roots end where the scope does
+// (willow-0g8j.3.3).
+//
+// The LIR back end gives every GC-managed local ONE stack slot, allocated and
+// rooted once at function entry: the lowered IR is a flat basic-block graph, so
+// a push/pop pair around each `let` would grow the shadow root stack once per
+// loop iteration. That makes the slot itself the root, and nothing would free a
+// scope's last value before the function returned — a loop body would pin one
+// object per call — unless the end of the scope clears the slot back to null.
+// This program watches that happen.
+//
+// Every number below is a DELTA across a collection, so it says only "the
+// objects this scope bound are gone", never anything about what the rest of the
+// program is holding or how large an object is on this platform.
+//
+// Try it under `WILLOW_LIR_BACKEND=0` as well: the AST emitter, which pushes and
+// pops a root around each binding, prints exactly the same thing.
+
+import std::collections::Array;
+
+// Deliberately all-scalar: a class with a `String` field would also allocate the
+// field's contents, and those are held by the string tables, which would show up
+// in the delta and say nothing about roots.
+class Cell {
+    pub init(self, id: i64) {
+        self.id = id;
+    }
+    id: i64;
+    pub fn id(self) -> i64 {
+        return self.id;
+    }
+}
+
+class Label {
+    pub init(self, text: String) {
+        self.text = text;
+    }
+    text: String;
+    pub fn text(self) -> String {
+        return self.text;
+    }
+}
+
+enum Tag {
+    Bare,
+    Boxed(Cell)
+}
+
+// A `while` body: the classic case. Without the clear, the last `cell` stays
+// reachable until `while_body` returns.
+fn while_body(rounds: i64) -> i64 {
+    gc_collect();
+    let before = gc_allocated_bytes();
+    let mut i = 0;
+    while i < rounds {
+        let cell = new Cell(i);
+        i = i + cell.id() - cell.id() + 1;
+    }
+    gc_collect();
+    return gc_allocated_bytes() - before;
+}
+
+// A `for` body over a range, with a nested `if` scope inside it: an inner scope
+// closes first and does not touch the bindings of the one around it.
+fn for_body(rounds: i64) -> i64 {
+    gc_collect();
+    let before = gc_allocated_bytes();
+    let mut seen = 0;
+    for n in 0..rounds {
+        let outer = new Cell(n);
+        if outer.id() >= 0 {
+            let inner = new Cell(n);
+            seen = seen + inner.id();
+        }
+        seen = seen + outer.id();
+    }
+    gc_collect();
+    return gc_allocated_bytes() - before + seen - seen;
+}
+
+// `for x in arr` desugars to a synthetic binding that holds the WHOLE array for
+// as long as the loop runs, and that binding belongs to no scope in the source:
+// the loop itself has to drop its root at the exit, or the array — and every
+// object in it — outlives the scope that built it.
+fn hoisted_iterable(rounds: i64) -> i64 {
+    gc_collect();
+    let before = gc_allocated_bytes();
+    let mut i = 0;
+    while i < rounds {
+        let src: Array<Cell> = [new Cell(i), new Cell(i + 1)];
+        let mut seen = 0;
+        for cell in src {
+            seen = seen + cell.id();
+        }
+        i = i + 1 + seen - seen;
+    }
+    gc_collect();
+    return gc_allocated_bytes() - before;
+}
+
+// `break` jumps out without passing the scope's fallthrough close, so the exit
+// has to drop the roots on its own — the same reason `defer` needs a flush on
+// early exits.
+fn early_break(rounds: i64) -> i64 {
+    gc_collect();
+    let before = gc_allocated_bytes();
+    let mut i = 0;
+    while i < rounds {
+        let cell = new Cell(i);
+        if cell.id() == 1 {
+            break;
+        }
+        i = i + 1;
+    }
+    gc_collect();
+    return gc_allocated_bytes() - before;
+}
+
+// `continue` leaves the same way, once per iteration.
+fn early_continue(rounds: i64) -> i64 {
+    gc_collect();
+    let before = gc_allocated_bytes();
+    let mut i = 0;
+    while i < rounds {
+        i = i + 1;
+        let cell = new Cell(i);
+        if cell.id() % 2 == 0 {
+            continue;
+        }
+    }
+    gc_collect();
+    return gc_allocated_bytes() - before;
+}
+
+// A `match` whose arm body holds a loop is lowered as a block graph rather than
+// a tree, and that shape brings two roots no source scope owns: the scrutinee,
+// held in a temp for the whole construct, and the arm's pattern binding, which
+// is declared ahead of the arm body's own scope. The construct closes both.
+fn matched(rounds: i64) -> i64 {
+    gc_collect();
+    let before = gc_allocated_bytes();
+    let mut i = 0;
+    while i < rounds {
+        let tag = Tag::Boxed(new Cell(i));
+        let mut acc = 0;
+        match tag {
+            Tag::Boxed(c) => {
+                let mut k = 0;
+                while k < 1 {
+                    acc = acc + c.id();
+                    k = k + 1;
+                }
+            }
+            Tag::Bare => {
+                acc = acc + 1;
+            }
+        }
+        i = i + 1 + acc - acc;
+    }
+    gc_collect();
+    return gc_allocated_bytes() - before;
+}
+
+fn divide(a: i64, b: i64) -> i64 {
+    return a / b;
+}
+
+// One recovered panic before anything is measured: recovering allocates the
+// panic info, and the string tables keep its message, which has nothing to do
+// with roots.
+fn warm() {
+    defer match recover() {
+        Some(info) => {}
+        None => {}
+    }
+    println(divide(1, 0));
+}
+
+// A recovered panic is a SECOND way out of a scope: the runtime resumes after
+// the scope, having run its `defer`s, without passing the fallthrough close. If
+// only the fallthrough dropped the roots, the object bound on the panicking
+// path would stay reachable — and here that path is the only one taken.
+fn recovered(rounds: i64) -> i64 {
+    gc_collect();
+    let before = gc_allocated_bytes();
+    let mut i = 0;
+    while i < rounds {
+        defer match recover() {
+            Some(info) => {}
+            None => {}
+        }
+        i = i + 1;
+        let cell = new Cell(i);
+        println(divide(cell.id(), cell.id() - i));
+    }
+    gc_collect();
+    return gc_allocated_bytes() - before;
+}
+
+// The scope's own `defer`s run BEFORE its roots are dropped, so a deferred body
+// can still read what the scope bound.
+fn deferred(rounds: i64) -> i64 {
+    gc_collect();
+    let before = gc_allocated_bytes();
+    let mut i = 0;
+    while i < rounds {
+        let cell = new Cell(i);
+        defer println(100 + cell.id());
+        i = i + 1;
+    }
+    gc_collect();
+    return gc_allocated_bytes() - before;
+}
+
+// A collection that happens while the array is live keeps everything the array
+// reaches, whatever the scope that allocated it has done since.
+fn reachable_from_an_array(rounds: i64) -> i64 {
+    let kept: Array<Cell> = [];
+    let mut i = 0;
+    while i < rounds {
+        let cell = new Cell(i);
+        kept.push(cell);
+        i = i + 1;
+    }
+    gc_collect();
+    let mut total = 0;
+    for cell in kept {
+        total = total + cell.id();
+    }
+    return total;
+}
+
+// A value that leaves the scope in an outer binding is NOT collected: it is
+// still rooted, by the slot of the variable that now holds it.
+fn escapes(rounds: i64) -> String {
+    let mut kept = new Label("replaced");
+    let mut i = 0;
+    while i < rounds {
+        let label = new Label("escapes into `kept`");
+        kept = label;
+        i = i + 1;
+    }
+    gc_collect();
+    return kept.text();
+}
+
+// An inner scope that reuses a name does not disturb the outer binding: HIR
+// lowering alpha-renames the shadowing one, so the two have separate slots.
+fn shadowed(rounds: i64) -> String {
+    let label = new Label("the outer label");
+    let mut i = 0;
+    while i < rounds {
+        let label = new Label("the inner label");
+        i = i + 1;
+        println("inner: " + label.text());
+    }
+    gc_collect();
+    return label.text();
+}
+
+fn main() {
+    println(while_body(50));
+    println(for_body(50));
+    println(hoisted_iterable(20));
+    println(early_break(50));
+    println(early_continue(50));
+    println(matched(20));
+    warm();
+    println(recovered(9));
+    println(deferred(2));
+    println(reachable_from_an_array(4));
+    println(escapes(3));
+    println(shadowed(2));
+}

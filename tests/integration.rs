@@ -51,6 +51,8 @@ mod lir_class_methods;
 mod lir_defer_block_order;
 #[path = "integration/lir_defer_scopes.rs"]
 mod lir_defer_scopes;
+#[path = "integration/lir_gc_stats.rs"]
+mod lir_gc_stats;
 #[path = "integration/lir_io.rs"]
 mod lir_io;
 #[path = "integration/lir_locks.rs"]
@@ -73,6 +75,11 @@ mod module_lir_bodies;
 mod missing_return;
 #[path = "integration/module_checker_tables.rs"]
 mod module_checker_tables;
+#[path = "integration/module_enum_tables.rs"]
+mod module_enum_tables;
+
+#[path = "integration/lir_scope_roots.rs"]
+mod lir_scope_roots;
 
 #[path = "integration/module_lambdas.rs"]
 mod module_lambdas;

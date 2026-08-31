@@ -1,0 +1,45 @@
+// A module that holds another module's enums in its own frame. The type of
+// `signal::read(...)` arrives here spelled BARE (`Level`) -- a module function's
+// signature only qualifies module-local interface names -- while this file's own
+// checker registered the same declaration as `signal::Level` and nothing else.
+//
+// Each local below is bound next to a String allocation, so a collection during
+// this frame walks the frame's roots while the enum value is live. A fieldless
+// enum value is a tag, not a pointer: rooting it aborts the collector.
+module relay;
+
+import depth;
+import signal;
+
+pub fn label(n: i64) -> String {
+    let l = signal::read(n);
+    let filler: String = "[" + "]";
+    return signal::describe(l) + filler;
+}
+
+// A payload-carrying enum over the same path, where rooting IS correct.
+pub fn note(n: i64) -> String {
+    let v = signal::note_of(signal::read(n));
+    let filler: String = "{" + "}";
+    return signal::note_text(v) + filler;
+}
+
+// An enum from a module the entry file never imports.
+pub fn deep(n: i64) -> String {
+    let d = depth::pick(n);
+    let filler: String = "(" + ")";
+    return depth::name(d) + filler;
+}
+
+// The enum value crossing back out of a loop, so it is live across many
+// allocations rather than one.
+pub fn repeated(n: i64) -> String {
+    let l = signal::read(n);
+    let mut i: i64 = 0;
+    let mut acc: String = "";
+    while i < 4 {
+        acc = acc + "." + signal::describe(l);
+        i = i + 1;
+    }
+    return acc;
+}

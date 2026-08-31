@@ -292,9 +292,13 @@ fn block_use_def(
                 }
                 defs.extend(bindings.iter().copied());
             }
+            // Naming a local does not read it: the instruction drops the GC
+            // root of a scope that ended, so nothing it names is live past it
+            // and nothing it names is redefined either (willow-0g8j.3.3).
             LirInst::EnterDeferScope { .. }
             | LirInst::LeaveDeferScope { .. }
-            | LirInst::FlushDefers { .. } => {}
+            | LirInst::FlushDefers { .. }
+            | LirInst::ClearScopeRoots { .. } => {}
         }
     }
     match &block.terminator {

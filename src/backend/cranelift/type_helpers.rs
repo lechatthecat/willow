@@ -313,6 +313,23 @@ pub(crate) fn builtin_call_return_type(callee: &str) -> Option<Type> {
     }
 }
 
+/// The zero-argument GC statistic builtins: `() -> i64` reads of a runtime
+/// counter. They carry no AST-only metadata, their ABI entries are all
+/// `NONE; ([] -> Some(I64))`, and the AST emitter does nothing around them
+/// beyond the call itself — so the LIR walker can admit them unchanged
+/// (willow-0g8j.3.1).
+///
+/// Derived from `builtin_call_runtime_name` rather than repeating its list:
+/// `gc_collect` / `gc_minor_collect` are the void pair beside these, and
+/// `sleep` / `yield` are futures, not reads.
+pub(crate) fn gc_stat_builtin_runtime_name(callee: &str) -> Option<&'static str> {
+    if callee == "gc_collect" || callee == "gc_minor_collect" {
+        return None;
+    }
+    callee.strip_prefix("gc_")?;
+    builtin_call_runtime_name(callee)
+}
+
 pub(crate) fn builtin_call_runtime_name(callee: &str) -> Option<&'static str> {
     match callee {
         "gc_collect" => Some("willow_gc_collect"),

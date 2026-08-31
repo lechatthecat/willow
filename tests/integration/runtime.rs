@@ -912,6 +912,10 @@ fn test_runnable_example_files_compile_and_run() {
             "example/imported_enum_match/main.wi",
             "1\n42\n200\n8\nink\n2\n20\n",
         ),
+        (
+            "example/module_enum_tables/main.wi",
+            "high[]\nlow[]\nloud{}\n-{}\nfar()\n.low.low.low.low\n11\n10\nloud/ok\ntrue\nlow\nloud\n",
+        ),
         ("example/direct_import_demo/main.wi", "7\n1\n99\n"),
         (
             "example/direct_import_iface_enum_demo/main.wi",
@@ -1063,6 +1067,15 @@ fn test_runnable_example_files_compile_and_run() {
             "example/lir_gc_collections.wi",
             "3\n{alpha:1: 0, beta:1: 1, gamma:1: 2}\ntrue\nfalse\n\
              {1: \"one\", 2: \"two\", 3: \"three\"}\n3\nfalse\n4\n3\nabtail\n2\n4\n",
+        ),
+        (
+            "example/lir_gc_stats.wi",
+            "true\ntrue\ntrue\ntrue\ntrue\n3\ntrue\nheap: ok\n",
+        ),
+        (
+            "example/lir_scope_roots.wi",
+            "0\n0\n0\n0\n0\n100\n101\n0\n6\nescapes into `kept`\n\
+             inner: the inner label\ninner: the inner label\nthe outer label\n",
         ),
         (
             "example/lir_enum_match.wi",

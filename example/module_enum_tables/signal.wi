@@ -1,0 +1,95 @@
+// A module whose enums the rest of the build sees under a name this file never
+// writes. Inside here they are `Level` and `Note`; an importer spells them
+// `signal::Level` and `signal::Note`, and the signature of a method declared on
+// the class below carries the qualified spelling too, because a class
+// declaration is module-qualified whole before it is declared.
+//
+// Both spellings must reach the same declaration in the back end's enum table
+// (willow-nm0g) and compare as one representation in the LIR walker
+// (willow-0g8j.3.2).
+module signal;
+
+// Fieldless: every value is a tag integer, never a pointer. The back end has to
+// KNOW that -- an unknown named type is assumed GC-managed, and a tag rooted as
+// a pointer aborts the collector.
+pub enum Level {
+    Low,
+    High,
+}
+
+// The payload twin of `Level`, so the same paths are exercised for an enum that
+// really is a heap object.
+pub enum Note {
+    Empty,
+    Text(String),
+}
+
+pub fn read(n: i64) -> Level {
+    if n > 0 {
+        return Level::High;
+    }
+    return Level::Low;
+}
+
+pub fn describe(l: Level) -> String {
+    return match l {
+        Low => "low",
+        High => "high",
+    };
+}
+
+pub fn note_of(l: Level) -> Note {
+    return match l {
+        Low => Note::Empty,
+        High => Note::Text("loud"),
+    };
+}
+
+pub fn note_text(n: Note) -> String {
+    return match n {
+        Empty => "-",
+        Text(t) => t,
+    };
+}
+
+pub class Gauge {
+    pub floor: i64;
+
+    // Declared in a module, so this parameter is `signal::Level` in the
+    // signature table while the call below passes a bare `Level`.
+    pub fn bump(self, l: Level) -> i64 {
+        return match l {
+            Low => self.floor,
+            High => self.floor + 1,
+        };
+    }
+
+    pub fn worded(self, n: Note) -> String {
+        return note_text(n) + "/" + "ok";
+    }
+
+    // Returning the module's own enum from a method: the qualified return type
+    // in the signature, the bare one in the body.
+    pub static fn top() -> Level {
+        return Level::High;
+    }
+}
+
+// The call that used to lose this function to the AST emitter: a method of this
+// module's own class, taking this module's own enum.
+pub fn own_bump(n: i64) -> i64 {
+    let g = new Gauge(10);
+    return g.bump(read(n));
+}
+
+pub fn own_worded(n: i64) -> String {
+    let g = new Gauge(0);
+    return g.worded(note_of(read(n)));
+}
+
+pub fn top_is_high() -> bool {
+    return match Gauge::top() {
+        Low => false,
+        High => true,
+    };
+}

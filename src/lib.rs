@@ -900,6 +900,63 @@ fn run_backend(
     for (name, info) in &checker.symbols.enums {
         codegen.register_enum_info(name.to_string(), info.clone());
     }
+    // ...and the names only a MODULE's checker knows (willow-nm0g). The table
+    // above is the entry file's, and the entry file learns an imported enum
+    // under its qualified spelling alone (`register_enum_with_module`) -- never
+    // under the bare name the declaring module's own body spells it by, and not
+    // at all for a module it does not itself import. The backend's enum table is
+    // one flat namespace for the whole build, so those names stayed unknown, and
+    // `is_gc_managed` answers an unknown named type with "GC-managed": a
+    // fieldless enum's tag was rooted as a pointer and the collector aborted on
+    // it, and the LIR walker refused every body that named one.
+    //
+    // These are aliases for declarations the checkers already agreed on, so a
+    // name is registered only where it cannot be ambiguous: the entry table wins
+    // any name it claims, and a name two different declarations answer to (two
+    // modules declaring `enum Kind`, or two aliases of the same spelling) is
+    // dropped rather than resolved arbitrarily.
+    {
+        // A name that ANY unit declares as a class or an interface is not an
+        // alias for an enum, and the backend answers a named type from the enum
+        // table first: registering `Point` because some module declares
+        // `enum Point` would make another unit's `class Point` read as a tag,
+        // and `is_gc_managed` would then leave a live object untraced. Those
+        // names are dropped on the same grounds as an ambiguous one.
+        let mut claimed: std::collections::HashSet<&semantic::ids::TypeId> = checker
+            .symbols
+            .classes
+            .keys()
+            .chain(checker.symbols.interfaces.keys())
+            .collect();
+        for module_checker in &module_checkers {
+            claimed.extend(module_checker.checker.symbols.classes.keys());
+            claimed.extend(module_checker.checker.symbols.interfaces.keys());
+        }
+        let mut aliases: std::collections::HashMap<
+            &semantic::ids::TypeId,
+            Option<&semantic::symbols::EnumInfo>,
+        > = std::collections::HashMap::new();
+        for module_checker in &module_checkers {
+            for (name, info) in &module_checker.checker.symbols.enums {
+                if checker.symbols.enums.contains_key(name) || claimed.contains(name) {
+                    continue;
+                }
+                aliases
+                    .entry(name)
+                    .and_modify(|seen| {
+                        if seen.is_some_and(|prev| prev.declaration_span != info.declaration_span) {
+                            *seen = None;
+                        }
+                    })
+                    .or_insert(Some(info));
+            }
+        }
+        for (name, info) in aliases {
+            if let Some(info) = info {
+                codegen.register_enum_info(name.to_string(), info.clone());
+            }
+        }
+    }
     // Register interface metadata for vtable codegen + interface dispatch.
     for (name, info) in &checker.symbols.interfaces {
         codegen.register_interface_info(name.to_string(), info.clone());

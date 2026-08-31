@@ -206,7 +206,10 @@ use super::emit_interface::{
 use super::gc_codegen::{GcLayoutMetadata, GcObjectKind, GcStoreDestination};
 use super::option_repr::{OptionRepr, option_inner, option_repr};
 use super::symbols::{class_method_symbol_name, class_name_for_object_type, module_item_symbol};
-use super::type_helpers::{builtin_call_runtime_name, clif_type, debug_type_name, is_gc_managed};
+use super::type_helpers::{
+    builtin_call_runtime_name, clif_type, debug_type_name, gc_stat_builtin_runtime_name,
+    is_gc_managed,
+};
 use super::{
     CoopSuspendPoint, FRAME_SLOT_TASK_ID, FuncGen, ParamDebug, VarStorage, array_element_type,
     async_frame_slot_offset, channel_runtime_suffix, reference_mode_name, result_err_type,
@@ -1206,16 +1209,74 @@ impl LirTypeCtx<'_> {
     /// else defers to [`assignable_repr`], including the deliberate exactness
     /// of the collection generics.
     fn same_repr(&self, target: &Type, value: &Type) -> bool {
+        let mut open = HashSet::new();
+        self.same_repr_inner(target, value, &mut open)
+    }
+
+    /// `open` carries the enum name pairs already being compared, so a
+    /// recursive payload (`enum List { Cons(List), Nil }`) closes its cycle
+    /// instead of recursing forever.
+    fn same_repr_inner(
+        &self,
+        target: &Type,
+        value: &Type,
+        open: &mut HashSet<(String, String)>,
+    ) -> bool {
         match (target, value) {
-            (Type::Named(a), Type::Named(b)) => a == b || self.same_class(a, b),
-            (Type::Array(a), Type::Array(b)) => self.same_repr(a, b),
+            (Type::Named(a), Type::Named(b)) => {
+                a == b || self.same_class(a, b) || self.same_enum(a, b, open)
+            }
+            (Type::Array(a), Type::Array(b)) => self.same_repr_inner(a, b, open),
             (Type::Generic(a, ta), Type::Generic(b, tb)) => {
                 a == b
                     && ta.len() == tb.len()
-                    && ta.iter().zip(tb).all(|(x, y)| self.same_repr(x, y))
+                    && ta
+                        .iter()
+                        .zip(tb)
+                        .all(|(x, y)| self.same_repr_inner(x, y, open))
             }
             _ => assignable_repr(target, value),
         }
+    }
+
+    /// Whether two enum names are one declaration under two spellings. A module
+    /// body spells its own enum bare (`Kind`), while the SIGNATURE of a method
+    /// declared in that module carries the qualified spelling (`kinds::Kind`) —
+    /// a class declaration is module-qualified whole before it is declared. One
+    /// declaration, registered under both names, so the strings differ where
+    /// the declaration does not (willow-0g8j.3.2).
+    ///
+    /// Enums have no `type_id` table to settle this the way [`Self::same_class`]
+    /// does, so both halves are checked directly: one name must be the other
+    /// under a module prefix this build declared, AND the two declarations must
+    /// agree on variant order (the order IS the tag), variant names, and payload
+    /// representation. Neither half alone would do — the prefix test cannot see
+    /// that two files disagree, and shape alone would merge two unrelated enums.
+    fn same_enum(&self, a: &str, b: &str, open: &mut HashSet<(String, String)>) -> bool {
+        let is_qualified_form = |bare: &str, qualified: &str| -> bool {
+            qualified.rsplit_once("::").is_some_and(|(prefix, last)| {
+                last == bare && self.known_modules.contains_key(prefix)
+            })
+        };
+        if !is_qualified_form(a, b) && !is_qualified_form(b, a) {
+            return false;
+        }
+        let (Some(da), Some(db)) = ((self.enum_def)(a), (self.enum_def)(b)) else {
+            return false;
+        };
+        if !open.insert((a.to_string(), b.to_string())) {
+            return true;
+        }
+        da.type_params == db.type_params
+            && da.variants.len() == db.variants.len()
+            && da.variants.iter().zip(&db.variants).all(|(x, y)| {
+                x.name == y.name
+                    && x.payloads.len() == y.payloads.len()
+                    && x.payloads
+                        .iter()
+                        .zip(&y.payloads)
+                        .all(|(p, q)| self.same_repr_inner(p, q, open))
+            })
     }
 
     /// Whether two class names name one runtime class. One class is one
@@ -1752,6 +1813,9 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                 // be given a decision here instead of silently falling back.
                 LirInst::EnterDeferScope { .. } | LirInst::LeaveDeferScope { .. } => {}
                 LirInst::FlushDefers { .. } => {}
+                // Names locals this walker has already decided on, and stores
+                // a constant into the slots it gave them (willow-0g8j.3.3).
+                LirInst::ClearScopeRoots { .. } => {}
                 // Every release has a matching acquisition in the same
                 // function, and the decision is made there — on the terminator
                 // that carries the type this reads back (willow-0g8j.2.13).
@@ -1937,6 +2001,7 @@ pub(super) fn lir_async_rejection_reason(f: &LirFunction) -> Option<String> {
                 LirInst::EnterDeferScope { .. }
                 | LirInst::LeaveDeferScope { .. }
                 | LirInst::FlushDefers { .. }
+                | LirInst::ClearScopeRoots { .. }
                 | LirInst::ReleaseLock { .. }
                 | LirInst::Defer { .. }
                 | LirInst::MatchTest { .. }
@@ -3534,6 +3599,13 @@ fn supported_expr<'n>(
             if callee == "gc_collect" || callee == "gc_minor_collect" {
                 return args.is_empty() && e.ty == Type::Void;
             }
+            // Their read-only siblings: `gc_allocated_bytes` and the other
+            // statistic counters. Same shape — a zero-argument runtime call
+            // with no AST-only metadata — but they return the counter
+            // (willow-0g8j.3.1).
+            if gc_stat_builtin_runtime_name(callee).is_some() {
+                return args.is_empty() && e.ty == Type::I64;
+            }
             if callee == "recover" {
                 return args.is_empty()
                     && builtin_types::unary_arg(&e.ty, B::Option)
@@ -4218,6 +4290,7 @@ fn lir_inst_span(inst: &LirInst) -> Option<crate::diagnostics::Span> {
         LirInst::EnterDeferScope { .. }
         | LirInst::LeaveDeferScope { .. }
         | LirInst::FlushDefers { .. }
+        | LirInst::ClearScopeRoots { .. }
         | LirInst::ReleaseLock { .. } => None,
         LirInst::Let { value, .. }
         | LirInst::Assign { value, .. }
@@ -5113,6 +5186,67 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         );
     }
 
+    /// Drop the GC roots a lexical scope owned, now that it has ended
+    /// (willow-0g8j.3.3).
+    ///
+    /// A GC-managed local's slot is allocated and rooted once at function entry
+    /// (see the module docs), so without this the last value a scope bound
+    /// stays reachable until the function returns: a loop body's binding pins
+    /// one object per call, where the AST emitter — which pops the root as the
+    /// scope closes — lets the collector take it. Nulling the slot leaves the
+    /// root registered and empty, which is the same state entry gave it.
+    ///
+    /// Two kinds of slot are cleared. A stack slot is the shadow-stack root
+    /// itself. A [`VarStorage::Frame`] local lives in the heap async frame,
+    /// traced by the frame's own map rather than by the shadow stack, and it
+    /// needs the same treatment for the same reason: the frame outlives every
+    /// scope in the function and is traced until the task completes, so a local
+    /// that was live across an `await` would otherwise be held by a scope that
+    /// ended. A [`VarStorage::Value`] local holds no root at all, and a
+    /// [`VarStorage::ReferencePtr`] one points into storage the callee does not
+    /// own. The `is_gc_managed` test is what separates a rooted slot from the
+    /// plain stack slot an address-taken local gets: clearing that one would
+    /// zero a live variable.
+    fn emit_lir_clear_scope_roots(&mut self, function: &LirFunction, locals: &[LirLocalId]) {
+        enum Root {
+            Slot(cranelift_codegen::ir::StackSlot),
+            Frame(i32),
+        }
+        let roots: Vec<Root> = locals
+            .iter()
+            .filter_map(|local| function.locals.get(local.0 as usize))
+            .filter_map(|local| match self.vars.get(local.name.as_str()) {
+                Some(VarStorage::Stack { slot, ty }) if is_gc_managed(ty, self.enum_infos) => {
+                    Some(Root::Slot(*slot))
+                }
+                Some(VarStorage::Frame { offset, ty }) if is_gc_managed(ty, self.enum_infos) => {
+                    Some(Root::Frame(*offset))
+                }
+                _ => None,
+            })
+            .collect();
+        if roots.is_empty() {
+            return;
+        }
+        let ptr_ty = self.module.target_config().pointer_type();
+        let zero = self.builder.ins().iconst(ptr_ty, 0);
+        let frame_base = self.async_frame;
+        for root in roots {
+            match root {
+                Root::Slot(slot) => self.stack_store(zero, slot),
+                // A plain store, not `emit_gc_heap_store`: the write barrier
+                // exists to record an old-to-young edge, and null creates none.
+                Root::Frame(offset) => {
+                    if let Some(base) = frame_base {
+                        self.builder
+                            .ins()
+                            .store(MemFlagsData::new(), zero, base, offset);
+                    }
+                }
+            }
+        }
+    }
+
     /// Give storage to every LIR local that nothing else binds (willow-ht1h).
     ///
     /// Lowering declares locals that carry a value ACROSS blocks — a
@@ -5430,6 +5564,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     } else {
                         self.emit_lir_sync_flush(sites, defers.scopes, defers.ledger);
                     }
+                }
+                LirInst::ClearScopeRoots { locals } => {
+                    self.emit_lir_clear_scope_roots(function, locals);
                 }
                 // Commit the protected value and hand the lock back
                 // (willow-0g8j.2.13). Idempotent at run time: the release is
@@ -6180,6 +6317,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .expect("the gc collect builtins are part of the backend ABI");
                 self.emit_runtime_call_with_cleanup(runtime, &[], |_| {});
                 self.builder.ins().iconst(types::I8, 0)
+            }
+            HirExprKind::Call { callee, args }
+                if gc_stat_builtin_runtime_name(callee).is_some() =>
+            {
+                debug_assert!(args.is_empty());
+                let runtime =
+                    gc_stat_builtin_runtime_name(callee).expect("vetted by the guard on this arm");
+                self.emit_value_runtime_call(runtime, &[])
             }
             HirExprKind::Call { callee, args } => {
                 let params = self.fn_param_types(callee);
