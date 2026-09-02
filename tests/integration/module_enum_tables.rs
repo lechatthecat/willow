@@ -768,6 +768,140 @@ fn main() {
     assert!(!ok, "`nope::Level` must not resolve: {log}");
 }
 
+/// A module that declares an enum under a name another unit uses for something
+/// else entirely.
+const CLASH: &str = "module other;
+
+pub enum Point { Near, Far }
+
+pub fn pick(n: i64) -> Point {
+    if n == 0 { return Point::Near; }
+    return Point::Far;
+}
+
+pub fn name(p: Point) -> String {
+    match p {
+        Point::Near => { return \"near\"; }
+        Point::Far => { return \"far\"; }
+    }
+}
+";
+
+// 27. The bare alias is registered only where it cannot be ambiguous, and a name
+//     ANOTHER unit declares as a class is exactly that. The back end answers a
+//     named type from the enum table first, so registering `Point` because a
+//     module declares `enum Point` would make the entry file's `class Point`
+//     read as a fieldless enum -- a tag, not a pointer -- and `is_gc_managed`
+//     would leave a live object untraced.
+#[test]
+fn p27_a_bare_enum_alias_never_shadows_another_units_class() {
+    let files = vec![
+        ("other.wi", CLASH),
+        (
+            "main.wi",
+            "import other;
+
+class Point {
+    pub init(self, label: String) { self.label = label; }
+    label: String;
+    pub fn label(self) -> String { return self.label; }
+}
+
+fn main() {
+    let p = new Point(\"a live class named Point\");
+    gc_collect();
+    gc_collect();
+    println(p.label());
+    println(other::name(other::pick(0)));
+}
+",
+        ),
+    ];
+    let expected = "a live class named Point\nnear\n";
+    let (lir, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", LIR_ON);
+    assert!(ok, "LIR run failed: {lir}");
+    assert_eq!(lir, expected);
+    let (ast, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", LIR_OFF);
+    assert!(ok, "AST run failed: {ast}");
+    assert_eq!(ast, expected);
+}
+
+// 28. ...and it holds when a collection runs at every allocation, which is where
+//     a mis-typed root shows up as an abort rather than as a wrong answer.
+#[test]
+fn p28_the_class_survives_alloc_stress() {
+    let files = vec![
+        ("other.wi", CLASH),
+        (
+            "main.wi",
+            "import other;
+
+class Point {
+    pub init(self, label: String) { self.label = label; }
+    label: String;
+    pub fn label(self) -> String { return self.label; }
+}
+
+fn main() {
+    let p = new Point(\"stressed\");
+    let mut i = 0;
+    while i < 20 {
+        let filler: String = \"[\" + \"]\";
+        i = i + 1;
+        println(filler + other::name(other::pick(i % 2)));
+    }
+    println(p.label());
+}
+",
+        ),
+    ];
+    for env in [ALLOC_STRESS_LIR, ALLOC_STRESS_AST] {
+        let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", env);
+        assert!(ok, "run under {env:?} failed: {out}");
+        assert!(
+            out.ends_with("stressed\n"),
+            "the class named `Point` must outlive the loop: {out}"
+        );
+    }
+}
+
+// 29. An interface claims a name the same way a class does.
+#[test]
+fn p29_a_bare_enum_alias_never_shadows_another_units_interface() {
+    let files = vec![
+        ("other.wi", CLASH),
+        (
+            "main.wi",
+            "import other;
+
+interface Point {
+    fn label(self) -> String;
+}
+
+class Marker implements Point {
+    pub init(self, label: String) { self.label = label; }
+    label: String;
+    pub fn label(self) -> String { return self.label; }
+}
+
+fn main() {
+    let p: Point = new Marker(\"a live interface named Point\");
+    gc_collect();
+    gc_collect();
+    println(p.label());
+    println(other::name(other::pick(1)));
+}
+",
+        ),
+    ];
+    let expected = "a live interface named Point\nfar\n";
+    for env in [LIR_ON, LIR_OFF] {
+        let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", env);
+        assert!(ok, "run under {env:?} failed: {out}");
+        assert_eq!(out, expected);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The whole build, and the runnable example.
 // ---------------------------------------------------------------------------

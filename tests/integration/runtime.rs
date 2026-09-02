@@ -1074,7 +1074,7 @@ fn test_runnable_example_files_compile_and_run() {
         ),
         (
             "example/lir_scope_roots.wi",
-            "0\n0\n0\n0\n0\n100\n101\n0\n6\nescapes into `kept`\n\
+            "0\n0\n0\n0\n0\n0\n0\n100\n101\n0\n6\nescapes into `kept`\n\
              inner: the inner label\ninner: the inner label\nthe outer label\n",
         ),
         (

@@ -158,6 +158,16 @@ fn restore_function_snapshots<T>(
 /// `CLASS_DESCRIPTOR_HEADER_BYTES + k * 8`.
 pub(super) const CLASS_DESCRIPTOR_HEADER_BYTES: u32 = 8;
 
+/// What one unit's bare enum aliases displaced, so the tables can be put back
+/// the way the next unit needs them (willow-nm0g).
+#[derive(Default)]
+pub struct EnumAliasScope {
+    /// Each aliased name and the enum it stood in front of, if any.
+    enums: Vec<(String, Option<EnumInfo>)>,
+    /// Interfaces taken out for the span of the aliases.
+    interfaces: Vec<(String, InterfaceInfo)>,
+}
+
 pub struct Codegen {
     module: ObjectModule,
     func_ids: FunctionMap<FuncId>,
@@ -584,6 +594,53 @@ impl Codegen {
     /// Register enum info so the backend can lower enum variant construction.
     pub fn register_enum_info(&mut self, name: String, info: EnumInfo) {
         self.enum_infos.insert(name, info);
+    }
+
+    /// Install a unit's bare enum names for the length of that unit's own
+    /// compilation, handing back what they displaced (willow-nm0g).
+    ///
+    /// The enum table is one flat namespace for the whole build, but a bare
+    /// name is only unambiguous inside the unit that wrote it: one module's
+    /// `enum Point` must not answer for another unit's `class Point` (the enum
+    /// table is consulted first, so a live object would read as a tag and go
+    /// untraced), and two modules that each declare `enum Kind` must each see
+    /// their own. So the names go in around the unit and come back out again.
+    ///
+    /// An interface of the same name comes OUT for that span. The interface
+    /// table is flat in the same way, and it is consulted first: with another
+    /// unit's `interface Point` standing, the declaring module's own
+    /// `Point::Near` reads as an interface and is refused. The alias is this
+    /// unit's answer for the name, so nothing else may answer for it here.
+    pub fn install_enum_aliases(&mut self, aliases: &[(String, EnumInfo)]) -> EnumAliasScope {
+        let mut scope = EnumAliasScope::default();
+        for (name, info) in aliases {
+            scope.enums.push((
+                name.clone(),
+                self.enum_infos.insert(name.clone(), info.clone()),
+            ));
+            if let Some(interface) = self.interface_infos.remove(name.as_str()) {
+                scope.interfaces.push((name.clone(), interface));
+            }
+        }
+        scope
+    }
+
+    /// Undo an [`Codegen::install_enum_aliases`], putting back whatever each
+    /// name held.
+    pub fn restore_enum_aliases(&mut self, scope: EnumAliasScope) {
+        for (name, info) in scope.enums {
+            match info {
+                Some(info) => {
+                    self.enum_infos.insert(name, info);
+                }
+                None => {
+                    self.enum_infos.remove(&name);
+                }
+            }
+        }
+        for (name, info) in scope.interfaces {
+            self.interface_infos.insert(name, info);
+        }
     }
 
     /// Register interface metadata for vtable generation and method dispatch.

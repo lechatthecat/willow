@@ -26,24 +26,32 @@
 //! into a synthetic `let` that outlives every iteration, and no source scope
 //! holds it, so the loop itself has to drop that root when it ends.
 //!
-//! 33 perspectives:
-//!   1 a `while` body                     18 an address-taken scalar too
-//!   2 a `for` body over a range          19 a `String` binding
-//!   3 a `for` body over an array         20 an `Array` binding
-//!   4 an `if` branch                     21 an enum payload binding
-//!   5 an `else` branch                   22 an async body's frame locals
-//!   6 an inner scope leaves the outer    23 a `lock` section in a loop
-//!   7 `break` drops what it abandons     24 the shapes are still lowered
-//!   8 `continue` drops it each time      25 alloc stress
-//!   9 `return` hands the value back      26 minor stress
-//!  10 a value that escapes survives      27 a release build
-//!  11 a shadowed outer binding lives     28 the example runs
-//!  12 an array still reaches it          29 the example is fully lowered
-//!  13 a `match` arm's scope              30 the example under GC stress
-//!  14 the scope's `defer` reads it       31 the `for` iterable temp
-//!  15 two bindings, both dropped         32 `break` out of a `for`
-//!  16 nested loops, both levels          33 a `for` over a range value
-//!  17 a scalar local is untouched
+//! A scope has more than one way out. A recovered panic resumes AFTER the scope,
+//! having run its `defer`s, so the close belongs in the block both that path and
+//! the fallthrough reach. And two constructs own roots the source never named:
+//! a `for` holds its hoisted iterable, and a `match` lowered as a block graph
+//! holds its scrutinee temp and each arm's pattern bindings.
+//!
+//! 38 perspectives:
+//!   1 a `while` body                     20 an `Array` binding
+//!   2 a `for` body over a range          21 an enum payload binding
+//!   3 a `for` body over an array         22 an async body's frame locals
+//!   4 an `if` branch                     23 a `lock` section in a loop
+//!   5 an `else` branch                   24 the shapes are still lowered
+//!   6 an inner scope leaves the outer    25 alloc stress
+//!   7 `break` drops what it abandons     26 minor stress
+//!   8 `continue` drops it each time      27 a release build
+//!   9 `return` hands the value back      28 the example runs
+//!  10 a value that escapes survives      29 the example is fully lowered
+//!  11 a shadowed outer binding lives     30 the example under GC stress
+//!  12 an array still reaches it          31 the `for` iterable temp
+//!  13 a `match` arm's scope              32 `break` out of a `for`
+//!  14 the scope's `defer` reads it       33 a `for` over a range value
+//!  15 two bindings, both dropped         34 a recovered panic drops it too
+//!  16 nested loops, both levels          35 a `match` scrutinee temp
+//!  17 a scalar local is untouched        36 an arm's pattern binding
+//!  18 an address-taken scalar too        37 an async frame word
+//!  19 a `String` binding                 38 those shapes under alloc stress
 
 use super::support::{
     compile_and_run_gc_stress_mode, compile_and_run_release, compile_and_run_with_env,
@@ -863,7 +871,7 @@ fn main() {{
     assert_eq!(out, "0\n");
 }
 
-const EXAMPLE_OUTPUT: &str = "0\n0\n0\n0\n0\n100\n101\n0\n6\nescapes into `kept`\ninner: the inner label\ninner: the inner label\nthe outer label\n";
+const EXAMPLE_OUTPUT: &str = "0\n0\n0\n0\n0\n0\n0\n100\n101\n0\n6\nescapes into `kept`\ninner: the inner label\ninner: the inner label\nthe outer label\n";
 
 // 28. The example program runs and prints what its comments claim.
 #[test]
@@ -888,6 +896,10 @@ fn p29_the_example_is_fully_lowered() {
             "hoisted_iterable",
             "early_break",
             "early_continue",
+            "matched",
+            "divide",
+            "warm",
+            "recovered",
             "deferred",
             "reachable_from_an_array",
             "escapes",
@@ -994,4 +1006,205 @@ fn main() {{
 "
     );
     assert_both_backends(&source, "0\n");
+}
+
+// 34. A recovered panic is a SECOND way out of a scope: the runtime resumes
+//     after the scope, having run its `defer`s, without ever passing the
+//     fallthrough close. A clear placed on the fallthrough alone would leave the
+//     binding rooted on exactly the path that took it.
+#[test]
+fn p34_a_recovered_panic_drops_the_scopes_binding() {
+    let source = format!(
+        "{CELL}fn divide(a: i64, b: i64) -> i64 {{
+    return a / b;
+}}
+fn warm() {{
+    defer match recover() {{
+        Some(info) => {{}}
+        None => {{}}
+    }}
+    println(divide(1, 0));
+}}
+fn run(rounds: i64) -> i64 {{
+    gc_collect();
+    let before = gc_allocated_bytes();
+    let mut i = 0;
+    while i < rounds {{
+        defer match recover() {{
+            Some(info) => {{}}
+            None => {{}}
+        }}
+        i = i + 1;
+        let cell = new Cell(i);
+        println(divide(cell.id(), cell.id() - i));
+    }}
+    gc_collect();
+    return gc_allocated_bytes() - before;
+}}
+fn main() {{
+    warm();
+    println(run(6));
+}}
+"
+    );
+    assert_both_backends(&source, "0\n");
+}
+
+// 35. The scrutinee of a `match` lowered as a block graph lives in a temp that
+//     outlives every arm and that no source scope declared. The construct closes
+//     at the merge every arm reaches, which is the one place all of them meet.
+#[test]
+fn p35_a_match_scrutinee_temp_is_dropped_at_the_merge() {
+    let source = format!(
+        "{CELL}enum Tag {{
+    Bare,
+    Boxed(Cell)
+}}
+fn run(rounds: i64) -> i64 {{
+    gc_collect();
+    let before = gc_allocated_bytes();
+    let mut i = 0;
+    while i < rounds {{
+        let mut acc = 0;
+        match Tag::Boxed(new Cell(i)) {{
+            Tag::Boxed(c) => {{
+                let mut k = 0;
+                while k < 1 {{
+                    acc = acc + c.id();
+                    k = k + 1;
+                }}
+            }}
+            Tag::Bare => {{
+                acc = acc + 1;
+            }}
+        }}
+        i = i + 1 + acc - acc;
+    }}
+    gc_collect();
+    return gc_allocated_bytes() - before;
+}}
+fn main() {{
+    println(run(8));
+}}
+"
+    );
+    assert_both_backends(&source, "0\n");
+}
+
+// 36. An arm's pattern bindings are declared ahead of the arm body's own scope,
+//     so the body's close does not reach them: the arm is a scope of its own and
+//     drops them where it ends.
+#[test]
+fn p36_a_match_arms_pattern_binding_is_dropped() {
+    let source = format!(
+        "{CELL}enum Tag {{
+    Bare,
+    Boxed(Cell)
+}}
+fn run(rounds: i64) -> i64 {{
+    gc_collect();
+    let before = gc_allocated_bytes();
+    let mut i = 0;
+    let mut acc = 0;
+    while i < rounds {{
+        let tag = Tag::Boxed(new Cell(i));
+        match tag {{
+            Tag::Boxed(held) => {{
+                acc = acc + held.id();
+            }}
+            Tag::Bare => {{
+                acc = acc + 1;
+            }}
+        }}
+        i = i + 1;
+    }}
+    gc_collect();
+    return gc_allocated_bytes() - before + acc - acc;
+}}
+fn main() {{
+    println(run(8));
+}}
+"
+    );
+    assert_both_backends(&source, "0\n");
+}
+
+// 37. An async local that is live across an `await` is not on the stack at all:
+//     it lives in the task's heap frame, which the frame's own map traces. The
+//     close has to null that frame word too, or the object stays traced until
+//     the whole task completes. Asserted under the walker alone — the AST
+//     emitter keeps frame words live for the task's lifetime, which is the
+//     behaviour the walker is replacing.
+#[test]
+fn p37_an_async_frame_local_is_dropped_at_the_scope_end() {
+    let source = format!(
+        "{CELL}async fn run(rounds: i64) -> i64 {{
+    gc_collect();
+    let before = gc_allocated_bytes();
+    let mut i = 0;
+    let mut total = 0;
+    while i < rounds {{
+        let cell = new Cell(i);
+        await sleep(1);
+        total = total + cell.id();
+        i = i + 1;
+    }}
+    gc_collect();
+    return gc_allocated_bytes() - before + total - total;
+}}
+async fn main() {{
+    println(await run(6));
+}}
+"
+    );
+    let (out, ok) = compile_and_run_with_env(&source, &LIR);
+    assert!(ok, "run failed under the walker: {out}");
+    assert_eq!(out, "0\n");
+}
+
+// 38. The three shapes above under allocation stress, where a slot cleared too
+//     early frees a live object and a stale one is a dangling root — and where
+//     the recovery path allocates on every round.
+#[test]
+fn p38_the_match_and_recovery_shapes_survive_alloc_stress() {
+    let source = format!(
+        "{CELL}{LABEL}enum Tag {{
+    Bare,
+    Boxed(Cell)
+}}
+fn divide(a: i64, b: i64) -> i64 {{
+    return a / b;
+}}
+fn run(rounds: i64) -> String {{
+    let kept = new Label(\"survivor\");
+    let mut i = 0;
+    let mut acc = 0;
+    while i < rounds {{
+        defer match recover() {{
+            Some(info) => {{}}
+            None => {{}}
+        }}
+        let tag = Tag::Boxed(new Cell(i));
+        match tag {{
+            Tag::Boxed(held) => {{
+                acc = acc + held.id();
+            }}
+            Tag::Bare => {{
+                acc = acc + 1;
+            }}
+        }}
+        i = i + 1;
+        println(divide(acc, i - i));
+    }}
+    gc_collect();
+    return kept.text();
+}}
+fn main() {{
+    println(run(4));
+}}
+"
+    );
+    let (out, ok) = compile_and_run_gc_stress_mode(&source, "alloc");
+    assert!(ok, "run failed under WILLOW_GC_STRESS=alloc: {out}");
+    assert_eq!(out, "survivor\n");
 }

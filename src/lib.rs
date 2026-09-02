@@ -910,53 +910,127 @@ fn run_backend(
     // fieldless enum's tag was rooted as a pointer and the collector aborted on
     // it, and the LIR walker refused every body that named one.
     //
-    // These are aliases for declarations the checkers already agreed on, so a
-    // name is registered only where it cannot be ambiguous: the entry table wins
-    // any name it claims, and a name two different declarations answer to (two
-    // modules declaring `enum Kind`, or two aliases of the same spelling) is
-    // dropped rather than resolved arbitrarily.
-    {
-        // A name that ANY unit declares as a class or an interface is not an
-        // alias for an enum, and the backend answers a named type from the enum
-        // table first: registering `Point` because some module declares
-        // `enum Point` would make another unit's `class Point` read as a tag,
-        // and `is_gc_managed` would then leave a live object untraced. Those
-        // names are dropped on the same grounds as an ambiguous one.
-        let mut claimed: std::collections::HashSet<&semantic::ids::TypeId> = checker
-            .symbols
-            .classes
-            .keys()
-            .chain(checker.symbols.interfaces.keys())
-            .collect();
-        for module_checker in &module_checkers {
-            claimed.extend(module_checker.checker.symbols.classes.keys());
-            claimed.extend(module_checker.checker.symbols.interfaces.keys());
-        }
-        let mut aliases: std::collections::HashMap<
-            &semantic::ids::TypeId,
-            Option<&semantic::symbols::EnumInfo>,
-        > = std::collections::HashMap::new();
-        for module_checker in &module_checkers {
-            for (name, info) in &module_checker.checker.symbols.enums {
-                if checker.symbols.enums.contains_key(name) || claimed.contains(name) {
-                    continue;
-                }
-                aliases
-                    .entry(name)
-                    .and_modify(|seen| {
-                        if seen.is_some_and(|prev| prev.declaration_span != info.declaration_span) {
-                            *seen = None;
-                        }
-                    })
-                    .or_insert(Some(info));
-            }
-        }
-        for (name, info) in aliases {
-            if let Some(info) = info {
+    // A qualified spelling names one type build-wide, so it goes in for good.
+    for module_checker in &module_checkers {
+        for (name, info) in &module_checker.checker.symbols.enums {
+            if name.namespace().is_some() && !checker.symbols.enums.contains_key(name) {
                 codegen.register_enum_info(name.to_string(), info.clone());
             }
         }
     }
+    // A BARE name is only unambiguous inside the unit that agreed on it, so it
+    // is installed for the length of that unit's own compilation and taken back
+    // out again. Registering bare names for the whole build would let a module's
+    // `enum Point` answer for another unit's `class Point` -- the enum table is
+    // consulted first, so a live object would read as a tag and go untraced --
+    // and would make two modules that each declare `enum Kind` resolve to
+    // whichever won the insert.
+    let module_bare_enums: std::collections::HashMap<
+        &str,
+        Vec<(semantic::ids::TypeId, semantic::symbols::EnumInfo)>,
+    > = module_checkers
+        .iter()
+        .map(|module_checker| {
+            let bare = module_checker
+                .checker
+                .symbols
+                .enums
+                .iter()
+                .filter(|(name, _)| name.namespace().is_none())
+                .filter(|(name, _)| !checker.symbols.enums.contains_key(*name))
+                .map(|(name, info)| (name.clone(), info.clone()))
+                .collect();
+            (module_checker.canonical_path.as_str(), bare)
+        })
+        .collect();
+    // Which modules each module imports, so a unit sees the bare names of the
+    // modules it named -- a signature it calls across can hand back a type the
+    // declaring module spells bare, and that spelling has to resolve here.
+    let module_imports: std::collections::HashMap<&str, Vec<String>> = modules
+        .iter()
+        .map(|m| {
+            let imports = module::resolver::classify_unit_imports(&m.program, &modules)
+                .modules
+                .iter()
+                .map(|binding| binding.canonical_path.clone())
+                .collect();
+            (m.canonical_path.as_str(), imports)
+        })
+        .collect();
+    let entry_imports: Vec<String> = module::resolver::classify_unit_imports(&program, &modules)
+        .modules
+        .iter()
+        .map(|binding| binding.canonical_path.clone())
+        .collect();
+    let unit_enum_aliases = |own: Option<&str>,
+                             imports: &[String],
+                             own_checker: &semantic::TypeChecker|
+     -> Vec<(String, semantic::symbols::EnumInfo)> {
+        // The unit's own module first, then everything its imports reach: a
+        // module the unit named can hand back a type IT spells bare, and that
+        // spelling has to resolve here.
+        let mut queue: std::collections::VecDeque<String> = own
+            .map(str::to_string)
+            .into_iter()
+            .chain(imports.iter().cloned())
+            .collect();
+        let mut visited: std::collections::HashSet<String> = queue.iter().cloned().collect();
+        let mut owners: Vec<(semantic::ids::TypeId, &str, semantic::symbols::EnumInfo)> =
+            Vec::new();
+        while let Some(path) = queue.pop_front() {
+            for (name, info) in module_bare_enums
+                .get(path.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+            {
+                // Never over a name this unit's OWN checker settled: the unit
+                // wrote `class Point` or `interface Point`, and an enum from
+                // somewhere else does not get to answer for it.
+                if own_checker.symbols.classes.contains_key(name)
+                    || own_checker.symbols.interfaces.contains_key(name)
+                {
+                    continue;
+                }
+                let owner = module_bare_enums
+                    .get_key_value(path.as_str())
+                    .map(|(key, _)| *key)
+                    .unwrap_or("");
+                owners.push((name.clone(), owner, info.clone()));
+            }
+            for imported in module_imports
+                .get(path.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+            {
+                if visited.insert(imported.clone()) {
+                    queue.push_back(imported.clone());
+                }
+            }
+        }
+        let mut aliases: Vec<(String, semantic::symbols::EnumInfo)> = Vec::new();
+        let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (name, owner, info) in &owners {
+            if !taken.insert(name.to_string()) {
+                continue;
+            }
+            // The unit's own declaration answers for the name outright.
+            if Some(*owner) == own {
+                aliases.push((name.to_string(), info.clone()));
+                continue;
+            }
+            // Two modules answering to one bare name is not resolved to
+            // whichever came first: the name is DROPPED, and the walker refuses
+            // the body rather than lowering it against an arbitrary one of the
+            // two layouts (willow-itcw is the checker's own confusion of them).
+            let ambiguous = owners
+                .iter()
+                .any(|(other, other_owner, _)| other == name && other_owner != owner);
+            if !ambiguous {
+                aliases.push((name.to_string(), info.clone()));
+            }
+        }
+        aliases
+    };
     // Register interface metadata for vtable codegen + interface dispatch.
     for (name, info) in &checker.symbols.interfaces {
         codegen.register_interface_info(name.to_string(), info.clone());
@@ -1012,12 +1086,28 @@ fn run_backend(
         // What THIS module's own imports bind (willow-vtlr, willow-28h8): the
         // modules it can name, and the single items it bound to local names.
         codegen.set_unit_imports(backend_unit_imports(&m.program, &modules));
-        match codegen.declare_module(
+        // ...and the bare enum names THIS module agreed on, for the length of
+        // its own declaration phase (willow-nm0g): the ones it declared itself,
+        // then the ones the modules it imports declared.
+        let aliases = match module_checker {
+            Some(m_checker) => unit_enum_aliases(
+                Some(m.canonical_path.as_str()),
+                module_imports
+                    .get(m.canonical_path.as_str())
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                &m_checker.checker,
+            ),
+            None => Vec::new(),
+        };
+        let displaced = codegen.install_enum_aliases(&aliases);
+        let declared = codegen.declare_module(
             &m.name,
             &m.canonical_path,
             &m.program,
             &m.path.to_string_lossy(),
-        ) {
+        );
+        match declared {
             Ok(unit) => {
                 // Lowered IR of THIS module's bodies (willow-0g8j.16). Without
                 // it every cross-module body is AST-emitted no matter what the
@@ -1030,9 +1120,11 @@ fn run_backend(
                     let (hir, _hir_gaps) = ir::lower::lower_program_with(&m.program, &tables);
                     codegen.register_module_lir(&unit, ir::lowered::lower_program(&hir));
                 }
-                declared_modules.push((m.name.clone(), unit));
+                codegen.restore_enum_aliases(displaced);
+                declared_modules.push((m.name.clone(), m.canonical_path.clone(), unit));
             }
             Err(error) => {
+                codegen.restore_enum_aliases(displaced);
                 return Err(report_backend_failure(
                     &mut codegen,
                     errors::CodegenError::new(errors::CodegenStage::Module(m.name.clone()), error),
@@ -1048,7 +1140,13 @@ fn run_backend(
     // mangled symbols exist), and rebind before the entry bodies: a module's
     // body phase runs in between and may hold the same local name.
     codegen.set_unit_imports(backend_unit_imports(&program, &modules));
-    let entry_unit = match codegen.declare_program(&program, src) {
+    // The entry file's bare enum aliases are the ones the modules it imports
+    // declared; its own are already in the table above (willow-nm0g).
+    let entry_aliases = unit_enum_aliases(None, &entry_imports, &checker);
+    let displaced = codegen.install_enum_aliases(&entry_aliases);
+    let declared_entry = codegen.declare_program(&program, src);
+    codegen.restore_enum_aliases(displaced);
+    let entry_unit = match declared_entry {
         Ok(unit) => unit,
         Err(error) => {
             return Err(report_backend_failure(
@@ -1060,8 +1158,28 @@ fn run_backend(
             ));
         }
     };
-    for (name, unit) in &declared_modules {
-        if let Err(error) = codegen.compile_module_bodies(unit) {
+    for (name, canonical_path, unit) in &declared_modules {
+        // The module's own bare enum names, again: the body phase resolves the
+        // same names the declaration phase did, and every other unit's phase
+        // runs in between (willow-nm0g).
+        let aliases = match module_checkers
+            .iter()
+            .find(|c| &c.canonical_path == canonical_path)
+        {
+            Some(m_checker) => unit_enum_aliases(
+                Some(canonical_path.as_str()),
+                module_imports
+                    .get(canonical_path.as_str())
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                &m_checker.checker,
+            ),
+            None => Vec::new(),
+        };
+        let displaced = codegen.install_enum_aliases(&aliases);
+        let compiled = codegen.compile_module_bodies(unit);
+        codegen.restore_enum_aliases(displaced);
+        if let Err(error) = compiled {
             return Err(report_backend_failure(
                 &mut codegen,
                 errors::CodegenError::new(errors::CodegenStage::Module(name.clone()), error),
@@ -1071,7 +1189,10 @@ fn run_backend(
             ));
         }
     }
-    if let Err(error) = codegen.compile_program_bodies(&entry_unit) {
+    let displaced = codegen.install_enum_aliases(&entry_aliases);
+    let compiled_entry = codegen.compile_program_bodies(&entry_unit);
+    codegen.restore_enum_aliases(displaced);
+    if let Err(error) = compiled_entry {
         return Err(report_backend_failure(
             &mut codegen,
             errors::CodegenError::new(errors::CodegenStage::Entry, error),
