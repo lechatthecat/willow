@@ -105,6 +105,14 @@ impl Parser {
         &self.tokens[self.pos].kind
     }
 
+    /// The token `offset` places ahead, saturating at the final token — which
+    /// is always EOF, so a lookahead past the end reads as EOF rather than
+    /// panicking.
+    fn peek_kind_at(&self, offset: usize) -> &TokenKind {
+        let idx = (self.pos + offset).min(self.tokens.len() - 1);
+        &self.tokens[idx].kind
+    }
+
     fn current_span(&self) -> Span {
         self.tokens[self.pos].span
     }

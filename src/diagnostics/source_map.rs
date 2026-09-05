@@ -669,6 +669,10 @@ fn type_name(ty: &Type) -> String {
             let param_str = params.iter().map(type_name).collect::<Vec<_>>().join(",");
             format!("fn({}) -> {}", param_str, type_name(ret))
         }
+        Type::Closure(params, ret) => {
+            let param_str = params.iter().map(type_name).collect::<Vec<_>>().join(",");
+            format!("closure({}) -> {}", param_str, type_name(ret))
+        }
     }
 }
 

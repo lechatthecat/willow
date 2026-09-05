@@ -77,6 +77,10 @@ pub(crate) fn type_name(ty: &Type) -> String {
             let param_str = params.iter().map(type_name).collect::<Vec<_>>().join(", ");
             format!("fn({}) -> {}", param_str, type_name(ret))
         }
+        Type::Closure(params, ret) => {
+            let param_str = params.iter().map(type_name).collect::<Vec<_>>().join(", ");
+            format!("closure({}) -> {}", param_str, type_name(ret))
+        }
     }
 }
 
@@ -151,6 +155,13 @@ pub(crate) fn qualify_type_for_module(ty: &Type, module_prefix: Option<&str>) ->
                 .collect(),
         ),
         Type::Fn(params, ret) => Type::Fn(
+            params
+                .iter()
+                .map(|param| qualify_type_for_module(param, module_prefix))
+                .collect(),
+            Box::new(qualify_type_for_module(ret, module_prefix)),
+        ),
+        Type::Closure(params, ret) => Type::Closure(
             params
                 .iter()
                 .map(|param| qualify_type_for_module(param, module_prefix))

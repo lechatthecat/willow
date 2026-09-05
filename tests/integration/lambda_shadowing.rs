@@ -6,7 +6,7 @@
 //!  06 free function declared after its caller, 07 `format` builtin shadow,
 //!  08 `panic` builtin shadow, 09 reserved `recover` remains unshadowable,
 //!  10 mutable function local reassignment, 11 two nested shadows,
-//!  12 noncapturing block lambda, 13 capture remains an E1002 diagnostic,
+//!  12 noncapturing block lambda, 13 a CAPTURING shadow is still the callee,
 //!  14 local arity diagnostic wins, 15 local parameter-type diagnostic wins,
 //!  16 non-callable local blocks free-function fallback, 17 loop scope,
 //!  18 deferred indirect call, 19 async function after suspension,
@@ -85,9 +85,13 @@ fn lambda_shadow_01_through_12_and_17_23_runtime_matrix() {
     assert_eq!(out, SHADOW_OUTPUT);
 }
 
+/// Shadowing does not depend on the lambda being a bare code address: since
+/// willow-0g8j.2.12 a capturing lambda is a `closure` value, and the local
+/// still wins over the free function of the same name — the call goes through
+/// the environment rather than to `f`'s symbol.
 #[test]
-fn lambda_shadow_13_capture_is_still_rejected() {
-    assert_compile_error_contains(
+fn lambda_shadow_13_a_capturing_shadow_is_still_the_callee() {
+    let (out, ok) = compile_and_run(
         r#"
 fn f(x: i64) -> i64 { return x + 1; }
 fn main() {
@@ -96,8 +100,9 @@ fn main() {
     println(f(1));
 }
 "#,
-        &["error[E1002]", "lambda cannot capture `offset`"],
     );
+    assert!(ok, "{out}");
+    assert_eq!(out, "101\n");
     assert_compile_error_contains(
         r#"fn main() { let recover = |x: i64| x; println(recover(1)); }"#,
         &["error[E0351]", "`recover` is a reserved builtin function"],

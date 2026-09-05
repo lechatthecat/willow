@@ -30,11 +30,12 @@ use crate::parser::ast::{
 };
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::symbols;
+use crate::semantic::type_checker::LambdaCapture;
 use crate::semantic::type_checker::types::await_output_type;
 
 use super::typed_ast::{
-    HirClass, HirDeferBody, HirExpr, HirExprKind, HirFunction, HirMatchArm, HirParam, HirPattern,
-    HirProgram, HirSelectCase, HirSelectCaseKind, HirStmt,
+    HirCapture, HirClass, HirDeferBody, HirExpr, HirExprKind, HirFunction, HirMatchArm, HirParam,
+    HirPattern, HirProgram, HirSelectCase, HirSelectCaseKind, HirStmt,
 };
 
 /// Type-checker side tables the lowering can consume to close gaps the
@@ -73,6 +74,11 @@ pub struct CheckerTables<'a> {
     /// What a static call's written class name resolved to, keyed by the call's
     /// span, for the calls where the two differ (willow-0g8j.3).
     pub static_call_classes: Option<&'a HashMap<Span, String>>,
+    /// What each lambda captures from its enclosing function, keyed by the
+    /// lambda's span and ordered as the closure environment lays its slots out
+    /// (willow-0g8j.2.12). Only the checker knows this: capture is decided by
+    /// name resolution, which the AST does not record.
+    pub lambda_captures: Option<&'a HashMap<Span, Vec<LambdaCapture>>>,
 }
 
 impl<'a> CheckerTables<'a> {
@@ -85,6 +91,7 @@ impl<'a> CheckerTables<'a> {
             enums: Some(&checker.symbols.enums),
             normalized_types: Some(&checker.normalized_types),
             static_call_classes: Some(&checker.static_call_classes),
+            lambda_captures: Some(&checker.lambda_captures),
         }
     }
 
@@ -110,6 +117,10 @@ impl<'a> CheckerTables<'a> {
                 params.iter().map(|p| self.normalize(p)).collect(),
                 Box::new(self.normalize(ret)),
             ),
+            Type::Closure(params, ret) => Type::Closure(
+                params.iter().map(|p| self.normalize(p)).collect(),
+                Box::new(self.normalize(ret)),
+            ),
             other => other.clone(),
         };
         match self.normalized_types.and_then(|m| m.get(&rebuilt)) {
@@ -118,14 +129,23 @@ impl<'a> CheckerTables<'a> {
         }
     }
 
-    /// A lambda's full inferred `fn(...) -> ...` type, from the checker's
-    /// expression table — including the parameter types a call site supplied,
-    /// which the AST cannot spell.
+    /// A lambda's full inferred callable type, from the checker's expression
+    /// table — including the parameter types a call site supplied, which the
+    /// AST cannot spell. Either callable form answers: which one it is says
+    /// whether the lambda captures, not what its signature is.
     fn lambda_fn_type(&self, span: &Span) -> Option<&Type> {
         match self.expr_types.and_then(|m| m.get(span)) {
-            Some(ty @ Type::Fn(..)) => Some(ty),
+            Some(ty @ (Type::Fn(..) | Type::Closure(..))) => Some(ty),
             _ => None,
         }
+    }
+
+    /// What the lambda at `span` captures, in environment-slot order.
+    fn lambda_captures(&self, span: &Span) -> &[LambdaCapture] {
+        self.lambda_captures
+            .and_then(|m| m.get(span))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     fn enum_variant_resolution(&self, span: &Span) -> Option<&String> {
@@ -1378,9 +1398,26 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
             // the AST cannot store: unannotated parameter types and, for
             // block-bodied lambdas, the inferred return type.
             let inferred = match ctx.tables.lambda_fn_type(&l.span) {
-                Some(Type::Fn(params, ret)) => Some((params.clone(), (**ret).clone())),
+                Some(Type::Fn(params, ret) | Type::Closure(params, ret)) => {
+                    Some((params.clone(), (**ret).clone()))
+                }
                 _ => None,
             };
+            let is_closure = matches!(ctx.tables.lambda_fn_type(&l.span), Some(Type::Closure(..)));
+            // Resolve every capture in the ENCLOSING namespace first: after the
+            // scope below, `n` means the lambda's own copy (willow-0g8j.2.12).
+            let capture_sources: Vec<(String, String, Type)> = ctx
+                .tables
+                .lambda_captures(&l.span)
+                .iter()
+                .map(|c| {
+                    (
+                        c.name.clone(),
+                        ctx.hir_name(&c.name),
+                        ctx.tables.normalize(&c.ty),
+                    )
+                })
+                .collect();
             let mut params = Vec::with_capacity(l.params.len());
             let mut param_tys = Vec::with_capacity(l.params.len());
             ctx.push_scope();
@@ -1393,6 +1430,18 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
             let outer_binds = std::mem::take(&mut ctx.binds_seen);
             let outer_namespace_scope_base = ctx.namespace_scope_base;
             ctx.namespace_scope_base = ctx.scopes.len();
+            // Bind the captures BEFORE anything else in the lambda's fresh
+            // namespace. They are the first names it sees, so a body-local
+            // rebinding of a captured name gets the shadow suffix and the two
+            // stay distinct locals in the lifted function.
+            let captures: Vec<HirCapture> = capture_sources
+                .into_iter()
+                .map(|(source_name, source, ty)| HirCapture {
+                    name: ctx.bind(source_name, ty.clone()),
+                    source,
+                    ty,
+                })
+                .collect();
             for (i, p) in l.params.iter().enumerate() {
                 let inferred_param = inferred
                     .as_ref()
@@ -1475,9 +1524,21 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
             ctx.pop_scope();
             ctx.binds_seen = outer_binds;
             ctx.namespace_scope_base = outer_namespace_scope_base;
+            // A capture-free lambda that a `closure(...)` slot expects is a
+            // closure too: the slot decides the calling convention, so the
+            // lifted body still takes the (empty) environment.
+            let ty = if is_closure {
+                Type::Closure(param_tys, Box::new(ret))
+            } else {
+                Type::Fn(param_tys, Box::new(ret))
+            };
             Ok(HirExpr {
-                kind: HirExprKind::Lambda { params, body },
-                ty: Type::Fn(param_tys, Box::new(ret)),
+                kind: HirExprKind::Lambda {
+                    params,
+                    captures,
+                    body,
+                },
+                ty,
                 span: l.span,
             })
         }

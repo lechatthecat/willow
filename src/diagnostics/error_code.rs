@@ -141,6 +141,12 @@ error_codes! {
     // Lambda E10xx
     E1001,
     E1002,
+    // E1009: assignment to a captured variable. A capture is a copy taken when
+    // the closure value is built, so `let mut` on the enclosing binding does
+    // not excuse the write either. E1011: a capturing lambda where a plain
+    // `fn(...)` pointer is required (both willow-0g8j.2.12).
+    E1009,
+    E1011,
     // Command-line / entry point E13xx
     E1301,
     E1302,

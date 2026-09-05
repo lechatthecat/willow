@@ -122,7 +122,8 @@ let squared = parallel::map(values.freeze(), |value| value * value);
 println((await squared).toString());
 ```
 
-The v1 mapper is `fn(i64) -> i64`; Willow lambdas cannot capture enclosing
-locals. Cancelling the returned Task cancels all chunk Tasks and exposes no
+The v1 mapper is `fn(i64) -> i64` — a bare code address with no environment, so
+the lambda passed here must not capture an enclosing local. A lambda that does
+capture is a `closure` value instead; see `lir_closures.wi`. Cancelling the returned Task cancels all chunk Tasks and exposes no
 partial result. A mapper panic follows the normal Task policy and aborts the
 process. See `parallel_map.wi`.

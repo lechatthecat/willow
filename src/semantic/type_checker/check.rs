@@ -1147,7 +1147,11 @@ impl TypeChecker {
                         .with_label(Label::primary(s.span, "not found in this scope")),
                     ),
                     Some(info) => {
-                        if !info.mutable {
+                        // A write to a capture was already reported against the
+                        // capture (willow-0g8j.2.12); reporting the enclosing
+                        // local's mutability on top of it would point at a fix
+                        // that does not exist.
+                        if !info.mutable && !self.capture_writes.contains(&s.span) {
                             if info.is_param {
                                 self.push(
                                     Diagnostic::new(
@@ -1710,7 +1714,10 @@ impl TypeChecker {
                 // `fn f` also existed (willow-bv9.1).
                 if let Some(var_info) = self.symbols.lookup_var(&c.callee).cloned() {
                     match var_info.ty {
-                        Type::Fn(param_types, ret) => {
+                        // Both callable types are called the same way in source
+                        // (willow-0g8j.2.12); they differ only in what codegen
+                        // has to load first.
+                        Type::Fn(param_types, ret) | Type::Closure(param_types, ret) => {
                             if param_types.len() != c.args.len() {
                                 self.push(
                                     Diagnostic::new(

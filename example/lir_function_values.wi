@@ -11,9 +11,10 @@
 //   * a named function used as a VALUE (`apply(double, 10)`) — spelled as a
 //     bare identifier, so what makes it a code address rather than a variable
 //     read is purely what the name resolves to;
-//   * a lambda, which is a lifted top-level function with NO captured
-//     environment (the checker rejects a capture outright), so its value is
-//     just that lifted function's address;
+//   * a lambda that captures nothing, which is a lifted top-level function
+//     with no environment, so its value is just that lifted function's
+//     address. A lambda that DOES capture is a different type — see
+//     `lir_closures.wi`, where the value is an environment object instead;
 //   * a call whose callee is a local function value rather than a symbol,
 //     which compiles to an indirect call.
 //

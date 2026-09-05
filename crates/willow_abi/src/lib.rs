@@ -169,6 +169,9 @@ pub enum GcObjectKind {
     Channel = 10,
     AtomicCell = 11,
     LockHandle = 12,
+    /// A closure value: payload word 0 is the lifted function's code address
+    /// and words 1..N are the captured environment (willow-0g8j.2.12).
+    Closure = 13,
 }
 
 /// Destination category supplied to the structural write-barrier hook.
@@ -414,6 +417,7 @@ mod tests {
     fn shared_discriminants_are_stable() {
         assert_eq!(GcObjectKind::Class as u64, 1);
         assert_eq!(GcObjectKind::LockHandle as u64, 12);
+        assert_eq!(GcObjectKind::Closure as u64, 13);
         assert_eq!(GcStoreDestination::ObjectField as i64, 1);
         assert_eq!(GcStoreDestination::AsyncRwLockCell as i64, 11);
         assert_eq!(RuntimePollResult::Pending as i32, 0);

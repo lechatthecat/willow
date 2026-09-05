@@ -62,6 +62,23 @@ pub struct HirParam {
     pub span: Span,
 }
 
+/// One value a lambda body reads from the enclosing function, lifted into the
+/// closure environment (willow-0g8j.2.12).
+///
+/// The two names are the SAME source variable seen from the two sides of the
+/// lift: `source` is what the enclosing function calls it, `name` is what the
+/// lifted body calls it. They differ whenever shadowing renamed one of them,
+/// because the lifted body restarts the flat namespace (willow-0g8j.2.10).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HirCapture {
+    /// The binding's name inside the lifted lambda body.
+    pub name: String,
+    /// The binding's name in the enclosing function, which is where the value
+    /// is read from when the environment is built.
+    pub source: String,
+    pub ty: Type,
+}
+
 /// What a `defer` runs when its scope exits (willow-0g8j.2.3).
 ///
 /// The two arms mirror the source forms and differ in SCOPE, not just shape: a
@@ -413,10 +430,14 @@ pub enum HirExprKind {
     TryPropagate {
         inner: Box<HirExpr>,
     },
-    /// `|params| body` lambda; `ty` is `fn(params) -> ret`. An expression body is
+    /// `|params| body` lambda; `ty` is `fn(params) -> ret` when it captures
+    /// nothing and `closure(params) -> ret` when it does. An expression body is
     /// represented as a single `Return` statement.
     Lambda {
         params: Vec<HirParam>,
+        /// What the body reads from the enclosing function, in environment-slot
+        /// order (willow-0g8j.2.12). Empty for a `fn`-typed lambda.
+        captures: Vec<HirCapture>,
         body: Vec<HirStmt>,
     },
     /// `match scrutinee { pat => body, ... }`; `ty` is the shared arm type.

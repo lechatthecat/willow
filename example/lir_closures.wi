@@ -1,0 +1,179 @@
+// Closures: lambdas that capture, through the LIR-walking backend.
+//
+// `lir_function_values.wi` covers the lambda that captures NOTHING, whose
+// value is just the lifted function's code address. This file covers the other
+// half (willow-0g8j.2.12): a lambda that reads a local of its enclosing
+// function is a `closure`, and its value is a GC object laid out exactly like a
+// class instance — payload word 0 is the lifted function's code address, words
+// 1..N are the captured values, and the lifted body takes that object as a
+// hidden leading argument.
+//
+// Three consequences run through every example below.
+//
+//   * `fn` and `closure` are different types with no coercion between them. A
+//     `fn` is a bare address with nowhere to put an environment, so a capturing
+//     lambda is not one; a capture-free lambda answers to either.
+//   * A capture is taken BY VALUE when the closure value is built, and is
+//     immutable inside the body. Assigning to one is an error, because the
+//     write could never be seen outside the closure and a second call would
+//     start from the same copy again.
+//   * By value means the SLOT is copied, not the object it points at. Writing a
+//     field or element through a captured reference is an ordinary mutation,
+//     shared with the enclosing function exactly as passing the reference to a
+//     function would be.
+//
+// Every free function here stays inside the walker's supported subset, so its
+// blocks come straight from the lowered IR; a body outside that subset is a
+// compile error, so this file compiling at all is what keeps that claim honest.
+
+import std::collections::Array;
+
+// ── The shape of the type ───────────────────────────────────────────────────
+
+// A `closure(...) -> ...` parameter. The call is indirect and passes the
+// environment: the callee address comes out of the object's first word.
+fn apply(f: closure(i64) -> i64, v: i64) -> i64 {
+    return f(v);
+}
+
+// A closure outlives the frame it captured from — the environment is a heap
+// object, so `n` is still readable after `adder` returns.
+fn adder(n: i64) -> closure(i64) -> i64 {
+    return |x: i64| x + n;
+}
+
+// A capture-free lambda is still accepted where a closure is expected: it
+// simply carries an environment with no slots in it.
+fn twice(f: closure(i64) -> i64, v: i64) -> i64 {
+    return f(f(v));
+}
+
+// A `fn` parameter, to show the two types living side by side in one program.
+fn apply_fn(f: fn(i64) -> i64, v: i64) -> i64 {
+    return f(v);
+}
+
+// ── What a capture can be ───────────────────────────────────────────────────
+
+fn describe(label: String, factor: i64) -> closure(i64) -> String {
+    // Two captures of different types, and the environment lays its slots out
+    // in first-mention order.
+    return |x: i64| label + "=" + (x * factor).toString();
+}
+
+fn scaled_sum(scale: f64, on: bool) -> f64 {
+    // A capture is not restricted to i64: an f64 rides a slot of its own, and
+    // so does a bool.
+    let f = |v: f64| on ? v * scale : 0.0;
+    return f(2.0) + f(0.5);
+}
+
+// ── Captures are by value ───────────────────────────────────────────────────
+
+fn snapshot() -> i64 {
+    let mut n = 1;
+    // `n` is copied into the environment HERE, so the later write to the
+    // enclosing `n` does not reach the closure.
+    let f = |x: i64| x + n;
+    n = 100;
+    return f(0);
+}
+
+// ── ...but the value can be a reference ─────────────────────────────────────
+
+class Counter {
+    pub count: i64;
+
+    pub fn bump(self) -> i64 {
+        // A method's own local is capturable; `self` is not, because the
+        // receiver is bound by the calling convention rather than by a slot.
+        let start = self.count;
+        let f = |step: i64| start + step;
+        return f(1);
+    }
+}
+
+fn share() -> i64 {
+    let c = new Counter(1);
+    let xs: Array<i64> = [10, 20];
+    // Both captures hold the same references the enclosing frame holds, so
+    // these writes land on the objects `main` goes on to read.
+    let f = |bump: i64| {
+        c.count = c.count + bump;
+        xs[0] = xs[0] + bump;
+        return c.count + xs[0];
+    };
+    let total = f(5);
+    return total + c.count + xs[0];
+}
+
+// ── Closures that close over closures ───────────────────────────────────────
+
+fn compose(f: closure(i64) -> i64, g: closure(i64) -> i64) -> closure(i64) -> i64 {
+    // `f` and `g` are themselves closure values, so this environment holds two
+    // GC references and the body's calls are indirect through both.
+    return |x: i64| f(g(x));
+}
+
+// The inner lambda cannot reach a frame two levels up, so `base` rides BOTH
+// environments: the outer closure captures it in order to hand it on.
+fn nested(base: i64) -> i64 {
+    let outer = |x: i64| {
+        let inner = |y: i64| y + base;
+        return inner(x) * 2;
+    };
+    return outer(3);
+}
+
+// A closure built inside a loop captures that iteration's values, and the
+// result is a fresh environment each time round.
+fn loop_captures(n: i64) -> i64 {
+    let mut total = 0;
+    let mut i = 1;
+    while i <= n {
+        let step = i * 10;
+        let f = |x: i64| x + step;
+        total = total + f(1);
+        i = i + 1;
+    }
+    return total;
+}
+
+// A capture is shadowable: the body may rebind the name after reading it, and
+// the two are separate slots in the lifted function.
+fn shadow(seed: i64) -> i64 {
+    let f = |x: i64| {
+        let seed = seed + x;
+        return seed * 2;
+    };
+    return f(1);
+}
+
+fn main() {
+    // The type in isolation.
+    let bump = 7;
+    println(apply(|x: i64| x + bump, 1));
+    let add5 = adder(5);
+    println(add5(10));
+    println(add5(0));
+    println(twice(|x: i64| x * 3, 2));
+    println(apply_fn(|x: i64| x - 1, 10));
+
+    // Capture types.
+    let d = describe("area", 3);
+    println(d(4));
+    println(scaled_sum(4.5, true));
+    println(scaled_sum(4.5, false));
+
+    // By value, and by reference-inside-the-value.
+    println(snapshot());
+    println(new Counter(41).bump());
+    println(share());
+
+    // Closures over closures.
+    let doubled = compose(add5, |x: i64| x * 2);
+    println(doubled(10));
+    println(nested(4));
+    println(loop_captures(3));
+    println(shadow(9));
+}

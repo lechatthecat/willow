@@ -52,8 +52,11 @@
 //! for a section that defers nothing.
 //!
 //! A capture-free lambda is lifted to its own [`LirFunction`] and materialized
-//! as a function address; capturing closures remain rejected by the language
-//! checker pending their representation design.
+//! as a function address. A CAPTURING one is lifted the same way, but its value
+//! is the environment object instead (willow-0g8j.2.12): a GC object holding
+//! the code address in word 0 and the captured values after it, which the
+//! lifted body takes as a hidden leading argument and an indirect call passes
+//! back.
 //!
 //! Enums and `match` (willow-0g8j.8) mirror [`FuncGen::emit_match`]
 //! instruction for instruction, including the rule that decides the
@@ -189,7 +192,8 @@ use crate::ir::lowered::{
     LirSelectWaitOp, SuspendOp, Terminator,
 };
 use crate::ir::typed_ast::{
-    HirExpr, HirExprKind, HirMatchArm, HirPattern, HirSelectCase, HirSelectCaseKind, HirStmt,
+    HirCapture, HirExpr, HirExprKind, HirMatchArm, HirPattern, HirSelectCase, HirSelectCaseKind,
+    HirStmt,
 };
 use crate::parser::ast::{BinOp, ParamMode, Type, UnaryOp};
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
@@ -1026,12 +1030,15 @@ impl LirTypeCtx<'_> {
                         })
                 }
             },
-            // A function value is a bare code pointer — no environment, since
-            // lambdas capture nothing (willow-0g8j.2.2). What has to hold is
-            // that every type in the SIGNATURE is one the walker can pass and
-            // receive, because an indirect call builds its Cranelift signature
-            // from exactly this type.
-            Type::Fn(params, ret) => {
+            // The two callable values (willow-0g8j.2.2, willow-0g8j.2.12). A
+            // `fn` is a bare code pointer; a `closure` is a GC object whose
+            // word 0 is the code pointer and whose remaining words are the
+            // captured environment. Both are vetted the same way, because both
+            // are CALLED through a Cranelift signature the walker builds from
+            // exactly this type: every type in the signature must be one it can
+            // pass and receive. The closure's hidden environment parameter adds
+            // nothing to vet — it is the object itself.
+            Type::Fn(params, ret) | Type::Closure(params, ret) => {
                 params
                     .iter()
                     .all(|p| !matches!(p, Type::Void) && self.supported_type_inner(p, open))
@@ -1400,8 +1407,11 @@ impl LirTypeCtx<'_> {
         self.class_layouts.get(&self.class_key(name)?)
     }
 
-    /// The declared `fn(...) -> ...` type of a symbol that is about to be used
-    /// as a VALUE (willow-0g8j.2.2), or `None` when it cannot be.
+    /// The declared callable type of a symbol that is about to be used as a
+    /// VALUE — `fn(...) -> ...`, or `closure(...) -> ...` for a lifted
+    /// capturing lambda (willow-0g8j.2.2, willow-0g8j.2.12) — or `None` when it
+    /// cannot be. The closure's hidden environment parameter is NOT part of
+    /// this type: it is the value itself, not something a call site passes.
     ///
     /// Three things have to hold, and all three are about the pointer being
     /// callable later through a signature built from the type alone: the symbol
@@ -1419,7 +1429,7 @@ impl LirTypeCtx<'_> {
         {
             return None;
         }
-        let ty @ Type::Fn(..) = self.fn_types.get(mangled)?.clone() else {
+        let ty @ (Type::Fn(..) | Type::Closure(..)) = self.fn_types.get(mangled)?.clone() else {
             return None;
         };
         self.supported_type(&ty).then_some(ty)
@@ -1480,10 +1490,12 @@ fn may_allocate(e: &HirExpr) -> bool {
         HirExprKind::Int(_) | HirExprKind::Float(_) | HirExprKind::Bool(_) => false,
         HirExprKind::Var(_) => false,
         HirExprKind::ReferenceArg { place } => may_allocate(place),
-        // Taking a function's address is a relocation, not an allocation: a
-        // lambda is a lifted top-level function with no captured environment
-        // to build (willow-0g8j.2.2).
-        HirExprKind::FnRef(_) | HirExprKind::Lambda { .. } => false,
+        // Taking a function's address is a relocation, not an allocation
+        // (willow-0g8j.2.2). A CLOSURE is the other case: its value is a fresh
+        // GC object holding the captured environment (willow-0g8j.2.12), so it
+        // allocates exactly like an object literal does.
+        HirExprKind::FnRef(_) => false,
+        HirExprKind::Lambda { .. } => matches!(e.ty, Type::Closure(..)),
         HirExprKind::Unary { operand, .. } => may_allocate(operand),
         // String concatenation allocates; equality/inequality only compare
         // bytes and collect only if evaluating an operand can allocate.
@@ -2090,6 +2102,17 @@ fn lir_suspends_here(expr: &HirExpr) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether a closure environment fits the inline GC reference mask.
+///
+/// The layout is the class layout: word 0 is not a reference (there, the class
+/// descriptor; here, the lifted function's code address) and capture `i` is
+/// word `i + 1`. The mask has one bit per word, so the last capture it can
+/// describe is number 62 (willow-0g8j.2.12). A wider environment would need a
+/// trace function, which the collector does not have yet.
+fn closure_env_representable(captures: &[HirCapture]) -> bool {
+    captures.len() <= super::OBJECT_FIELD_MASK_CAPACITY
 }
 
 /// Every suspension point inside `expr`, in evaluation order. An `await`'s own
@@ -3618,14 +3641,25 @@ fn supported_expr<'n>(
         // later CALLED through a Cranelift signature built from `e.ty`, so a
         // disagreement would call the target under the wrong ABI.
         HirExprKind::FnRef(name) => ctx.fn_value_of(name).is_some_and(|ty| ty == e.ty),
-        // A lambda evaluates to the address of its lifted function, so its BODY
-        // is not this function's problem — it is compiled under its own symbol
-        // and vetted on its own terms. What is checked here is the same thing
-        // as for a named function: the symbol exists and its declared signature
-        // is the type the expression carries.
-        HirExprKind::Lambda { .. } => (ctx.lambda_symbol)(e.span)
-            .and_then(|sym| ctx.fn_value_of(&sym))
-            .is_some_and(|ty| ty == e.ty),
+        // A lambda evaluates to its lifted function — the address itself for a
+        // `fn`, an environment object carrying that address for a `closure`. Its
+        // BODY is not this function's problem: that is compiled under its own
+        // symbol and vetted on its own terms. What is checked here is the same
+        // thing as for a named function — the symbol exists and its declared
+        // signature is the type the expression carries — plus, for a closure,
+        // that every value the environment is built from is a name THIS
+        // function can resolve and a word the walker can copy.
+        HirExprKind::Lambda { captures, .. } => {
+            (ctx.lambda_symbol)(e.span)
+                .and_then(|sym| ctx.fn_value_of(&sym))
+                .is_some_and(|ty| ty == e.ty)
+                && closure_env_representable(captures)
+                && captures.iter().all(|c| {
+                    names
+                        .get(c.source.as_str())
+                        .is_some_and(|bound| ctx.repr_compatible(&c.ty, bound))
+                })
+        }
         HirExprKind::Binary { op, lhs, rhs } => {
             // On strings only `+` (concat) and content comparison are emitted.
             if lhs.ty == Type::String && !matches!(op, BinOp::Add | BinOp::Eq | BinOp::Ne) {
@@ -3684,7 +3718,11 @@ fn supported_expr<'n>(
             // emitter: whichever this resolves to is what the type checker
             // checked the call against.
             if let Some(local) = names.get(callee.as_str()) {
-                let Type::Fn(params, ret) = local.as_ref() else {
+                // Either callable value: a `closure` is called through the code
+                // pointer in its word 0, with the object itself as the hidden
+                // leading argument, so the only difference from a `fn` is in
+                // the emitter (willow-0g8j.2.12).
+                let (Type::Fn(params, ret) | Type::Closure(params, ret)) = local.as_ref() else {
                     return false;
                 };
                 return ctx.same_repr(ret, &e.ty)
@@ -6392,34 +6430,76 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .ins()
                     .func_addr(super::type_helpers::FN_ADDR_TYPE, fref)
             }
-            // A lambda is a lifted top-level function with no captured
-            // environment, so its value is just that function's address. The
-            // span is the same key the AST path uses, which is what lets the
-            // walker name a symbol it never invented (willow-0g8j.2.2).
-            HirExprKind::Lambda { .. } => {
+            // A `fn`-typed lambda is a lifted top-level function with no
+            // captured environment, so its value is just that function's
+            // address. The span is the same key the AST path uses, which is
+            // what lets the walker name a symbol it never invented
+            // (willow-0g8j.2.2). A `closure`-typed one builds its environment
+            // object instead (willow-0g8j.2.12).
+            HirExprKind::Lambda { captures, .. } => {
                 let name = self.lambda_names[&e.span].clone();
                 let fid = self.func_ids[name.as_str()];
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                self.builder
+                let code = self
+                    .builder
                     .ins()
-                    .func_addr(super::type_helpers::FN_ADDR_TYPE, fref)
+                    .func_addr(super::type_helpers::FN_ADDR_TYPE, fref);
+                if matches!(e.ty, Type::Closure(..)) {
+                    self.emit_closure_env(code, captures)
+                } else {
+                    code
+                }
             }
             // A call through a local function value shadows every top-level
             // name, so it is tested before the direct-call path — the same
-            // order the AST path and eligibility use (willow-bv9.1).
+            // order the AST path and eligibility use (willow-bv9.1). Both
+            // callable types are called here; they differ in what is loaded
+            // first and in the hidden leading argument (willow-0g8j.2.12).
             HirExprKind::Call { callee, args }
                 if self.vars.contains_key(callee.as_str())
-                    && matches!(self.vars[callee.as_str()].ty(), Type::Fn(..)) =>
+                    && matches!(
+                        self.vars[callee.as_str()].ty(),
+                        Type::Fn(..) | Type::Closure(..)
+                    ) =>
             {
                 let storage = self.vars[callee.as_str()].clone();
-                let Type::Fn(param_types, ret_type) = storage.ty().clone() else {
+                let (Type::Fn(param_types, ret_type) | Type::Closure(param_types, ret_type)) =
+                    storage.ty().clone()
+                else {
                     unreachable!("non-callable local call passed eligibility")
                 };
-                let callee_val = self.load_var(&storage);
+                let is_closure = matches!(storage.ty(), Type::Closure(..));
+                let value = self.load_var(&storage);
+                // A closure value IS the environment object; the address to
+                // jump to is its word 0. Loading it before the arguments is
+                // deliberate: an argument can allocate, and the object is
+                // rooted through the local while a raw code address would not
+                // need to be.
+                let callee_val = if is_closure {
+                    self.builder.ins().load(
+                        super::type_helpers::FN_ADDR_TYPE,
+                        MemFlagsData::trusted(),
+                        value,
+                        0,
+                    )
+                } else {
+                    value
+                };
                 let (vals, temp_roots) =
                     self.emit_lir_args_rooted(args, Some(&param_types), None, None, None);
+                let vals = if is_closure {
+                    let mut with_env = Vec::with_capacity(vals.len() + 1);
+                    with_env.push(self.load_var(&storage));
+                    with_env.extend(vals);
+                    with_env
+                } else {
+                    vals
+                };
 
                 let mut sig = self.module.make_signature();
+                if is_closure {
+                    sig.params.push(AbiParam::new(types::I64));
+                }
                 for param_type in &param_types {
                     sig.params.push(AbiParam::new(clif_type(param_type)));
                 }
@@ -8008,6 +8088,52 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             | HirPattern::LiteralInt(_)
             | HirPattern::EnumVariant { .. } => Vec::new(),
         }
+    }
+
+    /// Build a closure value: a GC object whose word 0 is the lifted function's
+    /// code address and whose word `i + 1` holds capture `i` (willow-0g8j.2.12).
+    ///
+    /// The layout is deliberately the class layout — word 0 non-reference,
+    /// payload words after it — so the collector traces a closure with the
+    /// machinery it already has and `gc_ref_mask` means the same thing here as
+    /// it does for an object.
+    ///
+    /// Captures are read from the ENCLOSING function's locals, which are
+    /// already rooted there, so the allocation below cannot lose them even
+    /// when it takes the collecting slow path.
+    fn emit_closure_env(
+        &mut self,
+        code: cranelift_codegen::ir::Value,
+        captures: &[HirCapture],
+    ) -> cranelift_codegen::ir::Value {
+        let mut gc_ref_mask = 0u64;
+        for (i, capture) in captures.iter().enumerate() {
+            if is_gc_managed(&capture.ty, self.enum_infos) {
+                gc_ref_mask |= 1u64 << (i + 1);
+            }
+        }
+        let layout = GcLayoutMetadata::new(
+            GcObjectKind::Closure,
+            (captures.len() as i64 + 1) * 8,
+            0,
+            gc_ref_mask,
+        );
+        let env = self.emit_gc_alloc(layout);
+        // Word 0 is a code address, never a heap reference, so it is stored
+        // without a write barrier exactly like a class descriptor word.
+        self.emit_gc_heap_store_classified(env, 0, code, false, GcStoreDestination::ObjectField);
+        for (i, capture) in captures.iter().enumerate() {
+            let storage = self.vars[capture.source.as_str()].clone();
+            let value = self.load_var(&storage);
+            self.emit_gc_heap_store(
+                env,
+                (i as i32 + 1) * 8,
+                value,
+                &capture.ty,
+                GcStoreDestination::ObjectField,
+            );
+        }
+        env
     }
 
     /// Evaluate call arguments left to right, rooting each GC-managed one as it
@@ -14225,6 +14351,7 @@ fn f(n: i64) -> Result<i64, String> {
             return_type: Type::Void,
             is_async: false,
             locals: Vec::new(),
+            captures: Vec::new(),
             async_frame: Default::default(),
             blocks: vec![
                 block(
@@ -14314,6 +14441,7 @@ fn f() {
             name: "Child::init".to_string(),
             is_async: false,
             params: Vec::new(),
+            captures: Vec::new(),
             return_type: Type::Void,
             blocks: vec![LirBlock {
                 id: crate::ir::lowered::BlockId(0),
