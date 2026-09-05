@@ -121,6 +121,7 @@ macro_rules! lir_type_ctx {
             enum_def: &|n| {
                 let info = $me.enum_infos.get(n)?;
                 Some(super::lir_gen::LirEnumDef {
+                    identity: info.name.clone(),
                     type_params: info.type_params.clone(),
                     variants: info
                         .variants
@@ -244,6 +245,16 @@ impl Codegen {
         // compiled against. Only the function half is rebound, before this
         // unit's bodies (willow-28h8).
         let item_imports = unit_imports.item_imports;
+        // The one type table that does have to answer under this unit's own
+        // spelling while its declarations are made: `declare_vtables_for_classes`
+        // below resolves each `implements` name in `interface_infos`, and an
+        // interface this unit IMPORTED (`import proto::Describable;`) is keyed
+        // there by its canonical `proto::Describable` alone. The lookup missed,
+        // the vtable was silently skipped, and every later boxing site fell back
+        // to the raw object (willow-0g8j.3). Installed under a snapshot and taken
+        // back out below, so nothing declared after this unit sees it.
+        let mut import_aliases = ModuleAliasSnapshot::default();
+        self.alias_item_import_types(&item_imports, &mut import_aliases);
         let normalized_program = normalize_std_collection_program(program);
         let normalized_program = normalize_coop_suspensions(&normalized_program, &self.expr_types);
         let program = &normalized_program;
@@ -267,13 +278,25 @@ impl Codegen {
         // INTERFACE names declared in this module, so a module-local (possibly
         // generic) interface named in an `implements` / signature by its bare name
         // is qualified to `module::Iface` (qualify_module_type alone does not
-        // qualify a generic head name). Only interfaces are qualified so enum/class
-        // value params keep matching a directly-imported bare alias (willow-1js.5).
+        // qualify a generic head name).
         let local_type_names: std::collections::HashSet<String> = program
             .items
             .iter()
             .filter_map(|item| match item {
                 Item::Interface(i) => Some(i.name.clone()),
+                _ => None,
+            })
+            .collect();
+        // ENUM names declared in this module, qualified by the module's
+        // CANONICAL path rather than the name this unit reaches it by: an enum
+        // has one identity build-wide, and the type checker qualifies module
+        // signatures the same way, so what the walker reads off a cross-module
+        // call has to be the same name (willow-itcw).
+        let local_enum_names: std::collections::HashSet<String> = program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Enum(e) => Some(e.name.clone()),
                 _ => None,
             })
             .collect();
@@ -290,6 +313,14 @@ impl Codegen {
             })
             .collect();
 
+        // Function signatures must qualify module-local classes too. Otherwise
+        // `one::make() -> Point` and `two::make() -> Point` collapse to the same
+        // bare type even though their layouts have different identities. A
+        // directly imported short name still compares equal through the shared
+        // class type id (willow-0g8j.3).
+        let mut local_signature_type_names = local_type_names.clone();
+        local_signature_type_names.extend(local_class_names.iter().cloned());
+
         let module_classes: Vec<(String, ClassDecl)> = program
             .items
             .iter()
@@ -299,10 +330,19 @@ impl Codegen {
                 };
                 let local_name = c.name.clone();
                 let mut qualified = qualify_module_class_decl(c, mod_name);
-                // Qualify a module-local generic interface in `implements`
-                // (`implements Box<i64>` -> `boxmod2::Box<i64>`) so its vtable is
-                // declared and keyed by the same name the entry boxes against.
-                qualified.implements = qualified
+                // `implements` names are resolved against this module's own
+                // INTERFACE declarations rather than qualified wholesale: a
+                // module-local one (generic included -- `implements Box<i64>` ->
+                // `boxmod2::Box<i64>`) is qualified so its vtable is declared and
+                // keyed by the same name the entry boxes against (willow-1js.5),
+                // while an interface this module merely IMPORTED keeps the
+                // spelling it was written with. `qualify_module_class_decl`
+                // prefixes every bare name, which renamed `import
+                // proto::Describable;` into `impls::Describable` -- a type
+                // nothing declares -- so the vtable lookup below silently found
+                // no interface and the class got NO vtable, leaving every later
+                // box site to fall back to the raw object (willow-0g8j.3).
+                qualified.implements = c
                     .implements
                     .iter()
                     .map(|t| qualify_module_local_type(t, mod_name, &local_type_names))
@@ -351,7 +391,10 @@ impl Codegen {
             match item {
                 Item::Function(f) => {
                     let mangled = module_item_symbol(&module_prefix, &f.name);
-                    let qualified = qualify_module_fn_signature(f, mod_name, &local_type_names);
+                    let qualified =
+                        qualify_module_fn_signature(f, mod_name, &local_signature_type_names);
+                    let qualified =
+                        qualify_module_fn_signature(&qualified, canonical_path, &local_enum_names);
                     self.declare_function_named(&mangled, &qualified)?;
                 }
                 Item::Enum(_) | Item::Class(_) | Item::Interface(_) => {}
@@ -399,6 +442,11 @@ impl Codegen {
             },
             &lambdas,
         );
+
+        // Out again: from here the name means whatever the next unit says it
+        // does. An error above returns early and skips this, which costs
+        // nothing — a failed declaration aborts the build.
+        self.restore_module_aliases(import_aliases);
 
         Ok(DeclaredModule {
             mod_name: mod_name.to_string(),
@@ -498,8 +546,12 @@ impl Codegen {
 
         let program = &unit.program;
         let mut aliases = ModuleAliasSnapshot::default();
-        // Bind the module's own enums/interfaces under their unqualified names so
-        // the module body resolves its own types internally (willow-64gs.1).
+        // Bind the types this unit imported by single-item import under the
+        // local names it spells them by (willow-0g8j.3), then the module's own
+        // enums/interfaces under their unqualified names so the module body
+        // resolves its own types internally (willow-64gs.1). Own declarations
+        // are installed second, so they win.
+        self.alias_item_import_types(&unit.item_imports, &mut aliases);
         self.alias_module_local_types(program, &unit.mod_name, &mut aliases);
         for item in &program.items {
             if let Item::Function(f) = item {
@@ -737,7 +789,7 @@ impl Codegen {
     /// Declare the signature for a lambda private function.
     pub(super) fn declare_lambda(&mut self, name: &str, l: &LambdaExpr) -> Result<()> {
         let (param_types, ast_ret) =
-            if let Some(Type::Fn(params, ret)) = self.lambda_fn_types.get(&l.span) {
+            if let Some(Type::Fn(params, ret)) = self.expr_types.get(&l.span) {
                 (params.clone(), *ret.clone())
             } else {
                 let params = l
@@ -745,11 +797,7 @@ impl Codegen {
                     .iter()
                     .map(|p| p.ty.clone().unwrap_or(Type::I64))
                     .collect();
-                let ret = l
-                    .return_type
-                    .clone()
-                    .or_else(|| self.lambda_return_types.get(&l.span).cloned())
-                    .unwrap_or(Type::I64);
+                let ret = l.return_type.clone().unwrap_or(Type::I64);
                 (params, ret)
             };
         let mut sig = self.module.make_signature();
@@ -782,7 +830,7 @@ impl Codegen {
     /// Compile a lambda as a private function.
     pub(super) fn compile_lambda(&mut self, name: &str, l: &LambdaExpr) -> Result<()> {
         let (param_types, return_type) =
-            if let Some(Type::Fn(params, ret)) = self.lambda_fn_types.get(&l.span) {
+            if let Some(Type::Fn(params, ret)) = self.expr_types.get(&l.span) {
                 (params.clone(), *ret.clone())
             } else {
                 let params = l
@@ -790,11 +838,7 @@ impl Codegen {
                     .iter()
                     .map(|p| p.ty.clone().unwrap_or(Type::I64))
                     .collect();
-                let ret = l
-                    .return_type
-                    .clone()
-                    .or_else(|| self.lambda_return_types.get(&l.span).cloned())
-                    .unwrap_or(Type::I64);
+                let ret = l.return_type.clone().unwrap_or(Type::I64);
                 (params, ret)
             };
         let params: Vec<Param> = l
@@ -931,7 +975,7 @@ impl Codegen {
                     .push(AbiParam::new(param_abi_type(param, ptr_ty)));
             }
         }
-        let call_return_type = function_call_return_type(f);
+        let call_return_type = self.canonical_enum_type(&function_call_return_type(f));
         // A `Result<void, E>` main lowers to a VOID `willow_user_main` (it
         // inspects its result and exits in the body; willow-exg). Keep this in
         // sync with compile_function_named.
@@ -957,7 +1001,11 @@ impl Codegen {
         self.func_param_debug
             .insert(lookup_name, param_debug_from_params(&f.params));
         // Store full function type for use when the function is passed as a value.
-        let param_types = f.params.iter().map(|p| p.ty.clone()).collect();
+        let param_types = f
+            .params
+            .iter()
+            .map(|p| self.canonical_enum_type(&p.ty))
+            .collect();
         self.fn_types.insert(
             lookup_name,
             Type::Fn(param_types, Box::new(call_return_type)),
@@ -985,9 +1033,10 @@ impl Codegen {
                     .push(AbiParam::new(param_abi_type(param, ptr_ty)));
             }
         }
-        // LIR-walking path (willow-0g8j): a non-main function in the supported
-        // scalar subset compiles from its lowered IR; everything else uses the
-        // AST walk below. Decided here (before `self` is mutably borrowed).
+        // Stage 5 function-body cutover (willow-0g8j.3): every checked function
+        // compiles from lowered IR. The AST emitter remains available only to
+        // compiler-owned bootstrap paths; a missing or rejected LIR body is an
+        // internal compile error, never a backend selection decision.
         // `main` is eligible in its `void` forms, with or without the declared
         // `args: Array<String>` (willow-0g8j.2.10): `willow_user_main` takes no
         // arguments either way, and a declared `args` is bound from the process
@@ -997,79 +1046,33 @@ impl Codegen {
         // Synchronous exits are shaped in the walker; an async poll publishes
         // the Result into its frame and the generated main driver applies the
         // same `emit_main_result_exit` shaping after joining it (willow-4ylu).
-        // Any other `main` return type stays AST-only.
+        // Any other `main` return type is rejected here.
         let supported_main =
             is_main && (f.return_type == Type::Void || main_result_err_type(f).is_some());
-        // Why the walker turned this function down, for the `WILLOW_LIR_REQUIRE`
-        // error below. Filled in only on the path that actually asked.
-        let mut lir_reject: Option<String> = None;
-        let lir_fn = if (!is_main || supported_main) && super::lir_gen::lir_backend_enabled() {
-            let ctx = lir_type_ctx!(self, &f.return_type);
-            match self.lir_functions.get(name) {
-                Some(lf) => match super::lir_gen::lir_rejection_reason(lf, &ctx).or_else(|| {
-                    f.is_async
-                        .then(|| super::lir_gen::lir_async_rejection_reason(lf))
-                        .flatten()
-                }) {
-                    None => Some(lf.clone()),
-                    Some(why) => {
-                        lir_reject = Some(why);
-                        None
-                    }
-                },
-                None => None,
-            }
-        } else {
-            None
-        };
-        // `WILLOW_LIR_REQUIRE=1`: a fallback is an error instead of a silent
-        // downgrade, so a test can prove a function really compiled from the
-        // lowered IR.
-        if lir_fn.is_none()
-            && super::lir_gen::lir_backend_enabled()
-            && super::lir_gen::lir_required()
-        {
-            let reason = if is_main && !supported_main {
-                "`main` is not in a supported form (`void` or `Result<void, E>`)".to_string()
-            } else if !self.lir_functions.contains_key(name) {
-                "it has no lowered IR".to_string()
-            } else {
-                // Always `Some` here: this branch means the function had lowered
-                // IR and the walker rejected it, which is exactly when the reason
-                // was recorded. The fallback keeps a future restructure honest.
-                lir_reject.unwrap_or_else(|| {
-                    "it is outside the LIR walker's supported subset".to_string()
-                })
-            };
+        if is_main && !supported_main {
             anyhow::bail!(
-                "WILLOW_LIR_REQUIRE is set, but function `{name}` fell back to the AST backend: {reason}"
+                "function `{name}` has no valid lowered body: `main` must return `void` or `Result<void, E>`"
             );
         }
+        let lir_fn = self
+            .lir_functions
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("function `{name}` has no lowered IR"))?;
+        let ctx = lir_type_ctx!(self, &f.return_type);
+        if let Some(reason) = super::lir_gen::lir_rejection_reason(&lir_fn, &ctx).or_else(|| {
+            f.is_async
+                .then(|| super::lir_gen::lir_async_rejection_reason(&lir_fn))
+                .flatten()
+        }) {
+            anyhow::bail!("function `{name}` has invalid lowered IR: {reason}");
+        }
 
-        // Async functions still use the cooperative constructor/poll ABI, but
-        // an eligible body is now handed to that poll emitter as LIR. Keeping
-        // the decision beside the synchronous one makes WILLOW_LIR_REQUIRE
-        // police async fallback too (willow-0g8j.2.11).
+        // Async functions still use the cooperative constructor/poll ABI, with
+        // the same mandatory lowered body.
         if f.is_async {
             if std::env::var("WILLOW_LIR_LOG").is_ok() {
-                match &lir_fn {
-                    Some(_) => eprintln!("[lir] compiling async `{name}` from lowered IR"),
-                    None => {
-                        // The reason the cooperative AST emitter still owns this
-                        // body. `WILLOW_LIR_REQUIRE=1` now rejects this case
-                        // outright, so the log only runs when the fallback is
-                        // permitted, and it is how the remaining async surface
-                        // is measured.
-                        let reason = lir_reject.as_deref().unwrap_or(
-                            if self.lir_functions.contains_key(name) {
-                                "it is outside the LIR walker's supported subset"
-                            } else {
-                                "it has no lowered IR"
-                            },
-                        );
-                        eprintln!("[lir] async `{name}` stays on the AST backend: {reason}");
-                    }
-                }
+                eprintln!("[lir] compiling async `{name}` from lowered IR");
             }
             return if is_main {
                 self.compile_cooperative_main(name, f, lir_fn)
@@ -1107,8 +1110,8 @@ impl Codegen {
         builder.append_block_params_for_function_params(entry_block);
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
-        let panic_return_block = (!is_main && !f.is_async && self.user_function_may_panic(name))
-            .then(|| builder.create_block());
+        let panic_return_block =
+            (!is_main && self.user_function_may_panic(name)).then(|| builder.create_block());
 
         let mut fg = FuncGen {
             builder: &mut builder,
@@ -1150,11 +1153,8 @@ impl Codegen {
             class_type_ids: &self.class_type_ids,
             class_descriptor_ids: &self.class_descriptor_ids,
             class_vslots: &self.class_vslots,
-            lambda_return_types: &self.lambda_return_types,
-            lambda_fn_types: &self.lambda_fn_types,
             interface_infos: &self.interface_infos,
             vtable_ids: &self.vtable_ids,
-            async_local_types: &self.async_local_types,
             expr_types: &self.expr_types,
             coop_frame: None,
             coop_result_offset: None,
@@ -1169,7 +1169,9 @@ impl Codegen {
             vars: HashMap::new(),
             return_type: f.return_type.clone(),
             current_class: None,
-            is_async: f.is_async,
+            // Every async function returned above through the cooperative
+            // constructor/poll pair, so what is left here is synchronous.
+            is_async: false,
             terminated: false,
             gc_root_count: 0,
             coop_shadow_roots: None,
@@ -1180,14 +1182,6 @@ impl Codegen {
         if panic_return_block.is_some() {
             fg.panic_function_root_depth =
                 Some(fg.emit_value_runtime_call("willow_root_depth", &[]));
-        }
-
-        // Async fns (except `main`, which has special arg binding) allocate a
-        // heap frame and store GC-managed params/locals into it so they survive
-        // `await` (willow-lpn.5a/5b). Eager execution is unchanged. After this,
-        // `fg.async_frame_offsets` maps each frame-backed name to its offset.
-        if f.is_async && !is_main {
-            fg.setup_async_frame(&f.params, &f.body)?;
         }
 
         // Bind params
@@ -1216,14 +1210,10 @@ impl Codegen {
             }
         }
 
-        if let Some(lir_fn) = &lir_fn {
-            if std::env::var("WILLOW_LIR_LOG").is_ok() {
-                eprintln!("[lir] compiling `{name}` from lowered IR");
-            }
-            fg.emit_lir_function(lir_fn);
-        } else {
-            fg.emit_block(&f.body);
+        if std::env::var("WILLOW_LIR_LOG").is_ok() {
+            eprintln!("[lir] compiling `{name}` from lowered IR");
         }
+        fg.emit_lir_function(&lir_fn);
 
         // Implicit return at end of function body.
         if !fg.terminated {
@@ -1231,10 +1221,7 @@ impl Codegen {
             if fg.gc_root_count > 0 {
                 fg.emit_pop_roots_n(fg.gc_root_count);
             }
-            if fg.is_async {
-                let future = fg.emit_ready_future_void();
-                fg.builder.ins().return_(&[future]);
-            } else if call_return_type != Type::Void && !force_void_main {
+            if call_return_type != Type::Void && !force_void_main {
                 // A value-returning fn can END with a statement whose arms all
                 // return (e.g. a statement-position match, willow-zvkv); this
                 // fall-through is then unreachable but must still satisfy the
@@ -1419,11 +1406,8 @@ impl Codegen {
             class_type_ids: &self.class_type_ids,
             class_descriptor_ids: &self.class_descriptor_ids,
             class_vslots: &self.class_vslots,
-            lambda_return_types: &self.lambda_return_types,
-            lambda_fn_types: &self.lambda_fn_types,
             interface_infos: &self.interface_infos,
             vtable_ids: &self.vtable_ids,
-            async_local_types: &self.async_local_types,
             expr_types: &self.expr_types,
             coop_frame: None,
             coop_result_offset: None,
@@ -1663,17 +1647,6 @@ impl Codegen {
     }
 
     pub(super) fn compile_class_method(&mut self, c: &ClassDecl, m: &MethodDecl) -> Result<()> {
-        if m.is_default_injected {
-            // A default-interface-method body is INJECTED into every
-            // implementing class with the interface's original spans, so the
-            // checker's span-keyed expression types are recorded at most once
-            // (and for a different `self` context). Compile injected copies
-            // with the structural derivation only (willow-mb5).
-            let saved = std::mem::take(&mut self.expr_types);
-            let result = self.compile_class_method_inner(c, m);
-            self.expr_types = saved;
-            return result;
-        }
         self.compile_class_method_inner(c, m)
     }
 
@@ -1686,60 +1659,22 @@ impl Codegen {
         // list, exactly where the method ABI passes it. So the receiver and
         // parameter bindings below are what the walker's body reads.
         let lir_name = format!("{}::{}", c.name, m.name);
-        // Why the walker turned this body down, for the `WILLOW_LIR_REQUIRE`
-        // error below. Filled in only on the path that actually asked.
-        let mut lir_reject: Option<String> = None;
-        let lir_fn = if super::lir_gen::lir_backend_enabled() {
-            let ctx = lir_type_ctx!(self, &m.return_type);
-            match self.lir_functions.get(&lir_name) {
-                Some(lf) => match super::lir_gen::lir_rejection_reason(lf, &ctx).or_else(|| {
-                    m.is_async
-                        .then(|| super::lir_gen::lir_async_rejection_reason(lf))
-                        .flatten()
-                }) {
-                    None => Some(lf.clone()),
-                    Some(why) => {
-                        lir_reject = Some(why);
-                        None
-                    }
-                },
-                None => None,
-            }
-        } else {
-            None
-        };
-        // `WILLOW_LIR_REQUIRE=1` polices a method exactly as it polices a free
-        // function, so a test can prove a method body came from the walker.
-        if lir_fn.is_none()
-            && super::lir_gen::lir_backend_enabled()
-            && super::lir_gen::lir_required()
-        {
-            let reason = if !self.lir_functions.contains_key(&lir_name) {
-                "it has no lowered IR".to_string()
-            } else {
-                lir_reject.unwrap_or_else(|| {
-                    "it is outside the LIR walker's supported subset".to_string()
-                })
-            };
-            anyhow::bail!(
-                "WILLOW_LIR_REQUIRE is set, but method `{lir_name}` fell back to the AST backend: {reason}"
-            );
+        let lir_fn = self
+            .lir_functions
+            .get(&lir_name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("method `{lir_name}` has no lowered IR"))?;
+        let ctx = lir_type_ctx!(self, &m.return_type);
+        if let Some(reason) = super::lir_gen::lir_rejection_reason(&lir_fn, &ctx).or_else(|| {
+            m.is_async
+                .then(|| super::lir_gen::lir_async_rejection_reason(&lir_fn))
+                .flatten()
+        }) {
+            anyhow::bail!("method `{lir_name}` has invalid lowered IR: {reason}");
         }
         if m.is_async {
             if std::env::var("WILLOW_LIR_LOG").is_ok() {
-                match &lir_fn {
-                    Some(_) => eprintln!("[lir] compiling async `{lir_name}` from lowered IR"),
-                    None => {
-                        let reason = lir_reject.as_deref().unwrap_or(
-                            if self.lir_functions.contains_key(&lir_name) {
-                                "it is outside the LIR walker's supported subset"
-                            } else {
-                                "it has no lowered IR"
-                            },
-                        );
-                        eprintln!("[lir] async `{lir_name}` stays on the AST backend: {reason}");
-                    }
-                }
+                eprintln!("[lir] compiling async `{lir_name}` from lowered IR");
             }
             return self.compile_cooperative_method(&c.name, &mangled, m, lir_fn);
         }
@@ -1768,8 +1703,9 @@ impl Codegen {
         builder.append_block_params_for_function_params(entry_block);
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
-        let panic_return_block =
-            (!m.is_async && self.user_function_may_panic(&mangled)).then(|| builder.create_block());
+        let panic_return_block = self
+            .user_function_may_panic(&mangled)
+            .then(|| builder.create_block());
 
         let mut fg = FuncGen {
             builder: &mut builder,
@@ -1811,11 +1747,8 @@ impl Codegen {
             class_type_ids: &self.class_type_ids,
             class_descriptor_ids: &self.class_descriptor_ids,
             class_vslots: &self.class_vslots,
-            lambda_return_types: &self.lambda_return_types,
-            lambda_fn_types: &self.lambda_fn_types,
             interface_infos: &self.interface_infos,
             vtable_ids: &self.vtable_ids,
-            async_local_types: &self.async_local_types,
             expr_types: &self.expr_types,
             coop_frame: None,
             coop_result_offset: None,
@@ -1830,7 +1763,8 @@ impl Codegen {
             vars: HashMap::new(),
             return_type: m.return_type.clone(),
             current_class: Some(c.name.as_str()),
-            is_async: m.is_async,
+            // An async method returned above through `compile_cooperative_method`.
+            is_async: false,
             terminated: false,
             gc_root_count: 0,
             coop_shadow_roots: None,
@@ -1883,24 +1817,17 @@ impl Codegen {
             fg.bind_param(&p.name, &p.ty, &p.mode, val);
         }
 
-        if let Some(lir_fn) = &lir_fn {
-            if std::env::var("WILLOW_LIR_LOG").is_ok() {
-                eprintln!("[lir] compiling `{lir_name}` from lowered IR");
-            }
-            fg.emit_lir_function(lir_fn);
-        } else {
-            fg.emit_block(&m.body);
+        if std::env::var("WILLOW_LIR_LOG").is_ok() {
+            eprintln!("[lir] compiling `{lir_name}` from lowered IR");
         }
+        fg.emit_lir_function(&lir_fn);
 
         if !fg.terminated {
             // Pop any GC roots (self, params) before the implicit void return.
             if fg.gc_root_count > 0 {
                 fg.emit_pop_roots_n(fg.gc_root_count);
             }
-            if fg.is_async {
-                let future = fg.emit_ready_future_void();
-                fg.builder.ins().return_(&[future]);
-            } else if call_return_type != Type::Void {
+            if call_return_type != Type::Void {
                 // Unreachable fall-through after a body that ends with an
                 // all-returning statement match (willow-zvkv): satisfy the
                 // signature with a typed zero.

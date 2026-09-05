@@ -15,9 +15,9 @@
 // One file mixes both spellings. `net` is imported plainly while `fs`, `env`
 // and `parallel` are aliased, so both dispatch paths meet in the same program.
 //
-// Every function declared here is compiled by the walker. Run under
-// `WILLOW_LIR_LOG=1` to watch each one being claimed, or under
-// `WILLOW_LIR_REQUIRE=1` to make a fallback a hard error.
+// Every function declared here is compiled by the walker — since
+// willow-0g8j.3 there is nothing else to compile it. Run under
+// `WILLOW_LIR_LOG=1` to watch each one being claimed.
 
 import std::collections::Array;
 import std::fs as files;

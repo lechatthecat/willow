@@ -51,39 +51,35 @@
 //!  26. a static method is not routed through a slot
 //!  27. the runnable example prints what it documents
 //!
-//! Every behavioral perspective runs on BOTH backends and asserts they agree.
-//! Since willow-0g8j.2.4 the LIR walker compiles these hierarchies too, and it
-//! decides each call's slot with the same `plan_virtual_call` the AST emitter
-//! asks — so a slot-index bug shows up as a wrong ANSWER on both sides rather
-//! than as a disagreement. The LIR-specific eligibility and the differential
-//! coverage for it live in `lir_class_inheritance.rs`.
+//! Every behavioral perspective runs the program and asserts what it prints.
+//! Since willow-0g8j.2.4 the LIR walker compiles these hierarchies, deciding
+//! each call's slot through `plan_virtual_call`, so a slot-index bug shows up
+//! as a wrong ANSWER rather than as a refused body. The walker-specific
+//! eligibility coverage lives in `lir_class_inheritance.rs`.
 
 use super::support::{
     TestProject, compile_and_run_gc_stress, compile_with_env_and_run,
     compile_with_env_and_run_combined,
 };
 
-const LIR_ON: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "1")];
-const LIR_OFF: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
 
+/// The build runs and prints `expected`. Since willow-0g8j.3 every body is
+/// compiled from lowered IR, so a body the walker cannot take is a compile
+/// error here rather than a second emitter's answer.
 #[track_caller]
-fn assert_both_backends(source: &str, expected: &str) {
-    let (with_lir, ok_on) = compile_with_env_and_run(source, &LIR_ON);
-    assert!(ok_on, "LIR-enabled run failed: {with_lir}");
-    let (without_lir, ok_off) = compile_with_env_and_run(source, &LIR_OFF);
-    assert!(ok_off, "LIR-disabled run failed: {without_lir}");
-    assert_eq!(
-        with_lir, without_lir,
-        "the two backends disagreed about virtual dispatch"
-    );
-    assert_eq!(with_lir, expected);
+fn assert_project_output(source: &str, expected: &str) {
+    let (out, ok) = compile_with_env_and_run(source, &PLAIN);
+    assert!(ok, "run failed: {out}");
+    assert_eq!(out, expected, "wrong output");
 }
 
 /// Perspective 1. The slot index comes from `Base`, the address in it comes
 /// from the runtime class.
 #[test]
 fn vtable_01_a_base_reference_selects_the_override() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Base {
     pub n: i64;
@@ -106,7 +102,7 @@ fn main() {
 /// `Base::value`. Inheritance costs no indirection beyond the same one load.
 #[test]
 fn vtable_02_a_non_overriding_subclass_inherits_the_slot() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Base {
     pub n: i64;
@@ -128,7 +124,7 @@ fn main() {
 /// definition.
 #[test]
 fn vtable_03_three_levels_override_in_the_middle() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Top {
     pub n: i64;
@@ -152,7 +148,7 @@ fn main() {
 /// Perspective 4. The mirror image: the middle inherits and the leaf overrides.
 #[test]
 fn vtable_04_three_levels_override_at_the_leaf() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Top {
     pub n: i64;
@@ -181,7 +177,7 @@ fn main() {
 /// land on the SAME inherited slot.
 #[test]
 fn vtable_05_eight_levels_resolve_to_the_nearest_definition() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class L0 {
     pub n: i64;
@@ -214,7 +210,7 @@ fn main() {
 /// separate, so an override on one side can never reach the other.
 #[test]
 fn vtable_06_sibling_branches_never_cross() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Root {
     pub n: i64;
@@ -240,7 +236,7 @@ fn main() {
 /// its own `value`.
 #[test]
 fn vtable_07_self_call_inside_a_non_virtual_base_method_is_virtual() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Base {
     pub n: i64;
@@ -264,7 +260,7 @@ fn main() {
 /// collided, overriding one would silently redirect the other.
 #[test]
 fn vtable_08_two_virtual_methods_keep_distinct_slots() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Base {
     pub n: i64;
@@ -289,7 +285,7 @@ fn main() {
 /// method through a `Derived` receiver.
 #[test]
 fn vtable_09_appending_a_virtual_method_does_not_disturb_inherited_slots() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Base {
     pub n: i64;
@@ -316,7 +312,7 @@ fn main() {
 /// base's slots.
 #[test]
 fn vtable_10_an_override_reuses_its_bases_slot() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Base {
     pub n: i64;
@@ -342,7 +338,7 @@ fn main() {
 /// cannot change what an `Account` call site does.
 #[test]
 fn vtable_11_an_unrelated_same_named_class_is_unaffected() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Account {
     pub n: i64;
@@ -371,7 +367,7 @@ fn main() {
 /// inherits exactly that implementation.
 #[test]
 fn vtable_12_a_non_open_method_is_a_direct_call() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Base {
     pub n: i64;
@@ -391,7 +387,7 @@ fn main() {
 /// Perspective 13. One call site inside a loop, three runtime classes.
 #[test]
 fn vtable_13_an_array_of_base_elements_dispatches_per_element() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 import std::collections::Array;
 open class Base {
@@ -417,7 +413,7 @@ fn main() {
 /// argument with a side effect must still run exactly once and in order.
 #[test]
 fn vtable_14_argument_side_effects_and_order_survive() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Base {
     pub n: i64;
@@ -444,7 +440,7 @@ fn main() {
 /// unchanged.
 #[test]
 fn vtable_15_a_string_returning_virtual_method_dispatches() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Base {
     pub n: i64;
@@ -468,7 +464,7 @@ fn main() {
 /// slot.
 #[test]
 fn vtable_16_a_bool_returning_virtual_method_dispatches() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Base {
     pub n: i64;
@@ -491,7 +487,7 @@ fn main() {
 /// the emitter must not try to read one.
 #[test]
 fn vtable_17_a_void_returning_virtual_method_dispatches() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Base {
     pub n: i64;
@@ -515,7 +511,7 @@ fn main() {
 /// override shares it.
 #[test]
 fn vtable_18_a_virtual_method_with_several_parameters() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Base {
     pub n: i64;
@@ -546,7 +542,7 @@ fn main() {
 /// interface and overrides a class method must get both right.
 #[test]
 fn vtable_19_an_interface_receiver_uses_the_interface_vtable() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 interface Speaker {
     fn speak(self) -> String;
@@ -576,7 +572,7 @@ fn main() {
 /// loads instead of one — and the same answer.
 #[test]
 fn vtable_20_a_class_downcast_reads_the_id_through_the_descriptor() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 interface Shape {
     fn area(self) -> i64;
@@ -644,17 +640,15 @@ fn main() {
         ],
     );
 
-    for env in [LIR_ON.as_slice(), LIR_OFF.as_slice()] {
-        let compiled = project.compile_with_env("main.wi", env);
-        assert!(
-            compiled.status.success(),
-            "compile failed under {env:?}: {}",
-            String::from_utf8_lossy(&compiled.stderr)
-        );
-        let run = project.run();
-        assert!(run.status.success(), "binary failed under {env:?}");
-        assert_eq!(String::from_utf8_lossy(&run.stdout), "1\n101\n101\n");
-    }
+    let compiled = project.compile_with_env("main.wi", &PLAIN);
+    assert!(
+        compiled.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let run = project.run();
+    assert!(run.status.success(), "binary failed");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "1\n101\n101\n");
 }
 
 /// Perspective 22. A directly imported class arrives under two names — the
@@ -704,17 +698,15 @@ fn main() {
         ],
     );
 
-    for env in [LIR_ON.as_slice(), LIR_OFF.as_slice()] {
-        let compiled = project.compile_with_env("main.wi", env);
-        assert!(
-            compiled.status.success(),
-            "compile failed under {env:?}: {}",
-            String::from_utf8_lossy(&compiled.stderr)
-        );
-        let run = project.run();
-        assert!(run.status.success(), "binary failed under {env:?}");
-        assert_eq!(String::from_utf8_lossy(&run.stdout), "1005\n7\n-1\n");
-    }
+    let compiled = project.compile_with_env("main.wi", &PLAIN);
+    assert!(
+        compiled.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let run = project.run();
+    assert!(run.status.success(), "binary failed");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "1005\n7\n-1\n");
 }
 
 /// Perspective 23. The descriptor is a STATIC data symbol living in word 0 of
@@ -775,8 +767,10 @@ fn main() {
 /// whatever the hierarchy's size, so the difference is now just the 32 method
 /// bodies. The bound sits clear of both.
 ///
-/// AST backend only: the LIR walker rejects any class taking part in
-/// inheritance, so it would report a number that says nothing about dispatch.
+/// The per-class comparison chain this bound was written against lived in the
+/// AST emitter willow-0g8j.3 retired, and the walker compiles inherited classes
+/// itself since willow-0g8j.13. The measurement stays as a code-size regression
+/// guard on vtable dispatch.
 #[test]
 fn vtable_24_a_deep_hierarchy_costs_constant_code_per_call_site() {
     const CALL_SITES: usize = 256;
@@ -805,7 +799,7 @@ fn vtable_24_a_deep_hierarchy_costs_constant_code_per_call_site() {
 
     fn build(label: &str, source: &str) -> u64 {
         let project = TestProject::new(label, &[("main.wi", source)]);
-        let compiled = project.compile_with_env("main.wi", &LIR_OFF);
+        let compiled = project.compile_with_env("main.wi", &PLAIN);
         assert!(
             compiled.status.success(),
             "compile failed: {}",
@@ -846,25 +840,23 @@ fn main() {
     println(take(new Boom(1)));
 }
 "#;
-    for env in [LIR_ON.as_slice(), LIR_OFF.as_slice()] {
-        let (output, ok) = compile_with_env_and_run_combined(source, env);
-        assert!(!ok, "the program must abort under {env:?}: {output}");
-        assert!(
-            output.contains("runtime panic: boom"),
-            "missing panic message under {env:?}: {output}"
-        );
-        assert!(
-            output.contains("0: tick at"),
-            "missing method frame under {env:?}: {output}"
-        );
-    }
+    let (output, ok) = compile_with_env_and_run_combined(source, &PLAIN);
+    assert!(!ok, "the program must abort: {output}");
+    assert!(
+        output.contains("runtime panic: boom"),
+        "missing panic message: {output}"
+    );
+    assert!(
+        output.contains("0: tick at"),
+        "missing method frame: {output}"
+    );
 }
 
 /// Perspective 26. A static method has no receiver, so it has no slot and never
 /// reaches a descriptor — including on a class that is extended.
 #[test]
 fn vtable_26_a_static_method_is_not_routed_through_a_slot() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Base {
     pub n: i64;
@@ -888,7 +880,7 @@ fn main() {
 /// the slot order guarantees; it must print what its comments claim.
 #[test]
 fn vtable_27_the_example_prints_what_it_documents() {
-    assert_both_backends(
+    assert_project_output(
         include_str!("../../example/class_vtable_dispatch.wi"),
         "shape=4\nshape=16\nshape=16\ncircle=48\n5\ninvoice\n",
     );

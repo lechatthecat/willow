@@ -1,0 +1,27 @@
+module other;
+
+// The second `Level`: a different variant list, in a different order, so a
+// value of one enum read as the other gives a visibly wrong answer.
+pub enum Level {
+    Off,
+    On,
+    Extra,
+}
+
+pub fn pick(n: i64) -> Level {
+    if n > 1 {
+        return Level::Extra;
+    }
+    if n > 0 {
+        return Level::On;
+    }
+    return Level::Off;
+}
+
+pub fn name(l: Level) -> String {
+    return match l {
+        Off => "other:off",
+        On => "other:on",
+        Extra => "other:extra",
+    };
+}

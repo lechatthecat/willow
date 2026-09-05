@@ -19,10 +19,8 @@
 //!   interface downcast onto a class named `Failed` — a type that does not
 //!   exist. It is read from the prelude source now.
 //!
-//! Every test asserts the same output from the AST emitter and the walker, and
-//! confirms the walker is the path that ran, so a coverage regression that sent
-//! a function back to the AST emitter fails here rather than passing vacuously
-//! by comparing the AST path against itself.
+//! Tests assert runtime output and use the selection log to confirm that
+//! each named function was compiled from lowered IR.
 //!
 //! Nothing asserts on an OS error string: the message in an `IoError` is the
 //! host's, so the tests check that one is CARRIED, never what it says. Paths
@@ -45,37 +43,22 @@
 
 use super::support::{compile_and_run_with_env, compile_with_compiler_env};
 
-const AST: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const LIR: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_BUDGET: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_TASK_BUDGET", "1"),
-];
-const LIR_STRESS: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_GC_STRESS", "alloc"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const BUDGET: [(&str, &str); 1] = [("WILLOW_TASK_BUDGET", "1")];
+const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 
-/// Run `source` under the AST emitter and under the walker (plain, with the
-/// one-step task budget, and under allocation stress), asserting the same
+/// Run `source` plain, with the one-step task budget, and under allocation
+/// stress, asserting the same
 /// output every time, then assert that each of `functions` really was compiled
 /// from lowered IR.
 fn assert_io(source: &str, expected: &str, functions: &[&str]) {
-    for env in [&AST[..], &LIR[..], &LIR_BUDGET[..], &LIR_STRESS[..]] {
+    for env in [&PLAIN[..], &BUDGET[..], &STRESS[..]] {
         let (out, ok) = compile_and_run_with_env(source, env);
         assert!(ok, "io run failed under {env:?}: {out}");
         assert_eq!(out, expected, "wrong output under {env:?}");
     }
-    let (ok, stderr) = compile_with_compiler_env(
-        source,
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_LIR_LOG", "1"),
-        ],
-    );
+    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_LIR_LOG", "1")]);
     assert!(ok, "logged LIR compile failed: {stderr}");
     for function in functions {
         let sync = format!("[lir] compiling `{function}` from lowered IR");

@@ -1,8 +1,8 @@
 //! `parallel::map` compiled from Lowered IR (willow-0g8j.2.13).
 //!
 //! `parallel` is a NAMESPACE, not a class: it has no layout, no methods and no
-//! symbols of its own, so `parallel::map(frozen, f)` is one direct runtime call
-//! on both backends. The walker keeps a single table of those namespace entries
+//! symbols of its own, so `parallel::map(frozen, f)` is one direct runtime
+//! call. The walker keeps a single table of those namespace entries
 //! shared by eligibility and emission — so it cannot admit a call it has no
 //! entry point for — and takes the SIGNATURE from the stdlib schema, the same
 //! table the checker types the call from.
@@ -20,10 +20,8 @@
 //!
 //! The language contract — ordering, cancellation, panic policy, the rejections
 //! — is pinned by the `parallel_map_*` tests in `concurrency.rs` on the default
-//! backend. These tests pin the WALKER: every one asserts the same output from
-//! the AST emitter and the walker, and confirms the walker is the path that ran,
-//! so a coverage regression cannot pass vacuously by comparing the AST path
-//! against itself.
+//! backend. These tests assert runtime output and use the selection log to
+//! confirm that each named function was compiled from lowered IR.
 //!
 //! 20 perspectives:
 //!   1 named mapper keeps source order   11 cancellation has no partial result
@@ -43,31 +41,16 @@ use super::support::{
     compile_and_run_with_env, compile_and_run_with_env_timeout, compile_with_compiler_env,
 };
 
-const AST: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const LIR: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_BUDGET: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_TASK_BUDGET", "1"),
-];
-const LIR_STRESS: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_GC_STRESS", "alloc"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const BUDGET: [(&str, &str); 1] = [("WILLOW_TASK_BUDGET", "1")];
+const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 
 const IMPORTS: &str = "import std::collections::Array;\nimport std::parallel;\n";
 
 /// Each named function must appear in the walker's selection log for `source`.
 fn assert_walker_compiled(source: &str, functions: &[&str]) {
-    let (ok, stderr) = compile_with_compiler_env(
-        source,
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_LIR_LOG", "1"),
-        ],
-    );
+    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_LIR_LOG", "1")]);
     assert!(ok, "logged LIR compile failed: {stderr}");
     for function in functions {
         let sync = format!("[lir] compiling `{function}` from lowered IR");
@@ -82,7 +65,7 @@ fn assert_walker_compiled(source: &str, functions: &[&str]) {
 /// `expected` must come out of all four configurations, and `functions` must
 /// each be named in the walker's selection log.
 fn assert_maps(source: &str, expected: &str, functions: &[&str]) {
-    for env in [&AST[..], &LIR[..], &LIR_BUDGET[..], &LIR_STRESS[..]] {
+    for env in [&PLAIN[..], &BUDGET[..], &STRESS[..]] {
         let (out, ok) = compile_and_run_with_env(source, env);
         assert!(ok, "run failed under {env:?}: {out}");
         assert_eq!(out, expected, "wrong output under {env:?}");
@@ -342,13 +325,11 @@ async fn main() {{
 }}
 "
     );
-    for env in [&AST[..], &LIR[..]] {
-        let (out, ok, timed_out) =
-            compile_and_run_with_env_timeout(&source, env, Duration::from_secs(30));
-        assert!(!timed_out, "parallel cancellation parked forever: {out}");
-        assert!(ok, "run failed under {env:?}: {out}");
-        assert_eq!(out, "cancelled\n", "wrong output under {env:?}");
-    }
+    let (out, ok, timed_out) =
+        compile_and_run_with_env_timeout(&source, &PLAIN, Duration::from_secs(30));
+    assert!(!timed_out, "parallel cancellation parked forever: {out}");
+    assert!(ok, "run failed: {out}");
+    assert_eq!(out, "cancelled\n", "wrong output");
     assert_walker_compiled(&source, &["identity", "main"]);
 }
 
@@ -448,19 +429,14 @@ async fn main() {{
     );
     let expected = "1000\n-1\n1532\n2996\n";
     for env in [
-        &[("WILLOW_LIR_BACKEND", "0"), ("WILLOW_WORKERS", "16")][..],
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_WORKERS", "16"),
-            ("WILLOW_TASK_BUDGET", "1"),
-        ][..],
+        &[("WILLOW_WORKERS", "16")][..],
+        &[("WILLOW_WORKERS", "16"), ("WILLOW_TASK_BUDGET", "1")][..],
     ] {
         let (out, ok, timed_out) =
             compile_and_run_with_env_timeout(&source, env, Duration::from_secs(60));
-        assert!(!timed_out, "mapping parked forever under {env:?}: {out}");
-        assert!(ok, "run failed under {env:?}: {out}");
-        assert_eq!(out, expected, "wrong output under {env:?}");
+        assert!(!timed_out, "mapping parked forever: {out}");
+        assert!(ok, "run failed: {out}");
+        assert_eq!(out, expected, "wrong output");
     }
     assert_walker_compiled(&source, &["transform", "main"]);
 }
@@ -528,8 +504,8 @@ async fn main() {{
     );
 }
 
-// 19. A panic inside a mapper is a task abort on both backends: the process
-//     dies with the panic reported, and no partial array is printed.
+// 19. A panic inside a mapper is a task abort: the process dies with the panic
+//     reported, and no partial array is printed.
 #[test]
 fn lir_parallel_19_a_mapper_panic_still_aborts() {
     let source = format!(
@@ -544,14 +520,12 @@ async fn main() {{
 }}
 "
     );
-    for env in [&AST[..], &LIR[..]] {
-        let (out, ok) = compile_and_run_with_env(&source, env);
-        assert!(!ok, "a mapper panic must abort under {env:?}: {out}");
-        assert!(
-            out.contains("runtime panic: parallel mapper failed"),
-            "no panic report under {env:?}: {out}"
-        );
-    }
+    let (out, ok) = compile_and_run_with_env(&source, &PLAIN);
+    assert!(!ok, "a mapper panic must abort: {out}");
+    assert!(
+        out.contains("runtime panic: parallel mapper failed"),
+        "no panic report: {out}"
+    );
     assert_walker_compiled(&source, &["checked", "main"]);
 }
 

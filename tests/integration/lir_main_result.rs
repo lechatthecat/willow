@@ -14,13 +14,12 @@
 //! lowering reported a gap and the function never reached the LIR at all. And
 //! the walker's `return` and `?` emitters had no Result-main epilogue.
 //!
-//! Every test is differential — the same program under the AST emitter and
-//! under the walker must produce the same output AND the same success/failure
-//! status — and the walker side sets `WILLOW_LIR_REQUIRE=1`, so a silent
-//! fallback is a compile error rather than a comparison of the AST emitter
-//! against itself. Each also runs under `WILLOW_GC_STRESS=alloc`, because a
-//! reported `Err` payload is a heap value that has to survive the defer flush
-//! standing between its construction and the report.
+//! Each test pins down the output AND the success/failure status, and since
+//! willow-0g8j.3 a body outside the walker's subset is a compile error, so a
+//! run that produces both is proof the walker produced them. Each also runs
+//! under `WILLOW_GC_STRESS=alloc`, because a reported `Err` payload is a heap
+//! value that has to survive the defer flush standing between its construction
+//! and the report.
 //!
 //! 26 perspectives:
 //!   1 `Result::Ok()` exits cleanly       13 i64 payload, generic report
@@ -40,13 +39,9 @@
 
 use super::support::{compile_and_run_with_env, compile_error_stderr, compile_with_compiler_env};
 
-const AST: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const LIR: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_STRESS: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_GC_STRESS", "alloc"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 
 /// A helper whose `Err` is a `String`, so the report carries a message.
 const PARSE: &str = "fn parse_level(raw: i64) -> Result<i64, String> {
@@ -60,7 +55,7 @@ const PARSE: &str = "fn parse_level(raw: i64) -> Result<i64, String> {
 /// must be — a `Result<void, E>` main that fails is a *correct* non-zero exit,
 /// so both dispositions are asserted rather than only the happy one.
 fn assert_main(source: &str, expected: &str, succeeds: bool) {
-    for env in [&AST[..], &LIR[..], &LIR_STRESS[..]] {
+    for env in [&PLAIN[..], &STRESS[..]] {
         let (out, ok) = compile_and_run_with_env(source, env);
         assert_eq!(ok, succeeds, "wrong exit disposition under {env:?}: {out}");
         assert_eq!(out, expected, "wrong output under {env:?}");
@@ -69,17 +64,10 @@ fn assert_main(source: &str, expected: &str, succeeds: bool) {
 }
 
 /// Compile once with the selection log on and require the walker to have taken
-/// each named function. Without this a coverage regression would still print the
-/// right answer — from the AST emitter.
+/// each named function. Without this a coverage regression could leave a
+/// function unlowered while the program still printed the right answer.
 fn assert_walker_compiled(source: &str, functions: &[&str]) {
-    let (ok, stderr) = compile_with_compiler_env(
-        source,
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_LIR_LOG", "1"),
-        ],
-    );
+    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_LIR_LOG", "1")]);
     assert!(ok, "logged LIR compile failed: {stderr}");
     for function in functions {
         let sync = format!("[lir] compiling `{function}` from lowered IR");
@@ -408,7 +396,7 @@ fn main() -> Result<void, String> {
     return Result::Ok();
 }
 ";
-    let (out, ok) = compile_and_run_with_env(source, &LIR_STRESS);
+    let (out, ok) = compile_and_run_with_env(source, &STRESS);
     assert!(ok, "GC-stress run failed: {out}");
     assert_eq!(
         out, "value 0\nvalue 1\nvalue 2\nvalue 3\nvalue 4\nvalue 5\nvalue 6\nvalue 7\n",
@@ -433,7 +421,7 @@ fn main() -> Result<void, String> {
     return Result::Ok();
 }
 ";
-    let (out, ok) = compile_and_run_with_env(source, &LIR_STRESS);
+    let (out, ok) = compile_and_run_with_env(source, &STRESS);
     assert!(!ok, "the Err exit must be non-zero: {out}");
     assert_eq!(out, "0\n1\n2\n3\nError: stopped at 4\n");
 }
@@ -530,7 +518,7 @@ fn lir_main_result_21_other_main_signatures_still_reject() {
 fn lir_main_result_22_zero_arg_ok_has_no_hir_gap() {
     let (ok, stderr) = compile_with_compiler_env(
         "fn main() -> Result<void, String> { return Result::Ok(); }\n",
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")],
+        &[],
     );
     assert!(ok, "compile failed: {stderr}");
     assert!(

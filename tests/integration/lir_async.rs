@@ -6,12 +6,13 @@
 
 use super::support::{compile_and_run_with_env, compile_with_compiler_env};
 
-const LIR_REQUIRED: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
 
 fn assert_lir(source: &str, expected: &str) {
-    let (out, ok) = compile_and_run_with_env(source, &LIR_REQUIRED);
+    let (out, ok) = compile_and_run_with_env(source, &PLAIN);
     if !ok {
-        let (compiled, stderr) = compile_with_compiler_env(source, &LIR_REQUIRED);
+        let (compiled, stderr) = compile_with_compiler_env(source, &PLAIN);
         panic!("LIR-required async program failed (compiled={compiled}): {out}{stderr}");
     }
     assert_eq!(out, expected);
@@ -19,14 +20,7 @@ fn assert_lir(source: &str, expected: &str) {
 
 fn assert_lir_logged(source: &str, expected: &str, functions: &[&str]) {
     assert_lir(source, expected);
-    let (ok, stderr) = compile_with_compiler_env(
-        source,
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_LIR_LOG", "1"),
-        ],
-    );
+    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_LIR_LOG", "1")]);
     assert!(ok, "logged LIR compile failed: {stderr}");
     for function in functions {
         assert!(
@@ -221,10 +215,7 @@ async fn main() { println(await value()); }
 "#;
     // `main` still uses the mature Task-await path, but the log proves the
     // vulnerable `let x; return x` leaf is compiled from LIR.
-    let (compiled, stderr) = compile_with_compiler_env(
-        source,
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_LOG", "1")],
-    );
+    let (compiled, stderr) = compile_with_compiler_env(source, &[("WILLOW_LIR_LOG", "1")]);
     assert!(
         compiled,
         "budget regression fixture did not compile: {stderr}"
@@ -234,10 +225,7 @@ async fn main() { println(await value()); }
         "the vulnerable leaf did not use LIR: {stderr}"
     );
 
-    let (out, ok) = compile_and_run_with_env(
-        source,
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_TASK_BUDGET", "1")],
-    );
+    let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_TASK_BUDGET", "1")]);
     assert!(ok, "budget=1 async LIR program failed: {out}");
     assert_eq!(out, "42\n");
 }
@@ -458,16 +446,13 @@ async fn main() {
 }
 "#;
     assert_lir_logged(source, "kept\n18\n", &["step", "main"]);
-    let (out, ok) = compile_and_run_with_env(
-        source,
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_TASK_BUDGET", "1")],
-    );
+    let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_TASK_BUDGET", "1")]);
     assert!(ok, "budget=1 leaf-call await failed: {out}");
     assert_eq!(out, "kept\n18\n");
 }
 
 #[test]
-fn async_lir_24_leaf_call_await_matches_the_ast_backend() {
+fn async_lir_24_leaf_call_await_in_a_loop_carries_its_result() {
     let source = r#"
 async fn work(label: String, value: i64) -> i64 {
     await sleep(1);
@@ -484,12 +469,9 @@ async fn main() {
     println(total);
 }
 "#;
-    let (lir, lir_ok) = compile_and_run_with_env(source, &[("WILLOW_LIR_BACKEND", "1")]);
-    assert!(lir_ok, "LIR run failed: {lir}");
-    let (ast, ast_ok) = compile_and_run_with_env(source, &[("WILLOW_LIR_BACKEND", "0")]);
-    assert!(ast_ok, "AST run failed: {ast}");
-    assert_eq!(lir, ast, "the two backends disagree");
-    assert_eq!(lir, "step\nstep\nstep\n6\n");
+    let (out, ok) = compile_and_run_with_env(source, &[]);
+    assert!(ok, "run failed: {out}");
+    assert_eq!(out, "step\nstep\nstep\n6\n");
 }
 
 #[test]
@@ -510,38 +492,29 @@ fn async_lir_26_await_example_is_fully_lir() {
     // every one of its `async fn`s — leaf calls, builtin awaits, suspending
     // loops and branches — must stay on the LIR path.
     let source = include_str!("../../example/lir_async_await.wi");
-    let (ok, stderr) = compile_with_compiler_env(
-        source,
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_LOG", "1")],
-    );
+    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_LIR_LOG", "1")]);
     assert!(ok, "example/lir_async_await.wi did not compile: {stderr}");
+    // Compiling at all is the proof since willow-0g8j.3 — a body outside the
+    // subset is a hard `E0800` — so what is left to check is that the async
+    // bodies really went through the async LIR path and not some other one.
     assert!(
-        !stderr.contains("stays on the AST backend"),
+        stderr.contains("[lir] compiling async `main` from lowered IR"),
         "example/lir_async_await.wi must be entirely LIR-compiled: {stderr}"
     );
 }
 
 // --- preemption safepoints sit on loop back edges only (willow-0g8j.2.11) ---
 //
-// A safepoint parks the poll fn, and a local the AST liveness pass left in an
-// SSA value does not survive that park. The pass models suspension at loop back
-// edges and at statements that execute a call, so a safepoint anywhere else is
-// a resume past a definition. `WILLOW_TASK_BUDGET=1` trips every safepoint, so
-// these run the same program twice and require the same answer.
+// A safepoint parks the poll fn, and a local left in an SSA value does not
+// survive that park: liveness models suspension at loop back edges and at
+// statements that execute a call, so a safepoint anywhere else is a resume past
+// a definition. `WILLOW_TASK_BUDGET=1` trips EVERY safepoint, which is the
+// setting that turns such a resume into a wrong answer rather than a rare one.
 
-fn assert_same_under_budget_one(source: &str, expected: &str) {
-    let (ast, ast_ok) = compile_and_run_with_env(
-        source,
-        &[("WILLOW_LIR_BACKEND", "0"), ("WILLOW_TASK_BUDGET", "1")],
-    );
-    assert!(ast_ok, "AST run failed: {ast}");
-    let (lir, lir_ok) = compile_and_run_with_env(
-        source,
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_TASK_BUDGET", "1")],
-    );
-    assert!(lir_ok, "LIR run failed: {lir}");
-    assert_eq!(lir, ast, "the two backends disagree under budget=1");
-    assert_eq!(lir, expected);
+fn assert_under_budget_one(source: &str, expected: &str) {
+    let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_TASK_BUDGET", "1")]);
+    assert!(ok, "run failed under budget=1: {out}");
+    assert_eq!(out, expected, "wrong output under budget=1");
 }
 
 #[test]
@@ -551,7 +524,7 @@ fn async_lir_27_else_arm_await_result_survives_the_join() {
     // id. Reading that as a loop back edge put a safepoint on it, and the
     // awaited result — an SSA value, since the AST pass frames the hoisted
     // temp under its own span — was lost across the park.
-    assert_same_under_budget_one(
+    assert_under_budget_one(
         r#"
 async fn delayed(x: i64) -> i64 {
     await sleep(1);
@@ -570,7 +543,7 @@ async fn main() { println(await branch(false)); }
 
 #[test]
 fn async_lir_28_then_arm_await_result_survives_the_join() {
-    assert_same_under_budget_one(
+    assert_under_budget_one(
         r#"
 async fn delayed(x: i64) -> i64 {
     await sleep(1);
@@ -592,7 +565,7 @@ fn async_lir_29_branch_local_survives_the_join() {
     // The same join edge, with an ordinary call rather than an await before
     // it: the call is what the AST pass puts a safepoint on, and `value` still
     // has to reach the join.
-    assert_same_under_budget_one(
+    assert_under_budget_one(
         r#"
 fn plain(x: i64) -> i64 { return x + 1; }
 async fn branch(flag: bool) -> i64 {
@@ -635,10 +608,7 @@ async fn main() {
     println(first + second);
 }
 "#;
-    let (out, ok) = compile_and_run_with_env(
-        source,
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_TASK_BUDGET", "1")],
-    );
+    let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_TASK_BUDGET", "1")]);
     assert!(ok, "budget=1 spin program failed: {out}");
     let mut lines: Vec<&str> = out.lines().collect();
     assert_eq!(
@@ -652,7 +622,7 @@ async fn main() {
 
 #[test]
 fn async_lir_31_loop_carried_locals_survive_the_back_edge() {
-    assert_same_under_budget_one(
+    assert_under_budget_one(
         r#"
 async fn work(x: i64) -> i64 {
     await sleep(1);
@@ -676,7 +646,7 @@ async fn main() {
 
 #[test]
 fn async_lir_32_nested_branch_joins_keep_their_locals() {
-    assert_same_under_budget_one(
+    assert_under_budget_one(
         r#"
 async fn step(x: i64) -> i64 {
     await yield();
@@ -708,18 +678,16 @@ async fn main() {
 // so the walker splits the await out and emits it first, then emits the rest
 // of the statement against the resumed value. That reorder is only legal while
 // everything the statement would have evaluated ahead of the await can be
-// evaluated again afterwards — the same rule `coop_anf`'s `bind` applies on
-// the AST path, which is why the two backends still agree. Anything else keeps
-// falling back, and these tests pin both halves of that line.
+// evaluated again afterwards — the same rule `coop_anf`'s `bind` applies —
+// and anything else is refused, so these tests pin both halves of that line.
 
-/// Both backends, plus every scheduler/GC stress switch, produce `expected`.
-fn assert_value_position_agrees(source: &str, expected: &str) {
-    let configs: [&[(&str, &str)]; 5] = [
-        &[("WILLOW_LIR_BACKEND", "0")],
-        &[("WILLOW_LIR_BACKEND", "1")],
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_TASK_BUDGET", "1")],
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_GC_STRESS", "alloc")],
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_ASYNC_FRAME_ALL", "1")],
+/// Every scheduler and GC stress switch produces `expected`.
+fn assert_value_position_is_stable(source: &str, expected: &str) {
+    let configs: [&[(&str, &str)]; 4] = [
+        &[],
+        &[("WILLOW_TASK_BUDGET", "1")],
+        &[("WILLOW_GC_STRESS", "alloc")],
+        &[("WILLOW_ASYNC_FRAME_ALL", "1")],
     ];
     for env in configs {
         let (out, ok) = compile_and_run_with_env(source, env);
@@ -730,9 +698,8 @@ fn assert_value_position_agrees(source: &str, expected: &str) {
 
 #[test]
 fn async_lir_33_binary_operand_await_reads_its_variable_again() {
-    // `n` is evaluated before the await on the AST path too, and re-read after
-    // it, because `coop_anf` refuses to hoist a bare `Var` into a temp. The
-    // walker reproduces exactly that reorder.
+    // `n` is evaluated before the await and re-read after it, because
+    // `coop_anf` refuses to hoist a bare `Var` into a temp.
     assert_lir_logged(
         r#"
 async fn twice(n: i64) -> i64 { return n * 2; }
@@ -1028,7 +995,7 @@ async fn main() { println(count() + await seven()); }
 fn async_lir_52_split_result_survives_a_later_suspension() {
     // `a` is defined from a split await and then read after a SECOND await, so
     // the liveness pass has to have given it a frame slot.
-    assert_value_position_agrees(
+    assert_value_position_is_stable(
         r#"
 async fn bump(x: i64) -> i64 { return x + 1; }
 async fn main() {
@@ -1042,8 +1009,8 @@ async fn main() {
 }
 
 #[test]
-fn async_lir_53_value_position_mix_agrees_under_every_switch() {
-    assert_value_position_agrees(
+fn async_lir_53_value_position_mix_is_stable_under_every_switch() {
+    assert_value_position_is_stable(
         r#"
 async fn twice(n: i64) -> i64 { return n * 2; }
 async fn tag(s: String) -> String { return "[" + s + "]"; }
@@ -1069,7 +1036,7 @@ async fn main() {
 fn async_lir_54_gc_stress_keeps_the_split_string_alive() {
     // Every allocation collects, so an unrooted split result would be freed
     // between the resume and the concatenation that consumes it.
-    assert_value_position_agrees(
+    assert_value_position_is_stable(
         r#"
 async fn tag(s: String) -> String { return "[" + s + "]"; }
 async fn main() {
@@ -1086,7 +1053,7 @@ async fn main() {
 }
 
 #[test]
-fn async_lir_55_select_cfg_matches_ast_and_survives_gc_stress() {
+fn async_lir_55_select_cfg_survives_every_scheduler_and_gc_switch() {
     let source = r#"
 fn pick(ch: Channel<String>) -> Channel<String> {
     println("operand");
@@ -1110,19 +1077,10 @@ async fn main() {
     await producer;
 }
 "#;
-    let configs: [&[(&str, &str)]; 4] = [
-        &[("WILLOW_LIR_BACKEND", "0")],
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")],
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_TASK_BUDGET", "1"),
-        ],
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_GC_STRESS", "alloc"),
-        ],
+    let configs: [&[(&str, &str)]; 3] = [
+        &[],
+        &[("WILLOW_TASK_BUDGET", "1")],
+        &[("WILLOW_GC_STRESS", "alloc")],
     ];
     for env in configs {
         let (out, ok) = compile_and_run_with_env(source, env);
@@ -1188,20 +1146,10 @@ async fn main() {
     println("done");
 }
 "#;
-    let (out, ok) = compile_and_run_with_env(
-        source,
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_GC_STRESS", "alloc"),
-        ],
-    );
+    let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_GC_STRESS", "alloc")]);
     assert!(ok, "LIR defer cancellation failed under GC stress: {out}");
     assert_eq!(out, "ab!\ndone\n");
-    let (compiled, stderr) = compile_with_compiler_env(
-        source,
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_LOG", "1")],
-    );
+    let (compiled, stderr) = compile_with_compiler_env(source, &[("WILLOW_LIR_LOG", "1")]);
     assert!(compiled, "logged defer compile failed: {stderr}");
     assert!(
         stderr.contains("[lir] compiling async `worker` from lowered IR"),
@@ -1338,18 +1286,10 @@ async fn main() {
 }
 "#;
     let configs: [&[(&str, &str)]; 4] = [
-        &[("WILLOW_LIR_BACKEND", "0")],
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")],
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_TASK_BUDGET", "1"),
-        ],
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_GC_STRESS", "alloc"),
-        ],
+        &[],
+        &[],
+        &[("WILLOW_TASK_BUDGET", "1")],
+        &[("WILLOW_GC_STRESS", "alloc")],
     ];
     for env in configs {
         let (out, ok) = compile_and_run_with_env(source, env);
@@ -1394,18 +1334,10 @@ async fn main() {
 }
 "#;
     let configs: [&[(&str, &str)]; 4] = [
-        &[("WILLOW_LIR_BACKEND", "0")],
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")],
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_TASK_BUDGET", "1"),
-        ],
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_GC_STRESS", "alloc"),
-        ],
+        &[],
+        &[],
+        &[("WILLOW_TASK_BUDGET", "1")],
+        &[("WILLOW_GC_STRESS", "alloc")],
     ];
     for env in configs {
         let (out, ok) = compile_and_run_with_env(source, env);
@@ -1429,15 +1361,7 @@ async fn main() {
     }
 }
 "#;
-    for env in [
-        &[("WILLOW_LIR_BACKEND", "0")][..],
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")][..],
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_GC_STRESS", "alloc"),
-        ][..],
-    ] {
+    for env in [&[][..], &[][..], &[("WILLOW_GC_STRESS", "alloc")][..]] {
         let (out, ok) = compile_and_run_with_env(source, env);
         assert!(ok, "scalar task-result run failed under {env:?}: {out}");
         assert_eq!(out, "42\n", "wrong output under {env:?}");
@@ -1486,7 +1410,7 @@ async fn main() {
     }
 }
 "#;
-    let (ast, ok) = compile_and_run_with_env(source, &[("WILLOW_LIR_BACKEND", "0")]);
+    let (ast, ok) = compile_and_run_with_env(source, &[]);
     assert!(ok, "AST run failed: {ast}");
     assert_eq!(ast.lines().count(), 9, "unexpected AST output: {ast}");
 
@@ -1495,17 +1419,9 @@ async fn main() {
     // many times the first select waited, so it is stable across runs and
     // across scheduler pressure.
     for env in [
-        &LIR_REQUIRED[..],
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_TASK_BUDGET", "1"),
-        ][..],
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_GC_STRESS", "alloc"),
-        ][..],
+        &PLAIN[..],
+        &[("WILLOW_TASK_BUDGET", "1")][..],
+        &[("WILLOW_GC_STRESS", "alloc")][..],
     ] {
         for run in 0..3 {
             let (out, ok) = compile_and_run_with_env(source, env);
@@ -1528,7 +1444,7 @@ async fn main() {
 // with it; before that, such a local looked dead across the suspension, lost
 // its slot, and read back as zero.
 //
-// 20 perspectives, each asserted to agree with the AST emitter and to run
+// 20 perspectives, each asserting the program's output and that it is
 // unchanged under scheduler pressure and GC stress:
 //   1 scalar live only on the recovery path   11 recovery inside a loop
 //   2 String (traced pointer) ditto           12 loop keeps iterating after one
@@ -1541,23 +1457,15 @@ async fn main() {
 //   9 two defers run in reverse order         19 panic raised inside a defer
 //  10 nested scopes, inner recovers           20 early `return` out of a scope
 const RECOVERY_ENVS: [&[(&str, &str)]; 4] = [
-    &[("WILLOW_LIR_BACKEND", "0")],
-    &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")],
-    &[
-        ("WILLOW_LIR_BACKEND", "1"),
-        ("WILLOW_LIR_REQUIRE", "1"),
-        ("WILLOW_TASK_BUDGET", "1"),
-    ],
-    &[
-        ("WILLOW_LIR_BACKEND", "1"),
-        ("WILLOW_LIR_REQUIRE", "1"),
-        ("WILLOW_GC_STRESS", "alloc"),
-    ],
+    &[],
+    &[],
+    &[("WILLOW_TASK_BUDGET", "1")],
+    &[("WILLOW_GC_STRESS", "alloc")],
 ];
 
-/// Every configuration must produce `expected`, and the LIR path must actually
-/// be the one compiling `functions` rather than a fallback that agrees by
-/// virtue of being the same emitter.
+/// Every configuration must produce `expected`, and the walker must be logged
+/// as the path that compiled `functions`, so a coverage regression is a failure
+/// here rather than a still-passing program.
 fn assert_recovery(source: &str, expected: &str, functions: &[&str]) {
     for env in RECOVERY_ENVS {
         let (out, ok) = compile_and_run_with_env(source, env);

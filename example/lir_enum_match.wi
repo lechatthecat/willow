@@ -17,18 +17,17 @@
 //
 // One restriction is deliberate and visible in what this program does NOT do:
 // no arm has a block body, since a `return` or a local declaration inside an
-// arm is a statement form the walker has no emitter for in expression position.
-// A program using one still compiles — it just compiles on the AST path.
+// arm is a statement form the walker has no emitter for in expression position,
+// and since willow-0g8j.3 that is a compile error rather than a fallback.
 //
 // Generic enums are no longer a restriction here. `Option` and `Result` are
 // ordinary generic enums and the walker compiles them too, including the
 // pointer niche `Option<String>` uses in place of a tag word; see
 // example/lir_option_result.wi, which is about exactly that.
 //
-// Building this program with WILLOW_LIR_BACKEND=0 must print exactly the same
-// thing, including under WILLOW_GC_STRESS=alloc. Building it with
-// WILLOW_LIR_REQUIRE=1 must succeed: that mode rejects any function that falls
-// back to the AST emitter, which is what keeps the claim above honest.
+// Building this program must print the same thing under WILLOW_GC_STRESS=alloc
+// as without it, and the build succeeding at all is what keeps the claim above
+// honest.
 
 import std::collections::Array;
 

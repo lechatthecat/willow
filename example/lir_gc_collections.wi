@@ -8,17 +8,15 @@
 // across every runtime call that can allocate — an insert that builds its key,
 // a `toString` that builds a String, a `freeze` that copies.
 //
-// Two restrictions are deliberate and visible in what this program does NOT
-// do: a map key is only ever a `String` or an `i64` (the runtime key is
-// `Int | Str`, chosen from the is-reference flag the call site passes), and
-// `get` is never called, because it answers `Option<V>` and the walker has no
-// representation for that — a program using it still compiles, just on the AST
-// path.
+// One restriction is deliberate and visible in what this program does NOT do:
+// a map key is a `String` or a scalar, never another reference type. The
+// runtime key is `Int | Str`, chosen from the is-reference flag the call site
+// passes, so any other GC reference would be read back as a `WillowString`
+// pointer; the walker refuses those key types instead.
 //
-// Building this program with WILLOW_LIR_BACKEND=0 must print exactly the same
-// thing, including under WILLOW_GC_STRESS=alloc. Building it with
-// WILLOW_LIR_REQUIRE=1 must succeed: that mode rejects any function that falls
-// back to the AST emitter, so it is the proof that the walker really compiled
+// Building this program must print the same thing under WILLOW_GC_STRESS=alloc
+// as without it. Since willow-0g8j.3 a body outside the walker's subset is a
+// compile error, so the build succeeding is the proof that the walker compiled
 // every function below.
 
 import std::collections::Array;

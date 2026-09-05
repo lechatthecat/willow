@@ -1,0 +1,104 @@
+// An enum has ONE identity build-wide, however a file spells it.
+//
+// `import signal::Level as Rank;` binds a local name to the declaration in
+// `signal`; so does the plain `import signal::Level;`, and so does writing
+// `signal::Level` outright. All three are the same enum, so a value produced
+// under one spelling is usable everywhere the others are, and a `match` on it
+// selects by variant rather than binding a catch-all.
+import std::collections::Array;
+import signal::Level as Rank;
+import signal::Reading as Sample;
+import meter;
+
+class Gauge {
+    pub limit: Rank;
+
+    pub fn over(self, r: Rank) -> bool {
+        return signal::rank(r) > signal::rank(self.limit);
+    }
+}
+
+// The alias in a parameter type and in a return type.
+fn stronger(a: Rank, b: Rank) -> Rank {
+    return signal::strongest(a, b);
+}
+
+// Bare variant patterns: legal because the file item-imported the enum, and
+// each one selects its own arm rather than binding the scrutinee.
+fn score(r: Rank) -> i64 {
+    return match r {
+        Low => 1,
+        Mid => 2,
+        High => 3,
+    };
+}
+
+// The alias-qualified spelling of the same patterns.
+fn tag(r: Rank) -> i64 {
+    return match r {
+        Rank::Low => 10,
+        Rank::Mid => 20,
+        Rank::High => 30,
+    };
+}
+
+// A payload variant reached through an alias binds its payload.
+fn read(s: Sample) -> i64 {
+    return match s {
+        Sample::Empty => 0,
+        Sample::Value(v) => v,
+    };
+}
+
+// A lambda parameter carries the alias too, and the lambda body calls a
+// function whose parameter is the canonical spelling.
+fn bumped(r: Rank) -> i64 {
+    let f = |g: Rank| -> i64 { return score(g) + 1; };
+    return f(r);
+}
+
+async fn measured(r: Rank) -> i64 {
+    await sleep(1);
+    return score(r) * 100;
+}
+
+async fn main() {
+    // Written one way, matched another.
+    println(score(Rank::High));
+    println(tag(Rank::Low));
+    println(score(signal::Level::Mid));
+    println(score(signal::top()));
+
+    // The alias as a `let` annotation, and as an array element type.
+    let x: Rank = Rank::Mid;
+    println(score(x));
+    let xs: Array<Rank> = [Rank::Low, Rank::High, Rank::Mid];
+    println(score(xs[1]));
+
+    // Alias in, alias out.
+    println(score(stronger(Rank::Low, Rank::High)));
+
+    // Another file's alias for the same declaration.
+    println(meter::label(Rank::Mid));
+    println(meter::label(signal::Level::High));
+
+    // Payload variant.
+    println(read(Sample::Value(7)));
+    println(read(Sample::Empty));
+
+    // Class field and method parameter.
+    let g = new Gauge(Rank::Mid);
+    println(g.over(Rank::High));
+    println(g.over(Rank::Low));
+
+    // Lambda parameter.
+    println(bumped(Rank::High));
+
+    // A fieldless enum value is its tag, so `==` compares variants across
+    // spellings.
+    println(Rank::High == signal::Level::High);
+    println(Rank::High != signal::Level::Low);
+
+    // Async body, same alias.
+    println(await measured(Rank::Mid));
+}

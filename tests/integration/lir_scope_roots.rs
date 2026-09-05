@@ -58,13 +58,9 @@ use super::support::{
     compile_file_and_run, compile_with_compiler_env,
 };
 
-const AST: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const LIR: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LOG: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_LIR_LOG", "1"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const LOG: [(&str, &str); 1] = [("WILLOW_LIR_LOG", "1")];
 
 /// The class the delta tests allocate. All-scalar, so allocating one adds
 /// exactly one object and nothing else to the heap.
@@ -84,32 +80,26 @@ const LABEL: &str = "class Label {
 }
 ";
 
-/// The same program under the AST emitter and under the walker must print
-/// `expected`, and the walker side runs with `WILLOW_LIR_REQUIRE=1` so a silent
-/// fallback is a compile error rather than a comparison of the AST emitter
-/// against itself.
-fn assert_both_backends(source: &str, expected: &str) {
-    for env in [&AST[..], &LIR[..]] {
-        let (out, ok) = compile_and_run_with_env(source, env);
-        assert!(ok, "run failed under {env:?}: {out}");
-        assert_eq!(out, expected, "wrong output under {env:?}");
-    }
+/// The build runs and prints `expected`. Since willow-0g8j.3 every body is
+/// compiled from lowered IR, so a body the walker cannot take is a compile
+/// error here rather than a second emitter's answer.
+fn assert_project_output(source: &str, expected: &str) {
+    let (out, ok) = compile_and_run_with_env(source, &PLAIN);
+    assert!(ok, "run failed: {out}");
+    assert_eq!(out, expected, "wrong output");
 }
 
 /// For a measurement whose exact value depends on an allocator detail rather
-/// than on rooting: the two emitters still have to answer identically.
-fn assert_backends_agree(source: &str) -> String {
-    let (ast, ok) = compile_and_run_with_env(source, &AST);
-    assert!(ok, "run failed under the AST emitter: {ast}");
-    let (lir, ok) = compile_and_run_with_env(source, &LIR);
-    assert!(ok, "run failed under the walker: {lir}");
-    assert_eq!(ast, lir, "the two emitters disagree");
-    lir
+/// than on rooting: run it and hand the output back for the caller to inspect.
+fn run_output(source: &str) -> String {
+    let (out, ok) = compile_and_run_with_env(source, &PLAIN);
+    assert!(ok, "run failed: {out}");
+    out
 }
 
 /// Compile once with the selection log on and require the walker to have taken
-/// each named function. Without this a coverage regression would still print the
-/// right answer — from the AST emitter.
+/// each named function. Without this a coverage regression could leave a
+/// function unlowered while the program still printed the right answer.
 fn assert_walker_compiled(source: &str, functions: &[&str]) {
     let (ok, stderr) = compile_with_compiler_env(source, &LOG);
     assert!(ok, "logged LIR compile failed: {stderr}");
@@ -156,7 +146,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "0\n");
+    assert_project_output(&source, "0\n");
 }
 
 // 2. A `for` over a range is a separate lowering path — its own header,
@@ -180,7 +170,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "0\n");
+    assert_project_output(&source, "0\n");
 }
 
 // 3. A `for` over an array, where the loop also holds a live collection: the
@@ -209,7 +199,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "0\n");
+    assert_project_output(&source, "0\n");
 }
 
 // 4. A conditional branch is a lexical scope of its own, entered on some paths
@@ -236,7 +226,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "0\n");
+    assert_project_output(&source, "0\n");
 }
 
 // 5. And the `else` side, which lowering reaches through a different block.
@@ -265,7 +255,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "0\n");
+    assert_project_output(&source, "0\n");
 }
 
 // 6. Scopes nest, and the marks nest with them: closing the inner one must not
@@ -288,7 +278,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "inner\nouter\n");
+    assert_project_output(&source, "inner\nouter\n");
 }
 
 // 7. `break` jumps straight out of the loop body scope without passing its
@@ -315,7 +305,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "0\n");
+    assert_project_output(&source, "0\n");
 }
 
 // 8. `continue` leaves the same way, once per iteration rather than once.
@@ -341,7 +331,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "0\n");
+    assert_project_output(&source, "0\n");
 }
 
 // 9. `return` needs no clear of its own — the emitter pops every root there —
@@ -360,7 +350,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "7\n");
+    assert_project_output(&source, "7\n");
 }
 
 // 10. A value assigned out to an enclosing binding is still rooted — by the
@@ -384,7 +374,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "escaped\n");
+    assert_project_output(&source, "escaped\n");
 }
 
 // 11. A shadowing inner binding is alpha-renamed by HIR lowering, so it has a
@@ -408,7 +398,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "inner\ninner\nouter\n");
+    assert_project_output(&source, "inner\ninner\nouter\n");
 }
 
 // 12. Dropping the binding's root does not free an object something else still
@@ -437,7 +427,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "6\n");
+    assert_project_output(&source, "6\n");
 }
 
 // 13. A `match` arm body is its own scope, lowered into its own block, and its
@@ -477,7 +467,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "0\n");
+    assert_project_output(&source, "0\n");
 }
 
 // 14. The scope's own `defer`s run BEFORE its roots are dropped: a deferred body
@@ -502,7 +492,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "100\n101\n102\n0\n");
+    assert_project_output(&source, "100\n101\n102\n0\n");
 }
 
 // 15. One close names every local the scope declared, not just the last one.
@@ -526,7 +516,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "0\n");
+    assert_project_output(&source, "0\n");
 }
 
 // 16. Nested loops: the inner body closes once per inner iteration, the outer
@@ -555,7 +545,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "0\n");
+    assert_project_output(&source, "0\n");
 }
 
 // 17. The close names every SOURCE local the scope declared, GC-managed or not.
@@ -580,7 +570,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "24\n");
+    assert_project_output(&source, "24\n");
 }
 
 // 18. An address-taken scalar gets a real stack slot, which is what a rooted
@@ -608,15 +598,14 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "46\n");
+    assert_project_output(&source, "46\n");
 }
 
 // 19. A `String` binding is GC-managed too. The delta is not zero here — the
-//     string tables keep the contents of what was built — but it is an
-//     allocator detail, so what this pins down is that both emitters answer the
-//     same way.
+//     string tables keep the contents of what was built — so what this pins
+//     down is the loop's own output, not a number the allocator chooses.
 #[test]
-fn p19_a_string_binding_agrees_between_emitters() {
+fn p19_a_string_binding_in_a_loop_prints_every_round() {
     let source = "fn run(rounds: i64) -> i64 {
     gc_collect();
     let before = gc_allocated_bytes();
@@ -633,7 +622,7 @@ fn main() {
     println(run(3));
 }
 ";
-    let out = assert_backends_agree(source);
+    let out = run_output(source);
     assert!(
         out.starts_with("row 0\nrow 1\nrow 2\n"),
         "unexpected output: {out}"
@@ -659,7 +648,7 @@ fn main() {
     println(run(20));
 }
 ";
-    assert_both_backends(source, "0\n");
+    assert_project_output(source, "0\n");
 }
 
 // 21. A payload-carrying enum value is a heap object, so its binding is a root
@@ -687,7 +676,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "0\n");
+    assert_project_output(&source, "0\n");
 }
 
 // 22. An async body's locals live in the heap async frame, which the frame's own
@@ -713,7 +702,7 @@ async fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "6\n");
+    assert_project_output(&source, "6\n");
 }
 
 // 23. A `lock` section is a scope with a lock to hand back, so its close already
@@ -741,12 +730,10 @@ async fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "10\n");
+    assert_project_output(&source, "10\n");
 }
 
-// 24. The new instruction must not take any of these shapes out of the walker's
-//     subset: an instruction it cannot emit would be a silent fallback, and the
-//     answers above would then be the AST emitter's twice over.
+// 24. The selection log confirms these scope-root shapes remain lowered.
 #[test]
 fn p24_the_shapes_are_still_lowered() {
     let source = format!(
@@ -781,7 +768,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "1\n6\n");
+    assert_project_output(&source, "1\n6\n");
     assert_walker_compiled(&source, &["looped", "ranged", "main"]);
 }
 
@@ -882,12 +869,12 @@ fn p28_the_example_runs() {
 }
 
 // 29. ...and every function in it is compiled from lowered IR, so the example
-//     documents the walker's behaviour rather than the AST emitter's.
+//     documents the walker's scope-root behaviour.
 #[test]
 fn p29_the_example_is_fully_lowered() {
     let source =
         std::fs::read_to_string("example/lir_scope_roots.wi").expect("example is readable");
-    assert_both_backends(&source, EXAMPLE_OUTPUT);
+    assert_project_output(&source, EXAMPLE_OUTPUT);
     assert_walker_compiled(
         &source,
         &[
@@ -945,7 +932,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "0\n");
+    assert_project_output(&source, "0\n");
 }
 
 // 32. `break` leaves the loop by the same block the header falls through to, so
@@ -976,7 +963,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "0\n");
+    assert_project_output(&source, "0\n");
 }
 
 // 33. A range held as a value is hoisted the same way, so the close has to reach
@@ -1005,7 +992,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "0\n");
+    assert_project_output(&source, "0\n");
 }
 
 // 34. A recovered panic is a SECOND way out of a scope: the runtime resumes
@@ -1047,7 +1034,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "0\n");
+    assert_project_output(&source, "0\n");
 }
 
 // 35. The scrutinee of a `match` lowered as a block graph lives in a temp that
@@ -1088,7 +1075,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "0\n");
+    assert_project_output(&source, "0\n");
 }
 
 // 36. An arm's pattern bindings are declared ahead of the arm body's own scope,
@@ -1126,7 +1113,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "0\n");
+    assert_project_output(&source, "0\n");
 }
 
 // 37. An async local that is live across an `await` is not on the stack at all:
@@ -1157,7 +1144,7 @@ async fn main() {{
 }}
 "
     );
-    let (out, ok) = compile_and_run_with_env(&source, &LIR);
+    let (out, ok) = compile_and_run_with_env(&source, &PLAIN);
     assert!(ok, "run failed under the walker: {out}");
     assert_eq!(out, "0\n");
 }

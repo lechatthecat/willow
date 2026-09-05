@@ -3,8 +3,8 @@
 //!
 //! Lambda lifting is a DECLARATION-phase job. `declare_program` collects the
 //! entry file's lambdas, declares a symbol for each, and records
-//! `lambda_names[span] = symbol`; both emitters read that map to find the
-//! function a lambda expression takes the address of. `declare_module` had no
+//! `lambda_names[span] = symbol`; codegen reads that map to find the function a
+//! lambda expression takes the address of. `declare_module` had no
 //! such pass and `DeclaredModule` had no `lambdas` field, so a lambda inside a
 //! module body reached codegen with nothing behind it:
 //!
@@ -17,9 +17,8 @@
 //!     internal compiler error: lambda at line 4 reached codegen without a
 //!     lifted function name
 //!
-//! on BOTH backends — the AST emitter and the LIR walker want the same lifted
-//! symbol. `compile_module_bodies` compiled free functions and class methods
-//! and no lambda bodies at all.
+//! `compile_module_bodies` compiled free functions and class methods and no
+//! lambda bodies at all.
 //!
 //! This is capture-FREE lambdas only, which is all the checker admits today; a
 //! capture is still rejected in a module body exactly as in the entry file, and
@@ -32,25 +31,17 @@
 
 use super::support::*;
 
-const LIR_ON: &[(&str, &str)] = &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_OFF: &[(&str, &str)] = &[("WILLOW_LIR_BACKEND", "0")];
-const LIR_LOG: &[(&str, &str)] = &[
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_LIR_LOG", "1"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const LIR_LOG: &[(&str, &str)] = &[("WILLOW_LIR_LOG", "1")];
 const ALLOC_STRESS: &[(&str, &str)] = &[("WILLOW_GC_STRESS", "alloc")];
 const MINOR_STRESS: &[(&str, &str)] = &[("WILLOW_GC_STRESS", "minor")];
 
 #[track_caller]
-fn assert_both_backends(files: &[(&str, &str)], entry: &str, expected: &str) {
-    let (lir, ok) = compile_temp_project_with_env_and_run(files, entry, LIR_ON);
-    assert!(ok, "LIR build failed: {lir}");
-    assert_eq!(lir, expected, "lowered-IR output mismatch");
-
-    let (ast, ok) = compile_temp_project_with_env_and_run(files, entry, LIR_OFF);
-    assert!(ok, "AST build failed: {ast}");
-    assert_eq!(ast, expected, "AST output mismatch");
+fn assert_project_output(files: &[(&str, &str)], entry: &str, expected: &str) {
+    let (out, ok) = compile_temp_project_with_env_and_run(files, entry, &PLAIN[..]);
+    assert!(ok, "build failed: {out}");
+    assert_eq!(out, expected, "wrong output");
 }
 
 /// The bead's repro module, widened to every position a capture-free lambda can
@@ -138,7 +129,7 @@ fn calc_project(entry: &'static str) -> Vec<(&'static str, &'static str)> {
     vec![("calc.wi", CALC), ("main.wi", entry)]
 }
 
-// 1. The bead's repro compiles and answers, on both emitters. It used to ICE.
+// 1. The bead's repro compiles and answers. It used to ICE.
 #[test]
 fn a_lambda_in_a_module_body_no_longer_ices() {
     let entry = r#"
@@ -148,7 +139,7 @@ fn main() {
     println(calc::apply(41));
 }
 "#;
-    assert_both_backends(&calc_project(entry), "main.wi", "42\n");
+    assert_project_output(&calc_project(entry), "main.wi", "42\n");
 }
 
 // 2. The lifted function is module-qualified and really is compiled.
@@ -169,8 +160,8 @@ fn main() {
     );
 }
 
-// 3. `WILLOW_LIR_REQUIRE=1` accepts the whole project: the lifted body is
-//    itself compiled from lowered IR, not just declared.
+// 3. The whole project compiles: the lifted body is itself compiled from
+//    lowered IR, not just declared.
 #[test]
 fn a_module_lambda_body_compiles_from_lowered_ir() {
     let entry = r#"
@@ -180,8 +171,12 @@ fn main() {
     println(calc::apply(41));
 }
 "#;
-    let (out, ok) = compile_temp_project_with_env_and_run(&calc_project(entry), "main.wi", LIR_ON);
-    assert!(ok, "no body in this project may fall back: {out}");
+    let (out, ok) =
+        compile_temp_project_with_env_and_run(&calc_project(entry), "main.wi", &PLAIN[..]);
+    assert!(
+        ok,
+        "every body in this project must compile from LIR: {out}"
+    );
     assert_eq!(out, "42\n");
 }
 
@@ -195,7 +190,7 @@ fn main() {
     println(calc::chained(3));
 }
 "#;
-    assert_both_backends(&calc_project(entry), "main.wi", "40\n");
+    assert_project_output(&calc_project(entry), "main.wi", "40\n");
 }
 
 // 5. NEGATIVE control for the collision the module prefix prevents: the
@@ -248,7 +243,7 @@ fn main() {
             "`{symbol}` was not lifted: {log}"
         );
     }
-    assert_both_backends(files, "main.wi", "40\n5\n");
+    assert_project_output(files, "main.wi", "40\n5\n");
 }
 
 // 6. The ENTRY file's lambdas keep their unprefixed symbols — a module's
@@ -270,7 +265,7 @@ fn main() {
         log.contains("[lir] compiling `$lambda.0` from lowered IR"),
         "the entry file's lambda lost its own symbol: {log}"
     );
-    assert_both_backends(&calc_project(entry), "main.wi", "700\n2\n");
+    assert_project_output(&calc_project(entry), "main.wi", "700\n2\n");
 }
 
 // 7. A lambda inside a module CLASS METHOD, not a free function.
@@ -283,7 +278,7 @@ fn main() {
     println(calc::boxed(41));
 }
 "#;
-    assert_both_backends(&calc_project(entry), "main.wi", "42\n");
+    assert_project_output(&calc_project(entry), "main.wi", "42\n");
 }
 
 // 8. A lambda passed as an ARGUMENT inside a module body.
@@ -296,7 +291,7 @@ fn main() {
     println(calc::quadrupled(5));
 }
 "#;
-    assert_both_backends(&calc_project(entry), "main.wi", "20\n");
+    assert_project_output(&calc_project(entry), "main.wi", "20\n");
 }
 
 // 9. A lambda RETURNED from a module function, then called by the entry file.
@@ -310,7 +305,7 @@ fn main() {
     println(add(37));
 }
 "#;
-    assert_both_backends(&calc_project(entry), "main.wi", "42\n");
+    assert_project_output(&calc_project(entry), "main.wi", "42\n");
 }
 
 // 10. A lambda body that calls one of the module's own functions by its bare
@@ -324,7 +319,7 @@ fn main() {
     println(calc::twice_applied(40));
 }
 "#;
-    assert_both_backends(&calc_project(entry), "main.wi", "42\n");
+    assert_project_output(&calc_project(entry), "main.wi", "42\n");
 }
 
 // 11. A lifted module lambda that allocates.
@@ -337,7 +332,7 @@ fn main() {
     println(calc::label(7));
 }
 "#;
-    assert_both_backends(&calc_project(entry), "main.wi", "n=7\n");
+    assert_project_output(&calc_project(entry), "main.wi", "n=7\n");
 }
 
 // 12. A lambda in a body that also has a `defer`, which the walker keeps as an
@@ -353,7 +348,7 @@ fn main() {
     println(total);
 }
 "#;
-    assert_both_backends(&calc_project(entry), "main.wi", "42\n1\n");
+    assert_project_output(&calc_project(entry), "main.wi", "42\n1\n");
 }
 
 // 13. A lambda inside an ASYNC module body, whose frame is built by a different
@@ -367,7 +362,7 @@ async fn main() {
     println(await calc::slow(4));
 }
 "#;
-    assert_both_backends(&calc_project(entry), "main.wi", "6\n");
+    assert_project_output(&calc_project(entry), "main.wi", "6\n");
 }
 
 // 14. A module that imports another module, both with lambdas.
@@ -409,7 +404,7 @@ fn main() {
 "#,
         ),
     ];
-    assert_both_backends(files, "main.wi", "20\n");
+    assert_project_output(files, "main.wi", "20\n");
 }
 
 // 15. A module lambda used inside a `match` arm, which the walker keeps as an
@@ -460,7 +455,7 @@ fn main() {
 "#,
         ),
     ];
-    assert_both_backends(files, "main.wi", "42\n2\n");
+    assert_project_output(files, "main.wi", "42\n2\n");
 }
 
 // 16. A capture in a module body is still refused, and by the CHECKER — the
@@ -512,16 +507,17 @@ fn main() {
     let (out, ok) = compile_temp_project_with_env_and_run_under(
         &calc_project(entry),
         "main.wi",
-        LIR_ON,
+        &PLAIN[..],
         ALLOC_STRESS,
     );
     assert!(ok, "alloc-stress run failed: {out}");
     assert_eq!(out, "n=7\n42\n");
 }
 
-// 18. The same under minor-collection stress, on the AST emitter.
+// 18. The same under minor-collection stress, which is the mode that MOVES an
+//     object: a lifted lambda's captured environment has to be traced.
 #[test]
-fn module_lambdas_survive_minor_stress_on_the_ast_backend() {
+fn module_lambdas_survive_minor_stress() {
     let entry = r#"
 import calc;
 
@@ -533,7 +529,7 @@ fn main() {
     let (out, ok) = compile_temp_project_with_env_and_run_under(
         &calc_project(entry),
         "main.wi",
-        LIR_OFF,
+        &PLAIN[..],
         MINOR_STRESS,
     );
     assert!(ok, "minor-stress run failed: {out}");
@@ -580,7 +576,7 @@ fn main() {
     println(here(43));
 }
 "#;
-    assert_both_backends(
+    assert_project_output(
         &calc_project(entry),
         "main.wi",
         "42\n40\n20\n42\n42\nn=7\n42\n",

@@ -13,12 +13,11 @@
 //! `src/backend/cranelift/emit_pow.rs` (`pow_plan_01..12`); the type rules are
 //! unit-tested in `src/semantic/type_checker/mod.rs` (`pow_type_01..25`). This
 //! file covers what only a running binary can show: emitted values, evaluation
-//! order, panic behaviour, and agreement across the two backends and both
-//! build profiles.
+//! order, panic behaviour, and agreement across both build profiles.
 //!
 //! Perspectives 1–26 cover the integer path; `pow_f64_27` onward cover the
-//! numerical kernel, IEEE dispatch, compatibility spellings, backend parity,
-//! object linkage, async interaction, and versioned accuracy corpora.
+//! numerical kernel, IEEE dispatch, compatibility spellings, release-build
+//! parity, object linkage, async interaction, and versioned accuracy corpora.
 //!
 //! Integer perspectives:
 //!   1  constant exponents 0..10 of a fixed base
@@ -551,10 +550,10 @@ fn main() {
     assert_eq!(out, "base ran\n1\nbase ran\n1\n");
 }
 
-// ── 19. Backend agreement ────────────────────────────────────────────────────
+// ── 19. Every integer `**` shape in one program ──────────────────────────────
 
 #[test]
-fn pow_int_19_lir_backend_matches_the_ast_backend() {
+fn pow_int_19_every_integer_power_shape_in_one_program() {
     const SOURCE: &str = r#"
 fn pow(base: i64, exponent: i64) -> i64 {
     return base ** exponent;
@@ -572,19 +571,9 @@ fn main() {
 }
 "#;
 
-    let (ast_out, ast_ok) = compile_and_run(SOURCE);
-    assert!(ast_ok, "AST backend: {ast_out}");
-
-    let (lir_out, lir_ok) = compile_and_run_with_env(
-        SOURCE,
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")],
-    );
-    assert!(lir_ok, "LIR backend: {lir_out}");
-    assert_eq!(
-        ast_out, lir_out,
-        "the LIR walker and the AST emitter must lower `**` identically"
-    );
-    assert_eq!(ast_out, "1024\n243\n243\n0\n-8\n512\n-32\n1\n");
+    let (out, ok) = compile_and_run(SOURCE);
+    assert!(ok, "{out}");
+    assert_eq!(out, "1024\n243\n243\n0\n-8\n512\n-32\n1\n");
 }
 
 #[test]
@@ -599,7 +588,7 @@ fn main() {
     println(pow(2, 0 - 4));
 }
 "#,
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")],
+        &[],
     );
     assert!(!ok, "the LIR path must raise the same fault: {out}");
     assert!(
@@ -868,7 +857,7 @@ fn main() {
 // ── 26. Emitted code, not just emitted values ────────────────────────────────
 
 /// The structural half of perspective 25: `i64 **` must not *call* anything to
-/// compute a power, on either backend.
+/// compute a power.
 ///
 /// The check reads the relocations of the object file the backend emitted.
 /// Neither of the two obvious alternatives works:
@@ -892,22 +881,17 @@ fn main() {
 }
 "#;
 
-    for backend in [
-        &[][..],
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")][..],
-    ] {
-        let targets = compile_and_collect_relocation_targets(INTEGER_POWERS, backend);
-        let called_pow: Vec<&String> = targets
-            .iter()
-            .filter(|name| name.starts_with("willow_pow_"))
-            .collect();
-        assert_eq!(
-            called_pow,
-            vec!["willow_pow_negative_exponent"],
-            "integer `**` must reference only the negative-exponent raiser \
-             (backend env {backend:?}); relocations were {targets:?}"
-        );
-    }
+    let targets = compile_and_collect_relocation_targets(INTEGER_POWERS, &[]);
+    let called_pow: Vec<&String> = targets
+        .iter()
+        .filter(|name| name.starts_with("willow_pow_"))
+        .collect();
+    assert_eq!(
+        called_pow,
+        vec!["willow_pow_negative_exponent"],
+        "integer `**` must reference only the negative-exponent raiser; \
+         relocations were {targets:?}"
+    );
 
     // The unrolled form alone must not even need the raiser: a non-negative
     // literal exponent is known at compile time, so there is no sign to check.
@@ -1172,8 +1156,12 @@ fn pow_f64_30_versioned_high_precision_hard_case_corpus() {
     );
 }
 
+// The dynamic form — a non-literal exponent, so the square-and-multiply /
+// helper path rather than any constant folding — printed exactly, so a change
+// in the helper's rounding shows up here rather than being absorbed by a
+// comparison against another build of the same helper.
 #[test]
-fn pow_f64_31_lir_and_ast_emitters_match() {
+fn pow_f64_31_the_dynamic_form_prints_its_exact_values() {
     const SOURCE: &str = r#"
 fn dynamic(base: f64, exponent: f64) -> f64 {
     return base ** exponent;
@@ -1185,14 +1173,12 @@ fn main() {
     println(dynamic(0.5, 0.0 - 3.25));
 }
 "#;
-    let (ast, ast_ok) = compile_and_run_with_env(SOURCE, &[("WILLOW_LIR_BACKEND", "0")]);
-    assert!(ast_ok, "AST: {ast}");
-    let (lir, lir_ok) = compile_and_run_with_env(
-        SOURCE,
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")],
+    let (out, ok) = compile_and_run_with_env(SOURCE, &[]);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "1.414213562373095\n-128\n2.7182818284590446\n9.513656920021768\n"
     );
-    assert!(lir_ok, "LIR: {lir}");
-    assert_eq!(ast, lir);
 }
 
 #[test]
@@ -1247,7 +1233,7 @@ fn compatibility(x: f64, y: f64) -> f64 {
 }
 fn main() { println(compatibility(9.0, 0.5)); }
 "#,
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")],
+        &[],
     );
     assert!(ok, "LIR compatibility calls failed: {out}");
     assert_eq!(out, "6\n");

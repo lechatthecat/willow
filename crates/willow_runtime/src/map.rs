@@ -9,8 +9,9 @@
 //! * a finalizer frees the boxed `MapData` when the map is swept, so the Rust
 //!   allocation does not leak.
 //!
-//! Keys may be `i64` or `String` (compared by content). Values are stored as
-//! raw 64-bit words; `.get` returns a Willow `Option<V>` built directly here.
+//! Keys are one 64-bit word — an `i64`, the bits of an `f64`, or a `bool` — or
+//! a `String` compared by content. Values are stored as raw 64-bit words; `.get`
+//! returns a Willow `Option<V>` built directly here.
 
 use crate::gc::{
     GcObjectKind, GcStoreDestination, willow_alloc_with_layout, willow_gc_write_barrier,
@@ -24,7 +25,10 @@ const MAP_TYPE_ID: u32 = 0xA22A_0002;
 
 /// A key copied out of the Willow heap so the map owns it independently of the
 /// GC. String keys compare by content (not pointer identity), which is what
-/// `Map<String, V>` lookups require.
+/// `Map<String, V>` lookups require. Every other admitted key is one word, so
+/// `Int` holds it verbatim: an `i64`, a `bool` as 0/1, or the BITS of an `f64`
+/// (which is why `Map<f64, V>` matches keys bit-for-bit, and so distinguishes
+/// `0.0` from `-0.0`).
 #[derive(PartialEq, Eq, Hash, Clone)]
 enum MapKey {
     Int(i64),
@@ -243,9 +247,11 @@ fn alloc_none() -> *mut u8 {
 /// deterministic output (HashMap iteration order is not stable). Kinds follow
 /// `willow_array_to_string` (0=i64, 1=f64, 2=bool, 3=String); string KEYS are
 /// printed bare (they are identifiers-like), string VALUES are quoted
-/// (willow-vwn6). Returns a newly allocated WillowString.
+/// (willow-vwn6). `key_kind` is what tells a word key apart from the `f64` and
+/// `bool` that share its representation, so `Map<f64, V>` prints `1.5` and not
+/// the bit pattern. Returns a newly allocated WillowString.
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_map_to_string(map: *mut u8, val_kind: i64) -> *mut u8 {
+pub extern "C" fn willow_map_to_string(map: *mut u8, key_kind: i64, val_kind: i64) -> *mut u8 {
     let mut entries: Vec<(String, i64)> = if map.is_null() {
         Vec::new()
     } else {
@@ -254,7 +260,7 @@ pub extern "C" fn willow_map_to_string(map: *mut u8, val_kind: i64) -> *mut u8 {
             .iter()
             .map(|(k, &v)| {
                 let key = match k {
-                    MapKey::Int(n) => n.to_string(),
+                    MapKey::Int(n) => crate::array::element_word_to_string(*n, key_kind),
                     MapKey::Str(s) => s.clone(),
                 };
                 (key, v)

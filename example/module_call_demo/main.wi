@@ -5,9 +5,9 @@
 // the module's CLASS into this file under its own name, which is what makes a
 // value of that type usable here.
 //
-// Build it twice to see that the two backends agree:
-//   WILLOW_LIR_BACKEND=0 willowc build example/module_call_demo/main.wi -o /tmp/a
-//   WILLOW_LIR_BACKEND=1 willowc build example/module_call_demo/main.wi -o /tmp/b
+// Build it with the selection log to see the walker take every function,
+// module bodies included:
+//   WILLOW_LIR_LOG=1 willowc build example/module_call_demo/main.wi -o /tmp/a
 import tally;
 import tally::Entry;
 

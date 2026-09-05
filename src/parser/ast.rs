@@ -1,6 +1,9 @@
 use crate::diagnostics::Span;
 
-#[derive(Debug, Clone, PartialEq)]
+/// `Eq`/`Hash` so a written type can key the checker's normalization table
+/// (willow-0g8j.3): HIR lowering re-spells an AST annotation with what the
+/// checker made of it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     I64,
     F64,

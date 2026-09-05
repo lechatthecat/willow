@@ -11,15 +11,13 @@
 //! second case. Rooting the scrutinee keeps the payload *reachable*, but the
 //! scrutinee is what stays put while its child moves, so a binding that copied
 //! the payload word into a Cranelift variable named freed memory as soon as the
-//! arm allocated. Both emitters now give a GC-managed binding a rooted stack
-//! slot instead, which makes it a direct root the collector pins.
+//! arm allocated. A GC-managed binding gets a rooted stack slot instead, which
+//! makes it a direct root the collector pins.
 //!
 //! Each test mutates through the binding after a collection and reads the value
 //! back through the scrutinee, so a stale binding shows up as the old number
 //! rather than the new one -- a silent wrong answer, not a crash. Every program
-//! runs under the AST emitter and under the LIR walker, both with
-//! `WILLOW_LIR_REQUIRE=1` so a coverage regression cannot pass by comparing the
-//! AST path against itself, and under `WILLOW_GC_STRESS`. Note that the stress
+//! runs under `WILLOW_GC_STRESS`. Note that the stress
 //! mode that matters here is `minor`: `alloc` both skips the minor collector and
 //! allocates every object straight into the old generation, so it can never move
 //! anything. `gc_minor_collect()` is the deterministic trigger.
@@ -41,31 +39,18 @@
 
 use super::support::{compile_and_run_with_env, compile_with_compiler_env};
 
-const AST: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const AST_MINOR: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "0"), ("WILLOW_GC_STRESS", "minor")];
-const LIR: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_ALLOC: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_GC_STRESS", "alloc"),
-];
-const LIR_MINOR: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_GC_STRESS", "minor"),
-];
-const LIR_LOG: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_LIR_LOG", "1"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const MINOR_STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "minor")];
+const ALLOC_STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
+const LIR_LOG: [(&str, &str); 1] = [("WILLOW_LIR_LOG", "1")];
 
 /// Declarations every program shares.
 ///
 /// Mutation goes through `bump`, `set_side` and `put` rather than a field store
 /// written in the arm itself, because a field store inside a `match` arm is not
-/// yet in the walker's statement subset and would take the whole function back
-/// to the AST emitter -- which `WILLOW_LIR_REQUIRE=1` reports as a failure.
+/// yet in the walker's statement subset, and since willow-0g8j.3 that is a
+/// compile error rather than a fallback.
 const PRELUDE: &str = r#"class Node { pub v: i64; }
 class Cell { pub n: Node; }
 enum Boxed { One(Node), Pair(Node, i64), Empty }
@@ -106,18 +91,12 @@ fn program(body: &str) -> String {
     format!("{PRELUDE}{body}")
 }
 
-/// `expected` must come out of the AST emitter and the walker alike, plain and
-/// under both GC stress modes, and `functions` must each be named in the
+/// `expected` must come out plain and under both GC stress modes, and
+/// `functions` must each be named in the
 /// walker's selection log.
 fn assert_binding(body: &str, expected: &str, functions: &[&str]) {
     let source = program(body);
-    for env in [
-        &AST[..],
-        &AST_MINOR[..],
-        &LIR[..],
-        &LIR_ALLOC[..],
-        &LIR_MINOR[..],
-    ] {
+    for env in [&PLAIN[..], &MINOR_STRESS[..], &ALLOC_STRESS[..]] {
         let (out, ok) = compile_and_run_with_env(&source, env);
         assert!(ok, "run failed under {env:?}: {out}");
         assert_eq!(out, expected, "wrong output under {env:?}");
@@ -530,14 +509,12 @@ fn binding_roots_17_an_arm_panics_under_a_binding() {
 fn main() { println(guard(Boxed::One(new Node(1)))); }
 "#,
     );
-    for env in [&AST[..], &LIR[..]] {
-        let (out, ok) = compile_and_run_with_env(&source, env);
-        assert!(!ok, "expected a panic under {env:?}: {out}");
-        assert!(
-            out.contains("a node is not allowed here"),
-            "report under {env:?} is missing the message:\n{out}"
-        );
-    }
+    let (out, ok) = compile_and_run_with_env(&source, &PLAIN);
+    assert!(!ok, "expected a panic: {out}");
+    assert!(
+        out.contains("a node is not allowed here"),
+        "report is missing the message:\n{out}"
+    );
 }
 
 // 18. The collection happens inside a callee rather than in the arm, which is
@@ -668,18 +645,12 @@ fn main() {
     );
 }
 
-// 24. The runnable example, under both emitters and both stress modes.
+// 24. The runnable example, plain and under both stress modes.
 #[test]
 fn binding_roots_24_the_example_runs_the_same() {
     let source = std::fs::read_to_string("example/match_binding_gc_roots.wi")
         .expect("example/match_binding_gc_roots.wi");
-    for env in [
-        &AST[..],
-        &AST_MINOR[..],
-        &LIR[..],
-        &LIR_ALLOC[..],
-        &LIR_MINOR[..],
-    ] {
+    for env in [&PLAIN[..], &MINOR_STRESS[..], &ALLOC_STRESS[..]] {
         let (out, ok) = compile_and_run_with_env(&source, env);
         assert!(ok, "example failed under {env:?}: {out}");
         assert_eq!(

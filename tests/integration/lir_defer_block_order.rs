@@ -23,11 +23,10 @@
 //! are all created before the walk and nothing is sealed inside it, so the order
 //! is free.
 //!
-//! Every test is differential: the same program under the AST emitter and under
-//! the walker must print the same thing, with `WILLOW_LIR_REQUIRE=1` on the
-//! walker side so a fallback fails instead of quietly comparing the AST emitter
-//! against itself, and a third run under `WILLOW_GC_STRESS=alloc` because
-//! reordering emission also reorders the GC root bookkeeping.
+//! Since willow-0g8j.3 a body outside the walker's subset is a compile error,
+//! so a run that prints the right answer is proof the walker produced it. Each
+//! program also runs under `WILLOW_GC_STRESS=alloc`, because reordering
+//! emission also reorders the GC root bookkeeping.
 //!
 //! 22 perspectives:
 //!   1 the reported shape                    12 `while` + `break` past a merge
@@ -45,13 +44,9 @@
 
 use super::support::{compile_and_run_with_env, compile_with_compiler_env};
 
-const AST: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const LIR: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_STRESS: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_GC_STRESS", "alloc"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 
 /// A `Result`-returning helper, so `?` has something to propagate.
 const PARSE: &str = "fn parse(n: i64) -> Result<i64, String> {
@@ -62,25 +57,16 @@ const PARSE: &str = "fn parse(n: i64) -> Result<i64, String> {
 
 /// Run `source` under all three configurations and require identical output.
 fn assert_defers(source: &str, expected: &str) {
-    for env in [&AST[..], &LIR[..], &LIR_STRESS[..]] {
+    for env in [&PLAIN[..], &STRESS[..]] {
         let (out, ok) = compile_and_run_with_env(source, env);
         assert!(ok, "program failed under {env:?}: {out}");
         assert_eq!(out, expected, "wrong output under {env:?}");
     }
 }
 
-/// Compile once with the selection log on and require the walker to have taken
-/// each named function, so a coverage regression cannot pass by printing the
-/// right answer from the AST emitter.
+/// Compile with the selection log and verify each named function is lowered.
 fn assert_walker_compiled(source: &str, functions: &[&str]) {
-    let (ok, stderr) = compile_with_compiler_env(
-        source,
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_LIR_LOG", "1"),
-        ],
-    );
+    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_LIR_LOG", "1")]);
     assert!(ok, "logged LIR compile failed: {stderr}");
     for function in functions {
         let sync = format!("[lir] compiling `{function}` from lowered IR");
@@ -458,8 +444,7 @@ fn main() { println(f(false, false)); println(f(false, true)); println(f(true, t
     );
 }
 
-// 20. The walker really took these. Without this a coverage regression would
-//     still print the right answer, from the AST emitter.
+// 20. The selection log explicitly records each lowered defer function.
 #[test]
 fn lir_defer_block_order_20_the_walker_really_compiled_these() {
     assert_walker_compiled(

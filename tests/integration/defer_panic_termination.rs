@@ -108,7 +108,7 @@ fn return_path() {
             Some(info) => println("return:" + info.message),
             None => {}
         }
-        defer { panic("cleanup"); }
+        defer { panic("cleanup"); println("unreachable cleanup"); }
         return;
     }
     println("return-resumed");
@@ -120,7 +120,7 @@ fn fallthrough_path() {
             Some(info) => println("fallthrough:" + info.message),
             None => {}
         }
-        defer { panic("cleanup"); }
+        defer { panic("cleanup"); println("unreachable cleanup"); }
         println("body");
     }
     println("continued");
@@ -182,7 +182,7 @@ async fn worker() -> i64 {
             Some(info) => println("async:" + info.message),
             None => {}
         }
-        defer { panic("cleanup"); }
+        defer { panic("cleanup"); println("unreachable cleanup"); }
         return 7;
     }
     return 8;
@@ -234,10 +234,7 @@ fn main() {
 /// already been emitted (willow-0g8j.2.15).
 #[test]
 fn defer_term_24_lir_early_return_recovery_uses_the_lexical_continuation() {
-    let (out, ok) = compile_and_run_with_env(
-        RECOVERED_PATHS,
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")],
-    );
+    let (out, ok) = compile_and_run_with_env(RECOVERED_PATHS, &[]);
     assert!(ok, "{out}");
     assert_eq!(out, RECOVERED_OUTPUT);
 }

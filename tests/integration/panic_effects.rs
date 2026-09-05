@@ -228,15 +228,17 @@ fn main() { request(false); request(true); }
     assert_eq!(optimized, baseline);
 }
 
+// The effect summary is computed before codegen, so a recursive pure function
+// has to reach the same conclusion under GC stress, where every allocation is a
+// collection point and a dropped panic-depth snapshot would show.
 #[test]
-fn pe_14_ast_and_lir_paths_have_identical_effect_behavior() {
-    let (lir, lir_ok) = compile_and_run_with_env(
-        PURE_RECURSION,
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")],
-    );
-    let (ast, ast_ok) = compile_and_run_with_env(PURE_RECURSION, &[("WILLOW_LIR_BACKEND", "0")]);
-    assert!(lir_ok && ast_ok);
-    assert_eq!(lir, ast);
+fn pe_14_a_purely_recursive_program_is_stable_under_gc_stress() {
+    let (plain, plain_ok) = compile_and_run_with_env(PURE_RECURSION, &[]);
+    assert!(plain_ok, "{plain}");
+    let (stressed, stressed_ok) =
+        compile_and_run_with_env(PURE_RECURSION, &[("WILLOW_GC_STRESS", "alloc")]);
+    assert!(stressed_ok, "{stressed}");
+    assert_eq!(plain, stressed);
 }
 
 #[test]
@@ -408,13 +410,12 @@ fn main() {}
 }
 
 #[test]
-fn pe_23_virtual_self_call_agrees_across_ast_and_lir_selection() {
-    let (ast, ast_ok) =
-        compile_and_run_with_env(SELF_DISPATCH_PANIC, &[("WILLOW_LIR_BACKEND", "0")]);
-    let (lir, lir_ok) =
-        compile_and_run_with_env(SELF_DISPATCH_PANIC, &[("WILLOW_LIR_BACKEND", "1")]);
-    assert!(ast_ok && lir_ok, "{ast}\n{lir}");
-    assert_eq!(ast, lir);
+fn pe_23_virtual_self_call_survives_gc_stress() {
+    // The recovery carries an `info.message` allocated on the panic path, so a
+    // collection at every allocation is what would show a missing root.
+    let (out, ok) = compile_and_run_with_env(SELF_DISPATCH_PANIC, &[("WILLOW_GC_STRESS", "alloc")]);
+    assert!(ok, "{out}");
+    assert_eq!(out, "recovered:child hook\nafter\n");
 }
 
 #[test]
@@ -493,12 +494,10 @@ fn pe_26_walk_summaries_match_unconditional_panic_checks() {
 }
 
 #[test]
-fn pe_27_walk_summaries_agree_across_backend_selection() {
-    let (ast, ast_ok) = compile_and_run_with_env(SHARED_AST_WALK, &[("WILLOW_LIR_BACKEND", "0")]);
-    let (lir, lir_ok) = compile_and_run_with_env(SHARED_AST_WALK, &[("WILLOW_LIR_BACKEND", "1")]);
-    assert!(ast_ok && lir_ok, "{ast}\n{lir}");
-    assert_eq!(ast, lir);
-    assert_eq!(ast, SHARED_AST_WALK_OUTPUT);
+fn pe_27_walk_summaries_hold_under_gc_stress() {
+    let (out, ok) = compile_and_run_with_env(SHARED_AST_WALK, &[("WILLOW_GC_STRESS", "alloc")]);
+    assert!(ok, "{out}");
+    assert_eq!(out, SHARED_AST_WALK_OUTPUT);
 }
 
 #[test]

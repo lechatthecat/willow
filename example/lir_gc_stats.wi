@@ -8,12 +8,11 @@
 // Every counter's VALUE depends on the allocator's schedule, so this program
 // prints only what holds on every platform and under every collection schedule:
 // a counter is never negative, a cumulative counter never goes backwards, and
-// two reads with nothing between them agree. Building with
-// WILLOW_LIR_BACKEND=0 must print exactly the same thing, including under
-// WILLOW_GC_STRESS=alloc and WILLOW_GC_STRESS=minor. Building with
-// WILLOW_LIR_REQUIRE=1 must succeed: that mode rejects any function that falls
-// back to the AST emitter, so it is the proof that the walker compiled every
-// function below.
+// two reads with nothing between them agree. Building under
+// WILLOW_GC_STRESS=alloc and under WILLOW_GC_STRESS=minor must print exactly
+// the same thing as building without either. Since willow-0g8j.3 a body
+// outside the walker's subset is a compile error, so the build succeeding is
+// the proof that the walker compiled every function below.
 
 import std::collections::Array;
 

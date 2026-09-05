@@ -13,12 +13,10 @@
 // FREE function in it — the ones that build and move the boxes — is compiled
 // from the lowered IR.
 //
-// Building this program with WILLOW_LIR_BACKEND=0 must print exactly the same
-// thing, including under WILLOW_GC_STRESS=alloc: the box allocates AFTER its
-// value expression is produced, so a site that roots a live temporary across
-// the value has to count the box as allocating too. Building it with
-// WILLOW_LIR_REQUIRE=1 must succeed, which is the proof that the free
-// functions really took the walker path.
+// Building this program must print the same thing under WILLOW_GC_STRESS=alloc
+// as without it: the box allocates AFTER its value expression is produced, so a
+// site that roots a live temporary across the value has to count the box as
+// allocating too.
 //
 // The last section covers one object boxed into TWO DIFFERENT interfaces
 // (willow-j260.1): a class has one vtable PER INTERFACE, so the two boxes must

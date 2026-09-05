@@ -13,8 +13,8 @@
 // objects this scope bound are gone", never anything about what the rest of the
 // program is holding or how large an object is on this platform.
 //
-// Try it under `WILLOW_LIR_BACKEND=0` as well: the AST emitter, which pushes and
-// pops a root around each binding, prints exactly the same thing.
+// Try it under `WILLOW_GC_STRESS=alloc` as well: collecting at every allocation
+// site changes when the deltas are observed, not what they are.
 
 import std::collections::Array;
 

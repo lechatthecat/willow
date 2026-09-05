@@ -1,0 +1,34 @@
+module signal;
+
+// A fieldless enum: every value IS its tag, so it travels as a plain integer
+// and `==` on two of them is an integer comparison.
+pub enum Level {
+    Low,
+    Mid,
+    High,
+}
+
+// A payload-carrying enum: values are heap objects, matched by variant.
+pub enum Reading {
+    Empty,
+    Value(i64),
+}
+
+pub fn top() -> Level {
+    return Level::High;
+}
+
+pub fn strongest(a: Level, b: Level) -> Level {
+    if rank(a) >= rank(b) {
+        return a;
+    }
+    return b;
+}
+
+pub fn rank(l: Level) -> i64 {
+    return match l {
+        Low => 1,
+        Mid => 2,
+        High => 3,
+    };
+}

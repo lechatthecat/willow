@@ -644,7 +644,7 @@ fn main() {
 }
 
 #[test]
-fn panic_recover_30_lir_on_off_mixed_backend_parity() {
+fn panic_recover_30_a_deep_panic_recovers_under_gc_stress() {
     let source = r#"
 fn deep(value: String) -> String {
     let local = value + "-deep";
@@ -661,14 +661,9 @@ fn main() {
     println(root);
 }
 "#;
-    let on_env = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_GC_STRESS", "alloc")];
-    let off_env = [("WILLOW_LIR_BACKEND", "0"), ("WILLOW_GC_STRESS", "alloc")];
-    let (on, on_ok) = compile_with_env_and_run(source, &on_env);
-    let (off, off_ok) = compile_with_env_and_run(source, &off_env);
-    assert!(on_ok, "LIR-on failed: {on}");
-    assert!(off_ok, "LIR-off failed: {off}");
-    assert_eq!(on, off);
-    assert_eq!(on, "mixed\ncaller-root\n");
+    let (out, ok) = compile_with_env_and_run(source, &[("WILLOW_GC_STRESS", "alloc")]);
+    assert!(ok, "run failed under GC stress: {out}");
+    assert_eq!(out, "mixed\ncaller-root\n");
 }
 
 // Recoverable runtime language faults — willow-s9ej.5. Every helper returns a
@@ -738,7 +733,7 @@ fn main() {
 }
 
 #[test]
-fn panic_recover_34_integer_division_by_zero_lir_parity() {
+fn panic_recover_34_integer_division_by_zero_is_recoverable() {
     let source = r#"
 fn divide(value: i64) -> i64 { return 100 / value; }
 fn main() {
@@ -749,12 +744,9 @@ fn main() {
     println("after");
 }
 "#;
-    let (on, on_ok) = compile_with_env_and_run(source, &[("WILLOW_LIR_BACKEND", "1")]);
-    let (off, off_ok) = compile_with_env_and_run(source, &[("WILLOW_LIR_BACKEND", "0")]);
-    assert!(on_ok, "LIR-on failed: {on}");
-    assert!(off_ok, "LIR-off failed: {off}");
-    assert_eq!(on, off);
-    assert_eq!(on, "division by zero\nafter\n");
+    let (out, ok) = compile_with_env_and_run(source, &[]);
+    assert!(ok, "run failed: {out}");
+    assert_eq!(out, "division by zero\nafter\n");
 }
 
 #[test]

@@ -3,8 +3,7 @@
 // `All extends Alpha, Beta, Gamma`, so Beta and Gamma do not begin at slot 0
 // of All's vtable. Converting an All value to either interface must adjust its
 // vtable pointer; reusing the All box would call Alpha's methods instead.
-// Build with WILLOW_LIR_BACKEND=0 and with
-// WILLOW_LIR_BACKEND=1 WILLOW_LIR_REQUIRE=1: both must print the same 19 lines.
+// The program prints 19 lines; a reused box would change what they say.
 
 import std::collections::Array;
 

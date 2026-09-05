@@ -21,10 +21,9 @@
 //! A class static keeps the bare-method convention it already had, because a
 //! static is reached through its class and the class's own unit declares it.
 //!
-//! Every test is differential: the same project under the AST emitter and under
-//! the walker must report the same thing. `WILLOW_LIR_REQUIRE=1` cannot police
-//! a multi-file build — module functions are never registered as lowered IR —
-//! so walker coverage is asserted from `WILLOW_LIR_LOG=1` instead.
+//! Walker coverage is asserted from `WILLOW_LIR_LOG=1`, which names each
+//! function the walker really compiled: the build succeeding says only that
+//! nothing in the project is outside the subset.
 //!
 //! 25 perspectives:
 //!   1 a module panic names the call     14 in a match arm
@@ -34,7 +33,7 @@
 //!   5 the caller's frame below it       18 nested inside another call
 //!   6 module calling module, both hops  19 a class static stays bare
 //!   7 a module's private helper         20 a class method stays bare
-//!   8 the two emitters agree exactly    21 an awaited async call
+//!   8 a returning call's frames         21 an awaited async call
 //!   9 a returned call leaves no frame   22 a call inside a spawned task
 //!  10 a recovered panic leaves none     23 the walker compiled the caller
 //!  11 a loop accumulates no frames      24 under allocation-stress GC
@@ -46,10 +45,10 @@ use super::support::{
     compile_temp_project_with_env_run_stderr, compile_temp_project_with_env_stderr,
 };
 
-const AST: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const LIR: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "1")];
-const LIR_LOG: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_LOG", "1")];
-const LIR_STRESS: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_GC_STRESS", "alloc")];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const LIR_LOG: [(&str, &str); 1] = [("WILLOW_LIR_LOG", "1")];
+const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 
 /// The module every test imports. `checked` and `empty` panic; `safe` does not,
 /// so a test can prove a frame was popped by panicking somewhere else after it.
@@ -149,34 +148,28 @@ fn frames(report: &str) -> Vec<String> {
     out
 }
 
-/// Build and run a project that is expected to panic, returning the report each
-/// emitter wrote. Both are asserted to carry the same panic message first, so a
-/// test that goes on to read frames is reading the frames of the panic it meant.
-fn panic_reports(files: &[(&str, &str)], message: &str) -> Vec<String> {
-    let mut reports = Vec::new();
-    for env in [&AST[..], &LIR[..]] {
-        let (ok, stderr) = compile_temp_project_with_env_run_stderr(files, "main.wi", env);
-        assert!(ok, "compile failed under {env:?}:\n{stderr}");
-        assert!(
-            stderr.contains(&format!("runtime panic: {message}")),
-            "no `{message}` panic under {env:?}:\n{stderr}"
-        );
-        reports.push(stderr);
-    }
-    reports
+/// Build and run a project that is expected to panic, returning the report it
+/// wrote. The panic message is asserted first, so a test that goes on to read
+/// frames is reading the frames of the panic it meant.
+#[track_caller]
+fn panic_report(files: &[(&str, &str)], message: &str) -> String {
+    let (ok, stderr) = compile_temp_project_with_env_run_stderr(files, "main.wi", &PLAIN);
+    assert!(ok, "compile failed:\n{stderr}");
+    assert!(
+        stderr.contains(&format!("runtime panic: {message}")),
+        "no `{message}` panic:\n{stderr}"
+    );
+    stderr
 }
 
-/// The common shape: whichever emitter compiled the caller, the panic's frames
-/// are exactly `expected`.
+/// The common shape: the panic's frames are exactly `expected`.
+#[track_caller]
 fn assert_frames(files: &[(&str, &str)], message: &str, expected: &[&str]) {
-    for report in panic_reports(files, message) {
-        assert_eq!(frames(&report), expected, "wrong frames in:\n{report}");
-    }
+    let report = panic_report(files, message);
+    assert_eq!(frames(&report), expected, "wrong frames in:\n{report}");
 }
 
-/// Compile once with the selection log on and require the walker to have taken
-/// each named function. Without this a coverage regression would still report
-/// the right frames — from the AST emitter.
+/// Compile with the selection log and verify each named function is lowered.
 fn assert_walker_compiled(files: &[(&str, &str)], functions: &[&str]) {
     let (ok, stderr) = compile_temp_project_with_env_stderr(files, "main.wi", &LIR_LOG);
     assert!(ok, "compile failed under the walker:\n{stderr}");
@@ -223,11 +216,10 @@ fn main() {
 }
 "#,
     );
-    for report in panic_reports(&files, "negative input") {
-        assert!(report.contains("0: checks::checked at "), "{report}");
-        assert!(!report.contains("checks__checked"), "{report}");
-        assert!(!report.contains("0: checked at "), "{report}");
-    }
+    let report = panic_report(&files, "negative input");
+    assert!(report.contains("0: checks::checked at "), "{report}");
+    assert!(!report.contains("checks__checked"), "{report}");
+    assert!(!report.contains("0: checked at "), "{report}");
 }
 
 #[test]
@@ -244,18 +236,17 @@ fn main() {
 }
 "#,
     );
-    for report in panic_reports(&files, "negative input") {
-        let located = report
-            .split_whitespace()
-            .map(file_name)
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(
-            located.contains("runtime panic: negative input at checks.wi:"),
-            "{report}"
-        );
-        assert_eq!(frames(&report), ["checks::checked at main.wi:7:13"]);
-    }
+    let report = panic_report(&files, "negative input");
+    let located = report
+        .split_whitespace()
+        .map(file_name)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        located.contains("runtime panic: negative input at checks.wi:"),
+        "{report}"
+    );
+    assert_eq!(frames(&report), ["checks::checked at main.wi:7:13"]);
 }
 
 #[test]
@@ -356,10 +347,11 @@ fn main() {
 }
 
 #[test]
-fn module_frames_08_both_emitters_report_the_same_trace() {
-    // Not just the same frames — the same report, byte for byte once the
-    // temporary directories are cut. A trace must never depend on which
-    // emitter compiled the caller.
+fn module_frames_08_a_returning_module_call_leaves_the_chain_clean() {
+    // `checks::safe(1)` returns normally before `run(-1)` panics, so the report
+    // must carry the frames of the failing chain alone: the module call, and
+    // the ordinary local call that made it. A frame the successful call left
+    // behind would show up between them.
     let files = checks_project(
         r#"
 import checks;
@@ -374,20 +366,10 @@ fn main() {
 }
 "#,
     );
-    let reports = panic_reports(&files, "negative input");
-    let normalized = reports
-        .iter()
-        .map(|report| {
-            report
-                .split_whitespace()
-                .map(file_name)
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        normalized[0], normalized[1],
-        "the two emitters reported the same panic differently"
+    assert_frames(
+        &files,
+        "negative input",
+        &["checks::checked at main.wi:5:12", "run at main.wi:10:13"],
     );
 }
 
@@ -509,13 +491,12 @@ fn main() {
 }
 "#,
     );
-    for report in panic_reports(&files, "bumped past the limit") {
-        assert!(
-            report.contains("reference call: checks::bump parameter `slot` &mut i64"),
-            "{report}"
-        );
-        assert_eq!(frames(&report), ["checks::bump at main.wi:8:5"]);
-    }
+    let report = panic_report(&files, "bumped past the limit");
+    assert!(
+        report.contains("reference call: checks::bump parameter `slot` &mut i64"),
+        "{report}"
+    );
+    assert_eq!(frames(&report), ["checks::bump at main.wi:8:5"]);
 }
 
 #[test]
@@ -572,14 +553,13 @@ fn main() {
 }
 "#,
     );
-    for report in panic_reports(&files, "negative input") {
-        let frames = frames(&report);
-        assert_eq!(
-            frames.first().map(String::as_str),
-            Some("checks::checked at main.wi:5:33"),
-            "{report}"
-        );
-    }
+    let report = panic_report(&files, "negative input");
+    let frames = frames(&report);
+    assert_eq!(
+        frames.first().map(String::as_str),
+        Some("checks::checked at main.wi:5:33"),
+        "{report}"
+    );
 }
 
 #[test]
@@ -689,14 +669,13 @@ async fn main() {
 "#,
         ),
     ];
-    for report in panic_reports(&files, "scaled overflow") {
-        assert!(
-            report.contains("async stack (current task first):"),
-            "{report}"
-        );
-        assert!(report.contains("0: async scaled"), "{report}");
-        assert!(frames(&report).is_empty(), "{report}");
-    }
+    let report = panic_report(&files, "scaled overflow");
+    assert!(
+        report.contains("async stack (current task first):"),
+        "{report}"
+    );
+    assert!(report.contains("0: async scaled"), "{report}");
+    assert!(frames(&report).is_empty(), "{report}");
 }
 
 #[test]
@@ -721,24 +700,23 @@ async fn main() {
 "#,
         ),
     ];
-    for report in panic_reports(&files, "negative input") {
-        assert_eq!(
-            frames(&report),
-            ["checks::checked at main.wi:5:12"],
-            "{report}"
-        );
-        assert!(
-            report.contains("async stack (current task first):"),
-            "{report}"
-        );
-    }
+    let report = panic_report(&files, "negative input");
+    assert_eq!(
+        frames(&report),
+        ["checks::checked at main.wi:5:12"],
+        "{report}"
+    );
+    assert!(
+        report.contains("async stack (current task first):"),
+        "{report}"
+    );
 }
 
 // ── 23-25 coverage, stress, and the example ──────────────────────────────────
 
 #[test]
 fn module_frames_23_the_walker_compiled_the_caller_under_test() {
-    // Without this the frames above could all be the AST emitter's work.
+    // Explicitly verify that the module functions are logged as lowered.
     let files = checks_project(
         r#"
 import checks;
@@ -776,14 +754,14 @@ fn main() {
 }
 "#,
     );
-    let (ok, stderr) = compile_temp_project_with_env_run_stderr(&files, "main.wi", &LIR_STRESS);
+    let (ok, stderr) = compile_temp_project_with_env_run_stderr(&files, "main.wi", &STRESS);
     assert!(ok, "compile failed under stress:\n{stderr}");
     assert!(stderr.contains("runtime panic: negative input"), "{stderr}");
     assert_eq!(frames(&stderr), ["checks::checked at main.wi:13:13"]);
 }
 
 #[test]
-fn module_frames_25_the_example_project_agrees_under_both_emitters() {
+fn module_frames_25_the_example_project_runs() {
     // The runnable program of this bead, recovering everything it raises so its
     // stdout is deterministic; `runtime.rs` pins that stdout.
     let files = [
@@ -802,9 +780,7 @@ fn module_frames_25_the_example_project_agrees_under_both_emitters() {
     ];
     let expected = "10\n3\n4\nnegative: negative reading\nempty: empty reading\n9\n\
          side: negative side\nzero: zero side\n1\n2\nbump: bumped past the limit\n6\n";
-    for env in [&AST[..], &LIR[..]] {
-        let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", env);
-        assert!(ok, "the example failed under {env:?}:\n{out}");
-        assert_eq!(out, expected, "wrong output under {env:?}");
-    }
+    let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", &PLAIN);
+    assert!(ok, "the example failed:\n{out}");
+    assert_eq!(out, expected, "wrong output");
 }

@@ -10,7 +10,7 @@
 //!  14 local arity diagnostic wins, 15 local parameter-type diagnostic wins,
 //!  16 non-callable local blocks free-function fallback, 17 loop scope,
 //!  18 deferred indirect call, 19 async function after suspension,
-//!  20 LIR-enabled safe fallback, 21 LIR-required refusal is explicit,
+//!  20-21 a shadowing local lambda is the callee, not the free function,
 //!  22 debug/release parity, 23 static/method calls remain unaffected,
 //!  24 indirect calls remain conservative in panic-effect analysis.
 
@@ -183,7 +183,7 @@ async fn main() { println(await worker()); }
 }
 
 #[test]
-fn lambda_shadow_20_21_lir_mode_calls_the_shadowing_local() {
+fn lambda_shadow_20_21_a_shadowing_local_lambda_is_the_callee() {
     let (out, ok) = compile_and_run_with_env(
         r#"
 fn f(x: i64) -> i64 { return x + 1; }
@@ -193,7 +193,7 @@ fn chosen() -> i64 {
 }
 fn main() { println(chosen()); }
 "#,
-        &[("WILLOW_LIR_BACKEND", "1")],
+        &[],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "101\n");
@@ -208,7 +208,7 @@ fn f(x: i64) -> i64 { return x + 1; }
 fn chosen() -> i64 { let f = |x: i64| x + 100; return f(1); }
 fn main() { println(chosen()); }
 "#,
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")],
+        &[],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "101\n");

@@ -550,7 +550,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// Emit the unwind for a `panic(...)` whose message is already in hand,
     /// and return the expression's unreachable placeholder value.
     ///
-    /// Both backends share this: the AST caller assembles the message from
+    /// Both emitters share this: the AST caller — static-property initializers,
+    /// the only bodies still on that path — assembles the message from
     /// `CallArg`s, the LIR walker from `HirExpr`s (willow-0g8j.2.5), and the
     /// unwind protocol below — which branch of the three panic worlds applies,
     /// and in what order the file metadata is built relative to the message's

@@ -16,15 +16,10 @@
 //! resolves a bare class name through the imported modules, which is how the
 //! AST emitter has always resolved it.
 //!
-//! Every test is differential: the same project under the AST emitter and
-//! under the walker must print the same thing. Coverage is asserted from
-//! `WILLOW_LIR_LOG=1`, which names each function the walker really compiled,
-//! rather than from `WILLOW_LIR_REQUIRE=1`: when this file was written a
-//! module's functions were never registered as lowered IR at all, so requiring
-//! the walker failed on the module before the entry program was reached.
-//! Modules are lowered now (willow-0g8j.16), so `WILLOW_LIR_REQUIRE=1` does
-//! police a multi-file build — see `module_lir_bodies.rs` — but the log is
-//! still the sharper instrument here, because it names the individual body.
+//! Coverage is asserted from `WILLOW_LIR_LOG=1`, which names each function the
+//! walker really compiled. The build succeeding says only that nothing in the
+//! project is outside the subset; the log is the sharper instrument here,
+//! because it names the individual body this file is about.
 //!
 //! 25 perspectives:
 //!   1 bound, then passed back        14 two modules, one class name
@@ -46,11 +41,11 @@ use super::support::{
     compile_temp_project_with_env_stderr,
 };
 
-const AST: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const LIR: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "1")];
-const LIR_LOG: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_LOG", "1")];
-const LIR_ALLOC: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_GC_STRESS", "alloc")];
-const LIR_MINOR: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_GC_STRESS", "minor")];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const LIR_LOG: [(&str, &str); 1] = [("WILLOW_LIR_LOG", "1")];
+const ALLOC_STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
+const MINOR_STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "minor")];
 
 /// The module every perspective imports. It owns the class, so it owns every
 /// operation on the class: the entry file can only name the module.
@@ -127,19 +122,16 @@ fn geom_project(main: &str) -> [(&str, &str); 2] {
     [("geom.wi", GEOM), ("main.wi", main)]
 }
 
-/// Run a project under both emitters and require identical output.
-fn assert_same_output(files: &[(&str, &str)], expected: &str) {
-    for env in [&AST[..], &LIR[..]] {
-        let (out, ok) = compile_temp_project_with_env_and_run(files, "main.wi", env);
-        assert!(ok, "project failed under {env:?}: {out}");
-        assert_eq!(out, expected, "wrong output under {env:?}");
-    }
+/// Build a project and require it to print `expected`.
+fn assert_project_output(files: &[(&str, &str)], expected: &str) {
+    let (out, ok) = compile_temp_project_with_env_and_run(files, "main.wi", &PLAIN);
+    assert!(ok, "project failed: {out}");
+    assert_eq!(out, expected, "wrong output");
 }
 
 /// Compile once with the selection log on and require the walker to have taken
-/// each named function. Without this a coverage regression would still print
-/// the right answer — from the AST emitter, which is exactly the silent
-/// fallback this bead is about.
+/// each named function. Without this a coverage regression could leave a
+/// function unlowered while the program still printed the right answer.
 fn assert_walker_compiled(files: &[(&str, &str)], functions: &[&str]) {
     let (ok, stderr) = compile_temp_project_with_env_stderr(files, "main.wi", &LIR_LOG);
     assert!(ok, "compile failed under the walker:\n{stderr}");
@@ -152,23 +144,10 @@ fn assert_walker_compiled(files: &[(&str, &str)], functions: &[&str]) {
     }
 }
 
-/// The inverse: the walker must NOT have taken this function. Used where
-/// resolution is deliberately refused, so that the refusal is a tested
-/// decision rather than an accident of some later change.
-fn assert_walker_declined(files: &[(&str, &str)], function: &str) {
-    let (ok, stderr) = compile_temp_project_with_env_stderr(files, "main.wi", &LIR_LOG);
-    assert!(ok, "compile failed under the walker:\n{stderr}");
-    let line = format!("compiling `{function}` from lowered IR");
-    assert!(
-        !stderr.contains(&line),
-        "`{function}` was expected to fall back to the AST emitter:\n{stderr}"
-    );
-}
-
-/// The two assertions almost every perspective wants: the emitters agree, and
-/// the walker is what produced the second copy of the answer.
+/// The two assertions almost every perspective wants: the program prints what
+/// it should, and the walker is what compiled the functions that produced it.
 fn assert_module_class(files: &[(&str, &str)], expected: &str, functions: &[&str]) {
-    assert_same_output(files, expected);
+    assert_project_output(files, expected);
     assert_walker_compiled(files, functions);
 }
 
@@ -422,11 +401,9 @@ fn main() {
 }
 
 #[test]
-fn module_class_14_two_modules_one_class_name_is_refused() {
-    // Two DIFFERENT classes answer to `Point`, and nothing in the entry file
-    // says which one a local holds. The walker must decline rather than pick:
-    // the wrong layout would be silently wrong code, while the fallback is
-    // only slower. The AST emitter still prints the right answer.
+fn module_class_14_two_modules_one_class_name_keep_their_identity() {
+    // The module function signatures preserve `one::Point` and `two::Point`,
+    // so the walker never has to guess which of the two layouts a local holds.
     let files = [
         (
             "one.wi",
@@ -465,8 +442,7 @@ fn main() {
 "#,
         ),
     ];
-    assert_same_output(&files, "4\n20\n");
-    assert_walker_declined(&files, "main");
+    assert_module_class(&files, "4\n20\n", &["main"]);
 }
 
 #[test]
@@ -592,7 +568,7 @@ fn main() {
 }
 "#,
     );
-    let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", &LIR_ALLOC);
+    let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", &ALLOC_STRESS);
     assert!(ok, "project failed under allocation stress: {out}");
     assert_eq!(out, "12\nt\n");
 }
@@ -614,7 +590,7 @@ fn main() {
 }
 "#,
     );
-    let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", &LIR_MINOR);
+    let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", &MINOR_STRESS);
     assert!(ok, "project failed under minor-collection stress: {out}");
     assert_eq!(out, "(6, 6)\n");
 }
@@ -637,7 +613,7 @@ async fn main() {
 }
 "#,
     );
-    assert_same_output(&files, "8\n");
+    assert_project_output(&files, "8\n");
     // Both bodies are async, and the walker logs those with the `async`
     // prefix, so neither is asserted through [`assert_walker_compiled`].
     let (ok, stderr) = compile_temp_project_with_env_stderr(&files, "main.wi", &LIR_LOG);
@@ -652,7 +628,7 @@ async fn main() {
 }
 
 #[test]
-fn module_class_22_release_build_agrees() {
+fn module_class_22_release_build_answers_the_same() {
     // Release drops the debug instrumentation but not the resolution: the same
     // program, the same answer, with the walker still taking the body.
     let files = geom_project(

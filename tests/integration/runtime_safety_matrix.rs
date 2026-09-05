@@ -619,18 +619,14 @@ fn rsm_30_release_absent_array_must_be_unwrapped_before_len() {
 }
 
 #[test]
-fn rsm_31_absent_array_fault_matches_lir_and_ast_backends() {
+fn rsm_31_indexing_an_absent_array_faults_on_the_unwrap() {
     let source = absent_i64_array_program("println(values[0]);");
-    let (lir, lir_ok) = compile_with_env_and_run_combined(&source, &[("WILLOW_LIR_BACKEND", "1")]);
-    let (ast, ast_ok) = compile_with_env_and_run_combined(&source, &[("WILLOW_LIR_BACKEND", "0")]);
-    assert!(!lir_ok, "LIR path unexpectedly succeeded: {lir}");
-    assert!(!ast_ok, "AST path unexpectedly succeeded: {ast}");
-    for (backend, out) in [("LIR", lir), ("AST", ast)] {
-        assert!(
-            out.contains("called `Option::unwrap()` on a `None` value"),
-            "{backend} produced the wrong failure: {out}"
-        );
-    }
+    let (out, ok) = compile_with_env_and_run_combined(&source, &[]);
+    assert!(!ok, "the program must fault: {out}");
+    assert!(
+        out.contains("called `Option::unwrap()` on a `None` value"),
+        "wrong failure: {out}"
+    );
 }
 
 #[test]
@@ -930,7 +926,7 @@ fn main() {
 }
 
 #[test]
-fn rsm_46_option_unwrap_fault_matches_lir_and_ast_backends() {
+fn rsm_46_option_unwrap_fault_names_the_unwrap() {
     let source = r#"
 class BackendNilNode { pub value: i64; }
 fn read(node: Option<BackendNilNode>) -> i64 { return node.unwrap().value; }
@@ -938,12 +934,9 @@ fn main() {
     println(read(None));
 }
 "#;
-    let (lir, lir_ok) = compile_with_env_and_run_combined(source, &[("WILLOW_LIR_BACKEND", "1")]);
-    let (ast, ast_ok) = compile_with_env_and_run_combined(source, &[("WILLOW_LIR_BACKEND", "0")]);
-    assert!(!lir_ok, "LIR unwrap unexpectedly succeeded: {lir}");
-    assert!(!ast_ok, "AST unwrap unexpectedly succeeded: {ast}");
-    assert!(lir.contains("Option::unwrap"), "wrong LIR failure: {lir}");
-    assert!(ast.contains("Option::unwrap"), "wrong AST failure: {ast}");
+    let (out, ok) = compile_with_env_and_run_combined(source, &[]);
+    assert!(!ok, "the unwrap of a `None` unexpectedly succeeded: {out}");
+    assert!(out.contains("Option::unwrap"), "wrong failure: {out}");
 }
 
 #[test]
@@ -1677,7 +1670,7 @@ async fn main() {
 }
 
 #[test]
-fn rsm_84_full_send_fault_matches_lir_and_ast_backends() {
+fn rsm_84_full_send_fault_names_the_blocked_send() {
     let source = r#"
 fn main() {
     let channel = Channel<i64>::with_capacity(1);
@@ -1685,17 +1678,14 @@ fn main() {
     channel.send(2);
 }
 "#;
-    let (lir, lir_ok) = compile_with_env_and_run_combined(source, &[("WILLOW_LIR_BACKEND", "1")]);
-    let (ast, ast_ok) = compile_with_env_and_run_combined(source, &[("WILLOW_LIR_BACKEND", "0")]);
-    assert!(!lir_ok, "LIR full send unexpectedly succeeded: {lir}");
-    assert!(!ast_ok, "AST full send unexpectedly succeeded: {ast}");
+    let (out, ok) = compile_with_env_and_run_combined(source, &[]);
     assert!(
-        lir.contains("send on full bounded channel would block"),
-        "{lir}"
+        !ok,
+        "the send on a full channel unexpectedly succeeded: {out}"
     );
     assert!(
-        ast.contains("send on full bounded channel would block"),
-        "{ast}"
+        out.contains("send on full bounded channel would block"),
+        "{out}"
     );
 }
 

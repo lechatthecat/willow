@@ -2,48 +2,30 @@
 //! compiled can SEE, and only then against every module the build declared
 //! (willow-vtlr).
 //!
-//! An entry file that says `import shapes;` names a module class by the bare
-//! name the module declared — `shapes::make(1, 2)` is typed `Point` — while the
-//! tables the module unit contributed are keyed `shapes::Point`. `resolve_class_key`
-//! bridges that by retrying the bare name once per known module. `known_modules`
-//! is every module the WHOLE build declared, though, so a second module that
-//! happens to declare a class of the same name produced two candidates with
-//! different type_ids and the name resolved to nothing:
+//! Module function signatures preserve their class access path —
+//! `shapes::make(1, 2)` is typed `shapes::Point` — so two modules that both
+//! declare `Point` no longer erase the value's identity. `resolve_class_key`
+//! still handles genuinely bare annotations by checking visible modules first,
+//! and only then the whole build.
 //!
-//!     `let p` binds type `Point`, outside the walker's subset
-//!
-//! No wrong code — the body just fell back off the LIR walker — but an
-//! UNIMPORTED module is the wrong reason to lose a lowering. The retry now runs
-//! over the modules the unit's own `import`s name first, and only falls back to
-//! the all-modules scan when those say nothing, so nothing that resolved before
-//! stops resolving.
-//!
-//! Every test here is differential: a fallback is not observable in a program's
-//! output, so the evidence is `WILLOW_LIR_REQUIRE=1` (which turns a fallback
-//! into a hard error) and `WILLOW_LIR_LOG=1`, alongside the two emitters
-//! agreeing on what the program prints.
+//! Losing a body's lowering was never observable in a program's output, so the
+//! evidence here is the build itself — since willow-0g8j.3 an unlowered body
+//! does not compile — and `WILLOW_LIR_LOG=1`, which names the bodies that were
+//! walked, alongside what the program prints.
 
 use super::support::*;
 
-const LIR_ON: &[(&str, &str)] = &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_OFF: &[(&str, &str)] = &[("WILLOW_LIR_BACKEND", "0")];
-const LIR_LOG: &[(&str, &str)] = &[
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_LIR_LOG", "1"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const LIR_LOG: &[(&str, &str)] = &[("WILLOW_LIR_LOG", "1")];
 const ALLOC_STRESS: &[(&str, &str)] = &[("WILLOW_GC_STRESS", "alloc")];
 const MINOR_STRESS: &[(&str, &str)] = &[("WILLOW_GC_STRESS", "minor")];
 
 #[track_caller]
-fn assert_both_backends(files: &[(&str, &str)], entry: &str, expected: &str) {
-    let (lir, ok) = compile_temp_project_with_env_and_run(files, entry, LIR_ON);
-    assert!(ok, "LIR build failed: {lir}");
-    assert_eq!(lir, expected, "lowered-IR output mismatch");
-
-    let (ast, ok) = compile_temp_project_with_env_and_run(files, entry, LIR_OFF);
-    assert!(ok, "AST build failed: {ast}");
-    assert_eq!(ast, expected, "AST output mismatch");
+fn assert_project_output(files: &[(&str, &str)], entry: &str, expected: &str) {
+    let (out, ok) = compile_temp_project_with_env_and_run(files, entry, &PLAIN[..]);
+    assert!(ok, "build failed: {out}");
+    assert_eq!(out, expected, "wrong output");
 }
 
 /// The module the entry file imports. Its `Point` is two `i64`s.
@@ -158,7 +140,7 @@ fn two_points_project(entry: &'static str) -> Vec<(&'static str, &'static str)> 
 }
 
 /// The same entry file with no second `Point` in the build at all — the control
-/// that says a test's fallback came from the name clash and nothing else.
+/// that isolates the effect of the name clash.
 fn one_point_project(entry: &'static str) -> Vec<(&'static str, &'static str)> {
     vec![("shapes.wi", SHAPES), ("main.wi", entry)]
 }
@@ -179,13 +161,16 @@ fn main() {
 "#;
 
 // 1. The bug: an unimported module's class of the same name used to cost the
-//    entry function its lowering. `WILLOW_LIR_REQUIRE=1` turns that fallback
-//    into a build error, so a clean build IS the assertion.
+//    entry function its lowering, which is a build error now, so a clean build
+//    IS the assertion.
 #[test]
-fn an_unimported_module_of_the_same_class_name_no_longer_forces_a_fallback() {
+fn an_unimported_module_of_the_same_class_name_keeps_the_entry_lowered() {
     let (out, ok) =
-        compile_temp_project_with_env_and_run(&two_points_project(ENTRY), "main.wi", LIR_ON);
-    assert!(ok, "no body in this project may fall back: {out}");
+        compile_temp_project_with_env_and_run(&two_points_project(ENTRY), "main.wi", &PLAIN[..]);
+    assert!(
+        ok,
+        "every body in this project must compile from LIR: {out}"
+    );
     assert_eq!(out, "7\ncell:2\n");
 }
 
@@ -202,10 +187,11 @@ fn the_entry_function_holding_a_module_class_is_lowered() {
     );
 }
 
-// 3. Both emitters agree on what the program prints.
+// 3. Two `Point` classes in one build, and the program still prints the values
+//    of the one each call actually returns.
 #[test]
-fn both_backends_agree_with_two_point_classes_in_the_build() {
-    assert_both_backends(&two_points_project(ENTRY), "main.wi", "7\ncell:2\n");
+fn two_point_classes_in_one_build_keep_their_own_values() {
+    assert_project_output(&two_points_project(ENTRY), "main.wi", "7\ncell:2\n");
 }
 
 // 4. The layout the walker picked is `shapes`', not `grid`'s: reading `x`
@@ -226,14 +212,13 @@ fn main() {
     println(report::cell_row(9, 1));
 }
 "#;
-    assert_both_backends(&two_points_project(entry), "main.wi", "3\n9\n");
+    assert_project_output(&two_points_project(entry), "main.wi", "3\n9\n");
 }
 
-// 5. A file that really does see BOTH is still ambiguous: nothing there can say
-//    which `Point` a bare name means, so the body falls back rather than being
-//    compiled against one of the two layouts. No wrong code, on either emitter.
+// 5. A file that sees both modules still knows which class each module call
+//    returns because the checked signature carries its access path.
 #[test]
-fn a_file_that_imports_both_modules_falls_back() {
+fn a_file_that_imports_both_modules_keeps_call_result_identity() {
     let entry = r#"
 import shapes;
 import grid;
@@ -249,21 +234,7 @@ fn main() {
 }
 "#;
     let files = vec![("shapes.wi", SHAPES), ("grid.wi", GRID), ("main.wi", entry)];
-    let (log, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", LIR_ON);
-    assert!(
-        !ok,
-        "an ambiguous bare class name must not be lowered: {log}"
-    );
-    assert!(
-        log.contains("fell back to the AST backend") && log.contains("`total`"),
-        "the fallback should name the ambiguous function: {log}"
-    );
-
-    // ... and the program itself is unaffected: the AST emitter resolves the
-    // name the same way both emitters always have.
-    let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", LIR_OFF);
-    assert!(ok, "AST build failed: {out}");
-    assert_eq!(out, "7\ncell:2\n");
+    assert_project_output(&files, "main.wi", "7\ncell:2\n");
 }
 
 // 6. The control for 1: with no second `Point` in the build the same entry
@@ -283,8 +254,11 @@ fn main() {
 }
 "#;
     let (out, ok) =
-        compile_temp_project_with_env_and_run(&one_point_project(entry), "main.wi", LIR_ON);
-    assert!(ok, "no body in this project may fall back: {out}");
+        compile_temp_project_with_env_and_run(&one_point_project(entry), "main.wi", &PLAIN[..]);
+    assert!(
+        ok,
+        "every body in this project must compile from LIR: {out}"
+    );
     assert_eq!(out, "7\n");
 }
 
@@ -308,8 +282,11 @@ fn main() {
 }
 "#;
     let (out, ok) =
-        compile_temp_project_with_env_and_run(&two_points_project(entry), "main.wi", LIR_ON);
-    assert!(ok, "no body in this project may fall back: {out}");
+        compile_temp_project_with_env_and_run(&two_points_project(entry), "main.wi", &PLAIN[..]);
+    assert!(
+        ok,
+        "every body in this project must compile from LIR: {out}"
+    );
     assert_eq!(out, "7\ncell:2\n");
 }
 
@@ -330,8 +307,11 @@ fn main() {
 }
 "#;
     let (out, ok) =
-        compile_temp_project_with_env_and_run(&one_point_project(entry), "main.wi", LIR_ON);
-    assert!(ok, "no body in this project may fall back: {out}");
+        compile_temp_project_with_env_and_run(&one_point_project(entry), "main.wi", &PLAIN[..]);
+    assert!(
+        ok,
+        "every body in this project must compile from LIR: {out}"
+    );
     assert_eq!(out, "7\n");
 }
 
@@ -363,7 +343,7 @@ fn main() {
     println(report::cell_row(9, 1));
 }
 "#;
-    assert_both_backends(&two_points_project(entry), "main.wi", "11\n7\n9\n");
+    assert_project_output(&two_points_project(entry), "main.wi", "11\n7\n9\n");
 }
 
 // 10. The MODULE side of the same rule: `report` sees `grid` and not `shapes`,
@@ -447,8 +427,11 @@ fn main() {
         ("bridge.wi", bridge),
         ("main.wi", entry),
     ];
-    let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", LIR_ON);
-    assert!(ok, "no body in this project may fall back: {out}");
+    let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", &PLAIN[..]);
+    assert!(
+        ok,
+        "every body in this project must compile from LIR: {out}"
+    );
     assert_eq!(out, "7\n5\n6\n");
 }
 
@@ -470,7 +453,7 @@ fn main() {
     println(report::cell_row(4, 0));
 }
 "#;
-    assert_both_backends(&two_points_project(entry), "main.wi", "223\n4\n");
+    assert_project_output(&two_points_project(entry), "main.wi", "223\n4\n");
 }
 
 // 14. A class-typed FIELD inside the module, read through the module's own
@@ -486,7 +469,7 @@ fn main() {
     println(report::cell_row(1, 2));
 }
 "#;
-    assert_both_backends(&two_points_project(entry), "main.wi", "13\n1\n");
+    assert_project_output(&two_points_project(entry), "main.wi", "13\n1\n");
 }
 
 // 15. An array of the module's own class, which is where a wrong layout would
@@ -502,7 +485,7 @@ fn main() {
     println(report::cell_row(3, 3));
 }
 "#;
-    assert_both_backends(&two_points_project(entry), "main.wi", "16\n3\n");
+    assert_project_output(&two_points_project(entry), "main.wi", "16\n3\n");
 }
 
 // 16. An async module body holding a module class local across a suspension.
@@ -517,7 +500,7 @@ async fn main() {
     println(report::cell_row(8, 0));
 }
 "#;
-    assert_both_backends(&two_points_project(entry), "main.wi", "7\n8\n");
+    assert_project_output(&two_points_project(entry), "main.wi", "7\n8\n");
 }
 
 // 17. Under allocation stress every object is collected the hard way, so a
@@ -528,21 +511,21 @@ fn the_resolved_layout_survives_allocation_stress() {
     let (out, ok) = compile_temp_project_with_env_and_run_under(
         &two_points_project(ENTRY),
         "main.wi",
-        LIR_ON,
+        &PLAIN[..],
         ALLOC_STRESS,
     );
     assert!(ok, "alloc-stress run failed: {out}");
     assert_eq!(out, "7\ncell:2\n");
 }
 
-// 18. The same under minor-collection stress, on the AST emitter, so the two
-//     paths agree about what is a GC reference.
+// 18. The same under minor-collection stress, the mode that MOVES an object,
+//     so a field the emitter does not treat as a GC reference would show.
 #[test]
-fn the_ast_emitter_agrees_under_minor_stress() {
+fn the_two_point_build_survives_minor_stress() {
     let (out, ok) = compile_temp_project_with_env_and_run_under(
         &two_points_project(ENTRY),
         "main.wi",
-        LIR_OFF,
+        &PLAIN[..],
         MINOR_STRESS,
     );
     assert!(ok, "minor-stress run failed: {out}");
@@ -599,7 +582,7 @@ fn the_module_class_visibility_example_is_fully_lowered() {
             include_str!("../../example/module_class_visibility/main.wi"),
         ),
     ];
-    let (out, ok) = compile_temp_project_with_env_and_run(files, "main.wi", LIR_ON);
-    assert!(ok, "no body in the example may fall back: {out}");
+    let (out, ok) = compile_temp_project_with_env_and_run(files, "main.wi", &PLAIN[..]);
+    assert!(ok, "every body in the example must compile from LIR: {out}");
     assert_eq!(out, "7\n23\ncell:2,5\n7\n");
 }

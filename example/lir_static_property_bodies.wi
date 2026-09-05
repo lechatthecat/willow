@@ -17,12 +17,11 @@
 // the fallback simply hid a subset gap.
 //
 // The store is admitted in both island scopes now. Its destination is a data
-// segment, so — unlike a `let`, which a deferred body still refuses — it needs
-// no storage of its own, and a `defer` replayed by the unwinder with no root
-// bracket can run it safely.
+// segment, so it needs no storage of its own at all, and a `defer` the
+// unwinder replays can run it at every exit the registration is live for.
 //
-// Run it under the walker with fallback made fatal:
-//   WILLOW_LIR_REQUIRE=1 willowc build example/lir_static_property_bodies.wi -o /tmp/a
+// Watch the walker claim each body:
+//   WILLOW_LIR_LOG=1 willowc build example/lir_static_property_bodies.wi -o /tmp/a
 import std::collections::Array;
 
 class Registry {

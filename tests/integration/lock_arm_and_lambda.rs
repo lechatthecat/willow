@@ -1,14 +1,10 @@
-//! End-to-end guard: the compiler must not PANIC on source it accepts, and
-//! must not accept source neither backend can emit.
+//! End-to-end guard for match-arm lock lowering and lambda boundaries.
 //!
 //! Two leaks put a `lock` (and an `await`) somewhere no backend has a resume
 //! point, and each ended in an abort rather than a diagnostic:
 //!
-//! * a `match` arm body -- the LIR walker keeps a statement-position `match` as
-//!   one instruction with its arms still in HIR, and the AST async emitter has
-//!   no `match` handling at all, so the arm's statements fell through to the
-//!   SYNCHRONOUS emitter, where `Stmt::Lock` was an `unreachable!()` justified
-//!   by E2603 (willow-04fd);
+//! * a `match` arm body now becomes explicit LIR CFG, so its lock acquisition
+//!   owns a frame-backed resume edge (willow-0g8j.3);
 //! * a lambda body -- the type checker inherited the enclosing `async fn`'s
 //!   context across a boundary the backend treats as a separate lifted
 //!   function, so E2603 and E0801 both waved the body through (willow-3kty).
@@ -23,7 +19,7 @@
 //!   1 lock in an arm             5 lock in a section's lambda
 //!   2 lock in an arm's lambda    6 await in a lambda
 //!   3 lock in a lambda           7 the accepted rewrites still run
-//!   4 lock in an arm, RwLock     8 the example runs on both backends
+//!   4 lock in an arm, RwLock     8 the example runs
 
 use super::support::{compile_and_run_with_env, compile_error_stderr};
 
@@ -58,20 +54,19 @@ fn assert_rejected_without_aborting(source: &str, expected_code: &str) {
 /// mask the diagnostic under test.
 const APPLY: &str = "fn apply(m: Mutex<i64>, f: fn(Mutex<i64>) -> void) { f(m); }\n";
 
-// 1. The original report: a `lock` written directly in an async fn's `match`
-// arm. Reached the synchronous emitter's `unreachable!()`.
+// 1. The original report now compiles and resumes through LIR.
 #[test]
-fn lock_arm_e2e_01_lock_in_a_match_arm_is_reported_not_aborted() {
-    assert_rejected_without_aborting(
-        "async fn pick(m: Mutex<i64>, which: i64) -> i64 {
+fn lock_arm_e2e_01_lock_in_a_match_arm_resumes() {
+    let source = "async fn pick(m: Mutex<i64>, which: i64) -> i64 {
              match which {
                  1 => { lock m as mut v { v = v + 1; } return 1; }
                  _ => { return 0; }
              }
          }
-         async fn main() { let m = Mutex::new(0); println(await pick(m, 1)); }",
-        "E2606",
-    );
+         async fn main() { let m = Mutex::new(0); println(await pick(m, 1)); }";
+    let (out, ok) = compile_and_run_with_env(source, &[]);
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n");
 }
 
 // 2. The same statement one level further in, behind a lambda. Both leaks
@@ -111,20 +106,19 @@ fn lock_arm_e2e_03_lock_in_a_lambda_is_reported_not_aborted() {
     );
 }
 
-// 4. `lock write` takes the same path as the Mutex form, so the arm rule has
-// to cover it too rather than only the shape that happened to be reported.
+// 4. `lock write` takes the same resumable arm path as the Mutex form.
 #[test]
-fn lock_arm_e2e_04_rwlock_write_in_a_match_arm_is_reported_not_aborted() {
-    assert_rejected_without_aborting(
-        "async fn pick(l: RwLock<i64>, which: i64) -> i64 {
+fn lock_arm_e2e_04_rwlock_write_in_a_match_arm_resumes() {
+    let source = "async fn pick(l: RwLock<i64>, which: i64) -> i64 {
              match which {
                  1 => { lock write l as mut v { v = v + 1; } return 1; }
                  _ => { return 0; }
              }
          }
-         async fn main() { let l = RwLock::new(0); println(await pick(l, 1)); }",
-        "E2606",
-    );
+         async fn main() { let l = RwLock::new(0); println(await pick(l, 1)); }";
+    let (out, ok) = compile_and_run_with_env(source, &[]);
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n");
 }
 
 // 5. A lambda CONSTRUCTED inside a critical section. Before the boundary reset
@@ -217,20 +211,17 @@ fn lock_arm_e2e_07_the_named_rewrites_compile_and_run() {
     assert_eq!(out, "1\n1\n100\n3\n114\n");
 }
 
-// 8. The runnable example, on both backends and under GC stress. It is the one
-// place all three rewrites run under real contention.
+// 8. The runnable example, plainly and under GC stress. It is the one place all
+// three rewrites run under real contention.
 #[test]
-fn lock_arm_e2e_08_example_agrees_on_both_backends() {
+fn lock_arm_e2e_08_example_is_stable_under_gc_stress() {
     let source = include_str!("../../example/lock_match_arm.wi");
-    let (ast, ast_ok) = compile_and_run_with_env(source, &[("WILLOW_LIR_BACKEND", "0")]);
-    assert!(ast_ok, "AST run of the example failed: {ast}");
-    let (lir, lir_ok) = compile_and_run_with_env(source, &[("WILLOW_LIR_BACKEND", "1")]);
-    assert!(lir_ok, "LIR run of the example failed: {lir}");
-    assert_eq!(ast, lir, "the two backends must agree on the example");
+    let (out, ok) = compile_and_run_with_env(source, &[]);
+    assert!(ok, "the example must run: {out}");
     let (stressed, stressed_ok) = compile_and_run_with_env(
         source,
         &[("WILLOW_GC_STRESS", "alloc"), ("WILLOW_TASK_BUDGET", "1")],
     );
     assert!(stressed_ok, "{stressed}");
-    assert_eq!(stressed, lir, "GC stress must not change the output");
+    assert_eq!(stressed, out, "GC stress must not change the output");
 }

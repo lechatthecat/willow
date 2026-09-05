@@ -1,0 +1,13 @@
+module meter;
+
+// This module reaches the same enum under its OWN alias. Two files renaming one
+// declaration differently still name one enum.
+import signal::Level as Grade;
+
+pub fn label(g: Grade) -> String {
+    return match g {
+        Grade::Low => "low",
+        Grade::Mid => "mid",
+        Grade::High => "high",
+    };
+}

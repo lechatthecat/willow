@@ -1,0 +1,58 @@
+// The last LIR fallback categories, compiled through lowered IR and exercised
+// together by tests/integration/lir_stage5_cutover.rs (willow-0g8j.3).
+
+interface Box<T> {
+    fn get(self) -> T;
+}
+
+class IntBox implements Box<i64> {
+    pub fn get(self) -> i64 { return 7; }
+    pub fn extra(self) -> i64 { return 99; }
+}
+
+class OtherBox implements Box<i64> {
+    pub fn get(self) -> i64 { return 1; }
+}
+
+fn add_five(value: i64) -> Result<i64, String> {
+    return Result::Ok(value + 5);
+}
+
+fn positive(value: i64) -> Result<i64, String> {
+    if value > 0 {
+        return Result::Ok(value);
+    }
+    return Result::Err("not positive");
+}
+
+fn describe_panic() {
+    defer match recover() {
+        Some(info) => println(info.message + " at line " + info.line.toString()),
+        None => {}
+    }
+    panic("boom");
+}
+
+fn cleanup(value: i64) {
+    defer {
+        let doubled = value * 2;
+        println("cleaned up " + doubled.toString());
+    }
+}
+
+fn probe(value: Box<i64>) -> i64 {
+    return match value {
+        IntBox(boxed) => boxed.extra(),
+        _ => value.get(),
+    };
+}
+
+fn main() {
+    println(42);
+    describe_panic();
+    cleanup(4);
+    println(Result::Ok(10).and_then(add_five).unwrap());
+    println(Result::Ok(0 - 1).and_then(positive).unwrap_err());
+    println(probe(new IntBox()));
+    println(probe(new OtherBox()));
+}

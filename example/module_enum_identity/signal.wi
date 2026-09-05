@@ -1,0 +1,45 @@
+module signal;
+
+// One of two enums in this build named `Level`. Nothing in the source of this
+// file distinguishes it from `other`'s: both are declared bare, and both reach
+// an importer through a signature that also reads `Level`.
+pub enum Level {
+    Low,
+    High,
+}
+
+pub fn read(n: i64) -> Level {
+    if n > 0 {
+        return Level::High;
+    }
+    return Level::Low;
+}
+
+pub fn describe(l: Level) -> String {
+    return match l {
+        Low => "signal:low",
+        High => "signal:high",
+    };
+}
+
+// A payload variant, so one of the two enums is GC-managed and the other is a
+// bare tag: reading one as the other is an abort under GC stress, not just a
+// wrong answer.
+pub enum Note {
+    Empty,
+    Text(String),
+}
+
+pub fn note_of(l: Level) -> Note {
+    return match l {
+        Low => Note::Empty,
+        High => Note::Text("carried"),
+    };
+}
+
+pub fn note_text(n: Note) -> String {
+    return match n {
+        Empty => "-",
+        Text(s) => s,
+    };
+}

@@ -7,17 +7,15 @@
 // a String or an array local does, and a freshly built object is rooted while
 // anything that can collect runs.
 //
-// The walker claims only SIMPLE classes: no base class, not itself a base, and
-// no enum-typed field. Inheritance dispatches virtually, so those classes keep
-// using the AST emitter. Interface-typed slots ARE supported — storing into one
-// boxes the class object; see example/lir_interface_boxing.wi.
+// This file keeps to SIMPLE classes: no base class, not itself a base, and no
+// enum-typed field. Inheritance and virtual dispatch have their own example
+// (example/lir_class_inheritance.wi). Interface-typed slots ARE used here —
+// storing into one boxes the class object; see example/lir_interface_boxing.wi.
 //
-// Building this program with WILLOW_LIR_BACKEND=0 must print exactly the same
-// thing, including under WILLOW_GC_STRESS=alloc. Building it with
-// WILLOW_LIR_REQUIRE=1 must succeed: that mode rejects any function that falls
-// back to the AST emitter, so it is the proof that the walker really compiled
-// every free function below. (Class METHOD bodies have their own emitter and
-// are not covered by that mode yet.)
+// Building this program must print the same thing under WILLOW_GC_STRESS=alloc
+// as without it. Since willow-0g8j.3 a body outside the walker's subset is a
+// compile error, so the build succeeding is the proof that the walker compiled
+// every function below.
 
 import std::collections::Array;
 

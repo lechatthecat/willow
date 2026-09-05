@@ -10,8 +10,8 @@
 // Locals that stay live across a suspension cannot live in registers: the poll
 // function has RETURNED by the time the resume block runs. They are frame
 // backed instead, and the resume block reloads them. Building this program
-// with WILLOW_LIR_BACKEND=0 must print exactly the same thing, in the same
-// order, including under WILLOW_GC_STRESS=alloc.
+// under WILLOW_GC_STRESS=alloc must print exactly the same thing, in the same
+// order.
 
 // A leaf with no suspension of its own: the await in the caller still splits,
 // because the callee frame has to be polled to completion first.

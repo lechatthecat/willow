@@ -12,8 +12,7 @@
 // makes an arm-local binding safe, including a GC-managed one, which gets a
 // rooted slot popped when the arm ends. Every function declared here is
 // compiled by the walker; run it under `WILLOW_LIR_LOG=1` to watch each one
-// being claimed, or under `WILLOW_LIR_REQUIRE=1` to make a fallback a hard
-// error.
+// being claimed.
 //
 // An arm that PRODUCES a value is still a single expression. That is the
 // grammar's rule rather than the walker's: a block-bodied arm's last statement

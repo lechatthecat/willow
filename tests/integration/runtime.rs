@@ -909,12 +909,20 @@ fn test_runnable_example_files_compile_and_run() {
         ),
         ("example/module_import_scope/main.wi", "7\nsale:3\n9\n100\n"),
         (
+            "example/enum_identity_aliases/main.wi",
+            "3\n10\n2\n3\n2\n3\n3\nmid\nhigh\n7\n0\ntrue\nfalse\n4\ntrue\ntrue\n200\n",
+        ),
+        (
             "example/imported_enum_match/main.wi",
             "1\n42\n200\n8\nink\n2\n20\n",
         ),
         (
             "example/module_enum_tables/main.wi",
             "high[]\nlow[]\nloud{}\n-{}\nfar()\n.low.low.low.low\n11\n10\nloud/ok\ntrue\nlow\nloud\n",
+        ),
+        (
+            "example/module_enum_identity/main.wi",
+            "signal:high\nsignal:low\nother:off\nother:on\nother:extra\nsignal:high\nother:extra\ncarried\n",
         ),
         ("example/direct_import_demo/main.wi", "7\n1\n99\n"),
         (
@@ -1131,6 +1139,10 @@ fn test_runnable_example_files_compile_and_run() {
         (
             "example/lir_static_property_bodies.wi",
             "6\n3\n20\nbig\none\nmany\n2\n5\n0\n10\n7\n9\n10\n",
+        ),
+        (
+            "example/lir_stage5_cutover.wi",
+            "42\nboom at line 33\ncleaned up 8\n15\nnot positive\n99\n1\n",
         ),
         (
             "example/interface_reference_params.wi",
@@ -1821,21 +1833,17 @@ fn main() {
 fn test_reference_runtime_debug_hook_reports_array_element_call_site() {
     let src = r#"
 import std::collections::Array;
-import std::collections::Map;
 
 fn increment(x: &mut i64) {
     x = x + 1;
 }
 
 fn main() {
-    // Keep this runtime-hook test on the AST emitter. LIR reference calls have
-    // their own ABI coverage; debug-call context remains an AST facility.
-    let _metadata_anchor: Map<f64, i64> = Map::new();
     let mut xs: Array<i64> = [1];
     increment(&xs[3]);
 }
 "#;
-    let (out, ok) = compile_and_run_check_exit(src);
+    let (out, ok) = compile_and_run_with_env(src, &[]);
     assert!(!ok, "out-of-bounds reference call should abort");
     assert!(
         out.contains("array index out of bounds: the length is 1 but the index is 3"),

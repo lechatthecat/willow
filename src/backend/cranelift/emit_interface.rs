@@ -7,9 +7,10 @@ use super::*;
 
 /// How one class-method call site must be emitted (willow-fm7t).
 ///
-/// Produced by [`FuncGen::plan_virtual_call`] and consumed by both backends, so
-/// the AST emitter and the LIR walker cannot disagree about whether a call is
-/// virtual, which slot it uses, or which implementation's ABI describes it.
+/// Produced by [`FuncGen::plan_virtual_call`] and consumed by both emitters, so
+/// the static-init AST path and the LIR walker cannot disagree about whether a
+/// call is virtual, which slot it uses, or which implementation's ABI describes
+/// it.
 pub(super) struct VirtualCallPlan {
     /// The nearest class in the receiver's ancestry that defines the method.
     /// Its signature describes every target, since an `override` may not change
@@ -536,12 +537,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// How a call to `class_name::method_name` on a receiver of STATIC type
-    /// `class_name` must be emitted (willow-fm7t, shared by both backends).
+    /// `class_name` must be emitted (willow-fm7t, shared by both emitters).
     ///
     /// Everything here is compile-time reasoning over the class tables, so the
-    /// AST emitter and the LIR walker ask one function rather than each
-    /// deciding for itself — a divergence between them is a miscompile that
-    /// only shows up on whichever backend a given function happened to take.
+    /// static-init AST path and the LIR walker ask one function rather than
+    /// each deciding for itself — a divergence between them is a miscompile
+    /// that shows up only in whichever body took the other path.
     pub(super) fn plan_virtual_call(&self, class_name: &str, method_name: &str) -> VirtualCallPlan {
         // A method with no slot is neither `open` nor an `override`. It can
         // neither be overridden nor override anything, so its callee is fixed
@@ -1098,7 +1099,7 @@ fn main() {}
     /// boundary: its two-word representation can have a valid outer box with a
     /// zero object word, without preserving a safe-language path that creates
     /// that invalid state (willow-glaj.8).
-    fn compile_interface_probe(use_lir: bool) -> Vec<u8> {
+    fn compile_interface_probe() -> Vec<u8> {
         let tokens = crate::lexer::Lexer::new(INVALID_BOX_FIXTURE_SOURCE)
             .tokenize()
             .expect("fixture should lex");
@@ -1124,12 +1125,10 @@ fn main() {}
             codegen.register_interface_info(name.to_string(), info.clone());
         }
         codegen.register_expr_types(checker.expr_types.clone());
-        if use_lir {
-            let tables = crate::ir::lower::CheckerTables::from_checker(&checker);
-            let (hir, gaps) = crate::ir::lower::lower_program_with(&program, &tables);
-            assert!(gaps.is_empty(), "fixture lowering gaps: {gaps:?}");
-            codegen.register_lir_functions(crate::ir::lowered::lower_program(&hir));
-        }
+        let tables = crate::ir::lower::CheckerTables::from_checker(&checker);
+        let (hir, gaps) = crate::ir::lower::lower_program_with(&program, &tables);
+        assert!(gaps.is_empty(), "fixture lowering gaps: {gaps:?}");
+        codegen.register_lir_functions(crate::ir::lowered::lower_program(&hir));
         codegen
             .compile_program(&program, "interface_invalid_box_fixture.wi")
             .expect("fixture should compile");
@@ -1175,8 +1174,8 @@ fn main() {}
             .count()
     }
 
-    fn assert_invalid_object_word_guard(use_lir: bool) {
-        let bytes = compile_interface_probe(use_lir);
+    fn assert_invalid_object_word_guard() {
+        let bytes = compile_interface_probe();
         // One check validates the outer box and the second validates word 0.
         // A regression to checking only the box therefore drops this to one.
         assert_eq!(
@@ -1194,17 +1193,12 @@ fn main() {}
     }
 
     #[test]
-    fn interface_guard_01_ast_invalid_object_word_keeps_method_context() {
-        assert_invalid_object_word_guard(false);
+    fn interface_guard_01_invalid_object_word_keeps_method_context() {
+        assert_invalid_object_word_guard();
     }
 
-    #[test]
-    fn interface_guard_02_lir_invalid_object_word_keeps_method_context() {
-        assert_invalid_object_word_guard(true);
-    }
-
-    fn assert_direct_class_access_has_no_nil_guard(use_lir: bool) {
-        let bytes = compile_interface_probe(use_lir);
+    fn assert_direct_class_access_has_no_nil_guard() {
+        let bytes = compile_interface_probe();
         assert_eq!(
             nil_check_relocations_in_symbol(&bytes, "direct_field_probe"),
             0,
@@ -1218,12 +1212,7 @@ fn main() {}
     }
 
     #[test]
-    fn interface_guard_03_ast_direct_class_access_has_no_nil_guard() {
-        assert_direct_class_access_has_no_nil_guard(false);
-    }
-
-    #[test]
-    fn interface_guard_04_lir_direct_class_access_has_no_nil_guard() {
-        assert_direct_class_access_has_no_nil_guard(true);
+    fn interface_guard_02_direct_class_access_has_no_nil_guard() {
+        assert_direct_class_access_has_no_nil_guard();
     }
 }

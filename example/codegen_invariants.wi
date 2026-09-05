@@ -110,8 +110,8 @@ fn main() {
     println(bad.map(|x: i64| x + 1).unwrap_or(-1));
 
     // Downcast patterns, reading the type id the allocator stamped into the
-    // object. Both emitters — the AST one and the LIR one — must stamp a real
-    // id here; substituting 0 would make both arms miss and print -1.
+    // object. The allocator must stamp a real id here; substituting 0 would
+    // make both arms miss and print -1.
     println(identify(p));
     println(identify(new Robot(7)));
 }

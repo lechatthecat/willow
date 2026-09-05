@@ -12,8 +12,7 @@
 //   * a cell reached only through an object, so it survives a collection only
 //     if the field is traced
 //
-// Run it under `WILLOW_LIR_LOG=1` to see each function claimed by the walker,
-// and under `WILLOW_LIR_REQUIRE=1` to make a fallback a hard error.
+// Run it under `WILLOW_LIR_LOG=1` to see each function claimed by the walker.
 
 import std::collections::Array;
 

@@ -15,8 +15,8 @@
 //     runtime `type_id`, then one word per virtual slot. A call on a receiver
 //     whose runtime class is not statically known loads the slot and calls it.
 //     Which slot, and whether a slot is needed at all, is decided by the one
-//     `plan_virtual_call` both backends ask — so the two cannot disagree about
-//     which body runs.
+//     `plan_virtual_call` every call site asks — so which body runs is one
+//     answer, not a per-call-site guess.
 //
 //   * WIDENING. A subclass value in a base-typed slot is a no-op at run time:
 //     both are object pointers. It costs exactness, not instructions.
@@ -24,13 +24,11 @@
 //   * DOWNCAST. A class arm on an interface scrutinee compares the boxed
 //     object's `type_id` against the arm's class EXACTLY — not "is a
 //     descendant of" — and binds the object unboxed. `Tile` therefore falls to
-//     the `_` arm even though a `Tile` is a `Square`, which is what the AST
-//     path does too.
+//     the `_` arm even though a `Tile` is a `Square`.
 //
-// Built with WILLOW_LIR_BACKEND=0 this must print exactly the same thing, and
-// built with WILLOW_LIR_REQUIRE=1 it must compile — which is the proof that
-// every free function below really took the walker path rather than quietly
-// falling back to the emitter it is being compared against.
+// Since willow-0g8j.3 a body outside the walker's subset is a compile error, so
+// this file compiling at all is the proof that every free function below really
+// took the walker path.
 
 import std::collections::Array;
 

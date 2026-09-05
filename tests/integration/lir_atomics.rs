@@ -6,10 +6,9 @@
 //! suspends, so the same code has to work identically in a synchronous function
 //! and inside a poll function.
 //!
-//! Every test asserts the same output from the AST emitter and the walker. The
-//! walker is confirmed to be the path that ran, so a coverage regression that
-//! sent a function back to the AST emitter would fail here rather than pass
-//! vacuously by comparing the AST path against itself.
+//! Every test asserts the program's output, and confirms the walker was the
+//! path that compiled it, so a coverage regression fails here rather than
+//! passing on an answer nothing in the walker produced.
 //!
 //! 20 perspectives:
 //!   1 i64 load                       11 cell stored in a class field
@@ -25,37 +24,21 @@
 
 use super::support::{compile_and_run_with_env, compile_with_compiler_env};
 
-const AST: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const LIR: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_BUDGET: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_TASK_BUDGET", "1"),
-];
-const LIR_STRESS: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_GC_STRESS", "alloc"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const BUDGET: [(&str, &str); 1] = [("WILLOW_TASK_BUDGET", "1")];
+const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 
-/// `expected` must come out of all four configurations, and `functions` must
-/// each be named in the walker's selection log — otherwise a function that
-/// quietly fell back would make the AST/LIR comparison compare the AST path
-/// with itself.
+/// `expected` must come out of all three configurations, and `functions` must
+/// each be named in the walker's selection log — otherwise a body could go
+/// unlowered while the program still printed the right answer.
 fn assert_atomics(source: &str, expected: &str, functions: &[&str]) {
-    for env in [&AST[..], &LIR[..], &LIR_BUDGET[..], &LIR_STRESS[..]] {
+    for env in [&PLAIN[..], &BUDGET[..], &STRESS[..]] {
         let (out, ok) = compile_and_run_with_env(source, env);
         assert!(ok, "atomics run failed under {env:?}: {out}");
         assert_eq!(out, expected, "wrong output under {env:?}");
     }
-    let (ok, stderr) = compile_with_compiler_env(
-        source,
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_LIR_LOG", "1"),
-        ],
-    );
+    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_LIR_LOG", "1")]);
     assert!(ok, "logged LIR compile failed: {stderr}");
     for function in functions {
         let sync = format!("[lir] compiling `{function}` from lowered IR");
@@ -470,9 +453,8 @@ fn main() {
 #[test]
 fn lir_atomics_21_the_example_is_fully_lir_compiled() {
     // The example's header claims every function it declares is compiled from
-    // the lowered IR; `WILLOW_LIR_REQUIRE=1` is what keeps that claim honest,
-    // and the log check names them so a silent fallback cannot pass by leaving
-    // the run's output unchanged.
+    // the lowered IR. The log check names them, so a coverage regression cannot
+    // pass by leaving the run's output unchanged.
     let source = include_str!("../../example/lir_atomics.wi");
     assert_atomics(
         source,

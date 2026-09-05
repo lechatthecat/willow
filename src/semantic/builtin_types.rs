@@ -137,6 +137,23 @@ pub fn binary_args(ty: &Type, id: BuiltinTypeId) -> Option<(&Type, &Type)> {
     (resolved.id == id && resolved.args.len() == 2).then(|| (&resolved.args[0], &resolved.args[1]))
 }
 
+/// The instance fields of `PanicInfo`, in declaration (and memory) order.
+///
+/// `PanicInfo` is the one nominal type no source file declares: the checker
+/// defines it (`register_builtin_panic_surface`), the back end lays it out, and
+/// the runtime is the only thing that constructs one. Each of those used to
+/// carry its own transcription of this list, and HIR lowering carried none at
+/// all -- so `info.line` found no field on its receiver and the whole function
+/// fell back to the AST emitter (willow-0g8j.3). One list, read by all of them.
+pub fn panic_info_fields() -> [(&'static str, Type); 4] {
+    [
+        ("message", Type::String),
+        ("file", Type::String),
+        ("line", Type::I64),
+        ("column", Type::I64),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
