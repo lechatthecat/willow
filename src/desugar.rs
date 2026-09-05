@@ -865,7 +865,7 @@ fn inject_default_interface_methods(
                             is_override: false,
                             is_static: false,
                             params,
-                            has_self: dm.has_self,
+
                             return_type: subst_iface_type(&dm.return_type, &subst),
                             body: body.clone(),
                             span: dm.span,

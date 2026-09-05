@@ -820,15 +820,10 @@ impl Codegen {
             Some(Type::Fn(params, ret) | Type::Closure(params, ret)) => {
                 (params.clone(), *ret.clone())
             }
-            _ => {
-                let params = l
-                    .params
-                    .iter()
-                    .map(|p| p.ty.clone().unwrap_or(Type::I64))
-                    .collect();
-                let ret = l.return_type.clone().unwrap_or(Type::I64);
-                (params, ret)
-            }
+            _ => anyhow::bail!(
+                "lambda `{name}` at {:?} has no checked callable type",
+                l.span
+            ),
         };
         // A closure's lifted body takes its environment object as a hidden
         // LEADING argument (willow-0g8j.2.12). It is declared here, in the
@@ -898,15 +893,10 @@ impl Codegen {
             Some(Type::Fn(params, ret) | Type::Closure(params, ret)) => {
                 (params.clone(), *ret.clone())
             }
-            _ => {
-                let params = l
-                    .params
-                    .iter()
-                    .map(|p| p.ty.clone().unwrap_or(Type::I64))
-                    .collect();
-                let ret = l.return_type.clone().unwrap_or(Type::I64);
-                (params, ret)
-            }
+            _ => anyhow::bail!(
+                "lambda `{name}` at {:?} has no checked callable type",
+                l.span
+            ),
         };
         // Same leading environment parameter `declare_lambda` put in the
         // signature (willow-0g8j.2.12); the two are built from the same

@@ -1117,7 +1117,6 @@ fn main() {}
 
         let mut codegen =
             Codegen::new(&CompilerOptions::debug()).expect("codegen should initialize");
-        codegen.register_builtin_generic_enums();
         for (name, info) in &checker.symbols.enums {
             codegen.register_enum_info(name.to_string(), info.clone());
         }

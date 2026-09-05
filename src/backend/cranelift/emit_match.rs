@@ -45,10 +45,8 @@ pub(super) fn emit_main_result_exit_raw(
 
 impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_ternary(&mut self, t: &TernaryExpr) -> cranelift_codegen::ir::Value {
-        let result_ty = clif_type(&ast_type_of_ternary(
-            t,
-            &self.vars,
-            self.func_return_types,
+        let result_ty = clif_type(&checked_expr_type(
+            &Expr::Ternary(Box::new(t.clone())),
             self.expr_types,
         ));
         let result_var = self.builder.declare_var(result_ty);
@@ -397,75 +395,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Determine the result type: the checker's recorded type is
         // authoritative (a statement-position match is Void, willow-zvkv);
         // the structural arm-walk below only covers synthesized nodes.
-        let result_ast_type = if let Some(ty) = self.expr_types.get(&m.span) {
-            ty.clone()
-        } else {
-            let mut scratch = self.vars.clone();
-            let mut found = Type::I64;
-            'outer: for arm in &m.arms {
-                match &self.resolved_pattern(arm) {
-                    Pattern::Binding { name, .. } => {
-                        let sty = scrutinee_ast_type.clone();
-                        scratch.insert(
-                            name.clone(),
-                            VarStorage::Value {
-                                var: self.builder.declare_var(clif_type(&sty)),
-                                ty: sty,
-                            },
-                        );
-                    }
-                    Pattern::EnumVariantTuple {
-                        enum_name,
-                        variant,
-                        bindings,
-                        ..
-                    } => {
-                        // Resolve actual payload types — for generic types like Option/Result,
-                        // use the type argument from the scrutinee rather than the placeholder.
-                        let pts = self.resolve_variant_payload_types(
-                            enum_name,
-                            variant,
-                            &scrutinee_ast_type,
-                        );
-                        for (name, ty) in bindings.iter().zip(pts.iter()) {
-                            scratch.insert(
-                                name.clone(),
-                                VarStorage::Value {
-                                    var: self.builder.declare_var(clif_type(ty)),
-                                    ty: ty.clone(),
-                                },
-                            );
-                        }
-                    }
-                    Pattern::ClassDowncast {
-                        class_name,
-                        binding,
-                        ..
-                    } if binding != "_" => {
-                        let ty = Type::Named(class_name.clone());
-                        scratch.insert(
-                            binding.clone(),
-                            VarStorage::Value {
-                                var: self.builder.declare_var(clif_type(&ty)),
-                                ty,
-                            },
-                        );
-                    }
-                    _ => {}
-                }
-                let ty = match &arm.body {
-                    MatchBody::Expr(e) => {
-                        ast_type_of_expr(e, &scratch, self.func_return_types, self.expr_types)
-                    }
-                    MatchBody::Block(_) => Type::Void,
-                };
-                if ty != Type::Void && ty != Type::Never {
-                    found = ty;
-                    break 'outer;
-                }
-            }
-            found
-        };
+        let result_ast_type = self
+            .expr_types
+            .get(&m.span)
+            .expect("internal compiler error: match has no checked result type")
+            .clone();
         let result_clif_type = clif_type(&result_ast_type);
         let result_var = self.builder.declare_var(result_clif_type);
         let mut any_arm_merges = false;

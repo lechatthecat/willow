@@ -26,21 +26,25 @@ const MAP_TYPE_ID: u32 = 0xA22A_0002;
 /// A key copied out of the Willow heap so the map owns it independently of the
 /// GC. String keys compare by content (not pointer identity), which is what
 /// `Map<String, V>` lookups require. Every other admitted key is one word, so
-/// `Int` holds it verbatim: an `i64`, a `bool` as 0/1, or the BITS of an `f64`
+/// `Word` holds it verbatim: an `i64`, a `bool` as 0/1, or the BITS of an `f64`
 /// (which is why `Map<f64, V>` matches keys bit-for-bit, and so distinguishes
 /// `0.0` from `-0.0`).
 #[derive(PartialEq, Eq, Hash, Clone)]
 enum MapKey {
-    Int(i64),
+    Word(i64),
     Str(String),
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy)]
+struct MapLayout {
+    key_kind: i64,
+    value_kind: i64,
+    value_is_ref: bool,
+}
+
 struct MapData {
-    /// Whether values are GC references (recorded on insert, used by tracing
-    /// and by `Some` construction in `get`).
-    val_is_ref: bool,
-    /// Key -> raw 64-bit value word.
+    /// Fixed at construction from Map<K, V>; inserts never change GC metadata.
+    layout: MapLayout,
     entries: HashMap<MapKey, i64>,
 }
 
@@ -53,7 +57,7 @@ unsafe fn key_from_word(word: i64, key_is_ref: i64) -> MapKey {
         let s = unsafe { willow_string_as_str(word as *const u8) };
         MapKey::Str(s.to_string())
     } else {
-        MapKey::Int(word)
+        MapKey::Word(word)
     }
 }
 
@@ -69,7 +73,7 @@ unsafe fn map_data<'a>(map: *mut u8) -> &'a mut MapData {
 /// Trace hook: report reference-typed values as GC children.
 unsafe fn trace_map(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     let data = unsafe { map_data(payload) };
-    if data.val_is_ref {
+    if data.layout.value_is_ref {
         for value in data.entries.values_mut() {
             slots.push((value as *mut i64).cast::<*mut u8>());
         }
@@ -103,9 +107,16 @@ fn ensure_registered() {
 /// `MapData` pointer; `gc_ref_mask` is 0 because that word is a Rust pointer,
 /// not a GC pointer (tracing happens through `trace_map`).
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_map_new() -> *mut u8 {
+pub extern "C" fn willow_map_new(key_kind: i64, value_kind: i64, value_is_ref: i64) -> *mut u8 {
     ensure_registered();
-    let data = Box::into_raw(Box::new(MapData::default()));
+    let data = Box::into_raw(Box::new(MapData {
+        layout: MapLayout {
+            key_kind,
+            value_kind,
+            value_is_ref: value_is_ref != 0,
+        },
+        entries: HashMap::new(),
+    }));
     let map = willow_alloc_with_layout(GcObjectKind::Map, MAP_TYPE_ID, 8, 0);
     if map.is_null() {
         // Reclaim the box rather than leaking it.
@@ -130,9 +141,10 @@ pub extern "C" fn willow_map_insert(
         return;
     }
     let data = unsafe { map_data(map) };
-    data.val_is_ref = val_is_ref != 0;
+    debug_assert_eq!(data.layout.value_is_ref, val_is_ref != 0);
+    debug_assert_eq!(data.layout.key_kind == 3, key_is_ref != 0);
     let key = unsafe { key_from_word(key_word, key_is_ref) };
-    if data.val_is_ref {
+    if data.layout.value_is_ref {
         willow_gc_write_barrier(
             map,
             val_word as *mut u8,
@@ -165,7 +177,7 @@ pub extern "C" fn willow_map_get(
     let key = unsafe { key_from_word(key_word, key_is_ref) };
     match data.entries.get(&key) {
         Some(&v) if use_niche != 0 => v as *mut u8,
-        Some(&v) => alloc_some(v, data.val_is_ref),
+        Some(&v) => alloc_some(v, data.layout.value_is_ref),
         None if use_niche != 0 => std::ptr::null_mut(),
         None => alloc_none(),
     }
@@ -177,26 +189,29 @@ pub extern "C" fn willow_map_get(
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_map_copy(map: *mut u8) -> *mut u8 {
     if map.is_null() {
-        return willow_map_new();
+        return willow_map_new(0, 0, 0);
     }
     // Snapshot the source entries into owned Rust data first; the value words are
     // kept alive by the still-rooted source map across the `willow_map_new`
     // allocation below.
-    let (val_is_ref, entries): (bool, Vec<(MapKey, i64)>) = {
+    let (layout, entries): (MapLayout, Vec<(MapKey, i64)>) = {
         let src = unsafe { map_data(map) };
         (
-            src.val_is_ref,
+            src.layout,
             src.entries.iter().map(|(k, &v)| (k.clone(), v)).collect(),
         )
     };
-    let copy = willow_map_new();
+    let copy = willow_map_new(
+        layout.key_kind,
+        layout.value_kind,
+        i64::from(layout.value_is_ref),
+    );
     if copy.is_null() {
         return std::ptr::null_mut();
     }
     let dst = unsafe { map_data(copy) };
-    dst.val_is_ref = val_is_ref;
     for (k, v) in entries {
-        if val_is_ref {
+        if layout.value_is_ref {
             willow_gc_write_barrier(copy, v as *mut u8, GcStoreDestination::MapValue as i64);
         }
         dst.entries.insert(k, v);
@@ -251,7 +266,13 @@ fn alloc_none() -> *mut u8 {
 /// `bool` that share its representation, so `Map<f64, V>` prints `1.5` and not
 /// the bit pattern. Returns a newly allocated WillowString.
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_map_to_string(map: *mut u8, key_kind: i64, val_kind: i64) -> *mut u8 {
+pub extern "C" fn willow_map_to_string(map: *mut u8) -> *mut u8 {
+    let (key_kind, val_kind) = if map.is_null() {
+        (0, 0)
+    } else {
+        let layout = unsafe { map_data(map) }.layout;
+        (layout.key_kind, layout.value_kind)
+    };
     let mut entries: Vec<(String, i64)> = if map.is_null() {
         Vec::new()
     } else {
@@ -260,7 +281,7 @@ pub extern "C" fn willow_map_to_string(map: *mut u8, key_kind: i64, val_kind: i6
             .iter()
             .map(|(k, &v)| {
                 let key = match k {
-                    MapKey::Int(n) => crate::array::element_word_to_string(*n, key_kind),
+                    MapKey::Word(n) => crate::array::element_word_to_string(*n, key_kind),
                     MapKey::Str(s) => s.clone(),
                 };
                 (key, v)
@@ -300,7 +321,7 @@ mod tests {
     fn map_unit_01_new_is_empty() {
         let _guard = runtime_test_guard();
         willow_gc_init();
-        let m = willow_map_new();
+        let m = willow_map_new(0, 0, 0);
         assert!(!m.is_null());
         assert_eq!(willow_map_len(m), 0);
     }
@@ -309,7 +330,7 @@ mod tests {
     fn map_unit_02_int_key_insert_get() {
         let _guard = runtime_test_guard();
         willow_gc_init();
-        let m = willow_map_new();
+        let m = willow_map_new(0, 0, 0);
         willow_map_insert(m, 7, 0, 100, 0);
         willow_map_insert(m, 8, 0, 200, 0);
         assert_eq!(willow_map_len(m), 2);
@@ -323,7 +344,7 @@ mod tests {
     fn map_unit_03_insert_overwrites() {
         let _guard = runtime_test_guard();
         willow_gc_init();
-        let m = willow_map_new();
+        let m = willow_map_new(0, 0, 0);
         willow_map_insert(m, 1, 0, 10, 0);
         willow_map_insert(m, 1, 0, 20, 0);
         assert_eq!(willow_map_len(m), 1);
@@ -334,7 +355,7 @@ mod tests {
     fn map_unit_04_string_keys_compare_by_content() {
         let _guard = runtime_test_guard();
         willow_gc_init();
-        let m = willow_map_new();
+        let m = willow_map_new(3, 0, 0);
         let alice = willow_string_from_str("Alice");
         willow_map_insert(m, alice as i64, 1, 30, 0);
         // A *different* string object with the same content must hit.
@@ -350,7 +371,7 @@ mod tests {
     fn map_unit_05_contains() {
         let _guard = runtime_test_guard();
         willow_gc_init();
-        let m = willow_map_new();
+        let m = willow_map_new(0, 0, 0);
         willow_map_insert(m, 5, 0, 50, 0);
         assert_eq!(willow_map_contains(m, 5, 0), 1);
         assert_eq!(willow_map_contains(m, 6, 0), 0);
@@ -360,7 +381,7 @@ mod tests {
     fn map_unit_06_reference_values_survive_collection() {
         let _guard = runtime_test_guard();
         willow_gc_init();
-        let mut m = willow_map_new();
+        let mut m = willow_map_new(0, 3, 1);
         willow_push_root(&mut m as *mut *mut u8);
         let v = willow_string_from_str("kept-value");
         willow_map_insert(m, 1, 0, v as i64, 1);
@@ -376,10 +397,25 @@ mod tests {
     fn map_unit_07_reference_option_uses_nullable_pointer_niche() {
         let _guard = runtime_test_guard();
         willow_gc_init();
-        let m = willow_map_new();
+        let m = willow_map_new(0, 3, 1);
         let value = willow_string_from_str("niche-value");
         willow_map_insert(m, 1, 0, value as i64, 1);
         assert_eq!(willow_map_get(m, 1, 0, 1), value);
         assert!(willow_map_get(m, 2, 0, 1).is_null());
+    }
+    #[test]
+    fn map_layout_survives_freeze_and_drives_word_display() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let map = willow_map_new(1, 2, 0);
+        willow_map_insert(map, 1.5f64.to_bits() as i64, 0, 1, 0);
+        let copy = willow_map_copy(map);
+        let text = willow_map_to_string(copy);
+        assert_eq!(unsafe { willow_string_as_str(text) }, "{1.5: true}");
+        let layout = unsafe { map_data(copy) }.layout;
+        assert_eq!(
+            (layout.key_kind, layout.value_kind, layout.value_is_ref),
+            (1, 2, false)
+        );
     }
 }

@@ -933,9 +933,6 @@ fn run_backend(
         )
     })?;
 
-    // register_builtin_generic_enums is now a no-op: all enums (including
-    // prelude ones) come from the checker symbol table below.
-    codegen.register_builtin_generic_enums();
     // Register all enum infos (prelude + user-declared) for the backend.
     for (name, info) in &checker.symbols.enums {
         codegen.register_enum_info(name.to_string(), info.clone());

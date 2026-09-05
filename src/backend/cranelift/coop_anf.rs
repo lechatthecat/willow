@@ -63,7 +63,7 @@ impl Normalizer<'_> {
         self.expr_types
             .get(&expr.span())
             .cloned()
-            .unwrap_or(Type::I64)
+            .expect("internal compiler error: missing checked payload type")
     }
 
     fn bind(&mut self, prefix: &mut Vec<Stmt>, expr: Expr, ty: Type) -> Expr {

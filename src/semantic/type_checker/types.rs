@@ -203,7 +203,7 @@ pub(crate) fn param_info_name(p: &ParamInfo) -> String {
 
 pub(crate) fn interface_method_signature(m: &InterfaceMethodInfo) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if m.has_self {
+    if !m.is_static {
         parts.push("self".to_string());
     }
     parts.extend(m.param_infos.iter().map(param_info_name));

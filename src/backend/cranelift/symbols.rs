@@ -185,7 +185,7 @@ pub(crate) fn constructor_to_method(ctor: &ConstructorDecl) -> MethodDecl {
         is_override: false,
         is_static: false,
         params: ctor.params.clone(),
-        has_self: true,
+
         return_type: Type::Void,
         body: ctor.body.clone(),
         span: ctor.span,

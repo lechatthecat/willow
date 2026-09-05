@@ -537,13 +537,7 @@ fn lower_method(
 ) -> Result<HirFunction, Diagnostic> {
     let mut ctx = LowerCtx::new(fn_returns, classes, enums, tables);
     let mut params = Vec::with_capacity(m.params.len() + 1);
-    // Every instance method has a receiver, whether or not the declaration
-    // spells `self` out: `MethodDecl::has_self` records only the explicit
-    // (legacy) form, and `is_static` is what decides whether there is a
-    // receiver at all -- which is what the backend's own signatures do. Keying
-    // this on `has_self` left `self` unbound in the body of an implicit-self
-    // method, so lowering failed and the method had no lowered IR to compile
-    // from (willow-0g8j.14).
+    // Explicit and implicit `self` spellings normalize to the same receiver.
     if !m.is_static {
         let self_ty = Type::Named(class_name.to_string());
         ctx.bind("self".to_string(), self_ty.clone());
@@ -1328,7 +1322,12 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
                         // from the type checker's own definition so the HIR
                         // binding cannot disagree with what the checker typed
                         // the case body against.
-                        let binding_ty = await_output_type(&task.ty).unwrap_or(Type::I64);
+                        let binding_ty = await_output_type(&task.ty).ok_or_else(|| {
+                            internal(
+                                task.span,
+                                "select join operand has no checked await output type".to_string(),
+                            )
+                        })?;
                         ctx.push_scope();
                         let binding = ctx.bind(binding.clone(), binding_ty);
                         let mut body = Vec::with_capacity(case.body.stmts.len());

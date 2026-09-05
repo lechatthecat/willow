@@ -1,23 +1,10 @@
 //! Typed high-level IR (HIR) — willow-mb5.
 //!
-//! The compiler pipeline is meant to be `AST → Typed AST → Lowered IR →
-//! Cranelift IR`, but today the backend consumes the raw AST and re-derives
-//! types (via `ast_type_of_expr`) and looks them up by `Span`. This module is
-//! the first step toward fixing that: a typed IR where **every expression
-//! carries its resolved [`Type`]**, so a consumer reads the type instead of
-//! recomputing it.
-//!
-//! The node set covers most of the language: literals, variables, operators,
-//! calls (free, method, static, indirect, builtin), `print`, arrays/indexing,
-//! ternaries, ranges, classes (`new`, object literals, field access, method
-//! bodies, constructors with `super.init`, static members, inheritance), enums
-//! (variant construction and `match` with typed pattern bindings, including
-//! `Option`/`Result` substitution), builtin collection/concurrency methods
-//! (`Array`/`Map`/Task await/locks), array and range `for` loops, all
-//! assignment forms, `await`, `?` propagation, and annotated lambdas. General
-//! generic substitution and unannotated-lambda inference are future work, as is
-//! the control-flow → basic-block lowering (`lowered.rs`). The backend is not
-//! yet wired to consume this IR, so behavior is unchanged.
+//! Checked source functions lower through this typed tree into LIR and then
+//! Cranelift. Every expression carries its resolved type; backend consumers
+//! must not re-infer types from AST shape. Source spans remain diagnostic
+//! locations. The remaining frontend side tables still use spans and are a
+//! separate migration from typed body emission.
 
 use crate::diagnostics::Span;
 use crate::parser::ast::{BinOp, LockMode, Type, UnaryOp};

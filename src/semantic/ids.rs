@@ -161,43 +161,90 @@ pub struct ResolvedSymbolId {
     pub symbol: SymbolId,
 }
 
+/// One unit's local spellings resolve to canonical function identities.
+/// All signature/ABI tables share this scope instead of copying metadata.
+#[derive(Debug, Clone, Default)]
+pub struct FunctionScope(std::rc::Rc<std::cell::RefCell<HashMap<FunctionId, FunctionId>>>);
+
+impl FunctionScope {
+    pub fn resolve(&self, id: &FunctionId) -> FunctionId {
+        self.0
+            .borrow()
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| id.clone())
+    }
+
+    pub fn bind(&self, alias: FunctionId, canonical: FunctionId) -> Option<FunctionId> {
+        let canonical = self.resolve(&canonical);
+        self.0.borrow_mut().insert(alias, canonical)
+    }
+
+    pub fn restore(&self, alias: FunctionId, previous: Option<FunctionId>) {
+        match previous {
+            Some(id) => {
+                self.0.borrow_mut().insert(alias, id);
+            }
+            None => {
+                self.0.borrow_mut().remove(&alias);
+            }
+        }
+    }
+}
+
 /// A function-keyed compiler index with string adapters only at AST/linker
 /// boundaries. The stored key is always a [`FunctionId`], preventing it from
 /// being accidentally queried with a type or module ID.
 #[derive(Debug, Clone)]
-pub struct FunctionMap<V>(HashMap<FunctionId, V>);
+pub struct FunctionMap<V> {
+    values: HashMap<FunctionId, V>,
+    scope: FunctionScope,
+}
 
 impl<V> Default for FunctionMap<V> {
     fn default() -> Self {
-        Self(HashMap::new())
+        Self::with_scope(FunctionScope::default())
     }
 }
 
 impl<V> FunctionMap<V> {
+    pub fn with_scope(scope: FunctionScope) -> Self {
+        Self {
+            values: HashMap::new(),
+            scope,
+        }
+    }
+
+    pub fn scope(&self) -> &FunctionScope {
+        &self.scope
+    }
+
+    /// Register a declaration; an own declaration shadows a same-named import.
     pub fn insert(&mut self, name: impl AsRef<str>, value: V) -> Option<V> {
-        self.0
-            .insert(FunctionId::free_from_source_name(name.as_ref()), value)
+        let id = FunctionId::free_from_source_name(name.as_ref());
+        self.scope.restore(id.clone(), None);
+        self.values.insert(id, value)
     }
 
     pub fn get(&self, name: &str) -> Option<&V> {
-        self.0.get(&FunctionId::free_from_source_name(name))
+        self.values
+            .get(&self.scope.resolve(&FunctionId::free_from_source_name(name)))
     }
 
     pub fn contains_key(&self, name: &str) -> bool {
-        self.0
-            .contains_key(&FunctionId::free_from_source_name(name))
+        self.get(name).is_some()
     }
 
     pub fn ids(&self) -> impl Iterator<Item = &FunctionId> {
-        self.0.keys()
+        self.values.keys()
     }
 
     pub fn insert_id(&mut self, id: FunctionId, value: V) -> Option<V> {
-        self.0.insert(id, value)
+        self.values.insert(id, value)
     }
 
     pub fn remove_id(&mut self, id: &FunctionId) -> Option<V> {
-        self.0.remove(id)
+        self.values.remove(id)
     }
 }
 
@@ -205,7 +252,8 @@ impl<V> Index<&str> for FunctionMap<V> {
     type Output = V;
 
     fn index(&self, name: &str) -> &Self::Output {
-        &self.0[&FunctionId::free_from_source_name(name)]
+        self.get(name)
+            .expect("function is registered in the current scope")
     }
 }
 
@@ -259,5 +307,32 @@ mod tests {
             symbol,
         };
         assert_eq!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod function_scope_tests {
+    use super::*;
+
+    #[test]
+    fn aliases_share_identity_and_restore_shadowed_declarations() {
+        let scope = FunctionScope::default();
+        let mut signatures = FunctionMap::with_scope(scope.clone());
+        let mut effects = FunctionMap::with_scope(scope.clone());
+        signatures.insert("module.target", "String");
+        effects.insert("module.target", true);
+        signatures.insert("local", "i64");
+        let alias = FunctionId::free_from_source_name("local");
+        let old = scope.bind(
+            alias.clone(),
+            FunctionId::free_from_source_name("module.target"),
+        );
+        assert_eq!(signatures.get("local"), Some(&"String"));
+        assert_eq!(effects.get("local"), Some(&true));
+        signatures.insert("module.target", "bool");
+        assert_eq!(signatures.get("local"), Some(&"bool"));
+        scope.restore(alias, old);
+        assert_eq!(signatures.get("local"), Some(&"i64"));
+        assert_eq!(effects.get("local"), None);
     }
 }

@@ -612,7 +612,7 @@ impl TypeChecker {
                 MethodInfo {
                     param_infos: self.normalize_decl_param_infos(&method.params, module_prefix),
                     params,
-                    has_self: method.has_self,
+
                     is_static: method.is_static,
                     is_async: method.is_async,
                     return_type: self.normalize_decl_type(
@@ -1334,7 +1334,7 @@ fn class_info_from_decl(
             MethodInfo {
                 param_infos: param_infos_from_decl(&method.params, module_prefix),
                 params,
-                has_self: method.has_self,
+
                 is_static: method.is_static,
                 is_async: method.is_async,
                 return_type: qualify_type_for_module(&method.return_type, module_prefix),

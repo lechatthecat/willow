@@ -474,7 +474,7 @@ impl Parser {
         Ok(InterfaceMethodDecl {
             name,
             params,
-            has_self,
+            is_static: !has_self,
             return_type,
             default_body,
             span,
@@ -573,7 +573,6 @@ impl Parser {
         }
         self.expect(TokenKind::LParen)?;
 
-        let mut has_self = false;
         let mut params = Vec::new();
 
         if self.check(TokenKind::SelfKw) {
@@ -590,7 +589,6 @@ impl Parser {
                 .with_label(Label::primary(span, "`self` in a static method"))
                 .with_help("remove `self`, or make this an instance method by dropping `static`"));
             }
-            has_self = true;
             self.advance();
             if self.eat(TokenKind::Comma) && !self.check(TokenKind::RParen) {
                 // parse remaining params after self
@@ -628,7 +626,6 @@ impl Parser {
             is_override,
             is_static,
             params,
-            has_self,
             return_type,
             body,
             span,
