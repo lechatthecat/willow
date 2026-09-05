@@ -493,16 +493,9 @@ fn namespace_builtin_call(
     })
 }
 
-/// `Map<Void, Void>` — the type the checker gives `Map::new()`.
-///
-/// The empty-map constructor is genuinely untyped: `willow_map_new` takes no
-/// arguments and records nothing about its keys or values, and the runtime does
-/// not learn whether values are references until the first `insert`. So the
-/// checker never needs a concrete instantiation here and does not compute one,
-/// and the AST path has never cared. The walker does care, because it compares
-/// representations before every store — hence this one narrow exemption, which
-/// [`is_fresh_empty_map`] pairs with a node-level check so nothing ELSE can
-/// present itself as an untyped map.
+/// A context-dependent empty map constructor. Eligibility admits it only as
+/// a fresh value; emission uses the checked destination's type arguments to
+/// initialize the runtime layout before the map can receive any entries.
 fn empty_map_type(ty: &Type) -> bool {
     matches!(lir_collection(ty), Some((LirCollection::Map, args))
         if args.as_slice() == [Type::Void, Type::Void])
@@ -3288,8 +3281,7 @@ fn supported_body_stmt<'n>(
         // The same checked heap store as a function-level
         // `LirInst::FieldAssign`. Bracketed HIR islands can mutate an object
         // without forcing the whole function back to the AST emitter
-        // (willow-wene). Deferred bodies retain their existing restricted
-        // statement subset.
+        // (willow-wene). Deferred bodies use the same checked heap store.
         HirStmt::IndexAssign {
             array,
             index,
@@ -8336,6 +8328,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         value: &HirExpr,
         target_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
+        if is_fresh_empty_map(value) {
+            let (key, element) = builtin_types::binary_args(target_ty, B::Map)
+                .expect("a fresh map requires its checked destination type");
+            return self.emit_map_new(key, element);
+        }
         let val = self.emit_lir_expr(value);
         self.coerce_to_target(val, &value.ty, target_ty)
     }
@@ -8961,7 +8958,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // The one builtin constructor in the subset (willow-0g8j.7). It takes
         // no arguments and allocates nothing that needs rooting first.
         if class == "Map" && method == "new" {
-            return self.emit_value_runtime_call("willow_map_new", &[]);
+            let (key, value) = builtin_types::binary_args(ret_ty, B::Map)
+                .expect("map constructor must carry checked type arguments");
+            return self.emit_map_new(key, value);
         }
         if class == "Channel"
             && let Type::Generic(_, type_args) = ret_ty
@@ -9757,16 +9756,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 got.expect("willow_map_get returns a value")
             }
             (LirCollection::Map, "toString") => {
-                let key_kind = collection_elem_kind(&targs[0])
-                    .expect("map toString key kind vetted by eligibility");
-                let key_kind_val = self.builder.ins().iconst(types::I64, key_kind);
-                let kind = collection_elem_kind(&targs[1])
-                    .expect("map toString value kind vetted by eligibility");
-                let kind_val = self.builder.ins().iconst(types::I64, kind);
                 self.emit_push_root(handle);
                 let s = self.emit_runtime_call_with_cleanup(
                     "willow_map_to_string",
-                    &[handle, key_kind_val, kind_val],
+                    &[handle],
                     |this| {
                         this.emit_pop_roots_n(1);
                         this.gc_root_count -= 1;

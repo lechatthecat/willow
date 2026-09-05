@@ -3513,7 +3513,7 @@ mod tests {
     fn test_gc_minor_collection_updates_map_reference_slots() {
         let _guard = gc_test_guard();
         reset_gc();
-        let mut map = crate::map::willow_map_new();
+        let mut map = crate::map::willow_map_new(0, 3, 1);
         willow_push_root(&mut map as *mut *mut u8);
         let mut tls = new_tlab_state();
         let young = willow_gc_alloc_slow(&mut tls, 42, 0, 8, 0);

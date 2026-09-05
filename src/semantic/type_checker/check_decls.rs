@@ -916,7 +916,7 @@ impl TypeChecker {
             // instance method to satisfy it. With implicit `self`, the
             // implementing method need not write `self` explicitly — it just must
             // not be `static` (a static method has no receiver). (willow-qsqf)
-            if req.has_self && method.is_static {
+            if !req.is_static && method.is_static {
                 self.push(
                     Diagnostic::new(
                         Severity::Error,

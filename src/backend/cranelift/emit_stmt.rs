@@ -34,6 +34,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let elem = (**elem).clone();
             return self.emit_array_literal(elements, &elem);
         }
+        if matches!(expr, Expr::StaticCall(call) if call.class == "Map" && call.method == "new")
+            && let Some((key, value)) = builtin_types::binary_args(target_ty, B::Map)
+        {
+            return self.emit_map_new(key, value);
+        }
         let value = self.emit_expr(expr);
         let value_ty = self.ast_type_of(expr);
         self.coerce_to_target(value, &value_ty, target_ty)

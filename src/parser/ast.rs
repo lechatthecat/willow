@@ -89,7 +89,7 @@ pub struct InterfaceDecl {
 pub struct InterfaceMethodDecl {
     pub name: String,
     pub params: Vec<Param>,
-    pub has_self: bool,
+    pub is_static: bool,
     pub return_type: Type,
     /// A default method body (`fn m(self) { ... }`), if provided. Classes that
     /// implement the interface but do not override `m` inherit this body
@@ -174,7 +174,6 @@ pub struct MethodDecl {
     /// method is called as `Type::method(...)` and has no `self` in its body.
     pub is_static: bool,
     pub params: Vec<Param>,
-    pub has_self: bool,
     pub return_type: Type,
     pub body: Block,
     pub span: Span,

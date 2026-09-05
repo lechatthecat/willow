@@ -151,12 +151,8 @@ pub struct StaticPropInfo {
 pub struct MethodInfo {
     pub params: Vec<Type>,
     pub param_infos: Vec<ParamInfo>,
-    /// Records an explicit (legacy) `self` param; `is_static` drives resolution.
-    #[allow(dead_code)]
-    pub has_self: bool,
     /// `static fn` — class-level method with no receiver, called as
-    /// `Type::method(...)` (willow-qsqf). Drives `::` vs `.` resolution instead
-    /// of `has_self`, which now only records an explicit (legacy) `self` param.
+    /// `Type::method(...)` (willow-qsqf). Drives `::` vs `.` resolution.
     pub is_static: bool,
     pub is_async: bool,
     pub return_type: Type,
@@ -203,7 +199,7 @@ pub struct InterfaceMethodInfo {
     /// `params` alone cannot distinguish `value: i64` from `value: &mut i64`
     /// (willow-0g8j.9).
     pub param_infos: Vec<ParamInfo>,
-    pub has_self: bool,
+    pub is_static: bool,
     pub return_type: Type,
     pub declaration_span: Span,
 }

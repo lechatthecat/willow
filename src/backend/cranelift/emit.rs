@@ -159,8 +159,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// The CHECKER-recorded type of the call leads, because `Channel::new()`
     /// written without a type argument takes its element from the surrounding
     /// `let` annotation and so has no type argument of its own to read
-    /// (willow-nk3g). `i64` is the last resort: a channel whose element the
-    /// checker never resolved carries nothing for the collector to trace.
+    /// (willow-nk3g). Missing element metadata is a compiler invariant violation.
     fn channel_element_of(&self, s: &StaticCallExpr) -> Type {
         self.expr_types
             .get(&s.span)
@@ -168,7 +167,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .filter(|elem| !matches!(elem, Type::Void))
             .or_else(|| s.type_args.first())
             .cloned()
-            .unwrap_or(Type::I64)
+            .expect("internal compiler error: missing checked payload type")
     }
 
     pub(super) fn emit_static_call(&mut self, s: &StaticCallExpr) -> cranelift_codegen::ir::Value {
@@ -176,10 +175,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         // Built-in `Map::new()` constructor.
         if class_name == "Map" && s.method == "new" {
-            let new_id = self.func_id("willow_map_new");
-            let new_ref = self.module.declare_func_in_func(new_id, self.builder.func);
-            let call = self.builder.ins().call(new_ref, &[]);
-            return self.builder.inst_results(call)[0];
+            let ty = self
+                .expr_types
+                .get(&s.span)
+                .expect("map constructor requires checked type")
+                .clone();
+            let (key, value) = builtin_types::binary_args(&ty, B::Map)
+                .expect("map constructor requires checked type arguments");
+            return self.emit_map_new(key, value);
         }
 
         // Check if class is an enum — handle variant construction

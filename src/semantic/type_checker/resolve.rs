@@ -811,7 +811,7 @@ impl TypeChecker {
                     name: m.name.clone(),
                     params,
                     param_infos,
-                    has_self: m.has_self,
+                    is_static: m.is_static,
                     return_type,
                     declaration_span: m.span,
                 },
@@ -887,7 +887,7 @@ impl TypeChecker {
                                 type_span: p.type_span,
                             })
                             .collect(),
-                        has_self: m.has_self,
+                        is_static: m.is_static,
                         return_type: crate::semantic::symbols::substitute_type(
                             &m.return_type,
                             &param_map,

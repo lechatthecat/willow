@@ -367,7 +367,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     pub(super) fn emit_unary(&mut self, u: &UnaryExpr) -> cranelift_codegen::ir::Value {
         let val = self.emit_expr(&u.expr);
-        let ty = ast_type_of_expr(&u.expr, &self.vars, self.func_return_types, self.expr_types);
+        let ty = self.ast_type_of(&u.expr);
         match &u.op {
             UnaryOp::Neg => {
                 if ty == Type::F64 {
@@ -513,8 +513,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         // panic(message) / panic(spec, args...) — assemble the message and
-        // start explicit lexical unwinding. Async recovery is staged later, so
-        // async code retains the legacy abort path for now (willow-s9ej.3/.6).
+        // start explicit lexical unwinding, including task-owned async recovery.
         if c.callee == "panic" {
             let msg = if c.args.len() > 1 {
                 if let Expr::String(spec, _) = &c.args[0].expr {
@@ -596,28 +595,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return result;
         }
 
-        // Stage 6 will route cooperative async panic through task-owned
-        // unwind state. Until then preserve the existing fatal behavior.
-        if self.build_mode == BuildMode::Debug {
-            let source_file = self.source_file.to_string();
-            let file_ptr = self.emit_string_literal(&source_file);
-            let line = self.builder.ins().iconst(types::I32, span.line as i64);
-            let col = self.builder.ins().iconst(types::I32, span.col as i64);
-            let fid = self.func_id("willow_panic_at");
-            let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            self.builder.ins().call(fref, &[msg, file_ptr, line, col]);
-        } else {
-            let fid = self.func_id("willow_panic");
-            let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            self.builder.ins().call(fref, &[msg]);
-        }
-        // Produce the (unreachable) result value BEFORE the trap: `trap`
-        // terminates the block, so no instruction may follow it. willow_panic
-        // is noreturn; the trap just gives the block a terminator.
-        let result = self.builder.ins().iconst(types::I64, 0);
-        self.builder.ins().trap(TrapCode::unwrap_user(1));
-        self.terminated = true;
-        result
+        unreachable!("async panic emission requires a cooperative frame")
     }
 
     /// Lower the compiler-known `recover()` builtin. Runtime capability is

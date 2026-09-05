@@ -1913,9 +1913,10 @@ impl Builder {
                     // terminal frame; the `Result<T, Cancelled>` wrapper that
                     // `await t.result()` binds is built by the emitter from it,
                     // so only the BINDING carries the wrapped type.
-                    let (result_ty, cancel_aware) =
-                        awaitable_task_type(&task.ty).unwrap_or((Type::I64, false));
-                    let binding_ty = await_output_type(&task.ty).unwrap_or(Type::I64);
+                    let (result_ty, cancel_aware) = awaitable_task_type(&task.ty)
+                        .expect("checked select join must have a task type");
+                    let binding_ty = await_output_type(&task.ty)
+                        .expect("checked select join must have an output type");
                     let binding = (binding != "_").then(|| {
                         self.declare_local(
                             binding.clone(),

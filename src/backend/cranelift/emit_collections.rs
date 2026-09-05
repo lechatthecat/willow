@@ -3,6 +3,7 @@ use cranelift_module::Module;
 
 use crate::semantic::intrinsics::Intrinsic;
 
+use super::emit_interface::collection_elem_kind;
 use super::*;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
@@ -58,6 +59,27 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             })
             .expect("willow_array_get returns a value");
         self.coerce_i64_to(word, elem_ty)
+    }
+
+    /// Allocate a map with immutable layout and GC metadata from its checked type.
+    pub(super) fn emit_map_new(
+        &mut self,
+        key: &Type,
+        value: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let key_kind = self
+            .builder
+            .ins()
+            .iconst(types::I64, collection_elem_kind(key).unwrap_or(4));
+        let value_kind = self
+            .builder
+            .ins()
+            .iconst(types::I64, collection_elem_kind(value).unwrap_or(4));
+        let value_is_ref = self
+            .builder
+            .ins()
+            .iconst(types::I64, i64::from(is_gc_managed(value, self.enum_infos)));
+        self.emit_value_runtime_call("willow_map_new", &[key_kind, value_kind, value_is_ref])
     }
 
     /// Emit a `Map<K, V>` method call. Keys/values cross the runtime ABI as raw
@@ -155,13 +177,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             // `map.toString()` -> "{k: v, ...}" sorted by key (willow-vwn6).
             Intrinsic::MapToString => {
-                let key_kind = super::emit_interface::collection_elem_kind(key_ty).unwrap_or(0);
-                let key_kind_val = self.builder.ins().iconst(types::I64, key_kind);
-                let kind = super::emit_interface::collection_elem_kind(val_ty).unwrap_or(0);
-                let kind_val = self.builder.ins().iconst(types::I64, kind);
                 let id = self.func_id("willow_map_to_string");
                 let r = self.module.declare_func_in_func(id, self.builder.func);
-                let call = self.builder.ins().call(r, &[map, key_kind_val, kind_val]);
+                let call = self.builder.ins().call(r, &[map]);
                 self.builder.inst_results(call)[0]
             }
             // `map.freeze()` -> an immutable copy (willow-dgwo.10).

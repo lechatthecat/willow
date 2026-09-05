@@ -80,12 +80,7 @@ struct ParamDebug {
 
 #[derive(Default)]
 struct ModuleAliasSnapshot {
-    func_ids: Vec<(FunctionId, Option<FuncId>)>,
-    func_return_types: Vec<(FunctionId, Option<Type>)>,
-    fn_types: Vec<(FunctionId, Option<Type>)>,
-    func_param_modes: Vec<(FunctionId, Option<Vec<ParamMode>>)>,
-    func_param_debug: Vec<(FunctionId, Option<Vec<ParamDebug>>)>,
-    function_may_panic: Vec<(FunctionId, Option<bool>)>,
+    functions: Vec<(FunctionId, Option<FunctionId>)>,
     #[allow(clippy::type_complexity)]
     class_layouts: Vec<(String, Option<Vec<(String, Type)>>)>,
     #[allow(clippy::type_complexity)]
@@ -120,33 +115,6 @@ fn restore_snapshots<K: std::hash::Hash + Eq, T>(
             }
             None => {
                 map.remove(&key);
-            }
-        }
-    }
-}
-
-fn insert_function_with_snapshot<T: Clone>(
-    snapshots: &mut Vec<(FunctionId, Option<T>)>,
-    map: &mut FunctionMap<T>,
-    name: &str,
-    value: T,
-) {
-    let id = FunctionId::free_from_source_name(name);
-    let old = map.insert_id(id.clone(), value);
-    snapshots.push((id, old));
-}
-
-fn restore_function_snapshots<T>(
-    map: &mut FunctionMap<T>,
-    snapshots: Vec<(FunctionId, Option<T>)>,
-) {
-    for (id, old) in snapshots.into_iter().rev() {
-        match old {
-            Some(value) => {
-                map.insert_id(id, value);
-            }
-            None => {
-                map.remove_id(&id);
             }
         }
     }
@@ -439,14 +407,15 @@ impl Codegen {
                 .map(|(name, ty)| (name.to_string(), ty))
                 .collect(),
         );
+        let function_scope = crate::semantic::ids::FunctionScope::default();
         let mut codegen = Self {
             module,
-            func_ids: FunctionMap::default(),
-            func_return_types: FunctionMap::default(),
-            fn_types: FunctionMap::default(),
-            func_param_modes: FunctionMap::default(),
-            func_param_debug: FunctionMap::default(),
-            function_may_panic: FunctionMap::default(),
+            func_ids: FunctionMap::with_scope(function_scope.clone()),
+            func_return_types: FunctionMap::with_scope(function_scope.clone()),
+            fn_types: FunctionMap::with_scope(function_scope.clone()),
+            func_param_modes: FunctionMap::with_scope(function_scope.clone()),
+            func_param_debug: FunctionMap::with_scope(function_scope.clone()),
+            function_may_panic: FunctionMap::with_scope(function_scope.clone()),
             known_modules: HashMap::new(),
             visible_modules: HashSet::new(),
             unit_imports: compile::UnitImports::default(),
@@ -727,10 +696,6 @@ impl Codegen {
         }
     }
 
-    /// No-op: generic enums are now registered via `register_enum_info` from the
-    /// prelude, exactly like user-defined enums.  Kept for call-site compatibility.
-    pub fn register_builtin_generic_enums(&mut self) {}
-
     /// Hand the back end the imports the module resolver classified for the
     /// next unit to be declared (willow-vtlr, willow-28h8).
     ///
@@ -818,24 +783,10 @@ impl Codegen {
             for full in method_symbols {
                 let suffix = full.strip_prefix(&method_prefix).unwrap();
                 let alias = class_member_symbol(local, suffix);
-                if let Some(&id) = self.func_ids.get(&full) {
-                    self.func_ids.insert(alias.clone(), id);
-                }
-                if let Some(rt) = self.func_return_types.get(&full).cloned() {
-                    self.func_return_types.insert(alias.clone(), rt);
-                }
-                if let Some(ft) = self.fn_types.get(&full).cloned() {
-                    self.fn_types.insert(alias.clone(), ft);
-                }
-                if let Some(modes) = self.func_param_modes.get(&full).cloned() {
-                    self.func_param_modes.insert(alias.clone(), modes);
-                }
-                if let Some(pd) = self.func_param_debug.get(&full).cloned() {
-                    self.func_param_debug.insert(alias.clone(), pd);
-                }
-                if let Some(may_panic) = self.function_may_panic.get(&full).copied() {
-                    self.function_may_panic.insert(alias, may_panic);
-                }
+                self.func_ids.scope().bind(
+                    FunctionId::free_from_source_name(&alias),
+                    FunctionId::free_from_source_name(&full),
+                );
             }
             // Vtables: (`module::Item`, iface) -> (`local`, iface).
             let vt_aliases: Vec<((String, String), DataId)> = self
@@ -866,23 +817,11 @@ impl Codegen {
             .cloned()
             .unwrap_or_else(|| module_symbol_prefix(module));
         let mangled = module_item_symbol(&module_prefix, item);
-        if let Some(&id) = self.func_ids.get(&mangled) {
-            self.func_ids.insert(local, id);
-            if let Some(rt) = self.func_return_types.get(&mangled).cloned() {
-                self.func_return_types.insert(local, rt);
-            }
-            if let Some(ft) = self.fn_types.get(&mangled).cloned() {
-                self.fn_types.insert(local, ft);
-            }
-            if let Some(modes) = self.func_param_modes.get(&mangled).cloned() {
-                self.func_param_modes.insert(local, modes);
-            }
-            if let Some(params) = self.func_param_debug.get(&mangled).cloned() {
-                self.func_param_debug.insert(local, params);
-            }
-            if let Some(may_panic) = self.function_may_panic.get(&mangled).copied() {
-                self.function_may_panic.insert(local, may_panic);
-            }
+        if self.func_ids.contains_key(&mangled) {
+            self.func_ids.scope().bind(
+                FunctionId::free_from_source_name(local),
+                FunctionId::free_from_source_name(&mangled),
+            );
             return true;
         }
 
@@ -895,43 +834,13 @@ impl Codegen {
         canonical: &str,
         aliases: &mut ModuleAliasSnapshot,
     ) {
-        if let Some(&id) = self.func_ids.get(canonical) {
-            insert_function_with_snapshot(&mut aliases.func_ids, &mut self.func_ids, alias, id);
-        }
-        if let Some(ret) = self.func_return_types.get(canonical).cloned() {
-            insert_function_with_snapshot(
-                &mut aliases.func_return_types,
-                &mut self.func_return_types,
-                alias,
-                ret,
-            );
-        }
-        if let Some(ty) = self.fn_types.get(canonical).cloned() {
-            insert_function_with_snapshot(&mut aliases.fn_types, &mut self.fn_types, alias, ty);
-        }
-        if let Some(modes) = self.func_param_modes.get(canonical).cloned() {
-            insert_function_with_snapshot(
-                &mut aliases.func_param_modes,
-                &mut self.func_param_modes,
-                alias,
-                modes,
-            );
-        }
-        if let Some(params) = self.func_param_debug.get(canonical).cloned() {
-            insert_function_with_snapshot(
-                &mut aliases.func_param_debug,
-                &mut self.func_param_debug,
-                alias,
-                params,
-            );
-        }
-        if let Some(may_panic) = self.function_may_panic.get(canonical).copied() {
-            insert_function_with_snapshot(
-                &mut aliases.function_may_panic,
-                &mut self.function_may_panic,
-                alias,
-                may_panic,
-            );
+        if self.func_ids.contains_key(canonical) {
+            let alias = FunctionId::free_from_source_name(alias);
+            let previous = self
+                .func_ids
+                .scope()
+                .bind(alias.clone(), FunctionId::free_from_source_name(canonical));
+            aliases.functions.push((alias, previous));
         }
     }
 
@@ -1005,12 +914,9 @@ impl Codegen {
     }
 
     fn restore_module_aliases(&mut self, aliases: ModuleAliasSnapshot) {
-        restore_function_snapshots(&mut self.func_ids, aliases.func_ids);
-        restore_function_snapshots(&mut self.func_return_types, aliases.func_return_types);
-        restore_function_snapshots(&mut self.fn_types, aliases.fn_types);
-        restore_function_snapshots(&mut self.func_param_modes, aliases.func_param_modes);
-        restore_function_snapshots(&mut self.func_param_debug, aliases.func_param_debug);
-        restore_function_snapshots(&mut self.function_may_panic, aliases.function_may_panic);
+        for (alias, previous) in aliases.functions.into_iter().rev() {
+            self.func_ids.scope().restore(alias, previous);
+        }
         restore_snapshots(&mut self.class_layouts, aliases.class_layouts);
         restore_snapshots(&mut self.class_own_fields, aliases.class_own_fields);
         restore_snapshots(&mut self.class_base, aliases.class_base);
@@ -1152,12 +1058,7 @@ impl Codegen {
         let own: Vec<String> = c
             .methods
             .iter()
-            // `!is_static` is the receiver test: `has_self` records only the
-            // explicit (legacy) `self` spelling, and an implicit-self
-            // `open`/`override` method has a receiver just the same. Requiring
-            // it here left that method with no slot, and virtual dispatch then
-            // found two implementations and nowhere to dispatch through
-            // (willow-h7hv).
+            // Static methods have no receiver or virtual dispatch slot.
             .filter(|m| !m.is_static && (m.is_open || m.is_override))
             .map(|m| m.name.clone())
             .collect();
@@ -1906,227 +1807,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
-    /// Determine the AST type of a `let` initialiser, including full `Type::Fn` for
-    /// named-function and lambda values so indirect calls later work correctly.
-    /// Resolve the Willow AST type of an expression, handling FieldAccess and
-    /// MethodCall by looking up class layouts and func_return_types.
+    /// Read the type established before code generation. Missing metadata is
+    /// a compiler invariant violation, never a reason to guess an ABI type.
     fn ast_type_of(&self, expr: &Expr) -> Type {
-        // The checker's recorded type is authoritative (willow-mb5); the
-        // structural walk below only types compiler-synthesized expressions
-        // whose spans the checker never saw.
-        if let Some(ty) = self.expr_types.get(&expr.span()) {
-            return ty.clone();
-        }
-        self.ast_type_of_structural(expr)
-    }
-
-    fn ast_type_of_structural(&self, expr: &Expr) -> Type {
-        match expr {
-            // Static property read → its declared type (willow-qsqf), so e.g.
-            // `println(C::prop)` selects the right print function.
-            Expr::StaticField(s) => {
-                let class = self.static_call_class_name(&s.class);
-                self.lookup_static_storage(&class, &s.field)
-                    .map(|info| info.ty)
-                    .unwrap_or(Type::I64)
-            }
-            Expr::FieldAccess(obj, field_name, _) => {
-                if let Some(class_name) = class_name_for_object_type(&self.ast_type_of(obj))
-                    && let Some(layout) = self.class_layouts.get(&class_name)
-                    && let Some((_, ty)) = layout.iter().find(|(n, _)| n == field_name)
-                {
-                    return ty.clone();
-                }
-                Type::I64
-            }
-            Expr::MethodCall(m) => {
-                let obj_ty = self.ast_type_of(&m.object);
-                // Builtin methods resolve to an intrinsic identity and a result
-                // type in one table (willow-uqzx, catalog item 7). This walk
-                // used to repeat the emitter's string waterfall by hand and had
-                // already drifted from it: it knew `Array::freeze` but not
-                // `Array::toString`, answered `void` for `Map::toString` through
-                // a catch-all arm, and did not know `Task::result` or any
-                // `CancellationToken`/`TaskScope` method at all — those all fell
-                // through to the `i64` default at the end of this arm.
-                if let Some(resolved) = intrinsics::resolve(&obj_ty, &m.method, m.args.len()) {
-                    return resolved
-                        .return_type(|i| m.args.get(i).map(|arg| self.ast_type_of(&arg.expr)));
-                }
-                if let Some(ret) = option_result_method_return_type(
-                    &obj_ty,
-                    &m.method,
-                    m.args
-                        .first()
-                        .map(|a| self.ast_type_of_init(&a.expr))
-                        .as_ref(),
-                ) {
-                    return ret;
-                }
-                // Interface method call → the interface method's return type.
-                if let Type::Named(iface_name) = &obj_ty
-                    && let Some(iface) = self.interface_infos.get(iface_name)
-                    && let Some(method) = iface.methods.get(&m.method)
-                {
-                    return method.return_type.clone();
-                }
-                // Generic interface receiver (`Box<String>`): substitute the
-                // interface's type parameters into the method's return type
-                // (`fn get(self) -> T` -> `String`) (willow-1js.1).
-                if let Type::Generic(iface_name, type_args) = &obj_ty
-                    && let Some(iface) = self.interface_infos.get(iface_name)
-                    && let Some(method) = iface.methods.get(&m.method)
-                {
-                    let map: HashMap<String, Type> = iface
-                        .type_params
-                        .iter()
-                        .cloned()
-                        .zip(type_args.iter().cloned())
-                        .collect();
-                    return crate::semantic::symbols::substitute_type(&method.return_type, &map);
-                }
-                if let Some(class_name) = class_name_for_object_type(&obj_ty) {
-                    // Walk hierarchy to find the method return type.
-                    let mut search = Some(class_name.clone());
-                    let mut seen = std::collections::HashSet::new();
-                    while let Some(name) = search {
-                        if !seen.insert(name.clone()) {
-                            break;
-                        }
-                        let mangled =
-                            class_method_symbol_name(self.known_modules, &name, &m.method);
-                        if let Some(ty) = self.func_return_types.get(&mangled) {
-                            return ty.clone();
-                        }
-                        search = self.class_base.get(&name).cloned();
-                    }
-                }
-                Type::I64
-            }
-            Expr::Binary(b) => match &b.op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Pow => {
-                    self.ast_type_of(&b.lhs)
-                }
-                _ => Type::Bool,
-            },
-            Expr::Unary(u) => match &u.op {
-                UnaryOp::Neg => self.ast_type_of(&u.expr),
-                UnaryOp::Not => Type::Bool,
-            },
-            // Generic enum constructor: infer the concrete instantiated type using enum_infos.
-            Expr::StaticCall(s) => {
-                let class_name = self.static_call_class_name(&s.class);
-                if let Some(enum_info) = self.enum_infos.get(class_name.as_str())
-                    && !enum_info.type_params.is_empty()
-                    && let Some(variant) = enum_info.variants.iter().find(|v| v.name == s.method)
-                {
-                    // Infer type args: for each type parameter, find which payload position
-                    // uses it and take the type of the corresponding argument.
-                    let type_args: Vec<Type> = enum_info
-                        .type_params
-                        .iter()
-                        .map(|param| {
-                            variant
-                                .payload_types
-                                .iter()
-                                .zip(s.args.iter())
-                                .find_map(|(payload_ty, arg)| {
-                                    if matches!(payload_ty, Type::Named(n) if n == param) {
-                                        Some(self.ast_type_of(&arg.expr))
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or(Type::Void)
-                        })
-                        .collect();
-                    return Type::Generic(class_name.clone(), type_args);
-                }
-                // `Mutex::new(v)` / `RwLock::new(v)` / `BlockingCell::new(v)`:
-                // element type is the explicit type argument or, when omitted,
-                // inferred from the argument (willow-dgwo.3).
-                if matches!(
-                    class_name.as_str(),
-                    "Mutex" | "RwLock" | "BlockingCell" | "BlockingRwCell"
-                ) && s.method == "new"
-                {
-                    let elem = s.type_args.first().cloned().unwrap_or_else(|| {
-                        s.args
-                            .first()
-                            .map(|a| self.ast_type_of(&a.expr))
-                            .unwrap_or(Type::Void)
-                    });
-                    return Type::Generic(class_name.clone(), vec![elem]);
-                }
-                if let Some(ty) = builtin_static_return_type(&class_name, &s.type_args, &s.method) {
-                    return ty;
-                }
-                if let Some(module_prefix) = self.known_modules.get(&class_name) {
-                    let mangled = module_item_symbol(module_prefix, &s.method);
-                    if let Some(ty) = self.func_return_types.get(&mangled) {
-                        return ty.clone();
-                    }
-                }
-                let mangled = class_method_symbol_name(self.known_modules, &class_name, &s.method);
-                if let Some(ty) = self.func_return_types.get(&mangled) {
-                    return ty.clone();
-                }
-                ast_type_of_expr(expr, &self.vars, self.func_return_types, self.expr_types)
-            }
-            Expr::Await(a) => task_output_type(&self.ast_type_of(&a.expr))
-                .or_else(|| future_output_type(&self.ast_type_of(&a.expr)))
-                .unwrap_or_else(|| self.ast_type_of(&a.expr)),
-            _ => ast_type_of_expr(expr, &self.vars, self.func_return_types, self.expr_types),
-        }
+        checked_expr_type(expr, self.expr_types)
     }
 
     fn ast_type_of_init(&self, expr: &Expr) -> Type {
-        if let Some(ty) = self.expr_types.get(&expr.span()) {
-            return ty.clone();
-        }
-        self.ast_type_of_init_structural(expr)
-    }
-
-    fn ast_type_of_init_structural(&self, expr: &Expr) -> Type {
-        match expr {
-            // Static property read → its declared type (so `let x = C::prop`
-            // gets the right storage clif type), willow-qsqf.
-            Expr::StaticField(s) => {
-                let class = self.static_call_class_name(&s.class);
-                self.lookup_static_storage(&class, &s.field)
-                    .map(|info| info.ty)
-                    .unwrap_or(Type::Void)
-            }
-            // Named function used as a value → look up its full fn type.
-            Expr::Var(name, _) => {
-                if let Some(ty) = self.fn_types.get(name.as_str()) {
-                    return ty.clone();
-                }
-                self.ast_type_of(expr)
-            }
-            // Lambda expression → build the fn type from params and return type.
-            // Prefer: explicit annotation > type-checker inferred > expression-body inference > I64.
-            Expr::Lambda(l) => {
-                if let Some(ty @ Type::Fn(..)) = self.expr_types.get(&l.span) {
-                    return ty.clone();
-                }
-                let params: Vec<Type> = l.params.iter().filter_map(|p| p.ty.clone()).collect();
-                let ret = l.return_type.clone().unwrap_or_else(|| {
-                    if let crate::parser::ast::LambdaBody::Expr(e) = &l.body {
-                        let param_map: HashMap<String, Type> = l
-                            .params
-                            .iter()
-                            .filter_map(|p| p.ty.clone().map(|ty| (p.name.clone(), ty)))
-                            .collect();
-                        infer_lambda_body_type(e, &param_map, self.func_return_types)
-                    } else {
-                        Type::I64
-                    }
-                });
-                Type::Fn(params, Box::new(ret))
-            }
-            _ => self.ast_type_of(expr),
-        }
+        self.ast_type_of(expr)
     }
 
     fn static_call_class_name(&self, class_name: &str) -> String {
@@ -2383,10 +2071,6 @@ fn reference_index_name(expr: &Expr) -> String {
     }
 }
 
-fn range_type() -> Type {
-    Type::Generic("Range".to_string(), vec![Type::I64])
-}
-
 fn channel_runtime_suffix(ty: &Type) -> &'static str {
     match ty {
         Type::I64 => "i64",
@@ -2464,10 +2148,9 @@ fn try_gc_ref_mask_for_layout(
 #[allow(dead_code)] // Consumed by willow-lpn.5 (async frame emission + state machine).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AsyncFrameSlot {
-    /// Unique key for this binding — the declaration span of the param or `let`.
-    /// Frame offsets are keyed by this (NOT the name) so that two same-named
-    /// locals in nested scopes get distinct slots (willow-lpn.11).
-    pub key: crate::diagnostics::Span,
+    /// Diagnostic location only. Physical identity is the slot's index;
+    /// logical local/defer identities live in the LIR layout's offset maps.
+    pub source_span: Option<crate::diagnostics::Span>,
     pub name: String,
     pub ty: Type,
 }
@@ -2553,12 +2236,13 @@ fn collect_async_frame_slots(params: &[Param], body: &Block) -> Vec<AsyncFrameSl
     let mut slots: Vec<AsyncFrameSlot> = params
         .iter()
         .map(|p| AsyncFrameSlot {
-            key: p.span,
+            source_span: Some(p.span),
             name: p.name.clone(),
             ty: p.ty.clone(),
         })
         .collect();
-    let mut seen: HashSet<crate::diagnostics::Span> = slots.iter().map(|s| s.key).collect();
+    let mut seen: HashSet<crate::diagnostics::Span> =
+        slots.iter().filter_map(|s| s.source_span).collect();
     collect_let_slots(body, &mut slots, &mut seen);
     slots
 }
@@ -2577,7 +2261,7 @@ fn collect_let_slots(
                     && seen.insert(l.span)
                 {
                     out.push(AsyncFrameSlot {
-                        key: l.span,
+                        source_span: Some(l.span),
                         name: l.name.clone(),
                         ty: ty.clone(),
                     });
@@ -2616,7 +2300,7 @@ fn try_propagate_payload_type(ty: &Type) -> Type {
     builtin_types::resolve(ty)
         .filter(|resolved| matches!(resolved.id, B::Result | B::Option))
         .and_then(|resolved| resolved.args.first().cloned())
-        .unwrap_or(Type::I64)
+        .expect("internal compiler error: missing checked payload type")
 }
 
 /// The error type `E` of a `Result<T, E>`, used by `?` automatic error
@@ -2634,363 +2318,13 @@ fn main_result_err_type(f: &FunctionDecl) -> Option<Type> {
         .map(|(_, err)| err.clone())
 }
 
-fn ast_type_of_expr(
-    expr: &Expr,
-    vars: &HashMap<String, VarStorage>,
-    frt: &FunctionMap<Type>,
-    et: &HashMap<crate::diagnostics::Span, Type>,
-) -> Type {
-    // Checker-recorded types are authoritative (willow-mb5); fall back to the
-    // structural walk only for unrecorded (synthesized) expressions.
-    if let Some(ty) = et.get(&expr.span()) {
-        return ty.clone();
-    }
-    ast_type_of_expr_structural(expr, vars, frt, et)
-}
-
-fn ast_type_of_expr_structural(
-    expr: &Expr,
-    vars: &HashMap<String, VarStorage>,
-    frt: &FunctionMap<Type>,
-    et: &HashMap<crate::diagnostics::Span, Type>,
-) -> Type {
-    match expr {
-        Expr::Integer(_, _) => Type::I64,
-        Expr::Float(_, _) => Type::F64,
-        Expr::Bool(_, _) => Type::Bool,
-        Expr::String(_, _) => Type::String,
-        Expr::Var(name, _) => vars
-            .get(name.as_str())
-            .map(|storage| storage.ty().clone())
-            .unwrap_or(Type::I64),
-        Expr::Binary(b) => match &b.op {
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Pow => {
-                ast_type_of_expr(&b.lhs, vars, frt, et)
-            }
-            _ => Type::Bool,
-        },
-        Expr::Unary(u) => match &u.op {
-            UnaryOp::Neg => ast_type_of_expr(&u.expr, vars, frt, et),
-            UnaryOp::Not => Type::Bool,
-        },
-        Expr::Call(c) => frt
-            .get(&c.callee)
-            .cloned()
-            .or_else(|| builtin_call_return_type(&c.callee))
-            .unwrap_or(Type::I64),
-        Expr::Print(_, _, _) => Type::Void,
-        Expr::Ternary(t) => ast_type_of_ternary(t, vars, frt, et),
-        Expr::Range(_) => range_type(),
-        Expr::Lambda(l) => {
-            let params = l
-                .params
-                .iter()
-                .filter_map(|p| p.ty.clone())
-                .collect::<Vec<_>>();
-            let ret = l.return_type.clone().unwrap_or(Type::I64);
-            Type::Fn(params, Box::new(ret))
-        }
-        Expr::FieldAccess(_, _, _) => Type::Void,
-        // Static property type is resolved via FuncGen's static_storage in
-        // `ast_type_of_init`; this free function lacks that context.
-        Expr::StaticField(_) => Type::Void,
-        Expr::MethodCall(m) => {
-            let obj_ty = ast_type_of_expr(&m.object, vars, frt, et);
-            if m.method == "recv"
-                && let Some(element_ty) = channel_element_type(&obj_ty)
-            {
-                return element_ty;
-            }
-            if let Type::Array(elem) = &obj_ty {
-                match m.method.as_str() {
-                    "len" => return Type::I64,
-                    "pop" => return (**elem).clone(),
-                    "push" => return Type::Void,
-                    "freeze" => return B::FrozenArray.apply(vec![(**elem).clone()]),
-                    _ => {}
-                }
-            }
-            if builtin_types::unary_arg(&obj_ty, B::FrozenArray).is_some() && m.method == "len" {
-                return Type::I64;
-            }
-            if let Type::Generic(_, margs) = &obj_ty {
-                if builtin_types::binary_args(&obj_ty, B::Map).is_some() {
-                    match m.method.as_str() {
-                        "get" => {
-                            return B::Option.apply(vec![margs[1].clone()]);
-                        }
-                        "len" => return Type::I64,
-                        "contains" => return Type::Bool,
-                        "freeze" => return B::FrozenMap.apply(margs.clone()),
-                        _ => return Type::Void,
-                    }
-                }
-                if builtin_types::binary_args(&obj_ty, B::FrozenMap).is_some() {
-                    match m.method.as_str() {
-                        "get" => {
-                            return B::Option.apply(vec![margs[1].clone()]);
-                        }
-                        "contains" => return Type::Bool,
-                        "len" => return Type::I64,
-                        _ => return Type::Void,
-                    }
-                }
-            }
-            Type::Void
-        }
-        Expr::ObjectLiteral(o) => Type::Named(o.class.clone()),
-        Expr::New(n) => Type::Named(n.class_name.clone()),
-        Expr::Await(a) => task_output_type(&ast_type_of_expr(&a.expr, vars, frt, et))
-            .or_else(|| future_output_type(&ast_type_of_expr(&a.expr, vars, frt, et)))
-            .unwrap_or_else(|| ast_type_of_expr(&a.expr, vars, frt, et)),
-        Expr::Select(_) => Type::Void,
-        Expr::StaticCall(s) => {
-            if let Some(ty) = builtin_static_return_type(&s.class, &s.type_args, &s.method) {
-                return ty;
-            }
-            // Look up mangled name for module calls.
-            let mangled = class_member_symbol(&backend_symbol_component(&s.class), &s.method);
-            frt.get(&mangled)
-                .or_else(|| frt.get(&s.method))
-                .cloned()
-                .unwrap_or(Type::I64)
-        }
-        Expr::Match(m) => {
-            // Build augmented var map: include payload bindings from each arm
-            // so that `v` in `Option::Some(v) => v` resolves to the correct type.
-            let scrutinee_ty = ast_type_of_expr(&m.scrutinee, vars, frt, et);
-            for arm in &m.arms {
-                // Build a temporary augmented scope for this arm's bindings.
-                let mut arm_vars = vars.clone();
-                if let Pattern::EnumVariantTuple {
-                    enum_name,
-                    variant,
-                    bindings,
-                    ..
-                } = &arm.pattern
-                {
-                    // Derive payload types from the scrutinee's generic type arguments.
-                    // This is a positional heuristic: first arg → first payload, etc.
-                    // Works correctly for Option<T> (single param) and Result<T,E> (two params).
-                    let payload: Vec<Type> =
-                        infer_generic_payload_from_scrutinee(enum_name, variant, &scrutinee_ty);
-                    for (name, ty) in bindings.iter().zip(payload.iter()) {
-                        arm_vars.insert(
-                            name.clone(),
-                            VarStorage::Value {
-                                var: Variable::from_u32(0), // placeholder — ty() is the only field read here
-                                ty: ty.clone(),
-                            },
-                        );
-                    }
-                }
-                let ty = match &arm.body {
-                    MatchBody::Expr(e) => ast_type_of_expr(e, &arm_vars, frt, et),
-                    MatchBody::Block(_) => Type::Void,
-                };
-                if ty != Type::Void && ty != Type::Never {
-                    return ty;
-                }
-            }
-            Type::I64
-        }
-        Expr::TryPropagate(inner, _) => {
-            // ? extracts the Ok/Some payload from Result<T,E> or Option<T> → type T
-            let inner_ty = ast_type_of_expr(inner, vars, frt, et);
-            if let Some(payload) = builtin_types::unary_arg(&inner_ty, B::Option) {
-                return payload.clone();
-            }
-            if let Some((payload, _)) = builtin_types::binary_args(&inner_ty, B::Result) {
-                return payload.clone();
-            }
-            Type::I64
-        }
-        Expr::ArrayLiteral(elements, _) => {
-            let elem = elements
-                .first()
-                .map(|e| ast_type_of_expr(e, vars, frt, et))
-                .unwrap_or(Type::Void);
-            Type::Array(Box::new(elem))
-        }
-        Expr::Index(arr, _, _) => match ast_type_of_expr(arr, vars, frt, et) {
-            Type::Array(elem) => *elem,
-            ty @ Type::Generic(_, _) => builtin_types::unary_arg(&ty, B::FrozenArray)
-                .cloned()
-                .unwrap_or(Type::I64),
-            _ => Type::I64,
-        },
-    }
-}
-
-fn ast_type_of_ternary(
-    t: &TernaryExpr,
-    vars: &HashMap<String, VarStorage>,
-    frt: &FunctionMap<Type>,
-    et: &HashMap<crate::diagnostics::Span, Type>,
-) -> Type {
-    let then_ty = ast_type_of_expr(&t.then_expr, vars, frt, et);
-    let else_ty = ast_type_of_expr(&t.else_expr, vars, frt, et);
-
-    if then_ty == else_ty {
-        return then_ty;
-    }
-
-    then_ty
-}
-
-/// Infer the concrete payload types for a generic enum variant from the scrutinee type.
-/// This is used in `ast_type_of_expr` where `enum_infos` is not available.
-///
-/// Works positionally: the first scrutinee type argument maps to the first payload
-/// element, the second to the second, etc. This is correct for Option<T> and Result<T,E>.
-fn infer_generic_payload_from_scrutinee(
-    enum_name: &str,
-    variant: &str,
-    scrutinee_ty: &Type,
-) -> Vec<Type> {
-    let (name, args) = match scrutinee_ty {
-        Type::Generic(n, a) if n == enum_name => (n.as_str(), a.as_slice()),
-        _ => return vec![],
-    };
-    let _ = name;
-    // Heuristic mapping based on variant position:
-    // - Variants with a single payload use the type arg at the same enum-level position.
-    // We don't have the enum definition here, so we use a simple rule:
-    //   first variant with payload → first type arg
-    //   second variant with payload → second type arg (if it exists)
-    // For Option<T>: Some(T) → [args[0]], None → []
-    // For Result<T,E>: Ok(T) → [args[0]], Err(E) → [args[1]]
-    // We detect "second variant" by checking if variant is "Err" or the name ends with 2.
-    // This is intentionally simple; proper generic instantiation uses enum_infos.
-    match (enum_name, variant) {
-        (_, "None") => vec![],
-        (_, "Ok") | (_, "Some") => args.first().map(|t| vec![t.clone()]).unwrap_or_default(),
-        (_, "Err") => args.get(1).map(|t| vec![t.clone()]).unwrap_or_default(),
-        _ => {
-            // Generic fallback: single arg with first type param
-            args.first().map(|t| vec![t.clone()]).unwrap_or_default()
-        }
-    }
-}
-
-/// Infer the return type of a lambda body expression without needing the full
-/// VarStorage context. Only handles simple cases; falls back to I64 for complex ones.
-fn infer_lambda_body_type(
-    expr: &Expr,
-    param_types: &HashMap<String, Type>,
-    frt: &FunctionMap<Type>,
-) -> Type {
-    match expr {
-        Expr::Integer(_, _) => Type::I64,
-        Expr::Float(_, _) => Type::F64,
-        Expr::Bool(_, _) => Type::Bool,
-        Expr::String(_, _) => Type::String,
-        Expr::Var(name, _) => param_types.get(name.as_str()).cloned().unwrap_or(Type::I64),
-        Expr::Binary(b) => match &b.op {
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Pow => {
-                infer_lambda_body_type(&b.lhs, param_types, frt)
-            }
-            _ => Type::Bool,
-        },
-        Expr::Unary(u) => match &u.op {
-            UnaryOp::Neg => infer_lambda_body_type(&u.expr, param_types, frt),
-            UnaryOp::Not => Type::Bool,
-        },
-        Expr::Call(c) => frt
-            .get(&c.callee)
-            .cloned()
-            .or_else(|| builtin_call_return_type(&c.callee))
-            .unwrap_or(Type::I64),
-        Expr::Ternary(t) => infer_lambda_body_type(&t.then_expr, param_types, frt),
-        _ => Type::I64,
-    }
-}
-
-/// Compute the return type of an Option/Result method call without requiring
-/// full type-checker context. Used by the backend's ast_type_of for MethodCall.
-///
-/// For higher-order methods (map, and_then, etc.) whose return type depends on the
-/// function argument type: if the function argument type is not a Generic (i.e. it's a
-/// bare I64 because the lambda has no explicit return annotation), fall back to the
-/// receiver type. This is correct when the element type is preserved (common case) and
-/// at least tracks the value as Option/Result rather than a bare I64.
-fn option_result_method_return_type(
-    obj_ty: &Type,
-    method: &str,
-    first_arg_ty: Option<&Type>,
-) -> Option<Type> {
-    let builtin = builtin_types::resolve(obj_ty)?;
-    match builtin.id {
-        B::Option => {
-            let args = builtin.args;
-            let inner = args.first().cloned().unwrap_or(Type::Void);
-            match method {
-                "is_some" | "is_none" => Some(Type::Bool),
-                "unwrap" | "expect" | "unwrap_or" => Some(inner),
-                "map" => {
-                    if let Some(Type::Fn(_, ret)) = first_arg_ty {
-                        Some(B::Option.apply(vec![*ret.clone()]))
-                    } else {
-                        Some(obj_ty.clone())
-                    }
-                }
-                "and_then" | "or_else" => {
-                    if let Some(Type::Fn(_, ret)) = first_arg_ty {
-                        let ret_ty = *ret.clone();
-                        // If f's return is Generic (Option/Result), trust it.
-                        // Otherwise fall back to the receiver type so the result
-                        // is tracked as Option rather than a bare I64.
-                        if matches!(ret_ty, Type::Generic(..)) {
-                            Some(ret_ty)
-                        } else {
-                            Some(obj_ty.clone())
-                        }
-                    } else {
-                        Some(obj_ty.clone())
-                    }
-                }
-                _ => None,
-            }
-        }
-        B::Result => {
-            let args = builtin.args;
-            let ok_ty = args.first().cloned().unwrap_or(Type::Void);
-            let err_ty = args.get(1).cloned().unwrap_or(Type::Void);
-            match method {
-                "is_ok" | "is_err" => Some(Type::Bool),
-                "unwrap" | "expect" | "unwrap_or" => Some(ok_ty.clone()),
-                "unwrap_err" => Some(err_ty.clone()),
-                "map" => {
-                    if let Some(Type::Fn(_, ret)) = first_arg_ty {
-                        Some(B::Result.apply(vec![*ret.clone(), err_ty]))
-                    } else {
-                        Some(obj_ty.clone())
-                    }
-                }
-                "map_err" => {
-                    if let Some(Type::Fn(_, ret)) = first_arg_ty {
-                        Some(B::Result.apply(vec![ok_ty, *ret.clone()]))
-                    } else {
-                        Some(obj_ty.clone())
-                    }
-                }
-                "and_then" | "or_else" => {
-                    if let Some(Type::Fn(_, ret)) = first_arg_ty {
-                        let ret_ty = *ret.clone();
-                        if matches!(ret_ty, Type::Generic(..)) {
-                            Some(ret_ty)
-                        } else {
-                            Some(obj_ty.clone())
-                        }
-                    } else {
-                        Some(obj_ty.clone())
-                    }
-                }
-                _ => None,
-            }
-        }
-        _ => None,
-    }
+fn checked_expr_type(expr: &Expr, types: &HashMap<crate::diagnostics::Span, Type>) -> Type {
+    types.get(&expr.span()).cloned().unwrap_or_else(|| {
+        panic!(
+            "internal compiler error: missing checked type for expression at {:?}",
+            expr.span()
+        )
+    })
 }
 
 #[cfg(test)]
@@ -3000,6 +2334,15 @@ mod symbol_namespace_tests {
     /// Perspective 1: every symbol the runtime ABI actually exports is
     /// reserved. This is the set whose hijacking is silent, so it is the one
     /// that must be complete rather than approximated.
+    #[test]
+    #[should_panic(expected = "missing checked type")]
+    fn missing_expression_type_is_an_invariant_failure() {
+        checked_expr_type(
+            &Expr::Integer(1, crate::diagnostics::Span::dummy()),
+            &HashMap::new(),
+        );
+    }
+
     #[test]
     fn unit_symbols_01_every_runtime_abi_symbol_is_reserved() {
         for symbol in abi::RUNTIME_SYMBOLS {
@@ -3164,14 +2507,6 @@ mod tests {
     }
 
     #[test]
-    fn unit_async_codegen_01_sleep_builtin_returns_future_void() {
-        assert_eq!(
-            builtin_call_return_type("sleep"),
-            Some(Type::Generic("Future".to_string(), vec![Type::Void]))
-        );
-    }
-
-    #[test]
     fn unit_async_codegen_02_sleep_builtin_lowers_to_runtime_sleep() {
         assert_eq!(
             builtin_call_runtime_name("sleep"),
@@ -3180,34 +2515,10 @@ mod tests {
     }
 
     #[test]
-    fn unit_async_codegen_02b_yield_builtin_returns_future_void() {
-        assert_eq!(
-            builtin_call_return_type("yield"),
-            Some(Type::Generic("Future".to_string(), vec![Type::Void]))
-        );
-    }
-
-    #[test]
     fn unit_async_codegen_02c_yield_builtin_lowers_to_runtime_yield() {
         assert_eq!(
             builtin_call_runtime_name("yield"),
             Some("willow_runtime_yield")
-        );
-    }
-
-    #[test]
-    fn unit_async_codegen_03_channel_new_returns_channel_void_placeholder() {
-        assert_eq!(
-            builtin_static_return_type("Channel", &[], "new"),
-            Some(Type::Generic("Channel".to_string(), vec![Type::Void]))
-        );
-    }
-
-    #[test]
-    fn unit_async_codegen_06_channel_new_with_type_arg_returns_typed_channel() {
-        assert_eq!(
-            builtin_static_return_type("Channel", &[Type::I64], "new"),
-            Some(Type::Generic("Channel".to_string(), vec![Type::I64]))
         );
     }
 
@@ -3286,10 +2597,8 @@ mod tests {
     ) -> AsyncFrameLayout {
         let slots = slots
             .iter()
-            .enumerate()
-            .map(|(i, (n, t))| AsyncFrameSlot {
-                // Distinct dummy spans so each test slot has a unique key.
-                key: crate::diagnostics::Span::new(i, i, 0, 0),
+            .map(|(n, t)| AsyncFrameSlot {
+                source_span: None,
                 name: (*n).to_string(),
                 ty: t.clone(),
             })
@@ -3497,7 +2806,7 @@ mod tests {
 
         let too_many_slots: Vec<AsyncFrameSlot> = (0..=ASYNC_FRAME_GC_SLOT_CAPACITY)
             .map(|i| AsyncFrameSlot {
-                key: crate::diagnostics::Span::new(i, i, 0, 0),
+                source_span: None,
                 name: format!("r{i}"),
                 ty: Type::String,
             })

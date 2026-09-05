@@ -761,7 +761,7 @@ class ProtectedCtor { prot init(self) {} }
         };
         let method = &class.methods[0];
 
-        assert!(method.has_self);
+        assert!(!method.is_static);
         assert_eq!(method.params.len(), 1);
         assert_eq!(method.params[0].name, "value");
         assert_eq!(
@@ -1096,7 +1096,7 @@ class ProtectedCtor { prot init(self) {} }
         assert_eq!(i.methods.len(), 1);
         assert_eq!(i.methods[0].name, "speak");
         assert_eq!(i.methods[0].return_type, Type::String);
-        assert!(i.methods[0].has_self);
+        assert!(!i.methods[0].is_static);
     }
 
     #[test]
@@ -1165,7 +1165,7 @@ class ProtectedCtor { prot init(self) {} }
     fn interface_05_method_self_with_extra_params() {
         let p = parse_ok("interface Adder { fn add(self, a: i64, b: i64) -> i64; }");
         let m = &first_interface(&p).methods[0];
-        assert!(m.has_self);
+        assert!(!m.is_static);
         assert_eq!(m.params.len(), 2);
         assert_eq!(m.params[0].ty, Type::I64);
         assert_eq!(m.params[1].ty, Type::I64);
@@ -1176,7 +1176,7 @@ class ProtectedCtor { prot init(self) {} }
     fn interface_06_method_without_self() {
         let p = parse_ok("interface Factory { fn make(x: i64) -> i64; }");
         let m = &first_interface(&p).methods[0];
-        assert!(!m.has_self);
+        assert!(m.is_static);
         assert_eq!(m.params.len(), 1);
     }
 

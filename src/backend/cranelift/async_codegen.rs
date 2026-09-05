@@ -54,8 +54,7 @@ const RUNTIME_POLL_PENDING: i64 = willow_abi::RuntimePollResult::Pending as i64;
 impl Codegen {
     /// Turn the LIR-owned logical frame into the runtime's physical data-slot
     /// layout. The returned identity map is keyed only by `LirLocalId`; the
-    /// synthetic spans placed in `AsyncFrameSlot` are inert metadata required
-    /// by the legacy runtime-layout container.
+    /// optional spans on physical slots are diagnostic metadata only.
     fn lir_async_layout(
         &self,
         lir: &LirFunction,
@@ -92,18 +91,7 @@ impl Codegen {
             let index = reserved.len();
             offsets.insert(local.id, async_frame_slot_offset(index));
             reserved.push(AsyncFrameSlot {
-                // `AsyncFrameSlot::key` is the AST emitter's slot identity. On
-                // this path it is inert: `try_new` never dedupes or reorders by
-                // key (slot index is positional), the caller passes an empty
-                // span->offset map, and every lookup goes through the
-                // `LirLocalId -> offset` map built just above. A LIR-synthesized
-                // local has no source span at all, so it gets a placeholder no
-                // real span can equal rather than a borrowed one that would
-                // read like a claim about source position.
-                key: local.source_span.unwrap_or_else(|| {
-                    let start = usize::MAX - local.id.0 as usize;
-                    crate::diagnostics::Span::new(start, start, 0, 0)
-                }),
+                source_span: local.source_span,
                 name: local.name.clone(),
                 ty: local.ty.clone(),
             });
@@ -124,7 +112,7 @@ impl Codegen {
             let index = reserved.len();
             defer_offsets.insert(id, async_frame_slot_offset(index));
             reserved.push(AsyncFrameSlot {
-                key: span,
+                source_span: Some(span),
                 name: format!("__lir_defer_flag_{}", id.0),
                 ty: Type::I64,
             });
@@ -163,7 +151,7 @@ impl Codegen {
         let mut slots = Vec::new();
         let result_offset = main_result_err_ty.as_ref().map(|_| {
             slots.push(AsyncFrameSlot {
-                key: f.span,
+                source_span: Some(f.span),
                 name: "__result".to_string(),
                 ty: f.return_type.clone(),
             });
@@ -175,7 +163,7 @@ impl Codegen {
         // suspension; only GC-managed slots are in `gc_slot_mask` (traced), so
         // non-GC slots hold plain scalars (willow-lpn.5.3 slice 3b).
         slots.extend(f.params.iter().map(|p| AsyncFrameSlot {
-            key: p.span,
+            source_span: Some(p.span),
             name: p.name.clone(),
             ty: p.ty.clone(),
         }));
@@ -258,25 +246,25 @@ impl Codegen {
         // marks GC-ref slots only.
         let mut slots = vec![
             AsyncFrameSlot {
-                key: f.span,
+                source_span: Some(f.span),
                 name: "__result".to_string(),
                 ty: f.return_type.clone(),
             },
             AsyncFrameSlot {
-                key: crate::diagnostics::Span::new(usize::MAX, usize::MAX, 0, 0),
+                source_span: None,
                 name: "__task_id".to_string(),
                 ty: Type::I64,
             },
         ];
         for p in &f.params {
             slots.push(AsyncFrameSlot {
-                key: p.span,
+                source_span: Some(p.span),
                 name: p.name.clone(),
                 ty: p.ty.clone(),
             });
         }
         // Locals after the params: frame-backed so they survive the task's own
-        // suspensions, keyed by declaration span.
+        // suspensions, keyed by LirLocalId.
         let (layout, lir_offsets, lir_defer_offsets) = self.lir_async_layout(&lir, slots, 2)?;
         self.record_async_frame_size_warning(&f.name, f.span, &layout);
         let slot_count = layout.slot_count() as i64;
@@ -411,12 +399,12 @@ impl Codegen {
 
         let mut slots = vec![
             AsyncFrameSlot {
-                key: m.span,
+                source_span: Some(m.span),
                 name: "__result".to_string(),
                 ty: m.return_type.clone(),
             },
             AsyncFrameSlot {
-                key: crate::diagnostics::Span::new(usize::MAX, usize::MAX, 0, 0),
+                source_span: None,
                 name: "__task_id".to_string(),
                 ty: Type::I64,
             },
@@ -426,7 +414,7 @@ impl Codegen {
         } else {
             let offset = async_frame_slot_offset(slots.len());
             slots.push(AsyncFrameSlot {
-                key: crate::diagnostics::Span::new(usize::MAX - 1, usize::MAX - 1, 0, 0),
+                source_span: None,
                 name: "self".to_string(),
                 ty: Type::Named(class_name.to_string()),
             });
@@ -435,7 +423,7 @@ impl Codegen {
         let first_param_slot = slots.len();
         for p in &m.params {
             slots.push(AsyncFrameSlot {
-                key: p.span,
+                source_span: Some(p.span),
                 name: p.name.clone(),
                 ty: p.ty.clone(),
             });
@@ -1937,8 +1925,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         0,
                     ));
                     self.stack_store(v, vslot);
-                    let elem_ty =
-                        channel_element_type(&self.ast_type_of(channel)).unwrap_or(Type::I64);
+                    let elem_ty = channel_element_type(&self.ast_type_of(channel))
+                        .expect("internal compiler error: missing checked payload type");
                     if is_gc_managed(&elem_ty, self.enum_infos) {
                         self.emit_push_root_slot(vslot);
                     }
@@ -2169,8 +2157,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.terminated = false;
             match &case.kind {
                 SelectCaseKind::Recv { binding, channel } => {
-                    let elem_ty =
-                        channel_element_type(&self.ast_type_of(channel)).unwrap_or(Type::I64);
+                    let elem_ty = channel_element_type(&self.ast_type_of(channel))
+                        .expect("internal compiler error: missing checked payload type");
                     let slot = chan_slots[i].expect("recv case has a channel slot");
                     let ch = self.stack_load(types::I64, slot);
                     let recv_name =
@@ -2191,8 +2179,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.emit_block(&case.body);
                 }
                 SelectCaseKind::Send { channel, .. } => {
-                    let elem_ty =
-                        channel_element_type(&self.ast_type_of(channel)).unwrap_or(Type::I64);
+                    let elem_ty = channel_element_type(&self.ast_type_of(channel))
+                        .expect("internal compiler error: missing checked payload type");
                     let slot = chan_slots[i].expect("send case has a channel slot");
                     let ch = self.stack_load(types::I64, slot);
                     let vslot = aux_slots[i].expect("send case has a value slot");
