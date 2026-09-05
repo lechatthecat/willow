@@ -1145,7 +1145,7 @@ fn prm_matrix_281_290_debug_release_parity() {
 }
 
 #[test]
-fn prm_matrix_291_300_lir_ast_backend_parity() {
+fn prm_matrix_291_300_ten_recovered_divisions_in_one_body() {
     let mut source = String::new();
     for offset in 0..10 {
         let id = 291 + offset;
@@ -1172,11 +1172,7 @@ if true {{
     }
     source.push_str("}\n");
 
-    let (lir, lir_ok) = compile_with_env_and_run(&source, &[("WILLOW_LIR_BACKEND", "1")]);
-    let (ast, ast_ok) = compile_with_env_and_run(&source, &[("WILLOW_LIR_BACKEND", "0")]);
-    assert!(lir_ok, "LIR backend failed: {lir}");
-    assert!(ast_ok, "AST backend failed: {ast}");
-    assert_eq!(lir, expected);
-    assert_eq!(ast, expected);
-    assert_eq!(lir, ast, "LIR/AST recovery behavior diverged");
+    let (out, ok) = compile_with_env_and_run(&source, &[]);
+    assert!(ok, "run failed: {out}");
+    assert_eq!(out, expected);
 }

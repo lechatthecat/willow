@@ -117,8 +117,6 @@ impl TypeChecker {
     ///
     /// * `loop_depth`: an enclosing loop is NOT breakable from inside the body
     ///   (willow-kzka).
-    /// * `match_arm_depth`: a lambda written inside a `match` arm is emitted as
-    ///   its own function and is not part of the arm's body (willow-04fd).
     /// * `lock_depth`: the lambda is only CONSTRUCTED inside a critical
     ///   section. Its body runs whenever it is called, holding nothing, so a
     ///   `lock` there is not a nested acquisition (willow-3kty).
@@ -134,12 +132,10 @@ impl TypeChecker {
     /// the enclosing body, which continues after it.
     fn with_lambda_function_boundary<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         let saved_loop = std::mem::take(&mut self.loop_depth);
-        let saved_arm = std::mem::take(&mut self.match_arm_depth);
         let saved_lock = std::mem::take(&mut self.lock_depth);
         let saved_async = std::mem::replace(&mut self.current_async_context, false);
         let r = f(self);
         self.loop_depth = saved_loop;
-        self.match_arm_depth = saved_arm;
         self.lock_depth = saved_lock;
         self.current_async_context = saved_async;
         r
@@ -251,12 +247,17 @@ impl TypeChecker {
         self.check_lambda_captures(l);
 
         // Params may be annotated directly or inferred from an expected fn type.
+        // An annotation is normalized the way a named function's is: it may
+        // spell an item-imported enum by the local name (`Rank`, under
+        // `import signal::Level as Rank;`), and only the identity is comparable
+        // to what the rest of the program produces (willow-0g8j.3).
         let mut param_types = Vec::new();
         for (idx, p) in l.params.iter().enumerate() {
             match &p.ty {
                 Some(ty) => {
                     self.validate_type(ty, p.span);
-                    param_types.push(ty.clone());
+                    let ty = self.normalize_type(ty, p.span);
+                    param_types.push(ty);
                 }
                 None => {
                     if let Some(expected_ty) = expected_params.and_then(|params| params.get(idx)) {
@@ -279,7 +280,11 @@ impl TypeChecker {
         }
 
         // Determine expected return type from annotation or call-site context.
-        let expected_ret = l.return_type.as_ref().or(expected_return);
+        let annotated_return = l
+            .return_type
+            .as_ref()
+            .map(|ty| self.normalize_type(ty, l.span));
+        let expected_ret = annotated_return.as_ref().or(expected_return);
         if let Some(ret) = expected_ret {
             self.validate_type(ret, l.span);
         }
@@ -356,7 +361,7 @@ impl TypeChecker {
         self.current_return_type = saved_ret_ty;
         self.symbols.pop_scope();
 
-        let ret_ty = match &l.return_type {
+        let ret_ty = match &annotated_return {
             Some(ann) => {
                 if !self.types_compatible(ann, &body_ty) {
                     self.push(
@@ -397,12 +402,15 @@ impl TypeChecker {
             }
         };
 
-        // Record the inferred return type so the backend can use it without
-        // falling back to I64 when no explicit annotation is present.
-        self.lambda_return_types.insert(l.span, ret_ty.clone());
-
         let fn_ty = Type::Fn(param_types, Box::new(ret_ty));
-        self.lambda_fn_types.insert(l.span, fn_ty.clone());
+        // Record the lambda's type here rather than leaving it to `check_expr`:
+        // a lambda passed as a call argument is checked through
+        // `check_fn_arg_with_param_context`, which never goes through
+        // `check_expr`, and that is exactly the case whose parameter types come
+        // from the call site rather than from annotations. Without this the
+        // backend and the HIR lowering would have no type for it at all
+        // (willow-0g8j.3, replacing the `lambda_fn_types` side table).
+        self.expr_types.insert(l.span, fn_ty.clone());
         fn_ty
     }
 
@@ -422,6 +430,11 @@ impl TypeChecker {
             _ => return None,
         };
         let info = self.symbols.lookup_enum(enum_name)?;
+        // A bare `Boxy(v)` / `Round` is only the enum's variant for a unit that
+        // can name the enum bare; an importer of `kinds` writes
+        // `kinds::Kind::Boxy(v)` (willow-itcw). The qualified arms below stay
+        // open to every spelling the unit can actually resolve.
+        let bare = self.enum_nameable_bare(&info.name);
         match pattern {
             Pattern::ClassDowncast {
                 class_name,
@@ -429,7 +442,7 @@ impl TypeChecker {
                 span,
             } => {
                 let variant = info.variants.iter().find(|v| v.name == *class_name)?;
-                if variant.payload_types.is_empty() {
+                if !bare || variant.payload_types.is_empty() {
                     return None;
                 }
                 Some(Pattern::EnumVariantTuple {
@@ -441,7 +454,7 @@ impl TypeChecker {
             }
             Pattern::Binding { name, span } => {
                 let variant = info.variants.iter().find(|v| v.name == *name)?;
-                if !variant.payload_types.is_empty() {
+                if !bare || !variant.payload_types.is_empty() {
                     return None;
                 }
                 Some(Pattern::EnumVariant {
@@ -450,11 +463,46 @@ impl TypeChecker {
                     span: *span,
                 })
             }
+            // The same enum under another of its spellings: a module matching
+            // on its own `Level` against a scrutinee typed `signal::Level`, or
+            // an importer matching `Level::On` on one it imported by item name.
+            // Rewriting to the scrutinee's spelling is what makes one enum one
+            // type however the unit reached it (willow-itcw), and the resolution
+            // is recorded, so the back end reads the canonical name too.
+            Pattern::EnumVariant {
+                enum_name: written,
+                variant,
+                span,
+            } if written != enum_name && self.canonical_type_name(written) == info.name => {
+                Some(Pattern::EnumVariant {
+                    enum_name: enum_name.clone(),
+                    variant: variant.clone(),
+                    span: *span,
+                })
+            }
+            Pattern::EnumVariantTuple {
+                enum_name: written,
+                variant,
+                bindings,
+                span,
+            } if written != enum_name && self.canonical_type_name(written) == info.name => {
+                Some(Pattern::EnumVariantTuple {
+                    enum_name: enum_name.clone(),
+                    variant: variant.clone(),
+                    bindings: bindings.clone(),
+                    span: *span,
+                })
+            }
             _ => None,
         }
     }
 
     pub(super) fn check_match_expr(&mut self, m: &MatchExpr) -> Type {
+        // The type this `match` flows into, when it was reached through
+        // `check_expr_expecting` (willow-0g8j.3). Taken, not borrowed: a
+        // `match` nested anywhere inside an arm gets its own context or none,
+        // never this one by accident.
+        let expected = self.match_expected.take();
         let scrutinee_ty = self.check_expr(&m.scrutinee);
 
         if m.arms.is_empty() {
@@ -793,7 +841,7 @@ impl TypeChecker {
                     },
                 );
             }
-            let arm_ty = self.check_match_body(&arm.body);
+            let arm_ty = self.check_match_body(&arm.body, expected.as_ref());
             self.symbols.pop_scope();
 
             // Never arms don't constrain result type
@@ -909,43 +957,26 @@ impl TypeChecker {
         result_type.unwrap_or(Type::Void)
     }
 
-    pub(super) fn check_match_body(&mut self, body: &MatchBody) -> Type {
-        // Everything below is inside an arm. `lock` reads this to reject an
-        // acquisition it cannot give a resume shape (E2606, willow-04fd); the
-        // depth rather than a flag is what catches one nested further down,
-        // inside an `if` or a loop within the arm.
-        self.match_arm_depth += 1;
-        let ty = self.check_match_body_inner(body);
-        self.match_arm_depth -= 1;
-        ty
+    pub(super) fn check_match_body(&mut self, body: &MatchBody, expected: Option<&Type>) -> Type {
+        self.check_match_body_inner(body, expected)
     }
 
-    fn check_match_body_inner(&mut self, body: &MatchBody) -> Type {
+    fn check_match_body_inner(&mut self, body: &MatchBody, expected: Option<&Type>) -> Type {
         match body {
             MatchBody::Expr(expr) => {
-                let ty = self.check_expr(expr);
-                // In an async fn, a suspending recv/await inside an
-                // EXPRESSION arm has no frame-backed resume shape (the ANF
-                // pass hoists statements, not conditional arm values) — it
-                // would silently fall to the block-driving sync path. Reject
-                // with a rewrite hint (willow-0a6k.6 review fix).
-                if self.current_async_context && self.expr_suspends(expr) {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0811,
-                            "channel `recv` / `await` in a match-expression arm is not supported in an async fn",
-                        )
-                        .with_label(Label::primary(
-                            expr.span(),
-                            "this would block the scheduler instead of suspending",
-                        ))
-                        .with_help(
-                            "bind into a local first: `let v = ch.recv();` / `let v = await task;` then match on `v`, or use a statement match with a block arm",
-                        ),
-                    );
+                // An arm VALUE is checked against the type the whole `match`
+                // flows into, so `return match x { Some(v) => Result::Ok(v),
+                // None => Result::Err("none") }` types both arms as the
+                // function's `Result<i64, String>` instead of leaving the first
+                // one an `Ok` with no error type (willow-0g8j.3). This is what
+                // a ternary in the same position already does.
+                match expected {
+                    Some(expected) => {
+                        let expected = expected.clone();
+                        self.check_expr_expecting(expr, &expected)
+                    }
+                    None => self.check_expr(expr),
                 }
-                ty
             }
             MatchBody::Block(block) => {
                 self.check_block(block);
@@ -959,76 +990,6 @@ impl TypeChecker {
                 }
             }
         }
-    }
-}
-
-impl TypeChecker {
-    /// True when `expr` contains a scheduler-suspending channel `recv` or an
-    /// `await`, used to reject unliftable positions in async fns
-    /// (willow-0a6k.6). Task waiting is spelled `await` since `join()` was
-    /// removed (willow-qrj9), so the await form is what has to be caught here.
-    fn expr_suspends(&self, expr: &Expr) -> bool {
-        let direct = |e: &Expr| -> bool {
-            if matches!(e, Expr::Await(_)) {
-                return true;
-            }
-            let Expr::MethodCall(m) = e else {
-                return false;
-            };
-            let Some(recv_ty) = self.expr_types.get(&m.object.span()) else {
-                return false;
-            };
-            match m.method.as_str() {
-                "recv" => builtin_types::unary_arg(recv_ty, B::Channel).is_some(),
-                _ => false,
-            }
-        };
-        fn walk(e: &Expr, direct: &dyn Fn(&Expr) -> bool) -> bool {
-            if direct(e) {
-                return true;
-            }
-            match e {
-                Expr::Binary(b) => walk(&b.lhs, direct) || walk(&b.rhs, direct),
-                Expr::Unary(u) => walk(&u.expr, direct),
-                Expr::Call(c) => c.args.iter().any(|a| walk(&a.expr, direct)),
-                Expr::MethodCall(m) => {
-                    walk(&m.object, direct) || m.args.iter().any(|a| walk(&a.expr, direct))
-                }
-                Expr::StaticCall(c) => c.args.iter().any(|a| walk(&a.expr, direct)),
-                Expr::Ternary(t) => {
-                    walk(&t.condition, direct)
-                        || walk(&t.then_expr, direct)
-                        || walk(&t.else_expr, direct)
-                }
-                Expr::FieldAccess(o, _, _) => walk(o, direct),
-                Expr::Index(a, i, _) => walk(a, direct) || walk(i, direct),
-                Expr::TryPropagate(inner, _) => walk(inner, direct),
-                Expr::Await(a) => walk(&a.expr, direct),
-                Expr::Print(p, ..) => walk(p, direct),
-                Expr::Range(r) => walk(&r.start, direct) || walk(&r.end, direct),
-                Expr::New(n) => n.args.iter().any(|a| walk(&a.expr, direct)),
-                Expr::ObjectLiteral(o) => o.fields.iter().any(|f| walk(&f.value, direct)),
-                Expr::ArrayLiteral(elements, _) => elements.iter().any(|e| walk(e, direct)),
-                Expr::Match(m) => {
-                    walk(&m.scrutinee, direct)
-                        || m.arms.iter().any(|arm| match &arm.body {
-                            MatchBody::Expr(e) => walk(e, direct),
-                            MatchBody::Block(_) => false,
-                        })
-                }
-                Expr::Select(sel) => sel.cases.iter().any(|case| match &case.kind {
-                    SelectCaseKind::Recv { channel, .. } => walk(channel, direct),
-                    SelectCaseKind::Send { channel, value } => {
-                        walk(channel, direct) || walk(value, direct)
-                    }
-                    SelectCaseKind::Timeout { millis } => walk(millis, direct),
-                    SelectCaseKind::Join { task, .. } => walk(task, direct),
-                    SelectCaseKind::Default => false,
-                }),
-                _ => false,
-            }
-        }
-        walk(expr, &direct)
     }
 }
 

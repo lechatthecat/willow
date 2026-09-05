@@ -15,12 +15,10 @@
 //! instead would mangle `Helper__f` and prepend a null receiver the callee does
 //! not take.
 //!
-//! Every test is differential: the same project under the AST emitter and under
-//! the walker must print the same thing. `WILLOW_LIR_REQUIRE=1` cannot police a
-//! multi-file build — module functions are never registered as lowered IR at
-//! all, so the requirement fails on the module before the entry program is
-//! reached — so coverage is asserted from `WILLOW_LIR_LOG=1` instead, which
-//! names each function the walker really compiled.
+//! Coverage is asserted from `WILLOW_LIR_LOG=1`, which names each function the
+//! walker really compiled: the build succeeding says only that nothing in the
+//! project is outside the subset, while the log says which symbol the call
+//! actually resolved to.
 //!
 //! 26 perspectives:
 //!   1 an i64 module call             14 a returned module object's field
@@ -39,30 +37,28 @@
 //!
 //! Plus two more: a `&mut` argument crosses the module edge as a pointer to the
 //! caller's place (willow-0g8j.2.17); and an unrecovered panic raised inside the
-//! module must report the same thing whichever emitter compiled the caller.
+//! module must name the module frame and the caller frame under it.
 
 use super::support::{
     compile_temp_project_with_env_and_run, compile_temp_project_with_env_run_stderr,
     compile_temp_project_with_env_stderr,
 };
 
-const AST: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const LIR: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "1")];
-const LIR_LOG: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_LOG", "1")];
-const LIR_STRESS: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_GC_STRESS", "alloc")];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const LIR_LOG: [(&str, &str); 1] = [("WILLOW_LIR_LOG", "1")];
+const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 
-/// Run a project under both emitters and require identical output.
-fn assert_same_output(files: &[(&str, &str)], expected: &str) {
-    for env in [&AST[..], &LIR[..]] {
-        let (out, ok) = compile_temp_project_with_env_and_run(files, "main.wi", env);
-        assert!(ok, "project failed under {env:?}: {out}");
-        assert_eq!(out, expected, "wrong output under {env:?}");
-    }
+/// Build a project and require it to print `expected`.
+fn assert_project_output(files: &[(&str, &str)], expected: &str) {
+    let (out, ok) = compile_temp_project_with_env_and_run(files, "main.wi", &PLAIN);
+    assert!(ok, "project failed: {out}");
+    assert_eq!(out, expected, "wrong output");
 }
 
 /// Compile once with the selection log on and require the walker to have taken
-/// each named function. Without this a coverage regression would still print the
-/// right answer — from the AST emitter.
+/// each named function. Without this a coverage regression could leave a
+/// function unlowered while the program still printed the right answer.
 fn assert_walker_compiled(files: &[(&str, &str)], functions: &[&str]) {
     let (ok, stderr) = compile_temp_project_with_env_stderr(files, "main.wi", &LIR_LOG);
     assert!(ok, "compile failed under the walker:\n{stderr}");
@@ -75,11 +71,11 @@ fn assert_walker_compiled(files: &[(&str, &str)], functions: &[&str]) {
     }
 }
 
-/// [`assert_same_output`] plus the coverage check, which is what almost every
-/// perspective wants: the answer agrees AND the walker is the one that produced
-/// the second copy of it.
+/// [`assert_project_output`] plus the coverage check, which is what almost
+/// every perspective wants: the answer is right AND the walker is what
+/// compiled the functions that produced it.
 fn assert_module_call(files: &[(&str, &str)], expected: &str, functions: &[&str]) {
-    assert_same_output(files, expected);
+    assert_project_output(files, expected);
     assert_walker_compiled(files, functions);
 }
 
@@ -532,7 +528,7 @@ async fn main() {
     );
     // `main` is the generated synchronous driver here; the async bodies are
     // logged with the `async` prefix, so only the driver is asserted by name.
-    assert_same_output(&refs(&owned), "7\n");
+    assert_project_output(&refs(&owned), "7\n");
     let (ok, stderr) = compile_temp_project_with_env_stderr(&refs(&owned), "main.wi", &LIR_LOG[..]);
     assert!(ok, "compile failed under the walker:\n{stderr}");
     assert!(
@@ -560,7 +556,7 @@ fn main() {
     );
     let files = refs(&owned);
     assert_module_call(&files, "hi Alice\n", &["main"]);
-    let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", &LIR_STRESS[..]);
+    let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", &STRESS[..]);
     assert!(ok, "project failed under GC stress: {out}");
     assert_eq!(out, "hi Alice\n", "wrong output under GC stress");
 }
@@ -712,7 +708,7 @@ fn main() {
 }
 
 #[test]
-fn module_call_28_an_unrecovered_panic_reports_the_same_under_both_emitters() {
+fn module_call_28_an_unrecovered_panic_names_the_module_call() {
     let files = [
         (
             "checks.wi",
@@ -736,31 +732,27 @@ fn main() {
 "#,
         ),
     ];
-    // A debug panic report must not depend on which emitter compiled the
-    // caller. Both paths now push a call-stack frame naming the module call as
-    // the source spells it (willow-0g8j.2.20); the frames themselves are
-    // covered in `module_call_frames.rs`, and what this asserts is that the two
-    // emitters produce one report.
-    let mut reports = Vec::new();
-    for env in [&AST[..], &LIR[..]] {
-        let (ok, stderr) = compile_temp_project_with_env_run_stderr(&files, "main.wi", env);
-        assert!(ok, "compile failed under {env:?}:\n{stderr}");
-        assert!(
-            stderr.contains("runtime panic: negative input"),
-            "no panic report under {env:?}:\n{stderr}"
-        );
-        reports.push(stderr);
-    }
-    assert_eq!(
-        without_directories(&reports[0]),
-        without_directories(&reports[1]),
-        "the two emitters reported the same panic differently"
+    // A module call pushes a call-stack frame naming the call as the source
+    // spells it (willow-0g8j.2.20), and the panic itself is reported at the
+    // callee's `panic` — in the module's OWN file, not the caller's. The frame
+    // shapes are covered exhaustively in `module_call_frames.rs`; what this
+    // asserts is that an unrecovered panic out of a module call names both.
+    let (ok, stderr) = compile_temp_project_with_env_run_stderr(&files, "main.wi", &PLAIN);
+    assert!(ok, "compile failed:\n{stderr}");
+    let report = without_directories(&stderr);
+    assert!(
+        report.contains("runtime panic: negative input at checks.wi:4:9"),
+        "wrong panic site:\n{stderr}"
+    );
+    assert!(
+        report.contains("0: checks::checked at main.wi:5:13"),
+        "the module call is not the frame:\n{stderr}"
     );
 }
 
-/// Each build gets its own temporary project directory, so the two reports are
-/// compared with every path reduced to its file name. Both separators are cut,
-/// so the comparison is the same on Windows as on macOS and Linux.
+/// The project lives in a temporary directory, so the report is read with every
+/// path reduced to its file name. Both separators are cut, so the assertion
+/// reads the same on Windows as on macOS and Linux.
 fn without_directories(report: &str) -> String {
     report
         .split_whitespace()

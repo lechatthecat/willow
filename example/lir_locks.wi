@@ -28,9 +28,9 @@
 // critical section at all — which is why they are callable from a synchronous
 // function and a `lock` is not (E2603).
 //
-// Every function declared here is compiled by the walker. Run under
-// `WILLOW_LIR_LOG=1` to watch each one being claimed, or under
-// `WILLOW_LIR_REQUIRE=1` to make a fallback a hard error.
+// Every function declared here is compiled by the walker — since
+// willow-0g8j.3 there is nothing else to compile it. Run under
+// `WILLOW_LIR_LOG=1` to watch each one being claimed.
 
 class Ledger {
     pub total: Mutex<i64>;

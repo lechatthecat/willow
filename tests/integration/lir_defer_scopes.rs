@@ -18,12 +18,10 @@
 //! once the body is finished, since an inner scope's cleanup jumps to its
 //! parent's and block order can finish the inner one last.
 //!
-//! Every test is differential: the same program under the AST emitter and under
-//! the walker must print the same thing. The walker side sets
-//! `WILLOW_LIR_REQUIRE=1`, so a silent fallback fails the test instead of
-//! quietly comparing the AST emitter against itself, and each program also runs
-//! under `WILLOW_GC_STRESS=alloc`, because a defer body allocates while the
-//! value being returned past it is still live.
+//! Since willow-0g8j.3 a body outside the walker's subset is a compile error,
+//! so a run that prints the right answer is proof the walker produced it. Each
+//! program also runs under `WILLOW_GC_STRESS=alloc`, because a defer body
+//! allocates while the value being returned past it is still live.
 //!
 //! 24 perspectives:
 //!   1 `return` in the scope's own block     13 a defer per if/else arm
@@ -41,13 +39,9 @@
 
 use super::support::{compile_and_run_with_env, compile_with_compiler_env};
 
-const AST: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const LIR: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_STRESS: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_GC_STRESS", "alloc"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 
 /// A `Result`-returning helper, so `?` has something to propagate.
 const PARSE: &str = "fn parse(n: i64) -> Result<i64, String> {
@@ -56,11 +50,10 @@ const PARSE: &str = "fn parse(n: i64) -> Result<i64, String> {
 }
 ";
 
-/// Run `source` under all three configurations and require identical output.
-/// `WILLOW_LIR_REQUIRE=1` on two of them turns a fallback into a compile error,
-/// which is what makes this a comparison of two emitters rather than one.
+/// Run `source` plainly and under GC stress, and require identical output:
+/// collecting at every allocation site must not change what a defer observes.
 fn assert_defers(source: &str, expected: &str) {
-    for env in [&AST[..], &LIR[..], &LIR_STRESS[..]] {
+    for env in [&PLAIN[..], &STRESS[..]] {
         let (out, ok) = compile_and_run_with_env(source, env);
         assert!(ok, "program failed under {env:?}: {out}");
         assert_eq!(out, expected, "wrong output under {env:?}");
@@ -68,17 +61,10 @@ fn assert_defers(source: &str, expected: &str) {
 }
 
 /// Compile once with the selection log on and require the walker to have taken
-/// each named function. Without this a coverage regression would still print the
-/// right answer — from the AST emitter.
+/// each named function. Without this a coverage regression could leave a
+/// function unlowered while the program still printed the right answer.
 fn assert_walker_compiled(source: &str, functions: &[&str]) {
-    let (ok, stderr) = compile_with_compiler_env(
-        source,
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_LIR_LOG", "1"),
-        ],
-    );
+    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_LIR_LOG", "1")]);
     assert!(ok, "logged LIR compile failed: {stderr}");
     for function in functions {
         let sync = format!("[lir] compiling `{function}` from lowered IR");
@@ -272,7 +258,7 @@ fn main() {
 //     rewrites the emitter's variable table. Whatever follows the flush — here
 //     the `return` of a value bound AFTER the registration — still needs its
 //     own bindings, so the table is restored. Without that this crashed the
-//     compiler with an unbound variable, on BOTH emitters.
+//     compiler with an unbound variable.
 #[test]
 fn lir_defer_scopes_10_a_binding_made_after_registration_still_returns() {
     assert_defers(
@@ -439,7 +425,7 @@ fn lir_defer_scopes_18_a_panic_still_runs_no_defers() {
 }
 fn main() { println(boom(1)); println(boom(0)); println(\"after\"); }
 ";
-    for env in [&AST[..], &LIR[..], &LIR_STRESS[..]] {
+    for env in [&PLAIN[..], &STRESS[..]] {
         let (out, ok) = compile_and_run_with_env(source, env);
         assert!(!ok, "a panicking program must not succeed under {env:?}");
         assert!(
@@ -478,9 +464,7 @@ fn main() { println(outer(1)); }
     );
 }
 
-// 20. Coverage, not behavior. Every function above would print the same thing
-//     from the AST emitter, so the suite is only meaningful while the walker is
-//     the one compiling them.
+// 20. The selection log explicitly records each lowered defer function.
 #[test]
 fn lir_defer_scopes_20_the_walker_really_compiled_these() {
     assert_walker_compiled(

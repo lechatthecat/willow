@@ -21,7 +21,7 @@ use super::support::*;
 //  16-18  GC stress: allocating payload, minor collection, heap field
 //  19     an already-boxed interface is not boxed a second time
 //  20     None remains the no-payload control
-//  21     AST/LIR-selection differential
+//  21     contextual payload coercion through lowered IR
 //  22-24  reject Option/class and unrelated generic covariance
 //  25-27  explicit constructor, Array.push, and interface-call argument context
 
@@ -349,19 +349,16 @@ fn option_iface_20_none_control_has_no_payload() {
 }
 
 #[test]
-fn option_iface_21_ast_and_lir_selection_agree() {
+fn option_iface_21_an_option_interface_crosses_a_call_boundary() {
     let source = source(
         r#"
 fn make() -> Option<Greeter> { return Some(new Dog("parity")); }
 fn main() { println(read(make())); }
 "#,
     );
-    let (ast, ast_ok) = compile_and_run_with_env(&source, &[("WILLOW_LIR_BACKEND", "0")]);
-    let (lir, lir_ok) = compile_and_run_with_env(&source, &[("WILLOW_LIR_BACKEND", "1")]);
-    assert!(ast_ok, "AST: {ast}");
-    assert!(lir_ok, "LIR selection: {lir}");
-    assert_eq!(ast, lir);
-    assert_eq!(ast, "dog:parity\n");
+    let (out, ok) = compile_and_run_with_env(&source, &[]);
+    assert!(ok, "run failed: {out}");
+    assert_eq!(out, "dog:parity\n");
 }
 
 #[test]

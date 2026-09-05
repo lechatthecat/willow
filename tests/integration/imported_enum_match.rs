@@ -19,19 +19,15 @@
 //! the lowering seeds from it BEFORE this unit's own items, so a locally
 //! declared enum of the same bare name still shadows.
 //!
-//! No wrong answers here — the fallback computed the same values — so these
-//! perspectives assert `WILLOW_LIR_REQUIRE=1` builds and `WILLOW_LIR_LOG=1`
-//! lines, with the two emitters agreeing on the values throughout.
+//! No wrong answers here — the AST fallback of the day computed the same values
+//! — so what these perspectives pin down is that the body lowers at all: they
+//! assert on the build and on `WILLOW_LIR_LOG=1` lines as well as the values.
 
 use super::support::*;
 
-const LIR_ON: &[(&str, &str)] = &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_OFF: &[(&str, &str)] = &[("WILLOW_LIR_BACKEND", "0")];
-const LIR_LOG: &[(&str, &str)] = &[
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_LIR_LOG", "1"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const LIR_LOG: &[(&str, &str)] = &[("WILLOW_LIR_LOG", "1")];
 const ALLOC_STRESS: &[(&str, &str)] = &[("WILLOW_GC_STRESS", "alloc")];
 const MINOR_STRESS: &[(&str, &str)] = &[("WILLOW_GC_STRESS", "minor")];
 
@@ -112,19 +108,17 @@ fn borrowed<'a>(files: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a s
     files.iter().map(|(n, s)| (*n, s.as_str())).collect()
 }
 
-/// Both emitters must agree on the value, and the LIR one must not fall back.
+/// The project builds and prints `expected`. Since willow-0g8j.3 every body is
+/// compiled from lowered IR, so a match the walker cannot take is a compile
+/// error here rather than a second emitter's answer.
 #[track_caller]
-fn assert_both_backends(entry: &str, expected: &str) {
+fn assert_project_output(entry: &str, expected: &str) {
     let files = project(entry);
     let files = borrowed(&files);
 
-    let (lir, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", LIR_ON);
-    assert!(ok, "LIR build failed: {lir}");
-    assert_eq!(lir, expected, "lowered-IR output mismatch");
-
-    let (ast, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", LIR_OFF);
-    assert!(ok, "AST build failed: {ast}");
-    assert_eq!(ast, expected, "AST output mismatch");
+    let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", &PLAIN[..]);
+    assert!(ok, "build failed: {out}");
+    assert_eq!(out, expected, "wrong output");
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +128,7 @@ fn assert_both_backends(entry: &str, expected: &str) {
 // 1. The module-qualified name, on a fieldless variant.
 #[test]
 fn p1_a_module_qualified_fieldless_variant_matches() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 import palette;
 
@@ -158,7 +152,7 @@ fn main() {
 // 2. The same, on a variant that carries a payload the arm binds.
 #[test]
 fn p2_a_module_qualified_payload_variant_binds_its_payload() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 import palette;
 
@@ -211,7 +205,7 @@ fn main() {
 //    module's dotted path.
 #[test]
 fn p4_a_direct_type_import_matches_under_the_bare_name() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 import palette::shades::Shade;
 
@@ -234,7 +228,7 @@ fn main() {
 // 5. An aliased type import matches under the ALIAS.
 #[test]
 fn p5_an_aliased_type_import_matches_under_its_alias() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 import palette::Color as Hue;
 
@@ -284,7 +278,7 @@ fn main() {
     println(hue_code(Hue::Red));
 }
 "#;
-    assert_both_backends(entry, "1\n100\n");
+    assert_project_output(entry, "1\n100\n");
 
     let files = project(entry);
     let (ok, log) = compile_temp_project_with_env_stderr(&borrowed(&files), "main.wi", LIR_LOG);
@@ -300,7 +294,7 @@ fn main() {
 // 7. A GC-managed payload: the arm binds a `String` out of the imported enum.
 #[test]
 fn p7_a_string_payload_survives_the_match() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 import palette;
 
@@ -328,7 +322,7 @@ fn main() {
 //    broken, since a unit always knew its own items.
 #[test]
 fn p8_a_module_matching_its_own_enum_still_works() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 import theme;
 
@@ -354,7 +348,7 @@ fn main() {
     println(theme::palette_rank(palette::Color::Custom(5)));
 }
 "#;
-    assert_both_backends(entry, "10\n5\n");
+    assert_project_output(entry, "10\n5\n");
 
     let files = project(entry);
     let (ok, log) = compile_temp_project_with_env_stderr(&borrowed(&files), "main.wi", LIR_LOG);
@@ -368,7 +362,7 @@ fn main() {
 // 10. In a class method.
 #[test]
 fn p10_a_class_method_matches_an_imported_enum() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 import palette;
 
@@ -398,7 +392,7 @@ fn main() {
 //     path rather than the straight-line one.
 #[test]
 fn p11_an_async_function_matches_an_imported_enum() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 import palette;
 
@@ -426,7 +420,7 @@ async fn main() {
 // 12. A wildcard arm.
 #[test]
 fn p12_a_wildcard_arm_covers_the_rest() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 import palette;
 
@@ -450,7 +444,7 @@ fn main() {
 //     the imported enum, not as a variant of it.
 #[test]
 fn p13_a_binding_arm_binds_the_whole_scrutinee() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 import palette;
 
@@ -481,7 +475,7 @@ fn main() {
 // 14. Two imported enums nested, from two different files.
 #[test]
 fn p14_two_imported_enums_nest() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 import palette;
 import palette::shades::Shade;
@@ -509,7 +503,7 @@ fn main() {
 // 15. Block-bodied arms, which lower as statements rather than as a value.
 #[test]
 fn p15_block_bodied_arms_lower() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 import palette;
 
@@ -539,7 +533,7 @@ fn main() {
 // 16. The match as a value bound by `let`, not as the operand of `return`.
 #[test]
 fn p16_the_match_can_be_a_let_initializer() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 import palette;
 
@@ -569,7 +563,7 @@ fn main() {
 //     is still reachable under its qualified spelling in the same file.
 #[test]
 fn p17_a_local_enum_shadows_the_bare_name() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 import palette;
 
@@ -606,7 +600,7 @@ fn main() {
 //     `Color` and `palette`'s are matched in the same build.
 #[test]
 fn p18_two_modules_may_share_a_bare_enum_name() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 import palette;
 import theme;
@@ -624,7 +618,7 @@ fn main() {
 //     table, so `Option` had better survive it.
 #[test]
 fn p19_a_prelude_option_still_matches() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 import palette;
 
@@ -648,7 +642,7 @@ fn main() {
 // 20. So does the prelude's `Result`, whose variants carry payloads.
 #[test]
 fn p20_a_prelude_result_still_matches() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 import palette;
 
@@ -720,8 +714,11 @@ fn main() {
 }
 "#,
     );
-    let (out, ok) = compile_temp_project_with_env_and_run(&borrowed(&files), "main.wi", LIR_ON);
-    assert!(ok, "no body in this project may fall back: {out}");
+    let (out, ok) = compile_temp_project_with_env_and_run(&borrowed(&files), "main.wi", &PLAIN[..]);
+    assert!(
+        ok,
+        "every body in this project must compile from LIR: {out}"
+    );
     assert_eq!(out, "42\n200\n8\n10\n");
 }
 
@@ -749,7 +746,7 @@ fn main() {
     let (out, ok) = compile_temp_project_with_env_and_run_under(
         &borrowed(&files),
         "main.wi",
-        LIR_ON,
+        &PLAIN[..],
         ALLOC_STRESS,
     );
     assert!(ok, "alloc-stress run failed: {out}");
@@ -779,7 +776,7 @@ fn main() {
     let (out, ok) = compile_temp_project_with_env_and_run_under(
         &borrowed(&files),
         "main.wi",
-        LIR_ON,
+        &PLAIN[..],
         MINOR_STRESS,
     );
     assert!(ok, "minor-stress run failed: {out}");
@@ -858,7 +855,7 @@ fn p25_the_imported_enum_match_example_runs() {
 // 26. ... and every body in it is lowered, which is what this change buys.
 #[test]
 fn p26_the_imported_enum_match_example_is_fully_lowered() {
-    let (out, ok) = compile_temp_project_with_env_and_run(EXAMPLE, "main.wi", LIR_ON);
-    assert!(ok, "no body in the example may fall back: {out}");
+    let (out, ok) = compile_temp_project_with_env_and_run(EXAMPLE, "main.wi", &PLAIN[..]);
+    assert!(ok, "every body in the example must compile from LIR: {out}");
     assert_eq!(out, EXAMPLE_OUTPUT);
 }

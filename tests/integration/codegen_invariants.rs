@@ -716,11 +716,10 @@ fn main() {
     );
 }
 
-/// Perspective 32: construction forced through the LIR generator with
-/// `WILLOW_LIR_REQUIRE=1`, which turns any fallback to the AST emitter into a
-/// hard error. This is the emitter that used to stamp type id 0.
-/// (The object-literal form of the same bug is now unreachable from source at
-/// all: named-field construction is rejected with E0847.)
+/// Perspective 32: construction through the LIR generator, which is the emitter
+/// that used to stamp type id 0. (The object-literal form of the same bug is
+/// now unreachable from source at all: named-field construction is rejected
+/// with E0847.)
 #[test]
 fn lir_path_constructs_objects_without_tripping_an_invariant() {
     let (out, ok) = super::support::compile_with_env_and_run(
@@ -752,9 +751,9 @@ fn main() {
     println(ci.area());
 }
 "#,
-        &[("WILLOW_LIR_REQUIRE", "1")],
+        &[],
     );
-    assert!(ok, "LIR-required program failed to run: {out}");
+    assert!(ok, "the program failed to run: {out}");
     assert!(
         !out.contains("compiler invariant violated"),
         "valid program tripped an invariant panic: {out}"
@@ -762,16 +761,12 @@ fn main() {
     assert_eq!(out.trim(), "16\n12");
 }
 
-/// Perspective 33: the type ids the LIR emitter stamps are the ones the
-/// downcast lowering reads back. A downcast is not in the LIR walker's subset,
-/// so `which` compiles through the AST emitter while `main` constructs through
-/// LIR — which is exactly the mixed configuration the old `unwrap_or(0)` broke:
-/// an id of 0 would make both arms miss and print -1 twice.
-///
-/// The AST-only build (`WILLOW_LIR_BACKEND=0`) must produce the same answers,
-/// since the two emitters are supposed to be interchangeable.
+/// Perspective 33: the type ids the emitter stamps at construction are the ones
+/// the downcast lowering reads back. `main` builds the objects and `which`
+/// matches on them, so an id of 0 — what the old `unwrap_or(0)` produced —
+/// makes both arms miss and prints -1 twice.
 #[test]
-fn ast_and_lir_paths_agree_on_type_ids() {
+fn constructed_type_ids_are_the_ones_a_downcast_reads_back() {
     let source = r#"
 interface Shape {
     fn area(self) -> i64;
@@ -807,15 +802,7 @@ fn main() {
 }
 "#;
 
-    let (mixed_out, mixed_ok) = compile_and_run(source);
-    assert!(mixed_ok, "default-build program failed to run: {mixed_out}");
-    assert_eq!(mixed_out.trim(), "4\n200");
-
-    let (ast_out, ast_ok) =
-        super::support::compile_with_env_and_run(source, &[("WILLOW_LIR_BACKEND", "0")]);
-    assert!(ast_ok, "AST-only program failed to run: {ast_out}");
-    assert_eq!(
-        mixed_out, ast_out,
-        "LIR and AST emitters disagree on downcast results"
-    );
+    let (out, ok) = compile_and_run(source);
+    assert!(ok, "program failed to run: {out}");
+    assert_eq!(out.trim(), "4\n200");
 }

@@ -4,11 +4,10 @@
 // how to vet a method body, lowering already produced one under `Class::method`,
 // and the emitter already knew how to emit it -- but the compile path for a
 // method went straight to the AST emitter and never asked. So a program could
-// be 90% methods and `WILLOW_LIR_REQUIRE=1` would still pass, having checked
-// almost nothing.
+// be 90% methods and every bit of walker coverage would miss all of it.
 //
-// Everything below is a method body, and each one is a way the two emitters
-// could disagree about what a method IS:
+// Everything below is a method body, and each one is a way a compile path can
+// be wrong about what a method IS:
 //
 //   * THE RECEIVER. `self` is parameter 0 of the lowered function and the
 //     first argument of the method ABI. An emitter that numbered the lowered
@@ -28,10 +27,9 @@
 //     self-calls and `await` do not become different constructs because they
 //     are inside a method, and this file exercises each of them there.
 //
-// Built with WILLOW_LIR_BACKEND=0 this must print exactly the same thing, and
-// built with WILLOW_LIR_REQUIRE=1 it must compile -- the proof that every body
-// here took the walker path rather than falling back to the emitter it is
-// being compared against.
+// Since willow-0g8j.3 a body outside the walker's subset is a compile error, so
+// this file compiling at all is the proof that every body here took the walker
+// path.
 
 import std::collections::Array;
 

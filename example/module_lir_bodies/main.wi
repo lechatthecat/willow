@@ -18,8 +18,8 @@
 // (willow-9yhi): a module never got a lambda-lifting pass, so any lambda in a
 // module body used to ICE the compiler.
 //
-// Build it with fallback made fatal — the whole project, module included:
-//   WILLOW_LIR_REQUIRE=1 willowc build example/module_lir_bodies/main.wi -o /tmp/a
+// Build it with the selection log — the whole project, module included:
+//   WILLOW_LIR_LOG=1 willowc build example/module_lir_bodies/main.wi -o /tmp/a
 import shapes;
 
 fn main() {

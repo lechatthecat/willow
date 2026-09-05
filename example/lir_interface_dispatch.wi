@@ -17,12 +17,12 @@
 //   * a DEFAULT method body is a slot like any other — the implementing class
 //     may leave it alone and still answer the call.
 //
-// Building this program with WILLOW_LIR_BACKEND=0 must print exactly the same
-// thing, including under WILLOW_GC_STRESS=alloc: the receiver object is only
-// reachable through the box while the arguments are evaluated, so the walker
-// has to root it exactly as the AST emitter does. Building it with
-// WILLOW_LIR_REQUIRE=1 must succeed, which is the proof that every free
-// function below really took the walker path.
+// Building this program must print the same thing under WILLOW_GC_STRESS=alloc
+// as without it: the receiver object is only reachable through the box while
+// the arguments are evaluated, so the walker has to root it across them. Since
+// willow-0g8j.3 a body outside the walker's subset is a compile error, so this
+// file compiling at all is the proof that every free function below took the
+// walker path.
 
 import std::collections::Array;
 

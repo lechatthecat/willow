@@ -2,7 +2,7 @@
 //! IR (willow-nswv).
 //!
 //! `import std::fs as files;` makes `files::exists(..)` the same call as
-//! `fs::exists(..)`. The AST emitter never sees the alias: a normalization pass
+//! `fs::exists(..)`. The former AST emitter never saw the alias: a normalization pass
 //! rewrites the whole program before codegen, so it dispatches on canonical
 //! names only. The walker lowers to HIR from the RAW frontend program and so
 //! still sees whatever name the `import` spelled, and its namespace table is
@@ -15,10 +15,8 @@
 //! user module of the same name win — the order the normalization pass and the
 //! AST dispatch apply between them, so both paths admit the same set of calls.
 //!
-//! Every test is differential: the same program under the AST emitter and under
-//! the walker must print the same thing. The walker side sets
-//! `WILLOW_LIR_REQUIRE=1`, so a fallback fails the test rather than quietly
-//! comparing the AST emitter against itself.
+//! Since willow-0g8j.3 a body outside the walker's subset is a compile error,
+//! so a run that prints the right answer is proof the walker produced it.
 //!
 //! Nothing asserts on a host string. Paths come from `fs::temp_path`, which is
 //! process-unique, the listener binds port 0, and the program name and any OS
@@ -43,46 +41,33 @@ use super::support::{
     compile_and_run_with_env, compile_temp_project_with_env_and_run, compile_with_compiler_env,
 };
 
-const AST: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const LIR: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_STRESS: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_GC_STRESS", "alloc"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 
-/// Run `source` under both emitters and require identical output.
-/// `WILLOW_LIR_REQUIRE=1` on the second turns a fallback into a compile error,
-/// which is what makes this a comparison of two emitters rather than one.
+/// Run `source` plainly and under GC stress, and require identical output:
+/// collecting at every allocation site must not change what an aliased call
+/// returns.
 fn assert_aliased(source: &str, expected: &str) {
-    for env in [&AST[..], &LIR[..]] {
-        let (out, ok) = compile_and_run_with_env(source, env);
-        assert!(ok, "program failed under {env:?}: {out}");
-        assert_eq!(out, expected, "wrong output under {env:?}");
-    }
+    let (out, ok) = compile_and_run_with_env(source, &PLAIN);
+    assert!(ok, "program failed: {out}");
+    assert_eq!(out, expected, "wrong output");
 }
 
 /// [`assert_aliased`] plus a third run that collects on every allocation, for
 /// the programs that keep a heap string live across another namespace call.
 fn assert_aliased_under_stress(source: &str, expected: &str) {
     assert_aliased(source, expected);
-    let (out, ok) = compile_and_run_with_env(source, &LIR_STRESS);
+    let (out, ok) = compile_and_run_with_env(source, &STRESS);
     assert!(ok, "program failed under GC stress: {out}");
     assert_eq!(out, expected, "wrong output under GC stress");
 }
 
 /// Compile once with the selection log on and require the walker to have taken
-/// each named function. Without this a coverage regression would still print the
-/// right answer — from the AST emitter.
+/// each named function. Without this a coverage regression could leave a
+/// function unlowered while the program still printed the right answer.
 fn assert_walker_compiled(source: &str, functions: &[&str]) {
-    let (ok, stderr) = compile_with_compiler_env(
-        source,
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_LIR_LOG", "1"),
-        ],
-    );
+    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_LIR_LOG", "1")]);
     assert!(ok, "logged LIR compile failed: {stderr}");
     for function in functions {
         let sync = format!("[lir] compiling `{function}` from lowered IR");
@@ -614,9 +599,7 @@ fn main() {
     );
 }
 
-/// 22. Coverage, not output: every function above would still print the right
-///     answer from the AST emitter, so the selection log is what proves the
-///     walker is the path that ran.
+/// 22. The selection log explicitly records each lowered aliased call.
 #[test]
 fn alias_22_the_walker_really_compiled_the_aliased_calls() {
     assert_walker_compiled(
@@ -669,9 +652,8 @@ async fn main() {
 ///     registered under the canonical name still wins over the builtin, and an
 ///     alias of the std module reaches the std one from the same file.
 ///
-///     `WILLOW_LIR_REQUIRE=1` cannot be used here — a module's own functions
-///     have no lowered IR at all, so the entry's `main` is not the only thing
-///     the flag would police. The two emitters still have to agree.
+///     What the build proves is only that nothing here is outside the subset;
+///     which module each call reached is what the printed values say.
 #[test]
 fn alias_23_a_user_module_of_the_same_name_still_wins() {
     let files = [
@@ -697,23 +679,16 @@ fn main() {
 "#,
         ),
     ];
-    let (ast, ok) = compile_temp_project_with_env_and_run(&files, "src/main.wi", &AST);
-    assert!(ok, "AST build failed: {ast}");
-    assert_eq!(ast, "true\nfalse\nfalse\n");
-    let (lir, ok) = compile_temp_project_with_env_and_run(
-        &files,
-        "src/main.wi",
-        &[("WILLOW_LIR_BACKEND", "1")],
-    );
-    assert!(ok, "LIR build failed: {lir}");
-    assert_eq!(
-        lir, ast,
-        "the two emitters disagree about a shadowed builtin"
-    );
+    let (out, ok) = compile_temp_project_with_env_and_run(&files, "src/main.wi", &PLAIN);
+    assert!(ok, "build failed: {out}");
+    // Line 1 is the user module answering `true`; lines 2 and 3 are the user
+    // module and the std module answering `false` about a file that is not
+    // there — so `fs::` reached the user's and `files::` reached std's.
+    assert_eq!(out, "true\nfalse\nfalse\n");
 }
 
 /// 24. The shipped example, which mixes all four namespaces and both spellings,
-///     compiles end to end with no function left on the AST emitter.
+///     compiles end to end with every function claimed by the walker.
 #[test]
 fn alias_24_the_example_is_fully_lir() {
     let source = std::fs::read_to_string("example/lir_namespace_aliases.wi")

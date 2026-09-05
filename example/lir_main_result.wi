@@ -11,14 +11,11 @@
 //   <expr>?  where expr is Err  -> report the payload, exit non-zero
 //
 // The LIR walker used to accept `main` only in its `void` forms, so this whole
-// shape fell back to the AST emitter. It now emits the same three exits, which
-// means the entire program below -- helpers and entry point -- is walker
-// compiled. Prove it:
+// shape fell back to the AST emitter. It now emits all three exits itself,
+// which means the entire program below -- helpers and entry point -- is walker
+// compiled. Watch it happen:
 //
-//   WILLOW_LIR_REQUIRE=1 WILLOW_LIR_LOG=1 willowc run example/lir_main_result.wi
-//
-// `WILLOW_LIR_REQUIRE=1` turns any fallback into a hard error, so the run only
-// succeeds if nothing here reached the AST emitter.
+//   WILLOW_LIR_LOG=1 willowc run example/lir_main_result.wi
 //
 // The program takes the success path so its output is deterministic; the two
 // failure exits are exercised by `tests/integration/lir_main_result.rs`.

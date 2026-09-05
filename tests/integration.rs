@@ -29,6 +29,8 @@ mod codegen;
 mod codegen_invariants;
 #[path = "integration/defer_panic_termination.rs"]
 mod defer_panic_termination;
+#[path = "integration/enum_identity_aliases.rs"]
+mod enum_identity_aliases;
 #[path = "integration/gc_enum_payload_roots.rs"]
 mod gc_enum_payload_roots;
 #[path = "integration/imported_enum_match.rs"]
@@ -65,6 +67,8 @@ mod lir_module_calls;
 mod lir_namespace_aliases;
 #[path = "integration/lir_self_statics.rs"]
 mod lir_self_statics;
+#[path = "integration/lir_stage5_cutover.rs"]
+mod lir_stage5_cutover;
 #[path = "integration/lir_static_property_bodies.rs"]
 mod lir_static_property_bodies;
 

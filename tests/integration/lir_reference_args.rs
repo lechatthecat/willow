@@ -4,8 +4,7 @@
 //! debug builds, because a debug build also emits the reference-call hook that
 //! lets a panic inside the callee name the place the caller handed it, and only
 //! the AST emitter knew how to write that record. The walker now emits it, from
-//! the lowered node, at every call site the AST path emits it from and at none
-//! of the ones it skips.
+//! the lowered node, at each reference-argument call site.
 //!
 //! Every string the hook passes has to be byte-identical to the AST spelling.
 //! The literals are declared once, from the AST, before any function is
@@ -15,18 +14,16 @@
 //! rather than merely checking that a report exists.
 //!
 //! Putting `&x` into the walker's subset also made a long-standing storage bug
-//! reachable from two emitters instead of one. A local whose address is taken
-//! used to be promoted from an SSA variable to a stack slot AT THE `&`, which
-//! put the promoting store wherever that use sat in the control-flow graph: it
-//! re-ran on every iteration of an enclosing loop (losing the callee's writes)
-//! and never ran at all on a branch that took no address (reading uninitialised
-//! bytes). Address-taken locals are now stack-backed from their declaration in
-//! both emitters. Perspectives 16, 17, 22, 24, 26, 27 and 28 are that fix.
+//! reachable. A local whose address is taken used to be promoted from an SSA
+//! variable to a stack slot AT THE `&`, which put the promoting store wherever
+//! that use sat in the control-flow graph: it re-ran on every iteration of an
+//! enclosing loop (losing the callee's writes) and never ran at all on a branch
+//! that took no address (reading uninitialised bytes). Address-taken locals are
+//! now stack-backed from their declaration. Perspectives 16, 17, 22, 24, 26, 27
+//! and 28 are that fix.
 //!
-//! Every test is differential: the same source under the AST emitter and under
-//! the walker must print the same thing, and `WILLOW_LIR_REQUIRE=1` turns any
-//! fallback into a compile error so a coverage regression cannot pass by
-//! comparing the AST path against itself.
+//! Since willow-0g8j.3 a body outside the walker's subset is a compile error,
+//! so a run that prints the right answer is proof the walker produced it.
 //!
 //! An indirect call had the same half-record for longer still: interface
 //! dispatch wrote the reference-call context and never cleared it, on BOTH
@@ -56,24 +53,15 @@
 
 use super::support::{compile_and_run_with_env, compile_with_compiler_env};
 
-const AST: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const LIR: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_STRESS: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_GC_STRESS", "alloc"),
-];
-const LIR_LOG: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_LIR_LOG", "1"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
+const LIR_LOG: [(&str, &str); 1] = [("WILLOW_LIR_LOG", "1")];
 
 /// `expected` must come out of all three configurations, and `functions` must
-/// each be named in the walker's selection log — otherwise the second copy of
-/// the right answer came from the AST emitter too.
+/// each be named in the walker's selection log.
 fn assert_reference_args(source: &str, expected: &str, functions: &[&str]) {
-    for env in [&AST[..], &LIR[..], &LIR_STRESS[..]] {
+    for env in [&PLAIN[..], &STRESS[..]] {
         let (out, ok) = compile_and_run_with_env(source, env);
         assert!(ok, "run failed under {env:?}: {out}");
         assert_eq!(out, expected, "wrong output under {env:?}");
@@ -118,23 +106,17 @@ fn without_source_paths(out: &str) -> String {
         .join("\n")
 }
 
-/// A program that panics: both emitters must produce the same whole report,
-/// and it must contain `expected_parts`.
-fn assert_same_panic(source: &str, expected_parts: &[&str]) {
-    let (ast_out, ast_ok) = compile_and_run_with_env(source, &AST);
-    assert!(!ast_ok, "expected a panic on the AST path: {ast_out}");
-    let (lir_out, lir_ok) = compile_and_run_with_env(source, &LIR);
-    assert!(!lir_ok, "expected a panic on the LIR path: {lir_out}");
-    let ast_report = without_source_paths(&ast_out);
-    let lir_report = without_source_paths(&lir_out);
-    assert_eq!(
-        ast_report, lir_report,
-        "the two emitters reported the panic differently"
-    );
+/// A program that panics: the report must contain `expected_parts`. The
+/// compiled path is normalized first, so a frame is matched by its function,
+/// line and column and not by the temp file it came from.
+fn assert_panic_report(source: &str, expected_parts: &[&str]) {
+    let (out, ok) = compile_and_run_with_env(source, &PLAIN);
+    assert!(!ok, "the program must panic: {out}");
+    let report = without_source_paths(&out);
     for part in expected_parts {
         assert!(
-            lir_report.contains(part),
-            "report is missing `{part}`:\n{lir_report}"
+            report.contains(part),
+            "report is missing `{part}`:\n{report}"
         );
     }
 }
@@ -275,7 +257,7 @@ fn reference_args_09_an_array_element_with_a_variable_index() {
 }
 
 // 10. Two reference parameters in one call: both places must be addressed, and
-//     the debug hook records the LAST one, exactly as the AST path does.
+//     the debug hook records the LAST one.
 #[test]
 fn reference_args_10_two_reference_parameters() {
     assert_reference_args(
@@ -498,7 +480,7 @@ fn reference_args_19_an_immutable_reference_to_a_parameter() {
 //     parameter, its mode and type, the ampersand's position, and the place.
 #[test]
 fn reference_args_20_a_panic_under_the_call_reports_the_reference() {
-    assert_same_panic(
+    assert_panic_report(
         "fn bump(v: &mut i64) {\n\
         \x20   v = v + 1;\n\
         \x20   panic(\"inside\");\n\
@@ -525,8 +507,8 @@ fn reference_args_21_a_panic_after_the_call_reports_no_reference() {
                  \x20   bump(&n);\n\
                  \x20   panic(\"after\");\n\
                   }\n";
-    assert_same_panic(source, &["runtime panic: after"]);
-    let (out, _) = compile_and_run_with_env(source, &LIR);
+    assert_panic_report(source, &["runtime panic: after"]);
+    let (out, _) = compile_and_run_with_env(source, &PLAIN);
     assert!(
         !out.contains("reference call:"),
         "the reference context outlived the call it described:\n{out}"
@@ -691,7 +673,7 @@ fn reference_args_29_the_example_is_fully_lir() {
 //     ampersand's position and the caller's place.
 #[test]
 fn reference_args_30_a_panic_under_interface_dispatch_reports_the_reference() {
-    assert_same_panic(
+    assert_panic_report(
         "interface Scale {\n\
         \x20   fn nudge(self, v: &mut i64);\n\
          }\n\
@@ -715,11 +697,11 @@ fn reference_args_30_a_panic_under_interface_dispatch_reports_the_reference() {
     );
 }
 
-// 31. The half of perspective 30 that neither emitter used to do
-//     (willow-0g8j.11): interface dispatch recorded the reference call and
-//     never cleared it, so a later, unrelated panic in the SAME function was
-//     reported as if it had happened inside the callee, under a place the
-//     callee had already given back. Both emitters clear it now.
+// 31. The half of perspective 30 that nothing used to do (willow-0g8j.11):
+//     interface dispatch recorded the reference call and never cleared it, so a
+//     later, unrelated panic in the SAME function was reported as if it had
+//     happened inside the callee, under a place the callee had already given
+//     back. It is cleared now.
 #[test]
 fn reference_args_31_a_panic_after_interface_dispatch_reports_no_reference() {
     let source = "interface Scale {\n\
@@ -736,14 +718,12 @@ fn reference_args_31_a_panic_after_interface_dispatch_reports_no_reference() {
                  \x20   println(n);\n\
                  \x20   panic(\"after\");\n\
                   }\n";
-    assert_same_panic(source, &["15", "runtime panic: after"]);
-    for env in [&AST[..], &LIR[..]] {
-        let (out, _) = compile_and_run_with_env(source, env);
-        assert!(
-            !out.contains("reference call:"),
-            "the reference context outlived the interface call it described:\n{out}"
-        );
-    }
+    assert_panic_report(source, &["15", "runtime panic: after"]);
+    let (out, _) = compile_and_run_with_env(source, &PLAIN);
+    assert!(
+        !out.contains("reference call:"),
+        "the reference context outlived the interface call it described:\n{out}"
+    );
 }
 
 // 32. The sibling indirect path: a virtual call through a base-class handle
@@ -765,14 +745,12 @@ fn reference_args_32_a_panic_after_virtual_dispatch_reports_no_reference() {
                  \x20   println(n);\n\
                  \x20   panic(\"after\");\n\
                   }\n";
-    assert_same_panic(source, &["30", "runtime panic: after"]);
-    for env in [&AST[..], &LIR[..]] {
-        let (out, _) = compile_and_run_with_env(source, env);
-        assert!(
-            !out.contains("reference call:"),
-            "the reference context outlived the virtual call it described:\n{out}"
-        );
-    }
+    assert_panic_report(source, &["30", "runtime panic: after"]);
+    let (out, _) = compile_and_run_with_env(source, &PLAIN);
+    assert!(
+        !out.contains("reference call:"),
+        "the reference context outlived the virtual call it described:\n{out}"
+    );
 }
 
 // 33. A payload binding is declared at arm entry. The loop makes this match use

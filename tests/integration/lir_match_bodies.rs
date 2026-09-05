@@ -15,13 +15,13 @@
 //! collected rather than merely at risk.
 //!
 //! A `let` is admitted only where the bracket exists. A `select` case has one of
-//! its own, so it takes a `let` too; a `defer` block is replayed by the unwinder
-//! with no bracket at all, so it takes assignment and refuses `let`.
-//! Perspectives 18, 19 and 20 pin that down from both sides.
+//! its own, so it takes a `let` too, and as of willow-0g8j.3 so does a `defer`
+//! block: `emit_deferred_action` brackets a replayed body the same way, so the
+//! rooted slot a binding takes is popped at every exit the registration is live
+//! for. Perspectives 18, 19 and 20 pin that down from all three sides.
 //!
-//! Every test asserts the same output from the AST emitter and the walker, and
-//! confirms the walker is the path that ran — otherwise a coverage regression
-//! would pass vacuously by comparing the AST path against itself.
+//! Tests assert runtime output and use the selection log to confirm that
+//! each named function was compiled from lowered IR.
 //!
 //! 25 perspectives:
 //!   1 arm assigns an i64 outward         13 arm-local holds a new object
@@ -29,7 +29,7 @@
 //!   3 arm declares and uses a local      15 arm-local under GC stress
 //!   4 arm declares a GC local            16 arm bodies in a poll function
 //!   5 statements run in order            17 deferred match assigns (the census)
-//!   6 sibling arms reuse a source name   18 `let` in a `defer` block refused
+//!   6 sibling arms reuse a source name   18 `let` in a `defer` block admitted
 //!   7 arm-local shadows an outer name    19 `let` in a `select` case admitted
 //!   8 diverging arm: `let` then return   20 `select` case assigns outward
 //!   9 arm body inside a loop             21 empty arm body
@@ -40,37 +40,22 @@
 
 use super::support::{compile_and_run_with_env, compile_with_compiler_env};
 
-const AST: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const LIR: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_BUDGET: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_TASK_BUDGET", "1"),
-];
-const LIR_STRESS: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_GC_STRESS", "alloc"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const BUDGET: [(&str, &str); 1] = [("WILLOW_TASK_BUDGET", "1")];
+const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 
 const SIGNAL: &str = "enum Signal { Halt, Step(i64), Label(String) }\n";
 
 /// `expected` must come out of all four configurations, and `functions` must
 /// each be named in the walker's selection log.
 fn assert_bodies(source: &str, expected: &str, functions: &[&str]) {
-    for env in [&AST[..], &LIR[..], &LIR_BUDGET[..], &LIR_STRESS[..]] {
+    for env in [&PLAIN[..], &BUDGET[..], &STRESS[..]] {
         let (out, ok) = compile_and_run_with_env(source, env);
         assert!(ok, "run failed under {env:?}: {out}");
         assert_eq!(out, expected, "wrong output under {env:?}");
     }
-    let (ok, stderr) = compile_with_compiler_env(
-        source,
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_LIR_LOG", "1"),
-        ],
-    );
+    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_LIR_LOG", "1")]);
     assert!(ok, "logged LIR compile failed: {stderr}");
     for function in functions {
         let sync = format!("[lir] compiling `{function}` from lowered IR");
@@ -80,20 +65,6 @@ fn assert_bodies(source: &str, expected: &str, functions: &[&str]) {
             "`{function}` did not use the LIR walker: {stderr}"
         );
     }
-}
-
-/// The program is correct on the AST path but outside the walker's subset, so
-/// `WILLOW_LIR_REQUIRE=1` turns the fallback into a compile error. Both halves
-/// matter: a refusal that also broke the program would prove nothing.
-fn assert_refused(source: &str, expected: &str) {
-    let (out, ok) = compile_and_run_with_env(source, &AST);
-    assert!(ok, "AST run failed: {out}");
-    assert_eq!(out, expected, "wrong output on the AST path");
-    let (ok, stderr) = compile_with_compiler_env(source, &LIR);
-    assert!(
-        !ok,
-        "expected the walker to refuse this program, but it compiled: {stderr}"
-    );
 }
 
 // 1. The core shape: an arm assigns to a variable the match does not own. The
@@ -565,7 +536,7 @@ fn main() {{ println(combine(Signal::Label(\"ab\"))); }}
 }
 
 // 15. GC stress with a long chain of arm-locals, each allocating while the
-//     previous one is still live. `LIR_STRESS` collects at every allocation, so
+//     previous one is still live. `STRESS` collects at every allocation, so
 //     a missing root shows up as a wrong string rather than as luck.
 #[test]
 fn lir_bodies_15_arm_local_under_gc_stress() {
@@ -666,12 +637,15 @@ fn main() {
     );
 }
 
-// 18. A `let` in a deferred block stays out. The unwinder replays that body with
-//     no root bracket of its own, so a GC-managed binding there would leave a
-//     shadow-stack entry behind — the walker declines rather than leak one.
+// 18. A `let` in a deferred block is admitted (willow-0g8j.3). The unwinder
+//     replays that body inside the bracket `emit_deferred_action` opens for it,
+//     so the GC-managed binding's rooted slot is popped again on the way out and
+//     the code after the flush stays at the depth it was emitted for. Run under
+//     stress like the arm cases, where a leaked slot is collected rather than
+//     merely at risk.
 #[test]
-fn lir_bodies_18_let_in_a_defer_block_refused() {
-    assert_refused(
+fn lir_bodies_18_let_in_a_defer_block_admitted() {
+    assert_bodies(
         "fn serve() -> String {
     let mut status = \"ok\";
     if true {
@@ -686,6 +660,7 @@ fn lir_bodies_18_let_in_a_defer_block_refused() {
 fn main() { println(serve()); }
 ",
         "cleaned\nran\n",
+        &["serve", "main"],
     );
 }
 
@@ -846,14 +821,7 @@ fn lir_bodies_24_the_example_is_fully_lir() {
         "/example/lir_match_bodies.wi"
     ))
     .expect("the example is checked in");
-    let (ok, stderr) = compile_with_compiler_env(
-        &source,
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_LIR_LOG", "1"),
-        ],
-    );
+    let (ok, stderr) = compile_with_compiler_env(&source, &[("WILLOW_LIR_LOG", "1")]);
     assert!(ok, "the example fell back somewhere: {stderr}");
     for function in [
         "describe",
@@ -877,7 +845,7 @@ fn lir_bodies_24_the_example_is_fully_lir() {
 
 // 25. A field store is an ordinary effect statement inside an arm. Cover both
 //     binding shapes that used to reject it: an enum payload and an interface
-//     downcast. `WILLOW_LIR_REQUIRE=1` makes either fallback fail the test.
+//     downcast. Either refusal is a compile error, so the run is the check.
 #[test]
 fn lir_bodies_25_field_stores_inside_match_arms() {
     assert_bodies(

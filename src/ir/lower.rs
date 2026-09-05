@@ -42,14 +42,14 @@ use super::typed_ast::{
 /// the same tables the checker already hands to the backend.
 #[derive(Default)]
 pub struct CheckerTables<'a> {
-    /// Each lambda's full inferred `fn(...) -> ...` type, keyed by its span —
-    /// includes parameter types inferred from call-site context, so
-    /// unannotated lambda parameters become typeable.
-    pub lambda_fn_types: Option<&'a HashMap<Span, Type>>,
     /// Unqualified enum-variant constructions (`Ok(42)` in an expected-enum
     /// position), keyed by the call's span; the value is the resolved enum
     /// name and the variant is the call's callee.
     pub enum_variant_resolutions: Option<&'a HashMap<Span, String>>,
+    /// Checked reinterpretations of bare match patterns. When this table is
+    /// present, an absent entry preserves the parsed binding or downcast;
+    /// knowing an enum's identity does not grant access to its bare variants.
+    pub pattern_resolutions: Option<&'a HashMap<Span, crate::parser::ast::Pattern>>,
     /// The checker's authoritative type for every checked expression, keyed by
     /// span — the final fallback when the structural lowering cannot derive a
     /// type (generic constructions, `Self::` calls, module-qualified items).
@@ -62,25 +62,82 @@ pub struct CheckerTables<'a> {
     /// from another file decides its scrutinee is not an enum at all
     /// (willow-28h8 case B).
     pub enums: Option<&'a HashMap<crate::semantic::ids::TypeId, symbols::EnumInfo>>,
+    /// What the checker made of each type ANNOTATION it normalized, keyed by
+    /// the written spelling (willow-0g8j.3). Lowering reads annotations off the
+    /// AST, where `Arr<i64>` (an aliased import), `std::result::Result<i64, E>`
+    /// (a fully qualified std path) and a module's own `Level` (an enum whose
+    /// identity is `signal::Level`) are still the words the source used; every
+    /// other phase sees the normalized type, so without this the LIR walker
+    /// meets a named type nothing has heard of and turns the body down.
+    pub normalized_types: Option<&'a HashMap<Type, Type>>,
+    /// What a static call's written class name resolved to, keyed by the call's
+    /// span, for the calls where the two differ (willow-0g8j.3).
+    pub static_call_classes: Option<&'a HashMap<Span, String>>,
 }
 
 impl<'a> CheckerTables<'a> {
     /// Borrow the relevant tables from a run type checker.
     pub fn from_checker(checker: &'a crate::semantic::TypeChecker) -> Self {
         Self {
-            lambda_fn_types: Some(&checker.lambda_fn_types),
             enum_variant_resolutions: Some(&checker.enum_variant_resolutions),
+            pattern_resolutions: Some(&checker.pattern_resolutions),
             expr_types: Some(&checker.expr_types),
             enums: Some(&checker.symbols.enums),
+            normalized_types: Some(&checker.normalized_types),
+            static_call_classes: Some(&checker.static_call_classes),
         }
     }
 
+    /// Re-spell a written annotation as the checker's type. Bottom-up, so a
+    /// spelling inside a type argument is rewritten even when the whole type
+    /// was never written that way.
+    pub(crate) fn normalize(&self, ty: &Type) -> Type {
+        if let Some(normalized) = self.normalized_types.and_then(|m| m.get(ty)) {
+            return normalized.clone();
+        }
+        let rebuilt = match ty {
+            Type::Named(name) => self
+                .enums
+                .and_then(|enums| enums.get(&crate::semantic::ids::TypeId::from_source_name(name)))
+                .map(|info| Type::Named(info.name.clone()))
+                .unwrap_or_else(|| ty.clone()),
+            Type::Array(elem) => Type::Array(Box::new(self.normalize(elem))),
+            Type::Generic(name, args) => Type::Generic(
+                name.clone(),
+                args.iter().map(|a| self.normalize(a)).collect(),
+            ),
+            Type::Fn(params, ret) => Type::Fn(
+                params.iter().map(|p| self.normalize(p)).collect(),
+                Box::new(self.normalize(ret)),
+            ),
+            other => other.clone(),
+        };
+        match self.normalized_types.and_then(|m| m.get(&rebuilt)) {
+            Some(normalized) => normalized.clone(),
+            None => rebuilt,
+        }
+    }
+
+    /// A lambda's full inferred `fn(...) -> ...` type, from the checker's
+    /// expression table — including the parameter types a call site supplied,
+    /// which the AST cannot spell.
     fn lambda_fn_type(&self, span: &Span) -> Option<&Type> {
-        self.lambda_fn_types.and_then(|m| m.get(span))
+        match self.expr_types.and_then(|m| m.get(span)) {
+            Some(ty @ Type::Fn(..)) => Some(ty),
+            _ => None,
+        }
     }
 
     fn enum_variant_resolution(&self, span: &Span) -> Option<&String> {
         self.enum_variant_resolutions.and_then(|m| m.get(span))
+    }
+
+    /// The class a static call actually names, given the written spelling.
+    fn static_call_class(&self, span: &Span, written: &str) -> String {
+        self.static_call_classes
+            .and_then(|m| m.get(span))
+            .cloned()
+            .unwrap_or_else(|| written.to_string())
     }
 
     fn expr_type(&self, span: &Span) -> Option<Type> {
@@ -168,7 +225,9 @@ pub fn lower_program_with(
             Type::Generic("Future".to_string(), vec![Type::Void]),
         ),
     ]);
-    let mut classes = Classes::default();
+    // `PanicInfo` first: a program cannot redeclare it (the checker refuses),
+    // so nothing here overwrites it.
+    let mut classes = Classes::with_runtime_types();
     let mut enums = Enums::with_prelude();
     // Before this unit's own items, so a locally declared enum still shadows
     // an imported one of the same name below (willow-28h8 case B).
@@ -178,7 +237,10 @@ pub fn lower_program_with(
     for item in &program.items {
         match item {
             Item::Function(f) => {
-                fn_returns.insert(f.name.clone(), call_site_type(&f.return_type, f.is_async));
+                fn_returns.insert(
+                    f.name.clone(),
+                    call_site_type(&tables.normalize(&f.return_type), f.is_async),
+                );
             }
             Item::Class(c) => {
                 let mut info = ClassInfo {
@@ -187,13 +249,14 @@ pub fn lower_program_with(
                 };
                 for f in &c.fields {
                     if f.is_static {
-                        info.static_fields.insert(f.name.clone(), f.ty.clone());
+                        info.static_fields
+                            .insert(f.name.clone(), tables.normalize(&f.ty));
                     } else {
-                        info.fields.insert(f.name.clone(), f.ty.clone());
+                        info.fields.insert(f.name.clone(), tables.normalize(&f.ty));
                     }
                 }
                 for m in &c.methods {
-                    let call_ty = call_site_type(&m.return_type, m.is_async);
+                    let call_ty = call_site_type(&tables.normalize(&m.return_type), m.is_async);
                     if m.is_static {
                         info.static_methods.insert(m.name.clone(), call_ty);
                     } else {
@@ -360,6 +423,24 @@ struct Classes {
 }
 
 impl Classes {
+    /// The classes no source file declares. `PanicInfo` is the only one: the
+    /// checker defines it, the runtime is the only thing that builds one, and a
+    /// `recover()` handler reads its fields like any other object's. Without it
+    /// here, `info.line` found no field on its receiver and the enclosing
+    /// function fell back to the AST emitter whole (willow-0g8j.3).
+    fn with_runtime_types() -> Self {
+        let panic_info = ClassInfo {
+            fields: builtin_types::panic_info_fields()
+                .into_iter()
+                .map(|(name, ty)| (name.to_string(), ty))
+                .collect(),
+            ..ClassInfo::default()
+        };
+        Self {
+            map: HashMap::from([("PanicInfo".to_string(), panic_info)]),
+        }
+    }
+
     /// Walk the base-class chain from `class`, returning the first member type
     /// `pick` finds. Stops if a base class is not in the program (e.g. external).
     fn resolve<F: Fn(&ClassInfo) -> Option<Type>>(&self, class: &str, pick: F) -> Option<Type> {
@@ -402,20 +483,22 @@ fn lower_function(
     let mut ctx = LowerCtx::new(fn_returns, classes, enums, tables);
     let mut params = Vec::with_capacity(f.params.len());
     for p in &f.params {
-        let name = ctx.bind(p.name.clone(), p.ty.clone());
+        let ty = ctx.normalize(&p.ty);
+        let name = ctx.bind(p.name.clone(), ty.clone());
         params.push(HirParam {
             name,
-            ty: p.ty.clone(),
+            ty,
             by_reference: !matches!(p.mode, crate::parser::ast::ParamMode::Value),
             span: p.span,
         });
     }
+    let return_type = ctx.normalize(&f.return_type);
     let body = lower_block(&f.body, &mut ctx)?;
     Ok(HirFunction {
         name: f.name.clone(),
         is_async: f.is_async,
         params,
-        return_type: f.return_type.clone(),
+        return_type,
         body,
         span: f.span,
     })
@@ -452,20 +535,22 @@ fn lower_method(
         });
     }
     for p in &m.params {
-        let name = ctx.bind(p.name.clone(), p.ty.clone());
+        let ty = ctx.normalize(&p.ty);
+        let name = ctx.bind(p.name.clone(), ty.clone());
         params.push(HirParam {
             name,
-            ty: p.ty.clone(),
+            ty,
             by_reference: !matches!(p.mode, crate::parser::ast::ParamMode::Value),
             span: p.span,
         });
     }
+    let return_type = ctx.normalize(&m.return_type);
     let body = lower_block(&m.body, &mut ctx)?;
     Ok(HirFunction {
         name: m.name.clone(),
         is_async: m.is_async,
         params,
-        return_type: m.return_type.clone(),
+        return_type,
         body,
         span: m.span,
     })
@@ -492,10 +577,11 @@ fn lower_constructor(
         span: ctor.span,
     });
     for p in &ctor.params {
-        let name = ctx.bind(p.name.clone(), p.ty.clone());
+        let ty = ctx.normalize(&p.ty);
+        let name = ctx.bind(p.name.clone(), ty.clone());
         params.push(HirParam {
             name,
-            ty: p.ty.clone(),
+            ty,
             by_reference: !matches!(p.mode, crate::parser::ast::ParamMode::Value),
             span: p.span,
         });
@@ -558,6 +644,11 @@ impl<'a> LowerCtx<'a> {
             enums,
             tables,
         }
+    }
+
+    /// The checker's type for a written annotation (willow-0g8j.3).
+    fn normalize(&self, ty: &Type) -> Type {
+        self.tables.normalize(ty)
     }
 
     fn push_scope(&mut self) {
@@ -652,7 +743,10 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
             let mut value = lower_expr(&l.init, ctx)?;
             // A `let x: T = ..` annotation pins the binding type; otherwise the
             // type flows from the value expression.
-            let binding_ty = l.ty.clone().unwrap_or_else(|| value.ty.clone());
+            let binding_ty =
+                l.ty.as_ref()
+                    .map(|ty| ctx.normalize(ty))
+                    .unwrap_or_else(|| value.ty.clone());
             // An annotated array literal takes the ANNOTATION's element type,
             // exactly as `check_array_literal_expecting` typed it. Without this
             // the literal keeps the type of its first element, so
@@ -817,6 +911,12 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
 }
 
 fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+    let mut lowered = lower_expr_inner(expr, ctx)?;
+    lowered.ty = ctx.normalize(&lowered.ty);
+    Ok(lowered)
+}
+
+fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     match expr {
         Expr::Integer(n, span) => Ok(lit(HirExprKind::Int(*n), Type::I64, *span)),
         Expr::Float(f, span) => Ok(lit(HirExprKind::Float(*f), Type::F64, *span)),
@@ -1151,7 +1251,7 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
             let args = lower_value_args(&s.args, ctx)?;
             Ok(HirExpr {
                 kind: HirExprKind::StaticCall {
-                    class: s.class.clone(),
+                    class: ctx.tables.static_call_class(&s.span, &s.class),
                     method: s.method.clone(),
                     args,
                 },
@@ -1297,7 +1397,7 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                 let inferred_param = inferred
                     .as_ref()
                     .and_then(|(params, _)| params.get(i).cloned());
-                let Some(ty) = p.ty.clone().or(inferred_param) else {
+                let Some(ty) = p.ty.as_ref().map(|ty| ctx.normalize(ty)).or(inferred_param) else {
                     ctx.pop_scope();
                     ctx.binds_seen = outer_binds;
                     ctx.namespace_scope_base = outer_namespace_scope_base;
@@ -1326,7 +1426,8 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                     };
                     let ret = l
                         .return_type
-                        .clone()
+                        .as_ref()
+                        .map(|ty| ctx.normalize(ty))
                         .or(inferred_ret)
                         .unwrap_or_else(|| value.ty.clone());
                     let span = value.span;
@@ -1345,7 +1446,12 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                     (body, ret)
                 }
                 crate::parser::ast::LambdaBody::Block(block) => {
-                    let Some(ret) = l.return_type.clone().or(inferred_ret) else {
+                    let Some(ret) = l
+                        .return_type
+                        .as_ref()
+                        .map(|ty| ctx.normalize(ty))
+                        .or(inferred_ret)
+                    else {
                         ctx.pop_scope();
                         ctx.binds_seen = outer_binds;
                         ctx.namespace_scope_base = outer_namespace_scope_base;
@@ -1449,16 +1555,23 @@ fn lower_match(
     let mut arms = Vec::with_capacity(m.arms.len());
     for arm in &m.arms {
         ctx.push_scope();
-        // Normalize parse-level shapes: an unqualified `Some(x)` parses as a
-        // class downcast and a bare `None` as a binding; if the name matches a
-        // variant of the scrutinee's enum, it is that variant (the checker's
-        // pattern_resolutions does the same).
-        let pattern = match &arm.pattern {
+        // The checker owns whether a bare spelling is a variant visible in
+        // this unit. Structural inference is only for lowering without checker
+        // tables; redoing it for checked input would turn catch-all bindings
+        // into inaccessible imported variants.
+        let infer_variant = ctx.tables.pattern_resolutions.is_none();
+        let checked_pattern = ctx
+            .tables
+            .pattern_resolutions
+            .and_then(|patterns| patterns.get(&arm.pattern.span()))
+            .unwrap_or(&arm.pattern);
+        let pattern = match checked_pattern {
             Pattern::Wildcard(_) => HirPattern::Wildcard,
             Pattern::LiteralBool(b, _) => HirPattern::LiteralBool(*b),
             Pattern::LiteralInt(n, _) => HirPattern::LiteralInt(*n),
             Pattern::Binding { name, .. } => {
                 if let Some((enum_name, info, _)) = &enum_context
+                    && infer_variant
                     && info.variants.get(name).is_some_and(Vec::is_empty)
                 {
                     HirPattern::EnumVariant {
@@ -1495,9 +1608,10 @@ fn lower_match(
             } => {
                 // Unqualified variant like `Some(x)` if it names a variant of the
                 // scrutinee's enum; otherwise a real interface downcast.
-                if enum_context
-                    .as_ref()
-                    .is_some_and(|(_, info, _)| info.variants.contains_key(class_name))
+                if infer_variant
+                    && enum_context
+                        .as_ref()
+                        .is_some_and(|(_, info, _)| info.variants.contains_key(class_name))
                 {
                     bind_variant_tuple(
                         &enum_context,

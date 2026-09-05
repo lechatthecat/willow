@@ -186,7 +186,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     PANIC_ALLOC; "willow_array_push" => ([Word, Word] -> None);
     PANIC_ALLOC; "willow_array_pop" => ([Word] -> Some(Word));
     PANIC_ALLOC; "willow_array_to_string" => ([Word, I64] -> Some(Word));
-    ALLOC; "willow_map_to_string" => ([Word, I64] -> Some(Word));
+    ALLOC; "willow_map_to_string" => ([Word, I64, I64] -> Some(Word));
     PANIC_ALLOC; "willow_array_element_addr" => ([Word, I64] -> Some(Ptr));
     // --- maps (std::collections::Map) ---
     ALLOC; "willow_map_new" => ([] -> Some(Word));

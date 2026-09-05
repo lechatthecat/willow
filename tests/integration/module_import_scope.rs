@@ -13,34 +13,25 @@
 //!
 //!   * `import calc::add;` binds the local name `add` to THAT module's `add`.
 //!     The binding was global and installed once, for the entry file alone, so
-//!     a module that imported a different `add` called the entry's — silently,
-//!     on both emitters, and `WILLOW_LIR_REQUIRE=1` passed while doing it.
+//!     a module that imported a different `add` called the entry's, silently.
 //!
 //! The second half is a wrong-answer bug, so those perspectives assert VALUES;
-//! the first is an eligibility bug, so those assert `WILLOW_LIR_REQUIRE=1`
-//! builds and `WILLOW_LIR_LOG=1` lines, with both emitters agreeing throughout.
+//! the first is an eligibility bug, so those assert on the build and on
+//! `WILLOW_LIR_LOG=1` lines.
 
 use super::support::*;
 
-const LIR_ON: &[(&str, &str)] = &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_OFF: &[(&str, &str)] = &[("WILLOW_LIR_BACKEND", "0")];
-const LIR_LOG: &[(&str, &str)] = &[
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_LIR_LOG", "1"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const LIR_LOG: &[(&str, &str)] = &[("WILLOW_LIR_LOG", "1")];
 const ALLOC_STRESS: &[(&str, &str)] = &[("WILLOW_GC_STRESS", "alloc")];
 const MINOR_STRESS: &[(&str, &str)] = &[("WILLOW_GC_STRESS", "minor")];
 
 #[track_caller]
-fn assert_both_backends(files: &[(&str, &str)], entry: &str, expected: &str) {
-    let (lir, ok) = compile_temp_project_with_env_and_run(files, entry, LIR_ON);
-    assert!(ok, "LIR build failed: {lir}");
-    assert_eq!(lir, expected, "lowered-IR output mismatch");
-
-    let (ast, ok) = compile_temp_project_with_env_and_run(files, entry, LIR_OFF);
-    assert!(ok, "AST build failed: {ast}");
-    assert_eq!(ast, expected, "AST output mismatch");
+fn assert_project_output(files: &[(&str, &str)], entry: &str, expected: &str) {
+    let (out, ok) = compile_temp_project_with_env_and_run(files, entry, &PLAIN[..]);
+    assert!(ok, "build failed: {out}");
+    assert_eq!(out, expected, "wrong output");
 }
 
 /// Reached only because something imports ONE of its items. Its `Amount` is a
@@ -149,24 +140,26 @@ fn main() {
     println(totals::net(10));
 }
 "#;
-    let (out, ok) = compile_temp_project_with_env_and_run(&project(entry), "main.wi", LIR_ON);
+    let (out, ok) = compile_temp_project_with_env_and_run(&project(entry), "main.wi", &PLAIN[..]);
     assert!(ok, "build failed: {out}");
     assert_eq!(out, "9\n100\n");
 }
 
-// 2. The AST emitter had the same bug and now gives the same answers.
+// 2. The same two calls in the OPPOSITE order. The module's own binding is
+//    installed while its bodies are compiled, so a per-file binding that is
+//    really one global would depend on which call ran first.
 #[test]
-fn both_backends_agree_on_the_per_file_binding() {
+fn the_per_file_binding_does_not_depend_on_call_order() {
     let entry = r#"
 import sales::discount;
 import totals;
 
 fn main() {
-    println(discount(10));
     println(totals::net(10));
+    println(discount(10));
 }
 "#;
-    assert_both_backends(&project(entry), "main.wi", "9\n100\n");
+    assert_project_output(&project(entry), "main.wi", "100\n9\n");
 }
 
 // 3. The entry's own binding survives the module body phase, which runs
@@ -184,7 +177,7 @@ fn main() {
     println(discount(3));
 }
 "#;
-    assert_both_backends(&project(entry), "main.wi", "20\n1\n30\n2\n");
+    assert_project_output(&project(entry), "main.wi", "20\n1\n30\n2\n");
 }
 
 // 4. A module's item import binds even when the entry file imports no such
@@ -198,7 +191,7 @@ fn main() {
     println(totals::net(4));
 }
 "#;
-    assert_both_backends(&project(entry), "main.wi", "40\n");
+    assert_project_output(&project(entry), "main.wi", "40\n");
 }
 
 // 5. Two modules importing the SAME item both get it.
@@ -224,7 +217,7 @@ fn main() {
 "#;
     let mut files = project(entry);
     files.push(("rebate.wi", rebate));
-    assert_both_backends(&files, "main.wi", "10\n11\n");
+    assert_project_output(&files, "main.wi", "10\n11\n");
 }
 
 // 6. An aliased item import inside a module binds the ALIAS to that module's
@@ -251,7 +244,7 @@ fn main() {
 "#;
     let mut files = project(entry);
     files.push(("cutter.wi", cutter));
-    assert_both_backends(&files, "main.wi", "60\n5\n");
+    assert_project_output(&files, "main.wi", "60\n5\n");
 }
 
 // 7. The mirror image: the ENTRY aliases, a module takes the plain name.
@@ -266,7 +259,7 @@ fn main() {
     println(totals::net(7));
 }
 "#;
-    assert_both_backends(&project(entry), "main.wi", "6\n70\n");
+    assert_project_output(&project(entry), "main.wi", "6\n70\n");
 }
 
 // 8. Called from a lambda in a module body, which is lifted to its own
@@ -294,7 +287,7 @@ fn main() {
 "#;
     let mut files = project(entry);
     files.push(("lifted.wi", lifted));
-    assert_both_backends(&files, "main.wi", "30\n2\n");
+    assert_project_output(&files, "main.wi", "30\n2\n");
 }
 
 // 9. Called from a class METHOD in a module body, compiled under a mangled
@@ -330,7 +323,7 @@ fn main() {
 "#;
     let mut files = project(entry);
     files.push(("basket.wi", basket));
-    assert_both_backends(&files, "main.wi", "40\n3\n");
+    assert_project_output(&files, "main.wi", "40\n3\n");
 }
 
 // 10. Called from an async module function, whose body is split across a
@@ -358,7 +351,7 @@ async fn main() {
 "#;
     let mut files = project(entry);
     files.push(("slow.wi", slow));
-    assert_both_backends(&files, "main.wi", "50\n4\n");
+    assert_project_output(&files, "main.wi", "50\n4\n");
 }
 
 // 11. A chain of item imports: the middle module binds one, the top module
@@ -395,7 +388,7 @@ fn main() {
     let mut files = project(entry);
     files.push(("middle.wi", middle));
     files.push(("top.wi", top));
-    assert_both_backends(&files, "main.wi", "21\n1\n");
+    assert_project_output(&files, "main.wi", "21\n1\n");
 }
 
 // 12. The module function that calls its item import is really lowered, rather
@@ -434,7 +427,7 @@ fn main() {
     let (out, ok) = compile_temp_project_with_env_and_run_under(
         &project(entry),
         "main.wi",
-        LIR_ON,
+        &PLAIN[..],
         ALLOC_STRESS,
     );
     assert!(ok, "alloc-stress run failed: {out}");
@@ -487,20 +480,29 @@ fn main() {
 "#;
 
 // 15. The bug: `import pricing::rules;` does not put `pricing` in scope, so
-//     `pricing::Amount` must not make the entry's bare `Amount` ambiguous.
-//     `WILLOW_LIR_REQUIRE=1` turns that fallback into a build error.
+//     `pricing::Amount` must not make the entry's bare `Amount` ambiguous —
+//     which used to cost the body its lowering, and is a build error now.
 #[test]
 fn the_parent_of_a_child_module_import_is_not_visible() {
     let (out, ok) =
-        compile_temp_project_with_env_and_run(&project(CHILD_IMPORT_ENTRY), "main.wi", LIR_ON);
-    assert!(ok, "no body in this project may fall back: {out}");
+        compile_temp_project_with_env_and_run(&project(CHILD_IMPORT_ENTRY), "main.wi", &PLAIN[..]);
+    assert!(ok, "every body in this project must be walkable: {out}");
     assert_eq!(out, "7\n10\n");
 }
 
-// 16. Both emitters agree on that program's output.
+// 16. The same program under minor-collection stress, the mode that MOVES an
+//     object: resolving the class to the wrong module's layout would trace the
+//     wrong fields.
 #[test]
-fn both_backends_agree_with_a_child_module_import() {
-    assert_both_backends(&project(CHILD_IMPORT_ENTRY), "main.wi", "7\n10\n");
+fn a_child_module_import_survives_minor_stress() {
+    let (out, ok) = compile_temp_project_with_env_and_run_under(
+        &project(CHILD_IMPORT_ENTRY),
+        "main.wi",
+        &PLAIN[..],
+        MINOR_STRESS,
+    );
+    assert!(ok, "minor-stress run failed: {out}");
+    assert_eq!(out, "7\n10\n");
 }
 
 // 17. The entry function is named in the selection log, so it was lowered
@@ -535,7 +537,7 @@ fn main() {
     println(totals::net(1));
 }
 "#;
-    assert_both_backends(&project(entry), "main.wi", "sale:8\n10\n");
+    assert_project_output(&project(entry), "main.wi", "sale:8\n10\n");
 }
 
 // 19. An ITEM import does not make its module visible either: the entry binds
@@ -556,16 +558,18 @@ fn main() {
     println(discount(6));
 }
 "#;
-    let (out, ok) = compile_temp_project_with_env_and_run(&project(entry), "main.wi", LIR_ON);
-    assert!(ok, "no body in this project may fall back: {out}");
+    let (out, ok) = compile_temp_project_with_env_and_run(&project(entry), "main.wi", &PLAIN[..]);
+    assert!(
+        ok,
+        "every body in this project must compile from LIR: {out}"
+    );
     assert_eq!(out, "6\n60\n");
 }
 
-// 20. A file that really does import BOTH is still ambiguous — narrowing the
-//     visible set did not turn the ambiguity rule off. No wrong code: the body
-//     falls back, and the program still prints the right thing.
+// 20. A file that imports both modules keeps the class identity carried by each
+//     module call's checked signature.
 #[test]
-fn a_file_that_imports_both_modules_still_falls_back() {
+fn a_file_that_imports_both_modules_keeps_call_result_identity() {
     let entry = r#"
 import sales;
 import pricing;
@@ -579,23 +583,10 @@ fn main() {
     println(subtotal());
 }
 "#;
-    let (err, ok) = compile_temp_project_with_env_and_run(&project(entry), "main.wi", LIR_ON);
-    assert!(
-        !ok,
-        "a file seeing two `Amount` classes cannot resolve the bare name: {err}"
-    );
-    assert!(
-        err.contains("fell back to the AST backend") && err.contains("`subtotal`"),
-        "unexpected failure: {err}"
-    );
-
-    let (out, ok) = compile_temp_project_with_env_and_run(&project(entry), "main.wi", LIR_OFF);
-    assert!(ok, "AST build failed: {out}");
-    assert_eq!(out, "10\n");
+    assert_project_output(&project(entry), "main.wi", "10\n");
 }
 
-// 21. The control: with only one `Amount` in the build the same entry lowers,
-//     so the fallback above came from the clash and nothing else.
+// 21. The control: with only one `Amount` in the build the same entry lowers.
 #[test]
 fn one_amount_in_the_build_resolves() {
     let entry = r#"
@@ -611,7 +602,7 @@ fn main() {
 }
 "#;
     let files = &[("sales.wi", SALES), ("main.wi", entry)];
-    let (out, ok) = compile_temp_project_with_env_and_run(files, "main.wi", LIR_ON);
+    let (out, ok) = compile_temp_project_with_env_and_run(files, "main.wi", &PLAIN[..]);
     assert!(ok, "single-class build must lower: {out}");
     assert_eq!(out, "6\n");
 }
@@ -641,8 +632,11 @@ fn main() {
 "#;
     let mut files = project(entry);
     files.push(("ledger.wi", ledger));
-    let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", LIR_ON);
-    assert!(ok, "no body in this project may fall back: {out}");
+    let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", &PLAIN[..]);
+    assert!(
+        ok,
+        "every body in this project must compile from LIR: {out}"
+    );
     assert_eq!(out, "sale:2\n20\n");
 }
 
@@ -664,8 +658,11 @@ fn main() {
     println(totals::net(8));
 }
 "#;
-    let (out, ok) = compile_temp_project_with_env_and_run(&project(entry), "main.wi", LIR_ON);
-    assert!(ok, "no body in this project may fall back: {out}");
+    let (out, ok) = compile_temp_project_with_env_and_run(&project(entry), "main.wi", &PLAIN[..]);
+    assert!(
+        ok,
+        "every body in this project must compile from LIR: {out}"
+    );
     assert_eq!(out, "8\n80\n");
 }
 
@@ -676,7 +673,7 @@ fn the_resolved_layout_survives_minor_gc_stress() {
     let (out, ok) = compile_temp_project_with_env_and_run_under(
         &project(CHILD_IMPORT_ENTRY),
         "main.wi",
-        LIR_ON,
+        &PLAIN[..],
         MINOR_STRESS,
     );
     assert!(ok, "minor-stress run failed: {out}");
@@ -720,7 +717,7 @@ fn the_module_import_scope_example_is_fully_lowered() {
             include_str!("../../example/module_import_scope/main.wi"),
         ),
     ];
-    let (out, ok) = compile_temp_project_with_env_and_run(files, "main.wi", LIR_ON);
-    assert!(ok, "no body in the example may fall back: {out}");
+    let (out, ok) = compile_temp_project_with_env_and_run(files, "main.wi", &PLAIN[..]);
+    assert!(ok, "every body in the example must compile from LIR: {out}");
     assert_eq!(out, "7\nsale:3\n9\n100\n");
 }

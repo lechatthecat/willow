@@ -43,39 +43,36 @@
 //!  22. each level of a deep chain contributes its field in root-down order
 //!  23. the runnable example prints what it documents
 //!
-//! Every behavioral perspective runs on BOTH backends and asserts they agree.
+//! Every behavioral perspective runs the program and asserts what it prints:
+//! since willow-0g8j.3 a body outside the walker's subset does not compile, so
+//! a layout bug shows up as a wrong ANSWER rather than as a refusal.
 
 use super::support::{TestProject, compile_and_run_gc_stress, compile_with_env_and_run};
 
-const LIR_ON: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "1")];
-const LIR_OFF: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
 
+/// The build runs and prints `expected`. Since willow-0g8j.3 every body is
+/// compiled from lowered IR, so a body the walker cannot take is a compile
+/// error here rather than a second emitter's answer.
 #[track_caller]
-fn assert_both_backends(source: &str, expected: &str) {
-    let (with_lir, ok_on) = compile_with_env_and_run(source, &LIR_ON);
-    assert!(ok_on, "LIR-enabled run failed: {with_lir}");
-    let (without_lir, ok_off) = compile_with_env_and_run(source, &LIR_OFF);
-    assert!(ok_off, "LIR-disabled run failed: {without_lir}");
-    assert_eq!(
-        with_lir, without_lir,
-        "the two backends disagreed about field layout"
-    );
-    assert_eq!(with_lir, expected);
+fn assert_project_output(source: &str, expected: &str) {
+    let (out, ok) = compile_with_env_and_run(source, &PLAIN);
+    assert!(ok, "run failed: {out}");
+    assert_eq!(out, expected, "wrong output");
 }
 
 #[track_caller]
-fn assert_project_both_backends(project: &TestProject, expected: &str) {
-    for env in [LIR_ON.as_slice(), LIR_OFF.as_slice()] {
-        let compiled = project.compile_with_env("main.wi", env);
-        assert!(
-            compiled.status.success(),
-            "compile failed under {env:?}: {}",
-            String::from_utf8_lossy(&compiled.stderr)
-        );
-        let run = project.run();
-        assert!(run.status.success(), "binary failed under {env:?}");
-        assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
-    }
+fn assert_project_runs(project: &TestProject, expected: &str) {
+    let compiled = project.compile_with_env("main.wi", &PLAIN);
+    assert!(
+        compiled.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let run = project.run();
+    assert!(run.status.success(), "binary failed");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
 }
 
 /// Perspective 1. One level, subclass first. This order always worked — a base
@@ -83,7 +80,7 @@ fn assert_project_both_backends(project: &TestProject, expected: &str) {
 /// so it pins the case the fix must NOT disturb.
 #[test]
 fn layout_01_one_level_declared_subclass_first() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 class Sub extends Base {
     pub b: i64;
@@ -108,7 +105,7 @@ fn main() {
 /// layout and the field access had no slot to load from.
 #[test]
 fn layout_02_three_levels_declared_leaf_first() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 class C extends B {
     pub c: i64;
@@ -136,7 +133,7 @@ fn main() {
 /// one field, and a walk that stops one level short is visible in the sum.
 #[test]
 fn layout_03_eight_levels_declared_in_reverse() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 class L8 extends L7 {
     pub f8: i64;
@@ -168,7 +165,7 @@ fn main() {
 /// input.
 #[test]
 fn layout_04_the_same_hierarchy_declared_base_first() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class L1 { pub f1: i64; }
 open class L2 extends L1 { pub f2: i64; }
@@ -192,7 +189,7 @@ fn main() {
 /// depends on adjacency rather than on the `extends` chain would drift here.
 #[test]
 fn layout_05_unrelated_classes_interleaved() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 class Leaf extends Middle {
     pub c: i64;
@@ -217,7 +214,7 @@ fn main() {
 /// the other's.
 #[test]
 fn layout_06_two_subclasses_declared_before_their_base() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 class Left extends Shared {
     pub l: i64;
@@ -244,7 +241,7 @@ fn main() {
 /// fields, not four, and `new` takes three arguments.
 #[test]
 fn layout_07_a_redeclared_field_name_keeps_the_ancestor_slot() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 class Sub extends Base {
     pub shared: i64;
@@ -271,7 +268,7 @@ fn main() {
 /// layout — no padding slot, no shifted offset.
 #[test]
 fn layout_08_a_subclass_that_adds_no_fields() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 class Empty extends Base {
     pub fn sum(self) -> i64 { return self.a + self.b; }
@@ -295,7 +292,7 @@ fn main() {
 /// field lands at offset zero of the payload.
 #[test]
 fn layout_09_a_base_with_no_fields() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 class Sub extends Marker {
     pub v: i64;
@@ -316,7 +313,7 @@ fn main() {
 /// per level make that visible.
 #[test]
 fn layout_10_constructor_argument_order_follows_the_layout() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 class Leaf extends Middle {
     pub third: i64;
@@ -339,7 +336,7 @@ fn main() {
 /// field instead of erroring.
 #[test]
 fn layout_11_assignment_through_a_base_typed_reference() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 class Leaf extends Middle {
     pub c: i64;
@@ -366,7 +363,7 @@ fn main() {
 /// subclass's, so this is the offset agreement stated directly.
 #[test]
 fn layout_12_a_base_typed_parameter_reads_an_inherited_field() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 class Leaf extends Middle {
     pub c: i64;
@@ -430,7 +427,7 @@ fn main() {
 /// read back, so a shifted slot shows up as a wrong value rather than a crash.
 #[test]
 fn layout_14_mixed_field_types_keep_their_order() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 class Leaf extends Middle {
     pub flag: bool;
@@ -455,7 +452,7 @@ fn main() {
 /// leaf instance.
 #[test]
 fn layout_15_an_inherited_method_reads_the_grandparents_field() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 class Leaf extends Middle {
     pub c: i64;
@@ -480,7 +477,7 @@ fn main() {
 /// not just whichever one is being tested.
 #[test]
 fn layout_16_virtual_dispatch_is_unaffected_by_declaration_order() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 class Leaf extends Middle {
     pub c: i64;
@@ -542,7 +539,7 @@ fn main() {
             ),
         ],
     );
-    assert_project_both_backends(&project, "24\n2\n3\n4\n6\n");
+    assert_project_runs(&project, "24\n2\n3\n4\n6\n");
 }
 
 /// Perspective 18. A directly imported class arrives under two spellings —
@@ -580,7 +577,7 @@ fn main() {
             ),
         ],
     );
-    assert_project_both_backends(&project, "2\n9\n");
+    assert_project_runs(&project, "2\n9\n");
 }
 
 /// Perspective 19. A downcast reads the runtime class through the descriptor
@@ -589,7 +586,7 @@ fn main() {
 /// an interface, which is what a class downcast pattern requires (E1205).
 #[test]
 fn layout_19_a_downcast_in_a_reverse_declared_hierarchy() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 interface Countable { fn count(self) -> i64; }
 class Leaf extends Middle {
@@ -622,7 +619,7 @@ fn main() {
 /// misreads only its own elements.
 #[test]
 fn layout_20_an_array_of_a_base_type_holds_reverse_declared_subclasses() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 import std::collections::Array;
 class Leaf extends Middle {
@@ -657,7 +654,7 @@ fn main() {
 /// it must not consume a layout slot at any level of a reverse-declared chain.
 #[test]
 fn layout_21_a_static_field_stays_out_of_the_instance_layout() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 class Leaf extends Middle {
     pub static leaf_count: i64 = 7;
@@ -685,7 +682,7 @@ fn main() {
 /// and fails here.
 #[test]
 fn layout_22_each_level_contributes_its_field_in_root_down_order() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class M2 extends M1 { pub f3: i64; }
 class Leaf extends M3 {
@@ -712,5 +709,5 @@ fn main() {
 fn layout_23_the_example_program_runs() {
     let source = std::fs::read_to_string("example/class_layout_declaration_order.wi")
         .expect("example/class_layout_declaration_order.wi is missing");
-    assert_both_backends(&source, "6\n1\n2\n3\n1001\n2,4,8\n");
+    assert_project_output(&source, "6\n1\n2\n3\n1001\n2,4,8\n");
 }

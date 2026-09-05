@@ -844,8 +844,8 @@ pub(super) fn compile_temp_project_with_env_stderr(
 }
 
 /// Build a project and run it, returning `(ran_ok, the program's STDERR)`.
-/// A panic report is written to stderr, so this is what a test comparing the
-/// two emitters' diagnostics reads.
+/// A panic report is written to stderr, so this is what a test asserting on a
+/// program's diagnostics reads.
 pub(super) fn compile_temp_project_with_env_run_stderr(
     files: &[(&str, &str)],
     entry: &str,
@@ -961,10 +961,10 @@ pub(super) fn compile_with_compiler_env(source: &str, env: &[(&str, &str)]) -> (
     cmd.args(["build", &src_path, "-o", &bin_path]);
     cmd.env_remove("WILLOW_DATA_RACE_CHECK");
     cmd.env_remove("WILLOW_WORKERS");
-    // The LIR backend switches must come from `env` only, so a test can assert
-    // on the default (fallback allowed) regardless of the ambient environment.
-    cmd.env_remove("WILLOW_LIR_BACKEND");
-    cmd.env_remove("WILLOW_LIR_REQUIRE");
+    // The only backend switch left is the log (willow-0g8j.3 retired the
+    // kill-switch and the require mode along with the AST fallback), and a test
+    // that asserts on its absence must not inherit it from the environment.
+    cmd.env_remove("WILLOW_LIR_LOG");
     for (key, value) in env {
         cmd.env(key, value);
     }
@@ -1097,8 +1097,8 @@ pub(super) fn compile_with_env_and_run_combined(
 
 /// Compile with extra COMPILER environment variables, then run the binary with
 /// extra RUNTIME ones, reporting the binary's real exit status. Used by the
-/// LIR-backend GC-stress differential tests (willow-0g8j.1), which need
-/// `WILLOW_LIR_BACKEND` at compile time and `WILLOW_GC_STRESS` at run time.
+/// GC-stress tests, which need `WILLOW_GC_STRESS` set for the RUN and not for
+/// the compile.
 pub(super) fn compile_with_env_and_run_under(
     source: &str,
     compile_env: &[(&str, &str)],
@@ -1146,7 +1146,7 @@ pub(super) fn compile_with_env_and_run_under(
 }
 
 /// Compile with extra COMPILER environment variables, then run the binary.
-/// Used by the LIR-backend differential tests (willow-0g8j).
+/// Used by tests that vary compiler settings (willow-0g8j).
 pub(super) fn compile_with_env_and_run(source: &str, env: &[(&str, &str)]) -> (String, bool) {
     let id = unique_test_id();
     let src_path = temp_path(format!("willow_lirdiff_test_{}.wi", id));

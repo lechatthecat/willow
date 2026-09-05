@@ -33,31 +33,17 @@
 //!  28. the runnable example prints what it documents
 //!  29. an aliased imported base class still dispatches to its subclasses
 //!
-//! Every behavioral perspective runs on BOTH backends and asserts they agree:
-//! the chain lives in the AST emitter, and the LIR walker emits a direct call
-//! for the class shapes it accepts, so a filter bug would show up as a
-//! disagreement even where a single-backend test would pass.
+//! Every behavioral perspective asserts the program's whole output, not just
+//! the selected method: the chain is emitted around the call, so a filter bug
+//! shows up as a wrong value or a missing line rather than as a compile error.
 
 use super::support::{TestProject, compile_with_env_and_run, compile_with_env_and_run_combined};
 
-/// The LIR path is on by default; the "on" side names it explicitly so this
-/// never degrades into comparing the AST path with itself. `WILLOW_LIR_REQUIRE`
-/// is deliberately NOT set: an inherited/virtual class method is outside the
-/// walker's subset, so these programs are expected to mix paths.
-const LIR_ON: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "1")];
-const LIR_OFF: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-
 #[track_caller]
-fn assert_both_backends(source: &str, expected: &str) {
-    let (with_lir, ok_on) = compile_with_env_and_run(source, &LIR_ON);
-    assert!(ok_on, "LIR-enabled run failed: {with_lir}");
-    let (without_lir, ok_off) = compile_with_env_and_run(source, &LIR_OFF);
-    assert!(ok_off, "LIR-disabled run failed: {without_lir}");
-    assert_eq!(
-        with_lir, without_lir,
-        "the two backends disagreed about dispatch"
-    );
-    assert_eq!(with_lir, expected);
+fn assert_dispatch_output(source: &str, expected: &str) {
+    let (output, ok) = compile_with_env_and_run(source, &[]);
+    assert!(ok, "run failed: {output}");
+    assert_eq!(output, expected);
 }
 
 /// Perspective 13. `Hot` and `Cold` are unrelated classes that both declare
@@ -65,7 +51,7 @@ fn assert_both_backends(source: &str, expected: &str) {
 /// was a candidate at this call site and the emitter built a chain for it.
 #[test]
 fn dispatch_13_an_unrelated_same_named_class_is_not_a_candidate() {
-    assert_both_backends(
+    assert_dispatch_output(
         r#"
 class Hot {
     pub n: i64;
@@ -91,7 +77,7 @@ fn main() {
 /// filter must keep `Sub` in it.
 #[test]
 fn dispatch_14_a_base_reference_selects_the_override() {
-    assert_both_backends(
+    assert_dispatch_output(
         r#"
 open class Base {
     pub n: i64;
@@ -119,7 +105,7 @@ fn main() {
 /// it must stay in the chain and resolve to the INHERITED implementation.
 #[test]
 fn dispatch_15_a_non_overriding_subclass_inherits() {
-    assert_both_backends(
+    assert_dispatch_output(
         r#"
 open class Base {
     pub n: i64;
@@ -143,7 +129,7 @@ fn main() {
 /// resolves to `Middle`'s definition, not `Base`'s.
 #[test]
 fn dispatch_16_a_middle_override_wins_over_the_root() {
-    assert_both_backends(
+    assert_dispatch_output(
         r#"
 import std::collections::Array;
 open class Base {
@@ -172,7 +158,7 @@ fn main() {
 /// offered the other's implementation.
 #[test]
 fn dispatch_17_a_sibling_branch_is_never_selected() {
-    assert_both_backends(
+    assert_dispatch_output(
         r#"
 open class Base {
     pub n: i64;
@@ -202,7 +188,7 @@ fn main() {
 /// is really a `Sub`.
 #[test]
 fn dispatch_18_a_self_call_inside_a_base_method_stays_virtual() {
-    assert_both_backends(
+    assert_dispatch_output(
         r#"
 open class Base {
     pub n: i64;
@@ -230,7 +216,7 @@ fn main() {
 /// exactly what an interface is for, so this must keep working.
 #[test]
 fn dispatch_19_an_interface_receiver_is_unaffected() {
-    assert_both_backends(
+    assert_dispatch_output(
         r#"
 import std::collections::Array;
 interface Speaker {
@@ -300,17 +286,15 @@ fn main() {
         ],
     );
 
-    for env in [LIR_ON.as_slice(), LIR_OFF.as_slice()] {
-        let compiled = project.compile_with_env("main.wi", env);
-        assert!(
-            compiled.status.success(),
-            "compile failed under {env:?}: {}",
-            String::from_utf8_lossy(&compiled.stderr)
-        );
-        let run = project.run();
-        assert!(run.status.success(), "binary failed under {env:?}");
-        assert_eq!(String::from_utf8_lossy(&run.stdout), "16\n-1\n");
-    }
+    let compiled = project.compile_with_env("main.wi", &[]);
+    assert!(
+        compiled.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let run = project.run();
+    assert!(run.status.success(), "binary failed");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "16\n-1\n");
 }
 
 /// Perspective 21. Arguments are evaluated once, before the chain branches, and
@@ -318,7 +302,7 @@ fn main() {
 /// would show up here as repeated side effects.
 #[test]
 fn dispatch_21_argument_side_effects_happen_once_in_order() {
-    assert_both_backends(
+    assert_dispatch_output(
         r#"
 open class Base {
     pub n: i64;
@@ -348,7 +332,7 @@ fn main() {
 /// exercised, and every branch of it is reachable.
 #[test]
 fn dispatch_22_one_call_site_serves_every_runtime_type() {
-    assert_both_backends(
+    assert_dispatch_output(
         r#"
 open class Animal {
     pub n: i64;
@@ -382,7 +366,7 @@ fn main() {
 /// the receivers at 1, 3, 5 and 7 must each find the one just above them.
 #[test]
 fn dispatch_23_a_deep_hierarchy_resolves_to_the_nearest_definition() {
-    assert_both_backends(
+    assert_dispatch_output(
         r#"
 import std::collections::Array;
 open class L0 {
@@ -421,7 +405,7 @@ fn main() {
 /// unreachable rather than merely unlikely.
 #[test]
 fn dispatch_24_an_unrelated_same_named_method_may_differ_in_return_type() {
-    assert_both_backends(
+    assert_dispatch_output(
         r#"
 open class Base {
     pub n: i64;
@@ -466,18 +450,16 @@ fn main() {
     println(b.tick());
 }
 "#;
-    for env in [LIR_ON.as_slice(), LIR_OFF.as_slice()] {
-        let (output, ok) = compile_with_env_and_run_combined(source, env);
-        assert!(!ok, "the program must abort under {env:?}: {output}");
-        assert!(
-            output.contains("runtime panic: boom"),
-            "missing panic message under {env:?}: {output}"
-        );
-        assert!(
-            output.contains("0: tick at"),
-            "missing method frame under {env:?}: {output}"
-        );
-    }
+    let (output, ok) = compile_with_env_and_run_combined(source, &[]);
+    assert!(!ok, "the program must abort: {output}");
+    assert!(
+        output.contains("runtime panic: boom"),
+        "missing panic message: {output}"
+    );
+    assert!(
+        output.contains("0: tick at"),
+        "missing method frame: {output}"
+    );
 }
 
 /// Perspective 26. A static call names its class outright, so it never builds a
@@ -485,7 +467,7 @@ fn main() {
 /// the name.
 #[test]
 fn dispatch_26_a_static_call_is_not_routed_through_the_chain() {
-    assert_both_backends(
+    assert_dispatch_output(
         r#"
 class Factory {
     pub n: i64;
@@ -515,9 +497,10 @@ fn main() {
 /// difference is the 32 method bodies themselves, ~10 KB. The bound sits well
 /// clear of both, so it fails on a regression without tracking codegen noise.
 ///
-/// This runs on the AST backend deliberately: the chain lives there. The LIR
-/// walker emits a direct call for a class shape like this one, so it would
-/// report a passing number no matter what the filter did.
+/// The 33-way chain this bound was written against lived in the AST emitter
+/// willow-0g8j.3 retired. The LIR walker emits a direct call for a class shape
+/// like this one, so the bound is slack today and stands as a plain code-size
+/// regression guard rather than as a test of the filter itself.
 #[test]
 fn dispatch_27_unrelated_same_named_classes_cost_little_code() {
     const CALL_SITES: usize = 256;
@@ -545,7 +528,7 @@ fn dispatch_27_unrelated_same_named_classes_cost_little_code() {
 
     fn build(label: &str, source: &str) -> u64 {
         let project = TestProject::new(label, &[("main.wi", source)]);
-        let compiled = project.compile_with_env("main.wi", &LIR_OFF);
+        let compiled = project.compile_with_env("main.wi", &[]);
         assert!(
             compiled.status.success(),
             "compile failed: {}",
@@ -576,7 +559,7 @@ fn dispatch_27_unrelated_same_named_classes_cost_little_code() {
 /// still is.
 #[test]
 fn dispatch_28_the_example_prints_what_it_documents() {
-    assert_both_backends(
+    assert_dispatch_output(
         include_str!("../../example/class_method_dispatch.wi"),
         "100\n220\n300\n22000\nledger\n",
     );
@@ -634,15 +617,13 @@ fn main() {
         ],
     );
 
-    for env in [LIR_ON.as_slice(), LIR_OFF.as_slice()] {
-        let compiled = project.compile_with_env("main.wi", env);
-        assert!(
-            compiled.status.success(),
-            "compile failed under {env:?}: {}",
-            String::from_utf8_lossy(&compiled.stderr)
-        );
-        let run = project.run();
-        assert!(run.status.success(), "binary failed under {env:?}");
-        assert_eq!(String::from_utf8_lossy(&run.stdout), "1005\n7\n-1\n");
-    }
+    let compiled = project.compile_with_env("main.wi", &[]);
+    assert!(
+        compiled.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let run = project.run();
+    assert!(run.status.success(), "binary failed");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "1005\n7\n-1\n");
 }

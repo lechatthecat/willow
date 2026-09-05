@@ -2,10 +2,10 @@
 //
 // Every free function here stays inside the walker's supported subset, so its
 // basic blocks are compiled directly from the lowered IR instead of the AST.
-// Building this program with WILLOW_LIR_BACKEND=0 must print exactly the same
-// thing, including under WILLOW_GC_STRESS=alloc, and building it with
-// WILLOW_LIR_REQUIRE=1 must succeed — that mode turns a fallback to the AST
-// emitter into a compile error, which is what keeps the claim above honest.
+// Building this program must print the same thing under WILLOW_GC_STRESS=alloc
+// as without it. Since willow-0g8j.3 a body outside that subset is a compile
+// error rather than a fallback, so the build succeeding is what keeps the claim
+// above honest.
 //
 // `Option` and `Result` are not compiler magic: they are ordinary generic enums
 // declared in the prelude, so the walker admits them exactly the way it admits

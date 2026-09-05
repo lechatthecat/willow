@@ -10,11 +10,8 @@
 //! section's own cleanup block, which is why the scope is opened even for a
 //! body that defers nothing.
 //!
-//! Every test asserts the same output from the AST emitter and from the walker,
-//! and confirms in the selection log that the walker is the path that actually
-//! ran. Without that confirmation a coverage regression would send the function
-//! back to the AST emitter and the comparison would pass vacuously by comparing
-//! the AST path with itself.
+//! Tests assert runtime output and use the selection log to confirm that
+//! each named function was compiled from lowered IR.
 //!
 //! 20 perspectives:
 //!   1 read-modify-write commits       11 `?` out of the section releases
@@ -37,18 +34,10 @@ use super::support::{
     compile_and_run_with_env, compile_and_run_with_env_timeout, compile_with_compiler_env,
 };
 
-const AST: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const LIR: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_BUDGET: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_TASK_BUDGET", "1"),
-];
-const LIR_STRESS: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_GC_STRESS", "alloc"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const BUDGET: [(&str, &str); 1] = [("WILLOW_TASK_BUDGET", "1")];
+const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 
 /// `expected` must come out of all four configurations, and `functions` must
 /// each be named in the walker's selection log.
@@ -58,7 +47,7 @@ const LIR_STRESS: [(&str, &str); 3] = [
 /// protected value are both traced, so a collection between acquisition and
 /// release is exactly the case a wrong barrier would break.
 fn assert_locks(source: &str, expected: &str, functions: &[&str]) {
-    for env in [&AST[..], &LIR[..], &LIR_BUDGET[..], &LIR_STRESS[..]] {
+    for env in [&PLAIN[..], &BUDGET[..], &STRESS[..]] {
         let (out, ok) = compile_and_run_with_env(source, env);
         assert!(ok, "lock run failed under {env:?}: {out}");
         assert_eq!(out, expected, "wrong output under {env:?}");
@@ -69,14 +58,7 @@ fn assert_locks(source: &str, expected: &str, functions: &[&str]) {
 /// Assert the walker compiled each named function, without running anything.
 /// Used on its own by the tests whose runs need a deadline.
 fn assert_walker_owns(source: &str, functions: &[&str]) {
-    let (ok, stderr) = compile_with_compiler_env(
-        source,
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_LIR_LOG", "1"),
-        ],
-    );
+    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_LIR_LOG", "1")]);
     assert!(ok, "logged LIR compile failed: {stderr}");
     for function in functions {
         let sync = format!("[lir] compiling `{function}` from lowered IR");
@@ -475,11 +457,7 @@ async fn main() {
 "#;
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
         source,
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_WORKERS", "4"),
-        ],
+        &[("WILLOW_WORKERS", "4")],
         Duration::from_secs(20),
     );
     assert!(!timed_out, "concurrent readers did not overlap: {out}");
@@ -644,11 +622,7 @@ async fn main() {
 "#;
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
         source,
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_WORKERS", "4"),
-        ],
+        &[("WILLOW_WORKERS", "4")],
         Duration::from_secs(20),
     );
     assert!(!timed_out, "a cancelled waiter wedged the mutex: {out}");
@@ -711,12 +685,7 @@ async fn main() {
 "#;
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
         source,
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_TASK_BUDGET", "1"),
-            ("WILLOW_WORKERS", "5"),
-        ],
+        &[("WILLOW_TASK_BUDGET", "1"), ("WILLOW_WORKERS", "5")],
         Duration::from_secs(20),
     );
     assert!(!timed_out, "cancel cleanup deadlocked: {out}");
@@ -780,17 +749,14 @@ fn main() {
     );
 }
 
-/// The runnable example compiles with no fallback anywhere and prints the same
-/// thing on both backends. It is the one place every exit path out of a section
-/// appears in a single program.
+/// The runnable example compiles — every body in it is inside the walker's
+/// subset — and prints its expected transcript. It is the one place every exit
+/// path out of a section appears in a single program.
 #[test]
 fn lir_locks_23_example_compiles_from_lir_end_to_end() {
     let source = include_str!("../../example/lir_locks.wi");
-    let (ast, ast_ok) = compile_and_run_with_env(source, &AST);
-    assert!(ast_ok, "AST run of the example failed: {ast}");
-    let (lir, lir_ok) = compile_and_run_with_env(source, &LIR);
-    assert!(lir_ok, "LIR run of the example failed: {lir}");
-    assert_eq!(ast, lir, "the two backends must agree on the example");
+    let (out, ok) = compile_and_run_with_env(source, &PLAIN);
+    assert!(ok, "the example must run: {out}");
     assert_walker_owns(
         source,
         &[

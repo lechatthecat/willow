@@ -10,18 +10,17 @@
 //!     base-typed slot reads the same offsets whichever subclass it holds;
 //!   * DISPATCH — word 0 of an object is its class descriptor (`type_id`, then
 //!     one word per virtual slot), and which slot a call reads is decided by
-//!     the single `plan_virtual_call` BOTH backends ask;
+//!     `plan_virtual_call`;
 //!   * WIDENING — a subclass value in a base-typed slot is a no-op at run time,
 //!     both being object pointers;
 //!   * DOWNCAST — a class arm on an interface scrutinee compares the boxed
 //!     object's `type_id` EXACTLY, so a descendant of the arm's class does not
 //!     match it.
 //!
-//! Each test is differential: the same program is compiled with the walker on
-//! and off and the two outputs must be identical. The "on" side also sets
-//! `WILLOW_LIR_REQUIRE=1`, so a function that quietly fell back to the AST
-//! emitter is a compile error rather than a comparison of that emitter against
-//! itself — the failure mode these tests exist to rule out.
+//! Since willow-0g8j.3 a body outside the walker's subset is a compile error,
+//! so a run that prints the right answer is proof the walker produced it —
+//! the failure mode these tests exist to rule out is a walker that gets
+//! dispatch wrong, not one that quietly declines the body.
 //!
 //! Perspectives:
 //!   1. a base-typed parameter selects the subclass override
@@ -49,32 +48,22 @@
 //!  23. an inherited static property, read through a subclass name
 //!  24. an inherited static read from inside a method, against a same-named
 //!      static on an unrelated class
-//!  25. the whole hierarchy under GC stress, on both backends
+//!  25. the whole hierarchy under GC stress
 //!  26. `example/lir_class_inheritance.wi` compiles with no fallback at all
 
 use super::support::{compile_with_compiler_env, compile_with_env_and_run};
 
-/// The walker is on by default, so the "on" side names it explicitly rather
-/// than trusting the ambient environment. `WILLOW_LIR_REQUIRE=1` is what makes
-/// the comparison meaningful: without it a rejected function would fall back
-/// and both sides would run the same AST emitter.
-const LIR_ON: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_OFF: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
 
+/// The build runs and prints `expected`. Since willow-0g8j.3 every body is
+/// compiled from lowered IR, so a body the walker cannot take is a compile
+/// error here rather than a second emitter's answer.
 #[track_caller]
-fn assert_both_backends(source: &str, expected: &str) {
-    let (with_lir, ok_on) = compile_with_env_and_run(source, &LIR_ON);
-    assert!(
-        ok_on,
-        "the walker must claim every function in this program: {with_lir}"
-    );
-    let (without_lir, ok_off) = compile_with_env_and_run(source, &LIR_OFF);
-    assert!(ok_off, "AST-path run failed: {without_lir}");
-    assert_eq!(
-        with_lir, without_lir,
-        "the two backends disagreed about inheritance"
-    );
-    assert_eq!(with_lir, expected);
+fn assert_project_output(source: &str, expected: &str) {
+    let (out, ok) = compile_with_env_and_run(source, &PLAIN);
+    assert!(ok, "run failed: {out}");
+    assert_eq!(out, expected, "wrong output");
 }
 
 /// A base with two virtual slots, a subclass replacing slot 0, a grandchild
@@ -102,7 +91,7 @@ class Circle extends Shape {
 // callee to `Shape::area` by the parameter's STATIC type prints 5 5 5 5.
 #[test]
 fn lir_inh_01_base_typed_parameter_selects_the_override() {
-    assert_both_backends(
+    assert_project_output(
         &format!(
             "{HIERARCHY}
 fn area_of(s: Shape) -> i64 {{ return s.area(); }}
@@ -122,7 +111,7 @@ fn main() {{
 // not a walk performed at the call site.
 #[test]
 fn lir_inh_02_grandchild_inherits_without_a_redirect() {
-    assert_both_backends(
+    assert_project_output(
         &format!(
             "{HIERARCHY}
 fn area_of(s: Shape) -> i64 {{ return s.area(); }}
@@ -143,7 +132,7 @@ fn main() {{
 // `shape=3` for every receiver.
 #[test]
 fn lir_inh_03_inherited_method_makes_virtual_self_calls() {
-    assert_both_backends(
+    assert_project_output(
         &format!(
             "{HIERARCHY}
 fn report_of(s: Shape) -> String {{ return s.report(); }}
@@ -163,7 +152,7 @@ fn main() {{
 // devirtualization would freeze the first class assigned.
 #[test]
 fn lir_inh_04_base_typed_local_reassigned() {
-    assert_both_backends(
+    assert_project_output(
         &format!(
             "{HIERARCHY}
 fn main() {{
@@ -186,7 +175,7 @@ fn main() {{
 // all, which is exactly why it may be admitted.
 #[test]
 fn lir_inh_05_base_typed_return_holds_a_subclass() {
-    assert_both_backends(
+    assert_project_output(
         &format!(
             "{HIERARCHY}
 fn pick(n: i64) -> Shape {{
@@ -210,7 +199,7 @@ fn main() {{
 // root would print 1 five times.
 #[test]
 fn lir_inh_06_deep_chain_resolves_to_the_nearest_override() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class L1 { pub open fn depth(self) -> i64 { return 1; } }
 open class L2 extends L1 {}
@@ -235,7 +224,7 @@ fn main() {
 // hierarchy level is what keeps them apart.
 #[test]
 fn lir_inh_07_sibling_branches_never_cross() {
-    assert_both_backends(
+    assert_project_output(
         &format!(
             "{HIERARCHY}
 fn area_of(s: Shape) -> i64 {{ return s.area(); }}
@@ -257,7 +246,7 @@ fn main() {{
 // arguments to a function that does not take them.
 #[test]
 fn lir_inh_08_virtual_method_with_arguments_and_string_return() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Tag {
     pub open fn render(self, prefix: String, n: i64) -> String {
@@ -284,7 +273,7 @@ fn main() {
 // a `Circle`, which is the type the lowering used to hand the walker.
 #[test]
 fn lir_inh_09_array_of_a_base_type_from_subclass_literals() {
-    assert_both_backends(
+    assert_project_output(
         &format!(
             "import std::collections::Array;
 {HIERARCHY}
@@ -309,7 +298,7 @@ fn main() {{
 // is the base type and the argument is a subclass.
 #[test]
 fn lir_inh_10_push_widens_onto_an_array_of_the_base() {
-    assert_both_backends(
+    assert_project_output(
         &format!(
             "import std::collections::Array;
 {HIERARCHY}
@@ -332,7 +321,7 @@ fn main() {{
 // rearranging it — the property that makes the offset safe to hard-code.
 #[test]
 fn lir_inh_11_inherited_field_read_through_a_base_slot() {
-    assert_both_backends(
+    assert_project_output(
         &format!(
             "{HIERARCHY}
 fn size_of(s: Shape) -> i64 {{ return s.size; }}
@@ -351,7 +340,7 @@ fn main() {{
 // subclass's own type: one slot, not a base copy and a subclass copy.
 #[test]
 fn lir_inh_12_field_write_through_a_base_slot() {
-    assert_both_backends(
+    assert_project_output(
         &format!(
             "{HIERARCHY}
 fn grow(s: Shape) {{ s.size = s.size + 10; }}
@@ -370,7 +359,7 @@ fn main() {{
 // subclass's fields from zero would alias `extra` onto `size`.
 #[test]
 fn lir_inh_13_subclass_own_field_follows_the_inherited_ones() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Base { pub a: i64; pub b: i64; }
 class Sub extends Base { pub c: i64; pub d: i64; }
@@ -390,7 +379,7 @@ fn main() {
 // at the store, and the read dispatches on what is actually there.
 #[test]
 fn lir_inh_14_base_typed_field_holds_a_subclass() {
-    assert_both_backends(
+    assert_project_output(
         &format!(
             "{HIERARCHY}
 class Frame {{ pub inner: Shape; }}
@@ -410,7 +399,7 @@ fn main() {{
 // only the class's own declarations would leave `size` at zero.
 #[test]
 fn lir_inh_15_memberwise_new_fills_inherited_fields_first() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Base { pub a: i64; }
 open class Mid extends Base { pub b: i64; }
@@ -428,7 +417,7 @@ fn main() {
 // slots are written by the base's own code rather than positionally.
 #[test]
 fn lir_inh_16_explicit_init_delegates_to_super() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Animal {
     pub name: String;
@@ -461,7 +450,7 @@ fn main() {
 // same way any other inherited access does.
 #[test]
 fn lir_inh_17_protected_members_reached_from_a_subclass() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 pub open class Animal {
     pub name: String;
@@ -493,7 +482,7 @@ fn main() {
 // matter where in a hierarchy the `implements` clause was written.
 #[test]
 fn lir_inh_18_boxing_a_subclass_into_its_bases_interface() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 interface Animal {
     fn name(self) -> String;
@@ -521,7 +510,7 @@ fn main() {
 // the arm's class.
 #[test]
 fn lir_inh_19_downcast_arm_matches_its_exact_class() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 interface Animal { fn name(self) -> String; }
 class Dog implements Animal {
@@ -551,11 +540,11 @@ fn main() {
 }
 
 // 20. EXACT, not "is a descendant of": a `Puppy` is a `Dog`, but the `Dog` arm
-// does not take it. That is the selection the AST path makes, and an arm test
-// that walked the base chain would silently change which arm runs.
+// does not take it. An arm test that walked the base chain would silently
+// change which arm runs.
 #[test]
 fn lir_inh_20_a_descendant_does_not_match_the_base_arm() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 interface Animal { fn name(self) -> String; }
 open class Dog implements Animal { pub open fn name(self) -> String { return "dog"; } }
@@ -581,7 +570,7 @@ fn main() {
 // the arm bound the object rather than the box.
 #[test]
 fn lir_inh_21_downcast_binding_is_the_unboxed_object() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 interface Animal { fn name(self) -> String; }
 open class Dog implements Animal {
@@ -607,7 +596,7 @@ fn main() { println(info(new Puppy(21))); }
 // moment `Puppy` moved above `Dog`.
 #[test]
 fn lir_inh_22_downcast_arm_order_is_irrelevant() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 interface Animal { fn name(self) -> String; }
 open class Dog implements Animal { pub open fn name(self) -> String { return "dog"; } }
@@ -632,7 +621,7 @@ fn main() {
 // by the same ancestry walk the emitter uses to find the data slot.
 #[test]
 fn lir_inh_23_inherited_static_property_through_a_subclass_name() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Base {
     pub static kind: String = "base";
@@ -657,7 +646,7 @@ fn main() {
 // `Other::kind` is its own — matching on the name alone would confuse them.
 #[test]
 fn lir_inh_24_inherited_static_read_resolves_through_ancestry() {
-    assert_both_backends(
+    assert_project_output(
         r#"
 open class Base {
     pub static kind: String = "base";
@@ -681,11 +670,10 @@ fn main() {
 
 // 25. under allocation-on-every-request GC stress the receiver is only
 // reachable through a shadow-stack root while the arguments are evaluated and
-// the slot is loaded. The walker has to root it exactly where the AST emitter
-// does, or a collection between the two moves the object out from under the
-// indirect call.
+// the slot is loaded, or a collection between the two moves the object out
+// from under the indirect call.
 #[test]
-fn lir_inh_25_hierarchy_survives_gc_stress_on_both_backends() {
+fn lir_inh_25_hierarchy_survives_gc_stress() {
     let source = format!(
         "import std::collections::Array;
 {HIERARCHY}
@@ -707,26 +695,23 @@ fn main() {{
 }}"
     );
     let stress = [("WILLOW_GC_STRESS", "alloc")];
-    let (lir, ok_on) = super::support::compile_with_env_and_run_under(&source, &LIR_ON, &stress);
-    assert!(ok_on, "LIR run under GC stress failed: {lir}");
-    let (ast, ok_off) = super::support::compile_with_env_and_run_under(&source, &LIR_OFF, &stress);
-    assert!(ok_off, "AST run under GC stress failed: {ast}");
-    assert_eq!(lir, ast, "the backends disagreed under GC stress");
+    let (out, ok) = super::support::compile_with_env_and_run_under(&source, &PLAIN, &stress);
+    assert!(ok, "run under GC stress failed: {out}");
     // Two lines per round: `4 + 9 + 3 + 7 + round*round`, then the report of
     // `xs[0]`, which is the same `Square(2)` every time.
     let expected: String = (0..20)
         .map(|round: i64| format!("{}\nshape=4\n", 23 + round * round))
         .collect();
-    assert_eq!(lir, expected);
+    assert_eq!(out, expected);
 }
 
 // 26. the example is the readable statement of all of the above, so it must
 // compile with EVERY free function on the walker path — otherwise its own
-// header claim ("built with WILLOW_LIR_REQUIRE=1 must compile") is unchecked.
+// header claim is unchecked.
 #[test]
 fn lir_inh_26_example_is_fully_lir() {
     let source = include_str!("../../example/lir_class_inheritance.wi");
-    let (ok, stderr) = compile_with_compiler_env(source, &LIR_ON);
+    let (ok, stderr) = compile_with_compiler_env(source, &PLAIN);
     assert!(
         ok,
         "example/lir_class_inheritance.wi must compile with every free function \

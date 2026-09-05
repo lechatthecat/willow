@@ -19,12 +19,9 @@
 //! memberwise constructor reached the LIR emitter as a node it has no case for
 //! and panicked the compiler.
 //!
-//! Every runtime perspective is differential: the same source under the AST
-//! emitter and under the walker must print the same thing, with
-//! `WILLOW_LIR_REQUIRE=1` so a coverage regression cannot pass by comparing the
-//! AST path against itself. Note that a class method body is not in the
-//! walker's subset yet (willow-0g8j.2.18), so `init` itself is always AST code;
-//! what the walker compiles here is the *caller*.
+//! Since willow-0g8j.3 a body outside the walker's subset is a compile error,
+//! so a run that prints the right answer is proof the walker produced it —
+//! `init` bodies included, which the walker took over in willow-0g8j.2.18.
 //!
 //! 34 perspectives:
 //!   1 `&mut i64` writes back            18 a memberwise ctor takes values
@@ -49,24 +46,16 @@ use super::support::{
     assert_compile_error_contains, compile_and_run_with_env, compile_with_compiler_env,
 };
 
-const AST: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const LIR: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_STRESS: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_GC_STRESS", "alloc"),
-];
-const LIR_LOG: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_LIR_LOG", "1"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
+const LIR_LOG: [(&str, &str); 1] = [("WILLOW_LIR_LOG", "1")];
 
-/// `expected` must come out of all three configurations, and `functions` must
-/// each be named in the walker's selection log -- otherwise the second copy of
-/// the right answer came from the AST emitter too.
+/// `expected` must come out plain and under allocation stress, and `functions`
+/// must each be named in the walker's selection log -- otherwise a coverage
+/// regression could leave a body unlowered while the program still answered.
 fn assert_ctor_refs(source: &str, expected: &str, functions: &[&str]) {
-    for env in [&AST[..], &LIR[..], &LIR_STRESS[..]] {
+    for env in [&PLAIN[..], &STRESS[..]] {
         let (out, ok) = compile_and_run_with_env(source, env);
         assert!(ok, "run failed under {env:?}: {out}");
         assert_eq!(out, expected, "wrong output under {env:?}");
@@ -111,29 +100,23 @@ fn without_source_paths(out: &str) -> String {
         .join("\n")
 }
 
-/// A program that panics: both emitters must produce the same whole report, it
-/// must contain `expected_parts`, and it must contain none of `absent_parts`.
-fn assert_same_panic(source: &str, expected_parts: &[&str], absent_parts: &[&str]) {
-    let (ast_out, ast_ok) = compile_and_run_with_env(source, &AST);
-    assert!(!ast_ok, "expected a panic on the AST path: {ast_out}");
-    let (lir_out, lir_ok) = compile_and_run_with_env(source, &LIR);
-    assert!(!lir_ok, "expected a panic on the LIR path: {lir_out}");
-    let ast_report = without_source_paths(&ast_out);
-    let lir_report = without_source_paths(&lir_out);
-    assert_eq!(
-        ast_report, lir_report,
-        "the two emitters reported the panic differently"
-    );
+/// A program that panics: the report must contain `expected_parts` and none of
+/// `absent_parts`. The compiled path is normalized first, so a frame is matched
+/// by its function, line and column and not by the temp file it came from.
+fn assert_panic_report(source: &str, expected_parts: &[&str], absent_parts: &[&str]) {
+    let (out, ok) = compile_and_run_with_env(source, &PLAIN);
+    assert!(!ok, "the program must panic: {out}");
+    let report = without_source_paths(&out);
     for part in expected_parts {
         assert!(
-            lir_report.contains(part),
-            "report is missing `{part}`:\n{lir_report}"
+            report.contains(part),
+            "report is missing `{part}`:\n{report}"
         );
     }
     for part in absent_parts {
         assert!(
-            !lir_report.contains(part),
-            "report should not mention `{part}`:\n{lir_report}"
+            !report.contains(part),
+            "report should not mention `{part}`:\n{report}"
         );
     }
 }
@@ -520,7 +503,7 @@ fn ctor_refs_20_a_constructor_call_inside_another_constructor() {
 //     debug table to the argument emitter.
 #[test]
 fn ctor_refs_21_a_panic_inside_init_names_the_place() {
-    assert_same_panic(
+    assert_panic_report(
         "class Counter {\n\
         \x20   pub start: i64;\n\
         \x20   pub init(self, seed: &mut i64) { seed = seed + 1; self.start = seed; panic(\"inside init\"); }\n\
@@ -540,7 +523,7 @@ fn ctor_refs_21_a_panic_inside_init_names_the_place() {
 //     panic in the same function must not be attributed to it (willow-0g8j.11).
 #[test]
 fn ctor_refs_22_a_panic_after_new_returned_is_not_a_reference_call() {
-    assert_same_panic(
+    assert_panic_report(
         "class Counter {\n\
         \x20   pub start: i64;\n\
         \x20   pub init(self, seed: &mut i64) { seed = seed + 1; self.start = seed; }\n\
@@ -560,7 +543,7 @@ fn ctor_refs_22_a_panic_after_new_returned_is_not_a_reference_call() {
 //     record names the derived constructor's own parameter as the place.
 #[test]
 fn ctor_refs_23_a_panic_inside_the_base_init() {
-    assert_same_panic(
+    assert_panic_report(
         "open class Ledger {\n\
         \x20   pub opening: i64;\n\
         \x20   pub init(self, balance: &mut i64) { balance = balance * 2; self.opening = balance; panic(\"inside base init\"); }\n\
@@ -584,7 +567,7 @@ fn ctor_refs_23_a_panic_inside_the_base_init() {
 //     reported on its own.
 #[test]
 fn ctor_refs_24_a_panic_after_super_init_returned() {
-    assert_same_panic(
+    assert_panic_report(
         "open class Ledger {\n\
         \x20   pub opening: i64;\n\
         \x20   pub init(self, balance: &mut i64) { balance = balance * 2; self.opening = balance; }\n\
@@ -729,19 +712,19 @@ fn ctor_refs_31_a_reference_on_a_by_value_base_parameter_is_rejected() {
     );
 }
 
-// 32. The shipped example prints the same thing under both emitters.
+// 32. The shipped example prints the same thing plainly and under GC stress.
 #[test]
-fn ctor_refs_32_the_example_runs_the_same_under_both_emitters() {
+fn ctor_refs_32_the_example_runs_plainly_and_under_stress() {
     let source = std::fs::read_to_string("example/constructor_reference_args.wi")
         .expect("example/constructor_reference_args.wi");
-    for env in [&AST[..], &LIR[..], &LIR_STRESS[..]] {
+    for env in [&PLAIN[..], &STRESS[..]] {
         let (out, ok) = compile_and_run_with_env(&source, env);
         assert!(ok, "example failed under {env:?}: {out}");
         assert_eq!(out, "42\n22\n6\n20\nhi!/hi!\n31\n6\n", "under {env:?}");
     }
 }
 
-// 33. And every function in it is the walker's work, not the AST emitter's.
+// 33. And the log names every function in it, so none was quietly left out.
 #[test]
 fn ctor_refs_33_the_example_is_fully_lir() {
     let source = std::fs::read_to_string("example/constructor_reference_args.wi")
@@ -766,7 +749,7 @@ fn ctor_refs_33_the_example_is_fully_lir() {
 //     name the place `main` passed, not the inner call's parameter or nothing.
 #[test]
 fn ctor_refs_34_a_nested_reference_call_restores_the_outer_context() {
-    assert_same_panic(
+    assert_panic_report(
         "class Inner {\n\
         \x20   pub value: i64;\n\
         \x20   pub init(self, seed: &mut i64) { seed = seed + 1; self.value = seed; }\n\

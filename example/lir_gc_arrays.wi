@@ -5,11 +5,10 @@
 // `Array<T>` is a GC handle whose pointer stays put when the array grows, so an
 // array local uses the same entry-allocated, entry-rooted stack slot a String
 // local does, and a fresh array is rooted while anything that can collect runs.
-// Building this program with WILLOW_LIR_BACKEND=0 must print exactly the same
-// thing, including under WILLOW_GC_STRESS=alloc. Building it with
-// WILLOW_LIR_REQUIRE=1 must succeed: that mode rejects any function that falls
-// back to the AST emitter, so it is the proof that the walker really compiled
-// every function below.
+// Building this program must print the same thing under WILLOW_GC_STRESS=alloc
+// as without it. Since willow-0g8j.3 a body outside the walker's subset is a
+// compile error, so the build succeeding is itself the proof that the walker
+// compiled every function below.
 
 import std::collections::Array;
 

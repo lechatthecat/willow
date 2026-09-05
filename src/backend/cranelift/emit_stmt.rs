@@ -452,12 +452,28 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_lir_expr(expr);
             }
             super::DeferredAction::HirBlock(body) => {
+                // The block's own bracket, the same one a `match` arm gets
+                // (willow-0g8j.3). The unwinder replays this body at every exit
+                // the registration is live for, so a `let` in it takes a fresh
+                // rooted slot each time; popping the slots it pushed and
+                // restoring the compile-time depth is what keeps the code after
+                // the flush -- and the sibling replay sites -- at the depth they
+                // were emitted for.
+                let vars_before = self.vars.clone();
+                let roots_before = self.gc_root_count;
                 for stmt in body {
                     self.emit_lir_deferred_stmt(stmt);
                     if self.terminated {
                         break;
                     }
                 }
+                // A body that left through a panic never reaches the pop; the
+                // trap does not unwind this stack.
+                if !self.terminated {
+                    self.emit_pop_roots_n(self.gc_root_count - roots_before);
+                }
+                self.vars = vars_before;
+                self.gc_root_count = roots_before;
             }
         }
     }
@@ -1076,7 +1092,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 let ast_ty =
                     s.ty.clone()
-                        .or_else(|| self.async_local_types.get(&s.span).cloned())
                         .unwrap_or_else(|| self.ast_type_of_init(&s.init));
                 // In an async fn, a GC-managed local that is part of the frame
                 // layout lives in the heap frame so it survives `await`

@@ -1,14 +1,10 @@
 // Diverging code, formatted strings and scalar `toString` on the LIR backend
 // (willow-0g8j.2.5).
 //
-// Every function here stays inside the LIR walker's subset, so the program is
-// a differential test as much as a demonstration:
+// Every function here stays inside the LIR walker's subset, which since
+// willow-0g8j.3 is the only way a function body gets compiled at all:
 //
-//     WILLOW_LIR_BACKEND=0 willowc build example/lir_divergence.wi   # AST path
-//     WILLOW_LIR_BACKEND=1 WILLOW_LIR_REQUIRE=1 willowc build ...    # LIR path
-//
-// Both must print exactly the same thing, and the second must compile without
-// reporting a fallback.
+//     WILLOW_LIR_LOG=1 willowc build example/lir_divergence.wi
 //
 // The three shapes this file is about:
 //

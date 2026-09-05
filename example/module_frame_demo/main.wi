@@ -13,10 +13,9 @@
 // module it came from. A class static keeps the bare-method convention it
 // already had, because a static is reached through its class.
 //
-// Both backends emit the same frame, so a trace never depends on which emitter
-// compiled the caller:
-//   WILLOW_LIR_BACKEND=0 willowc build example/module_frame_demo/main.wi -o /tmp/a
-//   WILLOW_LIR_BACKEND=1 willowc build example/module_frame_demo/main.wi -o /tmp/b
+// The frame is built during lowering, so it names the call the same way
+// wherever the call appears:
+//   WILLOW_LIR_LOG=1 willowc build example/module_frame_demo/main.wi -o /tmp/a
 //
 // The frames go to stderr with the panic report, so this program recovers what
 // it raises and its stdout stays deterministic. Delete the `recover` guarding

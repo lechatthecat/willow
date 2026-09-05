@@ -3,13 +3,8 @@
 //! The walker was a free-function backend by accident. Eligibility could vet a
 //! method, lowering already produced one under `Class::method`, and the emitter
 //! already knew how to emit it — but `compile_class_method_inner` went straight
-//! to `emit_block(&m.body)` and never asked. Two things followed:
-//!
-//!   * every method in every program was compiled by the AST emitter, so a
-//!     differential test whose work lived in methods compared that emitter
-//!     against itself; and
-//!   * `WILLOW_LIR_REQUIRE=1` passed on such a program while checking nothing,
-//!     which is exactly the assurance it exists to provide.
+//! to `emit_block(&m.body)` and never asked, so every method in every program
+//! was compiled from the raw AST and no amount of walker coverage touched one.
 //!
 //! Admitting method bodies rests on facts the compile path now has to get
 //! right, and every perspective here is a way of getting one of them wrong:
@@ -28,10 +23,11 @@
 //!     self-calls and reference parameters are the same constructs inside a
 //!     method as outside one.
 //!
-//! Each runtime test is differential: the same program compiled with the walker
-//! on and off must print the same thing. The "on" side also sets
-//! `WILLOW_LIR_REQUIRE=1`, so a body that quietly fell back is a compile error
-//! rather than a comparison of the AST emitter against itself.
+//! Since willow-0g8j.3 there is no second emitter to compare against: a method
+//! body the walker cannot take is a compile error, so a run that prints the
+//! right answer is proof the walker produced it. Where the point of a
+//! perspective is WHICH body was walked, the test reads `WILLOW_LIR_LOG=1`
+//! instead of the program's output.
 //!
 //! Perspectives:
 //!   1. every method body in a program is logged as walker-compiled
@@ -54,49 +50,35 @@
 //!  18. a `&mut` parameter of a method writes through to the caller
 //!  19. a `&` parameter of a method
 //!  20. a `&mut` constructor parameter forwarded through `super.init`
-//!  21. a method that allocates, under GC stress on both backends
+//!  21. a method that allocates, under GC stress
 //!  22. an async method reads its receiver, not the first parameter's slot
 //!  23. an async method's parameters keep their order across a park
 //!  24. an async STATIC method has no receiver in its frame
 //!  25. an async method loops across a park
-//!  26. a method whose body the walker refuses is a `WILLOW_LIR_REQUIRE` error
-//!  27. a refused method still compiles and runs when REQUIRE is off
-//!  28. `example/lir_class_methods.wi` compiles with no fallback at all
+//!  26. `Self::method` resolves against the class being compiled
+//!  27. the resolved `Self::` call runs
+//!  28. every method in `example/lir_class_methods.wi` is walker-compiled
 
 use super::support::{
     compile_with_compiler_env, compile_with_env_and_run, compile_with_env_and_run_under,
 };
 
-/// The walker is on by default, so the "on" side names it explicitly rather
-/// than trusting the ambient environment. `WILLOW_LIR_REQUIRE=1` is what makes
-/// the comparison meaningful: without it a rejected body would fall back and
-/// both sides would run the same AST emitter.
-const LIR_ON: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_OFF: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const LIR_LOG: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_LIR_LOG", "1"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const LIR_LOG: [(&str, &str); 1] = [("WILLOW_LIR_LOG", "1")];
 
+/// The build runs and prints `expected`. Since willow-0g8j.3 every body is
+/// compiled from lowered IR, so a body the walker cannot take is a compile
+/// error here rather than a second emitter's answer.
 #[track_caller]
-fn assert_both_backends(source: &str, expected: &str) {
-    let (with_lir, ok_on) = compile_with_env_and_run(source, &LIR_ON);
-    assert!(
-        ok_on,
-        "the walker must claim every method in this program: {with_lir}"
-    );
-    let (without_lir, ok_off) = compile_with_env_and_run(source, &LIR_OFF);
-    assert!(ok_off, "AST-path run failed: {without_lir}");
-    assert_eq!(
-        with_lir, without_lir,
-        "the two backends disagreed about a method body"
-    );
-    assert_eq!(with_lir, expected);
+fn assert_project_output(source: &str, expected: &str) {
+    let (out, ok) = compile_with_env_and_run(source, &PLAIN);
+    assert!(ok, "run failed: {out}");
+    assert_eq!(out, expected, "wrong output");
 }
 
-// 1. The log line proves the body came from lowered IR. Without it a test can
-// only observe that the program ran, which the AST emitter also achieves.
+// 1. The log line names each body the walker compiled. Without it a test can
+// only observe that the program ran, and not which method produced the answer.
 #[test]
 fn lir_method_01_every_body_is_logged_as_walker_compiled() {
     let src = "class Point {
@@ -134,7 +116,7 @@ fn main() {
     c.bump();
     println(c.get());
 }";
-    assert_both_backends(src, "7\n");
+    assert_project_output(src, "7\n");
 }
 
 // 3. The receiver occupies argument 0, so a body that numbered the lowered
@@ -147,7 +129,7 @@ fn lir_method_03_declared_parameter_follows_the_receiver() {
 }
 
 fn main() { println(new Adder(10).plus(7)); }";
-    assert_both_backends(src, "17\n");
+    assert_project_output(src, "17\n");
 }
 
 // 4. Order and type together: a shift by one slot would also swap types here.
@@ -161,7 +143,7 @@ fn lir_method_04_four_parameters_keep_order_and_type() {
 }
 
 fn main() { println(new Mixer(\"m\").mix(1, \"x\", true, 2.5)); }";
-    assert_both_backends(src, "m/1xtrue2.5\n");
+    assert_project_output(src, "m/1xtrue2.5\n");
 }
 
 // 5. A static method keeps the hidden receiver slot in the ABI (callers pass a
@@ -179,7 +161,7 @@ fn main() {
     println(Math::add(4, 5));
     println(Math::label());
 }";
-    assert_both_backends(src, "9\nmath\n");
+    assert_project_output(src, "9\nmath\n");
 }
 
 // 6. `init` is a method whose body runs on an object the caller allocated, so
@@ -200,7 +182,7 @@ fn main() {
     println(r.lo);
     println(r.hi);
 }";
-    assert_both_backends(src, "3\n7\n");
+    assert_project_output(src, "3\n7\n");
 }
 
 // 7. `super.init` on a base that DECLARES a constructor is a call to that
@@ -225,7 +207,7 @@ fn main() {
     println(s.a);
     println(s.b);
 }";
-    assert_both_backends(src, "20\n3\n");
+    assert_project_output(src, "20\n3\n");
 }
 
 // 8. A base with no declared constructor: the arguments go straight into its
@@ -251,7 +233,7 @@ fn main() {
     println(s.weight);
     println(s.seal);
 }";
-    assert_both_backends(src, "hi\n4\n*\n");
+    assert_project_output(src, "hi\n4\n*\n");
 }
 
 // 9. Three levels: each `init` runs its base's before its own stores, so the
@@ -285,7 +267,7 @@ fn main() {
     println(v.b);
     println(v.c);
 }";
-    assert_both_backends(src, "11\n12\n23\n");
+    assert_project_output(src, "11\n12\n23\n");
 }
 
 // 10. A zero-argument `super.init` has no argument to borrow a source position
@@ -309,7 +291,7 @@ fn main() {
     let l = new Leaf();
     println(l.a + l.b);
 }";
-    assert_both_backends(src, "19\n");
+    assert_project_output(src, "19\n");
 }
 
 // 11. The arguments are ordinary expressions and are evaluated left to right,
@@ -342,7 +324,7 @@ fn main() {
     let s = new Shifted(4);
     println(s.z);
 }";
-    assert_both_backends(src, "8\n7\n15\n");
+    assert_project_output(src, "8\n7\n15\n");
 }
 
 // 12. A non-virtual method inherited by a subclass makes VIRTUAL self-calls, so
@@ -363,7 +345,7 @@ fn main() {
     println(new Fee(5).charged());
     println(new Premium(5).charged());
 }";
-    assert_both_backends(src, "5\n15\n");
+    assert_project_output(src, "5\n15\n");
 }
 
 // 13. Through a base-typed slot the concrete class is not statically known, so
@@ -385,7 +367,7 @@ fn main() {
     println(heard(new Animal(1)));
     println(heard(new Dog(1)));
 }";
-    assert_both_backends(src, "...\nwoof\n");
+    assert_project_output(src, "...\nwoof\n");
 }
 
 // 14. A `defer` in a method runs at the end of the method's scope, after the
@@ -402,7 +384,7 @@ fn lir_method_14_defer_inside_a_method() {
 }
 
 fn main() { println(new Job(3).run()); }";
-    assert_both_backends(src, "start\ndone\n3\n");
+    assert_project_output(src, "start\ndone\n3\n");
 }
 
 // 15. An early `return` has to flush the scope it leaves, which is a different
@@ -424,7 +406,7 @@ fn main() {
     println(new Gate(true).check());
     println(new Gate(false).check());
 }";
-    assert_both_backends(src, "closed\nin\nclosed\nout\n");
+    assert_project_output(src, "closed\nin\nclosed\nout\n");
 }
 
 // 16. A `match` over a value derived from `self`: the dispatch chain spans
@@ -447,7 +429,7 @@ fn main() {
     println(new Crew(1).describe());
     println(new Crew(7).describe());
 }";
-    assert_both_backends(src, "none\none\nmany\n");
+    assert_project_output(src, "none\none\nmany\n");
 }
 
 // 17. A loop inside a method body, with the induction variable and the
@@ -468,7 +450,7 @@ fn lir_method_17_loop_inside_a_method() {
 }
 
 fn main() { println(new Sum(5).total()); }";
-    assert_both_backends(src, "10\n");
+    assert_project_output(src, "10\n");
 }
 
 // 18. A `&mut` parameter of a method is passed by address, so the write lands
@@ -489,7 +471,7 @@ fn main() {
     s.apply(&n);
     println(n);
 }";
-    assert_both_backends(src, "18\n");
+    assert_project_output(src, "18\n");
 }
 
 // 19. A `&` parameter is read-only but still an address: the callee dereferences
@@ -506,7 +488,7 @@ fn main() {
     let v = 7;
     println(s.of(&v));
 }";
-    assert_both_backends(src, "21\n");
+    assert_project_output(src, "21\n");
 }
 
 // 20. A constructor's `&mut` parameter is already an address; `super.init(&p)`
@@ -537,7 +519,7 @@ fn main() {
     println(b.entries);
     println(money);
 }";
-    assert_both_backends(src, "10\n2\n11\n");
+    assert_project_output(src, "10\n2\n11\n");
 }
 
 // 21. A method that allocates must root what it holds across the allocation.
@@ -567,14 +549,10 @@ fn main() {
     println(ls[0]);
     println(ls[2]);
 }";
-    let expected = "3\nrow-0\nrow-2\n";
     let stress = [("WILLOW_GC_STRESS", "alloc")];
-    let (on, ok_on) = compile_with_env_and_run_under(src, &LIR_ON, &stress);
-    assert!(ok_on, "walker build under GC stress failed: {on}");
-    let (off, ok_off) = compile_with_env_and_run_under(src, &LIR_OFF, &stress);
-    assert!(ok_off, "AST build under GC stress failed: {off}");
-    assert_eq!(on, off, "the two backends disagreed under GC stress");
-    assert_eq!(on, expected);
+    let (out, ok) = compile_with_env_and_run_under(src, &PLAIN, &stress);
+    assert!(ok, "run under GC stress failed: {out}");
+    assert_eq!(out, "3\nrow-0\nrow-2\n");
 }
 
 // 22. THE async off-by-one. An async method's parameters live in the heap
@@ -596,7 +574,7 @@ async fn main() {
     let b = new Box(6);
     println(await b.get(5));
 }";
-    assert_both_backends(src, "11\n");
+    assert_project_output(src, "11\n");
 }
 
 // 23. Three parameters after the receiver: a one-slot shift would still produce
@@ -615,7 +593,7 @@ async fn main() {
     let j = new Joiner(\"h:\");
     println(await j.join(1, \"x\", false));
 }";
-    assert_both_backends(src, "h:1xfalse\n");
+    assert_project_output(src, "h:1xfalse\n");
 }
 
 // 24. A static async method has NO receiver slot, so its lowered parameter list
@@ -632,7 +610,7 @@ fn lir_method_24_async_static_method_has_no_receiver_slot() {
 }
 
 async fn main() { println(await Timer::after(3, 4)); }";
-    assert_both_backends(src, "304\n");
+    assert_project_output(src, "304\n");
 }
 
 // 25. A loop that parks on every iteration: the receiver and the locals are
@@ -654,11 +632,12 @@ fn lir_method_25_async_method_loops_across_a_park() {
 }
 
 async fn main() { println(await new Ticker(3).run(4)); }";
-    assert_both_backends(src, "12\n");
+    assert_project_output(src, "12\n");
 }
 
-// 26. `WILLOW_LIR_REQUIRE=1` now polices methods, and `Self::method` resolves
-// against the class whose body is being compiled rather than forcing fallback.
+// 26. `Self::method` resolves against the class whose body is being compiled.
+// Getting that wrong used to force a fallback; there is nothing to fall back
+// to now, so the log line is what proves the resolution happened.
 #[test]
 fn lir_method_26_self_static_call_is_walker_compiled() {
     let src = "class Helper {
@@ -681,9 +660,10 @@ fn main() { println(new Helper(3).viaself()); }";
     }
 }
 
-// 27. The resolved call produces the same result on both emitters.
+// 27. The resolved call also has to compute the right thing, and the sibling
+// method that does not go through `Self::` must be unaffected by it.
 #[test]
-fn lir_method_27_self_static_call_runs_on_both_backends() {
+fn lir_method_27_self_static_call_computes_its_result() {
     let src = "class Helper {
     pub n: i64;
     pub static fn twice(v: i64) -> i64 { return v * 2; }
@@ -696,21 +676,16 @@ fn main() {
     println(h.viaself());
     println(h.plain());
 }";
-    let (on, ok_on) = compile_with_env_and_run(src, &[("WILLOW_LIR_BACKEND", "1")]);
-    assert!(ok_on, "fallback build failed: {on}");
-    let (off, ok_off) = compile_with_env_and_run(src, &LIR_OFF);
-    assert!(ok_off, "AST-path run failed: {off}");
-    assert_eq!(on, off);
-    assert_eq!(on, "6\n4\n");
+    assert_project_output(src, "6\n4\n");
 }
 
 // 28. The example file: every method in it, constructors included, must be
-// claimed by the walker, and both backends must print the same thing.
+// claimed by the walker, and the program must print what it says it prints.
 #[test]
-fn lir_method_28_example_file_compiles_with_no_fallback() {
+fn lir_method_28_example_file_compiles_and_runs() {
     let src = std::fs::read_to_string("example/lir_class_methods.wi")
         .expect("example/lir_class_methods.wi must exist");
-    assert_both_backends(
+    assert_project_output(
         &src,
         "12\n12\n- left ops\nops:12\n30\n60\nmany\n- left pay\npay:30\n- left void\nvoid:empty\nops+pay\n42\n*seal7*\n112\n24\n11\n",
     );

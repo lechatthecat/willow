@@ -2,8 +2,8 @@
 //!
 //! `compile_program_with_modules` registers the backend's span-keyed
 //! resolution tables — `enum_variant_resolutions`, `pattern_resolutions`,
-//! `expr_types`, `lambda_return_types`, `lambda_fn_types`, `async_local_types`
-//! — exactly once, from the ENTRY file's checker. But a module is type-checked
+//! `expr_types`, `static_call_classes` — exactly once, from the ENTRY file's
+//! checker. But a module is type-checked
 //! in its own scope by `typecheck_modules` (willow-3eo1), so everything those
 //! passes resolved inside a module body lived in a checker the backend never
 //! saw. Module bodies were emitted against an empty resolution table.
@@ -28,26 +28,22 @@
 //! `file_id` of the file it came from, so a module's keys can never collide
 //! with the entry file's or with another module's.
 //!
-//! The LIR backend was already correct here — willow-0g8j.16 lowers each module
-//! with its own `CheckerTables` — so every perspective below pins BOTH emitters
-//! and would have caught the divergence as a disagreement.
+//! The LIR walker was already correct here — willow-0g8j.16 lowers each module
+//! with its own `CheckerTables` — so every perspective below pins the ANSWER a
+//! module's own tables produce, which is what the divergence used to corrupt.
 
 use super::support::*;
 
-const LIR_ON: &[(&str, &str)] = &[("WILLOW_LIR_BACKEND", "1")];
-const LIR_OFF: &[(&str, &str)] = &[("WILLOW_LIR_BACKEND", "0")];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
 const ALLOC_STRESS: &[(&str, &str)] = &[("WILLOW_GC_STRESS", "alloc")];
 const MINOR_STRESS: &[(&str, &str)] = &[("WILLOW_GC_STRESS", "minor")];
 
 #[track_caller]
-fn assert_both_backends(files: &[(&str, &str)], entry: &str, expected: &str) {
-    let (lir, ok) = compile_temp_project_with_env_and_run(files, entry, LIR_ON);
-    assert!(ok, "LIR build failed: {lir}");
-    assert_eq!(lir, expected, "lowered-IR output mismatch");
-
-    let (ast, ok) = compile_temp_project_with_env_and_run(files, entry, LIR_OFF);
-    assert!(ok, "AST build failed: {ast}");
-    assert_eq!(ast, expected, "AST output mismatch");
+fn assert_project_output(files: &[(&str, &str)], entry: &str, expected: &str) {
+    let (out, ok) = compile_temp_project_with_env_and_run(files, entry, &PLAIN[..]);
+    assert!(ok, "build failed: {out}");
+    assert_eq!(out, expected, "wrong output");
 }
 
 /// The bead's own repro module, plus everything else a module body can ask its
@@ -241,7 +237,7 @@ fn main() {
     println(kinds::boxy(9));
 }
 "#;
-    assert_both_backends(&kinds_project(entry), "main.wi", "9\n");
+    assert_project_output(&kinds_project(entry), "main.wi", "9\n");
 }
 
 // 2. The payload binding carries the value through, not a constant.
@@ -256,7 +252,7 @@ fn main() {
     println(kinds::boxy(0 - 5));
 }
 "#;
-    assert_both_backends(&kinds_project(entry), "main.wi", "1\n41\n-5\n");
+    assert_project_output(&kinds_project(entry), "main.wi", "1\n41\n-5\n");
 }
 
 // 3. The unit arm still wins for a unit variant.
@@ -269,7 +265,7 @@ fn main() {
     println(kinds::round());
 }
 "#;
-    assert_both_backends(&kinds_project(entry), "main.wi", "1\n");
+    assert_project_output(&kinds_project(entry), "main.wi", "1\n");
 }
 
 // 4. NEGATIVE control for the panic: with the payload arm FIRST, the same
@@ -312,7 +308,7 @@ fn main() {
         ),
     ];
     let _ = entry;
-    assert_both_backends(files, "main.wi", "109\n200\n");
+    assert_project_output(files, "main.wi", "109\n200\n");
 }
 
 // 5. A wildcard arm in a module body.
@@ -326,7 +322,7 @@ fn main() {
     println(kinds::through_unqualified(0));
 }
 "#;
-    assert_both_backends(&kinds_project(entry), "main.wi", "6\n0\n");
+    assert_project_output(&kinds_project(entry), "main.wi", "6\n0\n");
 }
 
 // 6. Unqualified variant CONSTRUCTION inside a module body — the other table
@@ -340,7 +336,7 @@ fn main() {
     println(kinds::through_unqualified(12));
 }
 "#;
-    assert_both_backends(&kinds_project(entry), "main.wi", "12\n");
+    assert_project_output(&kinds_project(entry), "main.wi", "12\n");
 }
 
 // 7. A match nested inside a match arm, all module-side.
@@ -354,7 +350,7 @@ fn main() {
     println(kinds::nested(1));
 }
 "#;
-    assert_both_backends(&kinds_project(entry), "main.wi", "4\n-1\n");
+    assert_project_output(&kinds_project(entry), "main.wi", "4\n-1\n");
 }
 
 // 8. A String payload, which is a GC pointer rather than an immediate.
@@ -368,7 +364,7 @@ fn main() {
     println(kinds::label(0));
 }
 "#;
-    assert_both_backends(&kinds_project(entry), "main.wi", "kept\nblank\n");
+    assert_project_output(&kinds_project(entry), "main.wi", "kept\nblank\n");
 }
 
 // 9. A PRELUDE enum inside a module body: `Option` is registered globally, but
@@ -383,7 +379,7 @@ fn main() {
     println(kinds::opt(4));
 }
 "#;
-    assert_both_backends(&kinds_project(entry), "main.wi", "4\n");
+    assert_project_output(&kinds_project(entry), "main.wi", "4\n");
 }
 
 // 10. An interface value dispatched inside a module body — `pattern_resolutions`
@@ -398,7 +394,7 @@ fn main() {
     println(kinds::speak_cat());
 }
 "#;
-    assert_both_backends(&kinds_project(entry), "main.wi", "7\n9\n");
+    assert_project_output(&kinds_project(entry), "main.wi", "7\n9\n");
 }
 
 // 11. A match inside a module METHOD, not a free function.
@@ -411,7 +407,7 @@ fn main() {
     println(kinds::stepped(10, 5));
 }
 "#;
-    assert_both_backends(&kinds_project(entry), "main.wi", "15\n");
+    assert_project_output(&kinds_project(entry), "main.wi", "15\n");
 }
 
 // 12. A match inside an ASYNC module body, whose locals also cross an await.
@@ -424,7 +420,7 @@ async fn main() {
     println(await kinds::slow(3));
 }
 "#;
-    assert_both_backends(&kinds_project(entry), "main.wi", "6\n");
+    assert_project_output(&kinds_project(entry), "main.wi", "6\n");
 }
 
 // 13. The ENTRY file's own tables survive the merge: a match in `main` still
@@ -456,7 +452,7 @@ fn main() {
     println(kinds::boxy(9));
 }
 "#;
-    assert_both_backends(&kinds_project(entry), "main.wi", "8\n1\n9\n");
+    assert_project_output(&kinds_project(entry), "main.wi", "8\n1\n9\n");
 }
 
 // 14. An entry enum and a module enum that share VARIANT names stay apart —
@@ -489,7 +485,7 @@ fn main() {
     println(kinds::round());
 }
 "#;
-    assert_both_backends(&kinds_project(entry), "main.wi", "1003\n1000\n3\n1\n");
+    assert_project_output(&kinds_project(entry), "main.wi", "1003\n1000\n3\n1\n");
 }
 
 // 15. TWO modules whose enums share variant names, both matched.
@@ -553,7 +549,7 @@ fn main() {
 "#,
         ),
     ];
-    assert_both_backends(files, "main.wi", "8\n12\n");
+    assert_project_output(files, "main.wi", "8\n12\n");
 }
 
 // 16. The merge does not leak the other way: the ENTRY file still cannot name a
@@ -589,16 +585,17 @@ fn main() {
     let (out, ok) = compile_temp_project_with_env_and_run_under(
         &kinds_project(entry),
         "main.wi",
-        LIR_ON,
+        &PLAIN[..],
         ALLOC_STRESS,
     );
     assert!(ok, "alloc-stress run failed: {out}");
     assert_eq!(out, "kept\n9\n");
 }
 
-// 18. The same under minor-collection stress, on the AST emitter this time.
+// 18. The same under minor-collection stress, which is the mode that MOVES an
+//     object: a match payload bound in a module body has to be traced.
 #[test]
-fn module_match_payloads_survive_minor_stress_on_the_ast_backend() {
+fn module_match_payloads_survive_minor_stress() {
     let entry = r#"
 import kinds;
 
@@ -610,7 +607,7 @@ fn main() {
     let (out, ok) = compile_temp_project_with_env_and_run_under(
         &kinds_project(entry),
         "main.wi",
-        LIR_OFF,
+        &PLAIN[..],
         MINOR_STRESS,
     );
     assert!(ok, "minor-stress run failed: {out}");
@@ -657,7 +654,7 @@ fn main() {
     println(kinds::stepped(10, 5));
 }
 "#;
-    assert_both_backends(
+    assert_project_output(
         &kinds_project(entry),
         "main.wi",
         "9\n1\n6\n4\nkept\n4\n7\n15\n",

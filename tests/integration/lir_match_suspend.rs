@@ -13,10 +13,9 @@
 //! covers the single-instruction form that everything else still uses, and
 //! perspectives 20 and 21 here pin down that it stays that way.
 //!
-//! Every test is differential — the same program under the AST emitter and under
-//! the walker must print the same thing — and the walker side sets
-//! `WILLOW_LIR_REQUIRE=1`, so a silent fallback is a compile error rather than a
-//! comparison of the AST emitter against itself. Several also run under a
+//! Since willow-0g8j.3 a body outside the walker's subset is a compile error,
+//! so a run that prints the right answer is proof the walker produced it.
+//! Several tests also run under a
 //! one-safepoint task budget (preemption between every safepoint) and under
 //! `WILLOW_GC_STRESS=alloc` (a collection at every allocation), because an arm
 //! binding that the frame forgot is only *at risk* under the default settings
@@ -32,25 +31,17 @@
 //!   7 two awaits, binding live across     20 non-suspending match unchanged
 //!   8 Option niche payload                21 sync match unchanged
 //!   9 GC binding read after the park      22 the arm really parks (rendezvous)
-//!  10 GC value allocated in the arm       23 E0811/E2606 still reject
+//!  10 GC value allocated in the arm       23 arm values and locks suspend
 //!  11 void statement-position match       24 suspending ternary condition
 //!  12 nested match inside an arm          25 the example is fully LIR
 //!  13 channel send/recv inside an arm
 
-use super::support::{compile_and_run_with_env, compile_error_stderr, compile_with_compiler_env};
+use super::support::{compile_with_compiler_env, compile_with_env_and_run};
 
-const AST: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const LIR: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_BUDGET: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_TASK_BUDGET", "1"),
-];
-const LIR_STRESS: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_GC_STRESS", "alloc"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const BUDGET: [(&str, &str); 1] = [("WILLOW_TASK_BUDGET", "1")];
+const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 
 const SHAPE: &str = "enum Shape { Circle(i64), Rect(i64, i64), Empty }\n";
 const SCALED: &str = "async fn scaled(n: i64) -> i64 { await yield(); return n * 3; }\n";
@@ -58,26 +49,37 @@ const SCALED: &str = "async fn scaled(n: i64) -> i64 { await yield(); return n *
 /// `expected` must come out of all four configurations, and each of `functions`
 /// must be named in the walker's selection log.
 fn assert_suspends(source: &str, expected: &str, functions: &[&str]) {
-    for env in [&AST[..], &LIR[..], &LIR_BUDGET[..], &LIR_STRESS[..]] {
-        let (out, ok) = compile_and_run_with_env(source, env);
+    for env in [&PLAIN[..], &BUDGET[..], &STRESS[..]] {
+        let (out, ok) = compile_with_env_and_run(source, env);
         assert!(ok, "run failed under {env:?}: {out}");
         assert_eq!(out, expected, "wrong output under {env:?}");
     }
     assert_walker_compiled(source, functions);
 }
 
+/// Prove Stage 5 suspension shapes under plain, one-step-budget, and allocation
+/// stress configurations, then verify the selection log.
+fn assert_lir_suspends(source: &str, expected: &str, functions: &[&str]) {
+    for env in [&PLAIN[..], &BUDGET[..], &STRESS[..]] {
+        let (out, ok) = compile_with_env_and_run(source, env);
+        assert!(ok, "run failed under {env:?}: {out}");
+        assert_eq!(out, expected, "wrong output under {env:?}");
+    }
+    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_LIR_LOG", "1")]);
+    assert!(ok, "logged LIR compile failed: {stderr}");
+    for function in functions {
+        assert!(
+            stderr.contains(&format!("compiling async `{function}` from lowered IR")),
+            "`{function}` was not &PLAIN[..]-compiled:\n{stderr}"
+        );
+    }
+}
+
 /// Compile once with the selection log on and require the walker to have taken
-/// each named function. Without this a coverage regression would still print the
-/// right answer — from the AST emitter.
+/// each named function. Without this a coverage regression could leave a
+/// function unlowered while the program still printed the right answer.
 fn assert_walker_compiled(source: &str, functions: &[&str]) {
-    let (ok, stderr) = compile_with_compiler_env(
-        source,
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_LIR_LOG", "1"),
-        ],
-    );
+    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_LIR_LOG", "1")]);
     assert!(ok, "logged LIR compile failed: {stderr}");
     for function in functions {
         let sync = format!("[lir] compiling `{function}` from lowered IR");
@@ -718,11 +720,10 @@ async fn main() {
     );
 }
 
-// 23. The two checker rules the split does NOT lift. Both exist because the AST
-//     emitter is still the fallback and cannot compile either shape; lifting
-//     them belongs with the Stage 5 cutover, not here.
+// 23. Stage 5 lifts the two temporary checker gates: expression arms and locks
+//     both use the same explicit arm CFG and frame-backed suspension edges.
 #[test]
-fn lir_suspend_23_arm_expression_and_lock_still_rejected() {
+fn lir_suspend_23_arm_expression_and_lock_resume() {
     let await_in_arm_expression = "async fn leaf(n: i64) -> i64 { return n; }
 async fn pick(n: i64) -> i64 {
     return match n {
@@ -732,11 +733,7 @@ async fn pick(n: i64) -> i64 {
 }
 async fn main() { println(await pick(1)); }
 ";
-    let stderr = compile_error_stderr(await_in_arm_expression);
-    assert!(
-        stderr.contains("E0811"),
-        "a suspending arm EXPRESSION must still be rejected: {stderr}"
-    );
+    assert_lir_suspends(await_in_arm_expression, "10\n", &["pick", "main"]);
 
     let lock_in_arm = "async fn apply(account: Mutex<i64>, n: i64) -> i64 {
     match n {
@@ -746,11 +743,7 @@ async fn main() { println(await pick(1)); }
 }
 async fn main() { println(await apply(Mutex::new(0), 1)); }
 ";
-    let stderr = compile_error_stderr(lock_in_arm);
-    assert!(
-        stderr.contains("E2606"),
-        "`lock` in an arm must still be rejected: {stderr}"
-    );
+    assert_lir_suspends(lock_in_arm, "1\n", &["apply", "main"]);
 }
 
 // 24. The sibling shape that the same block split exposed (willow-ht1h): a

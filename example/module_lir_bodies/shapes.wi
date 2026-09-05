@@ -128,7 +128,7 @@ pub fn grow(r: Rect, by: i64) -> Rect {
 
 // Lambda lifting is a DECLARATION-phase job, and until willow-9yhi a module
 // never had one: `lambda_names` held entry-file spans alone, so a lambda here
-// reached codegen with no lifted symbol and ICEd the compiler on BOTH backends.
+// reached codegen with no lifted symbol and ICEd the compiler.
 // The lifted functions are module-qualified (`shapes.$lambda.0`) because the
 // collector numbers from zero for every unit it walks.
 pub fn scaled(n: i64) -> i64 {

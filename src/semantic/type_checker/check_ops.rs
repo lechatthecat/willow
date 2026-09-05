@@ -403,7 +403,14 @@ impl TypeChecker {
     /// or enum) from another module (willow-7ihl). A module-qualified name
     /// contains `::`; same-module references are unqualified and never checked.
     pub(super) fn check_type_visibility(&mut self, name: &str, span: Span) {
-        if !name.contains("::") {
+        let Some((namespace, _)) = name.rsplit_once("::") else {
+            return;
+        };
+        // A module's own declarations carry its canonical identity now
+        // (willow-itcw), so a private enum a module uses in its OWN body reaches
+        // here fully qualified. It is at home; only the units that had to import
+        // it are asking about visibility.
+        if self.module_path.as_deref() == Some(namespace) {
             return;
         }
         let (is_private, kind) = if let Some(c) = self.symbols.lookup_class(name) {

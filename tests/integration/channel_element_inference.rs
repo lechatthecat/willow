@@ -4,7 +4,7 @@
 //! `Channel::new()` written without a type argument carries no element of its
 //! own: the checker types it `Channel<void>` and a `let` annotation supplies the
 //! real element. That placeholder used to survive into code generation, and both
-//! backends read the element from the wrong place — the AST emitter from the
+//! emitters read the element from the wrong place — the AST one from the
 //! (empty) call type arguments, the LIR walker from the `Channel<void>` node —
 //! so an annotated `Channel<String>` was built with `is_ref = 0`.
 //!
@@ -33,14 +33,9 @@
 
 use super::support::{compile_and_run_with_env, compile_error_stderr, compile_with_compiler_env};
 
-const AST: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const AST_STRESS: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "0"), ("WILLOW_GC_STRESS", "alloc")];
-const LIR: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_STRESS: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_GC_STRESS", "alloc"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 
 /// The padding loop every buffering perspective runs between queueing and
 /// draining. It allocates a fresh String per turn and keeps none of them, so
@@ -54,24 +49,17 @@ const PAD: &str = "    let mut padding = \"\";
     }
 ";
 
-/// `expected` must come out of both backends, with and without GC stress, and
-/// `functions` must each be named in the walker's selection log — otherwise a
-/// function that quietly fell back would make the comparison compare the AST
-/// path with itself.
+/// `expected` must come out with and without GC stress, and `functions` must
+/// each be named in the walker's selection log — otherwise a coverage
+/// regression could leave a function unlowered while the program still printed
+/// the right answer.
 fn assert_channels(source: &str, expected: &str, functions: &[&str]) {
-    for env in [&AST[..], &AST_STRESS[..], &LIR[..], &LIR_STRESS[..]] {
+    for env in [&PLAIN[..], &STRESS[..]] {
         let (out, ok) = compile_and_run_with_env(source, env);
         assert!(ok, "run failed under {env:?}: {out}");
         assert_eq!(out, expected, "wrong output under {env:?}");
     }
-    let (ok, stderr) = compile_with_compiler_env(
-        source,
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_LIR_LOG", "1"),
-        ],
-    );
+    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_LIR_LOG", "1")]);
     assert!(ok, "logged LIR compile failed: {stderr}");
     for function in functions {
         let sync = format!("[lir] compiling `{function}` from lowered IR");
@@ -641,14 +629,7 @@ fn channel_element_20_example_is_fully_lir() {
         source.contains("let ch: Channel<String> = Channel::new();"),
         "the example no longer exercises the annotated form"
     );
-    let (ok, stderr) = compile_with_compiler_env(
-        &source,
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_LIR_LOG", "1"),
-        ],
-    );
+    let (ok, stderr) = compile_with_compiler_env(&source, &[("WILLOW_LIR_LOG", "1")]);
     assert!(ok, "the example fell back to the AST backend: {stderr}");
     for function in [
         "buffered_strings",

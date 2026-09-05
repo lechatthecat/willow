@@ -6,9 +6,8 @@
 //! module's HIR at all. `lir_functions` therefore held no module symbol, the
 //! backend took its "this function has no lowered IR" branch for every
 //! cross-module body, and the AST emitter owned all of them — no matter how
-//! plainly the walker could have handled them. `WILLOW_LIR_REQUIRE=1` was
-//! quietly meaningless for a multi-file build: nothing to require, nothing to
-//! fall back from.
+//! plainly the walker could have handled them. Every bit of walker coverage was
+//! quietly meaningless for a multi-file build: nothing lowered, nothing walked.
 //!
 //! Three things had to line up for a module to be lowered:
 //!
@@ -31,32 +30,24 @@
 //!    which is what makes a field store, a call argument, and a return of a
 //!    module class eligible at all.
 //!
-//! Every perspective below asserts the two emitters agree, so a lowered module
-//! body is held to the AST emitter's answer rather than to its own.
+//! Every perspective below asserts the ANSWER a lowered module body produces,
+//! and the log perspectives name the functions the walker had to take.
 
 use super::support::*;
 
-const LIR_ON: &[(&str, &str)] = &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_OFF: &[(&str, &str)] = &[("WILLOW_LIR_BACKEND", "0")];
-const LIR_LOG: &[(&str, &str)] = &[
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_LIR_LOG", "1"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const LIR_LOG: &[(&str, &str)] = &[("WILLOW_LIR_LOG", "1")];
 const ALLOC_STRESS: &[(&str, &str)] = &[("WILLOW_GC_STRESS", "alloc")];
 const MINOR_STRESS: &[(&str, &str)] = &[("WILLOW_GC_STRESS", "minor")];
 
 /// Build the project twice — once with the walker required, once with it off —
 /// and assert both runs print `expected`.
 #[track_caller]
-fn assert_both_backends(files: &[(&str, &str)], entry: &str, expected: &str) {
-    let (lir, ok) = compile_temp_project_with_env_and_run(files, entry, LIR_ON);
-    assert!(ok, "LIR build failed: {lir}");
-    assert_eq!(lir, expected, "lowered-IR output mismatch");
-
-    let (ast, ok) = compile_temp_project_with_env_and_run(files, entry, LIR_OFF);
-    assert!(ok, "AST build failed: {ast}");
-    assert_eq!(ast, expected, "AST output mismatch");
+fn assert_project_output(files: &[(&str, &str)], entry: &str, expected: &str) {
+    let (out, ok) = compile_temp_project_with_env_and_run(files, entry, &PLAIN[..]);
+    assert!(ok, "build failed: {out}");
+    assert_eq!(out, expected, "wrong output");
 }
 
 /// A module with one class hierarchy, one enum, and a handful of bodies that
@@ -234,10 +225,10 @@ fn main() {
     );
 }
 
-// 3. `WILLOW_LIR_REQUIRE=1` now means something for a multi-file build: the
-//    whole project, module included, compiles with no fallback.
+// 3. Every body in a multi-file build has to be walkable now, module bodies
+//    included, since there is nothing else left to compile one.
 #[test]
-fn lir_require_now_polices_the_whole_project() {
+fn every_body_in_the_project_is_walker_compiled() {
     let entry = r#"
 import shapes;
 
@@ -246,8 +237,8 @@ fn main() {
 }
 "#;
     let (out, ok) =
-        compile_temp_project_with_env_and_run(&shapes_project(entry), "main.wi", LIR_ON);
-    assert!(ok, "no body in this project may fall back: {out}");
+        compile_temp_project_with_env_and_run(&shapes_project(entry), "main.wi", &PLAIN[..]);
+    assert!(ok, "every body in this project must be walkable: {out}");
     assert_eq!(out, "12\n");
 }
 
@@ -271,9 +262,10 @@ fn main() {
     );
 }
 
-// 5. A plain module free function returns the same value from both emitters.
+// 5. A plain module free function, called twice with different arguments: the
+//    lowered module body is reusable, not specialised to one call.
 #[test]
-fn module_free_function_agrees_across_backends() {
+fn a_module_free_function_returns_its_value() {
     let entry = r#"
 import shapes;
 
@@ -282,7 +274,7 @@ fn main() {
     println(shapes::area_of_rect(shapes::rect(7, 6)));
 }
 "#;
-    assert_both_backends(&shapes_project(entry), "main.wi", "12\n42\n");
+    assert_project_output(&shapes_project(entry), "main.wi", "12\n42\n");
 }
 
 // 6. A virtual call inside a module body resolves against the module's own
@@ -296,7 +288,7 @@ fn main() {
     println(shapes::area_of_rect(shapes::rect(5, 5)));
 }
 "#;
-    assert_both_backends(&shapes_project(entry), "main.wi", "25\n");
+    assert_project_output(&shapes_project(entry), "main.wi", "25\n");
 }
 
 // 7. Widening a subclass to its base is module-side: the entry file cannot even
@@ -311,12 +303,12 @@ fn main() {
     println(shapes::area_of_rect(shapes::rect(1, 9)));
 }
 "#;
-    assert_both_backends(&shapes_project(entry), "main.wi", "9\n");
+    assert_project_output(&shapes_project(entry), "main.wi", "9\n");
 }
 
 // 8. A class-typed FIELD is where the two spellings meet: the declaration says
 //    `shapes::Rect`, the module's own body says `Rect`. Without `same_class`
-//    the store is ineligible and the whole body falls back.
+//    the store would be rejected as invalid lowered IR.
 #[test]
 fn a_class_typed_field_is_eligible_under_both_spellings() {
     let entry = r#"
@@ -326,7 +318,7 @@ fn main() {
     println(shapes::frame_area(shapes::framed("win", 2, 5)));
 }
 "#;
-    assert_both_backends(&shapes_project(entry), "main.wi", "10\n");
+    assert_project_output(&shapes_project(entry), "main.wi", "10\n");
 }
 
 // 9. An `Array<i64>` field of a module class, read back through a loop.
@@ -339,7 +331,7 @@ fn main() {
     println(shapes::frame_marks(shapes::framed("win", 2, 5)));
 }
 "#;
-    assert_both_backends(&shapes_project(entry), "main.wi", "7\n");
+    assert_project_output(&shapes_project(entry), "main.wi", "7\n");
 }
 
 // 10. A `String` field and a method call on a nested class value.
@@ -352,7 +344,7 @@ fn main() {
     println(shapes::describe(shapes::framed("win", 2, 5)));
 }
 "#;
-    assert_both_backends(&shapes_project(entry), "main.wi", "win:rect\n");
+    assert_project_output(&shapes_project(entry), "main.wi", "win:rect\n");
 }
 
 // 11. A `defer` in a module body, made observable through a reference
@@ -368,7 +360,7 @@ fn main() {
     println(total);
 }
 "#;
-    assert_both_backends(&shapes_project(entry), "main.wi", "12\n12\n");
+    assert_project_output(&shapes_project(entry), "main.wi", "12\n12\n");
 }
 
 // 12. Recursion: the walker's call resolution has to find this module's own
@@ -382,7 +374,7 @@ fn main() {
     println(shapes::stack_area(shapes::rect(3, 4), 3));
 }
 "#;
-    assert_both_backends(&shapes_project(entry), "main.wi", "36\n");
+    assert_project_output(&shapes_project(entry), "main.wi", "36\n");
 }
 
 // 13. A method calling another method on `self`.
@@ -395,7 +387,7 @@ fn main() {
     println(shapes::doubled_rect(3, 4));
 }
 "#;
-    assert_both_backends(&shapes_project(entry), "main.wi", "24\n");
+    assert_project_output(&shapes_project(entry), "main.wi", "24\n");
 }
 
 // 14. A match on the module's own enum, inside the module.
@@ -408,7 +400,7 @@ fn main() {
     println(shapes::measure_boxy(9));
 }
 "#;
-    assert_both_backends(&shapes_project(entry), "main.wi", "9\n");
+    assert_project_output(&shapes_project(entry), "main.wi", "9\n");
 }
 
 // 15. TWO modules in one project are each lowered, each with its own tables.
@@ -455,7 +447,7 @@ fn main() {
             "`{symbol}` was not compiled from lowered IR: {log}"
         );
     }
-    assert_both_backends(files, "main.wi", "20\n");
+    assert_project_output(files, "main.wi", "20\n");
 }
 
 // 16. A module body calling INTO another module: the lowered call has to name
@@ -496,7 +488,7 @@ fn main() {
 "#,
         ),
     ];
-    assert_both_backends(files, "main.wi", "20\n");
+    assert_project_output(files, "main.wi", "20\n");
 }
 
 // 17. A module is lowered in ITS OWN scope. `mid` does not import `base`, so
@@ -583,7 +575,7 @@ async fn main() {
             "async module function `{symbol}` was not compiled from lowered IR: {log}"
         );
     }
-    assert_both_backends(files, "main.wi", "12\n");
+    assert_project_output(files, "main.wi", "12\n");
 }
 
 // 19. A module class value survives allocation stress: every allocation the
@@ -601,7 +593,7 @@ fn main() {
     let (out, ok) = compile_temp_project_with_env_and_run_under(
         &shapes_project(entry),
         "main.wi",
-        LIR_ON,
+        &PLAIN[..],
         ALLOC_STRESS,
     );
     assert!(ok, "alloc-stress run failed: {out}");
@@ -622,7 +614,7 @@ fn main() {
     let (out, ok) = compile_temp_project_with_env_and_run_under(
         &shapes_project(entry),
         "main.wi",
-        LIR_ON,
+        &PLAIN[..],
         MINOR_STRESS,
     );
     assert!(ok, "minor-stress run failed: {out}");
@@ -651,9 +643,9 @@ fn main() {
     assert_eq!(String::from_utf8_lossy(&run.stdout), "12\nwin:rect\n");
 }
 
-// 22. NEGATIVE control: a module body OUTSIDE the walker's subset is named by
-//     `WILLOW_LIR_REQUIRE=1` — which is only possible because module bodies are
-//     now lowered at all. The rejection has to name the module's symbol.
+// 22. NEGATIVE control: a module body OUTSIDE the walker's subset is REPORTED,
+//     which is only possible because module bodies are lowered at all. The
+//     rejection has to name the module's symbol, not the entry file's.
 #[test]
 fn a_module_body_outside_the_subset_is_now_reported() {
     let files = &[
@@ -682,21 +674,21 @@ fn main() {
 "#,
         ),
     ];
-    let (out, ok) = compile_temp_project_with_env_and_run(files, "main.wi", LIR_ON);
+    let (out, ok) = compile_temp_project_with_env_and_run(files, "main.wi", &PLAIN[..]);
     if !ok {
         assert!(
             out.contains("odd.spin"),
             "a rejected module body must be named by its mangled symbol: {out}"
         );
     }
-    // Whatever the subset covers today, both emitters must agree on the answer.
-    assert_both_backends(files, "main.wi", "12\n");
+    // Whatever the subset covers today, the answer must be the same one.
+    assert_project_output(files, "main.wi", "12\n");
 }
 
-// 23. A module body that falls back does NOT drag the rest of the project down:
-//     with `WILLOW_LIR_REQUIRE` unset, the build succeeds and still runs right.
+// 23. The plainest cross-module call there is, on the default build: no env,
+//     no log, just a module function reached from the entry file.
 #[test]
-fn a_fallback_in_one_module_leaves_the_others_lowered() {
+fn a_module_function_is_callable_on_the_default_build() {
     let files = &[
         (
             "good.wi",

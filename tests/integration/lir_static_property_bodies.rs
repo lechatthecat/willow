@@ -16,14 +16,14 @@
 //! and a silent one, since the fallback prints the same answer.
 //!
 //! The store is admitted in BOTH island scopes: its destination is a data
-//! segment, so unlike a `let` it needs no storage of its own, and a deferred
-//! body replayed by the unwinder with no root bracket can still run it.
-//! Perspective 23 is the boundary that did NOT move — a `let` in a deferred
-//! body is still refused.
+//! segment, so it needs no storage of its own at all. A `let` beside it is
+//! admitted too as of willow-0g8j.3 — `emit_deferred_action` brackets a
+//! deferred body's `vars` and GC root depth the way the match emitter brackets
+//! an arm — and perspective 23 is the pair of them together, a `let` a
+//! deferred static store reads.
 //!
-//! Every runtime perspective is differential, and the walker side sets
-//! `WILLOW_LIR_REQUIRE=1` so a body that quietly fell back is a compile error
-//! rather than the AST emitter being compared against itself.
+//! Since willow-0g8j.3 a body outside the walker's subset is a compile error,
+//! so a run that prints the right answer is proof the walker produced it.
 //!
 //! 24 perspectives:
 //!   1 every island body is logged     13 a subclass value into a base slot
@@ -43,34 +43,20 @@ use super::support::{
     compile_with_compiler_env, compile_with_env_and_run, compile_with_env_and_run_under,
 };
 
-/// The walker is on by default, so the "on" side names it explicitly rather
-/// than trusting the ambient environment. `WILLOW_LIR_REQUIRE=1` is what makes
-/// the comparison meaningful: without it a rejected body would fall back and
-/// both sides would run the same AST emitter.
-const LIR_ON: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_OFF: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const LIR_LOG: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_LIR_LOG", "1"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const LIR_LOG: [(&str, &str); 1] = [("WILLOW_LIR_LOG", "1")];
 const ALLOC_STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 const MINOR_STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "minor")];
 
+/// The build runs and prints `expected`. Since willow-0g8j.3 every body is
+/// compiled from lowered IR, so a body the walker cannot take is a compile
+/// error here rather than a second emitter's answer.
 #[track_caller]
-fn assert_both_backends(source: &str, expected: &str) {
-    let (with_lir, ok_on) = compile_with_env_and_run(source, &LIR_ON);
-    assert!(
-        ok_on,
-        "the walker must claim every function in this program: {with_lir}"
-    );
-    let (without_lir, ok_off) = compile_with_env_and_run(source, &LIR_OFF);
-    assert!(ok_off, "AST-path run failed: {without_lir}");
-    assert_eq!(
-        with_lir, without_lir,
-        "the two backends disagreed about an island body"
-    );
-    assert_eq!(with_lir, expected);
+fn assert_project_output(source: &str, expected: &str) {
+    let (out, ok) = compile_with_env_and_run(source, &PLAIN);
+    assert!(ok, "run failed: {out}");
+    assert_eq!(out, expected, "wrong output");
 }
 
 /// The class every perspective stores into.
@@ -86,8 +72,7 @@ fn with_registry(body: &str) -> String {
     format!("import std::collections::Array;\n\n{REGISTRY}\n{body}")
 }
 
-// 1. The log line is the proof. A program that merely RUNS says nothing about
-// which emitter compiled it, and the fallback this bead is about was silent.
+// 1. The selection log explicitly records each lowered island body.
 #[test]
 fn lir_static_body_01_every_island_body_is_logged() {
     let src = with_registry(
@@ -136,7 +121,7 @@ fn main() { println(deferred(3) + matched(0) + selected()); }",
 // 2. The bead's own repro: the store is the deferred body's only statement.
 #[test]
 fn lir_static_body_02_a_defer_block_stores() {
-    assert_both_backends(
+    assert_project_output(
         &with_registry(
             "fn bump(n: i64) -> i64 {
     defer {
@@ -158,7 +143,7 @@ fn main() {
 // load and the store must both resolve to the one data segment.
 #[test]
 fn lir_static_body_03_the_store_reads_its_own_slot() {
-    assert_both_backends(
+    assert_project_output(
         &with_registry(
             "fn add(n: i64) -> i64 {
     defer {
@@ -181,7 +166,7 @@ fn main() {
 // under it was not.
 #[test]
 fn lir_static_body_04_an_if_picks_the_stored_value() {
-    assert_both_backends(
+    assert_project_output(
         &with_registry(
             "fn classify(n: i64) -> i64 {
     defer {
@@ -206,7 +191,7 @@ fn main() {
 // 5. The other branch of the same `if`.
 #[test]
 fn lir_static_body_05_the_else_branch_stores() {
-    assert_both_backends(
+    assert_project_output(
         &with_registry(
             "fn classify(n: i64) -> i64 {
     defer {
@@ -232,7 +217,7 @@ fn main() {
 // spells a multi-way store.
 #[test]
 fn lir_static_body_06_a_match_arm_stores() {
-    assert_both_backends(
+    assert_project_output(
         &with_registry(
             "fn name(n: i64) -> String {
     match n {
@@ -262,7 +247,7 @@ fn main() {
 // runs inside the same bracket that holds it.
 #[test]
 fn lir_static_body_07_an_arm_with_a_payload_binding_stores() {
-    assert_both_backends(
+    assert_project_output(
         &with_registry(
             "enum Reading {
     Value(i64),
@@ -293,7 +278,7 @@ fn main() {
 // 8. A `select` case body is bracketed exactly as a `match` arm is.
 #[test]
 fn lir_static_body_08_a_select_case_stores() {
-    assert_both_backends(
+    assert_project_output(
         &with_registry(
             "fn selected() -> i64 {
     let ch = Channel<i64>::with_capacity(1);
@@ -316,7 +301,7 @@ fn main() { println(selected()); }",
 // DECLARED in (willow-0g8j.13), and the store is the same store.
 #[test]
 fn lir_static_body_09_self_prop_in_a_defer() {
-    assert_both_backends(
+    assert_project_output(
         "class Meter {
     pub static mut issued: i64 = 0;
 
@@ -340,7 +325,7 @@ fn main() {
 // 10. The same resolution inside the other island shape.
 #[test]
 fn lir_static_body_10_self_prop_in_a_match_arm() {
-    assert_both_backends(
+    assert_project_output(
         "class Meter {
     pub static mut issued: i64 = 0;
 
@@ -369,7 +354,7 @@ fn main() {
 // global static needs, not a plain word store.
 #[test]
 fn lir_static_body_11_a_string_property() {
-    assert_both_backends(
+    assert_project_output(
         &with_registry(
             "fn tag(a: String, b: String) -> i64 {
     defer {
@@ -391,7 +376,7 @@ fn main() {
 // function it was deferred in has returned.
 #[test]
 fn lir_static_body_12_an_array_property() {
-    assert_both_backends(
+    assert_project_output(
         &with_registry(
             "fn fill() -> i64 {
     defer {
@@ -413,7 +398,7 @@ fn main() {
 // is stored as its base — the same rule the function-level store follows.
 #[test]
 fn lir_static_body_13_a_subclass_value_into_a_base_slot() {
-    assert_both_backends(
+    assert_project_output(
         "open class Animal {
     pub legs: i64;
     pub open fn legs_of(self) -> i64 { return self.legs; }
@@ -446,7 +431,7 @@ fn main() {
 // emitter, and admitting the statement must not disturb it.
 #[test]
 fn lir_static_body_14_two_defers_run_lifo() {
-    assert_both_backends(
+    assert_project_output(
         &with_registry(
             "fn ordered() -> i64 {
     defer {
@@ -471,7 +456,7 @@ fn main() {
 // registration runs at scope exit.
 #[test]
 fn lir_static_body_15_a_defer_inside_a_loop() {
-    assert_both_backends(
+    assert_project_output(
         &with_registry(
             "fn counted(n: i64) -> i64 {
     let mut i = 0;
@@ -497,7 +482,7 @@ fn main() {
 // is recursive, so the store has to be admitted at every depth.
 #[test]
 fn lir_static_body_16_a_nested_if_in_a_defer() {
-    assert_both_backends(
+    assert_project_output(
         &with_registry(
             "fn grade(n: i64) -> i64 {
     defer {
@@ -527,7 +512,7 @@ fn main() {
 // function is inside.
 #[test]
 fn lir_static_body_17_another_classes_property() {
-    assert_both_backends(
+    assert_project_output(
         "class Left {
     pub static mut n: i64 = 0;
 }
@@ -558,7 +543,7 @@ fn main() {
 // this store is not.
 #[test]
 fn lir_static_body_18_a_defer_on_the_recover_path() {
-    assert_both_backends(
+    assert_project_output(
         &with_registry(
             "fn boom() {
     defer match recover() {
@@ -587,7 +572,7 @@ fn main() {
 // poll ABI, so its deferred island had the same gap.
 #[test]
 fn lir_static_body_19_an_async_functions_defer() {
-    assert_both_backends(
+    assert_project_output(
         &with_registry(
             "async fn work(n: i64) -> i64 {
     defer {
@@ -623,7 +608,7 @@ fn main() {
     println(Registry::label + \"!\");
 }",
     );
-    let (out, ok) = compile_with_env_and_run_under(&src, &LIR_ON, &ALLOC_STRESS);
+    let (out, ok) = compile_with_env_and_run_under(&src, &PLAIN, &ALLOC_STRESS);
     assert!(ok, "allocation-stress run failed: {out}");
     assert_eq!(out, "7\ntag-7\ntag-7!\n");
 }
@@ -647,7 +632,7 @@ fn main() {
     println(Registry::seen[2]);
 }",
     );
-    let (out, ok) = compile_with_env_and_run_under(&src, &LIR_ON, &MINOR_STRESS);
+    let (out, ok) = compile_with_env_and_run_under(&src, &PLAIN, &MINOR_STRESS);
     assert!(ok, "minor-collection-stress run failed: {out}");
     assert_eq!(out, "1\n6\n10\n12\n");
 }
@@ -656,7 +641,7 @@ fn main() {
 // not make it unconditional.
 #[test]
 fn lir_static_body_22_an_untaken_branch_stores_nothing() {
-    assert_both_backends(
+    assert_project_output(
         &with_registry(
             "fn maybe(n: i64) -> i64 {
     defer {
@@ -676,17 +661,22 @@ fn main() {
     );
 }
 
-// 23. The boundary that did NOT move. A `let` in a deferred body would leave a
-// shadow-stack entry behind, so it is still refused — and the refusal is a
-// tested decision, not an accident. The program is correct either way; only
-// the emitter that compiles it changes.
+// 23. The boundary that MOVED (willow-0g8j.3): a `let` in a deferred body is
+// admitted, and a deferred static store can read it. `emit_deferred_action`
+// replays the body inside a bracket of its own — `vars` and the GC root depth
+// snapshotted before and restored after — so the binding's rooted slot is
+// popped at every exit the registration is live for, and the code after the
+// flush stays at the depth it was emitted for. The String property makes that
+// concrete: `doubled` is GC-managed, so a leaked slot would show up here.
 #[test]
-fn lir_static_body_23_a_let_in_a_defer_is_still_refused() {
+fn lir_static_body_23_a_let_feeds_a_deferred_store() {
     let src = with_registry(
         "fn bump(n: i64) -> i64 {
     defer {
         let doubled = n * 2;
+        let tag = \"x\";
         Registry::count = doubled;
+        Registry::label = tag;
     }
     return n;
 }
@@ -694,26 +684,27 @@ fn lir_static_body_23_a_let_in_a_defer_is_still_refused() {
 fn main() {
     println(bump(3));
     println(Registry::count);
+    println(Registry::label);
 }",
     );
-    let (ok, report) = compile_with_compiler_env(&src, &LIR_ON);
+    assert_project_output(&src, "3\n6\nx\n");
+    let (ok, stderr) = compile_with_compiler_env(&src, &LIR_LOG);
+    assert!(ok, "the program must compile: {stderr}");
     assert!(
-        !ok,
-        "a `let` in a deferred body must still fall back:\n{report}"
+        stderr.contains("[lir] compiling `bump` from lowered IR"),
+        "`bump` was not walker-compiled:\n{stderr}"
     );
-    assert!(
-        report.contains("it registers an unsupported `defer` body"),
-        "unexpected rejection reason:\n{report}"
-    );
-    let (out, ran) = compile_with_env_and_run(&src, &LIR_OFF);
-    assert!(ran, "the AST emitter must still compile it: {out}");
-    assert_eq!(out, "3\n6\n");
+    for stress in [&ALLOC_STRESS[..], &MINOR_STRESS[..]] {
+        let (out, ran) = compile_with_env_and_run_under(&src, &PLAIN, stress);
+        assert!(ran, "stressed run failed: {out}");
+        assert_eq!(out, "3\n6\nx\n", "wrong output under {stress:?}");
+    }
 }
 
-// 24. The example, with fallback made fatal.
+// 24. The example compiles entirely through lowered IR.
 #[test]
 fn lir_static_body_24_the_example_has_no_fallback() {
     let src = std::fs::read_to_string("example/lir_static_property_bodies.wi")
         .expect("example/lir_static_property_bodies.wi must exist");
-    assert_both_backends(&src, "6\n3\n20\nbig\none\nmany\n2\n5\n0\n10\n7\n9\n10\n");
+    assert_project_output(&src, "6\n3\n20\nbig\none\nmany\n2\n5\n0\n10\n7\n9\n10\n");
 }

@@ -16,10 +16,8 @@
 //! now read off the arms, and admitted wherever nothing follows the `match` in
 //! the same Cranelift block.
 //!
-//! Every test is differential: the same source under the AST emitter and under
-//! the walker must print the same thing, and `WILLOW_LIR_REQUIRE=1` turns any
-//! fallback into a compile error, so a coverage regression cannot pass by
-//! comparing the AST path against itself.
+//! Since willow-0g8j.3 a body outside the walker's subset is a compile error,
+//! so a run that prints the right answer is proof the walker produced it.
 //!
 //! 31 perspectives:
 //!   1 a guard before the arm's return    14 an arm-local String under GC
@@ -43,24 +41,15 @@
 
 use super::support::{compile_and_run_with_env, compile_with_compiler_env};
 
-const AST: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const LIR: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_STRESS: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_GC_STRESS", "alloc"),
-];
-const LIR_LOG: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_LIR_LOG", "1"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
+const LIR_LOG: [(&str, &str); 1] = [("WILLOW_LIR_LOG", "1")];
 
 /// `expected` must come out of all three configurations, and `functions` must
-/// each be named in the walker's selection log — otherwise the second copy of
-/// the right answer came from the AST emitter too.
+/// each be named in the walker's selection log.
 fn assert_arm_control_flow(source: &str, expected: &str, functions: &[&str]) {
-    for env in [&AST[..], &LIR[..], &LIR_STRESS[..]] {
+    for env in [&PLAIN[..], &STRESS[..]] {
         let (out, ok) = compile_and_run_with_env(source, env);
         assert!(ok, "run failed under {env:?}: {out}");
         assert_eq!(out, expected, "wrong output under {env:?}");
@@ -81,17 +70,15 @@ fn assert_walker_compiled(source: &str, functions: &[&str]) {
     }
 }
 
-/// A program that panics under a guard: both emitters must fail, and the
-/// message must be the one the guarded `panic` carries.
-fn assert_same_panic(source: &str, message: &str) {
-    for env in [&AST[..], &LIR[..]] {
-        let (out, ok) = compile_and_run_with_env(source, env);
-        assert!(!ok, "expected a panic under {env:?}: {out}");
-        assert!(
-            out.contains(message),
-            "report under {env:?} is missing `{message}`:\n{out}"
-        );
-    }
+/// A program that panics under a guard: the build must run, the process must
+/// fail, and the message must be the one the guarded `panic` carries.
+fn assert_guarded_panic(source: &str, message: &str) {
+    let (out, ok) = compile_and_run_with_env(source, &PLAIN);
+    assert!(!ok, "expected a panic: {out}");
+    assert!(
+        out.contains(message),
+        "report is missing `{message}`:\n{out}"
+    );
 }
 
 const SHAPE: &str = "enum Shape { Square(i64), Circle(i64) }\n";
@@ -123,7 +110,7 @@ fn arm_flow_01_guard_before_the_arms_return() {
 //    to actually unwind, not merely compile.
 #[test]
 fn arm_flow_02_the_guarded_panic_fires() {
-    assert_same_panic(
+    assert_guarded_panic(
         &format!(
             "{SHAPE}\
              fn measure(s: Shape) -> i64 {{\n\

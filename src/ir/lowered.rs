@@ -791,6 +791,12 @@ struct ActiveLock {
 
 fn expr_suspends_here(expr: &HirExpr) -> bool {
     match &expr.kind {
+        HirExprKind::Await { inner }
+            if builtin_types::unary_arg(&inner.ty, B::Future).is_some()
+                && !matches!(&inner.kind, HirExprKind::Call { callee, .. } if matches!(callee.as_str(), "sleep" | "yield")) =>
+        {
+            false
+        }
         HirExprKind::Await { .. } | HirExprKind::Select { .. } => true,
         HirExprKind::MethodCall { object, method, .. } => {
             builtin_types::unary_arg(&object.ty, B::Channel).is_some()
@@ -814,16 +820,21 @@ fn collect_suspensions<'a>(expr: &'a HirExpr, out: &mut Vec<&'a HirExpr>) {
     }
 }
 
+/// Does a suspension live anywhere inside this expression?
+fn suspends_anywhere(expr: &HirExpr) -> bool {
+    let mut found = Vec::new();
+    collect_suspensions(expr, &mut found);
+    !found.is_empty()
+}
+
 /// Does any statement of this body suspend? Used to decide whether a `match`
 /// has to become blocks: an arm that never returns control to the scheduler is
 /// emittable as part of an expression tree, and staying a tree keeps the
 /// existing `match` emission (willow-0g8j.2.11.1).
 fn body_suspends(body: &[HirStmt]) -> bool {
-    body.iter().flat_map(HirStmt::child_exprs).any(|expr| {
-        let mut found = Vec::new();
-        collect_suspensions(expr, &mut found);
-        !found.is_empty()
-    })
+    body.iter()
+        .flat_map(HirStmt::child_exprs)
+        .any(suspends_anywhere)
 }
 
 /// Does this body contain a statement that cannot remain inside a match arm's
@@ -842,6 +853,7 @@ fn stmt_needs_match_cfg(stmt: &HirStmt) -> bool {
         | HirStmt::Break { .. }
         | HirStmt::Continue { .. }
         | HirStmt::Defer { .. }
+        | HirStmt::Lock { .. }
         | HirStmt::IndexAssign { .. }
         | HirStmt::StaticFieldAssign { .. } => true,
         HirStmt::If {
@@ -852,7 +864,6 @@ fn stmt_needs_match_cfg(stmt: &HirStmt) -> bool {
             body_needs_match_cfg(then_branch)
                 || else_branch.as_deref().is_some_and(body_needs_match_cfg)
         }
-        HirStmt::Lock { body, .. } => body_needs_match_cfg(body),
         _ => stmt.child_exprs().into_iter().any(expr_needs_match_cfg),
     }
 }
@@ -1301,18 +1312,39 @@ impl Builder {
             return None;
         }
         let operation = match &value.kind {
+            // Awaiting a `Future<T>` VALUE is a BLOCKING runtime call
+            // (`willow_future_await_*`), not a scheduler suspension: there is
+            // no async frame behind that pointer to park on. Splitting it into
+            // a `Suspend` would hand `SuspendOp::AwaitTask` a raw future
+            // pointer to read frame slots out of, so this refuses the SPLIT and
+            // leaves the await as an ordinary expression for the walker to emit
+            // as that call (willow-0g8j.3) — the function itself still compiles
+            // from LIR. `await sleep(..)` / `await yield()` are not this case:
+            // their type is `Future<void>` too, but they are recognised by
+            // their CALL shape below and become real suspensions.
+            HirExprKind::Await { inner }
+                if awaitable_task_type(&inner.ty).is_none()
+                    && builtin_types::unary_arg(&inner.ty, B::Future).is_some()
+                    && !matches!(&inner.kind, HirExprKind::Call { callee, args }
+                        if (callee == "sleep" && args.len() == 1)
+                            || (callee == "yield" && args.is_empty())) =>
+            {
+                return None;
+            }
             HirExprKind::Await { inner } => {
                 if let HirExprKind::Call { callee, args } = &inner.kind {
                     match (callee.as_str(), args.as_slice()) {
                         ("sleep", [millis]) if value.ty == Type::Void => {
+                            let millis = self.lower_operand_before_suspend(millis)?;
                             let name = self.synthetic_name("sleep_millis");
-                            let millis = self.push_synth_let(&name, false, millis.clone());
+                            let millis = self.push_synth_let(&name, false, millis);
                             SuspendOp::Sleep { millis }
                         }
                         ("yield", []) if value.ty == Type::Void => SuspendOp::Yield,
                         _ => {
+                            let awaited = self.lower_operand_before_suspend(inner)?;
                             let name = self.synthetic_name("task");
-                            let task = self.push_synth_let(&name, false, (**inner).clone());
+                            let task = self.push_synth_let(&name, false, awaited);
                             let (result_ty, cancel_aware) = awaitable_task_type(&inner.ty)
                                 .unwrap_or_else(|| (value.ty.clone(), false));
                             SuspendOp::AwaitTask {
@@ -1324,8 +1356,9 @@ impl Builder {
                         }
                     }
                 } else {
+                    let awaited = self.lower_operand_before_suspend(inner)?;
                     let name = self.synthetic_name("task");
-                    let task = self.push_synth_let(&name, false, (**inner).clone());
+                    let task = self.push_synth_let(&name, false, awaited);
                     let (result_ty, cancel_aware) =
                         awaitable_task_type(&inner.ty).unwrap_or_else(|| (value.ty.clone(), false));
                     SuspendOp::AwaitTask {
@@ -1341,8 +1374,9 @@ impl Builder {
                 method,
                 args,
             } if builtin_types::unary_arg(&object.ty, B::Channel).is_some() => {
+                let receiver = self.lower_operand_before_suspend(object)?;
                 let channel_name = self.synthetic_name("channel");
-                let channel = self.push_synth_let(&channel_name, false, (**object).clone());
+                let channel = self.push_synth_let(&channel_name, false, receiver);
                 match (method.as_str(), args.as_slice()) {
                     ("recv", []) => SuspendOp::ChannelRecv {
                         channel,
@@ -1357,8 +1391,9 @@ impl Builder {
                             .first()
                             .expect("Channel has an element type")
                             .clone();
+                        let sent = self.lower_operand_before_suspend(sent)?;
                         let value_name = self.synthetic_name("send_value");
-                        let sent = self.push_synth_let(&value_name, false, sent.clone());
+                        let sent = self.push_synth_let(&value_name, false, sent);
                         SuspendOp::ChannelSend {
                             channel,
                             value: sent,
@@ -1520,6 +1555,71 @@ impl Builder {
             }
             None => self.lower_scope(body),
         }
+    }
+
+    /// Evaluate one operand into a local of its own, splitting the suspension it
+    /// holds out of the expression that reads it (willow-0g8j.3).
+    ///
+    /// `None` when the suspension sits somewhere no split reaches; the operand
+    /// then keeps its suspension and the enclosing statement is refused as a
+    /// whole.
+    fn lower_suspending_operand(&mut self, operand: &HirExpr) -> Option<HirExpr> {
+        let name = self.synthetic_name("operand");
+        let local = self.declare_local(name.clone(), operand.ty.clone(), None, true, false);
+        if self.lower_root_suspend(operand, Some(local)).is_none() {
+            let value = self.lower_nested_suspend(operand)?;
+            self.push_existing_let(local, name, false, operand.ty.clone(), value, None);
+        }
+        Some(self.local_expr(local, operand.span))
+    }
+
+    /// An operand of a statement that is ITSELF about to park: anything it
+    /// suspends on runs first, in its own split, so the park that follows holds
+    /// no nested suspension (willow-0g8j.3). `done.send(work.recv())` parks on
+    /// the recv and sends the value it resumed with.
+    fn lower_operand_before_suspend(&mut self, operand: &HirExpr) -> Option<HirExpr> {
+        if !suspends_anywhere(operand) {
+            return Some(operand.clone());
+        }
+        self.lower_suspending_operand(operand)
+    }
+
+    /// Split a suspension out of an assignment's operands (willow-0g8j.3).
+    ///
+    /// `obj.field = await task;` and `xs[i] = await task;` park in the middle of
+    /// a store, so their operands are ANF'd here the way a `let`'s initialiser
+    /// is: the suspension becomes a [`Terminator::Suspend`] of its own and the
+    /// store reads the local the resume filled. Operands are evaluated left to
+    /// right, so every operand before the parking one is frozen into a local
+    /// first — a resume must not re-run `obj` or `i`.
+    ///
+    /// `None` when nothing suspends, or when a suspension sits somewhere this
+    /// cannot hoist it out of. The caller then pushes the operands as written,
+    /// and [`lir_async_rejection_reason`](crate::backend::cranelift) turns the
+    /// remaining suspension into an AST fallback — which is also why the
+    /// synthetic locals a partial split already pushed are harmless: the whole
+    /// lowered function is discarded with it.
+    fn lower_assign_operands(&mut self, operands: &[&HirExpr]) -> Option<Vec<HirExpr>> {
+        if !self.is_async {
+            return None;
+        }
+        let last = operands
+            .iter()
+            .rposition(|operand| suspends_anywhere(operand))?;
+        let mut out = Vec::with_capacity(operands.len());
+        for (index, operand) in operands.iter().enumerate() {
+            let lowered = if suspends_anywhere(operand) {
+                self.lower_suspending_operand(operand)?
+            } else if index < last && !rematerializable(operand) {
+                let name = self.synthetic_name("operand");
+                let local = self.push_synth_let(&name, false, (*operand).clone());
+                self.local_expr(local, operand.span)
+            } else {
+                (*operand).clone()
+            };
+            out.push(lowered);
+        }
+        Some(out)
     }
 
     fn lower_nested_suspend(&mut self, value: &HirExpr) -> Option<HirExpr> {
@@ -2236,31 +2336,55 @@ impl Builder {
                 field,
                 value,
                 ..
-            } => self.push(LirInst::FieldAssign {
-                object: object.clone(),
-                field: field.clone(),
-                value: value.clone(),
-            }),
+            } => {
+                let operands = self
+                    .lower_assign_operands(&[object, value])
+                    .unwrap_or_else(|| vec![object.clone(), value.clone()]);
+                let [object, value] = operands
+                    .try_into()
+                    .unwrap_or_else(|_| unreachable!("two operands in, two operands out"));
+                self.push(LirInst::FieldAssign {
+                    object,
+                    field: field.clone(),
+                    value,
+                });
+            }
             HirStmt::IndexAssign {
                 array,
                 index,
                 value,
                 ..
-            } => self.push(LirInst::IndexAssign {
-                array: array.clone(),
-                index: index.clone(),
-                value: value.clone(),
-            }),
+            } => {
+                let operands = self
+                    .lower_assign_operands(&[array, index, value])
+                    .unwrap_or_else(|| vec![array.clone(), index.clone(), value.clone()]);
+                let [array, index, value] = operands
+                    .try_into()
+                    .unwrap_or_else(|_| unreachable!("three operands in, three operands out"));
+                self.push(LirInst::IndexAssign {
+                    array,
+                    index,
+                    value,
+                });
+            }
             HirStmt::StaticFieldAssign {
                 class,
                 field,
                 value,
                 ..
-            } => self.push(LirInst::StaticFieldAssign {
-                class: class.clone(),
-                field: field.clone(),
-                value: value.clone(),
-            }),
+            } => {
+                let operands = self
+                    .lower_assign_operands(&[value])
+                    .unwrap_or_else(|| vec![value.clone()]);
+                let [value] = operands
+                    .try_into()
+                    .unwrap_or_else(|_| unreachable!("one operand in, one operand out"));
+                self.push(LirInst::StaticFieldAssign {
+                    class: class.clone(),
+                    field: field.clone(),
+                    value,
+                });
+            }
             HirStmt::SuperInit { args, span } => self.push(LirInst::SuperInit {
                 args: args.clone(),
                 span: *span,

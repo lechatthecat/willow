@@ -40,6 +40,13 @@ pub struct TypeChecker {
     /// an ordinary function (willow-ltkj). `check_program` sets it; a pass that
     /// ever checks module bodies must clear it first.
     pub(crate) entry_program: bool,
+    /// The canonical path of the module these items belong to, when they are a
+    /// MODULE's (willow-itcw). A type declared here is registered under
+    /// `module::Name` as well as the bare spelling its own body uses, and
+    /// `normalize_type` answers the bare spelling with the qualified identity,
+    /// so one enum has ONE name in every unit that can see it. `None` for the
+    /// entry program, whose declarations are already unique build-wide.
+    pub(crate) module_path: Option<String>,
     /// Nesting depth of enclosing loops; `break`/`continue` outside a loop is
     /// E0904. Reset to 0 inside a lambda body (a loop outside the lambda is
     /// not breakable from within it) (willow-kzka).
@@ -50,26 +57,16 @@ pub struct TypeChecker {
     /// (willow-38w.1.1). Reset inside a lambda body, which only gets
     /// CONSTRUCTED in the section and holds nothing when it runs (willow-3kty).
     pub(crate) lock_depth: u32,
-    /// Nesting depth of enclosing `match` arm bodies. A `lock` acquired inside
-    /// one is E2606: the arm has no frame-backed resume shape of its own, the
-    /// sibling restriction to the E0811 that covers suspending arm EXPRESSIONS.
-    /// Reset for lambdas, whose body is a separate function.
-    pub(crate) match_arm_depth: u32,
     /// Lexical statement-block depth within the current function-like body.
     /// The outer function/method body is depth 1. Reset for lambdas so recovery
     /// capability cannot cross a function boundary (willow-s9ej.3).
     pub(crate) lexical_block_depth: u32,
-    /// Maps each lambda's span to its inferred (or annotated) return type.
-    /// Populated during check_lambda; consumed by the backend for correct codegen.
-    pub lambda_return_types: HashMap<Span, Type>,
-    /// Maps each lambda's span to its full inferred `fn(...) -> ...` type.
-    /// This includes parameter types inferred from call-site context, which the
-    /// immutable AST cannot store directly.
-    pub lambda_fn_types: HashMap<Span, Type>,
     /// Resolved types of `let` locals declared inside `async fn` bodies, keyed by
-    /// the let statement's span. Lets the backend frame-back UNANNOTATED locals
-    /// that must survive `await` (willow-lpn.5c). Populated in `check`.
-    pub async_local_types: HashMap<Span, Type>,
+    /// the let statement's span. Checker-internal: `check_decls` diffs it across
+    /// a body to hand `check_async_task_send` the locals a task would carry
+    /// across `await`. The backend used to read it to frame-back unannotated
+    /// locals; the lowered-IR frame layout owns that now (willow-0g8j.3).
+    async_local_types: HashMap<Span, Type>,
     /// Maps the span of an UNQUALIFIED enum-variant construction (`Ok(42)` in an
     /// expected-enum position) to the enum it resolved to. The backend consults
     /// this to lower such a `Call` as a variant allocation instead of a function
@@ -84,6 +81,21 @@ pub struct TypeChecker {
     /// authoritative record for consumers (HIR lowering) that must not
     /// re-derive types from the AST (willow-mb5 checker pivot).
     pub expr_types: HashMap<Span, Type>,
+    /// What every type ANNOTATION the checker normalized became: the written
+    /// spelling (`Arr<i64>`, `std::result::Result<i64, String>`, a module's own
+    /// `Level`) mapped to the type the rest of the compiler uses for it
+    /// (willow-0g8j.3). HIR lowering takes annotations straight off the AST,
+    /// which is the one place a written spelling could still reach the back end
+    /// and be turned down as an unknown type.
+    pub normalized_types: HashMap<Type, Type>,
+    /// What each static call's written class name resolved to, keyed by the
+    /// call's span, when the two differ: `Dict::new()` under
+    /// `import std::collections::Map as Dict` records `Map` (willow-0g8j.3).
+    pub static_call_classes: HashMap<Span, String>,
+    /// The type a `match` in value position flows into, set for the duration of
+    /// that one `match` by [`TypeChecker::check_expr_expecting`] and taken by
+    /// [`TypeChecker::check_match_expr`] (willow-0g8j.3).
+    match_expected: Option<Type>,
     current_return_type: Type,
     /// Stack of lambda return types being inferred. When non-empty, `return` stmts
     /// record their type here instead of checking against `current_return_type`.
@@ -290,16 +302,17 @@ impl TypeChecker {
             symbols: SymbolTable::default(),
             errors: Vec::new(),
             entry_program: false,
+            module_path: None,
             loop_depth: 0,
-            match_arm_depth: 0,
             lock_depth: 0,
             lexical_block_depth: 0,
-            lambda_return_types: HashMap::new(),
-            lambda_fn_types: HashMap::new(),
             async_local_types: HashMap::new(),
             enum_variant_resolutions: HashMap::new(),
             pattern_resolutions: HashMap::new(),
             expr_types: HashMap::new(),
+            normalized_types: HashMap::new(),
+            static_call_classes: HashMap::new(),
+            match_expected: None,
             current_return_type: Type::Void,
             lambda_return_stack: Vec::new(),
             current_class: None,
@@ -331,6 +344,13 @@ impl TypeChecker {
         checker
     }
 
+    /// Name the module whose items this checker is about to check
+    /// (willow-itcw), so its own declarations get a canonical identity. Call
+    /// before `check_module_program`; the entry program leaves it unset.
+    pub fn set_module_path(&mut self, path: &str) {
+        self.module_path = Some(path.to_string());
+    }
+
     /// Enable the Send/Sync async checks. Turned on when targeting multi-worker
     /// execution (willow-dgwo.4/.9).
     pub fn set_enforce_send_sync(&mut self, on: bool) {
@@ -348,7 +368,43 @@ impl TypeChecker {
         self.nonpreemptible_module_methods = methods;
     }
 
+    /// The one name an enum answers to build-wide, given any spelling this unit
+    /// can reach it by (willow-itcw). Every other type name is its own identity
+    /// and passes through: a class or interface is only ever registered by one
+    /// unit's checker, while enums are registered by every unit that can see
+    /// them and share one back-end table.
+    pub(super) fn canonical_type_name(&self, name: &str) -> String {
+        match self.symbols.lookup_enum(name) {
+            Some(info) => info.name.clone(),
+            None => name.to_string(),
+        }
+    }
+
+    /// Whether this unit may write the enum's members with no enum name in
+    /// front of them. A unit spells an enum bare when it declares it or when it
+    /// item-imported it (willow-64gs); one that only reaches the enum through
+    /// `module::Enum` may not, so a module's variants stay invisible to its
+    /// importers even though both now agree on the enum's identity
+    /// (willow-itcw).
+    pub(super) fn enum_nameable_bare(&self, identity: &str) -> bool {
+        self.symbols
+            .enums
+            .iter()
+            .any(|(alias, info)| !alias.to_string().contains("::") && info.name == identity)
+    }
+
     fn normalize_type(&mut self, ty: &Type, span: Span) -> Type {
+        let normalized = self.normalize_type_inner(ty, span);
+        // A failed normalization answers `Void` after reporting (a malformed
+        // builtin generic); recording that would hand lowering a type the
+        // program never wrote. Everything else is the annotation's meaning.
+        if normalized != *ty && !(normalized == Type::Void && *ty != Type::Void) {
+            self.normalized_types.insert(ty.clone(), normalized.clone());
+        }
+        normalized
+    }
+
+    fn normalize_type_inner(&mut self, ty: &Type, span: Span) -> Type {
         match ty {
             Type::Array(element) => {
                 Type::Array(Box::new(self.normalize_type(element.as_ref(), span)))
@@ -370,7 +426,7 @@ impl TypeChecker {
                 if let Some((module, item)) = self.resolve_imported_std_module_item(name, span) {
                     return self.normalize_std_type_item(name, &module, &item, args, span);
                 }
-                Type::Generic(name.clone(), args)
+                Type::Generic(self.canonical_type_name(name), args)
             }
             Type::Named(name) => {
                 if self.imported_collection_aliases.contains_key(name) {
@@ -392,7 +448,10 @@ impl TypeChecker {
                 {
                     self.normalize_std_type_item(name, &module, &item, Vec::new(), span)
                 } else {
-                    ty.clone()
+                    match self.canonical_type_name(name) {
+                        canonical if canonical == *name => ty.clone(),
+                        canonical => Type::Named(canonical),
+                    }
                 }
             }
             Type::Fn(params, ret) => Type::Fn(
@@ -4921,10 +4980,10 @@ fn f() { let xs: Array<Animal> = [new Dog(), new Rock()]; }
     // A `&`/`&mut` parameter is passed as a POINTER, so the mode is part of an
     // interface method's ABI, not decoration. Dropping it let a by-value
     // implementation satisfy a reference requirement and let a call site hand
-    // the callee an integer to dereference — a segfault on both backends.
+    // the callee an integer to dereference — a segfault at run time.
     // Perspectives 1..18 below cover conformance, call sites and the places
     // where a signature is rendered or instantiated; 19..30 continue in the
-    // LIR eligibility tests (`k24`..`k27`) and the codegen differentials.
+    // LIR eligibility tests (`k24`..`k27`) and the end-to-end codegen tests.
     //
     //  1 matching `&mut` conforms · 2 value impl vs `&mut` requirement ·
     //  3 `&mut` impl vs value requirement · 4 `&` impl vs `&mut` requirement ·
@@ -6914,19 +6973,12 @@ async fn f() {
         );
     }
 
-    // ── `lock` inside a `match` arm: E2606 (willow-04fd) ─────────────────────
+    // ── `lock` inside a `match` arm (willow-0g8j.3) ──────────────────────────
     //
-    // A contended acquisition parks and resumes, so it needs a resume point.
-    // A `match` arm body has none: the cooperative ANF pass hoists suspensions
-    // at STATEMENT boundaries and an arm's statements are not in the enclosing
-    // sequence. Before this rule the program reached codegen, where the LIR
-    // walker declined it (the whole `match` is one instruction whose arms are
-    // still HIR) and the AST async emitter — which has no `match` handling at
-    // all — sent the arm body to the SYNCHRONOUS emitter, whose `lock` arm was
-    // an `unreachable!()` justified by E2603. The compiler aborted.
-    //
-    // This is the E0811 rule for BLOCK arms: that one rejects a suspending arm
-    // EXPRESSION for the same reason, with the same shape of rewrite hint.
+    // Stage 5 lowers an arm that contains a lock to explicit LIR blocks, so a
+    // contended acquisition has the same frame-backed resume edge as a lock in
+    // the enclosing statement sequence. The former E2606 cases are accepted;
+    // E2603 still rejects every lock in a synchronous function.
     //
     // 20 perspectives:
     //   1 the reported ICE repro          11 arm of a match on an enum
@@ -6951,8 +7003,8 @@ async fn f() {
 
     // 1. The reported program is rejected rather than aborting the compiler.
     #[test]
-    fn lock_arm_01_reported_repro_is_rejected() {
-        assert_lock_error_count(ARM_LOCK, ErrorCode::E2606, 1);
+    fn lock_arm_01_reported_repro_is_accepted() {
+        assert_lock_accepted(ARM_LOCK);
     }
 
     // 2. Exactly one diagnostic. The statement is well-formed in every other
@@ -6960,31 +7012,23 @@ async fn f() {
     #[test]
     fn lock_arm_02_reports_only_the_one_rule() {
         let errors = lock_errors_ignoring_gate(ARM_LOCK);
-        assert_eq!(errors.len(), 1, "expected exactly one error: {errors:?}");
-        assert_eq!(errors[0].code, ErrorCode::E2606);
+        assert!(
+            errors.is_empty(),
+            "the former gate must be gone: {errors:?}"
+        );
     }
 
     // 3. The label points at the `lock` header, not the whole arm: the header
     //    is the statement the programmer has to move.
     #[test]
     fn lock_arm_03_label_marks_the_lock_header() {
-        let errors = lock_errors_ignoring_gate(ARM_LOCK);
-        let label = errors[0].labels.first().expect("a primary label");
-        assert!(
-            label.message.contains("resume point"),
-            "label should say what the arm lacks: {label:?}"
-        );
+        assert_lock_accepted(ARM_LOCK);
     }
 
     // 4. The help names a rewrite rather than only stating the refusal.
     #[test]
     fn lock_arm_04_help_names_a_rewrite() {
-        let errors = lock_errors_ignoring_gate(ARM_LOCK);
-        let help = errors[0].helps.join(" ");
-        assert!(
-            help.contains("if") && help.contains("async fn"),
-            "help should name the rewrites: {help}"
-        );
+        assert_lock_accepted(ARM_LOCK);
     }
 
     // 5-8. Depth, not a flag: an acquisition nested further inside the arm is
@@ -6996,7 +7040,7 @@ async fn f() {
             "async fn main() { let m = Mutex::new(0); let w = 1; \
              match w { 1 => { if w > 0 { lock m as mut v { v = v + 1; } } } _ => {} } }",
             ErrorCode::E2606,
-            1,
+            0,
         );
     }
 
@@ -7007,7 +7051,7 @@ async fn f() {
              match w { 1 => { let mut i = 0; while i < 1 { \
                  lock m as mut v { v = v + 1; } i = i + 1; } } _ => {} } }",
             ErrorCode::E2606,
-            1,
+            0,
         );
     }
 
@@ -7017,7 +7061,7 @@ async fn f() {
             "async fn main() { let m = Mutex::new(0); let w = 1; \
              match w { 1 => { for i in 0..1 { lock m as mut v { v = v + i; } } } _ => {} } }",
             ErrorCode::E2606,
-            1,
+            0,
         );
     }
 
@@ -7028,7 +7072,7 @@ async fn f() {
              match w { 1 => { match w { 1 => { lock m as mut v { v = v + 1; } } _ => {} } } \
                        _ => {} } }",
             ErrorCode::E2606,
-            1,
+            0,
         );
     }
 
@@ -7058,7 +7102,7 @@ async fn f() {
              async fn main() { let m = Mutex::new(0); let k = Kind::A; \
              match k { Kind::A => { lock m as mut v { v = v + 1; } } _ => {} } }",
             ErrorCode::E2606,
-            1,
+            0,
         );
     }
 
@@ -7068,7 +7112,7 @@ async fn f() {
             "async fn main() { let m = Mutex::new(0); let s = \"a\"; \
              match s { other => { lock m as mut v { v = v + 1; } } } }",
             ErrorCode::E2606,
-            1,
+            0,
         );
     }
 
@@ -7079,7 +7123,7 @@ async fn f() {
             "async fn main() { let l = RwLock::new(0); let w = 1; \
              match w { 1 => { lock read l as v { println(v); } } _ => {} } }",
             ErrorCode::E2606,
-            1,
+            0,
         );
     }
 
@@ -7089,7 +7133,7 @@ async fn f() {
             "async fn main() { let l = RwLock::new(0); let w = 1; \
              match w { 1 => { lock write l as mut v { v = v + 1; } } _ => {} } }",
             ErrorCode::E2606,
-            1,
+            0,
         );
     }
 
@@ -7100,7 +7144,7 @@ async fn f() {
             "async fn main() { let m = Mutex::new(0); let w = 1; \
              match w { 1 => {} _ => { lock m as mut v { v = v + 1; } } } }",
             ErrorCode::E2606,
-            1,
+            0,
         );
     }
 
@@ -7113,7 +7157,7 @@ async fn f() {
              match w { 1 => { lock m as mut v { v = v + 1; } } \
                        _ => { lock m as mut v { v = v + 2; } } } }",
             ErrorCode::E2606,
-            2,
+            0,
         );
     }
 
@@ -7167,7 +7211,7 @@ async fn f() {
     // A lambda has no `async` form in the grammar and the backend lifts its
     // body into a plain private function, so the body is NOT part of the
     // enclosing async function. Every "where am I" counter has to stop there:
-    // `current_async_context`, `lock_depth`, `match_arm_depth`, `loop_depth`.
+    // `current_async_context`, `lock_depth`, `loop_depth`.
     //
     // Before the reset, an enclosing `async fn` kept the async context switched
     // on inside the body, so a `lock` there passed E2603 and an `await` there
@@ -7181,7 +7225,7 @@ async fn f() {
     //   2 and is NOT E2606                     8 await in a lambda is E0801
     //   3 lock in a lambda, no match at all    9 await after one still works
     //   4 lock in a section's lambda           10 a sync fn is unchanged
-    //   5 arm depth is restored                11 both RwLock modes
+    //   5 an arm resumes after the lambda      11 both RwLock modes
     //   6 lock depth is restored               12 loop depth still resets
 
     /// A sync taker, so the lambda is an argument rather than a local: an
@@ -7265,25 +7309,27 @@ async fn f() {
     }
 
     // 5-7. The other half: the enclosing body resumes with its own counters.
+    //
+    // Perspective 5 used to read the arm counter through E2606. Stage 5 lowers
+    // a lock in an arm to explicit blocks and the rule is gone (willow-0g8j.3),
+    // so what is pinned here is the shape itself: an arm that runs a lambda and
+    // then acquires a lock is accepted, with no residue of the lambda's own
+    // (synchronous, E2603-worthy) body left behind on the enclosing async fn.
     #[test]
-    fn lock_lambda_05_arm_depth_is_restored_after_the_lambda() {
-        assert_lock_error_count(
-            &format!(
-                "{TAKE_PLAIN_FN}\
-                 async fn outer(m: Mutex<i64>, x: i64) {{ \
-                     match x {{ \
-                         1 => {{ \
-                             println(call(|n| n + 1)); \
-                             lock m as mut v {{ v = v + 1; }} \
-                         }} \
-                         _ => {{}} \
+    fn lock_lambda_05_an_arm_resumes_after_the_lambda() {
+        assert_lock_accepted(&format!(
+            "{TAKE_PLAIN_FN}\
+             async fn outer(m: Mutex<i64>, x: i64) {{ \
+                 match x {{ \
+                     1 => {{ \
+                         println(call(|n| n + 1)); \
+                         lock m as mut v {{ v = v + 1; }} \
                      }} \
+                     _ => {{}} \
                  }} \
-                 async fn main() {{ let m = Mutex::new(0); await outer(m, 1); }}"
-            ),
-            ErrorCode::E2606,
-            1,
-        );
+             }} \
+             async fn main() {{ let m = Mutex::new(0); await outer(m, 1); }}"
+        ));
     }
 
     #[test]

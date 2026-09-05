@@ -32,7 +32,7 @@
 //!  11 a field assignment                   super
 //!  12 a static-method argument          21 widening an already-widened value
 //!                                       22 narrowing is still rejected
-//!                                       23 the example, both backends
+//!                                       23 the example runs
 //!                                       24 the example under GC stress, and
 //!                                          fully claimed by the LIR walker
 
@@ -40,8 +40,8 @@ use super::support::{
     compile_and_run_with_env, compile_with_compiler_env, compile_with_env_and_run_under,
 };
 
-const AST: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const LIR: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
 const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 
 const EXAMPLE: &str = include_str!("../../example/interface_super_coercion.wi");
@@ -74,16 +74,14 @@ fn program(rest: &str) -> String {
     format!("{DECLS}{rest}")
 }
 
-/// Require both emitters to compile the program and print `expected`. The LIR
-/// run demands the walker (`WILLOW_LIR_REQUIRE`), so a coercion it refuses is a
-/// failure here rather than a silent fall back to the AST path.
+/// The program compiles and prints `expected`. Since willow-0g8j.3 a coercion
+/// the walker refuses is a compile error, so a passing run is the proof it
+/// emitted the coercion itself.
 #[track_caller]
 fn assert_both(source: &str, expected: &str) {
-    for env in [&AST[..], &LIR[..]] {
-        let (out, ok) = compile_and_run_with_env(source, env);
-        assert!(ok, "program failed under {env:?}: {out}");
-        assert_eq!(out, expected, "wrong output under {env:?}");
-    }
+    let (out, ok) = compile_and_run_with_env(source, &PLAIN);
+    assert!(ok, "program failed: {out}");
+    assert_eq!(out, expected, "wrong output");
 }
 
 // 1. The baseline: dispatching on the child interface itself, where no
@@ -472,7 +470,7 @@ fn main() {
 #[test]
 fn super_coercion_22_narrowing_is_still_rejected() {
     let (ok, stderr) =
-        compile_with_compiler_env(&program("fn narrow(a: Alpha) -> All { return a; }"), &AST);
+        compile_with_compiler_env(&program("fn narrow(a: Alpha) -> All { return a; }"), &PLAIN);
     assert!(!ok, "interface narrowing unexpectedly compiled");
     assert!(
         stderr.contains("error[E0201]"),
@@ -481,36 +479,27 @@ fn super_coercion_22_narrowing_is_still_rejected() {
 }
 
 // 23. The runnable example, which exercises every store position in one
-// program, on both emitters.
+// program.
 #[test]
-fn super_coercion_23_example_runs_on_both_backends() {
+fn super_coercion_23_the_example_runs() {
     assert_both(EXAMPLE, EXAMPLE_OUTPUT);
 }
 
 // 24. The rebox ALLOCATES, so the object it copies over has to stay rooted
-// across that allocation — under stress every allocation collects. The same
-// run also proves the walker claimed the example rather than falling back.
+// across that allocation — under stress every allocation collects. The log
+// check beside it names the functions the walker had to take.
 #[test]
 fn super_coercion_24_example_is_gc_safe_and_fully_lir() {
-    for env in [&AST[..], &LIR[..]] {
-        let (out, ok) = compile_with_env_and_run_under(EXAMPLE, env, &STRESS);
-        assert!(ok, "stress run failed under {env:?}: {out}");
-        assert_eq!(out, EXAMPLE_OUTPUT, "wrong output under {env:?}");
-    }
+    let (out, ok) = compile_with_env_and_run_under(EXAMPLE, &PLAIN, &STRESS);
+    assert!(ok, "stress run failed: {out}");
+    assert_eq!(out, EXAMPLE_OUTPUT, "wrong output");
 
-    let (ok, stderr) = compile_with_compiler_env(
-        EXAMPLE,
-        &[
-            ("WILLOW_LIR_BACKEND", "1"),
-            ("WILLOW_LIR_REQUIRE", "1"),
-            ("WILLOW_LIR_LOG", "1"),
-        ],
-    );
+    let (ok, stderr) = compile_with_compiler_env(EXAMPLE, &[("WILLOW_LIR_LOG", "1")]);
     assert!(ok, "example did not compile through LIR: {stderr}");
     for function in ["via_argument", "via_return", "main"] {
         assert!(
             stderr.contains(&format!("[lir] compiling `{function}` from lowered IR")),
-            "`{function}` fell back: {stderr}"
+            "`{function}` was not walker-compiled: {stderr}"
         );
     }
 }

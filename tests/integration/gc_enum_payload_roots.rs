@@ -9,7 +9,7 @@
 //! store then writes a dangling pointer into a fresh object. The failure is
 //! silent: the enum reads back whatever the allocator put in that memory next.
 //!
-//! Two shapes reach it, and both backends share the emitters:
+//! Two shapes reach it, through two different emitters:
 //!
 //! * `emit_enum_variant_alloc` / `emit_lir_enum_construction` build the object
 //!   FIRST and evaluate the arguments into it, so what has to survive is the
@@ -22,9 +22,9 @@
 //!   payloads are rooted; rooting a scalar word would have the GC follow it as
 //!   a bogus object pointer.
 //!
-//! Every test runs the same program three ways — plain, AST emitter under
-//! `WILLOW_GC_STRESS=alloc`, LIR walker under the same — and requires identical
-//! output. Each loops a few hundred times so a collection lands inside the
+//! Every test runs the same program plain and under `WILLOW_GC_STRESS=alloc`
+//! and requires identical output. Each loops a few hundred times so a
+//! collection lands inside the
 //! window rather than only near it. Removing either rooting makes 17 of the 20
 //! programs below crash outright or print garbage; the three that survive are
 //! the ones whose payload never needed a root, and they are kept because that
@@ -44,28 +44,25 @@
 
 use super::support::{compile_and_run_with_env, compile_with_compiler_env};
 
-const PLAIN: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const AST_STRESS: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "0"), ("WILLOW_GC_STRESS", "alloc")];
-const LIR_STRESS: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_GC_STRESS", "alloc")];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 
-/// Run `source` plain and under allocation stress on both emitters, and require
-/// all three to print `expected`. Stress collects on every allocation, so an
-/// unrooted payload is reclaimed the moment the enum object is allocated.
+/// Run `source` plain and under allocation stress, and require both to print
+/// `expected`. Stress collects on every allocation, so an unrooted payload is
+/// reclaimed the moment the enum object is allocated.
 fn assert_rooted(source: &str, expected: &str) {
-    for env in [&PLAIN[..], &AST_STRESS[..], &LIR_STRESS[..]] {
+    for env in [&PLAIN[..], &STRESS[..]] {
         let (out, ok) = compile_and_run_with_env(source, env);
         assert!(ok, "program failed under {env:?}: {out}");
         assert_eq!(out, expected, "wrong output under {env:?}");
     }
 }
 
-/// Require the walker to have taken each named function, so the LIR half of the
-/// differential is not quietly the AST emitter again.
+/// Require the walker to have taken each named function, so a coverage
+/// regression shows up here rather than as a still-passing program.
 fn assert_walker_compiled(source: &str, functions: &[&str]) {
-    let (ok, stderr) = compile_with_compiler_env(
-        source,
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_LOG", "1")],
-    );
+    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_LIR_LOG", "1")]);
     assert!(ok, "logged LIR compile failed: {stderr}");
     for function in functions {
         let sync = format!("[lir] compiling `{function}` from lowered IR");
@@ -555,8 +552,8 @@ fn main() {
     );
 }
 
-// The walker really compiled the shapes above, so the LIR half of every
-// differential is the LIR emitter and not a silent fallback to the AST one.
+// The walker really compiled the shapes above, so the rooting the tests pin is
+// the rooting the walker emits.
 #[test]
 fn gc_enum_payload_21_the_walker_really_compiled_these() {
     assert_walker_compiled(

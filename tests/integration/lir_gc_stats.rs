@@ -14,9 +14,9 @@
 //! only what holds on every platform and under every collection schedule: a
 //! counter is never negative, a cumulative counter never goes backwards, and two
 //! reads with nothing between them agree. What each test really pins down is
-//! that the walker COMPILED the function: every one runs under
-//! `WILLOW_LIR_REQUIRE=1`, which turns a silent fallback into a compile error,
-//! and the log perspectives name the functions the walker had to take.
+//! that the walker COMPILED the function: since willow-0g8j.3 a body outside
+//! its subset is a compile error, and the log perspectives name the functions
+//! the walker had to take.
 //!
 //! 24 perspectives:
 //!   1 the read is in the subset at all    13 read inside a `defer` body
@@ -26,7 +26,7 @@
 //!   5 read in statement position          17 read inside a module function
 //!   6 read as a call argument             18 read inside an async function
 //!   7 read in a condition                 19 read across a collection
-//!   8 read in a `while` guard             20 both emitters agree
+//!   8 read in a `while` guard             20 one expression reads them all
 //!   9 read in a `return`                  21 alloc stress
 //!  10 read in arithmetic                  22 minor stress
 //!  11 read in a `match` scrutinee         23 release build
@@ -38,13 +38,9 @@ use super::support::{
     compile_temp_project_with_env_stderr, compile_with_compiler_env,
 };
 
-const AST: [(&str, &str); 1] = [("WILLOW_LIR_BACKEND", "0")];
-const LIR: [(&str, &str); 2] = [("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LOG: [(&str, &str); 3] = [
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_LIR_LOG", "1"),
-];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+const LOG: [(&str, &str); 1] = [("WILLOW_LIR_LOG", "1")];
 
 /// Every counter the language exposes, in declaration order.
 const COUNTERS: [&str; 22] = [
@@ -72,21 +68,18 @@ const COUNTERS: [&str; 22] = [
     "gc_major_collections",
 ];
 
-/// The same program under the AST emitter and under the walker must print
-/// `expected`, and the walker side runs with `WILLOW_LIR_REQUIRE=1` so a silent
-/// fallback is a compile error rather than a comparison of the AST emitter
-/// against itself.
-fn assert_both_backends(source: &str, expected: &str) {
-    for env in [&AST[..], &LIR[..]] {
-        let (out, ok) = compile_and_run_with_env(source, env);
-        assert!(ok, "run failed under {env:?}: {out}");
-        assert_eq!(out, expected, "wrong output under {env:?}");
-    }
+/// The program builds and prints `expected`. Since willow-0g8j.3 a body outside
+/// the walker's subset is a compile error, so a passing run is the proof that
+/// the walker compiled it.
+fn assert_project_output(source: &str, expected: &str) {
+    let (out, ok) = compile_and_run_with_env(source, &PLAIN);
+    assert!(ok, "run failed: {out}");
+    assert_eq!(out, expected, "wrong output");
 }
 
 /// Compile once with the selection log on and require the walker to have taken
-/// each named function. Without this a coverage regression would still print the
-/// right answer — from the AST emitter.
+/// each named function. Without this a coverage regression could leave a
+/// function unlowered while the program still printed the right answer.
 fn assert_walker_compiled(source: &str, functions: &[&str]) {
     let (ok, stderr) = compile_with_compiler_env(source, &LOG);
     assert!(ok, "logged LIR compile failed: {stderr}");
@@ -111,7 +104,7 @@ fn main() {
     println(probe());
 }
 ";
-    assert_both_backends(source, "true\n");
+    assert_project_output(source, "true\n");
     assert_walker_compiled(source, &["probe", "main"]);
 }
 
@@ -130,7 +123,7 @@ fn main() {{
 }}
 "
         );
-        let (out, ok) = compile_and_run_with_env(&source, &LIR);
+        let (out, ok) = compile_and_run_with_env(&source, &PLAIN);
         assert!(ok, "`{counter}` did not compile under the walker: {out}");
         assert_eq!(out, "true\n", "`{counter}` printed the wrong thing");
         assert_walker_compiled(&source, &["probe"]);
@@ -151,7 +144,7 @@ fn main() {
     println(sweep());
 }
 ";
-    assert_both_backends(source, "7\n");
+    assert_project_output(source, "7\n");
     assert_walker_compiled(source, &["sweep", "main"]);
 }
 
@@ -167,7 +160,7 @@ fn main() {
     println(probe());
 }
 ";
-    assert_both_backends(source, "true\n");
+    assert_project_output(source, "true\n");
     assert_walker_compiled(source, &["probe"]);
 }
 
@@ -184,7 +177,7 @@ fn main() {
     println(probe());
 }
 ";
-    assert_both_backends(source, "3\n");
+    assert_project_output(source, "3\n");
     assert_walker_compiled(source, &["probe"]);
 }
 
@@ -201,7 +194,7 @@ fn main() {
     println(probe());
 }
 ";
-    assert_both_backends(source, "true\n");
+    assert_project_output(source, "true\n");
     assert_walker_compiled(source, &["nonneg", "probe"]);
 }
 
@@ -218,7 +211,7 @@ fn main() {
     println(probe());
 }
 ";
-    assert_both_backends(source, "1\n");
+    assert_project_output(source, "1\n");
     assert_walker_compiled(source, &["probe"]);
 }
 
@@ -236,7 +229,7 @@ fn main() {
     println(probe());
 }
 ";
-    assert_both_backends(source, "3\n");
+    assert_project_output(source, "3\n");
     assert_walker_compiled(source, &["probe"]);
 }
 
@@ -250,7 +243,7 @@ fn main() {
     println(floor() >= 0);
 }
 ";
-    assert_both_backends(source, "true\n");
+    assert_project_output(source, "true\n");
     assert_walker_compiled(source, &["floor", "main"]);
 }
 
@@ -266,7 +259,7 @@ fn main() {
     println(probe());
 }
 ";
-    assert_both_backends(source, "true\n");
+    assert_project_output(source, "true\n");
     assert_walker_compiled(source, &["probe"]);
 }
 
@@ -284,7 +277,7 @@ fn main() {
     println(probe());
 }
 ";
-    assert_both_backends(source, "collected\n");
+    assert_project_output(source, "collected\n");
     assert_walker_compiled(source, &["probe"]);
 }
 
@@ -298,7 +291,7 @@ fn main() {
     println(probe());
 }
 ";
-    assert_both_backends(source, "5\n");
+    assert_project_output(source, "5\n");
     assert_walker_compiled(source, &["probe"]);
 }
 
@@ -316,7 +309,7 @@ fn main() {
     println(probe());
 }
 ";
-    assert_both_backends(source, "true\n2\n");
+    assert_project_output(source, "true\n2\n");
     assert_walker_compiled(source, &["probe"]);
 }
 
@@ -335,7 +328,7 @@ fn main() {
     println(new Meter(0).above());
 }
 ";
-    assert_both_backends(source, "true\n");
+    assert_project_output(source, "true\n");
     assert_walker_compiled(source, &["Meter::above"]);
 }
 
@@ -351,7 +344,7 @@ fn main() {
     println(Meter::snapshot() >= 0);
 }
 ";
-    assert_both_backends(source, "true\n");
+    assert_project_output(source, "true\n");
     assert_walker_compiled(source, &["Meter::snapshot"]);
 }
 
@@ -364,7 +357,7 @@ fn gcstat_16_read_inside_a_lambda() {
     println(probe(0));
 }
 ";
-    assert_both_backends(source, "true\n");
+    assert_project_output(source, "true\n");
 }
 
 // 17. Inside a module function. A module is lowered as its own unit, so the
@@ -389,11 +382,9 @@ fn main() {
 ",
         ),
     ];
-    for env in [&AST[..], &LIR[..]] {
-        let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", env);
-        assert!(ok, "run failed under {env:?}: {out}");
-        assert_eq!(out, "true\n", "wrong output under {env:?}");
-    }
+    let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", &PLAIN);
+    assert!(ok, "run failed: {out}");
+    assert_eq!(out, "true\n", "wrong output");
     let (ok, stderr) = compile_temp_project_with_env_stderr(&files, "main.wi", &LOG);
     assert!(ok, "logged LIR compile failed: {stderr}");
     assert!(
@@ -415,7 +406,7 @@ async fn main() {
     println(await probe());
 }
 ";
-    assert_both_backends(source, "true\n");
+    assert_project_output(source, "true\n");
 }
 
 // 19. A read on both sides of a collection. `gc_allocated_bytes` is a LIVE-bytes
@@ -433,14 +424,14 @@ fn main() {
     println(probe());
 }
 ";
-    assert_both_backends(source, "true\n");
+    assert_project_output(source, "true\n");
     assert_walker_compiled(source, &["probe"]);
 }
 
-// 20. Both emitters answer the same on a program that reads many counters at
-//     once: the walker calls the same runtime symbols the AST path does.
+// 20. Every counter in one expression: the walker has to resolve all of them
+//     through `builtin_call_runtime_name`, not a hand-written pair of names.
 #[test]
-fn gcstat_20_both_emitters_agree_on_a_wide_read() {
+fn gcstat_20_a_single_expression_reads_every_counter() {
     let reads = COUNTERS
         .iter()
         .map(|c| format!("        && {c}() >= 0"))
@@ -456,7 +447,7 @@ fn main() {{
 }}
 "
     );
-    assert_both_backends(&source, "true\n");
+    assert_project_output(&source, "true\n");
     assert_walker_compiled(&source, &["probe"]);
 }
 

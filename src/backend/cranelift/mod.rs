@@ -20,7 +20,6 @@ use crate::{BuildMode, CompilerOptions};
 
 mod ast_passes;
 mod async_codegen;
-mod async_liveness;
 mod compile;
 pub use compile::{DeclaredModule, DeclaredProgram, ItemBinding, UnitImports};
 mod coop;
@@ -246,25 +245,6 @@ pub struct Codegen {
     /// class's `type_id`; the virtual method slots follow it in
     /// [`Codegen::class_vslots`] order.
     class_descriptor_ids: HashMap<String, DataId>,
-    /// Maps each lambda's source span to its type-checker-inferred return type.
-    /// Populated via register_lambda_return_types before compilation starts.
-    lambda_return_types: HashMap<crate::diagnostics::Span, Type>,
-    /// Full type-checker-inferred fn types for lambdas, including parameter
-    /// types inferred from call-site context.
-    lambda_fn_types: HashMap<crate::diagnostics::Span, Type>,
-    /// Resolved types of async-fn `let` locals (keyed by span) so the backend
-    /// can frame-back unannotated live-across-await locals (willow-lpn.5c).
-    async_local_types: HashMap<crate::diagnostics::Span, Type>,
-    /// Frame-slot narrowing facts for the async fn or method currently being
-    /// compiled (willow-lpn.10), from [`async_liveness::analyze`].
-    /// `coop_collect_let_slots` frames a user `let` only when this says it has
-    /// to: a local that is dead at every suspension is read back within the same
-    /// poll segment that wrote it, so a poll-fn stack slot serves it and the
-    /// frame stays smaller. Set per function; the synthetic slots
-    /// (`__callee_frame`, `__defer_*`, `__send_*`, select bindings, `__for_*`)
-    /// are never narrowed, since they exist precisely to carry state across the
-    /// suspension they belong to.
-    coop_live_spans: HashSet<crate::diagnostics::Span>,
     /// The checker's authoritative type for every checked expression, keyed by
     /// span (willow-mb5). Consulted FIRST by the backend's type queries; the
     /// legacy structural derivation only covers unrecorded (compiler-
@@ -454,12 +434,10 @@ impl Codegen {
         let mut class_layouts = HashMap::new();
         class_layouts.insert(
             "PanicInfo".to_string(),
-            vec![
-                ("message".to_string(), Type::String),
-                ("file".to_string(), Type::String),
-                ("line".to_string(), Type::I64),
-                ("column".to_string(), Type::I64),
-            ],
+            crate::semantic::builtin_types::panic_info_fields()
+                .into_iter()
+                .map(|(name, ty)| (name.to_string(), ty))
+                .collect(),
         );
         let mut codegen = Self {
             module,
@@ -488,10 +466,6 @@ impl Codegen {
             class_own_vmethods: HashMap::new(),
             class_vslots: HashMap::new(),
             class_descriptor_ids: HashMap::new(),
-            lambda_return_types: HashMap::new(),
-            lambda_fn_types: HashMap::new(),
-            async_local_types: HashMap::new(),
-            coop_live_spans: HashSet::new(),
             expr_types: HashMap::new(),
             lir_functions: HashMap::new(),
             lir_lambdas: HashMap::new(),
@@ -667,10 +641,6 @@ impl Codegen {
             .collect();
     }
 
-    pub fn register_async_local_types(&mut self, types: HashMap<crate::diagnostics::Span, Type>) {
-        self.async_local_types = types;
-    }
-
     /// Register unqualified enum-variant construction resolutions (willow-60o.1).
     pub fn register_enum_variant_resolutions(
         &mut self,
@@ -685,19 +655,6 @@ impl Codegen {
         resolutions: HashMap<crate::diagnostics::Span, Pattern>,
     ) {
         self.pattern_resolutions = resolutions;
-    }
-
-    /// Register the type-checker-inferred return types for all lambdas in the program.
-    /// Must be called before compile_program / compile_module so that declare_lambda
-    /// can emit correct signatures for unannotated lambdas.
-    pub fn register_lambda_return_types(&mut self, types: HashMap<crate::diagnostics::Span, Type>) {
-        self.lambda_return_types = types;
-    }
-
-    /// Register complete inferred fn types for lambdas whose parameter types
-    /// were supplied by call-site context rather than source annotations.
-    pub fn register_lambda_fn_types(&mut self, types: HashMap<crate::diagnostics::Span, Type>) {
-        self.lambda_fn_types = types;
     }
 
     /// Merge one module's own checker tables into the backend (willow-9vvn).
@@ -715,19 +672,13 @@ impl Codegen {
     /// registrations.
     ///
     /// It must also run BEFORE that module's `declare_module`, not just before
-    /// its bodies: `declare_lambda` reads `lambda_fn_types` to give a lifted
-    /// lambda its signature, so a module lambda declared ahead of the merge is
-    /// declared `fn(i64) -> i64` whatever it really is, and every use of it is
-    /// then refused for a signature mismatch (willow-9yhi).
+    /// its bodies: `declare_lambda` reads `expr_types` to give a lifted lambda
+    /// its signature, so a module lambda declared ahead of the merge is declared
+    /// `fn(i64) -> i64` whatever it really is, and every use of it is then
+    /// refused for a signature mismatch (willow-9yhi).
     pub fn merge_module_checker_tables(&mut self, checker: &crate::semantic::TypeChecker) {
         self.expr_types
             .extend(checker.expr_types.iter().map(|(k, v)| (*k, v.clone())));
-        self.async_local_types.extend(
-            checker
-                .async_local_types
-                .iter()
-                .map(|(k, v)| (*k, v.clone())),
-        );
         self.enum_variant_resolutions.extend(
             checker
                 .enum_variant_resolutions
@@ -740,14 +691,40 @@ impl Codegen {
                 .iter()
                 .map(|(k, v)| (*k, v.clone())),
         );
-        self.lambda_return_types.extend(
-            checker
-                .lambda_return_types
-                .iter()
-                .map(|(k, v)| (*k, v.clone())),
-        );
-        self.lambda_fn_types
-            .extend(checker.lambda_fn_types.iter().map(|(k, v)| (*k, v.clone())));
+    }
+
+    /// The type as the enum TABLES spell it: every enum name replaced by the one
+    /// identity it answers to build-wide.
+    ///
+    /// The unit being declared may write an enum its own way — `Level` for
+    /// `signal::Level`, or `Grade` under `import signal::Level as Grade;` — and
+    /// those spellings live only for that unit's own declaration phase
+    /// ([`Codegen::install_enum_aliases`]). The signature tables outlive it and
+    /// are compared against HIR types the checker already normalized to the
+    /// identity, so recording the written spelling would leave the two halves
+    /// unable to agree that `Grade` and `signal::Level` are one type
+    /// (willow-0g8j.3). A name that is not an enum is its own identity and
+    /// passes through.
+    pub(super) fn canonical_enum_type(&self, ty: &Type) -> Type {
+        let identity = |name: &String| -> String {
+            self.enum_infos
+                .get(name.as_str())
+                .map(|info| info.name.clone())
+                .unwrap_or_else(|| name.clone())
+        };
+        match ty {
+            Type::Named(name) => Type::Named(identity(name)),
+            Type::Generic(name, args) => Type::Generic(
+                identity(name),
+                args.iter().map(|a| self.canonical_enum_type(a)).collect(),
+            ),
+            Type::Array(element) => Type::Array(Box::new(self.canonical_enum_type(element))),
+            Type::Fn(params, ret) => Type::Fn(
+                params.iter().map(|p| self.canonical_enum_type(p)).collect(),
+                Box::new(self.canonical_enum_type(ret)),
+            ),
+            _ => ty.clone(),
+        }
     }
 
     /// No-op: generic enums are now registered via `register_enum_info` from the
@@ -1045,6 +1022,47 @@ impl Codegen {
         restore_snapshots(&mut self.vtable_ids, aliases.vtable_ids);
     }
 
+    /// While compiling a module body, bind the types this unit IMPORTED by
+    /// single-item import under the local names it spells them by
+    /// (`import proto::Describable;` -> `Describable`), for the length of this
+    /// unit's bodies (willow-0g8j.3).
+    ///
+    /// The declaration phase deliberately does not do this — aliasing whole
+    /// compiled tables per module changes what the classes declared after it
+    /// are compiled against (willow-28h8) — and only the function half is
+    /// rebound before the bodies. The type half is needed here all the same:
+    /// the interface table is one flat build-wide namespace keyed by the
+    /// CANONICAL name, so a module body that names an imported interface found
+    /// nothing under `Describable`, and both back ends then read the value as a
+    /// class. With one implementation that silently called it directly; with
+    /// two it reached `emit_interface_dispatch`'s "no virtual slot but N
+    /// candidate implementations" invariant and aborted the compile.
+    ///
+    /// Classes need no such alias: [`resolve_class_key`] already resolves a
+    /// bare class name against every module's tables. Enums have their own, per
+    /// unit and from that unit's own checker
+    /// ([`Codegen::install_enum_aliases`]).
+    ///
+    /// Installed BEFORE [`Codegen::alias_module_local_types`] so a module's own
+    /// declaration still wins over anything it imported under the same name.
+    fn alias_item_import_types(
+        &mut self,
+        items: &[compile::ItemBinding],
+        aliases: &mut ModuleAliasSnapshot,
+    ) {
+        for item in items {
+            let qualified = format!("{}::{}", item.module, item.item);
+            if let Some(info) = self.interface_infos.get(&qualified).cloned() {
+                insert_with_snapshot(
+                    &mut aliases.interface_infos,
+                    &mut self.interface_infos,
+                    item.local.clone(),
+                    info,
+                );
+            }
+        }
+    }
+
     /// While compiling a module body, bind the module's own enums and interfaces
     /// under their unqualified local names (`module::Color` -> `Color`) so a
     /// function/method that references its own type internally resolves the
@@ -1087,462 +1105,6 @@ impl Codegen {
 
     fn class_method_symbol(&self, class_name: &str, method_name: &str) -> String {
         class_method_symbol_name(&self.known_modules, class_name, method_name)
-    }
-
-    /// Reserve a GC-traced frame slot to hold the callee frame of a call-await
-    /// (`await <coop-leaf-call>`) across the awaiter's suspension, keyed by the
-    /// await span. The slot is GC-managed so the collector keeps the callee frame
-    /// (a layout-aware GC object) alive — and traces its GC contents — after
-    /// the scheduler drops the callee's own root on completion (willow-lpn.5.3.1).
-    fn coop_collect_callee_frame_slot(
-        &self,
-        expr: &Expr,
-        out: &mut Vec<AsyncFrameSlot>,
-        seen: &mut HashSet<crate::diagnostics::Span>,
-    ) {
-        // Reserve a GC-traced callee-frame slot for every direct-call-form await
-        // that suspends cooperatively. A leaf call uses `emit_coop_call_await`; a
-        // non-leaf call (imported async) and a method/static-call await use
-        // `emit_coop_task_await`, whose resume path RELOADS the task frame from
-        // this slot instead of re-emitting the call — without the slot it would
-        // re-run the call on resume (willow-0a6k.6).
-        let await_span = await_callee_frame_slot_span(expr, &self.cooperative_leaves);
-        if let Some(await_span) = await_span
-            && seen.insert(await_span)
-        {
-            out.push(AsyncFrameSlot {
-                key: await_span,
-                name: "__callee_frame".to_string(),
-                ty: Type::Named("__coop_callee_frame".to_string()),
-            });
-        }
-    }
-
-    /// Recompute [`Self::coop_live_spans`] for one async fn/method body
-    /// before its frame slots are collected (willow-lpn.10).
-    /// `WILLOW_ASYNC_FRAME_ALL=1` makes every binding framed, restoring the
-    /// frame-everything behaviour.
-    fn set_coop_live_spans(&mut self, params: &[Param], body: &Block) {
-        self.coop_live_spans = if async_frame_all_override() {
-            async_liveness::all_binding_spans(params, body)
-        } else {
-            async_liveness::analyze(params, body)
-        };
-    }
-
-    /// Does this `let` need a heap frame slot, or can it stay a poll-fn stack
-    /// slot? (willow-lpn.10)
-    ///
-    /// A binding needs a heap-frame slot exactly when its value is live across
-    /// a suspension — the type does not enter into it. Dead-at-suspend GC locals
-    /// use ordinary rooted poll-stack slots; willow-p42j balances those roots at
-    /// lexical exits and poll returns and restores null-initialized slots on
-    /// resume.
-    fn coop_let_needs_frame(&self, span: crate::diagnostics::Span) -> bool {
-        self.coop_live_spans.contains(&span)
-    }
-
-    fn coop_collect_let_slots(
-        &self,
-        block: &Block,
-        out: &mut Vec<AsyncFrameSlot>,
-        seen: &mut HashSet<crate::diagnostics::Span>,
-    ) {
-        for stmt in &block.stmts {
-            match stmt {
-                Stmt::Break(_) | Stmt::Continue(_) => {}
-                // Async defer: one FLAG slot (i64, keyed by
-                // the defer stmt's span) + one slot per stashed operand
-                // (keyed by the operand expr's span; types recorded by the
-                // checker in async_local_types). Lexical scope exit consumes
-                // the flag before running cleanup (willow-s9ej.1).
-                Stmt::Defer(d) => {
-                    if seen.insert(d.span) {
-                        out.push(AsyncFrameSlot {
-                            key: d.span,
-                            name: "__defer_flag".to_string(),
-                            ty: Type::I64,
-                        });
-                    }
-                    let mut operand = |expr: &crate::parser::ast::Expr| {
-                        let span = expr.span();
-                        if seen.insert(span) {
-                            let ty = self
-                                .async_local_types
-                                .get(&span)
-                                .cloned()
-                                .unwrap_or(Type::I64);
-                            out.push(AsyncFrameSlot {
-                                key: span,
-                                name: "__defer_operand".to_string(),
-                                ty,
-                            });
-                        }
-                    };
-                    match &d.body {
-                        DeferBody::Expr(Expr::Call(c)) => {
-                            c.args.iter().for_each(|a| operand(&a.expr))
-                        }
-                        DeferBody::Expr(Expr::MethodCall(m)) => {
-                            operand(&m.object);
-                            m.args.iter().for_each(|a| operand(&a.expr));
-                        }
-                        DeferBody::Expr(Expr::Print(arg, ..)) => operand(arg),
-                        _ => {}
-                    }
-                }
-                Stmt::Let(l) => {
-                    let ty =
-                        l.ty.clone()
-                            .or_else(|| self.async_local_types.get(&l.span).cloned())
-                            .or_else(|| self.expr_types.get(&l.init.span()).cloned());
-                    // Narrow the frame to the locals that actually need it
-                    // (willow-lpn.10); see `coop_let_needs_frame`.
-                    if let Some(ty) = ty
-                        && self.coop_let_needs_frame(l.span)
-                        && seen.insert(l.span)
-                    {
-                        out.push(AsyncFrameSlot {
-                            key: l.span,
-                            name: l.name.clone(),
-                            ty,
-                        });
-                    }
-                    self.coop_collect_callee_frame_slot(&l.init, out, seen);
-                    self.coop_collect_nested_scope_slots_in_expr(&l.init, out, seen);
-                }
-                Stmt::Assign(s) => {
-                    self.coop_collect_callee_frame_slot(&s.value, out, seen);
-                    self.coop_collect_nested_scope_slots_in_expr(&s.value, out, seen);
-                }
-                Stmt::StaticFieldAssign(s) => {
-                    self.coop_collect_callee_frame_slot(&s.value, out, seen);
-                    self.coop_collect_nested_scope_slots_in_expr(&s.value, out, seen);
-                }
-                Stmt::FieldAssign(s) => {
-                    self.coop_collect_callee_frame_slot(&s.value, out, seen);
-                    self.coop_collect_nested_scope_slots_in_expr(&s.object, out, seen);
-                    self.coop_collect_nested_scope_slots_in_expr(&s.value, out, seen);
-                }
-                Stmt::IndexAssign(s) => {
-                    self.coop_collect_callee_frame_slot(&s.value, out, seen);
-                    self.coop_collect_nested_scope_slots_in_expr(&s.array, out, seen);
-                    self.coop_collect_nested_scope_slots_in_expr(&s.index, out, seen);
-                    self.coop_collect_nested_scope_slots_in_expr(&s.value, out, seen);
-                }
-                Stmt::SuperInit(s) => {
-                    for arg in &s.args {
-                        self.coop_collect_callee_frame_slot(&arg.expr, out, seen);
-                        self.coop_collect_nested_scope_slots_in_expr(&arg.expr, out, seen);
-                    }
-                }
-                Stmt::Expr(es) => {
-                    if let Expr::Select(sel) = &es.expr {
-                        // A cooperative `select` needs a frame slot per recv binding
-                        // (so it survives the case body's own suspensions) plus the
-                        // slots its case bodies declare (willow-7aj).
-                        for case in &sel.cases {
-                            match &case.kind {
-                                SelectCaseKind::Recv { binding, channel } => {
-                                    self.coop_collect_callee_frame_slot(channel, out, seen);
-                                    // The channel VALUE itself is frame-backed
-                                    // and evaluated exactly once at select
-                                    // entry: probe/unregister/recv re-load it,
-                                    // so a side-effecting channel expression
-                                    // cannot register one channel and receive
-                                    // from another (willow-0a6k.6 review fix).
-                                    if seen.insert(channel.span()) {
-                                        out.push(AsyncFrameSlot {
-                                            key: channel.span(),
-                                            name: "__select_chan".to_string(),
-                                            ty: Type::Generic(
-                                                "Channel".to_string(),
-                                                vec![Type::I64],
-                                            ),
-                                        });
-                                    }
-                                    if binding != "_"
-                                        && let Some(elem_ty) =
-                                            self.async_local_types.get(&case.span).cloned()
-                                        && seen.insert(case.span)
-                                    {
-                                        out.push(AsyncFrameSlot {
-                                            key: case.span,
-                                            name: binding.clone(),
-                                            ty: elem_ty,
-                                        });
-                                    }
-                                }
-                                SelectCaseKind::Send { channel, value } => {
-                                    self.coop_collect_callee_frame_slot(channel, out, seen);
-                                    self.coop_collect_callee_frame_slot(value, out, seen);
-                                    // Channel and sent VALUE are both evaluated
-                                    // exactly once at select entry and stashed
-                                    // in the frame (willow-o038): with bounded
-                                    // channels a send case can be not-ready, so
-                                    // the probe re-runs across wakeups and must
-                                    // not re-evaluate either operand.
-                                    if seen.insert(channel.span()) {
-                                        out.push(AsyncFrameSlot {
-                                            key: channel.span(),
-                                            name: "__select_chan".to_string(),
-                                            ty: Type::Generic(
-                                                "Channel".to_string(),
-                                                vec![Type::I64],
-                                            ),
-                                        });
-                                    }
-                                    let elem_ty = self
-                                        .async_local_types
-                                        .get(&value.span())
-                                        .cloned()
-                                        .unwrap_or(Type::I64);
-                                    if seen.insert(value.span()) {
-                                        out.push(AsyncFrameSlot {
-                                            key: value.span(),
-                                            name: "__select_send_value".to_string(),
-                                            ty: elem_ty,
-                                        });
-                                    }
-                                }
-                                SelectCaseKind::Timeout { millis } => {
-                                    self.coop_collect_callee_frame_slot(millis, out, seen);
-                                    // Absolute deadline, fixed once at select
-                                    // entry (willow-soro), keyed by the
-                                    // millis expr span.
-                                    if seen.insert(millis.span()) {
-                                        out.push(AsyncFrameSlot {
-                                            key: millis.span(),
-                                            name: "__select_deadline".to_string(),
-                                            ty: Type::I64,
-                                        });
-                                    }
-                                }
-                                SelectCaseKind::Join { binding, task, .. } => {
-                                    self.coop_collect_callee_frame_slot(task, out, seen);
-                                    // The task handle (a GC async frame) is
-                                    // stashed once at entry like channels.
-                                    if seen.insert(task.span()) {
-                                        out.push(AsyncFrameSlot {
-                                            key: task.span(),
-                                            name: "__select_task".to_string(),
-                                            ty: Type::Generic("Task".to_string(), vec![Type::I64]),
-                                        });
-                                    }
-                                    if binding != "_"
-                                        && let Some(result_ty) =
-                                            self.async_local_types.get(&case.span).cloned()
-                                        && seen.insert(case.span)
-                                    {
-                                        out.push(AsyncFrameSlot {
-                                            key: case.span,
-                                            name: binding.clone(),
-                                            ty: result_ty,
-                                        });
-                                    }
-                                }
-                                SelectCaseKind::Default => {}
-                            }
-                            self.coop_collect_let_slots(&case.body, out, seen);
-                        }
-                    } else {
-                        // `ch.send(v);` parks on a full bounded buffer, so both
-                        // operands live in the frame across the park
-                        // (willow-o038). The element type is recorded by the
-                        // checker keyed by the argument span; without it the
-                        // send falls back to the eager blocking form.
-                        if let Some(m) = is_channel_send(&es.expr)
-                            && let Some(elem_ty) =
-                                self.async_local_types.get(&m.args[0].expr.span()).cloned()
-                        {
-                            if seen.insert(m.span) {
-                                out.push(AsyncFrameSlot {
-                                    key: m.span,
-                                    name: "__send_chan".to_string(),
-                                    ty: Type::Generic("Channel".to_string(), vec![Type::I64]),
-                                });
-                            }
-                            if seen.insert(m.args[0].expr.span()) {
-                                out.push(AsyncFrameSlot {
-                                    key: m.args[0].expr.span(),
-                                    name: "__send_value".to_string(),
-                                    ty: elem_ty,
-                                });
-                            }
-                        }
-                        self.coop_collect_callee_frame_slot(&es.expr, out, seen);
-                    }
-                    self.coop_collect_nested_scope_slots_in_expr(&es.expr, out, seen);
-                }
-                Stmt::Return(s) => {
-                    if let Some(value) = &s.value {
-                        self.coop_collect_callee_frame_slot(value, out, seen);
-                        self.coop_collect_nested_scope_slots_in_expr(value, out, seen);
-                    }
-                }
-                Stmt::If(s) => {
-                    self.coop_collect_nested_scope_slots_in_expr(&s.cond, out, seen);
-                    self.coop_collect_let_slots(&s.then_block, out, seen);
-                    if let Some(e) = &s.else_block {
-                        self.coop_collect_let_slots(e, out, seen);
-                    }
-                }
-                Stmt::While(s) => {
-                    self.coop_collect_nested_scope_slots_in_expr(&s.cond, out, seen);
-                    self.coop_collect_let_slots(&s.body, out, seen);
-                }
-                Stmt::For(s) => {
-                    self.coop_collect_nested_scope_slots_in_expr(&s.iterable, out, seen);
-                    for (key, name) in [
-                        (s.iter_frame_key(), "__for_iter".to_string()),
-                        (s.index_frame_key(), "__for_index".to_string()),
-                        (s.name_span, s.name.clone()),
-                    ] {
-                        if let Some(ty) = self.async_local_types.get(&key).cloned()
-                            && seen.insert(key)
-                        {
-                            out.push(AsyncFrameSlot { key, name, ty });
-                        }
-                    }
-                    self.coop_collect_let_slots(&s.body, out, seen);
-                }
-                // A contended acquisition parks and resumes into the critical
-                // section, so the binding lives in the frame — the checker
-                // records its type keyed by `binding_span` (willow-38w.1.1).
-                // The evaluated handle and the registration token join it: the
-                // native stack is gone after a park, and the cancel entry has
-                // nothing but the frame to release a held lock from
-                // (willow-38w.1.4).
-                Stmt::Lock(s) => {
-                    self.coop_collect_callee_frame_slot(&s.target, out, seen);
-                    self.coop_collect_nested_scope_slots_in_expr(&s.target, out, seen);
-                    for (key, name) in [
-                        (s.handle_frame_key(), "__lock_handle".to_string()),
-                        (s.token_frame_key(), "__lock_token".to_string()),
-                        (s.phase_frame_key(), "__lock_phase".to_string()),
-                        (s.binding_span, s.binding.clone()),
-                    ] {
-                        if let Some(ty) = self.async_local_types.get(&key).cloned()
-                            && seen.insert(key)
-                        {
-                            out.push(AsyncFrameSlot { key, name, ty });
-                        }
-                    }
-                    self.coop_collect_let_slots(&s.body, out, seen);
-                }
-            }
-        }
-    }
-
-    /// Find lexical statement blocks nested inside expressions and collect the
-    /// async frame slots they own. In particular, a `match` arm is emitted via
-    /// the ordinary block emitter rather than `emit_coop_stmts`, but a defer in
-    /// that arm still needs its flag and operand slots in the enclosing async
-    /// frame (willow-s9ej.1).
-    ///
-    /// Lambda bodies deliberately do not recurse: a lambda owns a different
-    /// function/frame. Select bodies are included because nested expression
-    /// traversal can reach them outside the direct select-statement fast path;
-    /// `seen` makes the normal path's duplicate visit harmless.
-    fn coop_collect_nested_scope_slots_in_expr(
-        &self,
-        expr: &Expr,
-        out: &mut Vec<AsyncFrameSlot>,
-        seen: &mut HashSet<crate::diagnostics::Span>,
-    ) {
-        macro_rules! visit {
-            ($expr:expr) => {
-                self.coop_collect_nested_scope_slots_in_expr($expr, out, seen)
-            };
-        }
-        match expr {
-            Expr::Binary(binary) => {
-                visit!(&binary.lhs);
-                visit!(&binary.rhs);
-            }
-            Expr::Unary(unary) => visit!(&unary.expr),
-            Expr::Call(call) => {
-                for arg in &call.args {
-                    visit!(&arg.expr);
-                }
-            }
-            Expr::FieldAccess(object, ..) => visit!(object),
-            Expr::MethodCall(call) => {
-                visit!(&call.object);
-                for arg in &call.args {
-                    visit!(&arg.expr);
-                }
-            }
-            Expr::StaticCall(call) => {
-                for arg in &call.args {
-                    visit!(&arg.expr);
-                }
-            }
-            Expr::New(new) => {
-                for arg in &new.args {
-                    visit!(&arg.expr);
-                }
-            }
-            Expr::ObjectLiteral(object) => {
-                for field in &object.fields {
-                    visit!(&field.value);
-                }
-            }
-            Expr::Await(awaited) => visit!(&awaited.expr),
-            Expr::Select(select) => {
-                for case in &select.cases {
-                    match &case.kind {
-                        SelectCaseKind::Recv { channel, .. } => visit!(channel),
-                        SelectCaseKind::Send { channel, value } => {
-                            visit!(channel);
-                            visit!(value);
-                        }
-                        SelectCaseKind::Timeout { millis } => visit!(millis),
-                        SelectCaseKind::Join { task, .. } => visit!(task),
-                        SelectCaseKind::Default => {}
-                    }
-                    self.coop_collect_let_slots(&case.body, out, seen);
-                }
-            }
-            Expr::Print(value, ..) => visit!(value),
-            Expr::Ternary(ternary) => {
-                visit!(&ternary.condition);
-                visit!(&ternary.then_expr);
-                visit!(&ternary.else_expr);
-            }
-            Expr::Range(range) => {
-                visit!(&range.start);
-                visit!(&range.end);
-            }
-            Expr::Lambda(_) => {}
-            Expr::Match(matched) => {
-                visit!(&matched.scrutinee);
-                for arm in &matched.arms {
-                    match &arm.body {
-                        MatchBody::Expr(expr) => visit!(expr),
-                        MatchBody::Block(block) => {
-                            self.coop_collect_let_slots(block, out, seen);
-                        }
-                    }
-                }
-            }
-            Expr::TryPropagate(inner, _) => visit!(inner),
-            Expr::ArrayLiteral(elements, _) => {
-                for element in elements {
-                    visit!(element);
-                }
-            }
-            Expr::Index(array, index, _) => {
-                visit!(array);
-                visit!(index);
-            }
-            Expr::Integer(_, _)
-            | Expr::Float(_, _)
-            | Expr::Bool(_, _)
-            | Expr::String(_, _)
-            | Expr::Var(_, _)
-            | Expr::StaticField(_) => {}
-        }
     }
 
     // ── Class helpers ─────────────────────────────────────────────────────────
@@ -1940,17 +1502,10 @@ struct FuncGen<'a, 'b> {
     class_descriptor_ids: &'a HashMap<String, DataId>,
     /// Per-class virtual method slot order, indexed by slot (willow-fm7t).
     class_vslots: &'a HashMap<String, Vec<String>>,
-    /// Type-checker-inferred return types for lambdas without explicit annotations.
-    lambda_return_types: &'a HashMap<crate::diagnostics::Span, Type>,
-    /// Full inferred fn types for lambdas, including contextual parameter types.
-    lambda_fn_types: &'a HashMap<crate::diagnostics::Span, Type>,
     /// Interface metadata for method dispatch + boxing.
     interface_infos: &'a HashMap<String, InterfaceInfo>,
     /// Static `(class, interface)` vtable data objects for class→interface boxing.
     vtable_ids: &'a HashMap<(String, String), DataId>,
-    /// Resolved types of async-fn locals (keyed by span) for frame-backing
-    /// unannotated live-across-await locals (willow-lpn.5c).
-    async_local_types: &'a HashMap<crate::diagnostics::Span, Type>,
     /// Checker-recorded types of all checked expressions (willow-mb5); the
     /// backend's primary type source.
     expr_types: &'a HashMap<crate::diagnostics::Span, Type>,
@@ -2088,17 +1643,6 @@ fn async_frame_slot_offset(n: usize) -> i32 {
     ASYNC_FRAME_HEADER_BYTES + (n as i32) * 8
 }
 
-/// `WILLOW_ASYNC_FRAME_ALL=1` turns off live-across-await narrowing
-/// (willow-lpn.10) and frame-backs every GC-managed binding in an async fn, the
-/// way the backend did before the analysis existed. It is a bisection switch: if
-/// a program only survives collection with it set, the analysis under-framed
-/// something and the narrowing is at fault.
-fn async_frame_all_override() -> bool {
-    std::env::var("WILLOW_ASYNC_FRAME_ALL")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
 impl<'a, 'b> FuncGen<'a, 'b> {
     /// Cranelift 0.134 requires the target pointer type when lowering the
     /// implicit address calculation performed by stack-slot loads/stores.
@@ -2223,135 +1767,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 ty: ty.clone(),
             },
         );
-    }
-
-    /// Allocate and GC-root a heap async frame for this function if it has at
-    /// least one GC-managed value parameter that must survive `await`
-    /// (willow-lpn.5a). Returns the frame layout when a frame was allocated, so
-    /// the caller can frame-back the relevant parameters. Eager execution is
-    /// unchanged; the frame is the GC-safe home for live-across-await values.
-    /// Like the free `collect_async_frame_slots`, but also includes UNANNOTATED
-    /// `let` locals using the type-checker-resolved types in `async_local_types`
-    /// (willow-lpn.5c). Order: params, then locals in source order, deduped.
-    ///
-    /// The list is then narrowed to the bindings that are actually live across
-    /// an `await` (willow-lpn.10). A binding that is dead at every suspension
-    /// point does not need a frame slot: it keeps the ordinary stack slot plus
-    /// shadow-stack root that non-async code uses, which is equally GC-safe and
-    /// costs no frame word. Set `WILLOW_ASYNC_FRAME_ALL=1` to skip the narrowing
-    /// and frame everything, which is how a suspected rooting bug is bisected
-    /// against this analysis.
-    fn collect_async_frame_slots_resolved(
-        &self,
-        params: &[Param],
-        body: &Block,
-    ) -> Vec<AsyncFrameSlot> {
-        let mut slots: Vec<AsyncFrameSlot> = params
-            .iter()
-            .map(|p| AsyncFrameSlot {
-                key: p.span,
-                name: p.name.clone(),
-                ty: p.ty.clone(),
-            })
-            .collect();
-        // Dedup by the binding's span (unique per param/`let`), NOT by name, so
-        // that nested shadowed locals get their own slots (willow-lpn.11).
-        let mut seen: HashSet<crate::diagnostics::Span> = slots.iter().map(|s| s.key).collect();
-        self.collect_let_slots_resolved(body, &mut slots, &mut seen);
-        if async_frame_all_override() {
-            return slots;
-        }
-        // Params keep their slots unconditionally: slots 2..2+n_params are
-        // addressed positionally by the caller-side argument stores, so dropping
-        // one would shift every later slot. Locals only need frame storage when
-        // their value is live across an await; dead-at-await GC locals remain
-        // safe in balanced shadow-root slots (willow-p42j).
-        let param_spans: HashSet<crate::diagnostics::Span> =
-            params.iter().map(|p| p.span).collect();
-        let live = async_liveness::analyze(params, body);
-        slots.retain(|s| param_spans.contains(&s.key) || live.contains(&s.key));
-        slots
-    }
-
-    fn collect_let_slots_resolved(
-        &self,
-        block: &Block,
-        out: &mut Vec<AsyncFrameSlot>,
-        seen: &mut HashSet<crate::diagnostics::Span>,
-    ) {
-        for stmt in &block.stmts {
-            match stmt {
-                Stmt::Defer(_) => {}
-                Stmt::Let(l) => {
-                    // Annotated locals carry their type; unannotated ones use the
-                    // type-checker-resolved type recorded for their span.
-                    let ty =
-                        l.ty.clone()
-                            .or_else(|| self.async_local_types.get(&l.span).cloned());
-                    if let Some(ty) = ty
-                        && seen.insert(l.span)
-                    {
-                        out.push(AsyncFrameSlot {
-                            key: l.span,
-                            name: l.name.clone(),
-                            ty,
-                        });
-                    }
-                }
-                Stmt::If(s) => {
-                    self.collect_let_slots_resolved(&s.then_block, out, seen);
-                    if let Some(else_block) = &s.else_block {
-                        self.collect_let_slots_resolved(else_block, out, seen);
-                    }
-                }
-                Stmt::While(s) => self.collect_let_slots_resolved(&s.body, out, seen),
-                Stmt::For(s) => self.collect_let_slots_resolved(&s.body, out, seen),
-                _ => {}
-            }
-        }
-    }
-
-    fn setup_async_frame(
-        &mut self,
-        params: &[Param],
-        body: &Block,
-    ) -> Result<Option<AsyncFrameLayout>> {
-        let slots = self.collect_async_frame_slots_resolved(params, body);
-        let layout = AsyncFrameLayout::try_new(slots, self.enum_infos)?;
-
-        // The GC-managed slots (params + annotated locals) are the ones we
-        // frame-back. Only allocate a frame when there is at least one —
-        // async fns without GC state are unaffected (no extra allocation).
-        let mut offsets: HashMap<crate::diagnostics::Span, i32> = HashMap::new();
-        for (i, slot) in layout.slots.iter().enumerate() {
-            if layout.slot_is_gc_ref(i) {
-                offsets.insert(slot.key, async_frame_slot_offset(i));
-            }
-        }
-        if offsets.is_empty() {
-            return Ok(None);
-        }
-
-        let slot_count = self
-            .builder
-            .ins()
-            .iconst(types::I64, layout.slot_count() as i64);
-        let mask = self
-            .builder
-            .ins()
-            .iconst(types::I64, layout.gc_slot_mask as i64);
-        let alloc_id = self.func_id("willow_async_frame_alloc");
-        let alloc_ref = self
-            .module
-            .declare_func_in_func(alloc_id, self.builder.func);
-        let call = self.builder.ins().call(alloc_ref, &[slot_count, mask]);
-        let frame = self.builder.inst_results(call)[0];
-        // Root the frame for the function's duration (popped on return with the
-        // other parameter roots via the gc_root_count mechanism).
-        self.emit_push_root(frame);
-        self.async_frame = Some(frame);
-        self.async_frame_offsets = offsets;
-        Ok(Some(layout))
     }
 
     fn create_local_stack_slot(
@@ -2692,26 +2107,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // Lambda expression → build the fn type from params and return type.
             // Prefer: explicit annotation > type-checker inferred > expression-body inference > I64.
             Expr::Lambda(l) => {
-                if let Some(ty) = self.lambda_fn_types.get(&l.span) {
+                if let Some(ty @ Type::Fn(..)) = self.expr_types.get(&l.span) {
                     return ty.clone();
                 }
                 let params: Vec<Type> = l.params.iter().filter_map(|p| p.ty.clone()).collect();
-                let ret = l
-                    .return_type
-                    .clone()
-                    .or_else(|| self.lambda_return_types.get(&l.span).cloned())
-                    .unwrap_or_else(|| {
-                        if let crate::parser::ast::LambdaBody::Expr(e) = &l.body {
-                            let param_map: HashMap<String, Type> = l
-                                .params
-                                .iter()
-                                .filter_map(|p| p.ty.clone().map(|ty| (p.name.clone(), ty)))
-                                .collect();
-                            infer_lambda_body_type(e, &param_map, self.func_return_types)
-                        } else {
-                            Type::I64
-                        }
-                    });
+                let ret = l.return_type.clone().unwrap_or_else(|| {
+                    if let crate::parser::ast::LambdaBody::Expr(e) = &l.body {
+                        let param_map: HashMap<String, Type> = l
+                            .params
+                            .iter()
+                            .filter_map(|p| p.ty.clone().map(|ty| (p.name.clone(), ty)))
+                            .collect();
+                        infer_lambda_body_type(e, &param_map, self.func_return_types)
+                    } else {
+                        Type::I64
+                    }
+                });
                 Type::Fn(params, Box::new(ret))
             }
             _ => self.ast_type_of(expr),
@@ -3785,19 +3196,6 @@ mod tests {
     }
 
     #[test]
-    fn unit_async_codegen_02d_await_yield_is_suspend_point() {
-        let await_yield = Expr::Await(Box::new(AwaitExpr {
-            expr: Expr::Call(Box::new(CallExpr {
-                callee: "yield".to_string(),
-                args: vec![],
-                span: Span::dummy(),
-            })),
-            span: Span::dummy(),
-        }));
-        assert!(is_await_yield(&await_yield));
-    }
-
-    #[test]
     fn unit_async_codegen_03_channel_new_returns_channel_void_placeholder() {
         assert_eq!(
             builtin_static_return_type("Channel", &[], "new"),
@@ -4243,381 +3641,6 @@ mod tests {
         assert_eq!(
             future_await_runtime_name(&Type::Named("Node".to_string())),
             "willow_future_await_ptr"
-        );
-    }
-
-    #[test]
-    fn unit_async_codegen_11_coop_main_allows_await_in_while_with_assignment() {
-        let i_span = Span::new(1, 1, 1, 1);
-        let await_sleep = Expr::Await(Box::new(AwaitExpr {
-            expr: Expr::Call(Box::new(CallExpr {
-                callee: "sleep".to_string(),
-                args: vec![CallArg::value(Expr::Integer(1, Span::dummy()))],
-                span: Span::dummy(),
-            })),
-            span: Span::dummy(),
-        }));
-        let f = FunctionDecl {
-            name: "main".to_string(),
-            public: false,
-            is_async: true,
-            params: Vec::new(),
-            return_type: Type::Void,
-            body: Block {
-                stmts: vec![
-                    Stmt::Let(LetStmt {
-                        name: "i".to_string(),
-                        mutable: true,
-                        ty: Some(Type::I64),
-                        init: Expr::Integer(0, Span::dummy()),
-                        span: i_span,
-                    }),
-                    Stmt::While(WhileStmt {
-                        cond: Expr::Binary(Box::new(BinaryExpr {
-                            op: BinOp::Lt,
-                            lhs: Expr::Var("i".to_string(), Span::dummy()),
-                            rhs: Expr::Integer(2, Span::dummy()),
-                            span: Span::dummy(),
-                        })),
-                        body: Block {
-                            stmts: vec![
-                                Stmt::Expr(ExprStmt {
-                                    expr: await_sleep,
-                                    span: Span::dummy(),
-                                }),
-                                Stmt::Assign(AssignStmt {
-                                    name: "i".to_string(),
-                                    value: Expr::Binary(Box::new(BinaryExpr {
-                                        op: BinOp::Add,
-                                        lhs: Expr::Var("i".to_string(), Span::dummy()),
-                                        rhs: Expr::Integer(1, Span::dummy()),
-                                        span: Span::dummy(),
-                                    })),
-                                    span: Span::dummy(),
-                                }),
-                            ],
-                            span: Span::dummy(),
-                        },
-                        span: Span::dummy(),
-                    }),
-                ],
-                span: Span::dummy(),
-            },
-            span: Span::dummy(),
-        };
-
-        assert!(cooperative_main_eligible(
-            &f,
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashSet::new()
-        ));
-    }
-
-    #[test]
-    fn unit_async_codegen_11b_coop_main_allows_await_yield() {
-        let await_yield = Expr::Await(Box::new(AwaitExpr {
-            expr: Expr::Call(Box::new(CallExpr {
-                callee: "yield".to_string(),
-                args: vec![],
-                span: Span::dummy(),
-            })),
-            span: Span::dummy(),
-        }));
-        let f = FunctionDecl {
-            name: "main".to_string(),
-            public: false,
-            is_async: true,
-            params: Vec::new(),
-            return_type: Type::Void,
-            body: Block {
-                stmts: vec![Stmt::Expr(ExprStmt {
-                    expr: await_yield,
-                    span: Span::dummy(),
-                })],
-                span: Span::dummy(),
-            },
-            span: Span::dummy(),
-        };
-
-        assert!(cooperative_main_eligible(
-            &f,
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashSet::new()
-        ));
-    }
-
-    #[test]
-    fn unit_async_codegen_12_coop_main_allows_await_in_for_loop() {
-        let xs_span = Span::new(1, 2, 1, 1);
-        let item_span = Span::new(2, 3, 2, 5);
-        let await_sleep = Expr::Await(Box::new(AwaitExpr {
-            expr: Expr::Call(Box::new(CallExpr {
-                callee: "sleep".to_string(),
-                args: vec![CallArg::value(Expr::Integer(1, Span::dummy()))],
-                span: Span::dummy(),
-            })),
-            span: Span::dummy(),
-        }));
-        let for_stmt = ForStmt {
-            name: "item".to_string(),
-            name_span: item_span,
-            iterable: Expr::Var("xs".to_string(), Span::new(2, 7, 2, 13)),
-            body: Block {
-                stmts: vec![Stmt::Expr(ExprStmt {
-                    expr: await_sleep,
-                    span: Span::dummy(),
-                })],
-                span: Span::dummy(),
-            },
-            span: Span::new(2, 20, 2, 1),
-        };
-        let mut async_local_types = HashMap::new();
-        async_local_types.insert(for_stmt.iter_frame_key(), Type::Array(Box::new(Type::I64)));
-        async_local_types.insert(for_stmt.index_frame_key(), Type::I64);
-        async_local_types.insert(for_stmt.name_span, Type::I64);
-        let f = FunctionDecl {
-            name: "main".to_string(),
-            public: false,
-            is_async: true,
-            params: Vec::new(),
-            return_type: Type::Void,
-            body: Block {
-                stmts: vec![
-                    Stmt::Let(LetStmt {
-                        name: "xs".to_string(),
-                        mutable: false,
-                        ty: Some(Type::Array(Box::new(Type::I64))),
-                        init: Expr::ArrayLiteral(
-                            vec![
-                                Expr::Integer(1, Span::dummy()),
-                                Expr::Integer(2, Span::dummy()),
-                            ],
-                            Span::dummy(),
-                        ),
-                        span: xs_span,
-                    }),
-                    Stmt::For(for_stmt),
-                ],
-                span: Span::dummy(),
-            },
-            span: Span::dummy(),
-        };
-
-        assert!(cooperative_main_eligible(
-            &f,
-            &async_local_types,
-            &HashMap::new(),
-            &HashSet::new()
-        ));
-    }
-
-    #[test]
-    fn unit_async_codegen_13_coop_main_allows_await_in_range_for_loop() {
-        let item_span = Span::new(1, 3, 1, 5);
-        let await_sleep = Expr::Await(Box::new(AwaitExpr {
-            expr: Expr::Call(Box::new(CallExpr {
-                callee: "sleep".to_string(),
-                args: vec![CallArg::value(Expr::Integer(1, Span::dummy()))],
-                span: Span::dummy(),
-            })),
-            span: Span::dummy(),
-        }));
-        let for_stmt = ForStmt {
-            name: "n".to_string(),
-            name_span: item_span,
-            iterable: Expr::Range(Box::new(RangeExpr {
-                start: Expr::Integer(1, Span::new(1, 10, 1, 10)),
-                end: Expr::Integer(4, Span::new(1, 13, 1, 13)),
-                span: Span::new(1, 14, 1, 10),
-            })),
-            body: Block {
-                stmts: vec![Stmt::Expr(ExprStmt {
-                    expr: await_sleep,
-                    span: Span::dummy(),
-                })],
-                span: Span::dummy(),
-            },
-            span: Span::new(1, 20, 1, 1),
-        };
-        let mut async_local_types = HashMap::new();
-        async_local_types.insert(for_stmt.iter_frame_key(), Type::I64);
-        async_local_types.insert(for_stmt.index_frame_key(), Type::I64);
-        async_local_types.insert(for_stmt.name_span, Type::I64);
-        let f = FunctionDecl {
-            name: "main".to_string(),
-            public: false,
-            is_async: true,
-            params: Vec::new(),
-            return_type: Type::Void,
-            body: Block {
-                stmts: vec![Stmt::For(for_stmt)],
-                span: Span::dummy(),
-            },
-            span: Span::dummy(),
-        };
-
-        assert!(cooperative_main_eligible(
-            &f,
-            &async_local_types,
-            &HashMap::new(),
-            &HashSet::new()
-        ));
-    }
-
-    // ── Cooperative await routing + callee-frame-slot reservation (0a6k.6) ──
-    //
-    // Unit coverage for the two decision helpers behind the imported-async
-    // cooperative-await fix:
-    //   * `is_leaf_call_await` — only a leaf direct call routes to the dedicated
-    //     call-await; everything else (incl. non-leaf/imported calls) takes the
-    //     general cooperative task-await rather than block-driving.
-    //   * `await_callee_frame_slot_span` — every direct-call-form await reserves
-    //     a callee-frame slot so resume RELOADS the frame instead of re-running
-    //     the call.
-
-    fn leaves(names: &[&str]) -> HashSet<FunctionId> {
-        names.iter().map(|name| FunctionId::free(*name)).collect()
-    }
-
-    fn await_with(inner: Expr, await_span: Span) -> Expr {
-        Expr::Await(Box::new(AwaitExpr {
-            expr: inner,
-            span: await_span,
-        }))
-    }
-
-    fn call(callee: &str) -> Expr {
-        Expr::Call(Box::new(CallExpr {
-            callee: callee.to_string(),
-            args: vec![],
-            span: Span::dummy(),
-        }))
-    }
-
-    fn method_call() -> Expr {
-        Expr::MethodCall(Box::new(MethodCallExpr {
-            object: Expr::Var("t".to_string(), Span::dummy()),
-            method: "poll".to_string(),
-            args: vec![],
-            span: Span::dummy(),
-        }))
-    }
-
-    fn static_call() -> Expr {
-        Expr::StaticCall(Box::new(StaticCallExpr {
-            class: "worker".to_string(),
-            type_args: vec![],
-            method: "make_value".to_string(),
-            args: vec![],
-            span: Span::dummy(),
-        }))
-    }
-
-    #[test]
-    fn unit_coop_await_01_leaf_direct_call_is_leaf_await() {
-        let expr = await_with(call("local_async"), Span::dummy());
-        assert!(is_leaf_call_await(&expr, &leaves(&["local_async"])));
-    }
-
-    #[test]
-    fn unit_coop_await_02_non_leaf_direct_call_is_not_leaf_await() {
-        // An item-imported async fn is absent from `cooperative_leaves`, so it is
-        // NOT a leaf await — it takes the task-await (cooperative) path.
-        let expr = await_with(call("imported_async"), Span::dummy());
-        assert!(!is_leaf_call_await(&expr, &leaves(&["local_async"])));
-    }
-
-    #[test]
-    fn unit_coop_await_03_aliased_item_import_is_not_leaf_await() {
-        // `import worker::make_value as mv;` — the callee is the alias `mv`,
-        // which is never a leaf, so it routes cooperatively.
-        let expr = await_with(call("mv"), Span::dummy());
-        assert!(!is_leaf_call_await(&expr, &leaves(&["local_async"])));
-    }
-
-    #[test]
-    fn unit_coop_await_04_method_call_await_is_not_leaf_await() {
-        let expr = await_with(method_call(), Span::dummy());
-        assert!(!is_leaf_call_await(&expr, &leaves(&["local_async"])));
-    }
-
-    #[test]
-    fn unit_coop_await_05_static_call_await_is_not_leaf_await() {
-        let expr = await_with(static_call(), Span::dummy());
-        assert!(!is_leaf_call_await(&expr, &leaves(&["worker"])));
-    }
-
-    #[test]
-    fn unit_coop_await_06_await_of_var_is_not_leaf_await() {
-        let expr = await_with(Expr::Var("t".to_string(), Span::dummy()), Span::dummy());
-        assert!(!is_leaf_call_await(&expr, &leaves(&["t"])));
-    }
-
-    #[test]
-    fn unit_coop_await_07_bare_call_without_await_is_not_leaf_await() {
-        // The expression must be an `await`; a bare call is not.
-        let expr = call("local_async");
-        assert!(!is_leaf_call_await(&expr, &leaves(&["local_async"])));
-    }
-
-    #[test]
-    fn unit_coop_await_08_leaf_call_reserves_slot_at_await_span() {
-        let await_span = Span::new(10, 20, 3, 5);
-        let expr = await_with(call("local_async"), await_span);
-        assert_eq!(
-            await_callee_frame_slot_span(&expr, &leaves(&["local_async"])),
-            Some(await_span)
-        );
-    }
-
-    #[test]
-    fn unit_coop_await_09_non_leaf_call_reserves_slot_at_await_span() {
-        // The double-call guard: an imported async await must still reserve a
-        // slot, keyed by the await's span (not the inner call's).
-        let await_span = Span::new(30, 40, 7, 9);
-        let expr = await_with(call("imported_async"), await_span);
-        assert_eq!(
-            await_callee_frame_slot_span(&expr, &leaves(&["local_async"])),
-            Some(await_span)
-        );
-    }
-
-    #[test]
-    fn unit_coop_await_10_method_call_await_reserves_slot() {
-        let await_span = Span::new(1, 2, 1, 1);
-        let expr = await_with(method_call(), await_span);
-        assert_eq!(
-            await_callee_frame_slot_span(&expr, &HashSet::new()),
-            Some(await_span)
-        );
-    }
-
-    #[test]
-    fn unit_coop_await_11_static_call_await_reserves_slot() {
-        let await_span = Span::new(2, 3, 1, 1);
-        let expr = await_with(static_call(), await_span);
-        assert_eq!(
-            await_callee_frame_slot_span(&expr, &HashSet::new()),
-            Some(await_span)
-        );
-    }
-
-    #[test]
-    fn unit_coop_await_12_await_of_var_reserves_no_slot() {
-        // Awaiting a non-call value (e.g. a `Task` local) needs no callee-frame
-        // slot — the value is already frame-backed.
-        let expr = await_with(Expr::Var("t".to_string(), Span::dummy()), Span::dummy());
-        assert_eq!(await_callee_frame_slot_span(&expr, &HashSet::new()), None);
-    }
-
-    #[test]
-    fn unit_coop_await_13_non_await_reserves_no_slot() {
-        let expr = call("imported_async");
-        assert_eq!(
-            await_callee_frame_slot_span(&expr, &leaves(&["local_async"])),
-            None
         );
     }
 }

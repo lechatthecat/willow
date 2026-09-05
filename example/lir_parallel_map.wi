@@ -2,8 +2,8 @@
 // (willow-0g8j.2.13).
 //
 // `parallel::map` is a NAMESPACE call: `parallel` has no layout and no methods,
-// so both backends turn `parallel::map(frozen, f)` into one direct runtime call
-// and let the runtime own the chunking. The walker keeps a single table of
+// so `parallel::map(frozen, f)` becomes one direct runtime call and the runtime
+// owns the chunking. The walker keeps a single table of
 // those namespace entries, shared by eligibility and emission, so it cannot
 // admit a call it has no entry point for; the signature comes from the stdlib
 // schema, which is the same table the checker types the call from.
@@ -15,9 +15,9 @@
 // a capturing lambda at type-check time — so a mapper is a bare code address
 // with nothing for the collector to trace.
 //
-// Every function declared here is compiled by the walker. Run under
-// `WILLOW_LIR_LOG=1` to watch each one being claimed, or under
-// `WILLOW_LIR_REQUIRE=1` to make a fallback a hard error.
+// Every function declared here is compiled by the walker — since
+// willow-0g8j.3 there is nothing else to compile it. Run under
+// `WILLOW_LIR_LOG=1` to watch each one being claimed.
 
 import std::collections::Array;
 import std::parallel;

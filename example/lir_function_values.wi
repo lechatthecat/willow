@@ -2,10 +2,9 @@
 //
 // Every free function here stays inside the walker's supported subset, so its
 // basic blocks are compiled directly from the lowered IR instead of the AST.
-// Building this program with WILLOW_LIR_BACKEND=0 must print exactly the same
-// thing, and building it with WILLOW_LIR_REQUIRE=1 must succeed — that mode
-// turns a fallback to the AST emitter into a compile error, which is what keeps
-// the claim above honest.
+// Since willow-0g8j.3 a body outside that subset is a compile error rather than
+// a fallback, so this file compiling at all is what keeps the claim above
+// honest.
 //
 // Three things arrive together here and only make sense together:
 //

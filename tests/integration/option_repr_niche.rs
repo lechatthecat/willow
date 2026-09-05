@@ -308,16 +308,13 @@ fn main() {
 }
 
 #[test]
-fn option_niche_26_lir_selection_and_ast_selection_are_equivalent() {
+fn option_niche_26_a_niched_option_matches_on_its_some_arm() {
     let source = r#"
 fn main() { let v: Option<String> = Some("same"); match v { Some(s) => println(s), None => println("none") } }
 "#;
-    let (ast, ast_ok) = compile_and_run_with_env(source, &[("WILLOW_LIR_BACKEND", "0")]);
-    let (lir, lir_ok) = compile_and_run_with_env(source, &[("WILLOW_LIR_BACKEND", "1")]);
-    assert!(ast_ok, "{ast}");
-    assert!(lir_ok, "{lir}");
-    assert_eq!(ast, "same\n");
-    assert_eq!(lir, ast);
+    let (out, ok) = compile_and_run_with_env(source, &[]);
+    assert!(ok, "{out}");
+    assert_eq!(out, "same\n");
 }
 
 #[test]

@@ -4,8 +4,8 @@
 // walking their basic blocks instead of the AST. Strings are GC objects, and
 // the LIR has no block scopes, so each GC local gets one stack slot that is
 // both its storage and its GC root for the whole function, and every `return`
-// pops those roots. Building this program with WILLOW_LIR_BACKEND=0 must print
-// exactly the same thing, including under WILLOW_GC_STRESS=alloc.
+// pops those roots. Building this program under WILLOW_GC_STRESS=alloc must
+// print exactly the same thing as without it.
 
 fn wrap(s: String) -> String {
     return "[" + s + "]";

@@ -45,6 +45,34 @@ pub(crate) fn qualify_local_type(
     }
 }
 
+/// Replace type names a module reached through its OWN item imports with the
+/// identity they name. `import signal::Level as Grade;` lets a module write
+/// `Grade` in a public signature, and the importing file has no `Grade` at all;
+/// only the enum's build-wide identity is a name both units answer to
+/// (willow-0g8j.3). Complements [`qualify_local_type`], which does the same job
+/// for the names a module DECLARES.
+fn rename_imported_type(ty: &Type, renames: &HashMap<String, String>) -> Type {
+    let rename_name =
+        |n: &str| -> String { renames.get(n).cloned().unwrap_or_else(|| n.to_string()) };
+    match ty {
+        Type::Named(n) => Type::Named(rename_name(n)),
+        Type::Generic(n, args) => Type::Generic(
+            rename_name(n),
+            args.iter()
+                .map(|a| rename_imported_type(a, renames))
+                .collect(),
+        ),
+        Type::Array(e) => Type::Array(Box::new(rename_imported_type(e, renames))),
+        Type::Fn(ps, r) => Type::Fn(
+            ps.iter()
+                .map(|p| rename_imported_type(p, renames))
+                .collect(),
+            Box::new(rename_imported_type(r, renames)),
+        ),
+        _ => ty.clone(),
+    }
+}
+
 /// The AST type a std signature entry denotes.
 ///
 /// The schema is recursive (willow-uqzx, catalog item 11), so this is a thin
@@ -61,12 +89,7 @@ fn std_schema_type(ty: crate::stdlib_schema::StdType) -> Type {
 impl TypeChecker {
     pub(super) fn register_builtin_panic_surface(&mut self) {
         let mut fields = HashMap::new();
-        for (name, ty) in [
-            ("message", Type::String),
-            ("file", Type::String),
-            ("line", Type::I64),
-            ("column", Type::I64),
-        ] {
+        for (name, ty) in crate::semantic::builtin_types::panic_info_fields() {
             fields.insert(
                 name.to_string(),
                 FieldInfo {
@@ -89,12 +112,10 @@ impl TypeChecker {
                 fields,
                 methods: HashMap::new(),
                 static_props: HashMap::new(),
-                instance_field_order: vec![
-                    ("message".to_string(), Type::String),
-                    ("file".to_string(), Type::String),
-                    ("line".to_string(), Type::I64),
-                    ("column".to_string(), Type::I64),
-                ],
+                instance_field_order: crate::semantic::builtin_types::panic_info_fields()
+                    .into_iter()
+                    .map(|(name, ty)| (name.to_string(), ty))
+                    .collect(),
                 // Runtime-only construction is enforced explicitly by
                 // `check_new`; `None` must not be interpreted as a public
                 // memberwise constructor for this compiler-known type.
@@ -294,35 +315,47 @@ impl TypeChecker {
         self.register_interface(decl, None);
     }
 
-    pub fn register_module(&mut self, name: &str, path: &str, program: &Program) {
-        self.register_module_impl(None, name, path, program);
+    pub fn register_module(&mut self, name: &str, canonical: &str, path: &str, program: &Program) {
+        self.register_module_impl(None, name, canonical, path, program);
     }
 
     pub fn register_module_with_id(
         &mut self,
         id: crate::module::ModuleId,
         name: &str,
+        canonical: &str,
         path: &str,
         program: &Program,
     ) {
-        self.register_module_impl(Some(id), name, path, program);
+        self.register_module_impl(Some(id), name, canonical, path, program);
     }
 
+    /// `name` is what THIS unit calls the module -- an alias, or the last
+    /// segment of its path -- and is the spelling its items are registered
+    /// under. `canonical` is the module's one identity in the build, which is
+    /// what a type declared in it is NAMED after (willow-itcw), so two modules
+    /// that both declare `Level` stay distinct wherever both are in scope.
     fn register_module_impl(
         &mut self,
         id: Option<crate::module::ModuleId>,
         name: &str,
+        canonical: &str,
         path: &str,
         program: &Program,
     ) {
-        // INTERFACE names declared in this module. A module function signature
-        // that names one of its own interfaces by bare name is qualified to
-        // `module::Iface` so the importing file resolves it AND boxes interface
-        // arguments against the right vtable. Only interfaces are qualified:
-        // enum/class params are passed by value and a directly-imported alias
-        // (`import mod::Color` -> bare `Color`) must keep matching the bare arg
-        // type; builtin generics are left untouched (willow-1js.5).
-        let local_types: HashSet<String> = program
+        // Type names declared in this module. A module function signature that
+        // names one of them by bare name is qualified to `module::Name` so the
+        // importing file resolves it -- an interface argument against the right
+        // vtable (willow-1js.5), and an ENUM against the declaration it actually
+        // came from (willow-itcw): two modules that each declare `pub enum
+        // Level` both presented a bare `Level` to an importer, which then read
+        // one's tag as the other's variant. Classes need the same distinction
+        // at a call site: two imported modules may both return a class called
+        // `Point`, and leaving both return types bare loses which layout the
+        // value uses. A directly-imported alias still matches because the local
+        // binding carries the same registered class identity. Builtin generics
+        // are left untouched.
+        let local_interfaces: HashSet<String> = program
             .items
             .iter()
             .filter_map(|it| match it {
@@ -330,26 +363,73 @@ impl TypeChecker {
                 _ => None,
             })
             .collect();
+        let local_enums: HashSet<String> = program
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Enum(e) => Some(e.name.clone()),
+                _ => None,
+            })
+            .collect();
+        let local_classes: HashSet<String> = program
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Class(c) => Some(c.name.clone()),
+                _ => None,
+            })
+            .collect();
+        // An interface is qualified by the spelling THIS unit reaches the module
+        // by, because that is the key its vtable is registered under here; an
+        // enum by the module's canonical identity, because that is the one name
+        // it has build-wide. A class uses the access name because that is the
+        // key its layout and methods are registered under in this checker.
+        // An enum this module reached through an item import of its own is
+        // spelled by whatever local name that import bound — `Grade`, under
+        // `import signal::Level as Grade;` — and that name means nothing in the
+        // importing file. Modules are registered in dependency order, so the
+        // declaring module's enum is already in the table and can answer with
+        // the identity both units share (willow-0g8j.3).
+        let imported_enums: HashMap<String, String> = program
+            .imports
+            .iter()
+            .filter_map(|import| {
+                let last = import.path.rsplit("::").next()?;
+                let local = import.alias.clone().unwrap_or_else(|| last.to_string());
+                let info = self.symbols.lookup_enum(&import.path)?;
+                Some((local, info.name.clone()))
+            })
+            .collect();
+        let qualify = |ty: &Type| {
+            rename_imported_type(
+                &qualify_local_type(
+                    &qualify_local_type(
+                        &qualify_local_type(ty, name, &local_interfaces),
+                        name,
+                        &local_classes,
+                    ),
+                    canonical,
+                    &local_enums,
+                ),
+                &imported_enums,
+            )
+        };
 
         let mut functions = crate::semantic::ids::FunctionMap::default();
         for item in &program.items {
             match item {
                 Item::Function(f) => {
-                    let params = f
-                        .params
-                        .iter()
-                        .map(|p| qualify_local_type(&p.ty, name, &local_types))
-                        .collect::<Vec<_>>();
+                    let params = f.params.iter().map(|p| qualify(&p.ty)).collect::<Vec<_>>();
                     let mut param_infos = param_infos_from_decl(&f.params, None);
                     for pi in &mut param_infos {
-                        pi.ty = qualify_local_type(&pi.ty, name, &local_types);
+                        pi.ty = qualify(&pi.ty);
                     }
                     functions.insert(
                         f.name.clone(),
                         FuncInfo {
                             param_infos,
                             params,
-                            return_type: qualify_local_type(&f.return_type, name, &local_types),
+                            return_type: qualify(&f.return_type),
                             public: f.public,
                             is_async: f.is_async,
                             declaration_span: f.span,
@@ -364,7 +444,7 @@ impl TypeChecker {
                         class_info_from_decl(c, &class_name, Some(name)),
                     );
                 }
-                Item::Enum(e) => self.register_enum_with_module(e, name),
+                Item::Enum(e) => self.register_enum_with_module(e, name, canonical),
                 Item::Interface(i) => {
                     // Register imported interfaces under `module::Interface` so
                     // `animals::Animal` resolves as a type and in `implements`.
@@ -576,6 +656,15 @@ impl TypeChecker {
         }
     }
 
+    /// Register an enum declared in the program this checker is checking.
+    ///
+    /// The KEY is the bare name, because that is how the declaring body spells
+    /// it. The IDENTITY -- `EnumInfo::name` -- is `module::Enum` whenever the
+    /// program is a module's (willow-itcw): two modules that each declare `pub
+    /// enum Level` are two different types, and the back-end's enum table is one
+    /// namespace for the whole build, so a bare `Level` there could only ever
+    /// answer for one of them. The canonical spelling is registered as a key of
+    /// its own as well, since `normalize_type` rewrites every reference to it.
     pub(super) fn register_enum(&mut self, decl: &EnumDecl) {
         let mut variant_infos = Vec::new();
         for (tag, variant) in decl.variants.iter().enumerate() {
@@ -590,23 +679,41 @@ impl TypeChecker {
                 declaration_span: variant.span,
             });
         }
-        self.symbols.define_enum(
-            decl.name.clone(),
-            EnumInfo {
-                name: decl.name.clone(),
-                public: decl.public,
-                type_params: decl.type_params.clone(),
-                variants: variant_infos,
-                declaration_span: decl.span,
-            },
-        );
+        let canonical = match self.module_path.as_deref() {
+            Some(module) => format!("{module}::{}", decl.name),
+            None => decl.name.clone(),
+        };
+        let info = EnumInfo {
+            name: canonical.clone(),
+            public: decl.public,
+            type_params: decl.type_params.clone(),
+            variants: variant_infos,
+            declaration_span: decl.span,
+        };
+        if canonical != decl.name {
+            self.symbols.define_enum(canonical, info.clone());
+        }
+        self.symbols.define_enum(decl.name.clone(), info);
     }
 
     /// Register an enum imported from a module under its `module::Name` key, so
     /// `module::Enum` resolves as a type and `module::Enum::Variant` constructs
-    /// / matches (willow-64gs). Payload types are qualified for the owning module.
-    pub(super) fn register_enum_with_module(&mut self, decl: &EnumDecl, module: &str) {
+    /// / matches (willow-64gs).
+    ///
+    /// `module` is the spelling THIS unit uses -- an alias, or the tail of the
+    /// import path -- and `canonical` is the module's identity in the build.
+    /// They differ under `import a::b as c;`, and then the enum answers to both
+    /// keys but carries only the canonical name, so an aliasing unit and the
+    /// declaring module agree on which type it is (willow-itcw). Payload types
+    /// are qualified canonically for the same reason.
+    pub(super) fn register_enum_with_module(
+        &mut self,
+        decl: &EnumDecl,
+        module: &str,
+        canonical: &str,
+    ) {
         let qualified = format!("{module}::{}", decl.name);
+        let canonical_name = format!("{canonical}::{}", decl.name);
         let mut variant_infos = Vec::new();
         for (tag, variant) in decl.variants.iter().enumerate() {
             variant_infos.push(EnumVariantInfo {
@@ -614,22 +721,23 @@ impl TypeChecker {
                 payload_types: variant
                     .payload
                     .iter()
-                    .map(|ty| qualify_type_for_module(ty, Some(module)))
+                    .map(|ty| qualify_type_for_module(ty, Some(canonical)))
                     .collect(),
                 tag: tag as i64,
                 declaration_span: variant.span,
             });
         }
-        self.symbols.define_enum(
-            qualified.clone(),
-            EnumInfo {
-                name: qualified,
-                public: decl.public,
-                type_params: decl.type_params.clone(),
-                variants: variant_infos,
-                declaration_span: decl.span,
-            },
-        );
+        let info = EnumInfo {
+            name: canonical_name.clone(),
+            public: decl.public,
+            type_params: decl.type_params.clone(),
+            variants: variant_infos,
+            declaration_span: decl.span,
+        };
+        if qualified != canonical_name {
+            self.symbols.define_enum(canonical_name, info.clone());
+        }
+        self.symbols.define_enum(qualified, info);
     }
 
     pub(super) fn register_class(&mut self, c: &ClassDecl) {
@@ -1290,7 +1398,7 @@ impl TypeChecker {
                             .with_label(Label::primary(span, "unexpected arguments")),
                         );
                     }
-                    return Type::Named(class_name.to_string());
+                    return Type::Named(enum_info.name.clone());
                 } else {
                     // Payload variant: check arg count and types
                     let expected = variant.payload_types.len();
@@ -1331,7 +1439,7 @@ impl TypeChecker {
                             );
                         }
                     }
-                    return Type::Named(class_name.to_string());
+                    return Type::Named(enum_info.name.clone());
                 }
             } else {
                 self.push(
@@ -1342,7 +1450,7 @@ impl TypeChecker {
                     )
                     .with_label(Label::primary(span, "unknown enum variant")),
                 );
-                return Type::Named(class_name.to_string());
+                return Type::Named(enum_info.name.clone());
             }
         }
 
@@ -1370,7 +1478,7 @@ impl TypeChecker {
                         .with_label(Label::primary(span, "wrong number of arguments")),
                     );
                     let void_args = vec![Type::Void; enum_info.type_params.len()];
-                    return Type::Generic(class_name.to_string(), void_args);
+                    return Type::Generic(enum_info.name.clone(), void_args);
                 }
                 // Type-check args and infer type parameters.
                 let checked_args: Vec<Type> =
@@ -1397,7 +1505,7 @@ impl TypeChecker {
                             .unwrap_or(Type::Void)
                     })
                     .collect();
-                return Type::Generic(class_name.to_string(), type_args);
+                return Type::Generic(enum_info.name.clone(), type_args);
             } else {
                 // Unknown variant in generic enum
                 let valid: Vec<&str> = enum_info.variants.iter().map(|v| v.name.as_str()).collect();
@@ -1911,33 +2019,85 @@ impl TypeChecker {
         }
     }
 
+    /// What a written static-call class names, reporting nothing.
+    ///
+    /// [`Self::resolve_static_call_class_name`] stays the authority: it records
+    /// the resolution for lowering and diagnoses a bad std path. This is for the
+    /// contextual paths that run BEFORE it and must not report the same path
+    /// twice, nor take `&mut self` (willow-0g8j.3).
+    pub(super) fn resolve_static_call_class_quiet(&self, class_name: &str) -> Option<String> {
+        if class_name == "Self" {
+            return self.current_class.clone();
+        }
+        if let Some(item) = self.imported_collection_aliases.get(class_name) {
+            return Some(item.clone());
+        }
+        let builtin_or_path = |module: &str, item: &str| {
+            crate::stdlib_schema::type_item(module, item)
+                .map(|(_, builtin)| builtin.to_string())
+                .unwrap_or_else(|| format!("{module}::{item}"))
+        };
+        if std_registry::is_std_path(class_name)
+            && let Ok(std_registry::StdImport::Item { module, item }) =
+                std_registry::resolve_std_import(class_name, Span::dummy())
+        {
+            return Some(builtin_or_path(&module, &item));
+        }
+        if let Some((module_local, item)) = class_name.split_once("::")
+            && let Some(imported) = self.imported_std_modules.get(module_local)
+            && let Ok(std_registry::StdImport::Item { module, item }) =
+                std_registry::resolve_std_import(
+                    &format!("std::{}::{item}", imported.module),
+                    Span::dummy(),
+                )
+        {
+            return Some(builtin_or_path(&module, &item));
+        }
+        None
+    }
+
     pub(super) fn resolve_static_call_class_name(
         &mut self,
         class_name: &str,
         span: Span,
     ) -> Option<String> {
         if class_name != "Self" {
+            // What the written class turned out to name. Recorded per call site
+            // (willow-0g8j.3): HIR lowering keeps the source's own spelling, so
+            // `Dict::new()` would reach the back end as a static call on a class
+            // called `Dict` -- a name no table answers to.
+            let resolved = |this: &mut Self, name: String| {
+                if name != class_name {
+                    this.static_call_classes.insert(span, name.clone());
+                }
+                Some(name)
+            };
             if let Some(item) = self.imported_collection_aliases.get(class_name).cloned() {
-                return Some(item);
+                return resolved(self, item);
             }
             if let Some((module, item)) = self.resolve_fully_qualified_std_item(class_name, span) {
                 if module == "collections" {
                     self.fully_qualified_collection_types.insert(item.clone());
                 }
-                return Some(
-                    crate::stdlib_schema::type_item(&module, &item)
-                        .map(|(_, builtin)| builtin.to_string())
-                        .unwrap_or_else(|| format!("{module}::{item}")),
-                );
+                let name = crate::stdlib_schema::type_item(&module, &item)
+                    .map(|(_, builtin)| builtin.to_string())
+                    .unwrap_or_else(|| format!("{module}::{item}"));
+                return resolved(self, name);
             }
             if let Some((module, item)) = self.resolve_imported_std_module_item(class_name, span) {
-                return Some(
-                    crate::stdlib_schema::type_item(&module, &item)
-                        .map(|(_, builtin)| builtin.to_string())
-                        .unwrap_or_else(|| format!("{module}::{item}")),
-                );
+                let name = crate::stdlib_schema::type_item(&module, &item)
+                    .map(|(_, builtin)| builtin.to_string())
+                    .unwrap_or_else(|| format!("{module}::{item}"));
+                return resolved(self, name);
             }
-            return Some(class_name.to_string());
+            // An enum an item import brought in (`import signal::Level;`, or
+            // `as Rank`) is registered under the spelling THIS unit writes but
+            // carries the build-wide identity, and that identity is the only
+            // name the enum tables answer to. Recording it here is what lets
+            // `Level::High` reach the back end as `signal::Level::High`
+            // (willow-0g8j.3); a class or interface name is its own identity
+            // and passes through unchanged.
+            return resolved(self, self.canonical_type_name(class_name));
         }
 
         match self.current_class.clone() {

@@ -1,0 +1,30 @@
+// Two modules, one enum name. An enum's identity is the module that declares it
+// (`signal::Level`, `other::Level`), not the name a unit happens to spell it by
+// (willow-itcw), so both are in scope here at once and neither answers for the
+// other. The back end keeps ONE flat enum table for the whole build, and it is
+// keyed by that identity, so nothing has to be dropped or guessed.
+//
+// Run it under `WILLOW_GC_STRESS=alloc` too: `signal::Note` carries a payload
+// and `other::Level` is a bare tag, so confusing the two roots an integer as a
+// pointer and the collector aborts.
+import other;
+import signal;
+
+fn main() {
+    // Each module's own body, matching on its own enum by the bare name.
+    println(signal::describe(signal::read(1)));
+    println(signal::describe(signal::read(0)));
+    println(other::name(other::pick(0)));
+    println(other::name(other::pick(1)));
+    println(other::name(other::pick(2)));
+
+    // Both live across a collection at once, in the entry file's own frame.
+    let s = signal::read(1);
+    let o = other::pick(2);
+    let carried = signal::note_of(s);
+    gc_collect();
+    gc_collect();
+    println(signal::describe(s));
+    println(other::name(o));
+    println(signal::note_text(carried));
+}

@@ -196,6 +196,14 @@ impl TypeChecker {
         if let Expr::Ternary(t) = expr {
             return self.check_ternary_expecting(t, expected);
         }
+        // A `match` in value position is the same story one arm wider: the
+        // expected type reaches every arm VALUE (willow-0g8j.3).
+        if let Expr::Match(m) = expr {
+            let previous = self.match_expected.replace(expected.clone());
+            let ty = self.check_match_expr(m);
+            self.match_expected = previous;
+            return ty;
+        }
         // Unqualified enum-variant construction resolved by the expected type
         // (willow-60o.1): `Ok(42)` (payload) and `Closed`/`None` (fieldless), for
         // both non-generic enums and generic ones (`Result<i64, String>`, ...).
@@ -307,7 +315,7 @@ impl TypeChecker {
         match expected {
             Type::Named(enum_name) => {
                 let info = self.symbols.lookup_enum(enum_name)?;
-                if !info.type_params.is_empty() {
+                if !info.type_params.is_empty() || !self.enum_nameable_bare(&info.name) {
                     return None;
                 }
                 let variant = info.variants.iter().find(|v| v.name == name)?;
@@ -319,7 +327,7 @@ impl TypeChecker {
             }
             Type::Generic(enum_name, type_args) => {
                 let info = self.symbols.lookup_enum(enum_name)?;
-                if info.type_params.is_empty() {
+                if info.type_params.is_empty() || !self.enum_nameable_bare(&info.name) {
                     return None;
                 }
                 let instantiated = info.instantiate(type_args);
@@ -386,6 +394,26 @@ impl TypeChecker {
         result
     }
 
+    /// The symbol-table key a written static-call class stands for, when that
+    /// class is an enum's. A qualified variant may be spelled with any path the
+    /// unit can resolve -- `std::result::Result::Ok`, `res::Result::Ok` under
+    /// `import std::result as res`, or the bare `Result::Ok` -- and contextual
+    /// construction has to see through all of them (willow-0g8j.3).
+    /// The build-wide identity of the enum a written static-call class names,
+    /// or `None` if it names no enum. An item-imported enum answers to the
+    /// local spelling (`Level`, or `Rank` under an alias) and to its identity
+    /// (`signal::Level`); the identity is what the enum tables are keyed by, so
+    /// that is what a call site records (willow-0g8j.3).
+    fn static_call_enum_key(&self, class: &str) -> Option<String> {
+        if let Some(info) = self.symbols.lookup_enum(class) {
+            return Some(info.name.clone());
+        }
+        let resolved = self.resolve_static_call_class_quiet(class)?;
+        self.symbols
+            .lookup_enum(&resolved)
+            .map(|info| info.name.clone())
+    }
+
     /// A qualified variant participates in contextual construction only when
     /// its enum identity and any explicit type arguments agree with the
     /// expected enum. Mismatches fall through to ordinary static-call checking
@@ -396,7 +424,10 @@ impl TypeChecker {
         expected_enum: &str,
         expected: &Type,
     ) -> bool {
-        let Some(actual_info) = self.symbols.lookup_enum(&call.class) else {
+        let Some(actual_key) = self.static_call_enum_key(&call.class) else {
+            return false;
+        };
+        let Some(actual_info) = self.symbols.lookup_enum(&actual_key) else {
             return false;
         };
         let Some(expected_info) = self.symbols.lookup_enum(expected_enum) else {
@@ -430,6 +461,14 @@ impl TypeChecker {
         payload_types: &[Type],
         result: Type,
     ) -> Type {
+        // Contextual construction returns before the ordinary static-call path
+        // runs, so it owes lowering that path's record of what the written class
+        // resolved to (willow-0g8j.3).
+        if let Some(key) = self.static_call_enum_key(&call.class)
+            && key != call.class
+        {
+            self.static_call_classes.insert(call.span, key);
+        }
         let omitted_void_payload = call.args.is_empty() && matches!(payload_types, [Type::Void]);
         if call.args.len() != payload_types.len() && !omitted_void_payload {
             self.push(

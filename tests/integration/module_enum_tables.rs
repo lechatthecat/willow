@@ -1,5 +1,5 @@
-//! One enum declaration, two spellings, one back end (willow-nm0g,
-//! willow-0g8j.3.2).
+//! One enum declaration, one identity, one back end (willow-nm0g,
+//! willow-itcw, willow-0g8j.3.2).
 //!
 //! Each unit of a build spells a module's enum differently: the declaring
 //! module writes `Level`, every importer writes `signal::Level`, and the
@@ -14,34 +14,41 @@
 //!   * `is_gc_managed` answers an unknown named type with "GC-managed". A
 //!     fieldless enum is a tag integer, so the missing name made the emitter
 //!     root a tag as a pointer, and a collection during that frame aborted with
-//!     "invalid GC pointer in GC root graph: 0x1 ...". Both emitters, so these
-//!     perspectives run under `WILLOW_GC_STRESS`.
-//!   * the LIR walker asks the same table what a type is, so every body naming
-//!     one of those enums fell back to the AST emitter -- and where the table
-//!     DID know both names, `same_repr` still compared the two strings and said
-//!     no.
+//!     "invalid GC pointer in GC root graph: 0x1 ...", so these perspectives run
+//!     under `WILLOW_GC_STRESS`.
+//!   * the walker asks the same table what a type is, so every body naming one
+//!     of those enums dropped out of it -- at the time to the AST emitter, which
+//!     willow-0g8j.3 has since retired -- and where the table DID know both
+//!     names, `same_repr` still compared the two strings and said no.
 //!
-//! No wrong answers, so the values are the same throughout; what these assert is
-//! that the value survives a collection and that the body is really lowered.
+//! An enum now has an IDENTITY, `module::Enum`, which is the name it is
+//! registered under build-wide however many units can see it and whatever each
+//! of them calls it (willow-itcw). Before that the identity was the spelling,
+//! so two modules that each declared `enum Level` were one entry in the table:
+//! the checker let one pass for the other (a tag matched against the wrong
+//! variant list), and the back end, unable to tell which was meant, registered
+//! neither bare name, so neither body could be lowered at all. The
+//! spellings a unit reaches an enum by are installed for the length of that
+//! unit's own compilation, which is the only span in which they mean one thing.
+//!
+//! Identity is not access: an importer learns what a module's enum IS without
+//! gaining the right to spell its members bare (35-37). That stays with the
+//! declaring module and with importers that take the enum by item.
+//!
+//! Most of these assert no wrong answers -- the values are the same throughout,
+//! and what matters is that the value survives a collection and that the body is
+//! really lowered. Perspectives 21 and 30-32 are the exception: there the two
+//! enums must stay apart, and mixing them is an error rather than an answer.
 
 use super::support::*;
 
-const LIR_ON: &[(&str, &str)] = &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")];
-const LIR_OFF: &[(&str, &str)] = &[("WILLOW_LIR_BACKEND", "0")];
-const LIR_LOG: &[(&str, &str)] = &[
-    ("WILLOW_LIR_BACKEND", "1"),
-    ("WILLOW_LIR_REQUIRE", "1"),
-    ("WILLOW_LIR_LOG", "1"),
-];
-const ALLOC_STRESS_LIR: &[(&str, &str)] =
-    &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_GC_STRESS", "alloc")];
-const ALLOC_STRESS_AST: &[(&str, &str)] =
-    &[("WILLOW_LIR_BACKEND", "0"), ("WILLOW_GC_STRESS", "alloc")];
-const MINOR_STRESS_LIR: &[(&str, &str)] =
-    &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_GC_STRESS", "minor")];
-/// The lowered emitter WITHOUT the require flag: for the one case that is meant
-/// to fall back.
-const LIR_MAY_FALL_BACK: &[(&str, &str)] = &[("WILLOW_LIR_BACKEND", "1")];
+/// No extra compiler environment: the ordinary build.
+const PLAIN: [(&str, &str); 0] = [];
+/// Make the walker name every function it compiles from lowered IR.
+const LIR_LOG: &[(&str, &str)] = &[("WILLOW_LIR_LOG", "1")];
+/// A collection at every allocation, and one at every minor-collection point.
+const ALLOC_STRESS: &[(&str, &str)] = &[("WILLOW_GC_STRESS", "alloc")];
+const MINOR_STRESS: &[(&str, &str)] = &[("WILLOW_GC_STRESS", "minor")];
 
 /// The declaring module: a fieldless enum, a payload one, a recursive one, and a
 /// class whose method signatures carry the qualified spelling of all three.
@@ -283,33 +290,27 @@ fn borrowed<'a>(files: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a s
     files.iter().map(|(n, s)| (*n, s.as_str())).collect()
 }
 
-/// Both emitters agree on the value, and the LIR one does not fall back.
+/// The build runs and prints `expected`. Since willow-0g8j.3 every body is
+/// compiled from lowered IR, so a body the walker cannot take is a compile
+/// error here rather than a second emitter's answer.
 #[track_caller]
-fn assert_both_backends(entry: &str, expected: &str) {
+fn assert_program_output(entry: &str, expected: &str) {
     let files = project(entry);
     let files = borrowed(&files);
 
-    let (lir, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", LIR_ON);
-    assert!(ok, "LIR build failed: {lir}");
-    assert_eq!(lir, expected, "lowered-IR output mismatch");
-
-    let (ast, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", LIR_OFF);
-    assert!(ok, "AST build failed: {ast}");
-    assert_eq!(ast, expected, "AST output mismatch");
+    let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", &PLAIN[..]);
+    assert!(ok, "build failed: {out}");
+    assert_eq!(out, expected, "wrong output");
 }
 
-/// The same value with a collection forced at every allocation, on both
-/// emitters: a fieldless enum's tag must not be walked as a pointer.
+/// The same value with a collection forced at every allocation, and again at
+/// every minor point: a fieldless enum's tag must not be walked as a pointer.
 #[track_caller]
 fn assert_survives_gc_stress(entry: &str, expected: &str) {
     let files = project(entry);
     let files = borrowed(&files);
 
-    for (label, env) in [
-        ("LIR/alloc", ALLOC_STRESS_LIR),
-        ("AST/alloc", ALLOC_STRESS_AST),
-        ("LIR/minor", MINOR_STRESS_LIR),
-    ] {
+    for (label, env) in [("alloc", ALLOC_STRESS), ("minor", MINOR_STRESS)] {
         let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", env);
         assert!(ok, "{label} run failed: {out}");
         assert_eq!(out, expected, "{label} output mismatch");
@@ -338,10 +339,10 @@ fn main() {
     );
 }
 
-// 2. The plain values, both emitters, no stress.
+// 2. The plain values, no stress.
 #[test]
 fn p2_a_fieldless_module_enum_crosses_modules_with_the_same_value() {
-    assert_both_backends(
+    assert_program_output(
         r#"
 import relay;
 
@@ -427,7 +428,7 @@ fn main() {
 //    module's own functions.
 #[test]
 fn p7_the_entry_file_reads_a_module_enum_through_module_calls() {
-    assert_both_backends(
+    assert_program_output(
         r#"
 import signal;
 
@@ -484,9 +485,8 @@ fn main() {
 
 // 10. An alias is only safe where it cannot be ambiguous: `signal` and `other`
 //     both declare a bare `Level`, with different variants. Neither may claim
-//     the bare name -- and with the name unclaimed the walker cannot admit it,
-//     so this is the one shape that still falls back. Both emitters must answer
-//     the same, which is what the fallback is for.
+//     the bare name -- the walker resolves both through their identities
+//     instead, so an unclaimed bare name costs nothing.
 #[test]
 fn p10_two_modules_sharing_a_bare_enum_name_both_stay_correct() {
     let files = project(
@@ -505,13 +505,9 @@ fn main() {
     let files = borrowed(&files);
     let expected = "high\nextra\non\noff\n";
 
-    let (lir, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", LIR_MAY_FALL_BACK);
-    assert!(ok, "LIR build failed: {lir}");
-    assert_eq!(lir, expected, "lowered-IR output mismatch");
-
-    let (ast, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", LIR_OFF);
-    assert!(ok, "AST build failed: {ast}");
-    assert_eq!(ast, expected, "AST output mismatch");
+    let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", &PLAIN[..]);
+    assert!(ok, "build failed: {out}");
+    assert_eq!(out, expected, "wrong output");
 }
 
 // 11. ... including under stress, where a wrong merge would give one enum the
@@ -537,7 +533,7 @@ fn main() {
 //     correctly through the qualified one.
 #[test]
 fn p12_an_entry_enum_keeps_its_bare_name_against_a_modules() {
-    assert_both_backends(
+    assert_program_output(
         r#"
 import signal;
 
@@ -568,7 +564,7 @@ fn main() {
 //     signature says `signal::Level`, the argument is a bare `Level`.
 #[test]
 fn p13_a_module_method_takes_its_own_enum() {
-    assert_both_backends(
+    assert_program_output(
         r#"
 import signal;
 
@@ -581,8 +577,8 @@ fn main() {
     );
 }
 
-// 14. ... and the calling function is lowered, which is the whole point: the
-//     fallback answered the same numbers.
+// 14. ... and the calling function is lowered, which is the whole point: a
+//     body the walker cannot type is a compile error, not a quiet wrong answer.
 #[test]
 fn p14_the_module_function_calling_that_method_is_lowered() {
     let files = project(
@@ -606,7 +602,7 @@ fn main() {
 //     variant payload as well as on the tags.
 #[test]
 fn p15_a_module_method_takes_its_own_payload_enum() {
-    assert_both_backends(
+    assert_program_output(
         r#"
 import signal;
 
@@ -624,7 +620,7 @@ fn main() {
 //     instead of recursing forever.
 #[test]
 fn p16_a_recursive_module_enum_does_not_hang_the_comparison() {
-    assert_both_backends(
+    assert_program_output(
         r#"
 import signal;
 
@@ -641,7 +637,7 @@ fn main() {
 //     element type rather than compare two named types directly.
 #[test]
 fn p17_an_array_of_the_module_enum_matches_the_qualified_signature() {
-    assert_both_backends(
+    assert_program_output(
         r#"
 import signal;
 
@@ -658,7 +654,7 @@ fn main() {
 //     on the return side.
 #[test]
 fn p18_a_static_module_method_returns_its_own_enum() {
-    assert_both_backends(
+    assert_program_output(
         r#"
 import signal;
 
@@ -704,7 +700,7 @@ fn main() {
 //     module, where the argument arrives bare from a module signature.
 #[test]
 fn p20_a_module_enum_reaches_a_method_through_a_second_module() {
-    assert_both_backends(
+    assert_program_output(
         r#"
 import relay;
 
@@ -721,14 +717,15 @@ fn main() {
 // Neither change may merge two enums that only look alike.
 // ---------------------------------------------------------------------------
 
-// 21. Where two modules answer to one bare name, the alias is DROPPED rather
-//     than resolved to whichever module came first: `Level` stays unknown, and
-//     the walker refuses the body instead of lowering it against an arbitrary
-//     one of the two layouts. (The checker's own confusion of these two enums
-//     is willow-itcw, a separate hole; this asserts the back end does not add a
-//     silent layout guess on top of it.)
+// 21. Where two modules answer to one bare name, each is still ITS OWN enum:
+//     both bodies lower, and each answers with its own variant. `Level` is not
+//     a name the back end resolves at all any more -- an enum is registered
+//     under `module::Enum`, the one name it has build-wide (willow-itcw), and
+//     the bare spelling each unit uses for it is installed for that unit alone.
+//     Before that, the two bare `Level`s were one table entry, so the alias was
+//     dropped and neither body could be lowered.
 #[test]
-fn p21_an_ambiguous_bare_enum_name_is_refused_not_guessed() {
+fn p21_two_modules_sharing_a_bare_enum_name_both_lower_and_run() {
     let files = project(
         r#"
 import other;
@@ -736,18 +733,101 @@ import signal;
 
 fn main() {
     println(signal::describe(signal::read(1)));
+    println(other::name(other::pick(1)));
+    println(other::name(other::pick(2)));
 }
 "#,
     );
-    let (ok, log) = compile_temp_project_with_env_stderr(&borrowed(&files), "main.wi", LIR_ON);
+    let (out, ok) = compile_temp_project_with_env_and_run(&borrowed(&files), "main.wi", &PLAIN[..]);
+    assert!(ok, "run failed: {out}");
+    assert_eq!(out, "high\non\nextra\n");
+    let (_, log) = compile_temp_project_with_env_stderr(&borrowed(&files), "main.wi", LIR_LOG);
+    for f in ["signal.describe", "signal.read", "other.name", "other.pick"] {
+        assert!(
+            log.contains(&format!("[lir] compiling `{f}`")),
+            "`{f}` was not lowered: {log}"
+        );
+    }
+}
+
+// 21b. ...and they are not INTERCHANGEABLE. Handing `other`'s `Level` to a
+//      function that takes `signal`'s is the wrong-code case the flat table
+//      could not see: both signatures read `Level`, so the tag of one enum was
+//      matched against the variants of the other and `other::On` (tag 1) came
+//      back as `signal::High`. It is a type error now.
+#[test]
+fn p30_one_modules_enum_does_not_pass_for_anothers() {
+    let files = project(
+        r#"
+import other;
+import signal;
+
+fn main() {
+    println(signal::describe(other::pick(1)));
+}
+"#,
+    );
+    let (ok, log) = compile_temp_project_with_env_stderr(&borrowed(&files), "main.wi", &PLAIN[..]);
     assert!(
         !ok,
-        "an ambiguous bare enum name must not be lowered: {log}"
+        "`other::Level` must not pass for `signal::Level`: {log}"
     );
     assert!(
-        log.contains("outside the walker's subset") && log.contains("`Level`"),
-        "expected `Level` to stay unknown, got: {log}"
+        log.contains("signal::Level") && log.contains("other::Level"),
+        "expected both enums named in the diagnostic, got: {log}"
     );
+}
+
+// 21c. ...and neither may a VALUE of one be matched against the other's
+//      variants. The pattern names the variant bare, which is exactly the
+//      spelling that used to resolve against whichever `Level` the table held.
+#[test]
+fn p31_a_pattern_of_one_modules_enum_does_not_match_anothers() {
+    let files = project(
+        r#"
+import other;
+import signal;
+
+fn main() {
+    let l = other::pick(1);
+    let s = match l {
+        signal::Level::Low => "low",
+        signal::Level::High => "high",
+    };
+    println(s);
+}
+"#,
+    );
+    let (ok, log) = compile_temp_project_with_env_stderr(&borrowed(&files), "main.wi", &PLAIN[..]);
+    assert!(
+        !ok,
+        "a `signal::Level` pattern must not match an `other::Level`: {log}"
+    );
+}
+
+// 21d. ...and the two survive a collection at every allocation, which is where a
+//      tag rooted as a pointer shows up as an abort rather than a wrong answer.
+#[test]
+fn p32_two_modules_sharing_a_bare_enum_name_survive_alloc_stress() {
+    let files = project(
+        r#"
+import other;
+import signal;
+
+fn main() {
+    let a = signal::read(1);
+    let b = other::pick(2);
+    gc_collect();
+    println(signal::describe(a));
+    println(other::name(b));
+}
+"#,
+    );
+    let expected = "high\nextra\n";
+    let (out, ok) =
+        compile_temp_project_with_env_and_run(&borrowed(&files), "main.wi", ALLOC_STRESS);
+    assert!(ok, "stress run failed: {out}");
+    assert_eq!(out, expected);
 }
 
 // 22. A name that merely LOOKS qualified -- `Level` against a prefix no module
@@ -764,7 +844,7 @@ fn main() {
 }
 "#,
     );
-    let (ok, log) = compile_temp_project_with_env_stderr(&borrowed(&files), "main.wi", LIR_OFF);
+    let (ok, log) = compile_temp_project_with_env_stderr(&borrowed(&files), "main.wi", &PLAIN[..]);
     assert!(!ok, "`nope::Level` must not resolve: {log}");
 }
 
@@ -818,12 +898,9 @@ fn main() {
         ),
     ];
     let expected = "a live class named Point\nnear\n";
-    let (lir, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", LIR_ON);
-    assert!(ok, "LIR run failed: {lir}");
-    assert_eq!(lir, expected);
-    let (ast, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", LIR_OFF);
-    assert!(ok, "AST run failed: {ast}");
-    assert_eq!(ast, expected);
+    let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", &PLAIN[..]);
+    assert!(ok, "run failed: {out}");
+    assert_eq!(out, expected);
 }
 
 // 28. ...and it holds when a collection runs at every allocation, which is where
@@ -855,14 +932,12 @@ fn main() {
 ",
         ),
     ];
-    for env in [ALLOC_STRESS_LIR, ALLOC_STRESS_AST] {
-        let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", env);
-        assert!(ok, "run under {env:?} failed: {out}");
-        assert!(
-            out.ends_with("stressed\n"),
-            "the class named `Point` must outlive the loop: {out}"
-        );
-    }
+    let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", ALLOC_STRESS);
+    assert!(ok, "stress run failed: {out}");
+    assert!(
+        out.ends_with("stressed\n"),
+        "the class named `Point` must outlive the loop: {out}"
+    );
 }
 
 // 29. An interface claims a name the same way a class does.
@@ -895,11 +970,9 @@ fn main() {
         ),
     ];
     let expected = "a live interface named Point\nfar\n";
-    for env in [LIR_ON, LIR_OFF] {
-        let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", env);
-        assert!(ok, "run under {env:?} failed: {out}");
-        assert_eq!(out, expected);
-    }
+    let (out, ok) = compile_temp_project_with_env_and_run(&files, "main.wi", &PLAIN[..]);
+    assert!(ok, "run failed: {out}");
+    assert_eq!(out, expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -967,21 +1040,148 @@ fn p24_the_module_enum_tables_example_runs() {
 // 25. ... every body in it is lowered ...
 #[test]
 fn p25_the_module_enum_tables_example_is_fully_lowered() {
-    let (out, ok) = compile_temp_project_with_env_and_run(EXAMPLE, "main.wi", LIR_ON);
-    assert!(ok, "no body in the example may fall back: {out}");
+    let (out, ok) = compile_temp_project_with_env_and_run(EXAMPLE, "main.wi", &PLAIN[..]);
+    assert!(ok, "the example must build and run: {out}");
     assert_eq!(out, EXAMPLE_OUTPUT);
 }
 
-// 26. ... and it survives a collection at every allocation, on both emitters.
+// 26. ... and it survives a collection at every allocation.
 #[test]
 fn p26_the_module_enum_tables_example_survives_gc_stress() {
-    for (label, env) in [
-        ("LIR/alloc", ALLOC_STRESS_LIR),
-        ("AST/alloc", ALLOC_STRESS_AST),
-        ("LIR/minor", MINOR_STRESS_LIR),
-    ] {
+    for (label, env) in [("alloc", ALLOC_STRESS), ("minor", MINOR_STRESS)] {
         let (out, ok) = compile_temp_project_with_env_and_run(EXAMPLE, "main.wi", env);
         assert!(ok, "{label} run failed: {out}");
         assert_eq!(out, EXAMPLE_OUTPUT, "{label} output mismatch");
     }
+}
+
+/// The second example: two modules that each declare `enum Level`, both in
+/// scope at once (willow-itcw).
+const IDENTITY_EXAMPLE: &[(&str, &str)] = &[
+    (
+        "signal.wi",
+        include_str!("../../example/module_enum_identity/signal.wi"),
+    ),
+    (
+        "other.wi",
+        include_str!("../../example/module_enum_identity/other.wi"),
+    ),
+    (
+        "main.wi",
+        include_str!("../../example/module_enum_identity/main.wi"),
+    ),
+];
+
+const IDENTITY_OUTPUT: &str = "signal:high\nsignal:low\nother:off\nother:on\nother:extra\nsignal:high\nother:extra\ncarried\n";
+
+// 33. The two-`Level` example runs, and every body in it is lowered: nothing is
+//     dropped for being ambiguous any more.
+#[test]
+fn p33_the_module_enum_identity_example_is_fully_lowered() {
+    let (out, ok) = compile_file_and_run("example/module_enum_identity/main.wi");
+    assert!(
+        ok,
+        "example/module_enum_identity/main.wi failed to compile or run"
+    );
+    assert_eq!(out, IDENTITY_OUTPUT);
+    let (out, ok) = compile_temp_project_with_env_and_run(IDENTITY_EXAMPLE, "main.wi", &PLAIN[..]);
+    assert!(ok, "the example must build and run: {out}");
+    assert_eq!(out, IDENTITY_OUTPUT);
+}
+
+// 34. ... and it survives a collection at every allocation: one of the two
+//     enums carries a payload and the other is a bare tag, so confusing them
+//     roots an integer as a pointer.
+#[test]
+fn p34_the_module_enum_identity_example_survives_gc_stress() {
+    for (label, env) in [
+        ("alloc", ALLOC_STRESS),
+        ("minor", MINOR_STRESS),
+        ("plain", &PLAIN[..]),
+    ] {
+        let (out, ok) = compile_temp_project_with_env_and_run(IDENTITY_EXAMPLE, "main.wi", env);
+        assert!(ok, "{label} run failed: {out}");
+        assert_eq!(out, IDENTITY_OUTPUT, "{label} output mismatch");
+    }
+}
+
+// 35. Identity is not access: the entry now knows that `signal::describe` takes
+//     `signal::Level`, but knowing an enum's identity is not permission to write
+//     its variants bare. Only a unit that can name the ENUM bare -- the module
+//     that declares it, or an importer that took it by item -- may leave the
+//     name off its variants (willow-itcw).
+#[test]
+fn p35_an_importer_may_not_construct_a_modules_variant_bare() {
+    let files = project(
+        r#"
+import signal;
+
+fn main() {
+    println(signal::describe(High));
+}
+"#,
+    );
+    let (ok, log) = compile_temp_project_with_env_stderr(&borrowed(&files), "main.wi", &PLAIN[..]);
+    assert!(!ok, "a bare `High` must not reach `signal::Level`: {log}");
+    assert!(
+        log.contains("High"),
+        "expected the unresolved name in the diagnostic, got: {log}"
+    );
+}
+
+// 36. The same rule for patterns, where a bare name has a second meaning: with
+//     the enum out of reach `Low` is an ordinary catch-all BINDING, so the arm
+//     after it is unreachable and says so, rather than quietly standing for
+//     `signal::Level::Low`.
+#[test]
+fn p36_an_importers_bare_arm_name_is_a_binding_not_a_variant() {
+    let files = project(
+        r#"
+import signal;
+
+fn main() {
+    let l = signal::read(1);
+    let s = match l {
+        Low => "low",
+        High => "high",
+    };
+    println(s);
+}
+"#,
+    );
+    let (ok, log) = compile_temp_project_with_env_stderr(&borrowed(&files), "main.wi", &PLAIN[..]);
+    assert!(ok, "a catch-all binding is legal: {log}");
+    assert!(
+        log.contains("unreachable match arm"),
+        "the second arm is dead once the first is a binding: {log}"
+    );
+    let (out, ok) = compile_temp_project_with_env_and_run(&borrowed(&files), "main.wi", &PLAIN[..]);
+    assert!(ok, "run failed: {out}");
+    assert_eq!(out, "low\n", "the binding arm takes every value");
+}
+
+// 37. ... and taking the enum by item is what grants both bare forms: the item
+//     import binds `Level` unqualified (willow-64gs), so the unit can name the
+//     enum bare and therefore its variants too.
+#[test]
+fn p37_an_item_import_grants_the_bare_forms() {
+    let files = project(
+        r#"
+import signal;
+import signal::{Level};
+
+fn main() {
+    println(signal::describe(High));
+    let l = signal::read(0);
+    let s = match l {
+        Low => "low",
+        High => "high",
+    };
+    println(s);
+}
+"#,
+    );
+    let (out, ok) = compile_temp_project_with_env_and_run(&borrowed(&files), "main.wi", &PLAIN[..]);
+    assert!(ok, "item-imported enum build failed: {out}");
+    assert_eq!(out, "high\nlow\n");
 }
