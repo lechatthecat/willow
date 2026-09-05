@@ -24,7 +24,8 @@ use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::type_checker::types::{await_output_type, awaitable_task_type};
 
 use super::typed_ast::{
-    HirDeferBody, HirExpr, HirExprKind, HirFunction, HirParam, HirPattern, HirProgram, HirStmt,
+    HirCapture, HirDeferBody, HirExpr, HirExprKind, HirFunction, HirParam, HirPattern, HirProgram,
+    HirStmt,
 };
 
 pub mod async_liveness;
@@ -64,6 +65,24 @@ pub struct LirFunction {
     /// Frame ownership belongs to LIR: this is computed from the final CFG,
     /// after synthetic locals and explicit suspension edges exist.
     pub async_frame: LirAsyncFrameLayout,
+    /// The captured environment this body is entered with, in slot order
+    /// (willow-0g8j.2.12). Empty for every function that is not a lifted
+    /// capturing lambda. Each entry is also a `parameter` local, because the
+    /// backend binds it at entry exactly like a parameter — the difference is
+    /// only where the value comes from: environment word `i + 1` instead of an
+    /// argument register.
+    pub captures: Vec<LirCapture>,
+}
+
+/// One slot of a lifted lambda's closure environment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LirCapture {
+    /// The local this slot binds inside the lifted body.
+    pub name: String,
+    pub ty: Type,
+    /// The name the value is read from in the ENCLOSING function when the
+    /// environment is built.
+    pub source: String,
 }
 
 impl LirFunction {
@@ -595,14 +614,19 @@ fn collect_lambdas_in_expr(expr: &HirExpr, out: &mut Vec<LirLambda>) {
     for child in expr.children() {
         collect_lambdas_in_expr(child, out);
     }
-    if let HirExprKind::Lambda { params, body } = &expr.kind {
-        // The `fn(...) -> R` the checker gave the lambda expression is the only
+    if let HirExprKind::Lambda {
+        params,
+        captures,
+        body,
+    } = &expr.kind
+    {
+        // The callable type the checker gave the lambda expression is the only
         // place the return type lives: the HIR params carry their own types,
         // but a lambda has no declared return type node of its own.
-        let Type::Fn(_, ret) = &expr.ty else {
+        let (Type::Fn(_, ret) | Type::Closure(_, ret)) = &expr.ty else {
             return;
         };
-        let mut b = Builder::new(params, false);
+        let mut b = Builder::new_lambda(params, captures);
         // A lifted lambda owns a function scope just like a named function.
         // Lowering only its statements would leave top-level defer sites
         // without the scope metadata that assigns their stable identities.
@@ -616,6 +640,14 @@ fn collect_lambdas_in_expr(expr: &HirExpr, out: &mut Vec<LirLambda>) {
             blocks,
             locals,
             async_frame: LirAsyncFrameLayout::default(),
+            captures: captures
+                .iter()
+                .map(|c| LirCapture {
+                    name: c.name.clone(),
+                    ty: c.ty.clone(),
+                    source: c.source.clone(),
+                })
+                .collect(),
         };
         function.assert_unique_local_names();
         out.push(LirLambda {
@@ -697,6 +729,7 @@ fn lower_function(f: &HirFunction, class: Option<&str>) -> LirFunction {
         },
         blocks,
         locals,
+        captures: Vec::new(),
     };
     function.assert_unique_local_names();
     function
@@ -1164,6 +1197,30 @@ impl Builder {
             scope_starts: Vec::new(),
             local_by_name: std::collections::HashMap::new(),
         };
+        for param in params {
+            builder.declare_local(
+                param.name.clone(),
+                param.ty.clone(),
+                Some(param.span),
+                false,
+                true,
+            );
+        }
+        builder
+    }
+
+    /// A lifted lambda body, whose entry binds the captured environment before
+    /// the declared parameters (willow-0g8j.2.12).
+    ///
+    /// Captures come first because that is the order lowering bound them in,
+    /// and they are `parameter` locals for the same reason a parameter is: the
+    /// backend gives them their value at entry, so nothing in the body may
+    /// clear or re-slot them on a scope exit.
+    fn new_lambda(params: &[HirParam], captures: &[HirCapture]) -> Self {
+        let mut builder = Self::new(&[], false);
+        for capture in captures {
+            builder.declare_local(capture.name.clone(), capture.ty.clone(), None, false, true);
+        }
         for param in params {
             builder.declare_local(
                 param.name.clone(),

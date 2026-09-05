@@ -341,7 +341,7 @@ pub(crate) fn normalize_std_collection_type(ty: &mut Type, imports: &StdCollecti
                 _ => {}
             }
         }
-        Type::Fn(params, ret) => {
+        Type::Fn(params, ret) | Type::Closure(params, ret) => {
             for param in params {
                 normalize_std_collection_type(param, imports);
             }

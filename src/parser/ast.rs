@@ -15,6 +15,14 @@ pub enum Type {
     Generic(String, Vec<Type>),
     /// `fn(T1, T2) -> R` — plain function pointer type (non-capturing)
     Fn(Vec<Type>, Box<Type>),
+    /// `closure(T1, T2) -> R` — a GC-managed closure object: word 0 is the
+    /// code pointer and the words after it are the captured environment
+    /// (willow-0g8j.2.12). Kept apart from [`Type::Fn`] because the two are
+    /// CALLED differently: a `fn` value is the code address itself, while a
+    /// closure value is the object and its code pointer takes that object as a
+    /// hidden leading argument, so neither is assignable to the other: a bare
+    /// `fn` would need a wrapper object to become a closure value.
+    Closure(Vec<Type>, Box<Type>),
     /// Bottom type — coerces to any type (used for panic/return arms in match)
     Never,
 }
@@ -585,7 +593,9 @@ pub enum Expr {
     Ternary(Box<TernaryExpr>),
     /// `start..end` — half-open i64 range for `for` loops
     Range(Box<RangeExpr>),
-    /// `|params| expr` or `|params| { block }` — anonymous function (non-capturing for now)
+    /// `|params| expr` or `|params| { block }` — anonymous function. It is a
+    /// `fn` value when it captures nothing and a `closure` value when it does
+    /// (willow-0g8j.2.12); the two are different types.
     Lambda(Box<LambdaExpr>),
     Match(Box<MatchExpr>),
     /// `expr?` — propagate Result::Err early (the ? operator)

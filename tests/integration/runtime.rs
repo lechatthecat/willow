@@ -1115,6 +1115,10 @@ fn test_runnable_example_files_compile_and_run() {
              40\n-1\n4\ne:odd\n2\nodd\n4\n0\n4\n8\n",
         ),
         (
+            "example/lir_closures.wi",
+            "8\n15\n5\n18\n9\narea=12\n11.25\n0.0\n1\n42\n42\n25\n14\n63\n20\n",
+        ),
+        (
             "example/lir_interface_boxing.wi",
             "alpha/#7\ngamma/#8\ndelta/#9\n4\nthree!#2three#4\nsolo/#11\n3\n11\nHHTT\n",
         ),

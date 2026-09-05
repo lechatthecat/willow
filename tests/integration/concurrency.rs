@@ -9540,6 +9540,11 @@ async fn main() {
     );
 }
 
+/// `parallel::map`'s v1 mapper is a `fn(i64) -> i64` — a bare code address the
+/// worker calls with no environment — so a capturing lambda is refused there
+/// even though captures are legal in general (willow-0g8j.2.12). The refusal
+/// has to name the capture, since the fix is to stop capturing rather than to
+/// change the mapper.
 #[test]
 fn parallel_map_09_captured_mapper_is_rejected() {
     assert_compile_error_contains(
@@ -9552,7 +9557,11 @@ async fn main() {
     let result = await parallel::map(values.freeze(), |value| value + offset);
 }
 "#,
-        &["error[E1002]", "lambda cannot capture `offset`"],
+        &[
+            "error[E1011]",
+            "capturing lambda cannot be used as a plain function pointer",
+            "captures `offset`",
+        ],
     );
 }
 

@@ -109,7 +109,7 @@ impl TypeChecker {
     }
 
     pub(super) fn check_lambda(&mut self, l: &LambdaExpr) -> Type {
-        self.check_lambda_with_context(l, None, None)
+        self.check_lambda_with_context(l, None, None, false)
     }
 
     /// A lambda body is a new function, and every piece of state that describes
@@ -141,68 +141,143 @@ impl TypeChecker {
         r
     }
 
+    /// Check a lambda against the callable type its context asks for. Both
+    /// callable types supply the same context — parameter types and a return
+    /// type — and differ only in what the lambda ends up being (willow-0g8j.2.12).
     pub(super) fn check_lambda_expecting(&mut self, l: &LambdaExpr, expected: &Type) -> Type {
-        let Type::Fn(params, ret) = expected else {
+        let (Type::Fn(params, ret) | Type::Closure(params, ret)) = expected else {
             return self.check_lambda(l);
         };
         if params.len() != l.params.len() {
             return self.check_lambda(l);
         }
-        self.check_lambda_with_context(l, Some(params.as_slice()), Some(ret.as_ref()))
+        let actual = self.check_lambda_with_context(
+            l,
+            Some(params.as_slice()),
+            Some(ret.as_ref()),
+            matches!(expected, Type::Closure(..)),
+        );
+        // A `fn` value is a bare code address with no room for an environment,
+        // so a capturing lambda cannot be one (willow-0g8j.2.12). Reporting it
+        // here — and then answering with the EXPECTED type — keeps the message
+        // about the capture rather than about a type mismatch the user cannot
+        // act on.
+        if matches!(expected, Type::Fn(..)) && matches!(actual, Type::Closure(..)) {
+            let captured = self
+                .lambda_captures
+                .get(&l.span)
+                .map(|c| {
+                    c.iter()
+                        .map(|c| format!("`{}`", c.name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E1011,
+                    "capturing lambda cannot be used as a plain function pointer".to_string(),
+                )
+                .with_label(Label::primary(l.span, format!("captures {captured}")))
+                .with_help(format!(
+                    "a `fn` value carries no environment: take what it reads as a parameter, or, where the signature can be changed, declare it `closure({}) -> {}`",
+                    params
+                        .iter()
+                        .map(type_name)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    type_name(ret)
+                )),
+            );
+            return expected.clone();
+        }
+        actual
     }
 
-    /// Reject references to enclosing-function locals inside a lambda body.
-    /// Tracks names bound INSIDE the lambda (params, `let`s, loop/match/select
-    /// bindings) with proper scoping; any other variable that resolves to a
-    /// local of the enclosing function is a capture, which codegen cannot
-    /// express yet (willow-thqe). Nested lambdas are skipped — they run their
-    /// own scan when checked.
-    fn check_lambda_captures(&mut self, l: &LambdaExpr) {
+    /// Work out what a lambda takes from its enclosing function
+    /// (willow-0g8j.2.12). Names bound INSIDE the lambda — params, `let`s,
+    /// loop/match/select bindings — are tracked with proper scoping; any other
+    /// variable that resolves to a visible local is a capture.
+    ///
+    /// A NESTED lambda is walked too, under a scope of its own. Its free
+    /// variables are captures of this lambda as well, because the environment
+    /// it reads them from is the one this lambda has to carry: an inner lambda
+    /// cannot reach a frame two levels up any more than it can reach one.
+    ///
+    /// Runs while the enclosing function's locals are still the visible
+    /// variable scope, so `lookup_var` answers for exactly the names a capture
+    /// could name.
+    fn collect_lambda_captures(&mut self, l: &LambdaExpr) -> Vec<LambdaCapture> {
         let mut scan = CaptureScan {
             checker: self,
             scopes: vec![l.params.iter().map(|p| p.name.clone()).collect()],
+            captures: Vec::new(),
+            writes: Vec::new(),
         };
         match &l.body {
             LambdaBody::Expr(e) => scan.visit_expr(e),
             LambdaBody::Block(b) => scan.visit_block(b),
         }
-    }
-
-    fn scan_captures_name(
-        &mut self,
-        name: &str,
-        span: Span,
-        scopes: &[std::collections::HashSet<String>],
-    ) {
-        if name == "self" {
-            // `self` capture reads the receiver — same unsupported class.
-            if self.symbols.lookup_var("self").is_some() {
-                self.push_capture_error(name, span);
+        let CaptureScan {
+            captures, writes, ..
+        } = scan;
+        // A capture is a COPY taken when the closure value is built
+        // (willow-0g8j.2.12), so rebinding one inside the body could not change
+        // anything the enclosing function goes on to observe — and a second
+        // call would start from the same copy again. `let mut` does not change
+        // that: sharing a variable between the two frames would need a heap
+        // cell that the language does not have. Silence would be the worst of
+        // the three answers, so every such write is rejected.
+        for (name, span) in writes {
+            if captures.iter().any(|c| c.name == name) {
+                self.capture_writes.insert(span);
+                self.push_capture_write(&name, span, &captures);
             }
-            return;
         }
-        if scopes.iter().any(|s| s.contains(name)) {
-            return; // bound inside the lambda
-        }
-        if self.symbols.lookup_var(name).is_some() {
-            self.push_capture_error(name, span);
-        }
+        captures
     }
 
-    fn push_capture_error(&mut self, name: &str, span: Span) {
+    fn push_capture_write(&mut self, name: &str, span: Span, captures: &[LambdaCapture]) {
+        let declaration = captures
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.declaration_span);
+        let mut diagnostic = Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E1009,
+            format!("cannot assign to captured variable `{name}`"),
+        )
+        .with_label(Label::primary(span, "cannot assign to a capture"))
+        .with_help(
+            "a lambda captures by value, so this write could not be seen outside it: \
+             return the new value instead, or mutate a field or element of a captured object"
+                .to_string(),
+        );
+        if let Some(declaration) = declaration {
+            diagnostic = diagnostic.with_label(Label::secondary(
+                declaration,
+                format!("`{name}` is declared here and captured by value"),
+            ));
+        }
+        self.push(diagnostic);
+    }
+
+    /// `self` is the one name a lambda still cannot take: the receiver is bound
+    /// by the method's own calling convention rather than by a local slot, so
+    /// there is nothing for the environment to copy (willow-0g8j.2.12).
+    fn push_self_capture_error(&mut self, span: Span) {
         self.push(
             Diagnostic::new(
                 Severity::Error,
                 ErrorCode::E1002,
-                format!("lambda cannot capture `{name}` from the enclosing function"),
+                "lambda cannot capture `self` from the enclosing method".to_string(),
             )
             .with_label(Label::primary(
                 span,
-                "closures are not supported yet; lambdas may only use their own parameters and locals",
+                "`self` is not capturable; capture the fields it reads instead",
             ))
-            .with_help(format!(
-                "pass `{name}` as a lambda parameter instead, e.g. `|{name}, ...|`"
-            )),
+            .with_help("bind what you need first, e.g. `let n = self.count;` and capture `n`"),
         );
     }
 
@@ -210,11 +285,12 @@ impl TypeChecker {
         &mut self,
         l: &LambdaExpr,
         expected_params: &[Type],
+        expected_closure: bool,
     ) -> Type {
         if expected_params.len() != l.params.len() {
             return self.check_lambda(l);
         }
-        self.check_lambda_with_context(l, Some(expected_params), None)
+        self.check_lambda_with_context(l, Some(expected_params), None, expected_closure)
     }
 
     pub(super) fn check_lambda_with_context(
@@ -222,13 +298,19 @@ impl TypeChecker {
         l: &LambdaExpr,
         expected_params: Option<&[Type]>,
         expected_return: Option<&Type>,
+        expected_closure: bool,
     ) -> Type {
         // A lambda is a separate callable value. Do not attribute waits or
         // named-call edges in its body to the enclosing function (or to a lock
         // that merely constructs the lambda).
         let previous_effect_callable = self.current_effect_callable.take();
         let result = self.with_lambda_function_boundary(|this| {
-            this.check_lambda_with_context_inner(l, expected_params, expected_return)
+            this.check_lambda_with_context_inner(
+                l,
+                expected_params,
+                expected_return,
+                expected_closure,
+            )
         });
         self.current_effect_callable = previous_effect_callable;
         result
@@ -239,12 +321,13 @@ impl TypeChecker {
         l: &LambdaExpr,
         expected_params: Option<&[Type]>,
         expected_return: Option<&Type>,
+        expected_closure: bool,
     ) -> Type {
-        // Lambdas are non-capturing: a body reference to an enclosing local
-        // would silently read garbage in codegen, so reject it here
-        // (willow-thqe). Runs before the body check, while the enclosing
-        // function's locals are still the visible variable scope.
-        self.check_lambda_captures(l);
+        // What the lambda takes from the enclosing function decides which of
+        // the two callable types it has, so this runs first — and it must run
+        // while the enclosing function's locals are still the visible variable
+        // scope (willow-0g8j.2.12).
+        let captures = self.collect_lambda_captures(l);
 
         // Params may be annotated directly or inferred from an expected fn type.
         // An annotation is normalized the way a named function's is: it may
@@ -402,7 +485,18 @@ impl TypeChecker {
             }
         };
 
-        let fn_ty = Type::Fn(param_types, Box::new(ret_ty));
+        // A lambda that takes nothing is a plain code address; one that
+        // captures is a GC environment object and is CALLED differently, so the
+        // two carry different types (willow-0g8j.2.12). A non-capturing lambda
+        // still becomes a closure when the context asks for one, so that
+        // `closure(i64) -> i64` accepts `|x| x * 2` — the environment is then
+        // just the code pointer.
+        let fn_ty = if captures.is_empty() && !expected_closure {
+            Type::Fn(param_types, Box::new(ret_ty))
+        } else {
+            Type::Closure(param_types, Box::new(ret_ty))
+        };
+        self.lambda_captures.insert(l.span, captures);
         // Record the lambda's type here rather than leaving it to `check_expr`:
         // a lambda passed as a call argument is checked through
         // `check_fn_arg_with_param_context`, which never goes through
@@ -999,9 +1093,68 @@ impl TypeChecker {
 /// lambda is not a capture — so the scope stack comes from the walker's
 /// [`AstVisitor::enter_scope`]/[`AstVisitor::bind`] hooks rather than being
 /// re-implemented here. Everything else is one check on [`Expr::Var`].
+/// One value a lambda takes from its enclosing function (willow-0g8j.2.12).
+///
+/// The name is the enclosing function's spelling, which is also the name the
+/// lifted body binds the environment slot under, so the body's own references
+/// resolve to it without renaming.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LambdaCapture {
+    pub name: String,
+    pub ty: Type,
+    /// Where it was declared, for the diagnostic that points at it.
+    pub declaration_span: Span,
+}
+
 struct CaptureScan<'a> {
     checker: &'a mut TypeChecker,
     scopes: Vec<HashSet<String>>,
+    /// The captures found so far, in first-mention order — which is the order
+    /// the closure environment lays its slots out.
+    captures: Vec<LambdaCapture>,
+    /// Names the lambda ASSIGNS to that are not bound inside it. Kept apart
+    /// from `captures` because whether a write is legal depends on the
+    /// declaration, which is decided once the whole body has been seen.
+    writes: Vec<(String, Span)>,
+}
+
+impl CaptureScan<'_> {
+    fn bound_inside(&self, name: &str) -> bool {
+        self.scopes.iter().any(|s| s.contains(name))
+    }
+
+    fn note_use(&mut self, name: &str, span: Span) {
+        if name == "self" {
+            // The receiver has no local slot to copy from.
+            if !self.bound_inside("self") && self.checker.symbols.lookup_var("self").is_some() {
+                self.checker.push_self_capture_error(span);
+            }
+            return;
+        }
+        if self.bound_inside(name) {
+            return; // bound inside the lambda
+        }
+        if self.captures.iter().any(|c| c.name == name) {
+            return; // already recorded; first mention fixes the slot
+        }
+        let Some(info) = self.checker.symbols.lookup_var(name).cloned() else {
+            return; // a free function, a class, a constant — not a capture
+        };
+        self.captures.push(LambdaCapture {
+            name: name.to_string(),
+            ty: info.ty,
+            declaration_span: info.declaration_span,
+        });
+    }
+
+    fn note_write(&mut self, name: &str, span: Span) {
+        if self.bound_inside(name) {
+            return;
+        }
+        if self.checker.symbols.lookup_var(name).is_some() {
+            self.writes.push((name.to_string(), span));
+        }
+    }
 }
 
 impl AstVisitor for CaptureScan<'_> {
@@ -1020,22 +1173,25 @@ impl AstVisitor for CaptureScan<'_> {
             .insert(name.to_string());
     }
 
-    /// A nested lambda runs its own capture scan when it is checked.
-    fn visit_lambda(&mut self, _lambda: &LambdaExpr) {}
-
     fn visit_stmt(&mut self, stmt: &Stmt) {
         walk_stmt(self, stmt);
         // Writing an enclosing local captures it too, and an assignment target
         // is a name on the statement rather than a `Var` the walk can reach.
         if let Stmt::Assign(assign) = stmt {
-            self.checker
-                .scan_captures_name(&assign.name, assign.span, &self.scopes);
+            self.note_use(&assign.name, assign.span);
+            self.note_write(&assign.name, assign.span);
         }
     }
 
     fn visit_expr(&mut self, expr: &Expr) {
-        if let Expr::Var(name, span) = expr {
-            self.checker.scan_captures_name(name, *span, &self.scopes);
+        match expr {
+            Expr::Var(name, span) => self.note_use(name, *span),
+            // Calling a local function VALUE captures it: the callee is a name
+            // on the call node, not a `Var` the walk reaches, exactly as an
+            // assignment target is. A free function's name resolves to no
+            // variable, so `note_use` ignores it.
+            Expr::Call(call) => self.note_use(&call.callee, call.span),
+            _ => {}
         }
         walk_expr(self, expr);
     }
@@ -1043,33 +1199,57 @@ impl AstVisitor for CaptureScan<'_> {
 
 #[cfg(test)]
 mod lambda_capture_tests {
-    //! willow-thqe: lambdas are non-capturing; a body reference to an
-    //! enclosing local must be rejected (it used to silently read 0).
-    //! 20 perspectives: 1 read capture, 2 write capture, 3 param use ok,
-    //! 4 own-let ok, 5 shadowing param ok, 6 block-scoped let ok, 7 sibling-
-    //! scope leak caught, 8 capture in nested if, 9 capture in loop body,
-    //! 10 capture in match arm, 11 match binding ok, 12 for-var ok,
-    //! 13 nested lambda inner param ok, 14 nested lambda captures outer-lambda
-    //! param caught, 15 free fn call ok (not a capture), 16 capture in call
-    //! args caught, 17 capture in ternary caught, 18 self capture in method
-    //! caught, 19 block-bodied lambda capture caught, 20 capture of enclosing
-    //! param caught.
+    //! What a lambda takes from its enclosing function, and what that makes it.
     //!
-    //! willow-uqzx.1.1 moved the scan onto the shared structural walk and added
-    //! 21-30: 21 index expression, 22 range bound, 23 defer body, 24 `new`
-    //! argument, 25 array-literal element, 26 index-assignment target, 27 `for`
-    //! iterable, 28 `while` condition, 29 a `let` initializer is not excused by
-    //! its own binding, 30 a match payload binding is not a capture.
+    //! willow-thqe first wrote these perspectives when a capture was an error
+    //! (it used to silently read 0). willow-0g8j.2.12 gave lambdas a real
+    //! environment, so the same 30 shapes now pin the OPPOSITE answer: the
+    //! capture is accepted, recorded in slot order, and turns the lambda into a
+    //! `closure` value. The scan itself is the same code, so a container the
+    //! shared walk (willow-uqzx.1.1) misses is still a silent wrong answer —
+    //! now a capture the environment never carries rather than a missed error.
+    //!
+    //! 1 read capture, 2 param use, 3 own `let`, 4 shadowing param, 5 block-
+    //! scoped `let`, 6 sibling-scope leak, 7 nested `if`, 8 loop body, 9 match
+    //! arm, 10 match binding, 11 `for` variable, 12 nested-lambda inner param,
+    //! 13 nested lambda captures the outer lambda's param, 14 free fn call,
+    //! 15 call argument, 16 ternary, 17 block body, 18 enclosing param,
+    //! 19 index expression, 20 range bound, 21 `defer` body, 22 `new`
+    //! argument, 23 array-literal element, 24 index-assignment target,
+    //! 25 `for` iterable, 26 `while` condition, 27 a `let` initializer is not
+    //! excused by its own binding, 28 match payload binding.
+    //!
+    //! Then the rules the environment brought with it (willow-0g8j.2.12):
+    //! 29 `self` is still E1002, 30 a write to a capture is E1009, 31 `let mut`
+    //! does not excuse it, 32 the write is reported once, 33 a capturing lambda
+    //! is not a `fn` value (E1011), 34 but is a `closure` one, 35 a
+    //! non-capturing lambda stays a `fn` value, 36 calling a captured function
+    //! value captures it, 37 repeated mentions share one slot, 38 slots follow
+    //! first-mention order, 39 a field write THROUGH a capture is not a write
+    //! to it, 40 a capture two frames up rides both environments.
     use crate::diagnostics::Diagnostic;
 
-    fn check(src: &str) -> Vec<Diagnostic> {
+    /// Check `src`, and report both its diagnostics and what each lambda
+    /// captures — outer lambdas first, and within one lambda in the order the
+    /// closure environment lays its slots out.
+    fn scan(src: &str) -> (Vec<Diagnostic>, Vec<Vec<String>>) {
         let tokens = crate::lexer::Lexer::new(src).tokenize().expect("lex");
         let (program, parse_errors) = crate::parser::Parser::new(tokens).parse();
         assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
         let mut checker = crate::semantic::TypeChecker::new();
         crate::register_prelude(&mut checker).expect("prelude");
         checker.check_program(&program);
-        checker.errors
+        let mut lambdas: Vec<_> = checker.lambda_captures.iter().collect();
+        lambdas.sort_by_key(|(span, _)| (span.start, span.end));
+        let captures = lambdas
+            .into_iter()
+            .map(|(_, c)| c.iter().map(|c| c.name.clone()).collect())
+            .collect();
+        (checker.errors, captures)
+    }
+
+    fn check(src: &str) -> Vec<Diagnostic> {
+        scan(src).0
     }
 
     fn ok(src: &str) {
@@ -1077,236 +1257,419 @@ mod lambda_capture_tests {
         assert!(d.is_empty(), "expected clean, got {d:?}");
     }
 
-    fn capture_err(src: &str) {
+    /// `src` checks clean and its lambdas capture exactly `expected`, one row
+    /// per lambda in source order.
+    fn captures(src: &str, expected: &[&[&str]]) {
+        let (diagnostics, actual) = scan(src);
+        assert!(
+            diagnostics.is_empty(),
+            "expected clean, got {diagnostics:?}"
+        );
+        let expected: Vec<Vec<String>> = expected
+            .iter()
+            .map(|l| l.iter().map(|n| (*n).to_string()).collect())
+            .collect();
+        assert_eq!(actual, expected, "capture slots differ");
+    }
+
+    /// The one lambda in `src` captures exactly `names`.
+    fn captures_one(src: &str, names: &[&str]) {
+        captures(src, &[names]);
+    }
+
+    fn no_capture(src: &str) {
+        captures(src, &[&[]]);
+    }
+
+    fn err(src: &str, code: &str) {
         let d = check(src);
         assert!(
-            d.iter().any(|d| format!("{:?}", d.code) == "E1002"),
-            "expected E1002 capture error, got {d:?}"
+            d.iter().any(|d| format!("{:?}", d.code) == code),
+            "expected {code}, got {d:?}"
+        );
+    }
+
+    /// `src` reports exactly one diagnostic, with code `code`. Captures reach
+    /// the checker twice — once in the scan, once in the body check — so a rule
+    /// written in the wrong place reads as a duplicate rather than a miss.
+    fn only_err(src: &str, code: &str) {
+        let d = check(src);
+        assert_eq!(d.len(), 1, "expected exactly one diagnostic, got {d:?}");
+        assert_eq!(format!("{:?}", d[0].code), code, "got {d:?}");
+    }
+
+    #[test]
+    fn c01_read_capture_is_recorded() {
+        captures_one(
+            "fn main() { let y = 10; let f = |x: i64| x + y; println(f(1)); }",
+            &["y"],
         );
     }
 
     #[test]
-    fn c01_read_capture_rejected() {
-        capture_err("fn main() { let y = 10; let f = |x: i64| x + y; println(f(1)); }");
+    fn c02_param_use_is_not_a_capture() {
+        no_capture("fn main() { let f = |x: i64| x * 2; println(f(3)); }");
     }
 
     #[test]
-    fn c02_write_capture_rejected() {
-        capture_err(
-            "fn main() { let mut y = 0; let f = |x: i64| { y = x; return x; }; println(f(1)); }",
+    fn c03_own_let_is_not_a_capture() {
+        no_capture(
+            "fn main() { let f = |x: i64| { let d = x + 1; return d * 2; }; println(f(3)); }",
         );
     }
 
     #[test]
-    fn c03_param_use_ok() {
-        ok("fn main() { let f = |x: i64| x * 2; println(f(3)); }");
-    }
-
-    #[test]
-    fn c04_own_let_ok() {
-        ok("fn main() { let f = |x: i64| { let d = x + 1; return d * 2; }; println(f(3)); }");
-    }
-
-    #[test]
-    fn c05_shadowing_param_ok() {
+    fn c04_shadowing_param_is_not_a_capture() {
         // The lambda param shadows the outer local of the same name.
-        ok("fn main() { let y = 10; let f = |y: i64| y * 2; println(f(3)); }");
+        no_capture("fn main() { let y = 10; let f = |y: i64| y * 2; println(f(3)); }");
     }
 
     #[test]
-    fn c06_block_scoped_let_ok() {
-        ok(
+    fn c05_block_scoped_let_is_not_a_capture() {
+        no_capture(
             "fn main() { let f = |c: bool| { if c { let t = 1; return t; } return 0; }; println(f(true)); }",
         );
     }
 
     #[test]
-    fn c07_sibling_scope_leak_is_capture() {
-        // `t` bound in the if-block is OUT of scope afterwards; if the
-        // enclosing fn has a `t`, the later use is a capture of THAT one.
-        capture_err(
+    fn c06_sibling_scope_leak_is_a_capture() {
+        // `t` bound in the if-block is OUT of scope afterwards; the later use
+        // reads the enclosing fn's `t`, so the environment must carry it.
+        captures_one(
             "fn main() { let t = 9; let f = |c: bool| { if c { let t = 1; println(t); } return t; }; println(f(true)); }",
+            &["t"],
         );
     }
 
     #[test]
-    fn c08_capture_in_nested_if_rejected() {
-        capture_err(
+    fn c07_capture_in_nested_if() {
+        captures_one(
             "fn main() { let y = 1; let f = |c: bool| { if c { return y; } return 0; }; println(f(true)); }",
+            &["y"],
         );
     }
 
     #[test]
-    fn c09_capture_in_loop_body_rejected() {
-        capture_err(
+    fn c08_capture_in_loop_body() {
+        captures_one(
             "fn main() { let y = 1; let f = |n: i64| { let mut t = 0; for i in 0..n { t = t + y; } return t; }; println(f(3)); }",
+            &["y"],
         );
     }
 
     #[test]
-    fn c10_capture_in_match_arm_rejected() {
-        capture_err(
+    fn c09_capture_in_match_arm() {
+        captures_one(
             "fn main() { let y = 1; let f = |o: Option<i64>| match o { Some(v) => v + y, None => 0, }; println(f(Some(1))); }",
+            &["y"],
         );
     }
 
     #[test]
-    fn c11_match_binding_ok() {
-        ok(
+    fn c10_match_binding_is_not_a_capture() {
+        no_capture(
             "fn main() { let f = |o: Option<i64>| match o { Some(v) => v, None => 0, }; println(f(Some(1))); }",
         );
     }
 
     #[test]
-    fn c12_for_var_ok() {
-        ok(
+    fn c11_for_var_is_not_a_capture() {
+        no_capture(
             "fn main() { let f = |n: i64| { let mut t = 0; for i in 0..n { t = t + i; } return t; }; println(f(3)); }",
         );
     }
 
     #[test]
-    fn c13_nested_lambda_inner_param_ok() {
-        ok(
+    fn c12_nested_lambda_inner_param_is_not_a_capture() {
+        no_capture(
             "fn apply(g: fn(i64) -> i64, v: i64) -> i64 { return g(v); } \
             fn main() { let f = |x: i64| x + 1; println(apply(f, 2)); }",
         );
     }
 
     #[test]
-    fn c14_nested_lambda_capturing_outer_lambda_param_rejected() {
-        // The inner lambda captures `a`, a local (param) of the OUTER lambda.
-        capture_err(
+    fn c13_nested_lambda_capturing_outer_lambda_param() {
+        // The inner lambda reads `a`, a local (param) of the OUTER lambda, so
+        // the outer one has nothing to capture and the inner one has `a`.
+        captures(
             "fn main() { let f = |a: i64| { let g = |b: i64| a + b; return g(1); }; println(f(2)); }",
+            &[&[], &["a"]],
         );
     }
 
     #[test]
-    fn c15_free_fn_call_ok() {
-        // Calling a free function is not a variable capture.
-        ok("fn double(n: i64) -> i64 { return n * 2; } \
-            fn main() { let f = |x: i64| double(x); println(f(3)); }");
+    fn c14_free_fn_call_is_not_a_capture() {
+        // A free function's name resolves to no variable, so there is nothing
+        // to put in an environment.
+        no_capture(
+            "fn double(n: i64) -> i64 { return n * 2; } \
+            fn main() { let f = |x: i64| double(x); println(f(3)); }",
+        );
     }
 
     #[test]
-    fn c16_capture_in_call_args_rejected() {
-        capture_err(
+    fn c15_capture_in_call_args() {
+        captures_one(
             "fn double(n: i64) -> i64 { return n * 2; } \
              fn main() { let y = 1; let f = |x: i64| double(x + y); println(f(3)); }",
+            &["y"],
         );
     }
 
     #[test]
-    fn c17_capture_in_ternary_rejected() {
-        capture_err("fn main() { let y = 1; let f = |c: bool| c ? y : 0; println(f(true)); }");
-    }
-
-    #[test]
-    fn c18_self_capture_in_method_rejected() {
-        capture_err(
-            "class C { pub v: i64; pub fn m(self) -> i64 { let f = |x: i64| x + self.v; return f(1); } } \
-             fn main() { }",
+    fn c16_capture_in_ternary() {
+        captures_one(
+            "fn main() { let y = 1; let f = |c: bool| c ? y : 0; println(f(true)); }",
+            &["y"],
         );
     }
 
     #[test]
-    fn c19_block_bodied_capture_rejected() {
-        capture_err(
+    fn c17_block_bodied_capture() {
+        captures_one(
             "fn main() { let y = 2; let f = |x: i64| { let t = x * y; return t; }; println(f(3)); }",
+            &["y"],
         );
     }
 
     #[test]
-    fn c20_enclosing_param_capture_rejected() {
-        capture_err(
+    fn c18_enclosing_param_capture() {
+        captures_one(
             "fn g(y: i64) -> i64 { let f = |x: i64| x + y; return f(1); } fn main() { println(g(5)); }",
+            &["y"],
         );
     }
 
     // --- Shared structural AST walk (willow-uqzx.1.1) ---
     //
     // The scan reads the shared walk in `parser::visit`, so a slot the walk
-    // misses is a capture that silently reads 0 at runtime, and a binding the
-    // walk forgets is a false rejection of correct code. These perspectives
-    // pin the containers the original hand-written scan had to remember.
+    // misses is a value the environment never carries — the body would read an
+    // empty slot at runtime — and a binding the walk forgets is a capture of a
+    // name the enclosing frame does not even have. These perspectives pin the
+    // containers the original hand-written scan had to remember.
 
     #[test]
-    fn c21_capture_in_an_index_expression_rejected() {
-        capture_err(
+    fn c19_capture_in_an_index_expression() {
+        captures_one(
             "import std::collections::Array; \
              fn main() { let i = 1; let f = |xs: Array<i64>| xs[i]; println(f([1, 2])); }",
+            &["i"],
         );
     }
 
     #[test]
-    fn c22_capture_in_a_range_bound_rejected() {
-        capture_err(
+    fn c20_capture_in_a_range_bound() {
+        captures_one(
             "fn main() { let hi = 3; let f = |lo: i64| { let mut t = 0; for k in lo..hi { t = t + k; } return t; }; println(f(0)); }",
+            &["hi"],
         );
     }
 
     #[test]
-    fn c23_capture_in_a_defer_body_rejected() {
-        capture_err(
+    fn c21_capture_in_a_defer_body() {
+        captures_one(
             "fn main() { let y = 1; let f = |x: i64| { defer { println(y); } return x; }; println(f(1)); }",
+            &["y"],
         );
     }
 
     #[test]
-    fn c24_capture_in_a_new_argument_rejected() {
-        capture_err(
+    fn c22_capture_in_a_new_argument() {
+        captures_one(
             "class Cell { pub value: i64; } \
              fn main() { let y = 1; let f = |x: i64| { let c = new Cell(y); return x; }; println(f(1)); }",
+            &["y"],
         );
     }
 
     #[test]
-    fn c25_capture_in_an_array_literal_element_rejected() {
-        capture_err(
+    fn c23_capture_in_an_array_literal_element() {
+        captures_one(
             "import std::collections::Array; \
              fn main() { let y = 1; let f = |x: i64| { let xs: Array<i64> = [y]; return x; }; println(f(1)); }",
+            &["y"],
         );
     }
 
     #[test]
-    fn c26_capture_as_an_index_assignment_target_rejected() {
-        capture_err(
+    fn c24_capture_as_an_index_assignment_target() {
+        // Writing an ELEMENT of a captured array is a read of the array: the
+        // capture is the reference, and the write lands on the same object the
+        // enclosing function holds.
+        captures_one(
             "import std::collections::Array; \
              fn main() { let xs: Array<i64> = [0]; let f = |x: i64| { xs[0] = x; return x; }; println(f(1)); }",
+            &["xs"],
         );
     }
 
     /// The iterable of a `for` inside the lambda is evaluated in the lambda,
     /// so naming an enclosing local there is a capture.
     #[test]
-    fn c27_capture_in_a_for_iterable_rejected() {
-        capture_err(
+    fn c25_capture_in_a_for_iterable() {
+        captures_one(
             "import std::collections::Array; \
              fn main() { let xs: Array<i64> = [1]; let f = |x: i64| { for k in xs { println(k); } return x; }; println(f(1)); }",
+            &["xs"],
         );
     }
 
     #[test]
-    fn c28_capture_in_a_while_condition_rejected() {
-        capture_err(
+    fn c26_capture_in_a_while_condition() {
+        captures_one(
             "fn main() { let limit = 3; let f = |x: i64| { let mut i = 0; while i < limit { i = i + 1; } return x; }; println(f(1)); }",
+            &["limit"],
         );
     }
 
     /// A `let` binds after its own initializer, so the initializer still names
     /// the enclosing local — the shadowing does not retroactively excuse it.
     #[test]
-    fn c29_let_initializer_capture_is_not_excused_by_the_binding() {
-        capture_err(
+    fn c27_let_initializer_capture_is_not_excused_by_the_binding() {
+        captures_one(
             "fn main() { let y = 1; let f = |x: i64| { let y = y + x; return y; }; println(f(1)); }",
+            &["y"],
         );
     }
 
     /// The enum payload binding of a match arm is bound by the arm, so using
     /// it is not a capture (the walk binds pattern names).
     #[test]
-    fn c30_match_payload_binding_is_not_a_capture() {
-        ok(
+    fn c28_match_payload_binding_is_not_a_capture() {
+        no_capture(
             "fn main() { let f = |o: Option<i64>| match o { Some(v) => v, None => 0 }; println(f(Some(1))); }",
         );
+    }
+
+    // --- What an environment does and does not allow (willow-0g8j.2.12) ---
+
+    /// `self` is bound by the method's calling convention, not by a local slot,
+    /// so there is nothing for the environment to copy.
+    #[test]
+    fn c29_self_capture_in_a_method_is_rejected() {
+        err(
+            "class C { pub v: i64; pub fn m(self) -> i64 { let f = |x: i64| x + self.v; return f(1); } } \
+             fn main() { }",
+            "E1002",
+        );
+    }
+
+    /// A capture is a copy, so a write inside the body could never be seen
+    /// outside it.
+    #[test]
+    fn c30_write_to_a_capture_is_rejected() {
+        err(
+            "fn main() { let mut y = 0; let f = |x: i64| { y = x; return x; }; println(f(1)); }",
+            "E1009",
+        );
+    }
+
+    /// `let mut` on the enclosing binding does not make the copy shared, so it
+    /// does not excuse the write either.
+    #[test]
+    fn c31_let_mut_does_not_excuse_a_capture_write() {
+        err(
+            "fn main() { let mut n = 1; let f = |x: i64| { n = n + x; return n; }; println(f(2)); }",
+            "E1009",
+        );
+    }
+
+    /// The body is checked again after the scan, where the target still
+    /// resolves to the enclosing function's immutable local. Only the capture
+    /// error should come out: the mutability one points at the wrong fix.
+    #[test]
+    fn c32_a_capture_write_is_reported_once() {
+        only_err(
+            "fn main() { let y = 0; let f = |x: i64| { y = x; return x; }; println(f(1)); }",
+            "E1009",
+        );
+    }
+
+    /// A `fn` value is a bare code address with no room for an environment.
+    #[test]
+    fn c33_a_capturing_lambda_is_not_a_fn_value() {
+        err(
+            "fn apply(g: fn(i64) -> i64, v: i64) -> i64 { return g(v); } \
+             fn main() { let y = 1; println(apply(|x: i64| x + y, 2)); }",
+            "E1011",
+        );
+    }
+
+    /// The same lambda against a `closure` parameter is exactly what the
+    /// environment is for.
+    #[test]
+    fn c34_a_capturing_lambda_is_a_closure_value() {
+        captures_one(
+            "fn apply(g: closure(i64) -> i64, v: i64) -> i64 { return g(v); } \
+             fn main() { let y = 1; println(apply(|x: i64| x + y, 2)); }",
+            &["y"],
+        );
+    }
+
+    /// Nothing captured means nothing to carry, so the lambda stays a plain
+    /// `fn` value and a `fn` parameter still takes it.
+    #[test]
+    fn c35_a_non_capturing_lambda_stays_a_fn_value() {
+        no_capture(
+            "fn apply(g: fn(i64) -> i64, v: i64) -> i64 { return g(v); } \
+             fn main() { println(apply(|x: i64| x + 1, 2)); }",
+        );
+    }
+
+    /// The callee of a call is a name on the call node rather than a `Var` the
+    /// walk reaches, so calling a captured function value has to be noted by
+    /// hand — otherwise the environment would not carry the thing being called.
+    #[test]
+    fn c36_calling_a_captured_function_value_captures_it() {
+        captures(
+            "fn main() { let g = |x: i64| x * 2; let f = |x: i64| g(x) + 1; println(f(3)); }",
+            &[&[], &["g"]],
+        );
+    }
+
+    /// One slot per captured variable, however many times the body mentions it.
+    #[test]
+    fn c37_repeated_mentions_share_one_slot() {
+        captures_one(
+            "fn main() { let y = 2; let f = |x: i64| x + y * y + y; println(f(1)); }",
+            &["y"],
+        );
+    }
+
+    /// Slot order is first-mention order, which is what the environment layout
+    /// and the lifted body's parameter binding both read.
+    #[test]
+    fn c38_slots_follow_first_mention_order() {
+        captures_one(
+            "fn main() { let a = 1; let b = 2; let f = |x: i64| b + a + x + b; println(f(0)); }",
+            &["b", "a"],
+        );
+    }
+
+    /// A capture holds the same reference the enclosing function holds, so
+    /// writing a FIELD through it is an ordinary mutation, not a rebinding of
+    /// the capture.
+    #[test]
+    fn c39_a_field_write_through_a_capture_is_allowed() {
+        captures_one(
+            "class Cell { pub value: i64; } \
+             fn main() { let c = new Cell(1); let f = |x: i64| { c.value = x; return x; }; println(f(2)); println(c.value); }",
+            &["c"],
+        );
+    }
+
+    /// An inner lambda cannot reach a frame two levels up, so the value rides
+    /// BOTH environments: the outer lambda captures it to hand it on.
+    #[test]
+    fn c40_a_capture_two_frames_up_rides_both_environments() {
+        captures(
+            "fn main() { let n = 5; let f = |x: i64| { let g = |y: i64| y + n; return g(x); }; println(f(1)); }",
+            &[&["n"], &["n"]],
+        );
+    }
+
+    #[test]
+    fn c41_a_capture_free_lambda_reports_no_slots() {
+        ok("fn main() { let f = |x: i64| x; println(f(1)); }");
     }
 }

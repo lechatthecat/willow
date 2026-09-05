@@ -290,18 +290,36 @@ fn format_expr(e: &HirExpr) -> String {
         }
         HirExprKind::Await { inner } => format!("await {}", format_expr(inner)),
         HirExprKind::TryPropagate { inner } => format!("{}?", format_expr(inner)),
-        HirExprKind::Lambda { params, body } => {
+        HirExprKind::Lambda {
+            params,
+            captures,
+            body,
+        } => {
             let params = params
                 .iter()
                 .map(|p| format!("{}: {}", p.name, type_str(&p.ty)))
                 .collect::<Vec<_>>()
                 .join(", ");
+            // The environment is printed before the parameters because that is
+            // the order the lifted body binds them in (willow-0g8j.2.12).
+            let captures = if captures.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "[{}] ",
+                    captures
+                        .iter()
+                        .map(|c| format!("{} = {}: {}", c.name, c.source, type_str(&c.ty)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
             let mut body_text = String::new();
             for s in body {
                 format_stmt(s, 0, &mut body_text);
             }
             format!(
-                "|{params}| {{ {} }}",
+                "{captures}|{params}| {{ {} }}",
                 body_text.trim_end().replace('\n', " ")
             )
         }
@@ -410,6 +428,10 @@ fn type_str(ty: &Type) -> String {
         Type::Fn(params, ret) => {
             let params = params.iter().map(type_str).collect::<Vec<_>>().join(", ");
             format!("fn({params}) -> {}", type_str(ret))
+        }
+        Type::Closure(params, ret) => {
+            let params = params.iter().map(type_str).collect::<Vec<_>>().join(", ");
+            format!("closure({params}) -> {}", type_str(ret))
         }
     }
 }

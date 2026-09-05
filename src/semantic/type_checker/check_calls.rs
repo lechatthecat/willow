@@ -172,9 +172,12 @@ impl TypeChecker {
         &mut self,
         expr: &Expr,
         expected_params: &[Type],
+        expected_closure: bool,
     ) -> Type {
         match expr {
-            Expr::Lambda(lambda) => self.check_lambda_with_param_context(lambda, expected_params),
+            Expr::Lambda(lambda) => {
+                self.check_lambda_with_param_context(lambda, expected_params, expected_closure)
+            }
             _ => self.check_expr(expr),
         }
     }
@@ -187,7 +190,7 @@ impl TypeChecker {
 
     fn check_expr_expecting_inner(&mut self, expr: &Expr, expected: &Type) -> Type {
         // Contextually-typed lambda.
-        if let (Expr::Lambda(lambda), Type::Fn(..)) = (expr, expected) {
+        if let (Expr::Lambda(lambda), Type::Fn(..) | Type::Closure(..)) = (expr, expected) {
             return self.check_lambda_expecting(lambda, expected);
         }
         // A ternary propagates the expected type into BOTH branches, so

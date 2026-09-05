@@ -5,6 +5,7 @@ mod check_collections;
 mod check_concurrency;
 mod check_decls;
 mod check_lambda_match;
+pub use check_lambda_match::LambdaCapture;
 mod check_ops;
 mod diagnostics;
 mod resolve;
@@ -92,6 +93,17 @@ pub struct TypeChecker {
     /// call's span, when the two differ: `Dict::new()` under
     /// `import std::collections::Map as Dict` records `Map` (willow-0g8j.3).
     pub static_call_classes: HashMap<Span, String>,
+    /// What each lambda captures from its enclosing function, keyed by the
+    /// lambda expression's span and ordered as the closure environment lays the
+    /// slots out (willow-0g8j.2.12). An absent entry and an empty vector mean
+    /// the same thing — a non-capturing lambda, which stays a plain `fn` value.
+    pub lambda_captures: HashMap<Span, Vec<LambdaCapture>>,
+    /// Assignment statements already reported as writes to a capture
+    /// (willow-0g8j.2.12). The lambda body is checked again afterwards, where
+    /// the target still resolves to the enclosing function's immutable local;
+    /// without this the same statement would also be reported as an ordinary
+    /// mutability error, which points the reader at the wrong fix.
+    capture_writes: HashSet<Span>,
     /// The type a `match` in value position flows into, set for the duration of
     /// that one `match` by [`TypeChecker::check_expr_expecting`] and taken by
     /// [`TypeChecker::check_match_expr`] (willow-0g8j.3).
@@ -312,6 +324,8 @@ impl TypeChecker {
             expr_types: HashMap::new(),
             normalized_types: HashMap::new(),
             static_call_classes: HashMap::new(),
+            lambda_captures: HashMap::new(),
+            capture_writes: HashSet::new(),
             match_expected: None,
             current_return_type: Type::Void,
             lambda_return_stack: Vec::new(),
@@ -455,6 +469,13 @@ impl TypeChecker {
                 }
             }
             Type::Fn(params, ret) => Type::Fn(
+                params
+                    .iter()
+                    .map(|param| self.normalize_type(param, span))
+                    .collect(),
+                Box::new(self.normalize_type(ret.as_ref(), span)),
+            ),
+            Type::Closure(params, ret) => Type::Closure(
                 params
                     .iter()
                     .map(|param| self.normalize_type(param, span))
@@ -938,7 +959,7 @@ impl TypeChecker {
                     self.validate_type(arg, span);
                 }
             }
-            Type::Fn(params, ret) => {
+            Type::Fn(params, ret) | Type::Closure(params, ret) => {
                 for param in params {
                     self.validate_type(param, span);
                 }

@@ -18,6 +18,18 @@ impl Parser {
                 self.advance();
                 Ok(Type::Bool)
             }
+            // `closure(T1, T2) -> R` — the GC-managed callable
+            // (willow-0g8j.2.12). Spelled as an identifier rather than a
+            // keyword so that no existing program loses the name `closure`;
+            // only an identifier followed directly by `(` in TYPE position is
+            // read this way, and no type may be called.
+            TokenKind::Ident(name)
+                if name == "closure" && self.peek_kind_at(1) == &TokenKind::LParen =>
+            {
+                self.advance();
+                let (params, ret) = self.parse_callable_type_tail()?;
+                Ok(Type::Closure(params, Box::new(ret)))
+            }
             TokenKind::Ident(name) => {
                 self.advance();
                 let mut parts = vec![name];
@@ -61,25 +73,12 @@ impl Parser {
             // `fn(T1, T2) -> R` — function pointer type
             TokenKind::Fn => {
                 self.advance();
-                self.expect(TokenKind::LParen)?;
-                let mut params = Vec::new();
-                while !self.check(TokenKind::RParen) && !self.at_eof() {
-                    params.push(self.parse_type()?);
-                    if !self.eat(TokenKind::Comma) {
-                        break;
-                    }
-                }
-                self.expect(TokenKind::RParen)?;
-                let ret = if self.eat(TokenKind::Arrow) {
-                    self.parse_type()?
-                } else {
-                    Type::Void
-                };
+                let (params, ret) = self.parse_callable_type_tail()?;
                 Ok(Type::Fn(params, Box::new(ret)))
             }
             _ => Err(self.err(
                 ErrorCode::E0107,
-                "expected type (`i64`, `f64`, `bool`, `fn(...)`, or type name)",
+                "expected type (`i64`, `f64`, `bool`, `fn(...)`, `closure(...)`, or type name)",
             )),
         }?;
 
@@ -90,5 +89,25 @@ impl Parser {
             ty = Type::Generic("Option".to_string(), vec![ty]);
         }
         Ok(ty)
+    }
+
+    /// `(T1, T2) -> R` after the `fn` or `closure` head. A missing `-> R` is
+    /// `void`, which is what both callable types mean by an absent return.
+    fn parse_callable_type_tail(&mut self) -> Result<(Vec<Type>, Type), Diagnostic> {
+        self.expect(TokenKind::LParen)?;
+        let mut params = Vec::new();
+        while !self.check(TokenKind::RParen) && !self.at_eof() {
+            params.push(self.parse_type()?);
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen)?;
+        let ret = if self.eat(TokenKind::Arrow) {
+            self.parse_type()?
+        } else {
+            Type::Void
+        };
+        Ok((params, ret))
     }
 }

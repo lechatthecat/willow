@@ -2,6 +2,7 @@
 //! backend (`compile_*` / `declare_*`, extracted from `mod.rs`). `compile_module`
 //! / `compile_program` stay `pub` (the entry points); the rest are `pub(super)`.
 
+use crate::diagnostics::Span;
 use anyhow::Result;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, UserFuncName, types};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -9,6 +10,32 @@ use cranelift_module::{Linkage, Module};
 
 use super::coop_anf::normalize_coop_suspensions;
 use super::*;
+
+/// The name of a lifted closure's hidden leading parameter — the environment
+/// object it was called through (willow-0g8j.2.12).
+///
+/// `$` cannot appear in a source identifier, so this can never collide with a
+/// parameter, a capture, or a local the program wrote.
+pub(super) const CLOSURE_ENV_PARAM: &str = "$closure_env";
+
+/// The hidden environment parameter a `closure`-typed lambda's lifted body
+/// takes, or `None` for a `fn`-typed one, which is called through a bare code
+/// address and has no environment at all (willow-0g8j.2.12).
+///
+/// Its declared type is the closure type itself: that is what the value IS, so
+/// the parameter is rooted and traced like any other GC reference.
+fn closure_env_param(lambda_type: Option<&Type>, span: Span) -> Option<Param> {
+    match lambda_type {
+        Some(ty @ Type::Closure(..)) => Some(Param {
+            name: CLOSURE_ENV_PARAM.to_string(),
+            ty: ty.clone(),
+            mode: ParamMode::Value,
+            span,
+            type_span: span,
+        }),
+        _ => None,
+    }
+}
 
 /// A compilation unit whose symbols are declared but whose bodies are not yet
 /// lowered — carrying the per-unit state [`Codegen::declare_module`] derived so
@@ -788,10 +815,12 @@ impl Codegen {
 
     /// Declare the signature for a lambda private function.
     pub(super) fn declare_lambda(&mut self, name: &str, l: &LambdaExpr) -> Result<()> {
-        let (param_types, ast_ret) =
-            if let Some(Type::Fn(params, ret)) = self.expr_types.get(&l.span) {
+        let lambda_type = self.lambda_value_type(l);
+        let (param_types, ast_ret) = match &lambda_type {
+            Some(Type::Fn(params, ret) | Type::Closure(params, ret)) => {
                 (params.clone(), *ret.clone())
-            } else {
+            }
+            _ => {
                 let params = l
                     .params
                     .iter()
@@ -799,8 +828,17 @@ impl Codegen {
                     .collect();
                 let ret = l.return_type.clone().unwrap_or(Type::I64);
                 (params, ret)
-            };
+            }
+        };
+        // A closure's lifted body takes its environment object as a hidden
+        // LEADING argument (willow-0g8j.2.12). It is declared here, in the
+        // signature and in every per-parameter table, so the index a caller
+        // counts from and the index the body binds from stay the same one.
+        let env_param = closure_env_param(lambda_type.as_ref(), l.span);
         let mut sig = self.module.make_signature();
+        if env_param.is_some() {
+            sig.params.push(AbiParam::new(types::I64));
+        }
         for ty in &param_types {
             sig.params.push(AbiParam::new(clif_type(ty)));
         }
@@ -808,31 +846,59 @@ impl Codegen {
         let id = self.module.declare_function(name, Linkage::Local, &sig)?;
         self.func_ids.insert(name, id);
         self.func_return_types.insert(name, ast_ret.clone());
-        self.func_param_modes
-            .insert(name, l.params.iter().map(|_| ParamMode::Value).collect());
+        self.func_param_modes.insert(
+            name,
+            env_param
+                .iter()
+                .map(|_| ParamMode::Value)
+                .chain(l.params.iter().map(|_| ParamMode::Value))
+                .collect(),
+        );
         self.func_param_debug.insert(
             name,
-            l.params
+            env_param
                 .iter()
-                .zip(param_types.iter())
                 .map(|p| ParamDebug {
+                    name: p.name.clone(),
+                    ty: p.ty.clone(),
+                    mode: ParamMode::Value,
+                })
+                .chain(l.params.iter().zip(param_types.iter()).map(|p| ParamDebug {
                     name: p.0.name.clone(),
                     ty: p.1.clone(),
                     mode: ParamMode::Value,
-                })
+                }))
                 .collect(),
         );
-        self.fn_types
-            .insert(name, Type::Fn(param_types, Box::new(ast_ret)));
+        // The VALUE type, without the hidden environment parameter: this is
+        // what an expression of this lambda's type is, and eligibility compares
+        // the two directly.
+        self.fn_types.insert(
+            name,
+            match lambda_type {
+                Some(Type::Closure(..)) => Type::Closure(param_types, Box::new(ast_ret)),
+                _ => Type::Fn(param_types, Box::new(ast_ret)),
+            },
+        );
         Ok(())
+    }
+
+    /// The checker's callable type for a lambda expression, if it recorded one.
+    fn lambda_value_type(&self, l: &LambdaExpr) -> Option<Type> {
+        match self.expr_types.get(&l.span) {
+            Some(ty @ (Type::Fn(..) | Type::Closure(..))) => Some(ty.clone()),
+            _ => None,
+        }
     }
 
     /// Compile a lambda as a private function.
     pub(super) fn compile_lambda(&mut self, name: &str, l: &LambdaExpr) -> Result<()> {
-        let (param_types, return_type) =
-            if let Some(Type::Fn(params, ret)) = self.expr_types.get(&l.span) {
+        let lambda_type = self.lambda_value_type(l);
+        let (param_types, return_type) = match &lambda_type {
+            Some(Type::Fn(params, ret) | Type::Closure(params, ret)) => {
                 (params.clone(), *ret.clone())
-            } else {
+            }
+            _ => {
                 let params = l
                     .params
                     .iter()
@@ -840,18 +906,25 @@ impl Codegen {
                     .collect();
                 let ret = l.return_type.clone().unwrap_or(Type::I64);
                 (params, ret)
-            };
-        let params: Vec<Param> = l
-            .params
-            .iter()
-            .zip(param_types.iter())
-            .map(|(p, ty)| Param {
-                name: p.name.clone(),
-                ty: ty.clone(),
-                mode: ParamMode::Value,
-                span: p.span,
-                type_span: p.span,
-            })
+            }
+        };
+        // Same leading environment parameter `declare_lambda` put in the
+        // signature (willow-0g8j.2.12); the two are built from the same
+        // checker type, so they cannot disagree.
+        let params: Vec<Param> = closure_env_param(lambda_type.as_ref(), l.span)
+            .into_iter()
+            .chain(
+                l.params
+                    .iter()
+                    .zip(param_types.iter())
+                    .map(|(p, ty)| Param {
+                        name: p.name.clone(),
+                        ty: ty.clone(),
+                        mode: ParamMode::Value,
+                        span: p.span,
+                        type_span: p.span,
+                    }),
+            )
             .collect();
         let body = match &l.body {
             LambdaBody::Block(b) => b.clone(),
@@ -1207,6 +1280,24 @@ impl Codegen {
                     continue;
                 }
                 fg.bind_param(&param.name, &param.ty, &param.mode, val);
+            }
+        }
+
+        // Unpack the closure environment into ordinary locals, BEFORE the body
+        // runs (willow-0g8j.2.12). Each capture keeps its own declared type, so
+        // a GC-managed one is rooted here by exactly the machinery that roots a
+        // parameter, and the body cannot tell a capture from a parameter.
+        if !lir_fn.captures.is_empty() {
+            let env = fg.vars[CLOSURE_ENV_PARAM].clone();
+            let env = fg.load_var(&env);
+            for (i, capture) in lir_fn.captures.iter().enumerate() {
+                let val = fg.builder.ins().load(
+                    clif_type(&capture.ty),
+                    MemFlagsData::trusted(),
+                    env,
+                    (i as i32 + 1) * 8,
+                );
+                fg.bind_param(&capture.name, &capture.ty, &ParamMode::Value, val);
             }
         }
 

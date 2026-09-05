@@ -50,6 +50,10 @@ pub(crate) fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
         Type::Generic(_, _) => types::I64,
         // A function address, a fixed 64-bit word — see [`FN_ADDR_TYPE`].
         Type::Fn(_, _) => FN_ADDR_TYPE,
+        // A closure VALUE is the environment object, so it is a GC pointer and
+        // not a code address; the code pointer lives in its word 0
+        // (willow-0g8j.2.12).
+        Type::Closure(_, _) => types::I64,
         Type::Named(_) => types::I64,
         Type::Void => types::I8,
     }
@@ -96,6 +100,14 @@ pub(crate) fn debug_type_name(ty: &Type) -> String {
                 .collect::<Vec<_>>()
                 .join(",");
             format!("fn({}) -> {}", param_str, debug_type_name(ret))
+        }
+        Type::Closure(params, ret) => {
+            let param_str = params
+                .iter()
+                .map(debug_type_name)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("closure({}) -> {}", param_str, debug_type_name(ret))
         }
     }
 }
@@ -169,6 +181,11 @@ pub(crate) fn is_gc_managed(ty: &Type, enum_infos: &HashMap<String, EnumInfo>) -
         // String is now a GC-managed WillowString heap object (payload: len + bytes).
         // It is allocated through the central GC path and has a valid GcHeader.
         Type::String => true,
+        // A closure value is the environment OBJECT — allocated through the
+        // same central GC path, with a valid GcHeader and a ref mask covering
+        // its captured words (willow-0g8j.2.12). `Type::Fn` stays out: that is
+        // a bare code address in a text section, not a heap object.
+        Type::Closure(_, _) => true,
         _ => false,
     }
 }

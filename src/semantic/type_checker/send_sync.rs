@@ -185,7 +185,7 @@ impl TypeChecker {
             Type::Array(elem) => send && self.marker_holds(elem, Marker::Send, visiting),
             // Function/closure values capture unknown state — conservatively
             // neither Send nor Sync in the MVP.
-            Type::Fn(_, _) => false,
+            Type::Fn(_, _) | Type::Closure(_, _) => false,
 
             Type::Generic(name, args) => match name.as_str() {
                 // Immutable: Send iff args Send, Sync iff args Sync (the frozen

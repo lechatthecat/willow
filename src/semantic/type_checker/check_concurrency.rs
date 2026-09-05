@@ -291,6 +291,7 @@ impl TypeChecker {
                             let f_ty = self.check_fn_arg_with_param_context(
                                 &call.args[0].expr,
                                 std::slice::from_ref(&inner),
+                                false,
                             );
                             match f_ty {
                                 Type::Fn(ref params, ref ret) if params.len() == 1 => {
@@ -330,6 +331,7 @@ impl TypeChecker {
                             let f_ty = self.check_fn_arg_with_param_context(
                                 &call.args[0].expr,
                                 std::slice::from_ref(&inner),
+                                false,
                             );
                             match f_ty {
                                 Type::Fn(ref params, ref ret) if params.len() == 1 => {
@@ -366,8 +368,11 @@ impl TypeChecker {
                             );
                             Some(obj_ty.clone())
                         } else {
-                            let f_ty =
-                                self.check_fn_arg_with_param_context(&call.args[0].expr, &[]);
+                            let f_ty = self.check_fn_arg_with_param_context(
+                                &call.args[0].expr,
+                                &[],
+                                false,
+                            );
                             match f_ty {
                                 Type::Fn(ref params, ref ret) if params.is_empty() => {
                                     Some(*ret.clone())
@@ -520,6 +525,7 @@ impl TypeChecker {
                             let f_ty = self.check_fn_arg_with_param_context(
                                 &call.args[0].expr,
                                 std::slice::from_ref(&ok_ty),
+                                false,
                             );
                             match f_ty {
                                 Type::Fn(ref params, ref ret) if params.len() == 1 => {
@@ -562,6 +568,7 @@ impl TypeChecker {
                             let f_ty = self.check_fn_arg_with_param_context(
                                 &call.args[0].expr,
                                 std::slice::from_ref(&err_ty),
+                                false,
                             );
                             match f_ty {
                                 Type::Fn(ref params, ref ret) if params.len() == 1 => {
@@ -604,6 +611,7 @@ impl TypeChecker {
                             let f_ty = self.check_fn_arg_with_param_context(
                                 &call.args[0].expr,
                                 std::slice::from_ref(&ok_ty),
+                                false,
                             );
                             match f_ty {
                                 Type::Fn(ref params, ref ret) if params.len() == 1 => {
@@ -643,6 +651,7 @@ impl TypeChecker {
                             let f_ty = self.check_fn_arg_with_param_context(
                                 &call.args[0].expr,
                                 std::slice::from_ref(&err_ty),
+                                false,
                             );
                             match f_ty {
                                 Type::Fn(ref params, ref ret) if params.len() == 1 => {
