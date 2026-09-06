@@ -1,0 +1,17 @@
+// audit.wi — a second importer, with a third spelling of the same module.
+//
+// Each unit's own spelling lives only for that unit's own compilation, so
+// `books::Amount` here and `sales::Amount` in ledger.wi are one class without
+// either name leaking into the other file.
+module audit;
+
+import sales as books;
+
+pub fn total(v: i64) -> i64 {
+    let a: books::Amount = books::amount(v);
+    return a.scaled() + 1;
+}
+
+pub fn top(v: i64) -> bool {
+    return books::grade(v) == books::Grade::High;
+}

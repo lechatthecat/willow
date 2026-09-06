@@ -1,0 +1,30 @@
+// sales.wi — one module, reached by three different names.
+//
+// The entry file imports it as `market`, `audit.wi` imports it as `books`, and
+// `ledger.wi` writes its canonical `sales`. All three name this file.
+module sales;
+
+pub enum Grade { Low, High }
+
+pub open class Amount {
+    pub value: i64;
+
+    pub init(self, value: i64) {
+        self.value = value;
+    }
+
+    pub open fn scaled(self) -> i64 {
+        return self.value;
+    }
+}
+
+pub fn amount(v: i64) -> Amount {
+    return new Amount(v);
+}
+
+pub fn grade(v: i64) -> Grade {
+    if v > 10 {
+        return Grade::High;
+    }
+    return Grade::Low;
+}

@@ -120,6 +120,29 @@ impl<V> TypeMap<V> {
     pub fn contains_key(&self, key: &str) -> bool {
         self.get(key).is_some()
     }
+    /// Look `key` up as a DECLARATION identity, ignoring whatever aliases the
+    /// unit being compiled has installed (willow-kd1v).
+    ///
+    /// For the build-wide passes that walk names the tables themselves
+    /// recorded: those names are already canonical, and a unit that binds one
+    /// of them to another module's type — an `import sales as books;` in a
+    /// build that also has a real `books` module — must not change what they
+    /// mean for every other class in the program.
+    pub fn get_canonical(&self, key: &str) -> Option<&V> {
+        self.values
+            .get(&TypeId::from_source_name(key))
+            .map(|(_, v)| v)
+    }
+    /// Write under `key`'s own identity, leaving any alias over it in place.
+    ///
+    /// The counterpart of [`Self::get_canonical`]: a build-wide pass rewrites
+    /// the entries it reads, and must neither follow a unit's alias into
+    /// another module's entry (which [`Self::insert`] avoids by tearing the
+    /// alias down) nor tear that alias down under the unit still using it.
+    pub fn insert_canonical(&mut self, key: String, value: V) -> Option<V> {
+        let id = TypeId::from_source_name(&key);
+        self.values.insert(id, (key, value)).map(|(_, value)| value)
+    }
     pub fn entry(&mut self, key: String) -> TypeEntry<'_, V> {
         let id = key.declare(&self.scope);
         TypeEntry {
@@ -383,5 +406,35 @@ mod tests {
         // `bind` targets are declaration identities, so one hop is the contract.
         assert_eq!(map.get("Level"), Some(&7));
         assert_eq!(map.get("Rank"), None);
+    }
+
+    #[test]
+    fn ti_19_a_canonical_read_ignores_an_installed_binding() {
+        let scope = TypeScope::default();
+        let mut map = TypeMap::with_scope(scope.clone());
+        map.insert("pal::Color".to_string(), 7);
+        map.insert("ui::Color".to_string(), 9);
+        // One unit reaches `ui` under a spelling that is another module's key.
+        scope.bind("ui::Color", "pal::Color");
+        assert_eq!(map.get("ui::Color"), Some(&7));
+        // A build-wide pass walking recorded names must still see the entry it
+        // recorded (willow-kd1v).
+        assert_eq!(map.get_canonical("ui::Color"), Some(&9));
+    }
+
+    #[test]
+    fn ti_20_a_canonical_write_leaves_the_binding_standing() {
+        let scope = TypeScope::default();
+        let mut map = TypeMap::with_scope(scope.clone());
+        map.insert("pal::Color".to_string(), 7);
+        map.insert("ui::Color".to_string(), 9);
+        scope.bind("ui::Color", "pal::Color");
+        // The written entry is the shadowed one, and the alias survives the
+        // write -- where `insert` would both retarget it and tear it down.
+        assert_eq!(map.insert_canonical("ui::Color".to_string(), 11), Some(9));
+        assert_eq!(map.get_canonical("ui::Color"), Some(&11));
+        assert_eq!(map.get_canonical("pal::Color"), Some(&7));
+        assert_eq!(map.get("ui::Color"), Some(&7));
+        assert_eq!(map.len(), 2);
     }
 }

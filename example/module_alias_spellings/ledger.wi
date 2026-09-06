@@ -1,0 +1,34 @@
+// ledger.wi — writes `sales::` even though the ENTRY file aliased the module.
+//
+// The back end registers a module once, under the first importer's spelling,
+// which here is the entry file's `market`. This file never writes that name, so
+// every type it reaches through `sales::` — the class it binds, the base it
+// extends, the enum it matches — has to resolve to the same registered module
+// (willow-kd1v).
+module ledger;
+
+import sales;
+
+pub class Double extends sales::Amount {
+    pub init(self, value: i64) {
+        super.init(value);
+    }
+
+    pub override fn scaled(self) -> i64 {
+        return self.value * 2;
+    }
+}
+
+pub fn describe(v: i64) -> String {
+    let a: sales::Amount = sales::amount(v);
+    match sales::grade(a.value) {
+        sales::Grade::High => { return "high"; }
+        sales::Grade::Low => { return "low"; }
+    }
+}
+
+pub fn doubled(v: i64) -> i64 {
+    let d = new Double(v);
+    let a: sales::Amount = d;
+    return a.scaled();
+}

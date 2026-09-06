@@ -1,0 +1,18 @@
+// module_alias_spellings — one module named three ways across four files.
+//
+// Run: willowc run example/module_alias_spellings/main.wi
+import sales as market;
+import ledger;
+import audit;
+
+fn main() {
+    println(ledger::describe(50)); // high
+    println(ledger::describe(2)); // low
+    println(ledger::doubled(21)); // 42
+    println(audit::total(9)); // 10
+    println(audit::top(11)); // true
+
+    let own: market::Amount = market::amount(7);
+    println(own.scaled()); // 7
+    println(market::grade(1) == market::Grade::Low); // true
+}

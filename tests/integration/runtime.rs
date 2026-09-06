@@ -872,6 +872,10 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/maps.wi", "2\n31\n25\n-1\ntrue\nfalse\ntwo\n"),
         ("example/module_alias_demo/main.wi", "5\n16\n"),
         (
+            "example/module_alias_spellings/main.wi",
+            "high\nlow\n42\n10\ntrue\n7\ntrue\n",
+        ),
+        (
             "example/module_call_demo/main.wi",
             "5\n11\n12\nAlice: 12\n7\nBob=7\n=0\ntwo\n5\nrecovered: negative score\ntotal: 12\n",
         ),
@@ -2743,6 +2747,192 @@ fn main() {
     assert!(ok, "two-enum module no-crosstalk failed: {out}");
     // Blue (3) + M (20) = 23
     assert_eq!(out, "23\n");
+}
+
+// ---------------------------------------------------------------------------
+// A MODULE that reaches ANOTHER module's enum through a plain (unrenamed) item
+// import (willow-favj). The aliased form of this lives in
+// `enum_identity_aliases::METER`; the plain one had no coverage, and its
+// failure mode was silent: every construction behaved like variant 0.
+// ---------------------------------------------------------------------------
+
+const FAVJ_ALPHA: &str = r#"
+module alpha;
+pub enum Color { A, B, C }
+pub enum Tag { Plain, Payload(i64) }
+pub fn own_code(c: Color) -> i64 {
+    return match c {
+        Color::A => 1,
+        Color::B => 2,
+        Color::C => 3,
+    };
+}
+"#;
+
+const FAVJ_BETA: &str = r#"
+module beta;
+import alpha::Color;
+import alpha::Tag;
+
+pub fn code(c: Color) -> i64 {
+    return match c {
+        Color::A => 1,
+        Color::B => 2,
+        Color::C => 3,
+    };
+}
+pub fn code_a() -> i64 { return code(Color::A); }
+pub fn code_b() -> i64 { return code(Color::B); }
+pub fn code_c() -> i64 { return code(Color::C); }
+pub fn nth(n: i64) -> Color {
+    if n == 0 { return Color::A; }
+    if n == 1 { return Color::B; }
+    return Color::C;
+}
+pub fn value(t: Tag) -> i64 {
+    return match t {
+        Tag::Plain => 0,
+        Tag::Payload(v) => v,
+    };
+}
+pub fn payload(v: i64) -> Tag { return Tag::Payload(v); }
+"#;
+
+// dti_enum_06: the willow-favj repro. A module's plain type import constructs
+// each variant of another module's enum, and the entry never names the enum.
+#[test]
+fn dti_enum_06_module_plain_type_import_constructs_each_variant() {
+    let main = r#"
+import beta;
+fn main() {
+    println(beta::code_a());
+    println(beta::code_b());
+    println(beta::code_c());
+}
+"#;
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            ("alpha.wi", FAVJ_ALPHA),
+            ("beta.wi", FAVJ_BETA),
+            ("main.wi", main),
+        ],
+        "main.wi",
+    );
+    assert!(ok, "module plain type import failed: {out}");
+    assert_eq!(out, "1\n2\n3\n");
+}
+
+// dti_enum_07: the same enum crosses the module boundary in both directions —
+// the module returns a value the entry hands straight back to it.
+#[test]
+fn dti_enum_07_imported_enum_round_trips_through_the_entry() {
+    let main = r#"
+import beta;
+fn main() {
+    println(beta::code(beta::nth(0)));
+    println(beta::code(beta::nth(1)));
+    println(beta::code(beta::nth(2)));
+}
+"#;
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            ("alpha.wi", FAVJ_ALPHA),
+            ("beta.wi", FAVJ_BETA),
+            ("main.wi", main),
+        ],
+        "main.wi",
+    );
+    assert!(ok, "imported-enum round trip failed: {out}");
+    assert_eq!(out, "1\n2\n3\n");
+}
+
+// dti_enum_08: a PAYLOAD variant of the imported enum, built and matched inside
+// the importing module — the tag and the payload must both survive.
+#[test]
+fn dti_enum_08_imported_payload_variant_keeps_its_tag() {
+    let main = r#"
+import beta;
+import alpha;
+fn main() {
+    println(beta::value(beta::payload(41)));
+    println(beta::value(alpha::Tag::Plain));
+}
+"#;
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            ("alpha.wi", FAVJ_ALPHA),
+            ("beta.wi", FAVJ_BETA),
+            ("main.wi", main),
+        ],
+        "main.wi",
+    );
+    assert!(ok, "imported payload variant failed: {out}");
+    assert_eq!(out, "41\n0\n");
+}
+
+// dti_enum_09: one enum, three spellings — the owner's bare `Color`, the
+// importer's bare `Color`, and the entry's `alpha::Color`. All three name the
+// same identity, so a value built under any of them matches under the others.
+#[test]
+fn dti_enum_09_owner_importer_and_qualified_spellings_agree() {
+    let main = r#"
+import beta;
+import alpha;
+fn main() {
+    println(beta::code(alpha::Color::B));
+    println(alpha::own_code(beta::nth(2)));
+    println(beta::code(beta::nth(1)));
+}
+"#;
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            ("alpha.wi", FAVJ_ALPHA),
+            ("beta.wi", FAVJ_BETA),
+            ("main.wi", main),
+        ],
+        "main.wi",
+    );
+    assert!(ok, "cross-spelling identity failed: {out}");
+    assert_eq!(out, "2\n3\n2\n");
+}
+
+// dti_enum_10: TWO modules plain-import the same enum, one of them also under
+// its own second import. Neither unit's view of `Color` may leak into the
+// other's, which is what a build-wide alias table could not express.
+#[test]
+fn dti_enum_10_two_importing_modules_do_not_cross_talk() {
+    let gamma = r#"
+module gamma;
+import alpha::Color;
+pub fn weight(c: Color) -> i64 {
+    return match c {
+        Color::A => 100,
+        Color::B => 200,
+        Color::C => 300,
+    };
+}
+pub fn heaviest() -> Color { return Color::C; }
+"#;
+    let main = r#"
+import beta;
+import gamma;
+fn main() {
+    println(gamma::weight(beta::nth(0)));
+    println(beta::code(gamma::heaviest()));
+    println(gamma::weight(gamma::heaviest()));
+}
+"#;
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            ("alpha.wi", FAVJ_ALPHA),
+            ("beta.wi", FAVJ_BETA),
+            ("gamma.wi", gamma),
+            ("main.wi", main),
+        ],
+        "main.wi",
+    );
+    assert!(ok, "two importing modules cross-talked: {out}");
+    assert_eq!(out, "100\n3\n300\n");
 }
 
 // P11, P19: a module function boxes a local class to the module's OWN interface

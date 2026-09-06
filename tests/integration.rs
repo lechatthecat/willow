@@ -77,6 +77,8 @@ mod module_lir_bodies;
 
 #[path = "integration/missing_return.rs"]
 mod missing_return;
+#[path = "integration/module_alias_spellings.rs"]
+mod module_alias_spellings;
 #[path = "integration/module_checker_tables.rs"]
 mod module_checker_tables;
 #[path = "integration/module_enum_tables.rs"]

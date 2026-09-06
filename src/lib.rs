@@ -863,12 +863,43 @@ fn backend_unit_imports(
 ) -> backend::cranelift::UnitImports {
     let classified = module::resolver::classify_unit_imports(program, modules);
     let mut visible_modules = std::collections::HashSet::new();
+    let mut module_spellings = Vec::new();
     for binding in &classified.modules {
         // Both spellings: this file writes `access`, while the back end's
         // module tables are keyed by the name the graph registered, which is
         // the first importer's alias when that was another file.
         visible_modules.insert(binding.access.clone());
         visible_modules.insert(binding.graph_name.clone());
+        // Visibility alone was not enough: the tables are keyed by ONE of the
+        // two spellings, so the other has to be bound to it for this unit's
+        // phase (willow-kd1v). The types worth binding are the ones the module
+        // itself declares, which is why this is built here rather than in the
+        // back end — only the driver holds the imported module's program.
+        if binding.access == binding.graph_name {
+            continue;
+        }
+        let Some(dependency) = modules
+            .iter()
+            .find(|m| m.canonical_path == binding.canonical_path)
+        else {
+            continue;
+        };
+        module_spellings.push(backend::cranelift::ModuleSpelling {
+            access: binding.access.clone(),
+            graph_name: binding.graph_name.clone(),
+            canonical_path: binding.canonical_path.clone(),
+            types: dependency
+                .program
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    parser::ast::Item::Class(c) => Some(c.name.clone()),
+                    parser::ast::Item::Enum(e) => Some(e.name.clone()),
+                    parser::ast::Item::Interface(i) => Some(i.name.clone()),
+                    parser::ast::Item::Function(_) => None,
+                })
+                .collect(),
+        });
     }
     backend::cranelift::UnitImports {
         visible_modules,
@@ -881,6 +912,7 @@ fn backend_unit_imports(
                 item: item.item.clone(),
             })
             .collect(),
+        module_spellings,
     }
 }
 

@@ -23,7 +23,7 @@ use type_index::{TypeMap, TypeScope, VtableMap};
 mod ast_passes;
 mod async_codegen;
 mod compile;
-pub use compile::{DeclaredModule, DeclaredProgram, ItemBinding, UnitImports};
+pub use compile::{DeclaredModule, DeclaredProgram, ItemBinding, ModuleSpelling, UnitImports};
 mod coop;
 mod coop_anf;
 mod emit;
@@ -84,6 +84,10 @@ struct ParamDebug {
 struct ModuleAliasSnapshot {
     functions: Vec<(FunctionId, Option<FunctionId>)>,
     types: Vec<(String, Option<crate::semantic::ids::TypeId>)>,
+    /// Module access names bound to another module's symbol prefix for the
+    /// length of one unit (willow-kd1v), with whatever `known_modules` held
+    /// under them before.
+    modules: Vec<(String, Option<String>)>,
 }
 
 /// Bytes before the first virtual method slot in a class descriptor: the
@@ -617,18 +621,18 @@ impl Codegen {
         );
     }
 
-    /// The type as the enum TABLES spell it: every enum name replaced by the one
-    /// identity it answers to build-wide.
+    /// The type as the ENUM tables spell it: every enum name replaced by the one
+    /// identity it answers to build-wide, every other name left exactly as the
+    /// unit wrote it.
     ///
-    /// The unit being declared may write an enum its own way — `Level` for
-    /// `signal::Level`, or `Grade` under `import signal::Level as Grade;` — and
-    /// those spellings live only for that unit's own declaration phase
-    /// ([`Codegen::install_enum_aliases`]). The signature tables outlive it and
-    /// are compared against HIR types the checker already normalized to the
-    /// identity, so recording the written spelling would leave the two halves
-    /// unable to agree that `Grade` and `signal::Level` are one type
-    /// (willow-0g8j.3). A name that is not an enum is its own identity and
-    /// passes through.
+    /// This is what the SIGNATURE tables record. They are compared, by name,
+    /// against HIR types the checker produced for another unit, and a class or
+    /// interface reached by a direct type import (`import proto::Describable;`)
+    /// is spelled by its local name on both sides — canonicalizing that half
+    /// alone makes `Describable` and `proto::Describable` two types and every
+    /// cross-unit call falls out of the walker's subset. An enum is different:
+    /// the checker itself normalizes enum types to the identity, so the
+    /// signature has to as well (willow-0g8j.3).
     pub(super) fn canonical_enum_type(&self, ty: &Type) -> Type {
         let identity = |name: &String| -> String {
             self.enum_infos
@@ -649,6 +653,66 @@ impl Codegen {
             ),
             _ => ty.clone(),
         }
+    }
+
+    /// The type as the TABLES spell it: every declared name replaced by the one
+    /// identity it answers to build-wide.
+    ///
+    /// The unit being declared may write a type its own way — `Level` for
+    /// `signal::Level`, `Grade` under `import signal::Level as Grade;`,
+    /// `sales::Amount` for a class the graph registered as `market::Amount`
+    /// — and those spellings live only for that unit's own phase
+    /// ([`Codegen::install_enum_aliases`],
+    /// [`Codegen::alias_unit_module_spellings`]). The tables outlive it, are
+    /// rebuilt by every LATER unit's declaration phase, and are compared
+    /// against HIR types the checker already normalized, so recording the
+    /// written spelling leaves the two halves unable to agree that `Grade` and
+    /// `signal::Level` are one type (willow-0g8j.3) — or, worse, silently
+    /// rewrites an inherited layout to nothing once the alias is gone
+    /// (willow-kd1v). A name that is already an identity passes through.
+    pub(super) fn canonical_declared_type(&self, ty: &Type) -> Type {
+        match ty {
+            Type::Named(name) => Type::Named(self.canonical_declared_name(name)),
+            Type::Generic(name, args) => Type::Generic(
+                self.canonical_declared_name(name),
+                args.iter()
+                    .map(|a| self.canonical_declared_type(a))
+                    .collect(),
+            ),
+            Type::Array(element) => Type::Array(Box::new(self.canonical_declared_type(element))),
+            Type::Fn(params, ret) => Type::Fn(
+                params
+                    .iter()
+                    .map(|p| self.canonical_declared_type(p))
+                    .collect(),
+                Box::new(self.canonical_declared_type(ret)),
+            ),
+            _ => ty.clone(),
+        }
+    }
+
+    /// [`Codegen::canonical_declared_type`] for one name.
+    ///
+    /// An enum answers with its own recorded identity; anything else is
+    /// resolved one hop through the shared type scope, and only when the hop
+    /// lands on a class or interface the tables really hold — an unbound name,
+    /// or one bound to something not yet declared, is left exactly as written
+    /// so a base declared after its subclass still resolves later.
+    pub(super) fn canonical_declared_name(&self, name: &str) -> String {
+        if let Some(info) = self.enum_infos.get(name) {
+            return info.name.clone();
+        }
+        let resolved = self
+            .type_scope
+            .resolve(&crate::semantic::ids::TypeId::from_source_name(name))
+            .to_string();
+        if resolved != name
+            && (self.class_layouts.contains_key(&resolved)
+                || self.interface_infos.contains_key(&resolved))
+        {
+            return resolved;
+        }
+        name.to_string()
     }
 
     /// Hand the back end the imports the module resolver classified for the
@@ -774,12 +838,101 @@ impl Codegen {
         }
     }
 
+    /// Bind the module prefixes THIS unit writes to the names the build's
+    /// tables are keyed by, for the length of this unit's phase (willow-kd1v).
+    ///
+    /// A module is declared once, under the spelling the module graph
+    /// registered it by — the first importer's alias. Every other unit reaches
+    /// it by its own `import` spelling, and the two need not agree: an entry
+    /// file that says `import sales as market;` registers `market`, while the
+    /// module `ledger` that says `import sales;` writes `sales::Amount` and
+    /// calls `sales::describe`. Neither the class tables nor the symbol
+    /// mangler answered to that, so the module's own bodies fell out of the
+    /// LIR walker's subset and, in the AST emitter, mangled to a symbol that
+    /// does not exist.
+    ///
+    /// Both halves are bound: the TYPE half through the shared type scope, so
+    /// `sales::Amount` reads the registered `market::Amount` entry rather than
+    /// a copy of it, and the MODULE half in `known_modules`, which is what
+    /// [`class_method_symbol_name`] and the namespace-call paths resolve a
+    /// prefix through. An enum is keyed by the module's CANONICAL path
+    /// (willow-itcw) even when its classes carry the graph name, so both
+    /// spellings are offered as the alias target and the registered one wins.
+    ///
+    /// Nothing is bound for a spelling that already LANDS on the registered
+    /// entry: an enum is registered under its canonical path and its other
+    /// spellings bound to it (`register_enum_info`), so a unit writing the
+    /// canonical one needs nothing here, and binding it anyway would point the
+    /// canonical entry at its own alias — a binding is one hop, so the pair
+    /// would then resolve to a key neither table holds. A spelling that is a
+    /// key of something ELSE is a different case and IS bound: `books` in a
+    /// file that says `import sales as books;` means sales there, whatever a
+    /// real `books` module registered.
+    fn alias_unit_module_spellings(
+        &mut self,
+        spellings: &[compile::ModuleSpelling],
+        aliases: &mut ModuleAliasSnapshot,
+    ) {
+        for spelling in spellings {
+            if spelling.access == spelling.graph_name {
+                continue;
+            }
+            if let Some(prefix) = self.known_modules.get(&spelling.graph_name).cloned() {
+                let previous = self.known_modules.insert(spelling.access.clone(), prefix);
+                aliases.modules.push((spelling.access.clone(), previous));
+            }
+            for name in &spelling.types {
+                let alias = format!("{}::{name}", spelling.access);
+                let Some(canonical) = [
+                    format!("{}::{name}", spelling.graph_name),
+                    format!("{}::{name}", spelling.canonical_path),
+                ]
+                .into_iter()
+                .find(|candidate| self.registered_type(candidate)) else {
+                    continue;
+                };
+                // The KEY the candidate reaches, since the graph name of an
+                // enum is itself bound to the canonical path: binding the alias
+                // to a binding would be two hops, and nothing follows two.
+                let canonical = self.resolved_name(&canonical);
+                if self.resolved_name(&alias) == canonical {
+                    continue;
+                }
+                aliases
+                    .types
+                    .push((alias.clone(), self.type_scope.bind(&alias, &canonical)));
+            }
+        }
+    }
+
+    /// `name` with any binding currently installed over it followed, which is
+    /// the key the tables would answer it with.
+    fn resolved_name(&self, name: &str) -> String {
+        self.type_scope
+            .resolve(&crate::semantic::ids::TypeId::from_source_name(name))
+            .to_string()
+    }
+
+    /// Whether `name` reaches a registered class, enum or interface — directly
+    /// or through a binding already in the shared type scope.
+    fn registered_type(&self, name: &str) -> bool {
+        self.class_layouts.contains_key(name)
+            || self.enum_infos.contains_key(name)
+            || self.interface_infos.contains_key(name)
+    }
+
     fn restore_module_aliases(&mut self, aliases: ModuleAliasSnapshot) {
         for (alias, previous) in aliases.functions.into_iter().rev() {
             self.func_ids.scope().restore(alias, previous);
         }
         for (alias, previous) in aliases.types.into_iter().rev() {
             self.type_scope.restore(&alias, previous);
+        }
+        for (access, previous) in aliases.modules.into_iter().rev() {
+            match previous {
+                Some(prefix) => self.known_modules.insert(access, prefix),
+                None => self.known_modules.remove(&access),
+            };
         }
     }
 
@@ -860,7 +1013,10 @@ impl Codegen {
             .fields
             .iter()
             .filter(|f| !f.is_static)
-            .map(|f| (f.name.clone(), f.ty.clone()))
+            // Under the identity the tables answer to, not this unit's
+            // spelling of it: the layout is build-wide and every later unit
+            // reads it with its own aliases installed (willow-kd1v).
+            .map(|f| (f.name.clone(), self.canonical_declared_type(&f.ty)))
             .collect();
         // A provisional layout so nothing that runs before
         // `finalize_class_layouts` sees a missing class, and the whole answer
@@ -877,7 +1033,15 @@ impl Codegen {
                 TypePath::Local(name) => name.clone(),
                 TypePath::Qualified(parts) => parts.join("::"),
             };
-            self.class_base.insert(c.name.clone(), base_name);
+            // Recorded as the tables key it, NOW, while this unit's own
+            // spellings are still installed. `finalize_class_layouts` runs
+            // again for every later unit and walks this chain each time; a base
+            // kept under a spelling only this unit binds resolved to nothing
+            // then, and the subclass's layout was quietly rewritten to its own
+            // fields alone — `new Sub` then fell out of the walker's subset and
+            // every inherited field read the wrong offset (willow-kd1v).
+            self.class_base
+                .insert(c.name.clone(), self.canonical_declared_name(&base_name));
         }
         // Assign a unique type_id for runtime dynamic dispatch. It lives at
         // offset 0 of the class DESCRIPTOR, which word 0 of every object of the
@@ -925,7 +1089,11 @@ impl Codegen {
             let chain = self.ancestor_chain(&class_name);
             let mut fields: Vec<(String, Type)> = Vec::new();
             for ancestor in chain.iter().rev() {
-                let Some(own) = self.class_own_fields.get(ancestor) else {
+                // Under the ancestor's own identity: this pass re-runs for
+                // every unit in the build, and the unit it happens to run
+                // under may have bound that very name to another module's
+                // class (willow-kd1v).
+                let Some(own) = self.class_own_fields.get_canonical(ancestor) else {
                     continue;
                 };
                 for (name, ty) in own {
@@ -934,7 +1102,7 @@ impl Codegen {
                     }
                 }
             }
-            self.class_layouts.insert(class_name, fields);
+            self.class_layouts.insert_canonical(class_name, fields);
         }
     }
 
@@ -946,7 +1114,13 @@ impl Codegen {
     fn ancestor_chain(&self, class_name: &str) -> Vec<String> {
         let mut chain = vec![class_name.to_string()];
         let mut seen: HashSet<String> = HashSet::from([class_name.to_string()]);
-        while let Some(base) = self.class_base.get(chain.last().expect("non-empty")) {
+        // `class_base` records canonical names (`register_class_layout`
+        // canonicalizes as it stores), so the walk reads them as identities
+        // rather than through the aliases of whichever unit is compiling.
+        while let Some(base) = self
+            .class_base
+            .get_canonical(chain.last().expect("non-empty"))
+        {
             if !seen.insert(base.clone()) {
                 break;
             }
@@ -977,7 +1151,9 @@ impl Codegen {
             let chain = self.ancestor_chain(&class_name);
             let mut slots: Vec<String> = Vec::new();
             for ancestor in chain.iter().rev() {
-                let Some(own) = self.class_own_vmethods.get(ancestor) else {
+                // An identity, not a spelling, for the same reason
+                // `finalize_class_layouts` reads one.
+                let Some(own) = self.class_own_vmethods.get_canonical(ancestor) else {
                     continue;
                 };
                 for method in own {
@@ -986,7 +1162,7 @@ impl Codegen {
                     }
                 }
             }
-            self.class_vslots.insert(class_name, slots);
+            self.class_vslots.insert_canonical(class_name, slots);
         }
     }
 

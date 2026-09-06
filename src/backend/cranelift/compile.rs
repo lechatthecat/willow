@@ -70,6 +70,11 @@ pub struct DeclaredModule {
     /// name to another module's symbol, and two units can bind the same local
     /// name to different modules, so they are rebound before these bodies.
     item_imports: Vec<ItemBinding>,
+    /// The module prefixes this unit writes that the tables are not keyed by
+    /// (willow-kd1v), reinstalled before these bodies for the same reason the
+    /// item imports are: another unit's phase runs in between and restores
+    /// them.
+    module_spellings: Vec<ModuleSpelling>,
 }
 
 /// The entry program's counterpart to [`DeclaredModule`].
@@ -87,6 +92,10 @@ pub struct DeclaredProgram {
     /// its bodies because a module's body phase runs in between and may have
     /// bound the same local name to its own module's symbol.
     item_imports: Vec<ItemBinding>,
+    /// The module prefixes the entry file writes that the tables are not keyed
+    /// by (willow-kd1v) — it aliased a module some other file had already
+    /// registered under a different spelling.
+    module_spellings: Vec<ModuleSpelling>,
 }
 
 /// A single-item import (`import calc::add;`) as the resolver classified it for
@@ -97,6 +106,31 @@ pub struct ItemBinding {
     pub local: String,
     pub module: String,
     pub item: String,
+}
+
+/// One module spelling this unit writes that the build's tables are NOT keyed
+/// by (willow-kd1v).
+///
+/// A module is registered once, under the name the module graph gave it — the
+/// FIRST importer's spelling — while every other unit is free to reach it by
+/// its own `import` alias, or by its canonical name when it was another file
+/// that aliased it. Both spellings then name the same module and only one is a
+/// key, so the unit's own spelling is bound to the registered one for the
+/// length of that unit's phase.
+#[derive(Debug, Clone)]
+pub struct ModuleSpelling {
+    /// The prefix this unit writes (`import sales as biz;` -> `biz`).
+    pub access: String,
+    /// The prefix the build's tables are keyed by.
+    pub graph_name: String,
+    /// The module's canonical identity, which is what its ENUMS are keyed by
+    /// (willow-itcw) even when its classes carry the graph name.
+    pub canonical_path: String,
+    /// The class/enum/interface names the module declares, i.e. the suffixes
+    /// worth binding. Taken from the module's own program rather than scanned
+    /// out of the tables, so nothing another module registered under a
+    /// coincidentally matching prefix is aliased.
+    pub types: Vec<String>,
 }
 
 /// What one source unit's own `import` lines bind, as the module resolver
@@ -119,6 +153,9 @@ pub struct UnitImports {
     pub visible_modules: HashSet<String>,
     /// The single items this file bound, in import order.
     pub item_imports: Vec<ItemBinding>,
+    /// The module prefixes this file writes that are not themselves table keys
+    /// (willow-kd1v).
+    pub module_spellings: Vec<ModuleSpelling>,
 }
 
 /// The type/layout environment the LIR eligibility walker and the LIR emitter
@@ -272,6 +309,7 @@ impl Codegen {
         // compiled against. Only the function half is rebound, before this
         // unit's bodies (willow-28h8).
         let item_imports = unit_imports.item_imports;
+        let module_spellings = unit_imports.module_spellings;
         // The one type table that does have to answer under this unit's own
         // spelling while its declarations are made: `declare_vtables_for_classes`
         // below resolves each `implements` name in `interface_infos`, and an
@@ -290,6 +328,11 @@ impl Codegen {
         let module_prefix = module_symbol_prefix(canonical_path);
         self.known_modules
             .insert(mod_name.to_string(), module_prefix.clone());
+        // ...and the module prefixes THIS unit writes for modules the graph
+        // registered under some other spelling (willow-kd1v). Every module this
+        // one imports is already declared — dependencies are declared before
+        // their dependents — so the tables the aliases point at exist.
+        self.alias_unit_module_spellings(&module_spellings, &mut import_aliases);
         self.declare_runtime()?;
         self.declare_string_literals(program)?;
         // The source path backs `PanicInfo.file` for every panic, so it is a
@@ -486,6 +529,7 @@ impl Codegen {
             builtin_module_aliases: std::mem::take(&mut self.builtin_module_aliases),
             visible_modules: std::mem::take(&mut self.visible_modules),
             item_imports,
+            module_spellings,
         })
     }
 
@@ -580,6 +624,9 @@ impl Codegen {
         // resolves its own types internally (willow-64gs.1). Own declarations
         // are installed second, so they win.
         self.alias_item_import_types(&unit.item_imports, &mut aliases);
+        // Before the unit's own names, so a module reached under two spellings
+        // still loses to a type this module declares itself (willow-kd1v).
+        self.alias_unit_module_spellings(&unit.module_spellings, &mut aliases);
         self.alias_module_local_types(program, &unit.mod_name, &mut aliases);
         for item in &program.items {
             if let Item::Function(f) = item {
@@ -650,9 +697,16 @@ impl Codegen {
         let unit_imports = std::mem::take(&mut self.unit_imports);
         self.visible_modules = unit_imports.visible_modules;
         let item_imports = unit_imports.item_imports;
+        let module_spellings = unit_imports.module_spellings;
         for item in &item_imports {
             self.register_item_import(&item.local, &item.module, &item.item);
         }
+        // The entry's own spellings for modules another file registered under a
+        // different name (willow-kd1v). Snapshotted and taken back out below:
+        // every module's BODY phase runs between this declaration and the
+        // entry's own, and those units spell the same modules their own way.
+        let mut module_aliases = ModuleAliasSnapshot::default();
+        self.alias_unit_module_spellings(&module_spellings, &mut module_aliases);
         let normalized_program = normalize_std_collection_program(program);
         let normalized_program =
             normalize_coop_suspensions(&normalized_program, &mut self.expr_types);
@@ -759,6 +813,11 @@ impl Codegen {
         // keeps the runtime call path uniform regardless of the `main` lowering.
         self.declare_static_init()?;
 
+        // Out again, for the module body phases that follow (willow-kd1v). An
+        // error above returns early and skips this, which costs nothing — a
+        // failed declaration aborts the build.
+        self.restore_module_aliases(module_aliases);
+
         Ok(DeclaredProgram {
             program: normalized_program,
             lambdas,
@@ -766,6 +825,7 @@ impl Codegen {
             builtin_module_aliases: std::mem::take(&mut self.builtin_module_aliases),
             visible_modules: std::mem::take(&mut self.visible_modules),
             item_imports,
+            module_spellings,
         })
     }
 
@@ -780,25 +840,32 @@ impl Codegen {
         self.rebind_item_import_functions(&unit.item_imports);
         self.source_file = unit.source_file.clone();
         let program = &unit.program;
+        // The entry's own module spellings again: the last module body phase
+        // took its own back out (willow-kd1v).
+        let mut aliases = ModuleAliasSnapshot::default();
+        self.alias_unit_module_spellings(&unit.module_spellings, &mut aliases);
 
-        // Compile lambdas first (user functions are already declared, so calls inside work).
-        for (name, lambda) in &unit.lambdas {
-            self.compile_lambda(name, lambda)?;
-        }
-
-        // Compile user function bodies and class methods
-        for item in &program.items {
-            match item {
-                Item::Function(f) => self.compile_function(f)?,
-                Item::Class(c) => self.compile_class_methods(c)?,
-                Item::Enum(_) => {} // no codegen needed for enum declarations
-                Item::Interface(_) => {} // interfaces emit no code in Stage 1 (vtables: Stage 3)
+        let result = (|| -> Result<()> {
+            // Compile lambdas first (user functions are already declared, so calls inside work).
+            for (name, lambda) in &unit.lambdas {
+                self.compile_lambda(name, lambda)?;
             }
-        }
 
-        // Compile the static-init function body after all symbols are defined.
-        self.compile_static_init()?;
-        Ok(())
+            // Compile user function bodies and class methods
+            for item in &program.items {
+                match item {
+                    Item::Function(f) => self.compile_function(f)?,
+                    Item::Class(c) => self.compile_class_methods(c)?,
+                    Item::Enum(_) => {} // no codegen needed for enum declarations
+                    Item::Interface(_) => {} // interfaces emit no code in Stage 1 (vtables: Stage 3)
+                }
+            }
+
+            // Compile the static-init function body after all symbols are defined.
+            self.compile_static_init()
+        })();
+        self.restore_module_aliases(aliases);
+        result
     }
 
     /// Declare the `__willow_static_init` symbol (no params, no returns). Exported
