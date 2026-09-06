@@ -1,0 +1,21 @@
+import counting;
+import registry as records;
+
+fn main() {
+    // A module function writing its own class's static.
+    println(counting::bump(1));
+
+    // An instance method reaching the same slot through `Self::`.
+    let c = new counting::Counter();
+    println(c.tick());
+
+    // The entry program's own spelling of it, plus an initializer that called
+    // one of the module's functions.
+    println(counting::bump(1) + counting::Counter::limit - 5);
+
+    println(records::Registry::name);
+    println(records::record("first"));
+    println(records::rename("ledger"));
+    println(counting::made());
+    println(records::ready());
+}

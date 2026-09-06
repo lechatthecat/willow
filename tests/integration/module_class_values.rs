@@ -21,7 +21,7 @@
 //! project is outside the subset; the log is the sharper instrument here,
 //! because it names the individual body this file is about.
 //!
-//! 25 perspectives:
+//! 26 perspectives:
 //!   1 bound, then passed back        14 two modules, one class name
 //!   2 no binding at all              15 an entry class of the same name
 //!   3 the item import still works    16 an import alias
@@ -34,11 +34,12 @@
 //!  10 a String field, via the module 23 both branches of an `if`
 //!  11 a field of the same kind       24 a module subclass value
 //!  12 an `Array<String>` field       25 the example project
-//!  13 two modules, two class names
+//!  13 two modules, two class names   26 a same-named entry class does not
+//!                                     reinterpret a module value
 
 use super::support::{
-    compile_temp_project_and_run, compile_temp_project_with_env_and_run,
-    compile_temp_project_with_env_stderr,
+    compile_temp_project_and_run, compile_temp_project_error_stderr,
+    compile_temp_project_with_env_and_run, compile_temp_project_with_env_stderr,
 };
 
 /// No extra compiler environment: the ordinary build.
@@ -703,5 +704,53 @@ fn module_class_25_the_example_project() {
         &files,
         "7\n12\n10\n12\n(2, 2) -> (10, 10)\norigin\n7\n12\n",
         &["main", "ladder", "$lambda.0"],
+    );
+}
+
+#[test]
+fn module_class_26_a_same_named_entry_class_does_not_reinterpret_a_module_value() {
+    // The mirror of perspective 15, and the memory-unsafe half of it: a value
+    // the module made is read through the MODULE's layout even though the entry
+    // declares its own `Point`. Unifying the two once let `theirs.w` --
+    // `String` in the entry, `i64` at offset 0 in the module -- compile, and the
+    // program dereferenced the integer 4 as a string pointer (willow-wdoz).
+    let files = geom_project(
+        r#"
+import geom;
+
+class Point {
+    pub w: String;
+}
+
+fn main() {
+    let theirs = geom::point(4, 5);
+    let mine = new Point("hi");
+    println(geom::sum(theirs));
+    println(mine.w);
+}
+"#,
+    );
+    assert_module_class(&files, "9\nhi\n", &["main"]);
+
+    let stderr = compile_temp_project_error_stderr(
+        &geom_project(
+            r#"
+import geom;
+
+class Point {
+    pub w: String;
+}
+
+fn main() {
+    let theirs = geom::point(4, 5);
+    println(theirs.w);
+}
+"#,
+        ),
+        "main.wi",
+    );
+    assert!(
+        stderr.contains("no field `w` on class `geom::Point`"),
+        "expected the module's layout to decide the fields:\n{stderr}"
     );
 }

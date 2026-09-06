@@ -909,6 +909,18 @@ fn test_runnable_example_files_compile_and_run() {
             "example/module_item_imports/main.wi",
             "25\n275\n0\n1100\n1100\n",
         ),
+        (
+            "example/module_cross_module_types/main.wi",
+            "4\n12\n24\n9\nexpress\n",
+        ),
+        (
+            "example/module_alias_identity/main.wi",
+            "120\n60\n110\n60\n5\npremium\n",
+        ),
+        (
+            "example/module_static_properties/main.wi",
+            "1\n2\n8\nvault\n2\nledger\n4\ntrue\n",
+        ),
         ("example/module_demo/main.wi", "12\n14\n"),
         (
             "example/module_dispatch_demo/main.wi",

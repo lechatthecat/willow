@@ -1,0 +1,48 @@
+module depot;
+
+// A module whose exported signature is written in names it obtained through its
+// OWN item imports (willow-sxcp).
+//
+// Every `Parcel`, `Weighed` and `Grade` below used to be exported as
+// `depot::Parcel`, `depot::Weighed` and `depot::Grade` -- types nothing
+// declares. The base class resolved to nothing, so `Crate` inherited neither
+// `side` nor `area`; the `implements` name matched no interface, so no vtable
+// was emitted for the box `weigh` needs; and the enum field was left naming a
+// type the walker could not find, which rejected the whole module.
+
+import shipping::Parcel;
+import shipping::Weighed;
+import shipping::Grade;
+
+pub class Crate extends Parcel implements Weighed {
+    pub grade: Grade;
+
+    pub init(self, side: i64, grade: Grade) {
+        super.init(side);
+        self.grade = grade;
+    }
+
+    pub override fn area(self) -> i64 { return self.side * 3; }
+
+    pub fn weight(self) -> i64 { return self.area() * 2; }
+}
+
+pub fn make(side: i64) -> Crate {
+    return new Crate(side, Grade::Express);
+}
+
+// The imported class in a parameter and a return position.
+pub fn grow(p: Parcel) -> Parcel {
+    return new Parcel(p.side + 1);
+}
+
+// The imported interface in a parameter position: the entry file below never
+// imports `Weighed` itself, so the name this signature carries has to be one
+// the whole build answers to.
+pub fn weigh(w: Weighed) -> i64 {
+    return w.weight();
+}
+
+pub fn grade_of(c: Crate) -> Grade {
+    return c.grade;
+}

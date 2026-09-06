@@ -464,6 +464,10 @@ impl TypeChecker {
         payload_types: &[Type],
         result: Type,
     ) -> Type {
+        self.check_source_type_name(&call.class, call.span);
+        for ty in &call.type_args {
+            self.check_source_type_access(ty, call.span);
+        }
         // Contextual construction returns before the ordinary static-call path
         // runs, so it owes lowering that path's record of what the written class
         // resolved to (willow-0g8j.3).

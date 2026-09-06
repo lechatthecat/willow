@@ -1,0 +1,18 @@
+// This module writes `cat::` for the catalog, and it is the first file to
+// import it, so the whole build's tables are keyed by that spelling.
+import catalog as cat;
+
+pub class Bundle extends cat::Item implements cat::Priced {
+    pub override fn price(self) -> i64 { return self.cost * 2; }
+}
+
+pub fn bundle(sku: i64, cost: i64) -> Bundle { return new Bundle(sku, cost); }
+
+// A parameter and a return the entry file will write under its OWN spelling.
+pub fn discounted(item: cat::Item) -> cat::Item {
+    return cat::item(item.sku, item.cost - 10);
+}
+
+pub fn charge(p: cat::Priced) -> i64 { return p.price(); }
+
+pub fn tier_of(item: cat::Item) -> cat::Tier { return cat::tier(item.cost); }

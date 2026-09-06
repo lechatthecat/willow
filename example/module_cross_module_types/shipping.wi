@@ -1,0 +1,19 @@
+module shipping;
+
+// The leaf of the chain. Everything here is reached from `depot.wi` by a
+// SINGLE-ITEM import, and every one of those names then appears in the public
+// signature `depot` exports.
+
+pub open class Parcel {
+    pub side: i64;
+
+    pub init(self, side: i64) { self.side = side; }
+
+    pub open fn area(self) -> i64 { return self.side * self.side; }
+}
+
+pub interface Weighed {
+    fn weight(self) -> i64;
+}
+
+pub enum Grade { Standard, Express }

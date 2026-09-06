@@ -1,0 +1,30 @@
+import std::collections::Array;
+import counting;
+
+// A property whose initializer allocates. The slot is a GC root, so the value
+// it holds survives collections between writes.
+pub enum Status { Starting, Ready }
+
+pub class Registry {
+    pub static status: Status = Status::Ready;
+    pub static mut name: String = "vault";
+    pub static mut entries: Array<String> = ["boot"];
+}
+
+pub fn rename(to: String) -> String {
+    Registry::name = to;
+    return Registry::name;
+}
+
+pub fn record(entry: String) -> i64 {
+    Registry::entries.push(entry);
+    counting::bump(1);
+    return Registry::entries.len();
+}
+
+pub fn ready() -> bool {
+    match Registry::status {
+        Status::Starting => { return false; }
+        Status::Ready => { return true; }
+    }
+}

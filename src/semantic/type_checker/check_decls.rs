@@ -744,6 +744,7 @@ impl TypeChecker {
     pub(super) fn check_class_implements(&mut self, c: &ClassDecl) {
         let mut seen: HashSet<String> = HashSet::new();
         for iface_ty in &c.implements {
+            self.check_source_type_access(iface_ty, c.span);
             // Split the implemented interface into its name and type arguments:
             // `Animal` -> ("Animal", []), `From<Err>` -> ("From", [Err]).
             let (iface_name, type_args): (String, Vec<Type>) = match iface_ty {
@@ -1036,6 +1037,9 @@ impl TypeChecker {
             return;
         };
 
+        if !self.check_source_type_name(&base_name, c.span) {
+            return;
+        }
         match self.symbols.lookup_class(&base_name).cloned() {
             None => {
                 // A class may not extend an interface; that is what `implements` is for.

@@ -73,6 +73,55 @@ fn rename_imported_type(ty: &Type, renames: &HashMap<String, String>) -> Type {
     }
 }
 
+/// Translate a module-qualified path out of the spelling the module that WROTE
+/// it uses and into the spelling this checker registered that module under.
+///
+/// `ledger` may export `biz::Amount` because it wrote `import sales as biz;`,
+/// while the checker registered `sales` under whatever spelling reached it
+/// first -- `market`, say, because the entry file aliased it. `biz` names
+/// nothing here, and the two spellings made one class into two types
+/// (willow-uvlp). Only the leading segment is rewritten: what follows it is the
+/// type's own name, which every unit spells the same way.
+fn rename_module_prefix(ty: &Type, prefixes: &HashMap<String, String>) -> Type {
+    let rename_name = |n: &str| -> String {
+        match n.split_once("::") {
+            Some((module, item)) => match prefixes.get(module) {
+                Some(registered) => format!("{registered}::{item}"),
+                None => n.to_string(),
+            },
+            None => n.to_string(),
+        }
+    };
+    match ty {
+        Type::Named(n) => Type::Named(rename_name(n)),
+        Type::Generic(n, args) => Type::Generic(
+            rename_name(n),
+            args.iter()
+                .map(|a| rename_module_prefix(a, prefixes))
+                .collect(),
+        ),
+        Type::Array(e) => Type::Array(Box::new(rename_module_prefix(e, prefixes))),
+        Type::Fn(ps, r) => Type::Fn(
+            ps.iter()
+                .map(|p| rename_module_prefix(p, prefixes))
+                .collect(),
+            Box::new(rename_module_prefix(r, prefixes)),
+        ),
+        _ => ty.clone(),
+    }
+}
+
+/// How much of a module one registration brings into a checker.
+enum ModuleScope {
+    /// The unit imported it: its functions, its types, and its access name,
+    /// which local declarations may then not shadow.
+    Imported,
+    /// The unit only reaches it THROUGH another module's public signature. Its
+    /// types are registered so those signatures resolve; nothing else is
+    /// (willow-sxcp).
+    Types,
+}
+
 /// The AST type a std signature entry denotes.
 ///
 /// The schema is recursive (willow-uqzx, catalog item 11), so this is a thin
@@ -316,7 +365,7 @@ impl TypeChecker {
     }
 
     pub fn register_module(&mut self, name: &str, canonical: &str, path: &str, program: &Program) {
-        self.register_module_impl(None, name, canonical, path, program);
+        self.register_module_impl(None, name, canonical, path, program, ModuleScope::Imported);
     }
 
     pub fn register_module_with_id(
@@ -327,7 +376,86 @@ impl TypeChecker {
         path: &str,
         program: &Program,
     ) {
-        self.register_module_impl(Some(id), name, canonical, path, program);
+        self.register_module_impl(
+            Some(id),
+            name,
+            canonical,
+            path,
+            program,
+            ModuleScope::Imported,
+        );
+    }
+
+    /// Register only the TYPES of a module this unit did not import, under the
+    /// module's canonical path.
+    ///
+    /// A unit sees exactly the modules it imports -- except that an imported
+    /// module's public signature may name a type from further down: `mid`
+    /// exports `Crate extends Parcel`, and `Parcel` belongs to `base`. Without
+    /// `base::Parcel` in the table the subclass has a base class that resolves
+    /// to nothing, so it exports none of what it inherits (willow-sxcp). The
+    /// module itself is deliberately NOT defined: nothing here lets the
+    /// importing unit call into `base` or collide with its name.
+    pub fn register_module_type_signatures(
+        &mut self,
+        canonical: &str,
+        path: &str,
+        program: &Program,
+    ) {
+        self.register_module_impl(
+            None,
+            canonical,
+            canonical,
+            path,
+            program,
+            ModuleScope::Types,
+        );
+    }
+
+    /// Let `spelling` name a module already registered as `registered`.
+    ///
+    /// A module is registered ONCE, under the spelling of whichever unit
+    /// reached it first, and every other unit is free to write its own: the
+    /// entry file may say `import sales;` for a module a dependency already
+    /// brought in as `biz`. Registering it a second time under the other
+    /// spelling would make two of everything it declares -- two classes, two
+    /// interfaces, two types that never match (willow-uvlp) -- so the second
+    /// spelling is bound to the FIRST one's registrations instead: the same
+    /// `ClassInfo`, whose `name` stays the registered identity, answers under
+    /// both keys, which is how a directly-imported type already works
+    /// (willow-64gs).
+    pub fn alias_module_spelling(
+        &mut self,
+        id: crate::module::ModuleId,
+        spelling: &str,
+        registered: &str,
+        program: &Program,
+    ) {
+        if spelling == registered {
+            return;
+        }
+        for item in &program.items {
+            let declared = match item {
+                Item::Class(c) => &c.name,
+                Item::Interface(i) => &i.name,
+                Item::Enum(e) => &e.name,
+                Item::Function(_) => continue,
+            };
+            let from = format!("{registered}::{declared}");
+            let to = format!("{spelling}::{declared}");
+            if let Some(info) = self.symbols.lookup_class(&from).cloned() {
+                self.symbols.define_class(to, info);
+            } else if let Some(info) = self.symbols.lookup_interface(&from).cloned() {
+                self.symbols.define_interface(to, info);
+            } else if let Some(info) = self.symbols.lookup_enum(&from).cloned() {
+                self.symbols.define_enum(to, info);
+            }
+        }
+        if let Some(info) = self.symbols.lookup_module(registered).cloned() {
+            self.symbols
+                .define_module_with_id(spelling.to_string(), id, info);
+        }
+        self.imported_names.insert(spelling.to_string(), None);
     }
 
     /// `name` is what THIS unit calls the module -- an alias, or the last
@@ -342,7 +470,26 @@ impl TypeChecker {
         canonical: &str,
         path: &str,
         program: &Program,
+        scope: ModuleScope,
     ) {
+        match scope {
+            ModuleScope::Types => {
+                self.signature_only_modules.insert(canonical.to_string());
+            }
+            ModuleScope::Imported => {
+                self.signature_only_modules.remove(canonical);
+            }
+        }
+        // The spelling this checker reaches the module by, for the modules
+        // registered AFTER it: dependency order means an importer is registered
+        // once its dependencies already answer to a name here (willow-sxcp).
+        // The entry file registers some modules a second time under their
+        // canonical path, which must not displace the access spelling the rest
+        // of the build's types were qualified with.
+        self.module_access_names
+            .entry(canonical.to_string())
+            .or_insert_with(|| name.to_string());
+
         // Type names declared in this module. A module function signature that
         // names one of them by bare name is qualified to `module::Name` so the
         // importing file resolves it -- an interface argument against the right
@@ -390,29 +537,79 @@ impl TypeChecker {
         // importing file. Modules are registered in dependency order, so the
         // declaring module's enum is already in the table and can answer with
         // the identity both units share (willow-0g8j.3).
-        let imported_enums: HashMap<String, String> = program
+        // A CLASS or INTERFACE reached the same way is spelled the same way,
+        // and `mid::Parcel` — what blindly prefixing the declaring module's own
+        // name used to produce for `import base::Parcel;` — is a class no unit
+        // declares, so a subclass exported nothing it inherited and a signature
+        // mentioning the type resolved against nothing (willow-sxcp). Unlike an
+        // enum, a class answers here to the spelling THIS checker registered its
+        // module under, not to its canonical path, so the import's canonical
+        // module path is translated through `module_access_names` first.
+        let imported_types: HashMap<String, String> = program
+            .imports
+            .iter()
+            .filter(|import| !self.module_access_names.contains_key(import.path.as_str()))
+            .filter_map(|import| {
+                let (module_path, item) = import.path.rsplit_once("::")?;
+                let local = import.alias.clone().unwrap_or_else(|| item.to_string());
+                if let Some(info) = self.symbols.lookup_enum(&import.path) {
+                    return Some((local, info.name.clone()));
+                }
+                let access = self
+                    .module_access_names
+                    .get(module_path)
+                    .map(String::as_str)
+                    .unwrap_or(module_path);
+                let registered = format!("{access}::{item}");
+                (self.symbols.lookup_class(&registered).is_some()
+                    || self.symbols.lookup_interface(&registered).is_some())
+                .then_some((local, registered))
+            })
+            .collect();
+        // A path this module writes for a module IT imports -- `biz::Amount`
+        // under `import sales as biz;` -- is spelled for this module alone. The
+        // checker keys that module's types by the spelling that reached it
+        // first, which is the one name every unit here can share, so the
+        // exported signature is translated into it; otherwise one class under
+        // two spellings is two types and nothing an importer passes ever
+        // matches (willow-uvlp). Dependency order guarantees the map is
+        // complete: a module is registered only once its own imports are.
+        let own_module_prefixes: HashMap<String, String> = program
             .imports
             .iter()
             .filter_map(|import| {
-                let last = import.path.rsplit("::").next()?;
-                let local = import.alias.clone().unwrap_or_else(|| last.to_string());
-                let info = self.symbols.lookup_enum(&import.path)?;
-                Some((local, info.name.clone()))
+                let registered = self.module_access_names.get(import.path.as_str())?;
+                let access = import.alias.clone().unwrap_or_else(|| {
+                    import
+                        .path
+                        .rsplit("::")
+                        .next()
+                        .unwrap_or(import.path.as_str())
+                        .to_string()
+                });
+                (access != *registered).then(|| (access, registered.clone()))
             })
             .collect();
+        // ...and an ENUM has one identity build-wide (willow-itcw), which is
+        // not the access spelling its module answers to here. Snapshotted
+        // before the loop below starts defining types, since what a signature
+        // may name is already registered by then.
+        let enum_identities: HashMap<String, String> = self
+            .symbols
+            .enums
+            .iter()
+            .map(|(key, info)| (key.to_string(), info.name.clone()))
+            .collect();
         let qualify = |ty: &Type| {
-            rename_imported_type(
-                &qualify_local_type(
-                    &qualify_local_type(
-                        &qualify_local_type(ty, name, &local_interfaces),
-                        name,
-                        &local_classes,
-                    ),
-                    canonical,
-                    &local_enums,
-                ),
-                &imported_enums,
-            )
+            // Rewrite only paths the source wrote. Names introduced below are
+            // already identities in this checker, even if their prefix also
+            // happens to be one of the source module's import aliases.
+            let ty = rename_module_prefix(ty, &own_module_prefixes);
+            let ty = qualify_local_type(&ty, name, &local_interfaces);
+            let ty = qualify_local_type(&ty, name, &local_classes);
+            let ty = qualify_local_type(&ty, canonical, &local_enums);
+            let ty = rename_imported_type(&ty, &imported_types);
+            rename_imported_type(&ty, &enum_identities)
         };
 
         let mut functions = crate::semantic::ids::FunctionMap::default();
@@ -439,18 +636,19 @@ impl TypeChecker {
                 }
                 Item::Class(c) => {
                     let class_name = format!("{name}::{}", c.name);
-                    self.symbols.define_class(
-                        class_name.clone(),
-                        class_info_from_decl(c, &class_name, Some(name)),
-                    );
+                    let info = class_info_from_decl(c, &class_name, &qualify);
+                    self.symbols.define_class(class_name, info);
                 }
-                Item::Enum(e) => self.register_enum_with_module(e, name, canonical),
+                Item::Enum(e) => self.register_enum_with_module(e, name, canonical, &qualify),
                 Item::Interface(i) => {
                     // Register imported interfaces under `module::Interface` so
                     // `animals::Animal` resolves as a type and in `implements`.
                     self.register_interface(i, Some(name));
                 }
             }
+        }
+        if matches!(scope, ModuleScope::Types) {
+            return;
         }
         let info = ModuleInfo { functions };
         if let Some(id) = id {
@@ -704,13 +902,20 @@ impl TypeChecker {
     /// import path -- and `canonical` is the module's identity in the build.
     /// They differ under `import a::b as c;`, and then the enum answers to both
     /// keys but carries only the canonical name, so an aliasing unit and the
-    /// declaring module agree on which type it is (willow-itcw). Payload types
-    /// are qualified canonically for the same reason.
+    /// declaring module agree on which type it is (willow-itcw).
+    ///
+    /// A PAYLOAD type goes through the module's own `qualify`, the same
+    /// translation its fields and function signatures get: prefixing a bare
+    /// payload with the canonical path named a class no table here holds
+    /// whenever the module answers to another spelling, and a payload the
+    /// module wrote under its own module alias (`Filled(biz::Amount)`) named
+    /// one nothing declares (willow-uvlp).
     pub(super) fn register_enum_with_module(
         &mut self,
         decl: &EnumDecl,
         module: &str,
         canonical: &str,
+        qualify: &dyn Fn(&Type) -> Type,
     ) {
         let qualified = format!("{module}::{}", decl.name);
         let canonical_name = format!("{canonical}::{}", decl.name);
@@ -718,11 +923,7 @@ impl TypeChecker {
         for (tag, variant) in decl.variants.iter().enumerate() {
             variant_infos.push(EnumVariantInfo {
                 name: variant.name.clone(),
-                payload_types: variant
-                    .payload
-                    .iter()
-                    .map(|ty| qualify_type_for_module(ty, Some(canonical)))
-                    .collect(),
+                payload_types: variant.payload.iter().map(qualify).collect(),
                 tag: tag as i64,
                 declaration_span: variant.span,
             });
@@ -2070,6 +2271,9 @@ impl TypeChecker {
         class_name: &str,
         span: Span,
     ) -> Option<String> {
+        if !self.check_source_type_name(class_name, span) {
+            return None;
+        }
         if class_name != "Self" {
             // The same answer [`Self::resolve_static_call_class_quiet`] gives,
             // with the diagnostics a bad std path owes. `check_expr` records

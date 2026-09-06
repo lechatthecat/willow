@@ -87,6 +87,11 @@ pub(crate) fn module_item_symbol(module_prefix: &str, item: &str) -> String {
     symbol_path(&[module_prefix, item])
 }
 
+/// A module's generated initializer cannot share a name with a source item.
+pub(crate) fn module_static_init_symbol(module_prefix: &str) -> String {
+    with_role(module_prefix, "static_init")
+}
+
 /// `{class_symbol}.{method}` — a class method whose class is already a symbol
 /// path. Use [`class_method_symbol_name`] when the class is a `::`-qualified
 /// Willow name that may need module-prefix resolution.
@@ -233,20 +238,40 @@ pub(crate) fn class_method_symbol_name(
     }
 }
 
-pub(crate) fn qualify_module_class_decl(class: &ClassDecl, module_name: &str) -> ClassDecl {
+/// Clone a module's class declaration under its module-qualified NAME, with
+/// every type it mentions rewritten by `qualify`.
+///
+/// `qualify` is the caller's module-local qualifier ([`qualify_module_local_type`],
+/// usually applied twice — once for this unit's classes and interfaces, once for
+/// its enums under the canonical path). It must be import-aware: prefixing every
+/// bare name with the module's own spelling renamed a type the module obtained
+/// through its OWN item import (`import proto::Grade;`) into `lib::Grade` -- a
+/// type nothing declares -- so the field's enum lookup missed and the class fell
+/// out of the walker's subset (willow-sxcp).
+pub(crate) fn qualify_module_class_decl(
+    class: &ClassDecl,
+    module_name: &str,
+    qualify: &dyn Fn(&Type) -> Type,
+) -> ClassDecl {
+    let qualify_params = |params: &[Param]| -> Vec<Param> {
+        params
+            .iter()
+            .map(|param| {
+                let mut param = param.clone();
+                param.ty = qualify(&param.ty);
+                param
+            })
+            .collect()
+    };
     let mut qualified = class.clone();
     qualified.name = format!("{module_name}::{}", class.name);
-    qualified.implements = class
-        .implements
-        .iter()
-        .map(|iface| qualify_module_type(iface, module_name))
-        .collect();
+    qualified.implements = class.implements.iter().map(qualify).collect();
     qualified.fields = class
         .fields
         .iter()
         .map(|field| {
             let mut field = field.clone();
-            field.ty = qualify_module_type(&field.ty, module_name);
+            field.ty = qualify(&field.ty);
             field
         })
         .collect();
@@ -255,16 +280,8 @@ pub(crate) fn qualify_module_class_decl(class: &ClassDecl, module_name: &str) ->
         .iter()
         .map(|method| {
             let mut method = method.clone();
-            method.params = method
-                .params
-                .iter()
-                .map(|param| {
-                    let mut param = param.clone();
-                    param.ty = qualify_module_type(&param.ty, module_name);
-                    param
-                })
-                .collect();
-            method.return_type = qualify_module_type(&method.return_type, module_name);
+            method.params = qualify_params(&method.params);
+            method.return_type = qualify(&method.return_type);
             method
         })
         .collect();
@@ -273,40 +290,11 @@ pub(crate) fn qualify_module_class_decl(class: &ClassDecl, module_name: &str) ->
         .iter()
         .map(|ctor| {
             let mut ctor = ctor.clone();
-            ctor.params = ctor
-                .params
-                .iter()
-                .map(|param| {
-                    let mut param = param.clone();
-                    param.ty = qualify_module_type(&param.ty, module_name);
-                    param
-                })
-                .collect();
+            ctor.params = qualify_params(&ctor.params);
             ctor
         })
         .collect();
     qualified
-}
-
-pub(crate) fn qualify_module_type(ty: &Type, module_name: &str) -> Type {
-    match ty {
-        Type::Named(name) if !name.contains("::") => Type::Named(format!("{module_name}::{name}")),
-        Type::Array(element) => Type::Array(Box::new(qualify_module_type(element, module_name))),
-        Type::Generic(name, args) => Type::Generic(
-            name.clone(),
-            args.iter()
-                .map(|arg| qualify_module_type(arg, module_name))
-                .collect(),
-        ),
-        Type::Fn(params, ret) => Type::Fn(
-            params
-                .iter()
-                .map(|param| qualify_module_type(param, module_name))
-                .collect(),
-            Box::new(qualify_module_type(ret, module_name)),
-        ),
-        _ => ty.clone(),
-    }
 }
 
 /// Qualify a type's module-LOCAL declared type names (in `local`) to

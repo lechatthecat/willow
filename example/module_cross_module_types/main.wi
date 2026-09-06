@@ -1,0 +1,34 @@
+// Cross-module type names in a module's exported signature (willow-sxcp).
+//
+// `depot` reaches a class, an interface and an enum through its own item
+// imports of `shipping`, and writes all three into what it exports. The entry
+// file below never mentions `shipping::Weighed`, and mentions the class only to
+// hand one back, so what makes this program run is that the module exported the
+// identities `shipping` declared rather than names of its own invention.
+//
+// Run: willowc run example/module_cross_module_types/main.wi
+import depot;
+import shipping::Parcel;
+import shipping::Grade;
+
+fn main() {
+    let c = depot::make(4);
+
+    // The inherited field and the overriding method: `Crate extends Parcel`
+    // across a module boundary.
+    println(c.side); // 4
+    println(c.area()); // 12
+
+    // The imported interface, boxed inside the module.
+    println(depot::weigh(c)); // 24
+
+    // The imported class through the module's own signature, in and out.
+    let p = depot::grow(new Parcel(2));
+    println(p.area()); // 9
+
+    // The imported enum, matched in the entry file on a value the module built.
+    match depot::grade_of(c) {
+        Grade::Express => println("express"),
+        Grade::Standard => println("standard"),
+    }
+}

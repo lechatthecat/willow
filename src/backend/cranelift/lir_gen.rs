@@ -651,6 +651,12 @@ pub(super) struct LirTypeCtx<'x> {
     pub class_type_ids: &'x TypeMap<i64>,
     /// Whether a name is registered as an interface (never a class here).
     pub is_interface: &'x dyn Fn(&str) -> bool,
+    /// The build-wide identity of an interface NAME, or `None` when the name is
+    /// not an interface. An item import registers the interface under its local
+    /// spelling too, carrying the declaring module's identity, so this is what
+    /// makes two spellings of one interface comparable — the same role
+    /// [`LirEnumDef::identity`] plays for enums (willow-sxcp).
+    pub iface_identity: &'x dyn Fn(&str) -> Option<String>,
     /// Whether boxing `(class, interface)` resolves to a registered vtable —
     /// exactly what [`FuncGen::emit_interface_box`] will look up. A coercion it
     /// cannot build must not be admitted: the emitter's fallback is to pass the
@@ -1264,7 +1270,10 @@ impl LirTypeCtx<'_> {
     ) -> bool {
         match (target, value) {
             (Type::Named(a), Type::Named(b)) => {
-                a == b || self.same_class(a, b) || self.same_enum(a, b, open)
+                a == b
+                    || self.same_class(a, b)
+                    || self.same_enum(a, b, open)
+                    || self.same_iface(a, b)
             }
             (Type::Array(a), Type::Array(b)) => self.same_repr_inner(a, b, open),
             (Type::Generic(a, ta), Type::Generic(b, tb)) => {
@@ -1327,6 +1336,18 @@ impl LirTypeCtx<'_> {
                         .zip(&y.payloads)
                         .all(|(p, q)| self.same_repr_inner(p, q, open))
             })
+    }
+
+    /// Whether two interface names are one declaration under two spellings.
+    /// A module that item-imported an interface writes it bare in its own
+    /// signature while the unit reading that signature may hold the qualified
+    /// spelling, and neither is wrong — only the registered identity settles it
+    /// (willow-sxcp), exactly as [`Self::same_enum`] settles an enum alias.
+    fn same_iface(&self, a: &str, b: &str) -> bool {
+        match ((self.iface_identity)(a), (self.iface_identity)(b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        }
     }
 
     /// Whether two class names name one runtime class. One class is one
@@ -10277,6 +10298,7 @@ mod tests {
                 class_base: &self.class_base,
                 class_type_ids: &self.class_type_ids,
                 is_interface: &|n| self.interfaces.contains(n),
+                iface_identity: &|n| self.interfaces.contains(n).then(|| n.to_string()),
                 can_box: &|class, iface| {
                     self.vtables
                         .contains(&(class.to_string(), iface.to_string()))

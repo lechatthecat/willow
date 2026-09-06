@@ -212,13 +212,24 @@ pub struct Codegen {
     /// point at, so one thunk is emitted however many interfaces a class
     /// implements the method for (willow-tygf).
     vtable_thunk_ids: HashMap<(String, String), FuncId>,
-    /// Global storage for each `static [mut] name: T = expr` property, keyed by
-    /// (class_key, field) where class_key is the registered (module-qualified)
-    /// class name (willow-qsqf). Holds 8 bytes (i64/ptr/f64/bool).
-    static_storage: HashMap<(String, String), StaticStorageInfo>,
+    /// Global storage for each `static [mut] name: T = expr` property: the
+    /// registered (module-qualified) class name, then the field (willow-qsqf).
+    /// Each slot holds 8 bytes (i64/ptr/f64/bool).
+    ///
+    /// Keyed by CLASS through the shared type scope, like every other class
+    /// table, so a module body that spells its own class bare -- `Counter`,
+    /// aliased to `counting::Counter` for the length of the unit -- reaches the
+    /// same storage the declaration made. A plain map missed, and the read fell
+    /// through to a zero while the store went nowhere (willow-6xgo). The field
+    /// name is NOT a type and stays an ordinary map key.
+    static_storage: TypeMap<HashMap<String, StaticStorageInfo>>,
     /// Static-property initializers in program declaration order — replayed by
     /// the generated `__willow_static_init`, which runs before `main`.
     static_init_order: Vec<StaticInitItem>,
+    /// One initializer function per module that declares a static property,
+    /// in declaration (dependency) order; `__willow_static_init` calls them
+    /// before replaying the entry program's own items (willow-6xgo).
+    module_static_inits: Vec<FuncId>,
     /// Zero-initialized per-thread cursor/limit and allocation counters used by
     /// the inlined GC bump-allocation fast path.
     gc_tlab_state: DataId,
@@ -307,6 +318,12 @@ struct StaticInitItem {
     field: String,
     init: Expr,
     ty: Type,
+    /// The symbol prefix of the module that declared the property, or `None`
+    /// for the entry program. An initializer is an expression of the unit that
+    /// wrote it -- `new Slot(1)`, `seed()`, `Holder::base * 2` are all spelled
+    /// in that module's own names -- so it can only be emitted while that
+    /// unit's aliases are installed, which is its body phase (willow-6xgo).
+    owner: Option<String>,
 }
 
 impl Codegen {
@@ -417,8 +434,9 @@ impl Codegen {
             interface_infos: TypeMap::with_scope(type_scope.clone()),
             vtable_ids: VtableMap::with_scope(type_scope.clone()),
             vtable_thunk_ids: HashMap::new(),
-            static_storage: HashMap::new(),
+            static_storage: TypeMap::with_scope(type_scope.clone()),
             static_init_order: Vec::new(),
+            module_static_inits: Vec::new(),
             gc_tlab_state,
             async_frame_size_warnings: Vec::new(),
             symbol_owners: HashMap::new(),
@@ -761,7 +779,7 @@ impl Codegen {
         // Direct TYPE import (willow-64gs): alias the compiled tables of the
         // module-qualified type (`module::Item`) under the unqualified `local`
         // name, so the entry's use of `local` resolves to the module's symbols.
-        let qualified = format!("{module}::{item}");
+        let qualified = format!("{}::{item}", self.table_module_name(module));
         if self.class_layouts.contains_key(&qualified)
             || self.enum_infos.contains_key(&qualified)
             || self.interface_infos.contains_key(&qualified)
@@ -774,6 +792,32 @@ impl Codegen {
                 FunctionId::free_from_source_name(&full),
             );
         }
+    }
+
+    /// The spelling the build's tables key `module`'s items by.
+    ///
+    /// An item import names its module CANONICALLY (`import base::Parcel;`),
+    /// while a module is registered once under the first importer's spelling:
+    /// an entry file that says `import base as proto;` makes every table key
+    /// read `proto::Parcel`, and the item import above then found nothing under
+    /// its own canonical name -- no type alias, no method aliases, and a body
+    /// the walker admitted (a bare class name still resolves by scanning
+    /// modules) but the emitter could not key (willow-kd1v, willow-sxcp).
+    ///
+    /// Answered through the one mapping that is keyed by every spelling in
+    /// play: `known_modules` maps each access name to a symbol prefix built
+    /// from the module's canonical path, so the module `module` names is
+    /// whichever entry carries its prefix.
+    fn table_module_name(&self, module: &str) -> String {
+        if self.known_modules.contains_key(module) {
+            return module.to_string();
+        }
+        let prefix = module_symbol_prefix(module);
+        self.known_modules
+            .iter()
+            .find(|(_, candidate)| **candidate == prefix)
+            .map(|(name, _)| name.clone())
+            .unwrap_or_else(|| module.to_string())
     }
 
     /// Every `(local alias, mangled symbol)` pair binding the methods of the
@@ -792,15 +836,16 @@ impl Codegen {
         module: &str,
         item: &str,
     ) -> Vec<(String, String)> {
+        let module = self.table_module_name(module);
         let qualified = format!("{module}::{item}");
         if !self.class_layouts.contains_key(&qualified) {
             return Vec::new();
         }
         let module_prefix = self
             .known_modules
-            .get(module)
+            .get(&module)
             .cloned()
-            .unwrap_or_else(|| module_symbol_prefix(module));
+            .unwrap_or_else(|| module_symbol_prefix(&module));
         let method_prefix = class_member_prefix(&module_item_symbol(&module_prefix, item));
         self.func_ids
             .ids()
@@ -990,7 +1035,7 @@ impl Codegen {
         aliases: &mut ModuleAliasSnapshot,
     ) {
         for item in items {
-            let qualified = format!("{}::{}", item.module, item.item);
+            let qualified = format!("{}::{}", self.table_module_name(&item.module), item.item);
             if self.interface_infos.contains_key(&qualified)
                 || self.class_layouts.contains_key(&qualified)
                 || self.enum_infos.contains_key(&qualified)
@@ -1014,11 +1059,11 @@ impl Codegen {
         }
     }
 
-    /// While compiling a module body, bind the module's own enums and interfaces
-    /// under their unqualified local names (`module::Color` -> `Color`) so a
-    /// function/method that references its own type internally resolves the
-    /// registered info (enum variant tags, interface vtables) instead of silently
-    /// falling back to variant tag 0 / an unboxed value (willow-64gs.1).
+    /// Bind module-local interfaces under their unqualified names for body
+    /// compilation (willow-64gs.1). Enum aliases are installed from the unit's
+    /// checker by `install_enum_aliases`: their identity uses the canonical
+    /// path, which can differ from `mod_name`. Rebinding them here would
+    /// overwrite that identity and lose variant metadata (willow-wvlw).
     fn alias_module_local_types(
         &mut self,
         program: &Program,
@@ -1026,11 +1071,10 @@ impl Codegen {
         aliases: &mut ModuleAliasSnapshot,
     ) {
         for item in &program.items {
-            let name = match item {
-                Item::Enum(e) => &e.name,
-                Item::Interface(i) => &i.name,
-                _ => continue,
+            let Item::Interface(interface) = item else {
+                continue;
             };
+            let name = &interface.name;
             let qualified = format!("{mod_name}::{name}");
             aliases
                 .types
@@ -1443,7 +1487,7 @@ struct FuncGen<'a, 'b> {
     cooperative_leaves: &'a std::collections::HashSet<FunctionId>,
     string_literals: &'a HashMap<String, DataId>,
     class_layouts: &'a TypeMap<Vec<(String, Type)>>,
-    static_storage: &'a HashMap<(String, String), StaticStorageInfo>,
+    static_storage: &'a TypeMap<HashMap<String, StaticStorageInfo>>,
     enum_infos: &'a TypeMap<EnumInfo>,
     class_base: &'a TypeMap<String>,
     /// Maps class name → unique type_id (i64). Since willow-fm7t the id is no
@@ -2004,7 +2048,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 /// can ask the same question before a `FuncGen` exists. One walk, two callers:
 /// the walker must not admit a read the emitter would then resolve differently.
 fn lookup_static_storage_in(
-    static_storage: &HashMap<(String, String), StaticStorageInfo>,
+    static_storage: &TypeMap<HashMap<String, StaticStorageInfo>>,
     class_base: &TypeMap<String>,
     class: &str,
     field: &str,
@@ -2015,7 +2059,10 @@ fn lookup_static_storage_in(
         if !seen.insert(name.clone()) {
             break;
         }
-        if let Some(info) = static_storage.get(&(name.clone(), field.to_string())) {
+        if let Some(info) = static_storage
+            .get(&name)
+            .and_then(|fields| fields.get(field))
+        {
             return Some(info.clone());
         }
         current = class_base.get(&name).cloned();

@@ -1,0 +1,26 @@
+// The leaf module. Every other file in this program reaches it under a
+// different name: `pricing` calls it `cat`, `main` calls it `shop`.
+pub open class Item {
+    pub sku: i64;
+    pub cost: i64;
+
+    pub init(self, sku: i64, cost: i64) {
+        self.sku = sku;
+        self.cost = cost;
+    }
+
+    pub open fn price(self) -> i64 { return self.cost; }
+}
+
+pub interface Priced {
+    fn price(self) -> i64;
+}
+
+pub enum Tier { Basic, Premium }
+
+pub fn item(sku: i64, cost: i64) -> Item { return new Item(sku, cost); }
+
+pub fn tier(cost: i64) -> Tier {
+    if cost > 100 { return Tier::Premium; }
+    return Tier::Basic;
+}

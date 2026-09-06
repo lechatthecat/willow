@@ -134,6 +134,18 @@ pub struct TypeChecker {
     /// used to reject local declarations that collide with an import. The span
     /// is the item-import's location, or `None` for module access names.
     imported_names: HashMap<String, Option<Span>>,
+    /// Access spelling each registered module answers to here, keyed by the
+    /// module's canonical path. A module's own item import names its dependency
+    /// canonically (`import base::Parcel;`), but the dependency's types are
+    /// registered under whatever spelling THIS checker reached it by, so
+    /// exporting a signature that mentions `Parcel` needs the translation
+    /// (willow-sxcp). Modules register in dependency order, so the entry is
+    /// always present by the time an importer is registered.
+    module_access_names: HashMap<String, String>,
+    /// Dependency metadata needed by imported signatures, without a source
+    /// import in this unit. Lookups on inferred types still use the metadata;
+    /// explicitly written type names must pass `check_source_type_name` first.
+    signature_only_modules: HashSet<String>,
     /// Collection type names made available by `std::collections` imports.
     imported_collection_types: HashSet<String>,
     /// Local aliases for collection types imported from `std::collections`.
@@ -337,6 +349,8 @@ impl TypeChecker {
             in_static_initializer: false,
             in_constructor: false,
             imported_names: HashMap::new(),
+            module_access_names: HashMap::new(),
+            signature_only_modules: HashSet::new(),
             imported_collection_types: HashSet::new(),
             imported_collection_aliases: HashMap::new(),
             fully_qualified_collection_types: HashSet::new(),
@@ -409,7 +423,63 @@ impl TypeChecker {
             .any(|(alias, info)| !alias.to_string().contains("::") && info.name == identity)
     }
 
+    /// Check a name as written in source, before normalization turns an alias
+    /// into an identity. Do not apply this to inferred types or hierarchy
+    /// lookups: those must be able to use transitive signature metadata.
+    fn check_source_type_name(&mut self, name: &str, span: Span) -> bool {
+        let Some((module, _)) = name.rsplit_once("::") else {
+            return true;
+        };
+        if !self.signature_only_modules.contains(module)
+            || self.symbols.lookup_module(module).is_some()
+        {
+            return true;
+        }
+        self.push(
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0350,
+                format!("cannot name type `{name}`: module `{module}` is not imported"),
+            )
+            .with_label(Label::primary(
+                span,
+                "type is outside this file's import scope",
+            ))
+            .with_help(format!(
+                "import `{module}` in this file before naming its types"
+            )),
+        );
+        false
+    }
+
+    fn check_source_type_access(&mut self, ty: &Type, span: Span) {
+        match ty {
+            Type::Named(name) => {
+                self.check_source_type_name(name, span);
+            }
+            Type::Generic(name, args) => {
+                self.check_source_type_name(name, span);
+                for arg in args {
+                    self.check_source_type_access(arg, span);
+                }
+            }
+            Type::Array(element) => self.check_source_type_access(element, span),
+            Type::Fn(params, ret) | Type::Closure(params, ret) => {
+                for param in params {
+                    self.check_source_type_access(param, span);
+                }
+                self.check_source_type_access(ret, span);
+            }
+            _ => {}
+        }
+    }
+
     fn normalize_type(&mut self, ty: &Type, span: Span) -> Type {
+        if let Type::Named(name) | Type::Generic(name, _) = ty
+            && !self.check_source_type_name(name, span)
+        {
+            return Type::Void;
+        }
         let normalized = self.normalize_type_inner(ty, span);
         // A failed normalization answers `Void` after reporting (a malformed
         // builtin generic); recording that would hand lowering a type the
@@ -1116,6 +1186,23 @@ impl TypeChecker {
                 && builtin_types::binary_args(actual, B::Map)
                     .is_some_and(|(key, value)| *key == Type::Void && *value == Type::Void))
             || self.is_subtype(actual, expected)
+            || self.same_interface(expected, actual)
+    }
+
+    /// Two spellings of ONE interface: `Describable`, bound bare by an item
+    /// import, against the `proto::Describable` a module that imported it the
+    /// same way now writes in its public signature (willow-sxcp). An interface
+    /// is registered under the access spelling of whichever unit brought it in,
+    /// so only its registered name is an identity both units share -- the
+    /// reasoning `class_extends` already applies to classes (willow-2egr).
+    fn same_interface(&self, expected: &Type, actual: &Type) -> bool {
+        let named = |ty: &Type| match ty {
+            Type::Named(name) | Type::Generic(name, _) => self.symbols.lookup_interface(name),
+            _ => None,
+        };
+        named(expected).is_some()
+            && named(actual).is_some()
+            && self.canonical_interface_type(expected) == self.canonical_interface_type(actual)
     }
 
     /// Allow `GenericEnum<Void, ...>` to match `GenericEnum<T, ...>` when
@@ -1274,18 +1361,38 @@ fn param_infos_from_decl(params: &[Param], module_prefix: Option<&str>) -> Vec<P
         .collect()
 }
 
+/// Build the [`ClassInfo`] a MODULE exports for one of its classes.
+///
+/// `qualify` turns a type as the module wrote it into the name that type
+/// answers to in the checker doing the registering: a module-local name gets
+/// the module's spelling, and a name the module reached through an item import
+/// of its own gets the key the DECLARING module's type is registered under
+/// (willow-sxcp). It replaces a plain `module_prefix`, which prefixed every
+/// bare name blindly and so exported `mid::Parcel` — a class no unit declares —
+/// for a base, field, or parameter that came from `import base::Parcel;`.
 fn class_info_from_decl(
     class: &ClassDecl,
     registered_name: &str,
-    module_prefix: Option<&str>,
+    qualify: &dyn Fn(&Type) -> Type,
 ) -> ClassInfo {
+    let qualify_params = |params: &[Param]| -> Vec<ParamInfo> {
+        params
+            .iter()
+            .map(|param| ParamInfo {
+                ty: qualify(&param.ty),
+                mode: param.mode.clone(),
+                span: param.span,
+                type_span: param.type_span,
+            })
+            .collect()
+    };
     let mut fields = HashMap::new();
     let mut methods = HashMap::new();
     let mut static_props = HashMap::new();
     let mut instance_field_order: Vec<(String, Type)> = Vec::new();
 
     for (decl_index, field) in class.fields.iter().enumerate() {
-        let ty = qualify_type_for_module(&field.ty, module_prefix);
+        let ty = qualify(&field.ty);
         if field.is_static {
             static_props.insert(
                 field.name.clone(),
@@ -1312,13 +1419,9 @@ fn class_info_from_decl(
         }
     }
     let constructor = class.constructors.first().map(|ctor| {
-        let params = ctor
-            .params
-            .iter()
-            .map(|p| qualify_type_for_module(&p.ty, module_prefix))
-            .collect();
+        let params = ctor.params.iter().map(|p| qualify(&p.ty)).collect();
         crate::semantic::symbols::ConstructorInfo {
-            param_infos: param_infos_from_decl(&ctor.params, module_prefix),
+            param_infos: qualify_params(&ctor.params),
             params,
             public: ctor.public,
             protected: ctor.protected,
@@ -1329,17 +1432,17 @@ fn class_info_from_decl(
         let params = method
             .params
             .iter()
-            .map(|param| qualify_type_for_module(&param.ty, module_prefix))
+            .map(|param| qualify(&param.ty))
             .collect();
         methods.insert(
             method.name.clone(),
             MethodInfo {
-                param_infos: param_infos_from_decl(&method.params, module_prefix),
+                param_infos: qualify_params(&method.params),
                 params,
 
                 is_static: method.is_static,
                 is_async: method.is_async,
-                return_type: qualify_type_for_module(&method.return_type, module_prefix),
+                return_type: qualify(&method.return_type),
                 public: method.public,
                 protected: method.protected,
                 is_open: method.is_open,
@@ -1353,15 +1456,23 @@ fn class_info_from_decl(
         name: registered_name.to_string(),
         public: class.public,
         is_open: class.is_open,
-        base_class: class
-            .base_class
-            .as_ref()
-            .map(|base| qualified_type_path_name(base, module_prefix)),
-        implements: class
-            .implements
-            .iter()
-            .map(|iface| qualify_type_for_module(iface, module_prefix))
-            .collect(),
+        base_class: class.base_class.as_ref().map(|base| {
+            // Both spellings of a base go through `qualify`. A bare one for the
+            // same reason a field type does: `extends Parcel` under
+            // `import base::Parcel;` names the base module's class, not one of
+            // this module's. A QUALIFIED one because the module wrote it in its
+            // own spelling of that module -- `extends biz::Amount` -- which the
+            // checker may have registered under another (willow-uvlp).
+            let written = match base {
+                TypePath::Local(name) => name.clone(),
+                TypePath::Qualified(parts) => parts.join("::"),
+            };
+            match qualify(&Type::Named(written)) {
+                Type::Named(qualified) => qualified,
+                other => type_name(&other),
+            }
+        }),
+        implements: class.implements.iter().map(&qualify).collect(),
         declaration_span: class.span,
         fields,
         methods,

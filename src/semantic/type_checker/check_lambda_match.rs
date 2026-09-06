@@ -638,6 +638,22 @@ impl TypeChecker {
             // Reinterpret `Ok(v)` / `Closed` as enum-variant patterns when the
             // scrutinee is an enum, and record the reinterpretation for the
             // backend (willow-60o.1). Everything below uses `pattern`.
+            match &arm.pattern {
+                Pattern::EnumVariant {
+                    enum_name, span, ..
+                }
+                | Pattern::EnumVariantTuple {
+                    enum_name, span, ..
+                } => {
+                    self.check_source_type_name(enum_name, *span);
+                }
+                Pattern::ClassDowncast {
+                    class_name, span, ..
+                } => {
+                    self.check_source_type_name(class_name, *span);
+                }
+                _ => {}
+            }
             let reinterpreted = self.normalize_match_pattern(&arm.pattern, &scrutinee_ty);
             if let Some(p) = &reinterpreted {
                 self.pattern_resolutions.insert(arm.pattern.id(), p.clone());

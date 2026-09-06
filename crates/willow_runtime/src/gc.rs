@@ -3457,7 +3457,10 @@ mod tests {
             first.counters.allocation_bytes
         );
         willow_gc_unregister_mutator();
-        drop(tls);
+        // `GcTlabState` has no `Drop` hook, so letting the state die can merge
+        // nothing: the deltas above are in the totals only because
+        // `willow_gc_unregister_mutator` merged them, and the snapshot below
+        // stays put no matter how long the state lives.
         assert_eq!(
             crate::gc_telemetry::snapshot().counters.allocation_bytes,
             first.counters.allocation_bytes

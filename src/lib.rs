@@ -538,16 +538,13 @@ fn typecheck_phase(
             &m.path.to_string_lossy(),
             &m.program,
         );
-        if item_imports.iter().any(|item| {
-            item.canonical_module == m.canonical_path && item.canonical_module != m.name
-        }) {
-            checker.register_module_with_id(
-                m.id,
-                &m.canonical_path,
-                &m.canonical_path,
-                &m.path.to_string_lossy(),
-                &m.program,
-            );
+        // The graph name is the FIRST importer's spelling, which is another
+        // file's whenever a module got here before the entry did. The entry's
+        // own spelling has to answer too, and to the same registrations: a
+        // second registration under it would make a second class out of every
+        // one the module declares (willow-uvlp).
+        for spelling in entry_module_spellings(program, item_imports, m) {
+            checker.alias_module_spelling(m.id, &spelling, &m.name, &m.program);
         }
     }
     for item in item_imports {
@@ -660,17 +657,71 @@ fn typecheck_modules(
     Ok((out, checked))
 }
 
+/// Every spelling the ENTRY file writes for `module`.
+///
+/// A whole-module import contributes its alias, or the last segment of its
+/// path; an item import (`import sales::Amount;`) contributes the module's
+/// canonical path, which is what the item lookup resolves against. The graph
+/// name is not excluded here -- `alias_module_spelling` ignores it.
+fn entry_module_spellings(
+    program: &parser::ast::Program,
+    item_imports: &[module::resolver::ItemImport],
+    module: &module::ResolvedModule,
+) -> Vec<String> {
+    let mut spellings: Vec<String> = Vec::new();
+    let push = |spelling: String, out: &mut Vec<String>| {
+        if !out.contains(&spelling) {
+            out.push(spelling);
+        }
+    };
+    for import in &program.imports {
+        if import.path != module.canonical_path {
+            continue;
+        }
+        let access = import.alias.clone().unwrap_or_else(|| {
+            import
+                .path
+                .rsplit("::")
+                .next()
+                .unwrap_or(import.path.as_str())
+                .to_string()
+        });
+        push(access, &mut spellings);
+    }
+    if item_imports
+        .iter()
+        .any(|item| item.canonical_module == module.canonical_path)
+    {
+        push(module.canonical_path.clone(), &mut spellings);
+    }
+    spellings
+}
+
 /// Bring the modules `program` itself imports into `checker`'s scope.
 ///
 /// The entry file registers every module in the graph, including ones it
 /// reaches only transitively. A module gets no such latitude: it sees exactly
 /// what its own `import` lines name, under the name it gave them, because that
 /// is what the backend will resolve when it compiles this body.
+///
+/// What an imported module's public signature NAMES is another matter: `mid`
+/// may export `Crate extends Parcel` with `Parcel` declared in `base`, and a
+/// base class that resolves to nothing takes every inherited member with it
+/// (willow-sxcp). So the dependency closure is registered too, but by types
+/// only -- see `register_module_type_signatures`. Registration follows graph
+/// order, which is dependency order, because a module's exported signature is
+/// qualified against the spellings its own dependencies already answer to.
 fn register_module_imports(
     checker: &mut semantic::TypeChecker,
     program: &parser::ast::Program,
     modules: &[module::ResolvedModule],
 ) {
+    // `(canonical path, access spelling)` for each module this program imports.
+    // A module can appear twice under two spellings -- `import base as b;` next
+    // to `import base::Parcel;` -- and then it is registered under both, since
+    // the item lookup resolves against the canonical one.
+    let mut imported: Vec<(&str, &str)> = Vec::new();
+    let mut item_imports: Vec<(&str, &str, &str, diagnostics::Span)> = Vec::new();
     for import in &program.imports {
         let path = import.path.as_str();
         // Whole module: `import worker;`, `import a::b as c;`.
@@ -679,14 +730,7 @@ fn register_module_imports(
                 .alias
                 .as_deref()
                 .unwrap_or_else(|| path.rsplit("::").next().unwrap_or(path));
-            let dep_path = dep.path.to_string_lossy();
-            checker.register_module_with_id(
-                dep.id,
-                access,
-                &dep.canonical_path,
-                &dep_path,
-                &dep.program,
-            );
+            push_unique(&mut imported, (dep.canonical_path.as_str(), access));
             continue;
         }
         // Single item: `import math::add;`, `import math::add as plus;`. The
@@ -699,17 +743,82 @@ fn register_module_imports(
         let Some(dep) = modules.iter().find(|d| d.canonical_path == module_path) else {
             continue;
         };
+        push_unique(&mut imported, (dep.canonical_path.as_str(), module_path));
+        let local = import.alias.as_deref().unwrap_or(item);
+        item_imports.push((local, module_path, item, import.span));
+    }
+
+    let needed = dependency_closure(imported.iter().map(|(path, _)| *path), modules);
+    for dep in modules {
+        let canonical = dep.canonical_path.as_str();
+        if !needed.contains(canonical) {
+            continue;
+        }
         let dep_path = dep.path.to_string_lossy();
+        let mut spellings = imported
+            .iter()
+            .filter(|(path, _)| *path == canonical)
+            .peekable();
+        if spellings.peek().is_none() {
+            checker.register_module_type_signatures(canonical, &dep_path, &dep.program);
+            continue;
+        }
+        // The first spelling registers the module; the rest are bound to
+        // those same registrations, so one class this unit can write two names
+        // for stays one type (willow-uvlp).
+        let mut spellings = spellings.map(|(_, access)| *access);
+        let Some(registered) = spellings.next() else {
+            continue;
+        };
         checker.register_module_with_id(
             dep.id,
-            module_path,
+            registered,
             &dep.canonical_path,
             &dep_path,
             &dep.program,
         );
-        let local = import.alias.as_deref().unwrap_or(item);
-        checker.register_item_import(local, module_path, item, import.span);
+        for access in spellings {
+            checker.alias_module_spelling(dep.id, access, registered, &dep.program);
+        }
     }
+
+    for (local, module_path, item, span) in item_imports {
+        checker.register_item_import(local, module_path, item, span);
+    }
+}
+
+fn push_unique<'a>(out: &mut Vec<(&'a str, &'a str)>, entry: (&'a str, &'a str)) {
+    if !out.contains(&entry) {
+        out.push(entry);
+    }
+}
+
+/// The canonical paths of `roots` plus everything they import, transitively.
+fn dependency_closure<'a>(
+    roots: impl Iterator<Item = &'a str>,
+    modules: &'a [module::ResolvedModule],
+) -> std::collections::HashSet<&'a str> {
+    let mut closure: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut pending: Vec<&str> = roots.collect();
+    while let Some(path) = pending.pop() {
+        if !closure.insert(path) {
+            continue;
+        }
+        let Some(dep) = modules.iter().find(|d| d.canonical_path == path) else {
+            continue;
+        };
+        for import in &dep.program.imports {
+            let sub = import.path.as_str();
+            if let Some(found) = modules.iter().find(|d| d.canonical_path == sub) {
+                pending.push(found.canonical_path.as_str());
+            } else if let Some((module_path, _)) = sub.rsplit_once("::")
+                && let Some(found) = modules.iter().find(|d| d.canonical_path == module_path)
+            {
+                pending.push(found.canonical_path.as_str());
+            }
+        }
+    }
+    closure
 }
 
 /// Index non-preemptible methods visible through one module's own imports.

@@ -1,0 +1,27 @@
+// `pricing` is imported first, so `catalog` is already in the build under the
+// name that module gave it. This file calls the same module `shop`, and one
+// class reached by two spellings has to stay one class.
+import pricing;
+import catalog as shop;
+
+class Flat implements shop::Priced {
+    pub fn price(self) -> i64 { return 5; }
+}
+
+fn main() {
+    let plain: shop::Item = shop::item(1, 120);
+    println(plain.price());
+
+    let bundled = pricing::bundle(2, 30);
+    let as_item: shop::Item = bundled;
+    println(as_item.price());
+
+    println(pricing::discounted(plain).cost);
+    println(pricing::charge(bundled));
+    println(pricing::charge(new Flat()));
+
+    match pricing::tier_of(plain) {
+        shop::Tier::Premium => println("premium"),
+        shop::Tier::Basic => println("basic"),
+    }
+}

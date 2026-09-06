@@ -1,0 +1,28 @@
+// Every static property of a module class lives in one global slot, declared
+// under the class's registered name (`counting::Counter`). A module body can
+// only spell its own class bare, so `Counter::made` here and
+// `counting::Counter::made` in the entry program must reach the same slot.
+pub class Counter {
+    pub static mut made: i64 = 0;
+    pub static limit: i64 = seed() * 2;
+
+    pub static fn remaining() -> i64 {
+        return Counter::limit - Counter::made;
+    }
+
+    pub fn tick(self) -> i64 {
+        Self::made = Self::made + 1;
+        return Self::made;
+    }
+}
+
+// An initializer is an expression of the module that wrote it: `seed` above is
+// this file's function, and it is called before `main` runs.
+pub fn seed() -> i64 { return 5; }
+
+pub fn bump(n: i64) -> i64 {
+    Counter::made = Counter::made + n;
+    return Counter::made;
+}
+
+pub fn made() -> i64 { return Counter::made; }

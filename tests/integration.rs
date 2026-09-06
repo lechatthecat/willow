@@ -96,12 +96,18 @@ mod lir_scope_roots;
 #[path = "integration/module_lambdas.rs"]
 mod module_lambdas;
 
+#[path = "integration/module_alias_identity.rs"]
+mod module_alias_identity;
 #[path = "integration/module_class_visibility.rs"]
 mod module_class_visibility;
+#[path = "integration/module_cross_module_types.rs"]
+mod module_cross_module_types;
 #[path = "integration/module_import_scope.rs"]
 mod module_import_scope;
 #[path = "integration/module_item_imports.rs"]
 mod module_item_imports;
+#[path = "integration/module_static_properties.rs"]
+mod module_static_properties;
 
 #[path = "integration/module_call_frames.rs"]
 mod module_call_frames;

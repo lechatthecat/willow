@@ -174,6 +174,7 @@ macro_rules! lir_type_ctx {
             class_base: &$me.class_base,
             class_type_ids: &$me.class_type_ids,
             is_interface: &|n| $me.interface_infos.contains_key(n),
+            iface_identity: &|n| $me.interface_infos.get(n).map(|i| i.name.clone()),
             can_box: &|class, iface| {
                 super::emit::resolve_vtable_id(&$me.vtable_ids, &$me.interface_infos, class, iface)
                     .is_some()
@@ -392,6 +393,26 @@ impl Codegen {
         let mut local_signature_type_names = local_type_names.clone();
         local_signature_type_names.extend(local_class_names.iter().cloned());
 
+        // Every type a module class mentions is qualified the same way this
+        // unit's FUNCTION signatures are (below): module-local classes and
+        // interfaces under the unit's own spelling, module-local enums under the
+        // build-wide canonical path. A name that is neither -- a type the module
+        // itself imported (`import proto::Grade;`), or a builtin -- is left
+        // exactly as written, so it still resolves to the one table that answers
+        // to it. Prefixing wholesale renamed such a type into `lib::Grade`, which
+        // nothing declares (willow-sxcp).
+        // ...and a name that is neither is resolved through the aliases this
+        // unit's own item imports installed above, so what leaves the module is
+        // the identity the build's tables answer to (`Sized` -> `proto::Sized`).
+        // A bare class name a later unit can still find by scanning modules
+        // (`resolve_class_key`), but an interface has no such scan: left bare in
+        // an exported signature, it made every box site in a consumer that did
+        // not itself import the interface fall out of the walker's subset.
+        let qualify_class_type = |ty: &Type| -> Type {
+            let ty = qualify_module_local_type(ty, mod_name, &local_signature_type_names);
+            let ty = qualify_module_local_type(&ty, canonical_path, &local_enum_names);
+            self.canonical_declared_type(&ty)
+        };
         let module_classes: Vec<(String, ClassDecl)> = program
             .items
             .iter()
@@ -400,24 +421,16 @@ impl Codegen {
                     return None;
                 };
                 let local_name = c.name.clone();
-                let mut qualified = qualify_module_class_decl(c, mod_name);
-                // `implements` names are resolved against this module's own
-                // INTERFACE declarations rather than qualified wholesale: a
-                // module-local one (generic included -- `implements Box<i64>` ->
-                // `boxmod2::Box<i64>`) is qualified so its vtable is declared and
-                // keyed by the same name the entry boxes against (willow-1js.5),
-                // while an interface this module merely IMPORTED keeps the
-                // spelling it was written with. `qualify_module_class_decl`
-                // prefixes every bare name, which renamed `import
-                // proto::Describable;` into `impls::Describable` -- a type
-                // nothing declares -- so the vtable lookup below silently found
-                // no interface and the class got NO vtable, leaving every later
-                // box site to fall back to the raw object (willow-0g8j.3).
-                qualified.implements = c
-                    .implements
-                    .iter()
-                    .map(|t| qualify_module_local_type(t, mod_name, &local_type_names))
-                    .collect();
+                // A module-local `implements` name (generic included --
+                // `implements Box<i64>` -> `boxmod2::Box<i64>`) is qualified so
+                // its vtable is declared and keyed by the same name the entry
+                // boxes against (willow-1js.5), while an interface this module
+                // merely IMPORTED keeps the spelling it was written with:
+                // renaming `import proto::Describable;` into `impls::Describable`
+                // made the vtable lookup below silently find no interface, so the
+                // class got NO vtable and every later box site fell back to the
+                // raw object (willow-0g8j.3).
+                let mut qualified = qualify_module_class_decl(c, mod_name, &qualify_class_type);
                 // Qualify a module-local base class so `name()` yields the
                 // module-qualified base (TypePath::name() returns only the last
                 // segment, so the qualified name must live in a single Local
@@ -451,7 +464,7 @@ impl Codegen {
             self.declare_class_methods(c)?;
             // Static-property storage for imported modules (replayed by
             // `__willow_static_init`, compiled in the entry's compile_program).
-            self.declare_static_storage_for_class(&c.name, c)?;
+            self.declare_static_storage_for_class(&c.name, c, Some(&module_prefix))?;
         }
         self.validate_gc_ref_mask_layouts()?;
 
@@ -464,8 +477,16 @@ impl Codegen {
                     let mangled = module_item_symbol(&module_prefix, &f.name);
                     let qualified =
                         qualify_module_fn_signature(f, mod_name, &local_signature_type_names);
-                    let qualified =
+                    let mut qualified =
                         qualify_module_fn_signature(&qualified, canonical_path, &local_enum_names);
+                    // Same translation the classes above get: a type this module
+                    // reached through its own item import is exported under the
+                    // identity the tables hold, not the bare local spelling
+                    // (willow-sxcp).
+                    for param in &mut qualified.params {
+                        param.ty = self.canonical_declared_type(&param.ty);
+                    }
+                    qualified.return_type = self.canonical_declared_type(&qualified.return_type);
                     self.declare_function_named(&mangled, &qualified)?;
                 }
                 Item::Enum(_) | Item::Class(_) | Item::Interface(_) => {}
@@ -668,6 +689,8 @@ impl Codegen {
             for (_, c) in &unit.module_classes {
                 self.compile_class_methods(c)?;
             }
+            // Inside the alias scope, for the reason the bodies are.
+            self.compile_unit_static_init(unit)?;
             Ok(())
         })();
 
@@ -748,7 +771,7 @@ impl Codegen {
             match item {
                 Item::Class(c) => {
                     self.declare_class_methods(c)?;
-                    self.declare_static_storage_for_class(&c.name, c)?;
+                    self.declare_static_storage_for_class(&c.name, c, None)?;
                 }
                 Item::Enum(_) => {} // enum infos are registered via register_enum_info before compile
                 _ => {}
@@ -1458,6 +1481,7 @@ impl Codegen {
         &mut self,
         class_key: &str,
         c: &ClassDecl,
+        owner: Option<&str>,
     ) -> Result<()> {
         for field in &c.fields {
             if !field.is_static {
@@ -1466,8 +1490,11 @@ impl Codegen {
             let Some(init) = &field.initializer else {
                 continue;
             };
-            let key = (class_key.to_string(), field.name.clone());
-            if self.static_storage.contains_key(&key) {
+            if self
+                .static_storage
+                .get(class_key)
+                .is_some_and(|fields| fields.contains_key(&field.name))
+            {
                 continue;
             }
             let sym = static_property_symbol(class_key, &field.name);
@@ -1487,18 +1514,22 @@ impl Codegen {
             data.define_zeroinit(8);
             data.set_align(8);
             self.module.define_data(data_id, &data)?;
-            self.static_storage.insert(
-                key,
-                StaticStorageInfo {
-                    data_id,
-                    ty: field.ty.clone(),
-                },
-            );
+            self.static_storage
+                .entry(class_key.to_string())
+                .or_insert(HashMap::new())
+                .insert(
+                    field.name.clone(),
+                    StaticStorageInfo {
+                        data_id,
+                        ty: field.ty.clone(),
+                    },
+                );
             self.static_init_order.push(StaticInitItem {
                 class_key: class_key.to_string(),
                 field: field.name.clone(),
                 init: init.clone(),
                 ty: field.ty.clone(),
+                owner: owner.map(str::to_string),
             });
         }
         Ok(())
@@ -1509,9 +1540,56 @@ impl Codegen {
     /// GC-managed slots as permanent roots (willow-qsqf §11/§12). Called once at
     /// the start of `willow_user_main`.
     pub(super) fn compile_static_init(&mut self) -> Result<()> {
-        let items = self.static_init_order.clone();
+        // Every module's own initializers first, in declaration (dependency)
+        // order, then the entry program's -- the order the properties were
+        // declared in, which is the order the spec replays them in.
+        let calls = self.module_static_inits.clone();
+        let items: Vec<StaticInitItem> = self
+            .static_init_order
+            .iter()
+            .filter(|item| item.owner.is_none())
+            .cloned()
+            .collect();
         let func_id = self.func_ids[STATIC_INIT_SYMBOL];
+        self.emit_static_init_body(func_id, &calls, &items)
+    }
 
+    /// Compile one module's static-property initializers into a private
+    /// function of its own, called from `__willow_static_init` (willow-6xgo).
+    ///
+    /// Emitted from the module's BODY phase, so the expressions are compiled
+    /// under the same aliases the module's functions are: a bare `Slot` is this
+    /// module's `h::Slot`, a bare `seed()` its mangled symbol, and
+    /// `Holder::base` its own storage. Compiled in the entry's phase instead,
+    /// every one of those names resolved to nothing and the property silently
+    /// took a zero.
+    pub(super) fn compile_unit_static_init(&mut self, unit: &DeclaredModule) -> Result<()> {
+        let items: Vec<StaticInitItem> = self
+            .static_init_order
+            .iter()
+            .filter(|item| item.owner.as_deref() == Some(unit.module_prefix.as_str()))
+            .cloned()
+            .collect();
+        if items.is_empty() {
+            return Ok(());
+        }
+        let symbol = module_static_init_symbol(&unit.module_prefix);
+        let sig = self.module.make_signature();
+        let func_id = self
+            .module
+            .declare_function(&symbol, Linkage::Local, &sig)?;
+        self.module_static_inits.push(func_id);
+        self.emit_static_init_body(func_id, &[], &items)
+    }
+
+    /// The shared body of every static-initializer function: call `calls` in
+    /// order, then store each item's value into its slot.
+    fn emit_static_init_body(
+        &mut self,
+        func_id: FuncId,
+        calls: &[FuncId],
+        items: &[StaticInitItem],
+    ) -> Result<()> {
         let mut sig = self.module.make_signature();
         let _ = &mut sig; // no params, no returns
         let mut ctx = self.module.make_context();
@@ -1592,11 +1670,23 @@ impl Codegen {
         };
 
         let ptr_ty = fg.module.target_config().pointer_type();
-        for item in &items {
+        for callee in calls {
+            let callee_ref = fg.module.declare_func_in_func(*callee, fg.builder.func);
+            fg.builder.ins().call(callee_ref, &[]);
+        }
+        for item in items {
             // Initializers reference other statics by explicit class name
             // (`C::a`); `Self::` is not resolved here in the MVP.
             let val = fg.emit_expr_coerced(&item.init, &item.ty);
-            let info = &fg.static_storage[&(item.class_key.clone(), item.field.clone())];
+            // The declaration identity, not whatever a unit's aliases say:
+            // this runs once for the whole build, over keys the declaration
+            // phase itself recorded.
+            let info = &fg
+                .static_storage
+                .get_canonical(&item.class_key)
+                .and_then(|fields| fields.get(&item.field))
+                .expect("static property storage was declared")
+                .clone();
             let gv = fg
                 .module
                 .declare_data_in_func(info.data_id, fg.builder.func);
