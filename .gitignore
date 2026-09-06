@@ -15,3 +15,19 @@ CLAUDE.md
 AGENT.md
 AGENTS.md
 .vscode/changelists.json
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+
+# Private keys / certificates
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local logs / traces
+*.log
+*.trace
+*.ndjson
