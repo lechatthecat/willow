@@ -121,6 +121,7 @@ impl Toolchain for HostToolchain {
                 .arg("userenv.lib")
                 .arg("ws2_32.lib")
                 .arg("dbghelp.lib")
+                .arg("psapi.lib")
                 .arg("/defaultlib:msvcrt");
             command
                 .status()
