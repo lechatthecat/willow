@@ -890,8 +890,8 @@ pub(super) fn collection_elem_kind(ty: &Type) -> Option<i64> {
 /// Names with no `type_id` are dropped: a class that has no runtime id is not a
 /// dispatch candidate in the first place.
 pub(super) fn class_base_ids(
-    class_base: &HashMap<String, String>,
-    class_type_ids: &HashMap<String, i64>,
+    class_base: &TypeMap<String>,
+    class_type_ids: &TypeMap<i64>,
 ) -> HashMap<i64, i64> {
     class_base
         .iter()
@@ -1041,13 +1041,13 @@ mod tests {
     /// the subclass is filtered out of its own chain.
     #[test]
     fn dispatch_12_aliased_import_names_collapse_onto_one_id() {
-        let type_ids = HashMap::from([
+        let type_ids = TypeMap::from([
             ("zoo::Animal".to_string(), 1i64),
             ("Animal".to_string(), 1),
             ("zoo::Dog".to_string(), 2),
             ("Dog".to_string(), 2),
         ]);
-        let class_base = HashMap::from([
+        let class_base = TypeMap::from([
             ("zoo::Dog".to_string(), "zoo::Animal".to_string()),
             ("Dog".to_string(), "zoo::Animal".to_string()),
         ]);
@@ -1065,8 +1065,8 @@ mod tests {
     /// a bogus relation.
     #[test]
     fn dispatch_12b_edges_without_ids_are_dropped() {
-        let type_ids = HashMap::from([("Known".to_string(), 1i64)]);
-        let class_base = HashMap::from([
+        let type_ids = TypeMap::from([("Known".to_string(), 1i64)]);
+        let class_base = TypeMap::from([
             ("Known".to_string(), "Vanished".to_string()),
             ("Vanished".to_string(), "Known".to_string()),
         ]);

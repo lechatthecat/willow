@@ -304,9 +304,9 @@ impl ConcurrencyAnalyzer {
                     self.check_expr(&arg.expr);
                 }
             }
-            Expr::FieldAccess(object, _, _) => self.check_expr(object),
+            Expr::FieldAccess(object, _, _, _) => self.check_expr(object),
             Expr::MethodCall(method) => {
-                if matches!(&method.object, Expr::Var(name, _) if name == "self")
+                if matches!(&method.object, Expr::Var(name, _, _) if name == "self")
                     && let Some(class_name) = &self.current_class
                 {
                     self.check_task_sync_helper_call(
@@ -399,7 +399,7 @@ impl ConcurrencyAnalyzer {
                     self.check_block(&case.body);
                 }
             }
-            Expr::Print(arg, _, _) => self.check_expr(arg),
+            Expr::Print(arg, _, _, _) => self.check_expr(arg),
             Expr::Ternary(ternary) => {
                 self.check_expr(&ternary.condition);
                 self.check_expr(&ternary.then_expr);
@@ -432,21 +432,21 @@ impl ConcurrencyAnalyzer {
                     }
                 }
             }
-            Expr::TryPropagate(inner, _) => self.check_expr(inner),
-            Expr::ArrayLiteral(elements, _) => {
+            Expr::TryPropagate(inner, _, _) => self.check_expr(inner),
+            Expr::ArrayLiteral(elements, _, _) => {
                 for el in elements {
                     self.check_expr(el);
                 }
             }
-            Expr::Index(arr, index, _) => {
+            Expr::Index(arr, index, _, _) => {
                 self.check_expr(arr);
                 self.check_expr(index);
             }
-            Expr::Integer(_, _)
-            | Expr::Float(_, _)
-            | Expr::Bool(_, _)
-            | Expr::String(_, _)
-            | Expr::Var(_, _) => {}
+            Expr::Integer(_, _, _)
+            | Expr::Float(_, _, _)
+            | Expr::Bool(_, _, _)
+            | Expr::String(_, _, _)
+            | Expr::Var(_, _, _) => {}
         }
     }
 
@@ -739,7 +739,7 @@ impl AstVisitor for CallCollector {
                 ));
             }
             Expr::MethodCall(call) => {
-                if matches!(&call.object, Expr::Var(name, _) if name == "self") {
+                if matches!(&call.object, Expr::Var(name, _, _) if name == "self") {
                     self.calls.insert(FunctionId::method(
                         TypeId::local("self"),
                         call.method.as_str(),

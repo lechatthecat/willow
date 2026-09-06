@@ -1,5 +1,36 @@
 use crate::diagnostics::Span;
 
+/// Syntax identity, independent of source coordinates. Cloning a checked node
+/// preserves its identity; newly constructed syntax always receives a fresh ID,
+/// so a rebuilt or synthesized node never inherits another node's checker entry
+/// the way a shared `Span` used to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExprId(u64);
+
+/// The same identity for patterns; `Pattern::id` is what the checker's binding
+/// and match tables are keyed by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PatternId(u64);
+
+impl std::fmt::Display for ExprId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl ExprId {
+    pub fn fresh() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+impl PatternId {
+    pub fn fresh() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 /// `Eq`/`Hash` so a written type can key the checker's normalization table
 /// (willow-0g8j.3): HIR lowering re-spells an AST annotation with what the
 /// checker made of it.
@@ -561,16 +592,16 @@ pub struct ExprStmt {
 
 #[derive(Debug, Clone)]
 pub enum Expr {
-    Integer(i64, Span),
-    Float(f64, Span),
-    Bool(bool, Span),
-    String(String, Span),
-    Var(String, Span),
+    Integer(i64, Span, ExprId),
+    Float(f64, Span, ExprId),
+    Bool(bool, Span, ExprId),
+    String(String, Span, ExprId),
+    Var(String, Span, ExprId),
     Binary(Box<BinaryExpr>),
     Unary(Box<UnaryExpr>),
     Call(Box<CallExpr>),
     /// `obj.field`
-    FieldAccess(Box<Expr>, String, Span),
+    FieldAccess(Box<Expr>, String, Span, ExprId),
     /// `obj.method(args)`
     MethodCall(Box<MethodCallExpr>),
     /// `ClassName::method(args)` — static/constructor call
@@ -588,7 +619,7 @@ pub enum Expr {
     Await(Box<AwaitExpr>),
     /// `select { ... }` placeholder for future async select lowering
     Select(SelectExpr),
-    Print(Box<Expr>, bool, Span), // bool = newline
+    Print(Box<Expr>, bool, Span, ExprId), // bool = newline
     Ternary(Box<TernaryExpr>),
     /// `start..end` — half-open i64 range for `for` loops
     Range(Box<RangeExpr>),
@@ -598,15 +629,16 @@ pub enum Expr {
     Lambda(Box<LambdaExpr>),
     Match(Box<MatchExpr>),
     /// `expr?` — propagate Result::Err early (the ? operator)
-    TryPropagate(Box<Expr>, Span),
+    TryPropagate(Box<Expr>, Span, ExprId),
     /// `[a, b, c]` — array literal
-    ArrayLiteral(Vec<Expr>, Span),
+    ArrayLiteral(Vec<Expr>, Span, ExprId),
     /// `arr[index]` — array index access
-    Index(Box<Expr>, Box<Expr>, Span),
+    Index(Box<Expr>, Box<Expr>, Span, ExprId),
 }
 
 #[derive(Debug, Clone)]
 pub struct LambdaExpr {
+    pub id: ExprId,
     pub params: Vec<LambdaParam>,
     pub return_type: Option<Type>,
     pub body: LambdaBody,
@@ -628,6 +660,7 @@ pub enum LambdaBody {
 
 #[derive(Debug, Clone)]
 pub struct TernaryExpr {
+    pub id: ExprId,
     pub condition: Expr,
     pub then_expr: Expr,
     pub else_expr: Expr,
@@ -636,6 +669,7 @@ pub struct TernaryExpr {
 
 #[derive(Debug, Clone)]
 pub struct RangeExpr {
+    pub id: ExprId,
     pub start: Expr,
     pub end: Expr,
     pub span: Span,
@@ -645,6 +679,7 @@ pub struct RangeExpr {
 /// module-qualified (e.g. `geom::Config`).
 #[derive(Debug, Clone)]
 pub struct StaticFieldExpr {
+    pub id: ExprId,
     pub class: String,
     pub field: String,
     pub span: Span,
@@ -653,6 +688,7 @@ pub struct StaticFieldExpr {
 /// `new ClassName(args...)` object construction (willow-scq2).
 #[derive(Debug, Clone)]
 pub struct NewExpr {
+    pub id: ExprId,
     pub class_name: String,
     pub type_args: Vec<Type>,
     pub args: Vec<CallArg>,
@@ -660,15 +696,44 @@ pub struct NewExpr {
 }
 
 impl Expr {
+    pub fn id(&self) -> ExprId {
+        match self {
+            Self::Integer(_, _, id)
+            | Self::Float(_, _, id)
+            | Self::Bool(_, _, id)
+            | Self::String(_, _, id)
+            | Self::Var(_, _, id)
+            | Self::TryPropagate(_, _, id)
+            | Self::ArrayLiteral(_, _, id)
+            | Self::FieldAccess(_, _, _, id)
+            | Self::Print(_, _, _, id)
+            | Self::Index(_, _, _, id) => *id,
+            Self::Binary(e) => e.id,
+            Self::Unary(e) => e.id,
+            Self::Call(e) => e.id,
+            Self::MethodCall(e) => e.id,
+            Self::StaticCall(e) => e.id,
+            Self::StaticField(e) => e.id,
+            Self::New(e) => e.id,
+            Self::ObjectLiteral(e) => e.id,
+            Self::Await(e) => e.id,
+            Self::Select(e) => e.id,
+            Self::Ternary(e) => e.id,
+            Self::Range(e) => e.id,
+            Self::Lambda(e) => e.id,
+            Self::Match(e) => e.id,
+        }
+    }
+
     pub fn span(&self) -> Span {
         match self {
-            Expr::Integer(_, s)
-            | Expr::Float(_, s)
-            | Expr::Bool(_, s)
-            | Expr::String(_, s)
-            | Expr::Var(_, s)
-            | Expr::Print(_, _, s) => *s,
-            Expr::FieldAccess(_, _, s) => *s,
+            Expr::Integer(_, s, _)
+            | Expr::Float(_, s, _)
+            | Expr::Bool(_, s, _)
+            | Expr::String(_, s, _)
+            | Expr::Var(_, s, _)
+            | Expr::Print(_, _, s, _) => *s,
+            Expr::FieldAccess(_, _, s, _) => *s,
             Expr::Binary(b) => b.span,
             Expr::Unary(u) => u.span,
             Expr::Call(c) => c.span,
@@ -683,15 +748,16 @@ impl Expr {
             Expr::Range(r) => r.span,
             Expr::Lambda(l) => l.span,
             Expr::Match(m) => m.span,
-            Expr::TryPropagate(_, s) => *s,
-            Expr::ArrayLiteral(_, s) => *s,
-            Expr::Index(_, _, s) => *s,
+            Expr::TryPropagate(_, s, _) => *s,
+            Expr::ArrayLiteral(_, s, _) => *s,
+            Expr::Index(_, _, s, _) => *s,
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct BinaryExpr {
+    pub id: ExprId,
     pub op: BinOp,
     pub lhs: Expr,
     pub rhs: Expr,
@@ -700,6 +766,7 @@ pub struct BinaryExpr {
 
 #[derive(Debug, Clone)]
 pub struct UnaryExpr {
+    pub id: ExprId,
     pub op: UnaryOp,
     pub expr: Expr,
     pub span: Span,
@@ -707,6 +774,7 @@ pub struct UnaryExpr {
 
 #[derive(Debug, Clone)]
 pub struct CallExpr {
+    pub id: ExprId,
     pub callee: String,
     pub args: Vec<CallArg>,
     pub span: Span,
@@ -714,6 +782,7 @@ pub struct CallExpr {
 
 #[derive(Debug, Clone)]
 pub struct MethodCallExpr {
+    pub id: ExprId,
     pub object: Expr,
     pub method: String,
     pub args: Vec<CallArg>,
@@ -722,6 +791,7 @@ pub struct MethodCallExpr {
 
 #[derive(Debug, Clone)]
 pub struct StaticCallExpr {
+    pub id: ExprId,
     pub class: String,
     pub type_args: Vec<Type>,
     pub method: String,
@@ -731,6 +801,7 @@ pub struct StaticCallExpr {
 
 #[derive(Debug, Clone)]
 pub struct ObjectLiteralExpr {
+    pub id: ExprId,
     pub class: String,
     pub fields: Vec<ObjectLiteralField>,
     pub span: Span,
@@ -745,12 +816,14 @@ pub struct ObjectLiteralField {
 
 #[derive(Debug, Clone)]
 pub struct AwaitExpr {
+    pub id: ExprId,
     pub expr: Expr,
     pub span: Span,
 }
 
 #[derive(Debug, Clone)]
 pub struct SelectExpr {
+    pub id: ExprId,
     pub cases: Vec<SelectCase>,
     pub span: Span,
 }
@@ -802,18 +875,20 @@ pub struct EnumVariant {
 
 #[derive(Debug, Clone)]
 pub enum Pattern {
-    Wildcard(Span),
+    Wildcard(Span, PatternId),
     Binding {
         name: String,
         span: Span,
+        id: PatternId,
     },
-    LiteralBool(bool, Span),
-    LiteralInt(i64, Span),
+    LiteralBool(bool, Span, PatternId),
+    LiteralInt(i64, Span, PatternId),
     /// `Color::Red` — fieldless enum variant
     EnumVariant {
         enum_name: String,
         variant: String,
         span: Span,
+        id: PatternId,
     },
     /// `Shape::Circle(r)` or `Shape::Rectangle(w, h)` — associated value enum variant
     EnumVariantTuple {
@@ -821,6 +896,7 @@ pub enum Pattern {
         variant: String,
         bindings: Vec<String>,
         span: Span,
+        id: PatternId,
     },
     /// `Dog(d)` — downcast an interface-typed scrutinee to the concrete class
     /// `Dog`, binding `d: Dog` in the arm (willow-1js.4). `binding` may be `_`
@@ -829,16 +905,29 @@ pub enum Pattern {
         class_name: String,
         binding: String,
         span: Span,
+        id: PatternId,
     },
 }
 
 impl Pattern {
+    pub fn id(&self) -> PatternId {
+        match self {
+            Self::Wildcard(_, id)
+            | Self::LiteralBool(_, _, id)
+            | Self::LiteralInt(_, _, id)
+            | Self::Binding { id, .. }
+            | Self::EnumVariant { id, .. }
+            | Self::EnumVariantTuple { id, .. }
+            | Self::ClassDowncast { id, .. } => *id,
+        }
+    }
+
     pub fn span(&self) -> Span {
         match self {
-            Pattern::Wildcard(s) => *s,
+            Pattern::Wildcard(s, _) => *s,
             Pattern::Binding { span, .. } => *span,
-            Pattern::LiteralBool(_, s) => *s,
-            Pattern::LiteralInt(_, s) => *s,
+            Pattern::LiteralBool(_, s, _) => *s,
+            Pattern::LiteralInt(_, s, _) => *s,
             Pattern::EnumVariant { span, .. } => *span,
             Pattern::EnumVariantTuple { span, .. } => *span,
             Pattern::ClassDowncast { span, .. } => *span,
@@ -861,6 +950,7 @@ pub struct MatchArm {
 
 #[derive(Debug, Clone)]
 pub struct MatchExpr {
+    pub id: ExprId,
     pub scrutinee: Box<Expr>,
     pub arms: Vec<MatchArm>,
     pub span: Span,

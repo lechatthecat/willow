@@ -21,8 +21,8 @@ use super::*;
 /// a class → interface coercion that [`FuncGen::emit_interface_box`] can
 /// actually build, and the two must agree on every aliasing fallback below.
 pub(super) fn resolve_vtable_id(
-    vtable_ids: &HashMap<(String, String), DataId>,
-    interface_infos: &HashMap<String, InterfaceInfo>,
+    vtable_ids: &VtableMap<DataId>,
+    interface_infos: &TypeMap<InterfaceInfo>,
     class_name: &str,
     interface_name: &str,
 ) -> Option<DataId> {
@@ -162,7 +162,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// (willow-nk3g). Missing element metadata is a compiler invariant violation.
     fn channel_element_of(&self, s: &StaticCallExpr) -> Type {
         self.expr_types
-            .get(&s.span)
+            .get(&s.id)
             .and_then(|ty| builtin_types::unary_arg(ty, B::Channel))
             .filter(|elem| !matches!(elem, Type::Void))
             .or_else(|| s.type_args.first())
@@ -177,7 +177,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if class_name == "Map" && s.method == "new" {
             let ty = self
                 .expr_types
-                .get(&s.span)
+                .get(&s.id)
                 .expect("map constructor requires checked type")
                 .clone();
             let (key, value) = builtin_types::binary_args(&ty, B::Map)
@@ -198,7 +198,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             let result_ty = self
                 .expr_types
-                .get(&s.span)
+                .get(&s.id)
                 .cloned()
                 .unwrap_or_else(|| Type::Named(class_name.clone()));
             if variant.payload_types.is_empty() {

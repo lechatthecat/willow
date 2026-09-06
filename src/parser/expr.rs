@@ -21,6 +21,7 @@ impl Parser {
             start: lhs,
             end: rhs,
             span,
+            id: ExprId::fresh(),
         })))
     }
 
@@ -45,6 +46,7 @@ impl Parser {
             then_expr,
             else_expr,
             span,
+            id: ExprId::fresh(),
         })))
     }
 
@@ -59,6 +61,7 @@ impl Parser {
                 lhs,
                 rhs,
                 span,
+                id: ExprId::fresh(),
             }));
         }
         Ok(lhs)
@@ -75,6 +78,7 @@ impl Parser {
                 lhs,
                 rhs,
                 span,
+                id: ExprId::fresh(),
             }));
         }
         Ok(lhs)
@@ -95,7 +99,13 @@ impl Parser {
             let span = self.current_span();
             self.advance();
             let rhs = self.parse_add()?;
-            lhs = Expr::Binary(Box::new(BinaryExpr { op, lhs, rhs, span }));
+            lhs = Expr::Binary(Box::new(BinaryExpr {
+                op,
+                lhs,
+                rhs,
+                span,
+                id: ExprId::fresh(),
+            }));
         }
         Ok(lhs)
     }
@@ -111,7 +121,13 @@ impl Parser {
             let span = self.current_span();
             self.advance();
             let rhs = self.parse_mul()?;
-            lhs = Expr::Binary(Box::new(BinaryExpr { op, lhs, rhs, span }));
+            lhs = Expr::Binary(Box::new(BinaryExpr {
+                op,
+                lhs,
+                rhs,
+                span,
+                id: ExprId::fresh(),
+            }));
         }
         Ok(lhs)
     }
@@ -128,7 +144,13 @@ impl Parser {
             let span = self.current_span();
             self.advance();
             let rhs = self.parse_unary()?;
-            lhs = Expr::Binary(Box::new(BinaryExpr { op, lhs, rhs, span }));
+            lhs = Expr::Binary(Box::new(BinaryExpr {
+                op,
+                lhs,
+                rhs,
+                span,
+                id: ExprId::fresh(),
+            }));
         }
         Ok(lhs)
     }
@@ -150,6 +172,7 @@ impl Parser {
                     op: UnaryOp::Neg,
                     expr,
                     span,
+                    id: ExprId::fresh(),
                 })))
             }
             TokenKind::Bang => {
@@ -160,6 +183,7 @@ impl Parser {
                     op: UnaryOp::Not,
                     expr,
                     span,
+                    id: ExprId::fresh(),
                 })))
             }
             _ => self.parse_pow(),
@@ -187,6 +211,7 @@ impl Parser {
             lhs,
             rhs,
             span,
+            id: ExprId::fresh(),
         })))
     }
 
@@ -196,7 +221,11 @@ impl Parser {
             let span = self.current_span();
             self.advance();
             let expr = self.parse_await()?;
-            return Ok(Expr::Await(Box::new(AwaitExpr { expr, span })));
+            return Ok(Expr::Await(Box::new(AwaitExpr {
+                expr,
+                span,
+                id: ExprId::fresh(),
+            })));
         }
         self.parse_postfix()
     }
@@ -215,22 +244,23 @@ impl Parser {
                         method: member,
                         args,
                         span,
+                        id: ExprId::fresh(),
                     }));
                 } else {
-                    lhs = Expr::FieldAccess(Box::new(lhs), member, span);
+                    lhs = Expr::FieldAccess(Box::new(lhs), member, span, ExprId::fresh());
                 }
             } else if matches!(self.peek_kind(), TokenKind::Question)
                 && self.is_try_propagate_question()
             {
                 let span = self.current_span();
                 self.advance();
-                lhs = Expr::TryPropagate(Box::new(lhs), span);
+                lhs = Expr::TryPropagate(Box::new(lhs), span, ExprId::fresh());
             } else if matches!(self.peek_kind(), TokenKind::LBracket) {
                 let span = self.current_span(); // the `[`
                 self.advance();
                 let index = self.parse_expr()?;
                 self.expect(TokenKind::RBracket)?;
-                lhs = Expr::Index(Box::new(lhs), Box::new(index), span);
+                lhs = Expr::Index(Box::new(lhs), Box::new(index), span, ExprId::fresh());
             } else {
                 break;
             }
@@ -243,22 +273,22 @@ impl Parser {
             TokenKind::Integer(n) => {
                 let span = self.current_span();
                 self.advance();
-                Ok(Expr::Integer(n, span))
+                Ok(Expr::Integer(n, span, ExprId::fresh()))
             }
             TokenKind::Float(f) => {
                 let span = self.current_span();
                 self.advance();
-                Ok(Expr::Float(f, span))
+                Ok(Expr::Float(f, span, ExprId::fresh()))
             }
             TokenKind::True => {
                 let span = self.current_span();
                 self.advance();
-                Ok(Expr::Bool(true, span))
+                Ok(Expr::Bool(true, span, ExprId::fresh()))
             }
             TokenKind::False => {
                 let span = self.current_span();
                 self.advance();
-                Ok(Expr::Bool(false, span))
+                Ok(Expr::Bool(false, span, ExprId::fresh()))
             }
             TokenKind::Nil => {
                 let span = self.current_span();
@@ -272,12 +302,12 @@ impl Parser {
                 // removal error. The recovery expression is the replacement
                 // spelling, not a hidden nil value or type; the accumulated
                 // parser diagnostic still makes compilation fail.
-                Ok(Expr::Var("None".to_string(), span))
+                Ok(Expr::Var("None".to_string(), span, ExprId::fresh()))
             }
             TokenKind::StringLiteral(value) => {
                 let span = self.current_span();
                 self.advance();
-                Ok(Expr::String(value, span))
+                Ok(Expr::String(value, span, ExprId::fresh()))
             }
             TokenKind::Print => {
                 let span = self.current_span();
@@ -285,7 +315,7 @@ impl Parser {
                 self.expect(TokenKind::LParen)?;
                 let arg = self.parse_expr()?;
                 self.expect(TokenKind::RParen)?;
-                Ok(Expr::Print(Box::new(arg), false, span))
+                Ok(Expr::Print(Box::new(arg), false, span, ExprId::fresh()))
             }
             TokenKind::Println => {
                 let span = self.current_span();
@@ -293,7 +323,7 @@ impl Parser {
                 self.expect(TokenKind::LParen)?;
                 let arg = self.parse_expr()?;
                 self.expect(TokenKind::RParen)?;
-                Ok(Expr::Print(Box::new(arg), true, span))
+                Ok(Expr::Print(Box::new(arg), true, span, ExprId::fresh()))
             }
             TokenKind::SelfKw => {
                 let span = self.current_span();
@@ -301,7 +331,7 @@ impl Parser {
                 if self.eat(TokenKind::ColonColon) {
                     self.parse_static_call("Self".to_string(), span)
                 } else {
-                    Ok(Expr::Var("self".to_string(), span))
+                    Ok(Expr::Var("self".to_string(), span, ExprId::fresh()))
                 }
             }
             TokenKind::LBracket => {
@@ -315,7 +345,7 @@ impl Parser {
                     }
                 }
                 self.expect(TokenKind::RBracket)?;
-                Ok(Expr::ArrayLiteral(elements, span))
+                Ok(Expr::ArrayLiteral(elements, span, ExprId::fresh()))
             }
             TokenKind::New => self.parse_new(),
             TokenKind::Select => self.parse_select(),
@@ -354,6 +384,7 @@ impl Parser {
                                 method,
                                 args: vec![],
                                 span,
+                                id: ExprId::fresh(),
                             })))
                         } else if !matches!(self.peek_kind(), TokenKind::LParen) {
                             // `mod::Class::property` — static property read.
@@ -361,6 +392,7 @@ impl Parser {
                                 class,
                                 field: method,
                                 span,
+                                id: ExprId::fresh(),
                             }))
                         } else {
                             self.expect(TokenKind::LParen)?;
@@ -371,6 +403,7 @@ impl Parser {
                                 method,
                                 args,
                                 span,
+                                id: ExprId::fresh(),
                             })))
                         }
                     } else if super::is_type_constructor_name(&member)
@@ -387,6 +420,7 @@ impl Parser {
                             method: member,
                             args: vec![],
                             span,
+                            id: ExprId::fresh(),
                         })))
                     } else if !matches!(self.peek_kind(), TokenKind::LParen) {
                         // `Class::property` — static property read (no parens).
@@ -394,6 +428,7 @@ impl Parser {
                             class: name,
                             field: member,
                             span,
+                            id: ExprId::fresh(),
                         }))
                     } else {
                         self.expect(TokenKind::LParen)?;
@@ -404,6 +439,7 @@ impl Parser {
                             method: member,
                             args,
                             span,
+                            id: ExprId::fresh(),
                         })))
                     }
                 } else if self.eat(TokenKind::LParen) {
@@ -412,11 +448,12 @@ impl Parser {
                         callee: name,
                         args,
                         span,
+                        id: ExprId::fresh(),
                     })))
                 } else if super::is_type_constructor_name(&name) && self.eat(TokenKind::LBrace) {
                     self.parse_object_literal_fields(name, span)
                 } else {
-                    Ok(Expr::Var(name, span))
+                    Ok(Expr::Var(name, span, ExprId::fresh()))
                 }
             }
             TokenKind::LParen => {
@@ -450,6 +487,7 @@ impl Parser {
             method,
             args,
             span,
+            id: ExprId::fresh(),
         })))
     }
 
@@ -474,10 +512,16 @@ impl Parser {
                         method: parts.last().cloned().unwrap_or_default(),
                         args,
                         span,
+                        id: ExprId::fresh(),
                     })));
                 }
                 let mut args = args;
-                return Ok(Expr::Print(Box::new(args.remove(0).expr), newline, span));
+                return Ok(Expr::Print(
+                    Box::new(args.remove(0).expr),
+                    newline,
+                    span,
+                    ExprId::fresh(),
+                ));
             }
 
             let Some(method) = parts.pop() else {
@@ -492,6 +536,7 @@ impl Parser {
                 method,
                 args,
                 span,
+                id: ExprId::fresh(),
             })));
         }
 
@@ -503,6 +548,7 @@ impl Parser {
                 method,
                 args: vec![],
                 span,
+                id: ExprId::fresh(),
             })));
         }
 
@@ -548,6 +594,7 @@ impl Parser {
             method,
             args,
             span,
+            id: ExprId::fresh(),
         }))))
     }
 
@@ -604,6 +651,7 @@ impl Parser {
             class,
             fields,
             span,
+            id: ExprId::fresh(),
         })))
     }
 
@@ -634,6 +682,7 @@ impl Parser {
             type_args,
             args,
             span,
+            id: ExprId::fresh(),
         })))
     }
 
@@ -718,7 +767,11 @@ impl Parser {
         }
 
         self.expect(TokenKind::RBrace)?;
-        Ok(Expr::Select(SelectExpr { cases, span: start }))
+        Ok(Expr::Select(SelectExpr {
+            cases,
+            span: start,
+            id: ExprId::fresh(),
+        }))
     }
 
     /// Build the task-completion case behind `await <expr>` inside a `select`
@@ -830,6 +883,7 @@ impl Parser {
             return_type,
             body,
             span,
+            id: ExprId::fresh(),
         })))
     }
 
@@ -888,6 +942,7 @@ impl Parser {
             scrutinee: Box::new(scrutinee),
             arms,
             span,
+            id: ExprId::fresh(),
         })))
     }
 }

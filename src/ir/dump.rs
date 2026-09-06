@@ -294,6 +294,7 @@ fn format_expr(e: &HirExpr) -> String {
             params,
             captures,
             body,
+            ..
         } => {
             let params = params
                 .iter()

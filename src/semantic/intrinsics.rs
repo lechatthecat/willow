@@ -1122,7 +1122,7 @@ mod checker_agreement_tests {
                 out.push(m);
             }
             Expr::Await(a) => walk_expr(&a.expr, out),
-            Expr::Print(inner, _, _) => walk_expr(inner, out),
+            Expr::Print(inner, _, _, _) => walk_expr(inner, out),
             Expr::Binary(b) => {
                 walk_expr(&b.lhs, out);
                 walk_expr(&b.rhs, out);
@@ -1138,11 +1138,11 @@ mod checker_agreement_tests {
                     walk_expr(&arg.expr, out);
                 }
             }
-            Expr::Index(base, index, _) => {
+            Expr::Index(base, index, _, _) => {
                 walk_expr(base, out);
                 walk_expr(index, out);
             }
-            Expr::ArrayLiteral(items, _) => {
+            Expr::ArrayLiteral(items, _, _) => {
                 for item in items {
                     walk_expr(item, out);
                 }
@@ -1198,7 +1198,7 @@ mod checker_agreement_tests {
         for call in &calls {
             let recv = checker
                 .expr_types
-                .get(&call.object.span())
+                .get(&call.object.id())
                 .unwrap_or_else(|| {
                     panic!("checker recorded no receiver type for `{}`", call.method)
                 })
@@ -1210,13 +1210,13 @@ mod checker_agreement_tests {
             builtin_calls += 1;
             let checker_ret = checker
                 .expr_types
-                .get(&call.span)
+                .get(&call.id)
                 .unwrap_or_else(|| panic!("checker recorded no result type for `{}`", call.method))
                 .clone();
             let resolved_ret = resolved.return_type(|i| {
                 call.args
                     .get(i)
-                    .and_then(|arg| checker.expr_types.get(&arg.expr.span()))
+                    .and_then(|arg| checker.expr_types.get(&arg.expr.id()))
                     .cloned()
             });
             assert_eq!(

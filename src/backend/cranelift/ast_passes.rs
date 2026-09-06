@@ -162,14 +162,14 @@ pub(crate) fn walk_reference_args_in_expr(expr: &Expr, visit: &mut dyn FnMut(&st
             walk_reference_args_in_expr(&b.rhs, visit);
         }
         Expr::Unary(u) => walk_reference_args_in_expr(&u.expr, visit),
-        Expr::FieldAccess(obj, _, _) => walk_reference_args_in_expr(obj, visit),
+        Expr::FieldAccess(obj, _, _, _) => walk_reference_args_in_expr(obj, visit),
         Expr::ObjectLiteral(o) => {
             for field in &o.fields {
                 walk_reference_args_in_expr(&field.value, visit);
             }
         }
         Expr::Await(a) => walk_reference_args_in_expr(&a.expr, visit),
-        Expr::Print(arg, _, _) => walk_reference_args_in_expr(arg, visit),
+        Expr::Print(arg, _, _, _) => walk_reference_args_in_expr(arg, visit),
         Expr::Ternary(t) => {
             walk_reference_args_in_expr(&t.condition, visit);
             walk_reference_args_in_expr(&t.then_expr, visit);
@@ -192,13 +192,13 @@ pub(crate) fn walk_reference_args_in_expr(expr: &Expr, visit: &mut dyn FnMut(&st
                 }
             }
         }
-        Expr::TryPropagate(inner, _) => walk_reference_args_in_expr(inner, visit),
-        Expr::ArrayLiteral(elements, _) => {
+        Expr::TryPropagate(inner, _, _) => walk_reference_args_in_expr(inner, visit),
+        Expr::ArrayLiteral(elements, _, _) => {
             for el in elements {
                 walk_reference_args_in_expr(el, visit);
             }
         }
-        Expr::Index(arr, index, _) => {
+        Expr::Index(arr, index, _, _) => {
             walk_reference_args_in_expr(arr, visit);
             walk_reference_args_in_expr(index, visit);
         }
@@ -221,11 +221,11 @@ pub(crate) fn walk_reference_args_in_expr(expr: &Expr, visit: &mut dyn FnMut(&st
                 walk_reference_args_in_block(&case.body, visit);
             }
         }
-        Expr::Integer(_, _)
-        | Expr::Float(_, _)
-        | Expr::Bool(_, _)
-        | Expr::String(_, _)
-        | Expr::Var(_, _) => {}
+        Expr::Integer(_, _, _)
+        | Expr::Float(_, _, _)
+        | Expr::Bool(_, _, _)
+        | Expr::String(_, _, _)
+        | Expr::Var(_, _, _) => {}
     }
 }
 
@@ -261,7 +261,7 @@ pub(crate) fn collect_reference_debug_strings_in_block(block: &Block, out: &mut 
 pub(crate) fn collect_address_taken_locals(body: &Block) -> HashSet<String> {
     let mut out = HashSet::new();
     walk_reference_args_in_block(body, &mut |_, arg| {
-        if let Expr::Var(name, _) = &arg.expr {
+        if let Expr::Var(name, _, _) = &arg.expr {
             out.insert(name.clone());
         }
     });
@@ -356,7 +356,7 @@ pub(crate) fn collect_string_literals_in_stmt(stmt: &Stmt, out: &mut Vec<String>
 pub(crate) fn collect_string_literals_in_expr(expr: &Expr, out: &mut Vec<String>) {
     match expr {
         Expr::StaticField(_) => {}
-        Expr::String(value, _) => out.push(value.clone()),
+        Expr::String(value, _, _) => out.push(value.clone()),
         Expr::Binary(b) => {
             collect_string_literals_in_expr(&b.lhs, out);
             collect_string_literals_in_expr(&b.rhs, out);
@@ -370,7 +370,7 @@ pub(crate) fn collect_string_literals_in_expr(expr: &Expr, out: &mut Vec<String>
             // (willow-csax): collect each literal segment so
             // emit_interpolated_string finds its static data.
             if (c.callee == "format" || c.callee == "panic")
-                && let Some(crate::parser::ast::Expr::String(spec, _)) =
+                && let Some(crate::parser::ast::Expr::String(spec, _, _)) =
                     c.args.first().map(|a| &a.expr)
                 && let Ok(segments) = crate::interpolate::parse_spec(spec)
             {
@@ -382,7 +382,7 @@ pub(crate) fn collect_string_literals_in_expr(expr: &Expr, out: &mut Vec<String>
                 }
             }
         }
-        Expr::FieldAccess(obj, _, _) => collect_string_literals_in_expr(obj, out),
+        Expr::FieldAccess(obj, _, _, _) => collect_string_literals_in_expr(obj, out),
         Expr::MethodCall(m) => {
             collect_string_literals_in_expr(&m.object, out);
             for arg in &m.args {
@@ -424,7 +424,7 @@ pub(crate) fn collect_string_literals_in_expr(expr: &Expr, out: &mut Vec<String>
                 collect_string_literals_in_block(&case.body, out);
             }
         }
-        Expr::Print(arg, _, _) => collect_string_literals_in_expr(arg, out),
+        Expr::Print(arg, _, _, _) => collect_string_literals_in_expr(arg, out),
         Expr::Ternary(t) => {
             collect_string_literals_in_expr(&t.condition, out);
             collect_string_literals_in_expr(&t.then_expr, out);
@@ -447,17 +447,20 @@ pub(crate) fn collect_string_literals_in_expr(expr: &Expr, out: &mut Vec<String>
                 }
             }
         }
-        Expr::TryPropagate(inner, _) => collect_string_literals_in_expr(inner, out),
-        Expr::ArrayLiteral(elements, _) => {
+        Expr::TryPropagate(inner, _, _) => collect_string_literals_in_expr(inner, out),
+        Expr::ArrayLiteral(elements, _, _) => {
             for el in elements {
                 collect_string_literals_in_expr(el, out);
             }
         }
-        Expr::Index(arr, index, _) => {
+        Expr::Index(arr, index, _, _) => {
             collect_string_literals_in_expr(arr, out);
             collect_string_literals_in_expr(index, out);
         }
-        Expr::Integer(_, _) | Expr::Float(_, _) | Expr::Bool(_, _) | Expr::Var(_, _) => {}
+        Expr::Integer(_, _, _)
+        | Expr::Float(_, _, _)
+        | Expr::Bool(_, _, _)
+        | Expr::Var(_, _, _) => {}
     }
 }
 
@@ -583,7 +586,7 @@ pub(crate) fn collect_lambdas_in_expr(
             collect_lambdas_in_expr(&r.start, counter, out);
             collect_lambdas_in_expr(&r.end, counter, out);
         }
-        Expr::Print(e, _, _) => collect_lambdas_in_expr(e, counter, out),
+        Expr::Print(e, _, _, _) => collect_lambdas_in_expr(e, counter, out),
         Expr::StaticCall(s) => {
             for arg in &s.args {
                 collect_lambdas_in_expr(&arg.expr, counter, out);
@@ -627,7 +630,7 @@ pub(crate) fn collect_lambdas_in_expr(
                 collect_lambdas_in_expr(&arg.expr, counter, out);
             }
         }
-        Expr::FieldAccess(e, _, _) => collect_lambdas_in_expr(e, counter, out),
+        Expr::FieldAccess(e, _, _, _) => collect_lambdas_in_expr(e, counter, out),
         Expr::Match(m) => {
             collect_lambdas_in_expr(&m.scrutinee, counter, out);
             for arm in &m.arms {
@@ -637,12 +640,12 @@ pub(crate) fn collect_lambdas_in_expr(
                 }
             }
         }
-        Expr::ArrayLiteral(elements, _) => {
+        Expr::ArrayLiteral(elements, _, _) => {
             for el in elements {
                 collect_lambdas_in_expr(el, counter, out);
             }
         }
-        Expr::Index(arr, index, _) => {
+        Expr::Index(arr, index, _, _) => {
             collect_lambdas_in_expr(arr, counter, out);
             collect_lambdas_in_expr(index, counter, out);
         }
@@ -745,7 +748,7 @@ pub(crate) fn collect_nil_check_names_in_expr(
 ) {
     match expr {
         Expr::StaticField(_) => {}
-        Expr::FieldAccess(obj, name, _) => {
+        Expr::FieldAccess(obj, name, _, _) => {
             out.insert(name.clone());
             collect_nil_check_names_in_expr(obj, out);
         }
@@ -779,7 +782,7 @@ pub(crate) fn collect_nil_check_names_in_expr(
             LambdaBody::Expr(e) => collect_nil_check_names_in_expr(e, out),
             LambdaBody::Block(b) => collect_nil_check_names_in_block(b, out),
         },
-        Expr::Print(e, _, _) => collect_nil_check_names_in_expr(e, out),
+        Expr::Print(e, _, _, _) => collect_nil_check_names_in_expr(e, out),
         Expr::Await(a) => collect_nil_check_names_in_expr(&a.expr, out),
         Expr::StaticCall(s) => {
             // A module call's call-stack frame is named as the source spells
@@ -814,13 +817,13 @@ pub(crate) fn collect_nil_check_names_in_expr(
                 }
             }
         }
-        Expr::TryPropagate(inner, _) => collect_nil_check_names_in_expr(inner, out),
-        Expr::ArrayLiteral(elements, _) => {
+        Expr::TryPropagate(inner, _, _) => collect_nil_check_names_in_expr(inner, out),
+        Expr::ArrayLiteral(elements, _, _) => {
             for el in elements {
                 collect_nil_check_names_in_expr(el, out);
             }
         }
-        Expr::Index(arr, index, _) => {
+        Expr::Index(arr, index, _, _) => {
             collect_nil_check_names_in_expr(arr, out);
             collect_nil_check_names_in_expr(index, out);
         }
@@ -843,10 +846,10 @@ pub(crate) fn collect_nil_check_names_in_expr(
                 collect_nil_check_names_in_block(&case.body, out);
             }
         }
-        Expr::Integer(_, _)
-        | Expr::Float(_, _)
-        | Expr::Bool(_, _)
-        | Expr::String(_, _)
-        | Expr::Var(_, _) => {}
+        Expr::Integer(_, _, _)
+        | Expr::Float(_, _, _)
+        | Expr::Bool(_, _, _)
+        | Expr::String(_, _, _)
+        | Expr::Var(_, _, _) => {}
     }
 }

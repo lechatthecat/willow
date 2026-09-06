@@ -98,7 +98,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     pub(super) fn emit_format_call(&mut self, c: &CallExpr) -> cranelift_codegen::ir::Value {
-        let Some(Expr::String(spec, _)) = c.args.first().map(|arg| &arg.expr) else {
+        let Some(Expr::String(spec, _, _)) = c.args.first().map(|arg| &arg.expr) else {
             panic!("compiler invariant violated: checked format call has no literal format string");
         };
         let spec = spec.clone();

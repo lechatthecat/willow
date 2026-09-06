@@ -7,7 +7,7 @@
 //! separate migration from typed body emission.
 
 use crate::diagnostics::Span;
-use crate::parser::ast::{BinOp, LockMode, Type, UnaryOp};
+use crate::parser::ast::{BinOp, ExprId, LockMode, Type, UnaryOp};
 
 /// A whole program lowered to typed HIR. Slice 1 only carries free functions.
 #[derive(Debug, Clone, PartialEq)]
@@ -421,6 +421,7 @@ pub enum HirExprKind {
     /// nothing and `closure(params) -> ret` when it does. An expression body is
     /// represented as a single `Return` statement.
     Lambda {
+        id: ExprId,
         params: Vec<HirParam>,
         /// What the body reads from the enclosing function, in environment-slot
         /// order (willow-0g8j.2.12). Empty for a `fn`-typed lambda.

@@ -222,7 +222,7 @@ macro_rules! lir_type_ctx {
             // The same table `emit_expr` reads for a lambda's address, so
             // the symbol eligibility vets is the symbol emission takes the
             // address of (willow-0g8j.2.2).
-            lambda_symbol: &|span| $me.lambda_names.get(&span).cloned(),
+            lambda_symbol: &|id| $me.lambda_names.get(&id).cloned(),
             cooperative_leaves: &$me.cooperative_leaves,
         }
     };
@@ -283,7 +283,8 @@ impl Codegen {
         let mut import_aliases = ModuleAliasSnapshot::default();
         self.alias_item_import_types(&item_imports, &mut import_aliases);
         let normalized_program = normalize_std_collection_program(program);
-        let normalized_program = normalize_coop_suspensions(&normalized_program, &self.expr_types);
+        let normalized_program =
+            normalize_coop_suspensions(&normalized_program, &mut self.expr_types);
         let program = &normalized_program;
         self.source_file = source_file.to_string();
         let module_prefix = module_symbol_prefix(canonical_path);
@@ -456,7 +457,7 @@ impl Codegen {
             .collect();
         for (name, lambda) in &lambdas {
             self.declare_lambda(name, lambda)?;
-            self.lambda_names.insert(lambda.span, name.clone());
+            self.lambda_names.insert(lambda.id, name.clone());
         }
 
         // Analyze under canonical backend names before installing the module's
@@ -506,8 +507,8 @@ impl Codegen {
     /// them: every unit's functions have to be resolvable at once, and the key
     /// spaces cannot collide — an entry key is a bare identifier or
     /// `Class::method` with an unqualified head, a module key is a mangled
-    /// symbol path or a `::`-qualified class. Lambdas are keyed by span, and a
-    /// span carries the `FileId` of the unit it came from.
+    /// symbol path or a `::`-qualified class. Lambdas are keyed by node ID,
+    /// which is unique across every unit in the build.
     ///
     /// A method of a class this module does not declare is dropped: it has no
     /// qualified decl to be compiled under, so no lookup would ever reach it.
@@ -539,7 +540,7 @@ impl Codegen {
             // symbol is known here and the body can go straight into
             // `lir_functions`. A span with no name is left in `lir_lambdas` for
             // whichever unit does declare it.
-            match self.lambda_names.get(&l.span) {
+            match self.lambda_names.get(&l.id) {
                 Some(name) => {
                     let name = name.clone();
                     let mut f = l.function;
@@ -547,7 +548,7 @@ impl Codegen {
                     self.lir_functions.insert(name, f);
                 }
                 None => {
-                    self.lir_lambdas.insert(l.span, l.function);
+                    self.lir_lambdas.insert(l.id, l.function);
                 }
             }
         }
@@ -653,7 +654,8 @@ impl Codegen {
             self.register_item_import(&item.local, &item.module, &item.item);
         }
         let normalized_program = normalize_std_collection_program(program);
-        let normalized_program = normalize_coop_suspensions(&normalized_program, &self.expr_types);
+        let normalized_program =
+            normalize_coop_suspensions(&normalized_program, &mut self.expr_types);
         let program = &normalized_program;
         self.source_file = source_file.to_string();
         self.declare_runtime()?;
@@ -732,12 +734,12 @@ impl Codegen {
         let lambdas = collect_lambdas_in_program(program);
         for (name, lambda) in &lambdas {
             self.declare_lambda(name, lambda)?;
-            self.lambda_names.insert(lambda.span, name.clone());
+            self.lambda_names.insert(lambda.id, name.clone());
             // The lowered body was lifted under a span-derived placeholder
             // because only this loop knows the symbol (willow-0g8j.2.2). Moving
             // it into `lir_functions` under that symbol is what lets a lambda be
             // compiled by the walker like any other function.
-            if let Some(mut lf) = self.lir_lambdas.remove(&lambda.span) {
+            if let Some(mut lf) = self.lir_lambdas.remove(&lambda.id) {
                 lf.name = name.clone();
                 self.lir_functions.insert(name.clone(), lf);
             }
@@ -880,7 +882,7 @@ impl Codegen {
 
     /// The checker's callable type for a lambda expression, if it recorded one.
     fn lambda_value_type(&self, l: &LambdaExpr) -> Option<Type> {
-        match self.expr_types.get(&l.span) {
+        match self.expr_types.get(&l.id) {
             Some(ty @ (Type::Fn(..) | Type::Closure(..))) => Some(ty.clone()),
             _ => None,
         }

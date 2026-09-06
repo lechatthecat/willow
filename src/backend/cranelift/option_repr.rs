@@ -8,7 +8,7 @@
 //! `Option<Option<T>>` is always boxed so `None` and `Some(None)` remain
 //! distinguishable even when the inner option uses the nullable-pointer niche.
 
-use std::collections::HashMap;
+use super::type_index::TypeMap;
 
 use crate::parser::ast::Type;
 use crate::semantic::builtin_types::{self, BuiltinTypeId};
@@ -31,7 +31,7 @@ pub(crate) fn option_inner(ty: &Type) -> Option<&Type> {
 /// A nested Option is excluded because zero can already be a valid inner
 /// representation. The remaining GC-managed types are represented by non-null
 /// heap pointers when valid, so zero is available for `None`.
-pub(crate) fn option_repr(ty: &Type, enum_infos: &HashMap<String, EnumInfo>) -> Option<OptionRepr> {
+pub(crate) fn option_repr(ty: &Type, enum_infos: &TypeMap<EnumInfo>) -> Option<OptionRepr> {
     let inner = option_inner(ty)?;
     let niche = option_inner(inner).is_none() && is_gc_managed(inner, enum_infos);
     Some(if niche {
@@ -51,7 +51,7 @@ mod tests {
 
     #[test]
     fn gc_references_use_the_nullable_pointer_niche() {
-        let enums = HashMap::new();
+        let enums = TypeMap::new();
         assert_eq!(
             option_repr(&option(Type::String), &enums),
             Some(OptionRepr::NullableGcPointer)
@@ -68,7 +68,7 @@ mod tests {
 
     #[test]
     fn scalars_and_nested_options_stay_boxed() {
-        let enums = HashMap::new();
+        let enums = TypeMap::new();
         assert_eq!(
             option_repr(&option(Type::I64), &enums),
             Some(OptionRepr::BoxedTaggedEnum)
@@ -81,6 +81,6 @@ mod tests {
 
     #[test]
     fn non_option_types_have_no_option_representation() {
-        assert_eq!(option_repr(&Type::String, &HashMap::new()), None);
+        assert_eq!(option_repr(&Type::String, &TypeMap::new()), None);
     }
 }

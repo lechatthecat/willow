@@ -37,7 +37,7 @@ impl AstVisitor for SelfFieldAssignCollector<'_> {
         match stmt {
             Stmt::Defer(_) => return,
             Stmt::FieldAssign(assign) => {
-                if matches!(&assign.object, Expr::Var(name, _) if name == "self") {
+                if matches!(&assign.object, Expr::Var(name, _, _) if name == "self") {
                     self.out.insert(assign.field.clone());
                 }
             }
@@ -86,7 +86,7 @@ pub(crate) fn walk_subexprs(expr: &Expr, f: &mut impl FnMut(&Expr)) {
                 f(&a.expr);
             }
         }
-        Expr::FieldAccess(o, _, _) => f(o),
+        Expr::FieldAccess(o, _, _, _) => f(o),
         Expr::MethodCall(m) => {
             f(&m.object);
             for a in &m.args {
@@ -109,7 +109,7 @@ pub(crate) fn walk_subexprs(expr: &Expr, f: &mut impl FnMut(&Expr)) {
             }
         }
         Expr::Await(a) => f(&a.expr),
-        Expr::Print(e, _, _) => f(e),
+        Expr::Print(e, _, _, _) => f(e),
         Expr::Ternary(t) => {
             f(&t.condition);
             f(&t.then_expr);
@@ -125,13 +125,13 @@ pub(crate) fn walk_subexprs(expr: &Expr, f: &mut impl FnMut(&Expr)) {
             }
         }
         Expr::Match(m) => f(&m.scrutinee),
-        Expr::TryPropagate(e, _) => f(e),
-        Expr::ArrayLiteral(els, _) => {
+        Expr::TryPropagate(e, _, _) => f(e),
+        Expr::ArrayLiteral(els, _, _) => {
             for e in els {
                 f(e);
             }
         }
-        Expr::Index(a, i, _) => {
+        Expr::Index(a, i, _, _) => {
             f(a);
             f(i);
         }
@@ -140,14 +140,14 @@ pub(crate) fn walk_subexprs(expr: &Expr, f: &mut impl FnMut(&Expr)) {
 
 pub(crate) fn reference_place_key(expr: &Expr) -> Option<String> {
     match expr {
-        Expr::Var(name, _) => Some(name.clone()),
-        Expr::FieldAccess(obj, field_name, _) => {
+        Expr::Var(name, _, _) => Some(name.clone()),
+        Expr::FieldAccess(obj, field_name, _, _) => {
             reference_place_key(obj).map(|base| format!("{base}.{field_name}"))
         }
-        Expr::Index(array, index, _) => {
+        Expr::Index(array, index, _, _) => {
             let base = reference_place_key(array)?;
             match &**index {
-                Expr::Integer(value, _) => Some(format!("{base}[{value}]")),
+                Expr::Integer(value, _, _) => Some(format!("{base}[{value}]")),
                 _ => None,
             }
         }

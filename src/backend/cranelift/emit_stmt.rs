@@ -28,7 +28,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // An array literal with a known target element type emits its elements
         // boxed to that type (so `let a: Array<Animal> = [Dog {}]` stores boxes,
         // and `[]` becomes a reference-element array).
-        if let Expr::ArrayLiteral(elements, _) = expr
+        if let Expr::ArrayLiteral(elements, _, _) = expr
             && let Type::Array(elem) = target_ty
         {
             let elem = (**elem).clone();
@@ -957,7 +957,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 fg.vars
                     .insert(label.clone(), VarStorage::Stack { slot, ty });
             }
-            Expr::Var(label, expr.span())
+            Expr::Var(label, expr.span(), ExprId::fresh())
         };
         let action = match &d.body {
             DeferBody::Expr(Expr::Call(c)) => {
@@ -976,6 +976,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         callee: c.callee.clone(),
                         args,
                         span: c.span,
+                        id: ExprId::fresh(),
                     })),
                     span: d.span,
                 })))
@@ -998,14 +999,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         method: m.method.clone(),
                         args,
                         span: m.span,
+                        id: ExprId::fresh(),
                     })),
                     span: d.span,
                 })))
             }
-            DeferBody::Expr(Expr::Print(arg, newline, span)) => {
+            DeferBody::Expr(Expr::Print(arg, newline, span, _)) => {
                 let stashed = stash(self, format!("\0defer{n}_p"), arg);
                 super::DeferredAction::Stmt(Box::new(Stmt::Expr(ExprStmt {
-                    expr: Expr::Print(Box::new(stashed), *newline, *span),
+                    expr: Expr::Print(Box::new(stashed), *newline, *span, ExprId::fresh()),
                     span: d.span,
                 })))
             }

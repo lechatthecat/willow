@@ -19,7 +19,7 @@
 //! walker for the rest; `--emit-lir` renders it either way.
 
 use crate::diagnostics::Span;
-use crate::parser::ast::{LockMode, Type};
+use crate::parser::ast::{ExprId, LockMode, Type};
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::type_checker::types::{await_output_type, awaitable_task_type};
 
@@ -47,6 +47,7 @@ pub struct LirProgram {
 /// from — the same key the backend's own lambda table uses.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LirLambda {
+    pub id: ExprId,
     pub span: Span,
     pub function: LirFunction,
 }
@@ -615,6 +616,7 @@ fn collect_lambdas_in_expr(expr: &HirExpr, out: &mut Vec<LirLambda>) {
         collect_lambdas_in_expr(child, out);
     }
     if let HirExprKind::Lambda {
+        id,
         params,
         captures,
         body,
@@ -633,7 +635,7 @@ fn collect_lambdas_in_expr(expr: &HirExpr, out: &mut Vec<LirLambda>) {
         b.lower_scope(body);
         let (blocks, locals) = b.finish();
         let function = LirFunction {
-            name: lambda_placeholder_name(expr.span),
+            name: lambda_placeholder_name(*id),
             is_async: false,
             params: params.clone(),
             return_type: (**ret).clone(),
@@ -651,6 +653,7 @@ fn collect_lambdas_in_expr(expr: &HirExpr, out: &mut Vec<LirLambda>) {
         };
         function.assert_unique_local_names();
         out.push(LirLambda {
+            id: *id,
             span: expr.span,
             function,
         });
@@ -660,8 +663,8 @@ fn collect_lambdas_in_expr(expr: &HirExpr, out: &mut Vec<LirLambda>) {
 /// The name a lifted lambda carries until the backend renames it to the
 /// `$lambda.N` symbol it declared. Derived from the span so `--emit-lir` output
 /// is stable and two lambdas never collide.
-pub fn lambda_placeholder_name(span: Span) -> String {
-    format!("$lambda@{}:{}", span.file_id.0, span.start)
+pub fn lambda_placeholder_name(id: ExprId) -> String {
+    format!("$lambda@{id}")
 }
 
 /// Whether running `body` can END a panic rather than just clean up after one:

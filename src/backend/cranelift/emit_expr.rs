@@ -10,14 +10,14 @@ use super::*;
 impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_expr(&mut self, expr: &Expr) -> cranelift_codegen::ir::Value {
         match expr {
-            Expr::Integer(n, _) => self.builder.ins().iconst(types::I64, *n),
-            Expr::Float(f, _) => self.builder.ins().f64const(*f),
-            Expr::Bool(b, _) => self.builder.ins().iconst(types::I8, if *b { 1 } else { 0 }),
-            Expr::String(value, _) => self.emit_string_literal(value),
-            Expr::Var(name, span) => {
+            Expr::Integer(n, _, _) => self.builder.ins().iconst(types::I64, *n),
+            Expr::Float(f, _, _) => self.builder.ins().f64const(*f),
+            Expr::Bool(b, _, _) => self.builder.ins().iconst(types::I8, if *b { 1 } else { 0 }),
+            Expr::String(value, _, _) => self.emit_string_literal(value),
+            Expr::Var(name, _span, _) => {
                 // A resolved unqualified fieldless enum variant (`Closed`),
                 // lowered like the qualified `Enum::Closed` form (willow-60o.1).
-                if let Some(enum_name) = self.enum_variant_resolutions.get(span).cloned()
+                if let Some(enum_name) = self.enum_variant_resolutions.get(&expr.id()).cloned()
                     && let Some(enum_info) = self.enum_infos.get(&enum_name).cloned()
                     && let Some(variant) = enum_info.variants.iter().find(|v| v.name == *name)
                 {
@@ -27,7 +27,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     }
                     let result_ty = self
                         .expr_types
-                        .get(span)
+                        .get(&expr.id())
                         .cloned()
                         .unwrap_or_else(|| Type::Named(enum_name.clone()));
                     return self.emit_enum_variant_alloc(&result_ty, variant.tag, &[], &[]);
@@ -57,7 +57,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::Binary(b) => self.emit_binary(b),
             Expr::Unary(u) => self.emit_unary(u),
             Expr::Call(c) => self.emit_call(c),
-            Expr::Print(arg, newline, _) => {
+            Expr::Print(arg, newline, _, _) => {
                 let val = self.emit_expr(arg);
                 let arg_ty = self.ast_type_of(arg);
                 let fn_name = match (arg_ty, newline) {
@@ -85,7 +85,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // null function value there would compile a call through it into a
             // jump to address 0 (the willow-thqe class of bug), so fail loudly.
             Expr::Lambda(l) => {
-                let name = self.lambda_names.get(&l.span).unwrap_or_else(|| {
+                let name = self.lambda_names.get(&l.id).unwrap_or_else(|| {
                     panic!(
                         "internal compiler error: lambda at line {} reached codegen without a \
                          lifted function name",
@@ -103,7 +103,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .func_addr(super::type_helpers::FN_ADDR_TYPE, fref)
             }
             // Field/method access: codegen deferred to willow-jbf
-            Expr::FieldAccess(obj, field_name, _) => self.emit_field_access(obj, field_name),
+            Expr::FieldAccess(obj, field_name, _, _) => self.emit_field_access(obj, field_name),
             Expr::MethodCall(m) => self.emit_method_call(m),
             Expr::ObjectLiteral(o) => self.emit_object_literal(o),
             Expr::StaticCall(s) => self.emit_static_call(s),
@@ -115,15 +115,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.ins().iconst(types::I8, 0)
             }
             Expr::Match(m) => self.emit_match(m),
-            Expr::TryPropagate(inner, _) => self.emit_try_propagate(inner),
-            Expr::ArrayLiteral(elements, _) => {
+            Expr::TryPropagate(inner, _, _) => self.emit_try_propagate(inner),
+            Expr::ArrayLiteral(elements, _, _) => {
                 let elem_ty = elements
                     .first()
                     .map(|e| self.ast_type_of(e))
                     .unwrap_or(Type::Void);
                 self.emit_array_literal(elements, &elem_ty)
             }
-            Expr::Index(arr, index, _) => {
+            Expr::Index(arr, index, _, _) => {
                 // Null and out-of-bounds are checked inside `willow_array_get`,
                 // which aborts with a clear message.
                 let elem_ty = array_element_type(&self.ast_type_of(arr));
@@ -440,7 +440,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // An unqualified enum-variant construction (`Ok(42)`) the type checker
         // resolved to an enum: lower like the qualified `Enum::Variant(..)` form
         // (willow-60o.1).
-        if let Some(enum_name) = self.enum_variant_resolutions.get(&c.span).cloned()
+        if let Some(enum_name) = self.enum_variant_resolutions.get(&c.id).cloned()
             && let Some(enum_info) = self.enum_infos.get(&enum_name).cloned()
             && let Some(variant) = enum_info.variants.iter().find(|v| v.name == c.callee)
         {
@@ -449,7 +449,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             let result_ty = self
                 .expr_types
-                .get(&c.span)
+                .get(&c.id)
                 .cloned()
                 .unwrap_or_else(|| Type::Named(enum_name.clone()));
             if variant.payload_types.is_empty() {
@@ -516,7 +516,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // start explicit lexical unwinding, including task-owned async recovery.
         if c.callee == "panic" {
             let msg = if c.args.len() > 1 {
-                if let Expr::String(spec, _) = &c.args[0].expr {
+                if let Expr::String(spec, _, _) = &c.args[0].expr {
                     let spec = spec.clone();
                     self.emit_interpolated_string(&spec, &c.args[1..])
                 } else {
@@ -922,7 +922,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         arg: &CallArg,
     ) -> (cranelift_codegen::ir::Value, usize) {
         match &arg.expr {
-            Expr::Var(name, _) => {
+            Expr::Var(name, _, _) => {
                 let storage = self.vars.get(name.as_str()).cloned();
                 match storage {
                     Some(VarStorage::Stack { slot, .. }) => {
@@ -960,10 +960,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     None => {}
                 }
             }
-            Expr::FieldAccess(obj, field_name, span) => {
+            Expr::FieldAccess(obj, field_name, span, _) => {
                 return (self.emit_field_address(obj, field_name, *span), 0);
             }
-            Expr::Index(array, index, _) => {
+            Expr::Index(array, index, _, _) => {
                 return self.emit_array_element_address(array, index);
             }
             _ => {}

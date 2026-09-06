@@ -3,7 +3,7 @@
 //! to clif types, GC properties, runtime symbol names, and builtin return types;
 //! none of them touch codegen state.
 
-use std::collections::HashMap;
+use super::type_index::TypeMap;
 
 use cranelift_codegen::ir::types;
 
@@ -159,7 +159,7 @@ pub(crate) fn is_opaque_runtime_pointer_type(name: &str) -> bool {
     matches!(name, "Future" | "BlockingCell" | "BlockingRwCell")
 }
 
-pub(crate) fn is_gc_managed(ty: &Type, enum_infos: &HashMap<String, EnumInfo>) -> bool {
+pub(crate) fn is_gc_managed(ty: &Type, enum_infos: &TypeMap<EnumInfo>) -> bool {
     match ty {
         Type::Named(name) => match enum_infos.get(name) {
             // Fieldless enum → immediate tag; with-payload enum → heap object.

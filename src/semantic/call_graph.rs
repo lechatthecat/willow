@@ -390,7 +390,7 @@ impl CallSiteCollector<'_> {
         let ty = match expression {
             Expr::New(new) => Some(Type::Named(new.class_name.clone())),
             Expr::ObjectLiteral(object) => Some(Type::Named(object.class.clone())),
-            Expr::Var(name, _) => self.lookup(name).cloned().flatten(),
+            Expr::Var(name, _, _) => self.lookup(name).cloned().flatten(),
             _ => None,
         }?;
         match ty {
@@ -477,7 +477,7 @@ impl AstVisitor for CallSiteCollector<'_> {
                 // `self.method()` is virtual just like a call through any other
                 // class-typed receiver: an inherited body running on a subclass
                 // instance selects that subclass's override (willow-s9ej.11).
-                let declared_class = if matches!(&call.object, Expr::Var(name, _) if name == "self")
+                let declared_class = if matches!(&call.object, Expr::Var(name, _, _) if name == "self")
                 {
                     self.current_class.map(str::to_owned)
                 } else {

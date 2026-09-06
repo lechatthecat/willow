@@ -9,19 +9,19 @@ impl Parser {
         match self.peek_kind().clone() {
             TokenKind::Ident(ref name) if name == "_" => {
                 self.advance();
-                Ok(Pattern::Wildcard(span))
+                Ok(Pattern::Wildcard(span, PatternId::fresh()))
             }
             TokenKind::True => {
                 self.advance();
-                Ok(Pattern::LiteralBool(true, span))
+                Ok(Pattern::LiteralBool(true, span, PatternId::fresh()))
             }
             TokenKind::False => {
                 self.advance();
-                Ok(Pattern::LiteralBool(false, span))
+                Ok(Pattern::LiteralBool(false, span, PatternId::fresh()))
             }
             TokenKind::Integer(n) => {
                 self.advance();
-                Ok(Pattern::LiteralInt(n, span))
+                Ok(Pattern::LiteralInt(n, span, PatternId::fresh()))
             }
             TokenKind::Minus => {
                 self.advance();
@@ -29,7 +29,7 @@ impl Parser {
                     let end = self.current_span();
                     self.advance();
                     let merged = span.to(end);
-                    Ok(Pattern::LiteralInt(-n, merged))
+                    Ok(Pattern::LiteralInt(-n, merged, PatternId::fresh()))
                 } else {
                     Err(self.err(ErrorCode::E0102, "expected integer after '-' in pattern"))
                 }
@@ -66,6 +66,7 @@ impl Parser {
                             variant,
                             bindings,
                             span: merged,
+                            id: PatternId::fresh(),
                         })
                     } else {
                         let end = self.current_span();
@@ -74,6 +75,7 @@ impl Parser {
                             enum_name: name,
                             variant,
                             span: merged,
+                            id: PatternId::fresh(),
                         })
                     }
                 } else if matches!(self.peek_kind(), TokenKind::LParen) {
@@ -89,9 +91,14 @@ impl Parser {
                         class_name: name,
                         binding,
                         span: merged,
+                        id: PatternId::fresh(),
                     })
                 } else {
-                    Ok(Pattern::Binding { name, span })
+                    Ok(Pattern::Binding {
+                        name,
+                        span,
+                        id: PatternId::fresh(),
+                    })
                 }
             }
             _ => Err(self.err(ErrorCode::E0102, "expected pattern")),

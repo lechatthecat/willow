@@ -330,7 +330,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// pattern (willow-60o.1).
     pub(super) fn resolved_pattern(&self, arm: &MatchArm) -> Pattern {
         self.pattern_resolutions
-            .get(&arm.pattern.span())
+            .get(&arm.pattern.id())
             .cloned()
             .unwrap_or_else(|| arm.pattern.clone())
     }
@@ -397,7 +397,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // the structural arm-walk below only covers synthesized nodes.
         let result_ast_type = self
             .expr_types
-            .get(&m.span)
+            .get(&m.id)
             .expect("internal compiler error: match has no checked result type")
             .clone();
         let result_clif_type = clif_type(&result_ast_type);
@@ -426,7 +426,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let is_last = remaining.is_empty();
             let pat = self.resolved_pattern(arm);
 
-            let always_matches = matches!(pat, Pattern::Wildcard(_) | Pattern::Binding { .. });
+            let always_matches = matches!(pat, Pattern::Wildcard(_, _) | Pattern::Binding { .. });
 
             let arm_block = self.builder.create_block();
             let next_block = if always_matches || is_last {
@@ -620,14 +620,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         pattern: &Pattern,
     ) -> cranelift_codegen::ir::Value {
         match pattern {
-            Pattern::Wildcard(_) | Pattern::Binding { .. } => {
+            Pattern::Wildcard(_, _) | Pattern::Binding { .. } => {
                 self.builder.ins().iconst(types::I8, 1)
             }
-            Pattern::LiteralBool(b, _) => {
+            Pattern::LiteralBool(b, _, _) => {
                 let expected = self.builder.ins().iconst(types::I8, if *b { 1 } else { 0 });
                 self.builder.ins().icmp(IntCC::Equal, scrutinee, expected)
             }
-            Pattern::LiteralInt(n, _) => {
+            Pattern::LiteralInt(n, _, _) => {
                 let expected = self.builder.ins().iconst(types::I64, *n);
                 self.builder.ins().icmp(IntCC::Equal, scrutinee, expected)
             }

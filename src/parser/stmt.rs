@@ -276,12 +276,12 @@ impl Parser {
             TokenKind::SelfKw => {
                 let s = self.current_span();
                 self.advance();
-                Expr::Var("self".to_string(), s)
+                Expr::Var("self".to_string(), s, ExprId::fresh())
             }
             TokenKind::Ident(name) => {
                 let s = self.current_span();
                 self.advance();
-                Expr::Var(name, s)
+                Expr::Var(name, s, ExprId::fresh())
             }
             _ => unreachable!("is_field_assign_ahead checked"),
         };
@@ -434,7 +434,7 @@ impl Parser {
             self.advance(); // consume `=`
             let value = self.parse_expr()?;
             self.expect(TokenKind::Semicolon)?;
-            let Expr::Index(array, index, idx_span) = expr else {
+            let Expr::Index(array, index, idx_span, _) = expr else {
                 unreachable!("checked Expr::Index above");
             };
             return Ok(Stmt::IndexAssign(IndexAssignStmt {
@@ -481,7 +481,7 @@ impl Parser {
             self.advance(); // consume `=`
             let value = self.parse_expr()?;
             self.expect(TokenKind::Semicolon)?;
-            let Expr::FieldAccess(object, field, fa_span) = expr else {
+            let Expr::FieldAccess(object, field, fa_span, _) = expr else {
                 unreachable!("checked Expr::FieldAccess above");
             };
             return Ok(Stmt::FieldAssign(FieldAssignStmt {

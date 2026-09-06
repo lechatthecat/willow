@@ -237,13 +237,13 @@ pub fn walk_expr<V: AstVisitor + ?Sized>(visitor: &mut V, expr: &Expr) {
                 visitor.exit_scope();
             }
         }
-        Expr::TryPropagate(inner, _) => visitor.visit_expr(inner),
-        Expr::ArrayLiteral(elements, _) => {
+        Expr::TryPropagate(inner, _, _) => visitor.visit_expr(inner),
+        Expr::ArrayLiteral(elements, _, _) => {
             for element in elements {
                 visitor.visit_expr(element);
             }
         }
-        Expr::Index(array, index, _) => {
+        Expr::Index(array, index, _, _) => {
             visitor.visit_expr(array);
             visitor.visit_expr(index);
         }
@@ -266,7 +266,7 @@ pub fn walk_lambda<V: AstVisitor + ?Sized>(visitor: &mut V, lambda: &LambdaExpr)
 /// Bind every name a pattern introduces. `_` is a hole, not a name.
 pub fn walk_pattern<V: AstVisitor + ?Sized>(visitor: &mut V, pattern: &Pattern) {
     match pattern {
-        Pattern::Wildcard(_) | Pattern::LiteralBool(..) | Pattern::LiteralInt(..) => {}
+        Pattern::Wildcard(_, _) | Pattern::LiteralBool(..) | Pattern::LiteralInt(..) => {}
         Pattern::Binding { name, .. } => visitor.bind(name),
         Pattern::EnumVariant { .. } => {}
         Pattern::EnumVariantTuple { bindings, .. } => {
@@ -332,7 +332,7 @@ mod tests {
 
     impl AstVisitor for VarTrace {
         fn visit_expr(&mut self, expr: &Expr) {
-            if let Expr::Var(name, _) = expr {
+            if let Expr::Var(name, _, _) = expr {
                 self.seen.push(name.clone());
             }
             walk_expr(self, expr);
@@ -379,7 +379,7 @@ mod tests {
         }
 
         fn visit_expr(&mut self, expr: &Expr) {
-            if let Expr::Var(name, _) = expr {
+            if let Expr::Var(name, _, _) = expr {
                 let depth = self
                     .stack
                     .iter()
@@ -843,7 +843,7 @@ mod tests {
             fn visit_expr(&mut self, expr: &Expr) {
                 match expr {
                     Expr::Binary(_) => self.0.push("binary".to_string()),
-                    Expr::Var(name, _) => self.0.push(name.clone()),
+                    Expr::Var(name, _, _) => self.0.push(name.clone()),
                     _ => {}
                 }
                 walk_expr(self, expr);
@@ -866,7 +866,7 @@ mod tests {
                 walk_expr(self, expr);
                 match expr {
                     Expr::Binary(_) => self.0.push("binary".to_string()),
-                    Expr::Var(name, _) => self.0.push(name.clone()),
+                    Expr::Var(name, _, _) => self.0.push(name.clone()),
                     _ => {}
                 }
             }
@@ -891,7 +891,7 @@ mod tests {
                 walk_stmt(self, stmt);
             }
             fn visit_expr(&mut self, expr: &Expr) {
-                if let Expr::Var(name, _) = expr {
+                if let Expr::Var(name, _, _) = expr {
                     self.0.push(name.clone());
                 }
                 walk_expr(self, expr);

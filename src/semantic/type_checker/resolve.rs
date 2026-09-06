@@ -2021,10 +2021,14 @@ impl TypeChecker {
 
     /// What a written static-call class names, reporting nothing.
     ///
-    /// [`Self::resolve_static_call_class_name`] stays the authority: it records
-    /// the resolution for lowering and diagnoses a bad std path. This is for the
-    /// contextual paths that run BEFORE it and must not report the same path
-    /// twice, nor take `&mut self` (willow-0g8j.3).
+    /// The same answer [`Self::resolve_static_call_class_name`] gives, without
+    /// its diagnostics, its collection-import bookkeeping, or `&mut self`. Two
+    /// callers need that: the contextual paths that run BEFORE the checking one
+    /// and must not report the same bad std path twice, and `check_expr`, which
+    /// records the resolution per expression ID for HIR lowering. Every branch
+    /// that can name an enum must agree with the checking version, or lowering
+    /// keeps the written spelling while the node's type carries the identity,
+    /// and the LIR walker rejects the call as outside its subset (willow-njot).
     pub(super) fn resolve_static_call_class_quiet(&self, class_name: &str) -> Option<String> {
         if class_name == "Self" {
             return self.current_class.clone();
@@ -2053,7 +2057,12 @@ impl TypeChecker {
         {
             return Some(builtin_or_path(&module, &item));
         }
-        None
+        // An enum reached by any spelling this unit can write -- its own bare
+        // `Color` for `pal::Color`, `Level` or `Rank` for `signal::Level` --
+        // resolves to the build-wide identity the enum tables are keyed by. A
+        // class or interface name is its own identity and comes back unchanged
+        // (willow-0g8j.3).
+        Some(self.canonical_type_name(class_name))
     }
 
     pub(super) fn resolve_static_call_class_name(
@@ -2062,42 +2071,39 @@ impl TypeChecker {
         span: Span,
     ) -> Option<String> {
         if class_name != "Self" {
-            // What the written class turned out to name. Recorded per call site
-            // (willow-0g8j.3): HIR lowering keeps the source's own spelling, so
-            // `Dict::new()` would reach the back end as a static call on a class
-            // called `Dict` -- a name no table answers to.
-            let resolved = |this: &mut Self, name: String| {
-                if name != class_name {
-                    this.static_call_classes.insert(span, name.clone());
-                }
-                Some(name)
-            };
+            // The same answer [`Self::resolve_static_call_class_quiet`] gives,
+            // with the diagnostics a bad std path owes. `check_expr` records
+            // what the written class resolved to, per expression, so HIR
+            // lowering does not have to keep the source's own spelling
+            // (willow-0g8j.3).
             if let Some(item) = self.imported_collection_aliases.get(class_name).cloned() {
-                return resolved(self, item);
+                return Some(item);
             }
             if let Some((module, item)) = self.resolve_fully_qualified_std_item(class_name, span) {
                 if module == "collections" {
                     self.fully_qualified_collection_types.insert(item.clone());
                 }
-                let name = crate::stdlib_schema::type_item(&module, &item)
-                    .map(|(_, builtin)| builtin.to_string())
-                    .unwrap_or_else(|| format!("{module}::{item}"));
-                return resolved(self, name);
+                return Some(
+                    crate::stdlib_schema::type_item(&module, &item)
+                        .map(|(_, builtin)| builtin.to_string())
+                        .unwrap_or_else(|| format!("{module}::{item}")),
+                );
             }
             if let Some((module, item)) = self.resolve_imported_std_module_item(class_name, span) {
-                let name = crate::stdlib_schema::type_item(&module, &item)
-                    .map(|(_, builtin)| builtin.to_string())
-                    .unwrap_or_else(|| format!("{module}::{item}"));
-                return resolved(self, name);
+                return Some(
+                    crate::stdlib_schema::type_item(&module, &item)
+                        .map(|(_, builtin)| builtin.to_string())
+                        .unwrap_or_else(|| format!("{module}::{item}")),
+                );
             }
             // An enum an item import brought in (`import signal::Level;`, or
             // `as Rank`) is registered under the spelling THIS unit writes but
             // carries the build-wide identity, and that identity is the only
-            // name the enum tables answer to. Recording it here is what lets
-            // `Level::High` reach the back end as `signal::Level::High`
-            // (willow-0g8j.3); a class or interface name is its own identity
-            // and passes through unchanged.
-            return resolved(self, self.canonical_type_name(class_name));
+            // name the enum tables answer to. It is what lets `Level::High`
+            // reach the back end as `signal::Level::High` (willow-0g8j.3); a
+            // class or interface name is its own identity and passes through
+            // unchanged.
+            return Some(self.canonical_type_name(class_name));
         }
 
         match self.current_class.clone() {

@@ -931,9 +931,8 @@ impl TypeChecker {
                 // A `let xs: Array<I> = [..]` literal is checked element-wise
                 // against `I`, so classes implementing interface `I` are accepted.
                 let inferred = match (&annotation, &s.init) {
-                    (Some(Type::Array(elem)), Expr::ArrayLiteral(elements, lit_span)) => {
-                        self.check_array_literal_expecting(elements, *lit_span, Some(elem.as_ref()))
-                    }
+                    (Some(Type::Array(elem)), Expr::ArrayLiteral(elements, _lit_span, _)) => self
+                        .check_array_literal_expecting(elements, s.init.id(), Some(elem.as_ref())),
                     (Some(ann), _) => self.check_expr_expecting(&s.init, ann),
                     _ => self.check_expr(&s.init),
                 };
@@ -953,7 +952,7 @@ impl TypeChecker {
                         // a `Channel<String>` left as `Channel<void>` builds an
                         // untraced buffer whose contents the collector is free
                         // to reclaim while they are still queued.
-                        self.expr_types.insert(s.init.span(), ann.clone());
+                        self.expr_types.insert(s.init.id(), ann.clone());
                     } else if !self.types_compatible(ann, &inferred) {
                         let code = self.type_mismatch_error_code(ann, &inferred);
                         let message = if code == ErrorCode::E0704 {
@@ -1509,7 +1508,7 @@ impl TypeChecker {
                     let mut record = |expr: &Expr| {
                         let ty = self
                             .expr_types
-                            .get(&expr.span())
+                            .get(&expr.id())
                             .cloned()
                             .unwrap_or(Type::I64);
                         self.async_local_types.insert(expr.span(), ty);
@@ -1580,7 +1579,7 @@ impl TypeChecker {
                         // and HIR lowering asks the checker for the type of any
                         // static call it cannot resolve itself (willow-0g8j.2.14).
                         self.expr_types
-                            .insert(sc.span, self.current_return_type.clone());
+                            .insert(sc.id, self.current_return_type.clone());
                         return;
                     }
                 }
@@ -1628,20 +1627,36 @@ impl TypeChecker {
 
     pub(super) fn check_expr(&mut self, expr: &Expr) -> Type {
         let ty = self.check_expr_inner(expr);
+        // What the written class turned out to name, per call site: HIR lowering
+        // rewrites `Level::High` to the build-wide identity `signal::Level::High`
+        // with this, because the node's type already carries that identity and
+        // the enum tables answer to nothing else (willow-njot).
+        let written_class = match expr {
+            Expr::StaticCall(s) => Some(s.class.as_str()),
+            Expr::StaticField(s) => Some(s.class.as_str()),
+            _ => None,
+        };
+        if let Some(written) = written_class
+            && let Some(resolved) = self.resolve_static_call_class_quiet(written)
+            && resolved != written
+        {
+            self.static_call_classes.insert(expr.id(), resolved);
+        }
         // Record the authoritative expression type for downstream consumers
-        // (HIR lowering, willow-mb5): keyed by span, so the immutable AST
-        // never needs to be re-derived.
-        self.expr_types.insert(expr.span(), ty.clone());
+        // (HIR lowering, willow-mb5): keyed by node ID, so a pass that rebuilds
+        // or duplicates syntax cannot inherit another node's entry the way two
+        // nodes sharing a span could (willow-njot).
+        self.expr_types.insert(expr.id(), ty.clone());
         ty
     }
 
     fn check_expr_inner(&mut self, expr: &Expr) -> Type {
         match expr {
-            Expr::Integer(_, _) => Type::I64,
-            Expr::Float(_, _) => Type::F64,
-            Expr::Bool(_, _) => Type::Bool,
-            Expr::String(_, _) => Type::String,
-            Expr::Var(name, span) => {
+            Expr::Integer(_, _, _) => Type::I64,
+            Expr::Float(_, _, _) => Type::F64,
+            Expr::Bool(_, _, _) => Type::Bool,
+            Expr::String(_, _, _) => Type::String,
+            Expr::Var(name, span, _) => {
                 if name == "this" {
                     self.push_legacy_this_error(*span);
                     return Type::Void;
@@ -1817,14 +1832,14 @@ impl TypeChecker {
                 );
                 Type::Void
             }
-            Expr::FieldAccess(obj, field_name, span) => {
+            Expr::FieldAccess(obj, field_name, span, _) => {
                 let obj_ty = self.check_expr(obj);
                 self.resolve_field(&obj_ty, field_name, *span, true)
             }
             Expr::MethodCall(m) => {
                 // `.` is instance member access; module items use `::`. Using
                 // `math.add(..)` on a module is an error that points at `::`.
-                if let Expr::Var(name, _) = &m.object
+                if let Expr::Var(name, _, _) = &m.object
                     && self.symbols.lookup_var(name).is_none()
                     && self.symbols.lookup_module(name).is_some()
                 {
@@ -1958,7 +1973,7 @@ impl TypeChecker {
                 self.check_select(s);
                 Type::Void
             }
-            Expr::Print(arg, newline, _) => {
+            Expr::Print(arg, newline, _, _) => {
                 let arg_ty = self.check_expr(arg);
                 // Printable: i64/f64/bool/String and Never (a panicking
                 // argument never reaches the print). Option values require
@@ -2042,9 +2057,9 @@ impl TypeChecker {
             Expr::Range(r) => self.check_range(r),
             Expr::Lambda(l) => self.check_lambda(l),
             Expr::Match(m) => self.check_match_expr(m),
-            Expr::TryPropagate(inner, span) => self.check_try_propagate(inner, *span),
-            Expr::ArrayLiteral(elements, span) => self.check_array_literal(elements, *span),
-            Expr::Index(arr, index, span) => self.check_index(arr, index, *span),
+            Expr::TryPropagate(inner, span, _) => self.check_try_propagate(inner, *span),
+            Expr::ArrayLiteral(elements, _span, _) => self.check_array_literal(elements, expr.id()),
+            Expr::Index(arr, index, span, _) => self.check_index(arr, index, *span),
         }
     }
 
@@ -2286,7 +2301,7 @@ struct LockSuspend {
 /// Compiler-inserted preemption stays legal — it re-polls the same task and
 /// never hands the lock to another one. A nested `lock` is its own suspension
 /// edge but is already reported as E2605.
-fn lock_body_suspend_spans(body: &Block, expr_types: &HashMap<Span, Type>) -> Vec<LockSuspend> {
+fn lock_body_suspend_spans(body: &Block, expr_types: &HashMap<ExprId, Type>) -> Vec<LockSuspend> {
     let mut found = Vec::new();
     collect_lock_suspends_in_block(body, expr_types, None, &mut found);
     found.sort_by_key(|s| (s.span.start, s.span.end));
@@ -2295,7 +2310,7 @@ fn lock_body_suspend_spans(body: &Block, expr_types: &HashMap<Span, Type>) -> Ve
 
 fn collect_lock_suspends_in_block(
     block: &Block,
-    expr_types: &HashMap<Span, Type>,
+    expr_types: &HashMap<ExprId, Type>,
     deferred_by: Option<Span>,
     out: &mut Vec<LockSuspend>,
 ) {
@@ -2337,7 +2352,7 @@ fn collect_lock_suspends_in_block(
 
 fn collect_lock_suspends_in_expr(
     expr: &Expr,
-    expr_types: &HashMap<Span, Type>,
+    expr_types: &HashMap<ExprId, Type>,
     deferred_by: Option<Span>,
     out: &mut Vec<LockSuspend>,
 ) {
@@ -2377,7 +2392,7 @@ fn collect_lock_suspends_in_expr(
 /// task. Keep in step with the suspension edges the cooperative backend emits.
 fn lock_suspend_operation(
     expr: &Expr,
-    expr_types: &HashMap<Span, Type>,
+    expr_types: &HashMap<ExprId, Type>,
 ) -> Option<(&'static str, LockEffectKind)> {
     match expr {
         Expr::Await(_) => Some(("await", LockEffectKind::Suspend)),
@@ -2386,7 +2401,7 @@ fn lock_suspend_operation(
         // scheduler may then run a task that wants the same lock.
         Expr::MethodCall(call) if matches!(call.method.as_str(), "send" | "recv") => {
             let on_channel = expr_types
-                .get(&call.object.span())
+                .get(&call.object.id())
                 .is_some_and(|ty| builtin_types::is(ty, B::Channel));
             if !on_channel {
                 return None;
@@ -2402,7 +2417,7 @@ fn lock_suspend_operation(
         }
         Expr::MethodCall(call) if matches!(call.method.as_str(), "get" | "set") => {
             let on_blocking_cell = expr_types
-                .get(&call.object.span())
+                .get(&call.object.id())
                 .is_some_and(|ty| builtin_types::unary_arg(ty, B::BlockingCell).is_some());
             on_blocking_cell.then_some((
                 if call.method == "get" {
@@ -2415,7 +2430,7 @@ fn lock_suspend_operation(
         }
         Expr::MethodCall(call) if matches!(call.method.as_str(), "read" | "write") => {
             let on_rwlock = expr_types
-                .get(&call.object.span())
+                .get(&call.object.id())
                 .is_some_and(|ty| builtin_types::unary_arg(ty, B::BlockingRwCell).is_some());
             on_rwlock.then_some((
                 if call.method == "read" {
@@ -2502,13 +2517,13 @@ fn walk_defer_expr(expr: &Expr, on_stmt: &mut impl FnMut(&Stmt), on_expr: &mut i
                 }
             }
         }
-        Expr::TryPropagate(inner, _) => walk_defer_expr(inner, on_stmt, on_expr),
-        Expr::ArrayLiteral(elements, _) => {
+        Expr::TryPropagate(inner, _, _) => walk_defer_expr(inner, on_stmt, on_expr),
+        Expr::ArrayLiteral(elements, _, _) => {
             for element in elements {
                 walk_defer_expr(element, on_stmt, on_expr);
             }
         }
-        Expr::Index(array, index, _) => {
+        Expr::Index(array, index, _, _) => {
             walk_defer_expr(array, on_stmt, on_expr);
             walk_defer_expr(index, on_stmt, on_expr);
         }
@@ -2535,7 +2550,7 @@ fn defer_control_flow_violations(body: &DeferBody) -> Vec<(Span, &'static str)> 
             _ => {}
         },
         &mut |expr| {
-            if let Expr::TryPropagate(_, span) = expr {
+            if let Expr::TryPropagate(_, span, _) = expr {
                 expr_violations.push((*span, "?"));
             }
         },
@@ -2564,7 +2579,7 @@ pub(crate) fn defer_body_contains_direct_recover(body: &DeferBody) -> bool {
     contains
 }
 
-fn defer_async_call_span(body: &DeferBody, expr_types: &HashMap<Span, Type>) -> Option<Span> {
+fn defer_async_call_span(body: &DeferBody, expr_types: &HashMap<ExprId, Type>) -> Option<Span> {
     let mut found = None;
     walk_defer_body(body, &mut |_| {}, &mut |expr| {
         if found.is_some()
@@ -2575,7 +2590,7 @@ fn defer_async_call_span(body: &DeferBody, expr_types: &HashMap<Span, Type>) -> 
         {
             return;
         }
-        if expr_types.get(&expr.span()).is_some_and(|ty| {
+        if expr_types.get(&expr.id()).is_some_and(|ty| {
             builtin_types::resolve(ty)
                 .is_some_and(|resolved| matches!(resolved.id, B::Task | B::Future))
         }) {
@@ -2587,7 +2602,7 @@ fn defer_async_call_span(body: &DeferBody, expr_types: &HashMap<Span, Type>) -> 
 
 fn defer_scheduler_drive_span(
     body: &DeferBody,
-    expr_types: &HashMap<Span, Type>,
+    expr_types: &HashMap<ExprId, Type>,
 ) -> Option<(Span, &'static str)> {
     let mut statement = None;
     let mut expression = None;
@@ -2608,7 +2623,7 @@ fn defer_scheduler_drive_span(
                 return;
             };
             let is_channel = expr_types
-                .get(&call.object.span())
+                .get(&call.object.id())
                 .is_some_and(|ty| builtin_types::is(ty, B::Channel));
             if is_channel && matches!(call.method.as_str(), "send" | "recv") {
                 expression = Some((

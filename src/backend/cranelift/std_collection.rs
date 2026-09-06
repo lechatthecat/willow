@@ -200,7 +200,7 @@ pub(crate) fn normalize_std_collection_expr(expr: &mut Expr, imports: &StdCollec
                 normalize_std_collection_call_arg(arg, imports);
             }
         }
-        Expr::FieldAccess(object, _, _) => {
+        Expr::FieldAccess(object, _, _, _) => {
             normalize_std_collection_expr(object, imports);
         }
         Expr::MethodCall(call) => {
@@ -241,7 +241,7 @@ pub(crate) fn normalize_std_collection_expr(expr: &mut Expr, imports: &StdCollec
         Expr::Await(await_expr) => {
             normalize_std_collection_expr(&mut await_expr.expr, imports);
         }
-        Expr::Print(arg, _, _) => normalize_std_collection_expr(arg, imports),
+        Expr::Print(arg, _, _, _) => normalize_std_collection_expr(arg, imports),
         Expr::Ternary(ternary) => {
             normalize_std_collection_expr(&mut ternary.condition, imports);
             normalize_std_collection_expr(&mut ternary.then_expr, imports);
@@ -274,13 +274,13 @@ pub(crate) fn normalize_std_collection_expr(expr: &mut Expr, imports: &StdCollec
                 }
             }
         }
-        Expr::TryPropagate(inner, _) => normalize_std_collection_expr(inner, imports),
-        Expr::ArrayLiteral(elements, _) => {
+        Expr::TryPropagate(inner, _, _) => normalize_std_collection_expr(inner, imports),
+        Expr::ArrayLiteral(elements, _, _) => {
             for element in elements {
                 normalize_std_collection_expr(element, imports);
             }
         }
-        Expr::Index(array, index, _) => {
+        Expr::Index(array, index, _, _) => {
             normalize_std_collection_expr(array, imports);
             normalize_std_collection_expr(index, imports);
         }
@@ -305,11 +305,11 @@ pub(crate) fn normalize_std_collection_expr(expr: &mut Expr, imports: &StdCollec
                 normalize_std_collection_block(&mut case.body, imports);
             }
         }
-        Expr::Integer(_, _)
-        | Expr::Float(_, _)
-        | Expr::Bool(_, _)
-        | Expr::String(_, _)
-        | Expr::Var(_, _) => {}
+        Expr::Integer(_, _, _)
+        | Expr::Float(_, _, _)
+        | Expr::Bool(_, _, _)
+        | Expr::String(_, _, _)
+        | Expr::Var(_, _, _) => {}
     }
 }
 

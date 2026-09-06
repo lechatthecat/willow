@@ -125,7 +125,7 @@ impl TypeChecker {
         ))
         .with_help("pass the mutable place by reference");
 
-        if let Expr::Var(name, _) = &arg.expr {
+        if let Expr::Var(name, _, _) = &arg.expr {
             diagnostic = diagnostic.with_help(format!("write `&{}`", name));
             diagnostic = diagnostic.with_fix(FixSuggestion::insertion(
                 Span::in_file(
@@ -184,7 +184,7 @@ impl TypeChecker {
 
     pub(super) fn check_expr_expecting(&mut self, expr: &Expr, expected: &Type) -> Type {
         let ty = self.check_expr_expecting_inner(expr, expected);
-        self.expr_types.insert(expr.span(), ty.clone());
+        self.expr_types.insert(expr.id(), ty.clone());
         ty
     }
 
@@ -227,14 +227,14 @@ impl TypeChecker {
         {
             return self.construct_static_variant_call(call, &enum_name, &payloads, result);
         }
-        if let Expr::Var(name, span) = expr {
+        if let Expr::Var(name, _span, _) = expr {
             // A bare identifier resolves to a fieldless variant only when no
             // ordinary declaration shadows the prelude shorthand.
             if self.prelude_variant_name_is_unshadowed(name)
                 && let Some((enum_name, payloads, result)) = self.expected_variant(name, expected)
                 && payloads.is_empty()
             {
-                self.enum_variant_resolutions.insert(*span, enum_name);
+                self.enum_variant_resolutions.insert(expr.id(), enum_name);
                 return result;
             }
         }
@@ -393,7 +393,7 @@ impl TypeChecker {
             }
         }
         self.enum_variant_resolutions
-            .insert(c.span, enum_name.to_string());
+            .insert(c.id, enum_name.to_string());
         result
     }
 
@@ -470,7 +470,7 @@ impl TypeChecker {
         if let Some(key) = self.static_call_enum_key(&call.class)
             && key != call.class
         {
-            self.static_call_classes.insert(call.span, key);
+            self.static_call_classes.insert(call.id, key);
         }
         let omitted_void_payload = call.args.is_empty() && matches!(payload_types, [Type::Void]);
         if call.args.len() != payload_types.len() && !omitted_void_payload {
@@ -580,7 +580,7 @@ impl TypeChecker {
         if !self.current_async_context {
             return;
         }
-        if matches!(&m.object, Expr::Var(name, _) if name == "self") {
+        if matches!(&m.object, Expr::Var(name, _, _) if name == "self") {
             return;
         }
         let Type::Named(class) = obj_ty else {
@@ -793,7 +793,7 @@ impl TypeChecker {
             );
             return;
         };
-        let Expr::String(spec, spec_span) = &first.expr else {
+        let Expr::String(spec, spec_span, _) = &first.expr else {
             self.check_expr(&first.expr);
             for arg in &c.args[1..] {
                 self.check_expr(&arg.expr);

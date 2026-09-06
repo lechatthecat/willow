@@ -150,7 +150,7 @@ fn super_offset_guarded<S: IfaceShapes + ?Sized>(
     found
 }
 
-impl IfaceShapes for std::collections::HashMap<String, crate::semantic::symbols::InterfaceInfo> {
+impl IfaceShapes for super::type_index::TypeMap<crate::semantic::symbols::InterfaceInfo> {
     fn canonical(&self, iface: &str) -> String {
         self.get(iface)
             .map(|info| info.name.clone())

@@ -74,7 +74,7 @@ impl GcLayoutMetadata {
         class_name: &str,
         runtime_type_id: i64,
         fields: &[(String, Type)],
-        enum_infos: &HashMap<String, EnumInfo>,
+        enum_infos: &TypeMap<EnumInfo>,
     ) -> Self {
         let gc_ref_mask = gc_ref_mask_for_layout(class_name, fields, enum_infos);
         Self::new(
@@ -376,7 +376,7 @@ mod tests {
             ("count".to_string(), Type::I64),
             ("name".to_string(), Type::String),
         ];
-        let layout = GcLayoutMetadata::class("Node", 17, &fields, &HashMap::new());
+        let layout = GcLayoutMetadata::class("Node", 17, &fields, &TypeMap::new());
         assert_eq!(layout.kind, GcObjectKind::Class);
         assert_eq!(layout.payload_size, 24);
         assert_eq!(layout.runtime_type_id, 17);

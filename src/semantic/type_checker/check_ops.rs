@@ -264,7 +264,7 @@ impl TypeChecker {
     }
 
     fn is_unshadowed_bare_none(&self, expr: &Expr) -> bool {
-        matches!(expr, Expr::Var(name, _) if name == "None" && self.prelude_variant_name_is_unshadowed(name))
+        matches!(expr, Expr::Var(name, _, _) if name == "None" && self.prelude_variant_name_is_unshadowed(name))
     }
 
     fn option_none_comparison_receiver<'a>(
@@ -275,13 +275,13 @@ impl TypeChecker {
     ) -> Option<&'a str> {
         if is_option_none_expr(self, &binary.rhs)
             && is_option_type(left_ty)
-            && let Expr::Var(name, _) = &binary.lhs
+            && let Expr::Var(name, _, _) = &binary.lhs
         {
             return Some(name);
         }
         if is_option_none_expr(self, &binary.lhs)
             && is_option_type(right_ty)
-            && let Expr::Var(name, _) = &binary.rhs
+            && let Expr::Var(name, _, _) = &binary.rhs
         {
             return Some(name);
         }
@@ -469,8 +469,8 @@ fn negative_exponent_literal_span(exponent: &Expr) -> Option<Span> {
     // `- 0` is still zero, and `x ** 0` is 1, so only a non-zero magnitude is
     // an error.
     match unary.expr {
-        Expr::Integer(0, _) => None,
-        Expr::Integer(_, _) => Some(unary.span),
+        Expr::Integer(0, _, _) => None,
+        Expr::Integer(_, _, _) => Some(unary.span),
         _ => None,
     }
 }

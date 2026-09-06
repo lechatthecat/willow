@@ -25,8 +25,8 @@ use std::collections::HashMap;
 
 use crate::diagnostics::{Diagnostic, ErrorCode, Severity, Span};
 use crate::parser::ast::{
-    BinOp, Block, CallArg, CallArgMode, DeferBody, Expr, FunctionDecl, Item, MethodDecl, Program,
-    SelectCaseKind, Stmt, Type, UnaryOp,
+    BinOp, Block, CallArg, CallArgMode, DeferBody, Expr, ExprId, FunctionDecl, Item, MethodDecl,
+    PatternId, Program, SelectCaseKind, Stmt, Type, UnaryOp,
 };
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::symbols;
@@ -44,17 +44,17 @@ use super::typed_ast::{
 #[derive(Default)]
 pub struct CheckerTables<'a> {
     /// Unqualified enum-variant constructions (`Ok(42)` in an expected-enum
-    /// position), keyed by the call's span; the value is the resolved enum
+    /// position), keyed by the call's node ID; the value is the resolved enum
     /// name and the variant is the call's callee.
-    pub enum_variant_resolutions: Option<&'a HashMap<Span, String>>,
+    pub enum_variant_resolutions: Option<&'a HashMap<ExprId, String>>,
     /// Checked reinterpretations of bare match patterns. When this table is
     /// present, an absent entry preserves the parsed binding or downcast;
     /// knowing an enum's identity does not grant access to its bare variants.
-    pub pattern_resolutions: Option<&'a HashMap<Span, crate::parser::ast::Pattern>>,
+    pub pattern_resolutions: Option<&'a HashMap<PatternId, crate::parser::ast::Pattern>>,
     /// The checker's authoritative type for every checked expression, keyed by
-    /// span — the final fallback when the structural lowering cannot derive a
-    /// type (generic constructions, `Self::` calls, module-qualified items).
-    pub expr_types: Option<&'a HashMap<Span, Type>>,
+    /// node ID — the final fallback when the structural lowering cannot derive
+    /// a type (generic constructions, `Self::` calls, module-qualified items).
+    pub expr_types: Option<&'a HashMap<ExprId, Type>>,
     /// Every enum the checker registered, under every name it registered it
     /// by: a program's own `Color`, an imported module's `palette::Color`, and
     /// the bare local name a direct type import binds (`Kind` for
@@ -72,13 +72,13 @@ pub struct CheckerTables<'a> {
     /// meets a named type nothing has heard of and turns the body down.
     pub normalized_types: Option<&'a HashMap<Type, Type>>,
     /// What a static call's written class name resolved to, keyed by the call's
-    /// span, for the calls where the two differ (willow-0g8j.3).
-    pub static_call_classes: Option<&'a HashMap<Span, String>>,
+    /// node ID, for the calls where the two differ (willow-0g8j.3).
+    pub static_call_classes: Option<&'a HashMap<ExprId, String>>,
     /// What each lambda captures from its enclosing function, keyed by the
-    /// lambda's span and ordered as the closure environment lays its slots out
+    /// lambda's node ID and ordered as the closure environment lays its slots out
     /// (willow-0g8j.2.12). Only the checker knows this: capture is decided by
     /// name resolution, which the AST does not record.
-    pub lambda_captures: Option<&'a HashMap<Span, Vec<LambdaCapture>>>,
+    pub lambda_captures: Option<&'a HashMap<ExprId, Vec<LambdaCapture>>>,
 }
 
 impl<'a> CheckerTables<'a> {
@@ -133,35 +133,35 @@ impl<'a> CheckerTables<'a> {
     /// table — including the parameter types a call site supplied, which the
     /// AST cannot spell. Either callable form answers: which one it is says
     /// whether the lambda captures, not what its signature is.
-    fn lambda_fn_type(&self, span: &Span) -> Option<&Type> {
-        match self.expr_types.and_then(|m| m.get(span)) {
+    fn lambda_fn_type(&self, id: &ExprId) -> Option<&Type> {
+        match self.expr_types.and_then(|m| m.get(id)) {
             Some(ty @ (Type::Fn(..) | Type::Closure(..))) => Some(ty),
             _ => None,
         }
     }
 
     /// What the lambda at `span` captures, in environment-slot order.
-    fn lambda_captures(&self, span: &Span) -> &[LambdaCapture] {
+    fn lambda_captures(&self, id: &ExprId) -> &[LambdaCapture] {
         self.lambda_captures
-            .and_then(|m| m.get(span))
+            .and_then(|m| m.get(id))
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
 
-    fn enum_variant_resolution(&self, span: &Span) -> Option<&String> {
-        self.enum_variant_resolutions.and_then(|m| m.get(span))
+    fn enum_variant_resolution(&self, id: &ExprId) -> Option<&String> {
+        self.enum_variant_resolutions.and_then(|m| m.get(id))
     }
 
     /// The class a static call actually names, given the written spelling.
-    fn static_call_class(&self, span: &Span, written: &str) -> String {
+    fn static_call_class(&self, id: &ExprId, written: &str) -> String {
         self.static_call_classes
-            .and_then(|m| m.get(span))
+            .and_then(|m| m.get(id))
             .cloned()
             .unwrap_or_else(|| written.to_string())
     }
 
-    fn expr_type(&self, span: &Span) -> Option<Type> {
-        self.expr_types.and_then(|m| m.get(span).cloned())
+    fn expr_type(&self, id: &ExprId) -> Option<Type> {
+        self.expr_types.and_then(|m| m.get(id).cloned())
     }
 
     /// The checker's enums, re-keyed by the name they are WRITTEN with —
@@ -932,11 +932,11 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
 
 fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     match expr {
-        Expr::Integer(n, span) => Ok(lit(HirExprKind::Int(*n), Type::I64, *span)),
-        Expr::Float(f, span) => Ok(lit(HirExprKind::Float(*f), Type::F64, *span)),
-        Expr::Bool(b, span) => Ok(lit(HirExprKind::Bool(*b), Type::Bool, *span)),
-        Expr::String(s, span) => Ok(lit(HirExprKind::Str(s.clone()), Type::String, *span)),
-        Expr::Var(name, span) => {
+        Expr::Integer(n, span, _) => Ok(lit(HirExprKind::Int(*n), Type::I64, *span)),
+        Expr::Float(f, span, _) => Ok(lit(HirExprKind::Float(*f), Type::F64, *span)),
+        Expr::Bool(b, span, _) => Ok(lit(HirExprKind::Bool(*b), Type::Bool, *span)),
+        Expr::String(s, span, _) => Ok(lit(HirExprKind::Str(s.clone()), Type::String, *span)),
+        Expr::Var(name, span, _) => {
             if let Some(binding) = ctx.lookup(name) {
                 return Ok(HirExpr {
                     kind: HirExprKind::Var(binding.hir_name.clone()),
@@ -947,10 +947,10 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
             // A bare fieldless unqualified variant (`None`, `Halt`) parses as a
             // variable; the checker resolves it against the expected enum and
             // records both the enum and the expression type.
-            if let Some(enum_name) = ctx.tables.enum_variant_resolution(span) {
+            if let Some(enum_name) = ctx.tables.enum_variant_resolution(&expr.id()) {
                 let ty = ctx
                     .tables
-                    .expr_type(span)
+                    .expr_type(&expr.id())
                     .unwrap_or_else(|| Type::Named(enum_name.clone()));
                 return Ok(HirExpr {
                     kind: HirExprKind::StaticField {
@@ -967,7 +967,7 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
             // than rebuilding it keeps the parameter modes and the return type
             // exactly what the call site was checked against.
             if ctx.fn_returns.contains_key(name)
-                && let Some(ty @ Type::Fn(..)) = ctx.tables.expr_type(span)
+                && let Some(ty @ Type::Fn(..)) = ctx.tables.expr_type(&expr.id())
             {
                 return Ok(HirExpr {
                     kind: HirExprKind::FnRef(name.clone()),
@@ -1014,10 +1014,10 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
             // An unqualified enum-variant construction (`Ok(42)` in an
             // expected-enum position) parses as a call; the checker records
             // which enum it resolved to (willow-60o.1).
-            if let Some(enum_name) = ctx.tables.enum_variant_resolution(&c.span) {
+            if let Some(enum_name) = ctx.tables.enum_variant_resolution(&c.id) {
                 // Prefer the checker's recorded type (it carries generic type
                 // arguments, e.g. `Result<i64, String>` for `Ok(42)`).
-                let ty = match ctx.tables.expr_type(&c.span) {
+                let ty = match ctx.tables.expr_type(&c.id) {
                     Some(ty) => ty,
                     None => enum_variant_construction_type(ctx.enums, enum_name, &args, c.span)?,
                 };
@@ -1054,7 +1054,7 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
                 // symbol of the module THIS unit imported, rebinding it before
                 // each unit's bodies, so the call the type came from is the
                 // call that gets emitted (willow-28h8).
-                .or_else(|| ctx.tables.expr_type(&c.span))
+                .or_else(|| ctx.tables.expr_type(&c.id))
                 .ok_or_else(|| {
                     internal(
                         c.span,
@@ -1070,7 +1070,7 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
                 span: c.span,
             })
         }
-        Expr::Print(inner, newline, span) => {
+        Expr::Print(inner, newline, span, _) => {
             let value = lower_expr(inner, ctx)?;
             Ok(HirExpr {
                 kind: HirExprKind::Print {
@@ -1081,7 +1081,7 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
                 span: *span,
             })
         }
-        Expr::ArrayLiteral(elements, span) => {
+        Expr::ArrayLiteral(elements, span, _) => {
             let mut lowered = Vec::with_capacity(elements.len());
             for element in elements {
                 lowered.push(lower_expr(element, ctx)?);
@@ -1098,7 +1098,7 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
             // lowering picking one.
             let ty = match lowered.first() {
                 Some(first) => Type::Array(Box::new(first.ty.clone())),
-                None => match ctx.tables.expr_type(span) {
+                None => match ctx.tables.expr_type(&expr.id()) {
                     Some(recorded @ Type::Array(_)) => recorded,
                     _ => {
                         return Err(unsupported(
@@ -1114,7 +1114,7 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
                 span: *span,
             })
         }
-        Expr::Index(array, index, span) => {
+        Expr::Index(array, index, span, _) => {
             let array = lower_expr(array, ctx)?;
             let index = lower_expr(index, ctx)?;
             // A `FrozenArray<T>` is the same runtime handle as the `Array<T>` it
@@ -1166,7 +1166,7 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
                 span: n.span,
             })
         }
-        Expr::FieldAccess(object, field, span) => {
+        Expr::FieldAccess(object, field, span, _) => {
             let object = lower_expr(object, ctx)?;
             let ty = {
                 match class_name_of(&object.ty)
@@ -1175,7 +1175,7 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
                     Some(ty) => ty,
                     None => ctx
                         .tables
-                        .expr_type(span)
+                        .expr_type(&expr.id())
                         .ok_or_else(|| unsupported(*span, "field not found on receiver"))?,
                 }
             };
@@ -1200,7 +1200,7 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
                 // Checker authority: interface methods, generic receivers,
                 // Option/Result methods, and anything else it typed.
                 ctx.tables
-                    .expr_type(&m.span)
+                    .expr_type(&m.id)
                     .ok_or_else(|| unsupported(m.span, "method not found on receiver"))?
             };
             let args = lower_value_args(&m.args, ctx)?;
@@ -1237,7 +1237,7 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
                 // it: `Self::prop` inside a class body names a class the
                 // registry has no entry for, and the checker has already
                 // resolved and typed the read (willow-0g8j.13).
-                .or_else(|| ctx.tables.expr_type(&s.span))
+                .or_else(|| ctx.tables.expr_type(&s.id))
                 .ok_or_else(|| unsupported(s.span, "static property not found"))?;
             Ok(HirExpr {
                 kind: HirExprKind::StaticField {
@@ -1255,7 +1255,7 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
                 .or_else(|| ctx.classes.static_method_type(&s.class, &s.method))
                 // Checker authority: generic-enum construction, `Self::`,
                 // module-qualified statics, constructors.
-                .or_else(|| ctx.tables.expr_type(&s.span))
+                .or_else(|| ctx.tables.expr_type(&s.id))
                 .ok_or_else(|| {
                     unsupported(
                         s.span,
@@ -1265,7 +1265,7 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
             let args = lower_value_args(&s.args, ctx)?;
             Ok(HirExpr {
                 kind: HirExprKind::StaticCall {
-                    class: ctx.tables.static_call_class(&s.span, &s.class),
+                    class: ctx.tables.static_call_class(&s.id, &s.class),
                     method: s.method.clone(),
                     args,
                 },
@@ -1378,7 +1378,7 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
                 span: a.span,
             })
         }
-        Expr::TryPropagate(inner, span) => {
+        Expr::TryPropagate(inner, span, _) => {
             let inner = lower_expr(inner, ctx)?;
             let ty = builtin_types::resolve(&inner.ty)
                 .filter(|resolved| matches!(resolved.id, B::Result | B::Option))
@@ -1396,18 +1396,18 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
             // The checker's inferred full `fn(...) -> ...` type fills in what
             // the AST cannot store: unannotated parameter types and, for
             // block-bodied lambdas, the inferred return type.
-            let inferred = match ctx.tables.lambda_fn_type(&l.span) {
+            let inferred = match ctx.tables.lambda_fn_type(&l.id) {
                 Some(Type::Fn(params, ret) | Type::Closure(params, ret)) => {
                     Some((params.clone(), (**ret).clone()))
                 }
                 _ => None,
             };
-            let is_closure = matches!(ctx.tables.lambda_fn_type(&l.span), Some(Type::Closure(..)));
+            let is_closure = matches!(ctx.tables.lambda_fn_type(&l.id), Some(Type::Closure(..)));
             // Resolve every capture in the ENCLOSING namespace first: after the
             // scope below, `n` means the lambda's own copy (willow-0g8j.2.12).
             let capture_sources: Vec<(String, String, Type)> = ctx
                 .tables
-                .lambda_captures(&l.span)
+                .lambda_captures(&l.id)
                 .iter()
                 .map(|c| {
                     (
@@ -1533,6 +1533,7 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
             };
             Ok(HirExpr {
                 kind: HirExprKind::Lambda {
+                    id: l.id,
                     params,
                     captures,
                     body,
@@ -1623,12 +1624,12 @@ fn lower_match(
         let checked_pattern = ctx
             .tables
             .pattern_resolutions
-            .and_then(|patterns| patterns.get(&arm.pattern.span()))
+            .and_then(|patterns| patterns.get(&arm.pattern.id()))
             .unwrap_or(&arm.pattern);
         let pattern = match checked_pattern {
-            Pattern::Wildcard(_) => HirPattern::Wildcard,
-            Pattern::LiteralBool(b, _) => HirPattern::LiteralBool(*b),
-            Pattern::LiteralInt(n, _) => HirPattern::LiteralInt(*n),
+            Pattern::Wildcard(_, _) => HirPattern::Wildcard,
+            Pattern::LiteralBool(b, _, _) => HirPattern::LiteralBool(*b),
+            Pattern::LiteralInt(n, _, _) => HirPattern::LiteralInt(*n),
             Pattern::Binding { name, .. } => {
                 if let Some((enum_name, info, _)) = &enum_context
                     && infer_variant

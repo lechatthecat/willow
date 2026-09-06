@@ -165,7 +165,7 @@ impl TypeChecker {
         if matches!(expected, Type::Fn(..)) && matches!(actual, Type::Closure(..)) {
             let captured = self
                 .lambda_captures
-                .get(&l.span)
+                .get(&l.id)
                 .map(|c| {
                     c.iter()
                         .map(|c| format!("`{}`", c.name))
@@ -496,7 +496,7 @@ impl TypeChecker {
         } else {
             Type::Closure(param_types, Box::new(ret_ty))
         };
-        self.lambda_captures.insert(l.span, captures);
+        self.lambda_captures.insert(l.id, captures);
         // Record the lambda's type here rather than leaving it to `check_expr`:
         // a lambda passed as a call argument is checked through
         // `check_fn_arg_with_param_context`, which never goes through
@@ -504,7 +504,7 @@ impl TypeChecker {
         // from the call site rather than from annotations. Without this the
         // backend and the HIR lowering would have no type for it at all
         // (willow-0g8j.3, replacing the `lambda_fn_types` side table).
-        self.expr_types.insert(l.span, fn_ty.clone());
+        self.expr_types.insert(l.id, fn_ty.clone());
         fn_ty
     }
 
@@ -534,6 +534,7 @@ impl TypeChecker {
                 class_name,
                 binding,
                 span,
+                ..
             } => {
                 let variant = info.variants.iter().find(|v| v.name == *class_name)?;
                 if !bare || variant.payload_types.is_empty() {
@@ -544,9 +545,10 @@ impl TypeChecker {
                     variant: class_name.clone(),
                     bindings: vec![binding.clone()],
                     span: *span,
+                    id: PatternId::fresh(),
                 })
             }
-            Pattern::Binding { name, span } => {
+            Pattern::Binding { name, span, .. } => {
                 let variant = info.variants.iter().find(|v| v.name == *name)?;
                 if !bare || !variant.payload_types.is_empty() {
                     return None;
@@ -555,6 +557,7 @@ impl TypeChecker {
                     enum_name: enum_name.clone(),
                     variant: name.clone(),
                     span: *span,
+                    id: PatternId::fresh(),
                 })
             }
             // The same enum under another of its spellings: a module matching
@@ -567,11 +570,13 @@ impl TypeChecker {
                 enum_name: written,
                 variant,
                 span,
+                ..
             } if written != enum_name && self.canonical_type_name(written) == info.name => {
                 Some(Pattern::EnumVariant {
                     enum_name: enum_name.clone(),
                     variant: variant.clone(),
                     span: *span,
+                    id: PatternId::fresh(),
                 })
             }
             Pattern::EnumVariantTuple {
@@ -579,12 +584,14 @@ impl TypeChecker {
                 variant,
                 bindings,
                 span,
+                ..
             } if written != enum_name && self.canonical_type_name(written) == info.name => {
                 Some(Pattern::EnumVariantTuple {
                     enum_name: enum_name.clone(),
                     variant: variant.clone(),
                     bindings: bindings.clone(),
                     span: *span,
+                    id: PatternId::fresh(),
                 })
             }
             _ => None,
@@ -633,20 +640,19 @@ impl TypeChecker {
             // backend (willow-60o.1). Everything below uses `pattern`.
             let reinterpreted = self.normalize_match_pattern(&arm.pattern, &scrutinee_ty);
             if let Some(p) = &reinterpreted {
-                self.pattern_resolutions
-                    .insert(arm.pattern.span(), p.clone());
+                self.pattern_resolutions.insert(arm.pattern.id(), p.clone());
             }
             let pattern: &Pattern = reinterpreted.as_ref().unwrap_or(&arm.pattern);
 
             // Validate pattern and track coverage
             match pattern {
-                Pattern::Wildcard(_) => {
+                Pattern::Wildcard(_, _) => {
                     has_wildcard = true;
                 }
                 Pattern::Binding { .. } => {
                     has_wildcard = true; // binding covers everything
                 }
-                Pattern::LiteralBool(b, span) => {
+                Pattern::LiteralBool(b, span, _) => {
                     if scrutinee_ty != Type::Bool {
                         self.push(
                             Diagnostic::new(
@@ -666,7 +672,7 @@ impl TypeChecker {
                         has_false = true;
                     }
                 }
-                Pattern::LiteralInt(_, span) => {
+                Pattern::LiteralInt(_, span, _) => {
                     if scrutinee_ty != Type::I64 {
                         self.push(
                             Diagnostic::new(
@@ -685,6 +691,7 @@ impl TypeChecker {
                     enum_name,
                     variant,
                     span,
+                    ..
                 } => {
                     // Generic enum variant patterns: the scrutinee may be
                     // Generic(enum_name, type_args) rather than Named(enum_name).
@@ -735,6 +742,7 @@ impl TypeChecker {
                     variant,
                     bindings,
                     span,
+                    ..
                 } => {
                     // Generic enum variant: resolve concrete payload types from scrutinee.
                     let builtin_payload: Option<Vec<Type>> =
@@ -910,6 +918,7 @@ impl TypeChecker {
                 class_name,
                 binding,
                 span: bspan,
+                ..
             } = pattern
                 && binding != "_"
             {
@@ -924,7 +933,10 @@ impl TypeChecker {
                 );
             }
             // For binding patterns, define the variable
-            if let Pattern::Binding { name, span: bspan } = pattern {
+            if let Pattern::Binding {
+                name, span: bspan, ..
+            } = pattern
+            {
                 self.define_var(
                     name.clone(),
                     VarInfo {
@@ -1185,7 +1197,7 @@ impl AstVisitor for CaptureScan<'_> {
 
     fn visit_expr(&mut self, expr: &Expr) {
         match expr {
-            Expr::Var(name, span) => self.note_use(name, *span),
+            Expr::Var(name, span, _) => self.note_use(name, *span),
             // Calling a local function VALUE captures it: the callee is a name
             // on the call node, not a `Var` the walk reaches, exactly as an
             // assignment target is. A free function's name resolves to no
@@ -1228,6 +1240,7 @@ mod lambda_capture_tests {
     //! first-mention order, 39 a field write THROUGH a capture is not a write
     //! to it, 40 a capture two frames up rides both environments.
     use crate::diagnostics::Diagnostic;
+    use crate::parser::ast::ExprId;
 
     /// Check `src`, and report both its diagnostics and what each lambda
     /// captures — outer lambdas first, and within one lambda in the order the
@@ -1239,8 +1252,37 @@ mod lambda_capture_tests {
         let mut checker = crate::semantic::TypeChecker::new();
         crate::register_prelude(&mut checker).expect("prelude");
         checker.check_program(&program);
-        let mut lambdas: Vec<_> = checker.lambda_captures.iter().collect();
-        lambdas.sort_by_key(|(span, _)| (span.start, span.end));
+        struct LambdaOrder(Vec<ExprId>);
+        impl crate::parser::visit::AstVisitor for LambdaOrder {
+            fn visit_lambda(&mut self, lambda: &crate::parser::ast::LambdaExpr) {
+                self.0.push(lambda.id);
+                crate::parser::visit::walk_lambda(self, lambda);
+            }
+        }
+        let mut order = LambdaOrder(Vec::new());
+        for item in &program.items {
+            match item {
+                crate::parser::ast::Item::Function(f) => {
+                    crate::parser::visit::walk_block(&mut order, &f.body)
+                }
+                crate::parser::ast::Item::Class(c) => {
+                    for m in &c.methods {
+                        crate::parser::visit::walk_block(&mut order, &m.body);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let lambdas: Vec<_> = order
+            .0
+            .iter()
+            .filter_map(|id| {
+                checker
+                    .lambda_captures
+                    .get(id)
+                    .map(|captures| (id, captures))
+            })
+            .collect();
         let captures = lambdas
             .into_iter()
             .map(|(_, c)| c.iter().map(|c| c.name.clone()).collect())

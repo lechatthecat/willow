@@ -176,6 +176,7 @@
 //! emitter and the runtime ABI are built on, so a niche `Option<String>` and a
 //! boxed `Option<i64>` cannot be confused for one another.
 
+use super::type_index::TypeMap;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
@@ -195,7 +196,7 @@ use crate::ir::typed_ast::{
     HirCapture, HirExpr, HirExprKind, HirMatchArm, HirPattern, HirSelectCase, HirSelectCaseKind,
     HirStmt,
 };
-use crate::parser::ast::{BinOp, ParamMode, Type, UnaryOp};
+use crate::parser::ast::{BinOp, ExprId, ParamMode, Type, UnaryOp};
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::ids::{FunctionId, FunctionMap};
 use crate::semantic::intrinsics::{self, Intrinsic};
@@ -630,13 +631,13 @@ impl LirEnumDef {
 pub(super) struct LirTypeCtx<'x> {
     /// Whether a symbol name is a declared/linkable function.
     pub known_fn: &'x dyn Fn(&str) -> bool,
-    pub class_layouts: &'x HashMap<String, Vec<(String, Type)>>,
-    pub class_base: &'x HashMap<String, String>,
+    pub class_layouts: &'x TypeMap<Vec<(String, Type)>>,
+    pub class_base: &'x TypeMap<String>,
     /// Runtime `type_id` per class NAME. A direct type import (`import
     /// zoo::Animal;`) registers the imported class a second time under its
     /// unqualified name, sharing the canonical class's id — so this is what
     /// makes class IDENTITY comparable across those two names.
-    pub class_type_ids: &'x HashMap<String, i64>,
+    pub class_type_ids: &'x TypeMap<i64>,
     /// Whether a name is registered as an interface (never a class here).
     pub is_interface: &'x dyn Fn(&str) -> bool,
     /// Whether boxing `(class, interface)` resolves to a registered vtable —
@@ -690,7 +691,7 @@ pub(super) struct LirTypeCtx<'x> {
     /// module's own declaration phase (willow-9yhi). `None` for a lambda the
     /// backend never declared, so the walker refuses rather than emitting the
     /// address of nothing.
-    pub lambda_symbol: &'x dyn Fn(Span) -> Option<String>,
+    pub lambda_symbol: &'x dyn Fn(ExprId) -> Option<String>,
     /// The declared return type of the function being vetted. Unlike every
     /// other field this one is per-FUNCTION, and it is here because a `return`
     /// inside a `match` arm is checked deep inside `supported_expr`, where the
@@ -761,8 +762,8 @@ fn normalize_void_payloads(payloads: &mut Vec<Type>) {
 /// nothing, so no name that resolves today stops resolving — a class reached
 /// through a module that only another module imports keeps working.
 fn resolve_class_key(
-    class_layouts: &HashMap<String, Vec<(String, Type)>>,
-    class_type_ids: &HashMap<String, i64>,
+    class_layouts: &TypeMap<Vec<(String, Type)>>,
+    class_type_ids: &TypeMap<i64>,
     known_modules: &HashMap<String, String>,
     visible_modules: &HashSet<String>,
     name: &str,
@@ -3641,8 +3642,8 @@ fn supported_expr<'n>(
         // signature is the type the expression carries — plus, for a closure,
         // that every value the environment is built from is a name THIS
         // function can resolve and a word the walker can copy.
-        HirExprKind::Lambda { captures, .. } => {
-            (ctx.lambda_symbol)(e.span)
+        HirExprKind::Lambda { id, captures, .. } => {
+            (ctx.lambda_symbol)(*id)
                 .and_then(|sym| ctx.fn_value_of(&sym))
                 .is_some_and(|ty| ty == e.ty)
                 && closure_env_representable(captures)
@@ -6428,8 +6429,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // what lets the walker name a symbol it never invented
             // (willow-0g8j.2.2). A `closure`-typed one builds its environment
             // object instead (willow-0g8j.2.12).
-            HirExprKind::Lambda { captures, .. } => {
-                let name = self.lambda_names[&e.span].clone();
+            HirExprKind::Lambda { id, captures, .. } => {
+                let name = self.lambda_names[id].clone();
                 let fid = self.func_ids[name.as_str()];
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
                 let code = self
@@ -9972,10 +9973,10 @@ mod tests {
 
     struct TestTables {
         known: HashSet<String>,
-        class_layouts: HashMap<String, Vec<(String, Type)>>,
+        class_layouts: TypeMap<Vec<(String, Type)>>,
         static_fields: HashMap<(String, String), Type>,
-        class_base: HashMap<String, String>,
-        class_type_ids: HashMap<String, i64>,
+        class_base: TypeMap<String>,
+        class_type_ids: TypeMap<i64>,
         interfaces: HashSet<String>,
         iface_type_params: HashMap<String, Vec<String>>,
         /// Direct super-interfaces, in declaration order. The real backend
@@ -10015,7 +10016,7 @@ mod tests {
         /// in for the backend's `lambda_names` (willow-0g8j.2.2). Registered
         /// from the lowered IR's own lambda list, so a test's symbol table and
         /// its lambda bodies cannot describe different signatures.
-        lambdas: HashMap<Span, String>,
+        lambdas: HashMap<ExprId, String>,
         /// Cooperative leaf async functions, standing in for the backend's
         /// `cooperative_leaves` (willow-0g8j.2.11). Registered from every
         /// `async fn` the test program declares, which is what
@@ -10050,10 +10051,10 @@ mod tests {
             let mut t = TestTables {
                 known: extra_fns.iter().map(|s| s.to_string()).collect(),
                 cooperative_leaves: HashSet::new(),
-                class_layouts: HashMap::new(),
+                class_layouts: TypeMap::new(),
                 static_fields: HashMap::new(),
-                class_base: HashMap::new(),
-                class_type_ids: HashMap::new(),
+                class_base: TypeMap::new(),
+                class_type_ids: TypeMap::new(),
                 interfaces: HashSet::new(),
                 iface_type_params: HashMap::new(),
                 iface_supers: HashMap::new(),
@@ -10086,7 +10087,7 @@ mod tests {
                     &name,
                     l.function.params.iter().map(|_| ParamMode::Value).collect(),
                 );
-                t.lambdas.insert(l.span, name);
+                t.lambdas.insert(l.id, name);
             }
             let sig = |params: &[crate::parser::ast::Param], ret: &Type, with_self: bool| {
                 let mut ps: Vec<Type> = Vec::new();
@@ -10261,7 +10262,7 @@ mod tests {
                         .contains(&(class.to_string(), iface.to_string()))
                 },
                 enum_def: &|n| self.enums.get(n).cloned(),
-                lambda_symbol: &|span| self.lambdas.get(&span).cloned(),
+                lambda_symbol: &|id| self.lambdas.get(&id).cloned(),
                 cooperative_leaves: &self.cooperative_leaves,
                 iface_method: &|iface_ty, method| {
                     let (iface, args): (&str, &[Type]) = match iface_ty {
@@ -11036,12 +11037,12 @@ mod tests {
     /// The two tables [`resolve_class_key`] reads: layouts by class key, and
     /// the runtime type id of each (a negative id in the fixture means the
     /// class has none).
-    type ClassTables = (HashMap<String, Vec<(String, Type)>>, HashMap<String, i64>);
+    type ClassTables = (TypeMap<Vec<(String, Type)>>, TypeMap<i64>);
 
     /// `class_layouts` and `class_type_ids` holding one empty class per entry.
     fn class_tables(classes: &[(&str, i64)]) -> ClassTables {
-        let mut layouts = HashMap::new();
-        let mut ids = HashMap::new();
+        let mut layouts = TypeMap::new();
+        let mut ids = TypeMap::new();
         for (name, id) in classes {
             layouts.insert((*name).to_string(), Vec::new());
             if *id >= 0 {
@@ -13580,7 +13581,7 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
             tag,
             declaration_span: crate::diagnostics::Span::dummy(),
         };
-        let mut infos = HashMap::new();
+        let mut infos = TypeMap::new();
         infos.insert(
             "Color".to_string(),
             EnumInfo {
@@ -14710,7 +14711,7 @@ fn f() {
     }
 
     // f07. the walker never takes the address of a symbol it cannot name. The
-    // lambda's SYMBOL comes from the backend's span-keyed table, not from the
+    // lambda's SYMBOL comes from the backend's ID-keyed table, not from the
     // IR, so an unregistered lambda (one inside an imported module, today)
     // must refuse rather than emit an address of nothing.
     #[test]

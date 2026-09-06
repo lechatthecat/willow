@@ -9,8 +9,8 @@ impl TypeChecker {
     /// from the first element; all elements must agree. An empty literal yields
     /// `Array<Void>`, an unresolved placeholder that a type annotation resolves
     /// (e.g. `let xs: Array<i64> = [];`).
-    pub(super) fn check_array_literal(&mut self, elements: &[Expr], span: Span) -> Type {
-        self.check_array_literal_expecting(elements, span, None)
+    pub(super) fn check_array_literal(&mut self, elements: &[Expr], id: ExprId) -> Type {
+        self.check_array_literal_expecting(elements, id, None)
     }
 
     /// Type-check an array literal. When `expected_elem` is given (e.g. from a
@@ -20,7 +20,7 @@ impl TypeChecker {
     pub(super) fn check_array_literal_expecting(
         &mut self,
         elements: &[Expr],
-        span: Span,
+        id: ExprId,
         expected_elem: Option<&Type>,
     ) -> Type {
         let ty = self.check_array_literal_type(elements, expected_elem);
@@ -29,7 +29,7 @@ impl TypeChecker {
         // type gets recorded for downstream consumers (willow-0g8j.2.10). An
         // EMPTY literal has no element to infer from, and the annotation is the
         // only thing that says what it holds.
-        self.expr_types.insert(span, ty.clone());
+        self.expr_types.insert(id, ty.clone());
         ty
     }
 

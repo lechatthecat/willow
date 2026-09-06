@@ -68,20 +68,22 @@ pub struct TypeChecker {
     /// across `await`. The backend used to read it to frame-back unannotated
     /// locals; the lowered-IR frame layout owns that now (willow-0g8j.3).
     async_local_types: HashMap<Span, Type>,
-    /// Maps the span of an UNQUALIFIED enum-variant construction (`Ok(42)` in an
+    /// Maps the ID of an UNQUALIFIED enum-variant construction (`Ok(42)` in an
     /// expected-enum position) to the enum it resolved to. The backend consults
     /// this to lower such a `Call` as a variant allocation instead of a function
     /// call (willow-60o.1). The variant name is the call's callee.
-    pub enum_variant_resolutions: HashMap<Span, String>,
-    /// Maps an unqualified match-pattern span (`Ok(v)` / `Closed`, which parse as
+    pub enum_variant_resolutions: HashMap<ExprId, String>,
+    /// Maps an unqualified match pattern's ID (`Ok(v)` / `Closed`, which parse as
     /// `ClassDowncast` / `Binding`) to the enum-variant pattern it was
     /// reinterpreted as when the scrutinee is an enum. The backend consults this
     /// to lower the arm as a variant match (willow-60o.1).
-    pub pattern_resolutions: HashMap<Span, Pattern>,
-    /// The resolved type of every checked expression, keyed by its span. The
+    pub pattern_resolutions: HashMap<PatternId, Pattern>,
+    /// The resolved type of every checked expression, keyed by its node ID. The
     /// authoritative record for consumers (HIR lowering) that must not
-    /// re-derive types from the AST (willow-mb5 checker pivot).
-    pub expr_types: HashMap<Span, Type>,
+    /// re-derive types from the AST (willow-mb5 checker pivot). A node ID is
+    /// syntax identity rather than a source coordinate, so a pass that rebuilds
+    /// a node cannot silently inherit its neighbour's type (willow-njot).
+    pub expr_types: HashMap<ExprId, Type>,
     /// What every type ANNOTATION the checker normalized became: the written
     /// spelling (`Arr<i64>`, `std::result::Result<i64, String>`, a module's own
     /// `Level`) mapped to the type the rest of the compiler uses for it
@@ -90,14 +92,14 @@ pub struct TypeChecker {
     /// and be turned down as an unknown type.
     pub normalized_types: HashMap<Type, Type>,
     /// What each static call's written class name resolved to, keyed by the
-    /// call's span, when the two differ: `Dict::new()` under
+    /// call expression's ID, when the two differ: `Dict::new()` under
     /// `import std::collections::Map as Dict` records `Map` (willow-0g8j.3).
-    pub static_call_classes: HashMap<Span, String>,
+    pub static_call_classes: HashMap<ExprId, String>,
     /// What each lambda captures from its enclosing function, keyed by the
-    /// lambda expression's span and ordered as the closure environment lays the
+    /// lambda expression's ID and ordered as the closure environment lays the
     /// slots out (willow-0g8j.2.12). An absent entry and an empty vector mean
     /// the same thing — a non-capturing lambda, which stays a plain `fn` value.
-    pub lambda_captures: HashMap<Span, Vec<LambdaCapture>>,
+    pub lambda_captures: HashMap<ExprId, Vec<LambdaCapture>>,
     /// Assignment statements already reported as writes to a capture
     /// (willow-0g8j.2.12). The lambda body is checked again afterwards, where
     /// the target still resolves to the enclosing function's immutable local;
@@ -756,7 +758,7 @@ impl TypeChecker {
 
     fn reference_place_info(&mut self, expr: &Expr, arg_span: Span) -> Option<ReferencePlaceInfo> {
         match expr {
-            Expr::Var(name, _) => {
+            Expr::Var(name, _, _) => {
                 let Some(var_info) = self.symbols.lookup_var(name).cloned() else {
                     self.check_expr(expr);
                     return None;
@@ -770,7 +772,7 @@ impl TypeChecker {
                     immutable_reason: None,
                 })
             }
-            Expr::FieldAccess(obj, field_name, span) => {
+            Expr::FieldAccess(obj, field_name, span, _) => {
                 let obj_ty = self.check_expr(obj);
                 let field_ty = self.resolve_field(&obj_ty, field_name, *span, true);
                 if matches!(field_ty, Type::Void) {
@@ -790,7 +792,7 @@ impl TypeChecker {
                         .then_some("fields of `PanicInfo` are read-only"),
                 })
             }
-            Expr::Index(array, index, span) => {
+            Expr::Index(array, index, span, _) => {
                 let elem_ty = self.check_index(array, index, *span);
                 if matches!(elem_ty, Type::Void) {
                     return None;

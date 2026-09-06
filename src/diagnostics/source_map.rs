@@ -678,20 +678,20 @@ fn type_name(ty: &Type) -> String {
 
 fn reference_place_kind(expr: &Expr) -> &'static str {
     match expr {
-        Expr::Var(_, _) => "local",
-        Expr::FieldAccess(_, _, _) => "field",
-        Expr::Index(_, _, _) => "array_element",
+        Expr::Var(_, _, _) => "local",
+        Expr::FieldAccess(_, _, _, _) => "field",
+        Expr::Index(_, _, _, _) => "array_element",
         _ => "expression",
     }
 }
 
 fn reference_place_name(expr: &Expr) -> String {
     match expr {
-        Expr::Var(name, _) => name.clone(),
-        Expr::FieldAccess(object, field, _) => {
+        Expr::Var(name, _, _) => name.clone(),
+        Expr::FieldAccess(object, field, _, _) => {
             format!("{}.{}", reference_place_name(object), field)
         }
-        Expr::Index(array, index, _) => {
+        Expr::Index(array, index, _, _) => {
             format!(
                 "{}[{}]",
                 reference_place_name(array),
@@ -704,8 +704,8 @@ fn reference_place_name(expr: &Expr) -> String {
 
 fn reference_index_name(expr: &Expr) -> String {
     match expr {
-        Expr::Integer(value, _) => value.to_string(),
-        Expr::Var(name, _) => name.clone(),
+        Expr::Integer(value, _, _) => value.to_string(),
+        Expr::Var(name, _, _) => name.clone(),
         _ => "<expr>".to_string(),
     }
 }

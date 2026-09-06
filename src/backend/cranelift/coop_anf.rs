@@ -7,13 +7,13 @@
 
 use std::collections::HashMap;
 
-use crate::diagnostics::{FileId, Span};
+use crate::diagnostics::Span;
 use crate::parser::ast::*;
 use crate::semantic::intrinsics::{self, Intrinsic};
 
 pub(crate) fn normalize_coop_suspensions(
     program: &Program,
-    expr_types: &HashMap<Span, Type>,
+    expr_types: &mut HashMap<ExprId, Type>,
 ) -> Program {
     let mut program = program.clone();
     let mut normalizer = Normalizer {
@@ -39,7 +39,7 @@ pub(crate) fn normalize_coop_suspensions(
 }
 
 struct Normalizer<'a> {
-    expr_types: &'a HashMap<Span, Type>,
+    expr_types: &'a mut HashMap<ExprId, Type>,
     next_temp: usize,
 }
 
@@ -47,21 +47,12 @@ impl Normalizer<'_> {
     fn synthetic(&mut self, source: Span) -> (String, Span) {
         let index = self.next_temp;
         self.next_temp += 1;
-        (
-            format!("__willow$suspend${index}"),
-            Span::in_file(
-                FileId(source.file_id.0 ^ 0x8000_0000),
-                index.saturating_mul(2),
-                index.saturating_mul(2).saturating_add(1),
-                source.line,
-                source.col,
-            ),
-        )
+        (format!("__willow$suspend${index}"), source)
     }
 
     fn ty(&self, expr: &Expr) -> Type {
         self.expr_types
-            .get(&expr.span())
+            .get(&expr.id())
             .cloned()
             .expect("internal compiler error: missing checked payload type")
     }
@@ -83,11 +74,13 @@ impl Normalizer<'_> {
         prefix.push(Stmt::Let(LetStmt {
             name: name.clone(),
             mutable: false,
-            ty: Some(ty),
+            ty: Some(ty.clone()),
             init: expr,
             span,
         }));
-        Expr::Var(name, span)
+        let id = ExprId::fresh();
+        self.expr_types.insert(id, ty);
+        Expr::Var(name, span, id)
     }
 
     /// A suspension point that must occupy a statement of its own, with the
@@ -107,7 +100,7 @@ impl Normalizer<'_> {
                 // rather than comparing `method.method` to `"recv"` is what
                 // keeps this pass and the emitter agreeing about which calls
                 // suspend (willow-uqzx, catalog item 7).
-                let receiver_ty = self.expr_types.get(&method.object.span())?;
+                let receiver_ty = self.expr_types.get(&method.object.id())?;
                 let resolved = intrinsics::resolve(receiver_ty, &method.method, method.args.len())?;
                 // Only `recv` is hoisted. A cooperative `send` suspends too, but
                 // it produces no value, so there is nothing to bind a `let` to
@@ -160,11 +153,11 @@ impl Normalizer<'_> {
                             .any(|stmt| self.stmt_contains_suspend(stmt)),
                     })
             }
-            Expr::TryPropagate(inner, _) => self.contains_suspend(inner),
-            Expr::ArrayLiteral(elements, _) => {
+            Expr::TryPropagate(inner, _, _) => self.contains_suspend(inner),
+            Expr::ArrayLiteral(elements, _, _) => {
                 elements.iter().any(|expr| self.contains_suspend(expr))
             }
-            Expr::Index(array, index, _) => {
+            Expr::Index(array, index, _, _) => {
                 self.contains_suspend(array) || self.contains_suspend(index)
             }
             // The awaited call's ARGUMENTS may contain nested suspends
@@ -334,6 +327,7 @@ impl Normalizer<'_> {
                         op: UnaryOp::Not,
                         span: cond.span(),
                         expr: cond,
+                        id: ExprId::fresh(),
                     }));
                     cond_prefix.push(Stmt::If(IfStmt {
                         cond: not_cond,
@@ -345,7 +339,7 @@ impl Normalizer<'_> {
                         span: stmt.span,
                     }));
                     cond_prefix.append(&mut stmt.body.stmts);
-                    stmt.cond = Expr::Bool(true, stmt.span);
+                    stmt.cond = Expr::Bool(true, stmt.span, ExprId::fresh());
                     stmt.body.stmts = cond_prefix;
                     output.push(Stmt::While(stmt));
                 }
@@ -491,6 +485,15 @@ impl Normalizer<'_> {
     }
 
     fn normalize_expr(&mut self, expr: Expr) -> (Vec<Stmt>, Expr) {
+        let ty = self.expr_types.get(&expr.id()).cloned();
+        let (prefix, value) = self.normalize_expr_inner(expr);
+        if let Some(ty) = ty {
+            self.expr_types.insert(value.id(), ty);
+        }
+        (prefix, value)
+    }
+
+    fn normalize_expr_inner(&mut self, expr: Expr) -> (Vec<Stmt>, Expr) {
         if !self.contains_suspend(&expr) {
             return (Vec::new(), expr);
         }
@@ -532,9 +535,12 @@ impl Normalizer<'_> {
                 unary.expr = value;
                 (prefix, Expr::Unary(unary))
             }
-            Expr::Print(value, newline, span) => {
+            Expr::Print(value, newline, span, _) => {
                 let (prefix, value) = self.normalize_expr(*value);
-                (prefix, Expr::Print(Box::new(value), newline, span))
+                (
+                    prefix,
+                    Expr::Print(Box::new(value), newline, span, ExprId::fresh()),
+                )
             }
             Expr::Call(mut call) => {
                 let prefix = self.normalize_args(&mut call.args);
@@ -556,9 +562,12 @@ impl Normalizer<'_> {
                 let prefix = self.normalize_args(&mut new.args);
                 (prefix, Expr::New(new))
             }
-            Expr::FieldAccess(object, field, span) => {
+            Expr::FieldAccess(object, field, span, _) => {
                 let (prefix, object) = self.normalize_expr(*object);
-                (prefix, Expr::FieldAccess(Box::new(object), field, span))
+                (
+                    prefix,
+                    Expr::FieldAccess(Box::new(object), field, span, ExprId::fresh()),
+                )
             }
             Expr::ObjectLiteral(mut object) => {
                 let mut prefix = Vec::new();
@@ -592,9 +601,12 @@ impl Normalizer<'_> {
                 }
                 (prefix, Expr::Match(match_expr))
             }
-            Expr::TryPropagate(inner, span) => {
+            Expr::TryPropagate(inner, span, _) => {
                 let (prefix, inner) = self.normalize_expr(*inner);
-                (prefix, Expr::TryPropagate(Box::new(inner), span))
+                (
+                    prefix,
+                    Expr::TryPropagate(Box::new(inner), span, ExprId::fresh()),
+                )
             }
             Expr::Await(mut a) => {
                 // Hoist suspends OUT of the awaited call's arguments; the
@@ -603,7 +615,7 @@ impl Normalizer<'_> {
                 a.expr = inner;
                 (prefix, Expr::Await(a))
             }
-            Expr::ArrayLiteral(mut elements, span) => {
+            Expr::ArrayLiteral(mut elements, span, _) => {
                 let mut prefix = Vec::new();
                 for element in &mut elements {
                     let ty = self.ty(element);
@@ -611,9 +623,9 @@ impl Normalizer<'_> {
                     prefix.append(&mut element_prefix);
                     *element = self.bind(&mut prefix, value, ty);
                 }
-                (prefix, Expr::ArrayLiteral(elements, span))
+                (prefix, Expr::ArrayLiteral(elements, span, ExprId::fresh()))
             }
-            Expr::Index(array, index, span) => {
+            Expr::Index(array, index, span, _) => {
                 let array_ty = self.ty(&array);
                 let index_ty = self.ty(&index);
                 let (mut prefix, array) = self.normalize_expr(*array);
@@ -621,7 +633,10 @@ impl Normalizer<'_> {
                 let (mut index_prefix, index) = self.normalize_expr(*index);
                 prefix.append(&mut index_prefix);
                 let index = self.bind(&mut prefix, index, index_ty);
-                (prefix, Expr::Index(Box::new(array), Box::new(index), span))
+                (
+                    prefix,
+                    Expr::Index(Box::new(array), Box::new(index), span, ExprId::fresh()),
+                )
             }
             other => (Vec::new(), other),
         }
@@ -650,7 +665,7 @@ impl Normalizer<'_> {
             init: lhs,
             span: result_span,
         }));
-        let result_var = Expr::Var(name.clone(), result_span);
+        let result_var = Expr::Var(name.clone(), result_span, ExprId::fresh());
         let cond = if op == BinOp::And {
             result_var.clone()
         } else {
@@ -658,6 +673,7 @@ impl Normalizer<'_> {
                 op: UnaryOp::Not,
                 expr: result_var.clone(),
                 span,
+                id: ExprId::fresh(),
             }))
         };
         let (mut rhs_prefix, rhs) = self.normalize_expr(binary.rhs);
@@ -713,15 +729,15 @@ impl Normalizer<'_> {
             }),
             span: ternary.span,
         }));
-        (prefix, Expr::Var(name, result_span))
+        (prefix, Expr::Var(name, result_span, ExprId::fresh()))
     }
 }
 
 fn default_value(ty: &Type, span: Span) -> Expr {
     match ty {
-        Type::Bool => Expr::Bool(false, span),
-        Type::F64 => Expr::Float(0.0, span),
-        Type::I64 => Expr::Integer(0, span),
-        _ => Expr::Integer(0, span),
+        Type::Bool => Expr::Bool(false, span, ExprId::fresh()),
+        Type::F64 => Expr::Float(0.0, span, ExprId::fresh()),
+        Type::I64 => Expr::Integer(0, span, ExprId::fresh()),
+        _ => Expr::Integer(0, span, ExprId::fresh()),
     }
 }

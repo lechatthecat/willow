@@ -18,6 +18,8 @@ use crate::semantic::intrinsics;
 use crate::semantic::symbols::{EnumInfo, InterfaceInfo};
 use crate::{BuildMode, CompilerOptions};
 
+mod type_index;
+use type_index::{TypeMap, TypeScope, VtableMap};
 mod ast_passes;
 mod async_codegen;
 mod compile;
@@ -81,43 +83,7 @@ struct ParamDebug {
 #[derive(Default)]
 struct ModuleAliasSnapshot {
     functions: Vec<(FunctionId, Option<FunctionId>)>,
-    #[allow(clippy::type_complexity)]
-    class_layouts: Vec<(String, Option<Vec<(String, Type)>>)>,
-    #[allow(clippy::type_complexity)]
-    class_own_fields: Vec<(String, Option<Vec<(String, Type)>>)>,
-    class_base: Vec<(String, Option<String>)>,
-    class_type_ids: Vec<(String, Option<i64>)>,
-    class_vslots: Vec<(String, Option<Vec<String>>)>,
-    class_descriptor_ids: Vec<(String, Option<DataId>)>,
-    enum_infos: Vec<(String, Option<EnumInfo>)>,
-    interface_infos: Vec<(String, Option<InterfaceInfo>)>,
-    vtable_ids: Vec<((String, String), Option<DataId>)>,
-}
-
-fn insert_with_snapshot<K: Clone + std::hash::Hash + Eq, T: Clone>(
-    snapshots: &mut Vec<(K, Option<T>)>,
-    map: &mut HashMap<K, T>,
-    key: K,
-    value: T,
-) {
-    let old = map.insert(key.clone(), value);
-    snapshots.push((key, old));
-}
-
-fn restore_snapshots<K: std::hash::Hash + Eq, T>(
-    map: &mut HashMap<K, T>,
-    snapshots: Vec<(K, Option<T>)>,
-) {
-    for (key, old) in snapshots.into_iter().rev() {
-        match old {
-            Some(value) => {
-                map.insert(key, value);
-            }
-            None => {
-                map.remove(&key);
-            }
-        }
-    }
+    types: Vec<(String, Option<crate::semantic::ids::TypeId>)>,
 }
 
 /// Bytes before the first virtual method slot in a class descriptor: the
@@ -129,13 +95,11 @@ pub(super) const CLASS_DESCRIPTOR_HEADER_BYTES: u32 = 8;
 /// the way the next unit needs them (willow-nm0g).
 #[derive(Default)]
 pub struct EnumAliasScope {
-    /// Each aliased name and the enum it stood in front of, if any.
-    enums: Vec<(String, Option<EnumInfo>)>,
-    /// Interfaces taken out for the span of the aliases.
-    interfaces: Vec<(String, InterfaceInfo)>,
+    types: Vec<(String, Option<crate::semantic::ids::TypeId>)>,
 }
 
 pub struct Codegen {
+    type_scope: TypeScope,
     module: ObjectModule,
     func_ids: FunctionMap<FuncId>,
     func_return_types: FunctionMap<Type>,
@@ -171,7 +135,7 @@ pub struct Codegen {
     /// frontend program and canonicalizes here (willow-nswv).
     builtin_module_aliases: HashMap<String, String>,
     /// Maps each lambda's source span to its generated private function name.
-    lambda_names: HashMap<crate::diagnostics::Span, String>,
+    lambda_names: HashMap<ExprId, String>,
     /// Source names of async fns lowered as cooperative tasks (constructor +
     /// poll fn). Calling one schedules the task and returns its frame.
     cooperative_leaves: std::collections::HashSet<FunctionId>,
@@ -179,26 +143,26 @@ pub struct Codegen {
     string_counter: usize,
     runtime_declared: bool,
     /// Per-class ordered field list: class_name -> [(field_name, type)].
-    class_layouts: HashMap<String, Vec<(String, Type)>>,
+    class_layouts: TypeMap<Vec<(String, Type)>>,
     /// Build mode for source locations, call stacks, and debug instrumentation.
     build_mode: BuildMode,
     /// Source file path of the current compilation unit, used in diagnostics.
     source_file: String,
     /// Enum info for enum variant construction in generated code.
-    enum_infos: HashMap<String, EnumInfo>,
+    enum_infos: TypeMap<EnumInfo>,
     /// Maps child class name → base class name for inherited method dispatch.
-    class_base: HashMap<String, String>,
+    class_base: TypeMap<String>,
     /// Maps each class name to a unique integer type_id for runtime dynamic dispatch.
     /// Type ids start at 1; 0 is reserved for null/unknown.
-    class_type_ids: HashMap<String, i64>,
+    class_type_ids: TypeMap<i64>,
     /// The non-static fields each class declares ITSELF, in declaration order
     /// (willow-59gx). Recorded as classes are registered;
     /// [`Codegen::finalize_class_layouts`] turns it into `class_layouts`.
-    class_own_fields: HashMap<String, Vec<(String, Type)>>,
+    class_own_fields: TypeMap<Vec<(String, Type)>>,
     /// The `open`/`override` instance methods each class declares ITSELF, in
     /// declaration order (willow-fm7t). Recorded as classes are registered;
     /// [`Codegen::finalize_class_vslots`] turns it into `class_vslots`.
-    class_own_vmethods: HashMap<String, Vec<String>>,
+    class_own_vmethods: TypeMap<Vec<String>>,
     /// Per-class VIRTUAL METHOD SLOT ORDER: the names of the methods this class
     /// dispatches through its descriptor, in slot order (willow-fm7t).
     ///
@@ -207,39 +171,39 @@ pub struct Codegen {
     /// appending a new one. A method that is neither `open` nor `override` gets
     /// no slot: it can neither be overridden nor override anything, so a direct
     /// call to it is always right.
-    class_vslots: HashMap<String, Vec<String>>,
+    class_vslots: TypeMap<Vec<String>>,
     /// Maps each class name to its descriptor data symbol — word 0 of every
     /// object of that class (willow-fm7t). Offset 0 of the descriptor is the
     /// class's `type_id`; the virtual method slots follow it in
     /// [`Codegen::class_vslots`] order.
-    class_descriptor_ids: HashMap<String, DataId>,
+    class_descriptor_ids: TypeMap<DataId>,
     /// The checker's authoritative type for every checked expression, keyed by
-    /// span (willow-mb5). Consulted FIRST by the backend's type queries; the
+    /// node ID (willow-mb5, re-keyed in willow-njot). Consulted FIRST by the backend's type queries; the
     /// legacy structural derivation only covers unrecorded (compiler-
     /// synthesized) expressions.
-    expr_types: HashMap<crate::diagnostics::Span, Type>,
+    expr_types: HashMap<ExprId, Type>,
     /// Lowered-IR functions of the entry program (willow-0g8j): a function in
     /// the supported subset is compiled by walking its LIR instead of the AST.
     lir_functions: HashMap<String, crate::ir::lowered::LirFunction>,
     /// Lifted lambda bodies in lowered IR, keyed by the lambda expression's
-    /// span (willow-0g8j.2.2). The LIR cannot know the `$lambda.N` symbol, so
+    /// ID (willow-0g8j.2.2). The LIR cannot know the `$lambda.N` symbol, so
     /// `compile_program` moves these into `lir_functions` once it has assigned
     /// the names.
-    lir_lambdas: HashMap<crate::diagnostics::Span, crate::ir::lowered::LirFunction>,
-    /// Spans of unqualified enum-variant constructions (`Ok(42)`) → the enum they
+    lir_lambdas: HashMap<ExprId, crate::ir::lowered::LirFunction>,
+    /// IDs of unqualified enum-variant constructions (`Ok(42)`) → the enum they
     /// resolved to, so an otherwise-function-shaped `Call` is lowered as a
     /// variant allocation. Registered from the type checker (willow-60o.1).
-    enum_variant_resolutions: HashMap<crate::diagnostics::Span, String>,
-    /// Unqualified match-pattern spans → the enum-variant pattern they were
+    enum_variant_resolutions: HashMap<ExprId, String>,
+    /// Unqualified match-pattern IDs → the enum-variant pattern they were
     /// reinterpreted as (`Ok(v)` → EnumVariantTuple). Registered from the type
     /// checker (willow-60o.1).
-    pattern_resolutions: HashMap<crate::diagnostics::Span, Pattern>,
+    pattern_resolutions: HashMap<PatternId, Pattern>,
     /// Interface metadata (method order + signatures) for vtable codegen and
     /// interface method dispatch. Registered from the type checker.
-    interface_infos: HashMap<String, InterfaceInfo>,
+    interface_infos: TypeMap<InterfaceInfo>,
     /// Static vtable data object per `(class, interface)` pair, used to box a
     /// concrete class value into an interface value (willow-xds).
-    vtable_ids: HashMap<(String, String), DataId>,
+    vtable_ids: VtableMap<DataId>,
     /// Global storage for each `static [mut] name: T = expr` property, keyed by
     /// (class_key, field) where class_key is the registered (module-qualified)
     /// class name (willow-qsqf). Holds 8 bytes (i64/ptr/f64/bool).
@@ -399,7 +363,8 @@ impl Codegen {
         tlab_data.define(vec![0u8; 32].into_boxed_slice());
         tlab_data.set_align(8);
         module.define_data(gc_tlab_state, &tlab_data)?;
-        let mut class_layouts = HashMap::new();
+        let type_scope = TypeScope::default();
+        let mut class_layouts = TypeMap::with_scope(type_scope.clone());
         class_layouts.insert(
             "PanicInfo".to_string(),
             crate::semantic::builtin_types::panic_info_fields()
@@ -409,6 +374,7 @@ impl Codegen {
         );
         let function_scope = crate::semantic::ids::FunctionScope::default();
         let mut codegen = Self {
+            type_scope: type_scope.clone(),
             module,
             func_ids: FunctionMap::with_scope(function_scope.clone()),
             func_return_types: FunctionMap::with_scope(function_scope.clone()),
@@ -428,20 +394,20 @@ impl Codegen {
             class_layouts,
             build_mode: opts.target.build_mode,
             source_file: String::new(),
-            enum_infos: HashMap::new(),
-            class_base: HashMap::new(),
-            class_type_ids: HashMap::new(),
-            class_own_fields: HashMap::new(),
-            class_own_vmethods: HashMap::new(),
-            class_vslots: HashMap::new(),
-            class_descriptor_ids: HashMap::new(),
+            enum_infos: TypeMap::with_scope(type_scope.clone()),
+            class_base: TypeMap::with_scope(type_scope.clone()),
+            class_type_ids: TypeMap::with_scope(type_scope.clone()),
+            class_own_fields: TypeMap::with_scope(type_scope.clone()),
+            class_own_vmethods: TypeMap::with_scope(type_scope.clone()),
+            class_vslots: TypeMap::with_scope(type_scope.clone()),
+            class_descriptor_ids: TypeMap::with_scope(type_scope.clone()),
             expr_types: HashMap::new(),
             lir_functions: HashMap::new(),
             lir_lambdas: HashMap::new(),
             enum_variant_resolutions: HashMap::new(),
             pattern_resolutions: HashMap::new(),
-            interface_infos: HashMap::new(),
-            vtable_ids: HashMap::new(),
+            interface_infos: TypeMap::with_scope(type_scope.clone()),
+            vtable_ids: VtableMap::with_scope(type_scope.clone()),
             static_storage: HashMap::new(),
             static_init_order: Vec::new(),
             gc_tlab_state,
@@ -536,7 +502,11 @@ impl Codegen {
 
     /// Register enum info so the backend can lower enum variant construction.
     pub fn register_enum_info(&mut self, name: String, info: EnumInfo) {
-        self.enum_infos.insert(name, info);
+        let identity = info.name.clone();
+        self.enum_infos.insert(identity.clone(), info);
+        if name != identity {
+            self.type_scope.bind(&name, &identity);
+        }
     }
 
     /// Install a unit's bare enum names for the length of that unit's own
@@ -557,43 +527,35 @@ impl Codegen {
     pub fn install_enum_aliases(&mut self, aliases: &[(String, EnumInfo)]) -> EnumAliasScope {
         let mut scope = EnumAliasScope::default();
         for (name, info) in aliases {
-            scope.enums.push((
-                name.clone(),
-                self.enum_infos.insert(name.clone(), info.clone()),
-            ));
-            if let Some(interface) = self.interface_infos.remove(name.as_str()) {
-                scope.interfaces.push((name.clone(), interface));
+            // The unit checker supplies identity; metadata remains build-wide.
+            if !self.enum_infos.contains_key(&info.name) {
+                self.enum_infos.insert(info.name.clone(), info.clone());
             }
+            scope
+                .types
+                .push((name.clone(), self.type_scope.bind(name, &info.name)));
         }
         scope
     }
 
-    /// Undo an [`Codegen::install_enum_aliases`], putting back whatever each
-    /// name held.
     pub fn restore_enum_aliases(&mut self, scope: EnumAliasScope) {
-        for (name, info) in scope.enums {
-            match info {
-                Some(info) => {
-                    self.enum_infos.insert(name, info);
-                }
-                None => {
-                    self.enum_infos.remove(&name);
-                }
-            }
-        }
-        for (name, info) in scope.interfaces {
-            self.interface_infos.insert(name, info);
+        for (name, previous) in scope.types.into_iter().rev() {
+            self.type_scope.restore(&name, previous);
         }
     }
 
     /// Register interface metadata for vtable generation and method dispatch.
     pub fn register_interface_info(&mut self, name: String, info: InterfaceInfo) {
-        self.interface_infos.insert(name, info);
+        let identity = info.name.clone();
+        self.interface_infos.insert(identity.clone(), info);
+        if name != identity {
+            self.type_scope.bind(&name, &identity);
+        }
     }
 
     /// Register resolved async-fn local types (willow-lpn.5c) for frame-backing
     /// unannotated live-across-await locals.
-    pub fn register_expr_types(&mut self, types: HashMap<crate::diagnostics::Span, Type>) {
+    pub fn register_expr_types(&mut self, types: HashMap<ExprId, Type>) {
         self.expr_types = types;
     }
 
@@ -606,23 +568,17 @@ impl Codegen {
         self.lir_lambdas = lir
             .lambdas
             .into_iter()
-            .map(|l| (l.span, l.function))
+            .map(|l| (l.id, l.function))
             .collect();
     }
 
     /// Register unqualified enum-variant construction resolutions (willow-60o.1).
-    pub fn register_enum_variant_resolutions(
-        &mut self,
-        resolutions: HashMap<crate::diagnostics::Span, String>,
-    ) {
+    pub fn register_enum_variant_resolutions(&mut self, resolutions: HashMap<ExprId, String>) {
         self.enum_variant_resolutions = resolutions;
     }
 
     /// Register unqualified match-pattern reinterpretations (willow-60o.1).
-    pub fn register_pattern_resolutions(
-        &mut self,
-        resolutions: HashMap<crate::diagnostics::Span, Pattern>,
-    ) {
+    pub fn register_pattern_resolutions(&mut self, resolutions: HashMap<PatternId, Pattern>) {
         self.pattern_resolutions = resolutions;
     }
 
@@ -634,11 +590,10 @@ impl Codegen {
     /// pattern in a module reaches `emit_match` unresolved: it stays a
     /// `ClassDowncast`, which takes the wrong arm or panics outright.
     ///
-    /// These tables are all keyed by `Span`, and a span carries the `file_id`
-    /// of the file it came from, so a module's keys cannot collide with the
-    /// entry file's or with another module's. That is why this extends the maps
-    /// instead of replacing them, and why it must run after the entry
-    /// registrations.
+    /// These tables are all keyed by AST node ID, drawn from one build-wide
+    /// counter, so a module's keys cannot collide with the entry file's or with
+    /// another module's. That is why this extends the maps instead of replacing
+    /// them, and why it must run after the entry registrations.
     ///
     /// It must also run BEFORE that module's `declare_module`, not just before
     /// its bodies: `declare_lambda` reads `expr_types` to give a lifted lambda
@@ -744,35 +699,13 @@ impl Codegen {
         // module-qualified type (`module::Item`) under the unqualified `local`
         // name, so the entry's use of `local` resolves to the module's symbols.
         let qualified = format!("{module}::{item}");
-        if let Some(layout) = self.class_layouts.get(&qualified).cloned() {
-            self.class_layouts.insert(local.to_string(), layout);
-            if let Some(&id) = self.class_type_ids.get(&qualified) {
-                self.class_type_ids.insert(local.to_string(), id);
-            }
-            if let Some(base) = self.class_base.get(&qualified).cloned() {
-                self.class_base.insert(local.to_string(), base);
-            }
-            // The virtual slot order and the descriptor symbol travel with the
-            // type, exactly as the type_id does: a directly imported class is
-            // ONE runtime class under two spellings, and both must reach the
-            // same descriptor (willow-fm7t; the aliasing trap willow-au5k hit).
-            if let Some(own) = self.class_own_fields.get(&qualified).cloned() {
-                self.class_own_fields.insert(local.to_string(), own);
-            }
-            if let Some(own) = self.class_own_vmethods.get(&qualified).cloned() {
-                self.class_own_vmethods.insert(local.to_string(), own);
-            }
-            if let Some(slots) = self.class_vslots.get(&qualified).cloned() {
-                self.class_vslots.insert(local.to_string(), slots);
-            }
-            if let Some(&descriptor) = self.class_descriptor_ids.get(&qualified) {
-                self.class_descriptor_ids
-                    .insert(local.to_string(), descriptor);
-            }
-            // Methods: alias every per-method table from
-            // `{module_prefix}__{item}__M` to `{local}__M` (func id AND return
-            // type / fn type / param modes / debug, so dispatch + return typing
-            // resolve under the local name).
+        if self.class_layouts.contains_key(&qualified)
+            || self.enum_infos.contains_key(&qualified)
+            || self.interface_infos.contains_key(&qualified)
+        {
+            self.type_scope.bind(local, &qualified);
+        }
+        if self.class_layouts.contains_key(&qualified) {
             let method_prefix = class_member_prefix(&module_item_symbol(&module_prefix, item));
             let method_symbols: Vec<String> = self
                 .func_ids
@@ -788,22 +721,6 @@ impl Codegen {
                     FunctionId::free_from_source_name(&full),
                 );
             }
-            // Vtables: (`module::Item`, iface) -> (`local`, iface).
-            let vt_aliases: Vec<((String, String), DataId)> = self
-                .vtable_ids
-                .iter()
-                .filter(|((cls, _), _)| cls == &qualified)
-                .map(|((_, iface), &d)| ((local.to_string(), iface.clone()), d))
-                .collect();
-            for (k, d) in vt_aliases {
-                self.vtable_ids.insert(k, d);
-            }
-        }
-        if let Some(info) = self.interface_infos.get(&qualified).cloned() {
-            self.interface_infos.insert(local.to_string(), info);
-        }
-        if let Some(info) = self.enum_infos.get(&qualified).cloned() {
-            self.enum_infos.insert(local.to_string(), info);
         }
     }
 
@@ -850,66 +767,10 @@ impl Codegen {
         canonical: &str,
         aliases: &mut ModuleAliasSnapshot,
     ) {
-        if let Some(layout) = self.class_layouts.get(canonical).cloned() {
-            insert_with_snapshot(
-                &mut aliases.class_layouts,
-                &mut self.class_layouts,
-                alias.to_string(),
-                layout,
-            );
-        }
-        if let Some(own) = self.class_own_fields.get(canonical).cloned() {
-            insert_with_snapshot(
-                &mut aliases.class_own_fields,
-                &mut self.class_own_fields,
-                alias.to_string(),
-                own,
-            );
-        }
-        if let Some(base) = self.class_base.get(canonical).cloned() {
-            insert_with_snapshot(
-                &mut aliases.class_base,
-                &mut self.class_base,
-                alias.to_string(),
-                base,
-            );
-        }
-        if let Some(type_id) = self.class_type_ids.get(canonical).copied() {
-            insert_with_snapshot(
-                &mut aliases.class_type_ids,
-                &mut self.class_type_ids,
-                alias.to_string(),
-                type_id,
-            );
-        }
-        if let Some(slots) = self.class_vslots.get(canonical).cloned() {
-            insert_with_snapshot(
-                &mut aliases.class_vslots,
-                &mut self.class_vslots,
-                alias.to_string(),
-                slots,
-            );
-        }
-        if let Some(descriptor) = self.class_descriptor_ids.get(canonical).copied() {
-            insert_with_snapshot(
-                &mut aliases.class_descriptor_ids,
-                &mut self.class_descriptor_ids,
-                alias.to_string(),
-                descriptor,
-            );
-        }
-        // Alias the class's (class, interface) vtables under the local name too, so
-        // a module body that boxes its own class to an interface internally finds
-        // the vtable (`(mod::Cls, mod::Iface)` -> `(Cls, mod::Iface)`); the entry's
-        // `register_item_import` does the same for direct imports (willow-64gs.1).
-        let vt_aliases: Vec<((String, String), DataId)> = self
-            .vtable_ids
-            .iter()
-            .filter(|((cls, _), _)| cls == canonical)
-            .map(|((_, iface), &d)| ((alias.to_string(), iface.clone()), d))
-            .collect();
-        for (key, data_id) in vt_aliases {
-            insert_with_snapshot(&mut aliases.vtable_ids, &mut self.vtable_ids, key, data_id);
+        if self.class_layouts.contains_key(canonical) {
+            aliases
+                .types
+                .push((alias.to_string(), self.type_scope.bind(alias, canonical)));
         }
     }
 
@@ -917,15 +778,9 @@ impl Codegen {
         for (alias, previous) in aliases.functions.into_iter().rev() {
             self.func_ids.scope().restore(alias, previous);
         }
-        restore_snapshots(&mut self.class_layouts, aliases.class_layouts);
-        restore_snapshots(&mut self.class_own_fields, aliases.class_own_fields);
-        restore_snapshots(&mut self.class_base, aliases.class_base);
-        restore_snapshots(&mut self.class_type_ids, aliases.class_type_ids);
-        restore_snapshots(&mut self.class_vslots, aliases.class_vslots);
-        restore_snapshots(&mut self.class_descriptor_ids, aliases.class_descriptor_ids);
-        restore_snapshots(&mut self.enum_infos, aliases.enum_infos);
-        restore_snapshots(&mut self.interface_infos, aliases.interface_infos);
-        restore_snapshots(&mut self.vtable_ids, aliases.vtable_ids);
+        for (alias, previous) in aliases.types.into_iter().rev() {
+            self.type_scope.restore(&alias, previous);
+        }
     }
 
     /// While compiling a module body, bind the types this unit IMPORTED by
@@ -958,13 +813,14 @@ impl Codegen {
     ) {
         for item in items {
             let qualified = format!("{}::{}", item.module, item.item);
-            if let Some(info) = self.interface_infos.get(&qualified).cloned() {
-                insert_with_snapshot(
-                    &mut aliases.interface_infos,
-                    &mut self.interface_infos,
+            if self.interface_infos.contains_key(&qualified)
+                || self.class_layouts.contains_key(&qualified)
+                || self.enum_infos.contains_key(&qualified)
+            {
+                aliases.types.push((
                     item.local.clone(),
-                    info,
-                );
+                    self.type_scope.bind(&item.local, &qualified),
+                ));
             }
         }
     }
@@ -981,31 +837,15 @@ impl Codegen {
         aliases: &mut ModuleAliasSnapshot,
     ) {
         for item in &program.items {
-            match item {
-                Item::Enum(e) => {
-                    let qualified = format!("{mod_name}::{}", e.name);
-                    if let Some(info) = self.enum_infos.get(&qualified).cloned() {
-                        insert_with_snapshot(
-                            &mut aliases.enum_infos,
-                            &mut self.enum_infos,
-                            e.name.clone(),
-                            info,
-                        );
-                    }
-                }
-                Item::Interface(i) => {
-                    let qualified = format!("{mod_name}::{}", i.name);
-                    if let Some(info) = self.interface_infos.get(&qualified).cloned() {
-                        insert_with_snapshot(
-                            &mut aliases.interface_infos,
-                            &mut self.interface_infos,
-                            i.name.clone(),
-                            info,
-                        );
-                    }
-                }
-                Item::Function(_) | Item::Class(_) => {}
-            }
+            let name = match item {
+                Item::Enum(e) => &e.name,
+                Item::Interface(i) => &i.name,
+                _ => continue,
+            };
+            let qualified = format!("{mod_name}::{name}");
+            aliases
+                .types
+                .push((name.clone(), self.type_scope.bind(name, &qualified)));
         }
     }
 
@@ -1151,7 +991,7 @@ impl Codegen {
     }
 
     fn validate_gc_ref_mask_layouts(&self) -> Result<()> {
-        for (class_name, layout) in &self.class_layouts {
+        for (class_name, layout) in self.class_layouts.iter() {
             try_gc_ref_mask_for_layout(class_name, layout, &self.enum_infos)?;
         }
         Ok(())
@@ -1387,29 +1227,29 @@ struct FuncGen<'a, 'b> {
     /// Local alias -> canonical builtin schema module, for the file being
     /// compiled (willow-nswv). Only the LIR path reads it.
     builtin_module_aliases: &'a HashMap<String, String>,
-    lambda_names: &'a HashMap<crate::diagnostics::Span, String>,
+    lambda_names: &'a HashMap<ExprId, String>,
     cooperative_leaves: &'a std::collections::HashSet<FunctionId>,
     string_literals: &'a HashMap<String, DataId>,
-    class_layouts: &'a HashMap<String, Vec<(String, Type)>>,
+    class_layouts: &'a TypeMap<Vec<(String, Type)>>,
     static_storage: &'a HashMap<(String, String), StaticStorageInfo>,
-    enum_infos: &'a HashMap<String, EnumInfo>,
-    class_base: &'a HashMap<String, String>,
+    enum_infos: &'a TypeMap<EnumInfo>,
+    class_base: &'a TypeMap<String>,
     /// Maps class name → unique type_id (i64). Since willow-fm7t the id is no
     /// longer stored inline in the object: word 0 points at the class
     /// DESCRIPTOR, which holds the id at its own offset 0.
-    class_type_ids: &'a HashMap<String, i64>,
+    class_type_ids: &'a TypeMap<i64>,
     /// Maps class name → its descriptor data symbol, the value stored in word 0
     /// of every object of that class (willow-fm7t).
-    class_descriptor_ids: &'a HashMap<String, DataId>,
+    class_descriptor_ids: &'a TypeMap<DataId>,
     /// Per-class virtual method slot order, indexed by slot (willow-fm7t).
-    class_vslots: &'a HashMap<String, Vec<String>>,
+    class_vslots: &'a TypeMap<Vec<String>>,
     /// Interface metadata for method dispatch + boxing.
-    interface_infos: &'a HashMap<String, InterfaceInfo>,
+    interface_infos: &'a TypeMap<InterfaceInfo>,
     /// Static `(class, interface)` vtable data objects for class→interface boxing.
-    vtable_ids: &'a HashMap<(String, String), DataId>,
+    vtable_ids: &'a VtableMap<DataId>,
     /// Checker-recorded types of all checked expressions (willow-mb5); the
     /// backend's primary type source.
-    expr_types: &'a HashMap<crate::diagnostics::Span, Type>,
+    expr_types: &'a HashMap<ExprId, Type>,
     /// When emitting a cooperative poll fn: the async frame pointer, so a
     /// `return` inside nested statement control flow (e.g. a statement-position
     /// match arm, willow-zvkv) stores the result and returns the Ready status
@@ -1419,10 +1259,10 @@ struct FuncGen<'a, 'b> {
     coop_result_offset: Option<i32>,
     /// Spans of unqualified enum-variant constructions → resolved enum name,
     /// so the call is lowered as a variant allocation (willow-60o.1).
-    enum_variant_resolutions: &'a HashMap<crate::diagnostics::Span, String>,
+    enum_variant_resolutions: &'a HashMap<ExprId, String>,
     /// Unqualified match-pattern spans → the enum-variant pattern they were
     /// reinterpreted as, so the arm lowers as a variant match (willow-60o.1).
-    pattern_resolutions: &'a HashMap<crate::diagnostics::Span, Pattern>,
+    pattern_resolutions: &'a HashMap<PatternId, Pattern>,
     /// Base pointer of this function's heap async frame, if one was allocated
     /// (async fns with values that must survive `await`; willow-lpn.5a).
     async_frame: Option<cranelift_codegen::ir::Value>,
@@ -1953,7 +1793,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 /// the walker must not admit a read the emitter would then resolve differently.
 fn lookup_static_storage_in(
     static_storage: &HashMap<(String, String), StaticStorageInfo>,
-    class_base: &HashMap<String, String>,
+    class_base: &TypeMap<String>,
     class: &str,
     field: &str,
 ) -> Option<StaticStorageInfo> {
@@ -2039,20 +1879,20 @@ fn reference_mode_name(mode: &ParamMode) -> &'static str {
 
 fn reference_place_kind(expr: &Expr) -> &'static str {
     match expr {
-        Expr::Var(_, _) => "local",
-        Expr::FieldAccess(_, _, _) => "field",
-        Expr::Index(_, _, _) => "array_element",
+        Expr::Var(_, _, _) => "local",
+        Expr::FieldAccess(_, _, _, _) => "field",
+        Expr::Index(_, _, _, _) => "array_element",
         _ => "expression",
     }
 }
 
 fn reference_place_name(expr: &Expr) -> String {
     match expr {
-        Expr::Var(name, _) => name.clone(),
-        Expr::FieldAccess(object, field, _) => {
+        Expr::Var(name, _, _) => name.clone(),
+        Expr::FieldAccess(object, field, _, _) => {
             format!("{}.{}", reference_place_name(object), field)
         }
-        Expr::Index(array, index, _) => {
+        Expr::Index(array, index, _, _) => {
             format!(
                 "{}[{}]",
                 reference_place_name(array),
@@ -2065,8 +1905,8 @@ fn reference_place_name(expr: &Expr) -> String {
 
 fn reference_index_name(expr: &Expr) -> String {
     match expr {
-        Expr::Integer(value, _) => value.to_string(),
-        Expr::Var(name, _) => name.clone(),
+        Expr::Integer(value, _, _) => value.to_string(),
+        Expr::Var(name, _, _) => name.clone(),
         _ => "<expr>".to_string(),
     }
 }
@@ -2093,7 +1933,7 @@ fn param_abi_type(
 fn gc_ref_mask_for_layout(
     class_name: &str,
     layout: &[(String, Type)],
-    enum_infos: &HashMap<String, EnumInfo>,
+    enum_infos: &TypeMap<EnumInfo>,
 ) -> u64 {
     try_gc_ref_mask_for_layout(class_name, layout, enum_infos)
         .expect("class GC ref mask layout should have been validated before codegen")
@@ -2102,7 +1942,7 @@ fn gc_ref_mask_for_layout(
 fn try_gc_ref_mask_for_layout(
     class_name: &str,
     layout: &[(String, Type)],
-    enum_infos: &HashMap<String, EnumInfo>,
+    enum_infos: &TypeMap<EnumInfo>,
 ) -> Result<u64> {
     // Object layout: word 0 = the class DESCRIPTOR address, words 1..N = fields.
     // Bit i in the mask corresponds to word i; field[idx] lives at word (idx+1).
@@ -2178,14 +2018,11 @@ impl AsyncFrameLayout {
     /// pointers without a `GcHeader`, so they are NOT marked traceable here
     /// either (tracing them would crash the collector, see willow-lpn.9);
     /// JoinHandle is represented as a GC async-frame pointer and is traceable.
-    pub fn new(slots: Vec<AsyncFrameSlot>, enum_infos: &HashMap<String, EnumInfo>) -> Self {
+    pub fn new(slots: Vec<AsyncFrameSlot>, enum_infos: &TypeMap<EnumInfo>) -> Self {
         Self::try_new(slots, enum_infos).unwrap_or_else(|err| panic!("{err}"))
     }
 
-    pub fn try_new(
-        slots: Vec<AsyncFrameSlot>,
-        enum_infos: &HashMap<String, EnumInfo>,
-    ) -> Result<Self> {
+    pub fn try_new(slots: Vec<AsyncFrameSlot>, enum_infos: &TypeMap<EnumInfo>) -> Result<Self> {
         for (k, slot) in slots.iter().enumerate() {
             if k >= ASYNC_FRAME_GC_SLOT_CAPACITY && is_gc_managed(&slot.ty, enum_infos) {
                 bail!(
@@ -2318,8 +2155,8 @@ fn main_result_err_type(f: &FunctionDecl) -> Option<Type> {
         .map(|(_, err)| err.clone())
 }
 
-fn checked_expr_type(expr: &Expr, types: &HashMap<crate::diagnostics::Span, Type>) -> Type {
-    types.get(&expr.span()).cloned().unwrap_or_else(|| {
+fn checked_expr_type(expr: &Expr, types: &HashMap<ExprId, Type>) -> Type {
+    types.get(&expr.id()).cloned().unwrap_or_else(|| {
         panic!(
             "internal compiler error: missing checked type for expression at {:?}",
             expr.span()
@@ -2338,7 +2175,7 @@ mod symbol_namespace_tests {
     #[should_panic(expected = "missing checked type")]
     fn missing_expression_type_is_an_invariant_failure() {
         checked_expr_type(
-            &Expr::Integer(1, crate::diagnostics::Span::dummy()),
+            &Expr::Integer(1, crate::diagnostics::Span::dummy(), ExprId::fresh()),
             &HashMap::new(),
         );
     }
@@ -2560,7 +2397,7 @@ mod tests {
         let layout: Vec<(String, Type)> = (0..OBJECT_FIELD_MASK_CAPACITY)
             .map(|i| (format!("f{i}"), Type::String))
             .collect();
-        let mask = try_gc_ref_mask_for_layout("ManyRefs", &layout, &HashMap::new()).unwrap();
+        let mask = try_gc_ref_mask_for_layout("ManyRefs", &layout, &TypeMap::new()).unwrap();
         // Word 0 is the class descriptor, so fields occupy mask bits 1..63.
         assert_eq!(mask, u64::MAX << 1);
     }
@@ -2572,7 +2409,7 @@ mod tests {
             .collect();
         layout.push(("late".to_string(), Type::String));
 
-        let err = try_gc_ref_mask_for_layout("TooWide", &layout, &HashMap::new())
+        let err = try_gc_ref_mask_for_layout("TooWide", &layout, &TypeMap::new())
             .unwrap_err()
             .to_string();
         assert!(err.contains("TooWide"), "{err}");
@@ -2587,13 +2424,13 @@ mod tests {
 
     /// Helper: build a layout from `(name, ty)` slots with no enum registry.
     fn frame_layout(slots: &[(&str, Type)]) -> AsyncFrameLayout {
-        let enum_infos: HashMap<String, EnumInfo> = HashMap::new();
+        let enum_infos: TypeMap<EnumInfo> = TypeMap::new();
         frame_layout_with(slots, &enum_infos)
     }
 
     fn frame_layout_with(
         slots: &[(&str, Type)],
-        enum_infos: &HashMap<String, EnumInfo>,
+        enum_infos: &TypeMap<EnumInfo>,
     ) -> AsyncFrameLayout {
         let slots = slots
             .iter()
@@ -2607,8 +2444,8 @@ mod tests {
     }
 
     /// Helper: an EnumInfo registry with one enum of the given (name, payload) variants.
-    fn enum_infos_with(name: &str, variants: &[(&str, Vec<Type>)]) -> HashMap<String, EnumInfo> {
-        let mut map = HashMap::new();
+    fn enum_infos_with(name: &str, variants: &[(&str, Vec<Type>)]) -> TypeMap<EnumInfo> {
+        let mut map = TypeMap::new();
         map.insert(
             name.to_string(),
             EnumInfo {
@@ -2811,7 +2648,7 @@ mod tests {
                 ty: Type::String,
             })
             .collect();
-        let err = AsyncFrameLayout::try_new(too_many_slots, &HashMap::new())
+        let err = AsyncFrameLayout::try_new(too_many_slots, &TypeMap::new())
             .unwrap_err()
             .to_string();
         assert!(err.contains("outside gc_ref_mask coverage"), "{err}");
@@ -2836,17 +2673,17 @@ mod tests {
                     name: "y".to_string(),
                     mutable: false,
                     ty: Some(Type::String),
-                    init: Expr::Integer(0, Span::dummy()),
+                    init: Expr::Integer(0, Span::dummy(), ExprId::fresh()),
                     span: Span::new(2, 2, 2, 1),
                 }),
                 Stmt::While(WhileStmt {
-                    cond: Expr::Bool(true, Span::dummy()),
+                    cond: Expr::Bool(true, Span::dummy(), ExprId::fresh()),
                     body: Block {
                         stmts: vec![Stmt::Let(LetStmt {
                             name: "z".to_string(),
                             mutable: false,
                             ty: Some(Type::I64),
-                            init: Expr::Integer(0, Span::dummy()),
+                            init: Expr::Integer(0, Span::dummy(), ExprId::fresh()),
                             span: Span::new(3, 3, 3, 1),
                         })],
                         span: Span::dummy(),
@@ -2861,7 +2698,7 @@ mod tests {
         assert_eq!(names, vec!["x", "y", "z"]);
 
         // And the mask over those slots: x (Node) and y (String) are refs, z (i64) is not.
-        let enum_infos: HashMap<String, EnumInfo> = HashMap::new();
+        let enum_infos: TypeMap<EnumInfo> = TypeMap::new();
         let layout = AsyncFrameLayout::new(slots, &enum_infos);
         assert_eq!(layout.gc_slot_mask, 0b011);
     }
@@ -2875,7 +2712,7 @@ mod tests {
                 name: "inferred".to_string(),
                 mutable: false,
                 ty: None,
-                init: Expr::Integer(1, Span::dummy()),
+                init: Expr::Integer(1, Span::dummy(), ExprId::fresh()),
                 span: Span::dummy(),
             })],
             span: Span::dummy(),

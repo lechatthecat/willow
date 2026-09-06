@@ -348,7 +348,7 @@ mod tests {
             panic!("expected a for statement");
         };
         assert_eq!(for_stmt.name, "value");
-        assert!(matches!(for_stmt.iterable, Expr::Var(ref name, _) if name == "values"));
+        assert!(matches!(for_stmt.iterable, Expr::Var(ref name, _, _) if name == "values"));
         assert_eq!(for_stmt.body.stmts.len(), 1);
     }
 
@@ -360,7 +360,7 @@ mod tests {
             panic!("expected a for statement");
         };
         assert_eq!(for_stmt.name, "_");
-        assert!(matches!(for_stmt.iterable, Expr::Var(ref name, _) if name == "values"));
+        assert!(matches!(for_stmt.iterable, Expr::Var(ref name, _, _) if name == "values"));
     }
 
     #[test]
@@ -374,8 +374,8 @@ mod tests {
         let Expr::Range(range) = &for_stmt.iterable else {
             panic!("expected a range iterable");
         };
-        assert!(matches!(range.start, Expr::Integer(1, _)));
-        assert!(matches!(range.end, Expr::Integer(101, _)));
+        assert!(matches!(range.start, Expr::Integer(1, _, _)));
+        assert!(matches!(range.end, Expr::Integer(101, _, _)));
     }
 
     #[test]
@@ -879,9 +879,9 @@ class ProtectedCtor { prot init(self) {} }
             &call.args[0].mode,
             CallArgMode::Reference { ampersand_span } if &source[ampersand_span.start..ampersand_span.end] == "&"
         ));
-        assert!(matches!(&call.args[0].expr, Expr::Var(name, _) if name == "x"));
+        assert!(matches!(&call.args[0].expr, Expr::Var(name, _, _) if name == "x"));
         assert!(matches!(&call.args[1].mode, CallArgMode::Value));
-        assert!(matches!(&call.args[1].expr, Expr::Var(name, _) if name == "y"));
+        assert!(matches!(&call.args[1].expr, Expr::Var(name, _, _) if name == "y"));
     }
 
     #[test]
@@ -1394,7 +1394,7 @@ class ProtectedCtor { prot init(self) {} }
         let f = first_function(&p);
         assert!(matches!(
             f.body.stmts[0],
-            Stmt::Let(ref l) if matches!(l.init, Expr::TryPropagate(_, _))
+            Stmt::Let(ref l) if matches!(l.init, Expr::TryPropagate(_, _, _))
         ));
     }
 
@@ -2028,10 +2028,10 @@ class ProtectedCtor { prot init(self) {} }
     /// is a bug in the test, not in the parser, so it panics loudly.
     fn shape(e: &Expr) -> String {
         match e {
-            Expr::Integer(v, _) => v.to_string(),
-            Expr::Float(v, _) => format!("{v}"),
-            Expr::Bool(v, _) => v.to_string(),
-            Expr::Var(name, _) => name.clone(),
+            Expr::Integer(v, _, _) => v.to_string(),
+            Expr::Float(v, _, _) => format!("{v}"),
+            Expr::Bool(v, _, _) => v.to_string(),
+            Expr::Var(name, _, _) => name.clone(),
             Expr::Binary(b) => {
                 format!("({} {} {})", shape(&b.lhs), b.op.symbol(), shape(&b.rhs))
             }
@@ -2051,8 +2051,8 @@ class ProtectedCtor { prot init(self) {} }
                 let args: Vec<String> = m.args.iter().map(|a| shape(&a.expr)).collect();
                 format!("{}.{}({})", shape(&m.object), m.method, args.join(", "))
             }
-            Expr::FieldAccess(object, name, _) => format!("{}.{name}", shape(object)),
-            Expr::Index(array, index, _) => format!("{}[{}]", shape(array), shape(index)),
+            Expr::FieldAccess(object, name, _, _) => format!("{}.{name}", shape(object)),
+            Expr::Index(array, index, _, _) => format!("{}[{}]", shape(array), shape(index)),
             other => panic!("shape() does not render {other:?}"),
         }
     }
@@ -2093,8 +2093,8 @@ class ProtectedCtor { prot init(self) {} }
             panic!("expected a binary expression");
         };
         assert_eq!(b.op, BinOp::Pow);
-        assert!(matches!(b.lhs, Expr::Integer(2, _)));
-        assert!(matches!(b.rhs, Expr::Integer(3, _)));
+        assert!(matches!(b.lhs, Expr::Integer(2, _, _)));
+        assert!(matches!(b.rhs, Expr::Integer(3, _, _)));
     }
 
     // Perspective 2: `**` is right associative, unlike every other binary
@@ -2299,7 +2299,7 @@ class ProtectedCtor { prot init(self) {} }
     fn lock_parse_01_mutex_form() {
         let lock = first_stmt_lock("async fn main() { lock m as value { println(value); } }");
         assert_eq!(lock.mode, LockMode::Mutex);
-        assert!(matches!(&lock.target, Expr::Var(name, _) if name == "m"));
+        assert!(matches!(&lock.target, Expr::Var(name, _, _) if name == "m"));
         assert_eq!(lock.binding, "value");
         assert!(!lock.mutable);
         assert_eq!(lock.body.stmts.len(), 1);
@@ -2318,7 +2318,7 @@ class ProtectedCtor { prot init(self) {} }
     fn lock_parse_03_read_form() {
         let lock = first_stmt_lock("async fn main() { lock read r as value { println(value); } }");
         assert_eq!(lock.mode, LockMode::Read);
-        assert!(matches!(&lock.target, Expr::Var(name, _) if name == "r"));
+        assert!(matches!(&lock.target, Expr::Var(name, _, _) if name == "r"));
         assert!(!lock.mutable);
     }
 
@@ -2411,7 +2411,7 @@ class ProtectedCtor { prot init(self) {} }
     fn lock_parse_13_target_named_read() {
         let lock = first_stmt_lock("async fn main() { lock read as value { println(value); } }");
         assert_eq!(lock.mode, LockMode::Mutex);
-        assert!(matches!(&lock.target, Expr::Var(name, _) if name == "read"));
+        assert!(matches!(&lock.target, Expr::Var(name, _, _) if name == "read"));
     }
 
     // Perspective 14: same for a target named `write`, with a `mut` binding
@@ -2421,7 +2421,7 @@ class ProtectedCtor { prot init(self) {} }
     fn lock_parse_14_target_named_write() {
         let lock = first_stmt_lock("async fn main() { lock write as mut value { value = 1; } }");
         assert_eq!(lock.mode, LockMode::Mutex);
-        assert!(matches!(&lock.target, Expr::Var(name, _) if name == "write"));
+        assert!(matches!(&lock.target, Expr::Var(name, _, _) if name == "write"));
         assert!(lock.mutable);
     }
 
@@ -2430,7 +2430,7 @@ class ProtectedCtor { prot init(self) {} }
     #[test]
     fn lock_parse_15_complex_targets() {
         let field = first_stmt_lock("async fn main() { lock registry.mutex as value { } }");
-        assert!(matches!(&field.target, Expr::FieldAccess(_, name, _) if name == "mutex"));
+        assert!(matches!(&field.target, Expr::FieldAccess(_, name, _, _) if name == "mutex"));
 
         let indexed = first_stmt_lock("async fn main() { lock registry.locks[0] as value { } }");
         assert!(matches!(&indexed.target, Expr::Index(..)));
@@ -2534,7 +2534,7 @@ class ProtectedCtor { prot init(self) {} }
         assert!(matches!(&function.body.stmts[0], Stmt::FieldAssign(f) if f.field == "write"));
 
         let lock = first_stmt_lock("async fn main() { lock config.read as value { } }");
-        assert!(matches!(&lock.target, Expr::FieldAccess(_, name, _) if name == "read"));
+        assert!(matches!(&lock.target, Expr::FieldAccess(_, name, _, _) if name == "read"));
     }
 
     // Perspective 25: the target expression is stored ONCE in the AST, so no
@@ -2554,5 +2554,153 @@ class ProtectedCtor { prot init(self) {} }
                 .any(|stmt| matches!(stmt, Stmt::Expr(_))),
             "the target must not be duplicated into the body"
         );
+    }
+
+    // Node identity (willow-njot). The checker and the backend key their side
+    // tables by `Expr::id`/`Pattern::id` rather than by `Span`, so these pin
+    // what an ID promises: unique per parsed node, stable across a clone, and
+    // never reused by a node the compiler builds later.
+
+    /// Collects every expression and pattern ID the walker reaches.
+    #[derive(Default)]
+    struct IdTrace {
+        exprs: Vec<ExprId>,
+        patterns: Vec<PatternId>,
+    }
+
+    impl crate::parser::visit::AstVisitor for IdTrace {
+        fn visit_expr(&mut self, expr: &Expr) {
+            self.exprs.push(expr.id());
+            crate::parser::visit::walk_expr(self, expr);
+        }
+
+        fn visit_pattern(&mut self, pattern: &Pattern) {
+            self.patterns.push(pattern.id());
+            crate::parser::visit::walk_pattern(self, pattern);
+        }
+    }
+
+    fn trace_ids(source: &str) -> IdTrace {
+        use crate::parser::visit::AstVisitor;
+        let program = parse_ok(source);
+        let mut trace = IdTrace::default();
+        for item in &program.items {
+            if let Item::Function(function) = item {
+                trace.visit_block(&function.body);
+            }
+        }
+        trace
+    }
+
+    const ID_SOURCE: &str = "fn f(n: i64) -> i64 {\n\
+        let a = 1 + 2;\n\
+        let b = [1, 2, 3];\n\
+        let c = b[0];\n\
+        let d = |x: i64| x + 1;\n\
+        let e = match n { 1 => 1, _ => 0 };\n\
+        println(a + c + d(1) + e);\n\
+        return n;\n\
+    }\nfn main() { println(f(1)); }\n";
+
+    #[test]
+    fn node_id_01_every_expression_in_a_program_is_unique() {
+        let trace = trace_ids(ID_SOURCE);
+        let mut ids = trace.exprs.clone();
+        ids.sort();
+        ids.dedup();
+        assert!(trace.exprs.len() > 20, "expected a broad walk");
+        assert_eq!(ids.len(), trace.exprs.len(), "duplicate expression ID");
+    }
+
+    #[test]
+    fn node_id_02_every_pattern_in_a_program_is_unique() {
+        let trace = trace_ids(ID_SOURCE);
+        let mut ids = trace.patterns.clone();
+        ids.sort();
+        ids.dedup();
+        assert!(!trace.patterns.is_empty(), "expected match patterns");
+        assert_eq!(ids.len(), trace.patterns.len(), "duplicate pattern ID");
+    }
+
+    #[test]
+    fn node_id_03_two_parses_of_one_source_share_no_ids() {
+        let first = trace_ids(ID_SOURCE);
+        let second = trace_ids(ID_SOURCE);
+        // Identical text, identical spans -- and disjoint identities, which is
+        // exactly what span keying could not give a two-unit build.
+        assert!(
+            !first.exprs.iter().any(|id| second.exprs.contains(id)),
+            "a second parse reused expression IDs"
+        );
+        assert!(
+            !first.patterns.iter().any(|id| second.patterns.contains(id)),
+            "a second parse reused pattern IDs"
+        );
+    }
+
+    #[test]
+    fn node_id_04_cloning_an_expression_preserves_its_id() {
+        let p = parse_ok("fn f() { let a = 1 + 2; }");
+        let f = first_function(&p);
+        let Stmt::Let(let_stmt) = &f.body.stmts[0] else {
+            panic!("expected a let statement");
+        };
+        let clone = let_stmt.init.clone();
+        assert_eq!(clone.id(), let_stmt.init.id());
+    }
+
+    #[test]
+    fn node_id_05_cloning_a_pattern_preserves_its_id() {
+        let p = parse_ok("fn f(n: i64) { let a = match n { 1 => 1, _ => 0 }; }");
+        let f = first_function(&p);
+        let Stmt::Let(let_stmt) = &f.body.stmts[0] else {
+            panic!("expected a let statement");
+        };
+        let Expr::Match(match_expr) = &let_stmt.init else {
+            panic!("expected a match expression");
+        };
+        let pattern = &match_expr.arms[0].pattern;
+        assert_eq!(pattern.clone().id(), pattern.id());
+    }
+
+    #[test]
+    fn node_id_06_a_parent_and_its_operands_have_distinct_ids() {
+        let p = parse_ok("fn f() { let a = 1 + 2; }");
+        let f = first_function(&p);
+        let Stmt::Let(let_stmt) = &f.body.stmts[0] else {
+            panic!("expected a let statement");
+        };
+        let Expr::Binary(binary) = &let_stmt.init else {
+            panic!("expected a binary expression");
+        };
+        assert_ne!(binary.id, binary.lhs.id());
+        assert_ne!(binary.id, binary.rhs.id());
+        assert_ne!(binary.lhs.id(), binary.rhs.id());
+        assert_eq!(let_stmt.init.id(), binary.id);
+    }
+
+    #[test]
+    fn node_id_07_a_synthesized_node_never_collides_with_a_parsed_one() {
+        let trace = trace_ids(ID_SOURCE);
+        // What a rewriting pass (`ast_passes`, `coop_anf`) builds after checking.
+        let synthesized: Vec<ExprId> = (0..8).map(|_| ExprId::fresh()).collect();
+        assert!(
+            !synthesized.iter().any(|id| trace.exprs.contains(id)),
+            "a fresh ID collided with a parsed node"
+        );
+        let mut unique = synthesized.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), synthesized.len());
+        let fresh_patterns: Vec<PatternId> = (0..8).map(|_| PatternId::fresh()).collect();
+        assert!(!fresh_patterns.iter().any(|id| trace.patterns.contains(id)));
+    }
+
+    #[test]
+    fn node_id_08_ids_are_ordered_by_creation() {
+        let first = ExprId::fresh();
+        let second = ExprId::fresh();
+        assert!(first < second, "{first} is not before {second}");
+        assert!(PatternId::fresh() < PatternId::fresh());
     }
 }

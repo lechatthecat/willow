@@ -1022,13 +1022,13 @@ fn run_backend(
             .iter()
             .find(|c| c.canonical_path == m.canonical_path);
         // The module's own checker tables go in BEFORE its declaration phase
-        // (willow-9vvn). The span-keyed maps registered above hold the entry
+        // (willow-9vvn). The node-ID-keyed maps registered above hold the entry
         // file's entries alone, and a module is checked in its own scope, so
         // without this an unqualified enum pattern in a module body reached
         // `emit_match` unresolved and took the wrong arm — and `declare_lambda`
         // read no type for a module lambda, declaring it `fn(i64) -> i64`
-        // whatever it really was. Merging is safe because a span carries its
-        // file_id, so no two files' keys collide.
+        // whatever it really was. Merging is safe because node IDs come from
+        // one build-wide counter, so no two units' keys collide.
         if let Some(m_checker) = module_checker {
             codegen.merge_module_checker_tables(&m_checker.checker);
         }

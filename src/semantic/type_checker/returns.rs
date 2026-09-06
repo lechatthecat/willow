@@ -168,7 +168,7 @@ impl TypeChecker {
             // `while true` with no way out is the idiomatic never-returning
             // loop. Any other condition may be false on the first test.
             Stmt::While(s) => {
-                matches!(s.cond, Expr::Bool(true, _)) && !block_breaks_enclosing_loop(&s.body)
+                matches!(s.cond, Expr::Bool(true, _, _)) && !block_breaks_enclosing_loop(&s.body)
             }
             Stmt::Let(s) => self.expr_diverges(&s.init),
             Stmt::Assign(s) => self.expr_diverges(&s.value),
