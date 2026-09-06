@@ -25,6 +25,7 @@ pub mod fs;
 pub mod future;
 pub mod gc;
 pub mod gc_mark_queue;
+pub mod gc_telemetry;
 pub mod lock;
 pub mod lock_wait;
 pub mod map;

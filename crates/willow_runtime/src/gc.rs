@@ -386,6 +386,8 @@ struct GcState {
     nursery_threshold_bytes: usize,
     /// Total objects allocated lifetime.
     total_allocs: u64,
+    total_allocated_bytes: u64,
+    released_bytes: u64,
     /// Total objects freed lifetime.
     total_frees: u64,
     /// TLAB tuning counters.
@@ -684,6 +686,8 @@ impl Default for GcState {
             young_allocated_bytes: 0,
             nursery_threshold_bytes: GC_NURSERY_THRESHOLD_BYTES,
             total_allocs: 0,
+            total_allocated_bytes: 0,
+            released_bytes: 0,
             total_frees: 0,
             tlab_fast_allocations: 0,
             tlab_slow_allocations: 0,
@@ -949,7 +953,9 @@ fn all_registered_stack_roots(coord: &GcCoord) -> Vec<*mut u8> {
 /// Trace the GC graph from `worklist` (the marked-set fixpoint via the TypeInfo
 /// registry + gc_ref_mask interior pointers). Shared by the single-mutator and
 /// stop-the-world collection paths.
-fn mark_worklist(mut worklist: Vec<*mut u8>) {
+fn mark_worklist(mut worklist: Vec<*mut u8>) -> crate::gc_telemetry::MarkWork {
+    let started = std::time::Instant::now();
+    let mut work = crate::gc_telemetry::MarkWork::roots(worklist.len());
     while let Some(obj_ptr) = worklist.pop() {
         let header = checked_payload_to_header(obj_ptr, "GC root graph");
         let object = HeapObject::from_raw(header).expect("validated payload has a header");
@@ -957,11 +963,13 @@ fn mark_worklist(mut worklist: Vec<*mut u8>) {
             continue; // already visited — handles cycles
         };
         let payload_words = metadata.payload_size / std::mem::size_of::<usize>();
+        let mut scanned_slots = 0usize;
         for i in 0..payload_words.min(64) {
-            if (metadata.gc_ref_mask & (1u64 << i)) != 0
-                && let Some(child) = object.payload_word(i)
-            {
-                worklist.push(child.as_ptr());
+            if (metadata.gc_ref_mask & (1u64 << i)) != 0 {
+                scanned_slots += 1;
+                if let Some(child) = object.payload_word(i) {
+                    worklist.push(child.as_ptr());
+                }
             }
         }
         let trace_fn = type_registry()
@@ -974,6 +982,7 @@ fn mark_worklist(mut worklist: Vec<*mut u8>) {
             // SAFETY: trace is the registered function for this type_id.
             unsafe { trace(object.payload().as_ptr(), &mut child_slots) };
             for slot in child_slots.into_iter().filter(|slot| !slot.is_null()) {
+                scanned_slots += 1;
                 // SAFETY: registered trace callbacks expose live GC-reference
                 // slots owned by this object or its runtime payload.
                 let child = unsafe { *slot };
@@ -982,7 +991,10 @@ fn mark_worklist(mut worklist: Vec<*mut u8>) {
                 }
             }
         }
+        work.object(object.size(), scanned_slots);
     }
+    work.mark_ns = crate::gc_telemetry::elapsed_ns(started);
+    work
 }
 
 // ---------------------------------------------------------------------------
@@ -1206,6 +1218,7 @@ fn sync_tlab_accounting(state: &mut GcState) {
         record.observed_fast_allocations = fast_allocations;
         record.observed_fast_allocated_bytes = fast_bytes;
         state.total_allocs = state.total_allocs.saturating_add(allocation_delta);
+        state.total_allocated_bytes = state.total_allocated_bytes.saturating_add(byte_delta);
         state.tlab_fast_allocations = state.tlab_fast_allocations.saturating_add(allocation_delta);
         state.tlab_fast_allocated_bytes =
             state.tlab_fast_allocated_bytes.saturating_add(byte_delta);
@@ -1537,6 +1550,9 @@ pub extern "C" fn willow_gc_alloc_slow(
     state.allocated_bytes = state.allocated_bytes.saturating_add(total_size);
     state.young_allocated_bytes = state.young_allocated_bytes.saturating_add(total_size);
     state.total_allocs = state.total_allocs.saturating_add(1);
+    state.total_allocated_bytes = state
+        .total_allocated_bytes
+        .saturating_add(total_size as u64);
     state.tlab_slow_allocations = state.tlab_slow_allocations.saturating_add(1);
     if state.allocated_bytes >= state.threshold_bytes {
         state.threshold_bytes = state.threshold_bytes.saturating_mul(2);
@@ -1740,6 +1756,9 @@ fn allocate_old_region_object_locked(
     }
     if count_logical_allocation {
         state.total_allocs = state.total_allocs.saturating_add(1);
+        state.total_allocated_bytes = state
+            .total_allocated_bytes
+            .saturating_add(object.size() as u64);
     }
     Some(object)
 }
@@ -1838,6 +1857,48 @@ pub(crate) fn stress_collect(kind: &str) {
 }
 
 /// Return the total bytes currently on the GC heap (header + payload).
+pub(crate) fn telemetry_heap_snapshot() -> (
+    crate::gc_telemetry::GcCountersV1,
+    crate::gc_telemetry::GcHeapV1,
+) {
+    use crate::gc_telemetry::{GcCountersV1, GcHeapV1};
+    let mut state = runtime().heap.lock().unwrap_or_else(|p| p.into_inner());
+    sync_tlab_accounting(&mut state);
+    let old_reserved = state.old_regions.iter().fold(0u64, |sum, region| {
+        sum.saturating_add(region.capacity as u64)
+    });
+    let reserved = old_reserved.saturating_add(state.tlab_reserved_bytes as u64);
+    (
+        GcCountersV1 {
+            allocation_count: state.total_allocs,
+            allocation_bytes: state.total_allocated_bytes,
+            freed_objects: state.total_frees,
+            released_bytes: state.released_bytes,
+            tlab_fast_allocations: state.tlab_fast_allocations,
+            tlab_slow_allocations: state.tlab_slow_allocations,
+            tlab_refills: state.tlab_refills,
+            promoted_objects: state.promoted_objects,
+            promoted_bytes: state.promoted_bytes,
+            moved_objects: state.moved_objects,
+            barrier_calls: state.write_barrier_calls,
+            barrier_hits: state.write_barrier_hits,
+        },
+        GcHeapV1 {
+            occupied_bytes: state.allocated_bytes as u64,
+            young_occupied_bytes: state.young_allocated_bytes as u64,
+            reserved_bytes: reserved,
+            committed_bytes: reserved,
+            old_reserved_bytes: old_reserved,
+            nursery_reserved_bytes: state.tlab_reserved_bytes as u64,
+            old_regions: state.old_regions.len() as u64,
+            remembered_objects: state.remembered_set.len() as u64,
+            dirty_cards: state.dirty_cards.len() as u64,
+            major_trigger_bytes: state.threshold_bytes as u64,
+            minor_trigger_bytes: state.nursery_threshold_bytes as u64,
+        },
+    )
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_allocated_bytes() -> i64 {
     let mut state = runtime().heap.lock().unwrap();
@@ -2026,6 +2087,7 @@ pub(crate) fn registered_mutator_count() -> usize {
 // ---------------------------------------------------------------------------
 
 struct MinorCollector<'a> {
+    work: crate::gc_telemetry::MarkWork,
     state: &'a mut GcState,
     young_objects: HashMap<usize, HeapObject>,
     forwarding: HashMap<usize, *mut u8>,
@@ -2276,6 +2338,7 @@ impl<'a> MinorCollector<'a> {
             }
         }
         Self {
+            work: crate::gc_telemetry::MarkWork::default(),
             state,
             young_objects,
             forwarding: HashMap::new(),
@@ -2382,12 +2445,24 @@ impl<'a> MinorCollector<'a> {
         if !object.allocated() || !self.scanned.insert(address) {
             return;
         }
-        for slot in object_reference_slots(object, &self.trace_registry) {
+        let slots = object_reference_slots(object, &self.trace_registry);
+        self.work.object(
+            object.size(),
+            slots.iter().filter(|slot| !slot.is_null()).count(),
+        );
+        for slot in slots {
             self.scan_slot(slot);
         }
     }
 
-    fn run(mut self, roots: Vec<*mut u8>, remembered: HashSet<usize>) -> usize {
+    fn run(
+        mut self,
+        roots: Vec<*mut u8>,
+        remembered: HashSet<usize>,
+    ) -> (usize, crate::gc_telemetry::MarkWork) {
+        let started = std::time::Instant::now();
+        self.work.root_scan_bytes =
+            crate::gc_telemetry::MarkWork::roots(roots.len()).root_scan_bytes;
         // Pin every direct root before scanning any interior edge so a duplicate
         // stack/runtime root can never observe a moved stale SSA pointer.
         for root in roots {
@@ -2400,6 +2475,7 @@ impl<'a> MinorCollector<'a> {
             self.scan_object(object);
         }
 
+        self.work.mark_ns = crate::gc_telemetry::elapsed_ns(started);
         let mut reclaimed_bytes = 0usize;
         for (&payload, &object) in &self.young_objects {
             if !object.allocated() || object.generation() != GC_GENERATION_YOUNG {
@@ -2451,6 +2527,10 @@ impl<'a> MinorCollector<'a> {
                         .expect("TLAB chunk layout remains valid");
                 // SAFETY: every object in this retired chunk was reclaimed or moved.
                 unsafe { dealloc(chunk.base, layout) };
+                self.state.released_bytes = self
+                    .state
+                    .released_bytes
+                    .saturating_add(chunk.capacity as u64);
                 self.state.tlab_reserved_bytes = self
                     .state
                     .tlab_reserved_bytes
@@ -2461,11 +2541,11 @@ impl<'a> MinorCollector<'a> {
                 chunk_index += 1;
             }
         }
-        reclaimed_bytes
+        (reclaimed_bytes, self.work)
     }
 }
 
-fn minor_collect_with_roots(mut roots: Vec<*mut u8>) -> usize {
+fn minor_collect_with_roots(mut roots: Vec<*mut u8>) -> (u64, u64, crate::gc_telemetry::MarkWork) {
     roots.extend(runtime_roots_snapshot());
     roots.extend(crate::lock::lock_gc_roots());
     let trace_registry = type_registry().lock().unwrap().clone();
@@ -2479,14 +2559,15 @@ fn minor_collect_with_roots(mut roots: Vec<*mut u8>) -> usize {
     let remembered = std::mem::take(&mut state.remembered_set);
     state.dirty_cards.clear();
     state.minor_collections = state.minor_collections.saturating_add(1);
-    let reclaimed =
+    let before = state.allocated_bytes as u64;
+    let (_, work) =
         MinorCollector::new(&mut state, trace_registry, drop_registry).run(roots, remembered);
     if std::env::var("WILLOW_GC_VERIFY_REGIONS").is_ok()
         && let Err(message) = verify_old_region_metadata(&state)
     {
         panic!("willow gc: region verification failed after minor collection: {message}");
     }
-    reclaimed
+    (before, state.allocated_bytes as u64, work)
 }
 
 fn minor_collect_internal() {
@@ -2512,7 +2593,8 @@ fn minor_collect_internal() {
         return;
     }
 
-    if multi_mutator_active() {
+    let cycle = crate::gc_telemetry::Cycle::begin(crate::gc_telemetry::CycleKind::Minor);
+    let (before, after, work) = if multi_mutator_active() {
         with_stw(|coord| {
             {
                 let mut state = runtime().heap.lock().unwrap();
@@ -2520,7 +2602,7 @@ fn minor_collect_internal() {
             }
             let roots = all_registered_stack_roots(coord);
             minor_collect_with_roots(roots)
-        });
+        })
     } else {
         {
             let mut state = runtime().heap.lock().unwrap();
@@ -2530,8 +2612,11 @@ fn minor_collect_internal() {
             .into_iter()
             .map(|address| address as *mut u8)
             .collect();
-        minor_collect_with_roots(roots);
-    }
+        minor_collect_with_roots(roots)
+    };
+    let event = cycle.finish(before, after, work);
+    drop(_serialize);
+    crate::gc_telemetry::emit_cycle(event);
 }
 
 fn collect_internal() {
@@ -2578,7 +2663,7 @@ fn collect_internal() {
     }
     let gc_log = std::env::var("WILLOW_GC_LOG").is_ok();
 
-    let heap_before = willow_gc_allocated_bytes() as usize;
+    let cycle = crate::gc_telemetry::Cycle::begin(crate::gc_telemetry::CycleKind::Major);
 
     // ---- Mark phase --------------------------------------------------------
     // Gather the root set, then trace. When other mutator threads are registered
@@ -2591,24 +2676,28 @@ fn collect_internal() {
     // install a runtime root on it before sweep walked the heap — sweep would
     // then free that live, already-rooted object, leaving a dangling runtime
     // root that the next collection traces and aborts on (willow-w5e2).
-    let freed = if multi_mutator_active() {
+    let (heap_before, heap_after, freed, work) = if multi_mutator_active() {
         with_stw(|coord| {
             {
                 let mut state = runtime().heap.lock().unwrap();
                 retire_all_tlabs_locked(&mut state);
             }
+            let before = runtime().heap.lock().unwrap().allocated_bytes as u64;
             let mut worklist = all_registered_stack_roots(coord);
             worklist.extend(runtime_roots_snapshot());
             worklist.extend(crate::lock::lock_gc_roots());
-            mark_worklist(worklist);
-            sweep()
+            let work = mark_worklist(worklist);
+            let freed = sweep();
+            let after = runtime().heap.lock().unwrap().allocated_bytes as u64;
+            (before, after, freed, work)
         })
     } else {
         {
             let mut state = runtime().heap.lock().unwrap();
             retire_all_tlabs_locked(&mut state);
         }
-        ROOT_STACK.with(|rs| {
+        let before = runtime().heap.lock().unwrap().allocated_bytes as u64;
+        let work = ROOT_STACK.with(|rs| {
             let mut worklist: Vec<*mut u8> = {
                 let stack = rs.borrow();
                 stack
@@ -2624,11 +2713,14 @@ fn collect_internal() {
             worklist.extend(runtime_roots_snapshot());
             // GC-element channel buffers hold live references (willow-dsw).
             worklist.extend(crate::lock::lock_gc_roots());
-            mark_worklist(worklist);
+            mark_worklist(worklist)
         });
         // Single-mutator: no other thread can allocate during the sweep.
-        sweep()
+        let freed = sweep();
+        let after = runtime().heap.lock().unwrap().allocated_bytes as u64;
+        (before, after, freed, work)
     };
+    let event = cycle.finish(heap_before, heap_after, work);
 
     if gc_log {
         let state = runtime().heap.lock().unwrap();
@@ -2637,6 +2729,8 @@ fn collect_internal() {
             heap_before, freed, state.allocated_bytes, state.total_allocs, state.total_frees,
         );
     }
+    drop(_serialize);
+    crate::gc_telemetry::emit_cycle(event);
 }
 
 /// Sweep the region-backed old-object index and nursery/pinned regions without
@@ -2698,15 +2792,22 @@ fn sweep() -> usize {
             freed_bytes += size;
             freed_count += 1;
             state.allocated_bytes = state.allocated_bytes.saturating_sub(size);
-            state.total_frees += 1;
+            state.total_frees = state.total_frees.saturating_add(1);
             current = next;
         }
     }
 
     let regions_before = state.old_regions.len();
-    state
-        .old_regions
-        .retain(|region| !region.allocations.is_empty());
+    let mut released = 0u64;
+    state.old_regions.retain(|region| {
+        if region.allocations.is_empty() {
+            released = released.saturating_add(region.capacity as u64);
+            false
+        } else {
+            true
+        }
+    });
+    state.released_bytes = state.released_bytes.saturating_add(released);
     state.old_regions_released = state
         .old_regions_released
         .saturating_add((regions_before - state.old_regions.len()) as u64);
@@ -2764,7 +2865,7 @@ fn sweep() -> usize {
                 freed_bytes += size;
                 freed_count += 1;
                 state.allocated_bytes = state.allocated_bytes.saturating_sub(size);
-                state.total_frees += 1;
+                state.total_frees = state.total_frees.saturating_add(1);
             }
             offset += size;
         }
@@ -2775,6 +2876,7 @@ fn sweep() -> usize {
                 .expect("TLAB chunk layout remains valid");
             // SAFETY: the retired chunk has no live objects and is removed once.
             unsafe { dealloc(chunk.base, layout) };
+            state.released_bytes = state.released_bytes.saturating_add(chunk.capacity as u64);
             state.tlab_reserved_bytes = state.tlab_reserved_bytes.saturating_sub(chunk.capacity);
         } else {
             state.tlab_chunks[chunk_index].kind = if has_old_objects {
@@ -2992,6 +3094,9 @@ fn reset_internal() {
     state.young_allocated_bytes = 0;
     state.nursery_threshold_bytes = GC_NURSERY_THRESHOLD_BYTES;
     state.total_allocs = 0;
+    state.total_allocated_bytes = 0;
+    state.released_bytes = 0;
+    crate::gc_telemetry::reset_for_test();
     state.total_frees = 0;
     state.tlab_fast_allocations = 0;
     state.tlab_slow_allocations = 0;
@@ -3324,6 +3429,77 @@ mod tests {
             fast_allocations: AtomicU64::new(0),
             fast_allocated_bytes: AtomicU64::new(0),
         }
+    }
+
+    #[test]
+    fn telemetry_merges_fast_tlab_deltas_once_and_on_unregister() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        willow_gc_register_mutator();
+        let mut tls = new_tlab_state();
+        let first = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
+        assert!(!first.is_null());
+        let bytes = GC_HEADER_SIZE + 8;
+        let cursor = tls.cursor.load(Ordering::Acquire);
+        // Reproduce the generated bump fast path, including its TLS counters.
+        initialize_object_at(cursor as *mut u8, bytes, 0, 1, 0).unwrap();
+        tls.cursor.store(cursor + bytes, Ordering::Release);
+        tls.fast_allocations.store(1, Ordering::Release);
+        tls.fast_allocated_bytes
+            .store(bytes as u64, Ordering::Release);
+        let first = crate::gc_telemetry::snapshot();
+        let second = crate::gc_telemetry::snapshot();
+        assert_eq!(first.counters.allocation_count, 2);
+        assert_eq!(first.counters.allocation_bytes, (bytes * 2) as u64);
+        assert_eq!(first.counters.tlab_fast_allocations, 1);
+        assert_eq!(
+            second.counters.allocation_bytes,
+            first.counters.allocation_bytes
+        );
+        willow_gc_unregister_mutator();
+        drop(tls);
+        assert_eq!(
+            crate::gc_telemetry::snapshot().counters.allocation_bytes,
+            first.counters.allocation_bytes
+        );
+        willow_gc_collect();
+        assert_eq!(crate::gc_telemetry::snapshot().heap.occupied_bytes, 0);
+        reset_gc();
+    }
+
+    #[test]
+    fn telemetry_promotion_is_not_a_second_logical_allocation() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let mut tls = new_tlab_state();
+        let young = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
+        let mut parent = willow_alloc_typed(8, 1);
+        willow_push_root(&mut parent);
+        willow_gc_write_barrier(parent, young, GcStoreDestination::ObjectField as i64);
+        unsafe {
+            *parent.cast::<*mut u8>() = young;
+        }
+        let before = crate::gc_telemetry::snapshot();
+        willow_gc_minor_collect();
+        let after = crate::gc_telemetry::snapshot();
+        assert_eq!(
+            after.counters.allocation_count,
+            before.counters.allocation_count
+        );
+        assert_eq!(
+            after.counters.allocation_bytes,
+            before.counters.allocation_bytes
+        );
+        assert_eq!(after.counters.promoted_objects, 1);
+        assert_eq!(after.counters.promoted_bytes, (GC_HEADER_SIZE + 8) as u64);
+        assert_eq!(after.last_cycle.reclaimed_bytes, 0);
+        assert_eq!(after.counters.released_bytes, GC_TLAB_CHUNK_SIZE as u64);
+        assert_eq!(
+            after.last_cycle.marked_bytes,
+            (2 * (GC_HEADER_SIZE + 8)) as u64
+        );
+        willow_pop_root();
+        reset_gc();
     }
 
     #[test]

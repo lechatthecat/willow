@@ -1,0 +1,77 @@
+{
+  "alloc": {
+    "baseline": {
+      "median_ns": 380619839,
+      "samples_ns": [
+        382002334,
+        378841605,
+        380619839,
+        380033573,
+        385622472
+      ]
+    },
+    "candidate": {
+      "median_ns": 381027982,
+      "samples_ns": [
+        378678850,
+        381027982,
+        384569423,
+        375619782,
+        386211353
+      ]
+    },
+    "trace": {
+      "median_ns": 388500471,
+      "samples_ns": [
+        387314184,
+        393451508,
+        379623576,
+        388500471,
+        398868625
+      ]
+    },
+    "candidate_overhead_percent": 0.10723114198993855,
+    "trace_overhead_percent": 2.0704732629556855
+  },
+  "mixed": {
+    "baseline": {
+      "median_ns": 1155263736,
+      "samples_ns": [
+        1150614153,
+        1155263736,
+        1146849155,
+        1166246619,
+        1179780700
+      ]
+    },
+    "candidate": {
+      "median_ns": 1168213716,
+      "samples_ns": [
+        1190378523,
+        1166556858,
+        1168213716,
+        1158786692,
+        1220365714
+      ]
+    },
+    "trace": {
+      "median_ns": 1198143420,
+      "samples_ns": [
+        1198143420,
+        1171132342,
+        1167675510,
+        1226018502,
+        1202723041
+      ]
+    },
+    "candidate_overhead_percent": 1.1209544276736372,
+    "trace_overhead_percent": 3.7116792178093716
+  },
+  "baseline_commit": "05f30cc",
+  "method": "Linux x86_64 release; 1,000,448 allocations per run; five measured samples after one warmup; alternating order; same workload source; buffered trace to regular file",
+  "cpu": "AMD Ryzen 7 7800X3D (16 logical CPUs)",
+  "snapshot_cost_ns": {
+    "p50": 120,
+    "p99": 180
+  }
+}
