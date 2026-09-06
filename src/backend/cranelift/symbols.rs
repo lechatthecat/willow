@@ -130,6 +130,19 @@ pub(crate) fn vtable_symbol(class_name: &str, iface_name: &str) -> String {
     with_role(&pair, "vtable")
 }
 
+/// `{class}.{method}$virtual_thunk` — the stub a vtable slot holds for an
+/// `open`/`override` method, dispatching through the receiver's class
+/// descriptor instead of naming one body (willow-tygf).
+///
+/// The method symbol plus a role, so it cannot collide with the method body it
+/// forwards to: a role separator cannot appear in a source name.
+pub(crate) fn vtable_thunk_symbol(class_name: &str, method_name: &str) -> String {
+    with_role(
+        &class_member_symbol(&backend_symbol_component(class_name), method_name),
+        "virtual_thunk",
+    )
+}
+
 /// The descriptor data symbol for `class_name` — word 0 of every object of that
 /// class (willow-fm7t). Offset 0 holds the class's `type_id`; the virtual
 /// method slots follow.
@@ -623,6 +636,31 @@ mod mangling_tests {
         assert_eq!(
             method.split(PATH_SEP).collect::<Vec<_>>(),
             ["shapes", "Config", "reset"]
+        );
+    }
+
+    /// Perspective 51: a vtable thunk is the method's own symbol plus a role,
+    /// so it can never land on the body it forwards to (willow-tygf).
+    #[test]
+    fn unit_mangle_51_vtable_thunk_is_distinct_from_its_method() {
+        let known = HashMap::new();
+        assert_eq!(
+            vtable_thunk_symbol("shapes::Parcel", "size"),
+            "shapes.Parcel.size$virtual_thunk"
+        );
+        assert_ne!(
+            vtable_thunk_symbol("shapes::Parcel", "size"),
+            class_method_symbol_name(&known, "shapes::Parcel", "size")
+        );
+        // One thunk per (class, method): two classes, or two methods, are two
+        // different symbols.
+        assert_ne!(
+            vtable_thunk_symbol("Parcel", "size"),
+            vtable_thunk_symbol("Crate", "size")
+        );
+        assert_ne!(
+            vtable_thunk_symbol("Parcel", "size"),
+            vtable_thunk_symbol("Parcel", "label")
         );
     }
 }

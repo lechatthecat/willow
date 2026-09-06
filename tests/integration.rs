@@ -35,6 +35,8 @@ mod enum_identity_aliases;
 mod gc_enum_payload_roots;
 #[path = "integration/imported_enum_match.rs"]
 mod imported_enum_match;
+#[path = "integration/interface_box_dynamic_dispatch.rs"]
+mod interface_box_dynamic_dispatch;
 #[path = "integration/interface_default_inheritance.rs"]
 mod interface_default_inheritance;
 #[path = "integration/interface_super_coercion.rs"]
@@ -57,6 +59,8 @@ mod lir_defer_scopes;
 mod lir_gc_stats;
 #[path = "integration/lir_io.rs"]
 mod lir_io;
+#[path = "integration/lir_local_binding_order.rs"]
+mod lir_local_binding_order;
 #[path = "integration/lir_locks.rs"]
 mod lir_locks;
 #[path = "integration/lir_main_result.rs"]
@@ -83,6 +87,8 @@ mod module_alias_spellings;
 mod module_checker_tables;
 #[path = "integration/module_enum_tables.rs"]
 mod module_enum_tables;
+#[path = "integration/module_inherited_interfaces.rs"]
+mod module_inherited_interfaces;
 
 #[path = "integration/lir_scope_roots.rs"]
 mod lir_scope_roots;
@@ -94,6 +100,8 @@ mod module_lambdas;
 mod module_class_visibility;
 #[path = "integration/module_import_scope.rs"]
 mod module_import_scope;
+#[path = "integration/module_item_imports.rs"]
+mod module_item_imports;
 
 #[path = "integration/module_call_frames.rs"]
 mod module_call_frames;

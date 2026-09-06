@@ -146,6 +146,17 @@
 //! roots are popped at each `return`. Expression temporaries that must survive
 //! an allocating call are rooted exactly as the AST path roots them.
 //!
+//! Every OTHER local is bound at function entry too (willow-ht1h,
+//! willow-34su). A block's index is not a position in any order control can
+//! flow in: an `if/else` merge is lowered before the arm that jumps to it, and
+//! an async body — emitted in index order — puts a `lock` section's blocks
+//! ahead of the `let` whose value they carry. Binding a local wherever its
+//! [`LirInst::Let`] happened to be emitted therefore dropped stores on the
+//! floor and reached reads with nothing bound at all, so
+//! [`FuncGen::bind_lir_locals`] hands every non-parameter local its storage up
+//! front — a stack slot if its address is taken, a zero-seeded Cranelift
+//! variable otherwise — and `Let` only stores into what is already there.
+//!
 //! Arrays (willow-0g8j.4) ride on the same discipline: an `Array<T>` value is a
 //! GC handle whose pointer is stable across growth (a `push` reallocates only
 //! the buffer), so the entry slot of an array local stays valid for the whole
@@ -4657,7 +4668,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             self.bind_lir_gc_locals(f);
         }
-        self.bind_lir_merge_locals(f);
+        self.bind_lir_locals(f);
         let mut blocks = vec![entry];
         for _ in 1..f.blocks.len() {
             blocks.push(self.builder.create_block());
@@ -5457,35 +5468,36 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
-    /// Give storage to every LIR local that nothing else binds (willow-ht1h).
+    /// Give storage to every LIR local that nothing else binds (willow-ht1h,
+    /// willow-34su).
     ///
-    /// Lowering declares locals that carry a value ACROSS blocks — a
-    /// conditional's merge result, a `match` scrutinee, a `match` arm's pattern
-    /// bindings. They are written by [`LirInst::Assign`] or by
-    /// [`LirInst::MatchBind`] and never by a [`LirInst::Let`], so neither
-    /// [`FuncGen::bind_lir_gc_locals`] nor [`FuncGen::bind_coop_lir_locals`]
-    /// sees them. With no entry binding the write is silently discarded and the
-    /// read after the merge reaches codegen unbound.
+    /// Two kinds of local need it. Lowering declares locals that carry a value
+    /// ACROSS blocks — a conditional's merge result, a `match` scrutinee, a
+    /// `match` arm's pattern bindings. They are written by
+    /// [`LirInst::Assign`] or by [`LirInst::MatchBind`] and never by a
+    /// [`LirInst::Let`], so neither [`FuncGen::bind_lir_gc_locals`] nor
+    /// [`FuncGen::bind_coop_lir_locals`] sees them.
+    ///
+    /// The rest are ordinary `let`s whose [`LirInst::Let`] is EMITTED after a
+    /// block that names them. A block index is not a position in any order
+    /// control flows in, and an async body is emitted in index order, so a
+    /// `lock` body and its continuation can both come out before the block
+    /// holding the `let` they read: `let mut got = 0; lock m as v { got = v; }`
+    /// lowers the two lock blocks ahead of the block that binds `got`. Binding
+    /// at the `Let` alone is therefore too late for them.
+    ///
+    /// Either way the consequence is the same: with no entry binding the write
+    /// is silently discarded and the read reaches codegen unbound. So every
+    /// local gets its storage here, and [`LirInst::Let`] stores into whatever
+    /// this left it — a binding point that does not depend on emission order.
     ///
     /// A local async liveness put in the heap frame is already bound and is
     /// skipped here — and that set is exactly the one that has to survive a
     /// poll return, so a Cranelift variable is sound for everything left.
-    fn bind_lir_merge_locals(&mut self, f: &LirFunction) {
-        let bound_by_let: HashSet<LirLocalId> = f
-            .blocks
-            .iter()
-            .flat_map(|block| &block.instrs)
-            .filter_map(|inst| match inst {
-                LirInst::Let { local, .. } => Some(*local),
-                _ => None,
-            })
-            .collect();
+    fn bind_lir_locals(&mut self, f: &LirFunction) {
         let mut null = None;
         for local in &f.locals {
-            if local.parameter
-                || bound_by_let.contains(&local.id)
-                || self.vars.contains_key(local.name.as_str())
-            {
+            if local.parameter || self.vars.contains_key(local.name.as_str()) {
                 continue;
             }
             if is_gc_managed(&local.ty, self.enum_infos) {
@@ -5493,9 +5505,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 continue;
             }
             if self.address_taken.contains(local.name.as_str()) {
-                // Pattern/merge locals are written later by `MatchBind` or an
-                // assignment. Give an address-taken one its definitive slot at
-                // function entry so no `&` use inserts path-local promotion.
+                // Give an address-taken local its definitive slot at function
+                // entry so no `&` use inserts path-local promotion, and so the
+                // one slot is the same one whichever block writes it first.
                 let clif = clif_type(&local.ty);
                 let zero = if clif == types::F64 {
                     self.builder.ins().f64const(0.0)
@@ -5802,10 +5814,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         }
                         None => self.emit_lir_store_value(value, ty),
                     };
-                    // A GC-managed local already has its rooted slot from
-                    // `bind_lir_gc_locals`; storing into it is the whole binding.
+                    // The binding itself was made at function entry — by
+                    // `bind_lir_gc_locals` for a GC-managed local, by
+                    // `bind_lir_locals` for the rest — so storing into it is
+                    // the whole `let` (willow-34su). The two branches below
+                    // only cover a name no local of this function declares.
                     if let Some(storage) = self.vars.get(name.as_str()).cloned()
-                        && matches!(storage, VarStorage::Stack { .. } | VarStorage::Frame { .. })
+                        && matches!(
+                            storage,
+                            VarStorage::Value { .. }
+                                | VarStorage::Stack { .. }
+                                | VarStorage::Frame { .. }
+                        )
                     {
                         self.store_var(&storage, val);
                     } else if self.address_taken.contains(name.as_str()) {

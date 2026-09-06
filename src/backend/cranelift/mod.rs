@@ -208,6 +208,10 @@ pub struct Codegen {
     /// Static vtable data object per `(class, interface)` pair, used to box a
     /// concrete class value into an interface value (willow-xds).
     vtable_ids: VtableMap<DataId>,
+    /// The virtual-dispatch thunk each `(class, method)` pair's vtable slots
+    /// point at, so one thunk is emitted however many interfaces a class
+    /// implements the method for (willow-tygf).
+    vtable_thunk_ids: HashMap<(String, String), FuncId>,
     /// Global storage for each `static [mut] name: T = expr` property, keyed by
     /// (class_key, field) where class_key is the registered (module-qualified)
     /// class name (willow-qsqf). Holds 8 bytes (i64/ptr/f64/bool).
@@ -412,6 +416,7 @@ impl Codegen {
             pattern_resolutions: HashMap::new(),
             interface_infos: TypeMap::with_scope(type_scope.clone()),
             vtable_ids: VtableMap::with_scope(type_scope.clone()),
+            vtable_thunk_ids: HashMap::new(),
             static_storage: HashMap::new(),
             static_init_order: Vec::new(),
             gc_tlab_state,
@@ -753,12 +758,6 @@ impl Codegen {
         if self.bind_item_import_function(local, module, item) {
             return;
         }
-        let module_prefix = self
-            .known_modules
-            .get(module)
-            .cloned()
-            .unwrap_or_else(|| module_symbol_prefix(module));
-
         // Direct TYPE import (willow-64gs): alias the compiled tables of the
         // module-qualified type (`module::Item`) under the unqualified `local`
         // name, so the entry's use of `local` resolves to the module's symbols.
@@ -769,23 +768,49 @@ impl Codegen {
         {
             self.type_scope.bind(local, &qualified);
         }
-        if self.class_layouts.contains_key(&qualified) {
-            let method_prefix = class_member_prefix(&module_item_symbol(&module_prefix, item));
-            let method_symbols: Vec<String> = self
-                .func_ids
-                .ids()
-                .map(ToString::to_string)
-                .filter(|name| name.starts_with(&method_prefix))
-                .collect();
-            for full in method_symbols {
-                let suffix = full.strip_prefix(&method_prefix).unwrap();
-                let alias = class_member_symbol(local, suffix);
-                self.func_ids.scope().bind(
-                    FunctionId::free_from_source_name(&alias),
-                    FunctionId::free_from_source_name(&full),
-                );
-            }
+        for (alias, full) in self.item_import_method_aliases(local, module, item) {
+            self.func_ids.scope().bind(
+                FunctionId::free_from_source_name(&alias),
+                FunctionId::free_from_source_name(&full),
+            );
         }
+    }
+
+    /// Every `(local alias, mangled symbol)` pair binding the methods of the
+    /// class `{module}::{item}` under the local name an item import gave it.
+    ///
+    /// Empty when the item is not a class: only a class carries methods that
+    /// have to answer under a second spelling. A method is reached as
+    /// `{receiver class}.{method}` by both the walker
+    /// (`class_method_symbol_name`) and the emitter, so an item-imported class
+    /// needs one alias per method or every call on it is unresolvable —
+    /// which, for a module body, is a hard `E0800` rather than a fallback
+    /// (willow-kxy8).
+    fn item_import_method_aliases(
+        &self,
+        local: &str,
+        module: &str,
+        item: &str,
+    ) -> Vec<(String, String)> {
+        let qualified = format!("{module}::{item}");
+        if !self.class_layouts.contains_key(&qualified) {
+            return Vec::new();
+        }
+        let module_prefix = self
+            .known_modules
+            .get(module)
+            .cloned()
+            .unwrap_or_else(|| module_symbol_prefix(module));
+        let method_prefix = class_member_prefix(&module_item_symbol(&module_prefix, item));
+        self.func_ids
+            .ids()
+            .map(ToString::to_string)
+            .filter(|name| name.starts_with(&method_prefix))
+            .map(|full| {
+                let suffix = full.strip_prefix(&method_prefix).expect("filtered above");
+                (class_member_symbol(local, suffix), full.clone())
+            })
+            .collect()
     }
 
     /// The function half of [`Codegen::register_item_import`]: bind `local` to
@@ -974,6 +999,17 @@ impl Codegen {
                     item.local.clone(),
                     self.type_scope.bind(&item.local, &qualified),
                 ));
+            }
+            // A class's methods travel with the name: `import leaf::Box;` then
+            // `b.get()` mangles to `Box.get`, which is nothing this build
+            // declared. The entry file gets these from
+            // `register_item_import`; a module unit gets them here, under the
+            // snapshot, so the next unit's bodies do not inherit this one's
+            // spelling (willow-kxy8).
+            for (alias, full) in
+                self.item_import_method_aliases(&item.local, &item.module, &item.item)
+            {
+                self.alias_function_symbol(&alias, &full, aliases);
             }
         }
     }

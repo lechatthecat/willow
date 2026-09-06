@@ -477,13 +477,18 @@ impl Codegen {
         // module-qualified by `qualify_module_class_decl`).
         let qualified_classes: Vec<ClassDecl> =
             module_classes.iter().map(|(_, c)| c.clone()).collect();
+        // Before the vtables: an `open` method's vtable slot holds a thunk
+        // that dispatches through virtual slot N of the receiver's descriptor,
+        // so the slot ORDER has to be settled first (willow-tygf). Every
+        // ancestor of a class in this unit is already registered — dependencies
+        // are declared before their dependents — so its order is final here.
+        self.finalize_class_vslots();
         self.declare_vtables_for_classes(&qualified_classes)?;
 
         // Emit one descriptor per module class: word 0 of every object of that
         // class, holding its `type_id` and its virtual method slots
         // (willow-fm7t). Must follow the method declarations above, since every
         // slot is filled by function address.
-        self.finalize_class_vslots();
         self.declare_class_descriptors_for(&qualified_classes)?;
 
         // Collect and declare this module's lambdas, exactly as
@@ -773,6 +778,11 @@ impl Codegen {
             }
         }
 
+        // Settle every class's virtual slot ORDER before the vtables: an
+        // `open` method's vtable slot holds a thunk that dispatches through
+        // virtual slot N of the receiver's descriptor (willow-tygf).
+        self.finalize_class_vslots();
+
         // Emit one static vtable per (class, implemented-interface) pair. All
         // class method symbols are declared by now, so the vtable can reference
         // them by function address.
@@ -781,7 +791,6 @@ impl Codegen {
         // Emit one descriptor per class (willow-fm7t). Unlike interface
         // vtables this covers EVERY class, since word 0 of every object points
         // at its descriptor whether or not the class implements an interface.
-        self.finalize_class_vslots();
         self.declare_class_descriptors(program)?;
 
         // Collect and declare all lambdas (they may call user functions already declared above).
@@ -1691,14 +1700,125 @@ impl Codegen {
         // Filled BY NAME, which is what lets one method occupy several slots
         // (a diamond's shared grandparent) without the copies disagreeing.
         for (slot, method_name) in slots.iter().enumerate() {
-            if let Some(func_id) = self.resolve_class_method_func_id(class_name, method_name) {
-                let func_ref = self.module.declare_func_in_data(func_id, &mut data);
-                data.write_function_addr((slot * 8) as u32, func_ref);
-            }
+            let Some(func_id) = self.resolve_class_method_func_id(class_name, method_name) else {
+                continue;
+            };
+            // An `open`/`override` method must not be nailed to the body THIS
+            // class would inherit: the box may have been built from a
+            // base-typed expression whose object is really a subclass, and the
+            // subclass's override has to win (willow-tygf). Its slot therefore
+            // holds a thunk that re-dispatches through the receiver's own class
+            // descriptor. A method with no virtual slot is neither `open` nor
+            // an `override`, so no subclass can replace it and the direct
+            // address is both correct and cheaper.
+            //
+            // Slotted methods take the thunk unconditionally rather than
+            // devirtualizing a lone implementation the way `plan_virtual_call`
+            // does: vtables are laid out per UNIT, and a class declared by a
+            // later unit — the entry file, typically — can still contribute the
+            // override that makes the count two.
+            let vslot = self
+                .class_vslots
+                .get(class_name)
+                .and_then(|slots| slots.iter().position(|n| n == method_name));
+            let entry = match vslot {
+                Some(vslot) => {
+                    self.declare_vtable_thunk(class_name, method_name, vslot, func_id, span)?
+                }
+                None => func_id,
+            };
+            let func_ref = self.module.declare_func_in_data(entry, &mut data);
+            data.write_function_addr((slot * 8) as u32, func_ref);
         }
         self.module.define_data(data_id, &data)?;
         self.vtable_ids.insert(key, data_id);
         Ok(())
+    }
+
+    /// Emit (once per `(class, method)` pair) the virtual-dispatch thunk a
+    /// vtable slot points at instead of a method body (willow-tygf).
+    ///
+    /// The thunk takes the target method's own signature, loads the receiver's
+    /// class descriptor from word 0 of the object, reads virtual slot `vslot`
+    /// from it, and calls that. `vslot` is the index the STATIC class assigns
+    /// the method, and it is valid for every class the receiver can actually be
+    /// because a subclass's slot order EXTENDS its base's — the same invariant
+    /// [`FuncGen::emit_vtable_slot_load`] relies on for a class-typed call.
+    ///
+    /// Nothing is allocated between entry and the call, so no GC can run inside
+    /// the thunk and its arguments need no roots of their own; the callee roots
+    /// its parameters exactly as it does under a direct call.
+    fn declare_vtable_thunk(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        vslot: usize,
+        target: FuncId,
+        span: crate::diagnostics::Span,
+    ) -> Result<FuncId> {
+        let key = (class_name.to_string(), method_name.to_string());
+        if let Some(&existing) = self.vtable_thunk_ids.get(&key) {
+            return Ok(existing);
+        }
+        // The body it forwards to is already declared, so its signature is the
+        // one authority on the thunk's own: an `override` must match the method
+        // it replaces, so every class the receiver can be agrees with it.
+        let sig = self
+            .module
+            .declarations()
+            .get_function_decl(target)
+            .signature
+            .clone();
+        if sig.params.is_empty() {
+            // No receiver to read a descriptor from. Unreachable for an
+            // instance method, and a vtable slot is only ever entered through
+            // one, but codegen stays total rather than indexing into nothing.
+            return Ok(target);
+        }
+        let symbol = vtable_thunk_symbol(class_name, method_name);
+        // Shares the one linker namespace with every other symbol the backend
+        // hands out, so it is claimed like the rest (willow-uqzx, item 8).
+        self.claim_symbol(
+            &symbol,
+            format!("virtual dispatch thunk for `{class_name}::{method_name}`"),
+            span,
+        )?;
+        let func_id = self
+            .module
+            .declare_function(&symbol, Linkage::Local, &sig)?;
+
+        let mut ctx = self.module.make_context();
+        ctx.func.signature = sig.clone();
+        ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+        let mut fn_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_ctx);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+
+        let params: Vec<cranelift_codegen::ir::Value> = builder.block_params(entry).to_vec();
+        let ptr_ty = self.module.target_config().pointer_type();
+        // Parameter 0 is the receiver for every instance method, which is what
+        // a vtable slot is only ever reached through.
+        let self_ptr = params[0];
+        let descriptor = builder
+            .ins()
+            .load(ptr_ty, MemFlagsData::new(), self_ptr, 0i32);
+        let offset = (CLASS_DESCRIPTOR_HEADER_BYTES as usize + vslot * 8) as i32;
+        let callee = builder
+            .ins()
+            .load(ptr_ty, MemFlagsData::new(), descriptor, offset);
+        let sig_ref = builder.import_signature(sig);
+        let call = builder.ins().call_indirect(sig_ref, callee, &params);
+        let results = builder.inst_results(call).to_vec();
+        builder.ins().return_(&results);
+        builder.finalize(self.module.target_config());
+        self.module.define_function(func_id, &mut ctx)?;
+        self.module.clear_context(&mut ctx);
+
+        self.vtable_thunk_ids.insert(key, func_id);
+        Ok(func_id)
     }
 
     /// Emit one descriptor per class named in `classes` (already

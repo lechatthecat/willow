@@ -3931,6 +3931,72 @@ async fn f(which: i64) -> i64 {
         );
     }
 
+    // 37. a `lock` body and its continuation are emitted BEFORE the block
+    // that holds the `let` they read (willow-34su).
+    //
+    // This is the shape that made lazy binding at `LirInst::Let` wrong: the
+    // assignment in the section and the read after it both land in blocks of
+    // lower index than the `let`, so codegen reaches them first. The backend
+    // answers it by binding every local at function entry; this pins the
+    // premise, so a lowering change that reorders the blocks shows up here
+    // rather than as a silent dependency the backend no longer needs.
+    #[test]
+    fn l37_lock_body_is_emitted_before_the_let_it_reads() {
+        // The call is what makes the shape: an async body is split at its
+        // preemption points and each continuation is APPENDED, so the block
+        // holding everything after the `gc_collect()` — the `let` included —
+        // is allocated after the section's own blocks.
+        let p = lir(r#"
+async fn peek(m: Mutex<i64>) -> i64 {
+    gc_collect();
+    let mut got = 0;
+    lock m as value { got = value; }
+    return got;
+}
+"#);
+        let f = func(&p, "peek");
+        let block_of = |pick: &dyn Fn(&LirInst) -> bool| {
+            f.blocks
+                .iter()
+                .position(|block| block.instrs.iter().any(pick))
+                .expect("no block holds the instruction")
+        };
+        let binds = block_of(&|inst| matches!(inst, LirInst::Let { name, .. } if name == "got"));
+        let writes =
+            block_of(&|inst| matches!(inst, LirInst::Assign { name, .. } if name == "got"));
+        assert!(
+            writes < binds,
+            "the section writes `got` in bb{writes} and binds it in bb{binds}; \
+             the binding is no longer the later block"
+        );
+    }
+
+    // 38. the same in a synchronous body: `if/else` lowers the merge block
+    // before the `else` arm that jumps to it, so a block index has never been
+    // a position in an order control can flow in (willow-ht1h, willow-fvt4).
+    #[test]
+    fn l38_if_else_merge_is_emitted_before_its_predecessor() {
+        let p = lir("fn f(c: bool) -> i64 { if c { return 1; } else { print(2); } return 3; }");
+        let f = func(&p, "f");
+        let Terminator::Branch { else_block, .. } = &f.blocks[0].terminator else {
+            panic!("entry does not branch");
+        };
+        let merge = f
+            .blocks
+            .iter()
+            .position(|block| {
+                matches!(&block.terminator, Terminator::Return(Some(v))
+                    if matches!(v.kind, HirExprKind::Int(3)))
+            })
+            .expect("no merge block");
+        assert!(
+            merge < else_block.0,
+            "merge is bb{merge} and the else arm bb{}; index order no longer \
+             puts a block before its predecessor",
+            else_block.0
+        );
+    }
+
     /// A synchronous function never suspends, so the split never applies to
     /// one however its arms are written.
     #[test]

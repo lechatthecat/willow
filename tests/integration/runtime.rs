@@ -796,12 +796,20 @@ fn test_runnable_example_files_compile_and_run() {
             "north\nwest\n78.53975\n12\n0.0\nzero\nnonzero\nyes\nno\n",
         ),
         ("example/unqualified_enum_variant.wi", "42\n1007\n-1\n"),
+        (
+            "example/interface_box_dynamic_dispatch.wi",
+            "20\n60\n200\n90\n140\n18\n9\n",
+        ),
         ("example/leibniz_pi.wi", "3.141592663589326\n"),
         ("example/locks.wi", "5\ndev\nprod\nfalse\ntrue\n"),
         (
             "example/lock_match_arm.wi",
             "10\n6\n6\ncredited\ndebited\n10\n100\n20\n3\n123\n\
              draft\nfinal\n120\n",
+        ),
+        (
+            "example/lir_local_binding_order.wi",
+            "41\n10\n307\n10\nheld\nboxed\n42\nmany\n16\n5\n-1\n",
         ),
         (
             "example/lir_locks.wi",
@@ -892,6 +900,14 @@ fn test_runnable_example_files_compile_and_run() {
         (
             "example/module_class_inheritance_demo/main.wi",
             "1005\n6\n1005\n",
+        ),
+        (
+            "example/module_inherited_interfaces/main.wi",
+            "30\n100\n40\nparcel\nentry\n7\n21\n120\n",
+        ),
+        (
+            "example/module_item_imports/main.wi",
+            "25\n275\n0\n1100\n1100\n",
         ),
         ("example/module_demo/main.wi", "12\n14\n"),
         (

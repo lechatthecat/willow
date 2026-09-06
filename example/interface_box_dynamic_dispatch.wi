@@ -1,0 +1,84 @@
+// Widening a value to an interface must keep the RUNTIME class's overrides,
+// even when the expression being widened is typed on a base class
+// (willow-tygf).
+//
+// A `(class, interface)` vtable is chosen from the STATIC type at the boxing
+// site, so a `Parcel`-typed parameter holding a `Sub` used to box with
+// `Parcel`'s table and call `Parcel::size` — the override was silently lost.
+// Every `open`/`override` slot now holds a thunk that re-dispatches through the
+// receiver's own class descriptor, which is the same table a class-typed call
+// goes through, so both spellings of the call agree.
+
+import std::collections::Array;
+
+interface Measured {
+    fn size(self) -> i64;
+
+    // A default body is injected as a plain (non-`open`) class method, so its
+    // own slot is a direct address — but the `self.size()` inside it still
+    // reaches the override.
+    fn doubled(self) -> i64 {
+        return self.size() * 2;
+    }
+}
+
+open class Parcel implements Measured {
+    pub side: i64;
+
+    pub open fn size(self) -> i64 {
+        return self.side;
+    }
+}
+
+open class Crate extends Parcel {
+    pub open override fn size(self) -> i64 {
+        return self.side * 3;
+    }
+}
+
+class Reinforced extends Crate {
+    pub override fn size(self) -> i64 {
+        return self.side * 10;
+    }
+}
+
+fn describe(m: Measured) -> i64 {
+    return m.size() * 10;
+}
+
+fn doubled_of(m: Measured) -> i64 {
+    return m.doubled();
+}
+
+// The bug's shape: the widening happens on a value typed as the BASE.
+fn through_base(p: Parcel) -> i64 {
+    return describe(p);
+}
+
+fn main() {
+    // A base-typed parameter holding each class in the chain.
+    println(through_base(new Parcel(2)));
+    println(through_base(new Crate(2)));
+    println(through_base(new Reinforced(2)));
+
+    // A base-typed local, an array element, and a branch are the same widening
+    // in different clothes.
+    let held: Parcel = new Crate(3);
+    println(describe(held));
+
+    let items: Array<Parcel> = [new Parcel(1), new Crate(1), new Reinforced(1)];
+    let mut total = 0;
+    let mut i = 0;
+    while i < items.len() {
+        total = total + describe(items[i]);
+        i = i + 1;
+    }
+    println(total);
+
+    // The interface default, reached through a base-typed value.
+    println(doubled_of(held));
+
+    // The class-typed call was always right; it is printed next to the boxed
+    // one so the two can be compared.
+    println(held.size());
+}

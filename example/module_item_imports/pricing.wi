@@ -1,0 +1,18 @@
+module pricing;
+
+// The leaf of the chain: one public function and one public class, both reached
+// from `inventory` by a SINGLE-ITEM import rather than a module import.
+
+pub fn tax(cents: i64) -> i64 {
+    return cents / 10;
+}
+
+pub class Price {
+    pub cents: i64;
+
+    pub init(self, cents: i64) { self.cents = cents; }
+
+    pub fn total(self) -> i64 { return self.cents + tax(self.cents); }
+
+    pub static fn free() -> Price { return new Price(0); }
+}

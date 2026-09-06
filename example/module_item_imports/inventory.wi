@@ -1,0 +1,32 @@
+module inventory;
+
+// A module with item imports OF ITS OWN. Both lines below were broken:
+//
+//   * `tax(...)` used to lower to a stub returning 0, because a module's item
+//     imports never reached the back end (willow-kxy8), so `run` printed a
+//     total with no tax in it;
+//   * `p.total()` and `Price::free()` failed to compile at all, because only
+//     the entry file aliased an item-imported class's method symbols
+//     (willow-2g6s).
+//
+// `Price` is also written into this module's own public signature, so the entry
+// file below passes and receives the very same class under its own spelling.
+
+import pricing::tax;
+import pricing::Price;
+
+pub fn taxed(cents: i64) -> i64 {
+    return tax(cents);
+}
+
+pub fn priced(cents: i64) -> Price {
+    return new Price(cents);
+}
+
+pub fn total_of(p: Price) -> i64 {
+    return p.total();
+}
+
+pub fn nothing() -> i64 {
+    return Price::free().total();
+}

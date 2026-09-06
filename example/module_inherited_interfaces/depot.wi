@@ -1,0 +1,50 @@
+module depot;
+
+// A module that publishes two interfaces and an `open` class implementing them,
+// plus functions typed on the interfaces. Every call below boxes its argument
+// into `[object | vtable]`, so each concrete class reaching one of them needs a
+// `(class, interface)` vtable of its own -- including classes declared in the
+// program that IMPORTS this module (willow-himv).
+
+pub interface Named {
+    fn tag(self) -> String;
+}
+
+// `Measured` inherits `Named`, so a `Measured` value is usable as a `Named` one.
+pub interface Measured extends Named {
+    fn size(self) -> i64;
+
+    // A default body: injected once, into the topmost class that implements
+    // this interface, and inherited from there like any other method.
+    fn doubled(self) -> i64 {
+        return self.size() * 2;
+    }
+}
+
+pub open class Parcel implements Measured {
+    pub side: i64;
+
+    pub open fn size(self) -> i64 {
+        return self.side;
+    }
+
+    pub open fn tag(self) -> String {
+        return "parcel";
+    }
+}
+
+// A second level INSIDE the module: `Crate` names no interface itself and
+// inherits `implements Measured` from `Parcel`.
+pub open class Crate extends Parcel {}
+
+pub fn describe(m: Measured) -> i64 {
+    return m.size() * 10;
+}
+
+pub fn name(n: Named) -> String {
+    return n.tag();
+}
+
+pub fn twice(m: Measured) -> i64 {
+    return m.doubled() + 1;
+}

@@ -1,0 +1,30 @@
+// A module's own single-item imports (willow-kxy8, willow-2g6s).
+//
+// `inventory` imports one function and one class out of `pricing`, and uses
+// both by their bare names: an unqualified call, a constructor, an instance
+// method, a static method, and the class in its own public signature.
+//
+// The entry file imports `inventory` as a module and `pricing::Price` as an
+// item, so the same class is reached under two spellings in the one program —
+// `Price` here, `Price` inside `inventory`, and `pricing::Price` in neither.
+// They are one runtime class, which is what the last two lines show.
+
+import inventory;
+import pricing::Price;
+
+fn main() {
+    // The function half: 250 + 25 of tax.
+    println(inventory::taxed(250));
+
+    // The class half, inside the module: an instance method...
+    println(inventory::total_of(inventory::priced(250)));
+
+    // ...and a static one.
+    println(inventory::nothing());
+
+    // The entry file's own spelling of the same class, handed back to the
+    // module that imported it by item.
+    let p = new Price(1000);
+    println(p.total());
+    println(inventory::total_of(p));
+}

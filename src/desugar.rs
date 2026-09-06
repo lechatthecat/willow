@@ -23,13 +23,17 @@ impl DesugarPass {
         let entry_class_shapes =
             augment_index_with_import_aliases(&class_shape_index, &program.imports);
 
-        let mut diagnostics = resolve_interface_inheritance(program, &entry_ifaces);
+        let mut diagnostics =
+            resolve_interface_inheritance(program, &entry_ifaces, &entry_class_shapes);
         for module in modules.iter_mut() {
             let module_ifaces =
                 augment_index_with_import_aliases(&iface_index, &module.program.imports);
+            let module_class_shapes =
+                augment_index_with_import_aliases(&class_shape_index, &module.program.imports);
             diagnostics.extend(resolve_interface_inheritance(
                 &mut module.program,
                 &module_ifaces,
+                &module_class_shapes,
             ));
         }
 
@@ -309,11 +313,14 @@ fn augment_index_with_import_aliases<V: Clone>(
 ///     (and gets a vtable for) each super, and conformance covers the full set.
 ///
 /// `external` carries the module-qualified interfaces of every imported module
-/// so cross-module `extends` / `implements` resolve. Must run BEFORE
-/// default-method injection.
+/// so cross-module `extends` / `implements` resolve, and `external_classes` the
+/// base class and `implements` clause of every imported CLASS, so step 2 keeps
+/// working when the ancestor that names the interface lives in a module
+/// (willow-himv). Must run BEFORE default-method injection.
 fn resolve_interface_inheritance(
     program: &mut parser::ast::Program,
     external: &IfaceIndex,
+    external_classes: &std::collections::HashMap<String, ClassShape>,
 ) -> Vec<diagnostics::Diagnostic> {
     use parser::ast::{Item, Type, TypePath};
     use std::collections::{HashMap, HashSet};
@@ -339,20 +346,31 @@ fn resolve_interface_inheritance(
     // class name -> (base class name, directly-implemented interface TYPES), so
     // a subclass can inherit the interfaces its ancestors implement — keeping
     // generic type arguments, e.g. `Into<AppErr>` (willow-2s4i / willow-bpk6).
-    let class_info: HashMap<String, (Option<String>, Vec<Type>)> = program
-        .items
+    //
+    // Imported classes go in FIRST, under their module-qualified name and every
+    // import-alias spelling of it, because an ancestor of a class declared here
+    // may live in a module: without them `class EntryParcel extends lib::Parcel`
+    // inherited nothing, so no `(EntryParcel, lib::Measured)` vtable was ever
+    // emitted and boxing it into that interface produced a box with no methods
+    // (willow-himv). This program's own classes are inserted after, so a local
+    // declaration always wins over an entry of the same spelling. The imported
+    // shapes carry each class's DIRECT `implements` only — they are built before
+    // any program's propagation runs — which is why the walk below is transitive
+    // over the whole base chain rather than reading one ancestor's finished list.
+    let mut class_info: HashMap<String, (Option<String>, Vec<Type>)> = external_classes
         .iter()
-        .filter_map(|it| match it {
-            Item::Class(c) => {
-                let base = c.base_class.as_ref().map(|tp| match tp {
-                    TypePath::Local(n) => n.clone(),
-                    TypePath::Qualified(p) => p.join("::"),
-                });
-                Some((c.name.clone(), (base, c.implements.clone())))
-            }
-            _ => None,
-        })
+        .map(|(name, shape)| (name.clone(), (shape.base.clone(), shape.implements.clone())))
         .collect();
+    class_info.extend(program.items.iter().filter_map(|it| match it {
+        Item::Class(c) => {
+            let base = c.base_class.as_ref().map(|tp| match tp {
+                TypePath::Local(n) => n.clone(),
+                TypePath::Qualified(p) => p.join("::"),
+            });
+            Some((c.name.clone(), (base, c.implements.clone())))
+        }
+        _ => None,
+    }));
     // Nothing to do only when there is neither interface inheritance nor any
     // class with a base class (a subclass may inherit its base's interfaces).
     let own_has_inheritance = program.items.iter().any(|it| match it {
@@ -940,6 +958,90 @@ mod tests {
             _ => None,
         });
         assert!(class.unwrap().implements.contains(&Type::Named("A".into())));
+    }
+
+    /// A one-file module, as the driver hands them to [`DesugarPass::run`].
+    fn resolved_module(name: &str, source: &str) -> module::ResolvedModule {
+        module::ResolvedModule {
+            id: crate::module::ModuleId(0),
+            name: name.to_string(),
+            canonical_path: name.to_string(),
+            path: std::path::PathBuf::from(format!("{name}.wi")),
+            source: source.to_string(),
+            program: parse(source),
+        }
+    }
+
+    fn class_implements(program: &parser::ast::Program, class: &str) -> Vec<Type> {
+        program
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Class(c) if c.name == class => Some(c.implements.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("class `{class}` not found"))
+    }
+
+    #[test]
+    fn pass_inherits_implements_from_a_module_base_class() {
+        // willow-himv: the ancestor naming the interface lives in an imported
+        // module, so the propagation only reaches it through the class shapes
+        // built from `modules` — `program.items` alone never sees `lib::Parcel`.
+        let mut modules = [resolved_module(
+            "lib",
+            "module lib;\n\
+             pub interface Measured { fn size(self) -> i64; }\n\
+             pub open class Parcel implements Measured {\n\
+                 pub side: i64;\n\
+                 pub open fn size(self) -> i64 { return self.side; }\n\
+             }",
+        )];
+        let mut program = parse(
+            "import lib::Parcel;\n\
+             class EntryParcel extends Parcel {}\n\
+             fn main() {}",
+        );
+        let output = DesugarPass::run(&mut program, &mut modules);
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert!(
+            class_implements(&program, "EntryParcel")
+                .contains(&Type::Named("lib::Measured".into())),
+            "an entry subclass should inherit its module base's `implements`, got {:?}",
+            class_implements(&program, "EntryParcel")
+        );
+    }
+
+    #[test]
+    fn pass_walks_a_chain_that_leaves_and_re_enters_the_entry_program() {
+        // `Leaf -> Mid (entry) -> lib::Crate -> lib::Parcel`: the interface is
+        // named only by the root, and the imported shapes carry each class's
+        // DIRECT `implements`, so the walk has to keep going past `lib::Crate`.
+        let mut modules = [resolved_module(
+            "lib",
+            "module lib;\n\
+             pub interface Measured { fn size(self) -> i64; }\n\
+             pub open class Parcel implements Measured {\n\
+                 pub side: i64;\n\
+                 pub open fn size(self) -> i64 { return self.side; }\n\
+             }\n\
+             pub open class Crate extends Parcel {}",
+        )];
+        let mut program = parse(
+            "import lib::Crate;\n\
+             open class Mid extends Crate {}\n\
+             class Leaf extends Mid {}\n\
+             fn main() {}",
+        );
+        let output = DesugarPass::run(&mut program, &mut modules);
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        for class in ["Mid", "Leaf"] {
+            assert!(
+                class_implements(&program, class).contains(&Type::Named("lib::Measured".into())),
+                "`{class}` should inherit `lib::Measured`, got {:?}",
+                class_implements(&program, class)
+            );
+        }
     }
 
     #[test]

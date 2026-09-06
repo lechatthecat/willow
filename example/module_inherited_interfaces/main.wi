@@ -1,0 +1,50 @@
+// An entry-file subclass of a module class is usable as the interfaces that
+// module class implements.
+//
+// `implements` travels down an `extends` chain, and the ancestor that names the
+// interface here lives in `depot`, not in this file. Until willow-himv the
+// desugaring pass that does the propagation only ever looked at the classes
+// declared in the SAME program, so `EntryParcel` below inherited nothing: no
+// `(EntryParcel, depot::Measured)` vtable was declared, and handing one to
+// `depot::describe` produced a box with no methods in it -- the program stopped
+// mid-`main` and still exited 0.
+
+import depot;
+import depot::Parcel;
+import depot::Crate;
+
+// Overrides both interface methods.
+class EntryParcel extends Parcel {
+    pub override fn size(self) -> i64 {
+        return self.side + 7;
+    }
+
+    pub override fn tag(self) -> String {
+        return "entry";
+    }
+}
+
+// Overrides nothing: the vtable slots point at `Parcel`'s bodies.
+class Plain extends Parcel {}
+
+// Three deep: `Big -> depot::Crate -> depot::Parcel`, and only the root names
+// the interface.
+class Big extends Crate {
+    pub override fn size(self) -> i64 {
+        return self.side * 3;
+    }
+}
+
+fn main() {
+    println(depot::describe(new Parcel(3)));       // 30  -- the module's own class
+    println(depot::describe(new EntryParcel(3)));  // 100 -- the entry override
+    println(depot::describe(new Plain(4)));        // 40  -- inherited body
+
+    println(depot::name(new Parcel(3)));           // parcel -- the super-interface
+    println(depot::name(new EntryParcel(3)));      // entry
+
+    println(depot::twice(new Parcel(3)));          // 7  -- the interface default
+    println(depot::twice(new EntryParcel(3)));     // 21 -- default over an override
+
+    println(depot::describe(new Big(4)));          // 120 -- through two ancestors
+}

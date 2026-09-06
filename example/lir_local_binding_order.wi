@@ -1,0 +1,159 @@
+// lir_local_binding_order.wi — a local's storage does not depend on which
+// block the emitter reaches first (willow-34su).
+//
+// Lowered IR is a graph, and a block's index in the function is not a position
+// in any order control can flow in. An async body is emitted in index order,
+// and `lock` lowering allocates the section's body and its continuation while
+// the statement itself is being lowered — so both come out AHEAD of the block
+// that holds the `let` they read:
+//
+//     let mut got = 0;                 // the later block
+//     lock m as value { got = value; } // emitted first
+//     return got;                      // emitted first
+//
+// When `let` was what created the binding, at the point it was emitted, the
+// assignment above found no storage and was dropped on the floor, and the read
+// after it reached codegen with nothing bound at all. So the binding is made
+// once at function entry for every local — a rooted slot for a GC-managed one,
+// a stack slot for one whose address is taken, a seeded variable otherwise —
+// and `let` stores into what is already there.
+//
+// Every function here hands a value out of a critical section through a local
+// declared outside it. Run: `willowc run example/lir_local_binding_order.wi`.
+
+import std::collections::Array;
+
+class Cell {
+    id: i64;
+    pub init(self, id: i64) { self.id = id; }
+    pub fn id(self) -> i64 { return self.id; }
+}
+
+class Tag {
+    text: String;
+    pub init(self, text: String) { self.text = text; }
+    pub fn text(self) -> String { return self.text; }
+}
+
+// The reported shape: a read-only section copies the protected value out.
+async fn peek(m: Mutex<i64>) -> i64 {
+    let mut got = 0;
+    lock m as value { got = value; }
+    return got;
+}
+
+// Allocation inside the section, a collection after it, then the read.
+async fn locked(m: Mutex<i64>, rounds: i64) -> i64 {
+    let mut i = 0;
+    while i < rounds {
+        lock m as mut value {
+            let cell = new Cell(i);
+            value = value + cell.id();
+        }
+        i = i + 1;
+    }
+    gc_collect();
+    let mut got = 0;
+    lock m as value { got = value; }
+    return got;
+}
+
+// Two sections, one local each: both bodies precede both `let`s.
+async fn both(a: Mutex<i64>, b: Mutex<i64>) -> i64 {
+    let mut first = 0;
+    let mut second = 0;
+    lock a as value { first = value; }
+    lock b as value { second = value; }
+    return first * 100 + second;
+}
+
+// An accumulator read back by the next round of the loop.
+async fn total(m: Mutex<i64>, rounds: i64) -> i64 {
+    let mut sum = 0;
+    let mut i = 0;
+    while i < rounds {
+        lock m as mut value {
+            value = value + 1;
+            sum = sum + value;
+        }
+        i = i + 1;
+    }
+    return sum;
+}
+
+// A GC-managed local: its entry storage is a rooted slot.
+async fn label(m: Mutex<String>) -> String {
+    let mut got = "none";
+    lock m as value { got = value; }
+    return got;
+}
+
+// An object comes out and is called on after the release.
+async fn unwrap(m: Mutex<Tag>) -> String {
+    let mut got = new Tag("empty");
+    lock m as value { got = value; }
+    return got.text();
+}
+
+// `RwLock`'s shared and exclusive sections, feeding one another.
+async fn touch(l: RwLock<i64>) -> i64 {
+    let mut before = 0;
+    lock read l as value { before = value; }
+    let mut after = 0;
+    lock write l as mut value {
+        value = value + before;
+        after = value;
+    }
+    return after;
+}
+
+// A `match` inside the body writes the outer local; its arm bindings are
+// merge locals, bound by the same entry pass.
+async fn classify(m: Mutex<i64>) -> String {
+    let mut name = "?";
+    lock m as value {
+        match value {
+            0 => { name = "zero"; }
+            1 => { name = "one"; }
+            _ => { name = "many"; }
+        }
+    }
+    return name;
+}
+
+fn twice(n: &mut i64) {
+    n = n * 2;
+}
+
+// The local's address is taken, so its entry storage is a stack slot and the
+// section's write has to land in the slot the reference reads through.
+async fn doubled(m: Mutex<i64>) -> i64 {
+    let mut got = 0;
+    lock m as value { got = value; }
+    twice(&got);
+    return got;
+}
+
+// A section that never runs leaves the seed the entry storage was given.
+async fn maybe(m: Mutex<i64>, take: bool) -> i64 {
+    let mut got = -1;
+    if take {
+        lock m as value { got = value; }
+    }
+    return got;
+}
+
+async fn main() {
+    println(await peek(Mutex::new(41))); // 41
+    println(await locked(Mutex::new(0), 5)); // 10
+    println(await both(Mutex::new(3), Mutex::new(7))); // 307
+    println(await total(Mutex::new(0), 4)); // 10
+    println(await label(Mutex::new("held"))); // held
+    println(await unwrap(Mutex::new(new Tag("boxed")))); // boxed
+    println(await touch(RwLock::new(21))); // 42
+    println(await classify(Mutex::new(9))); // many
+    println(await doubled(Mutex::new(8))); // 16
+    let m = Mutex::new(5);
+    println(await maybe(m, true)); // 5
+    println(await maybe(m, false)); // -1
+}
