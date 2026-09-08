@@ -198,8 +198,8 @@ macro_rules! lir_type_ctx {
                         .collect(),
                 })
             },
-            // Straight from the same table `emit_interface_dispatch` reads,
-            // so the slot the walker vets is the slot it will index.
+            // Straight from the table the vtables are emitted from, so the
+            // slot the walker vets is the slot it will index.
             iface_method: &|iface_ty, method| {
                 let (iface, args): (&str, &[Type]) = match iface_ty {
                     Type::Named(name) => (name, &[]),
@@ -257,9 +257,9 @@ macro_rules! lir_type_ctx {
             // from the function it is vetting, so nothing here can get it
             // wrong (willow-0g8j.13).
             self_class: None,
-            // The same table `emit_expr` reads for a lambda's address, so
-            // the symbol eligibility vets is the symbol emission takes the
-            // address of (willow-0g8j.2.2).
+            // The same table emission reads for a lambda's address, so the
+            // symbol eligibility vets is the symbol emission takes the address
+            // of (willow-0g8j.2.2).
             lambda_symbol: &|id| $me.lambda_names.get(&id).cloned(),
             cooperative_leaves: &$me.cooperative_leaves,
         }
@@ -319,243 +319,243 @@ impl Codegen {
         // the vtable was silently skipped, and every later boxing site fell back
         // to the raw object (willow-0g8j.3). Installed under a snapshot and taken
         // back out below, so nothing declared after this unit sees it.
-        let mut import_aliases = ModuleAliasSnapshot::default();
-        self.alias_item_import_types(&item_imports, &mut import_aliases);
-        let normalized_program = normalize_std_collection_program(program);
-        let normalized_program =
-            normalize_coop_suspensions(&normalized_program, &mut self.expr_types);
-        let program = &normalized_program;
-        self.source_file = source_file.to_string();
-        let module_prefix = module_symbol_prefix(canonical_path);
-        self.known_modules
-            .insert(mod_name.to_string(), module_prefix.clone());
-        // ...and the module prefixes THIS unit writes for modules the graph
-        // registered under some other spelling (willow-kd1v). Every module this
-        // one imports is already declared — dependencies are declared before
-        // their dependents — so the tables the aliases point at exist.
-        self.alias_unit_module_spellings(&module_spellings, &mut import_aliases);
-        self.declare_runtime()?;
-        self.declare_string_literals(program)?;
-        // The source path backs `PanicInfo.file` for every panic, so it is a
-        // release-mode literal too: V1 records message AND source location
-        // (willow-s9ej.7).
-        self.declare_string_literal(source_file)?;
-        if self.build_mode == BuildMode::Debug {
-            for name in collect_nil_check_names(program) {
-                self.declare_string_literal(&name)?;
+        self.with_module_aliases(|this, import_aliases| {
+            this.alias_item_import_types(&item_imports, import_aliases);
+            let normalized_program = normalize_std_collection_program(program);
+            let normalized_program =
+                normalize_coop_suspensions(&normalized_program, &mut this.expr_types);
+            let program = &normalized_program;
+            this.source_file = source_file.to_string();
+            let module_prefix = module_symbol_prefix(canonical_path);
+            this.known_modules
+                .insert(mod_name.to_string(), module_prefix.clone());
+            // ...and the module prefixes THIS unit writes for modules the graph
+            // registered under some other spelling (willow-kd1v). Every module this
+            // one imports is already declared — dependencies are declared before
+            // their dependents — so the tables the aliases point at exist.
+            this.alias_unit_module_spellings(&module_spellings, import_aliases);
+            this.declare_runtime()?;
+            this.declare_string_literals(program)?;
+            // The source path backs `PanicInfo.file` for every panic, so it is a
+            // release-mode literal too: V1 records message AND source location
+            // (willow-s9ej.7).
+            this.declare_string_literal(source_file)?;
+            if this.build_mode == BuildMode::Debug {
+                for name in collect_nil_check_names(program) {
+                    this.declare_string_literal(&name)?;
+                }
+                this.declare_reference_debug_strings(program)?;
             }
-            self.declare_reference_debug_strings(program)?;
-        }
 
-        // INTERFACE names declared in this module, so a module-local (possibly
-        // generic) interface named in an `implements` / signature by its bare name
-        // is qualified to `module::Iface` (qualify_module_type alone does not
-        // qualify a generic head name).
-        let local_type_names: std::collections::HashSet<String> = program
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Interface(i) => Some(i.name.clone()),
-                _ => None,
-            })
-            .collect();
-        // ENUM names declared in this module, qualified by the module's
-        // CANONICAL path rather than the name this unit reaches it by: an enum
-        // has one identity build-wide, and the type checker qualifies module
-        // signatures the same way, so what the walker reads off a cross-module
-        // call has to be the same name (willow-itcw).
-        let local_enum_names: std::collections::HashSet<String> = program
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Enum(e) => Some(e.name.clone()),
-                _ => None,
-            })
-            .collect();
-
-        // CLASS names declared in this module, used to qualify a module-local
-        // `extends Base` so the subclass's class_base / layout / inherited-method
-        // resolution all key off `module::Base` (willow-2egr).
-        let local_class_names: std::collections::HashSet<String> = program
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Class(c) => Some(c.name.clone()),
-                _ => None,
-            })
-            .collect();
-
-        // Function signatures must qualify module-local classes too. Otherwise
-        // `one::make() -> Point` and `two::make() -> Point` collapse to the same
-        // bare type even though their layouts have different identities. A
-        // directly imported short name still compares equal through the shared
-        // class type id (willow-0g8j.3).
-        let mut local_signature_type_names = local_type_names.clone();
-        local_signature_type_names.extend(local_class_names.iter().cloned());
-
-        // Every type a module class mentions is qualified the same way this
-        // unit's FUNCTION signatures are (below): module-local classes and
-        // interfaces under the unit's own spelling, module-local enums under the
-        // build-wide canonical path. A name that is neither -- a type the module
-        // itself imported (`import proto::Grade;`), or a builtin -- is left
-        // exactly as written, so it still resolves to the one table that answers
-        // to it. Prefixing wholesale renamed such a type into `lib::Grade`, which
-        // nothing declares (willow-sxcp).
-        // ...and a name that is neither is resolved through the aliases this
-        // unit's own item imports installed above, so what leaves the module is
-        // the identity the build's tables answer to (`Sized` -> `proto::Sized`).
-        // A bare class name a later unit can still find by scanning modules
-        // (`resolve_class_key`), but an interface has no such scan: left bare in
-        // an exported signature, it made every box site in a consumer that did
-        // not itself import the interface fall out of the walker's subset.
-        let qualify_class_type = |ty: &Type| -> Type {
-            let ty = qualify_module_local_type(ty, mod_name, &local_signature_type_names);
-            let ty = qualify_module_local_type(&ty, canonical_path, &local_enum_names);
-            self.canonical_declared_type(&ty)
-        };
-        let module_classes: Vec<(String, ClassDecl)> = program
-            .items
-            .iter()
-            .filter_map(|item| {
-                let Item::Class(c) = item else {
-                    return None;
-                };
-                let local_name = c.name.clone();
-                // A module-local `implements` name (generic included --
-                // `implements Box<i64>` -> `boxmod2::Box<i64>`) is qualified so
-                // its vtable is declared and keyed by the same name the entry
-                // boxes against (willow-1js.5), while an interface this module
-                // merely IMPORTED keeps the spelling it was written with:
-                // renaming `import proto::Describable;` into `impls::Describable`
-                // made the vtable lookup below silently find no interface, so the
-                // class got NO vtable and every later box site fell back to the
-                // raw object (willow-0g8j.3).
-                let mut qualified = qualify_module_class_decl(c, mod_name, &qualify_class_type);
-                // Qualify a module-local base class so `name()` yields the
-                // module-qualified base (TypePath::name() returns only the last
-                // segment, so the qualified name must live in a single Local
-                // string) (willow-2egr).
-                let module_local_base = match &qualified.base_class {
-                    Some(TypePath::Local(name)) if local_class_names.contains(name) => {
-                        Some(name.clone())
-                    }
+            // INTERFACE names declared in this module, so a module-local (possibly
+            // generic) interface named in an `implements` / signature by its bare name
+            // is qualified to `module::Iface` (qualify_module_type alone does not
+            // qualify a generic head name).
+            let local_type_names: std::collections::HashSet<String> = program
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Interface(i) => Some(i.name.clone()),
                     _ => None,
-                };
-                if let Some(base) = module_local_base {
-                    qualified.base_class = Some(TypePath::Local(format!("{mod_name}::{base}")));
-                }
-                Some((local_name, qualified))
-            })
-            .collect();
+                })
+                .collect();
+            // ENUM names declared in this module, qualified by the module's
+            // CANONICAL path rather than the name this unit reaches it by: an enum
+            // has one identity build-wide, and the type checker qualifies module
+            // signatures the same way, so what the walker reads off a cross-module
+            // call has to be the same name (willow-itcw).
+            let local_enum_names: std::collections::HashSet<String> = program
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Enum(e) => Some(e.name.clone()),
+                    _ => None,
+                })
+                .collect();
 
-        // Register imported module class layouts and methods under their
-        // module-qualified names so entry code can call `geom::Point::new(...)`.
-        //
-        // Registration only records each class's OWN fields; the inherited ones
-        // are prepended afterwards by `finalize_class_layouts`, which walks the
-        // `extends` chain root-down. A cross-module hierarchy can arrive
-        // subclass-first too, and no declaration order may change a layout
-        // (willow-59gx).
-        for (_, c) in &module_classes {
-            self.register_class_layout(c);
-        }
-        self.finalize_class_layouts();
-        for (_, c) in &module_classes {
-            self.declare_class_methods(c)?;
-            // Static-property storage for imported modules (replayed by
-            // `__willow_static_init`, compiled in the entry's compile_program).
-            self.declare_static_storage_for_class(&c.name, c, Some(&module_prefix))?;
-        }
-        self.validate_gc_ref_mask_layouts()?;
+            // CLASS names declared in this module, used to qualify a module-local
+            // `extends Base` so the subclass's class_base / layout / inherited-method
+            // resolution all key off `module::Base` (willow-2egr).
+            let local_class_names: std::collections::HashSet<String> = program
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Class(c) => Some(c.name.clone()),
+                    _ => None,
+                })
+                .collect();
 
-        // Forward-declare all functions in this module. The declaration records
-        // the SIGNATURE-qualified type metadata (fn_types / param debug); the body
-        // is compiled later from the original `f` under local-name aliases.
-        for item in &program.items {
-            match item {
-                Item::Function(f) => {
-                    let mangled = module_item_symbol(&module_prefix, &f.name);
-                    let qualified =
-                        qualify_module_fn_signature(f, mod_name, &local_signature_type_names);
-                    let mut qualified =
-                        qualify_module_fn_signature(&qualified, canonical_path, &local_enum_names);
-                    // Same translation the classes above get: a type this module
-                    // reached through its own item import is exported under the
-                    // identity the tables hold, not the bare local spelling
-                    // (willow-sxcp).
-                    for param in &mut qualified.params {
-                        param.ty = self.canonical_declared_type(&param.ty);
+            // Function signatures must qualify module-local classes too. Otherwise
+            // `one::make() -> Point` and `two::make() -> Point` collapse to the same
+            // bare type even though their layouts have different identities. A
+            // directly imported short name still compares equal through the shared
+            // class type id (willow-0g8j.3).
+            let mut local_signature_type_names = local_type_names.clone();
+            local_signature_type_names.extend(local_class_names.iter().cloned());
+
+            // Every type a module class mentions is qualified the same way this
+            // unit's FUNCTION signatures are (below): module-local classes and
+            // interfaces under the unit's own spelling, module-local enums under the
+            // build-wide canonical path. A name that is neither -- a type the module
+            // itself imported (`import proto::Grade;`), or a builtin -- is left
+            // exactly as written, so it still resolves to the one table that answers
+            // to it. Prefixing wholesale renamed such a type into `lib::Grade`, which
+            // nothing declares (willow-sxcp).
+            // ...and a name that is neither is resolved through the aliases this
+            // unit's own item imports installed above, so what leaves the module is
+            // the identity the build's tables answer to (`Sized` -> `proto::Sized`).
+            // A bare class name a later unit can still find by scanning modules
+            // (`resolve_class_key`), but an interface has no such scan: left bare in
+            // an exported signature, it made every box site in a consumer that did
+            // not itself import the interface fall out of the walker's subset.
+            let qualify_class_type = |ty: &Type| -> Type {
+                let ty = qualify_module_local_type(ty, mod_name, &local_signature_type_names);
+                let ty = qualify_module_local_type(&ty, canonical_path, &local_enum_names);
+                this.canonical_declared_type(&ty)
+            };
+            let module_classes: Vec<(String, ClassDecl)> = program
+                .items
+                .iter()
+                .filter_map(|item| {
+                    let Item::Class(c) = item else {
+                        return None;
+                    };
+                    let local_name = c.name.clone();
+                    // A module-local `implements` name (generic included --
+                    // `implements Box<i64>` -> `boxmod2::Box<i64>`) is qualified so
+                    // its vtable is declared and keyed by the same name the entry
+                    // boxes against (willow-1js.5), while an interface this module
+                    // merely IMPORTED keeps the spelling it was written with:
+                    // renaming `import proto::Describable;` into `impls::Describable`
+                    // made the vtable lookup below silently find no interface, so the
+                    // class got NO vtable and every later box site fell back to the
+                    // raw object (willow-0g8j.3).
+                    let mut qualified = qualify_module_class_decl(c, mod_name, &qualify_class_type);
+                    // Qualify a module-local base class so `name()` yields the
+                    // module-qualified base (TypePath::name() returns only the last
+                    // segment, so the qualified name must live in a single Local
+                    // string) (willow-2egr).
+                    let module_local_base = match &qualified.base_class {
+                        Some(TypePath::Local(name)) if local_class_names.contains(name) => {
+                            Some(name.clone())
+                        }
+                        _ => None,
+                    };
+                    if let Some(base) = module_local_base {
+                        qualified.base_class = Some(TypePath::Local(format!("{mod_name}::{base}")));
                     }
-                    qualified.return_type = self.canonical_declared_type(&qualified.return_type);
-                    self.declare_function_named(&mangled, &qualified)?;
-                }
-                Item::Enum(_) | Item::Class(_) | Item::Interface(_) => {}
+                    Some((local_name, qualified))
+                })
+                .collect();
+
+            // Register imported module class layouts and methods under their
+            // module-qualified names so entry code can call `geom::Point::new(...)`.
+            //
+            // Registration only records each class's OWN fields; the inherited ones
+            // are prepended afterwards by `finalize_class_layouts`, which walks the
+            // `extends` chain root-down. A cross-module hierarchy can arrive
+            // subclass-first too, and no declaration order may change a layout
+            // (willow-59gx).
+            for (_, c) in &module_classes {
+                this.register_class_layout(c);
             }
-        }
+            this.finalize_class_layouts();
+            for (_, c) in &module_classes {
+                this.declare_class_methods(c)?;
+                // Static-property storage for imported modules (replayed by
+                // `__willow_static_init`, compiled in the entry's compile_program).
+                this.declare_static_storage_for_class(&c.name, c, Some(&module_prefix))?;
+            }
+            this.validate_gc_ref_mask_layouts()?;
 
-        // Emit (class, interface) vtables for module classes that implement an
-        // interface (their methods are declared above; implements paths were
-        // module-qualified by `qualify_module_class_decl`).
-        let qualified_classes: Vec<ClassDecl> =
-            module_classes.iter().map(|(_, c)| c.clone()).collect();
-        // Before the vtables: an `open` method's vtable slot holds a thunk
-        // that dispatches through virtual slot N of the receiver's descriptor,
-        // so the slot ORDER has to be settled first (willow-tygf). Every
-        // ancestor of a class in this unit is already registered — dependencies
-        // are declared before their dependents — so its order is final here.
-        self.finalize_class_vslots();
-        self.declare_vtables_for_classes(&qualified_classes)?;
+            // Forward-declare all functions in this module. The declaration records
+            // the SIGNATURE-qualified type metadata (fn_types / param debug); the body
+            // is compiled later from the original `f` under local-name aliases.
+            for item in &program.items {
+                match item {
+                    Item::Function(f) => {
+                        let mangled = module_item_symbol(&module_prefix, &f.name);
+                        let qualified =
+                            qualify_module_fn_signature(f, mod_name, &local_signature_type_names);
+                        let mut qualified = qualify_module_fn_signature(
+                            &qualified,
+                            canonical_path,
+                            &local_enum_names,
+                        );
+                        // Same translation the classes above get: a type this module
+                        // reached through its own item import is exported under the
+                        // identity the tables hold, not the bare local spelling
+                        // (willow-sxcp).
+                        for param in &mut qualified.params {
+                            param.ty = this.canonical_declared_type(&param.ty);
+                        }
+                        qualified.return_type =
+                            this.canonical_declared_type(&qualified.return_type);
+                        this.declare_function_named(&mangled, &qualified)?;
+                    }
+                    Item::Enum(_) | Item::Class(_) | Item::Interface(_) => {}
+                }
+            }
 
-        // Emit one descriptor per module class: word 0 of every object of that
-        // class, holding its `type_id` and its virtual method slots
-        // (willow-fm7t). Must follow the method declarations above, since every
-        // slot is filled by function address.
-        self.declare_class_descriptors_for(&qualified_classes)?;
+            // Emit (class, interface) vtables for module classes that implement an
+            // interface (their methods are declared above; implements paths were
+            // module-qualified by `qualify_module_class_decl`).
+            let qualified_classes: Vec<ClassDecl> =
+                module_classes.iter().map(|(_, c)| c.clone()).collect();
+            // Before the vtables: an `open` method's vtable slot holds a thunk
+            // that dispatches through virtual slot N of the receiver's descriptor,
+            // so the slot ORDER has to be settled first (willow-tygf). Every
+            // ancestor of a class in this unit is already registered — dependencies
+            // are declared before their dependents — so its order is final here.
+            this.finalize_class_vslots();
+            this.declare_vtables_for_classes(&qualified_classes)?;
 
-        // Collect and declare this module's lambdas, exactly as
-        // `declare_program` does for the entry file (willow-9yhi). Lifting a
-        // lambda is a DECLARATION-phase job: `lambda_names` is what both
-        // emitters read to find the lifted symbol for a lambda expression, so
-        // without this pass a module body's lambda reaches codegen with no name
-        // at all. The symbols carry the module prefix because the collector
-        // restarts its numbering for every unit it is given.
-        let lambdas: Vec<(String, LambdaExpr)> = collect_lambdas_in_program(program)
-            .into_iter()
-            .enumerate()
-            .map(|(index, (_, lambda))| (module_lambda_symbol(&module_prefix, index), lambda))
-            .collect();
-        for (name, lambda) in &lambdas {
-            self.declare_lambda(name, lambda)?;
-            self.lambda_names.insert(lambda.id, name.clone());
-        }
+            // Emit one descriptor per module class: word 0 of every object of that
+            // class, holding its `type_id` and its virtual method slots
+            // (willow-fm7t). Must follow the method declarations above, since every
+            // slot is filled by function address.
+            this.declare_class_descriptors_for(&qualified_classes)?;
 
-        // Analyze under canonical backend names before installing the module's
-        // temporary local aliases. Imported/unknown callees remain conservative
-        // unless an earlier module already published an explicit summary.
-        self.analyze_and_register_panic_effects(
-            program,
-            super::panic_effect::UnitNaming {
-                module_prefix: Some(&module_prefix),
-            },
-            &lambdas,
-        );
+            // Collect and declare this module's lambdas, exactly as
+            // `declare_program` does for the entry file (willow-9yhi). Lifting a
+            // lambda is a DECLARATION-phase job: `lambda_names` is what both
+            // emitters read to find the lifted symbol for a lambda expression, so
+            // without this pass a module body's lambda reaches codegen with no name
+            // at all. The symbols carry the module prefix because the collector
+            // restarts its numbering for every unit it is given.
+            let lambdas: Vec<(String, LambdaExpr)> = collect_lambdas_in_program(program)
+                .into_iter()
+                .enumerate()
+                .map(|(index, (_, lambda))| (module_lambda_symbol(&module_prefix, index), lambda))
+                .collect();
+            for (name, lambda) in &lambdas {
+                this.declare_lambda(name, lambda)?;
+                this.lambda_names.insert(lambda.id, name.clone());
+            }
 
-        // Out again: from here the name means whatever the next unit says it
-        // does. An error above returns early and skips this, which costs
-        // nothing — a failed declaration aborts the build.
-        self.restore_module_aliases(import_aliases);
+            // Analyze under canonical backend names before installing the module's
+            // temporary local aliases. Imported/unknown callees remain conservative
+            // unless an earlier module already published an explicit summary.
+            this.analyze_and_register_panic_effects(
+                program,
+                super::panic_effect::UnitNaming {
+                    module_prefix: Some(&module_prefix),
+                },
+                &lambdas,
+            );
 
-        Ok(DeclaredModule {
-            mod_name: mod_name.to_string(),
-            program: normalized_program,
-            module_prefix,
-            module_classes,
-            lambdas,
-            source_file: source_file.to_string(),
-            builtin_module_aliases: std::mem::take(&mut self.builtin_module_aliases),
-            visible_modules: std::mem::take(&mut self.visible_modules),
-            item_imports,
-            module_spellings,
+            Ok(DeclaredModule {
+                mod_name: mod_name.to_string(),
+                program: normalized_program,
+                module_prefix,
+                module_classes,
+                lambdas,
+                source_file: source_file.to_string(),
+                builtin_module_aliases: std::mem::take(&mut this.builtin_module_aliases),
+                visible_modules: std::mem::take(&mut this.visible_modules),
+                item_imports,
+                module_spellings,
+            })
         })
     }
 
@@ -643,58 +643,57 @@ impl Codegen {
         let entry_leaves = std::mem::take(&mut self.cooperative_leaves);
 
         let program = &unit.program;
-        let mut aliases = ModuleAliasSnapshot::default();
-        // Bind the types this unit imported by single-item import under the
-        // local names it spells them by (willow-0g8j.3), then the module's own
-        // enums/interfaces under their unqualified names so the module body
-        // resolves its own types internally (willow-64gs.1). Own declarations
-        // are installed second, so they win.
-        self.alias_item_import_types(&unit.item_imports, &mut aliases);
-        // Before the unit's own names, so a module reached under two spellings
-        // still loses to a type this module declares itself (willow-kd1v).
-        self.alias_unit_module_spellings(&unit.module_spellings, &mut aliases);
-        self.alias_module_local_types(program, &unit.mod_name, &mut aliases);
-        for item in &program.items {
-            if let Item::Function(f) = item {
-                let mangled = module_item_symbol(&unit.module_prefix, &f.name);
-                self.alias_function_symbol(&f.name, &mangled, &mut aliases);
-            }
-        }
-        for (local_name, qualified) in &unit.module_classes {
-            self.alias_class_symbol(local_name, &qualified.name, &mut aliases);
-            for method in &qualified.methods {
-                let local_mangled = class_member_symbol(local_name, &method.name);
-                let qualified_mangled = self.class_method_symbol(&qualified.name, &method.name);
-                self.alias_function_symbol(&local_mangled, &qualified_mangled, &mut aliases);
-            }
-        }
-
-        let result = (|| -> Result<()> {
-            // Lambdas first, and inside the alias scope, so a lambda body that
-            // calls one of this module's own functions by its bare name
-            // resolves to the mangled symbol (willow-9yhi).
-            for (name, lambda) in &unit.lambdas {
-                self.compile_lambda(name, lambda)?;
-            }
-            // Compile bodies.
+        let result = self.with_module_aliases(|this, aliases| {
+            // Bind the types this unit imported by single-item import under the
+            // local names it spells them by (willow-0g8j.3), then the module's own
+            // enums/interfaces under their unqualified names so the module body
+            // resolves its own types internally (willow-64gs.1). Own declarations
+            // are installed second, so they win.
+            this.alias_item_import_types(&unit.item_imports, aliases);
+            // Before the unit's own names, so a module reached under two spellings
+            // still loses to a type this module declares itself (willow-kd1v).
+            this.alias_unit_module_spellings(&unit.module_spellings, aliases);
+            this.alias_module_local_types(program, &unit.mod_name, aliases);
             for item in &program.items {
-                match item {
-                    Item::Function(f) => {
-                        let mangled = module_item_symbol(&unit.module_prefix, &f.name);
-                        self.compile_function_named(&mangled, f)?;
-                    }
-                    Item::Class(_) | Item::Enum(_) | Item::Interface(_) => {}
+                if let Item::Function(f) = item {
+                    let mangled = module_item_symbol(&unit.module_prefix, &f.name);
+                    this.alias_function_symbol(&f.name, &mangled, aliases);
                 }
             }
-            for (_, c) in &unit.module_classes {
-                self.compile_class_methods(c)?;
+            for (local_name, qualified) in &unit.module_classes {
+                this.alias_class_symbol(local_name, &qualified.name, aliases);
+                for method in &qualified.methods {
+                    let local_mangled = class_member_symbol(local_name, &method.name);
+                    let qualified_mangled = this.class_method_symbol(&qualified.name, &method.name);
+                    this.alias_function_symbol(&local_mangled, &qualified_mangled, aliases);
+                }
             }
-            // Inside the alias scope, for the reason the bodies are.
-            self.compile_unit_static_init(unit)?;
-            Ok(())
-        })();
 
-        self.restore_module_aliases(aliases);
+            (|| -> Result<()> {
+                // Lambdas first, and inside the alias scope, so a lambda body that
+                // calls one of this module's own functions by its bare name
+                // resolves to the mangled symbol (willow-9yhi).
+                for (name, lambda) in &unit.lambdas {
+                    this.compile_lambda(name, lambda)?;
+                }
+                // Compile bodies.
+                for item in &program.items {
+                    match item {
+                        Item::Function(f) => {
+                            let mangled = module_item_symbol(&unit.module_prefix, &f.name);
+                            this.compile_function_named(&mangled, f)?;
+                        }
+                        Item::Class(_) | Item::Enum(_) | Item::Interface(_) => {}
+                    }
+                }
+                for (_, c) in &unit.module_classes {
+                    this.compile_class_methods(c)?;
+                }
+                // Inside the alias scope, for the reason the bodies are.
+                this.compile_unit_static_init(unit)?;
+                Ok(())
+            })()
+        });
         self.cooperative_leaves = entry_leaves;
         result
     }
@@ -733,131 +732,127 @@ impl Codegen {
         // different name (willow-kd1v). Snapshotted and taken back out below:
         // every module's BODY phase runs between this declaration and the
         // entry's own, and those units spell the same modules their own way.
-        let mut module_aliases = ModuleAliasSnapshot::default();
-        self.alias_unit_module_spellings(&module_spellings, &mut module_aliases);
-        let normalized_program = normalize_std_collection_program(program);
-        let normalized_program =
-            normalize_coop_suspensions(&normalized_program, &mut self.expr_types);
-        let program = &normalized_program;
-        self.source_file = source_file.to_string();
-        self.declare_runtime()?;
-        self.declare_string_literals(program)?;
-        // The source path backs `PanicInfo.file` for every panic, so it is a
-        // release-mode literal too: V1 records message AND source location
-        // (willow-s9ej.7).
-        self.declare_string_literal(source_file)?;
-        if self.build_mode == BuildMode::Debug {
-            for name in collect_nil_check_names(program) {
-                self.declare_string_literal(&name)?;
-            }
-            self.declare_reference_debug_strings(program)?;
-        }
-
-        // Pass 1: record every class's OWN fields, base and type_id. No
-        // inherited field is resolved here, because a subclass may be declared
-        // before its base and reading a base mid-walk sees whatever has been
-        // registered so far (willow-59gx).
-        for item in &program.items {
-            if let Item::Class(c) = item {
-                self.register_class_layout(c);
-            }
-        }
-        // Pass 2: prepend inherited fields by walking each `extends` chain
-        // root-down, which makes the result independent of declaration order.
-        self.finalize_class_layouts();
-        // Pass 3: forward-declare methods and static storage, now that every
-        // layout is final -- a constructor's parameter order IS the layout.
-        for item in &program.items {
-            match item {
-                Item::Class(c) => {
-                    self.declare_class_methods(c)?;
-                    self.declare_static_storage_for_class(&c.name, c, None)?;
+        self.with_module_aliases(|this, module_aliases| {
+            this.alias_unit_module_spellings(&module_spellings, module_aliases);
+            let normalized_program = normalize_std_collection_program(program);
+            let normalized_program =
+                normalize_coop_suspensions(&normalized_program, &mut this.expr_types);
+            let program = &normalized_program;
+            this.source_file = source_file.to_string();
+            this.declare_runtime()?;
+            this.declare_string_literals(program)?;
+            // The source path backs `PanicInfo.file` for every panic, so it is a
+            // release-mode literal too: V1 records message AND source location
+            // (willow-s9ej.7).
+            this.declare_string_literal(source_file)?;
+            if this.build_mode == BuildMode::Debug {
+                for name in collect_nil_check_names(program) {
+                    this.declare_string_literal(&name)?;
                 }
-                Item::Enum(_) => {} // enum infos are registered via register_enum_info before compile
-                _ => {}
+                this.declare_reference_debug_strings(program)?;
             }
-        }
-        self.validate_gc_ref_mask_layouts()?;
 
-        // Async calls are eager tasks (willow-h2vf): every non-main async fn is
-        // exposed as a constructor that schedules its poll fn and returns the
-        // async frame (`Task<T>`).
-        self.cooperative_leaves.clear();
-        for item in &program.items {
-            if let Item::Function(f) = item
-                && f.is_async
-                && f.name != "main"
-            {
-                self.cooperative_leaves
-                    .insert(crate::semantic::ids::FunctionId::free(f.name.as_str()));
+            // Pass 1: record every class's OWN fields, base and type_id. No
+            // inherited field is resolved here, because a subclass may be declared
+            // before its base and reading a base mid-walk sees whatever has been
+            // registered so far (willow-59gx).
+            for item in &program.items {
+                if let Item::Class(c) = item {
+                    this.register_class_layout(c);
+                }
             }
-        }
-
-        // Forward-declare all user functions first
-        for item in &program.items {
-            match item {
-                Item::Function(f) => self.declare_user_function(f)?,
-                Item::Class(_) | Item::Enum(_) | Item::Interface(_) => {}
+            // Pass 2: prepend inherited fields by walking each `extends` chain
+            // root-down, which makes the result independent of declaration order.
+            this.finalize_class_layouts();
+            // Pass 3: forward-declare methods and static storage, now that every
+            // layout is final -- a constructor's parameter order IS the layout.
+            for item in &program.items {
+                match item {
+                    Item::Class(c) => {
+                        this.declare_class_methods(c)?;
+                        this.declare_static_storage_for_class(&c.name, c, None)?;
+                    }
+                    Item::Enum(_) => {} // enum infos are registered via register_enum_info before compile
+                    _ => {}
+                }
             }
-        }
+            this.validate_gc_ref_mask_layouts()?;
 
-        // Settle every class's virtual slot ORDER before the vtables: an
-        // `open` method's vtable slot holds a thunk that dispatches through
-        // virtual slot N of the receiver's descriptor (willow-tygf).
-        self.finalize_class_vslots();
-
-        // Emit one static vtable per (class, implemented-interface) pair. All
-        // class method symbols are declared by now, so the vtable can reference
-        // them by function address.
-        self.declare_interface_vtables(program)?;
-
-        // Emit one descriptor per class (willow-fm7t). Unlike interface
-        // vtables this covers EVERY class, since word 0 of every object points
-        // at its descriptor whether or not the class implements an interface.
-        self.declare_class_descriptors(program)?;
-
-        // Collect and declare all lambdas (they may call user functions already declared above).
-        let lambdas = collect_lambdas_in_program(program);
-        for (name, lambda) in &lambdas {
-            self.declare_lambda(name, lambda)?;
-            self.lambda_names.insert(lambda.id, name.clone());
-            // The lowered body was lifted under a span-derived placeholder
-            // because only this loop knows the symbol (willow-0g8j.2.2). Moving
-            // it into `lir_functions` under that symbol is what lets a lambda be
-            // compiled by the walker like any other function.
-            if let Some(mut lf) = self.lir_lambdas.remove(&lambda.id) {
-                lf.name = name.clone();
-                self.lir_functions.insert(name.clone(), lf);
+            // Async calls are eager tasks (willow-h2vf): every non-main async fn is
+            // exposed as a constructor that schedules its poll fn and returns the
+            // async frame (`Task<T>`).
+            this.cooperative_leaves.clear();
+            for item in &program.items {
+                if let Item::Function(f) = item
+                    && f.is_async
+                    && f.name != "main"
+                {
+                    this.cooperative_leaves
+                        .insert(crate::semantic::ids::FunctionId::free(f.name.as_str()));
+                }
             }
-        }
 
-        self.analyze_and_register_panic_effects(
-            program,
-            super::panic_effect::UnitNaming {
-                module_prefix: None,
-            },
-            &lambdas,
-        );
+            // Forward-declare all user functions first
+            for item in &program.items {
+                match item {
+                    Item::Function(f) => this.declare_user_function(f)?,
+                    Item::Class(_) | Item::Enum(_) | Item::Interface(_) => {}
+                }
+            }
 
-        // Always declare `__willow_static_init` (willow-qsqf §13.5). The runtime
-        // calls it after `gc_init` and before `willow_user_main`; it is a no-op
-        // when the program has no static properties. Declaring it unconditionally
-        // keeps the runtime call path uniform regardless of the `main` lowering.
-        self.declare_static_init()?;
+            // Settle every class's virtual slot ORDER before the vtables: an
+            // `open` method's vtable slot holds a thunk that dispatches through
+            // virtual slot N of the receiver's descriptor (willow-tygf).
+            this.finalize_class_vslots();
 
-        // Out again, for the module body phases that follow (willow-kd1v). An
-        // error above returns early and skips this, which costs nothing — a
-        // failed declaration aborts the build.
-        self.restore_module_aliases(module_aliases);
+            // Emit one static vtable per (class, implemented-interface) pair. All
+            // class method symbols are declared by now, so the vtable can reference
+            // them by function address.
+            this.declare_interface_vtables(program)?;
 
-        Ok(DeclaredProgram {
-            program: normalized_program,
-            lambdas,
-            source_file: source_file.to_string(),
-            builtin_module_aliases: std::mem::take(&mut self.builtin_module_aliases),
-            visible_modules: std::mem::take(&mut self.visible_modules),
-            item_imports,
-            module_spellings,
+            // Emit one descriptor per class (willow-fm7t). Unlike interface
+            // vtables this covers EVERY class, since word 0 of every object points
+            // at its descriptor whether or not the class implements an interface.
+            this.declare_class_descriptors(program)?;
+
+            // Collect and declare all lambdas (they may call user functions already declared above).
+            let lambdas = collect_lambdas_in_program(program);
+            for (name, lambda) in &lambdas {
+                this.declare_lambda(name, lambda)?;
+                this.lambda_names.insert(lambda.id, name.clone());
+                // The lowered body was lifted under a span-derived placeholder
+                // because only this loop knows the symbol (willow-0g8j.2.2). Moving
+                // it into `lir_functions` under that symbol is what lets a lambda be
+                // compiled by the walker like any other function.
+                if let Some(mut lf) = this.lir_lambdas.remove(&lambda.id) {
+                    lf.name = name.clone();
+                    this.lir_functions.insert(name.clone(), lf);
+                }
+            }
+
+            this.analyze_and_register_panic_effects(
+                program,
+                super::panic_effect::UnitNaming {
+                    module_prefix: None,
+                },
+                &lambdas,
+            );
+
+            // Always declare `__willow_static_init` (willow-qsqf §13.5). The runtime
+            // calls it after `gc_init` and before `willow_user_main`; it is a no-op
+            // when the program has no static properties. Declaring it unconditionally
+            // keeps the runtime call path uniform regardless of the `main` lowering.
+            this.declare_static_init()?;
+
+            Ok(DeclaredProgram {
+                program: normalized_program,
+                lambdas,
+                source_file: source_file.to_string(),
+                builtin_module_aliases: std::mem::take(&mut this.builtin_module_aliases),
+                visible_modules: std::mem::take(&mut this.visible_modules),
+                item_imports,
+                module_spellings,
+            })
         })
     }
 
@@ -874,30 +869,29 @@ impl Codegen {
         let program = &unit.program;
         // The entry's own module spellings again: the last module body phase
         // took its own back out (willow-kd1v).
-        let mut aliases = ModuleAliasSnapshot::default();
-        self.alias_unit_module_spellings(&unit.module_spellings, &mut aliases);
+        self.with_module_aliases(|this, aliases| {
+            this.alias_unit_module_spellings(&unit.module_spellings, aliases);
 
-        let result = (|| -> Result<()> {
-            // Compile lambdas first (user functions are already declared, so calls inside work).
-            for (name, lambda) in &unit.lambdas {
-                self.compile_lambda(name, lambda)?;
-            }
-
-            // Compile user function bodies and class methods
-            for item in &program.items {
-                match item {
-                    Item::Function(f) => self.compile_function(f)?,
-                    Item::Class(c) => self.compile_class_methods(c)?,
-                    Item::Enum(_) => {} // no codegen needed for enum declarations
-                    Item::Interface(_) => {} // interfaces emit no code in Stage 1 (vtables: Stage 3)
+            (|| -> Result<()> {
+                // Compile lambdas first (user functions are already declared, so calls inside work).
+                for (name, lambda) in &unit.lambdas {
+                    this.compile_lambda(name, lambda)?;
                 }
-            }
 
-            // Compile the static-init function body after all symbols are defined.
-            self.compile_static_init()
-        })();
-        self.restore_module_aliases(aliases);
-        result
+                // Compile user function bodies and class methods
+                for item in &program.items {
+                    match item {
+                        Item::Function(f) => this.compile_function(f)?,
+                        Item::Class(c) => this.compile_class_methods(c)?,
+                        Item::Enum(_) => {} // no codegen needed for enum declarations
+                        Item::Interface(_) => {} // interfaces emit no code in Stage 1 (vtables: Stage 3)
+                    }
+                }
+
+                // Compile the static-init function body after all symbols are defined.
+                this.compile_static_init()
+            })()
+        })
     }
 
     /// Declare the `__willow_static_init` symbol (no params, no returns). Exported
@@ -1198,8 +1192,8 @@ impl Codegen {
             }
         }
         // Stage 5 function-body cutover (willow-0g8j.3): every checked function
-        // compiles from lowered IR. The AST emitter remains available only to
-        // compiler-owned bootstrap paths; a missing or rejected LIR body is an
+        // compiles from lowered IR, and since willow-t0uy.3 there is no AST
+        // emitter left to fall back to — a missing or rejected LIR body is an
         // internal compile error, never a backend selection decision.
         // `main` is eligible in its `void` forms, with or without the declared
         // `args: Array<String>` (willow-0g8j.2.10): `willow_user_main` takes no
@@ -1279,7 +1273,6 @@ impl Codegen {
 
         let mut fg = FuncGen {
             builder: &mut builder,
-            loop_stack: Vec::new(),
             defer_stack: Vec::new(),
             defer_counter: 0,
             sync_defer_flags: HashMap::new(),
@@ -1319,11 +1312,8 @@ impl Codegen {
             class_vslots: &self.class_vslots,
             interface_infos: &self.interface_infos,
             vtable_ids: &self.vtable_ids,
-            expr_types: &self.expr_types,
             coop_frame: None,
             coop_result_offset: None,
-            enum_variant_resolutions: &self.enum_variant_resolutions,
-            pattern_resolutions: &self.pattern_resolutions,
             async_frame: None,
             async_frame_offsets: HashMap::new(),
             lir_frame_offsets: HashMap::new(),
@@ -1524,10 +1514,27 @@ impl Codegen {
                         ty: field.ty.clone(),
                     },
                 );
+            let initializer_name =
+                crate::ir::typed_ast::static_initializer_name(class_key, &field.name);
+            let initializer = FunctionDecl {
+                name: initializer_name.clone(),
+                public: false,
+                is_async: false,
+                params: Vec::new(),
+                return_type: field.ty.clone(),
+                body: Block {
+                    stmts: Vec::new(),
+                    span: init.span(),
+                },
+                span: init.span(),
+            };
+            let symbol =
+                self.class_method_symbol(class_key, &format!("$static_init.{}", field.name));
+            self.declare_function_symbol(&initializer_name, &symbol, &initializer, false)?;
             self.static_init_order.push(StaticInitItem {
                 class_key: class_key.to_string(),
                 field: field.name.clone(),
-                init: init.clone(),
+                initializer,
                 ty: field.ty.clone(),
                 owner: owner.map(str::to_string),
             });
@@ -1590,8 +1597,10 @@ impl Codegen {
         calls: &[FuncId],
         items: &[StaticInitItem],
     ) -> Result<()> {
-        let mut sig = self.module.make_signature();
-        let _ = &mut sig; // no params, no returns
+        for item in items {
+            self.compile_function_named(&item.initializer.name, &item.initializer)?;
+        }
+        let sig = self.module.make_signature();
         let mut ctx = self.module.make_context();
         ctx.func.signature = sig;
         ctx.func.name = UserFuncName::user(0, func_id.as_u32());
@@ -1605,7 +1614,6 @@ impl Codegen {
 
         let mut fg = FuncGen {
             builder: &mut builder,
-            loop_stack: Vec::new(),
             defer_stack: Vec::new(),
             defer_counter: 0,
             sync_defer_flags: HashMap::new(),
@@ -1645,11 +1653,8 @@ impl Codegen {
             class_vslots: &self.class_vslots,
             interface_infos: &self.interface_infos,
             vtable_ids: &self.vtable_ids,
-            expr_types: &self.expr_types,
             coop_frame: None,
             coop_result_offset: None,
-            enum_variant_resolutions: &self.enum_variant_resolutions,
-            pattern_resolutions: &self.pattern_resolutions,
             async_frame: None,
             async_frame_offsets: HashMap::new(),
             lir_frame_offsets: HashMap::new(),
@@ -1677,7 +1682,13 @@ impl Codegen {
         for item in items {
             // Initializers reference other statics by explicit class name
             // (`C::a`); `Self::` is not resolved here in the MVP.
-            let val = fg.emit_expr_coerced(&item.init, &item.ty);
+            fg.fault_site_span = Some(item.initializer.span);
+            let callee = fg.func_ids[&item.initializer.name];
+            let callee = fg.module.declare_func_in_func(callee, fg.builder.func);
+            let depth = fg.emit_pre_user_call_panic_depth(&item.initializer.name);
+            let call = fg.builder.ins().call(callee, &[]);
+            let val = fg.builder.inst_results(call)[0];
+            fg.emit_post_willow_call_panic_check(depth);
             // The declaration identity, not whatever a unit's aliases say:
             // this runs once for the whole build, over keys the declaration
             // phase itself recorded.
@@ -2069,7 +2080,6 @@ impl Codegen {
 
         let mut fg = FuncGen {
             builder: &mut builder,
-            loop_stack: Vec::new(),
             defer_stack: Vec::new(),
             defer_counter: 0,
             sync_defer_flags: HashMap::new(),
@@ -2109,11 +2119,8 @@ impl Codegen {
             class_vslots: &self.class_vslots,
             interface_infos: &self.interface_infos,
             vtable_ids: &self.vtable_ids,
-            expr_types: &self.expr_types,
             coop_frame: None,
             coop_result_offset: None,
-            enum_variant_resolutions: &self.enum_variant_resolutions,
-            pattern_resolutions: &self.pattern_resolutions,
             async_frame: None,
             async_frame_offsets: HashMap::new(),
             lir_frame_offsets: HashMap::new(),

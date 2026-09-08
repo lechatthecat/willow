@@ -139,7 +139,7 @@ fn main() {
 }
 
 #[test]
-fn test_class_gc_ref_mask_rejects_gc_field_beyond_coverage() {
+fn test_class_gc_bitmap_traces_gc_field_beyond_inline_coverage() {
     let mut fields = String::new();
     let mut args = Vec::new();
     for i in 0..63 {
@@ -156,22 +156,15 @@ class TooWide {{
 
 fn main() {{
     let value = new TooWide({});
-    println(1);
+    gc_collect();
+    println(value.late);
 }}
 "#,
         args.join(", ")
     );
-    assert_compile_error_contains(
-        &src,
-        &[
-            "TooWide",
-            "late",
-            "outside gc_ref_mask coverage",
-            // Word 0 of a class object is the class DESCRIPTOR since
-            // willow-fm7t; it used to be the inline type_id.
-            "word 0 is the class descriptor",
-        ],
-    );
+    let (out, ok) = compile_and_run(&src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "late\n");
 }
 
 #[test]
@@ -791,6 +784,7 @@ fn test_runnable_example_files_compile_and_run() {
              []\ncancelled\n",
         ),
         ("example/gc_linked_list.wi", "6\n"),
+        ("example/gc_mutator_registration.wi", "ledger\n288\n"),
         (
             "example/enum_match.wi",
             "north\nwest\n78.53975\n12\n0.0\nzero\nnonzero\nyes\nno\n",
@@ -832,6 +826,11 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/functions.wi", "25\ntrue\n"),
         ("example/hello.wi", "50"),
         ("example/hello_world.wi", "Hello, world!\n"),
+        (
+            "example/gc_scalable_bitmap.wi",
+            "x\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n",
+        ),
+        ("example/compiler_scalability/main.wi", "3\n42\n"),
         ("example/import_demo/main.wi", "30\n42\n42\n99\n3\n42\n"),
         ("example/item_import_demo/main.wi", "7\n25\n"),
         ("example/interfaces.wi", "woof\n4\ntweet\n2\nwoof\ntweet\n"),
@@ -1171,6 +1170,10 @@ fn test_runnable_example_files_compile_and_run() {
         (
             "example/lir_self_statics.wi",
             "1\n2\n2\nseat 2\n12\nseat\nrow\nclosed 2\n2\n42\n4\n3\n103\nseat 9\n",
+        ),
+        (
+            "example/lir_static_initializers.wi",
+            "42\n-5\ntrue\n3\nwillow\n42\n4\n0\n3\n7\n1\n8\n43\n1\n10\n3\n5\np8\n84\n11\n",
         ),
         (
             "example/lir_static_property_bodies.wi",

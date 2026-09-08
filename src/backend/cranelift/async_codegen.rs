@@ -29,6 +29,7 @@ struct CoopPollBody<'a> {
 pub(super) struct CoopMainDriverFrame {
     slot_count: i64,
     mask: i64,
+    bitmap: Vec<u64>,
     first_param_slot: usize,
     main_result: Option<(i32, Type)>,
 }
@@ -52,6 +53,32 @@ const MUTEX_STATUS_PHASE_POLL: i64 = willow_abi::LockStatusPhase::Poll as i64;
 const RUNTIME_POLL_PENDING: i64 = willow_abi::RuntimePollResult::Pending as i64;
 
 impl Codegen {
+    fn emit_async_frame_alloc(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        slot_count: i64,
+        mask: i64,
+        bitmap: &[u64],
+    ) -> cranelift_codegen::ir::Value {
+        if bitmap.iter().skip(1).any(|word| *word != 0) {
+            let alloc = self.func_id("willow_gc_alloc_bitmap");
+            return super::gc_codegen::emit_bitmap_alloc(
+                &mut self.module,
+                builder,
+                alloc,
+                0,
+                (slot_count + ASYNC_FRAME_HEADER_WORDS as i64) * 8,
+                bitmap,
+            );
+        }
+        let alloc = self.func_id("willow_async_frame_alloc");
+        let alloc = self.module.declare_func_in_func(alloc, builder.func);
+        let count = builder.ins().iconst(types::I64, slot_count);
+        let mask = builder.ins().iconst(types::I64, mask);
+        let call = builder.ins().call(alloc, &[count, mask]);
+        builder.inst_results(call)[0]
+    }
+
     /// Turn the LIR-owned logical frame into the runtime's physical data-slot
     /// layout. The returned identity map is keyed only by `LirLocalId`; the
     /// optional spans on physical slots are diagnostic metadata only.
@@ -95,6 +122,13 @@ impl Codegen {
                 name: local.name.clone(),
                 ty: local.ty.clone(),
             });
+        }
+        if !frame_all {
+            // Every logical occupant uses its representative's physical slot.
+            for (local, slot) in &lir.async_frame.locals {
+                let representative = lir.async_frame.slots[slot.index];
+                offsets.insert(*local, offsets[&representative]);
+            }
         }
         let mut defer_sites: Vec<_> = lir
             .blocks
@@ -192,6 +226,7 @@ impl Codegen {
             CoopMainDriverFrame {
                 slot_count,
                 mask,
+                bitmap: layout.gc_payload_bitmap.clone(),
                 first_param_slot,
                 main_result: result_offset.zip(main_result_err_ty.clone()),
             },
@@ -295,14 +330,10 @@ impl Codegen {
         builder.append_block_params_for_function_params(entry);
         builder.switch_to_block(entry);
         builder.seal_block(entry);
-        let alloc_fid = self.func_id("willow_async_frame_alloc");
-        let alloc_ref = self.module.declare_func_in_func(alloc_fid, builder.func);
         let barrier_fid = self.func_id("willow_gc_write_barrier");
         let barrier_ref = self.module.declare_func_in_func(barrier_fid, builder.func);
-        let sc = builder.ins().iconst(types::I64, slot_count);
-        let mk = builder.ins().iconst(types::I64, mask);
-        let call = builder.ins().call(alloc_ref, &[sc, mk]);
-        let frame = builder.inst_results(call)[0];
+        let frame =
+            self.emit_async_frame_alloc(&mut builder, slot_count, mask, &layout.gc_payload_bitmap);
         // Store args into their param slots (slots 2..) before spawning (no
         // allocation happens between alloc and spawn, so the unrooted frame is
         // safe).
@@ -483,14 +514,10 @@ impl Codegen {
         builder.switch_to_block(entry);
         builder.seal_block(entry);
 
-        let alloc_fid = self.func_id("willow_async_frame_alloc");
-        let alloc_ref = self.module.declare_func_in_func(alloc_fid, builder.func);
         let barrier_fid = self.func_id("willow_gc_write_barrier");
         let barrier_ref = self.module.declare_func_in_func(barrier_fid, builder.func);
-        let sc = builder.ins().iconst(types::I64, slot_count);
-        let mk = builder.ins().iconst(types::I64, mask);
-        let call = builder.ins().call(alloc_ref, &[sc, mk]);
-        let frame = builder.inst_results(call)[0];
+        let frame =
+            self.emit_async_frame_alloc(&mut builder, slot_count, mask, &layout.gc_payload_bitmap);
 
         if let Some(offset) = self_offset {
             let self_arg = builder.block_params(entry)[0];
@@ -595,15 +622,14 @@ impl Codegen {
         builder.switch_to_block(entry);
         builder.seal_block(entry);
 
-        // frame = willow_async_frame_alloc(slot_count, mask)
-        let alloc_fid = self.func_id("willow_async_frame_alloc");
-        let alloc_ref = self.module.declare_func_in_func(alloc_fid, builder.func);
         let barrier_fid = self.func_id("willow_gc_write_barrier");
         let barrier_ref = self.module.declare_func_in_func(barrier_fid, builder.func);
-        let slot_count_v = builder.ins().iconst(types::I64, frame_layout.slot_count);
-        let mask_v = builder.ins().iconst(types::I64, frame_layout.mask);
-        let call = builder.ins().call(alloc_ref, &[slot_count_v, mask_v]);
-        let frame = builder.inst_results(call)[0];
+        let frame = self.emit_async_frame_alloc(
+            &mut builder,
+            frame_layout.slot_count,
+            frame_layout.mask,
+            &frame_layout.bitmap,
+        );
 
         // The scheduler owns a frame root only until the poll task reaches a
         // terminal state. A Result main reads the frame after run_until
@@ -763,7 +789,6 @@ impl Codegen {
         {
             let mut fg = FuncGen {
                 builder: &mut builder,
-                loop_stack: Vec::new(),
                 defer_stack: Vec::new(),
                 defer_counter: 0,
                 sync_defer_flags: HashMap::new(),
@@ -803,11 +828,8 @@ impl Codegen {
                 class_vslots: &self.class_vslots,
                 interface_infos: &self.interface_infos,
                 vtable_ids: &self.vtable_ids,
-                expr_types: &self.expr_types,
                 coop_frame: None,
                 coop_result_offset: None,
-                enum_variant_resolutions: &self.enum_variant_resolutions,
-                pattern_resolutions: &self.pattern_resolutions,
                 // The frame is the poll fn's parameter (allocated + GC-rooted by
                 // the driver via willow_sched_spawn); locals are frame-backed via
                 // these offsets so they survive suspension.
@@ -1004,7 +1026,6 @@ impl Codegen {
         {
             let mut fg = FuncGen {
                 builder: &mut builder,
-                loop_stack: Vec::new(),
                 defer_stack: Vec::new(),
                 defer_counter: 0,
                 sync_defer_flags: HashMap::new(),
@@ -1044,11 +1065,8 @@ impl Codegen {
                 class_vslots: &self.class_vslots,
                 interface_infos: &self.interface_infos,
                 vtable_ids: &self.vtable_ids,
-                expr_types: &self.expr_types,
                 coop_frame: None,
                 coop_result_offset: None,
-                enum_variant_resolutions: &self.enum_variant_resolutions,
-                pattern_resolutions: &self.pattern_resolutions,
                 async_frame: Some(frame),
                 async_frame_offsets: HashMap::new(),
                 lir_frame_offsets: HashMap::new(),
@@ -1306,61 +1324,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .declare_func_in_func(yield_fid, self.builder.func);
         self.builder.ins().call(yield_ref, &[]);
         self.finish_coop_builtin_suspend(suspends, frame);
-    }
-
-    pub(super) fn emit_ready_future_void(&mut self) -> cranelift_codegen::ir::Value {
-        let fid = self.func_id("willow_future_ready_void");
-        let fref = self.module.declare_func_in_func(fid, self.builder.func);
-        let call = self.builder.ins().call(fref, &[]);
-        self.builder.inst_results(call)[0]
-    }
-
-    pub(super) fn emit_ready_future(
-        &mut self,
-        ty: &Type,
-        value: cranelift_codegen::ir::Value,
-    ) -> cranelift_codegen::ir::Value {
-        let runtime_name = future_ready_runtime_name(ty);
-        self.emit_value_runtime_call(runtime_name, &[value])
-    }
-
-    pub(super) fn emit_await(&mut self, await_expr: &AwaitExpr) -> cranelift_codegen::ir::Value {
-        let awaitable_ty = self.ast_type_of(&await_expr.expr);
-
-        // `await task` / `await task.result()`: the expression evaluates to an
-        // eager task frame (the `.result()` adapter is the identity, so both
-        // forms yield the SAME frame). Outside a cooperative poll lowering,
-        // block-run the scheduler until just this task reaches a terminal state
-        // (slot 1 = task id), then map that state to a value — panic-on-cancel
-        // for `await task`, `Result<T, Cancelled>` for `await task.result()`
-        // (willow-bsqy, willow-qrj9).
-        if let Some((task_result_ty, cancel_aware)) = awaitable_task_type(&awaitable_ty) {
-            let frame = self.emit_expr(&await_expr.expr);
-            self.emit_push_root(frame);
-            let task_id = self.builder.ins().load(
-                types::I64,
-                MemFlagsData::new(),
-                frame,
-                async_frame_slot_offset(FRAME_SLOT_TASK_ID),
-            );
-            let run_fid = self.func_id("willow_sched_run_until");
-            let run_ref = self.module.declare_func_in_func(run_fid, self.builder.func);
-            self.builder.ins().call(run_ref, &[task_id]);
-            let value =
-                self.emit_task_terminal_value(frame, task_id, &task_result_ty, cancel_aware);
-            self.emit_pop_roots_n(1);
-            self.gc_root_count -= 1;
-            return match value {
-                Some(v) => v,
-                // `await` on a `void` task: no result slot to read.
-                None => self.builder.ins().iconst(types::I8, 0),
-            };
-        }
-
-        let output_ty = future_output_type(&awaitable_ty).unwrap_or(Type::Void);
-        let future = self.emit_expr(&await_expr.expr);
-        let runtime_name = future_await_runtime_name(&output_ty);
-        self.emit_value_runtime_call(runtime_name, &[future])
     }
 
     /// Emit a call-await (`await <coop-leaf-call>`) as a suspend point
@@ -1845,399 +1808,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // normally reached from cooperative `await task.result()` lowering.
         self.builder.seal_block(merge_b);
         self.builder.block_params(merge_b)[0]
-    }
-
-    /// Register a `select` case's stashed channel pointer as a shadow-stack
-    /// root. Channels are GC objects, so the stash is a real reference; the
-    /// type guard keeps this uniform with the other stash slots.
-    fn root_select_channel_slot(&mut self, channel: &Expr, slot: cranelift_codegen::ir::StackSlot) {
-        let ty = self.ast_type_of(channel);
-        if is_gc_managed(&ty, self.enum_infos) {
-            self.emit_push_root_slot(slot);
-        }
-    }
-
-    /// Eager (block-driving) `select` (willow-7aj): probe each case in source
-    /// order — a recv case is ready when its channel has a value or is closed; a
-    /// send case is ready while its channel has room (always, when unbounded).
-    /// If none is ready and there is a `default`, it runs; otherwise the scheduler
-    /// is driven and the probe retried (giving up if no task could progress). In a
-    /// non-task context recv_ready does not register a waiter (current task is 0),
-    /// so it is a pure readiness probe here.
-    ///
-    /// This is the AST emitter's `select`. Async bodies are lowered through
-    /// `lir_gen`, so the only body that still reaches it is a synchronous one —
-    /// a static-field initialiser — and a task-await case cannot appear there:
-    /// the parser only builds one from `await`, which E0801 rejects outside an
-    /// async function.
-    pub(super) fn emit_select(&mut self, s: &SelectExpr) {
-        // Evaluate each case's CHANNEL expression exactly once (stack-slot
-        // stash): the retry loop re-probes without re-running side effects,
-        // and probe/recv/send all target the same channel (willow-0a6k.6
-        // review fix).
-        let mut chan_slots: Vec<Option<cranelift_codegen::ir::StackSlot>> = Vec::new();
-        // Timeout deadlines / task-await handles, stashed once per case index
-        // (willow-soro), parallel to chan_slots.
-        let mut aux_slots: Vec<Option<cranelift_codegen::ir::StackSlot>> = Vec::new();
-        // GC-managed stash slots (send values, task handles) must be shadow-stack
-        // roots for as long as the select loop can collect: the probe loop drives
-        // the scheduler, which allocates. Popped on the `done_b` exit; a `return`
-        // out of a case body pops them with the rest via `gc_root_count`.
-        let roots_before_select = self.gc_root_count;
-        for case in &s.cases {
-            match &case.kind {
-                SelectCaseKind::Recv { channel, .. } => {
-                    let ch = self.emit_expr(channel);
-                    let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        8,
-                        0,
-                    ));
-                    self.stack_store(ch, slot);
-                    // A channel is a GC object (willow-p4er) and this stash may
-                    // be its only reference — a temporary or factory-returned
-                    // channel would otherwise be collected while the probe loop
-                    // drives the scheduler, leaving a dangling pointer.
-                    self.root_select_channel_slot(channel, slot);
-                    chan_slots.push(Some(slot));
-                    aux_slots.push(None);
-                }
-                // A send case stashes BOTH operands: with bounded channels the
-                // probe loop can spin several times before the send fits, and
-                // neither the channel nor the value may be re-evaluated
-                // (willow-o038).
-                SelectCaseKind::Send { channel, value } => {
-                    let ch = self.emit_expr(channel);
-                    let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        8,
-                        0,
-                    ));
-                    self.stack_store(ch, slot);
-                    // Rooted before the value is evaluated: that expression can
-                    // allocate and collect on its own.
-                    self.root_select_channel_slot(channel, slot);
-                    chan_slots.push(Some(slot));
-                    let v = self.emit_expr(value);
-                    let vslot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        8,
-                        0,
-                    ));
-                    self.stack_store(v, vslot);
-                    let elem_ty = channel_element_type(&self.ast_type_of(channel))
-                        .expect("internal compiler error: missing checked payload type");
-                    if is_gc_managed(&elem_ty, self.enum_infos) {
-                        self.emit_push_root_slot(vslot);
-                    }
-                    aux_slots.push(Some(vslot));
-                }
-                SelectCaseKind::Timeout { millis } => {
-                    let ms = self.emit_expr(millis);
-                    let now_fid = self.func_id("willow_monotonic_millis");
-                    let now_ref = self.module.declare_func_in_func(now_fid, self.builder.func);
-                    let ncall = self.builder.ins().call(now_ref, &[]);
-                    let now = self.builder.inst_results(ncall)[0];
-                    let deadline = self.builder.ins().iadd(now, ms);
-                    let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        8,
-                        0,
-                    ));
-                    self.stack_store(deadline, slot);
-                    chan_slots.push(None);
-                    aux_slots.push(Some(slot));
-                }
-                SelectCaseKind::Join { .. } => {
-                    unreachable!("select task-await case outside an async fn is rejected by E0801")
-                }
-                SelectCaseKind::Default => {
-                    chan_slots.push(None);
-                    aux_slots.push(None);
-                }
-            }
-        }
-        let loop_b = self.builder.create_block();
-        let done_b = self.builder.create_block();
-        let case_blocks: Vec<_> = s
-            .cases
-            .iter()
-            .map(|_| self.builder.create_block())
-            .collect();
-        let mut cont_blocks = Vec::new();
-        let default_idx = s
-            .cases
-            .iter()
-            .position(|c| matches!(c.kind, SelectCaseKind::Default));
-
-        self.builder.ins().jump(loop_b, &[]);
-        self.builder.switch_to_block(loop_b);
-        // Pseudo-randomized pick, mirroring the cooperative select
-        // (willow-0a6k.6): probe ALL cases' readiness, then run the
-        // (rotation % ready_count)-th one. Avoids systematic source-order
-        // starvation; not a bounded-fairness guarantee.
-        let zero32 = self.builder.ins().iconst(types::I32, 0);
-        let mut ready_flags: Vec<Option<cranelift_codegen::ir::Value>> = Vec::new();
-        for (i, case) in s.cases.iter().enumerate() {
-            match &case.kind {
-                SelectCaseKind::Recv { .. } => {
-                    let slot = chan_slots[i].expect("recv case has a channel slot");
-                    let ch = self.stack_load(types::I64, slot);
-                    let ready_fid = self.func_id("willow_channel_recv_ready");
-                    let ready_ref = self
-                        .module
-                        .declare_func_in_func(ready_fid, self.builder.func);
-                    let rcall = self.builder.ins().call(ready_ref, &[ch]);
-                    let raw = self.builder.inst_results(rcall)[0];
-                    let is_ready = self.builder.ins().icmp(IntCC::NotEqual, raw, zero32);
-                    let flag = self.builder.ins().uextend(types::I64, is_ready);
-                    ready_flags.push(Some(flag));
-                }
-                SelectCaseKind::Send { .. } => {
-                    // Ready when unbounded, not full, or closed (willow-o038).
-                    let slot = chan_slots[i].expect("send case has a channel slot");
-                    let ch = self.stack_load(types::I64, slot);
-                    let ready_fid = self.func_id("willow_channel_send_ready");
-                    let ready_ref = self
-                        .module
-                        .declare_func_in_func(ready_fid, self.builder.func);
-                    let rcall = self.builder.ins().call(ready_ref, &[ch]);
-                    let raw = self.builder.inst_results(rcall)[0];
-                    let is_ready = self.builder.ins().icmp(IntCC::NotEqual, raw, zero32);
-                    let flag = self.builder.ins().uextend(types::I64, is_ready);
-                    ready_flags.push(Some(flag));
-                }
-                SelectCaseKind::Timeout { .. } => {
-                    let slot = aux_slots[i].expect("timeout case has a deadline slot");
-                    let deadline = self.stack_load(types::I64, slot);
-                    let now_fid = self.func_id("willow_monotonic_millis");
-                    let now_ref = self.module.declare_func_in_func(now_fid, self.builder.func);
-                    let ncall = self.builder.ins().call(now_ref, &[]);
-                    let now = self.builder.inst_results(ncall)[0];
-                    let due =
-                        self.builder
-                            .ins()
-                            .icmp(IntCC::SignedGreaterThanOrEqual, now, deadline);
-                    let flag = self.builder.ins().uextend(types::I64, due);
-                    ready_flags.push(Some(flag));
-                }
-                SelectCaseKind::Join { .. } => {
-                    unreachable!("select task-await case outside an async fn is rejected by E0801")
-                }
-                SelectCaseKind::Default => ready_flags.push(None),
-            }
-        }
-        let mut total = self.builder.ins().iconst(types::I64, 0);
-        for flag in ready_flags.iter().flatten() {
-            total = self.builder.ins().iadd(total, *flag);
-        }
-        let none_ready = self.builder.ins().icmp_imm_s(IntCC::Equal, total, 0);
-        let pick_b = self.builder.create_block();
-        let idle_b = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(none_ready, idle_b, &[], pick_b, &[]);
-
-        self.builder.switch_to_block(pick_b);
-        self.builder.seal_block(pick_b);
-        let rot_fid = self.func_id("willow_select_rotation");
-        let rot_ref = self.module.declare_func_in_func(rot_fid, self.builder.func);
-        let rot_call = self.builder.ins().call(rot_ref, &[]);
-        let rotation = self.builder.inst_results(rot_call)[0];
-        let k = self.builder.ins().urem(rotation, total);
-        let mut acc = self.builder.ins().iconst(types::I64, 0);
-        for (i, flag) in ready_flags.iter().enumerate() {
-            let Some(flag) = flag else { continue };
-            let next_acc = self.builder.ins().iadd(acc, *flag);
-            let k1 = self.builder.ins().iadd_imm_s(k, 1);
-            let is_kth = self.builder.ins().icmp(IntCC::Equal, next_acc, k1);
-            let one64 = self.builder.ins().iconst(types::I64, 1);
-            let is_ready_now =
-                self.builder
-                    .ins()
-                    .icmp(IntCC::SignedGreaterThanOrEqual, *flag, one64);
-            let chosen = self.builder.ins().band(is_kth, is_ready_now);
-            let cont = self.builder.create_block();
-            cont_blocks.push(cont);
-            self.builder
-                .ins()
-                .brif(chosen, case_blocks[i], &[], cont, &[]);
-            self.builder.switch_to_block(cont);
-            acc = next_acc;
-        }
-        self.builder
-            .ins()
-            .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
-
-        self.builder.switch_to_block(idle_b);
-        self.builder.seal_block(idle_b);
-        {
-            if let Some(di) = default_idx {
-                self.builder.ins().jump(case_blocks[di], &[]);
-            } else {
-                let timeout_slots: Vec<_> = s
-                    .cases
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, case)| match &case.kind {
-                        SelectCaseKind::Timeout { .. } => aux_slots[i],
-                        _ => None,
-                    })
-                    .collect();
-                if timeout_slots.is_empty() {
-                    let run_fid = self.func_id("willow_sched_run");
-                    let run_ref = self.module.declare_func_in_func(run_fid, self.builder.func);
-                    let rcall = self.builder.ins().call(run_ref, &[]);
-                    let completed = self.builder.inst_results(rcall)[0];
-                    let zero = self.builder.ins().iconst(types::I64, 0);
-                    let progressed = self.builder.ins().icmp(IntCC::NotEqual, completed, zero);
-                    // A select with no default and no timeout BLOCKS until a
-                    // case is ready; it must never fall through to the merge
-                    // block, which would run no case at all and continue past
-                    // the select with its bindings unwritten. A drive that
-                    // completed nothing is not proof that no case can become
-                    // ready, so idle-wait and re-probe; the runtime raises a
-                    // blocking-forever panic when there is genuinely no wake
-                    // source left (willow-atth).
-                    let idle_wait_b = self.builder.create_block();
-                    self.builder
-                        .ins()
-                        .brif(progressed, loop_b, &[], idle_wait_b, &[]);
-                    self.builder.switch_to_block(idle_wait_b);
-                    self.builder.seal_block(idle_wait_b);
-                    self.emit_void_runtime_call("willow_select_idle_wait", &[]);
-                    self.builder.ins().jump(loop_b, &[]);
-                } else {
-                    // With a timeout case the drive MUST be bounded by the
-                    // NEAREST deadline: an unbounded `willow_sched_run` runs
-                    // unrelated tasks to quiescence first, so a 30ms timeout
-                    // could lose to a 5s task (willow-o038 review).
-                    let mut min_deadline: Option<cranelift_codegen::ir::Value> = None;
-                    for slot in timeout_slots {
-                        let d = self.stack_load(types::I64, slot);
-                        min_deadline = Some(match min_deadline {
-                            None => d,
-                            Some(m) => {
-                                let lt = self.builder.ins().icmp(IntCC::SignedLessThan, d, m);
-                                self.builder.ins().select(lt, d, m)
-                            }
-                        });
-                    }
-                    let m = min_deadline.expect("at least one timeout slot");
-                    let run_fid = self.func_id("willow_sched_run_until_deadline");
-                    let run_ref = self.module.declare_func_in_func(run_fid, self.builder.func);
-                    let rcall = self.builder.ins().call(run_ref, &[m]);
-                    let completed = self.builder.inst_results(rcall)[0];
-                    let zero = self.builder.ins().iconst(types::I64, 0);
-                    let progressed = self.builder.ins().icmp(IntCC::NotEqual, completed, zero);
-                    // Progress can have made a case ready: re-probe. Otherwise
-                    // the scheduler had nothing left to do before the deadline,
-                    // so wait it out here and let the timeout flag fire
-                    // (willow-soro).
-                    let wait_b = self.builder.create_block();
-                    self.builder
-                        .ins()
-                        .brif(progressed, loop_b, &[], wait_b, &[]);
-                    self.builder.switch_to_block(wait_b);
-                    self.builder.seal_block(wait_b);
-                    let sleep_fid = self.func_id("willow_sleep_until_monotonic");
-                    let sleep_ref = self
-                        .module
-                        .declare_func_in_func(sleep_fid, self.builder.func);
-                    self.builder.ins().call(sleep_ref, &[m]);
-                    self.builder.ins().jump(loop_b, &[]);
-                }
-            }
-        }
-
-        for (i, case) in s.cases.iter().enumerate() {
-            self.builder.switch_to_block(case_blocks[i]);
-            let saved_vars = self.vars.clone();
-            let saved_roots = self.gc_root_count;
-            self.terminated = false;
-            match &case.kind {
-                SelectCaseKind::Recv { binding, channel } => {
-                    let elem_ty = channel_element_type(&self.ast_type_of(channel))
-                        .expect("internal compiler error: missing checked payload type");
-                    let slot = chan_slots[i].expect("recv case has a channel slot");
-                    let ch = self.stack_load(types::I64, slot);
-                    let recv_name =
-                        format!("willow_channel_recv_{}", channel_runtime_suffix(&elem_ty));
-                    let v = self.emit_value_runtime_call(&recv_name, &[ch]);
-                    if binding != "_" {
-                        let storage = self.create_local_stack_slot(&elem_ty, v);
-                        // The received value has just left the channel: this slot
-                        // is now its only reference, so it must be a root.
-                        if let VarStorage::Stack { slot, .. } = &storage
-                            && is_gc_managed(&elem_ty, self.enum_infos)
-                        {
-                            let slot = *slot;
-                            self.emit_push_root_slot(slot);
-                        }
-                        self.vars.insert(binding.clone(), storage);
-                    }
-                    self.emit_block(&case.body);
-                }
-                SelectCaseKind::Send { channel, .. } => {
-                    let elem_ty = channel_element_type(&self.ast_type_of(channel))
-                        .expect("internal compiler error: missing checked payload type");
-                    let slot = chan_slots[i].expect("send case has a channel slot");
-                    let ch = self.stack_load(types::I64, slot);
-                    let vslot = aux_slots[i].expect("send case has a value slot");
-                    let val = self.stack_load(clif_type(&elem_ty), vslot);
-                    // Non-blocking: the probe said not-full, but a task on
-                    // another worker may have filled the channel since. Retry
-                    // the whole probe instead of blocking (willow-o038).
-                    let try_name = format!(
-                        "willow_channel_try_send_{}",
-                        channel_runtime_suffix(&elem_ty)
-                    );
-                    let try_fid = self.func_id(&try_name);
-                    let try_ref = self.module.declare_func_in_func(try_fid, self.builder.func);
-                    let scall = self.builder.ins().call(try_ref, &[ch, val]);
-                    let sent = self.builder.inst_results(scall)[0];
-                    let body_b = self.builder.create_block();
-                    let sent_ok = self.builder.ins().icmp_imm_s(IntCC::NotEqual, sent, 0);
-                    self.builder.ins().brif(sent_ok, body_b, &[], loop_b, &[]);
-                    self.builder.switch_to_block(body_b);
-                    self.builder.seal_block(body_b);
-                    self.emit_block(&case.body);
-                }
-                SelectCaseKind::Timeout { .. } => self.emit_block(&case.body),
-                SelectCaseKind::Join { .. } => {
-                    unreachable!("select task-await case outside an async fn is rejected by E0801")
-                }
-                SelectCaseKind::Default => self.emit_block(&case.body),
-            }
-            if !self.terminated {
-                // Roots pushed for this case's binding (the body's own roots were
-                // already popped by `emit_block`). Terminated paths popped
-                // everything through the return/break handler.
-                let case_roots = self.gc_root_count - saved_roots;
-                if case_roots > 0 {
-                    self.emit_pop_roots_n(case_roots);
-                }
-                self.builder.ins().jump(done_b, &[]);
-            }
-            self.vars = saved_vars;
-            self.gc_root_count = saved_roots;
-        }
-
-        self.builder.seal_block(loop_b);
-        for c in &cont_blocks {
-            self.builder.seal_block(*c);
-        }
-        for c in &case_blocks {
-            self.builder.seal_block(*c);
-        }
-        self.builder.seal_block(done_b);
-        self.builder.switch_to_block(done_b);
-        self.terminated = false;
-        let select_roots = self.gc_root_count - roots_before_select;
-        if select_roots > 0 {
-            self.emit_pop_roots_n(select_roots);
-            self.gc_root_count = roots_before_select;
-        }
     }
 }
 

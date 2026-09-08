@@ -114,117 +114,63 @@ impl Normalizer<'_> {
     }
 
     fn contains_suspend(&self, expr: &Expr) -> bool {
-        if self.direct_suspend_type(expr).is_some() {
-            return true;
-        }
-        match expr {
-            Expr::Binary(binary) => {
-                self.contains_suspend(&binary.lhs) || self.contains_suspend(&binary.rhs)
-            }
-            Expr::Unary(unary) => self.contains_suspend(&unary.expr),
-            Expr::Call(call) => call.args.iter().any(|arg| self.contains_suspend(&arg.expr)),
-            Expr::FieldAccess(object, ..) => self.contains_suspend(object),
-            Expr::MethodCall(call) => {
-                self.contains_suspend(&call.object)
-                    || call.args.iter().any(|arg| self.contains_suspend(&arg.expr))
-            }
-            Expr::StaticCall(call) => call.args.iter().any(|arg| self.contains_suspend(&arg.expr)),
-            Expr::New(new) => new.args.iter().any(|arg| self.contains_suspend(&arg.expr)),
-            Expr::ObjectLiteral(object) => object
-                .fields
-                .iter()
-                .any(|field| self.contains_suspend(&field.value)),
-            Expr::Print(value, ..) => self.contains_suspend(value),
-            Expr::Ternary(ternary) => {
-                self.contains_suspend(&ternary.condition)
-                    || self.contains_suspend(&ternary.then_expr)
-                    || self.contains_suspend(&ternary.else_expr)
-            }
-            Expr::Range(range) => {
-                self.contains_suspend(&range.start) || self.contains_suspend(&range.end)
-            }
-            Expr::Match(match_expr) => {
-                self.contains_suspend(&match_expr.scrutinee)
-                    || match_expr.arms.iter().any(|arm| match &arm.body {
-                        MatchBody::Expr(expr) => self.contains_suspend(expr),
-                        MatchBody::Block(block) => block
-                            .stmts
-                            .iter()
-                            .any(|stmt| self.stmt_contains_suspend(stmt)),
-                    })
-            }
-            Expr::TryPropagate(inner, _, _) => self.contains_suspend(inner),
-            Expr::ArrayLiteral(elements, _, _) => {
-                elements.iter().any(|expr| self.contains_suspend(expr))
-            }
-            Expr::Index(array, index, _, _) => {
-                self.contains_suspend(array) || self.contains_suspend(index)
-            }
-            // The awaited call's ARGUMENTS may contain nested suspends
-            // (`await consume(ch.recv())`) — they evaluate before the await
-            // and must be hoisted like any other argument (review fix on
-            // willow-0a6k.6). The await target itself has its own lowering.
-            Expr::Await(a) => self.contains_suspend(&a.expr),
-            // Select OPERANDS (channel exprs, send values) may contain
-            // nested suspends and are hoisted to the select entry (Go
-            // semantics: operands evaluate once, in order, at entry) —
-            // review fix on willow-0a6k.6. Case bodies are statement lists
-            // normalized separately.
-            Expr::Select(sel) => sel.cases.iter().any(|case| match &case.kind {
-                SelectCaseKind::Recv { channel, .. } => self.contains_suspend(channel),
-                SelectCaseKind::Send { channel, value } => {
-                    self.contains_suspend(channel) || self.contains_suspend(value)
+        use crate::parser::iter::{AstEvent, AstWalk};
+        let mut walk = AstWalk::new(AstEvent::Expr(expr));
+        while let Some(event) = walk.next() {
+            match event {
+                AstEvent::Expr(expr) => {
+                    if self.direct_suspend_type(expr).is_some() {
+                        return true;
+                    }
+                    match expr {
+                        Expr::Lambda(_) => walk.skip_children(),
+                        // Case bodies are normalized separately; only operands
+                        // are evaluated at the enclosing select entry.
+                        Expr::Select(select) => {
+                            walk.skip_children();
+                            for case in &select.cases {
+                                match &case.kind {
+                                    SelectCaseKind::Recv { channel, .. } => {
+                                        walk.push(AstEvent::Expr(channel))
+                                    }
+                                    SelectCaseKind::Send { channel, value } => {
+                                        walk.push(AstEvent::Expr(channel));
+                                        walk.push(AstEvent::Expr(value));
+                                    }
+                                    SelectCaseKind::Timeout { millis } => {
+                                        walk.push(AstEvent::Expr(millis))
+                                    }
+                                    SelectCaseKind::Join { task, .. } => {
+                                        walk.push(AstEvent::Expr(task))
+                                    }
+                                    SelectCaseKind::Default => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-                SelectCaseKind::Timeout { millis } => self.contains_suspend(millis),
-                SelectCaseKind::Join { task, .. } => self.contains_suspend(task),
-                SelectCaseKind::Default => false,
-            }),
-            // Lambdas are separate functions/scopes; do not move their
-            // internals into the caller.
-            Expr::Lambda(_)
-            | Expr::Integer(..)
-            | Expr::Float(..)
-            | Expr::Bool(..)
-            | Expr::String(..)
-            | Expr::Var(..)
-            | Expr::StaticField(_) => false,
-        }
-    }
-
-    fn stmt_contains_suspend(&self, stmt: &Stmt) -> bool {
-        match stmt {
-            Stmt::Let(stmt) => self.contains_suspend(&stmt.init),
-            Stmt::Assign(stmt) => self.contains_suspend(&stmt.value),
-            Stmt::FieldAssign(stmt) => {
-                self.contains_suspend(&stmt.object) || self.contains_suspend(&stmt.value)
+                AstEvent::Stmt(stmt) => {
+                    let operand = match stmt {
+                        Stmt::If(s) => Some(&s.cond),
+                        Stmt::While(s) => Some(&s.cond),
+                        Stmt::For(s) => Some(&s.iterable),
+                        Stmt::Lock(s) => Some(&s.target),
+                        Stmt::Break(_) | Stmt::Continue(_) => {
+                            walk.skip_children();
+                            None
+                        }
+                        _ => None,
+                    };
+                    if let Some(expr) = operand {
+                        walk.skip_children();
+                        walk.push(AstEvent::Expr(expr));
+                    }
+                }
+                _ => {}
             }
-            Stmt::SuperInit(stmt) => stmt.args.iter().any(|arg| self.contains_suspend(&arg.expr)),
-            Stmt::StaticFieldAssign(stmt) => self.contains_suspend(&stmt.value),
-            Stmt::IndexAssign(stmt) => {
-                self.contains_suspend(&stmt.array)
-                    || self.contains_suspend(&stmt.index)
-                    || self.contains_suspend(&stmt.value)
-            }
-            Stmt::If(stmt) => self.contains_suspend(&stmt.cond),
-            Stmt::While(stmt) => self.contains_suspend(&stmt.cond),
-            Stmt::For(stmt) => self.contains_suspend(&stmt.iterable),
-            // The type checker forbids a suspension inside the critical section
-            // (E2604), so only the target can carry one (willow-38w.1.1).
-            Stmt::Lock(stmt) => self.contains_suspend(&stmt.target),
-            Stmt::Return(stmt) => stmt
-                .value
-                .as_ref()
-                .is_some_and(|expr| self.contains_suspend(expr)),
-            Stmt::Expr(stmt) => self.contains_suspend(&stmt.expr),
-            Stmt::Defer(stmt) => match &stmt.body {
-                DeferBody::Expr(expr) => self.contains_suspend(expr),
-                DeferBody::Block(block) => block
-                    .stmts
-                    .iter()
-                    .any(|stmt| self.stmt_contains_suspend(stmt)),
-            },
-            Stmt::Break(_) | Stmt::Continue(_) => false,
         }
+        false
     }
 
     fn normalize_block(&mut self, block: &mut Block) {

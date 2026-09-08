@@ -323,6 +323,7 @@ impl<'a> CompilerSession<'a> {
     }
 
     pub fn run(self) -> Result<()> {
+        let _node_ids = parser::ast::NodeIdSession::enter();
         let src_path = PathBuf::from(self.src);
         let source = std::fs::read_to_string(&src_path)
             .with_context(|| format!("cannot read {}", src_path.display()))?;
@@ -1133,10 +1134,6 @@ fn run_backend(
     for (name, info) in &checker.symbols.interfaces {
         codegen.register_interface_info(name.to_string(), info.clone());
     }
-    // Unqualified enum-variant constructions resolved by the type checker
-    // (willow-60o.1), so the backend lowers them as variant allocations.
-    codegen.register_enum_variant_resolutions(checker.enum_variant_resolutions.clone());
-    codegen.register_pattern_resolutions(checker.pattern_resolutions.clone());
     // The checker's authoritative per-expression types (willow-mb5): the
     // backend's type queries consult these FIRST, so the legacy structural
     // re-derivation only covers compiler-synthesized expressions.
@@ -1166,7 +1163,7 @@ fn run_backend(
         // (willow-9vvn). The node-ID-keyed maps registered above hold the entry
         // file's entries alone, and a module is checked in its own scope, so
         // without this an unqualified enum pattern in a module body reached
-        // `emit_match` unresolved and took the wrong arm — and `declare_lambda`
+        // lowering unresolved and took the wrong arm — and `declare_lambda`
         // read no type for a module lambda, declaring it `fn(i64) -> i64`
         // whatever it really was. Merging is safe because node IDs come from
         // one build-wide counter, so no two units' keys collide.
@@ -1484,6 +1481,7 @@ pub fn compile(
 /// covers the constructs implemented so far (willow-mb5) and lists the rest as
 /// trailing comments rather than failing.
 pub fn emit_hir_text(src: &str) -> Result<String> {
+    let _node_ids = parser::ast::NodeIdSession::enter();
     let src_path = PathBuf::from(src);
     let source = std::fs::read_to_string(&src_path)
         .with_context(|| format!("cannot read {}", src_path.display()))?;
@@ -1511,6 +1509,7 @@ pub fn emit_hir_text(src: &str) -> Result<String> {
 /// `--emit-lir` build flag). Runs the normal front-end, lowers to typed HIR,
 /// then makes control flow explicit as blocks.
 pub fn emit_lir_text(src: &str) -> Result<String> {
+    let _node_ids = parser::ast::NodeIdSession::enter();
     let src_path = PathBuf::from(src);
     let source = std::fs::read_to_string(&src_path)
         .with_context(|| format!("cannot read {}", src_path.display()))?;

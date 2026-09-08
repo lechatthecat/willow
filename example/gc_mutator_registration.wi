@@ -1,0 +1,75 @@
+// gc_mutator_registration.wi — collections that race the worker pool
+// (willow-v6k0).
+//
+// Every thread that can hold GC roots registers itself as a MUTATOR: the thread
+// driving `main`, and each worker the scheduler spins up to run a
+// `parallel::map`. A worker registers when it starts and unregisters when the
+// map is done, so the set of registered mutators changes underneath the
+// collector while this program runs.
+//
+// The collector used to ask "is anyone else registered?" and, when the answer
+// was no, scan only its own root stack before sweeping the shared heap. The
+// answer is a snapshot: a worker that registers just after it is read runs
+// unseen for the rest of that cycle, and the sweep frees the objects it has
+// just allocated and rooted. The program keeps running on freed memory — it
+// prints a wrong total, or aborts on a dangling root one cycle later.
+//
+// So every collection here stops the world and scans every registered mutator.
+// The output is fixed: each round doubles 1..8 (72) and adds it to the ledger,
+// four rounds make 288, and the label survives the churn in between.
+
+import std::collections::Array;
+import std::parallel;
+
+class Ledger {
+    pub total: i64;
+    pub label: String;
+}
+
+fn double(value: i64) -> i64 {
+    return value * 2;
+}
+
+// One round of mapped work. The mapper runs on pool workers, so the array it
+// returns was allocated by a thread that registered after this drive began.
+async fn round_total(values: FrozenArray<i64>) -> i64 {
+    let mapped = await parallel::map(values, double);
+    let mut sum = 0;
+    let mut index = 0;
+    while index < mapped.len() {
+        sum = sum + mapped[index];
+        index = index + 1;
+    }
+    return sum;
+}
+
+// Garbage between rounds, so the collection below has something to reclaim and
+// the ledger has something to survive.
+async fn churn(count: i64) -> i64 {
+    let mut scratch: Array<String> = [];
+    let mut index = 0;
+    while index < count {
+        scratch.push("scratch");
+        index = index + 1;
+    }
+    return scratch.len();
+}
+
+async fn main() {
+    let values: Array<i64> = [1, 2, 3, 4, 5, 6, 7, 8];
+    let frozen = values.freeze();
+    let ledger = new Ledger(0, "ledger");
+
+    let mut round = 0;
+    while round < 4 {
+        ledger.total = ledger.total + await round_total(frozen);
+        await churn(64);
+        // Collect with the pool still in play, then again after it has settled.
+        gc_collect();
+        gc_minor_collect();
+        round = round + 1;
+    }
+
+    println(ledger.label);
+    println(ledger.total);
+}

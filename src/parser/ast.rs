@@ -18,16 +18,80 @@ impl std::fmt::Display for ExprId {
     }
 }
 
+// Reserve a disjoint range per session (or direct-parser thread). The hot
+// allocation path touches only TLS. A new range also handles counter exhaustion
+// without wrapping identities that may survive in cached/prelude syntax.
+#[derive(Clone, Copy, Default)]
+struct NodeIds {
+    next: u64,
+    end: u64,
+}
+
+impl NodeIds {
+    fn fresh(&mut self) -> u64 {
+        if self.next == self.end {
+            const RANGE: u64 = 1 << 32;
+            static NEXT_RANGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            self.next = NEXT_RANGE
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |next| next.checked_add(RANGE),
+                )
+                .expect("syntax identity namespaces exhausted");
+            self.end = self.next + RANGE;
+        }
+        let id = self.next;
+        self.next += 1;
+        id
+    }
+}
+
+thread_local! {
+    static NODE_IDS: std::cell::Cell<NodeIds> = const {
+        std::cell::Cell::new(NodeIds { next: 0, end: 0 })
+    };
+}
+
+fn fresh_node_id() -> u64 {
+    NODE_IDS.with(|slot| {
+        let mut ids = slot.get();
+        let id = ids.fresh();
+        slot.set(ids);
+        id
+    })
+}
+
+/// Restores the enclosing allocator even after an error or panic. The guard
+/// cannot move across threads; syntax IDs themselves remain freely movable.
+pub(crate) struct NodeIdSession {
+    previous: NodeIds,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl NodeIdSession {
+    pub(crate) fn enter() -> Self {
+        Self {
+            previous: NODE_IDS.with(|slot| slot.replace(NodeIds::default())),
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for NodeIdSession {
+    fn drop(&mut self) {
+        NODE_IDS.with(|slot| slot.set(self.previous));
+    }
+}
+
 impl ExprId {
     pub fn fresh() -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        Self(fresh_node_id())
     }
 }
 impl PatternId {
     pub fn fresh() -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        Self(fresh_node_id())
     }
 }
 
@@ -1001,4 +1065,85 @@ impl BinOp {
 pub enum UnaryOp {
     Neg,
     Not,
+}
+
+#[cfg(test)]
+mod node_identity_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn session_identity_matrix() {
+        // Twenty independent session sizes exercise nesting, clone stability,
+        // retained identities and restoration of a direct-parser allocator.
+        let mut seen = HashSet::new();
+        for count in 1..=20 {
+            let before = ExprId::fresh();
+            assert!(seen.insert(before));
+            {
+                let _outer = NodeIdSession::enter();
+                let first = ExprId::fresh();
+                assert!(seen.insert(first));
+                for _ in 0..count {
+                    let _inner = NodeIdSession::enter();
+                    let expr = Expr::Integer(1, Span::dummy(), ExprId::fresh());
+                    assert_eq!(expr.id(), expr.clone().id());
+                    assert!(seen.insert(expr.id()));
+                    let pattern = Pattern::Wildcard(Span::dummy(), PatternId::fresh());
+                    assert_eq!(pattern.id(), pattern.clone().id());
+                    assert_ne!(expr.id().0, pattern.id().0);
+                }
+                assert_eq!(ExprId::fresh().0, first.0 + 1);
+            }
+            let after = ExprId::fresh();
+            assert_eq!(after.0, before.0 + 1);
+            assert!(seen.insert(after));
+        }
+    }
+
+    #[test]
+    fn concurrent_sessions_and_cross_thread_syntax() {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let _session = NodeIdSession::enter();
+                    (0..128).map(|_| ExprId::fresh()).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut seen = HashSet::new();
+        for handle in handles {
+            for id in handle.join().unwrap() {
+                assert!(seen.insert(id));
+            }
+        }
+        assert!(seen.insert(ExprId::fresh()));
+    }
+
+    #[test]
+    fn panic_restores_enclosing_allocator() {
+        let before = ExprId::fresh();
+        let mut retained = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _session = NodeIdSession::enter();
+            retained = Some(ExprId::fresh());
+            panic!("abort compilation");
+        }));
+        assert!(result.is_err());
+        let after = ExprId::fresh();
+        assert_eq!(after.0, before.0 + 1);
+        assert_ne!(retained.unwrap(), after);
+    }
+
+    #[test]
+    fn exhausted_local_range_reserves_another_namespace() {
+        let mut ids = NodeIds::default();
+        let first = ids.fresh();
+        ids.next = ids.end - 1;
+        let last = ids.fresh();
+        let rollover = ids.fresh();
+        assert_ne!(first, last);
+        assert_ne!(rollover, last);
+        assert_eq!(ids.fresh(), rollover + 1);
+    }
 }

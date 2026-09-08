@@ -1,8 +1,7 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use cranelift_codegen::ir::{
     AbiParam, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind, TrapCode, UserFuncName,
-    condcodes::{FloatCC, IntCC},
-    types,
+    condcodes::IntCC, types,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -14,7 +13,6 @@ use crate::backend::abi;
 use crate::parser::ast::*;
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::ids::{FunctionId, FunctionMap};
-use crate::semantic::intrinsics;
 use crate::semantic::symbols::{EnumInfo, InterfaceInfo};
 use crate::{BuildMode, CompilerOptions};
 
@@ -24,10 +22,8 @@ mod ast_passes;
 mod async_codegen;
 mod compile;
 pub use compile::{DeclaredModule, DeclaredProgram, ItemBinding, ModuleSpelling, UnitImports};
-mod coop;
 mod coop_anf;
 mod emit;
-mod emit_builtins;
 mod emit_collections;
 mod emit_expr;
 mod emit_interface;
@@ -46,7 +42,6 @@ mod symbols;
 mod type_helpers;
 mod vtable_layout;
 use ast_passes::*;
-use coop::*;
 use gc_codegen::*;
 use option_repr::*;
 use std_collection::*;
@@ -83,11 +78,24 @@ struct ParamDebug {
 #[derive(Default)]
 struct ModuleAliasSnapshot {
     functions: Vec<(FunctionId, Option<FunctionId>)>,
-    types: Vec<(String, Option<crate::semantic::ids::TypeId>)>,
+    types: Vec<(String, Option<type_index::TypeBinding>)>,
     /// Module access names bound to another module's symbol prefix for the
     /// length of one unit (willow-kd1v), with whatever `known_modules` held
     /// under them before.
     modules: Vec<(String, Option<String>)>,
+}
+
+/// Owns restoration even when a unit returns an error or unwinds.
+struct ModuleAliasScope<'a> {
+    codegen: &'a mut Codegen,
+    aliases: ModuleAliasSnapshot,
+}
+
+impl Drop for ModuleAliasScope<'_> {
+    fn drop(&mut self) {
+        self.codegen
+            .restore_module_aliases(std::mem::take(&mut self.aliases));
+    }
 }
 
 /// Bytes before the first virtual method slot in a class descriptor: the
@@ -99,7 +107,7 @@ pub(super) const CLASS_DESCRIPTOR_HEADER_BYTES: u32 = 8;
 /// the way the next unit needs them (willow-nm0g).
 #[derive(Default)]
 pub struct EnumAliasScope {
-    types: Vec<(String, Option<crate::semantic::ids::TypeId>)>,
+    types: Vec<(String, Option<type_index::TypeBinding>)>,
 }
 
 pub struct Codegen {
@@ -163,6 +171,9 @@ pub struct Codegen {
     /// (willow-59gx). Recorded as classes are registered;
     /// [`Codegen::finalize_class_layouts`] turns it into `class_layouts`.
     class_own_fields: TypeMap<Vec<(String, Type)>>,
+    class_dependents: HashMap<String, HashSet<String>>,
+    dirty_class_layouts: HashSet<String>,
+    dirty_class_vslots: HashSet<String>,
     /// The `open`/`override` instance methods each class declares ITSELF, in
     /// declaration order (willow-fm7t). Recorded as classes are registered;
     /// [`Codegen::finalize_class_vslots`] turns it into `class_vslots`.
@@ -194,14 +205,6 @@ pub struct Codegen {
     /// `compile_program` moves these into `lir_functions` once it has assigned
     /// the names.
     lir_lambdas: HashMap<ExprId, crate::ir::lowered::LirFunction>,
-    /// IDs of unqualified enum-variant constructions (`Ok(42)`) → the enum they
-    /// resolved to, so an otherwise-function-shaped `Call` is lowered as a
-    /// variant allocation. Registered from the type checker (willow-60o.1).
-    enum_variant_resolutions: HashMap<ExprId, String>,
-    /// Unqualified match-pattern IDs → the enum-variant pattern they were
-    /// reinterpreted as (`Ok(v)` → EnumVariantTuple). Registered from the type
-    /// checker (willow-60o.1).
-    pattern_resolutions: HashMap<PatternId, Pattern>,
     /// Interface metadata (method order + signatures) for vtable codegen and
     /// interface method dispatch. Registered from the type checker.
     interface_infos: TypeMap<InterfaceInfo>,
@@ -316,7 +319,7 @@ struct StaticStorageInfo {
 struct StaticInitItem {
     class_key: String,
     field: String,
-    init: Expr,
+    initializer: FunctionDecl,
     ty: Type,
     /// The symbol prefix of the module that declared the property, or `None`
     /// for the entry program. An initializer is an expression of the unit that
@@ -423,14 +426,15 @@ impl Codegen {
             class_base: TypeMap::with_scope(type_scope.clone()),
             class_type_ids: TypeMap::with_scope(type_scope.clone()),
             class_own_fields: TypeMap::with_scope(type_scope.clone()),
+            class_dependents: HashMap::new(),
+            dirty_class_layouts: HashSet::new(),
+            dirty_class_vslots: HashSet::new(),
             class_own_vmethods: TypeMap::with_scope(type_scope.clone()),
             class_vslots: TypeMap::with_scope(type_scope.clone()),
             class_descriptor_ids: TypeMap::with_scope(type_scope.clone()),
             expr_types: HashMap::new(),
             lir_functions: HashMap::new(),
             lir_lambdas: HashMap::new(),
-            enum_variant_resolutions: HashMap::new(),
-            pattern_resolutions: HashMap::new(),
             interface_infos: TypeMap::with_scope(type_scope.clone()),
             vtable_ids: VtableMap::with_scope(type_scope.clone()),
             vtable_thunk_ids: HashMap::new(),
@@ -532,7 +536,7 @@ impl Codegen {
         let identity = info.name.clone();
         self.enum_infos.insert(identity.clone(), info);
         if name != identity {
-            self.type_scope.bind(&name, &identity);
+            self.type_scope.bind_canonical(&name, &identity);
         }
     }
 
@@ -555,12 +559,13 @@ impl Codegen {
         let mut scope = EnumAliasScope::default();
         for (name, info) in aliases {
             // The unit checker supplies identity; metadata remains build-wide.
-            if !self.enum_infos.contains_key(&info.name) {
+            if self.enum_infos.get_canonical(&info.name).is_none() {
                 self.enum_infos.insert(info.name.clone(), info.clone());
             }
-            scope
-                .types
-                .push((name.clone(), self.type_scope.bind(name, &info.name)));
+            scope.types.push((
+                name.clone(),
+                self.type_scope.bind_canonical(name, &info.name),
+            ));
         }
         scope
     }
@@ -576,7 +581,7 @@ impl Codegen {
         let identity = info.name.clone();
         self.interface_infos.insert(identity.clone(), info);
         if name != identity {
-            self.type_scope.bind(&name, &identity);
+            self.type_scope.bind_canonical(&name, &identity);
         }
     }
 
@@ -599,22 +604,12 @@ impl Codegen {
             .collect();
     }
 
-    /// Register unqualified enum-variant construction resolutions (willow-60o.1).
-    pub fn register_enum_variant_resolutions(&mut self, resolutions: HashMap<ExprId, String>) {
-        self.enum_variant_resolutions = resolutions;
-    }
-
-    /// Register unqualified match-pattern reinterpretations (willow-60o.1).
-    pub fn register_pattern_resolutions(&mut self, resolutions: HashMap<PatternId, Pattern>) {
-        self.pattern_resolutions = resolutions;
-    }
-
     /// Merge one module's own checker tables into the backend (willow-9vvn).
     ///
     /// Every `register_*` above installs the ENTRY file's tables wholesale, but
     /// a module is type-checked in its own scope, so the entry checker resolved
     /// nothing inside a module body. Without this, an unqualified `Boxy(n)`
-    /// pattern in a module reaches `emit_match` unresolved: it stays a
+    /// pattern in a module reaches lowering unresolved: it stays a
     /// `ClassDowncast`, which takes the wrong arm or panics outright.
     ///
     /// These tables are all keyed by AST node ID, drawn from one build-wide
@@ -630,18 +625,6 @@ impl Codegen {
     pub fn merge_module_checker_tables(&mut self, checker: &crate::semantic::TypeChecker) {
         self.expr_types
             .extend(checker.expr_types.iter().map(|(k, v)| (*k, v.clone())));
-        self.enum_variant_resolutions.extend(
-            checker
-                .enum_variant_resolutions
-                .iter()
-                .map(|(k, v)| (*k, v.clone())),
-        );
-        self.pattern_resolutions.extend(
-            checker
-                .pattern_resolutions
-                .iter()
-                .map(|(k, v)| (*k, v.clone())),
-        );
     }
 
     /// The type as the ENUM tables spell it: every enum name replaced by the one
@@ -717,7 +700,7 @@ impl Codegen {
     /// [`Codegen::canonical_declared_type`] for one name.
     ///
     /// An enum answers with its own recorded identity; anything else is
-    /// resolved one hop through the shared type scope, and only when the hop
+    /// resolved through the shared type scope, and only when the chain
     /// lands on a class or interface the tables really hold — an unbound name,
     /// or one bound to something not yet declared, is left exactly as written
     /// so a base declared after its subclass still resolves later.
@@ -730,8 +713,8 @@ impl Codegen {
             .resolve(&crate::semantic::ids::TypeId::from_source_name(name))
             .to_string();
         if resolved != name
-            && (self.class_layouts.contains_key(&resolved)
-                || self.interface_infos.contains_key(&resolved))
+            && (self.class_layouts.get_canonical(&resolved).is_some()
+                || self.interface_infos.get_canonical(&resolved).is_some())
         {
             return resolved;
         }
@@ -933,8 +916,7 @@ impl Codegen {
     /// entry: an enum is registered under its canonical path and its other
     /// spellings bound to it (`register_enum_info`), so a unit writing the
     /// canonical one needs nothing here, and binding it anyway would point the
-    /// canonical entry at its own alias — a binding is one hop, so the pair
-    /// would then resolve to a key neither table holds. A spelling that is a
+    /// canonical entry at its own alias and create a cycle. A spelling that is a
     /// key of something ELSE is a different case and IS bound: `books` in a
     /// file that says `import sales as books;` means sales there, whatever a
     /// real `books` module registered.
@@ -962,15 +944,16 @@ impl Codegen {
                     continue;
                 };
                 // The KEY the candidate reaches, since the graph name of an
-                // enum is itself bound to the canonical path: binding the alias
-                // to a binding would be two hops, and nothing follows two.
+                // enum is itself bound to the canonical path. Freeze the declaration
+                // target so another unit alias cannot reinterpret its identity.
                 let canonical = self.resolved_name(&canonical);
                 if self.resolved_name(&alias) == canonical {
                     continue;
                 }
-                aliases
-                    .types
-                    .push((alias.clone(), self.type_scope.bind(&alias, &canonical)));
+                aliases.types.push((
+                    alias.clone(),
+                    self.type_scope.bind_canonical(&alias, &canonical),
+                ));
             }
         }
     }
@@ -989,6 +972,17 @@ impl Codegen {
         self.class_layouts.contains_key(name)
             || self.enum_infos.contains_key(name)
             || self.interface_infos.contains_key(name)
+    }
+
+    fn with_module_aliases<R>(
+        &mut self,
+        body: impl FnOnce(&mut Self, &mut ModuleAliasSnapshot) -> R,
+    ) -> R {
+        let mut scope = ModuleAliasScope {
+            codegen: self,
+            aliases: ModuleAliasSnapshot::default(),
+        };
+        body(scope.codegen, &mut scope.aliases)
     }
 
     fn restore_module_aliases(&mut self, aliases: ModuleAliasSnapshot) {
@@ -1019,8 +1013,8 @@ impl Codegen {
     /// CANONICAL name, so a module body that names an imported interface found
     /// nothing under `Describable`, and both back ends then read the value as a
     /// class. With one implementation that silently called it directly; with
-    /// two it reached `emit_interface_dispatch`'s "no virtual slot but N
-    /// candidate implementations" invariant and aborted the compile.
+    /// two it reached the "no virtual slot but N candidate implementations"
+    /// invariant of interface dispatch and aborted the compile.
     ///
     /// Classes need no such alias: [`resolve_class_key`] already resolves a
     /// bare class name against every module's tables. Enums have their own, per
@@ -1120,8 +1114,12 @@ impl Codegen {
             // then, and the subclass's layout was quietly rewritten to its own
             // fields alone — `new Sub` then fell out of the walker's subset and
             // every inherited field read the wrong offset (willow-kd1v).
-            self.class_base
-                .insert(c.name.clone(), self.canonical_declared_name(&base_name));
+            let base = self.canonical_declared_name(&base_name);
+            self.class_dependents
+                .entry(base.clone())
+                .or_default()
+                .insert(c.name.clone());
+            self.class_base.insert(c.name.clone(), base);
         }
         // Assign a unique type_id for runtime dynamic dispatch. It lives at
         // offset 0 of the class DESCRIPTOR, which word 0 of every object of the
@@ -1129,6 +1127,22 @@ impl Codegen {
         let next_id = self.class_type_ids.len() as i64 + 1;
         self.class_type_ids.entry(c.name.clone()).or_insert(next_id);
         self.register_class_own_vmethods(c);
+        self.invalidate_class_layout(&c.name);
+    }
+
+    fn invalidate_class_layout(&mut self, name: &str) {
+        let mut pending = vec![name.to_string()];
+        let mut seen = HashSet::new();
+        while let Some(name) = pending.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            self.dirty_class_layouts.insert(name.clone());
+            self.dirty_class_vslots.insert(name.clone());
+            if let Some(children) = self.class_dependents.get(&name) {
+                pending.extend(children.iter().cloned());
+            }
+        }
     }
 
     /// Record the `open`/`override` instance methods `c` declares itself.
@@ -1164,7 +1178,7 @@ impl Codegen {
     /// order -- got one level right by accident and dropped the grandparent's
     /// fields at two, because the base it read had not been rebuilt yet.
     fn finalize_class_layouts(&mut self) {
-        let classes: Vec<String> = self.class_own_fields.keys().cloned().collect();
+        let classes = std::mem::take(&mut self.dirty_class_layouts);
         for class_name in classes {
             let chain = self.ancestor_chain(&class_name);
             let mut fields: Vec<(String, Type)> = Vec::new();
@@ -1224,7 +1238,7 @@ impl Codegen {
     /// arrive in DECLARATION order, and a subclass may be declared before its
     /// base. Walking the chain here makes the result order-independent.
     fn finalize_class_vslots(&mut self) {
-        let classes: Vec<String> = self.class_own_vmethods.keys().cloned().collect();
+        let classes = std::mem::take(&mut self.dirty_class_vslots);
         for class_name in classes {
             // Root-most ancestor first, so each level appends onto the order it
             // inherits.
@@ -1293,13 +1307,10 @@ impl Codegen {
     }
 }
 
-/// Code executed by one queued defer. Direct calls use a synthetic statement
-/// whose operands read hidden registration-time slots; match expressions and
-/// blocks retain their deferred AST body (willow-oorh).
+/// Typed code executed by one queued defer. Captured operands retain their
+/// registration-time values; block bodies retain their checked HIR.
 #[derive(Clone)]
 pub(super) enum DeferredAction {
-    Stmt(Box<Stmt>),
-    Block(Block),
     HirExpr(crate::ir::typed_ast::HirExpr),
     HirBlock(Vec<crate::ir::typed_ast::HirStmt>),
 }
@@ -1408,14 +1419,6 @@ struct FuncGen<'a, 'b> {
     builder: &'a mut FunctionBuilder<'b>,
     module: &'a mut ObjectModule,
     gc_tlab_state: DataId,
-    /// (exit block, continue target, GC-root count at loop entry, defer-frame
-    /// depth at loop entry — break/continue flush frames deeper than this).
-    loop_stack: Vec<(
-        cranelift_codegen::ir::Block,
-        cranelift_codegen::ir::Block,
-        usize,
-        usize,
-    )>,
     /// Lexical scope frames of registered `defer` actions: synthetic
     /// statements whose operands were already evaluated into hidden locals,
     /// plus (async only) the frame offset of the registration FLAG consumed
@@ -1503,9 +1506,6 @@ struct FuncGen<'a, 'b> {
     interface_infos: &'a TypeMap<InterfaceInfo>,
     /// Static `(class, interface)` vtable data objects for class→interface boxing.
     vtable_ids: &'a VtableMap<DataId>,
-    /// Checker-recorded types of all checked expressions (willow-mb5); the
-    /// backend's primary type source.
-    expr_types: &'a HashMap<ExprId, Type>,
     /// When emitting a cooperative poll fn: the async frame pointer, so a
     /// `return` inside nested statement control flow (e.g. a statement-position
     /// match arm, willow-zvkv) stores the result and returns the Ready status
@@ -1513,12 +1513,6 @@ struct FuncGen<'a, 'b> {
     coop_frame: Option<cranelift_codegen::ir::Value>,
     /// Byte offset of the poll frame's `__result` slot, when it has one.
     coop_result_offset: Option<i32>,
-    /// Spans of unqualified enum-variant constructions → resolved enum name,
-    /// so the call is lowered as a variant allocation (willow-60o.1).
-    enum_variant_resolutions: &'a HashMap<ExprId, String>,
-    /// Unqualified match-pattern spans → the enum-variant pattern they were
-    /// reinterpreted as, so the arm lowers as a variant match (willow-60o.1).
-    pattern_resolutions: &'a HashMap<PatternId, Pattern>,
     /// Base pointer of this function's heap async frame, if one was allocated
     /// (async fns with values that must survive `await`; willow-lpn.5a).
     async_frame: Option<cranelift_codegen::ir::Value>,
@@ -1903,16 +1897,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
-    /// Read the type established before code generation. Missing metadata is
-    /// a compiler invariant violation, never a reason to guess an ABI type.
-    fn ast_type_of(&self, expr: &Expr) -> Type {
-        checked_expr_type(expr, self.expr_types)
-    }
-
-    fn ast_type_of_init(&self, expr: &Expr) -> Type {
-        self.ast_type_of(expr)
-    }
-
     fn static_call_class_name(&self, class_name: &str) -> String {
         if class_name == "Self" {
             self.current_class.unwrap_or(class_name).to_string()
@@ -2070,25 +2054,6 @@ fn lookup_static_storage_in(
     None
 }
 
-fn fcmp_to_i8(
-    builder: &mut FunctionBuilder<'_>,
-    cc: FloatCC,
-    lhs: cranelift_codegen::ir::Value,
-    rhs: cranelift_codegen::ir::Value,
-) -> cranelift_codegen::ir::Value {
-    builder.ins().fcmp(cc, lhs, rhs)
-}
-
-fn icmp_to_i8(
-    builder: &mut FunctionBuilder<'_>,
-    cc: IntCC,
-    lhs: cranelift_codegen::ir::Value,
-    rhs: cranelift_codegen::ir::Value,
-) -> cranelift_codegen::ir::Value {
-    // icmp returns I8 in cranelift 0.132
-    builder.ins().icmp(cc, lhs, rhs)
-}
-
 fn function_call_return_type(f: &FunctionDecl) -> Type {
     if f.is_async {
         Type::Generic("Task".to_string(), vec![f.return_type.clone()])
@@ -2114,18 +2079,6 @@ fn param_debug_from_params(params: &[Param]) -> Vec<ParamDebug> {
             mode: param.mode.clone(),
         })
         .collect()
-}
-
-fn has_reference_args(modes: Option<&[ParamMode]>, args: &[CallArg]) -> bool {
-    args.iter().enumerate().any(|(idx, arg)| {
-        matches!(
-            (modes.and_then(|modes| modes.get(idx)), &arg.mode),
-            (
-                Some(ParamMode::Reference { .. }),
-                CallArgMode::Reference { .. }
-            )
-        )
-    })
 }
 
 fn reference_mode_name(mode: &ParamMode) -> &'static str {
@@ -2199,7 +2152,7 @@ fn gc_ref_mask_for_layout(
 }
 
 fn try_gc_ref_mask_for_layout(
-    class_name: &str,
+    _class_name: &str,
     layout: &[(String, Type)],
     enum_infos: &TypeMap<EnumInfo>,
 ) -> Result<u64> {
@@ -2211,15 +2164,13 @@ fn try_gc_ref_mask_for_layout(
     // heap object, so bit 0 stays clear and the collector's view of the payload
     // is unchanged. Nothing about the field offsets or the mask moved with it.
     let mut mask = 0u64;
-    for (idx, (field_name, ty)) in layout.iter().enumerate() {
+    for (idx, (_, ty)) in layout.iter().enumerate() {
         if !is_gc_managed(ty, enum_infos) {
             continue;
         }
         let word = idx + 1;
         if word >= GC_REF_MASK_BITS {
-            bail!(
-                "class `{class_name}` field `{field_name}` is a GC-managed reference at payload word {word}, outside gc_ref_mask coverage; word 0 is the class descriptor, so only the first {OBJECT_FIELD_MASK_CAPACITY} fields can be represented without a trace function"
-            );
+            continue;
         }
         mask |= 1u64 << word;
     }
@@ -2262,6 +2213,7 @@ pub struct AsyncFrameSlot {
 pub struct AsyncFrameLayout {
     pub slots: Vec<AsyncFrameSlot>,
     pub gc_slot_mask: u64,
+    pub gc_payload_bitmap: Vec<u64>,
 }
 
 #[allow(dead_code)] // Consumed by willow-lpn.5 (async frame emission + state machine).
@@ -2282,12 +2234,12 @@ impl AsyncFrameLayout {
     }
 
     pub fn try_new(slots: Vec<AsyncFrameSlot>, enum_infos: &TypeMap<EnumInfo>) -> Result<Self> {
+        let mut gc_payload_bitmap =
+            vec![0u64; (slots.len() + ASYNC_FRAME_HEADER_WORDS).div_ceil(64)];
         for (k, slot) in slots.iter().enumerate() {
-            if k >= ASYNC_FRAME_GC_SLOT_CAPACITY && is_gc_managed(&slot.ty, enum_infos) {
-                bail!(
-                    "async frame slot `{}` is a GC-managed reference at data slot {k}, outside gc_ref_mask coverage; the runtime frame header uses {ASYNC_FRAME_HEADER_WORDS} payload words, so only the first {ASYNC_FRAME_GC_SLOT_CAPACITY} GC-managed data slots can be represented without a trace function",
-                    slot.name
-                );
+            if is_gc_managed(&slot.ty, enum_infos) {
+                let word = k + ASYNC_FRAME_HEADER_WORDS;
+                gc_payload_bitmap[word / 64] |= 1 << (word % 64);
             }
         }
         let gc_slot_mask = slots
@@ -2304,6 +2256,7 @@ impl AsyncFrameLayout {
         Ok(Self {
             slots,
             gc_slot_mask,
+            gc_payload_bitmap,
         })
     }
 
@@ -2314,7 +2267,10 @@ impl AsyncFrameLayout {
 
     /// Whether data slot `k` holds a GC-managed heap reference.
     pub fn slot_is_gc_ref(&self, k: usize) -> bool {
-        k < 64 && (self.gc_slot_mask & (1u64 << k)) != 0
+        k < self.slots.len() && {
+            let word = k + ASYNC_FRAME_HEADER_WORDS;
+            self.gc_payload_bitmap[word / 64] & (1 << (word % 64)) != 0
+        }
     }
 }
 
@@ -2414,30 +2370,9 @@ fn main_result_err_type(f: &FunctionDecl) -> Option<Type> {
         .map(|(_, err)| err.clone())
 }
 
-fn checked_expr_type(expr: &Expr, types: &HashMap<ExprId, Type>) -> Type {
-    types.get(&expr.id()).cloned().unwrap_or_else(|| {
-        panic!(
-            "internal compiler error: missing checked type for expression at {:?}",
-            expr.span()
-        )
-    })
-}
-
 #[cfg(test)]
 mod symbol_namespace_tests {
     use super::*;
-
-    /// Perspective 1: every symbol the runtime ABI actually exports is
-    /// reserved. This is the set whose hijacking is silent, so it is the one
-    /// that must be complete rather than approximated.
-    #[test]
-    #[should_panic(expected = "missing checked type")]
-    fn missing_expression_type_is_an_invariant_failure() {
-        checked_expr_type(
-            &Expr::Integer(1, crate::diagnostics::Span::dummy(), ExprId::fresh()),
-            &HashMap::new(),
-        );
-    }
 
     #[test]
     fn unit_symbols_01_every_runtime_abi_symbol_is_reserved() {
@@ -2576,6 +2511,152 @@ mod symbol_namespace_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn incremental_layouts_track_only_changed_dependency_subtrees() {
+        for length in 1..=10 {
+            for reverse in [false, true] {
+                let mut source = String::new();
+                for i in 0..length {
+                    let base = if i == 0 {
+                        String::new()
+                    } else {
+                        format!(" extends C{}", i - 1)
+                    };
+                    source.push_str(&format!("open class C{i}{base} {{ pub f{i}: i64; pub open fn m{i}(self) -> i64 {{ return {i}; }} }}"));
+                }
+                let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+                let (program, errors) = crate::parser::Parser::new(tokens).parse();
+                assert!(errors.is_empty(), "{errors:?}");
+                let mut classes: Vec<_> = program
+                    .items
+                    .iter()
+                    .filter_map(|item| {
+                        if let Item::Class(class) = item {
+                            Some(class)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if reverse {
+                    classes.reverse();
+                }
+                let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+                for class in classes {
+                    codegen.register_class_layout(class);
+                    codegen.finalize_class_layouts();
+                    codegen.finalize_class_vslots();
+                    assert!(codegen.dirty_class_layouts.is_empty());
+                    assert!(codegen.dirty_class_vslots.is_empty());
+                }
+                for i in 0..length {
+                    let name = format!("C{i}");
+                    assert_eq!(
+                        codegen.class_layouts.get_canonical(&name).unwrap().len(),
+                        i + 1
+                    );
+                    assert_eq!(
+                        codegen.class_vslots.get_canonical(&name).unwrap().len(),
+                        i + 1
+                    );
+                }
+                let leaf = format!("C{}", length - 1);
+                codegen.invalidate_class_layout(&leaf);
+                assert_eq!(codegen.dirty_class_layouts, HashSet::from([leaf.clone()]));
+                assert_eq!(codegen.dirty_class_vslots, HashSet::from([leaf]));
+                codegen.finalize_class_layouts();
+                codegen.finalize_class_vslots();
+                codegen.finalize_class_layouts();
+                codegen.finalize_class_vslots();
+                assert!(codegen.dirty_class_layouts.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn module_alias_scope_restores_all_tables_on_every_exit() {
+        use crate::semantic::ids::TypeId;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        // 4 binding shapes x 5 exits = 20 restoration perspectives. Check all
+        // three tables on every path, including repeated and nested shadowing.
+        for binding_shape in 0..4 {
+            for exit in 0..5 {
+                let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+                let function = FunctionId::free_from_source_name("local");
+                let original = FunctionId::free_from_source_name("original");
+                if binding_shape != 0 {
+                    codegen
+                        .func_ids
+                        .scope()
+                        .bind(function.clone(), original.clone());
+                    codegen.type_scope.bind("Local", "Original");
+                    codegen
+                        .known_modules
+                        .insert("local".into(), "original".into());
+                }
+                let before_function = codegen.func_ids.scope().resolve(&function);
+                let before_type = codegen
+                    .type_scope
+                    .resolve(&TypeId::from_source_name("Local"));
+                let before_module = codegen.known_modules.get("local").cloned();
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    codegen.with_module_aliases(|this, aliases| -> anyhow::Result<()> {
+                        let repetitions = if binding_shape == 2 { 3 } else { 1 };
+                        for i in 0..repetitions {
+                            let target = format!("temporary{i}");
+                            aliases.functions.push((
+                                function.clone(),
+                                this.func_ids.scope().bind(
+                                    function.clone(),
+                                    FunctionId::free_from_source_name(&target),
+                                ),
+                            ));
+                            aliases
+                                .types
+                                .push(("Local".into(), this.type_scope.bind("Local", &target)));
+                            aliases.modules.push((
+                                "local".into(),
+                                this.known_modules.insert("local".into(), target),
+                            ));
+                        }
+                        if binding_shape == 3 {
+                            this.with_module_aliases(|inner, aliases| {
+                                aliases.modules.push((
+                                    "local".into(),
+                                    inner.known_modules.insert("local".into(), "inner".into()),
+                                ));
+                            });
+                            assert_eq!(this.known_modules["local"], "temporary0");
+                        }
+                        match exit {
+                            0 => Ok(()),
+                            1 => Err(anyhow::anyhow!("explicit error")),
+                            2 => {
+                                Err(anyhow::anyhow!("propagated error"))?;
+                                Ok(())
+                            }
+                            3 => panic!("scope unwind regression"),
+                            _ => Ok(()),
+                        }
+                    })
+                }));
+                assert_eq!(result.is_err(), exit == 3);
+                if let Ok(result) = result {
+                    assert_eq!(result.is_err(), exit == 1 || exit == 2);
+                }
+                assert_eq!(codegen.func_ids.scope().resolve(&function), before_function);
+                assert_eq!(
+                    codegen
+                        .type_scope
+                        .resolve(&TypeId::from_source_name("Local")),
+                    before_type
+                );
+                assert_eq!(codegen.known_modules.get("local").cloned(), before_module);
+            }
+        }
+    }
+
     use super::*;
     use crate::diagnostics::Span;
 
@@ -2662,18 +2743,13 @@ mod tests {
     }
 
     #[test]
-    fn class_gc_ref_mask_rejects_gc_field_beyond_coverage() {
-        let mut layout: Vec<(String, Type)> = (0..OBJECT_FIELD_MASK_CAPACITY)
-            .map(|i| (format!("n{i}"), Type::I64))
-            .collect();
-        layout.push(("late".to_string(), Type::String));
-
-        let err = try_gc_ref_mask_for_layout("TooWide", &layout, &TypeMap::new())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("TooWide"), "{err}");
-        assert!(err.contains("late"), "{err}");
-        assert!(err.contains("outside gc_ref_mask coverage"), "{err}");
+    fn class_gc_ref_mask_uses_bitmap_beyond_coverage() {
+        let mut fields: Vec<(String, Type)> =
+            (0..64).map(|i| (format!("n{i}"), Type::I64)).collect();
+        fields.push(("late".into(), Type::String));
+        let layout = gc_codegen::GcLayoutMetadata::class("Wide", 1, &fields, &TypeMap::new());
+        assert_eq!(layout.gc_ref_mask, 0);
+        assert_eq!(layout.bitmap, [0, 2]);
     }
 
     // ── Async frame GC metadata (willow-lpn.4) ──────────────────────────────
@@ -2887,9 +2963,9 @@ mod tests {
         assert_eq!(layout.gc_slot_mask, 1u64 << 3);
     }
 
-    // 20. GC slots beyond runtime mask coverage are rejected, not truncated.
+    // 20. GC slots beyond the inline mask use scalable metadata.
     #[test]
-    fn async_frame_20_gc_slots_beyond_runtime_mask_are_rejected() {
+    fn async_frame_20_gc_slots_beyond_runtime_mask_are_traced() {
         let mut slots: Vec<(&str, Type)> = Vec::new();
         for _ in 0..ASYNC_FRAME_GC_SLOT_CAPACITY {
             slots.push(("r", Type::String));
@@ -2907,10 +2983,9 @@ mod tests {
                 ty: Type::String,
             })
             .collect();
-        let err = AsyncFrameLayout::try_new(too_many_slots, &TypeMap::new())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("outside gc_ref_mask coverage"), "{err}");
+        let layout = AsyncFrameLayout::try_new(too_many_slots, &TypeMap::new()).unwrap();
+        assert!(layout.slot_is_gc_ref(ASYNC_FRAME_GC_SLOT_CAPACITY));
+        assert_eq!(layout.gc_payload_bitmap[1], 1);
     }
 
     // 21. The collector lists parameters first, then annotated `let` locals,
@@ -2998,30 +3073,6 @@ mod tests {
         assert_eq!(
             function_call_return_type(&function),
             Type::Generic("Task".to_string(), vec![Type::I64])
-        );
-    }
-
-    #[test]
-    fn unit_async_codegen_09_future_ready_runtime_selects_by_value_type() {
-        assert_eq!(
-            future_ready_runtime_name(&Type::Void),
-            "willow_future_ready_void"
-        );
-        assert_eq!(
-            future_ready_runtime_name(&Type::I64),
-            "willow_future_ready_i64"
-        );
-        assert_eq!(
-            future_ready_runtime_name(&Type::Bool),
-            "willow_future_ready_bool"
-        );
-        assert_eq!(
-            future_ready_runtime_name(&Type::F64),
-            "willow_future_ready_f64"
-        );
-        assert_eq!(
-            future_ready_runtime_name(&Type::String),
-            "willow_future_ready_ptr"
         );
     }
 

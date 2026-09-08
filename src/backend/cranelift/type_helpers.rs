@@ -59,18 +59,6 @@ pub(crate) fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
     }
 }
 
-// `join_handle_result_type` / `task_result_output_type` / `awaitable_task_type`
-// live in the type checker's pure type helpers: the backend must classify
-// awaitable handles exactly the way the checker did, so there is one definition
-// (willow-qrj9). The backend's own uses of `join_handle_result_type` went away
-// with the method-call string waterfall — `Task`/`JoinHandle` receivers are now
-// recognised by `intrinsics::resolve` (willow-uqzx, catalog item 7).
-pub(crate) use crate::semantic::type_checker::awaitable_task_type;
-
-pub(crate) fn future_output_type(ty: &Type) -> Option<Type> {
-    builtin_types::unary_arg(ty, B::Future).cloned()
-}
-
 pub(crate) fn debug_type_name(ty: &Type) -> String {
     match ty {
         Type::I64 => "i64".to_string(),
@@ -108,16 +96,6 @@ pub(crate) fn debug_type_name(ty: &Type) -> String {
     }
 }
 
-pub(crate) fn future_ready_runtime_name(ty: &Type) -> &'static str {
-    match ty {
-        Type::Void => "willow_future_ready_void",
-        Type::I64 => "willow_future_ready_i64",
-        Type::Bool => "willow_future_ready_bool",
-        Type::F64 => "willow_future_ready_f64",
-        _ => "willow_future_ready_ptr",
-    }
-}
-
 pub(crate) fn future_await_runtime_name(ty: &Type) -> &'static str {
     match ty {
         Type::Void => "willow_future_await_void",
@@ -138,7 +116,7 @@ pub(crate) fn channel_element_type(ty: &Type) -> Option<Type> {
 ///
 /// `enum_infos` is required because a *fieldless* (C-like) enum — every variant
 /// has no payload — is lowered to an immediate integer tag, NOT a heap pointer
-/// (see `emit_static_call`).  Treating such a value as GC-managed would root or
+/// (see `emit_lir_enum_variant`).  Treating such a value as GC-managed would root or
 /// trace a small integer as if it were an object pointer, and the collector
 /// would dereference it as a header and crash.  An enum with at least one
 /// payload-carrying variant is always heap-allocated and so is GC-managed.

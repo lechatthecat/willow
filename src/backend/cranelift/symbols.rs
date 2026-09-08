@@ -217,25 +217,18 @@ pub(crate) fn class_method_symbol_name(
     class_name: &str,
     method_name: &str,
 ) -> String {
-    let module_match = known_modules
-        .iter()
-        .filter_map(|(access_name, symbol_prefix)| {
-            class_name
-                .strip_prefix(access_name)
-                .and_then(|rest| rest.strip_prefix("::"))
-                .map(|suffix| (access_name.len(), symbol_prefix, suffix))
-        })
-        .max_by_key(|(len, _, _)| *len);
-
-    if let Some((_, symbol_prefix, class_suffix)) = module_match {
-        let class_suffix = module_symbol_prefix(class_suffix);
-        class_member_symbol(
-            &module_item_symbol(symbol_prefix, &class_suffix),
-            method_name,
-        )
-    } else {
-        class_member_symbol(&backend_symbol_component(class_name), method_name)
+    // Probe only prefixes of this class, longest first. Work depends on the
+    // qualification depth, not on the number of modules in the build.
+    for (offset, _) in class_name.rmatch_indices("::") {
+        if let Some(symbol_prefix) = known_modules.get(&class_name[..offset]) {
+            let class_suffix = module_symbol_prefix(&class_name[offset + 2..]);
+            return class_member_symbol(
+                &module_item_symbol(symbol_prefix, &class_suffix),
+                method_name,
+            );
+        }
     }
+    class_member_symbol(&backend_symbol_component(class_name), method_name)
 }
 
 /// Clone a module's class declaration under its module-qualified NAME, with
@@ -459,6 +452,43 @@ mod mangling_tests {
             class_method_symbol_name(&known, "m::Vec2", "len"),
             "math.Vec2.len"
         );
+    }
+
+    #[test]
+    fn module_prefix_lookup_preserves_resolution_cases() {
+        // Twenty distinct lookup perspectives, including aliases whose target
+        // differs from their spelling and overlapping component names.
+        let known = modules(&[
+            ("a", "root"),
+            ("a::b", "nested"),
+            ("ab", "neighbor"),
+            ("日本", "unicode"),
+            ("alias", "real.module"),
+        ]);
+        for (class, method, expected) in [
+            ("C", "m", "C.m"),
+            ("a::C", "m", "root.C.m"),
+            ("a::b::C", "m", "nested.C.m"),
+            ("a::b::c::C", "m", "nested.c.C.m"),
+            ("a::bc::C", "m", "root.bc.C.m"),
+            ("ab::C", "m", "neighbor.C.m"),
+            ("abc::C", "m", "abc.C.m"),
+            ("unknown::C", "m", "unknown.C.m"),
+            ("日本::C", "m", "unicode.C.m"),
+            ("alias::C", "m", "real.module.C.m"),
+            ("alias::inner::C", "m", "real.module.inner.C.m"),
+            ("a::C", "init", "root.C.init"),
+            ("a::b::C", "init", "nested.C.init"),
+            ("a::C_name", "get_value", "root.C_name.get_value"),
+            ("a::b", "m", "root.b.m"),
+            ("a", "m", "a.m"),
+            ("alias", "m", "alias.m"),
+            ("日本語::C", "m", "日本語.C.m"),
+            ("x::a::C", "m", "x.a.C.m"),
+            ("a::x::b::C", "m", "root.x.b.C.m"),
+        ] {
+            assert_eq!(class_method_symbol_name(&known, class, method), expected);
+        }
     }
 
     /// Perspective 40: a static property's storage carries the `$static` role,

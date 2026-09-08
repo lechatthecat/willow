@@ -24,8 +24,8 @@ use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::type_checker::types::{await_output_type, awaitable_task_type};
 
 use super::typed_ast::{
-    HirCapture, HirDeferBody, HirExpr, HirExprKind, HirFunction, HirParam, HirPattern, HirProgram,
-    HirStmt,
+    HirCapture, HirDeferBody, HirDeferId, HirExpr, HirExprKind, HirFunction, HirParam, HirPattern,
+    HirProgram, HirStmt,
 };
 
 pub mod async_liveness;
@@ -794,7 +794,7 @@ struct Builder {
     /// How many defer scopes are currently open. `return` flushes all of them.
     defer_depth: usize,
     defer_counter: u32,
-    defer_scopes: Vec<std::collections::HashMap<Span, LirDeferId>>,
+    defer_scopes: Vec<std::collections::HashMap<HirDeferId, LirDeferId>>,
     is_async: bool,
     suspend_counter: usize,
     locals: Vec<LirLocal>,
@@ -843,24 +843,15 @@ fn expr_suspends_here(expr: &HirExpr) -> bool {
 }
 
 fn collect_suspensions<'a>(expr: &'a HirExpr, out: &mut Vec<&'a HirExpr>) {
-    if matches!(expr.kind, HirExprKind::Lambda { .. }) {
-        return;
-    }
-    for child in expr.children() {
-        collect_suspensions(child, out);
-    }
-    // Children are evaluated before their enclosing expression. In
-    // particular `await f(ch.recv())` must split the recv before the await.
-    if expr_suspends_here(expr) {
-        out.push(expr);
-    }
+    out.extend(
+        expr.walk_postorder(false)
+            .filter(|expr| expr_suspends_here(expr)),
+    );
 }
 
 /// Does a suspension live anywhere inside this expression?
 fn suspends_anywhere(expr: &HirExpr) -> bool {
-    let mut found = Vec::new();
-    collect_suspensions(expr, &mut found);
-    !found.is_empty()
+    expr.walk_postorder(false).any(expr_suspends_here)
 }
 
 /// Does any statement of this body suspend? Used to decide whether a `match`
@@ -956,19 +947,13 @@ fn rematerializable(expr: &HirExpr) -> bool {
 }
 
 fn contains_expr(node: &HirExpr, target: &HirExpr) -> bool {
-    std::ptr::eq(node, target)
-        || node
-            .children()
-            .into_iter()
-            .any(|child| contains_expr(child, target))
+    node.walk_postorder(true)
+        .any(|child| std::ptr::eq(child, target))
 }
 
 fn contains_suspend_span(node: &HirExpr, target_span: Span) -> bool {
-    (node.span == target_span && expr_suspends_here(node))
-        || node
-            .children()
-            .into_iter()
-            .any(|child| contains_suspend_span(child, target_span))
+    node.walk_postorder(true)
+        .any(|child| child.span == target_span && expr_suspends_here(child))
 }
 
 fn hoistable_around(node: &HirExpr, target: &HirExpr, seen: &mut bool) -> bool {
@@ -2180,12 +2165,19 @@ impl Builder {
         let lexical_scope = self.scope_starts.len();
         self.scope_starts
             .push(LirScopeMark::opening_at(self.locals.len()));
+        let mut scope = std::collections::HashMap::new();
         let sites: Vec<(LirDeferId, Span)> = stmts
             .iter()
             .filter_map(|s| match s {
-                HirStmt::Defer { span, .. } => {
+                HirStmt::Defer {
+                    id: hir_id, span, ..
+                } => {
                     let id = LirDeferId(self.defer_counter);
                     self.defer_counter += 1;
+                    assert!(
+                        scope.insert(*hir_id, id).is_none(),
+                        "duplicate HIR defer identity"
+                    );
                     Some((id, *span))
                 }
                 _ => None,
@@ -2197,7 +2189,6 @@ impl Builder {
             self.scope_starts.pop();
             return;
         }
-        let scope = sites.iter().map(|(id, span)| (*span, *id)).collect();
         let enter_block = self.current;
         let enter_index = self.blocks[enter_block].0.len();
         // Only a scope that can actually swallow a panic continues at its
@@ -2531,11 +2522,15 @@ impl Builder {
                 let dead = self.new_block();
                 self.switch_to(dead);
             }
-            HirStmt::Defer { body, span } => {
+            HirStmt::Defer {
+                id: hir_id,
+                body,
+                span,
+            } => {
                 let id = self
                     .defer_scopes
                     .last()
-                    .and_then(|scope| scope.get(span))
+                    .and_then(|scope| scope.get(hir_id))
                     .copied()
                     .expect("defer outside its LIR scope");
                 let body = match body {
@@ -3212,6 +3207,84 @@ fn format_terminator(t: &Terminator) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn defer_identity_survives_twenty_shared_span_shapes() {
+        for count in 1..=20 {
+            let source = format!("fn f() {{ {} }}", "defer print(1);".repeat(count));
+            let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+            let (mut ast, errors) = crate::parser::Parser::new(tokens).parse();
+            assert!(errors.is_empty());
+            let crate::parser::ast::Item::Function(f) = &mut ast.items[0] else {
+                unreachable!()
+            };
+            for stmt in &mut f.body.stmts {
+                if let crate::parser::ast::Stmt::Defer(defer) = stmt {
+                    defer.span = f.span;
+                }
+            }
+            let (hir, errors) = crate::ir::lower::lower_program(&ast);
+            assert!(errors.is_empty(), "{errors:?}");
+            let lir = lower_program(&hir);
+            let ids: std::collections::HashSet<_> = lir.functions[0]
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instrs)
+                .filter_map(|inst| {
+                    if let LirInst::Defer { id, .. } = inst {
+                        Some(*id)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(ids.len(), count, "same-span defer sites must stay distinct");
+        }
+    }
+
+    #[test]
+    fn deep_hir_suspension_collection_uses_a_one_megabyte_stack() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let span = Span::new(0, 0, 1, 1);
+                let mut expr = HirExpr {
+                    kind: HirExprKind::Int(1),
+                    ty: Type::I64,
+                    span,
+                };
+                expr = HirExpr {
+                    kind: HirExprKind::Await {
+                        inner: Box::new(expr),
+                    },
+                    ty: Type::I64,
+                    span,
+                };
+                for _ in 0..50_000 {
+                    expr = HirExpr {
+                        kind: HirExprKind::TryPropagate {
+                            inner: Box::new(expr),
+                        },
+                        ty: Type::I64,
+                        span,
+                    };
+                }
+                let mut found = Vec::new();
+                collect_suspensions(&expr, &mut found);
+                assert_eq!(found.len(), 1);
+                assert!(suspends_anywhere(&expr));
+                assert!(contains_suspend_span(&expr, span));
+                drop(found);
+                while let HirExprKind::TryPropagate { inner } | HirExprKind::Await { inner } =
+                    expr.kind
+                {
+                    expr = *inner;
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     use super::*;
     use crate::lexer::Lexer;
     use crate::parser::Parser;

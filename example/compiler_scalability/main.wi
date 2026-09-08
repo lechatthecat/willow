@@ -1,0 +1,7 @@
+import models as types;
+import consumer;
+fn main() {
+    let item = new types::Derived(1, 2);
+    println(item.read());
+    println(consumer::answer());
+}

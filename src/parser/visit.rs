@@ -347,7 +347,21 @@ mod tests {
 
     fn vars(source: &str) -> Vec<String> {
         let mut trace = VarTrace::default();
-        trace.visit_block(&body_of(source, "f"));
+        let body = body_of(source, "f");
+        trace.visit_block(&body);
+        let iterative: Vec<_> =
+            crate::parser::iter::AstWalk::new(crate::parser::iter::AstEvent::Block(&body))
+                .filter_map(|event| match event {
+                    crate::parser::iter::AstEvent::Expr(Expr::Var(name, _, _)) => {
+                        Some(name.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+        assert_eq!(
+            iterative, trace.seen,
+            "iterative and recursive source order"
+        );
         trace.seen
     }
 

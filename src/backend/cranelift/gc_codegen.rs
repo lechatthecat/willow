@@ -43,13 +43,14 @@ const GC_TLAB_MAX_OBJECT_SIZE: i64 = willow_abi::tlab::MAX_OBJECT_SIZE as i64;
 /// `layout_id` is a stable fingerprint of the current shape, not a registry
 /// index. The runtime treats it as opaque today; a future layout registry may
 /// replace the fingerprint without changing allocation call sites.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct GcLayoutMetadata {
     pub(super) kind: GcObjectKind,
     pub(super) payload_size: i64,
     pub(super) runtime_type_id: i64,
     pub(super) gc_ref_mask: u64,
     pub(super) layout_id: u64,
+    pub(super) bitmap: Vec<u64>,
 }
 
 impl GcLayoutMetadata {
@@ -67,6 +68,7 @@ impl GcLayoutMetadata {
             runtime_type_id,
             gc_ref_mask,
             layout_id: hash,
+            bitmap: Vec::new(),
         }
     }
 
@@ -77,13 +79,59 @@ impl GcLayoutMetadata {
         enum_infos: &TypeMap<EnumInfo>,
     ) -> Self {
         let gc_ref_mask = gc_ref_mask_for_layout(class_name, fields, enum_infos);
-        Self::new(
+        let mut layout = Self::new(
             GcObjectKind::Class,
             (fields.len() as i64 + 1) * 8,
             runtime_type_id,
             gc_ref_mask,
-        )
+        );
+        if fields
+            .iter()
+            .enumerate()
+            .any(|(i, (_, ty))| i + 1 >= 64 && is_gc_managed(ty, enum_infos))
+        {
+            layout.bitmap = vec![0; (fields.len() + 1).div_ceil(64)];
+            for (i, (_, ty)) in fields.iter().enumerate() {
+                if is_gc_managed(ty, enum_infos) {
+                    layout.bitmap[(i + 1) / 64] |= 1 << ((i + 1) % 64);
+                }
+            }
+        }
+        layout
     }
+}
+
+/// Shared allocation path for wide class objects and async frames.
+pub(super) fn emit_bitmap_alloc(
+    module: &mut ObjectModule,
+    builder: &mut FunctionBuilder<'_>,
+    alloc_id: FuncId,
+    type_id: i64,
+    payload_size: i64,
+    bitmap: &[u64],
+) -> Value {
+    let data_id = module
+        .declare_anonymous_data(false, false)
+        .expect("GC bitmap data");
+    let mut data = DataDescription::new();
+    let bytes: Vec<_> = std::iter::once(bitmap.len() as u64)
+        .chain(bitmap.iter().copied())
+        .flat_map(u64::to_ne_bytes)
+        .collect();
+    data.define(bytes.into_boxed_slice());
+    data.set_align(8);
+    module
+        .define_data(data_id, &data)
+        .expect("GC bitmap definition");
+    let global = module.declare_data_in_func(data_id, builder.func);
+    let pointer = builder
+        .ins()
+        .symbol_value(module.target_config().pointer_type(), global);
+    let type_id = builder.ins().iconst(types::I64, type_id);
+    let size = builder.ins().iconst(types::I64, payload_size);
+    let alloc = module.declare_func_in_func(alloc_id, builder.func);
+    let call = builder.ins().call(alloc, &[type_id, size, pointer]);
+    builder.inst_results(call)[0]
 }
 
 /// Low-level centralized heap-store emitter for codegen paths that construct a
@@ -111,6 +159,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// Only empty/exhausted TLABs, large objects, and stress-mode allocations
     /// call the runtime slow path.
     pub(super) fn emit_gc_alloc(&mut self, layout: GcLayoutMetadata) -> Value {
+        if !layout.bitmap.is_empty() {
+            let alloc = self.func_id("willow_gc_alloc_bitmap");
+            return emit_bitmap_alloc(
+                self.module,
+                self.builder,
+                alloc,
+                layout.runtime_type_id,
+                layout.payload_size,
+                &layout.bitmap,
+            );
+        }
         debug_assert_eq!(GC_TLAB_STATE_SIZE, 32, "compiler/runtime TLAB ABI changed");
         let total_size = (GC_HEADER_SIZE + layout.payload_size + 7) & !7;
         if total_size > GC_TLAB_MAX_OBJECT_SIZE {

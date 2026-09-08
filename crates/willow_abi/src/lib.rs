@@ -6,6 +6,10 @@
 //! keeps cross-compilation independent of the host Rust process layout.
 
 /// Maximum number of payload words represented by the inline GC reference mask.
+/// Reserved GC tracing type: `layout_id` points to a static descriptor containing
+/// `[bitmap_word_count, bitmap_word_0, ...]`. Inline bits remain in the mask.
+pub const GC_BITMAP_TYPE_ID: u32 = 0xB17B_17B1;
+
 pub const GC_REF_MASK_BITS: usize = u64::BITS as usize;
 
 /// Target-independent representation class for one C-ABI parameter/return.

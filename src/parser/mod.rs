@@ -1,6 +1,7 @@
 pub mod ast;
 mod decl;
 mod expr;
+pub mod iter;
 mod pattern;
 mod stmt;
 mod types;

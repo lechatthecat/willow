@@ -1,0 +1,152 @@
+// lir_static_initializers — a static property's INITIALIZER expression, on the
+// LIR-walking backend (willow-t0uy.3).
+//
+// A static property's initializer is not written inside any function, so the
+// compiler gives it one of its own: `Class::$static_init.field`, called from
+// `__willow_static_init` before `main`. That synthetic function was the last
+// body in the compiler still emitted by walking the AST; every other checked
+// body had moved to lowered IR in willow-0g8j.3. So an initializer silently
+// had a different expression subset than the same expression one line down in
+// a function — and the AST emitter had to be kept alive for it alone.
+//
+// The initializer lowers to HIR now, as a parameterless function returning the
+// property's type, and compiles from LIR like everything else. Watch the
+// walker claim each one, by the name the class and field give it:
+//
+//   WILLOW_LIR_LOG=1 willowc build example/lir_static_initializers.wi -o /tmp/a
+//   [lir] compiling `Config::$static_init.answer` from lowered IR
+//
+// The initializers still run in DECLARATION order, within a class and across
+// classes, so one may read a property declared before it and see its value.
+
+import std::collections::Array;
+
+enum Shade {
+    Light,
+    Dark(i64),
+}
+
+interface Named {
+    fn name(self) -> String;
+}
+
+class Point implements Named {
+    pub x: i64;
+
+    pub fn name(self) -> String {
+        return "p" + self.x.toString();
+    }
+
+    pub fn doubled(self) -> i64 {
+        return self.x * 2;
+    }
+}
+
+fn seed() -> i64 {
+    return 7;
+}
+
+open class Base {
+    pub static mut hits: i64 = 0;
+
+    pub static fn bump() -> i64 {
+        Base::hits = Base::hits + 1;
+        return Base::hits;
+    }
+}
+
+class Derived extends Base {}
+
+class Config {
+    // Literals and arithmetic.
+    pub static answer: i64 = 40 + 2;
+    pub static negative: i64 = -5;
+    pub static ready: bool = 1 < 2;
+    pub static ratio: f64 = 1.5 * 2.0;
+
+    // Strings: a concatenation and an intrinsic method call.
+    pub static label: String = "wil" + "low";
+    pub static digits: String = 42.toString();
+
+    // GC-managed values: the slot is registered as a permanent root, so the
+    // store goes through the write barrier and survives a later collection.
+    pub static list: Array<i64> = [1, 2, 3];
+    pub static blank: Array<i64> = [];
+    pub static origin: Point = new Point(3);
+
+    // Calls: a free function, a static method (with a side effect of its own),
+    // and an instance method on a freshly allocated receiver.
+    pub static from_fn: i64 = seed();
+    pub static from_static: i64 = Base::bump();
+    pub static from_method: i64 = new Point(4).doubled();
+
+    // Reads of statics initialized EARLIER: the one above in this class, and
+    // the inherited slot `Base::bump()` already wrote.
+    pub static prior: i64 = Config::answer + 1;
+    pub static inherited: i64 = Derived::hits;
+
+    // Control flow inside an initializer.
+    pub static picked: i64 = Config::answer > 40 ? 10 : 20;
+
+    // Payload-carrying values.
+    pub static shade: Shade = Shade::Dark(3);
+    pub static maybe: i64? = Option::Some(5);
+
+    // An interface-typed slot: the initializer boxes the class value.
+    pub static named: Named = new Point(8);
+}
+
+// Declaration order runs ACROSS classes too, so this reads a value the class
+// above already stored.
+class Echo {
+    pub static doubled: i64 = Config::answer * 2;
+}
+
+fn shade_value() -> i64 {
+    match Config::shade {
+        Shade::Dark(v) => {
+            return v;
+        }
+        _ => {
+            return 0;
+        }
+    }
+}
+
+fn maybe_value() -> i64 {
+    match Config::maybe {
+        Option::Some(v) => {
+            return v;
+        }
+        Option::None => {
+            return -1;
+        }
+    }
+}
+
+fn main() {
+    println(Config::answer);
+    println(Config::negative);
+    println(Config::ready);
+    println(Config::ratio);
+    println(Config::label);
+    println(Config::digits);
+    println(Config::list[0] + Config::list[2]);
+    println(Config::blank.len());
+    println(Config::origin.x);
+    println(Config::from_fn);
+    println(Config::from_static);
+    println(Config::from_method);
+    println(Config::prior);
+    println(Config::inherited);
+    println(Config::picked);
+    println(shade_value());
+    println(maybe_value());
+    println(Config::named.name());
+    println(Echo::doubled);
+
+    // A mutable static keeps taking stores after initialization, and the
+    // initialized value is what the first one reads.
+    Base::hits = Base::hits + 10;
+    println(Base::hits);
+}

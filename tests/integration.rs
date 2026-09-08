@@ -33,6 +33,8 @@ mod defer_panic_termination;
 mod enum_identity_aliases;
 #[path = "integration/gc_enum_payload_roots.rs"]
 mod gc_enum_payload_roots;
+#[path = "integration/gc_mutator_registration.rs"]
+mod gc_mutator_registration;
 #[path = "integration/imported_enum_match.rs"]
 mod imported_enum_match;
 #[path = "integration/interface_box_dynamic_dispatch.rs"]
@@ -73,6 +75,8 @@ mod lir_namespace_aliases;
 mod lir_self_statics;
 #[path = "integration/lir_stage5_cutover.rs"]
 mod lir_stage5_cutover;
+#[path = "integration/lir_static_initializers.rs"]
+mod lir_static_initializers;
 #[path = "integration/lir_static_property_bodies.rs"]
 mod lir_static_property_bodies;
 
@@ -174,3 +178,6 @@ mod stack_switch_capability;
 mod symbol_conflicts;
 #[path = "integration/toolchain.rs"]
 mod toolchain;
+
+#[path = "integration/gc_scalable_bitmap.rs"]
+mod gc_scalable_bitmap;

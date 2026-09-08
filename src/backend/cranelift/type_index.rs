@@ -2,24 +2,45 @@
 use crate::semantic::ids::TypeId;
 use std::{cell::RefCell, collections::HashMap, hash::Hash, ops::Index, rc::Rc};
 
+/// Alias spellings can refer forward to other spellings. Declaration targets
+/// are terminal, even when another source alias shadows that declaration name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TypeBinding {
+    Alias(TypeId),
+    Canonical(TypeId),
+}
+
 #[derive(Clone, Debug, Default)]
-pub struct TypeScope(Rc<RefCell<HashMap<TypeId, TypeId>>>);
+pub struct TypeScope(Rc<RefCell<HashMap<TypeId, TypeBinding>>>);
 impl TypeScope {
     pub fn resolve(&self, id: &TypeId) -> TypeId {
-        self.0
-            .borrow()
-            .get(id)
-            .cloned()
-            .unwrap_or_else(|| id.clone())
+        let bindings = self.0.borrow();
+        let mut current = id.clone();
+        // At most one visit per binding before reaching a terminal or a cycle.
+        // Cyclic aliases have no declaration identity: preserve the original
+        // spelling, allowing normal missing-type handling instead of looping.
+        for _ in 0..=bindings.len() {
+            match bindings.get(&current) {
+                Some(TypeBinding::Alias(next)) => current = next.clone(),
+                Some(TypeBinding::Canonical(target)) => return target.clone(),
+                None => return current,
+            }
+        }
+        id.clone()
     }
-    pub fn bind(&self, alias: &str, canonical: &str) -> Option<TypeId> {
-        // Targets are declaration identities, not another unit's local spelling.
+    pub fn bind(&self, alias: &str, target: &str) -> Option<TypeBinding> {
         self.0.borrow_mut().insert(
             TypeId::from_source_name(alias),
-            TypeId::from_source_name(canonical),
+            TypeBinding::Alias(TypeId::from_source_name(target)),
         )
     }
-    pub fn restore(&self, alias: &str, previous: Option<TypeId>) {
+    pub fn bind_canonical(&self, alias: &str, canonical: &str) -> Option<TypeBinding> {
+        self.0.borrow_mut().insert(
+            TypeId::from_source_name(alias),
+            TypeBinding::Canonical(TypeId::from_source_name(canonical)),
+        )
+    }
+    pub fn restore(&self, alias: &str, previous: Option<TypeBinding>) {
         let id = TypeId::from_source_name(alias);
         match previous {
             Some(previous) => {
@@ -397,15 +418,15 @@ mod tests {
     }
 
     #[test]
-    fn ti_18_binding_chains_are_not_followed_transitively() {
+    fn ti_18_forward_binding_chains_reach_the_canonical_entry() {
         let scope = TypeScope::default();
         let mut map = TypeMap::with_scope(scope.clone());
         map.insert("pal::Color".to_string(), 7);
         scope.bind("Rank", "Level");
         scope.bind("Level", "pal::Color");
-        // `bind` targets are declaration identities, so one hop is the contract.
+        // Forward spelling aliases resolve after their target is installed.
         assert_eq!(map.get("Level"), Some(&7));
-        assert_eq!(map.get("Rank"), None);
+        assert_eq!(map.get("Rank"), Some(&7));
     }
 
     #[test]
@@ -436,5 +457,83 @@ mod tests {
         assert_eq!(map.get_canonical("pal::Color"), Some(&7));
         assert_eq!(map.get("ui::Color"), Some(&7));
         assert_eq!(map.len(), 2);
+    }
+    #[test]
+    fn ti_21_canonical_targets_stop_at_shadowed_declarations() {
+        let (scope, mut map) = map_pair();
+        map.insert("ui::Color".into(), 9);
+        scope.bind_canonical("pal::Color", "ui::Color");
+        scope.bind_canonical("Color", "pal::Color");
+        scope.bind("Rank", "Color");
+        assert_eq!(map.get("pal::Color"), Some(&9));
+        assert_eq!(map.get("Color"), Some(&7));
+        assert_eq!(map.get("Rank"), Some(&7));
+    }
+
+    #[test]
+    fn ti_22_restore_preserves_alias_and_terminal_target_kinds() {
+        let (scope, mut map) = map_pair();
+        map.insert("ui::Color".into(), 9);
+        scope.bind_canonical("pal::Color", "ui::Color");
+        scope.bind_canonical("Color", "pal::Color");
+        let terminal = scope.bind("Color", "pal::Color");
+        assert_eq!(map.get("Color"), Some(&9));
+        scope.restore("Color", terminal);
+        assert_eq!(map.get("Color"), Some(&7));
+        scope.bind("Rank", "Color");
+        let alias = scope.bind_canonical("Rank", "ui::Color");
+        scope.restore("Rank", alias);
+        assert_eq!(map.get("Rank"), Some(&7));
+    }
+
+    #[test]
+    fn ti_23_cycles_terminate_and_can_be_repaired() {
+        for count in 1..=20 {
+            let (scope, map) = map_pair();
+            for index in 0..count {
+                scope.bind(&format!("A{index}"), &format!("A{}", (index + 1) % count));
+            }
+            assert_eq!(
+                scope.resolve(&TypeId::from_source_name("A0")).to_string(),
+                "A0"
+            );
+            assert_eq!(map.get("A0"), None);
+            scope.bind_canonical(&format!("A{}", count - 1), "pal::Color");
+            assert_eq!(map.get("A0"), Some(&7));
+        }
+    }
+
+    #[test]
+    fn ti_24_long_forward_chain_has_no_depth_limit() {
+        let (scope, map) = map_pair();
+        for index in 0..1024 {
+            scope.bind(&format!("A{index}"), &format!("A{}", index + 1));
+        }
+        assert_eq!(map.get("A0"), None);
+        scope.bind_canonical("A1024", "pal::Color");
+        assert_eq!(map.get("A0"), Some(&7));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn ti_25_declaration_replaces_a_forward_alias() {
+        let (scope, mut map) = map_pair();
+        scope.bind("Rank", "Level");
+        scope.bind("Level", "pal::Color");
+        map.insert("Level".into(), 12);
+        assert_eq!(map.get("Rank"), Some(&12));
+        assert_eq!(map.get_canonical("pal::Color"), Some(&7));
+    }
+
+    #[test]
+    fn ti_26_vtables_resolve_chains_on_both_sides() {
+        let scope = TypeScope::default();
+        let mut map = VtableMap::with_scope(scope.clone());
+        map.insert(("pal::Color".into(), "shape::Draw".into()), 3);
+        scope.bind("Color", "C");
+        scope.bind_canonical("C", "pal::Color");
+        scope.bind("Draw", "D");
+        scope.bind_canonical("D", "shape::Draw");
+        assert_eq!(map.get(&("Color".into(), "Draw".into())), Some(&3));
     }
 }

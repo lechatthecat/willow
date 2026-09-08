@@ -58,8 +58,7 @@
 //! lifted body takes as a hidden leading argument and an indirect call passes
 //! back.
 //!
-//! Enums and `match` (willow-0g8j.8) mirror [`FuncGen::emit_match`]
-//! instruction for instruction, including the rule that decides the
+//! Enums and `match` (willow-0g8j.8) follow one rule for the
 //! representation: an enum is a bare i64 tag when NO variant carries a
 //! payload, and a `[tag | payload…]` GC object otherwise
 //! ([`FuncGen::enum_is_gc_object_type`]). Generic enums came in with
@@ -116,10 +115,9 @@
 //! Interface DISPATCH (willow-0g8j.6) is now in the subset too: a method call
 //! on an interface-typed receiver loads `[object | vtable]` out of the box,
 //! indexes the vtable by the method's declaration-order slot and issues a
-//! `call_indirect`, mirroring [`FuncGen::emit_interface_dispatch`] including
-//! the `Self`-returning re-box. Eligibility resolves that slot through
-//! `LirTypeCtx::iface_method` — the AST emitter answers a call the interface
-//! does not declare with a constant `0`, so admitting one would miscompile.
+//! `call_indirect`, re-boxing a `Self`-returning result. Eligibility resolves
+//! that slot through `LirTypeCtx::iface_method` — a method the interface does
+//! not declare has no slot at all, so admitting such a call would miscompile.
 //! `&`/`&mut` parameters use pointer ABI for direct, class, static, constructor
 //! and interface calls, and willow-0g8j.2.17 put the `&place` ARGUMENT in the
 //! subset for debug builds too: the walker now emits the reference-call
@@ -671,10 +669,10 @@ pub(super) struct LirTypeCtx<'x> {
     /// see [`LirTypeCtx::is_enum`] — so the two can never disagree.
     pub enum_def: &'x dyn Fn(&str) -> Option<LirEnumDef>,
     /// The vtable slot and signature of `(interface, method)`, i.e. exactly what
-    /// [`FuncGen::emit_interface_dispatch`] indexes and calls. `None` when the
+    /// [`FuncGen::emit_lir_interface_call`] indexes and calls. `None` when the
     /// name is not an interface, or the interface does not declare that method
-    /// — the AST emitter answers such a call with a constant `0`, so a walker
-    /// that admitted it would silently miscompile (willow-0g8j.6).
+    /// — there is no slot to index, so a walker that admitted such a call would
+    /// silently miscompile (willow-0g8j.6).
     pub iface_method: &'x dyn Fn(&Type, &str) -> Option<IfaceMethodSig>,
     /// The slot offset at which interface `target`'s vtable is embedded in
     /// interface `source`'s, or `None` when `target` is not a super-interface.
@@ -2898,8 +2896,7 @@ fn atomic_method(recv: &Type, method: &str, arity: usize) -> Option<(Intrinsic, 
 /// or a `TaskScope`.
 ///
 /// The two expose the same four operations over different runtime objects, so
-/// what differs is the runtime symbol PREFIX rather than the operation — the
-/// same split [`cancellation_runtime_prefix`] makes on the AST path. A scope
+/// what differs is the runtime symbol PREFIX rather than the operation. A scope
 /// additionally has `finish`.
 #[derive(Clone, Copy)]
 struct CancelHandle {
@@ -7417,12 +7414,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ptr
     }
 
-    /// `match` in expression position, mirroring [`FuncGen::emit_match`]: one
-    /// result variable, one merge block, and a chain of arm blocks each entered
-    /// by a `brif` on its pattern test (willow-0g8j.8).
+    /// `match` in expression position: one result variable, one merge block,
+    /// and a chain of arm blocks each entered by a `brif` on its pattern test
+    /// (willow-0g8j.8).
     ///
-    /// Two simplifications the AST version cannot make, both bought by
-    /// eligibility: every arm body is a single expression, so no arm can
+    /// Two simplifications a walk over the raw AST could not make, both bought
+    /// by eligibility: every arm body is a single expression, so no arm can
     /// terminate its block and the merge block is always reachable; and the
     /// result type is `e.ty` directly, with no structural re-derivation.
     /// `panic(...)`: assemble the message, then hand off to the shared unwind
@@ -7530,9 +7527,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     // — `Some(n) => { helper(n); }` where `helper` returns an
                     // `i64`. Handing that word to the result variable, which a
                     // Void match declares `I8`, is a Cranelift type error and
-                    // aborts the compiler, so drop it the way the AST emitter's
-                    // `emit_match_body` drops a block arm's last value
-                    // (willow-vdfj).
+                    // aborts the compiler, so drop it (willow-vdfj).
                     if let Some(arm_val) = arm_val
                         && *result_ty != Type::Void
                     {
@@ -8855,8 +8850,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ///
     /// The OBJECT is rooted across argument evaluation, not the box: the callee
     /// receives the object, and a box whose only reference is this register can
-    /// be collected without harming the call. Mirrors
-    /// [`FuncGen::emit_interface_dispatch`] on the AST path.
+    /// be collected without harming the call.
     fn emit_lir_interface_call(
         &mut self,
         object: &HirExpr,
@@ -8873,8 +8867,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .get(&iface_name)
             .cloned()
             .expect("interface info vetted by LIR eligibility");
-        // The embedded-region layout the vtables are emitted from, which is
-        // what `emit_interface_dispatch` indexes too (willow-1fc6).
+        // The embedded-region layout the vtables are emitted from, so the slot
+        // indexed here is the slot the data object holds (willow-1fc6).
         let slot = super::vtable_layout::slot_of(self.interface_infos, &info.name, method)
             .expect("interface method slot vetted by LIR eligibility");
         let sig_info = info.methods[method].clone();
@@ -8921,10 +8915,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .load(types::I64, MemFlagsData::new(), vtable, (slot * 8) as i32);
 
         // The frame was installed before receiver validation and remains active
-        // through arguments, matching the AST instance-method path.
+        // through arguments, as it is for a direct instance-method call.
         self.emit_push_root(obj);
-        // `emit_interface_dispatch` on the AST path names the callee by its
-        // bare method name and records no parameter debug; this mirrors both.
+        // The callee is named by its bare method name, and no parameter debug
+        // is recorded for it.
         let has_reference_args = lir_has_reference_args(Some(&param_modes), args);
         let (arg_vals, arg_roots) = self.emit_lir_args_rooted(
             args,
@@ -9401,10 +9395,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     /// A `BlockingCell<T>` or `BlockingRwCell<T>` accessor (willow-0g8j.2.13).
     ///
-    /// Mirrors the AST path in `emit_builtins.rs`: the operation name comes
-    /// from the RESOLVED intrinsic and the receiver supplies the symbol prefix,
-    /// so a spelling the runtime does not implement becomes a diagnostic rather
-    /// than a link error.
+    /// The operation name comes from the RESOLVED intrinsic and the receiver
+    /// supplies the symbol prefix, so a spelling the runtime does not implement
+    /// becomes a diagnostic rather than a link error.
     ///
     /// The ABI is word-based, so the stored value is coerced into a word on the
     /// way in and back out of one on the way out — that is the whole difference

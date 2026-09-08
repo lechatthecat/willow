@@ -25,8 +25,10 @@ use std::collections::HashMap;
 
 use crate::diagnostics::{Diagnostic, ErrorCode, Severity, Span};
 use crate::parser::ast::{
-    BinOp, Block, CallArg, CallArgMode, DeferBody, Expr, ExprId, FunctionDecl, Item, MethodDecl,
-    PatternId, Program, SelectCaseKind, Stmt, Type, UnaryOp,
+    AwaitExpr, BinOp, BinaryExpr, Block, CallArg, CallArgMode, CallExpr, DeferBody, Expr, ExprId,
+    FunctionDecl, Item, LambdaExpr, MethodCallExpr, MethodDecl, NewExpr, ObjectLiteralExpr,
+    PatternId, Program, RangeExpr, SelectCaseKind, SelectExpr, StaticCallExpr, StaticFieldExpr,
+    Stmt, TernaryExpr, Type, UnaryExpr, UnaryOp,
 };
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::symbols;
@@ -34,8 +36,8 @@ use crate::semantic::type_checker::LambdaCapture;
 use crate::semantic::type_checker::types::await_output_type;
 
 use super::typed_ast::{
-    HirCapture, HirClass, HirDeferBody, HirExpr, HirExprKind, HirFunction, HirMatchArm, HirParam,
-    HirPattern, HirProgram, HirSelectCase, HirSelectCaseKind, HirStmt,
+    HirCapture, HirClass, HirDeferBody, HirDeferId, HirExpr, HirExprKind, HirFunction, HirMatchArm,
+    HirParam, HirPattern, HirProgram, HirSelectCase, HirSelectCaseKind, HirStmt,
 };
 
 /// Type-checker side tables the lowering can consume to close gaps the
@@ -315,6 +317,32 @@ pub fn lower_program_with(
                     match lower_method(m, &c.name, &fn_returns, &classes, &enums, tables) {
                         Ok(func) => methods.push(func),
                         Err(d) => diagnostics.push(d),
+                    }
+                }
+                for field in c.fields.iter().filter(|field| field.is_static) {
+                    if let Some(init) = &field.initializer {
+                        let mut ctx = LowerCtx::new(&fn_returns, &classes, &enums, tables);
+                        match lower_expr(init, &mut ctx) {
+                            Ok(mut value) => {
+                                let return_type = ctx.normalize(&field.ty);
+                                retype_array_literal(&mut value, &return_type);
+                                functions.push(HirFunction {
+                                    name: super::typed_ast::static_initializer_name(
+                                        &c.name,
+                                        &field.name,
+                                    ),
+                                    is_async: false,
+                                    params: Vec::new(),
+                                    return_type,
+                                    body: vec![HirStmt::Return {
+                                        value: Some(value),
+                                        span: init.span(),
+                                    }],
+                                    span: init.span(),
+                                });
+                            }
+                            Err(diagnostic) => diagnostics.push(diagnostic),
+                        }
                     }
                 }
                 hir_classes.push(HirClass {
@@ -636,6 +664,7 @@ struct LowerCtx<'a> {
     /// Not popped with a scope: the suffix has to be unique across the whole
     /// function, not only across the scopes currently open.
     binds_seen: HashMap<String, usize>,
+    next_defer_id: u32,
     fn_returns: &'a HashMap<String, Type>,
     classes: &'a Classes,
     enums: &'a Enums,
@@ -653,6 +682,7 @@ impl<'a> LowerCtx<'a> {
             scopes: vec![HashMap::new()],
             namespace_scope_base: 1,
             binds_seen: HashMap::new(),
+            next_defer_id: 0,
             fn_returns,
             classes,
             enums,
@@ -806,11 +836,20 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
         // recover()` sees the same bindings the registering scope did; a block
         // body gets its own scope, exactly as `lower_block` gives any block.
         Stmt::Defer(d) => {
+            let id = HirDeferId(ctx.next_defer_id);
+            ctx.next_defer_id = ctx
+                .next_defer_id
+                .checked_add(1)
+                .expect("too many defer sites");
             let body = match &d.body {
                 DeferBody::Expr(expr) => HirDeferBody::Expr(lower_expr(expr, ctx)?),
                 DeferBody::Block(block) => HirDeferBody::Block(lower_block(block, ctx)?),
             };
-            Ok(HirStmt::Defer { body, span: d.span })
+            Ok(HirStmt::Defer {
+                id,
+                body,
+                span: d.span,
+            })
         }
         // HIR needs explicit acquire/cleanup edges for a critical section, which
         // arrive with the backend lowering (willow-38w.1.3). Until then the
@@ -936,614 +975,713 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
         Expr::Float(f, span, _) => Ok(lit(HirExprKind::Float(*f), Type::F64, *span)),
         Expr::Bool(b, span, _) => Ok(lit(HirExprKind::Bool(*b), Type::Bool, *span)),
         Expr::String(s, span, _) => Ok(lit(HirExprKind::Str(s.clone()), Type::String, *span)),
-        Expr::Var(name, span, _) => {
-            if let Some(binding) = ctx.lookup(name) {
-                return Ok(HirExpr {
-                    kind: HirExprKind::Var(binding.hir_name.clone()),
-                    ty: binding.ty.clone(),
-                    span: *span,
-                });
-            }
-            // A bare fieldless unqualified variant (`None`, `Halt`) parses as a
-            // variable; the checker resolves it against the expected enum and
-            // records both the enum and the expression type.
-            if let Some(enum_name) = ctx.tables.enum_variant_resolution(&expr.id()) {
-                let ty = ctx
-                    .tables
-                    .expr_type(&expr.id())
-                    .unwrap_or_else(|| Type::Named(enum_name.clone()));
-                return Ok(HirExpr {
-                    kind: HirExprKind::StaticField {
-                        class: enum_name.clone(),
-                        field: name.clone(),
-                    },
-                    ty,
-                    span: *span,
-                });
-            }
-            // A named top-level function used as a value (`apply(10, double)`,
-            // willow-0g8j.2.2). The checker types the bare identifier as the
-            // function's `fn(...) -> ...`; taking that from the checker rather
-            // than rebuilding it keeps the parameter modes and the return type
-            // exactly what the call site was checked against.
-            if ctx.fn_returns.contains_key(name)
-                && let Some(ty @ Type::Fn(..)) = ctx.tables.expr_type(&expr.id())
-            {
-                return Ok(HirExpr {
-                    kind: HirExprKind::FnRef(name.clone()),
-                    ty,
-                    span: *span,
-                });
-            }
-            Err(internal(
-                *span,
-                format!("unbound variable `{name}` reached HIR lowering"),
-            ))
-        }
-        Expr::Binary(b) => {
-            let lhs = lower_expr(&b.lhs, ctx)?;
-            let rhs = lower_expr(&b.rhs, ctx)?;
-            let ty = binary_result_type(&b.op, &lhs.ty);
-            Ok(HirExpr {
-                kind: HirExprKind::Binary {
-                    op: b.op.clone(),
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                },
-                ty,
-                span: b.span,
-            })
-        }
-        Expr::Unary(u) => {
-            let operand = lower_expr(&u.expr, ctx)?;
-            let ty = match u.op {
-                UnaryOp::Neg => operand.ty.clone(),
-                UnaryOp::Not => Type::Bool,
-            };
-            Ok(HirExpr {
-                kind: HirExprKind::Unary {
-                    op: u.op.clone(),
-                    operand: Box::new(operand),
-                },
-                ty,
-                span: u.span,
-            })
-        }
-        Expr::Call(c) => {
-            let args = lower_value_args(&c.args, ctx)?;
-            // An unqualified enum-variant construction (`Ok(42)` in an
-            // expected-enum position) parses as a call; the checker records
-            // which enum it resolved to (willow-60o.1).
-            if let Some(enum_name) = ctx.tables.enum_variant_resolution(&c.id) {
-                // Prefer the checker's recorded type (it carries generic type
-                // arguments, e.g. `Result<i64, String>` for `Ok(42)`).
-                let ty = match ctx.tables.expr_type(&c.id) {
-                    Some(ty) => ty,
-                    None => enum_variant_construction_type(ctx.enums, enum_name, &args, c.span)?,
-                };
-                return Ok(HirExpr {
-                    kind: HirExprKind::StaticCall {
-                        class: enum_name.clone(),
-                        method: c.callee.clone(),
-                        args,
-                    },
-                    ty,
-                    span: c.span,
-                });
-            }
-            // A local fn-typed variable shadows a free function; its call is an
-            // indirect call typed by the variable's `fn(..) -> R`, and it is
-            // named by the binding's HIR name (willow-0g8j.2.10).
-            let indirect = ctx.lookup(&c.callee).and_then(|b| match &b.ty {
-                Type::Fn(_, ret) => Some((b.hir_name.clone(), (**ret).clone())),
-                _ => None,
-            });
-            let callee = match &indirect {
-                Some((name, _)) => name.clone(),
-                None => c.callee.clone(),
-            };
-            let ty = indirect
-                .map(|(_, ret)| ret)
-                .or_else(|| ctx.fn_returns.get(&c.callee).cloned())
-                // A function bound by an ITEM import (`import calc::add;`) is a
-                // plain unqualified call in this file, but it is not one of the
-                // program's own items, so `fn_returns` has never heard of it
-                // (willow-28h8). The checker did resolve the import and typed
-                // the call, so its type is what makes the call lowerable at
-                // all. The back end binds this same local name to the mangled
-                // symbol of the module THIS unit imported, rebinding it before
-                // each unit's bodies, so the call the type came from is the
-                // call that gets emitted (willow-28h8).
-                .or_else(|| ctx.tables.expr_type(&c.id))
-                .ok_or_else(|| {
-                    internal(
-                        c.span,
-                        format!(
-                            "call to unknown function `{}` reached HIR lowering",
-                            c.callee
-                        ),
-                    )
-                })?;
-            Ok(HirExpr {
-                kind: HirExprKind::Call { callee, args },
-                ty,
-                span: c.span,
-            })
-        }
-        Expr::Print(inner, newline, span, _) => {
-            let value = lower_expr(inner, ctx)?;
-            Ok(HirExpr {
-                kind: HirExprKind::Print {
-                    value: Box::new(value),
-                    newline: *newline,
-                },
-                ty: Type::Void,
-                span: *span,
-            })
-        }
+        Expr::Var(name, span, _) => lower_var_expr(expr, name, *span, ctx),
+        Expr::Binary(b) => lower_binary_expr(b, ctx),
+        Expr::Unary(u) => lower_unary_expr(u, ctx),
+        Expr::Call(c) => lower_call_expr(c, ctx),
+        Expr::Print(inner, newline, span, _) => lower_print_expr(inner, *newline, *span, ctx),
         Expr::ArrayLiteral(elements, span, _) => {
-            let mut lowered = Vec::with_capacity(elements.len());
-            for element in elements {
-                lowered.push(lower_expr(element, ctx)?);
-            }
-            // A non-empty literal is typed by its first element, exactly as
-            // before; `retype_array_literal` then widens it to an annotated
-            // slot's element type where there is one.
-            //
-            // An empty literal has no element to infer from, so its type comes
-            // from the checker, which typed it against the slot it was written
-            // into (willow-0g8j.2.10). A literal the checker recorded nothing
-            // for — or recorded a non-array for — leaves the element type
-            // genuinely unknown, and the function falls back rather than the
-            // lowering picking one.
-            let ty = match lowered.first() {
-                Some(first) => Type::Array(Box::new(first.ty.clone())),
-                None => match ctx.tables.expr_type(&expr.id()) {
-                    Some(recorded @ Type::Array(_)) => recorded,
-                    _ => {
-                        return Err(unsupported(
-                            *span,
-                            "empty array literal with no recorded element type",
-                        ));
-                    }
-                },
-            };
-            Ok(HirExpr {
-                kind: HirExprKind::Array { elements: lowered },
-                ty,
-                span: *span,
-            })
+            lower_array_literal_expr(expr, elements, *span, ctx)
         }
-        Expr::Index(array, index, span, _) => {
-            let array = lower_expr(array, ctx)?;
-            let index = lower_expr(index, ctx)?;
-            // A `FrozenArray<T>` is the same runtime handle as the `Array<T>` it
-            // was frozen from, and `arr[i]` reads it the same way, so both lower
-            // to one `Index` node (willow-0g8j.7). `Range<i64>` also spells a
-            // read this way but is not a handle at all, so it stays unsupported.
-            let element = match &array.ty {
-                Type::Array(element) => (**element).clone(),
-                ty => match builtin_types::unary_arg(ty, B::FrozenArray) {
-                    Some(element) => element.clone(),
-                    None => return Err(unsupported(*span, "index of a non-array value")),
-                },
-            };
-            let ty = element;
-            Ok(HirExpr {
-                kind: HirExprKind::Index {
-                    array: Box::new(array),
-                    index: Box::new(index),
-                },
-                ty,
-                span: *span,
-            })
-        }
-        Expr::Ternary(t) => {
-            let condition = lower_expr(&t.condition, ctx)?;
-            let then_expr = lower_expr(&t.then_expr, ctx)?;
-            let else_expr = lower_expr(&t.else_expr, ctx)?;
-            // Both arms share a type (the checker enforces it); use the `then`
-            // arm's resolved type as the ternary's type.
-            let ty = then_expr.ty.clone();
-            Ok(HirExpr {
-                kind: HirExprKind::Ternary {
-                    condition: Box::new(condition),
-                    then_expr: Box::new(then_expr),
-                    else_expr: Box::new(else_expr),
-                },
-                ty,
-                span: t.span,
-            })
-        }
-        Expr::New(n) => {
-            let args = lower_value_args(&n.args, ctx)?;
-            Ok(HirExpr {
-                kind: HirExprKind::New {
-                    class: n.class_name.clone(),
-                    args,
-                },
-                ty: Type::Named(n.class_name.clone()),
-                span: n.span,
-            })
-        }
+        Expr::Index(array, index, span, _) => lower_index_expr(array, index, *span, ctx),
+        Expr::Ternary(t) => lower_ternary_expr(t, ctx),
+        Expr::New(n) => lower_new_expr(n, ctx),
         Expr::FieldAccess(object, field, span, _) => {
-            let object = lower_expr(object, ctx)?;
-            let ty = {
-                match class_name_of(&object.ty)
-                    .and_then(|class| ctx.classes.field_type(class, field))
-                {
-                    Some(ty) => ty,
-                    None => ctx
-                        .tables
-                        .expr_type(&expr.id())
-                        .ok_or_else(|| unsupported(*span, "field not found on receiver"))?,
-                }
-            };
-            Ok(HirExpr {
-                kind: HirExprKind::FieldAccess {
-                    object: Box::new(object),
-                    field: field.clone(),
-                },
-                ty,
-                span: *span,
-            })
+            lower_field_access_expr(expr, object, field, *span, ctx)
         }
-        Expr::MethodCall(m) => {
-            let object = lower_expr(&m.object, ctx)?;
-            let ty = if let Some(ty) = builtin_method_type(&object.ty, &m.method) {
-                ty
-            } else if let Some(ty) = class_name_of(&object.ty)
-                .and_then(|class| ctx.classes.method_type(class, &m.method))
-            {
-                ty
-            } else {
-                // Checker authority: interface methods, generic receivers,
-                // Option/Result methods, and anything else it typed.
-                ctx.tables
-                    .expr_type(&m.id)
-                    .ok_or_else(|| unsupported(m.span, "method not found on receiver"))?
-            };
-            let args = lower_value_args(&m.args, ctx)?;
-            Ok(HirExpr {
-                kind: HirExprKind::MethodCall {
-                    object: Box::new(object),
-                    method: m.method.clone(),
-                    args,
-                },
-                ty,
-                span: m.span,
-            })
-        }
-        Expr::ObjectLiteral(o) => {
-            let mut fields = Vec::with_capacity(o.fields.len());
-            for f in &o.fields {
-                fields.push((f.name.clone(), lower_expr(&f.value, ctx)?));
+        Expr::MethodCall(m) => lower_method_call_expr(m, ctx),
+        Expr::ObjectLiteral(o) => lower_object_literal_expr(o, ctx),
+        Expr::StaticField(s) => lower_static_field_expr(s, ctx),
+        Expr::StaticCall(s) => lower_static_call_expr(s, ctx),
+        Expr::Range(r) => lower_range_expr(r, ctx),
+        Expr::Select(select) => lower_select_expr(select, ctx),
+        Expr::Await(a) => lower_await_expr(a, ctx),
+        Expr::TryPropagate(inner, span, _) => lower_try_propagate_expr(inner, *span, ctx),
+        Expr::Lambda(l) => lower_lambda_expr(l, ctx),
+        Expr::Match(m) => lower_match(m, ctx),
+    }
+}
+
+/// Each non-trivial arm of [`lower_expr_inner`] lives in its own function so a
+/// nested expression costs one SMALL frame per level instead of one frame
+/// holding every arm's locals at once: a debug build gives the match's frame
+/// room for all of them, which cost ~63KB per level and overflowed a 2MiB
+/// thread at around 30 levels of nesting (willow-t0uy.1). `inline(never)` keeps
+/// that true in release builds, where the arms would otherwise be folded back
+/// into one frame.
+#[inline(never)]
+fn lower_var_expr(
+    expr: &Expr,
+    name: &str,
+    span: Span,
+    ctx: &mut LowerCtx,
+) -> Result<HirExpr, Diagnostic> {
+    if let Some(binding) = ctx.lookup(name) {
+        return Ok(HirExpr {
+            kind: HirExprKind::Var(binding.hir_name.to_string()),
+            ty: binding.ty.clone(),
+            span,
+        });
+    }
+    // A bare fieldless unqualified variant (`None`, `Halt`) parses as a
+    // variable; the checker resolves it against the expected enum and
+    // records both the enum and the expression type.
+    if let Some(enum_name) = ctx.tables.enum_variant_resolution(&expr.id()) {
+        let ty = ctx
+            .tables
+            .expr_type(&expr.id())
+            .unwrap_or_else(|| Type::Named(enum_name.to_string()));
+        return Ok(HirExpr {
+            kind: HirExprKind::StaticField {
+                class: enum_name.to_string(),
+                field: name.to_string(),
+            },
+            ty,
+            span,
+        });
+    }
+    // A named top-level function used as a value (`apply(10, double)`,
+    // willow-0g8j.2.2). The checker types the bare identifier as the
+    // function's `fn(...) -> ...`; taking that from the checker rather
+    // than rebuilding it keeps the parameter modes and the return type
+    // exactly what the call site was checked against.
+    if ctx.fn_returns.contains_key(name)
+        && let Some(ty @ Type::Fn(..)) = ctx.tables.expr_type(&expr.id())
+    {
+        return Ok(HirExpr {
+            kind: HirExprKind::FnRef(name.to_string()),
+            ty,
+            span,
+        });
+    }
+    Err(internal(
+        span,
+        format!("unbound variable `{name}` reached HIR lowering"),
+    ))
+}
+
+#[inline(never)]
+fn lower_binary_expr(b: &BinaryExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+    let lhs = lower_expr(&b.lhs, ctx)?;
+    let rhs = lower_expr(&b.rhs, ctx)?;
+    let ty = binary_result_type(&b.op, &lhs.ty);
+    Ok(HirExpr {
+        kind: HirExprKind::Binary {
+            op: b.op.clone(),
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        },
+        ty,
+        span: b.span,
+    })
+}
+
+#[inline(never)]
+fn lower_unary_expr(u: &UnaryExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+    let operand = lower_expr(&u.expr, ctx)?;
+    let ty = match u.op {
+        UnaryOp::Neg => operand.ty.clone(),
+        UnaryOp::Not => Type::Bool,
+    };
+    Ok(HirExpr {
+        kind: HirExprKind::Unary {
+            op: u.op.clone(),
+            operand: Box::new(operand),
+        },
+        ty,
+        span: u.span,
+    })
+}
+
+#[inline(never)]
+fn lower_call_expr(c: &CallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+    let args = lower_value_args(&c.args, ctx)?;
+    // An unqualified enum-variant construction (`Ok(42)` in an
+    // expected-enum position) parses as a call; the checker records
+    // which enum it resolved to (willow-60o.1).
+    if let Some(enum_name) = ctx.tables.enum_variant_resolution(&c.id) {
+        // Prefer the checker's recorded type (it carries generic type
+        // arguments, e.g. `Result<i64, String>` for `Ok(42)`).
+        let ty = match ctx.tables.expr_type(&c.id) {
+            Some(ty) => ty,
+            None => enum_variant_construction_type(ctx.enums, enum_name, &args, c.span)?,
+        };
+        return Ok(HirExpr {
+            kind: HirExprKind::StaticCall {
+                class: enum_name.clone(),
+                method: c.callee.clone(),
+                args,
+            },
+            ty,
+            span: c.span,
+        });
+    }
+    // A local fn-typed variable shadows a free function; its call is an
+    // indirect call typed by the variable's `fn(..) -> R`, and it is
+    // named by the binding's HIR name (willow-0g8j.2.10).
+    let indirect = ctx.lookup(&c.callee).and_then(|b| match &b.ty {
+        Type::Fn(_, ret) => Some((b.hir_name.clone(), (**ret).clone())),
+        _ => None,
+    });
+    let callee = match &indirect {
+        Some((name, _)) => name.clone(),
+        None => c.callee.clone(),
+    };
+    let ty = indirect
+        .map(|(_, ret)| ret)
+        .or_else(|| ctx.fn_returns.get(&c.callee).cloned())
+        // A function bound by an ITEM import (`import calc::add;`) is a
+        // plain unqualified call in this file, but it is not one of the
+        // program's own items, so `fn_returns` has never heard of it
+        // (willow-28h8). The checker did resolve the import and typed
+        // the call, so its type is what makes the call lowerable at
+        // all. The back end binds this same local name to the mangled
+        // symbol of the module THIS unit imported, rebinding it before
+        // each unit's bodies, so the call the type came from is the
+        // call that gets emitted (willow-28h8).
+        .or_else(|| ctx.tables.expr_type(&c.id))
+        .ok_or_else(|| {
+            internal(
+                c.span,
+                format!(
+                    "call to unknown function `{}` reached HIR lowering",
+                    c.callee
+                ),
+            )
+        })?;
+    Ok(HirExpr {
+        kind: HirExprKind::Call { callee, args },
+        ty,
+        span: c.span,
+    })
+}
+
+#[inline(never)]
+fn lower_print_expr(
+    inner: &Expr,
+    newline: bool,
+    span: Span,
+    ctx: &mut LowerCtx,
+) -> Result<HirExpr, Diagnostic> {
+    let value = lower_expr(inner, ctx)?;
+    Ok(HirExpr {
+        kind: HirExprKind::Print {
+            value: Box::new(value),
+            newline,
+        },
+        ty: Type::Void,
+        span,
+    })
+}
+
+#[inline(never)]
+fn lower_array_literal_expr(
+    expr: &Expr,
+    elements: &[Expr],
+    span: Span,
+    ctx: &mut LowerCtx,
+) -> Result<HirExpr, Diagnostic> {
+    let mut lowered = Vec::with_capacity(elements.len());
+    for element in elements {
+        lowered.push(lower_expr(element, ctx)?);
+    }
+    // A non-empty literal is typed by its first element, exactly as
+    // before; `retype_array_literal` then widens it to an annotated
+    // slot's element type where there is one.
+    //
+    // An empty literal has no element to infer from, so its type comes
+    // from the checker, which typed it against the slot it was written
+    // into (willow-0g8j.2.10). A literal the checker recorded nothing
+    // for — or recorded a non-array for — leaves the element type
+    // genuinely unknown, and the function falls back rather than the
+    // lowering picking one.
+    let ty = match lowered.first() {
+        Some(first) => Type::Array(Box::new(first.ty.clone())),
+        None => match ctx.tables.expr_type(&expr.id()) {
+            Some(recorded @ Type::Array(_)) => recorded,
+            _ => {
+                return Err(unsupported(
+                    span,
+                    "empty array literal with no recorded element type",
+                ));
             }
-            Ok(HirExpr {
-                kind: HirExprKind::ObjectLiteral {
-                    class: o.class.clone(),
-                    fields,
-                },
-                ty: Type::Named(o.class.clone()),
-                span: o.span,
-            })
+        },
+    };
+    Ok(HirExpr {
+        kind: HirExprKind::Array { elements: lowered },
+        ty,
+        span,
+    })
+}
+
+#[inline(never)]
+fn lower_index_expr(
+    array: &Expr,
+    index: &Expr,
+    span: Span,
+    ctx: &mut LowerCtx,
+) -> Result<HirExpr, Diagnostic> {
+    let array = lower_expr(array, ctx)?;
+    let index = lower_expr(index, ctx)?;
+    // A `FrozenArray<T>` is the same runtime handle as the `Array<T>` it
+    // was frozen from, and `arr[i]` reads it the same way, so both lower
+    // to one `Index` node (willow-0g8j.7). `Range<i64>` also spells a
+    // read this way but is not a handle at all, so it stays unsupported.
+    let element = match &array.ty {
+        Type::Array(element) => (**element).clone(),
+        ty => match builtin_types::unary_arg(ty, B::FrozenArray) {
+            Some(element) => element.clone(),
+            None => return Err(unsupported(span, "index of a non-array value")),
+        },
+    };
+    let ty = element;
+    Ok(HirExpr {
+        kind: HirExprKind::Index {
+            array: Box::new(array),
+            index: Box::new(index),
+        },
+        ty,
+        span,
+    })
+}
+
+#[inline(never)]
+fn lower_ternary_expr(t: &TernaryExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+    let condition = lower_expr(&t.condition, ctx)?;
+    let then_expr = lower_expr(&t.then_expr, ctx)?;
+    let else_expr = lower_expr(&t.else_expr, ctx)?;
+    // Both arms share a type (the checker enforces it); use the `then`
+    // arm's resolved type as the ternary's type.
+    let ty = then_expr.ty.clone();
+    Ok(HirExpr {
+        kind: HirExprKind::Ternary {
+            condition: Box::new(condition),
+            then_expr: Box::new(then_expr),
+            else_expr: Box::new(else_expr),
+        },
+        ty,
+        span: t.span,
+    })
+}
+
+#[inline(never)]
+fn lower_new_expr(n: &NewExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+    let args = lower_value_args(&n.args, ctx)?;
+    Ok(HirExpr {
+        kind: HirExprKind::New {
+            class: n.class_name.clone(),
+            args,
+        },
+        ty: Type::Named(n.class_name.clone()),
+        span: n.span,
+    })
+}
+
+#[inline(never)]
+fn lower_field_access_expr(
+    expr: &Expr,
+    object: &Expr,
+    field: &str,
+    span: Span,
+    ctx: &mut LowerCtx,
+) -> Result<HirExpr, Diagnostic> {
+    let object = lower_expr(object, ctx)?;
+    let ty = {
+        match class_name_of(&object.ty).and_then(|class| ctx.classes.field_type(class, field)) {
+            Some(ty) => ty,
+            None => ctx
+                .tables
+                .expr_type(&expr.id())
+                .ok_or_else(|| unsupported(span, "field not found on receiver"))?,
         }
-        Expr::StaticField(s) => {
-            // `Enum::Variant` (fieldless) parses like a static property read.
-            let variant_ty = enum_variant_value_type(ctx.enums, &s.class, &s.field, true);
-            let ty = variant_ty
-                .or_else(|| ctx.classes.static_field_type(&s.class, &s.field))
-                // Checker authority, exactly as the static-CALL arm below uses
-                // it: `Self::prop` inside a class body names a class the
-                // registry has no entry for, and the checker has already
-                // resolved and typed the read (willow-0g8j.13).
-                .or_else(|| ctx.tables.expr_type(&s.id))
-                .ok_or_else(|| unsupported(s.span, "static property not found"))?;
-            Ok(HirExpr {
-                kind: HirExprKind::StaticField {
-                    class: s.class.clone(),
-                    field: s.field.clone(),
-                },
-                ty,
-                span: s.span,
-            })
-        }
-        Expr::StaticCall(s) => {
-            // `Enum::Variant(args)` construction parses like a static call.
-            let variant_ty = enum_variant_value_type(ctx.enums, &s.class, &s.method, false);
-            let ty = variant_ty
-                .or_else(|| ctx.classes.static_method_type(&s.class, &s.method))
-                // Checker authority: generic-enum construction, `Self::`,
-                // module-qualified statics, constructors.
-                .or_else(|| ctx.tables.expr_type(&s.id))
-                .ok_or_else(|| {
-                    unsupported(
-                        s.span,
-                        "static method not found (and no checker-recorded type)",
-                    )
-                })?;
-            let args = lower_value_args(&s.args, ctx)?;
-            Ok(HirExpr {
-                kind: HirExprKind::StaticCall {
-                    class: ctx.tables.static_call_class(&s.id, &s.class),
-                    method: s.method.clone(),
-                    args,
-                },
-                ty,
-                span: s.span,
-            })
-        }
-        Expr::Range(r) => {
-            let start = lower_expr(&r.start, ctx)?;
-            let end = lower_expr(&r.end, ctx)?;
-            Ok(HirExpr {
-                kind: HirExprKind::Range {
-                    start: Box::new(start),
-                    end: Box::new(end),
-                },
-                ty: Type::Generic("Range".to_string(), vec![Type::I64]),
-                span: r.span,
-            })
-        }
-        Expr::Select(select) => {
-            let mut cases = Vec::with_capacity(select.cases.len());
-            for case in &select.cases {
-                let kind = match &case.kind {
-                    SelectCaseKind::Recv { binding, channel } => {
-                        let channel = lower_expr(channel, ctx)?;
-                        let binding_ty = builtin_types::unary_arg(&channel.ty, B::Channel)
-                            .ok_or_else(|| unsupported(case.span, "select receive channel"))?
-                            .clone();
-                        ctx.push_scope();
-                        let binding = ctx.bind(binding.clone(), binding_ty);
-                        let mut body = Vec::with_capacity(case.body.stmts.len());
-                        for stmt in &case.body.stmts {
-                            body.push(lower_stmt(stmt, ctx)?);
-                        }
-                        ctx.pop_scope();
-                        cases.push(HirSelectCase {
-                            kind: HirSelectCaseKind::Recv { binding, channel },
-                            body,
-                            span: case.span,
-                        });
-                        continue;
-                    }
-                    SelectCaseKind::Send { channel, value } => HirSelectCaseKind::Send {
-                        channel: lower_expr(channel, ctx)?,
-                        value: lower_expr(value, ctx)?,
-                    },
-                    SelectCaseKind::Timeout { millis } => HirSelectCaseKind::Timeout {
-                        millis: lower_expr(millis, ctx)?,
-                    },
-                    SelectCaseKind::Join { binding, task } => {
-                        let task = lower_expr(task, ctx)?;
-                        // What awaiting the operand YIELDS: `T` for `Task<T>`,
-                        // but `Result<T, Cancelled>` for `TaskResult<T>`. Taken
-                        // from the type checker's own definition so the HIR
-                        // binding cannot disagree with what the checker typed
-                        // the case body against.
-                        let binding_ty = await_output_type(&task.ty).ok_or_else(|| {
-                            internal(
-                                task.span,
-                                "select join operand has no checked await output type".to_string(),
-                            )
-                        })?;
-                        ctx.push_scope();
-                        let binding = ctx.bind(binding.clone(), binding_ty);
-                        let mut body = Vec::with_capacity(case.body.stmts.len());
-                        for stmt in &case.body.stmts {
-                            body.push(lower_stmt(stmt, ctx)?);
-                        }
-                        ctx.pop_scope();
-                        cases.push(HirSelectCase {
-                            kind: HirSelectCaseKind::Join { binding, task },
-                            body,
-                            span: case.span,
-                        });
-                        continue;
-                    }
-                    SelectCaseKind::Default => HirSelectCaseKind::Default,
-                };
-                let body = lower_block(&case.body, ctx)?;
+    };
+    Ok(HirExpr {
+        kind: HirExprKind::FieldAccess {
+            object: Box::new(object),
+            field: field.to_string(),
+        },
+        ty,
+        span,
+    })
+}
+
+#[inline(never)]
+fn lower_method_call_expr(m: &MethodCallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+    let object = lower_expr(&m.object, ctx)?;
+    let ty = if let Some(ty) = builtin_method_type(&object.ty, &m.method) {
+        ty
+    } else if let Some(ty) =
+        class_name_of(&object.ty).and_then(|class| ctx.classes.method_type(class, &m.method))
+    {
+        ty
+    } else {
+        // Checker authority: interface methods, generic receivers,
+        // Option/Result methods, and anything else it typed.
+        ctx.tables
+            .expr_type(&m.id)
+            .ok_or_else(|| unsupported(m.span, "method not found on receiver"))?
+    };
+    let args = lower_value_args(&m.args, ctx)?;
+    Ok(HirExpr {
+        kind: HirExprKind::MethodCall {
+            object: Box::new(object),
+            method: m.method.clone(),
+            args,
+        },
+        ty,
+        span: m.span,
+    })
+}
+
+#[inline(never)]
+fn lower_object_literal_expr(
+    o: &ObjectLiteralExpr,
+    ctx: &mut LowerCtx,
+) -> Result<HirExpr, Diagnostic> {
+    let mut fields = Vec::with_capacity(o.fields.len());
+    for f in &o.fields {
+        fields.push((f.name.clone(), lower_expr(&f.value, ctx)?));
+    }
+    Ok(HirExpr {
+        kind: HirExprKind::ObjectLiteral {
+            class: o.class.clone(),
+            fields,
+        },
+        ty: Type::Named(o.class.clone()),
+        span: o.span,
+    })
+}
+
+#[inline(never)]
+fn lower_static_field_expr(s: &StaticFieldExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+    // `Enum::Variant` (fieldless) parses like a static property read.
+    let variant_ty = enum_variant_value_type(ctx.enums, &s.class, &s.field, true);
+    let ty = variant_ty
+        .or_else(|| ctx.classes.static_field_type(&s.class, &s.field))
+        // Checker authority, exactly as the static-CALL arm below uses
+        // it: `Self::prop` inside a class body names a class the
+        // registry has no entry for, and the checker has already
+        // resolved and typed the read (willow-0g8j.13).
+        .or_else(|| ctx.tables.expr_type(&s.id))
+        .ok_or_else(|| unsupported(s.span, "static property not found"))?;
+    Ok(HirExpr {
+        kind: HirExprKind::StaticField {
+            class: s.class.clone(),
+            field: s.field.clone(),
+        },
+        ty,
+        span: s.span,
+    })
+}
+
+#[inline(never)]
+fn lower_static_call_expr(s: &StaticCallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+    // `Enum::Variant(args)` construction parses like a static call.
+    let variant_ty = enum_variant_value_type(ctx.enums, &s.class, &s.method, false);
+    let ty = variant_ty
+        .or_else(|| ctx.classes.static_method_type(&s.class, &s.method))
+        // Checker authority: generic-enum construction, `Self::`,
+        // module-qualified statics, constructors.
+        .or_else(|| ctx.tables.expr_type(&s.id))
+        .ok_or_else(|| {
+            unsupported(
+                s.span,
+                "static method not found (and no checker-recorded type)",
+            )
+        })?;
+    let args = lower_value_args(&s.args, ctx)?;
+    Ok(HirExpr {
+        kind: HirExprKind::StaticCall {
+            class: ctx.tables.static_call_class(&s.id, &s.class),
+            method: s.method.clone(),
+            args,
+        },
+        ty,
+        span: s.span,
+    })
+}
+
+#[inline(never)]
+fn lower_range_expr(r: &RangeExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+    let start = lower_expr(&r.start, ctx)?;
+    let end = lower_expr(&r.end, ctx)?;
+    Ok(HirExpr {
+        kind: HirExprKind::Range {
+            start: Box::new(start),
+            end: Box::new(end),
+        },
+        ty: Type::Generic("Range".to_string(), vec![Type::I64]),
+        span: r.span,
+    })
+}
+
+#[inline(never)]
+fn lower_select_expr(select: &SelectExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+    let mut cases = Vec::with_capacity(select.cases.len());
+    for case in &select.cases {
+        let kind = match &case.kind {
+            SelectCaseKind::Recv { binding, channel } => {
+                let channel = lower_expr(channel, ctx)?;
+                let binding_ty = builtin_types::unary_arg(&channel.ty, B::Channel)
+                    .ok_or_else(|| unsupported(case.span, "select receive channel"))?
+                    .clone();
+                ctx.push_scope();
+                let binding = ctx.bind(binding.clone(), binding_ty);
+                let mut body = Vec::with_capacity(case.body.stmts.len());
+                for stmt in &case.body.stmts {
+                    body.push(lower_stmt(stmt, ctx)?);
+                }
+                ctx.pop_scope();
                 cases.push(HirSelectCase {
-                    kind,
+                    kind: HirSelectCaseKind::Recv { binding, channel },
                     body,
                     span: case.span,
                 });
+                continue;
             }
-            Ok(HirExpr {
-                kind: HirExprKind::Select { cases },
-                ty: Type::Void,
-                span: select.span,
-            })
-        }
-        Expr::Await(a) => {
-            let inner = lower_expr(&a.expr, ctx)?;
-            let resolved = builtin_types::resolve(&inner.ty)
-                .filter(|resolved| resolved.args.len() == 1)
-                .ok_or_else(|| unsupported(a.span, "await of a non-Task/Future value"))?;
-            let ty = match resolved.id {
-                B::Task | B::Future | B::JoinHandle => resolved.args[0].clone(),
-                // `await task.result()` yields `Result<T, Cancelled>`.
-                B::TaskResult => {
-                    B::Result.apply(vec![resolved.args[0].clone(), B::Cancelled.apply(vec![])])
-                }
-                _ => return Err(unsupported(a.span, "await of a non-Task/Future value")),
-            };
-            Ok(HirExpr {
-                kind: HirExprKind::Await {
-                    inner: Box::new(inner),
-                },
-                ty,
-                span: a.span,
-            })
-        }
-        Expr::TryPropagate(inner, span, _) => {
-            let inner = lower_expr(inner, ctx)?;
-            let ty = builtin_types::resolve(&inner.ty)
-                .filter(|resolved| matches!(resolved.id, B::Result | B::Option))
-                .and_then(|resolved| resolved.args.first().cloned())
-                .ok_or_else(|| unsupported(*span, "`?` on a non-Result/Option value"))?;
-            Ok(HirExpr {
-                kind: HirExprKind::TryPropagate {
-                    inner: Box::new(inner),
-                },
-                ty,
-                span: *span,
-            })
-        }
-        Expr::Lambda(l) => {
-            // The checker's inferred full `fn(...) -> ...` type fills in what
-            // the AST cannot store: unannotated parameter types and, for
-            // block-bodied lambdas, the inferred return type.
-            let inferred = match ctx.tables.lambda_fn_type(&l.id) {
-                Some(Type::Fn(params, ret) | Type::Closure(params, ret)) => {
-                    Some((params.clone(), (**ret).clone()))
-                }
-                _ => None,
-            };
-            let is_closure = matches!(ctx.tables.lambda_fn_type(&l.id), Some(Type::Closure(..)));
-            // Resolve every capture in the ENCLOSING namespace first: after the
-            // scope below, `n` means the lambda's own copy (willow-0g8j.2.12).
-            let capture_sources: Vec<(String, String, Type)> = ctx
-                .tables
-                .lambda_captures(&l.id)
-                .iter()
-                .map(|c| {
-                    (
-                        c.name.clone(),
-                        ctx.hir_name(&c.name),
-                        ctx.tables.normalize(&c.ty),
+            SelectCaseKind::Send { channel, value } => HirSelectCaseKind::Send {
+                channel: lower_expr(channel, ctx)?,
+                value: lower_expr(value, ctx)?,
+            },
+            SelectCaseKind::Timeout { millis } => HirSelectCaseKind::Timeout {
+                millis: lower_expr(millis, ctx)?,
+            },
+            SelectCaseKind::Join { binding, task } => {
+                let task = lower_expr(task, ctx)?;
+                // What awaiting the operand YIELDS: `T` for `Task<T>`,
+                // but `Result<T, Cancelled>` for `TaskResult<T>`. Taken
+                // from the type checker's own definition so the HIR
+                // binding cannot disagree with what the checker typed
+                // the case body against.
+                let binding_ty = await_output_type(&task.ty).ok_or_else(|| {
+                    internal(
+                        task.span,
+                        "select join operand has no checked await output type".to_string(),
                     )
-                })
-                .collect();
-            let mut params = Vec::with_capacity(l.params.len());
-            let mut param_tys = Vec::with_capacity(l.params.len());
-            ctx.push_scope();
-            // A lambda body is lifted into a LirFunction of its own, so its
-            // flat namespace is its own too and the shadow suffixes restart
-            // here (willow-0g8j.2.10). Without this a lambda parameter could
-            // arrive renamed after an unrelated binding of the same name in the
-            // enclosing function — and the backend, which binds the lifted
-            // parameters by their source names, would never bind it.
-            let outer_binds = std::mem::take(&mut ctx.binds_seen);
-            let outer_namespace_scope_base = ctx.namespace_scope_base;
-            ctx.namespace_scope_base = ctx.scopes.len();
-            // Bind the captures BEFORE anything else in the lambda's fresh
-            // namespace. They are the first names it sees, so a body-local
-            // rebinding of a captured name gets the shadow suffix and the two
-            // stay distinct locals in the lifted function.
-            let captures: Vec<HirCapture> = capture_sources
-                .into_iter()
-                .map(|(source_name, source, ty)| HirCapture {
-                    name: ctx.bind(source_name, ty.clone()),
-                    source,
-                    ty,
-                })
-                .collect();
-            for (i, p) in l.params.iter().enumerate() {
-                let inferred_param = inferred
-                    .as_ref()
-                    .and_then(|(params, _)| params.get(i).cloned());
-                let Some(ty) = p.ty.as_ref().map(|ty| ctx.normalize(ty)).or(inferred_param) else {
-                    ctx.pop_scope();
-                    ctx.binds_seen = outer_binds;
-                    ctx.namespace_scope_base = outer_namespace_scope_base;
-                    return Err(unsupported(p.span, "unannotated lambda parameter"));
-                };
-                let name = ctx.bind(p.name.clone(), ty.clone());
-                param_tys.push(ty.clone());
-                params.push(HirParam {
-                    name,
-                    ty,
-                    by_reference: false,
-                    span: p.span,
+                })?;
+                ctx.push_scope();
+                let binding = ctx.bind(binding.clone(), binding_ty);
+                let mut body = Vec::with_capacity(case.body.stmts.len());
+                for stmt in &case.body.stmts {
+                    body.push(lower_stmt(stmt, ctx)?);
+                }
+                ctx.pop_scope();
+                cases.push(HirSelectCase {
+                    kind: HirSelectCaseKind::Join { binding, task },
+                    body,
+                    span: case.span,
                 });
+                continue;
             }
-            let inferred_ret = inferred.map(|(_, ret)| ret);
-            let (body, ret) = match &l.body {
-                crate::parser::ast::LambdaBody::Expr(e) => {
-                    let value = match lower_expr(e, ctx) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            ctx.pop_scope();
-                            ctx.binds_seen = outer_binds;
-                            ctx.namespace_scope_base = outer_namespace_scope_base;
-                            return Err(err);
-                        }
-                    };
-                    let ret = l
-                        .return_type
-                        .as_ref()
-                        .map(|ty| ctx.normalize(ty))
-                        .or(inferred_ret)
-                        .unwrap_or_else(|| value.ty.clone());
-                    let span = value.span;
-                    // A `void` body has no value to return: `|s| println(s)` is
-                    // a statement, and returning its non-existent value would
-                    // build a `return` against a signature with no result slot
-                    // (willow-0g8j.2.2).
-                    let body = if matches!(ret, Type::Void) {
-                        vec![HirStmt::Expr(value), HirStmt::Return { value: None, span }]
-                    } else {
-                        vec![HirStmt::Return {
-                            value: Some(value),
-                            span,
-                        }]
-                    };
-                    (body, ret)
-                }
-                crate::parser::ast::LambdaBody::Block(block) => {
-                    let Some(ret) = l
-                        .return_type
-                        .as_ref()
-                        .map(|ty| ctx.normalize(ty))
-                        .or(inferred_ret)
-                    else {
-                        ctx.pop_scope();
-                        ctx.binds_seen = outer_binds;
-                        ctx.namespace_scope_base = outer_namespace_scope_base;
-                        return Err(unsupported(
-                            l.span,
-                            "block-bodied lambda without a return type annotation",
-                        ));
-                    };
-                    let block = lower_block(block, ctx);
-                    match block {
-                        Ok(block) => (block, ret),
-                        Err(err) => {
-                            ctx.pop_scope();
-                            ctx.binds_seen = outer_binds;
-                            ctx.namespace_scope_base = outer_namespace_scope_base;
-                            return Err(err);
-                        }
-                    }
-                }
-            };
+            SelectCaseKind::Default => HirSelectCaseKind::Default,
+        };
+        let body = lower_block(&case.body, ctx)?;
+        cases.push(HirSelectCase {
+            kind,
+            body,
+            span: case.span,
+        });
+    }
+    Ok(HirExpr {
+        kind: HirExprKind::Select { cases },
+        ty: Type::Void,
+        span: select.span,
+    })
+}
+
+#[inline(never)]
+fn lower_await_expr(a: &AwaitExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+    let inner = lower_expr(&a.expr, ctx)?;
+    let resolved = builtin_types::resolve(&inner.ty)
+        .filter(|resolved| resolved.args.len() == 1)
+        .ok_or_else(|| unsupported(a.span, "await of a non-Task/Future value"))?;
+    let ty = match resolved.id {
+        B::Task | B::Future | B::JoinHandle => resolved.args[0].clone(),
+        // `await task.result()` yields `Result<T, Cancelled>`.
+        B::TaskResult => {
+            B::Result.apply(vec![resolved.args[0].clone(), B::Cancelled.apply(vec![])])
+        }
+        _ => return Err(unsupported(a.span, "await of a non-Task/Future value")),
+    };
+    Ok(HirExpr {
+        kind: HirExprKind::Await {
+            inner: Box::new(inner),
+        },
+        ty,
+        span: a.span,
+    })
+}
+
+#[inline(never)]
+fn lower_try_propagate_expr(
+    inner: &Expr,
+    span: Span,
+    ctx: &mut LowerCtx,
+) -> Result<HirExpr, Diagnostic> {
+    let inner = lower_expr(inner, ctx)?;
+    let ty = builtin_types::resolve(&inner.ty)
+        .filter(|resolved| matches!(resolved.id, B::Result | B::Option))
+        .and_then(|resolved| resolved.args.first().cloned())
+        .ok_or_else(|| unsupported(span, "`?` on a non-Result/Option value"))?;
+    Ok(HirExpr {
+        kind: HirExprKind::TryPropagate {
+            inner: Box::new(inner),
+        },
+        ty,
+        span,
+    })
+}
+
+#[inline(never)]
+fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+    // The checker's inferred full `fn(...) -> ...` type fills in what
+    // the AST cannot store: unannotated parameter types and, for
+    // block-bodied lambdas, the inferred return type.
+    let inferred = match ctx.tables.lambda_fn_type(&l.id) {
+        Some(Type::Fn(params, ret) | Type::Closure(params, ret)) => {
+            Some((params.clone(), (**ret).clone()))
+        }
+        _ => None,
+    };
+    let is_closure = matches!(ctx.tables.lambda_fn_type(&l.id), Some(Type::Closure(..)));
+    // Resolve every capture in the ENCLOSING namespace first: after the
+    // scope below, `n` means the lambda's own copy (willow-0g8j.2.12).
+    let capture_sources: Vec<(String, String, Type)> = ctx
+        .tables
+        .lambda_captures(&l.id)
+        .iter()
+        .map(|c| {
+            (
+                c.name.clone(),
+                ctx.hir_name(&c.name),
+                ctx.tables.normalize(&c.ty),
+            )
+        })
+        .collect();
+    let mut params = Vec::with_capacity(l.params.len());
+    let mut param_tys = Vec::with_capacity(l.params.len());
+    ctx.push_scope();
+    // A lambda body is lifted into a LirFunction of its own, so its
+    // flat namespace is its own too and the shadow suffixes restart
+    // here (willow-0g8j.2.10). Without this a lambda parameter could
+    // arrive renamed after an unrelated binding of the same name in the
+    // enclosing function — and the backend, which binds the lifted
+    // parameters by their source names, would never bind it.
+    let outer_binds = std::mem::take(&mut ctx.binds_seen);
+    let outer_namespace_scope_base = ctx.namespace_scope_base;
+    ctx.namespace_scope_base = ctx.scopes.len();
+    // Bind the captures BEFORE anything else in the lambda's fresh
+    // namespace. They are the first names it sees, so a body-local
+    // rebinding of a captured name gets the shadow suffix and the two
+    // stay distinct locals in the lifted function.
+    let captures: Vec<HirCapture> = capture_sources
+        .into_iter()
+        .map(|(source_name, source, ty)| HirCapture {
+            name: ctx.bind(source_name, ty.clone()),
+            source,
+            ty,
+        })
+        .collect();
+    for (i, p) in l.params.iter().enumerate() {
+        let inferred_param = inferred
+            .as_ref()
+            .and_then(|(params, _)| params.get(i).cloned());
+        let Some(ty) = p.ty.as_ref().map(|ty| ctx.normalize(ty)).or(inferred_param) else {
             ctx.pop_scope();
             ctx.binds_seen = outer_binds;
             ctx.namespace_scope_base = outer_namespace_scope_base;
-            // A capture-free lambda that a `closure(...)` slot expects is a
-            // closure too: the slot decides the calling convention, so the
-            // lifted body still takes the (empty) environment.
-            let ty = if is_closure {
-                Type::Closure(param_tys, Box::new(ret))
-            } else {
-                Type::Fn(param_tys, Box::new(ret))
-            };
-            Ok(HirExpr {
-                kind: HirExprKind::Lambda {
-                    id: l.id,
-                    params,
-                    captures,
-                    body,
-                },
-                ty,
-                span: l.span,
-            })
-        }
-        Expr::Match(m) => lower_match(m, ctx),
+            return Err(unsupported(p.span, "unannotated lambda parameter"));
+        };
+        let name = ctx.bind(p.name.clone(), ty.clone());
+        param_tys.push(ty.clone());
+        params.push(HirParam {
+            name,
+            ty,
+            by_reference: false,
+            span: p.span,
+        });
     }
+    let inferred_ret = inferred.map(|(_, ret)| ret);
+    let (body, ret) = match &l.body {
+        crate::parser::ast::LambdaBody::Expr(e) => {
+            let value = match lower_expr(e, ctx) {
+                Ok(value) => value,
+                Err(err) => {
+                    ctx.pop_scope();
+                    ctx.binds_seen = outer_binds;
+                    ctx.namespace_scope_base = outer_namespace_scope_base;
+                    return Err(err);
+                }
+            };
+            let ret = l
+                .return_type
+                .as_ref()
+                .map(|ty| ctx.normalize(ty))
+                .or(inferred_ret)
+                .unwrap_or_else(|| value.ty.clone());
+            let span = value.span;
+            // A `void` body has no value to return: `|s| println(s)` is
+            // a statement, and returning its non-existent value would
+            // build a `return` against a signature with no result slot
+            // (willow-0g8j.2.2).
+            let body = if matches!(ret, Type::Void) {
+                vec![HirStmt::Expr(value), HirStmt::Return { value: None, span }]
+            } else {
+                vec![HirStmt::Return {
+                    value: Some(value),
+                    span,
+                }]
+            };
+            (body, ret)
+        }
+        crate::parser::ast::LambdaBody::Block(block) => {
+            let Some(ret) = l
+                .return_type
+                .as_ref()
+                .map(|ty| ctx.normalize(ty))
+                .or(inferred_ret)
+            else {
+                ctx.pop_scope();
+                ctx.binds_seen = outer_binds;
+                ctx.namespace_scope_base = outer_namespace_scope_base;
+                return Err(unsupported(
+                    l.span,
+                    "block-bodied lambda without a return type annotation",
+                ));
+            };
+            let block = lower_block(block, ctx);
+            match block {
+                Ok(block) => (block, ret),
+                Err(err) => {
+                    ctx.pop_scope();
+                    ctx.binds_seen = outer_binds;
+                    ctx.namespace_scope_base = outer_namespace_scope_base;
+                    return Err(err);
+                }
+            }
+        }
+    };
+    ctx.pop_scope();
+    ctx.binds_seen = outer_binds;
+    ctx.namespace_scope_base = outer_namespace_scope_base;
+    // A capture-free lambda that a `closure(...)` slot expects is a
+    // closure too: the slot decides the calling convention, so the
+    // lifted body still takes the (empty) environment.
+    let ty = if is_closure {
+        Type::Closure(param_tys, Box::new(ret))
+    } else {
+        Type::Fn(param_tys, Box::new(ret))
+    };
+    Ok(HirExpr {
+        kind: HirExprKind::Lambda {
+            id: l.id,
+            params,
+            captures,
+            body,
+        },
+        ty,
+        span: l.span,
+    })
 }
 
 /// The value type of a checker-resolved unqualified variant construction.
@@ -1893,6 +2031,30 @@ mod tests {
     use super::*;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
+
+    /// Deeply nested expressions must lower without exhausting a modest
+    /// stack. Lowering is recursive, so the cost that matters is the size of
+    /// ONE level: the arms of `lower_expr_inner` live in their own functions
+    /// precisely so a level pays for the arm it takes instead of for every arm
+    /// at once (willow-t0uy.1). With them inline, a debug build spent ~63KB per
+    /// level and 256 levels needed 16MiB; a level now costs ~6KB, so this fits
+    /// several times over.
+    #[test]
+    fn deep_expression_nesting_lowers_within_a_four_megabyte_stack() {
+        const DEPTH: usize = 256;
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let chain = vec!["1"; DEPTH].join(" + ");
+                let src = format!("fn main() {{ let total = {chain}; println(total); }}");
+                let (hir, diags) = lower_src(&src);
+                assert!(diags.is_empty(), "{diags:?}");
+                assert_eq!(hir.functions.len(), 1);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     fn lower_src(src: &str) -> (HirProgram, Vec<Diagnostic>) {
         let tokens = Lexer::new(src).tokenize().expect("lexing failed");
@@ -2488,7 +2650,14 @@ mod tests {
              fn f() { let p = new C(1); p.x = 2; let xs = [1]; xs[0] = 9; C::t = 5; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
-        let body = &hir.functions[0].body;
+        // A class with a static initializer contributes its own `$static_init`
+        // function ahead of the user's, so pick `f` by name (willow-t0uy.3).
+        let body = &hir
+            .functions
+            .iter()
+            .find(|f| f.name == "f")
+            .expect("`f` lowers")
+            .body;
         assert!(
             body.iter()
                 .any(|s| matches!(s, HirStmt::FieldAssign { .. }))

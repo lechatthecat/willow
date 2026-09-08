@@ -9,6 +9,12 @@
 use crate::diagnostics::Span;
 use crate::parser::ast::{BinOp, ExprId, LockMode, Type, UnaryOp};
 
+/// Compiler-owned function identity for one static property's initializer.
+/// `$` cannot occur in a source identifier.
+pub fn static_initializer_name(class: &str, field: &str) -> String {
+    format!("{class}::$static_init.{field}")
+}
+
 /// A whole program lowered to typed HIR. Slice 1 only carries free functions.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirProgram {
@@ -121,10 +127,13 @@ pub enum HirStmt {
     Break { span: Span },
     /// `continue;` — next iteration of the innermost loop.
     Continue { span: Span },
-    /// `defer <body>;` — scope-exit cleanup (willow-vynv.2). `span` is the
-    /// `defer` statement's own span, which is the key the backend registers
-    /// the site's cleanup flag under (willow-0g8j.2.3).
-    Defer { body: HirDeferBody, span: Span },
+    /// Scope-exit cleanup with an identity allocated during HIR lowering.
+    /// Source coordinates remain diagnostic metadata only.
+    Defer {
+        id: HirDeferId,
+        body: HirDeferBody,
+        span: Span,
+    },
     Lock {
         mode: LockMode,
         target: HirExpr,
@@ -167,6 +176,10 @@ pub enum HirStmt {
     SuperInit { args: Vec<HirExpr>, span: Span },
 }
 
+/// A defer site within one lowered callable, independent of source spans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HirDeferId(pub u32);
+
 /// A typed expression: a [`HirExprKind`] plus its resolved [`Type`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirExpr {
@@ -180,6 +193,15 @@ impl HirExpr {
     /// consumer reads this instead of re-deriving the type from the AST.
     pub fn ty(&self) -> &Type {
         &self.ty
+    }
+
+    /// Traverse in evaluation postorder, optionally treating lambdas as
+    /// separate callables. The work list lives on the heap.
+    pub fn walk_postorder(&self, include_lambdas: bool) -> HirExprWalk<'_> {
+        HirExprWalk {
+            pending: vec![(self, false)],
+            include_lambdas,
+        }
     }
 
     /// Every sub-expression one level down, in evaluation order.
@@ -256,6 +278,32 @@ impl HirExpr {
     }
 }
 
+pub struct HirExprWalk<'a> {
+    pending: Vec<(&'a HirExpr, bool)>,
+    include_lambdas: bool,
+}
+impl<'a> Iterator for HirExprWalk<'a> {
+    type Item = &'a HirExpr;
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((expr, visited)) = self.pending.pop() {
+            if !self.include_lambdas && matches!(expr.kind, HirExprKind::Lambda { .. }) {
+                continue;
+            }
+            if visited {
+                return Some(expr);
+            }
+            self.pending.push((expr, true));
+            self.pending.extend(
+                expr.children()
+                    .into_iter()
+                    .rev()
+                    .map(|child| (child, false)),
+            );
+        }
+        None
+    }
+}
+
 /// Every expression inside a statement body, flattened. Free rather than a
 /// closure so the returned borrows keep the body's lifetime instead of the
 /// caller's frame.
@@ -268,53 +316,72 @@ impl HirStmt {
     /// its nested statement bodies. Exhaustive for the same reason as
     /// [`HirExpr::children`].
     pub fn child_exprs(&self) -> Vec<&HirExpr> {
-        match self {
-            HirStmt::Break { .. } | HirStmt::Continue { .. } => Vec::new(),
-            HirStmt::Let { value, .. } | HirStmt::Assign { value, .. } => vec![value],
-            HirStmt::If {
-                cond,
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                let mut out = vec![cond];
-                out.extend(nested_exprs(then_branch));
-                if let Some(else_branch) = else_branch {
-                    out.extend(nested_exprs(else_branch));
-                }
-                out
-            }
-            HirStmt::While { cond, body, .. } => {
-                let mut out = vec![cond];
-                out.extend(nested_exprs(body));
-                out
-            }
-            HirStmt::Return { value, .. } => value.iter().collect(),
-            HirStmt::Defer { body, .. } => match body {
-                HirDeferBody::Expr(e) => vec![e],
-                HirDeferBody::Block(stmts) => nested_exprs(stmts),
-            },
-            HirStmt::Lock { target, body, .. } => {
-                let mut out = vec![target];
-                out.extend(nested_exprs(body));
-                out
-            }
-            HirStmt::Expr(e) => vec![e],
-            HirStmt::For { iterable, body, .. } => {
-                let mut out = vec![iterable];
-                out.extend(nested_exprs(body));
-                out
-            }
-            HirStmt::FieldAssign { object, value, .. } => vec![object, value],
-            HirStmt::IndexAssign {
-                array,
-                index,
-                value,
-                ..
-            } => vec![array, index, value],
-            HirStmt::StaticFieldAssign { value, .. } => vec![value],
-            HirStmt::SuperInit { args, .. } => args.iter().collect(),
+        enum Child<'a> {
+            Stmt(&'a HirStmt),
+            Expr(&'a HirExpr),
         }
+        let mut stack = vec![Child::Stmt(self)];
+        let mut pending = Vec::new();
+        let mut out = Vec::new();
+        while let Some(child) = stack.pop() {
+            let stmt = match child {
+                Child::Expr(expr) => {
+                    out.push(expr);
+                    continue;
+                }
+                Child::Stmt(stmt) => stmt,
+            };
+            match stmt {
+                HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
+                HirStmt::Let { value, .. }
+                | HirStmt::Assign { value, .. }
+                | HirStmt::StaticFieldAssign { value, .. } => pending.push(Child::Expr(value)),
+                HirStmt::If {
+                    cond,
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    pending.push(Child::Expr(cond));
+                    pending.extend(then_branch.iter().map(Child::Stmt));
+                    if let Some(body) = else_branch {
+                        pending.extend(body.iter().map(Child::Stmt));
+                    }
+                }
+                HirStmt::While { cond, body, .. } => {
+                    pending.push(Child::Expr(cond));
+                    pending.extend(body.iter().map(Child::Stmt));
+                }
+                HirStmt::For { iterable, body, .. } => {
+                    pending.push(Child::Expr(iterable));
+                    pending.extend(body.iter().map(Child::Stmt));
+                }
+                HirStmt::Lock { target, body, .. } => {
+                    pending.push(Child::Expr(target));
+                    pending.extend(body.iter().map(Child::Stmt));
+                }
+                HirStmt::Return { value, .. } => pending.extend(value.iter().map(Child::Expr)),
+                HirStmt::Defer { body, .. } => match body {
+                    HirDeferBody::Expr(expr) => pending.push(Child::Expr(expr)),
+                    HirDeferBody::Block(body) => pending.extend(body.iter().map(Child::Stmt)),
+                },
+                HirStmt::Expr(expr) => pending.push(Child::Expr(expr)),
+                HirStmt::FieldAssign { object, value, .. } => {
+                    pending.extend([Child::Expr(object), Child::Expr(value)]);
+                }
+                HirStmt::IndexAssign {
+                    array,
+                    index,
+                    value,
+                    ..
+                } => {
+                    pending.extend([Child::Expr(array), Child::Expr(index), Child::Expr(value)]);
+                }
+                HirStmt::SuperInit { args, .. } => pending.extend(args.iter().map(Child::Expr)),
+            }
+            stack.extend(pending.drain(..).rev());
+        }
+        out
     }
 }
 

@@ -60,41 +60,42 @@ pub fn analyze(blocks: &[LirBlock], locals: &[LirLocal]) -> LirAsyncFrameLayout 
     }
 
     let mut framed = HashSet::new();
+    let mut pinned = HashSet::new();
     for block in blocks {
         if let Terminator::Suspend { operation, .. } = &block.terminator {
             framed.extend(live_out[block.id.0].iter().copied());
-            operation.collect_locals(&mut framed);
+            operation.collect_locals(&mut pinned);
         }
         for inst in &block.instrs {
             match inst {
                 LirInst::SelectInit { operations } => {
                     for operation in operations {
-                        collect_select_locals(operation, &mut framed);
+                        collect_select_locals(operation, &mut pinned);
                         if let LirSelectOp::Timeout { deadline, .. } = operation {
-                            framed.insert(*deadline);
+                            pinned.insert(*deadline);
                         }
                     }
                 }
                 LirInst::SelectProbe { operations, ready } => {
                     for operation in operations {
-                        collect_select_locals(operation, &mut framed);
+                        collect_select_locals(operation, &mut pinned);
                     }
-                    framed.extend(ready.iter().flatten().copied());
+                    pinned.extend(ready.iter().flatten().copied());
                 }
                 LirInst::SelectPick { chosen, .. } => {
-                    framed.insert(*chosen);
+                    pinned.insert(*chosen);
                 }
                 LirInst::SelectUnregister { operations } => {
                     for operation in operations {
-                        collect_select_locals(operation, &mut framed);
+                        collect_select_locals(operation, &mut pinned);
                     }
                 }
                 LirInst::SelectCommit { operation, success } => {
-                    collect_select_locals(operation, &mut framed);
-                    framed.insert(*success);
+                    collect_select_locals(operation, &mut pinned);
+                    pinned.insert(*success);
                     match operation {
                         LirSelectOp::Recv { binding, .. } | LirSelectOp::Join { binding, .. } => {
-                            framed.extend(binding.iter().copied());
+                            pinned.extend(binding.iter().copied());
                         }
                         _ => {}
                     }
@@ -103,11 +104,11 @@ pub fn analyze(blocks: &[LirBlock], locals: &[LirLocal]) -> LirAsyncFrameLayout 
                     let no_defs = HashSet::new();
                     match body {
                         super::LirDeferBody::Expr(expr) => {
-                            collect_expr_uses(expr, &names, &mut framed, &no_defs)
+                            collect_expr_uses(expr, &names, &mut pinned, &no_defs)
                         }
                         super::LirDeferBody::Block(stmts) => {
                             for expr in stmts.iter().flat_map(|stmt| stmt.child_exprs()) {
-                                collect_expr_uses(expr, &names, &mut framed, &no_defs);
+                                collect_expr_uses(expr, &names, &mut pinned, &no_defs);
                             }
                         }
                     }
@@ -123,22 +124,84 @@ pub fn analyze(blocks: &[LirBlock], locals: &[LirLocal]) -> LirAsyncFrameLayout 
             let no_defs = HashSet::new();
             match &block.terminator {
                 Terminator::Return(Some(value)) | Terminator::Branch { cond: value, .. } => {
-                    collect_expr_uses(value, &names, &mut framed, &no_defs);
+                    collect_expr_uses(value, &names, &mut pinned, &no_defs);
                 }
                 _ => {}
             }
         }
     }
-    let slots: Vec<_> = locals
-        .iter()
-        .filter_map(|local| framed.contains(&local.id).then_some(local.id))
-        .collect();
-    let locals = slots
-        .iter()
-        .enumerate()
-        .map(|(index, local)| (*local, FrameSlot { index }))
-        .collect();
-    LirAsyncFrameLayout { locals, slots }
+    framed.extend(pinned.iter().copied());
+    pinned.extend(
+        locals
+            .iter()
+            .filter(|local| local.parameter)
+            .map(|local| local.id),
+    );
+    // A block is an indivisible interference region. Include writes and root
+    // clears even when ordinary liveness does not consider them reads: either
+    // can overwrite another logical local's physical frame slot.
+    let mut regions = vec![HashSet::new(); locals.len()];
+    for block in blocks {
+        let mut touched = live_in[block.id.0].clone();
+        touched.extend(&live_out[block.id.0]);
+        touched.extend(&uses[block.id.0]);
+        touched.extend(&defs[block.id.0]);
+        for inst in &block.instrs {
+            if let LirInst::ClearScopeRoots { locals: cleared } = inst {
+                // Primitive locals have no root to clear; the backend emits
+                // no store for them. Scope-exit lists include all source
+                // locals, including scalars whose lifetimes already ended.
+                touched.extend(
+                    cleared
+                        .iter()
+                        .filter(|id| !reusable_scalar(&locals[id.0 as usize])),
+                );
+            }
+        }
+        for local in touched {
+            regions[local.0 as usize].insert(block.id.0);
+        }
+    }
+    let mut slots = Vec::new();
+    let mut occupants: Vec<Vec<&LirLocal>> = Vec::new();
+    let mut mapping = HashMap::new();
+    for local in locals.iter().filter(|local| framed.contains(&local.id)) {
+        // GC values and protocol/defer slots retain exclusive ownership. This
+        // first tier only reuses primitive scalars with identical types.
+        let reusable = !pinned.contains(&local.id) && reusable_scalar(local);
+        let index = reusable
+            .then(|| {
+                occupants.iter().position(|members| {
+                    members.iter().all(|other| {
+                        !pinned.contains(&other.id)
+                            && other.ty == local.ty
+                            && regions[local.id.0 as usize]
+                                .is_disjoint(&regions[other.id.0 as usize])
+                    })
+                })
+            })
+            .flatten()
+            .unwrap_or_else(|| {
+                slots.push(local.id);
+                occupants.push(Vec::new());
+                slots.len() - 1
+            });
+        occupants[index].push(local);
+        mapping.insert(local.id, FrameSlot { index });
+    }
+    LirAsyncFrameLayout {
+        locals: mapping,
+        slots,
+    }
+}
+
+fn reusable_scalar(local: &LirLocal) -> bool {
+    matches!(
+        local.ty,
+        crate::parser::ast::Type::I64
+            | crate::parser::ast::Type::F64
+            | crate::parser::ast::Type::Bool
+    )
 }
 
 fn collect_select_locals(operation: &LirSelectOp, out: &mut HashSet<LirLocalId>) {
@@ -366,4 +429,94 @@ fn successors(block: &LirBlock) -> Vec<BlockId> {
     };
     out.extend(block.recovery.iter().copied());
     out
+}
+
+#[cfg(test)]
+mod coalescing_tests {
+    use super::*;
+
+    fn layout(source: &str) -> (LirAsyncFrameLayout, Vec<LirLocal>) {
+        let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
+        let (ast, errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(errors.is_empty(), "{errors:?}");
+        let (hir, errors) = crate::ir::lower::lower_program(&ast);
+        assert!(errors.is_empty(), "{errors:?}");
+        let mut program = super::super::lower_program(&hir);
+        let f = program.functions.remove(0);
+        (f.async_frame, f.locals)
+    }
+
+    fn compare(source: &str, shared: bool) {
+        let (layout, locals) = layout(source);
+        let slot = |name: &str| {
+            let local = locals.iter().find(|local| local.name == name).unwrap();
+            layout
+                .slot(local.id)
+                .unwrap_or_else(|| panic!("missing frame local {name}: {source}"))
+        };
+        assert_eq!(slot("a") == slot("b"), shared, "{source}");
+        for slot in layout.locals.values() {
+            assert!(slot.index < layout.slots.len());
+        }
+    }
+
+    #[test]
+    fn scalar_lifetime_matrix() {
+        // 21 perspectives: each primitive type exercises separated lifetimes,
+        // simultaneous values, writes in a shared block, loop backedges,
+        // parameter ownership, defer ownership, and deterministic planning.
+        for (ty, a, b) in [
+            ("i64", "1", "2"),
+            ("f64", "1.0", "2.0"),
+            ("bool", "true", "false"),
+        ] {
+            let separated = format!(
+                "async fn f() {{ if true {{ let a: {ty} = {a}; await sleep(0); print(a); }} await sleep(0); if true {{ let b: {ty} = {b}; await sleep(0); print(b); }} }}"
+            );
+            compare(&separated, true);
+            compare(
+                &format!(
+                    "async fn f() {{ let a: {ty} = {a}; let b: {ty} = {b}; await sleep(0); print(a); print(b); }}"
+                ),
+                false,
+            );
+            compare(
+                &format!(
+                    "async fn f() {{ let a: {ty} = {a}; await sleep(0); print(a); let b: {ty} = {b}; await sleep(0); print(b); }}"
+                ),
+                false,
+            );
+            compare(
+                &format!(
+                    "async fn f() {{ let a: {ty} = {a}; while true {{ let b: {ty} = {b}; await sleep(0); print(a); print(b); }} }}"
+                ),
+                false,
+            );
+            compare(
+                &format!(
+                    "async fn f(a: {ty}) {{ await sleep(0); print(a); await sleep(0); let b: {ty} = {b}; await sleep(0); print(b); }}"
+                ),
+                false,
+            );
+            compare(
+                &format!(
+                    "async fn f() {{ let a: {ty} = {a}; defer print(a); await sleep(0); print(a); let b: {ty} = {b}; await sleep(0); print(b); }}"
+                ),
+                false,
+            );
+            assert_eq!(layout(&separated).0, layout(&separated).0);
+        }
+    }
+
+    #[test]
+    fn different_types_and_gc_values_do_not_share() {
+        compare(
+            "async fn f() { if true { let a = 1; await sleep(0); print(a); } await sleep(0); if true { let b = true; await sleep(0); print(b); } }",
+            false,
+        );
+        compare(
+            "async fn f() { if true { let a = \"first\"; await sleep(0); print(a); } await sleep(0); if true { let b = \"second\"; await sleep(0); print(b); } }",
+            false,
+        );
+    }
 }

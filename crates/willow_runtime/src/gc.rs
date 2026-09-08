@@ -911,7 +911,7 @@ fn with_stw<R>(collect: impl FnOnce(&GcCoord) -> R) -> R {
     runtime()
         .stop_requested
         .store(true, std::sync::atomic::Ordering::Release);
-    let mut coord = lock.lock().unwrap();
+    let mut coord = lock.lock().unwrap_or_else(|poison| poison.into_inner());
     coord.stop_requested = true;
     loop {
         let all_parked = coord
@@ -922,15 +922,24 @@ fn with_stw<R>(collect: impl FnOnce(&GcCoord) -> R) -> R {
         if all_parked {
             break;
         }
-        coord = cv.wait(coord).unwrap();
+        coord = cv.wait(coord).unwrap_or_else(|poison| poison.into_inner());
     }
-    let result = collect(&coord);
+    // A collection can panic: the debug pointer validation aborts the cycle on
+    // a corrupt root, and callers catch that. The world has to be resumed
+    // either way — an unwind that leaves `stop_requested` set parks every other
+    // mutator forever, and one that unwinds out of the guard poisons the
+    // registry, taking every later collection down with it (willow-v6k0).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| collect(&coord)));
     coord.stop_requested = false;
     runtime()
         .stop_requested
         .store(false, std::sync::atomic::Ordering::Release);
     cv.notify_all();
-    result
+    drop(coord);
+    match result {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 /// All roots to scan under stop-the-world: this (collector) thread's LIVE
@@ -970,6 +979,16 @@ fn mark_worklist(mut worklist: Vec<*mut u8>) -> crate::gc_telemetry::MarkWork {
                 if let Some(child) = object.payload_word(i) {
                     worklist.push(child.as_ptr());
                 }
+            }
+        }
+        let mut bitmap_slots = Vec::new();
+        append_bitmap_slots(object, &mut bitmap_slots);
+        for slot in bitmap_slots {
+            scanned_slots += 1;
+            // SAFETY: bitmap slots belong to this live object's payload.
+            let child = unsafe { *slot };
+            if !child.is_null() {
+                worklist.push(child);
             }
         }
         let trace_fn = type_registry()
@@ -1469,6 +1488,32 @@ pub extern "C" fn willow_alloc(payload_size: i64) -> *mut u8 {
 /// Generated Willow code uses its inlined TLS bump path and calls
 /// `willow_gc_alloc_slow` only on refill/large/stress paths. Runtime containers
 /// without access to the generated TLS block use the old-region slow path.
+/// Allocate an object with scalable tracing metadata. `descriptor` points to
+/// immutable, aligned static u64 data `[count, bits...]`, alive until all such
+/// objects have been reclaimed. Payload and bitmap sizes must agree.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_alloc_bitmap(
+    _type_id: i64,
+    payload_size: i64,
+    descriptor: *const u64,
+) -> *mut u8 {
+    assert!(!descriptor.is_null());
+    assert!(payload_size >= 0 && payload_size % 8 == 0);
+    let count = unsafe { *descriptor } as usize;
+    assert_eq!(count, (payload_size as usize / 8).div_ceil(64));
+    let mask = if count == 0 {
+        0
+    } else {
+        unsafe { *descriptor.add(1) }
+    };
+    allocate_object(
+        descriptor as u64,
+        willow_abi::GC_BITMAP_TYPE_ID,
+        payload_size,
+        mask,
+    )
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_alloc_layout(
     layout_id: u64,
@@ -2097,6 +2142,31 @@ struct MinorCollector<'a> {
     drop_registry: HashMap<u32, DropFn>,
 }
 
+/// Extend tracing beyond the inline mask. Bitmap descriptors are immutable
+/// static data whose lifetime covers every object using them, including moves.
+fn append_bitmap_slots(object: HeapObject, slots: &mut Vec<*mut *mut u8>) {
+    let metadata = object.trace_metadata();
+    if metadata.type_id != willow_abi::GC_BITMAP_TYPE_ID {
+        return;
+    }
+    let descriptor = metadata.layout_id as *const u64;
+    // SAFETY: only willow_gc_alloc_bitmap installs the reserved tracing type, after validating a
+    // compiler-owned, process-lifetime descriptor. Moving GC copies the pointer.
+    let count = unsafe { *descriptor } as usize;
+    let payload_words = metadata.payload_size / std::mem::size_of::<usize>();
+    for word in 1..count {
+        let mut bits = unsafe { *descriptor.add(word + 1) };
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            let index = word * 64 + bit;
+            if index < payload_words {
+                slots.push(object.payload_slot(index));
+            }
+            bits &= bits - 1;
+        }
+    }
+}
+
 fn object_reference_slots(
     object: HeapObject,
     trace_registry: &HashMap<u32, TraceFn>,
@@ -2109,6 +2179,7 @@ fn object_reference_slots(
             slots.push(object.payload_slot(index));
         }
     }
+    append_bitmap_slots(object, &mut slots);
     if let Some(trace) = trace_registry.get(&metadata.type_id).copied() {
         // SAFETY: trace is registered for this runtime type and exposes mutable
         // reference slots without allocating GC objects.
@@ -2594,26 +2665,17 @@ fn minor_collect_internal() {
     }
 
     let cycle = crate::gc_telemetry::Cycle::begin(crate::gc_telemetry::CycleKind::Minor);
-    let (before, after, work) = if multi_mutator_active() {
-        with_stw(|coord| {
-            {
-                let mut state = runtime().heap.lock().unwrap();
-                retire_all_tlabs_locked(&mut state);
-            }
-            let roots = all_registered_stack_roots(coord);
-            minor_collect_with_roots(roots)
-        })
-    } else {
+    // Stop the world and scan every registered mutator, for the reason spelled
+    // out over the major cycle's mark phase: a registration that races a
+    // single-mutator scan leaves the newcomer's objects unmarked (willow-v6k0).
+    let (before, after, work) = with_stw(|coord| {
         {
             let mut state = runtime().heap.lock().unwrap();
             retire_all_tlabs_locked(&mut state);
         }
-        let roots = snapshot_local_roots()
-            .into_iter()
-            .map(|address| address as *mut u8)
-            .collect();
+        let roots = all_registered_stack_roots(coord);
         minor_collect_with_roots(roots)
-    };
+    });
     let event = cycle.finish(before, after, work);
     drop(_serialize);
     crate::gc_telemetry::emit_cycle(event);
@@ -2666,60 +2728,40 @@ fn collect_internal() {
     let cycle = crate::gc_telemetry::Cycle::begin(crate::gc_telemetry::CycleKind::Major);
 
     // ---- Mark phase --------------------------------------------------------
-    // Gather the root set, then trace. When other mutator threads are registered
-    // (willow-6fv.5.6), stop the world and scan EVERY registered mutator's root
-    // stack; otherwise scan only this thread's stack (the unchanged single-
-    // mutator path). Either way, runtime roots and channel buffers are included.
-    // Mark AND sweep must both run with the world stopped in the multi-mutator
-    // case. If sweep ran after the world resumed, another mutator could, in the
-    // gap, allocate an object (prepended to the heap, hence unmarked) and even
-    // install a runtime root on it before sweep walked the heap — sweep would
-    // then free that live, already-rooted object, leaving a dangling runtime
-    // root that the next collection traces and aborts on (willow-w5e2).
-    let (heap_before, heap_after, freed, work) = if multi_mutator_active() {
-        with_stw(|coord| {
-            {
-                let mut state = runtime().heap.lock().unwrap();
-                retire_all_tlabs_locked(&mut state);
-            }
-            let before = runtime().heap.lock().unwrap().allocated_bytes as u64;
-            let mut worklist = all_registered_stack_roots(coord);
-            worklist.extend(runtime_roots_snapshot());
-            worklist.extend(crate::lock::lock_gc_roots());
-            let work = mark_worklist(worklist);
-            let freed = sweep();
-            let after = runtime().heap.lock().unwrap().allocated_bytes as u64;
-            (before, after, freed, work)
-        })
-    } else {
+    // Gather the root set, then trace. Every collection stops the world and
+    // scans EVERY registered mutator's root stack, plus runtime roots and
+    // channel buffers (willow-6fv.5.6).
+    //
+    // Mark AND sweep both run with the world stopped. If sweep ran after the
+    // world resumed, another mutator could, in the gap, allocate an object
+    // (prepended to the heap, hence unmarked) and even install a runtime root
+    // on it before sweep walked the heap — sweep would then free that live,
+    // already-rooted object, leaving a dangling runtime root that the next
+    // collection traces and aborts on (willow-w5e2).
+    //
+    // There is no "only this thread is registered, so scan just my stack" fast
+    // path: `multi_mutator_active` is a snapshot, and a thread that registers
+    // between that check and the sweep runs unseen. Its brand-new objects are
+    // unmarked and unreachable from this thread's roots, so the sweep frees
+    // them under it, and the dangling shadow roots left behind abort the next
+    // collection (willow-v6k0). `with_stw` holds the mutator registry lock for
+    // the whole cycle, so a registration either lands before the scan (and is
+    // scanned) or blocks until the cycle is over.
+    let (heap_before, heap_after, freed, work) = with_stw(|coord| {
         {
             let mut state = runtime().heap.lock().unwrap();
             retire_all_tlabs_locked(&mut state);
         }
         let before = runtime().heap.lock().unwrap().allocated_bytes as u64;
-        let work = ROOT_STACK.with(|rs| {
-            let mut worklist: Vec<*mut u8> = {
-                let stack = rs.borrow();
-                stack
-                    .iter()
-                    .filter(|&&slot| !slot.is_null())
-                    .filter_map(|&slot| {
-                        RootSlot::from_raw(slot)
-                            .and_then(RootSlot::load)
-                            .map(GcPayload::as_ptr)
-                    })
-                    .collect()
-            };
-            worklist.extend(runtime_roots_snapshot());
-            // GC-element channel buffers hold live references (willow-dsw).
-            worklist.extend(crate::lock::lock_gc_roots());
-            mark_worklist(worklist)
-        });
-        // Single-mutator: no other thread can allocate during the sweep.
+        let mut worklist = all_registered_stack_roots(coord);
+        worklist.extend(runtime_roots_snapshot());
+        // GC-element channel buffers hold live references (willow-dsw).
+        worklist.extend(crate::lock::lock_gc_roots());
+        let work = mark_worklist(worklist);
         let freed = sweep();
         let after = runtime().heap.lock().unwrap().allocated_bytes as u64;
         (before, after, freed, work)
-    };
+    });
     let event = cycle.finish(heap_before, heap_after, work);
 
     if gc_log {
@@ -3396,6 +3438,250 @@ mod tests {
         done.store(true, Ordering::SeqCst);
         worker.join().unwrap();
         willow_gc_unregister_mutator();
+    }
+
+    // ── A registration that races a collection (willow-v6k0) ────────────────
+    //
+    // The collector used to ask `multi_mutator_active()` and, when it was the
+    // only registered mutator, scan just its own root stack and sweep without
+    // stopping the world. That question is a snapshot: a thread registering
+    // right after it runs unseen for the rest of the cycle, so the sweep frees
+    // the objects it has just allocated and rooted. The program keeps running
+    // on the dangling pointers until a later cycle traces one and aborts, or
+    // the reused memory produces a wrong answer.
+
+    /// Allocate `count` rooted objects, each stamped with a sentinel, into
+    /// `slots`, whose storage the caller keeps alive for the roots' lifetime.
+    fn root_stamped_objects(slots: &mut [*mut u8], sentinel: i64) {
+        for (index, slot) in slots.iter_mut().enumerate() {
+            *slot = willow_alloc_object(0, 8);
+            // SAFETY: a freshly allocated 8-byte payload.
+            unsafe { *(slot.cast::<i64>()) = sentinel + index as i64 };
+            willow_push_root(slot as *mut *mut u8);
+        }
+    }
+
+    /// Every slot still names a live object holding its sentinel.
+    fn assert_stamped_objects_live(slots: &[*mut u8], sentinel: i64, context: &str) {
+        for (index, &slot) in slots.iter().enumerate() {
+            #[cfg(debug_assertions)]
+            if let Err(message) = validate_payload_pointer(slot, "test") {
+                panic!("{context}: rooted object {index} was collected: {message}");
+            }
+            // SAFETY: the object above is rooted, so it is still live.
+            let stamp = unsafe { *(slot.cast::<i64>()) };
+            assert_eq!(
+                stamp,
+                sentinel + index as i64,
+                "{context}: rooted object {index} lost its payload"
+            );
+        }
+    }
+
+    /// A worker that registers, roots objects, verifies them across another
+    /// thread's collections, and leaves. Returns once it has done `rounds`.
+    fn racing_root_worker(rounds: usize, sentinel: i64, minor: bool) {
+        const PER_ROUND: usize = 4;
+        for round in 0..rounds {
+            willow_gc_register_mutator();
+            let mut slots = [std::ptr::null_mut::<u8>(); PER_ROUND];
+            root_stamped_objects(&mut slots, sentinel);
+            // Give the collector a window in which this thread is registered
+            // and holding roots it must scan.
+            for _ in 0..4 {
+                willow_gc_safepoint();
+                std::thread::yield_now();
+            }
+            if minor {
+                willow_gc_minor_collect();
+            }
+            assert_stamped_objects_live(&slots, sentinel, &format!("round {round}"));
+            willow_pop_roots(PER_ROUND as i32);
+            willow_gc_unregister_mutator();
+        }
+    }
+
+    /// Hammer collections on one thread while `workers` threads register,
+    /// allocate rooted objects and unregister underneath it.
+    fn run_registration_race(workers: usize, rounds: usize, minor: bool) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        let collector_stop = stop.clone();
+        let collector = std::thread::spawn(move || {
+            while !collector_stop.load(Ordering::Acquire) {
+                // This thread never registers, so it is the one that used to
+                // take the "I am alone" fast path.
+                if minor {
+                    willow_gc_minor_collect();
+                } else {
+                    willow_gc_collect();
+                }
+                std::thread::yield_now();
+            }
+        });
+        let handles: Vec<_> = (0..workers)
+            .map(|worker| {
+                std::thread::spawn(move || {
+                    racing_root_worker(rounds, 1_000 + worker as i64 * 1_000, minor)
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("worker thread panicked");
+        }
+        stop.store(true, Ordering::Release);
+        collector.join().expect("collector thread panicked");
+    }
+
+    #[test]
+    fn coord_registration_racing_a_major_collection_keeps_the_newcomers_roots() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        run_registration_race(1, 200, false);
+        reset_gc();
+    }
+
+    #[test]
+    fn coord_registration_racing_a_minor_collection_keeps_the_newcomers_roots() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        run_registration_race(1, 200, true);
+        reset_gc();
+    }
+
+    #[test]
+    fn coord_several_mutators_registering_at_once_keep_their_roots() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        run_registration_race(4, 100, false);
+        reset_gc();
+    }
+
+    #[test]
+    fn coord_a_registered_mutators_runtime_root_survives_a_racing_collection() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _guard = gc_test_guard();
+        reset_gc();
+        // The same race reaches runtime roots — the scheduler's hold on a task
+        // frame — because the sweep, not the scan, is what frees the object.
+        let stop = Arc::new(AtomicBool::new(false));
+        let collector_stop = stop.clone();
+        let collector = std::thread::spawn(move || {
+            while !collector_stop.load(Ordering::Acquire) {
+                willow_gc_collect();
+                std::thread::yield_now();
+            }
+        });
+        for round in 0..200 {
+            willow_gc_register_mutator();
+            let object = willow_alloc_object(0, 8);
+            willow_gc_add_runtime_root(object);
+            // SAFETY: the runtime root keeps this payload alive.
+            unsafe { *(object.cast::<i64>()) = 77 };
+            for _ in 0..4 {
+                willow_gc_safepoint();
+                std::thread::yield_now();
+            }
+            #[cfg(debug_assertions)]
+            if let Err(message) = validate_payload_pointer(object, "test") {
+                panic!("round {round}: runtime root was collected: {message}");
+            }
+            // SAFETY: still rooted.
+            assert_eq!(unsafe { *(object.cast::<i64>()) }, 77, "round {round}");
+            willow_gc_remove_runtime_root(object);
+            willow_gc_unregister_mutator();
+        }
+        stop.store(true, Ordering::Release);
+        collector.join().expect("collector thread panicked");
+        reset_gc();
+    }
+
+    #[test]
+    fn coord_a_collection_racing_registration_still_frees_garbage() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _guard = gc_test_guard();
+        reset_gc();
+        // Stopping the world for every cycle must not make the collector
+        // conservative: unrooted objects allocated by a registering worker are
+        // still reclaimed.
+        let stop = Arc::new(AtomicBool::new(false));
+        let collector_stop = stop.clone();
+        let collector = std::thread::spawn(move || {
+            while !collector_stop.load(Ordering::Acquire) {
+                willow_gc_collect();
+                std::thread::yield_now();
+            }
+        });
+        for _ in 0..200 {
+            willow_gc_register_mutator();
+            let _garbage = willow_alloc_object(0, 8);
+            willow_gc_safepoint();
+            willow_gc_unregister_mutator();
+        }
+        stop.store(true, Ordering::Release);
+        collector.join().expect("collector thread panicked");
+        willow_gc_collect();
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            0,
+            "unrooted objects from a registering worker must still be freed"
+        );
+        reset_gc();
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn coord_a_panicking_collection_resumes_the_world() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        // Now that every cycle stops the world, a cycle that panics has to put
+        // the world back: an unwind that leaves `stop_requested` set parks every
+        // other mutator forever, and one that escapes the registry guard
+        // poisons it, so no later collection can run at all.
+        willow_gc_add_runtime_root(std::ptr::dangling_mut::<u8>());
+        let result = std::panic::catch_unwind(collect_internal);
+        assert!(
+            result.is_err(),
+            "an invalid runtime root must fail the cycle"
+        );
+        assert!(
+            !runtime()
+                .stop_requested
+                .load(std::sync::atomic::Ordering::Acquire),
+            "the world must be resumed after a panicking cycle"
+        );
+        reset_gc();
+        let mut slots = [std::ptr::null_mut::<u8>(); 2];
+        root_stamped_objects(&mut slots, 9);
+        willow_gc_collect();
+        assert_stamped_objects_live(&slots, 9, "after a panicking cycle");
+        willow_pop_roots(2);
+        reset_gc();
+    }
+
+    #[test]
+    fn coord_a_lone_thread_still_collects_without_registering() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        // The fast path is gone, so check the ordinary single-threaded program
+        // still collects: an unregistered thread with no other mutators must
+        // reclaim its garbage and keep its roots.
+        let mut slots = [std::ptr::null_mut::<u8>(); 2];
+        root_stamped_objects(&mut slots, 5);
+        let _garbage = willow_alloc_object(0, 8);
+        willow_gc_collect();
+        assert_stamped_objects_live(&slots, 5, "lone thread");
+        willow_pop_roots(2);
+        willow_gc_collect();
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            0,
+            "a lone thread's collection reclaims everything once the roots go"
+        );
+        reset_gc();
     }
 
     fn reset_gc() {

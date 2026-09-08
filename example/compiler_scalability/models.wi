@@ -1,0 +1,8 @@
+pub open class Base {
+    pub value: i64;
+    pub open fn read(self) -> i64 { return self.value; }
+}
+pub class Derived extends Base {
+    pub extra: i64;
+    pub override fn read(self) -> i64 { return self.value + self.extra; }
+}

@@ -15,7 +15,6 @@ pub(crate) mod types;
 pub(crate) use analysis::*;
 #[cfg(test)]
 use check::check_source;
-pub(crate) use check::defer_body_contains_direct_recover;
 use diagnostics::*;
 use returns::ReturnSite;
 pub(crate) use types::*;

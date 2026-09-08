@@ -155,6 +155,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     ALLOC; "willow_alloc" => ([I64] -> Some(Word));
     ALLOC; "willow_alloc_typed" => ([I64, I64] -> Some(Word));
     ALLOC; "willow_gc_alloc_layout" => ([I64, I64, I64, I64] -> Some(Word));
+    ALLOC; "willow_gc_alloc_bitmap" => ([I64, I64, Ptr] -> Some(Word));
     ALLOC; "willow_gc_alloc_slow" => ([Ptr, I64, I64, I64, I64] -> Some(Word));
     NONE; "willow_gc_write_barrier" => ([Ptr, Word, I64] -> None);
     PREEMPT; "willow_gc_collect" => ([] -> None);
@@ -718,6 +719,7 @@ mod alloc_effects_tests {
         "willow_alloc_typed",
         "willow_gc_alloc_layout",
         "willow_gc_alloc_slow",
+        "willow_gc_alloc_bitmap",
         "willow_array_new",
         "willow_array_copy",
         "willow_array_len",

@@ -301,8 +301,8 @@ async fn main() {
 /// The p42j root protocol is what makes lpn.10 narrowing legal for GC locals,
 /// not only scalar locals. More dead GC locals than the 61-bit frame reference
 /// mask can represent must compile by staying in balanced stack-root slots. The
-/// frame-everything override intentionally demonstrates that the same source
-/// would exceed the mask without narrowing.
+/// frame-everything override also compiles, using the scalable bitmap when
+/// narrowing is disabled.
 #[test]
 fn async_frame_narrowing_drops_dead_gc_locals_beyond_frame_mask_capacity() {
     let mut source = String::from("async fn oversized() {\n");
@@ -315,11 +315,7 @@ fn async_frame_narrowing_drops_dead_gc_locals_beyond_frame_mask_capacity() {
     assert!(ok, "narrowed GC frame must compile: {stderr}");
 
     let (ok, stderr) = compile_with_compiler_env(&source, &[("WILLOW_ASYNC_FRAME_ALL", "1")]);
-    assert!(!ok, "frame-everything override unexpectedly fit: {stderr}");
-    assert!(
-        stderr.contains("outside gc_ref_mask coverage"),
-        "override must restore the over-capacity GC-local frame: {stderr}"
-    );
+    assert!(ok, "wide frames must compile with bitmap tracing: {stderr}");
 }
 
 #[test]
