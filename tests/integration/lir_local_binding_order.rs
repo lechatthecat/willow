@@ -520,29 +520,36 @@ async fn main() {
 /// Perspective 18: two tasks in flight, each with its own frame and its own
 /// copy of the local. Contention makes the sections interleave, so a binding
 /// shared through anything but per-frame storage would cross the two.
+///
+/// Which task enters the section first is the scheduler's choice — the runtime
+/// clamps every worker override up to `DEFAULT_WORKERS`, so these two really do
+/// run in parallel — and the assertion must not encode one order. Both tasks
+/// add the same amount and separate themselves by a private `tag`, so the two
+/// observations are 10 and 20 either way and the printed sum is 33 for both
+/// interleavings. A crossed binding loses a tag and changes it.
 #[test]
 fn lbo_18_two_tasks_each_keep_their_own_local() {
     assert_binds(
         r#"
-async fn claim(m: Mutex<i64>, by: i64) -> i64 {
+async fn claim(m: Mutex<i64>, tag: i64) -> i64 {
     let mut mine = 0;
     lock m as mut value {
-        value = value + by;
-        mine = value;
+        value = value + 10;
+        mine = value + tag;
     }
     return mine;
 }
 async fn main() {
     let m = Mutex::new(0);
-    let a = claim(m, 10);
-    let b = claim(m, 20);
+    let a = claim(m, 1);
+    let b = claim(m, 2);
     let first = await a;
     let second = await b;
     println(first + second);
     lock m as value { println(value); }
 }
 "#,
-        "40\n30\n",
+        "33\n20\n",
         &["claim", "main"],
     );
 }
