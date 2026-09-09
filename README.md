@@ -1,225 +1,56 @@
 # Willow
 
-Willow is a statically typed, garbage-collected OOP language that compiles to native binaries.
+> A statically typed, garbage-collected native programming language with class-based OOP, algebraic enums, pattern matching, and stackless async.
 
-Willow is:
-- class-based OOP with private-by-default members
-- GC-managed objects
-- type inference
-- async/await with runtime scheduling
-- native binary output via Cranelift
+![Status](https://img.shields.io/badge/status-experimental-orange)
+![License](https://img.shields.io/badge/license-MIT-blue)
 
-## Current limitations
+Willow combines familiar object-oriented programming with modern typed-language features such as payload-carrying enums, `match`, `Option`, `Result`, closures, and `async` / `await`.
 
-- Runs use at least five active workers. `WILLOW_WORKERS=N` can request more;
-  values below five are clamped to five.
-- The standard library surface is still small: prelude plus `std::collections`,
-  `std::option`, `std::result`, `std::io`, `std::env`, and `std::fs` (sync
-  forms plus `*_async` variants backed by a bounded blocking pool).
-- Syntax and runtime APIs may still change.
+Willow compiles to native binaries through [Cranelift](https://cranelift.dev/) and includes its own garbage collector and task runtime.
 
-## Install
+## Why Willow?
 
-Requires a Rust toolchain.
+Willow is an experiment in building a native language that keeps memory management automatic without giving up expressive types or structured concurrency.
 
-```bash
-git clone https://github.com/lechatthecat/willow
-cd willow
-cargo build --release
-```
+- **Native code** — compiles to native binaries through Cranelift.
+- **Garbage collected** — objects, strings, collections, closures, and async frames are GC-managed.
+- **OOP without forcing everything into classes** — classes, inheritance, interfaces, static members, and free functions coexist.
+- **Algebraic enums and pattern matching** — enum variants can carry values and can be destructured with `match`.
+- **`Option` and `Result`** — nullable/fallible values are represented explicitly; `?` propagation is supported.
+- **First-class functions and closures** — functions can be passed around, and closures can capture their environment.
+- **Stackless async runtime** — `async` / `await`, task cancellation, channels, `select`, locks, and scheduler-aware synchronization.
+- **Multi-module compilation** — imported modules are resolved with canonical semantic identities and dependency-ordered initialization.
 
-The compiler binary is at `target/release/willowc`.
-
-## Usage
-Please see [examples](https://github.com/lechatthecat/willow/tree/main/example).
-```bash
-# Compile a source file
-./target/release/willowc example/hello_world.wi -o hello_world
-
-# Or
-cargo run --release -- build example/hello_world.wi -o hello_world
-
-# Release build
-./target/release/willowc example/hello_world.wi -o hello_world --release
-
-# Or
-cargo run --release -- build example/hello_world.wi -o hello_world --release
-
-# Run the output binary
-./hello_world
-```
-
-During development you can use `cargo run`:
-
-```bash
-cargo run -- example/hello_world.wi -o hello_world
-./hello_world
-```
-
-## Examples
-
-## Conway's game of life
-
-```
-cargo run --release --quiet --bin willowc -- \
-  run example/game_of_life.wi --release -- \
-  2,1 3,2 1,3 2,3 3,3
-```
-
-### Hello World
+## A taste of Willow
 
 ```rust
-fn main() {
-    println("Hello World");
+enum Shape {
+    Circle(f64),
+    Rectangle(f64, f64),
+    Dot,
+}
+
+fn area(shape: Shape) -> f64 {
+    return match shape {
+        Shape::Circle(r) => r * r * 3.14159,
+        Shape::Rectangle(w, h) => w * h,
+        Shape::Dot => 0.0,
+    };
+}
+
+async fn compute() -> f64 {
+    await sleep(1);
+    return area(Shape::Circle(5.0));
+}
+
+async fn main() {
+    let task = compute();
+    println(await task);
 }
 ```
 
-### Functions
-
-```rust
-fn add(a: i64, b: i64) -> i64 {
-    return a + b;
-}
-
-fn main() {
-    println(add(3, 4));  // 7
-}
-```
-
-### Recursion
-
-```rust
-fn fib(n: i64) -> i64 {
-    if n <= 1 {
-        return n;
-    }
-    return fib(n - 1) + fib(n - 2);
-}
-
-fn main() {
-    println(fib(10));  // 55
-}
-```
-
-### if / else
-
-```rust
-fn main() {
-    let x = 42;
-    if x > 10 {
-        println(x);
-    } else {
-        println(0);
-    }
-}
-```
-
-### while
-
-```rust
-fn main() {
-    let mut i = 0;
-    while i < 5 {
-        println(i);
-        i = i + 1;
-    }
-}
-```
-
-## Types
-
-| Type   | Example         |
-|--------|-----------------|
-| `i64`  | `let x = 10;`   |
-| `bool` | `let b = true;` |
-
-Type annotations are optional when the type can be inferred:
-
-```rust
-let x: i64 = 10;  // explicit
-let y = 10;       // inferred
-```
-
-## Mutability
-
-Variables are immutable by default. Use `mut` to allow reassignment:
-
-```rust
-let x = 10;
-x = 20;      // compile error
-
-let mut y = 10;
-y = 20;      // ok
-```
-
-## Classes & OOP
-
-Willow is class-based with **private-by-default** fields and methods. Use `pub`
-to expose them. Objects are GC-managed and created with `new`.
-
-```rust
-class User {
-    name: String;        // private by default
-    pub age: i64;        // public field
-
-    // `init` is the constructor — it takes an explicit `self`.
-    pub init(self, name: String, age: i64) {
-        self.name = name;
-        self.age = age;
-    }
-
-    // Methods are private by default; `pub` exposes them.
-    pub fn greet(self) -> String {
-        return self.name;
-    }
-}
-
-fn main() {
-    let u = new User("Alice", 30);   // construct with `new`
-    println(u.greet());              // Alice
-    println(u.age);                  // 30
-}
-```
-
-A class with no `init` gets an implicit constructor taking its fields in
-declaration order.
-
-### Static members
-
-`static fn` methods and `static` properties belong to the class, not an
-instance. Call them through the type with `::`. Static properties are immutable
-and initialized once before `main` runs; `Self::` refers to the enclosing class.
-
-```rust
-class Counter {
-    value: i64;
-    pub static origin: i64 = 100;     // class-level, immutable
-
-    pub init(self, value: i64) {
-        self.value = value;
-    }
-
-    // Static factory — no `self`.
-    pub static fn make(value: i64) -> Counter {
-        return new Counter(value);
-    }
-
-    pub fn get(self) -> i64 {
-        return self.value;
-    }
-}
-
-fn main() {
-    let c = Counter::make(7);
-    println(c.get());          // 7
-    println(Counter::origin);  // 100
-}
-```
-
-### Interfaces
-
-An `interface` is a set of required methods. A class `implements` it and can
-then be used wherever the interface type is expected; calls dispatch at runtime.
+Classes and interfaces are also first-class language features:
 
 ```rust
 interface Animal {
@@ -227,106 +58,223 @@ interface Animal {
 }
 
 class Dog implements Animal {
-    pub fn speak(self) -> String { return "woof"; }
+    pub fn speak(self) -> String {
+        return "woof";
+    }
 }
 
-fn describe(a: Animal) {
-    println(a.speak());
+fn describe(animal: Animal) {
+    println(animal.speak());
 }
 
 fn main() {
-    describe(new Dog());   // woof
+    describe(new Dog());
 }
 ```
 
-## Async / Await
+## Quick start
+
+A Rust toolchain is currently required to build the Willow compiler.
+
+```bash
+git clone https://github.com/lechatthecat/willow.git
+cd willow
+cargo build --release
+```
+
+Run a Willow program directly:
+
+```bash
+./target/release/willowc run example/hello_world.wi --release
+```
+
+Or compile it to a native executable:
+
+```bash
+./target/release/willowc example/hello_world.wi -o hello_world --release
+./hello_world
+```
+
+During compiler development you can also run through Cargo:
+
+```bash
+cargo run --release -- run example/hello_world.wi --release
+```
+
+## Language highlights
+
+### Types and inference
+
+Willow currently includes scalar types such as `i64`, `f64`, and `bool`, plus GC-managed types such as `String`, arrays, maps, class instances, closures, interfaces, enums, and tasks.
+
+Type annotations are optional when the type can be inferred:
+
+```rust
+let x: i64 = 10;
+let y = 10;
+```
+
+Variables are immutable by default:
+
+```rust
+let x = 10;
+// x = 20; // compile error
+
+let mut y = 10;
+y = 20;
+```
+
+### Classes and inheritance
+
+Members are private by default; use `pub` to expose them.
+
+```rust
+class User {
+    name: String;
+    pub age: i64;
+
+    pub init(self, name: String, age: i64) {
+        self.name = name;
+        self.age = age;
+    }
+
+    pub fn greet(self) -> String {
+        return self.name;
+    }
+}
+
+fn main() {
+    let user = new User("Alice", 30);
+    println(user.greet());
+}
+```
+
+Willow also supports interfaces, inheritance, virtual dispatch, static methods, and static properties.
+
+### Enums and `match`
+
+Enums can be simple tags or carry payloads:
+
+```rust
+enum ResultCode {
+    Ok(i64),
+    Failed(String),
+}
+
+fn print_result(result: ResultCode) {
+    match result {
+        ResultCode::Ok(value) => {
+            println(value);
+        }
+        ResultCode::Failed(message) => {
+            println(message);
+        }
+    }
+}
+```
+
+`Option<T>` and `Result<T, E>` use the same enum machinery and integrate with pattern matching and `?` propagation.
+
+### Async / await
+
+Calling an async function starts a task. Waiting is explicit with `await`:
 
 ```rust
 async fn work(x: i64) -> i64 {
-    await sleep(1);     // suspend so other tasks can make progress
+    await sleep(1);
     return x * 2;
 }
 
 async fn main() {
-    let a = work(10);     // start a task (runs concurrently)
-    let b = work(20);     // start another
+    let a = work(10);
+    let b = work(20);
 
-    println(await a);     // 20
-    println(await b);     // 40
+    println(await a);
+    println(await b);
 }
 ```
 
-Waiting on a task is always spelled `await`:
+Task cancellation can either propagate as a panic or be observed as a value:
 
-| Operation | Waits | Value | If the task was cancelled |
-| --- | --- | --- | --- |
-| `await task` | yes | `T` | panics |
-| `await task.result()` | yes | `Result<T, Cancelled>` | `Err(Cancelled)` |
+| Operation | Result | Cancelled task |
+| --- | --- | --- |
+| `await task` | `T` | panics |
+| `await task.result()` | `Result<T, Cancelled>` | `Err(Cancelled)` |
 
-## Conway's Game of Life patterns
+## Compiler architecture
 
-### Glider
+Willow has an explicit multi-stage compiler pipeline:
 
-```bash
-cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release --  2,1 3,2 1,3 2,3 3,3
+```text
+source
+  ↓
+AST
+  ↓
+type checking / typed HIR
+  ↓
+LIR (control-flow graph + async liveness)
+  ↓
+Cranelift IR
+  ↓
+native binary
 ```
 
-### Blinker
+All checked source bodies, including static-property initializers, are emitted through the LIR path.
+
+The compiler uses stable semantic identities such as `ExprId`, `PatternId`, `TypeId`, `FunctionId`, and `ModuleId` instead of relying on source spans or linker spellings as identity.
+
+## Runtime architecture
+
+Willow's runtime is implemented alongside the compiler rather than delegated to a host-language async runtime.
+
+Highlights include:
+
+- generational moving garbage collection
+- scalable GC reference bitmaps for wide objects and async frames
+- stackless async frames whose layout is derived from LIR liveness
+- multi-worker task scheduling with work stealing
+- channels and `select`
+- scheduler-aware locks and synchronization
+- cancellation-aware tasks
+- GC telemetry and stress modes used by the test suite
+
+## Examples
+
+The [`example/`](example/) directory contains runnable programs covering the language and runtime.
+
+A few useful starting points:
+
+- [`example/hello_world.wi`](example/hello_world.wi) — smallest program
+- [`example/enum_match.wi`](example/enum_match.wi) — enums and pattern matching
+- [`example/async_concurrent.wi`](example/async_concurrent.wi) — concurrent async tasks
+- [`example/game_of_life.wi`](example/game_of_life.wi) — larger runnable example
+- [`example/gc_scalable_bitmap.wi`](example/gc_scalable_bitmap.wi) — GC tracing beyond the inline reference mask
+
+Run the Game of Life example with an initial pattern:
 
 ```bash
-cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release -- 5,4 6,4 7,4
+./target/release/willowc run example/game_of_life.wi --release -- \
+  2,1 3,2 1,3 2,3 3,3
 ```
 
-### Toad
+## Project status
 
-```bash
-cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release -- 5,4 6,4 7,4 4,5 5,5 6,5
-```
+Willow is **experimental and under active development**. It is not yet intended as a production replacement for established languages.
 
-### Beacon
+Current limitations include:
 
-```bash
-cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release -- 3,3 4,3 3,4 4,4 5,5 6,5 5,6 6,6
-```
+- the standard library is still small: prelude plus `std::collections`, `std::option`, `std::result`, `std::io`, `std::env`, and `std::fs`
+- synchronous and `*_async` filesystem forms are currently backed by a bounded blocking pool
+- runs use at least five active workers; `WILLOW_WORKERS=N` can request more, while values below five are clamped to five
+- syntax, runtime APIs, and compiler internals may still change
+- the compiler currently requires a Rust toolchain to build from source
 
-### Pentadecathlon
+The project intentionally focuses on making the compiler and runtime architecture solid before treating the language surface as stable.
 
-```bash
-cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release -- 3,3 8,3 1,4 2,4 4,4 5,4 6,4 7,4 9,4 10,4 3,5 8,5
-```
+## Feedback
 
-### Lightweight spaceship
+Willow is a personal language project, and feedback from compiler/runtime developers or people experimenting with new languages is welcome. Bug reports, implementation discussion, and small reproducible examples are especially useful.
 
-```bash
-cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release -- 4,3 7,3 3,4 3,5 7,5 3,6 4,6 5,6 6,6
-```
+## License
 
-### R-pentomino
-
-```bash
-cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release -- 6,3 7,3 5,4 6,4 6,5
-```
-
-### Acorn
-
-```bash
-cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release -- 3,3 5,4 2,5 3,5 6,5 7,5 8,5
-```
-
-### Diehard
-
-```bash
-cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release -- 8,3 2,4 3,4 3,5 7,5 8,5 9,5
-```
-
-### Loaf
-
-```bash
-cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release -- 5,3 6,3 4,4 7,4 5,5 7,5 6,6
-```
-
-### Edge-crossing glider
-
-```bash
-cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release -- 10,7 11,8 9,9 10,9 11,9
-```
+Willow is available under the [MIT License](LICENSE).
