@@ -31,32 +31,77 @@ impl TypeChecker {
         Type::Named(literal.class.clone())
     }
 
-    pub(super) fn check_binary(&mut self, b: &BinaryExpr) -> Type {
-        let (lty, rty) = if matches!(b.op, BinOp::Eq | BinOp::Ne) {
-            // Give a bare `None` the other operand's Option context so it is
-            // diagnosed as the forbidden Option equality, not as an unknown
-            // variable. A user declaration named `None` shadows this path.
-            if self.is_unshadowed_bare_none(&b.lhs) {
-                let rty = self.check_expr(&b.rhs);
-                let lty = if is_option_type(&rty) {
-                    self.check_expr_expecting(&b.lhs, &rty)
-                } else {
-                    self.check_expr(&b.lhs)
-                };
-                (lty, rty)
-            } else {
-                let lty = self.check_expr(&b.lhs);
-                let rty = if is_option_type(&lty) && self.is_unshadowed_bare_none(&b.rhs) {
-                    self.check_expr_expecting(&b.rhs, &lty)
-                } else {
-                    self.check_expr(&b.rhs)
-                };
-                (lty, rty)
+    /// Traverse contiguous unary/binary trees on the heap. Non-operator leaves
+    /// still use normal checking so contextual and callable state is preserved.
+    pub(super) fn check_operator_tree(&mut self, expr: &Expr) -> Type {
+        enum Work<'a> {
+            Enter(&'a Expr),
+            AfterLeft(&'a BinaryExpr),
+            FinishBinary(&'a BinaryExpr, Type),
+            AfterRightForBareNoneLhs(&'a BinaryExpr),
+            FinishUnary(&'a UnaryExpr),
+        }
+        let mut work = vec![Work::Enter(expr)];
+        let mut value = Type::Void;
+        while let Some(next) = work.pop() {
+            match next {
+                Work::Enter(Expr::Binary(binary)) => {
+                    if matches!(binary.op, BinOp::Eq | BinOp::Ne)
+                        && self.is_unshadowed_bare_none(&binary.lhs)
+                    {
+                        // A bare None on the left derives its Option context
+                        // from the right, retaining the original evaluation order.
+                        work.push(Work::AfterRightForBareNoneLhs(binary));
+                        work.push(Work::Enter(&binary.rhs));
+                    } else {
+                        work.push(Work::AfterLeft(binary));
+                        work.push(Work::Enter(&binary.lhs));
+                    }
+                }
+                Work::Enter(Expr::Unary(unary)) => {
+                    work.push(Work::FinishUnary(unary));
+                    work.push(Work::Enter(&unary.expr));
+                }
+                Work::Enter(leaf) => value = self.check_expr(leaf),
+                Work::AfterLeft(binary) => {
+                    let left = value;
+                    if matches!(binary.op, BinOp::Eq | BinOp::Ne)
+                        && is_option_type(&left)
+                        && self.is_unshadowed_bare_none(&binary.rhs)
+                    {
+                        let right = self.check_expr_expecting(&binary.rhs, &left);
+                        value = self.finish_binary(binary, left, right);
+                        self.expr_types.insert(binary.id, value.clone());
+                    } else {
+                        work.push(Work::FinishBinary(binary, left));
+                        work.push(Work::Enter(&binary.rhs));
+                        value = Type::Void;
+                    }
+                }
+                Work::FinishBinary(binary, left) => {
+                    value = self.finish_binary(binary, left, value);
+                    self.expr_types.insert(binary.id, value.clone());
+                }
+                Work::AfterRightForBareNoneLhs(binary) => {
+                    let right = value;
+                    let left = if is_option_type(&right) {
+                        self.check_expr_expecting(&binary.lhs, &right)
+                    } else {
+                        self.check_expr(&binary.lhs)
+                    };
+                    value = self.finish_binary(binary, left, right);
+                    self.expr_types.insert(binary.id, value.clone());
+                }
+                Work::FinishUnary(unary) => {
+                    value = self.finish_unary(unary, value);
+                    self.expr_types.insert(unary.id, value.clone());
+                }
             }
-        } else {
-            (self.check_expr(&b.lhs), self.check_expr(&b.rhs))
-        };
+        }
+        value
+    }
 
+    fn finish_binary(&mut self, b: &BinaryExpr, lty: Type, rty: Type) -> Type {
         match &b.op {
             // `**` is deliberately narrower than the other arithmetic operators:
             // only `i64 ** i64 -> i64` and `f64 ** f64 -> f64` are defined
@@ -288,8 +333,7 @@ impl TypeChecker {
         None
     }
 
-    pub(super) fn check_unary(&mut self, u: &UnaryExpr) -> Type {
-        let ty = self.check_expr(&u.expr);
+    fn finish_unary(&mut self, u: &UnaryExpr, ty: Type) -> Type {
         match &u.op {
             UnaryOp::Neg => {
                 if ty != Type::I64 && ty != Type::F64 {
@@ -489,4 +533,113 @@ pub(crate) fn negative_exponent_literal(span: Span) -> Diagnostic {
         "integer exponentiation has no fractional result",
     ))
     .with_help("use `f64` operands (`2.0 ** -3.0`), or compute `1 / (x ** 3)` explicitly")
+}
+
+#[cfg(test)]
+mod operator_tree_tests {
+    use super::*;
+
+    #[test]
+    fn operator_types_and_errors_cover_twenty_four_perspectives() {
+        let cases = [
+            ("1 + 2", Type::I64, 0),
+            ("3 - 1", Type::I64, 0),
+            ("2 * 4", Type::I64, 0),
+            ("8 / 2", Type::I64, 0),
+            ("9 % 2", Type::I64, 0),
+            ("2 ** 3", Type::I64, 0),
+            ("1.0 + 2.0", Type::F64, 0),
+            ("2.0 ** 3.0", Type::F64, 0),
+            ("1 < 2", Type::Bool, 0),
+            ("1 <= 2", Type::Bool, 0),
+            ("2 > 1", Type::Bool, 0),
+            ("2 >= 1", Type::Bool, 0),
+            ("1 == 2", Type::Bool, 0),
+            ("1 != 2", Type::Bool, 0),
+            ("true && false", Type::Bool, 0),
+            ("true || false", Type::Bool, 0),
+            ("-1", Type::I64, 0),
+            ("-1.0", Type::F64, 0),
+            ("!false", Type::Bool, 0),
+            ("-(1 + 2) * -3", Type::I64, 0),
+            ("1 + true", Type::I64, 1),
+            ("-false", Type::Bool, 1),
+            ("!1", Type::Bool, 1),
+            ("2 ** -1", Type::I64, 1),
+        ];
+        for (expression, expected, error_count) in cases {
+            let source = format!("fn probe() {{ let value = {expression}; }}");
+            let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+            let (program, errors) = crate::parser::Parser::new(tokens).parse();
+            assert!(errors.is_empty(), "{expression}: {errors:?}");
+            let Item::Function(function) = &program.items[0] else {
+                unreachable!()
+            };
+            let Stmt::Let(binding) = &function.body.stmts[0] else {
+                unreachable!()
+            };
+            let mut checker = TypeChecker::new();
+            assert_eq!(checker.check_expr(&binding.init), expected, "{expression}");
+            assert_eq!(
+                checker.errors.len(),
+                error_count,
+                "{expression}: {:?}",
+                checker.errors
+            );
+            for event in crate::parser::iter::AstWalk::new(crate::parser::iter::AstEvent::Expr(
+                &binding.init,
+            )) {
+                if let crate::parser::iter::AstEvent::Expr(expr) = event {
+                    assert!(checker.expr_types.contains_key(&expr.id()), "{expression}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_operator_tree_uses_a_one_megabyte_stack() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let mut checker = TypeChecker::new();
+                let span = Span::new(0, 0, 1, 1);
+                let mut expr = Expr::Integer(1, span, ExprId::fresh());
+                for index in 0..50_000 {
+                    expr = if index % 2 == 0 {
+                        Expr::Unary(Box::new(UnaryExpr {
+                            id: ExprId::fresh(),
+                            op: UnaryOp::Neg,
+                            expr,
+                            span,
+                        }))
+                    } else {
+                        Expr::Binary(Box::new(BinaryExpr {
+                            id: ExprId::fresh(),
+                            op: BinOp::Add,
+                            lhs: expr,
+                            rhs: Expr::Integer(1, span, ExprId::fresh()),
+                            span,
+                        }))
+                    };
+                }
+                let result = checker.check_expr(&expr);
+                let type_count = checker.expr_types.len();
+                let errors = checker.errors;
+                // Drain before asserting so a regression reports its assertion,
+                // without overflowing the native stack in the owned AST destructor.
+                loop {
+                    expr = match expr {
+                        Expr::Unary(unary) => unary.expr,
+                        Expr::Binary(binary) => binary.lhs,
+                        _ => break,
+                    };
+                }
+                assert_eq!(result, Type::I64);
+                assert_eq!(type_count, 75_001);
+                assert!(errors.is_empty(), "{errors:?}");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 }

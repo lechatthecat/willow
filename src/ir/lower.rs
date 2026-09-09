@@ -976,8 +976,7 @@ fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
         Expr::Bool(b, span, _) => Ok(lit(HirExprKind::Bool(*b), Type::Bool, *span)),
         Expr::String(s, span, _) => Ok(lit(HirExprKind::Str(s.clone()), Type::String, *span)),
         Expr::Var(name, span, _) => lower_var_expr(expr, name, *span, ctx),
-        Expr::Binary(b) => lower_binary_expr(b, ctx),
-        Expr::Unary(u) => lower_unary_expr(u, ctx),
+        Expr::Binary(_) | Expr::Unary(_) => lower_operator_tree(expr, ctx),
         Expr::Call(c) => lower_call_expr(c, ctx),
         Expr::Print(inner, newline, span, _) => lower_print_expr(inner, *newline, *span, ctx),
         Expr::ArrayLiteral(elements, span, _) => {
@@ -1060,37 +1059,87 @@ fn lower_var_expr(
     ))
 }
 
-#[inline(never)]
-fn lower_binary_expr(b: &BinaryExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
-    let lhs = lower_expr(&b.lhs, ctx)?;
-    let rhs = lower_expr(&b.rhs, ctx)?;
-    let ty = binary_result_type(&b.op, &lhs.ty);
-    Ok(HirExpr {
-        kind: HirExprKind::Binary {
-            op: b.op.clone(),
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
-        },
-        ty,
-        span: b.span,
-    })
-}
-
-#[inline(never)]
-fn lower_unary_expr(u: &UnaryExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
-    let operand = lower_expr(&u.expr, ctx)?;
-    let ty = match u.op {
-        UnaryOp::Neg => operand.ty.clone(),
-        UnaryOp::Not => Type::Bool,
-    };
-    Ok(HirExpr {
-        kind: HirExprKind::Unary {
-            op: u.op.clone(),
-            operand: Box::new(operand),
-        },
-        ty,
-        span: u.span,
-    })
+/// Operator chains have no lexical boundaries. Keep their construction frames
+/// on the heap, delegating other syntax to its context-sensitive lowering.
+fn lower_operator_tree(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
+    enum Step<'a> {
+        Enter(&'a Expr),
+        Binary(&'a BinaryExpr),
+        Unary(&'a UnaryExpr),
+    }
+    let mut work = vec![Step::Enter(expr)];
+    let mut values: Vec<HirExpr> = Vec::new();
+    while let Some(step) = work.pop() {
+        let mut value = match step {
+            Step::Enter(Expr::Binary(binary)) => {
+                work.push(Step::Binary(binary));
+                work.push(Step::Enter(&binary.rhs));
+                work.push(Step::Enter(&binary.lhs));
+                continue;
+            }
+            Step::Enter(Expr::Unary(unary)) => {
+                work.push(Step::Unary(unary));
+                work.push(Step::Enter(&unary.expr));
+                continue;
+            }
+            Step::Enter(other) => match lower_expr(other, ctx) {
+                Ok(value) => {
+                    values.push(value);
+                    continue;
+                }
+                Err(error) => {
+                    // Completed operator subtrees can be very deep even when
+                    // a later operand fails; discard them without recursive Drop.
+                    while let Some(value) = values.pop() {
+                        match value.kind {
+                            HirExprKind::Binary { lhs, rhs, .. } => {
+                                values.push(*lhs);
+                                values.push(*rhs);
+                            }
+                            HirExprKind::Unary { operand, .. } => values.push(*operand),
+                            _ => {}
+                        }
+                    }
+                    return Err(error);
+                }
+            },
+            Step::Binary(binary) => {
+                let rhs = values.pop().expect("lowered right operand");
+                let lhs = values.pop().expect("lowered left operand");
+                let ty = binary_result_type(&binary.op, &lhs.ty);
+                HirExpr {
+                    kind: HirExprKind::Binary {
+                        op: binary.op.clone(),
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    },
+                    ty,
+                    span: binary.span,
+                }
+            }
+            Step::Unary(unary) => {
+                let operand = values.pop().expect("lowered unary operand");
+                let ty = match unary.op {
+                    UnaryOp::Neg => operand.ty.clone(),
+                    UnaryOp::Not => Type::Bool,
+                };
+                HirExpr {
+                    kind: HirExprKind::Unary {
+                        op: unary.op.clone(),
+                        operand: Box::new(operand),
+                    },
+                    ty,
+                    span: unary.span,
+                }
+            }
+        };
+        // The outer lower_expr normalizes the root once, just as before.
+        if !work.is_empty() {
+            value.ty = ctx.normalize(&value.ty);
+        }
+        values.push(value);
+    }
+    Ok(values.pop().expect("lowered operator root"))
 }
 
 #[inline(never)]
@@ -2050,6 +2099,115 @@ mod tests {
                 let (hir, diags) = lower_src(&src);
                 assert!(diags.is_empty(), "{diags:?}");
                 assert_eq!(hir.functions.len(), 1);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn operator_lowering_uses_heap_frames_on_success_and_error() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                for fail_after_left in [false, true] {
+                    let span = Span::new(0, 1, 1, 1);
+                    let mut expr = Expr::Integer(1, span, ExprId::fresh());
+                    for depth in 0..50_000 {
+                        expr = if depth % 2 == 0 {
+                            Expr::Unary(Box::new(UnaryExpr {
+                                id: ExprId::fresh(),
+                                op: UnaryOp::Neg,
+                                expr,
+                                span,
+                            }))
+                        } else {
+                            Expr::Binary(Box::new(BinaryExpr {
+                                id: ExprId::fresh(),
+                                op: BinOp::Add,
+                                lhs: expr,
+                                rhs: Expr::Integer(1, span, ExprId::fresh()),
+                                span,
+                            }))
+                        };
+                    }
+                    if fail_after_left {
+                        expr = Expr::Binary(Box::new(BinaryExpr {
+                            id: ExprId::fresh(),
+                            op: BinOp::Add,
+                            lhs: expr,
+                            rhs: Expr::Var("missing".into(), span, ExprId::fresh()),
+                            span,
+                        }));
+                    }
+                    let program = Program {
+                        module: None,
+                        imports: vec![],
+                        items: vec![Item::Function(FunctionDecl {
+                            name: "main".into(),
+                            public: false,
+                            is_async: false,
+                            params: vec![],
+                            return_type: Type::Void,
+                            body: Block {
+                                stmts: vec![Stmt::Expr(crate::parser::ast::ExprStmt {
+                                    expr,
+                                    span,
+                                })],
+                                span,
+                            },
+                            span,
+                        })],
+                    };
+                    let (hir, diagnostics) = lower_program(&program);
+                    let mut count = 0;
+                    let mut root_type = None;
+                    for function in hir.functions {
+                        for statement in function.body {
+                            if let HirStmt::Expr(expr) = statement {
+                                count = expr.walk_postorder(true).count();
+                                root_type = Some(expr.ty.clone());
+                                let mut values = vec![expr];
+                                while let Some(value) = values.pop() {
+                                    match value.kind {
+                                        HirExprKind::Binary { lhs, rhs, .. } => {
+                                            values.push(*lhs);
+                                            values.push(*rhs);
+                                        }
+                                        HirExprKind::Unary { operand, .. } => values.push(*operand),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for item in program.items {
+                        if let Item::Function(function) = item {
+                            for statement in function.body.stmts {
+                                if let Stmt::Expr(statement) = statement {
+                                    let mut values = vec![statement.expr];
+                                    while let Some(value) = values.pop() {
+                                        match value {
+                                            Expr::Binary(binary) => {
+                                                values.push(binary.lhs);
+                                                values.push(binary.rhs);
+                                            }
+                                            Expr::Unary(unary) => values.push(unary.expr),
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if fail_after_left {
+                        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+                    } else {
+                        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+                        assert_eq!(root_type, Some(Type::I64));
+                        assert_eq!(count, 75_001);
+                    }
+                }
             })
             .unwrap()
             .join()

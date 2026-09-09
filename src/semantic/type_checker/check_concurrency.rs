@@ -15,10 +15,11 @@ impl TypeChecker {
                     let ch_ty = self.check_expr(channel);
                     let elem = self.select_channel_elem(&ch_ty, channel.span());
                     if binding != "_" {
-                        // Record the binding type keyed by the case span so the
-                        // cooperative async lowering can frame-back it (willow-7aj),
-                        // mirroring how `let`/`for` locals are recorded.
-                        self.async_local_types.insert(case.span, elem.clone());
+                        // Include the received binding in the task's Send check,
+                        // independently of other bindings at the same source span.
+                        if self.current_async_context {
+                            self.async_local_types.push(elem.clone());
+                        }
                         self.define_var(
                             binding.clone(),
                             VarInfo {
@@ -34,12 +35,10 @@ impl TypeChecker {
                     let ch_ty = self.check_expr(channel);
                     let elem = self.select_channel_elem(&ch_ty, channel.span());
                     let v_ty = self.check_expr(value);
-                    // Record the sent value's type keyed by its own span: a
-                    // bounded send case can be not-ready, so the cooperative
-                    // lowering frame-backs the value and needs its type
-                    // (willow-o038).
-                    if elem != Type::Void {
-                        self.async_local_types.insert(value.span(), elem.clone());
+                    // A bounded send can suspend while holding the value,
+                    // so its type participates in the task's Send check.
+                    if self.current_async_context && elem != Type::Void {
+                        self.async_local_types.push(elem.clone());
                     }
                     if elem != Type::Void && v_ty != elem {
                         self.push(
@@ -122,8 +121,10 @@ impl TypeChecker {
                         output_ty
                     };
                     if binding != "_" {
-                        // Frame-backed like the recv binding (keyed by case span).
-                        self.async_local_types.insert(case.span, result_ty.clone());
+                        // Include the join binding just like a received binding.
+                        if self.current_async_context {
+                            self.async_local_types.push(result_ty.clone());
+                        }
                         self.define_var(
                             binding.clone(),
                             VarInfo {
@@ -1125,13 +1126,12 @@ impl TypeChecker {
                 }
                 if let Some(arg) = call.args.first() {
                     let arg_ty = self.check_expr_expecting(&arg.expr, &element_ty);
-                    // Record the element type keyed by the argument span: a
+                    // Record each suspended value independently: a
                     // cooperative `send` on a bounded channel is a suspend
                     // point, so the lowering frame-backs channel + value and
-                    // needs the value's type (willow-o038).
-                    if element_ty != Type::Void {
-                        self.async_local_types
-                            .insert(arg.expr.span(), element_ty.clone());
+                    // carries the value into the task (willow-o038).
+                    if self.current_async_context && element_ty != Type::Void {
+                        self.async_local_types.push(element_ty.clone());
                     }
                     if matches!(arg.mode, CallArgMode::Reference { .. }) {
                         self.push(

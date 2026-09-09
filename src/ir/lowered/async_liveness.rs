@@ -400,15 +400,12 @@ fn collect_expr_uses(
     uses: &mut HashSet<LirLocalId>,
     defs: &HashSet<LirLocalId>,
 ) {
-    if let HirExprKind::Var(name) = &expr.kind
-        && let Some(local) = names.get(name.as_str())
-        && !defs.contains(local)
-    {
-        uses.insert(*local);
-    }
-    if !matches!(expr.kind, HirExprKind::Lambda { .. }) {
-        for child in expr.children() {
-            collect_expr_uses(child, names, uses, defs);
+    for expr in expr.walk_postorder(false) {
+        if let HirExprKind::Var(name) = &expr.kind
+            && let Some(local) = names.get(name.as_str())
+            && !defs.contains(local)
+        {
+            uses.insert(*local);
         }
     }
 }
@@ -434,6 +431,44 @@ fn successors(block: &LirBlock) -> Vec<BlockId> {
 #[cfg(test)]
 mod coalescing_tests {
     use super::*;
+    use crate::parser::ast::Type;
+
+    #[test]
+    fn deep_local_use_collection_uses_a_one_megabyte_stack() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let span = crate::diagnostics::Span::new(0, 0, 1, 1);
+                let mut expr = HirExpr {
+                    kind: HirExprKind::Var("value".into()),
+                    ty: Type::I64,
+                    span,
+                };
+                for _ in 0..50_000 {
+                    expr = HirExpr {
+                        kind: HirExprKind::TryPropagate {
+                            inner: Box::new(expr),
+                        },
+                        ty: Type::I64,
+                        span,
+                    };
+                }
+                let id = LirLocalId(0);
+                let names = HashMap::from([("value", id)]);
+                let mut uses = HashSet::new();
+                collect_expr_uses(&expr, &names, &mut uses, &HashSet::new());
+                assert_eq!(uses, HashSet::from([id]));
+                uses.clear();
+                collect_expr_uses(&expr, &names, &mut uses, &HashSet::from([id]));
+                assert!(uses.is_empty());
+                while let HirExprKind::TryPropagate { inner } = expr.kind {
+                    expr = *inner;
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     fn layout(source: &str) -> (LirAsyncFrameLayout, Vec<LirLocal>) {
         let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();

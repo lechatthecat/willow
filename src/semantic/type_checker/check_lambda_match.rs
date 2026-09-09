@@ -1,6 +1,6 @@
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
-use crate::parser::visit::{AstVisitor, walk_expr, walk_stmt};
+use crate::parser::iter::{AstEvent, AstWalk};
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::symbols::*;
 use std::collections::HashSet;
@@ -216,8 +216,8 @@ impl TypeChecker {
             writes: Vec::new(),
         };
         match &l.body {
-            LambdaBody::Expr(e) => scan.visit_expr(e),
-            LambdaBody::Block(b) => scan.visit_block(b),
+            LambdaBody::Expr(e) => scan.walk(AstEvent::Expr(e)),
+            LambdaBody::Block(b) => scan.walk(AstEvent::Block(b)),
         }
         let CaptureScan {
             captures, writes, ..
@@ -1185,7 +1185,20 @@ impl CaptureScan<'_> {
     }
 }
 
-impl AstVisitor for CaptureScan<'_> {
+impl CaptureScan<'_> {
+    fn walk(&mut self, root: AstEvent<'_>) {
+        for event in AstWalk::new(root) {
+            match event {
+                AstEvent::EnterScope => self.enter_scope(),
+                AstEvent::ExitScope => self.exit_scope(),
+                AstEvent::Bind(name) => self.bind(name),
+                AstEvent::Expr(expr) => self.visit_expr(expr),
+                AstEvent::ExitStmt(stmt) => self.visit_stmt(stmt),
+                _ => {}
+            }
+        }
+    }
+
     fn enter_scope(&mut self) {
         self.scopes.push(HashSet::new());
     }
@@ -1202,7 +1215,6 @@ impl AstVisitor for CaptureScan<'_> {
     }
 
     fn visit_stmt(&mut self, stmt: &Stmt) {
-        walk_stmt(self, stmt);
         // Writing an enclosing local captures it too, and an assignment target
         // is a name on the statement rather than a `Var` the walk can reach.
         if let Stmt::Assign(assign) = stmt {
@@ -1221,7 +1233,6 @@ impl AstVisitor for CaptureScan<'_> {
             Expr::Call(call) => self.note_use(&call.callee, call.span),
             _ => {}
         }
-        walk_expr(self, expr);
     }
 }
 
@@ -1257,6 +1268,53 @@ mod lambda_capture_tests {
     //! to it, 40 a capture two frames up rides both environments.
     use crate::diagnostics::Diagnostic;
     use crate::parser::ast::ExprId;
+
+    #[test]
+    fn deep_capture_scan_uses_a_one_megabyte_stack() {
+        use super::*;
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let mut checker = TypeChecker::new();
+                let span = Span::new(0, 0, 1, 1);
+                checker.symbols.push_scope();
+                checker.symbols.define_var(
+                    "outer".into(),
+                    crate::semantic::symbols::VarInfo {
+                        ty: Type::I64,
+                        mutable: false,
+                        is_param: false,
+                        declaration_span: span,
+                    },
+                );
+                let mut expr = Expr::Var("outer".into(), span, ExprId::fresh());
+                for _ in 0..50_000 {
+                    expr = Expr::TryPropagate(Box::new(expr), span, ExprId::fresh());
+                }
+                let mut scan = CaptureScan {
+                    checker: &mut checker,
+                    scopes: vec![HashSet::new()],
+                    captures: Vec::new(),
+                    writes: Vec::new(),
+                };
+                scan.walk(AstEvent::Expr(&expr));
+                while let Expr::TryPropagate(inner, _, _) = expr {
+                    expr = *inner;
+                }
+                assert_eq!(
+                    scan.captures
+                        .iter()
+                        .map(|capture| capture.name.as_str())
+                        .collect::<Vec<_>>(),
+                    ["outer"]
+                );
+                assert!(scan.writes.is_empty());
+                assert_eq!(scan.scopes.len(), 1);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     /// Check `src`, and report both its diagnostics and what each lambda
     /// captures — outer lambdas first, and within one lambda in the order the

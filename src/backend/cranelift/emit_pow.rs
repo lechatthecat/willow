@@ -76,9 +76,8 @@ pub(crate) fn pow_unroll_imul_count(steps: &[PowStep]) -> usize {
 
 /// Is `value` an `iconst`, and if so what does it hold?
 ///
-/// Reading the emitted definition rather than the source expression is what
-/// lets both the AST emitter and the LIR walker share one unroll decision. It
-/// recognizes exactly what some earlier stage already reduced to an `iconst` —
+/// Inspect the emitted definition to make the unroll decision. This recognizes
+/// exactly what an earlier stage already reduced to an `iconst` —
 /// today only an integer literal, since nothing folds constant expressions, so
 /// `x ** (1 + 2)` answers `None` here and takes the dynamic path.
 pub(crate) fn const_i64_operand(builder: &FunctionBuilder, value: Value) -> Option<i64> {

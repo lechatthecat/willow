@@ -1065,7 +1065,14 @@ fn run_backend(
         checker,
         module_checkers,
     } = frontend;
-    let modules = module_graph.files;
+    let module_init_plan = ir::module_init::ModuleInitPlan::from_graph(&module_graph);
+    let mut modules = module_graph.files;
+
+    let debug_metadata = if opts.target.emit_debug_info || opts.target.emit_source_map {
+        Some(debug_source_map_text(map, &program, &modules))
+    } else {
+        None
+    };
 
     // Codegen — wrap internal errors in a structured diagnostic.
     let mut codegen = backend::Codegen::new(opts).map_err(|error| {
@@ -1074,6 +1081,8 @@ fn run_backend(
             map,
         )
     })?;
+
+    codegen.set_module_init_plan(module_init_plan);
 
     // Register all enum infos (prelude + user-declared) for the backend.
     for (name, info) in &checker.symbols.enums {
@@ -1134,18 +1143,10 @@ fn run_backend(
     for (name, info) in &checker.symbols.interfaces {
         codegen.register_interface_info(name.to_string(), info.clone());
     }
-    // The checker's authoritative per-expression types (willow-mb5): the
-    // backend's type queries consult these FIRST, so the legacy structural
-    // re-derivation only covers compiler-synthesized expressions.
-    codegen.register_expr_types(checker.expr_types.clone());
-    // Lowered IR of the entry program (willow-0g8j): functions in the
-    // supported subset are compiled by walking blocks instead of the AST.
-    {
-        let tables = ir::lower::CheckerTables::from_checker(&checker);
-        let (hir, hir_gaps) = ir::lower::lower_program_with(&program, &tables);
-        log_hir_gaps(&hir_gaps);
-        codegen.register_lir_functions(ir::lowered::lower_program(&hir));
-    }
+    let mut module_checkers: std::collections::HashMap<_, _> = module_checkers
+        .into_iter()
+        .map(|checker| (checker.canonical_path.clone(), checker))
+        .collect();
 
     // Declaration and body lowering are two separate sweeps over the units
     // (willow-4zt8). EVERY unit -- each module and the entry program -- is
@@ -1156,19 +1157,11 @@ fn run_backend(
     // entry file had not contributed yet.
     let mut declared_modules = Vec::with_capacity(modules.len());
     for m in &modules {
-        let module_checker = module_checkers
-            .iter()
-            .find(|c| c.canonical_path == m.canonical_path);
-        // The module's own checker tables go in BEFORE its declaration phase
-        // (willow-9vvn). The node-ID-keyed maps registered above hold the entry
-        // file's entries alone, and a module is checked in its own scope, so
-        // without this an unqualified enum pattern in a module body reached
-        // lowering unresolved and took the wrong arm — and `declare_lambda`
-        // read no type for a module lambda, declaring it `fn(i64) -> i64`
-        // whatever it really was. Merging is safe because node IDs come from
-        // one build-wide counter, so no two units' keys collide.
+        let module_checker = module_checkers.get(&m.canonical_path);
+        // Lambda declarations read this unit's checked callable types. Replace
+        // the previous unit's transient table; declared signatures are global.
         if let Some(m_checker) = module_checker {
-            codegen.merge_module_checker_tables(&m_checker.checker);
+            codegen.register_module_checker_tables(&m_checker.checker);
         }
         // What THIS module's own imports bind (willow-vtlr, willow-28h8): the
         // modules it can name, and the single items it bound to local names.
@@ -1188,18 +1181,6 @@ fn run_backend(
         );
         match declared {
             Ok(unit) => {
-                // Lowered IR of THIS module's bodies (willow-0g8j.16). Without
-                // it every cross-module body is AST-emitted no matter what the
-                // walker could handle, because `lir_functions` holds the entry
-                // program alone. The tables are the module's own — a module is
-                // checked in its own scope, and lowering it against the entry
-                // file's would resolve names it never imported.
-                if let Some(m_checker) = module_checker {
-                    let tables = ir::lower::CheckerTables::from_checker(&m_checker.checker);
-                    let (hir, hir_gaps) = ir::lower::lower_program_with(&m.program, &tables);
-                    log_hir_gaps(&hir_gaps);
-                    codegen.register_module_lir(&unit, ir::lowered::lower_program(&hir));
-                }
                 codegen.restore_enum_aliases(displaced);
                 declared_modules.push((m.name.clone(), m.canonical_path.clone(), unit));
             }
@@ -1224,7 +1205,9 @@ fn run_backend(
     // local name. Its own declarations are already canonical (willow-nm0g).
     let entry_aliases = unit_enum_aliases(&checker);
     let displaced = codegen.install_enum_aliases(&entry_aliases);
+    codegen.register_expr_types(checker.expr_types.clone());
     let declared_entry = codegen.declare_program(&program, src);
+    codegen.register_expr_types(Default::default());
     codegen.restore_enum_aliases(displaced);
     let entry_unit = match declared_entry {
         Ok(unit) => unit,
@@ -1238,19 +1221,32 @@ fn run_backend(
             ));
         }
     };
-    for (name, canonical_path, unit) in &declared_modules {
+    for (name, canonical_path, unit) in declared_modules {
         // The module's own enum spellings, again: the body phase resolves the
         // same names the declaration phase did, and every other unit's phase
         // runs in between (willow-nm0g).
-        let aliases = match module_checkers
-            .iter()
-            .find(|c| &c.canonical_path == canonical_path)
-        {
+        let aliases = match module_checkers.get(&canonical_path) {
             Some(m_checker) => unit_enum_aliases(&m_checker.checker),
             None => Vec::new(),
         };
         let displaced = codegen.install_enum_aliases(&aliases);
-        let compiled = codegen.compile_module_bodies(unit);
+        // Keep lowered module bodies only while emitting this unit. All symbols
+        // and lambda names are already declared, so cross-unit calls need no
+        // other unit's LIR here.
+        if let Some(m_checker) = module_checkers.remove(&canonical_path) {
+            let module = modules
+                .iter_mut()
+                .find(|m| m.canonical_path == canonical_path)
+                .expect("declared module belongs to the resolved graph");
+            let tables = ir::lower::CheckerTables::from_checker(&m_checker.checker);
+            let (hir, hir_gaps) = ir::lower::lower_program_with(&module.program, &tables);
+            log_hir_gaps(&hir_gaps);
+            codegen.register_module_lir(&unit, ir::lowered::lower_program(&hir));
+            // Imports and module identity remain available; this source tree
+            // and checker have finished their final lowering pass.
+            module.program.items.clear();
+        }
+        let compiled = codegen.compile_module_bodies(&unit);
         codegen.restore_enum_aliases(displaced);
         if let Err(error) = compiled {
             return Err(report_backend_failure(
@@ -1262,6 +1258,18 @@ fn run_backend(
             ));
         }
     }
+    // Lower the entry only after module emission releases each module's LIR.
+    // Lambda symbols have already been declared and can be bound immediately.
+    {
+        let tables = ir::lower::CheckerTables::from_checker(&checker);
+        let (hir, hir_gaps) = ir::lower::lower_program_with(&program, &tables);
+        log_hir_gaps(&hir_gaps);
+        codegen.register_lir_functions(ir::lowered::lower_program(&hir));
+    }
+
+    drop(checker);
+    drop(program);
+
     let displaced = codegen.install_enum_aliases(&entry_aliases);
     let compiled_entry = codegen.compile_program_bodies(&entry_unit);
     codegen.restore_enum_aliases(displaced);
@@ -1304,11 +1312,6 @@ fn run_backend(
         diagnostics::emit(&diagnostic, &warning_map);
     }
 
-    let debug_metadata = if opts.target.emit_debug_info || opts.target.emit_source_map {
-        Some(debug_source_map_text(map, &program, &modules))
-    } else {
-        None
-    };
     if opts.target.emit_debug_info {
         codegen
             .embed_runtime_metadata(debug_metadata.as_deref().unwrap_or(""))

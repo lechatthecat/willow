@@ -773,14 +773,10 @@ impl TypeChecker {
         // and the cancel entry need: the evaluated lock handle, this
         // acquisition's registration token, and its phase (willow-38w.1.4).
         if self.current_async_context {
-            self.async_local_types
-                .insert(s.binding_span, binding_ty.clone());
-            self.async_local_types
-                .insert(s.handle_frame_key(), target_ty.clone());
-            self.async_local_types
-                .insert(s.token_frame_key(), Type::I64);
-            self.async_local_types
-                .insert(s.phase_frame_key(), Type::I64);
+            self.async_local_types.push(binding_ty.clone());
+            self.async_local_types.push(target_ty.clone());
+            self.async_local_types.push(Type::I64);
+            self.async_local_types.push(Type::I64);
         }
 
         self.symbols.push_scope();
@@ -998,7 +994,7 @@ impl TypeChecker {
                 // backend can frame-back unannotated live-across-await locals
                 // (willow-lpn.5c).
                 if self.current_async_context {
-                    self.async_local_types.insert(s.span, ty.clone());
+                    self.async_local_types.push(ty.clone());
                 }
                 // `_` is a wildcard: evaluate the initializer for side effects but do
                 // not bind a variable (allows multiple `let _ = expr;` in the same scope).
@@ -1302,12 +1298,10 @@ impl TypeChecker {
                     } else {
                         iterable_ty.clone()
                     };
-                    self.async_local_types
-                        .insert(s.iter_frame_key(), iter_slot_ty);
-                    self.async_local_types
-                        .insert(s.index_frame_key(), Type::I64);
+                    self.async_local_types.push(iter_slot_ty);
+                    self.async_local_types.push(Type::I64);
                     if s.name != "_" {
-                        self.async_local_types.insert(s.name_span, elem_ty.clone());
+                        self.async_local_types.push(elem_ty.clone());
                     }
                 }
 
@@ -1511,7 +1505,7 @@ impl TypeChecker {
                             .get(&expr.id())
                             .cloned()
                             .unwrap_or(Type::I64);
-                        self.async_local_types.insert(expr.span(), ty);
+                        self.async_local_types.push(ty);
                     };
                     match &d.body {
                         DeferBody::Expr(Expr::Call(c)) => {
@@ -1720,8 +1714,7 @@ impl TypeChecker {
                 );
                 Type::I64
             }
-            Expr::Binary(b) => self.check_binary(b),
-            Expr::Unary(u) => self.check_unary(u),
+            Expr::Binary(_) | Expr::Unary(_) => self.check_operator_tree(expr),
             Expr::Call(c) => {
                 // Lexical value bindings win over module/free-function names.
                 // Looking up the free function first silently compiled

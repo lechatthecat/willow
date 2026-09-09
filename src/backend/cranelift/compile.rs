@@ -48,6 +48,7 @@ fn closure_env_param(lambda_type: Option<&Type>, span: Span) -> Option<Param> {
 /// module body devirtualize an `open` call against only the classes declared so
 /// far, silently ignoring an override the entry file had not yet contributed.
 pub struct DeclaredModule {
+    init_unit: InitUnitId,
     mod_name: String,
     /// The module program after the std-collection and coop-suspension
     /// normalizations, i.e. exactly what the declaration phase read.
@@ -295,6 +296,7 @@ impl Codegen {
         program: &Program,
         source_file: &str,
     ) -> Result<DeclaredModule> {
+        let init_unit = self.module_init_plan.ensure_module(canonical_path);
         // Recorded from the RAW program, because the normalization on the next
         // line is what erases the aliases from it (willow-nswv).
         self.builtin_module_aliases = builtin_module_aliases(program);
@@ -327,8 +329,11 @@ impl Codegen {
             let program = &normalized_program;
             this.source_file = source_file.to_string();
             let module_prefix = module_symbol_prefix(canonical_path);
+            let InitUnitId::Module(module_id) = init_unit else {
+                unreachable!("module declaration has a module identity");
+            };
             this.known_modules
-                .insert(mod_name.to_string(), module_prefix.clone());
+                .register(module_id, canonical_path, mod_name);
             // ...and the module prefixes THIS unit writes for modules the graph
             // registered under some other spelling (willow-kd1v). Every module this
             // one imports is already declared — dependencies are declared before
@@ -464,7 +469,7 @@ impl Codegen {
                 this.declare_class_methods(c)?;
                 // Static-property storage for imported modules (replayed by
                 // `__willow_static_init`, compiled in the entry's compile_program).
-                this.declare_static_storage_for_class(&c.name, c, Some(&module_prefix))?;
+                this.declare_static_storage_for_class(&c.name, c, init_unit)?;
             }
             this.validate_gc_ref_mask_layouts()?;
 
@@ -545,6 +550,7 @@ impl Codegen {
             );
 
             Ok(DeclaredModule {
+                init_unit,
                 mod_name: mod_name.to_string(),
                 program: normalized_program,
                 module_prefix,
@@ -770,7 +776,7 @@ impl Codegen {
                 match item {
                     Item::Class(c) => {
                         this.declare_class_methods(c)?;
-                        this.declare_static_storage_for_class(&c.name, c, None)?;
+                        this.declare_static_storage_for_class(&c.name, c, InitUnitId::Entry)?;
                     }
                     Item::Enum(_) => {} // enum infos are registered via register_enum_info before compile
                     _ => {}
@@ -983,7 +989,7 @@ impl Codegen {
 
     /// Compile a lambda as a private function.
     pub(super) fn compile_lambda(&mut self, name: &str, l: &LambdaExpr) -> Result<()> {
-        let lambda_type = self.lambda_value_type(l);
+        let lambda_type = self.fn_types.get(name).cloned();
         let (param_types, return_type) = match &lambda_type {
             Some(Type::Fn(params, ret) | Type::Closure(params, ret)) => {
                 (params.clone(), *ret.clone())
@@ -1214,8 +1220,7 @@ impl Codegen {
         }
         let lir_fn = self
             .lir_functions
-            .get(name)
-            .cloned()
+            .remove(name)
             .ok_or_else(|| anyhow::anyhow!("function `{name}` has no lowered IR"))?;
         let ctx = lir_type_ctx!(self, &f.return_type);
         if let Some(reason) = super::lir_gen::lir_rejection_reason(&lir_fn, &ctx).or_else(|| {
@@ -1471,7 +1476,7 @@ impl Codegen {
         &mut self,
         class_key: &str,
         c: &ClassDecl,
-        owner: Option<&str>,
+        owner: InitUnitId,
     ) -> Result<()> {
         for field in &c.fields {
             if !field.is_static {
@@ -1531,13 +1536,16 @@ impl Codegen {
             let symbol =
                 self.class_method_symbol(class_key, &format!("$static_init.{}", field.name));
             self.declare_function_symbol(&initializer_name, &symbol, &initializer, false)?;
-            self.static_init_order.push(StaticInitItem {
-                class_key: class_key.to_string(),
-                field: field.name.clone(),
-                initializer,
-                ty: field.ty.clone(),
-                owner: owner.map(str::to_string),
-            });
+            self.unit_static_inits
+                .entry(owner)
+                .or_default()
+                .items
+                .push(StaticInitItem {
+                    class_key: class_key.to_string(),
+                    field: field.name.clone(),
+                    initializer,
+                    ty: field.ty.clone(),
+                });
         }
         Ok(())
     }
@@ -1547,16 +1555,24 @@ impl Codegen {
     /// GC-managed slots as permanent roots (willow-qsqf §11/§12). Called once at
     /// the start of `willow_user_main`.
     pub(super) fn compile_static_init(&mut self) -> Result<()> {
-        // Every module's own initializers first, in declaration (dependency)
-        // order, then the entry program's -- the order the properties were
-        // declared in, which is the order the spec replays them in.
-        let calls = self.module_static_inits.clone();
-        let items: Vec<StaticInitItem> = self
-            .static_init_order
+        let calls: Vec<FuncId> = self
+            .module_init_plan
+            .order()
             .iter()
-            .filter(|item| item.owner.is_none())
-            .cloned()
+            .filter(|unit| **unit != InitUnitId::Entry)
+            .filter_map(|unit| {
+                self.unit_static_inits
+                    .get(unit)
+                    .and_then(|node| node.function)
+            })
             .collect();
+        let items = std::mem::take(
+            &mut self
+                .unit_static_inits
+                .entry(InitUnitId::Entry)
+                .or_default()
+                .items,
+        );
         let func_id = self.func_ids[STATIC_INIT_SYMBOL];
         self.emit_static_init_body(func_id, &calls, &items)
     }
@@ -1571,12 +1587,13 @@ impl Codegen {
     /// every one of those names resolved to nothing and the property silently
     /// took a zero.
     pub(super) fn compile_unit_static_init(&mut self, unit: &DeclaredModule) -> Result<()> {
-        let items: Vec<StaticInitItem> = self
-            .static_init_order
-            .iter()
-            .filter(|item| item.owner.as_deref() == Some(unit.module_prefix.as_str()))
-            .cloned()
-            .collect();
+        let items = std::mem::take(
+            &mut self
+                .unit_static_inits
+                .entry(unit.init_unit)
+                .or_default()
+                .items,
+        );
         if items.is_empty() {
             return Ok(());
         }
@@ -1585,8 +1602,12 @@ impl Codegen {
         let func_id = self
             .module
             .declare_function(&symbol, Linkage::Local, &sig)?;
-        self.module_static_inits.push(func_id);
-        self.emit_static_init_body(func_id, &[], &items)
+        self.emit_static_init_body(func_id, &[], &items)?;
+        self.unit_static_inits
+            .entry(unit.init_unit)
+            .or_default()
+            .function = Some(func_id);
+        Ok(())
     }
 
     /// The shared body of every static-initializer function: call `calls` in
@@ -2032,8 +2053,7 @@ impl Codegen {
         let lir_name = format!("{}::{}", c.name, m.name);
         let lir_fn = self
             .lir_functions
-            .get(&lir_name)
-            .cloned()
+            .remove(&lir_name)
             .ok_or_else(|| anyhow::anyhow!("method `{lir_name}` has no lowered IR"))?;
         let ctx = lir_type_ctx!(self, &m.return_type);
         if let Some(reason) = super::lir_gen::lir_rejection_reason(&lir_fn, &ctx).or_else(|| {

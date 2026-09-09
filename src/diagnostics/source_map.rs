@@ -2,7 +2,7 @@ use crate::parser::ast::{
     Block, CallArg, CallArgMode, ClassDecl, Expr, FunctionDecl, Item, MethodDecl, Param, ParamMode,
     Program, StaticCallExpr, Stmt, Type,
 };
-use crate::parser::visit::{AstVisitor, walk_expr, walk_stmt};
+use crate::parser::iter::{AstEvent, AstWalk};
 use std::collections::HashMap;
 
 use super::FileId;
@@ -455,24 +455,27 @@ struct AwaitPointCollector {
     await_points: Vec<DebugAwaitPoint>,
 }
 
-impl AstVisitor for AwaitPointCollector {
-    fn visit_stmt(&mut self, stmt: &Stmt) {
-        if matches!(stmt, Stmt::Defer(_)) {
-            return;
+impl AwaitPointCollector {
+    fn visit_block(&mut self, block: &Block) {
+        let mut walk = AstWalk::new(AstEvent::Block(block));
+        while let Some(event) = walk.next() {
+            match event {
+                AstEvent::Stmt(Stmt::Defer(_)) | AstEvent::Expr(Expr::Select(_)) => {
+                    walk.skip_children();
+                }
+                AstEvent::Expr(expr) => self.visit_expr(expr),
+                _ => {}
+            }
         }
-        walk_stmt(self, stmt);
     }
 
     fn visit_expr(&mut self, expr: &Expr) {
-        match expr {
-            Expr::Await(await_expr) => self.await_points.push(DebugAwaitPoint {
+        if let Expr::Await(await_expr) = expr {
+            self.await_points.push(DebugAwaitPoint {
                 line: await_expr.span.line,
                 col: await_expr.span.col,
-            }),
-            Expr::Select(_) => return,
-            _ => {}
+            });
         }
-        walk_expr(self, expr);
     }
 }
 
@@ -487,12 +490,18 @@ struct ReferenceCallCollector<'a> {
     reference_calls: Vec<DebugReferenceCall>,
 }
 
-impl AstVisitor for ReferenceCallCollector<'_> {
-    fn visit_stmt(&mut self, stmt: &Stmt) {
-        if matches!(stmt, Stmt::Defer(_)) {
-            return;
+impl ReferenceCallCollector<'_> {
+    fn visit_block(&mut self, block: &Block) {
+        let mut walk = AstWalk::new(AstEvent::Block(block));
+        while let Some(event) = walk.next() {
+            match event {
+                AstEvent::Stmt(Stmt::Defer(_)) | AstEvent::Expr(Expr::Select(_)) => {
+                    walk.skip_children();
+                }
+                AstEvent::Expr(expr) => self.visit_expr(expr),
+                _ => {}
+            }
         }
-        walk_stmt(self, stmt);
     }
 
     fn visit_expr(&mut self, expr: &Expr) {
@@ -512,10 +521,8 @@ impl AstVisitor for ReferenceCallCollector<'_> {
             Expr::StaticCall(call) => {
                 collect_static_reference_call_args(call, self.signatures, &mut self.reference_calls)
             }
-            Expr::Select(_) => return,
             _ => {}
         }
-        walk_expr(self, expr);
     }
 }
 
@@ -526,7 +533,8 @@ fn collect_debug_statements(block: &Block) -> Vec<DebugStatement> {
 }
 
 fn collect_block_statements(block: &Block, statements: &mut Vec<DebugStatement>) {
-    for stmt in &block.stmts {
+    let mut pending: Vec<_> = block.stmts.iter().rev().collect();
+    while let Some(stmt) = pending.pop() {
         let span = stmt_span(stmt);
         statements.push(DebugStatement {
             kind: stmt_kind(stmt).to_string(),
@@ -538,14 +546,14 @@ fn collect_block_statements(block: &Block, statements: &mut Vec<DebugStatement>)
             Stmt::Defer(_) => {}
             Stmt::Break(_) | Stmt::Continue(_) => {}
             Stmt::If(if_stmt) => {
-                collect_block_statements(&if_stmt.then_block, statements);
                 if let Some(else_block) = &if_stmt.else_block {
-                    collect_block_statements(else_block, statements);
+                    pending.extend(else_block.stmts.iter().rev());
                 }
+                pending.extend(if_stmt.then_block.stmts.iter().rev());
             }
-            Stmt::While(while_stmt) => collect_block_statements(&while_stmt.body, statements),
-            Stmt::For(for_stmt) => collect_block_statements(&for_stmt.body, statements),
-            Stmt::Lock(lock_stmt) => collect_block_statements(&lock_stmt.body, statements),
+            Stmt::While(while_stmt) => pending.extend(while_stmt.body.stmts.iter().rev()),
+            Stmt::For(for_stmt) => pending.extend(for_stmt.body.stmts.iter().rev()),
+            Stmt::Lock(lock_stmt) => pending.extend(lock_stmt.body.stmts.iter().rev()),
             Stmt::Let(_)
             | Stmt::Assign(_)
             | Stmt::FieldAssign(_)
@@ -713,6 +721,52 @@ fn reference_index_name(expr: &Expr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deep_read_only_scans_use_a_one_megabyte_stack() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let tokens = crate::lexer::Lexer::new("async fn f() { await sleep(1); }")
+                    .tokenize()
+                    .unwrap();
+                let (mut program, errors) = crate::parser::Parser::new(tokens).parse();
+                assert!(errors.is_empty());
+                let Item::Function(function) = &mut program.items[0] else {
+                    unreachable!()
+                };
+                let Stmt::Expr(expr) = function.body.stmts.remove(0) else {
+                    unreachable!()
+                };
+                let span = crate::diagnostics::Span::new(0, 0, 1, 1);
+                let mut expr = expr.expr;
+                for _ in 0..50_000 {
+                    expr = Expr::TryPropagate(
+                        Box::new(expr),
+                        span,
+                        crate::parser::ast::ExprId::fresh(),
+                    );
+                }
+                function
+                    .body
+                    .stmts
+                    .push(Stmt::Expr(crate::parser::ast::ExprStmt { expr, span }));
+                assert_eq!(collect_debug_await_points(&function.body).len(), 1);
+                assert!(collect_debug_reference_calls(&function.body, &HashMap::new()).is_empty());
+                assert_eq!(collect_debug_statements(&function.body).len(), 1);
+                let Stmt::Expr(expr) = function.body.stmts.remove(0) else {
+                    unreachable!()
+                };
+                let mut expr = expr.expr;
+                while let Expr::TryPropagate(inner, _, _) = expr {
+                    expr = *inner;
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     use crate::lexer::Lexer;
     use crate::parser::Parser;
 

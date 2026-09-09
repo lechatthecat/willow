@@ -6,62 +6,40 @@ use std::collections::HashSet;
 
 use crate::diagnostics::Span;
 use crate::parser::ast::*;
-use crate::parser::visit::{AstVisitor, walk_stmt};
+use crate::parser::iter::{AstEvent, AstWalk};
 
 /// Collect the names of fields assigned via `self.field = ...` anywhere in the
 /// block (willow-scq2 §8 definite-assignment, MVP non-path-sensitive).
 pub(crate) fn collect_self_field_assigns(block: &Block, out: &mut HashSet<String>) {
-    let mut collector = SelfFieldAssignCollector { out };
-    collector.visit_block(block);
+    walk_constructor_statements(block, |stmt| {
+        if let Stmt::FieldAssign(assign) = stmt
+            && matches!(&assign.object, Expr::Var(name, _, _) if name == "self")
+        {
+            out.insert(assign.field.clone());
+        }
+    });
 }
 
 /// Collect the span of every `super(...)` call in the block.
 pub(crate) fn collect_super_init_spans(block: &Block, out: &mut Vec<Span>) {
-    let mut collector = SuperInitSpanCollector { out };
-    collector.visit_block(block);
+    walk_constructor_statements(block, |stmt| {
+        if let Stmt::SuperInit(init) = stmt {
+            out.push(init.span);
+        }
+    });
 }
 
-/// Both constructor scans are statement-structure only: the `visit_expr`
-/// override below stops the walk at every expression, so a `self.x = ...` or a
-/// `super(...)` inside a lambda body or a `match` arm belongs to that body and
-/// not to this constructor. A `defer` body is skipped for a related reason: it
-/// runs at scope exit, after the constructor's definite-assignment point.
-struct SelfFieldAssignCollector<'a> {
-    out: &'a mut HashSet<String>,
-}
-
-impl AstVisitor for SelfFieldAssignCollector<'_> {
-    fn visit_expr(&mut self, _expr: &Expr) {}
-
-    fn visit_stmt(&mut self, stmt: &Stmt) {
-        match stmt {
-            Stmt::Defer(_) => return,
-            Stmt::FieldAssign(assign) => {
-                if matches!(&assign.object, Expr::Var(name, _, _) if name == "self") {
-                    self.out.insert(assign.field.clone());
-                }
-            }
+/// Constructor scans only inspect statement structure: assignments in a lambda
+/// or match expression belong to that body. Deferred work runs after the
+/// constructor's definite-assignment point and must also be excluded.
+fn walk_constructor_statements(block: &Block, mut visit: impl FnMut(&Stmt)) {
+    let mut walk = AstWalk::new(AstEvent::Block(block));
+    while let Some(event) = walk.next() {
+        match event {
+            AstEvent::Expr(_) | AstEvent::Stmt(Stmt::Defer(_)) => walk.skip_children(),
+            AstEvent::Stmt(stmt) => visit(stmt),
             _ => {}
         }
-        walk_stmt(self, stmt);
-    }
-}
-
-/// See [`SelfFieldAssignCollector`] for the shared traversal rules.
-struct SuperInitSpanCollector<'a> {
-    out: &'a mut Vec<Span>,
-}
-
-impl AstVisitor for SuperInitSpanCollector<'_> {
-    fn visit_expr(&mut self, _expr: &Expr) {}
-
-    fn visit_stmt(&mut self, stmt: &Stmt) {
-        match stmt {
-            Stmt::Defer(_) => return,
-            Stmt::SuperInit(init) => self.out.push(init.span),
-            _ => {}
-        }
-        walk_stmt(self, stmt);
     }
 }
 
@@ -211,6 +189,43 @@ mod tests {
     //! source order including one inside a branch, a7 a `super.init` in a
     //! `defer` body is skipped.
     use super::*;
+
+    #[test]
+    fn constructor_scans_use_a_one_megabyte_stack() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let span = Span::new(0, 0, 1, 1);
+                let mut body = Block {
+                    stmts: vec![Stmt::SuperInit(SuperInitStmt { args: vec![], span })],
+                    span,
+                };
+                for _ in 0..50_000 {
+                    body = Block {
+                        stmts: vec![Stmt::If(IfStmt {
+                            cond: Expr::Bool(true, span, ExprId::fresh()),
+                            then_block: body,
+                            else_block: None,
+                            span,
+                        })],
+                        span,
+                    };
+                }
+                let mut spans = Vec::new();
+                collect_super_init_spans(&body, &mut spans);
+                assert_eq!(spans, [span]);
+                let mut fields = HashSet::new();
+                collect_self_field_assigns(&body, &mut fields);
+                assert!(fields.is_empty());
+                // Owned AST destruction is tested separately from these scans.
+                while let Some(Stmt::If(branch)) = body.stmts.pop() {
+                    body = branch.then_block;
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     fn class_ctor_body(src: &str, class_name: &str) -> Block {
         let tokens = crate::lexer::Lexer::new(src).tokenize().expect("lex");

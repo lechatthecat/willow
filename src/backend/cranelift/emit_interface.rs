@@ -5,10 +5,8 @@ use super::*;
 
 /// How one class-method call site must be emitted (willow-fm7t).
 ///
-/// Produced by [`FuncGen::plan_virtual_call`] and consumed by both emitters, so
-/// the static-init AST path and the LIR walker cannot disagree about whether a
-/// call is virtual, which slot it uses, or which implementation's ABI describes
-/// it.
+/// Produced by [`FuncGen::plan_virtual_call`] for LIR emission. The plan fixes
+/// whether the call is virtual, its slot, and the implementation ABI.
 pub(super) struct VirtualCallPlan {
     /// The nearest class in the receiver's ancestry that defines the method.
     /// Its signature describes every target, since an `override` may not change
@@ -220,12 +218,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// How a call to `class_name::method_name` on a receiver of STATIC type
-    /// `class_name` must be emitted (willow-fm7t, shared by both emitters).
+    /// `class_name` must be emitted (willow-fm7t).
     ///
-    /// Everything here is compile-time reasoning over the class tables, so the
-    /// static-init AST path and the LIR walker ask one function rather than
-    /// each deciding for itself — a divergence between them is a miscompile
-    /// that shows up only in whichever body took the other path.
+    /// Resolve dispatch from the class tables once for each call site. Static
+    /// initializers use the same LIR emission and dispatch rules as other bodies.
     pub(super) fn plan_virtual_call(&self, class_name: &str, method_name: &str) -> VirtualCallPlan {
         // A method with no slot is neither `open` nor an `override`. It can
         // neither be overridden nor override anything, so its callee is fixed

@@ -61,12 +61,10 @@ pub struct TypeChecker {
     /// The outer function/method body is depth 1. Reset for lambdas so recovery
     /// capability cannot cross a function boundary (willow-s9ej.3).
     pub(crate) lexical_block_depth: u32,
-    /// Resolved types of `let` locals declared inside `async fn` bodies, keyed by
-    /// the let statement's span. Checker-internal: `check_decls` diffs it across
-    /// a body to hand `check_async_task_send` the locals a task would carry
-    /// across `await`. The backend used to read it to frame-back unannotated
-    /// locals; the lowered-IR frame layout owns that now (willow-0g8j.3).
-    async_local_types: HashMap<Span, Type>,
+    /// Types carried by the current callable's async locals and suspension
+    /// temporaries. Each occurrence has its own slot, independent of source
+    /// spans; callable checking drains its slots after checking Send.
+    async_local_types: Vec<Type>,
     /// Maps the ID of an UNQUALIFIED enum-variant construction (`Ok(42)` in an
     /// expected-enum position) to the enum it resolved to. The backend consults
     /// this to lower such a `Call` as a variant allocation instead of a function
@@ -331,7 +329,7 @@ impl TypeChecker {
             loop_depth: 0,
             lock_depth: 0,
             lexical_block_depth: 0,
-            async_local_types: HashMap::new(),
+            async_local_types: Vec::new(),
             enum_variant_resolutions: HashMap::new(),
             pattern_resolutions: HashMap::new(),
             expr_types: HashMap::new(),
@@ -1484,6 +1482,86 @@ fn class_info_from_decl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn async_local_occurrences_survive_shared_spans() {
+        // Twenty perspectives: ten colliding scalar counts, with the non-Send
+        // local before or after them. All callable bodies also share spans,
+        // proving one callable cannot suppress another callable's observations.
+        for scalar_count in 1..=10 {
+            for bad_first in [false, true] {
+                let scalars = (0..scalar_count)
+                    .map(|i| format!("let value_{i}: i64 = {i};"))
+                    .collect::<String>();
+                let bad = "let op: fn(i64) -> i64 = inc;";
+                let body = if bad_first {
+                    format!("{bad}{scalars}")
+                } else {
+                    format!("{scalars}{bad}")
+                };
+                let source = format!(
+                    "fn inc(x: i64) -> i64 {{ return x; }} \
+                     async fn first() {{ {body} }} \
+                     async fn second() {{ {body} }} \
+                     async fn clean() {{ let value = 1; }}"
+                );
+                let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+                let (mut program, errors) = crate::parser::Parser::new(tokens).parse();
+                assert!(errors.is_empty(), "{errors:?}");
+                for item in &mut program.items {
+                    if let Item::Function(function) = item {
+                        for statement in &mut function.body.stmts {
+                            if let Stmt::Let(binding) = statement {
+                                binding.span = Span::new(0, 1, 1, 1);
+                            }
+                        }
+                    }
+                }
+                let mut checker = TypeChecker::new();
+                checker.set_enforce_send_sync(true);
+                checker.check_program(&program);
+                assert_eq!(
+                    checker
+                        .errors
+                        .iter()
+                        .filter(|e| e.code == ErrorCode::E2402)
+                        .count(),
+                    2,
+                    "count={scalar_count}, bad_first={bad_first}: {:?}",
+                    checker.errors
+                );
+                assert!(checker.async_local_types.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn synchronous_lambda_send_does_not_add_outer_async_locals() {
+        let source = r#"
+fn inc(x: i64) -> i64 { return x; }
+async fn run() {
+    (|| {
+        let ch = Channel<fn(i64) -> i64>::new();
+        ch.send(inc);
+    });
+}
+"#;
+        let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
+        let (program, errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(errors.is_empty(), "{errors:?}");
+        let mut checker = TypeChecker::new();
+        checker.set_enforce_send_sync(true);
+        checker.check_program(&program);
+        // The invalid channel element still has its own E2403 diagnostic;
+        // it must not manufacture an unrelated outer task-frame error.
+        assert!(checker.errors.iter().any(|e| e.code == ErrorCode::E2403));
+        assert!(
+            !checker.errors.iter().any(|e| e.code == ErrorCode::E2402),
+            "{:?}",
+            checker.errors
+        );
+        assert!(checker.async_local_types.is_empty());
+    }
 
     fn assert_typecheck_ok(source: &str) {
         let errors = check_source(source);

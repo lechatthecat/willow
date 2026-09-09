@@ -1452,12 +1452,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_task_terminal_value(awaited, cid, result_ty.unwrap_or(&Type::Void), cancel_aware)
     }
 
-    /// The LIR spelling of an acquisition (willow-0g8j.2.13): the same
-    /// acquire/park/poll/owned state machine [`Self::emit_coop_lock`] builds,
-    /// driven by frame offsets the LIR walker owns rather than by an AST
-    /// statement.
+    /// Emit the acquire/park/poll/owned state machine using the acquisition's
+    /// LIR frame offsets (willow-0g8j.2.13).
     ///
-    /// Three things the AST path does are already done by the time this runs.
+    /// Lowering prepares three parts of the acquisition before emission.
     /// The handle was evaluated and stored by the `LirInst::Let` the lowerer
     /// hoisted the target into. The binding is a LIR local whose frame slot is
     /// bound in `vars` for the whole function, so no name is shadowed and none
@@ -1466,9 +1464,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// is why this leaves the builder in `owned_b` with the path still open.
     ///
     /// What it keeps is everything that is not a body: the status chain, the
-    /// reentrancy fault, and the park/re-poll edges. The two cleanup
-    /// registrations the AST path makes here are made by the body's
-    /// `EnterDeferScope` instead — see the walker — because a suspension split
+    /// reentrancy fault, and the park/re-poll edges. The body registers its two
+    /// cleanup actions at `EnterDeferScope`, because a suspension split
     /// can put this acquisition in a LATER block than the section it opens, and
     /// both registrations are ordered by emission.
     ///

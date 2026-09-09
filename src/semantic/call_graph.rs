@@ -33,7 +33,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::parser::ast::*;
-use crate::parser::visit::{AstVisitor, walk_expr, walk_stmt};
+use crate::parser::iter::{AstEvent, AstWalk};
 use crate::semantic::ids::{FunctionId, TypeId};
 
 /// The class inheritance relation and the set of methods each class declares.
@@ -344,7 +344,7 @@ fn collect_call_sites(
         ],
         sites: CallSites::default(),
     };
-    collector.visit_block(body);
+    collector.walk(body);
     collector.sites
 }
 
@@ -406,12 +406,21 @@ impl CallSiteCollector<'_> {
 /// Call sites are read off the shared structural walk (willow-uqzx.1.1). Every
 /// arm is POST-order: the children are already recorded by `walk_*` before this
 /// node is classified.
-impl AstVisitor for CallSiteCollector<'_> {
-    /// A lambda body is its own node and every call through a function value is
-    /// unknown at the call site, so descending here would only double-count.
-    /// Its parameters are therefore never bound here either, which is correct:
-    /// they are not in scope at any call site this collector still sees.
-    fn visit_lambda(&mut self, _lambda: &LambdaExpr) {}
+impl CallSiteCollector<'_> {
+    fn walk(&mut self, body: &Block) {
+        let mut walk = AstWalk::new(AstEvent::Block(body));
+        while let Some(event) = walk.next() {
+            match event {
+                AstEvent::Lambda(_) => walk.skip_children(),
+                AstEvent::EnterScope => self.enter_scope(),
+                AstEvent::ExitScope => self.exit_scope(),
+                AstEvent::Bind(name) => self.bind(name),
+                AstEvent::ExitStmt(stmt) => self.visit_stmt(stmt),
+                AstEvent::ExitExpr(expr) => self.visit_expr(expr),
+                _ => {}
+            }
+        }
+    }
 
     fn enter_scope(&mut self) {
         self.scopes.push(HashMap::new());
@@ -431,10 +440,9 @@ impl AstVisitor for CallSiteCollector<'_> {
     }
 
     fn visit_stmt(&mut self, statement: &Stmt) {
-        walk_stmt(self, statement);
         match statement {
             Stmt::Let(stmt) => {
-                // `walk_stmt` already bound the name in the innermost scope,
+                // The Bind event already introduced the name in the innermost scope,
                 // after the initializer was walked. Fill in its type there.
                 if let Some(ty) = stmt.ty.clone().or_else(|| match &stmt.init {
                     Expr::New(new) => Some(Type::Named(new.class_name.clone())),
@@ -457,7 +465,6 @@ impl AstVisitor for CallSiteCollector<'_> {
     }
 
     fn visit_expr(&mut self, expression: &Expr) {
-        walk_expr(self, expression);
         match expression {
             Expr::Call(call) => {
                 let callee = call.callee.as_str();
@@ -549,6 +556,49 @@ mod tests {
     //! receiver's class does not leak to a same-named outer receiver, 33 a
     //! parameter stays local inside a nested block.
     use super::*;
+
+    #[test]
+    fn deep_call_site_scan_uses_a_one_megabyte_stack() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let mut program = parse("fn caller() { helper(); }");
+                let Item::Function(function) = &mut program.items[0] else {
+                    unreachable!()
+                };
+                let Stmt::Expr(statement) = function.body.stmts.remove(0) else {
+                    unreachable!()
+                };
+                let span = statement.span;
+                let mut expr = statement.expr;
+                for _ in 0..50_000 {
+                    expr = Expr::TryPropagate(Box::new(expr), span, ExprId::fresh());
+                }
+                function
+                    .body
+                    .stmts
+                    .push(Stmt::Expr(ExprStmt { expr, span }));
+                let sites = collect_call_sites(
+                    &[],
+                    &function.body,
+                    None,
+                    &ClassHierarchy::default(),
+                    &HashSet::from(["helper"]),
+                );
+                let Stmt::Expr(statement) = function.body.stmts.remove(0) else {
+                    unreachable!()
+                };
+                let mut expr = statement.expr;
+                while let Expr::TryPropagate(inner, _, _) = expr {
+                    expr = *inner;
+                }
+                assert_eq!(sites.targets, BTreeSet::from([FunctionId::free("helper")]));
+                assert!(!sites.has_unknown);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     fn parse(source: &str) -> Program {
         let tokens = crate::lexer::Lexer::new(source).tokenize().expect("lex");

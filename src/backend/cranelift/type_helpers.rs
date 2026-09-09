@@ -165,10 +165,8 @@ pub(crate) fn is_gc_managed(ty: &Type, enum_infos: &TypeMap<EnumInfo>) -> bool {
 }
 
 /// The zero-argument GC statistic builtins: `() -> i64` reads of a runtime
-/// counter. They carry no AST-only metadata, their ABI entries are all
-/// `NONE; ([] -> Some(I64))`, and the AST emitter does nothing around them
-/// beyond the call itself — so the LIR walker can admit them unchanged
-/// (willow-0g8j.3.1).
+/// counter. Their ABI entries are all `NONE; ([] -> Some(I64))`, so LIR
+/// emission needs only the runtime call (willow-0g8j.3.1).
 ///
 /// Derived from `builtin_call_runtime_name` rather than repeating its list:
 /// `gc_collect` / `gc_minor_collect` are the void pair beside these, and

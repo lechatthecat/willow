@@ -12,10 +12,11 @@
 //! hazard classification and the [`FunctionId`] -> linker-symbol mapping in
 //! [`backend_symbol`].
 
+use super::ModuleSymbols;
 use std::collections::{HashMap, HashSet};
 
 use crate::parser::ast::*;
-use crate::parser::visit::{AstVisitor, walk_expr, walk_stmt};
+use crate::parser::iter::{AstEvent, AstWalk};
 use crate::semantic::call_graph::{CallGraph, ClassHierarchy};
 use crate::semantic::effects::{EffectProblem, RuntimeEffects};
 use crate::semantic::ids::{FunctionId, FunctionMap};
@@ -49,7 +50,7 @@ pub(super) fn analyze_program(
     program: &Program,
     naming: UnitNaming<'_>,
     known: &FunctionMap<bool>,
-    known_modules: &HashMap<String, String>,
+    known_modules: &ModuleSymbols,
     lambdas: &[(String, LambdaExpr)],
 ) -> HashMap<String, bool> {
     let mut free_keys = HashMap::new();
@@ -246,7 +247,7 @@ fn method_key(
     class: &str,
     method: &str,
     naming: UnitNaming<'_>,
-    known_modules: &HashMap<String, String>,
+    known_modules: &ModuleSymbols,
 ) -> String {
     if let Some(prefix) = naming.module_prefix {
         return class_member_symbol(
@@ -259,7 +260,7 @@ fn method_key(
 
 struct AnalysisContext<'a> {
     known: &'a FunctionMap<bool>,
-    known_modules: &'a HashMap<String, String>,
+    known_modules: &'a ModuleSymbols,
     free_keys: &'a HashMap<String, String>,
     method_keys: &'a HashMap<(String, String), String>,
 }
@@ -295,7 +296,7 @@ fn backend_symbol(id: &FunctionId, context: &AnalysisContext<'_>) -> String {
     {
         return key.clone();
     }
-    if let Some(prefix) = context.known_modules.get(&class) {
+    if let Some(prefix) = context.known_modules.linker_prefix(&class) {
         return module_item_symbol(prefix, id.name());
     }
     class_method_symbol_name(context.known_modules, &class, id.name())
@@ -338,9 +339,8 @@ fn external_effects(target: &FunctionId, context: &AnalysisContext<'_>) -> Runti
 
 /// Direct hazards a body performs itself, independent of what it calls.
 ///
-/// Read off the shared structural walk (willow-uqzx.1.1). Every arm is
-/// POST-order: the children are already accounted for by `walk_*` before this
-/// node is classified.
+/// Direct hazards accumulate independently of traversal order. The explicit
+/// worklist keeps this read-only analysis independent of expression depth.
 struct HazardVisitor {
     panics: bool,
 }
@@ -351,14 +351,21 @@ impl HazardVisitor {
     }
 }
 
-impl AstVisitor for HazardVisitor {
-    /// A lambda body is registered as its own candidate, and every call through
-    /// a function value stays conservative at the call site, so descending here
-    /// would only double-count.
-    fn visit_lambda(&mut self, _lambda: &LambdaExpr) {}
+impl HazardVisitor {
+    fn visit_block(&mut self, block: &Block) {
+        let mut walk = AstWalk::new(AstEvent::Block(block));
+        while let Some(event) = walk.next() {
+            match event {
+                // A lambda is analyzed as its own callable.
+                AstEvent::Lambda(_) => walk.skip_children(),
+                AstEvent::Stmt(stmt) => self.visit_stmt(stmt),
+                AstEvent::Expr(expr) => self.visit_expr(expr),
+                _ => {}
+            }
+        }
+    }
 
     fn visit_stmt(&mut self, statement: &Stmt) {
-        walk_stmt(self, statement);
         match statement {
             // Bounds guard.
             Stmt::IndexAssign(_) => self.mark_direct(),
@@ -384,7 +391,6 @@ impl AstVisitor for HazardVisitor {
     }
 
     fn visit_expr(&mut self, expression: &Expr) {
-        walk_expr(self, expression);
         match expression {
             Expr::Binary(expr) => {
                 if matches!(expr.op, BinOp::Div | BinOp::Rem | BinOp::Pow) {
@@ -428,6 +434,52 @@ impl AstVisitor for HazardVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deep_read_only_scans_use_a_one_megabyte_stack() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let tokens = crate::lexer::Lexer::new("async fn f() { await sleep(1); }")
+                    .tokenize()
+                    .unwrap();
+                let (mut program, errors) = crate::parser::Parser::new(tokens).parse();
+                assert!(errors.is_empty());
+                let Item::Function(function) = &mut program.items[0] else {
+                    unreachable!()
+                };
+                let Stmt::Expr(expr) = function.body.stmts.remove(0) else {
+                    unreachable!()
+                };
+                let span = crate::diagnostics::Span::new(0, 0, 1, 1);
+                let mut expr = expr.expr;
+                for _ in 0..50_000 {
+                    expr = Expr::TryPropagate(
+                        Box::new(expr),
+                        span,
+                        crate::parser::ast::ExprId::fresh(),
+                    );
+                }
+                function
+                    .body
+                    .stmts
+                    .push(Stmt::Expr(crate::parser::ast::ExprStmt { expr, span }));
+                let mut hazards = HazardVisitor { panics: false };
+                hazards.visit_block(&function.body);
+                assert!(hazards.panics);
+                let Stmt::Expr(expr) = function.body.stmts.remove(0) else {
+                    unreachable!()
+                };
+                let mut expr = expr.expr;
+                while let Expr::TryPropagate(inner, _, _) = expr {
+                    expr = *inner;
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     use crate::lexer::Lexer;
     use crate::parser::Parser;
 
@@ -441,7 +493,7 @@ mod tests {
                 module_prefix: None,
             },
             &FunctionMap::default(),
-            &HashMap::new(),
+            &ModuleSymbols::default(),
             &[],
         )
     }

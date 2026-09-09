@@ -349,6 +349,7 @@ mod tests {
         let mut trace = VarTrace::default();
         let body = body_of(source, "f");
         trace.visit_block(&body);
+        compare_scope_walks(&body, source);
         let iterative: Vec<_> =
             crate::parser::iter::AstWalk::new(crate::parser::iter::AstEvent::Block(&body))
                 .filter_map(|event| match event {
@@ -373,19 +374,23 @@ mod tests {
         /// `(name, depth-of-scope-holding-it)` for every resolved `Var` read.
         resolved: Vec<(String, Option<usize>)>,
         max_depth: usize,
+        events: Vec<String>,
     }
 
     impl AstVisitor for ScopeTrace {
         fn enter_scope(&mut self) {
+            self.events.push("enter".into());
             self.stack.push(Vec::new());
             self.max_depth = self.max_depth.max(self.stack.len());
         }
 
         fn exit_scope(&mut self) {
+            self.events.push("exit".into());
             self.stack.pop().expect("balanced scopes");
         }
 
         fn bind(&mut self, name: &str) {
+            self.events.push(format!("bind:{name}"));
             self.stack
                 .last_mut()
                 .expect("a binding needs an open scope")
@@ -404,11 +409,38 @@ mod tests {
         }
     }
 
-    fn scope_trace(source: &str) -> ScopeTrace {
+    fn compare_scope_walks(body: &Block, source: &str) -> ScopeTrace {
+        use crate::parser::iter::{AstEvent, AstWalk};
         let mut trace = ScopeTrace::default();
-        trace.visit_block(&body_of(source, "f"));
+        trace.visit_block(body);
         assert!(trace.stack.is_empty(), "scopes must be balanced");
+        let mut iterative = ScopeTrace::default();
+        for event in AstWalk::new(AstEvent::Block(body)) {
+            match event {
+                AstEvent::EnterScope => iterative.enter_scope(),
+                AstEvent::ExitScope => iterative.exit_scope(),
+                AstEvent::Bind(name) => iterative.bind(name),
+                // Visiting a variable has no children, so this reuses only the
+                // existing trace's resolution observation, never recursion.
+                AstEvent::Expr(expr @ Expr::Var(..)) => iterative.visit_expr(expr),
+                _ => {}
+            }
+        }
+        assert!(iterative.stack.is_empty(), "iterative scopes: {source}");
+        assert_eq!(iterative.events, trace.events, "scope events: {source}");
+        assert_eq!(
+            iterative.resolved, trace.resolved,
+            "binding resolution: {source}"
+        );
+        assert_eq!(
+            iterative.max_depth, trace.max_depth,
+            "scope depth: {source}"
+        );
         trace
+    }
+
+    fn scope_trace(source: &str) -> ScopeTrace {
+        compare_scope_walks(&body_of(source, "f"), source)
     }
 
     /// True when `name` resolved to some open scope at every read.

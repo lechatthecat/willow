@@ -13,10 +13,9 @@
 //!
 //! Expressions stay as typed [`HirExpr`] trees inside instructions; lowering
 //! expression-level control flow (ternary, `match`, short-circuit operators)
-//! into blocks is the backend slice's job. The backend consumes this IR for
-//! every function whose lowering stays inside its supported subset
-//! (`backend::cranelift::lir_gen`, willow-0g8j) and falls back to the AST
-//! walker for the rest; `--emit-lir` renders it either way.
+//! into blocks is the backend's job. Every user body, including static
+//! initializers, is emitted from this IR (`backend::cranelift::lir_gen`).
+//! Unsupported lowering is diagnosed; `--emit-lir` renders the lowered program.
 
 use crate::diagnostics::Span;
 use crate::parser::ast::{ExprId, LockMode, Type};
@@ -612,9 +611,12 @@ fn collect_lambdas(body: &[HirStmt], out: &mut Vec<LirLambda>) {
 }
 
 fn collect_lambdas_in_expr(expr: &HirExpr, out: &mut Vec<LirLambda>) {
-    for child in expr.children() {
-        collect_lambdas_in_expr(child, out);
+    for expr in expr.walk_postorder(true) {
+        collect_lambda(expr, out);
     }
+}
+
+fn collect_lambda(expr: &HirExpr, out: &mut Vec<LirLambda>) {
     if let HirExprKind::Lambda {
         id,
         params,
@@ -694,11 +696,8 @@ impl LirDeferBody {
 }
 
 fn expr_has_recover(expr: &HirExpr) -> bool {
-    match &expr.kind {
-        HirExprKind::Call { callee, .. } if callee == "recover" => true,
-        HirExprKind::Lambda { .. } => false,
-        _ => expr.children().into_iter().any(expr_has_recover),
-    }
+    expr.walk_postorder(false)
+        .any(|expr| matches!(&expr.kind, HirExprKind::Call { callee, .. } if callee == "recover"))
 }
 
 fn block_has_recover(stmts: &[HirStmt]) -> bool {
@@ -870,40 +869,53 @@ fn body_suspends(body: &[HirStmt]) -> bool {
 /// resolving `break`/`continue` against the loop stack active at the match site
 /// (willow-o3xi).
 fn body_needs_match_cfg(body: &[HirStmt]) -> bool {
-    body.iter().any(stmt_needs_match_cfg)
+    needs_match_cfg(body.iter().map(MatchCfgNode::Stmt).collect())
 }
 
-fn stmt_needs_match_cfg(stmt: &HirStmt) -> bool {
-    match stmt {
-        HirStmt::While { .. }
-        | HirStmt::For { .. }
-        | HirStmt::Break { .. }
-        | HirStmt::Continue { .. }
-        | HirStmt::Defer { .. }
-        | HirStmt::Lock { .. }
-        | HirStmt::IndexAssign { .. }
-        | HirStmt::StaticFieldAssign { .. } => true,
-        HirStmt::If {
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            body_needs_match_cfg(then_branch)
-                || else_branch.as_deref().is_some_and(body_needs_match_cfg)
-        }
-        _ => stmt.child_exprs().into_iter().any(expr_needs_match_cfg),
-    }
+enum MatchCfgNode<'a> {
+    Stmt(&'a HirStmt),
+    Expr(&'a HirExpr),
 }
 
-fn expr_needs_match_cfg(expr: &HirExpr) -> bool {
-    match &expr.kind {
-        HirExprKind::Match { scrutinee, arms } => {
-            expr_needs_match_cfg(scrutinee)
-                || arms.iter().any(|arm| body_needs_match_cfg(&arm.body))
+fn needs_match_cfg(mut pending: Vec<MatchCfgNode<'_>>) -> bool {
+    while let Some(node) = pending.pop() {
+        match node {
+            MatchCfgNode::Stmt(stmt) => match stmt {
+                HirStmt::While { .. }
+                | HirStmt::For { .. }
+                | HirStmt::Break { .. }
+                | HirStmt::Continue { .. }
+                | HirStmt::Defer { .. }
+                | HirStmt::Lock { .. }
+                | HirStmt::IndexAssign { .. }
+                | HirStmt::StaticFieldAssign { .. } => return true,
+                HirStmt::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    // Preserve the predicate's existing branch-only treatment
+                    // of statement conditions.
+                    pending.extend(then_branch.iter().map(MatchCfgNode::Stmt));
+                    if let Some(body) = else_branch {
+                        pending.extend(body.iter().map(MatchCfgNode::Stmt));
+                    }
+                }
+                _ => pending.extend(stmt.child_exprs().into_iter().map(MatchCfgNode::Expr)),
+            },
+            MatchCfgNode::Expr(expr) => match &expr.kind {
+                HirExprKind::Match { scrutinee, arms } => {
+                    pending.push(MatchCfgNode::Expr(scrutinee));
+                    for arm in arms {
+                        pending.extend(arm.body.iter().map(MatchCfgNode::Stmt));
+                    }
+                }
+                HirExprKind::Lambda { .. } => {}
+                _ => pending.extend(expr.children().into_iter().map(MatchCfgNode::Expr)),
+            },
         }
-        HirExprKind::Lambda { .. } => false,
-        _ => expr.children().into_iter().any(expr_needs_match_cfg),
     }
+    false
 }
 
 /// The names a pattern binds, with the type each is bound at, in the order the
@@ -912,8 +924,7 @@ fn expr_needs_match_cfg(expr: &HirExpr) -> bool {
 /// A variant whose payloads are ALL `void` carries no word, so its bindings
 /// name values that do not exist. They are deliberately absent here: nothing
 /// declares a local for them, so an arm body that reads one finds no binding
-/// and takes the function back to the AST emitter — the same outcome the
-/// tree-shaped `match` already produces.
+/// and is rejected by LIR validation, matching tree-shaped `match` validation.
 fn pattern_bindings(pattern: &HirPattern) -> Vec<(String, Type)> {
     match pattern {
         HirPattern::Wildcard
@@ -1104,19 +1115,20 @@ fn replace_suspension(expr: &HirExpr, target_span: Span, replacement: &HirExpr) 
 }
 
 fn expression_executes_call(expr: &HirExpr) -> bool {
-    match &expr.kind {
-        HirExprKind::Call { .. }
-        | HirExprKind::MethodCall { .. }
-        | HirExprKind::StaticCall { .. }
-        | HirExprKind::New { .. }
-        | HirExprKind::ObjectLiteral { .. }
-        | HirExprKind::Print { .. }
-        | HirExprKind::Array { .. }
-        | HirExprKind::Index { .. }
-        | HirExprKind::Select { .. } => true,
-        HirExprKind::Lambda { .. } => false,
-        _ => expr.children().into_iter().any(expression_executes_call),
-    }
+    expr.walk_postorder(false).any(|expr| {
+        matches!(
+            expr.kind,
+            HirExprKind::Call { .. }
+                | HirExprKind::MethodCall { .. }
+                | HirExprKind::StaticCall { .. }
+                | HirExprKind::New { .. }
+                | HirExprKind::ObjectLiteral { .. }
+                | HirExprKind::Print { .. }
+                | HirExprKind::Array { .. }
+                | HirExprKind::Index { .. }
+                | HirExprKind::Select { .. }
+        )
+    })
 }
 
 fn instruction_executes_call(inst: &LirInst) -> bool {
@@ -1148,8 +1160,7 @@ fn instruction_executes_call(inst: &LirInst) -> bool {
         // The release calls the runtime, but it is compiler-owned bookkeeping
         // rather than a user statement, and a preemption edge in front of it
         // would park the task holding a lock it is one instruction from giving
-        // back. The AST path emits its release from the defer unwinder, which
-        // has no safepoint either.
+        // back. Cleanup unwinding also emits release without a safepoint.
         // A pattern test and its bindings are loads and integer compares on a
         // value the enclosing block already holds. No call, so no safepoint.
         LirInst::ReleaseLock { .. }
@@ -2836,8 +2847,7 @@ impl Builder {
                     },
                 );
                 // Not hoisted into a `let`: the header re-evaluates it, so a
-                // body that grows or shrinks the array is observed, exactly as
-                // on the AST path.
+                // body that grows or shrinks the array is observed.
                 bound_expr = HirExpr {
                     kind: HirExprKind::MethodCall {
                         object: Box::new(arr_var.clone()),
@@ -2860,9 +2870,8 @@ impl Builder {
             // that returns one) — for x in r  →  rng = r; i = rng.start;
             // end = rng.end; while i < end { x = i; .. } (willow-0g8j.2.10).
             //
-            // Both bounds are read ONCE, before the loop, exactly as
-            // `emit_range_for_value` reads them on the AST path: a `Range<i64>`
-            // is immutable, so re-reading them per iteration could only cost
+            // Both bounds are read once before the loop. A `Range<i64>` is
+            // immutable, so re-reading them per iteration could only cost
             // loads, and hoisting the value itself keeps a call in the iterable
             // position from running twice.
             (_, Type::Generic(g, args)) if g == "Range" && args.first() == Some(&Type::I64) => {
@@ -3239,6 +3248,99 @@ mod tests {
                 .collect();
             assert_eq!(ids.len(), count, "same-span defer sites must stay distinct");
         }
+    }
+
+    #[test]
+    fn deep_match_cfg_predicate_uses_a_one_megabyte_stack() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                for hazard in [false, true] {
+                    let span = Span::new(0, 0, 1, 1);
+                    let leaf = HirExpr {
+                        kind: HirExprKind::Int(1),
+                        ty: Type::I64,
+                        span,
+                    };
+                    let mut expr = HirExpr {
+                        kind: HirExprKind::Match {
+                            scrutinee: Box::new(leaf),
+                            arms: vec![crate::ir::typed_ast::HirMatchArm {
+                                pattern: HirPattern::Wildcard,
+                                ty: Type::I64,
+                                body: if hazard {
+                                    vec![HirStmt::Break { span }]
+                                } else {
+                                    Vec::new()
+                                },
+                                span,
+                            }],
+                        },
+                        ty: Type::I64,
+                        span,
+                    };
+                    for _ in 0..50_000 {
+                        expr = HirExpr {
+                            kind: HirExprKind::TryPropagate {
+                                inner: Box::new(expr),
+                            },
+                            ty: Type::I64,
+                            span,
+                        };
+                    }
+                    let found = needs_match_cfg(vec![MatchCfgNode::Expr(&expr)]);
+                    while let HirExprKind::TryPropagate { inner } = expr.kind {
+                        expr = *inner;
+                    }
+                    assert_eq!(found, hazard);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn deep_hir_predicates_use_a_one_megabyte_stack() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                for has_call in [false, true] {
+                    let span = Span::new(0, 0, 1, 1);
+                    let mut expr = HirExpr {
+                        kind: if has_call {
+                            HirExprKind::Call {
+                                callee: "recover".into(),
+                                args: Vec::new(),
+                            }
+                        } else {
+                            HirExprKind::Int(1)
+                        },
+                        ty: Type::I64,
+                        span,
+                    };
+                    for _ in 0..50_000 {
+                        expr = HirExpr {
+                            kind: HirExprKind::TryPropagate {
+                                inner: Box::new(expr),
+                            },
+                            ty: Type::I64,
+                            span,
+                        };
+                    }
+                    assert_eq!(expr_has_recover(&expr), has_call);
+                    assert_eq!(expression_executes_call(&expr), has_call);
+                    let mut lambdas = Vec::new();
+                    collect_lambdas_in_expr(&expr, &mut lambdas);
+                    assert!(lambdas.is_empty());
+                    while let HirExprKind::TryPropagate { inner } = expr.kind {
+                        expr = *inner;
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

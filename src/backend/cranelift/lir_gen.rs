@@ -2,12 +2,10 @@
 //!
 //! The emit layer for user function bodies: a function is compiled by walking
 //! its [`LirFunction`] basic blocks directly (typed [`HirExpr`] trees inside),
-//! so the backend never touches the AST body for it. Since willow-0g8j.3 there
-//! is no AST fallback to fall back TO — a body outside the subset below is a
-//! compile error naming the construct, not a silent switch of emitters — and
-//! the subset covers the whole language the checker accepts.
+//! using the LIR-only body emitter. A missing or invalid lowered body produces
+//! a compile error naming the construct (willow-t0uy.3).
 //!
-//! Current supported subset: `i64`/`f64`/`bool`/`String`/`Array<T>` values,
+//! Supported representations include: `i64`/`f64`/`bool`/`String`/`Array<T>` values,
 //! class objects (including inheritance), plain and generic interface values,
 //! plain and generic enums, function values, `Channel<T>`, `Task<T>` and
 //! `JoinHandle<T>`, plus the builtin collections `Map<K, V>`, `FrozenArray<T>`
@@ -23,14 +21,14 @@
 //! control flow (jump/branch/return).
 //!
 //! Class layouts include inherited fields in declaration order, while method
-//! calls on a hierarchy use the same vtable slots as the AST emitter. Canonical
+//! calls on a hierarchy use the declared virtual method slots. Canonical
 //! nullable values are supported through `Option<T>`. A `defer` body must be an
 //! effect-only match or straight-line HIR block, but its scope may span blocks
 //! and be left by an early exit. A SYNCHRONOUS function keeps that scope stack
 //! on the Rust side, so the emitter hands each LIR block the state its
 //! predecessor exited with and emits blocks in an order the edges permit rather
 //! than in LIR index order; a function whose blocks disagree about what is open
-//! falls back. An async function has no such bookkeeping — its scopes are frame
+//! fails validation. An async function has no such bookkeeping — its scopes are frame
 //! flags and its recovery continuation is a real LIR block.
 //!
 //! An async function walks LIR inside the cooperative poll ABI: LIR-owned frame
@@ -99,35 +97,32 @@
 //! fixed up behind it. An enum payload and the object inside an interface box
 //! are that second case, so a binding that merely copied the payload word would
 //! name freed memory as soon as the arm allocated. Rooting the binding makes it
-//! a direct root too, which the collector pins. The AST path does the same
-//! thing, in [`FuncGen::bind_match_binding`].
+//! a direct root too, which the collector pins.
 //!
 //! Interface boxing (willow-j260): an interface-typed slot holds a 16-byte
 //! `[object | vtable]` GC box, so storing a class value into one is a real
 //! conversion, not a reinterpretation. The walker now performs it, but only
 //! where a store actually happens — `let` init, assignment, call argument,
 //! `return`, field store, array element, `push` — and only through
-//! [`FuncGen::coerce_to_target`], the same helper the AST path uses.
+//! [`FuncGen::coerce_to_target`].
 //! Eligibility admits such a store only when
 //! [`super::emit::resolve_vtable_id`] finds the vtable the emitter will need,
 //! because `coerce_to_target` silently yields the raw object when it does not
 //! and an unboxed class pointer in an interface slot would crash dispatch.
-//! Interface DISPATCH (willow-0g8j.6) is now in the subset too: a method call
+//! Interface dispatch (willow-0g8j.6) is supported: a method call
 //! on an interface-typed receiver loads `[object | vtable]` out of the box,
 //! indexes the vtable by the method's declaration-order slot and issues a
 //! `call_indirect`, re-boxing a `Self`-returning result. Eligibility resolves
 //! that slot through `LirTypeCtx::iface_method` — a method the interface does
 //! not declare has no slot at all, so admitting such a call would miscompile.
 //! `&`/`&mut` parameters use pointer ABI for direct, class, static, constructor
-//! and interface calls, and willow-0g8j.2.17 put the `&place` ARGUMENT in the
-//! subset for debug builds too: the walker now emits the reference-call
-//! diagnostic hook and its post-call clear at exactly the sites the AST
-//! emitter does, and at none of the ones it skips, so a panic under a
-//! reference call reports the same thing whichever emitter compiled the
+//! and interface calls. `&place` arguments are supported in debug builds
+//! (willow-0g8j.2.17): the walker emits the reference-call
+//! diagnostic hook and clears it after the call so panic reports identify the
 //! caller. Every string that hook passes is declared once from the AST, which
 //! is why the LIR place kind/name helpers must spell a place exactly as the
 //! AST ones do.
-//! Field access through an interface is still outside the subset: `new` and
+//! Field access through an interface is rejected: `new` and
 //! field reads go through `class_layout_of`, which has no layout for an
 //! interface name. The boxing allocation is the one coercion that runs
 //! AFTER its value expression, so every site that roots a live temporary
@@ -135,14 +130,14 @@
 //! [`FuncGen::lir_store_allocates`].
 //!
 //! GC rooting (willow-0g8j.1): the LIR has no block scopes — it is a flat
-//! basic-block graph — so a per-`let` push/pop pairing like the AST path's
+//! basic-block graph — so a per-`let` push/pop pairing
 //! would grow the shadow root stack once per loop iteration. Instead every
 //! GC-managed local gets ONE stack slot allocated and rooted at function
 //! entry, null-initialized so a collection before the `let` runs sees an empty
-//! slot; the slot is both the variable's storage and its root (the AST
-//! invariant that keeps a reassignment from leaving a stale root), and all
+//! slot; the slot is both the variable's storage and its root, which keeps
+//! reassignment from leaving a stale root, and all
 //! roots are popped at each `return`. Expression temporaries that must survive
-//! an allocating call are rooted exactly as the AST path roots them.
+//! an allocating call are rooted until that call completes.
 //!
 //! Every OTHER local is bound at function entry too (willow-ht1h,
 //! willow-34su). A block's index is not a position in any order control can
@@ -181,10 +176,11 @@
 //! admits them the same way as any other generic enum: construction, `match`,
 //! the value-taking methods (`unwrap`, `unwrapOr`, `isSome`, …), `Map::get`, and
 //! `?` propagation. The representation choice is NOT re-derived here — every
-//! site asks [`super::option_repr::option_repr`], the same decision the AST
-//! emitter and the runtime ABI are built on, so a niche `Option<String>` and a
+//! site asks [`super::option_repr::option_repr`], which defines the runtime
+//! ABI representation, so a niche `Option<String>` and a
 //! boxed `Option<i64>` cannot be confused for one another.
 
+use super::ModuleSymbols;
 use super::type_index::TypeMap;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -367,10 +363,8 @@ fn lir_collection(ty: &Type) -> Option<(LirCollection, Vec<Type>)> {
 /// object `[start, end]`, both `i64`, with no reference slots
 /// (willow-0g8j.2.10).
 ///
-/// Recognised by NAME, exactly as `emit_field_access` and `emit_range_for_value`
-/// recognise it on the AST path. `Range` is not a [`BuiltinTypeId`], so there is
-/// no resolved identity to compare against, and agreeing with the emitter is
-/// what decides whether an admitted range is an emittable one.
+/// Recognised by name: `Range` is not a [`BuiltinTypeId`]. Eligibility and
+/// field emission share this predicate to agree on the two-word layout.
 ///
 /// [`BuiltinTypeId`]: crate::semantic::builtin_types::BuiltinTypeId
 fn range_i64(ty: &Type) -> bool {
@@ -385,7 +379,7 @@ struct NamespaceBuiltin {
     params: Vec<Type>,
     ret: Type,
     /// `fs::exists` is the one entry whose runtime returns a full word for a
-    /// `bool` result; the AST path narrows it the same way.
+    /// `bool` result; emission narrows that word to a boolean.
     narrow_to_bool: bool,
 }
 
@@ -414,7 +408,7 @@ struct NamespaceBuiltin {
 /// `emit_static_method_call` answers them: a module imported under the name
 /// `f64` does not displace either one.
 fn namespace_builtin_call(
-    known_modules: &HashMap<String, String>,
+    known_modules: &ModuleSymbols,
     builtin_module_aliases: &HashMap<String, String>,
     class: &str,
     method: &str,
@@ -536,8 +530,7 @@ fn is_fresh_empty_map(e: &HirExpr) -> bool {
 ///
 /// `f64` keys therefore match bit-for-bit: `0.0` and `-0.0` are distinct keys,
 /// and a `NaN` key matches only a `NaN` with the same payload. That is the
-/// representation, not a walker restriction — the AST emitter keyed them the
-/// same way.
+/// runtime representation, not an additional eligibility restriction.
 fn map_key_supported(ty: &Type) -> bool {
     matches!(ty, Type::String) || scalar(ty)
 }
@@ -689,16 +682,16 @@ pub(super) struct LirTypeCtx<'x> {
     pub static_field: &'x dyn Fn(&str, &str) -> Option<Type>,
     pub fn_types: &'x FunctionMap<Type>,
     pub func_param_modes: &'x FunctionMap<Vec<ParamMode>>,
-    pub known_modules: &'x HashMap<String, String>,
+    pub known_modules: &'x ModuleSymbols,
     /// The module access names the file being vetted imports (willow-vtlr).
     /// `known_modules` is every module the build declared, so a bare class name
     /// is looked for in THESE first: an unrelated module that happens to
     /// declare the same class name must not make the name ambiguous.
     pub visible_modules: &'x HashSet<String>,
     /// Local alias -> canonical builtin schema module, for the file being
-    /// compiled (`import std::fs as files;` records `files -> fs`). The AST
-    /// path has these folded out of its program before it ever runs; the LIR
-    /// path lowers from the raw frontend program, so a namespace call still
+    /// compiled (`import std::fs as files;` records `files -> fs`). Declaration
+    /// normalization folds these aliases into its program, but LIR lowering
+    /// reads the raw frontend program, so a namespace call still
     /// carries whatever name the `import` spelled (willow-nswv).
     pub builtin_module_aliases: &'x HashMap<String, String>,
     /// The `$lambda.N` symbol a lambda expression was lifted to, by the span of
@@ -732,14 +725,13 @@ pub(super) struct LirTypeCtx<'x> {
 ///
 /// `Result<void, E>::Ok()` is the case that forces this: the declared payload
 /// is `T`, the instantiation makes it `void`, and the checker accepts the call
-/// with ZERO arguments. The AST emitter already behaves this way — it derives
-/// the heap layout from the ARGUMENTS and only indexes `payload_types`
-/// positionally — so dropping the list here is what keeps eligibility, the LIR
-/// emitter and [`FuncGen::emit_enum_variant_alloc`] describing one object.
+/// with ZERO arguments. The heap layout is derived from the arguments, with
+/// `payload_types` indexed positionally. Dropping the list keeps validation,
+/// the LIR emitter and [`FuncGen::emit_enum_variant_alloc`] describing one object.
 ///
 /// A *mixed* list (`void` in one slot, a real type in another) is deliberately
-/// left alone: the arity check downstream then fails and the function falls
-/// back, rather than the walker silently renumbering payload slots.
+/// left alone: the arity check downstream rejects the function rather than
+/// silently renumbering payload slots.
 fn normalize_void_payloads(payloads: &mut Vec<Type>) {
     if !payloads.is_empty() && payloads.iter().all(|t| matches!(t, Type::Void)) {
         payloads.clear();
@@ -754,8 +746,7 @@ fn normalize_void_payloads(payloads: &mut Vec<Type>) {
 /// while the tables the module unit contributed are keyed on the canonical
 /// `shapes::Point`; only an item import (`import shapes::Point;`) copies them
 /// under the short name (see `Codegen::register_item_import`). So a bare name
-/// no table answers to is retried once per known module, which is how the AST
-/// emitter has always resolved the same name (willow-0g8j.2.19). Without this
+/// no table answers to is retried once per known module (willow-0g8j.2.19). Without this
 /// the walker refused every entry function that so much as bound a module
 /// class, and the fallback was silent.
 ///
@@ -779,7 +770,7 @@ fn normalize_void_payloads(payloads: &mut Vec<Type>) {
 fn resolve_class_key(
     class_layouts: &TypeMap<Vec<(String, Type)>>,
     class_type_ids: &TypeMap<i64>,
-    known_modules: &HashMap<String, String>,
+    known_modules: &ModuleSymbols,
     visible_modules: &HashSet<String>,
     name: &str,
 ) -> Option<String> {
@@ -1108,8 +1099,8 @@ impl LirTypeCtx<'_> {
     /// ordinary `[tag | payload…]` heap object, and the `Option` pointer niche
     /// where `Some(x)` IS `x` and `None` is the null word. Eligibility
     /// deliberately does not care which — [`option_repr`] decides that at
-    /// emission, from the same instantiated type vetted here, so the walker and
-    /// the AST emitter always pick the same one.
+    /// emission, from the same instantiated type vetted here, so validation and
+    /// emission always pick the same representation.
     pub(super) fn supported_enum_type(&self, ty: &Type) -> bool {
         let mut open = HashSet::new();
         self.supported_enum_inner(ty, &mut open)
@@ -1510,37 +1501,45 @@ impl LirTypeCtx<'_> {
 /// including any expression form added later — answers `true`, so a new node
 /// kind cannot silently drop a root.
 fn may_allocate(e: &HirExpr) -> bool {
-    match &e.kind {
-        HirExprKind::Int(_) | HirExprKind::Float(_) | HirExprKind::Bool(_) => false,
-        HirExprKind::Var(_) => false,
-        HirExprKind::ReferenceArg { place } => may_allocate(place),
-        // Taking a function's address is a relocation, not an allocation
-        // (willow-0g8j.2.2). A CLOSURE is the other case: its value is a fresh
-        // GC object holding the captured environment (willow-0g8j.2.12), so it
-        // allocates exactly like an object literal does.
-        HirExprKind::FnRef(_) => false,
-        HirExprKind::Lambda { .. } => matches!(e.ty, Type::Closure(..)),
-        HirExprKind::Unary { operand, .. } => may_allocate(operand),
-        // String concatenation allocates; equality/inequality only compare
-        // bytes and collect only if evaluating an operand can allocate.
-        HirExprKind::Binary { op, lhs, rhs } => {
-            (lhs.ty == Type::String && matches!(op, BinOp::Add))
-                || may_allocate(lhs)
-                || may_allocate(rhs)
+    let mut pending = vec![e];
+    while let Some(expr) = pending.pop() {
+        match &expr.kind {
+            HirExprKind::Int(_)
+            | HirExprKind::Float(_)
+            | HirExprKind::Bool(_)
+            | HirExprKind::Var(_)
+            | HirExprKind::FnRef(_) => {}
+            HirExprKind::ReferenceArg { place } => pending.push(place),
+            // Only constructing a captured environment allocates. Never inspect
+            // a lambda body: it executes later as a separate callable.
+            HirExprKind::Lambda { .. } => {
+                if matches!(expr.ty, Type::Closure(..)) {
+                    return true;
+                }
+            }
+            HirExprKind::Unary { operand, .. } => pending.push(operand),
+            HirExprKind::Binary { op, lhs, rhs } => {
+                if lhs.ty == Type::String && matches!(op, BinOp::Add) {
+                    return true;
+                }
+                pending.extend([rhs.as_ref(), lhs.as_ref()]);
+            }
+            HirExprKind::Ternary {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                pending.extend([else_expr.as_ref(), then_expr.as_ref(), condition.as_ref()]);
+            }
+            HirExprKind::Index { array, index } => {
+                pending.extend([index.as_ref(), array.as_ref()]);
+            }
+            HirExprKind::FieldAccess { object, .. } => pending.push(object),
+            // Unknown forms conservatively retain GC roots.
+            _ => return true,
         }
-        HirExprKind::Ternary {
-            condition,
-            then_expr,
-            else_expr,
-        } => may_allocate(condition) || may_allocate(then_expr) || may_allocate(else_expr),
-        // `willow_array_get` only reads through the handle.
-        HirExprKind::Index { array, index } => may_allocate(array) || may_allocate(index),
-        // A field read is a plain load at a fixed offset from a statically
-        // non-optional class receiver (willow-0g8j.5), or from a `Range<i64>`
-        // (willow-0g8j.2.10).
-        HirExprKind::FieldAccess { object, .. } => may_allocate(object),
-        _ => true,
     }
+    false
 }
 
 /// Conservative eligibility: every type, instruction, and expression must be in
@@ -1739,8 +1738,8 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
     // Names the walker can resolve, mapped to the type they are BOUND with (not
     // the initialiser's type — see `LirInst::Let::ty`). Any other `Var` is
     // something the HIR spells like a variable but codegen must special-case —
-    // a bare enum variant, a function used as a value — so the function falls
-    // back (willow-0g8j.1).
+    // a bare enum variant, a function used as a value — so an unresolved
+    // form fails validation (willow-0g8j.1).
     let mut names: HashMap<&str, Cow<'_, Type>> = HashMap::new();
     for local in &f.locals {
         if names
@@ -1884,7 +1883,7 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                     }
                 }
                 // Listed rather than caught by `_` so a new instruction has to
-                // be given a decision here instead of silently falling back.
+                // be given an explicit validation decision here.
                 LirInst::EnterDeferScope { .. } | LirInst::LeaveDeferScope { .. } => {}
                 LirInst::FlushDefers { .. } => {}
                 // Names locals this walker has already decided on, and stores
@@ -2541,7 +2540,7 @@ fn minimal_unsupported_expr<'e>(
     }
 }
 
-/// How to name an expression in a fallback reason. Deliberately short: the line
+/// How to name an expression in a LIR validation diagnostic. Deliberately short: the line
 /// number locates it, this says what to look for on that line.
 fn describe_expr(e: &HirExpr) -> String {
     match &e.kind {
@@ -2650,9 +2649,8 @@ fn supported_pattern<'n>(
             // by exactly that (willow-0g8j.2.13). The emitter zips bindings
             // against the same normalized list and so binds nothing here, which
             // is correct: the name denotes a value that does not exist. An arm
-            // body that reads it finds no binding and takes the function back
-            // to the AST emitter rather than loading a word that was never
-            // written.
+            // body that reads it finds no binding and fails LIR validation
+            // rather than loading a word that was never written.
             if !bindings.is_empty()
                 && v.payloads.is_empty()
                 && bindings.iter().all(|(_, ty)| matches!(ty, Type::Void))
@@ -2779,7 +2777,7 @@ fn supported_panic<'e>(
     if callee != "panic" || e.ty != Type::Never || names.contains_key(callee.as_str()) {
         return false;
     }
-    // The three message shapes the AST emitter accepts: none (it substitutes a
+    // The three accepted message shapes: none (emission substitutes a
     // default literal), one `String`, or a literal spec plus its operands.
     match args.len() {
         0 => true,
@@ -2997,8 +2995,7 @@ fn blocking_cell(ty: &Type) -> Option<(BlockingCellKind, &Type)> {
 ///
 /// Matched by NAME rather than through [`builtin_types`], because these two are
 /// not builtin type ids: the checker keys `lock`/`read`/`write` on exactly these
-/// two spellings too ([`crate::parser::ast::LockMode::lock_type_name`]), and so
-/// does the AST emitter's constructor.
+/// two spellings too ([`crate::parser::ast::LockMode::lock_type_name`]).
 ///
 /// The `&'static str` is the runtime symbol PREFIX, which is what distinguishes
 /// the two state machines: `Mutex<T>` has one owner, `RwLock<T>` has readers and
@@ -3074,7 +3071,7 @@ fn option_result_method(recv: &Type, method: &str, args: &[Type]) -> Option<Type
     };
     let no_args = |t: Type| args.is_empty().then_some(t);
     // `expect(msg)` takes exactly one `String`; `unwrap_or(default)` takes
-    // exactly one value of the payload type. The AST emitter passes both
+    // exactly one value of the payload type. Emission passes both
     // straight through with no coercion, so `assignable_repr` is the rule.
     let one_string = |t: Type| matches!(args, [Type::String]).then_some(t);
     let one_of = |t: Type| matches!(args, [a] if assignable_repr(&t, a)).then_some(t);
@@ -3138,8 +3135,8 @@ fn option_result_method(recv: &Type, method: &str, args: &[Type]) -> Option<Type
             // NEITHER error type is constrained, the receiver's included. A
             // `Result::Ok(5)` written with nothing to infer `E` from records
             // `Result<i64, void>`, and requiring a non-void one here took the
-            // whole enclosing function back to the AST emitter for a receiver
-            // the emitter never even reads the error type of
+            // whole enclosing function out of LIR for a receiver
+            // whose error type the emitter never reads
             // (`emit_result_and_then` takes only the ok type) — willow-0g8j.3.
             "and_then" => {
                 let produced = one_fn(&[payload(0)?])?;
@@ -3310,7 +3307,7 @@ fn supported_body_stmt<'n>(
         }
         // The same checked heap store as a function-level
         // `LirInst::FieldAssign`. Bracketed HIR islands can mutate an object
-        // without forcing the whole function back to the AST emitter
+        // through the same LIR emission path as ordinary statements
         // (willow-wene). Deferred bodies use the same checked heap store.
         HirStmt::IndexAssign {
             array,
@@ -3736,8 +3733,7 @@ fn supported_expr<'n>(
         HirExprKind::Call { callee, args } => {
             // HIR spells direct and indirect calls with the same node, and a
             // local fn-typed binding shadows a free function (willow-bv9.1).
-            // The local wins here for the same reason it wins in the AST
-            // emitter: whichever this resolves to is what the type checker
+            // The local wins here because this must resolve to what the type checker
             // checked the call against.
             if let Some(local) = names.get(callee.as_str()) {
                 // Either callable value: a `closure` is called through the code
@@ -3796,8 +3792,8 @@ fn supported_expr<'n>(
                     && builtin_types::unary_arg(&e.ty, B::Option)
                         .is_some_and(|payload| payload == &Type::Named("PanicInfo".to_string()));
             }
-            // These compiler-known control-flow operations require the AST
-            // backend's lexical panic-scope metadata (willow-s9ej.3).
+            // These compiler-known control-flow operations require lexical
+            // panic-scope handling through the dedicated paths above (willow-s9ej.3).
             !matches!(callee.as_str(), "panic" | "recover")
                 && ctx.callable(callee.as_str(), args, false)
                 && args.iter().all(|a| supported_expr(a, ctx, names))
@@ -3874,8 +3870,7 @@ fn supported_expr<'n>(
             })
         }
         // `object.field` on a simple class, or the two `i64` bounds of a
-        // `Range<i64>` (willow-0g8j.2.10). Every other receiver stays on the
-        // AST path.
+        // `Range<i64>` (willow-0g8j.2.10). Other receivers fail validation.
         HirExprKind::FieldAccess { object, field } => {
             if range_i64(&object.ty) {
                 return matches!(field.as_str(), "start" | "end")
@@ -4007,7 +4002,7 @@ fn supported_expr<'n>(
                             && ctx.storable(&targs[1], &args[1].ty)
                     }
                     // Rendered in the runtime, which knows only the four
-                    // scalar/string kinds — the AST path passes `0` for
+                    // scalar/string kinds — the former AST path passed `0` for
                     // anything else, which would render a pointer as an `i64`.
                     // Both halves are vetted: an admitted KEY always has a kind
                     // (`map_key_supported` allows only those four), but the
@@ -4133,7 +4128,7 @@ fn supported_expr<'n>(
             // receiver's own class, so an INHERITED method is in the subset
             // (willow-0g8j.2.4); whether the emitted call is direct or goes
             // through the descriptor slot is decided later, by the same
-            // `plan_virtual_call` the AST path uses.
+            // shared `plan_virtual_call` helper.
             Type::Named(class) if ctx.supported_class(class) => {
                 let Some(mangled) = ctx.resolve_class_method(class, method) else {
                     return false;
@@ -4171,7 +4166,7 @@ fn supported_expr<'n>(
         // `Class::method(args)` — a static method of a simple class, or an enum
         // variant construction. A module call (`math::add`) and a builtin
         // namespace (`fs`, `env`) spell themselves the same way and still need
-        // the AST path's special cases.
+        // dedicated builtin dispatch.
         HirExprKind::StaticCall {
             class,
             method,
@@ -4275,7 +4270,7 @@ fn supported_expr<'n>(
             // module item symbol, and it takes no hidden `self` — which is why
             // it cannot fall through to the class path below, where a module
             // name is not a class and `supported_class` would refuse it.
-            if let Some(module_prefix) = ctx.known_modules.get(class) {
+            if let Some(module_prefix) = ctx.known_modules.linker_prefix(class) {
                 let mangled = module_item_symbol(module_prefix, method);
                 return ctx.callable(&mangled, args, false)
                     && ctx.fn_types.get(&mangled).is_some_and(
@@ -4393,7 +4388,7 @@ fn supported_expr<'n>(
 
 /// Whether this call passes at least one `&place` into a reference parameter —
 /// the condition under which the debug reference-call context must be cleared
-/// once the call returns. Mirrors `has_reference_args` on the AST path.
+/// once the call returns.
 fn lir_has_reference_args(modes: Option<&[ParamMode]>, args: &[HirExpr]) -> bool {
     args.iter().enumerate().any(|(idx, arg)| {
         matches!(
@@ -4450,8 +4445,7 @@ fn lir_reference_index_name(index: &HirExpr) -> String {
 }
 
 /// Whether `place` has stable address semantics for a `&`/`&mut` call
-/// argument. These are exactly the three place forms accepted by the AST
-/// emitter: a local/reference parameter, a class field, or an array element.
+/// argument: a local/reference parameter, a class field, or an array element.
 fn supported_reference_place<'n>(
     place: &'n HirExpr,
     ctx: &LirTypeCtx<'_>,
@@ -4659,8 +4653,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// Emit an async poll body from LIR while retaining the established
-    /// cooperative ABI. Each instruction boundary gets the same cancellable
-    /// preemption transition as the AST cooperative emitter; locals selected
+    /// cooperative ABI. Each instruction boundary gets a cancellable
+    /// preemption transition; locals selected
     /// by async liveness are read from their heap-frame slots after resume.
     pub(super) fn emit_coop_lir_function(
         &mut self,
@@ -4951,8 +4945,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // `willow_select_rotation` advances a PROCESS-WIDE counter, so
                 // it may only be called on a probe that actually picks a case.
                 // Calling it unconditionally would shift the fairness sequence
-                // of every other select in the program, including ones the AST
-                // backend emits.
+                // of every other select in the program.
                 let none = self.builder.ins().icmp_imm_s(IntCC::Equal, total, 0);
                 let unready = self.builder.ins().iconst(types::I64, -1);
                 self.store_lir_local(function, *chosen, unready);
@@ -5235,9 +5228,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().jump(blocks[resume.0], &[]);
     }
 
-    /// Emit one cooperative suspension from LIR (willow-0g8j.2.11): the same
-    /// scheduler protocol [`FuncGen::emit_coop_call_await`] runs on the AST
-    /// path, driven by HIR operands. `None` is returned for a `void` await.
+    /// Emit one cooperative suspension using HIR operands and the scheduler
+    /// protocol (willow-0g8j.2.11). `None` is returned for a `void` await.
     ///
     /// On return the builder is positioned in the resume block, so everything
     /// the enclosing LIR block emits afterwards belongs to the resumed state.
@@ -5265,9 +5257,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // synchronous call to the same function coerces them.
                 let params = self.fn_param_types(callee);
                 let modes = self.func_param_modes.get(callee).cloned();
-                // The AST twin records no parameter debug for a leaf-call
-                // constructor; this mirrors it so a trace does not depend on
-                // the emitter.
+                // Leaf-call constructors carry no parameter debug metadata.
                 let has_reference_args = lir_has_reference_args(modes.as_deref(), args);
                 let (arg_vals, arg_roots) = self.emit_lir_args_rooted(
                     args,
@@ -5282,8 +5272,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .declare_func_in_func(ctor_fid, self.builder.func);
                 let call = self.builder.ins().call(ctor_ref, &arg_vals);
                 let callee_frame = self.builder.inst_results(call)[0];
-                // Cleared for the same reason the AST twin clears, and
-                // unreachable for the same reason: E1707 refuses a reference
+                // Clear any reference-call context. This is unreachable for
+                // checked code: E1707 refuses a reference
                 // parameter on an async function (willow-0g8j.11).
                 if has_reference_args {
                     self.emit_debug_reference_call_clear();
@@ -5431,9 +5421,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// A GC-managed local's slot is allocated and rooted once at function entry
     /// (see the module docs), so without this the last value a scope bound
     /// stays reachable until the function returns: a loop body's binding pins
-    /// one object per call, where the AST emitter — which pops the root as the
-    /// scope closes — lets the collector take it. Nulling the slot leaves the
-    /// root registered and empty, which is the same state entry gave it.
+    /// one object per call. Nulling the slot at scope exit lets the collector
+    /// reclaim it while leaving the root registered and empty, as at entry.
     ///
     /// Two kinds of slot are cleared. A stack slot is the shadow-stack root
     /// itself. A [`VarStorage::Frame`] local lives in the heap async frame,
@@ -5539,7 +5528,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // Seeded so a path that reads the local without having run its
             // write — a `match` whose arms all diverge, a merge reached from a
             // branch that never assigned — still has a reaching definition,
-            // exactly as the AST `match` emitter seeds its result variable.
+            // including a match merge whose other arm diverges.
             let clif = clif_type(&local.ty);
             let var = self.builder.declare_var(clif);
             let zero = match clif {
@@ -5587,8 +5576,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // Debug builds report runtime-raised faults (array bounds, a
             // blocked channel op) at the location of the code that ran, so the
             // LIR path must publish its own site too. Without this the fault
-            // would inherit the CALLER's statement, because the AST path
-            // published one before calling in (willow-s9ej.7 review).
+            // would inherit the caller's statement (willow-s9ej.7 review).
             if let Some(span) = lir_inst_span(inst) {
                 self.fault_site_span = Some(span);
             }
@@ -5847,8 +5835,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     {
                         self.store_var(&storage, val);
                     } else if self.address_taken.contains(name.as_str()) {
-                        // Address-taken: bind straight to a stack slot, exactly as
-                        // the AST `Stmt::Let` does. Promoting at the `&` instead
+                        // Address-taken: bind straight to a stack slot.
+                        // Promoting at the `&` instead
                         // would put the initialising store wherever that use sits
                         // — re-running it every loop iteration, or skipping it
                         // entirely on a branch that takes no address.
@@ -5979,8 +5967,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             } => {
                 self.fault_site_span = Some(cond.span);
                 // A loop header re-runs its condition on every iteration, so an
-                // awaited condition parks once per iteration - exactly what the
-                // AST path does (willow-0g8j.2.11).
+                // awaited condition parks once per iteration (willow-0g8j.2.11).
                 let split = coop.as_mut().and_then(|(s, f)| {
                     lir_value_position_await(cond, self.cooperative_leaves)
                         .map(|(target, site)| (target, site, s, *f))
@@ -6255,8 +6242,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         // `fn main() -> Result<void, E>`: `willow_user_main` is void, so a
         // `return` is an EXIT rather than a value handed back -- `Err` reports
-        // its payload and exits non-zero, `Ok` exits 0 (willow-exg). The walker
-        // reaches the same shaping the AST emitter does (willow-0g8j.2.14).
+        // its payload and exits non-zero, `Ok` exits 0 (willow-exg, willow-0g8j.2.14).
         if self.main_result_err_ty.is_some() {
             match value.filter(|value| !hir_is_zero_arg_result_ok(value)) {
                 Some(value) => {
@@ -6319,7 +6305,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ///
     /// The slot is declared and initialized by the shared static-property path,
     /// before `willow_user_main` runs. GC-managed slots are permanent roots, so
-    /// this uses the same heap-store/write-barrier helper as the AST emitter.
+    /// stores use the shared heap-store/write-barrier helper.
     fn emit_lir_static_field_assign(&mut self, class: &str, field: &str, value: &HirExpr) {
         let class_name = self.static_call_class_name(class);
         let info = self
@@ -6347,7 +6333,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             HirExprKind::Str(s) => self.emit_string_literal(s),
             HirExprKind::Var(name) => match self.vars.get(name.as_str()).cloned() {
                 Some(storage) => self.load_var(&storage),
-                // Same loud failure as the AST path (willow-thqe class): a
+                // Fail loudly (willow-thqe class): a
                 // variable the eligibility check admitted must be bound.
                 None => {
                     panic!("internal compiler error: variable `{name}` reached LIR codegen unbound")
@@ -6453,7 +6439,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
             }
             // A named function used as a value — the address of the compiled
-            // function, exactly as the AST path emits it (willow-0g8j.2.2).
+            // function (willow-0g8j.2.2).
             HirExprKind::FnRef(name) => {
                 let fid = self.func_ids[name.as_str()];
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
@@ -6463,8 +6449,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             // A `fn`-typed lambda is a lifted top-level function with no
             // captured environment, so its value is just that function's
-            // address. The span is the same key the AST path uses, which is
-            // what lets the walker name a symbol it never invented
+            // address. The expression ID maps to its declared symbol, which
+            // lets the walker name a symbol it never invented
             // (willow-0g8j.2.2). A `closure`-typed one builds its environment
             // object instead (willow-0g8j.2.12).
             HirExprKind::Lambda { id, captures, .. } => {
@@ -6483,7 +6469,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             // A call through a local function value shadows every top-level
             // name, so it is tested before the direct-call path — the same
-            // order the AST path and eligibility use (willow-bv9.1). Both
+            // order eligibility uses (willow-bv9.1). Both
             // callable types are called here; they differ in what is loaded
             // first and in the hidden leading argument (willow-0g8j.2.12).
             HirExprKind::Call { callee, args }
@@ -6558,8 +6544,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 result
             }
             // `format(spec, ..)` has no callee symbol — it assembles its
-            // result at the call site, through the same emitter the AST path
-            // uses so the two produce the same string (willow-0g8j.2.5).
+            // result at the call site through the formatting emitter (willow-0g8j.2.5).
             // The one `!`-typed expression the walker emits. Eligibility
             // admits it only in statement or match-arm position, where the
             // block-terminating unwind below is legal (willow-0g8j.2.5).
@@ -6620,7 +6605,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 });
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
                 // Debug builds record the call on the panic call-chain stack,
-                // exactly like the AST path (willow-992h).
+                // for diagnostic traces (willow-992h).
                 let pushed = self.emit_callstack_push(callee, e.span);
                 let panic_depth = self.emit_pre_user_call_panic_depth(callee);
                 let call = self.builder.ins().call(fref, &vals);
@@ -6728,8 +6713,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             } => self.emit_lir_static_call(class, method, args, &e.ty, e.span),
             // A fieldless variant, written qualified or bare (`Color::Red`,
             // `Red`, the `None` of a non-generic user enum) — or a real static
-            // class property, which loads from its global slot exactly as the
-            // AST path does.
+            // class property, which loads from its global slot.
             HirExprKind::StaticField { class, field } => {
                 if self.enum_infos.contains_key(class) {
                     self.emit_lir_enum_construction(class, field, &[], &e.ty)
@@ -7318,8 +7302,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// `enum_ty` is the type of the expression BEING BUILT, not the bare enum
     /// name: it is what instantiates a generic enum's payloads and what
     /// [`option_repr`] reads, so passing anything else would pick a different
-    /// representation than the AST emitter and the two paths would disagree
-    /// about the same value.
+    /// representation than the value's runtime ABI requires.
     fn emit_lir_enum_construction(
         &mut self,
         enum_name: &str,
@@ -7414,16 +7397,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ptr
     }
 
-    /// `match` in expression position: one result variable, one merge block,
-    /// and a chain of arm blocks each entered by a `brif` on its pattern test
-    /// (willow-0g8j.8).
-    ///
-    /// Two simplifications a walk over the raw AST could not make, both bought
-    /// by eligibility: every arm body is a single expression, so no arm can
-    /// terminate its block and the merge block is always reachable; and the
-    /// result type is `e.ty` directly, with no structural re-derivation.
     /// `panic(...)`: assemble the message, then hand off to the shared unwind
-    /// so the LIR and AST paths cannot drift apart on panic protocol.
+    /// using the common panic protocol.
     ///
     /// The returned value is the unreachable placeholder every `panic` yields;
     /// `self.terminated` is set, and the caller must not emit anything more
@@ -8168,7 +8143,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// Evaluate call arguments left to right, rooting each GC-managed one as it
     /// is produced: a later argument (or the callee itself) can allocate and
     /// collect, and an already-evaluated argument is otherwise only held in an
-    /// SSA register the GC cannot see (same rule as the AST path). Returns the
+    /// SSA register the GC cannot see. Returns the
     /// values and the number of roots the caller must pop after the call.
     ///
     /// `params` are the callee's declared parameter types with the hidden
@@ -8180,9 +8155,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// eligibility then admits no argument that could need a coercion.
     ///
     /// `callee` and `param_debug` are what the debug reference-call hook needs
-    /// to name a `&place` argument. Both are passed exactly as the AST path's
-    /// corresponding call site passes them, so a panic under a reference call
-    /// reports the same thing whichever emitter compiled the caller.
+    /// to name a `&place` argument in a panic report.
     fn emit_lir_args_rooted(
         &mut self,
         args: &[HirExpr],
@@ -8227,9 +8200,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// Debug builds: record the `&place` about to be passed, so a panic inside
-    /// the callee can name the reference the caller handed it. The AST twin is
-    /// [`FuncGen::emit_debug_reference_call_hook`]; every payload field is
-    /// derived the same way, from the lowered node instead of the AST one.
+    /// the callee can name the reference the caller handed it. Every payload
+    /// field is derived from the lowered reference node.
     fn emit_lir_debug_reference_call_hook(
         &mut self,
         callee: Option<&str>,
@@ -8246,7 +8218,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         };
         // `&place` lowers under the span the parser built from the ampersand
         // onwards, so this node's line/col ARE the ampersand's — the position
-        // the AST path reads out of `CallArgMode::Reference`.
+        // recorded in the source `CallArgMode::Reference`.
         let ampersand_span = arg.span;
 
         let param = param_debug.and_then(|params| params.get(idx));
@@ -8449,7 +8421,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Runtime type ids start at 1, so 0 is not a class — falling back to it
         // would stamp a bogus id into the descriptor and make every later
         // `is`/downcast on the object answer wrong instead of failing here. The
-        // AST emitter treats a missing id the same way (willow-uqzx, catalog
+        // former AST emitter also rejected a missing id (willow-uqzx, catalog
         // item 14). The id still selects the GC layout; word 0 of the object
         // itself holds the descriptor (willow-fm7t).
         let type_id = self.class_type_ids.get(class).copied().unwrap_or_else(|| {
@@ -8464,7 +8436,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Some(&init_fid) = self.func_ids.get(&mangled) {
             let params = self.method_param_types(&mangled);
             let modes = self.func_param_modes.get(&mangled).cloned();
-            // The AST path passes the same parameter debug (willow-0g8j.10), so
+            // Pass parameter debug metadata (willow-0g8j.10), so
             // a trace names the constructor's parameter rather than `<unknown>`.
             let param_debug = self.func_param_debug.get(&mangled).cloned();
             let has_reference_args = lir_has_reference_args(modes.as_deref(), args);
@@ -8525,8 +8497,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// constructor -- store the arguments into its memberwise field slots.
     ///
     /// The twin of [`FuncGen::emit_super_init`], step for step, so a
-    /// constructor compiled from lowered IR builds the same base state as one
-    /// compiled from the AST (willow-0g8j.2.18).
+    /// constructor initializes the declared base state (willow-0g8j.2.18).
     fn emit_lir_super_init(&mut self, args: &[HirExpr], span: Span) {
         let current_class = self
             .current_class
@@ -8649,8 +8620,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         field: &str,
     ) -> cranelift_codegen::ir::Value {
         // `Range<i64>` bounds: word 0 = start, word 1 = end — the layout
-        // `emit_range_value` writes and `emit_field_access` reads on the AST
-        // path (willow-0g8j.2.10).
+        // used by range construction and field loads (willow-0g8j.2.10).
         if range_i64(&object.ty) {
             let ptr = self.emit_lir_expr(object);
             let offset = if field == "end" { 8i32 } else { 0i32 };
@@ -8672,10 +8642,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// `start..end` as a VALUE: a two-word GC object `[start, end]`
-    /// (willow-0g8j.2.10), byte-for-byte what [`FuncGen::emit_range_value`]
-    /// builds on the AST path — the same `GcObjectKind::Range` header, so the
-    /// collector traces it identically and either backend's ranges can be read
-    /// by the other's field loads.
+    /// (willow-0g8j.2.10), with the `GcObjectKind::Range` header and two
+    /// payload words shared by range construction and field loads.
     ///
     /// Both bounds are `i64` scalars, so they survive the one allocation in
     /// registers with nothing to root.
@@ -8730,8 +8698,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// `object.method(args)` on a class receiver.
     ///
     /// Which implementation runs is NOT decided here: [`Self::plan_virtual_call`]
-    /// decides it, and every other call site — the static-init AST path
-    /// included — asks the same function for the same receiver, so whether a
+    /// decides it, and every call site asks that function for its receiver, so whether a
     /// call is virtual, which descriptor slot it uses, and which symbol a
     /// devirtualized call names are one answer (willow-0g8j.2.4). A method with
     /// one implementation in the
@@ -8775,8 +8742,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let param_debug = self.func_param_debug.get(&mangled).cloned();
         let has_reference_args = lir_has_reference_args(modes.as_deref(), args);
         // The callee name a reference report shows is the STATIC class the
-        // method resolved on, not the runtime one — the same name the AST path
-        // records, since neither can know which override will run.
+        // method resolved on, since the override is only known at runtime.
         let user_callee = format!("{static_class}::{method}");
         let (arg_vals, arg_roots) = self.emit_lir_args_rooted(
             args,
@@ -8898,7 +8864,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let box_ptr = self.emit_lir_expr(object);
         self.emit_interface_dispatch_nil_check(box_ptr, object.span, method);
         // Install the method frame before validating the concrete object so a
-        // invalid boxed receiver retains the same method context as the AST path.
+        // invalid boxed receiver retains the method context in its diagnostic.
         let pushed = self.emit_callstack_push(method, span);
         let obj = self
             .builder
@@ -8959,7 +8925,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_callstack_pop();
         }
         // The record naming this call's `&place` must not outlive the call
-        // (willow-0g8j.11); the AST twin clears here too.
+        // (willow-0g8j.11).
         if has_reference_args {
             self.emit_debug_reference_call_clear();
         }
@@ -8975,8 +8941,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// `Class::method(args)`: class methods always carry a hidden receiver
-    /// parameter, so a static call passes a null `self` — the same convention
-    /// the AST path uses.
+    /// parameter, so a static call passes a null `self`.
     fn emit_lir_static_call(
         &mut self,
         class: &str,
@@ -9091,8 +9056,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return self.emit_lir_enum_construction(class, method, args, ret_ty);
         }
         // The `env`, `fs` and `net` builtin namespaces and the two `f64::`
-        // calls (willow-0g8j.2.10, willow-0g8j.2.13). Same dispatch the AST
-        // path does in `emit_static_method_call`: a plain runtime call, with a
+        // calls (willow-0g8j.2.10, willow-0g8j.2.13): a plain runtime call, with a
         // user module of the same name winning over the builtin.
         if let Some(entry) = namespace_builtin_call(
             self.known_modules,
@@ -9118,10 +9082,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         // A call into an imported user module (`math::add(1, 2)`): a free
         // function under the module item symbol, with NO hidden receiver
-        // (willow-7nc6). Mirrors the module branch of `emit_static_method_call`
-        // on the AST path; the class path below would both mangle the wrong
+        // (willow-7nc6). The class path below would both mangle the wrong
         // symbol and prepend a `self` the callee does not take.
-        if let Some(module_prefix) = self.known_modules.get(class).cloned() {
+        if let Some(module_prefix) = self.known_modules.linker_prefix(class).cloned() {
             let mangled = module_item_symbol(&module_prefix, method);
             let params = self.fn_param_types(&mangled);
             let modes = self.func_param_modes.get(&mangled).cloned();
@@ -9141,9 +9104,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 panic!("eligible LIR module call `{class}::{method}` has no declared function")
             });
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            // Named as the source spells the call, exactly as the AST path's
-            // module branch names it: a debug panic trace must not depend on
-            // which emitter compiled the caller (willow-0g8j.2.20).
+            // Use the source spelling in debug panic traces (willow-0g8j.2.20).
             let pushed = self.emit_callstack_push(&user_callee, span);
             let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
             let call = self.builder.ins().call(fref, &arg_vals);
@@ -9254,7 +9215,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     /// `CancellationToken` / `TaskScope` methods (willow-0g8j.2.13).
     ///
-    /// Mirrors the AST path in `emit_interface.rs`: the operation name comes
+    /// The operation name comes
     /// from the RESOLVED intrinsic and the object it belongs to supplies the
     /// symbol prefix, so a token and a scope share this one emitter without the
     /// walker learning which operations each of them has.
@@ -9294,7 +9255,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     },
                 );
                 // `cancel` returns nothing; the expression node still needs a
-                // value, exactly as it does on the AST path.
+                // placeholder value.
                 self.builder.ins().iconst(types::I8, 0)
             }
             Intrinsic::TokenChild | Intrinsic::ScopeChild => {
@@ -9338,9 +9299,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     /// `AtomicI64`/`AtomicBool` load/store/swap/add/sub (willow-0g8j.2.13).
     ///
-    /// Follows [`FuncGen::emit_atomic_method_call`], with one deliberate
-    /// difference noted below: this roots the receiver where the AST path does
-    /// not. The runtime symbol is built from the RESOLVED intrinsic and the cell's
+    /// Roots the receiver across argument evaluation. The runtime symbol is
+    /// built from the resolved intrinsic and the cell's
     /// width, never from the source spelling: interpolating the method name
     /// would turn an operation the runtime does not implement into a link error
     /// instead of a diagnostic.
@@ -9348,8 +9308,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// The atomic call itself never allocates, but the OPERAND expression can,
     /// and the receiver is only an SSA temporary until it is stored somewhere —
     /// so it is rooted across that evaluation, exactly as a channel `send`
-    /// roots its channel. The AST path omits that root, which is a hole there
-    /// for a receiver that is itself a temporary; it is tracked separately.
+    /// roots its channel, including receivers that are temporary expressions.
     fn emit_lir_atomic_method(
         &mut self,
         object: &HirExpr,
@@ -9389,7 +9348,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
         })
         // `store` returns nothing; the expression node still needs a value,
-        // exactly as it does on the AST path.
+        // represented by an unused placeholder.
         .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
     }
 
@@ -9437,7 +9396,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // `get` / `read` hand back a word — coerce it to the element type.
             Some(result) => self.coerce_i64_to(result, &elem),
             // `set` / `write` return nothing; the expression node still needs a
-            // value, exactly as it does on the AST path.
+            // placeholder value.
             None => self.builder.ins().iconst(types::I8, 0),
         }
     }
@@ -9446,9 +9405,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// ARE the async frame pointer, so neither call needs the scheduler's task
     /// table and neither allocates: `is_cancelled` is one Acquire load of the
     /// frame header (willow-ezs.1.3), and `cancel` reads the task id out of the
-    /// frame before handing it to the scheduler. This mirrors the AST emitter's
-    /// `Intrinsic::TaskCancel`/`TaskIsCancelled` arms instruction for
-    /// instruction, including the absence of a root push: the receiver is
+    /// frame before handing it to the scheduler. Neither operation needs
+    /// a root push: the receiver is
     /// consumed by the call itself and is dead immediately after it.
     fn emit_lir_task_handle_method(
         &mut self,
@@ -9488,8 +9446,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// `String` `+` / `==` / `!=`. Concatenation allocates; equality only
     /// compares bytes. The left operand is rooted across evaluation of the
     /// right operand because that expression may allocate. Keeping that root
-    /// through the allocation-free equality call is conservative and mirrors
-    /// the AST path.
+    /// through the allocation-free equality call is conservative.
     fn emit_lir_string_binop(
         &mut self,
         op: &BinOp,
@@ -9731,7 +9688,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // rooted because evaluating either argument can collect; the key
                 // is rooted because evaluating the VALUE can; and both are rooted
                 // across the call itself, which may grow the table and collect
-                // before it has stored them (the AST path's rule, willow-oewp.6).
+                // before it has stored them (willow-oewp.6).
                 self.emit_push_root(handle);
                 let mut roots = 1usize;
                 let k = self.emit_lir_expr(&args[0]);
@@ -9836,8 +9793,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let recv = self.emit_lir_expr(object);
         // Every branch below either allocates a panic message or evaluates an
         // argument that may allocate, and the receiver is otherwise live only
-        // in an SSA register — so it is rooted for the whole method, exactly as
-        // the AST path roots it.
+        // in an SSA register — so it is rooted for the whole method.
         self.emit_push_root(recv);
         let value = match (id, method) {
             (B::Option, "is_some") => self.emit_option_is_some(recv, &ok_ty),
@@ -9886,9 +9842,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // The callable-taking combinators (willow-0g8j.2.2). The receiver
             // is already rooted above, which is what makes calling an arbitrary
             // function — and allocating the new enum around its result — safe
-            // here. Each one routes into the SHARED emitter the AST path uses,
-            // so the two paths cannot disagree about tag layout, the pointer
-            // niche, or the indirect-call ABI.
+            // here. Shared helpers enforce tag layout, the pointer niche,
+            // and the indirect-call ABI.
             (B::Option, "map") => {
                 let (f_val, f_ty) = self.emit_lir_fn_operand(&args[0]);
                 let produced = fn_return_type(&f_ty);
@@ -10032,7 +9987,7 @@ mod tests {
         enums: HashMap<String, LirEnumDef>,
         fn_types: FunctionMap<Type>,
         param_modes: FunctionMap<Vec<ParamMode>>,
-        known_modules: HashMap<String, String>,
+        known_modules: ModuleSymbols,
         /// The module access names the unit under test imports (willow-vtlr).
         /// `TestTables::build` leaves it empty because the plain test programs
         /// declare no modules; a test that populates `known_modules` says here
@@ -10097,7 +10052,7 @@ mod tests {
                 enums: HashMap::new(),
                 fn_types: FunctionMap::default(),
                 param_modes: FunctionMap::default(),
-                known_modules: HashMap::new(),
+                known_modules: ModuleSymbols::default(),
                 visible_modules: HashSet::new(),
                 builtin_module_aliases:
                     crate::backend::cranelift::std_collection::builtin_module_aliases(program),
@@ -10428,7 +10383,7 @@ mod tests {
         }
     }
 
-    /// The fallback reason for `name`, through the same checked pipeline as
+    /// The validation diagnostic for `name`, through the same checked pipeline as
     /// [`eligible_checked`]. Panics if the function did not survive lowering,
     /// which would mean the test is exercising a HIR gap and not this code.
     fn reason_of(src: &str, name: &str, fns: &[&str]) -> Option<String> {
@@ -10474,6 +10429,144 @@ mod tests {
             } => value.clone(),
             other => panic!("expected value return, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn may_allocate_preserves_twenty_wrapper_perspectives() {
+        fn node(kind: HirExprKind) -> HirExpr {
+            HirExpr {
+                kind,
+                ty: Type::I64,
+                span: Span::new(0, 0, 1, 1),
+            }
+        }
+        fn scalar() -> Box<HirExpr> {
+            Box::new(node(HirExprKind::Int(0)))
+        }
+        // Ten wrapper positions, each with an allocation-free scalar and an
+        // allocating call. All wrappers must propagate the same conservative bit.
+        for position in 0..10 {
+            for allocating in [false, true] {
+                let leaf = Box::new(node(if allocating {
+                    HirExprKind::Call {
+                        callee: "value".into(),
+                        args: vec![],
+                    }
+                } else {
+                    HirExprKind::Int(1)
+                }));
+                let expr = node(match position {
+                    0 => HirExprKind::Unary {
+                        op: UnaryOp::Neg,
+                        operand: leaf,
+                    },
+                    1 => HirExprKind::ReferenceArg { place: leaf },
+                    2 => HirExprKind::FieldAccess {
+                        object: leaf,
+                        field: "field".into(),
+                    },
+                    3 => HirExprKind::Index {
+                        array: leaf,
+                        index: scalar(),
+                    },
+                    4 => HirExprKind::Index {
+                        array: scalar(),
+                        index: leaf,
+                    },
+                    5 => HirExprKind::Binary {
+                        op: BinOp::Add,
+                        lhs: leaf,
+                        rhs: scalar(),
+                    },
+                    6 => HirExprKind::Binary {
+                        op: BinOp::Add,
+                        lhs: scalar(),
+                        rhs: leaf,
+                    },
+                    7 => HirExprKind::Ternary {
+                        condition: leaf,
+                        then_expr: scalar(),
+                        else_expr: scalar(),
+                    },
+                    8 => HirExprKind::Ternary {
+                        condition: scalar(),
+                        then_expr: leaf,
+                        else_expr: scalar(),
+                    },
+                    _ => HirExprKind::Ternary {
+                        condition: scalar(),
+                        then_expr: scalar(),
+                        else_expr: leaf,
+                    },
+                });
+                assert_eq!(may_allocate(&expr), allocating, "position={position}");
+            }
+        }
+        for kind in [
+            HirExprKind::Float(1.0),
+            HirExprKind::Bool(true),
+            HirExprKind::Var("x".into()),
+            HirExprKind::FnRef("f".into()),
+        ] {
+            assert!(!may_allocate(&node(kind)));
+        }
+        // Even an allocation-free child does not make an unlisted wrapper safe.
+        assert!(may_allocate(&node(HirExprKind::TryPropagate {
+            inner: scalar()
+        })));
+        assert!(may_allocate(&node(HirExprKind::Str("literal".into()))));
+        for closure in [false, true] {
+            let mut lambda = node(HirExprKind::Lambda {
+                id: crate::parser::ast::ExprId::fresh(),
+                params: vec![],
+                captures: vec![],
+                body: vec![HirStmt::Return {
+                    value: Some(node(HirExprKind::Call {
+                        callee: "allocates".into(),
+                        args: vec![],
+                    })),
+                    span: Span::new(0, 0, 1, 1),
+                }],
+            });
+            lambda.ty = if closure {
+                Type::Closure(vec![], Box::new(Type::I64))
+            } else {
+                Type::Fn(vec![], Box::new(Type::I64))
+            };
+            assert_eq!(may_allocate(&lambda), closure);
+        }
+    }
+
+    #[test]
+    fn may_allocate_uses_a_one_megabyte_stack() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let span = Span::new(0, 0, 1, 1);
+                let mut expr = HirExpr {
+                    kind: HirExprKind::Int(0),
+                    ty: Type::I64,
+                    span,
+                };
+                for _ in 0..50_000 {
+                    expr = HirExpr {
+                        kind: HirExprKind::Unary {
+                            op: UnaryOp::Neg,
+                            operand: Box::new(expr),
+                        },
+                        ty: Type::I64,
+                        span,
+                    };
+                }
+                let allocates = may_allocate(&expr);
+                while let HirExprKind::Unary { operand, .. } = expr.kind {
+                    expr = *operand;
+                }
+                assert!(!allocates);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
@@ -10632,9 +10725,9 @@ mod tests {
     //  7. a String `let` that is reassigned in a loop is eligible
     //  8. calling a String-returning function is eligible
     //  9. a `let` shadowing a PARAMETER is rejected (flattened scopes)
-    // 10. a bare enum variant `Var` is rejected (needs the AST special case)
+    // 10. enum variants need resolved enum metadata
     // 11. an unsupported String operator (`<`) is rejected
-    // 12. arrays / class objects / interfaces still fall back
+    // 12. array, class, and interface representations are checked separately
     // ---------------------------------------------------------------------
 
     // 15. String parameters and returns are eligible
@@ -10866,7 +10959,7 @@ mod tests {
         assert!(eligible_checked(src, "f", &["f"]));
     }
 
-    // 37. `toString()` on an element type the runtime cannot render falls back
+    // 37. `toString()` on an element type the runtime cannot render is rejected
     #[test]
     fn e37_nested_array_to_string_ineligible() {
         let src = "fn f() -> String { let xs = [[1], [2]]; return xs.toString(); }";
@@ -10959,8 +11052,8 @@ mod tests {
     // ---------------------------------------------------------------------
     // willow-nswv — a builtin namespace reached through an `import` alias.
     //
-    // The AST path never sees an alias: `normalize_std_collection_program`
-    // rewrites the program before codegen. The walker lowers to HIR from the
+    // Declaration normalization folds aliases with `normalize_std_collection_program`.
+    // The walker lowers to HIR from the
     // RAW frontend program, so it does, and resolves the alias at the point of
     // dispatch — before the gate that lets a user module of the same name win,
     // which is the order those two passes apply between them.
@@ -11011,10 +11104,12 @@ mod tests {
             ("files", "fs", "read_to_string"),
             ("par", "parallel", "map"),
         ] {
-            let through = namespace_builtin_call(&empty, &aliases, alias, method)
-                .unwrap_or_else(|| panic!("{alias}::{method} has no entry"));
-            let direct = namespace_builtin_call(&empty, &empty, canonical, method)
-                .unwrap_or_else(|| panic!("{canonical}::{method} has no entry"));
+            let through =
+                namespace_builtin_call(&ModuleSymbols::default(), &aliases, alias, method)
+                    .unwrap_or_else(|| panic!("{alias}::{method} has no entry"));
+            let direct =
+                namespace_builtin_call(&ModuleSymbols::default(), &empty, canonical, method)
+                    .unwrap_or_else(|| panic!("{canonical}::{method} has no entry"));
             assert_eq!(through.runtime, direct.runtime, "{alias}::{method}");
             assert_eq!(through.params, direct.params, "{alias}::{method}");
             assert_eq!(through.ret, direct.ret, "{alias}::{method}");
@@ -11029,14 +11124,17 @@ mod tests {
     fn na5_a_user_module_wins_only_through_its_access_name() {
         // `files` and `fs` are distinct access paths even though the std alias
         // maps to the same canonical namespace name (willow-0g8j.3).
-        let mut known = HashMap::new();
+        let mut known = ModuleSymbols::default();
         known.insert("fs".to_string(), "fs__".to_string());
         let mut aliases = HashMap::new();
         aliases.insert("files".to_string(), "fs".to_string());
         assert!(namespace_builtin_call(&known, &aliases, "files", "exists").is_some());
         assert!(namespace_builtin_call(&known, &aliases, "fs", "exists").is_none());
         // Without the user module the same call IS the builtin.
-        assert!(namespace_builtin_call(&HashMap::new(), &aliases, "files", "exists").is_some());
+        assert!(
+            namespace_builtin_call(&ModuleSymbols::default(), &aliases, "files", "exists")
+                .is_some()
+        );
     }
 
     #[test]
@@ -11045,11 +11143,12 @@ mod tests {
         // answered ahead of everything an `import` could have renamed.
         let mut aliases = HashMap::new();
         aliases.insert("f64".to_string(), "fs".to_string());
-        let empty = HashMap::new();
-        let entry = namespace_builtin_call(&empty, &aliases, "f64", "to_string")
+        let entry = namespace_builtin_call(&ModuleSymbols::default(), &aliases, "f64", "to_string")
             .expect("f64::to_string has an entry");
         assert_eq!(entry.runtime, "willow_f64_to_string");
-        assert!(namespace_builtin_call(&empty, &aliases, "f64", "exists").is_none());
+        assert!(
+            namespace_builtin_call(&ModuleSymbols::default(), &aliases, "f64", "exists").is_none()
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -11087,7 +11186,7 @@ mod tests {
         (layouts, ids)
     }
 
-    fn modules(names: &[&str]) -> HashMap<String, String> {
+    fn modules(names: &[&str]) -> ModuleSymbols {
         names
             .iter()
             .map(|n| ((*n).to_string(), format!("{n}.")))
@@ -11652,7 +11751,7 @@ mod tests {
     // time under `Animal`, sharing the canonical `type_id`, while `class_base`
     // keeps canonical names on both sides (`zoo::Dog` -> `zoo::Animal`) — so
     // the name `Animal` never appears in the base chain at all. Comparing names
-    // would call the two unrelated and refuse a store the AST path performs.
+    // would call the two unrelated and reject a valid store.
     #[test]
     fn e62_imported_base_class_alias_widens_by_type_id() {
         let src = "class Animal { pub value: i64; } fn f(a: Animal) -> i64 { return a.value; }";
@@ -11733,8 +11832,8 @@ mod tests {
     // An interface value is a 16-byte `[object | vtable]` GC box, so putting a
     // class instance in an interface-typed slot is a conversion, not a
     // reinterpretation. The walker now emits it at every STORE position, and
-    // only there; reading THROUGH an interface (dispatch, field access) is
-    // still the AST path's job (willow-0g8j.6).
+    // only there. Interface dispatch is covered separately (willow-0g8j.6);
+    // interfaces do not expose a concrete field layout.
     //
     // Perspectives j01-j21 below are the eligibility half; j22-j36 live in
     // `tests/integration/codegen.rs` as differential and
@@ -11850,7 +11949,7 @@ mod tests {
 
         // The per-element boxing is a real requirement, not an assumption: with
         // the vtable table emptied there is no box to build, and the same
-        // literal falls back rather than storing a bare `Item` into an
+        // literal fails validation rather than storing a bare `Item` into an
         // interface-typed element slot.
         let (f, mut tables) = lir_fn_and_tables(&src, "f", &["f"]);
         assert!(tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
@@ -12032,7 +12131,7 @@ mod tests {
 
     // j20. both ternary arms define ONE Cranelift variable and the walker
     // inserts no conversion between them, so a ternary that widens to the
-    // interface must fall back rather than store two raw class pointers.
+    // interface must fail validation rather than store two raw class pointers.
     #[test]
     fn j20_widening_ternary_rejected() {
         let src = format!(
@@ -12574,7 +12673,7 @@ mod tests {
     }
 
     // p5. a power on String operands is NOT claimed — the walker emits only
-    // `+`, `==` and `!=` for strings, so `**` there must fall back rather than
+    // `+`, `==` and `!=` for strings, so `**` there must be rejected rather than
     // reach `emit_lir_binop` (which has no string path at all).
     #[test]
     fn p5_string_pow_is_not_lir_eligible() {
@@ -12589,15 +12688,10 @@ mod tests {
     // willow-0g8j.7 — `Map<K, V>`, `FrozenArray<T>` and `FrozenMap<K, V>` in
     // the LIR walker, plus the array methods that were still missing.
     //
-    // Two restrictions are deliberate and are what most of these perspectives
-    // pin down:
-    //
-    //   * a map key is admitted only as `String` or `i64`, because the runtime
-    //     `MapKey` is `Int(i64) | Str(String)` and picks between them from the
-    //     is-ref flag the call site passes. Any other key type is representable
-    //     on the AST path but not through this ABI, so it falls back.
-    //   * `get` is absent from both map kinds: it yields `Option<V>`, which the
-    //     walker has no representation for.
+    // Map keys follow the runtime `MapKey::Int | Str` representation: String
+    // keys carry the reference flag; i64, bool, and f64 keys occupy one raw
+    // word. Other key types fail validation. `get` returns the Option
+    // representation selected for the map's value type.
     //
     // Perspectives c01-c24 below are the *eligibility* half. The emitted-code
     // half — LIR-on/off differentials, including under `WILLOW_GC_STRESS=alloc`
@@ -12609,17 +12703,17 @@ mod tests {
     // c03. `Map::new()` + `insert` is eligible despite its `Map<Void, Void>`
     // c04. `contains` is eligible
     // c05. `toString` on a renderable value type is eligible
-    // c06. `toString` on a NON-renderable value type falls back
+    // c06. `toString` on a non-renderable value type is rejected
     // c07. `freeze` on a map is eligible
     // c08. `FrozenMap` answers `len` and `contains`
     // c09. `FrozenArray` answers `len`
     // c10. indexing a `FrozenArray` is eligible (it lowers like an array read)
     // c11. `freeze` on an array is eligible
-    // c12. `Map::get` falls back — `Option<V>` has no representation
-    // c13. `FrozenMap::get` falls back for the same reason
-    // c14. a `bool` key falls back (the `MapKey` restriction)
-    // c15. an `f64` key falls back too
-    // c16. a value type outside the subset (a base class) falls back
+    // c12. `Map::get` returns the value type's Option representation
+    // c13. `FrozenMap::get` uses the same Option representation
+    // c14. a `bool` key uses the raw-word MapKey representation
+    // c15. an `f64` key uses its raw bits as the key word
+    // c16. unsupported value layouts are rejected
     // c17. nested maps are eligible: the value type is checked recursively
     // c18. an `Array<T>` value type is eligible
     // c19. a `FrozenArray` of class elements is eligible
@@ -12819,7 +12913,7 @@ mod tests {
     }
 
     // c15. so is an `f64` key: the flag says "not a reference" and the bits go
-    // in as the key word, which is exactly how the AST emitter keyed one.
+    // in as the key word, preserving its runtime representation.
     #[test]
     fn c15_float_key_eligible() {
         let src = format!("{MAP_IMPORT} fn f(m: Map<f64, i64>) -> i64 {{ return m.len(); }}");
@@ -13055,10 +13149,9 @@ mod tests {
     // ── enum values and `match` (willow-0g8j.8) ────────────────────────────
     //
     // Perspectives m01-m28. The differential behaviour — that a LIR-compiled
-    // enum program prints what the AST-compiled one prints, including under
+    // enum program retained the former AST emitter's behavior, including under
     // WILLOW_GC_STRESS=alloc — is pinned in tests/integration/codegen.rs; these
-    // pin the ELIGIBILITY boundary, which is what decides whether the walker
-    // ever gets to run.
+    // pin the validation boundary that every emitted body must satisfy.
 
     /// The two enums nearly every perspective below needs: one with no payload
     /// anywhere (a bare `i64` tag) and one where a payload exists (so EVERY
@@ -13238,7 +13331,7 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
 
     // m08b. the downcast needs the arm class's `type_id` to compare against.
     // With the id table emptied there is nothing to compare and the `match`
-    // falls back, rather than the emitter inventing a constant.
+    // fails validation rather than inventing a constant.
     #[test]
     fn m08b_class_downcast_needs_a_type_id() {
         let src = "interface Speaker { fn speak(self) -> String; }
@@ -13762,7 +13855,7 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
     // p05. `Result<void, E>::Ok()` takes ZERO arguments while the substituted
     // payload list is `[void]`. Eligibility and emission both normalise that
     // list away, so the arity check sees `0 == 0` and the object built is the
-    // one-word one the AST emitter builds.
+    // one-word object required by the enum layout.
     #[test]
     fn p05_void_ok_payload_is_normalised_away() {
         let src = "fn f() -> Result<void, String> { return Ok(); }";
@@ -14001,7 +14094,7 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         assert!(eligible_checked(src, "f", &["step", "f"]));
     }
 
-    // p20. the fallback reason names the `?` itself when the `?` is what
+    // p20. the validation reason names the `?` itself when the `?` is what
     // blocked the function, rather than blaming the enclosing statement.
     #[test]
     fn p20_try_propagate_is_named_in_the_reason() {
@@ -14038,7 +14131,7 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         );
     }
 
-    // p22. a generic that is NOT an enum keeps falling back, so admitting
+    // p22. an unsupported generic remains rejected, so admitting
     // `Type::Generic` for enums did not open the shape as a whole.
     #[test]
     fn p22_non_enum_generics_still_fall_back() {
@@ -14358,7 +14451,7 @@ fn f(n: i64) -> Result<i64, String> {
     // r11h. A scope opened on only ONE side of a branch leaves the two edges
     // into the join disagreeing about what is open. No source program lowers to
     // this — `defer` is lexical — so it is built by hand, and it is what the
-    // agreement check exists to catch: a fallback, not a miscompile. The blocks
+    // agreement check rejects. The blocks
     // are all reachable, so this is the disagreement and not the separate
     // unreachable-block rejection.
     #[test]
@@ -14444,7 +14537,7 @@ fn f() {
 
     // r12. Source-declared static stores are eligible since willow-0g8j.2.6.
     // Removing the registered storage models a broken declaration pass and
-    // proves the fallback still names the exact class and field.
+    // proves the diagnostic names the exact class and field.
     #[test]
     fn r12_unresolved_static_field_store_reason() {
         let src = "class Counter { pub static mut total: i64 = 0; \
@@ -14723,7 +14816,7 @@ fn f() {
     #[test]
     fn f05_unsupported_lambda_body_does_not_sink_its_taker() {
         // The lifted body calls a symbol the backend never declared, so it
-        // falls back on its own terms. (`format` used to serve as the
+        // fails validation independently. (`format` used to serve as the
         // unsupported body here; it joined the subset in willow-0g8j.2.5.)
         let src = "fn helper(x: i64) -> String { return \"h\"; }
                    fn apply(f: fn(i64) -> String, v: i64) -> String { return f(v); }
@@ -14776,7 +14869,7 @@ fn f() {
     }
 
     // f09. a function whose parameters are not all by-value has no honest
-    // function-pointer value: the AST path passes such a parameter through a
+    // function-pointer value: reference parameters use a
     // different ABI, so its address must not be handed to an indirect call.
     #[test]
     fn f09_by_reference_parameters_are_not_function_values() {
@@ -15269,7 +15362,7 @@ fn f() {
 
     // d14. THE position rule. In an operand position the panic's terminator
     // would strand the call that consumes its value, so the whole function
-    // falls back — and the reason names the type, not the callee, because the
+    // fails validation — the reason names the type, not the callee, because the
     // problem is the `!` and not `panic` itself.
     #[test]
     fn d14_operand_position_panic_is_refused() {
@@ -15947,7 +16040,7 @@ fn f() {
 
     // v1. only values the emitter can produce twice with the same result are
     // rematerializable - deliberately the set `coop_anf`'s `bind` refuses to
-    // hoist, so the AST path re-reads them after a suspension too.
+    // hoist, so they can be re-read after a suspension.
     #[test]
     fn v1_literals_and_variables_are_rematerializable() {
         let src = "fn f(a: i64) -> i64 { return a; }

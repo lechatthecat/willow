@@ -33,7 +33,7 @@
 //! Decoding is the inverse: split off a trailing `$role`, then split on `.`.
 //! No component can contain either separator, so nothing is ambiguous.
 
-use std::collections::HashMap;
+use super::ModuleSymbols;
 
 use crate::parser::ast::*;
 
@@ -213,14 +213,14 @@ pub(crate) fn constructor_to_method(ctor: &ConstructorDecl) -> MethodDecl {
 }
 
 pub(crate) fn class_method_symbol_name(
-    known_modules: &HashMap<String, String>,
+    known_modules: &ModuleSymbols,
     class_name: &str,
     method_name: &str,
 ) -> String {
     // Probe only prefixes of this class, longest first. Work depends on the
     // qualification depth, not on the number of modules in the build.
     for (offset, _) in class_name.rmatch_indices("::") {
-        if let Some(symbol_prefix) = known_modules.get(&class_name[..offset]) {
+        if let Some(symbol_prefix) = known_modules.linker_prefix(&class_name[..offset]) {
             let class_suffix = module_symbol_prefix(&class_name[offset + 2..]);
             return class_member_symbol(
                 &module_item_symbol(symbol_prefix, &class_suffix),
@@ -379,7 +379,7 @@ mod mangling_tests {
     /// them would have been ambiguous under the old `__` scheme.
     const NASTY: &[&str] = &["a", "b", "a_b", "a__b", "__", "a__b__c", "_", "b__c"];
 
-    fn modules(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    fn modules(pairs: &[(&str, &str)]) -> ModuleSymbols {
         pairs
             .iter()
             .map(|(access, prefix)| (access.to_string(), prefix.to_string()))
@@ -661,7 +661,7 @@ mod mangling_tests {
     /// so it can never land on the body it forwards to (willow-tygf).
     #[test]
     fn unit_mangle_51_vtable_thunk_is_distinct_from_its_method() {
-        let known = HashMap::new();
+        let known = ModuleSymbols::default();
         assert_eq!(
             vtable_thunk_symbol("shapes::Parcel", "size"),
             "shapes.Parcel.size$virtual_thunk"

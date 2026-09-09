@@ -1,6 +1,6 @@
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
-use crate::parser::visit::{AstVisitor, walk_expr, walk_stmt};
+use crate::parser::iter::{AstEvent, AstWalk};
 use crate::semantic::call_graph::{CallGraph, CallSites};
 use crate::semantic::effects::{EffectProblem, RuntimeEffects, cycle_members};
 use crate::semantic::ids::{FunctionId, TypeId};
@@ -229,225 +229,91 @@ impl ConcurrencyAnalyzer {
     }
 
     fn check_block(&mut self, block: &Block) {
-        for stmt in &block.stmts {
-            self.check_stmt(stmt);
-        }
-    }
-
-    fn check_stmt(&mut self, stmt: &Stmt) {
-        match stmt {
-            Stmt::Defer(d) => match &d.body {
-                DeferBody::Expr(expr) => self.check_expr(expr),
-                DeferBody::Block(block) => self.check_block(block),
-            },
-            Stmt::Break(_) | Stmt::Continue(_) => {}
-            Stmt::Let(let_stmt) => {
-                self.check_expr(&let_stmt.init);
-            }
-            Stmt::Assign(assign) => self.check_expr(&assign.value),
-            Stmt::StaticFieldAssign(s) => self.check_expr(&s.value),
-            Stmt::FieldAssign(fa) => {
-                self.check_expr(&fa.object);
-                self.check_expr(&fa.value);
-            }
-            Stmt::IndexAssign(ia) => {
-                self.check_expr(&ia.array);
-                self.check_expr(&ia.index);
-                self.check_expr(&ia.value);
-            }
-            Stmt::SuperInit(super_init) => {
-                for arg in &super_init.args {
-                    self.check_expr(&arg.expr);
-                }
-            }
-            Stmt::If(if_stmt) => {
-                self.check_expr(&if_stmt.cond);
-                self.check_block(&if_stmt.then_block);
-                if let Some(else_block) = &if_stmt.else_block {
-                    self.check_block(else_block);
-                }
-            }
-            Stmt::While(while_stmt) => {
-                self.check_expr(&while_stmt.cond);
-                self.check_block(&while_stmt.body);
-            }
-            Stmt::For(for_stmt) => {
-                self.check_expr(&for_stmt.iterable);
-                self.check_block(&for_stmt.body);
-            }
-            Stmt::Lock(lock_stmt) => {
-                self.check_expr(&lock_stmt.target);
-                self.check_block(&lock_stmt.body);
-            }
-            Stmt::Return(return_stmt) => {
-                if let Some(value) = &return_stmt.value {
-                    self.check_expr(value);
-                }
-            }
-            Stmt::Expr(expr_stmt) => self.check_expr(&expr_stmt.expr),
-        }
-    }
-
-    fn check_expr(&mut self, expr: &Expr) {
-        match expr {
-            Expr::Binary(binary) => {
-                self.check_expr(&binary.lhs);
-                self.check_expr(&binary.rhs);
-            }
-            Expr::Unary(unary) => self.check_expr(&unary.expr),
-            Expr::Call(call) => {
-                self.check_task_sync_helper_call(
-                    &FunctionId::free_from_source_name(&call.callee),
-                    call.span,
-                );
-                for arg in &call.args {
-                    self.check_expr(&arg.expr);
-                }
-            }
-            Expr::FieldAccess(object, _, _, _) => self.check_expr(object),
-            Expr::MethodCall(method) => {
-                if matches!(&method.object, Expr::Var(name, _, _) if name == "self")
-                    && let Some(class_name) = &self.current_class
-                {
+        let mut lambda_contexts = Vec::new();
+        for event in AstWalk::new(AstEvent::Block(block)) {
+            match event {
+                AstEvent::Expr(Expr::Call(call)) => {
                     self.check_task_sync_helper_call(
-                        &FunctionId::method(class_name.clone(), method.method.as_str()),
-                        method.span,
+                        &FunctionId::free_from_source_name(&call.callee),
+                        call.span,
                     );
                 }
-                self.check_expr(&method.object);
-                match method.method.as_str() {
+                AstEvent::Expr(Expr::MethodCall(method)) => {
+                    if matches!(&method.object, Expr::Var(name, _, _) if name == "self")
+                        && let Some(class_name) = &self.current_class
+                    {
+                        self.check_task_sync_helper_call(
+                            &FunctionId::method(class_name.clone(), method.method.as_str()),
+                            method.span,
+                        );
+                    }
+                }
+                // Method operation accounting follows its receiver, as in the
+                // original recursive traversal, and precedes its arguments.
+                AstEvent::CallArguments(Expr::MethodCall(method)) => match method.method.as_str() {
                     "result" => self.report.task_result_queries += 1,
                     "send" | "recv" | "close" => self.report.channel_operations += 1,
                     _ => {}
-                }
-                for arg in &method.args {
-                    self.check_expr(&arg.expr);
-                }
-            }
-            Expr::StaticCall(static_call) => {
-                let callee = if static_call.class == "Self" {
-                    FunctionId::method(
-                        self.current_class
-                            .clone()
-                            .unwrap_or_else(|| TypeId::local("Self")),
-                        static_call.method.as_str(),
-                    )
-                } else {
-                    // The parser shape `a::b()` can be a module function or a
-                    // static method. Prefer a seeded module-function identity;
-                    // otherwise retain the owner type explicitly.
-                    let module_function = FunctionId::free(static_call.method.as_str())
-                        .in_namespace(static_call.class.as_str());
-                    if self
-                        .nonpreemptible_sync_helpers
-                        .contains_key(&module_function)
-                    {
-                        module_function
-                    } else {
+                },
+                AstEvent::Expr(Expr::StaticCall(static_call)) => {
+                    let callee = if static_call.class == "Self" {
                         FunctionId::method(
-                            TypeId::from_source_name(&static_call.class),
+                            self.current_class
+                                .clone()
+                                .unwrap_or_else(|| TypeId::local("Self")),
                             static_call.method.as_str(),
                         )
-                    }
-                };
-                self.check_task_sync_helper_call(&callee, static_call.span);
-                for arg in &static_call.args {
-                    self.check_expr(&arg.expr);
-                }
-            }
-            Expr::New(new_expr) => {
-                for arg in &new_expr.args {
-                    self.check_expr(&arg.expr);
-                }
-            }
-            // A static property read is a leaf — no sub-expressions to check.
-            Expr::StaticField(_) => {}
-            Expr::ObjectLiteral(object) => {
-                for field in &object.fields {
-                    self.check_expr(&field.value);
-                }
-            }
-            Expr::Await(await_expr) => {
-                self.report.await_expressions += 1;
-                if !self.current_async_context {
-                    self.report.await_outside_async += 1;
-                }
-                self.check_expr(&await_expr.expr);
-            }
-            Expr::Select(select) => {
-                self.report.select_expressions += 1;
-                for case in &select.cases {
-                    match &case.kind {
-                        SelectCaseKind::Recv { channel, .. } => self.check_expr(channel),
-                        SelectCaseKind::Send { channel, value } => {
-                            self.check_expr(channel);
-                            self.check_expr(value);
+                    } else {
+                        // The parser shape `a::b()` can be a module function or a
+                        // static method. Prefer a seeded module-function identity;
+                        // otherwise retain the owner type explicitly.
+                        let module_function = FunctionId::free(static_call.method.as_str())
+                            .in_namespace(static_call.class.as_str());
+                        if self
+                            .nonpreemptible_sync_helpers
+                            .contains_key(&module_function)
+                        {
+                            module_function
+                        } else {
+                            FunctionId::method(
+                                TypeId::from_source_name(&static_call.class),
+                                static_call.method.as_str(),
+                            )
                         }
-                        SelectCaseKind::Timeout { millis } => self.check_expr(millis),
-                        // A task case IS an `await`. The awaited expression is
-                        // visited normally, so an inline `.result()` is counted
-                        // as a task-result query by the method-call visitor.
-                        SelectCaseKind::Join { task, .. } => {
-                            self.report.await_expressions += 1;
-                            if !self.current_async_context {
-                                self.report.await_outside_async += 1;
-                            }
-                            self.check_expr(task);
-                        }
-                        SelectCaseKind::Default => {}
-                    }
-                    self.check_block(&case.body);
+                    };
+                    self.check_task_sync_helper_call(&callee, static_call.span);
                 }
-            }
-            Expr::Print(arg, _, _, _) => self.check_expr(arg),
-            Expr::Ternary(ternary) => {
-                self.check_expr(&ternary.condition);
-                self.check_expr(&ternary.then_expr);
-                self.check_expr(&ternary.else_expr);
-            }
-            Expr::Range(range) => {
-                self.check_expr(&range.start);
-                self.check_expr(&range.end);
-            }
-            Expr::Lambda(lambda) => {
-                // A lambda body is a separate callable with no `async` form of
-                // its own, so the enclosing function's async context does not
-                // reach into it: an `await` written there IS outside an async
-                // fn, and a nonpreemptible sync helper called there is not
-                // called from the enclosing task (willow-3kty).
-                let previous_async_context =
-                    std::mem::replace(&mut self.current_async_context, false);
-                match &lambda.body {
-                    LambdaBody::Expr(expr) => self.check_expr(expr),
-                    LambdaBody::Block(block) => self.check_block(block),
-                }
-                self.current_async_context = previous_async_context;
-            }
-            Expr::Match(m) => {
-                self.check_expr(&m.scrutinee);
-                for arm in &m.arms {
-                    match &arm.body {
-                        MatchBody::Expr(e) => self.check_expr(e),
-                        MatchBody::Block(b) => self.check_block(b),
+                AstEvent::Expr(Expr::Await(_)) => {
+                    self.report.await_expressions += 1;
+                    if !self.current_async_context {
+                        self.report.await_outside_async += 1;
                     }
                 }
-            }
-            Expr::TryPropagate(inner, _, _) => self.check_expr(inner),
-            Expr::ArrayLiteral(elements, _, _) => {
-                for el in elements {
-                    self.check_expr(el);
+                AstEvent::Expr(Expr::Select(select)) => {
+                    self.report.select_expressions += 1;
+                    // Join counters commute with visiting case operands; all
+                    // cases share this select's enclosing callable context.
+                    let joins = select
+                        .cases
+                        .iter()
+                        .filter(|case| matches!(case.kind, SelectCaseKind::Join { .. }))
+                        .count();
+                    self.report.await_expressions += joins;
+                    if !self.current_async_context {
+                        self.report.await_outside_async += joins;
+                    }
                 }
+                AstEvent::Expr(Expr::Lambda(_)) => {
+                    // A lambda has no async form and is a separate callable.
+                    lambda_contexts.push(std::mem::replace(&mut self.current_async_context, false));
+                }
+                AstEvent::ExitExpr(Expr::Lambda(_)) => {
+                    self.current_async_context = lambda_contexts.pop().expect("lambda context");
+                }
+                _ => {}
             }
-            Expr::Index(arr, index, _, _) => {
-                self.check_expr(arr);
-                self.check_expr(index);
-            }
-            Expr::Integer(_, _, _)
-            | Expr::Float(_, _, _)
-            | Expr::Bool(_, _, _)
-            | Expr::String(_, _, _)
-            | Expr::Var(_, _, _) => {}
         }
+        debug_assert!(lambda_contexts.is_empty());
     }
 
     fn check_async_reference_params(&mut self, context: &str, owner_span: Span, params: &[Param]) {
@@ -641,36 +507,15 @@ pub(crate) fn compute_nonpreemptible_helpers(
 ///   is attributed to the deferred callable, not to this one;
 /// * a lambda body is a separate callable with its own summary.
 fn block_contains_loop(block: &Block) -> bool {
-    let mut finder = LoopFinder::default();
-    finder.visit_block(block);
-    finder.found
-}
-
-#[derive(Default)]
-struct LoopFinder {
-    found: bool,
-}
-
-impl AstVisitor for LoopFinder {
-    fn visit_stmt(&mut self, stmt: &Stmt) {
-        if self.found {
-            return;
-        }
-        match stmt {
-            Stmt::While(_) | Stmt::For(_) => self.found = true,
-            Stmt::Defer(_) => {}
-            other => walk_stmt(self, other),
+    let mut walk = AstWalk::new(AstEvent::Block(block));
+    while let Some(event) = walk.next() {
+        match event {
+            AstEvent::Stmt(Stmt::While(_) | Stmt::For(_)) => return true,
+            AstEvent::Stmt(Stmt::Defer(_)) | AstEvent::Lambda(_) => walk.skip_children(),
+            _ => {}
         }
     }
-
-    fn visit_expr(&mut self, expr: &Expr) {
-        if self.found {
-            return;
-        }
-        walk_expr(self, expr);
-    }
-
-    fn visit_lambda(&mut self, _lambda: &LambdaExpr) {}
+    false
 }
 
 fn called_helpers(block: &Block, params: &[Param]) -> HashSet<FunctionId> {
@@ -678,7 +523,17 @@ fn called_helpers(block: &Block, params: &[Param]) -> HashSet<FunctionId> {
         calls: HashSet::new(),
         scopes: vec![params.iter().map(|param| param.name.clone()).collect()],
     };
-    collector.visit_block(block);
+    let mut walk = AstWalk::new(AstEvent::Block(block));
+    while let Some(event) = walk.next() {
+        match event {
+            AstEvent::EnterScope => collector.enter_scope(),
+            AstEvent::ExitScope => collector.exit_scope(),
+            AstEvent::Bind(name) => collector.bind(name),
+            AstEvent::Expr(expr) => collector.visit_expr(expr),
+            AstEvent::Lambda(_) => walk.skip_children(),
+            _ => {}
+        }
+    }
     collector.calls
 }
 
@@ -705,7 +560,7 @@ impl CallCollector {
     }
 }
 
-impl AstVisitor for CallCollector {
+impl CallCollector {
     fn enter_scope(&mut self) {
         self.scopes.push(HashSet::new());
     }
@@ -720,9 +575,6 @@ impl AstVisitor for CallCollector {
             .expect("call collector scope")
             .insert(name.to_string());
     }
-
-    /// A lambda body is its own callable and is summarized separately.
-    fn visit_lambda(&mut self, _lambda: &LambdaExpr) {}
 
     fn visit_expr(&mut self, expr: &Expr) {
         match expr {
@@ -748,7 +600,6 @@ impl AstVisitor for CallCollector {
             }
             _ => {}
         }
-        walk_expr(self, expr);
     }
 }
 
@@ -758,6 +609,85 @@ mod tests {
     use crate::diagnostics::label::LabelKind;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
+
+    #[test]
+    fn helper_collectors_use_a_one_megabyte_stack() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let mut program = parse("fn wrapper() { heavy(); }");
+                let Item::Function(function) = program.items.pop().unwrap() else {
+                    unreachable!()
+                };
+                let mut body = function.body;
+                let Stmt::Expr(statement) = body.stmts.pop().unwrap() else {
+                    unreachable!()
+                };
+                let span = statement.span;
+                let mut expr = statement.expr;
+                for _ in 0..50_000 {
+                    expr = Expr::TryPropagate(Box::new(expr), span, ExprId::fresh());
+                }
+                body.stmts.push(Stmt::Expr(ExprStmt { expr, span }));
+                assert!(!block_contains_loop(&body));
+                assert_eq!(
+                    called_helpers(&body, &[]),
+                    HashSet::from([FunctionId::free("heavy")])
+                );
+                let Stmt::Expr(statement) = body.stmts.pop().unwrap() else {
+                    unreachable!()
+                };
+                let mut expr = statement.expr;
+                while let Expr::TryPropagate(inner, _, _) = expr {
+                    expr = *inner;
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn complete_analyzer_uses_a_one_megabyte_stack() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let mut program = parse("async fn wrapper() { await task(); }");
+                let Item::Function(function) = &mut program.items[0] else {
+                    unreachable!()
+                };
+                let Stmt::Expr(statement) = function.body.stmts.pop().unwrap() else {
+                    unreachable!()
+                };
+                let span = statement.span;
+                let mut expr = statement.expr;
+                for _ in 0..50_000 {
+                    expr = Expr::TryPropagate(Box::new(expr), span, ExprId::fresh());
+                }
+                function
+                    .body
+                    .stmts
+                    .push(Stmt::Expr(ExprStmt { expr, span }));
+                let analyzer = ConcurrencyAnalyzer::new().check_program(&program);
+                assert!(analyzer.errors.is_empty());
+                assert_eq!(analyzer.report.async_functions, 1);
+                assert_eq!(analyzer.report.await_expressions, 1);
+                assert_eq!(analyzer.report.await_outside_async, 0);
+                let Item::Function(function) = &mut program.items[0] else {
+                    unreachable!()
+                };
+                let Stmt::Expr(statement) = function.body.stmts.pop().unwrap() else {
+                    unreachable!()
+                };
+                let mut expr = statement.expr;
+                while let Expr::TryPropagate(inner, _, _) = expr {
+                    expr = *inner;
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     fn parse(source: &str) -> Program {
         let tokens = Lexer::new(source).tokenize().unwrap();

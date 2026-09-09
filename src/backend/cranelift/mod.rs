@@ -10,12 +10,15 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 use std::collections::{HashMap, HashSet};
 
 use crate::backend::abi;
+use crate::ir::module_init::{InitUnitId, ModuleInitPlan};
 use crate::parser::ast::*;
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::ids::{FunctionId, FunctionMap};
 use crate::semantic::symbols::{EnumInfo, InterfaceInfo};
 use crate::{BuildMode, CompilerOptions};
 
+mod module_index;
+use module_index::ModuleSymbols;
 mod type_index;
 use type_index::{TypeMap, TypeScope, VtableMap};
 mod ast_passes;
@@ -79,10 +82,9 @@ struct ParamDebug {
 struct ModuleAliasSnapshot {
     functions: Vec<(FunctionId, Option<FunctionId>)>,
     types: Vec<(String, Option<type_index::TypeBinding>)>,
-    /// Module access names bound to another module's symbol prefix for the
-    /// length of one unit (willow-kd1v), with whatever `known_modules` held
-    /// under them before.
-    modules: Vec<(String, Option<String>)>,
+    /// Module access names temporarily bound to a ModuleId for one unit
+    /// (willow-kd1v), together with their previous identity bindings.
+    modules: Vec<(String, Option<crate::module::ModuleId>)>,
 }
 
 /// Owns restoration even when a unit returns an error or unwinds.
@@ -125,10 +127,9 @@ pub struct Codegen {
     /// Missing entries are `MAY_PANIC`; only an explicit `false` may remove a
     /// generated depth check or panic-return path (willow-s9ej.8).
     function_may_panic: FunctionMap<bool>,
-    /// Imported module access name -> canonical symbol prefix. Every module
-    /// the whole build declared, whether or not the unit being compiled
-    /// imported it.
-    known_modules: HashMap<String, String>,
+    /// Access names resolve to ModuleId; definitions own canonical paths and
+    /// linker spelling independently of unit-local alias bindings.
+    known_modules: ModuleSymbols,
     /// The module access names the file currently being compiled can actually
     /// see, i.e. the ones its own `import`s name (willow-vtlr). `known_modules`
     /// is the whole build, so an unrelated module declaring a class of the same
@@ -142,8 +143,8 @@ pub struct Codegen {
     unit_imports: compile::UnitImports,
     /// Local alias -> canonical builtin schema module (`import std::fs as
     /// files;` records `files -> fs`), for the file currently being compiled.
-    /// The AST path never needs it because `normalize_std_collection_program`
-    /// has already folded it into the program; the LIR path lowers from the raw
+    /// Declaration normalization folds these aliases into its program; LIR
+    /// lowering reads the raw
     /// frontend program and canonicalizes here (willow-nswv).
     builtin_module_aliases: HashMap<String, String>,
     /// Maps each lambda's source span to its generated private function name.
@@ -192,13 +193,10 @@ pub struct Codegen {
     /// class's `type_id`; the virtual method slots follow it in
     /// [`Codegen::class_vslots`] order.
     class_descriptor_ids: TypeMap<DataId>,
-    /// The checker's authoritative type for every checked expression, keyed by
-    /// node ID (willow-mb5, re-keyed in willow-njot). Consulted FIRST by the backend's type queries; the
-    /// legacy structural derivation only covers unrecorded (compiler-
-    /// synthesized) expressions.
+    /// Current declaration unit's checked expression types, used to establish
+    /// lambda signatures. Body emission reads the declared callable signatures.
     expr_types: HashMap<ExprId, Type>,
-    /// Lowered-IR functions of the entry program (willow-0g8j): a function in
-    /// the supported subset is compiled by walking its LIR instead of the AST.
+    /// Current unit's lowered bodies, consumed individually during emission.
     lir_functions: HashMap<String, crate::ir::lowered::LirFunction>,
     /// Lifted lambda bodies in lowered IR, keyed by the lambda expression's
     /// ID (willow-0g8j.2.2). The LIR cannot know the `$lambda.N` symbol, so
@@ -226,13 +224,10 @@ pub struct Codegen {
     /// through to a zero while the store went nowhere (willow-6xgo). The field
     /// name is NOT a type and stays an ordinary map key.
     static_storage: TypeMap<HashMap<String, StaticStorageInfo>>,
-    /// Static-property initializers in program declaration order — replayed by
-    /// the generated `__willow_static_init`, which runs before `main`.
-    static_init_order: Vec<StaticInitItem>,
-    /// One initializer function per module that declares a static property,
-    /// in declaration (dependency) order; `__willow_static_init` calls them
-    /// before replaying the entry program's own items (willow-6xgo).
-    module_static_inits: Vec<FuncId>,
+    /// Resolver-owned execution order, independent of body emission order.
+    module_init_plan: ModuleInitPlan,
+    /// Each unit owns its declaration-ordered initializers and emitted function.
+    unit_static_inits: HashMap<InitUnitId, UnitStaticInit>,
     /// Zero-initialized per-thread cursor/limit and allocation counters used by
     /// the inlined GC bump-allocation fast path.
     gc_tlab_state: DataId,
@@ -321,15 +316,20 @@ struct StaticInitItem {
     field: String,
     initializer: FunctionDecl,
     ty: Type,
-    /// The symbol prefix of the module that declared the property, or `None`
-    /// for the entry program. An initializer is an expression of the unit that
-    /// wrote it -- `new Slot(1)`, `seed()`, `Holder::base * 2` are all spelled
-    /// in that module's own names -- so it can only be emitted while that
-    /// unit's aliases are installed, which is its body phase (willow-6xgo).
-    owner: Option<String>,
+}
+
+#[derive(Default)]
+struct UnitStaticInit {
+    items: Vec<StaticInitItem>,
+    function: Option<FuncId>,
 }
 
 impl Codegen {
+    /// Supply the resolver's initialization nodes before declaring units.
+    pub fn set_module_init_plan(&mut self, plan: ModuleInitPlan) {
+        self.module_init_plan = plan;
+    }
+
     /// Look up a declared runtime/user function id by symbol name, with a clear
     /// panic if it was never declared (e.g. a backend symbol missing from
     /// `abi.rs`) instead of an opaque index-out-of-bounds.
@@ -410,7 +410,7 @@ impl Codegen {
             func_param_modes: FunctionMap::with_scope(function_scope.clone()),
             func_param_debug: FunctionMap::with_scope(function_scope.clone()),
             function_may_panic: FunctionMap::with_scope(function_scope.clone()),
-            known_modules: HashMap::new(),
+            known_modules: ModuleSymbols::default(),
             visible_modules: HashSet::new(),
             unit_imports: compile::UnitImports::default(),
             builtin_module_aliases: HashMap::new(),
@@ -439,8 +439,8 @@ impl Codegen {
             vtable_ids: VtableMap::with_scope(type_scope.clone()),
             vtable_thunk_ids: HashMap::new(),
             static_storage: TypeMap::with_scope(type_scope.clone()),
-            static_init_order: Vec::new(),
-            module_static_inits: Vec::new(),
+            module_init_plan: ModuleInitPlan::default(),
+            unit_static_inits: HashMap::new(),
             gc_tlab_state,
             async_frame_size_warnings: Vec::new(),
             symbol_owners: HashMap::new(),
@@ -597,34 +597,22 @@ impl Codegen {
             .into_iter()
             .map(|f| (f.name.clone(), f))
             .collect();
-        self.lir_lambdas = lir
-            .lambdas
-            .into_iter()
-            .map(|l| (l.id, l.function))
-            .collect();
+        for lambda in lir.lambdas {
+            if let Some(name) = self.lambda_names.get(&lambda.id) {
+                let mut function = lambda.function;
+                function.name = name.clone();
+                self.lir_functions.insert(name.clone(), function);
+            } else {
+                self.lir_lambdas.insert(lambda.id, lambda.function);
+            }
+        }
     }
 
-    /// Merge one module's own checker tables into the backend (willow-9vvn).
-    ///
-    /// Every `register_*` above installs the ENTRY file's tables wholesale, but
-    /// a module is type-checked in its own scope, so the entry checker resolved
-    /// nothing inside a module body. Without this, an unqualified `Boxy(n)`
-    /// pattern in a module reaches lowering unresolved: it stays a
-    /// `ClassDowncast`, which takes the wrong arm or panics outright.
-    ///
-    /// These tables are all keyed by AST node ID, drawn from one build-wide
-    /// counter, so a module's keys cannot collide with the entry file's or with
-    /// another module's. That is why this extends the maps instead of replacing
-    /// them, and why it must run after the entry registrations.
-    ///
-    /// It must also run BEFORE that module's `declare_module`, not just before
-    /// its bodies: `declare_lambda` reads `expr_types` to give a lifted lambda
-    /// its signature, so a module lambda declared ahead of the merge is declared
-    /// `fn(i64) -> i64` whatever it really is, and every use of it is then
-    /// refused for a signature mismatch (willow-9yhi).
-    pub fn merge_module_checker_tables(&mut self, checker: &crate::semantic::TypeChecker) {
-        self.expr_types
-            .extend(checker.expr_types.iter().map(|(k, v)| (*k, v.clone())));
+    /// Install only the current unit's expression types for lambda declaration.
+    /// Declared callable signatures live in `fn_types`; body emission does not
+    /// need to retain every checked expression from every imported module.
+    pub fn register_module_checker_tables(&mut self, checker: &crate::semantic::TypeChecker) {
+        self.register_expr_types(checker.expr_types.clone());
     }
 
     /// The type as the ENUM tables spell it: every enum name replaced by the one
@@ -787,20 +775,16 @@ impl Codegen {
     /// the walker admitted (a bare class name still resolves by scanning
     /// modules) but the emitter could not key (willow-kd1v, willow-sxcp).
     ///
-    /// Answered through the one mapping that is keyed by every spelling in
-    /// play: `known_modules` maps each access name to a symbol prefix built
-    /// from the module's canonical path, so the module `module` names is
-    /// whichever entry carries its prefix.
+    /// Canonical module identity records the original table name directly;
+    /// linker spelling and temporary aliases do not determine this lookup.
     fn table_module_name(&self, module: &str) -> String {
         if self.known_modules.contains_key(module) {
             return module.to_string();
         }
-        let prefix = module_symbol_prefix(module);
         self.known_modules
-            .iter()
-            .find(|(_, candidate)| **candidate == prefix)
-            .map(|(name, _)| name.clone())
-            .unwrap_or_else(|| module.to_string())
+            .table_name(module)
+            .unwrap_or(module)
+            .to_string()
     }
 
     /// Every `(local alias, mangled symbol)` pair binding the methods of the
@@ -826,7 +810,7 @@ impl Codegen {
         }
         let module_prefix = self
             .known_modules
-            .get(&module)
+            .linker_prefix(&module)
             .cloned()
             .unwrap_or_else(|| module_symbol_prefix(&module));
         let method_prefix = class_member_prefix(&module_item_symbol(&module_prefix, item));
@@ -847,7 +831,7 @@ impl Codegen {
     fn bind_item_import_function(&mut self, local: &str, module: &str, item: &str) -> bool {
         let module_prefix = self
             .known_modules
-            .get(module)
+            .linker_prefix(module)
             .cloned()
             .unwrap_or_else(|| module_symbol_prefix(module));
         let mangled = module_item_symbol(&module_prefix, item);
@@ -902,7 +886,7 @@ impl Codegen {
     /// calls `sales::describe`. Neither the class tables nor the symbol
     /// mangler answered to that, so the module's own bodies fell out of the
     /// LIR walker's subset and, in the AST emitter, mangled to a symbol that
-    /// does not exist.
+    /// did not exist.
     ///
     /// Both halves are bound: the TYPE half through the shared type scope, so
     /// `sales::Amount` reads the registered `market::Amount` entry rather than
@@ -929,8 +913,8 @@ impl Codegen {
             if spelling.access == spelling.graph_name {
                 continue;
             }
-            if let Some(prefix) = self.known_modules.get(&spelling.graph_name).cloned() {
-                let previous = self.known_modules.insert(spelling.access.clone(), prefix);
+            if let Some(id) = self.known_modules.resolve(&spelling.graph_name) {
+                let previous = self.known_modules.bind(spelling.access.clone(), id);
                 aliases.modules.push((spelling.access.clone(), previous));
             }
             for name in &spelling.types {
@@ -993,10 +977,7 @@ impl Codegen {
             self.type_scope.restore(&alias, previous);
         }
         for (access, previous) in aliases.modules.into_iter().rev() {
-            match previous {
-                Some(prefix) => self.known_modules.insert(access, prefix),
-                None => self.known_modules.remove(&access),
-            };
+            self.known_modules.restore(access, previous);
         }
     }
 
@@ -1328,7 +1309,7 @@ pub(super) struct DeferEntry {
     sync_flag_slot: Option<cranelift_codegen::ir::StackSlot>,
     bindings: Vec<(String, i32, Type)>,
     vars_at_registration: HashMap<String, VarStorage>,
-    /// The deferred AST contains a direct call to the compiler-known
+    /// The deferred body contains a direct call to the compiler-known
     /// `recover()` builtin. Calls hidden behind another function/lambda do not
     /// grant recovery capability (willow-s9ej.3).
     recovery_capable: bool,
@@ -1439,7 +1420,7 @@ struct FuncGen<'a, 'b> {
     /// its own panic record.
     panic_defer_codegen_depth: usize,
     /// Direct `recover()` calls lower to the runtime capability only while a
-    /// recovery-capable deferred AST body is being emitted. Helpers/lambdas
+    /// recovery-capable deferred HIR body is being emitted. Helpers/lambdas
     /// are separate functions and therefore start at zero.
     recover_eligible_depth: usize,
     /// Scope resume blocks that have an incoming recovery edge.
@@ -1478,7 +1459,7 @@ struct FuncGen<'a, 'b> {
     func_param_modes: &'a FunctionMap<Vec<ParamMode>>,
     func_param_debug: &'a FunctionMap<Vec<ParamDebug>>,
     function_may_panic: &'a FunctionMap<bool>,
-    known_modules: &'a HashMap<String, String>,
+    known_modules: &'a ModuleSymbols,
     /// The module access names the file being compiled imports (willow-vtlr).
     /// Read only to resolve a bare module class name, and read there because
     /// eligibility resolves it from the same set.
@@ -1520,8 +1501,7 @@ struct FuncGen<'a, 'b> {
     /// (param or annotated local) to its byte offset in the frame (willow-lpn.5b).
     async_frame_offsets: HashMap<crate::diagnostics::Span, i32>,
     /// LIR-owned async frame slots. This is the identity map used by the LIR
-    /// poll emitter; source spans remain available only for diagnostics and
-    /// the legacy AST emitter.
+    /// poll emitter; source spans remain available only for diagnostics.
     lir_frame_offsets: HashMap<crate::ir::lowered::LirLocalId, i32>,
     lir_defer_offsets: HashMap<crate::ir::lowered::LirDeferId, i32>,
     /// The cooperative LIR emitter splits a value-position `await` out of its
@@ -2599,7 +2579,7 @@ mod tests {
                 let before_type = codegen
                     .type_scope
                     .resolve(&TypeId::from_source_name("Local"));
-                let before_module = codegen.known_modules.get("local").cloned();
+                let before_module = codegen.known_modules.linker_prefix("local").cloned();
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     codegen.with_module_aliases(|this, aliases| -> anyhow::Result<()> {
                         let repetitions = if binding_shape == 2 { 3 } else { 1 };
@@ -2615,19 +2595,20 @@ mod tests {
                             aliases
                                 .types
                                 .push(("Local".into(), this.type_scope.bind("Local", &target)));
-                            aliases.modules.push((
-                                "local".into(),
-                                this.known_modules.insert("local".into(), target),
-                            ));
+                            let previous = this.known_modules.resolve("local");
+                            this.known_modules.insert("local".into(), target);
+                            aliases.modules.push(("local".into(), previous));
                         }
                         if binding_shape == 3 {
                             this.with_module_aliases(|inner, aliases| {
-                                aliases.modules.push((
-                                    "local".into(),
-                                    inner.known_modules.insert("local".into(), "inner".into()),
-                                ));
+                                let previous = inner.known_modules.resolve("local");
+                                inner.known_modules.insert("local".into(), "inner".into());
+                                aliases.modules.push(("local".into(), previous));
                             });
-                            assert_eq!(this.known_modules["local"], "temporary0");
+                            assert_eq!(
+                                this.known_modules.linker_prefix("local").unwrap(),
+                                "temporary0"
+                            );
                         }
                         match exit {
                             0 => Ok(()),
@@ -2652,7 +2633,10 @@ mod tests {
                         .resolve(&TypeId::from_source_name("Local")),
                     before_type
                 );
-                assert_eq!(codegen.known_modules.get("local").cloned(), before_module);
+                assert_eq!(
+                    codegen.known_modules.linker_prefix("local").cloned(),
+                    before_module
+                );
             }
         }
     }
