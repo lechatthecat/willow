@@ -1,0 +1,15 @@
+// Mixed operator trees retain evaluation and short-circuit behavior.
+fn base() -> i64 { return 7; }
+
+class Value { pub amount: i64; }
+fn add(a: i64, b: i64) -> i64 { return a + b; }
+
+fn main() {
+    let value = true ? -(-(base() + 1) * 2) : 99;
+    println(value);
+    println(false ? 0 : value + 4);
+    println(value > 10 && value < 20);
+    // Calls, arrays, constructors and field reads can alternate with operators.
+    let mixed = add([new Value(add(value, 1)).amount][0], (2..5).start);
+    println(mixed);
+}

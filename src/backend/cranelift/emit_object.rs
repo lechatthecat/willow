@@ -3,6 +3,7 @@ use cranelift_module::Module;
 
 use super::*;
 
+#[willow_continuations::methods(emit_lir_interpolated, emit_lir_expr)]
 impl<'a, 'b> FuncGen<'a, 'b> {
     /// The address of `class`'s DESCRIPTOR: the value that lives in word 0 of
     /// every object of that class (willow-fm7t).
@@ -58,6 +59,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 }
 
+#[willow_continuations::methods(emit_lir_interpolated, emit_lir_expr)]
 impl<'a, 'b> FuncGen<'a, 'b> {
     /// The body of [`FuncGen::emit_interpolated_string`], with the arguments
     /// supplied by a callback rather than read from the AST.
@@ -69,11 +71,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// placeholder is reached — because an operand that has not been evaluated
     /// yet cannot be collected, which is what lets the rooting below be exactly
     /// one push per live piece.
-    pub(super) fn emit_interpolated_with(
+    pub(super) fn emit_lir_interpolated(
         &mut self,
         spec: &str,
-        arg_count: usize,
-        mut emit_arg: impl FnMut(&mut Self, usize) -> (cranelift_codegen::ir::Value, Type),
+        operands: &[crate::ir::typed_ast::HirExpr],
     ) -> cranelift_codegen::ir::Value {
         let segments = match crate::interpolate::parse_spec(spec) {
             Ok(segments) => segments,
@@ -95,10 +96,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.emit_string_literal(&text)
                 }
                 crate::interpolate::Segment::Display => {
-                    if next_arg >= arg_count {
+                    if next_arg >= operands.len() {
                         break;
                     }
-                    let (val, ty) = emit_arg(self, next_arg);
+                    let val = self.emit_lir_expr(&operands[next_arg]);
+                    let ty = operands[next_arg].ty.clone();
                     next_arg += 1;
                     let converted = match ty {
                         Type::String => val,
@@ -111,10 +113,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     converted
                 }
                 crate::interpolate::Segment::F64(format) => {
-                    if next_arg >= arg_count {
+                    if next_arg >= operands.len() {
                         break;
                     }
-                    let (val, _) = emit_arg(self, next_arg);
+                    let val = self.emit_lir_expr(&operands[next_arg]);
                     next_arg += 1;
                     let converted = self.emit_runtime_call1(format.runtime_symbol(), val);
                     self.emit_push_root(converted);

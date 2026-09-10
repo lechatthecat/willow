@@ -5,32 +5,32 @@ use crate::semantic::ids::{FunctionId, FunctionMap, TypeId};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
-pub struct EnumVariantInfo {
+pub struct EnumVariantInfo<N = String> {
     pub name: String,
-    pub payload_types: Vec<Type>,
+    pub payload_types: Vec<Type<N>>,
     pub tag: i64,
     pub declaration_span: Span,
 }
 
 #[derive(Debug, Clone)]
-pub struct EnumInfo {
-    pub name: String,
+pub struct EnumInfo<N = String> {
+    pub name: N,
     pub public: bool,
     /// Generic type parameter names in declaration order.
     /// Empty for non-generic enums.
-    pub type_params: Vec<String>,
-    pub variants: Vec<EnumVariantInfo>,
+    pub type_params: Vec<N>,
+    pub variants: Vec<EnumVariantInfo<N>>,
     pub declaration_span: Span,
 }
 
-impl EnumInfo {
+impl<N: Clone + Eq + std::hash::Hash> EnumInfo<N> {
     /// Instantiate a generic enum by substituting type arguments for parameters.
     /// Returns `self` unchanged if `type_params` is empty or `type_args` is empty.
-    pub fn instantiate(&self, type_args: &[Type]) -> Self {
+    pub fn instantiate(&self, type_args: &[Type<N>]) -> Self {
         if self.type_params.is_empty() || type_args.is_empty() {
             return self.clone();
         }
-        let param_map: std::collections::HashMap<String, Type> = self
+        let param_map: std::collections::HashMap<N, Type<N>> = self
             .type_params
             .iter()
             .zip(type_args.iter())
@@ -59,29 +59,11 @@ impl EnumInfo {
     }
 }
 
-pub fn substitute_type(ty: &Type, param_map: &std::collections::HashMap<String, Type>) -> Type {
-    match ty {
-        Type::Named(n) => {
-            if let Some(replacement) = param_map.get(n) {
-                replacement.clone()
-            } else {
-                ty.clone()
-            }
-        }
-        Type::Generic(name, args) => Type::Generic(
-            name.clone(),
-            args.iter().map(|a| substitute_type(a, param_map)).collect(),
-        ),
-        Type::Array(inner) => Type::Array(Box::new(substitute_type(inner, param_map))),
-        Type::Fn(params, ret) => Type::Fn(
-            params
-                .iter()
-                .map(|p| substitute_type(p, param_map))
-                .collect(),
-            Box::new(substitute_type(ret, param_map)),
-        ),
-        _ => ty.clone(),
-    }
+pub fn substitute_type<N: Clone + Eq + std::hash::Hash>(
+    ty: &Type<N>,
+    param_map: &std::collections::HashMap<N, Type<N>>,
+) -> Type<N> {
+    ty.substitute_names(|name| param_map.get(name).cloned())
 }
 
 #[derive(Debug, Clone)]
@@ -104,8 +86,8 @@ pub struct FuncInfo {
 }
 
 #[derive(Debug, Clone)]
-pub struct ParamInfo {
-    pub ty: Type,
+pub struct ParamInfo<N = String> {
+    pub ty: Type<N>,
     pub mode: ParamMode,
     pub span: Span,
     pub type_span: Span,
@@ -189,41 +171,41 @@ pub struct ClassInfo {
 
 /// A required method signature declared inside an `interface`.
 #[derive(Debug, Clone)]
-pub struct InterfaceMethodInfo {
+pub struct InterfaceMethodInfo<N = String> {
     pub name: String,
-    pub params: Vec<Type>,
+    pub params: Vec<Type<N>>,
     /// The same parameters with their declared [`ParamMode`], mirroring
     /// [`MethodInfo::param_infos`]. A `&`/`&mut` parameter is passed as a
     /// POINTER (`param_abi_type`), so the mode is part of the dispatch ABI:
     /// conformance, call checking and interface codegen all need it, and
     /// `params` alone cannot distinguish `value: i64` from `value: &mut i64`
     /// (willow-0g8j.9).
-    pub param_infos: Vec<ParamInfo>,
+    pub param_infos: Vec<ParamInfo<N>>,
     pub is_static: bool,
-    pub return_type: Type,
+    pub return_type: Type<N>,
     pub declaration_span: Span,
 }
 
 /// A registered `interface` declaration: a named set of required methods.
 #[derive(Debug, Clone)]
-pub struct InterfaceInfo {
-    pub name: String,
+pub struct InterfaceInfo<N = String> {
+    pub name: N,
     // `public`/`module_path` drive import visibility (willow-k6g); `declaration_span`
     // feeds future diagnostics. Not read until those stages.
     #[allow(dead_code)]
     pub public: bool,
-    pub methods: HashMap<String, InterfaceMethodInfo>,
+    pub methods: HashMap<String, InterfaceMethodInfo<N>>,
     /// Method names in declaration order — the deterministic vtable slot order
     /// used by interface dispatch codegen (willow-xds).
     pub method_order: Vec<String>,
     /// Generic type parameter names in declaration order (`interface Foo<T>`),
     /// empty for non-generic interfaces (willow-1js.1).
     #[allow(dead_code)]
-    pub type_params: Vec<String>,
+    pub type_params: Vec<N>,
     /// Direct super-interfaces (`interface B extends A`), module-qualified
     /// (willow-1js.2). Drives interface-to-interface subtyping; the inherited
     /// methods themselves are composed into `method_order` during desugaring.
-    pub extends: Vec<String>,
+    pub extends: Vec<N>,
     #[allow(dead_code)]
     pub declaration_span: Span,
     #[allow(dead_code)]
@@ -342,6 +324,70 @@ impl SymbolTable {
 
     pub fn lookup_interface(&self, name: &str) -> Option<&InterfaceInfo> {
         self.interfaces.get(&TypeId::from_source_name(name))
+    }
+}
+
+impl EnumInfo {
+    pub fn to_semantic(&self) -> EnumInfo<TypeId> {
+        EnumInfo {
+            name: TypeId::from_source_name(&self.name),
+            public: self.public,
+            type_params: self.type_params.iter().map(TypeId::local).collect(),
+            declaration_span: self.declaration_span,
+            variants: self
+                .variants
+                .iter()
+                .map(|v| EnumVariantInfo {
+                    name: v.name.clone(),
+                    tag: v.tag,
+                    declaration_span: v.declaration_span,
+                    payload_types: v.payload_types.iter().map(Into::into).collect(),
+                })
+                .collect(),
+        }
+    }
+}
+impl InterfaceInfo {
+    pub fn to_semantic(&self) -> InterfaceInfo<TypeId> {
+        InterfaceInfo {
+            name: TypeId::from_source_name(&self.name),
+            public: self.public,
+            type_params: self.type_params.iter().map(TypeId::local).collect(),
+            extends: self
+                .extends
+                .iter()
+                .map(|name| TypeId::from_source_name(name))
+                .collect(),
+            method_order: self.method_order.clone(),
+            declaration_span: self.declaration_span,
+            module_path: self.module_path.clone(),
+            methods: self
+                .methods
+                .iter()
+                .map(|(name, m)| {
+                    (
+                        name.clone(),
+                        InterfaceMethodInfo {
+                            name: m.name.clone(),
+                            params: m.params.iter().map(Into::into).collect(),
+                            param_infos: m
+                                .param_infos
+                                .iter()
+                                .map(|p| ParamInfo {
+                                    ty: (&p.ty).into(),
+                                    mode: p.mode.clone(),
+                                    span: p.span,
+                                    type_span: p.type_span,
+                                })
+                                .collect(),
+                            is_static: m.is_static,
+                            return_type: (&m.return_type).into(),
+                            declaration_span: m.declaration_span,
+                        },
+                    )
+                })
+                .collect(),
+        }
     }
 }
 

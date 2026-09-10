@@ -735,11 +735,11 @@ mod tests {
                 let Item::Function(function) = &mut program.items[0] else {
                     unreachable!()
                 };
-                let Stmt::Expr(expr) = function.body.stmts.remove(0) else {
+                let Stmt::Expr(expr) = &mut function.body.stmts.remove(0) else {
                     unreachable!()
                 };
                 let span = crate::diagnostics::Span::new(0, 0, 1, 1);
-                let mut expr = expr.expr;
+                let mut expr = expr.expr.take();
                 for _ in 0..50_000 {
                     expr = Expr::TryPropagate(
                         Box::new(expr),
@@ -754,13 +754,11 @@ mod tests {
                 assert_eq!(collect_debug_await_points(&function.body).len(), 1);
                 assert!(collect_debug_reference_calls(&function.body, &HashMap::new()).is_empty());
                 assert_eq!(collect_debug_statements(&function.body).len(), 1);
-                let Stmt::Expr(expr) = function.body.stmts.remove(0) else {
+                let Stmt::Expr(expr) = &mut function.body.stmts.remove(0) else {
                     unreachable!()
                 };
-                let mut expr = expr.expr;
-                while let Expr::TryPropagate(inner, _, _) = expr {
-                    expr = *inner;
-                }
+                let expr = expr.expr.take();
+                drop(expr);
             })
             .unwrap()
             .join()

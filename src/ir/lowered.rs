@@ -18,8 +18,9 @@
 //! Unsupported lowering is diagnosed; `--emit-lir` renders the lowered program.
 
 use crate::diagnostics::Span;
-use crate::parser::ast::{ExprId, LockMode, Type};
+use crate::parser::ast::{ExprId, LockMode};
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
+use crate::semantic::ids::{FunctionId, SemanticType as Type, TypeId};
 use crate::semantic::type_checker::types::{await_output_type, awaitable_task_type};
 
 use super::typed_ast::{
@@ -54,7 +55,7 @@ pub struct LirLambda {
 /// One function as a basic-block graph. `blocks[0]` is the entry block.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LirFunction {
-    pub name: String,
+    pub name: FunctionId,
     pub is_async: bool,
     pub params: Vec<HirParam>,
     pub return_type: Type,
@@ -474,7 +475,7 @@ pub enum LirInst {
         value: HirExpr,
     },
     StaticFieldAssign {
-        class: String,
+        class: TypeId,
         field: String,
         value: HirExpr,
     },
@@ -637,7 +638,7 @@ fn collect_lambda(expr: &HirExpr, out: &mut Vec<LirLambda>) {
         b.lower_scope(body);
         let (blocks, locals) = b.finish();
         let function = LirFunction {
-            name: lambda_placeholder_name(*id),
+            name: FunctionId::free(lambda_placeholder_name(*id)),
             is_async: false,
             params: params.clone(),
             return_type: (**ret).clone(),
@@ -697,7 +698,7 @@ impl LirDeferBody {
 
 fn expr_has_recover(expr: &HirExpr) -> bool {
     expr.walk_postorder(false)
-        .any(|expr| matches!(&expr.kind, HirExprKind::Call { callee, .. } if callee == "recover"))
+        .any(|expr| matches!(&expr.kind, HirExprKind::Call { callee, .. } if callee.is_free_named("recover")))
 }
 
 fn block_has_recover(stmts: &[HirStmt]) -> bool {
@@ -708,7 +709,7 @@ fn block_has_recover(stmts: &[HirStmt]) -> bool {
 }
 
 /// Lower one function's statement tree into a block graph.
-fn lower_function(f: &HirFunction, class: Option<&str>) -> LirFunction {
+fn lower_function(f: &HirFunction, class: Option<&TypeId>) -> LirFunction {
     let mut b = Builder::new(&f.params, f.is_async);
     b.lower_scope(&f.body);
     b.materialize_preemption_safepoints();
@@ -716,7 +717,7 @@ fn lower_function(f: &HirFunction, class: Option<&str>) -> LirFunction {
     // checker has already guaranteed value-returning paths return).
     let (blocks, locals) = b.finish();
     let name = match class {
-        Some(class) => format!("{class}::{}", f.name),
+        Some(class) => FunctionId::method(class.clone(), f.name.name()),
         None => f.name.clone(),
     };
     let function = LirFunction {
@@ -828,7 +829,7 @@ fn expr_suspends_here(expr: &HirExpr) -> bool {
     match &expr.kind {
         HirExprKind::Await { inner }
             if builtin_types::unary_arg(&inner.ty, B::Future).is_some()
-                && !matches!(&inner.kind, HirExprKind::Call { callee, .. } if matches!(callee.as_str(), "sleep" | "yield")) =>
+                && !matches!(&inner.kind, HirExprKind::Call { callee, .. } if matches!(callee.name(), "sleep" | "yield")) =>
         {
             false
         }
@@ -957,160 +958,66 @@ fn rematerializable(expr: &HirExpr) -> bool {
     )
 }
 
-fn contains_expr(node: &HirExpr, target: &HirExpr) -> bool {
-    node.walk_postorder(true)
-        .any(|child| std::ptr::eq(child, target))
-}
-
+#[cfg(test)]
 fn contains_suspend_span(node: &HirExpr, target_span: Span) -> bool {
     node.walk_postorder(true)
         .any(|child| child.span == target_span && expr_suspends_here(child))
 }
 
 fn hoistable_around(node: &HirExpr, target: &HirExpr, seen: &mut bool) -> bool {
-    if std::ptr::eq(node, target) {
-        *seen = true;
-        return true;
-    }
-    if !contains_expr(node, target) {
+    let Some(path) = node.path_to(target) else {
         return *seen || rematerializable(node);
+    };
+    let ancestors: std::collections::HashSet<*const HirExpr> =
+        path.into_iter().map(std::ptr::from_ref).collect();
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        if std::ptr::eq(node, target) {
+            *seen = true;
+            continue;
+        }
+        if !ancestors.contains(&std::ptr::from_ref(node)) {
+            if !*seen && !rematerializable(node) {
+                return false;
+            }
+            continue;
+        }
+        // Only unconditional operands can be pulled ahead of their parent.
+        let conditional = match &node.kind {
+            HirExprKind::Ternary { condition, .. } => {
+                !ancestors.contains(&std::ptr::from_ref(&**condition))
+            }
+            HirExprKind::Match { scrutinee, .. } => {
+                !ancestors.contains(&std::ptr::from_ref(&**scrutinee))
+            }
+            HirExprKind::Binary {
+                op: crate::parser::ast::BinOp::And | crate::parser::ast::BinOp::Or,
+                lhs,
+                ..
+            } => !ancestors.contains(&std::ptr::from_ref(&**lhs)),
+            HirExprKind::Select { .. } | HirExprKind::Lambda { .. } => true,
+            _ => false,
+        };
+        if conditional {
+            return false;
+        }
+        pending.extend(node.children().into_iter().rev());
     }
-    // A conditionally evaluated child cannot be pulled in front of the whole
-    // expression, but the part that IS evaluated unconditionally can: a
-    // ternary's condition, a `match` scrutinee, the left operand of `&&`/`||`.
-    match &node.kind {
-        HirExprKind::Ternary { condition, .. } if !contains_expr(condition, target) => {
-            return false;
-        }
-        HirExprKind::Match { scrutinee, .. } if !contains_expr(scrutinee, target) => {
-            return false;
-        }
-        HirExprKind::Binary {
-            op: crate::parser::ast::BinOp::And | crate::parser::ast::BinOp::Or,
-            lhs,
-            ..
-        } if !contains_expr(lhs, target) => {
-            return false;
-        }
-        HirExprKind::Select { .. } | HirExprKind::Lambda { .. } => return false,
-        _ => {}
-    }
-    node.children()
-        .into_iter()
-        .all(|child| hoistable_around(child, target, seen))
+    true
 }
 
 fn replace_suspension(expr: &HirExpr, target_span: Span, replacement: &HirExpr) -> HirExpr {
-    if expr.span == target_span && expr_suspends_here(expr) {
-        return replacement.clone();
-    }
     let mut out = expr.clone();
-    out.kind = match &expr.kind {
-        HirExprKind::Binary { op, lhs, rhs } => HirExprKind::Binary {
-            op: op.clone(),
-            lhs: Box::new(replace_suspension(lhs, target_span, replacement)),
-            rhs: Box::new(replace_suspension(rhs, target_span, replacement)),
-        },
-        HirExprKind::Unary { op, operand } => HirExprKind::Unary {
-            op: op.clone(),
-            operand: Box::new(replace_suspension(operand, target_span, replacement)),
-        },
-        HirExprKind::Call { callee, args } => HirExprKind::Call {
-            callee: callee.clone(),
-            args: args
-                .iter()
-                .map(|arg| replace_suspension(arg, target_span, replacement))
-                .collect(),
-        },
-        HirExprKind::Print { value, newline } => HirExprKind::Print {
-            value: Box::new(replace_suspension(value, target_span, replacement)),
-            newline: *newline,
-        },
-        HirExprKind::Array { elements } => HirExprKind::Array {
-            elements: elements
-                .iter()
-                .map(|element| replace_suspension(element, target_span, replacement))
-                .collect(),
-        },
-        HirExprKind::Index { array, index } => HirExprKind::Index {
-            array: Box::new(replace_suspension(array, target_span, replacement)),
-            index: Box::new(replace_suspension(index, target_span, replacement)),
-        },
-        HirExprKind::Ternary {
-            condition,
-            then_expr,
-            else_expr,
-        } => HirExprKind::Ternary {
-            condition: Box::new(replace_suspension(condition, target_span, replacement)),
-            then_expr: Box::new(replace_suspension(then_expr, target_span, replacement)),
-            else_expr: Box::new(replace_suspension(else_expr, target_span, replacement)),
-        },
-        HirExprKind::New { class, args } => HirExprKind::New {
-            class: class.clone(),
-            args: args
-                .iter()
-                .map(|arg| replace_suspension(arg, target_span, replacement))
-                .collect(),
-        },
-        HirExprKind::FieldAccess { object, field } => HirExprKind::FieldAccess {
-            object: Box::new(replace_suspension(object, target_span, replacement)),
-            field: field.clone(),
-        },
-        HirExprKind::MethodCall {
-            object,
-            method,
-            args,
-        } => HirExprKind::MethodCall {
-            object: Box::new(replace_suspension(object, target_span, replacement)),
-            method: method.clone(),
-            args: args
-                .iter()
-                .map(|arg| replace_suspension(arg, target_span, replacement))
-                .collect(),
-        },
-        HirExprKind::ObjectLiteral { class, fields } => HirExprKind::ObjectLiteral {
-            class: class.clone(),
-            fields: fields
-                .iter()
-                .map(|(name, value)| {
-                    (
-                        name.clone(),
-                        replace_suspension(value, target_span, replacement),
-                    )
-                })
-                .collect(),
-        },
-        HirExprKind::StaticCall {
-            class,
-            method,
-            args,
-        } => HirExprKind::StaticCall {
-            class: class.clone(),
-            method: method.clone(),
-            args: args
-                .iter()
-                .map(|arg| replace_suspension(arg, target_span, replacement))
-                .collect(),
-        },
-        HirExprKind::ReferenceArg { place } => HirExprKind::ReferenceArg {
-            place: Box::new(replace_suspension(place, target_span, replacement)),
-        },
-        HirExprKind::Range { start, end } => HirExprKind::Range {
-            start: Box::new(replace_suspension(start, target_span, replacement)),
-            end: Box::new(replace_suspension(end, target_span, replacement)),
-        },
-        HirExprKind::Await { inner } => HirExprKind::Await {
-            inner: Box::new(replace_suspension(inner, target_span, replacement)),
-        },
-        HirExprKind::TryPropagate { inner } => HirExprKind::TryPropagate {
-            inner: Box::new(replace_suspension(inner, target_span, replacement)),
-        },
-        HirExprKind::Match { scrutinee, arms } => HirExprKind::Match {
-            scrutinee: Box::new(replace_suspension(scrutinee, target_span, replacement)),
-            arms: arms.clone(),
-        },
-        _ => return out,
-    };
+    out.visit_mut_preorder(false, |node| {
+        if node.span == target_span && expr_suspends_here(node) {
+            *node = replacement.clone();
+            return false;
+        }
+        !matches!(
+            node.kind,
+            HirExprKind::Lambda { .. } | HirExprKind::Select { .. }
+        )
+    });
     out
 }
 
@@ -1178,6 +1085,26 @@ fn instruction_executes_call(inst: &LirInst) -> bool {
     }
 }
 
+#[willow_continuations::methods(
+    lower_assign_operands,
+    lower_condition,
+    lower_conditional_branches,
+    lower_conditional_suspend,
+    lower_for,
+    lower_lock,
+    lower_match_arm_body,
+    lower_match_arms_cfg,
+    lower_nested_suspend,
+    lower_operand_before_suspend,
+    lower_root_suspend,
+    lower_scope,
+    lower_scope_inner,
+    lower_select,
+    lower_stmt,
+    lower_stmts,
+    lower_suspending_operand,
+    lower_value_into
+)]
 impl Builder {
     fn new(params: &[HirParam], is_async: bool) -> Self {
         let mut builder = Self {
@@ -1382,14 +1309,14 @@ impl Builder {
                 if awaitable_task_type(&inner.ty).is_none()
                     && builtin_types::unary_arg(&inner.ty, B::Future).is_some()
                     && !matches!(&inner.kind, HirExprKind::Call { callee, args }
-                        if (callee == "sleep" && args.len() == 1)
-                            || (callee == "yield" && args.is_empty())) =>
+                        if (callee.is_free_named("sleep") && args.len() == 1)
+                            || (callee.is_free_named("yield") && args.is_empty())) =>
             {
                 return None;
             }
             HirExprKind::Await { inner } => {
                 if let HirExprKind::Call { callee, args } = &inner.kind {
-                    match (callee.as_str(), args.as_slice()) {
+                    match (callee.name(), args.as_slice()) {
                         ("sleep", [millis]) if value.ty == Type::Void => {
                             let millis = self.lower_operand_before_suspend(millis)?;
                             let name = self.synthetic_name("sleep_millis");
@@ -1722,41 +1649,72 @@ impl Builder {
     /// in the right operand. This is the minimal ANF step needed for expressions
     /// such as `count() + await task`: `count()` runs once, before the park.
     fn freeze_binary_prefix(&mut self, value: &HirExpr, target_span: Span) -> Option<HirExpr> {
+        let target = value
+            .walk_postorder(true)
+            .find(|node| node.span == target_span && expr_suspends_here(node))?;
+        let ancestors: std::collections::HashSet<*const HirExpr> = value
+            .path_to(target)?
+            .into_iter()
+            .map(std::ptr::from_ref)
+            .collect();
         let mut out = value.clone();
-        out.kind = match &value.kind {
-            HirExprKind::Print { value, newline } => HirExprKind::Print {
-                value: Box::new(self.freeze_binary_prefix(value, target_span)?),
-                newline: *newline,
-            },
-            HirExprKind::Binary { op, lhs, rhs } if contains_suspend_span(lhs, target_span) => {
-                HirExprKind::Binary {
-                    op: op.clone(),
-                    lhs: Box::new(self.freeze_binary_prefix(lhs, target_span)?),
-                    rhs: rhs.clone(),
+        let mut source = value;
+        let mut current = &mut out;
+        let mut can_fall_back = false;
+        loop {
+            match &source.kind {
+                HirExprKind::Print { value: child, .. } => {
+                    let HirExprKind::Print { value, .. } = &mut current.kind else {
+                        unreachable!()
+                    };
+                    source = child;
+                    current = value;
                 }
-            }
-            HirExprKind::Binary { op, lhs, rhs } if contains_suspend_span(rhs, target_span) => {
-                let lhs = if rematerializable(lhs) {
-                    (**lhs).clone()
-                } else {
-                    let name = self.synthetic_name("prefix");
-                    let local = self.push_synth_let(&name, false, (**lhs).clone());
-                    self.local_expr(local, lhs.span)
-                };
-                let rhs = if rhs.span == target_span && expr_suspends_here(rhs) {
-                    (**rhs).clone()
-                } else {
-                    self.freeze_binary_prefix(rhs, target_span)
-                        .unwrap_or_else(|| (**rhs).clone())
-                };
-                HirExprKind::Binary {
-                    op: op.clone(),
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
+                HirExprKind::Binary { lhs, rhs, .. } => {
+                    let HirExprKind::Binary {
+                        lhs: target_lhs,
+                        rhs: target_rhs,
+                        ..
+                    } = &mut current.kind
+                    else {
+                        unreachable!()
+                    };
+                    if ancestors.contains(&std::ptr::from_ref(&**lhs)) {
+                        source = lhs;
+                        current = target_lhs;
+                        continue;
+                    }
+                    if !ancestors.contains(&std::ptr::from_ref(&**rhs)) {
+                        if can_fall_back {
+                            break;
+                        } else {
+                            return None;
+                        }
+                    }
+                    if !rematerializable(lhs) {
+                        let name = self.synthetic_name("prefix");
+                        let old = std::mem::replace(
+                            &mut **target_lhs,
+                            HirExpr {
+                                kind: HirExprKind::Int(0),
+                                ty: Type::Void,
+                                span: lhs.span,
+                            },
+                        );
+                        let local = self.push_synth_let(&name, false, old);
+                        **target_lhs = self.local_expr(local, lhs.span);
+                    }
+                    can_fall_back = true;
+                    if rhs.span == target_span && expr_suspends_here(rhs) {
+                        break;
+                    }
+                    source = rhs;
+                    current = target_rhs;
                 }
+                _ if can_fall_back => break,
+                _ => return None,
             }
-            _ => return None,
-        };
+        }
         Some(out)
     }
 
@@ -2466,57 +2424,70 @@ impl Builder {
                 // The returned value is computed BEFORE the defers run: a
                 // deferred body can mutate what the expression reads.
                 let value = if self.defer_depth == 0 {
-                    value.as_ref().and_then(|value| {
-                        let destination = if value.ty == Type::Void {
-                            None
-                        } else {
-                            let name = self.synthetic_name("return");
-                            Some(self.declare_local(name, value.ty.clone(), None, true, false))
-                        };
-                        match self.lower_root_suspend(value, destination) {
-                            Some(Some(value)) => Some(value),
-                            // A `void` operand that lowering already turned
-                            // into blocks — `return await sleep(1);`, a `void`
-                            // `match` — has nothing left to return. Re-reading
-                            // the operand here would put the suspension back
-                            // into the terminator.
-                            Some(None) => None,
-                            None => Some(
-                                self.lower_nested_suspend(value)
-                                    .unwrap_or_else(|| value.clone()),
-                            ),
+                    if let Some(value) = value.as_ref() {
+                        {
+                            let destination = if value.ty == Type::Void {
+                                None
+                            } else {
+                                let name = self.synthetic_name("return");
+                                Some(self.declare_local(name, value.ty.clone(), None, true, false))
+                            };
+                            match self.lower_root_suspend(value, destination) {
+                                Some(Some(value)) => Some(value),
+                                // A `void` operand that lowering already turned
+                                // into blocks — `return await sleep(1);`, a `void`
+                                // `match` — has nothing left to return. Re-reading
+                                // the operand here would put the suspension back
+                                // into the terminator.
+                                Some(None) => None,
+                                None => Some(
+                                    self.lower_nested_suspend(value)
+                                        .unwrap_or_else(|| value.clone()),
+                                ),
+                            }
                         }
-                    })
+                    } else {
+                        None
+                    }
                 } else {
-                    value.as_ref().and_then(|value| {
-                        if value.ty == Type::Void {
-                            if self.lower_root_suspend(value, None).is_none() {
-                                let value = self
+                    if let Some(value) = value.as_ref() {
+                        'returned: {
+                            if value.ty == Type::Void {
+                                if self.lower_root_suspend(value, None).is_none() {
+                                    let value = self
+                                        .lower_nested_suspend(value)
+                                        .unwrap_or_else(|| value.clone());
+                                    self.push(LirInst::Expr(value));
+                                }
+                                break 'returned None;
+                            }
+
+                            let name = self.synthetic_name("return");
+                            let destination = self.declare_local(
+                                name.clone(),
+                                value.ty.clone(),
+                                None,
+                                true,
+                                false,
+                            );
+                            if self.lower_root_suspend(value, Some(destination)).is_none() {
+                                let evaluated = self
                                     .lower_nested_suspend(value)
                                     .unwrap_or_else(|| value.clone());
-                                self.push(LirInst::Expr(value));
+                                self.push_existing_let(
+                                    destination,
+                                    name,
+                                    false,
+                                    value.ty.clone(),
+                                    evaluated,
+                                    None,
+                                );
                             }
-                            return None;
+                            Some(self.local_expr(destination, value.span))
                         }
-
-                        let name = self.synthetic_name("return");
-                        let destination =
-                            self.declare_local(name.clone(), value.ty.clone(), None, true, false);
-                        if self.lower_root_suspend(value, Some(destination)).is_none() {
-                            let evaluated = self
-                                .lower_nested_suspend(value)
-                                .unwrap_or_else(|| value.clone());
-                            self.push_existing_let(
-                                destination,
-                                name,
-                                false,
-                                value.ty.clone(),
-                                evaluated,
-                                None,
-                            );
-                        }
-                        Some(self.local_expr(destination, value.span))
-                    })
+                    } else {
+                        None
+                    }
                 };
                 self.flush_defers_down_to(0);
                 self.terminate(Terminator::Return(value));
@@ -2874,7 +2845,11 @@ impl Builder {
             // immutable, so re-reading them per iteration could only cost
             // loads, and hoisting the value itself keeps a call in the iterable
             // position from running twice.
-            (_, Type::Generic(g, args)) if g == "Range" && args.first() == Some(&Type::I64) => {
+            (_, Type::Generic(g, args))
+                if g.namespace().is_none()
+                    && g.name() == "Range"
+                    && args.first() == Some(&Type::I64) =>
+            {
                 let range_name = format!("__for{n}_range");
                 let bound_name = format!("__for{n}_end");
                 let range_local = self.push_synth_let(&range_name, false, iterable.clone());
@@ -3289,9 +3264,7 @@ mod tests {
                         };
                     }
                     let found = needs_match_cfg(vec![MatchCfgNode::Expr(&expr)]);
-                    while let HirExprKind::TryPropagate { inner } = expr.kind {
-                        expr = *inner;
-                    }
+                    drop(expr);
                     assert_eq!(found, hazard);
                 }
             })
@@ -3333,9 +3306,7 @@ mod tests {
                     let mut lambdas = Vec::new();
                     collect_lambdas_in_expr(&expr, &mut lambdas);
                     assert!(lambdas.is_empty());
-                    while let HirExprKind::TryPropagate { inner } = expr.kind {
-                        expr = *inner;
-                    }
+                    drop(expr);
                 }
             })
             .unwrap()
@@ -3376,11 +3347,7 @@ mod tests {
                 assert!(suspends_anywhere(&expr));
                 assert!(contains_suspend_span(&expr, span));
                 drop(found);
-                while let HirExprKind::TryPropagate { inner } | HirExprKind::Await { inner } =
-                    expr.kind
-                {
-                    expr = *inner;
-                }
+                drop(expr);
             })
             .unwrap()
             .join()
@@ -3404,7 +3371,7 @@ mod tests {
     fn func<'a>(p: &'a LirProgram, name: &str) -> &'a LirFunction {
         p.functions
             .iter()
-            .find(|f| f.name == name)
+            .find(|f| f.name.to_string() == name)
             .unwrap_or_else(|| panic!("no function {name}"))
     }
 
@@ -3719,7 +3686,11 @@ mod tests {
     #[test]
     fn l17_class_methods_flattened() {
         let p = lir("class Box { pub v: i64; pub fn get(self) -> i64 { return self.v; } }");
-        assert!(p.functions.iter().any(|f| f.name == "Box::get"));
+        assert!(
+            p.functions
+                .iter()
+                .any(|f| f.name == FunctionId::method(TypeId::local("Box"), "get"))
+        );
     }
 
     // 18. a constructor flattens as `Class::init` and keeps super.init

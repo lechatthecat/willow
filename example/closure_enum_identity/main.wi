@@ -1,0 +1,11 @@
+// Captured enums retain their canonical identity through closure signatures.
+import choices::Choice as Pick;
+
+fn main() {
+    let held = Pick::One;
+    let copy = || held;
+    let compare = |choice: Pick| choice == held;
+    println(copy() == Pick::One);
+    println(compare(Pick::One));
+    println(compare(Pick::Two));
+}

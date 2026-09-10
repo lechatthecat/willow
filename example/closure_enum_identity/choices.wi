@@ -1,0 +1,1 @@
+pub enum Choice { One, Two }

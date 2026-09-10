@@ -42,6 +42,7 @@ pub mod preempt;
 pub mod print;
 pub mod reference_debug;
 pub mod scheduler;
+pub(crate) mod stack_overflow;
 pub mod stack_trace;
 pub mod string;
 pub mod sync;
@@ -72,6 +73,7 @@ unsafe extern "C" fn __willow_static_init() {}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn runtime_start(argc: i32, argv: *mut *mut c_char) {
+    stack_overflow::protect_current_thread();
     args::willow_runtime_store_args(argc, argv);
     gc::willow_gc_init();
     // Synchronous top-level code owns a standalone execution context. Task

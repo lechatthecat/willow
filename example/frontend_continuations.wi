@@ -1,0 +1,7 @@
+fn identity(value: i64) -> i64 { return value; }
+fn choose(flag: bool) -> i64 {
+    return flag ? match flag { true => identity([42][0]), false => 0 } : 0;
+}
+fn main() {
+    println(choose(true));
+}

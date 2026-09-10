@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::module::{ModuleGraph, ModuleId};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum InitUnitId {
     Module(ModuleId),
     Entry,

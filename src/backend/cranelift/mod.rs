@@ -13,8 +13,9 @@ use crate::backend::abi;
 use crate::ir::module_init::{InitUnitId, ModuleInitPlan};
 use crate::parser::ast::*;
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
-use crate::semantic::ids::{FunctionId, FunctionMap};
-use crate::semantic::symbols::{EnumInfo, InterfaceInfo};
+use crate::semantic::ids::{FunctionId, FunctionMap, SemanticType as Type, TypeId};
+type EnumInfo = crate::semantic::symbols::EnumInfo<TypeId>;
+type InterfaceInfo = crate::semantic::symbols::InterfaceInfo<TypeId>;
 use crate::{BuildMode, CompilerOptions};
 
 mod module_index;
@@ -148,7 +149,7 @@ pub struct Codegen {
     /// frontend program and canonicalizes here (willow-nswv).
     builtin_module_aliases: HashMap<String, String>,
     /// Maps each lambda's source span to its generated private function name.
-    lambda_names: HashMap<ExprId, String>,
+    lambda_names: HashMap<ExprId, FunctionId>,
     /// Source names of async fns lowered as cooperative tasks (constructor +
     /// poll fn). Calling one schedules the task and returns its frame.
     cooperative_leaves: std::collections::HashSet<FunctionId>,
@@ -164,7 +165,7 @@ pub struct Codegen {
     /// Enum info for enum variant construction in generated code.
     enum_infos: TypeMap<EnumInfo>,
     /// Maps child class name → base class name for inherited method dispatch.
-    class_base: TypeMap<String>,
+    class_base: TypeMap<TypeId>,
     /// Maps each class name to a unique integer type_id for runtime dynamic dispatch.
     /// Type ids start at 1; 0 is reserved for null/unknown.
     class_type_ids: TypeMap<i64>,
@@ -172,9 +173,9 @@ pub struct Codegen {
     /// (willow-59gx). Recorded as classes are registered;
     /// [`Codegen::finalize_class_layouts`] turns it into `class_layouts`.
     class_own_fields: TypeMap<Vec<(String, Type)>>,
-    class_dependents: HashMap<String, HashSet<String>>,
-    dirty_class_layouts: HashSet<String>,
-    dirty_class_vslots: HashSet<String>,
+    class_dependents: HashMap<TypeId, HashSet<TypeId>>,
+    dirty_class_layouts: HashSet<TypeId>,
+    dirty_class_vslots: HashSet<TypeId>,
     /// The `open`/`override` instance methods each class declares ITSELF, in
     /// declaration order (willow-fm7t). Recorded as classes are registered;
     /// [`Codegen::finalize_class_vslots`] turns it into `class_vslots`.
@@ -197,7 +198,7 @@ pub struct Codegen {
     /// lambda signatures. Body emission reads the declared callable signatures.
     expr_types: HashMap<ExprId, Type>,
     /// Current unit's lowered bodies, consumed individually during emission.
-    lir_functions: HashMap<String, crate::ir::lowered::LirFunction>,
+    lir_functions: HashMap<FunctionId, crate::ir::lowered::LirFunction>,
     /// Lifted lambda bodies in lowered IR, keyed by the lambda expression's
     /// ID (willow-0g8j.2.2). The LIR cannot know the `$lambda.N` symbol, so
     /// `compile_program` moves these into `lir_functions` once it has assigned
@@ -363,6 +364,11 @@ impl Codegen {
             "elf_gd"
         };
         flag_builder.set("tls_model", tls_model)?;
+        // Touch every intervening stack page before a large frame is used.
+        // Otherwise a generated prologue can jump over the OS guard page and
+        // corrupt an adjacent mapping before the runtime can diagnose overflow.
+        flag_builder.set("enable_probestack", "true")?;
+        flag_builder.set("probestack_strategy", "inline")?;
         let flags = settings::Flags::new(flag_builder);
         let isa = isa_builder.finish(flags)?;
         // Willow's ABI is 64-bit throughout: every reference — GC handle,
@@ -397,7 +403,7 @@ impl Codegen {
             "PanicInfo".to_string(),
             crate::semantic::builtin_types::panic_info_fields()
                 .into_iter()
-                .map(|(name, ty)| (name.to_string(), ty))
+                .map(|(name, ty)| (name.to_string(), ty.into()))
                 .collect(),
         );
         let function_scope = crate::semantic::ids::FunctionScope::default();
@@ -535,8 +541,8 @@ impl Codegen {
     pub fn register_enum_info(&mut self, name: String, info: EnumInfo) {
         let identity = info.name.clone();
         self.enum_infos.insert(identity.clone(), info);
-        if name != identity {
-            self.type_scope.bind_canonical(&name, &identity);
+        if TypeId::from_source_name(&name) != identity {
+            self.type_scope.bind_canonical(&name, &identity.to_string());
         }
     }
 
@@ -564,7 +570,7 @@ impl Codegen {
             }
             scope.types.push((
                 name.clone(),
-                self.type_scope.bind_canonical(name, &info.name),
+                self.type_scope.bind_canonical(name, &info.name.to_string()),
             ));
         }
         scope
@@ -580,8 +586,8 @@ impl Codegen {
     pub fn register_interface_info(&mut self, name: String, info: InterfaceInfo) {
         let identity = info.name.clone();
         self.interface_infos.insert(identity.clone(), info);
-        if name != identity {
-            self.type_scope.bind_canonical(&name, &identity);
+        if TypeId::from_source_name(&name) != identity {
+            self.type_scope.bind_canonical(&name, &identity.to_string());
         }
     }
 
@@ -589,6 +595,12 @@ impl Codegen {
     /// unannotated live-across-await locals.
     pub fn register_expr_types(&mut self, types: HashMap<ExprId, Type>) {
         self.expr_types = types;
+    }
+
+    pub fn release_unit_transients(&mut self) {
+        self.lir_functions.clear();
+        self.lir_lambdas.clear();
+        self.expr_types.clear();
     }
 
     pub fn register_lir_functions(&mut self, lir: crate::ir::lowered::LirProgram) {
@@ -601,7 +613,7 @@ impl Codegen {
             if let Some(name) = self.lambda_names.get(&lambda.id) {
                 let mut function = lambda.function;
                 function.name = name.clone();
-                self.lir_functions.insert(name.clone(), function);
+                self.lir_functions.insert(function.name.clone(), function);
             } else {
                 self.lir_lambdas.insert(lambda.id, lambda.function);
             }
@@ -612,7 +624,13 @@ impl Codegen {
     /// Declared callable signatures live in `fn_types`; body emission does not
     /// need to retain every checked expression from every imported module.
     pub fn register_module_checker_tables(&mut self, checker: &crate::semantic::TypeChecker) {
-        self.register_expr_types(checker.expr_types.clone());
+        self.register_expr_types(
+            checker
+                .expr_types
+                .iter()
+                .map(|(id, ty)| (*id, ty.into()))
+                .collect(),
+        );
     }
 
     /// The type as the ENUM tables spell it: every enum name replaced by the one
@@ -627,26 +645,17 @@ impl Codegen {
     /// cross-unit call falls out of the walker's subset. An enum is different:
     /// the checker itself normalizes enum types to the identity, so the
     /// signature has to as well (willow-0g8j.3).
-    pub(super) fn canonical_enum_type(&self, ty: &Type) -> Type {
-        let identity = |name: &String| -> String {
+    pub(super) fn canonical_enum_type<N: type_index::TypeLookup>(
+        &self,
+        ty: &crate::parser::ast::Type<N>,
+    ) -> Type {
+        ty.map_names(|name| {
+            let id = name.type_id();
             self.enum_infos
-                .get(name.as_str())
+                .get_id(&id)
                 .map(|info| info.name.clone())
-                .unwrap_or_else(|| name.clone())
-        };
-        match ty {
-            Type::Named(name) => Type::Named(identity(name)),
-            Type::Generic(name, args) => Type::Generic(
-                identity(name),
-                args.iter().map(|a| self.canonical_enum_type(a)).collect(),
-            ),
-            Type::Array(element) => Type::Array(Box::new(self.canonical_enum_type(element))),
-            Type::Fn(params, ret) => Type::Fn(
-                params.iter().map(|p| self.canonical_enum_type(p)).collect(),
-                Box::new(self.canonical_enum_type(ret)),
-            ),
-            _ => ty.clone(),
-        }
+                .unwrap_or(id)
+        })
     }
 
     /// The type as the TABLES spell it: every declared name replaced by the one
@@ -664,49 +673,25 @@ impl Codegen {
     /// `signal::Level` are one type (willow-0g8j.3) — or, worse, silently
     /// rewrites an inherited layout to nothing once the alias is gone
     /// (willow-kd1v). A name that is already an identity passes through.
-    pub(super) fn canonical_declared_type(&self, ty: &Type) -> Type {
-        match ty {
-            Type::Named(name) => Type::Named(self.canonical_declared_name(name)),
-            Type::Generic(name, args) => Type::Generic(
-                self.canonical_declared_name(name),
-                args.iter()
-                    .map(|a| self.canonical_declared_type(a))
-                    .collect(),
-            ),
-            Type::Array(element) => Type::Array(Box::new(self.canonical_declared_type(element))),
-            Type::Fn(params, ret) => Type::Fn(
-                params
-                    .iter()
-                    .map(|p| self.canonical_declared_type(p))
-                    .collect(),
-                Box::new(self.canonical_declared_type(ret)),
-            ),
-            _ => ty.clone(),
-        }
+    pub(super) fn canonical_declared_type<N: type_index::TypeLookup>(
+        &self,
+        ty: &crate::parser::ast::Type<N>,
+    ) -> Type {
+        ty.map_names(|name| self.canonical_declared_id(&name.type_id()))
     }
 
-    /// [`Codegen::canonical_declared_type`] for one name.
-    ///
-    /// An enum answers with its own recorded identity; anything else is
-    /// resolved through the shared type scope, and only when the chain
-    /// lands on a class or interface the tables really hold — an unbound name,
-    /// or one bound to something not yet declared, is left exactly as written
-    /// so a base declared after its subclass still resolves later.
-    pub(super) fn canonical_declared_name(&self, name: &str) -> String {
-        if let Some(info) = self.enum_infos.get(name) {
+    fn canonical_declared_id(&self, id: &TypeId) -> TypeId {
+        if let Some(info) = self.enum_infos.get_id(id) {
             return info.name.clone();
         }
-        let resolved = self
-            .type_scope
-            .resolve(&crate::semantic::ids::TypeId::from_source_name(name))
-            .to_string();
-        if resolved != name
-            && (self.class_layouts.get_canonical(&resolved).is_some()
-                || self.interface_infos.get_canonical(&resolved).is_some())
+        let resolved = self.type_scope.resolve(id);
+        if self.class_layouts.get_canonical_id(&resolved).is_some()
+            || self.interface_infos.get_canonical_id(&resolved).is_some()
         {
-            return resolved;
+            resolved
+        } else {
+            id.clone()
         }
-        name.to_string()
     }
 
     /// Hand the back end the imports the module resolver classified for the
@@ -759,8 +744,8 @@ impl Codegen {
         }
         for (alias, full) in self.item_import_method_aliases(local, module, item) {
             self.func_ids.scope().bind(
-                FunctionId::free_from_source_name(&alias),
-                FunctionId::free_from_source_name(&full),
+                FunctionId::free(&alias),
+                self.func_ids.scope().lookup_id(&full),
             );
         }
     }
@@ -808,19 +793,15 @@ impl Codegen {
         if !self.class_layouts.contains_key(&qualified) {
             return Vec::new();
         }
-        let module_prefix = self
-            .known_modules
-            .linker_prefix(&module)
-            .cloned()
-            .unwrap_or_else(|| module_symbol_prefix(&module));
-        let method_prefix = class_member_prefix(&module_item_symbol(&module_prefix, item));
+        let owner = TypeId::from_source_name(&qualified);
         self.func_ids
             .ids()
-            .map(ToString::to_string)
-            .filter(|name| name.starts_with(&method_prefix))
-            .map(|full| {
-                let suffix = full.strip_prefix(&method_prefix).expect("filtered above");
-                (class_member_symbol(local, suffix), full.clone())
+            .filter(|id| id.namespace() == owner.namespace() && id.owner() == Some(owner.name()))
+            .map(|id| {
+                (
+                    class_member_symbol(local, id.name()),
+                    self.class_method_symbol(&qualified, id.name()),
+                )
             })
             .collect()
     }
@@ -837,8 +818,8 @@ impl Codegen {
         let mangled = module_item_symbol(&module_prefix, item);
         if self.func_ids.contains_key(&mangled) {
             self.func_ids.scope().bind(
-                FunctionId::free_from_source_name(local),
-                FunctionId::free_from_source_name(&mangled),
+                FunctionId::free(local),
+                self.func_ids.scope().lookup_id(&mangled),
             );
             return true;
         }
@@ -853,11 +834,11 @@ impl Codegen {
         aliases: &mut ModuleAliasSnapshot,
     ) {
         if self.func_ids.contains_key(canonical) {
-            let alias = FunctionId::free_from_source_name(alias);
+            let alias = FunctionId::free(alias);
             let previous = self
                 .func_ids
                 .scope()
-                .bind(alias.clone(), FunctionId::free_from_source_name(canonical));
+                .bind(alias.clone(), self.func_ids.scope().lookup_id(canonical));
             aliases.functions.push((alias, previous));
         }
     }
@@ -1095,11 +1076,13 @@ impl Codegen {
             // then, and the subclass's layout was quietly rewritten to its own
             // fields alone — `new Sub` then fell out of the walker's subset and
             // every inherited field read the wrong offset (willow-kd1v).
-            let base = self.canonical_declared_name(&base_name);
+            let base = self
+                .type_scope
+                .resolve(&TypeId::from_source_name(&base_name));
             self.class_dependents
                 .entry(base.clone())
                 .or_default()
-                .insert(c.name.clone());
+                .insert(TypeId::from_source_name(&c.name));
             self.class_base.insert(c.name.clone(), base);
         }
         // Assign a unique type_id for runtime dynamic dispatch. It lives at
@@ -1112,7 +1095,7 @@ impl Codegen {
     }
 
     fn invalidate_class_layout(&mut self, name: &str) {
-        let mut pending = vec![name.to_string()];
+        let mut pending = vec![TypeId::from_source_name(name)];
         let mut seen = HashSet::new();
         while let Some(name) = pending.pop() {
             if !seen.insert(name.clone()) {
@@ -1168,7 +1151,7 @@ impl Codegen {
                 // every unit in the build, and the unit it happens to run
                 // under may have bound that very name to another module's
                 // class (willow-kd1v).
-                let Some(own) = self.class_own_fields.get_canonical(ancestor) else {
+                let Some(own) = self.class_own_fields.get_canonical_id(ancestor) else {
                     continue;
                 };
                 for (name, ty) in own {
@@ -1177,7 +1160,7 @@ impl Codegen {
                     }
                 }
             }
-            self.class_layouts.insert_canonical(class_name, fields);
+            self.class_layouts.insert_canonical_id(class_name, fields);
         }
     }
 
@@ -1186,15 +1169,15 @@ impl Codegen {
     /// A cyclic `extends` -- already a checker error, but reachable here when
     /// the backend is driven directly -- stops at the repeat rather than
     /// looping forever.
-    fn ancestor_chain(&self, class_name: &str) -> Vec<String> {
-        let mut chain = vec![class_name.to_string()];
-        let mut seen: HashSet<String> = HashSet::from([class_name.to_string()]);
+    fn ancestor_chain(&self, class_name: &TypeId) -> Vec<TypeId> {
+        let mut chain = vec![class_name.clone()];
+        let mut seen = HashSet::from([class_name.clone()]);
         // `class_base` records canonical names (`register_class_layout`
         // canonicalizes as it stores), so the walk reads them as identities
         // rather than through the aliases of whichever unit is compiling.
         while let Some(base) = self
             .class_base
-            .get_canonical(chain.last().expect("non-empty"))
+            .get_canonical_id(chain.last().expect("non-empty"))
         {
             if !seen.insert(base.clone()) {
                 break;
@@ -1228,7 +1211,7 @@ impl Codegen {
             for ancestor in chain.iter().rev() {
                 // An identity, not a spelling, for the same reason
                 // `finalize_class_layouts` reads one.
-                let Some(own) = self.class_own_vmethods.get_canonical(ancestor) else {
+                let Some(own) = self.class_own_vmethods.get_canonical_id(ancestor) else {
                     continue;
                 };
                 for method in own {
@@ -1237,13 +1220,13 @@ impl Codegen {
                     }
                 }
             }
-            self.class_vslots.insert_canonical(class_name, slots);
+            self.class_vslots.insert_canonical_id(class_name, slots);
         }
     }
 
     fn validate_gc_ref_mask_layouts(&self) -> Result<()> {
         for (class_name, layout) in self.class_layouts.iter() {
-            try_gc_ref_mask_for_layout(class_name, layout, &self.enum_infos)?;
+            try_gc_ref_mask_for_layout(&class_name.to_string(), layout, &self.enum_infos)?;
         }
         Ok(())
     }
@@ -1251,17 +1234,18 @@ impl Codegen {
     /// Find the func_id for `class_name::method_name`, searching the class and
     /// then its ancestors (an inherited method satisfies the interface).
     fn resolve_class_method_func_id(&self, class_name: &str, method_name: &str) -> Option<FuncId> {
-        let mut search = Some(class_name.to_string());
+        let mut search = Some(TypeId::from_source_name(class_name));
         let mut seen = HashSet::new();
         while let Some(name) = search {
             if !seen.insert(name.clone()) {
                 break;
             }
-            let mangled = class_method_symbol_name(&self.known_modules, &name, method_name);
+            let mangled =
+                class_method_symbol_name(&self.known_modules, &name.to_string(), method_name);
             if let Some(&fid) = self.func_ids.get(&mangled) {
                 return Some(fid);
             }
-            search = self.class_base.get(&name).cloned();
+            search = self.class_base.get_id(&name).cloned();
         }
         None
     }
@@ -1467,13 +1451,13 @@ struct FuncGen<'a, 'b> {
     /// Local alias -> canonical builtin schema module, for the file being
     /// compiled (willow-nswv). Only the LIR path reads it.
     builtin_module_aliases: &'a HashMap<String, String>,
-    lambda_names: &'a HashMap<ExprId, String>,
+    lambda_names: &'a HashMap<ExprId, FunctionId>,
     cooperative_leaves: &'a std::collections::HashSet<FunctionId>,
     string_literals: &'a HashMap<String, DataId>,
     class_layouts: &'a TypeMap<Vec<(String, Type)>>,
     static_storage: &'a TypeMap<HashMap<String, StaticStorageInfo>>,
     enum_infos: &'a TypeMap<EnumInfo>,
-    class_base: &'a TypeMap<String>,
+    class_base: &'a TypeMap<TypeId>,
     /// Maps class name → unique type_id (i64). Since willow-fm7t the id is no
     /// longer stored inline in the object: word 0 points at the class
     /// DESCRIPTOR, which holds the id at its own offset 0.
@@ -1851,7 +1835,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Type::Named(class_name) = value_ty
             && self.class_layouts.contains_key(class_name)
         {
-            return self.emit_interface_box(value, class_name, iface_name);
+            return self.emit_interface_box(
+                value,
+                &class_name.to_string(),
+                &iface_name.to_string(),
+            );
         }
         value
     }
@@ -1921,33 +1909,33 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     /// True when `cls` is `ancestor` or transitively extends it.
     fn class_is_a(&self, cls: &str, ancestor: &str) -> bool {
-        let mut current = Some(cls.to_string());
+        let mut current = Some(TypeId::from_source_name(cls));
         let mut seen = HashSet::new();
         while let Some(name) = current {
-            if name == ancestor {
+            if name == TypeId::from_source_name(ancestor) {
                 return true;
             }
             if !seen.insert(name.clone()) {
                 break;
             }
-            current = self.class_base.get(&name).cloned();
+            current = self.class_base.get_id(&name).cloned();
         }
         false
     }
 
     /// FuncId of `cls`'s (or the nearest ancestor's) `method`, or `None`.
     fn resolve_method_func_id(&self, cls: &str, method: &str) -> Option<FuncId> {
-        let mut current = Some(cls.to_string());
+        let mut current = Some(TypeId::from_source_name(cls));
         let mut seen = HashSet::new();
         while let Some(name) = current {
             if !seen.insert(name.clone()) {
                 break;
             }
-            let mangled = class_method_symbol_name(self.known_modules, &name, method);
+            let mangled = class_method_symbol_name(self.known_modules, &name.to_string(), method);
             if let Some(&fid) = self.func_ids.get(&mangled) {
                 return Some(fid);
             }
-            current = self.class_base.get(&name).cloned();
+            current = self.class_base.get_id(&name).cloned();
         }
         None
     }
@@ -1965,7 +1953,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         };
         // Instantiate with type args from the scrutinee if available.
         let type_args: &[Type] = if let Type::Generic(n, args) = scrutinee_ty {
-            if n == enum_name { args.as_slice() } else { &[] }
+            if n == &TypeId::from_source_name(enum_name) {
+                args.as_slice()
+            } else {
+                &[]
+            }
         } else {
             &[]
         };
@@ -2013,40 +2005,46 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 /// the walker must not admit a read the emitter would then resolve differently.
 fn lookup_static_storage_in(
     static_storage: &TypeMap<HashMap<String, StaticStorageInfo>>,
-    class_base: &TypeMap<String>,
+    class_base: &TypeMap<TypeId>,
     class: &str,
     field: &str,
 ) -> Option<StaticStorageInfo> {
-    let mut current = Some(class.to_string());
+    let mut current = Some(TypeId::from_source_name(class));
     let mut seen = std::collections::HashSet::new();
     while let Some(name) = current {
         if !seen.insert(name.clone()) {
             break;
         }
         if let Some(info) = static_storage
-            .get(&name)
+            .get_id(&name)
             .and_then(|fields| fields.get(field))
         {
             return Some(info.clone());
         }
-        current = class_base.get(&name).cloned();
+        current = class_base.get_id(&name).cloned();
     }
     None
 }
 
 fn function_call_return_type(f: &FunctionDecl) -> Type {
     if f.is_async {
-        Type::Generic("Task".to_string(), vec![f.return_type.clone()])
+        Type::Generic(
+            "Task".to_string().into(),
+            vec![f.return_type.clone().into()],
+        )
     } else {
-        f.return_type.clone()
+        f.return_type.clone().into()
     }
 }
 
 fn method_call_return_type(m: &MethodDecl) -> Type {
     if m.is_async {
-        Type::Generic("Task".to_string(), vec![m.return_type.clone()])
+        Type::Generic(
+            "Task".to_string().into(),
+            vec![m.return_type.clone().into()],
+        )
     } else {
-        m.return_type.clone()
+        m.return_type.clone().into()
     }
 }
 
@@ -2055,7 +2053,7 @@ fn param_debug_from_params(params: &[Param]) -> Vec<ParamDebug> {
         .iter()
         .map(|param| ParamDebug {
             name: param.name.clone(),
-            ty: param.ty.clone(),
+            ty: param.ty.clone().into(),
             mode: param.mode.clone(),
         })
         .collect()
@@ -2079,20 +2077,33 @@ fn reference_place_kind(expr: &Expr) -> &'static str {
 }
 
 fn reference_place_name(expr: &Expr) -> String {
-    match expr {
-        Expr::Var(name, _, _) => name.clone(),
-        Expr::FieldAccess(object, field, _, _) => {
-            format!("{}.{}", reference_place_name(object), field)
+    let mut current = expr;
+    let mut suffixes = Vec::new();
+    let mut out = loop {
+        match current {
+            Expr::Var(name, _, _) => break name.clone(),
+            Expr::FieldAccess(object, field, _, _) => {
+                suffixes.push((Some(field.as_str()), None));
+                current = object;
+            }
+            Expr::Index(array, index, _, _) => {
+                suffixes.push((None, Some(index.as_ref())));
+                current = array;
+            }
+            _ => break "<expression>".to_string(),
         }
-        Expr::Index(array, index, _, _) => {
-            format!(
-                "{}[{}]",
-                reference_place_name(array),
-                reference_index_name(index)
-            )
+    };
+    for (field, index) in suffixes.into_iter().rev() {
+        if let Some(field) = field {
+            out.push('.');
+            out.push_str(field);
+        } else if let Some(index) = index {
+            out.push('[');
+            out.push_str(&reference_index_name(index));
+            out.push(']');
         }
-        _ => "<expression>".to_string(),
     }
+    out
 }
 
 fn reference_index_name(expr: &Expr) -> String {
@@ -2270,7 +2281,7 @@ fn collect_async_frame_slots(params: &[Param], body: &Block) -> Vec<AsyncFrameSl
         .map(|p| AsyncFrameSlot {
             source_span: Some(p.span),
             name: p.name.clone(),
-            ty: p.ty.clone(),
+            ty: p.ty.clone().into(),
         })
         .collect();
     let mut seen: HashSet<crate::diagnostics::Span> =
@@ -2286,7 +2297,8 @@ fn collect_let_slots(
     out: &mut Vec<AsyncFrameSlot>,
     seen: &mut HashSet<crate::diagnostics::Span>,
 ) {
-    for stmt in &block.stmts {
+    let mut pending: Vec<&Stmt> = block.stmts.iter().rev().collect();
+    while let Some(stmt) = pending.pop() {
         match stmt {
             Stmt::Let(l) => {
                 if let Some(ty) = &l.ty
@@ -2295,18 +2307,18 @@ fn collect_let_slots(
                     out.push(AsyncFrameSlot {
                         source_span: Some(l.span),
                         name: l.name.clone(),
-                        ty: ty.clone(),
+                        ty: ty.into(),
                     });
                 }
             }
             Stmt::If(s) => {
-                collect_let_slots(&s.then_block, out, seen);
-                if let Some(else_block) = &s.else_block {
-                    collect_let_slots(else_block, out, seen);
+                if let Some(block) = &s.else_block {
+                    pending.extend(block.stmts.iter().rev());
                 }
+                pending.extend(s.then_block.stmts.iter().rev());
             }
-            Stmt::While(s) => collect_let_slots(&s.body, out, seen),
-            Stmt::For(s) => collect_let_slots(&s.body, out, seen),
+            Stmt::While(s) => pending.extend(s.body.stmts.iter().rev()),
+            Stmt::For(s) => pending.extend(s.body.stmts.iter().rev()),
             _ => {}
         }
     }
@@ -2323,7 +2335,11 @@ fn array_element_type(ty: &Type) -> Type {
                 .unwrap()
                 .clone()
         }
-        Type::Generic(name, args) if name == "Range" && args.as_slice() == [Type::I64] => Type::I64,
+        Type::Generic(name, args)
+            if name == &TypeId::local("Range") && args.as_slice() == [Type::I64] =>
+        {
+            Type::I64
+        }
         _ => Type::Void,
     }
 }
@@ -2346,8 +2362,8 @@ fn result_err_type(ty: &Type) -> Option<Type> {
 /// inspects the result and exits accordingly (willow-exg).
 fn main_result_err_type(f: &FunctionDecl) -> Option<Type> {
     builtin_types::binary_args(&f.return_type, B::Result)
-        .filter(|(ok, _)| **ok == Type::Void)
-        .map(|(_, err)| err.clone())
+        .filter(|(ok, _)| **ok == (Type::Void).to_source())
+        .map(|(_, err)| err.into())
 }
 
 #[cfg(test)]
@@ -2491,6 +2507,145 @@ mod symbol_namespace_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn closure_type_canonicalization_perspectives() {
+        use super::*;
+
+        let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+        codegen.enum_infos.insert(
+            "origin::Choice",
+            EnumInfo {
+                name: "origin::Choice".into(),
+                public: true,
+                type_params: vec![],
+                declaration_span: Span::dummy(),
+                variants: vec![],
+            },
+        );
+        codegen.type_scope.bind_canonical("Alias", "origin::Choice");
+        codegen.type_scope.bind("Forward", "Alias");
+        codegen.class_layouts.insert("origin::Record", vec![]);
+        codegen
+            .type_scope
+            .bind_canonical("Record", "origin::Record");
+
+        let named = |name: &str| Type::Named(name.into());
+        let closure = |params, ret| Type::Closure(params, Box::new(ret));
+        let function = |params, ret| Type::Fn(params, Box::new(ret));
+        let array = |ty| Type::Array(Box::new(ty));
+        let generic = |ty| Type::Generic("Container".into(), vec![ty]);
+        let alias = named("Alias");
+        let canonical = named("origin::Choice");
+        // Each row checks BOTH signature enum normalization and declared layout
+        // normalization: 24 explicit perspectives, including unchanged Fn paths.
+        let cases = [
+            (
+                "closure parameter",
+                closure(vec![alias.clone()], Type::Void),
+                closure(vec![canonical.clone()], Type::Void),
+            ),
+            (
+                "closure result",
+                closure(vec![], alias.clone()),
+                closure(vec![], canonical.clone()),
+            ),
+            (
+                "array parameter",
+                closure(vec![array(alias.clone())], Type::Void),
+                closure(vec![array(canonical.clone())], Type::Void),
+            ),
+            (
+                "array result",
+                closure(vec![], array(alias.clone())),
+                closure(vec![], array(canonical.clone())),
+            ),
+            (
+                "generic parameter",
+                closure(vec![generic(alias.clone())], Type::Void),
+                closure(vec![generic(canonical.clone())], Type::Void),
+            ),
+            (
+                "generic result",
+                closure(vec![], generic(alias.clone())),
+                closure(vec![], generic(canonical.clone())),
+            ),
+            (
+                "function parameter",
+                closure(
+                    vec![function(vec![alias.clone()], alias.clone())],
+                    Type::Void,
+                ),
+                closure(
+                    vec![function(vec![canonical.clone()], canonical.clone())],
+                    Type::Void,
+                ),
+            ),
+            (
+                "function result",
+                closure(vec![], function(vec![alias.clone()], alias.clone())),
+                closure(vec![], function(vec![canonical.clone()], canonical.clone())),
+            ),
+            (
+                "nested closure",
+                closure(
+                    vec![closure(vec![alias.clone()], alias.clone())],
+                    closure(vec![], alias.clone()),
+                ),
+                closure(
+                    vec![closure(vec![canonical.clone()], canonical.clone())],
+                    closure(vec![], canonical.clone()),
+                ),
+            ),
+            (
+                "closure inside function",
+                function(
+                    vec![closure(vec![alias.clone()], alias.clone())],
+                    closure(vec![], alias.clone()),
+                ),
+                function(
+                    vec![closure(vec![canonical.clone()], canonical.clone())],
+                    closure(vec![], canonical.clone()),
+                ),
+            ),
+            (
+                "forward alias",
+                closure(vec![named("Forward")], named("Forward")),
+                closure(vec![canonical.clone()], canonical.clone()),
+            ),
+            (
+                "canonical unchanged",
+                closure(vec![canonical.clone()], canonical.clone()),
+                closure(vec![canonical.clone()], canonical),
+            ),
+        ];
+        for (perspective, input, expected) in cases {
+            assert_eq!(
+                codegen.canonical_enum_type(&input),
+                expected,
+                "signature: {perspective}"
+            );
+            assert_eq!(
+                codegen.canonical_declared_type(&input),
+                expected,
+                "layout: {perspective}"
+            );
+        }
+        // Signature normalization intentionally preserves class spellings; the
+        // layout flow resolves them, just as both flows already do for Fn.
+        let record = closure(vec![named("Record")], named("Record"));
+        assert_eq!(codegen.canonical_enum_type(&record), record);
+        assert_eq!(
+            codegen.canonical_declared_type(&record),
+            closure(vec![named("origin::Record")], named("origin::Record"))
+        );
+        let unchanged = closure(
+            vec![Type::I64, Type::Bool, Type::String, named("Unknown")],
+            Type::Never,
+        );
+        assert_eq!(codegen.canonical_enum_type(&unchanged), unchanged);
+        assert_eq!(codegen.canonical_declared_type(&unchanged), unchanged);
+    }
     #[test]
     fn incremental_layouts_track_only_changed_dependency_subtrees() {
         for length in 1..=10 {
@@ -2542,8 +2697,14 @@ mod tests {
                 }
                 let leaf = format!("C{}", length - 1);
                 codegen.invalidate_class_layout(&leaf);
-                assert_eq!(codegen.dirty_class_layouts, HashSet::from([leaf.clone()]));
-                assert_eq!(codegen.dirty_class_vslots, HashSet::from([leaf]));
+                assert_eq!(
+                    codegen.dirty_class_layouts,
+                    HashSet::from([TypeId::from_source_name(&leaf)])
+                );
+                assert_eq!(
+                    codegen.dirty_class_vslots,
+                    HashSet::from([TypeId::from_source_name(&leaf)])
+                );
                 codegen.finalize_class_layouts();
                 codegen.finalize_class_vslots();
                 codegen.finalize_class_layouts();
@@ -2686,7 +2847,10 @@ mod tests {
     #[test]
     fn unit_async_codegen_04_channel_element_type_extracts_generic_argument() {
         assert_eq!(
-            channel_element_type(&Type::Generic("Channel".to_string(), vec![Type::I64])),
+            channel_element_type(&Type::Generic(
+                "Channel".to_string().into(),
+                vec![Type::I64]
+            )),
             Some(Type::I64)
         );
         assert_eq!(channel_element_type(&Type::I64), None);
@@ -2699,7 +2863,7 @@ mod tests {
         assert_eq!(channel_runtime_suffix(&Type::F64), "f64");
         assert_eq!(channel_runtime_suffix(&Type::String), "ptr");
         assert_eq!(
-            channel_runtime_suffix(&Type::Named("Node".to_string())),
+            channel_runtime_suffix(&Type::Named("Node".to_string().into())),
             "ptr"
         );
     }
@@ -2707,11 +2871,14 @@ mod tests {
     #[test]
     fn unit_async_codegen_07_future_uses_runtime_pointer_abi() {
         assert_eq!(
-            clif_type(&Type::Generic("Future".to_string(), vec![Type::I64])),
+            clif_type(&Type::Generic("Future".to_string().into(), vec![Type::I64])),
             types::I64
         );
         assert_eq!(
-            clif_type(&Type::Generic("Future".to_string(), vec![Type::Void])),
+            clif_type(&Type::Generic(
+                "Future".to_string().into(),
+                vec![Type::Void]
+            )),
             types::I64
         );
     }
@@ -2768,7 +2935,7 @@ mod tests {
         map.insert(
             name.to_string(),
             EnumInfo {
-                name: name.to_string(),
+                name: name.to_string().into(),
                 public: true,
                 type_params: vec![],
                 declaration_span: Span::dummy(),
@@ -2820,7 +2987,7 @@ mod tests {
     // 6. A class reference (named, non-enum) is traced.
     #[test]
     fn async_frame_06_class_slot_traced() {
-        let layout = frame_layout(&[("node", Type::Named("Node".to_string()))]);
+        let layout = frame_layout(&[("node", Type::Named("Node".to_string().into()))]);
         assert_eq!(layout.gc_slot_mask, 0b1);
         assert!(layout.slot_is_gc_ref(0));
     }
@@ -2848,14 +3015,17 @@ mod tests {
     // nullable-pointer niche and is traced (the runtime skips zero).
     #[test]
     fn async_frame_10_optional_ref_slot_traced() {
-        let ty = Type::Generic("Option".to_string(), vec![Type::Named("Node".to_string())]);
+        let ty = Type::Generic(
+            "Option".to_string().into(),
+            vec![Type::Named("Node".to_string().into())],
+        );
         assert_eq!(frame_layout(&[("maybe", ty)]).gc_slot_mask, 0b1);
     }
 
     // 11. Option<i64> needs a tagged enum allocation and is therefore traced.
     #[test]
     fn async_frame_11_optional_primitive_slot_traced() {
-        let ty = Type::Generic("Option".to_string(), vec![Type::I64]);
+        let ty = Type::Generic("Option".to_string().into(), vec![Type::I64]);
         assert_eq!(frame_layout(&[("maybe", ty)]).gc_slot_mask, 0b1);
     }
 
@@ -2863,8 +3033,11 @@ mod tests {
     #[test]
     fn async_frame_12_nested_optional_ref_traced() {
         let ty = Type::Generic(
-            "Option".to_string(),
-            vec![Type::Generic("Option".to_string(), vec![Type::String])],
+            "Option".to_string().into(),
+            vec![Type::Generic(
+                "Option".to_string().into(),
+                vec![Type::String],
+            )],
         );
         assert_eq!(frame_layout(&[("m", ty)]).gc_slot_mask, 0b1);
     }
@@ -2874,10 +3047,10 @@ mod tests {
     //     Task/JoinHandle are GC async frames — all three ARE traced.
     #[test]
     fn async_frame_13_runtime_pointer_generics_and_joinhandle() {
-        let future = Type::Generic("Future".to_string(), vec![Type::I64]);
-        let channel = Type::Generic("Channel".to_string(), vec![Type::String]);
-        let task = Type::Generic("Task".to_string(), vec![Type::I64]);
-        let join = Type::Generic("JoinHandle".to_string(), vec![Type::Void]);
+        let future = Type::Generic("Future".to_string().into(), vec![Type::I64]);
+        let channel = Type::Generic("Channel".to_string().into(), vec![Type::String]);
+        let task = Type::Generic("Task".to_string().into(), vec![Type::I64]);
+        let join = Type::Generic("JoinHandle".to_string().into(), vec![Type::Void]);
         assert_eq!(frame_layout(&[("f", future)]).gc_slot_mask, 0);
         assert_eq!(frame_layout(&[("c", channel)]).gc_slot_mask, 0b1);
         assert_eq!(frame_layout(&[("t", task)]).gc_slot_mask, 0b1);
@@ -2887,14 +3060,14 @@ mod tests {
     // 14. Option<i64> (a generic enum carrying payload) is a heap object → traced.
     #[test]
     fn async_frame_14_option_generic_enum_traced() {
-        let ty = Type::Generic("Option".to_string(), vec![Type::I64]);
+        let ty = Type::Generic("Option".to_string().into(), vec![Type::I64]);
         assert_eq!(frame_layout(&[("o", ty)]).gc_slot_mask, 0b1);
     }
 
     // 15. Result<String,i64> is a heap object → traced.
     #[test]
     fn async_frame_15_result_generic_enum_traced() {
-        let ty = Type::Generic("Result".to_string(), vec![Type::String, Type::I64]);
+        let ty = Type::Generic("Result".to_string().into(), vec![Type::String, Type::I64]);
         assert_eq!(frame_layout(&[("r", ty)]).gc_slot_mask, 0b1);
     }
 
@@ -2905,7 +3078,7 @@ mod tests {
             "Color",
             &[("Red", vec![]), ("Green", vec![]), ("Blue", vec![])],
         );
-        let layout = frame_layout_with(&[("c", Type::Named("Color".to_string()))], &enums);
+        let layout = frame_layout_with(&[("c", Type::Named("Color".to_string().into()))], &enums);
         assert_eq!(layout.gc_slot_mask, 0);
     }
 
@@ -2913,7 +3086,7 @@ mod tests {
     #[test]
     fn async_frame_17_payload_enum_traced() {
         let enums = enum_infos_with("Shape", &[("Dot", vec![]), ("Circle", vec![Type::I64])]);
-        let layout = frame_layout_with(&[("s", Type::Named("Shape".to_string()))], &enums);
+        let layout = frame_layout_with(&[("s", Type::Named("Shape".to_string().into()))], &enums);
         assert_eq!(layout.gc_slot_mask, 0b1);
     }
 
@@ -2921,10 +3094,10 @@ mod tests {
     #[test]
     fn async_frame_18_mixed_slots_mask_by_index() {
         let layout = frame_layout(&[
-            ("count", Type::I64),                      // slot 0 — not traced
-            ("node", Type::Named("Node".to_string())), // slot 1 — traced
-            ("ok", Type::Bool),                        // slot 2 — not traced
-            ("name", Type::String),                    // slot 3 — traced
+            ("count", Type::I64),                             // slot 0 — not traced
+            ("node", Type::Named("Node".to_string().into())), // slot 1 — traced
+            ("ok", Type::Bool),                               // slot 2 — not traced
+            ("name", Type::String),                           // slot 3 — traced
         ]);
         assert_eq!(layout.gc_slot_mask, 0b1010);
         assert!(!layout.slot_is_gc_ref(0));
@@ -2979,7 +3152,7 @@ mod tests {
     fn async_frame_21_collector_params_then_nested_lets() {
         let params = vec![Param {
             name: "x".to_string(),
-            ty: Type::Named("Node".to_string()),
+            ty: crate::parser::ast::Type::Named("Node".to_string()),
             mode: ParamMode::Value,
             span: Span::new(1, 1, 1, 1),
             type_span: Span::dummy(),
@@ -2990,7 +3163,7 @@ mod tests {
                 Stmt::Let(LetStmt {
                     name: "y".to_string(),
                     mutable: false,
-                    ty: Some(Type::String),
+                    ty: Some(crate::parser::ast::Type::String),
                     init: Expr::Integer(0, Span::dummy(), ExprId::fresh()),
                     span: Span::new(2, 2, 2, 1),
                 }),
@@ -3000,7 +3173,7 @@ mod tests {
                         stmts: vec![Stmt::Let(LetStmt {
                             name: "z".to_string(),
                             mutable: false,
-                            ty: Some(Type::I64),
+                            ty: Some(crate::parser::ast::Type::I64),
                             init: Expr::Integer(0, Span::dummy(), ExprId::fresh()),
                             span: Span::new(3, 3, 3, 1),
                         })],
@@ -3046,7 +3219,7 @@ mod tests {
             public: false,
             is_async: true,
             params: Vec::new(),
-            return_type: Type::I64,
+            return_type: crate::parser::ast::Type::I64,
             body: Block {
                 stmts: Vec::new(),
                 span: crate::diagnostics::Span::dummy(),
@@ -3056,7 +3229,7 @@ mod tests {
 
         assert_eq!(
             function_call_return_type(&function),
-            Type::Generic("Task".to_string(), vec![Type::I64])
+            Type::Generic("Task".to_string().into(), vec![Type::I64])
         );
     }
 
@@ -3079,7 +3252,7 @@ mod tests {
             "willow_future_await_f64"
         );
         assert_eq!(
-            future_await_runtime_name(&Type::Named("Node".to_string())),
+            future_await_runtime_name(&Type::Named("Node".to_string().into())),
             "willow_future_await_ptr"
         );
     }

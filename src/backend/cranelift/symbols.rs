@@ -106,6 +106,7 @@ pub(crate) fn class_member_symbol(class_symbol: &str, member: &str) -> String {
 
 /// The prefix every method symbol of `class_symbol` starts with, used to
 /// re-alias a module's methods under an imported local class name.
+#[cfg(test)]
 pub(crate) fn class_member_prefix(class_symbol: &str) -> String {
     format!("{class_symbol}{PATH_SEP}")
 }
@@ -308,23 +309,7 @@ pub(crate) fn qualify_module_local_type(
             n.to_string()
         }
     };
-    match ty {
-        Type::Named(name) => Type::Named(qual(name)),
-        Type::Generic(name, args) => Type::Generic(
-            qual(name),
-            args.iter()
-                .map(|a| qualify_module_local_type(a, module_name, local))
-                .collect(),
-        ),
-        Type::Array(e) => Type::Array(Box::new(qualify_module_local_type(e, module_name, local))),
-        Type::Fn(ps, r) => Type::Fn(
-            ps.iter()
-                .map(|p| qualify_module_local_type(p, module_name, local))
-                .collect(),
-            Box::new(qualify_module_local_type(r, module_name, local)),
-        ),
-        _ => ty.clone(),
-    }
+    ty.map_names(|name| qual(name))
 }
 
 /// Clone a module function declaration with its SIGNATURE (parameter and return
@@ -343,7 +328,9 @@ pub(crate) fn qualify_module_fn_signature(
     out
 }
 
-pub(crate) fn class_name_for_object_type(ty: &Type) -> Option<String> {
+pub(crate) fn class_name_for_object_type(
+    ty: &crate::semantic::ids::SemanticType,
+) -> Option<crate::semantic::ids::TypeId> {
     match ty {
         Type::Named(name) => Some(name.clone()),
         _ => None,

@@ -3,6 +3,7 @@ use super::ast::*;
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity};
 use crate::lexer::token::TokenKind;
 
+#[willow_continuations::parser]
 impl Parser {
     pub(super) fn parse_block(&mut self) -> Result<Block, Diagnostic> {
         let start = self.current_span();
@@ -420,7 +421,7 @@ impl Parser {
 
     pub(super) fn parse_expr_stmt(&mut self) -> Result<Stmt, Diagnostic> {
         let span = self.current_span();
-        let expr = self.parse_expr()?;
+        let mut expr = self.parse_expr()?;
         // `array[index] = value;` — element assignment. Detected after parsing
         // the lvalue expression because the index can be an arbitrary expression
         // (fixed lookahead cannot find the `=`).
@@ -434,14 +435,14 @@ impl Parser {
             self.advance(); // consume `=`
             let value = self.parse_expr()?;
             self.expect(TokenKind::Semicolon)?;
-            let Expr::Index(array, index, idx_span, _) = expr else {
+            let Expr::Index(array, index, idx_span, _) = &mut expr else {
                 unreachable!("checked Expr::Index above");
             };
             return Ok(Stmt::IndexAssign(IndexAssignStmt {
-                array: *array,
-                index: *index,
+                array: array.take(),
+                index: index.take(),
                 value,
-                span: idx_span,
+                span: *idx_span,
             }));
         }
         // `ClassName::property = value;` — static property assignment. Detected
@@ -457,12 +458,12 @@ impl Parser {
             self.advance(); // consume `=`
             let value = self.parse_expr()?;
             self.expect(TokenKind::Semicolon)?;
-            let Expr::StaticField(sf) = expr else {
+            let Expr::StaticField(sf) = &mut expr else {
                 unreachable!("checked Expr::StaticField above");
             };
             return Ok(Stmt::StaticFieldAssign(StaticFieldAssignStmt {
-                class: sf.class,
-                field: sf.field,
+                class: std::mem::take(&mut sf.class),
+                field: std::mem::take(&mut sf.field),
                 value,
                 span: sf.span,
             }));
@@ -481,14 +482,14 @@ impl Parser {
             self.advance(); // consume `=`
             let value = self.parse_expr()?;
             self.expect(TokenKind::Semicolon)?;
-            let Expr::FieldAccess(object, field, fa_span, _) = expr else {
+            let Expr::FieldAccess(object, field, fa_span, _) = &mut expr else {
                 unreachable!("checked Expr::FieldAccess above");
             };
             return Ok(Stmt::FieldAssign(FieldAssignStmt {
-                object: *object,
-                field,
+                object: object.take(),
+                field: std::mem::take(field),
                 value,
-                span: fa_span,
+                span: *fa_span,
             }));
         }
         // Any other expression followed by `=` is an invalid assignment target;

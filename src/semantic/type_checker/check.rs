@@ -17,6 +17,7 @@ use crate::semantic::symbols::*;
 
 use super::*;
 
+#[willow_continuations::checker]
 impl TypeChecker {
     /// Introduce a local binding (let, parameter, loop variable, pattern
     /// binding, ...), rejecting the reserved builtin names first.
@@ -1721,7 +1722,7 @@ impl TypeChecker {
                 // `let f = |...| ...; f(...)` as a direct call when a top-level
                 // `fn f` also existed (willow-bv9.1).
                 if let Some(var_info) = self.symbols.lookup_var(&c.callee).cloned() {
-                    match var_info.ty {
+                    match &var_info.ty {
                         // Both callable types are called the same way in source
                         // (willow-0g8j.2.12); they differ only in what codegen
                         // has to load first.
@@ -1744,8 +1745,8 @@ impl TypeChecker {
                                     )),
                                 );
                             }
-                            self.check_value_call_args(&param_types, &c.args);
-                            return *ret;
+                            self.check_value_call_args(param_types, &c.args);
+                            return ret.as_ref().clone();
                         }
                         ty => {
                             for arg in &c.args {
@@ -1758,7 +1759,7 @@ impl TypeChecker {
                                     format!(
                                         "cannot call value `{}` of type `{}`",
                                         c.callee,
-                                        type_name(&ty)
+                                        type_name(ty)
                                     ),
                                 )
                                 .with_label(Label::primary(
@@ -2204,17 +2205,35 @@ fn walk_defer_body(
     }
 }
 
-fn walk_defer_block(
-    block: &Block,
-    on_stmt: &mut impl FnMut(&Stmt),
-    on_expr: &mut impl FnMut(&Expr),
+#[willow_continuations::function(
+    collect_lock_suspends_in_block,
+    collect_lock_suspends_in_expr,
+    walk_defer_block,
+    walk_defer_expr,
+    walk_defer_stmt
+)]
+fn walk_defer_block<'tree>(
+    block: &'tree Block,
+    on_stmt: &mut impl FnMut(&'tree Stmt),
+    on_expr: &mut impl FnMut(&'tree Expr),
 ) {
     for stmt in &block.stmts {
         walk_defer_stmt(stmt, on_stmt, on_expr);
     }
 }
 
-fn walk_defer_stmt(stmt: &Stmt, on_stmt: &mut impl FnMut(&Stmt), on_expr: &mut impl FnMut(&Expr)) {
+#[willow_continuations::function(
+    collect_lock_suspends_in_block,
+    collect_lock_suspends_in_expr,
+    walk_defer_block,
+    walk_defer_expr,
+    walk_defer_stmt
+)]
+fn walk_defer_stmt<'tree>(
+    stmt: &'tree Stmt,
+    on_stmt: &mut impl FnMut(&'tree Stmt),
+    on_expr: &mut impl FnMut(&'tree Expr),
+) {
     on_stmt(stmt);
     match stmt {
         Stmt::Let(stmt) => walk_defer_expr(&stmt.init, on_stmt, on_expr),
@@ -2301,6 +2320,13 @@ fn lock_body_suspend_spans(body: &Block, expr_types: &HashMap<ExprId, Type>) -> 
     found
 }
 
+#[willow_continuations::function(
+    collect_lock_suspends_in_block,
+    collect_lock_suspends_in_expr,
+    walk_defer_block,
+    walk_defer_expr,
+    walk_defer_stmt
+)]
 fn collect_lock_suspends_in_block(
     block: &Block,
     expr_types: &HashMap<ExprId, Type>,
@@ -2311,21 +2337,12 @@ fn collect_lock_suspends_in_block(
     // at the same time and cannot both borrow `out`.
     let mut direct = Vec::new();
     let mut from_defers = Vec::new();
+    let mut deferred = Vec::new();
     walk_defer_block(
         block,
         &mut |stmt| {
             if let Stmt::Defer(d) = stmt {
-                // Attribute to the OUTERMOST defer: that is the statement whose
-                // own diagnostics decide whether E2604 would be a duplicate.
-                let owner = deferred_by.or(Some(d.span));
-                match &d.body {
-                    DeferBody::Expr(expr) => {
-                        collect_lock_suspends_in_expr(expr, expr_types, owner, &mut from_defers)
-                    }
-                    DeferBody::Block(body) => {
-                        collect_lock_suspends_in_block(body, expr_types, owner, &mut from_defers)
-                    }
-                }
+                deferred.push(d);
             }
         },
         &mut |expr| {
@@ -2339,10 +2356,28 @@ fn collect_lock_suspends_in_block(
             }
         },
     );
+    for d in deferred {
+        let owner = deferred_by.or(Some(d.span));
+        match &d.body {
+            DeferBody::Expr(expr) => {
+                collect_lock_suspends_in_expr(expr, expr_types, owner, &mut from_defers)
+            }
+            DeferBody::Block(body) => {
+                collect_lock_suspends_in_block(body, expr_types, owner, &mut from_defers)
+            }
+        }
+    }
     out.append(&mut direct);
     out.append(&mut from_defers);
 }
 
+#[willow_continuations::function(
+    collect_lock_suspends_in_block,
+    collect_lock_suspends_in_expr,
+    walk_defer_block,
+    walk_defer_expr,
+    walk_defer_stmt
+)]
 fn collect_lock_suspends_in_expr(
     expr: &Expr,
     expr_types: &HashMap<ExprId, Type>,
@@ -2351,19 +2386,12 @@ fn collect_lock_suspends_in_expr(
 ) {
     let mut direct = Vec::new();
     let mut from_defers = Vec::new();
+    let mut deferred = Vec::new();
     walk_defer_expr(
         expr,
         &mut |stmt| {
             if let Stmt::Defer(d) = stmt {
-                let owner = deferred_by.or(Some(d.span));
-                match &d.body {
-                    DeferBody::Expr(expr) => {
-                        collect_lock_suspends_in_expr(expr, expr_types, owner, &mut from_defers)
-                    }
-                    DeferBody::Block(body) => {
-                        collect_lock_suspends_in_block(body, expr_types, owner, &mut from_defers)
-                    }
-                }
+                deferred.push(d);
             }
         },
         &mut |expr| {
@@ -2377,6 +2405,17 @@ fn collect_lock_suspends_in_expr(
             }
         },
     );
+    for d in deferred {
+        let owner = deferred_by.or(Some(d.span));
+        match &d.body {
+            DeferBody::Expr(expr) => {
+                collect_lock_suspends_in_expr(expr, expr_types, owner, &mut from_defers)
+            }
+            DeferBody::Block(body) => {
+                collect_lock_suspends_in_block(body, expr_types, owner, &mut from_defers)
+            }
+        }
+    }
     out.append(&mut direct);
     out.append(&mut from_defers);
 }
@@ -2438,7 +2477,18 @@ fn lock_suspend_operation(
     }
 }
 
-fn walk_defer_expr(expr: &Expr, on_stmt: &mut impl FnMut(&Stmt), on_expr: &mut impl FnMut(&Expr)) {
+#[willow_continuations::function(
+    collect_lock_suspends_in_block,
+    collect_lock_suspends_in_expr,
+    walk_defer_block,
+    walk_defer_expr,
+    walk_defer_stmt
+)]
+fn walk_defer_expr<'tree>(
+    expr: &'tree Expr,
+    on_stmt: &mut impl FnMut(&'tree Stmt),
+    on_expr: &mut impl FnMut(&'tree Expr),
+) {
     on_expr(expr);
     match expr {
         Expr::Call(call) => {

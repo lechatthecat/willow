@@ -7,6 +7,24 @@
 
 use crate::parser::ast::Type;
 
+pub trait TypeName {
+    fn builtin_name(&self) -> &str;
+}
+impl TypeName for String {
+    fn builtin_name(&self) -> &str {
+        self
+    }
+}
+impl TypeName for crate::semantic::ids::TypeId {
+    fn builtin_name(&self) -> &str {
+        if self.namespace().is_none() {
+            self.name()
+        } else {
+            ""
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BuiltinTypeId {
     Option,
@@ -80,7 +98,7 @@ impl BuiltinTypeId {
         })
     }
 
-    pub fn apply(self, args: Vec<Type>) -> Type {
+    pub fn apply<N: From<&'static str>>(self, args: Vec<Type<N>>) -> Type<N> {
         if args.is_empty()
             && matches!(
                 self,
@@ -92,47 +110,47 @@ impl BuiltinTypeId {
                     | Self::IoError
             )
         {
-            Type::Named(self.source_name().to_string())
+            Type::Named(self.source_name().into())
         } else {
-            Type::Generic(self.source_name().to_string(), args)
+            Type::Generic(self.source_name().into(), args)
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct BuiltinTypeRef<'a> {
+pub struct BuiltinTypeRef<'a, N = String> {
     pub id: BuiltinTypeId,
-    pub args: &'a [Type],
+    pub args: &'a [Type<N>],
 }
 
-pub fn resolve(ty: &Type) -> Option<BuiltinTypeRef<'_>> {
+pub fn resolve<N: TypeName>(ty: &Type<N>) -> Option<BuiltinTypeRef<'_, N>> {
     match ty {
         Type::Array(element) => Some(BuiltinTypeRef {
             id: BuiltinTypeId::Array,
             args: std::slice::from_ref(element.as_ref()),
         }),
         Type::Generic(name, args) => Some(BuiltinTypeRef {
-            id: BuiltinTypeId::from_name(name)?,
+            id: BuiltinTypeId::from_name(name.builtin_name())?,
             args,
         }),
         Type::Named(name) => Some(BuiltinTypeRef {
-            id: BuiltinTypeId::from_name(name)?,
+            id: BuiltinTypeId::from_name(name.builtin_name())?,
             args: &[],
         }),
         _ => None,
     }
 }
 
-pub fn is(ty: &Type, id: BuiltinTypeId) -> bool {
+pub fn is<N: TypeName>(ty: &Type<N>, id: BuiltinTypeId) -> bool {
     resolve(ty).is_some_and(|resolved| resolved.id == id)
 }
 
-pub fn unary_arg(ty: &Type, id: BuiltinTypeId) -> Option<&Type> {
+pub fn unary_arg<N: TypeName>(ty: &Type<N>, id: BuiltinTypeId) -> Option<&Type<N>> {
     let resolved = resolve(ty)?;
     (resolved.id == id && resolved.args.len() == 1).then(|| &resolved.args[0])
 }
 
-pub fn binary_args(ty: &Type, id: BuiltinTypeId) -> Option<(&Type, &Type)> {
+pub fn binary_args<N: TypeName>(ty: &Type<N>, id: BuiltinTypeId) -> Option<(&Type<N>, &Type<N>)> {
     let resolved = resolve(ty)?;
     (resolved.id == id && resolved.args.len() == 2).then(|| (&resolved.args[0], &resolved.args[1]))
 }
@@ -157,6 +175,7 @@ pub fn panic_info_fields() -> [(&'static str, Type); 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    type Type = crate::parser::ast::Type<String>;
 
     #[test]
     fn builtin_identity_is_independent_of_type_arguments() {

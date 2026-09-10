@@ -1,0 +1,9 @@
+// Run: willowc build example/current_unit_memory/main.wi -o /tmp/current-unit
+// WILLOW_UNIT_MEMORY_LOG=1 reports bounded live compilation-unit counts.
+import base;
+
+class Final extends base::Base {
+    pub override fn value(self) -> i64 { return base::answer(); }
+}
+
+fn main() { println(base::read(new Final())); } // 42

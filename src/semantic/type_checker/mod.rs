@@ -319,6 +319,7 @@ impl Default for TypeChecker {
     }
 }
 
+#[willow_continuations::checker]
 impl TypeChecker {
     pub fn new() -> Self {
         let mut checker = Self {
@@ -1367,7 +1368,7 @@ fn param_infos_from_decl(params: &[Param], module_prefix: Option<&str>) -> Vec<P
 /// (willow-sxcp). It replaces a plain `module_prefix`, which prefixed every
 /// bare name blindly and so exported `mid::Parcel` — a class no unit declares —
 /// for a base, field, or parameter that came from `import base::Parcel;`.
-fn class_info_from_decl(
+fn imported_class_info_from_decl(
     class: &ClassDecl,
     registered_name: &str,
     qualify: &dyn Fn(&Type) -> Type,
@@ -1464,9 +1465,9 @@ fn class_info_from_decl(
                 TypePath::Local(name) => name.clone(),
                 TypePath::Qualified(parts) => parts.join("::"),
             };
-            match qualify(&Type::Named(written)) {
-                Type::Named(qualified) => qualified,
-                other => type_name(&other),
+            match &qualify(&Type::Named(written)) {
+                Type::Named(qualified) => qualified.clone(),
+                other => type_name(other),
             }
         }),
         implements: class.implements.iter().map(&qualify).collect(),
@@ -7868,5 +7869,60 @@ fn bump(value: &mut i64) { value = value + 1; }
 fn main() { let c = new Counter(1); bump(&c.value); println(c.value); }
 "#,
         );
+    }
+}
+
+#[cfg(test)]
+mod continuation_depth_tests {
+    use super::*;
+    #[test]
+    fn contextual_calls_and_ternaries_fifty_thousand_deep_on_one_mib() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let tokens = crate::lexer::Lexer::new(
+                    "fn id(x: i64) -> i64 { return x; } fn f() -> i64 { return 7; }",
+                )
+                .tokenize()
+                .unwrap();
+                let (mut program, errors) = crate::parser::Parser::new(tokens).parse();
+                assert!(errors.is_empty());
+                let span = Span::dummy();
+                let mut expression = Expr::Integer(7, span, ExprId::fresh());
+                for index in 0..50_000 {
+                    expression = if index % 2 == 0 {
+                        Expr::Call(Box::new(CallExpr {
+                            id: ExprId::fresh(),
+                            callee: "id".into(),
+                            args: vec![CallArg::value(expression)],
+                            span,
+                        }))
+                    } else {
+                        Expr::Ternary(Box::new(TernaryExpr {
+                            id: ExprId::fresh(),
+                            condition: Expr::Bool(true, span, ExprId::fresh()),
+                            then_expr: expression,
+                            else_expr: Expr::Integer(0, span, ExprId::fresh()),
+                            span,
+                        }))
+                    };
+                }
+                let Item::Function(function) = &mut program.items[1] else {
+                    unreachable!()
+                };
+                function.body.stmts = vec![Stmt::Return(ReturnStmt {
+                    value: Some(expression),
+                    span,
+                })];
+                let mut checker = TypeChecker::new();
+                checker.check_program(&program);
+                assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+                assert!(checker.expr_types.len() >= 100_000);
+                drop(checker);
+                drop(program);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

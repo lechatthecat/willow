@@ -3,6 +3,7 @@ use crate::parser::ast::*;
 
 use super::*;
 
+#[willow_continuations::checker]
 impl TypeChecker {
     pub(super) fn check_object_literal(&mut self, literal: &ObjectLiteralExpr) -> Type {
         for field in &literal.fields {
@@ -625,15 +626,7 @@ mod operator_tree_tests {
                 let result = checker.check_expr(&expr);
                 let type_count = checker.expr_types.len();
                 let errors = checker.errors;
-                // Drain before asserting so a regression reports its assertion,
-                // without overflowing the native stack in the owned AST destructor.
-                loop {
-                    expr = match expr {
-                        Expr::Unary(unary) => unary.expr,
-                        Expr::Binary(binary) => binary.lhs,
-                        _ => break,
-                    };
-                }
+                drop(expr);
                 assert_eq!(result, Type::I64);
                 assert_eq!(type_count, 75_001);
                 assert!(errors.is_empty(), "{errors:?}");

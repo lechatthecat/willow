@@ -182,6 +182,7 @@
 
 use super::ModuleSymbols;
 use super::type_index::TypeMap;
+use crate::semantic::ids::SemanticType as Type;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
@@ -201,12 +202,12 @@ use crate::ir::typed_ast::{
     HirCapture, HirExpr, HirExprKind, HirMatchArm, HirPattern, HirSelectCase, HirSelectCaseKind,
     HirStmt,
 };
-use crate::parser::ast::{BinOp, ExprId, ParamMode, Type, UnaryOp};
+use crate::parser::ast::{BinOp, ExprId, ParamMode, UnaryOp};
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
-use crate::semantic::ids::{FunctionId, FunctionMap};
+use crate::semantic::ids::{FunctionId, FunctionMap, TypeId};
 use crate::semantic::intrinsics::{self, Intrinsic};
 use crate::semantic::type_checker::types::{await_output_type, awaitable_task_type, type_name};
-use crate::stdlib_schema::{self, StdItemKind, StdType};
+use crate::stdlib_schema::{self, StdItemKind};
 
 use super::channel_element_type;
 use super::emit_interface::{
@@ -368,7 +369,7 @@ fn lir_collection(ty: &Type) -> Option<(LirCollection, Vec<Type>)> {
 ///
 /// [`BuiltinTypeId`]: crate::semantic::builtin_types::BuiltinTypeId
 fn range_i64(ty: &Type) -> bool {
-    matches!(ty, Type::Generic(name, args) if name == "Range" && args.as_slice() == [Type::I64])
+    matches!(ty, Type::Generic(name, args) if name == &TypeId::local("Range") && args.as_slice() == [Type::I64])
 }
 
 /// One entry of a builtin namespace: the runtime symbol a call lowers to, its
@@ -425,8 +426,8 @@ fn namespace_builtin_call(
                 runtime: "willow_f64_parse",
                 params: vec![Type::String],
                 ret: Type::Generic(
-                    "Result".to_string(),
-                    vec![Type::F64, Type::Named("ParseFloatError".to_string())],
+                    "Result".to_string().into(),
+                    vec![Type::F64, Type::Named("ParseFloatError".to_string().into())],
                 ),
                 narrow_to_bool: false,
             }),
@@ -490,9 +491,9 @@ fn namespace_builtin_call(
         runtime,
         params: params
             .iter()
-            .map(StdType::to_ast_type)
+            .map(|ty| ty.to_ast_type().map(Into::into))
             .collect::<Option<Vec<_>>>()?,
-        ret: return_type.to_ast_type()?,
+        ret: return_type.to_ast_type()?.into(),
         narrow_to_bool: (class, method) == ("fs", "exists"),
     })
 }
@@ -514,7 +515,7 @@ fn empty_map_type(ty: &Type) -> bool {
 /// function is through this node, which is admitted here and nowhere else.
 fn is_fresh_empty_map(e: &HirExpr) -> bool {
     matches!(&e.kind, HirExprKind::StaticCall { class, method, args }
-        if class == "Map" && method == "new" && args.is_empty())
+        if class == &TypeId::local("Map") && method == "new" && args.is_empty())
         && empty_map_type(&e.ty)
 }
 
@@ -609,13 +610,13 @@ pub(super) struct LirEnumDef {
     /// under `import signal::Level as Rank;` — and every such entry carries the
     /// declaring module's `signal::Level` here, which is what makes two
     /// spellings comparable without going through their names.
-    pub identity: String,
+    pub identity: TypeId,
     /// Declared type parameters, in order. A non-empty list means the enum is
     /// GENERIC, and [`LirTypeCtx::supported_enum`] refuses it: `payloads` then
     /// holds type-parameter placeholders rather than real types, and only a
     /// concrete `Type::Generic` scrutinee carries the arguments that would
     /// resolve them.
-    pub type_params: Vec<String>,
+    pub type_params: Vec<TypeId>,
     pub variants: Vec<LirEnumVariant>,
 }
 
@@ -634,33 +635,33 @@ pub(super) struct LirTypeCtx<'x> {
     /// Whether a symbol name is a declared/linkable function.
     pub known_fn: &'x dyn Fn(&str) -> bool,
     pub class_layouts: &'x TypeMap<Vec<(String, Type)>>,
-    pub class_base: &'x TypeMap<String>,
+    pub class_base: &'x TypeMap<TypeId>,
     /// Runtime `type_id` per class NAME. A direct type import (`import
     /// zoo::Animal;`) registers the imported class a second time under its
     /// unqualified name, sharing the canonical class's id — so this is what
     /// makes class IDENTITY comparable across those two names.
     pub class_type_ids: &'x TypeMap<i64>,
     /// Whether a name is registered as an interface (never a class here).
-    pub is_interface: &'x dyn Fn(&str) -> bool,
+    pub is_interface: &'x dyn Fn(&TypeId) -> bool,
     /// The build-wide identity of an interface NAME, or `None` when the name is
     /// not an interface. An item import registers the interface under its local
     /// spelling too, carrying the declaring module's identity, so this is what
     /// makes two spellings of one interface comparable — the same role
     /// [`LirEnumDef::identity`] plays for enums (willow-sxcp).
-    pub iface_identity: &'x dyn Fn(&str) -> Option<String>,
+    pub iface_identity: &'x dyn Fn(&TypeId) -> Option<TypeId>,
     /// Whether boxing `(class, interface)` resolves to a registered vtable —
     /// exactly what [`FuncGen::emit_interface_box`] will look up. A coercion it
     /// cannot build must not be admitted: the emitter's fallback is to pass the
     /// raw object through, which would put an unboxed class pointer in an
     /// interface slot (willow-j260).
-    pub can_box: &'x dyn Fn(&str, &str) -> bool,
+    pub can_box: &'x dyn Fn(&TypeId, &TypeId) -> bool,
     /// The declaration of an enum NAME, or `None` when the name is not an enum.
     /// Read from the same `enum_infos` table [`FuncGen::enum_variant_tag`] and
     /// [`FuncGen::enum_is_gc_object_type`] answer from, so the tags and the
     /// representation eligibility vets are the ones emission uses
     /// (willow-0g8j.8). This is also the single source of "is this an enum?" —
     /// see [`LirTypeCtx::is_enum`] — so the two can never disagree.
-    pub enum_def: &'x dyn Fn(&str) -> Option<LirEnumDef>,
+    pub enum_def: &'x dyn Fn(&TypeId) -> Option<LirEnumDef>,
     /// The vtable slot and signature of `(interface, method)`, i.e. exactly what
     /// [`FuncGen::emit_lir_interface_call`] indexes and calls. `None` when the
     /// name is not an interface, or the interface does not declare that method
@@ -672,7 +673,7 @@ pub(super) struct LirTypeCtx<'x> {
     /// Offset zero is representation-compatible; a non-zero offset makes
     /// [`FuncGen::coerce_to_target`] allocate a box whose vtable pointer is
     /// advanced to the embedded target region (willow-1fc6).
-    pub iface_widen_offset: &'x dyn Fn(&str, &str) -> Option<usize>,
+    pub iface_widen_offset: &'x dyn Fn(&TypeId, &TypeId) -> Option<usize>,
     /// The declared type of the static property `(class, field)`, resolved
     /// through the class hierarchy exactly as
     /// [`FuncGen::emit_static_field_read`] resolves the storage it loads from —
@@ -699,7 +700,7 @@ pub(super) struct LirTypeCtx<'x> {
     /// module's own declaration phase (willow-9yhi). `None` for a lambda the
     /// backend never declared, so the walker refuses rather than emitting the
     /// address of nothing.
-    pub lambda_symbol: &'x dyn Fn(ExprId) -> Option<String>,
+    pub lambda_symbol: &'x dyn Fn(ExprId) -> Option<FunctionId>,
     /// The declared return type of the function being vetted. Unlike every
     /// other field this one is per-FUNCTION, and it is here because a `return`
     /// inside a `match` arm is checked deep inside `supported_expr`, where the
@@ -767,32 +768,33 @@ fn normalize_void_payloads(payloads: &mut Vec<Type>) {
 /// The all-modules scan is still what answers when the visible ones say
 /// nothing, so no name that resolves today stops resolving — a class reached
 /// through a module that only another module imports keeps working.
-fn resolve_class_key(
+fn resolve_class_key<Q: super::type_index::TypeLookup + ?Sized>(
     class_layouts: &TypeMap<Vec<(String, Type)>>,
     class_type_ids: &TypeMap<i64>,
     known_modules: &ModuleSymbols,
     visible_modules: &HashSet<String>,
-    name: &str,
-) -> Option<String> {
+    name: &Q,
+) -> Option<TypeId> {
+    let name = &name.type_id();
     if class_layouts.contains_key(name) {
-        return Some(name.to_string());
+        return Some(name.clone());
     }
     // One runtime class is one `type_id`, so two spellings that carry the same
     // id are one answer; a class with no id at all is never merged by name.
-    let same_class = |a: &str, b: &str| match (class_type_ids.get(a), class_type_ids.get(b)) {
+    let same_class = |a: &TypeId, b: &TypeId| match (class_type_ids.get(a), class_type_ids.get(b)) {
         (Some(x), Some(y)) => x == y,
         _ => false,
     };
     // `Err` is "these modules disagree", which is not the same answer as `None`
     // ("none of them has such a class") — only the first makes the name
     // genuinely ambiguous at this site.
-    let scan = |visible_only: bool| -> Result<Option<String>, ()> {
-        let mut found: Option<String> = None;
+    let scan = |visible_only: bool| -> Result<Option<TypeId>, ()> {
+        let mut found: Option<TypeId> = None;
         for module in known_modules.keys() {
             if visible_only && !visible_modules.contains(module) {
                 continue;
             }
-            let qualified = format!("{module}::{name}");
+            let qualified = name.clone().in_namespace(module);
             if !class_layouts.contains_key(&qualified) {
                 continue;
             }
@@ -811,6 +813,13 @@ fn resolve_class_key(
     }
 }
 
+#[willow_continuations::methods(
+    same_enum,
+    same_repr_inner,
+    supported_class_inner,
+    supported_enum_inner,
+    supported_type_inner
+)]
 impl LirTypeCtx<'_> {
     /// `class` with `Self` resolved against the enclosing class body, exactly
     /// as [`FuncGen::static_call_class_name`] resolves it at emission time
@@ -827,8 +836,8 @@ impl LirTypeCtx<'_> {
 
     /// Whether `name` is a declared enum. Answered from [`Self::enum_def`], so
     /// there is exactly one table deciding it.
-    fn is_enum(&self, name: &str) -> bool {
-        (self.enum_def)(name).is_some()
+    fn is_enum<Q: super::type_index::TypeLookup + ?Sized>(&self, name: &Q) -> bool {
+        (self.enum_def)(&name.type_id()).is_some()
     }
 
     /// Whether `ty` is an enum whose values ARE the tag: every variant is
@@ -859,8 +868,8 @@ impl LirTypeCtx<'_> {
     /// Substitution mirrors [`FuncGen::resolve_variant_payload_types`], which
     /// is what emission calls, so the payload types vetted here are the payload
     /// types stored.
-    fn enum_instance(&self, ty: &Type) -> Option<(String, LirEnumDef)> {
-        let (name, args): (&str, &[Type]) = match ty {
+    fn enum_instance(&self, ty: &Type) -> Option<(TypeId, LirEnumDef)> {
+        let (name, args): (&TypeId, &[Type]) = match ty {
             Type::Named(n) => (n, &[]),
             Type::Generic(n, a) => (n, a),
             _ => return None,
@@ -872,7 +881,7 @@ impl LirTypeCtx<'_> {
         if def.type_params.len() != args.len() {
             return None;
         }
-        let map: HashMap<String, Type> = def
+        let map: HashMap<TypeId, Type> = def
             .type_params
             .iter()
             .cloned()
@@ -895,7 +904,7 @@ impl LirTypeCtx<'_> {
             })
             .collect();
         Some((
-            name.to_string(),
+            name.clone(),
             LirEnumDef {
                 identity: def.identity,
                 type_params: Vec::new(),
@@ -925,7 +934,7 @@ impl LirTypeCtx<'_> {
         self.supported_type_inner(ty, &mut open)
     }
 
-    fn supported_type_inner(&self, ty: &Type, open: &mut HashSet<String>) -> bool {
+    fn supported_type_inner(&self, ty: &Type, open: &mut HashSet<Type>) -> bool {
         match ty {
             Type::Array(elem) => {
                 !matches!(**elem, Type::Void) && self.supported_type_inner(elem, open)
@@ -948,7 +957,7 @@ impl LirTypeCtx<'_> {
                     // unlike the atomic cells and the cancellation handles: the
                     // prelude does not own these two names, so anything the
                     // program declares under them answers first.
-                    || matches!(name.as_str(), "TcpListener" | "TcpStream")
+                    || matches!(name.name(), "TcpListener" | "TcpStream")
             }
             // A `Range<i64>` value (willow-0g8j.2.10): two `i64` words, no
             // element type to vet and no other instantiation to admit.
@@ -1087,7 +1096,7 @@ impl LirTypeCtx<'_> {
     /// name-level tests below are written against.
     #[cfg(test)]
     pub(super) fn supported_enum(&self, name: &str) -> bool {
-        self.supported_enum_type(&Type::Named(name.to_string()))
+        self.supported_enum_type(&Type::Named(name.to_string().into()))
     }
 
     /// An enum *instance* the walker can construct and match on: `ty` names a
@@ -1106,7 +1115,7 @@ impl LirTypeCtx<'_> {
         self.supported_enum_inner(ty, &mut open)
     }
 
-    fn supported_enum_inner(&self, ty: &Type, open: &mut HashSet<String>) -> bool {
+    fn supported_enum_inner(&self, ty: &Type, open: &mut HashSet<Type>) -> bool {
         let Some((_, def)) = self.enum_instance(ty) else {
             return false;
         };
@@ -1117,7 +1126,7 @@ impl LirTypeCtx<'_> {
         // cycle on itself while `Option<Option<i64>>` still walks its inner
         // type. Same guard, and the same shared `open` set, as the class walk
         // below.
-        if !open.insert(type_name(ty)) {
+        if !open.insert(ty.clone()) {
             return true;
         }
         def.variants.iter().all(|v| {
@@ -1144,16 +1153,19 @@ impl LirTypeCtx<'_> {
     /// Only the class NAMED here has to be supported. A subclass with a field
     /// type the walker does not admit stays out of the subset on its own terms
     /// — no expression typed as the base ever touches that field.
-    pub(super) fn supported_class(&self, name: &str) -> bool {
+    pub(super) fn supported_class<Q: super::type_index::TypeLookup + ?Sized>(
+        &self,
+        name: &Q,
+    ) -> bool {
         let mut open = HashSet::new();
-        self.supported_class_inner(name, &mut open)
+        self.supported_class_inner(&name.type_id(), &mut open)
     }
 
     /// The name the class tables are keyed on for `name`, or `None` when
     /// nothing this compilation unit registered answers to it. See
     /// [`resolve_class_key`] — eligibility and emission must resolve a name the
     /// same way or the walker admits a body the emitter then cannot key.
-    fn class_key(&self, name: &str) -> Option<String> {
+    fn class_key(&self, name: &TypeId) -> Option<TypeId> {
         resolve_class_key(
             self.class_layouts,
             self.class_type_ids,
@@ -1163,7 +1175,7 @@ impl LirTypeCtx<'_> {
         )
     }
 
-    fn supported_class_inner(&self, name: &str, open: &mut HashSet<String>) -> bool {
+    fn supported_class_inner(&self, name: &TypeId, open: &mut HashSet<Type>) -> bool {
         if (self.is_interface)(name) || self.is_enum(name) {
             return false;
         }
@@ -1177,7 +1189,7 @@ impl LirTypeCtx<'_> {
         // is fine — it is the same layout — but must not recurse forever. Keyed
         // on the resolved name, so the bare and qualified spellings of one
         // class close the same cycle.
-        if !open.insert(key) {
+        if !open.insert(Type::Named(key)) {
             return true;
         }
         layout
@@ -1187,7 +1199,7 @@ impl LirTypeCtx<'_> {
 
     /// Whether `name` names a class — as opposed to an interface, an enum, or
     /// nothing this compilation unit registered.
-    fn is_class(&self, name: &str) -> bool {
+    fn is_class(&self, name: &TypeId) -> bool {
         !(self.is_interface)(name) && !self.is_enum(name) && self.class_key(name).is_some()
     }
 
@@ -1255,7 +1267,7 @@ impl LirTypeCtx<'_> {
         &self,
         target: &Type,
         value: &Type,
-        open: &mut HashSet<(String, String)>,
+        open: &mut HashSet<(TypeId, TypeId)>,
     ) -> bool {
         match (target, value) {
             (Type::Named(a), Type::Named(b)) => {
@@ -1297,22 +1309,24 @@ impl LirTypeCtx<'_> {
     /// names, and payload representation. Neither half alone would do — the
     /// prefix test cannot see that two files disagree, and shape alone would
     /// merge two unrelated enums.
-    fn same_enum(&self, a: &str, b: &str, open: &mut HashSet<(String, String)>) -> bool {
+    fn same_enum(&self, a: &TypeId, b: &TypeId, open: &mut HashSet<(TypeId, TypeId)>) -> bool {
         let (Some(da), Some(db)) = ((self.enum_def)(a), (self.enum_def)(b)) else {
             return false;
         };
         if da.identity == db.identity {
             return true;
         }
-        let is_qualified_form = |bare: &str, qualified: &str| -> bool {
-            qualified.rsplit_once("::").is_some_and(|(prefix, last)| {
-                last == bare && self.known_modules.contains_key(prefix)
-            })
+        let is_qualified_form = |bare: &TypeId, qualified: &TypeId| -> bool {
+            bare.namespace().is_none()
+                && bare.name() == qualified.name()
+                && qualified
+                    .namespace()
+                    .is_some_and(|namespace| self.known_modules.contains_key(namespace))
         };
         if !is_qualified_form(a, b) && !is_qualified_form(b, a) {
             return false;
         }
-        if !open.insert((a.to_string(), b.to_string())) {
+        if !open.insert((a.clone(), b.clone())) {
             return true;
         }
         da.type_params == db.type_params
@@ -1332,7 +1346,7 @@ impl LirTypeCtx<'_> {
     /// signature while the unit reading that signature may hold the qualified
     /// spelling, and neither is wrong — only the registered identity settles it
     /// (willow-sxcp), exactly as [`Self::same_enum`] settles an enum alias.
-    fn same_iface(&self, a: &str, b: &str) -> bool {
+    fn same_iface(&self, a: &TypeId, b: &TypeId) -> bool {
         match ((self.iface_identity)(a), (self.iface_identity)(b)) {
             (Some(x), Some(y)) => x == y,
             _ => false,
@@ -1342,7 +1356,7 @@ impl LirTypeCtx<'_> {
     /// Whether two class names name one runtime class. One class is one
     /// `type_id`, which is what the bare alias copies from the canonical entry,
     /// so the ids answer this even though the strings differ.
-    fn same_class(&self, a: &str, b: &str) -> bool {
+    fn same_class(&self, a: &TypeId, b: &TypeId) -> bool {
         if !self.is_class(a) || !self.is_class(b) {
             return false;
         }
@@ -1389,7 +1403,7 @@ impl LirTypeCtx<'_> {
     /// Mirrors [`FuncGen::resolve_defining_class`], which is what emission then
     /// uses through [`FuncGen::plan_virtual_call`]; answering `None` here is
     /// what keeps a call the emitter could not resolve out of the subset.
-    fn resolve_class_method(&self, class: &str, method: &str) -> Option<String> {
+    fn resolve_class_method(&self, class: &TypeId, method: &str) -> Option<String> {
         // Deliberately NOT run through [`resolve_class_key`]: emission resolves
         // a method through `FuncGen::resolve_defining_class` and
         // `plan_virtual_call`, which key on the class name AS WRITTEN, so
@@ -1398,13 +1412,13 @@ impl LirTypeCtx<'_> {
         // `p.m()` on a module class the entry file never item-imported
         // (E0350), and an item import puts the short name in the tables
         // (willow-0g8j.2.19).
-        let mut search = Some(class.to_string());
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut search = Some(class.clone());
+        let mut seen = HashSet::new();
         while let Some(name) = search {
             if !seen.insert(name.clone()) {
                 break;
             }
-            let mangled = class_method_symbol_name(self.known_modules, &name, method);
+            let mangled = class_method_symbol_name(self.known_modules, &name.to_string(), method);
             if (self.known_fn)(&mangled) {
                 return Some(mangled);
             }
@@ -1433,18 +1447,18 @@ impl LirTypeCtx<'_> {
     /// is linkable, every parameter is passed by value (a by-reference
     /// parameter has no spelling in a `fn(...)` type, so the call site could not
     /// reproduce it), and the whole signature is inside the subset.
-    fn fn_value_of(&self, mangled: &str) -> Option<Type> {
-        if !(self.known_fn)(mangled) {
+    fn fn_value_of(&self, mangled: &FunctionId) -> Option<Type> {
+        if !(self.known_fn)(&mangled.to_string()) {
             return None;
         }
         if self
             .func_param_modes
-            .get(mangled)
+            .get_id(mangled)
             .is_some_and(|modes| modes.iter().any(|m| !matches!(m, ParamMode::Value)))
         {
             return None;
         }
-        let ty @ (Type::Fn(..) | Type::Closure(..)) = self.fn_types.get(mangled)?.clone() else {
+        let ty @ (Type::Fn(..) | Type::Closure(..)) = self.fn_types.get_id(mangled)?.clone() else {
             return None;
         };
         self.supported_type(&ty).then_some(ty)
@@ -1712,12 +1726,13 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
     // The enclosing class comes from the lowered name (`Class::method`), which
     // is the same string `compile_class_method_inner` looks the body up under
     // and the same class the emitter sets as `FuncGen::current_class`.
+    let owner = f.name.owner_type().map(|owner| owner.to_string());
     let ctx = &LirTypeCtx {
         return_type: &f.return_type,
         // `rsplit`, not `split`: a module class is keyed by its qualified
         // name, so the method `shapes::Point::area` has `shapes::Point` as its
         // class and only the LAST separator divides the two (willow-0g8j.16).
-        self_class: f.name.rsplit_once("::").map(|(class, _)| class),
+        self_class: owner.as_deref(),
         ..*ctx
     };
     if !ctx.supported_type(&f.return_type) {
@@ -1914,7 +1929,8 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                 } => {
                     // `Self::prop = ..` resolves against the enclosing class,
                     // as `emit_lir_static_field_assign` does (willow-0g8j.13).
-                    let Some(field_ty) = (ctx.static_field)(ctx.resolved_class(class), field)
+                    let Some(field_ty) =
+                        (ctx.static_field)(ctx.resolved_class(&class.to_string()), field)
                     else {
                         return Some(format!(
                             "the static store `{class}::{field} = ...` at line {} targets \
@@ -2114,7 +2130,7 @@ fn lir_suspends_here(expr: &HirExpr) -> bool {
     match &expr.kind {
         HirExprKind::Await { inner }
             if builtin_types::unary_arg(&inner.ty, B::Future).is_some()
-                && !matches!(&inner.kind, HirExprKind::Call { callee, .. } if matches!(callee.as_str(), "sleep" | "yield")) =>
+                && !matches!(&inner.kind, HirExprKind::Call { callee, .. } if matches!(callee.unqualified_name(), "sleep" | "yield")) =>
         {
             false
         }
@@ -2141,14 +2157,14 @@ fn closure_env_representable(captures: &[HirCapture]) -> bool {
 /// Every suspension point inside `expr`, in evaluation order. An `await`'s own
 /// operands are walked too: `await f(ch.recv())` holds two.
 fn lir_collect_suspensions<'e>(expr: &'e HirExpr, out: &mut Vec<&'e HirExpr>) {
-    if lir_suspends_here(expr) {
-        out.push(expr);
-    }
-    if matches!(expr.kind, HirExprKind::Lambda { .. }) {
-        return;
-    }
-    for child in expr.children() {
-        lir_collect_suspensions(child, out);
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        if lir_suspends_here(expr) {
+            out.push(expr);
+        }
+        if !matches!(expr.kind, HirExprKind::Lambda { .. }) {
+            pending.extend(expr.children().into_iter().rev());
+        }
     }
 }
 
@@ -2189,33 +2205,33 @@ fn lir_evaluates_children_conditionally(expr: &HirExpr) -> bool {
     }
 }
 
-fn lir_subtree_contains(node: &HirExpr, target: &HirExpr) -> bool {
-    std::ptr::eq(node, target)
-        || node
-            .children()
-            .into_iter()
-            .any(|child| lir_subtree_contains(child, target))
-}
-
 /// Whether `node` still evaluates correctly once `target` is pulled out in
 /// front of it. `seen` tracks whether the walk has passed `target` yet: what
 /// comes after it is emitted on the resume path and may be anything, while what
 /// comes before it has to survive being moved after the park.
 fn lir_hoistable_around(node: &HirExpr, target: &HirExpr, seen: &mut bool) -> bool {
-    if std::ptr::eq(node, target) {
-        *seen = true;
-        return true;
-    }
-    if !lir_subtree_contains(node, target) {
-        // Wholly before or wholly after the suspension, never straddling it.
+    let Some(path) = node.path_to(target) else {
         return *seen || lir_rematerializable(node);
+    };
+    let ancestors: HashSet<*const HirExpr> = path.into_iter().map(std::ptr::from_ref).collect();
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        if std::ptr::eq(node, target) {
+            *seen = true;
+            continue;
+        }
+        if !ancestors.contains(&std::ptr::from_ref(node)) {
+            if !*seen && !lir_rematerializable(node) {
+                return false;
+            }
+            continue;
+        }
+        if lir_evaluates_children_conditionally(node) {
+            return false;
+        }
+        pending.extend(node.children().into_iter().rev());
     }
-    if lir_evaluates_children_conditionally(node) {
-        return false;
-    }
-    node.children()
-        .into_iter()
-        .all(|child| lir_hoistable_around(child, target, seen))
+    true
 }
 
 /// The single value-position `await` this statement value can be split around
@@ -2269,7 +2285,7 @@ fn hir_is_zero_arg_result_ok(value: &HirExpr) -> bool {
     matches!(
         &value.kind,
         HirExprKind::StaticCall { class, method, args }
-            if class == "Result" && method == "Ok" && args.is_empty()
+            if class == &TypeId::local("Result") && method == "Ok" && args.is_empty()
     )
 }
 
@@ -2301,7 +2317,7 @@ enum LirAwaitSite<'a> {
     /// await's own span, which is the key its callee-frame slot is reserved
     /// under.
     LeafCall {
-        callee: &'a str,
+        callee: &'a FunctionId,
         args: &'a [HirExpr],
         span: Span,
     },
@@ -2338,7 +2354,7 @@ fn lir_await_site<'e>(
     let HirExprKind::Call { callee, args } = &inner.kind else {
         return None;
     };
-    if !cooperative_leaves.contains(&FunctionId::free_from_source_name(callee)) {
+    if !cooperative_leaves.contains(&callee.clone()) {
         return None;
     }
     Some(LirAwaitSite::LeafCall {
@@ -2364,7 +2380,7 @@ fn lir_builtin_await(expr: &HirExpr) -> Option<LirAwaitSite<'_>> {
     {
         return None;
     }
-    match (callee.as_str(), args.as_slice()) {
+    match (callee.unqualified_name(), args.as_slice()) {
         ("sleep", [millis]) if millis.ty == Type::I64 => Some(LirAwaitSite::Sleep(millis)),
         ("yield", []) => Some(LirAwaitSite::Yield),
         _ => None,
@@ -2401,13 +2417,13 @@ fn super_init_rejection<'e>(
 ) -> Option<String> {
     // The last separator divides class from method: a module class carries its
     // own `module::` qualification (willow-0g8j.16).
-    let class = match f.name.rsplit_once("::") {
-        Some((class, _)) => class,
+    let class = match f.name.owner_type() {
+        Some(class) => class,
         // Not a method at all: the emitter's `current_class` would be `None`
         // and it would evaluate the arguments and store nothing.
         None => return Some("it calls `super.init(...)` outside a class body".to_string()),
     };
-    let Some(base) = ctx.class_base.get(class) else {
+    let Some(base) = ctx.class_base.get(&class) else {
         return Some(format!(
             "it calls `super.init(...)`, but class `{class}` has no base class"
         ));
@@ -2417,7 +2433,7 @@ fn super_init_rejection<'e>(
             return Some(reason);
         }
     }
-    let mangled = class_method_symbol_name(ctx.known_modules, base, "init");
+    let mangled = class_method_symbol_name(ctx.known_modules, &base.to_string(), "init");
     if (ctx.known_fn)(&mangled) {
         // An explicit base constructor is an ordinary `init` method call with
         // the receiver already in hand, so it is vetted like one.
@@ -2432,7 +2448,7 @@ fn super_init_rejection<'e>(
     // No declared base constructor: the emitter stores the arguments straight
     // into the base's memberwise field slots, so those slots must line up with
     // the arguments one for one.
-    let Some(layout) = ctx.class_layouts.get(base.as_str()) else {
+    let Some(layout) = ctx.class_layouts.get(base) else {
         return Some(format!(
             "`super.init(...)` targets base class `{base}`, whose layout the walker cannot resolve"
         ));
@@ -2498,14 +2514,50 @@ fn expr_rejection<'e>(
 /// binding scope: inside a lambda body, or inside an arm whose pattern the
 /// walker cannot bind, `names` does not describe what is actually in scope, so
 /// a child would be blamed for a name the walker simply never sees.
+#[willow_continuations::function(
+    minimal_unsupported_expr,
+    minimal_unsupported_scoped_expr,
+    supported_body_stmt,
+    supported_branch_body,
+    supported_divergent_body,
+    supported_divergent_expr,
+    supported_effect_body,
+    supported_expr,
+    supported_expr_node,
+    supported_match,
+    supported_panic,
+    supported_select,
+    validate_expr
+)]
 fn minimal_unsupported_expr<'e>(
     e: &'e HirExpr,
     ctx: &LirTypeCtx<'_>,
     names: &HashMap<&'e str, Cow<'e, Type>>,
 ) -> Option<&'e HirExpr> {
-    if supported_expr(e, ctx, names) {
-        return None;
-    }
+    validate_expr(e, ctx, names, true).1
+}
+
+/// Diagnose a rejected scope boundary using the bindings visible inside it.
+#[willow_continuations::function(
+    minimal_unsupported_expr,
+    minimal_unsupported_scoped_expr,
+    supported_body_stmt,
+    supported_branch_body,
+    supported_divergent_body,
+    supported_divergent_expr,
+    supported_effect_body,
+    supported_expr,
+    supported_expr_node,
+    supported_match,
+    supported_panic,
+    supported_select,
+    validate_expr
+)]
+fn minimal_unsupported_scoped_expr<'e>(
+    e: &'e HirExpr,
+    ctx: &LirTypeCtx<'_>,
+    names: &HashMap<&'e str, Cow<'e, Type>>,
+) -> Option<&'e HirExpr> {
     match &e.kind {
         HirExprKind::Lambda { .. } => Some(e),
         HirExprKind::Match { scrutinee, arms } => {
@@ -2532,11 +2584,14 @@ fn minimal_unsupported_expr<'e>(
             }
             Some(e)
         }
-        _ => e
-            .children()
-            .into_iter()
-            .find_map(|child| minimal_unsupported_expr(child, ctx, names))
-            .or(Some(e)),
+        _ => {
+            for child in e.children() {
+                if let Some(rejected) = minimal_unsupported_expr(child, ctx, names) {
+                    return Some(rejected);
+                }
+            }
+            Some(e)
+        }
     }
 }
 
@@ -2612,7 +2667,7 @@ fn supported_pattern<'n>(
         // placeholders are already resolved to the types this `match` will
         // actually load (willow-0g8j.2.1).
         let (name, def) = ctx.enum_instance(scrutinee_ty)?;
-        if name != enum_name {
+        if name != TypeId::from_source_name(enum_name) {
             return None;
         }
         def.variant(variant).cloned()
@@ -2631,14 +2686,14 @@ fn supported_pattern<'n>(
         HirPattern::LiteralBool(_) => *scrutinee_ty == Type::Bool,
         HirPattern::LiteralInt(_) => *scrutinee_ty == Type::I64,
         HirPattern::EnumVariant { enum_name, variant } => {
-            variant_of(enum_name, variant).is_some_and(|v| v.payloads.is_empty())
+            variant_of(&enum_name.to_string(), variant).is_some_and(|v| v.payloads.is_empty())
         }
         HirPattern::EnumVariantTuple {
             enum_name,
             variant,
             bindings,
         } => {
-            let Some(v) = variant_of(enum_name, variant) else {
+            let Some(v) = variant_of(&enum_name.to_string(), variant) else {
                 return false;
             };
             // A variant whose payloads are ALL `void` carries no word at all:
@@ -2689,7 +2744,7 @@ fn supported_pattern<'n>(
             };
             if !(ctx.is_interface)(iface)
                 || !matches!(binding_ty, Type::Named(n) if n == class_name)
-                || !ctx.supported_class(class_name)
+                || !ctx.supported_class(&class_name.to_string())
                 || !ctx.class_type_ids.contains_key(class_name)
             {
                 return false;
@@ -2764,6 +2819,21 @@ fn format_operands(args: &[HirExpr]) -> Option<&[HirExpr]> {
 /// an operand would strand the instructions that consume its value after a
 /// terminator. Callers therefore ask this only where nothing else follows in
 /// the same block — a whole statement, or a whole `match` arm.
+#[willow_continuations::function(
+    minimal_unsupported_expr,
+    minimal_unsupported_scoped_expr,
+    supported_body_stmt,
+    supported_branch_body,
+    supported_divergent_body,
+    supported_divergent_expr,
+    supported_effect_body,
+    supported_expr,
+    supported_expr_node,
+    supported_match,
+    supported_panic,
+    supported_select,
+    validate_expr
+)]
 fn supported_panic<'e>(
     e: &'e HirExpr,
     ctx: &LirTypeCtx<'_>,
@@ -2774,7 +2844,10 @@ fn supported_panic<'e>(
     };
     // A local binding of the same name is an ordinary indirect call, not the
     // builtin, and it wins here exactly as it does in `supported_expr`.
-    if callee != "panic" || e.ty != Type::Never || names.contains_key(callee.as_str()) {
+    if !callee.is_free_named("panic")
+        || e.ty != Type::Never
+        || names.contains_key(callee.unqualified_name())
+    {
         return false;
     }
     // The three accepted message shapes: none (emission substitutes a
@@ -3007,7 +3080,7 @@ fn scheduler_lock(ty: &Type) -> Option<(&'static str, &Type)> {
     let [protected] = args.as_slice() else {
         return None;
     };
-    match name.as_str() {
+    match name.name() {
         "Mutex" => Some(("willow_async_mutex", protected)),
         "RwLock" => Some(("willow_async_rwlock", protected)),
         _ => None,
@@ -3085,8 +3158,8 @@ fn option_result_method(recv: &Type, method: &str, args: &[Type]) -> Option<Type
         }
     };
     let non_void = |t: Type| (!matches!(t, Type::Void)).then_some(t);
-    let option_of = |t: Type| Type::Generic("Option".to_string(), vec![t]);
-    let result_of = |ok: Type, err: Type| Type::Generic("Result".to_string(), vec![ok, err]);
+    let option_of = |t: Type| Type::Generic("Option".to_string().into(), vec![t]);
+    let result_of = |ok: Type, err: Type| Type::Generic("Result".to_string().into(), vec![ok, err]);
     match resolved.id {
         B::Option => match method {
             "is_some" | "is_none" => no_args(Type::Bool),
@@ -3184,6 +3257,21 @@ fn match_diverges(arms: &[HirMatchArm]) -> bool {
 ///
 /// `e` is the match expression itself; its type is what every arm that reaches
 /// the merge block must produce.
+#[willow_continuations::function(
+    minimal_unsupported_expr,
+    minimal_unsupported_scoped_expr,
+    supported_body_stmt,
+    supported_branch_body,
+    supported_divergent_body,
+    supported_divergent_expr,
+    supported_effect_body,
+    supported_expr,
+    supported_expr_node,
+    supported_match,
+    supported_panic,
+    supported_select,
+    validate_expr
+)]
 fn supported_match<'n>(
     e: &'n HirExpr,
     scrutinee: &'n HirExpr,
@@ -3285,6 +3373,21 @@ enum BodyScope {
 /// ([`lir_async_rejection_reason`]) already rejects a suspending `match` arm,
 /// but it does not look inside a `defer` body, so the rule is stated here where
 /// both are covered.
+#[willow_continuations::function(
+    minimal_unsupported_expr,
+    minimal_unsupported_scoped_expr,
+    supported_body_stmt,
+    supported_branch_body,
+    supported_divergent_body,
+    supported_divergent_expr,
+    supported_effect_body,
+    supported_expr,
+    supported_expr_node,
+    supported_match,
+    supported_panic,
+    supported_select,
+    validate_expr
+)]
 fn supported_body_stmt<'n>(
     stmt: &'n HirStmt,
     ctx: &LirTypeCtx<'_>,
@@ -3358,7 +3461,8 @@ fn supported_body_stmt<'n>(
         } => {
             // `Self::prop` resolves against the enclosing class, as
             // `emit_lir_static_field_assign` resolves it (willow-0g8j.13).
-            let Some(field_ty) = (ctx.static_field)(ctx.resolved_class(class), field) else {
+            let Some(field_ty) = (ctx.static_field)(ctx.resolved_class(&class.to_string()), field)
+            else {
                 return false;
             };
             !lir_expr_suspends(value)
@@ -3448,6 +3552,21 @@ fn supported_body_stmt<'n>(
 /// The emitter gives each branch a Cranelift block of its own and jumps to the
 /// join only from the branches that did not terminate, so the two endings need
 /// no agreement with each other.
+#[willow_continuations::function(
+    minimal_unsupported_expr,
+    minimal_unsupported_scoped_expr,
+    supported_body_stmt,
+    supported_branch_body,
+    supported_divergent_body,
+    supported_divergent_expr,
+    supported_effect_body,
+    supported_expr,
+    supported_expr_node,
+    supported_match,
+    supported_panic,
+    supported_select,
+    validate_expr
+)]
 fn supported_branch_body<'n>(
     body: &'n [HirStmt],
     ctx: &LirTypeCtx<'_>,
@@ -3471,6 +3590,21 @@ fn supported_branch_body<'n>(
 ///
 /// The map is cloned rather than borrowed mutably because a `let` here is
 /// scoped to this body; the caller's own scope must not gain the name.
+#[willow_continuations::function(
+    minimal_unsupported_expr,
+    minimal_unsupported_scoped_expr,
+    supported_body_stmt,
+    supported_branch_body,
+    supported_divergent_body,
+    supported_divergent_expr,
+    supported_effect_body,
+    supported_expr,
+    supported_expr_node,
+    supported_match,
+    supported_panic,
+    supported_select,
+    validate_expr
+)]
 fn supported_effect_body<'n>(
     body: &'n [HirStmt],
     ctx: &LirTypeCtx<'_>,
@@ -3491,6 +3625,21 @@ fn supported_effect_body<'n>(
     true
 }
 
+#[willow_continuations::function(
+    minimal_unsupported_expr,
+    minimal_unsupported_scoped_expr,
+    supported_body_stmt,
+    supported_branch_body,
+    supported_divergent_body,
+    supported_divergent_expr,
+    supported_effect_body,
+    supported_expr,
+    supported_expr_node,
+    supported_match,
+    supported_panic,
+    supported_select,
+    validate_expr
+)]
 fn supported_select<'n>(
     cases: &'n [HirSelectCase],
     ctx: &LirTypeCtx<'_>,
@@ -3561,27 +3710,50 @@ fn arm_diverges(arm: &HirMatchArm) -> bool {
 /// rather than absent. Reading that shape is what lets an arm guard a path with
 /// an early `return` and still count as leaving (willow-0g8j.2.16).
 fn body_diverges(body: &[HirStmt]) -> bool {
-    match body.last() {
-        Some(HirStmt::Return { .. }) => true,
-        Some(HirStmt::Expr(e)) => {
-            e.ty == Type::Never
-                || matches!(&e.kind, HirExprKind::Match { arms, .. } if match_diverges(arms))
+    let mut pending = vec![body];
+    while let Some(body) = pending.pop() {
+        match body.last() {
+            Some(HirStmt::Return { .. }) => {}
+            Some(HirStmt::Expr(e)) if e.ty == Type::Never => {}
+            Some(HirStmt::Expr(HirExpr {
+                kind: HirExprKind::Match { arms, .. },
+                ..
+            })) if !arms.is_empty() => {
+                pending.extend(arms.iter().rev().map(|arm| arm.body.as_slice()));
+            }
+            Some(HirStmt::If {
+                then_branch,
+                else_branch: Some(else_branch),
+                ..
+            }) => {
+                pending.push(else_branch);
+                pending.push(then_branch);
+            }
+            _ => return false,
         }
-        // A missing `else` is a path that falls through, so only a complete
-        // `if` can end one.
-        Some(HirStmt::If {
-            then_branch,
-            else_branch,
-            ..
-        }) => body_diverges(then_branch) && else_branch.as_deref().is_some_and(body_diverges),
-        _ => false,
     }
+    true
 }
 
 /// Whether the walker can emit `body` where nothing follows it in the same
 /// Cranelift block: a run of ordinary effect statements ending in something
 /// that leaves — `return`, `panic(...)`, or a `match` all of whose arms do
 /// (willow-0g8j.2.5).
+#[willow_continuations::function(
+    minimal_unsupported_expr,
+    minimal_unsupported_scoped_expr,
+    supported_body_stmt,
+    supported_branch_body,
+    supported_divergent_body,
+    supported_divergent_expr,
+    supported_effect_body,
+    supported_expr,
+    supported_expr_node,
+    supported_match,
+    supported_panic,
+    supported_select,
+    validate_expr
+)]
 fn supported_divergent_body<'n>(
     body: &'n [HirStmt],
     ctx: &LirTypeCtx<'_>,
@@ -3621,6 +3793,21 @@ fn supported_divergent_body<'n>(
 /// match arm. Both forms end the block, which is why the position matters:
 /// nested in an operand, either would strand the instructions that consume its
 /// value after a terminator.
+#[willow_continuations::function(
+    minimal_unsupported_expr,
+    minimal_unsupported_scoped_expr,
+    supported_body_stmt,
+    supported_branch_body,
+    supported_divergent_body,
+    supported_divergent_expr,
+    supported_effect_body,
+    supported_expr,
+    supported_expr_node,
+    supported_match,
+    supported_panic,
+    supported_select,
+    validate_expr
+)]
 fn supported_divergent_expr<'n>(
     e: &'n HirExpr,
     ctx: &LirTypeCtx<'_>,
@@ -3640,10 +3827,110 @@ fn supported_divergent_expr<'n>(
 /// `'n` ties the borrowed names to the expression tree being vetted, so a
 /// `match` arm can extend the map with its own pattern bindings — which live in
 /// that same tree — before checking the arm body (willow-0g8j.8).
+#[willow_continuations::function(
+    minimal_unsupported_expr,
+    minimal_unsupported_scoped_expr,
+    supported_body_stmt,
+    supported_branch_body,
+    supported_divergent_body,
+    supported_divergent_expr,
+    supported_effect_body,
+    supported_expr,
+    supported_expr_node,
+    supported_match,
+    supported_panic,
+    supported_select,
+    validate_expr
+)]
 fn supported_expr<'n>(
     e: &'n HirExpr,
     ctx: &LirTypeCtx<'_>,
     names: &HashMap<&'n str, Cow<'n, Type>>,
+) -> bool {
+    validate_expr(e, ctx, names, false).0
+}
+
+/// Cache results by node address for this borrowed tree and this lexical scope.
+/// A rule may inspect a grandchild (await constructors and reference places),
+/// or deliberately ignore a structural child (namespace receivers). Evaluating
+/// the original rules against cached results preserves both cases; blindly
+/// requiring every structural child to pass would change the accepted subset.
+#[willow_continuations::function(
+    minimal_unsupported_expr,
+    minimal_unsupported_scoped_expr,
+    supported_body_stmt,
+    supported_branch_body,
+    supported_divergent_body,
+    supported_divergent_expr,
+    supported_effect_body,
+    supported_expr,
+    supported_expr_node,
+    supported_match,
+    supported_panic,
+    supported_select,
+    validate_expr
+)]
+fn validate_expr<'n>(
+    e: &'n HirExpr,
+    ctx: &LirTypeCtx<'_>,
+    names: &HashMap<&'n str, Cow<'n, Type>>,
+    diagnose: bool,
+) -> (bool, Option<&'n HirExpr>) {
+    let mut pending = vec![(e, false)];
+    let mut results: HashMap<*const HirExpr, (bool, Option<&HirExpr>)> = HashMap::new();
+    while let Some((expr, visited)) = pending.pop() {
+        let scoped = matches!(
+            expr.kind,
+            HirExprKind::Lambda { .. } | HirExprKind::Match { .. } | HirExprKind::Select { .. }
+        );
+        if !visited && !scoped {
+            pending.push((expr, true));
+            pending.extend(
+                expr.children()
+                    .into_iter()
+                    .rev()
+                    .map(|child| (child, false)),
+            );
+            continue;
+        }
+        let accepted = supported_expr_node(expr, ctx, names, &|child| {
+            results[&(child as *const HirExpr)].0
+        });
+        let rejection = if !diagnose || accepted {
+            None
+        } else if scoped {
+            minimal_unsupported_scoped_expr(expr, ctx, names)
+        } else {
+            expr.children()
+                .into_iter()
+                .find_map(|child| results[&(child as *const HirExpr)].1)
+                .or(Some(expr))
+        };
+        results.insert(expr, (accepted, rejection));
+    }
+    results[&(e as *const HirExpr)]
+}
+
+#[willow_continuations::function(
+    minimal_unsupported_expr,
+    minimal_unsupported_scoped_expr,
+    supported_body_stmt,
+    supported_branch_body,
+    supported_divergent_body,
+    supported_divergent_expr,
+    supported_effect_body,
+    supported_expr,
+    supported_expr_node,
+    supported_match,
+    supported_panic,
+    supported_select,
+    validate_expr
+)]
+fn supported_expr_node<'n>(
+    e: &'n HirExpr,
+    ctx: &LirTypeCtx<'_>,
+    names: &HashMap<&'n str, Cow<'n, Type>>,
+    child_supported: &impl Fn(&'n HirExpr) -> bool,
 ) -> bool {
     if !ctx.supported_type(&e.ty) && !is_fresh_empty_map(e) {
         return false;
@@ -3653,7 +3940,8 @@ fn supported_expr<'n>(
         HirExprKind::Str(_) => true,
         HirExprKind::Var(name) => names.contains_key(name.as_str()),
         HirExprKind::ReferenceArg { place } => {
-            ctx.same_repr(&place.ty, &e.ty) && supported_reference_place(place, ctx, names)
+            ctx.same_repr(&place.ty, &e.ty)
+                && supported_reference_place(place, ctx, names, child_supported)
         }
         // A named function used as a value (willow-0g8j.2.2). The declared
         // signature must be the type this expression carries: the pointer is
@@ -3707,7 +3995,7 @@ fn supported_expr<'n>(
                     return false;
                 }
             }
-            supported_expr(lhs, ctx, names) && supported_expr(rhs, ctx, names)
+            child_supported(lhs) && child_supported(rhs)
         }
         // Both arms feed one Cranelift variable, and the walker inserts no
         // conversion between them — a `cond ? new Dog() : new Cat()` typed
@@ -3719,9 +4007,9 @@ fn supported_expr<'n>(
         } => {
             ctx.same_repr(&e.ty, &then_expr.ty)
                 && ctx.same_repr(&e.ty, &else_expr.ty)
-                && supported_expr(condition, ctx, names)
-                && supported_expr(then_expr, ctx, names)
-                && supported_expr(else_expr, ctx, names)
+                && child_supported(condition)
+                && child_supported(then_expr)
+                && child_supported(else_expr)
         }
         // `match` as an expression (willow-0g8j.8). Every arm feeds one
         // Cranelift variable, so the same no-conversion rule `Ternary` states
@@ -3729,13 +4017,13 @@ fn supported_expr<'n>(
         HirExprKind::Match { scrutinee, arms } => {
             supported_match(e, scrutinee, arms, ctx, names, MatchPosition::Operand)
         }
-        HirExprKind::Unary { operand, .. } => supported_expr(operand, ctx, names),
+        HirExprKind::Unary { operand, .. } => child_supported(operand),
         HirExprKind::Call { callee, args } => {
             // HIR spells direct and indirect calls with the same node, and a
             // local fn-typed binding shadows a free function (willow-bv9.1).
             // The local wins here because this must resolve to what the type checker
             // checked the call against.
-            if let Some(local) = names.get(callee.as_str()) {
+            if let Some(local) = names.get(callee.unqualified_name()) {
                 // Either callable value: a `closure` is called through the code
                 // pointer in its word 0, with the object itself as the hidden
                 // leading argument, so the only difference from a `fn` is in
@@ -3752,61 +4040,59 @@ fn supported_expr<'n>(
                         .iter()
                         .zip(args)
                         .all(|(p, a)| ctx.supported_type(p) && ctx.storable(p, &a.ty))
-                    && args.iter().all(|a| supported_expr(a, ctx, names));
+                    && args.iter().all(child_supported);
             }
-            if matches!(callee.as_str(), "sleep" | "yield") {
+            if matches!(callee.unqualified_name(), "sleep" | "yield") {
                 return builtin_types::unary_arg(&e.ty, B::Future) == Some(&Type::Void)
-                    && match (callee.as_str(), args.as_slice()) {
-                        ("sleep", [millis]) => {
-                            millis.ty == Type::I64 && supported_expr(millis, ctx, names)
-                        }
+                    && match (callee.unqualified_name(), args.as_slice()) {
+                        ("sleep", [millis]) => millis.ty == Type::I64 && child_supported(millis),
                         ("yield", []) => true,
                         _ => false,
                     };
             }
             // `format` is variadic and has no function symbol: it assembles a
             // string from a literal spec at the call site (willow-0g8j.2.5).
-            if callee == "format" {
+            if callee.is_free_named("format") {
                 return e.ty == Type::String
-                    && format_operands(args).is_some_and(|operands| {
-                        operands.iter().all(|a| supported_expr(a, ctx, names))
-                    });
+                    && format_operands(args)
+                        .is_some_and(|operands| operands.iter().all(child_supported));
             }
             // `references.wi` deliberately collects inside reference-taking
             // functions to prove pointed-to GC values stay alive. These builtins
             // are zero-argument runtime calls and need no AST-only metadata.
             // `gc_minor_collect` is the MOVING one, and is what a test has to
             // reach to prove a binding survives evacuation (willow-10zt).
-            if callee == "gc_collect" || callee == "gc_minor_collect" {
+            if callee.is_free_named("gc_collect") || callee.is_free_named("gc_minor_collect") {
                 return args.is_empty() && e.ty == Type::Void;
             }
             // Their read-only siblings: `gc_allocated_bytes` and the other
             // statistic counters. Same shape — a zero-argument runtime call
             // with no AST-only metadata — but they return the counter
             // (willow-0g8j.3.1).
-            if gc_stat_builtin_runtime_name(callee).is_some() {
+            if gc_stat_builtin_runtime_name(callee.unqualified_name()).is_some() {
                 return args.is_empty() && e.ty == Type::I64;
             }
-            if callee == "recover" {
+            if callee.is_free_named("recover") {
                 return args.is_empty()
-                    && builtin_types::unary_arg(&e.ty, B::Option)
-                        .is_some_and(|payload| payload == &Type::Named("PanicInfo".to_string()));
+                    && builtin_types::unary_arg(&e.ty, B::Option).is_some_and(|payload| {
+                        payload == &Type::Named("PanicInfo".to_string().into())
+                    });
             }
             // These compiler-known control-flow operations require lexical
             // panic-scope handling through the dedicated paths above (willow-s9ej.3).
-            !matches!(callee.as_str(), "panic" | "recover")
-                && ctx.callable(callee.as_str(), args, false)
-                && args.iter().all(|a| supported_expr(a, ctx, names))
+            !matches!(callee.unqualified_name(), "panic" | "recover")
+                && ctx.callable(callee.unqualified_name(), args, false)
+                && args.iter().all(child_supported)
         }
         HirExprKind::Print { value, newline: _ } => {
-            (scalar(&value.ty) || value.ty == Type::String) && supported_expr(value, ctx, names)
+            (scalar(&value.ty) || value.ty == Type::String) && child_supported(value)
         }
         // The element type is already vetted by `supported_type(&e.ty)` above.
         HirExprKind::Array { elements } => {
             let elem = array_element_type(&e.ty);
             elements
                 .iter()
-                .all(|el| ctx.storable(&elem, &el.ty) && supported_expr(el, ctx, names))
+                .all(|el| ctx.storable(&elem, &el.ty) && child_supported(el))
         }
         // `Array<T>` and `FrozenArray<T>` are the same runtime handle, so both
         // index through `willow_array_get` (willow-0g8j.7). `Range<i64>` also
@@ -3819,8 +4105,8 @@ fn supported_expr<'n>(
                 );
             indexable
                 && ctx.same_repr(&array_element_type(&array.ty), &e.ty)
-                && supported_expr(array, ctx, names)
-                && supported_expr(index, ctx, names)
+                && child_supported(array)
+                && child_supported(index)
         }
         // `new Class(args)` — explicit `Class__init` or the implicit memberwise
         // constructor (willow-0g8j.5).
@@ -3831,7 +4117,7 @@ fn supported_expr<'n>(
             if !matches!(&e.ty, Type::Named(n) if n == class) {
                 return false;
             }
-            let mangled = class_method_symbol_name(ctx.known_modules, class, "init");
+            let mangled = class_method_symbol_name(ctx.known_modules, &class.to_string(), "init");
             let shape_ok = if (ctx.known_fn)(&mangled) {
                 ctx.callable(&mangled, args, true)
             } else {
@@ -3842,7 +4128,7 @@ fn supported_expr<'n>(
                         .zip(args)
                         .all(|((_, fty), a)| ctx.storable(fty, &a.ty))
             };
-            shape_ok && args.iter().all(|a| supported_expr(a, ctx, names))
+            shape_ok && args.iter().all(child_supported)
         }
         // `Class { field: value, ... }` — the given names must be exactly the
         // declared fields, each once. Matching only the COUNT would accept
@@ -3866,7 +4152,7 @@ fn supported_expr<'n>(
                         .iter()
                         .find(|(n, _)| n == name)
                         .is_some_and(|(_, fty)| ctx.storable(fty, &value.ty))
-                    && supported_expr(value, ctx, names)
+                    && child_supported(value)
             })
         }
         // `object.field` on a simple class, or the two `i64` bounds of a
@@ -3875,12 +4161,12 @@ fn supported_expr<'n>(
             if range_i64(&object.ty) {
                 return matches!(field.as_str(), "start" | "end")
                     && e.ty == Type::I64
-                    && supported_expr(object, ctx, names);
+                    && child_supported(object);
             }
             ctx.class_layout_of(&object.ty)
                 .and_then(|l| l.iter().find(|(n, _)| n == field))
                 .is_some_and(|(_, fty)| ctx.same_repr(fty, &e.ty))
-                && supported_expr(object, ctx, names)
+                && child_supported(object)
         }
         // The builtin array methods the walker emits, plus a direct call to a
         // method of a simple class. Anything else on an array (`freeze`,
@@ -3908,9 +4194,7 @@ fn supported_expr<'n>(
                     }
                     _ => false,
                 };
-                shape_ok
-                    && supported_expr(object, ctx, names)
-                    && args.iter().all(|a| supported_expr(a, ctx, names))
+                shape_ok && child_supported(object) && args.iter().all(child_supported)
             }
             // The value-taking `Option`/`Result` methods (willow-0g8j.2.1).
             // Checked before the collection arm because both receivers are
@@ -3920,8 +4204,8 @@ fn supported_expr<'n>(
                 let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
                 option_result_method(&object.ty, method, &arg_tys)
                     .is_some_and(|ret| ctx.same_repr(&ret, &e.ty))
-                    && supported_expr(object, ctx, names)
-                    && args.iter().all(|a| supported_expr(a, ctx, names))
+                    && child_supported(object)
+                    && args.iter().all(child_supported)
             }
             Type::Generic(_, type_args)
                 if builtin_types::unary_arg(&object.ty, B::Channel).is_some() =>
@@ -3937,9 +4221,7 @@ fn supported_expr<'n>(
                     "close" => args.is_empty() && e.ty == Type::Void,
                     _ => false,
                 };
-                shape_ok
-                    && supported_expr(object, ctx, names)
-                    && args.iter().all(|arg| supported_expr(arg, ctx, names))
+                shape_ok && child_supported(object) && args.iter().all(child_supported)
             }
             // `Task<T>`/`JoinHandle<T>` cancellation (willow-0g8j.2.11). Both
             // read only the frame header the handle already points at, so
@@ -3950,7 +4232,7 @@ fn supported_expr<'n>(
                     && task_handle_method(&object.ty, method, args.len())
                         .is_some_and(|ret| ctx.same_repr(&ret, &e.ty)) =>
             {
-                args.is_empty() && supported_expr(object, ctx, names)
+                args.is_empty() && child_supported(object)
             }
             // The native-blocking cells (willow-0g8j.2.13). Each accessor is
             // one runtime call over a word-based ABI, so beyond the receiver
@@ -3964,8 +4246,8 @@ fn supported_expr<'n>(
                 };
                 ctx.same_repr(&ret, &e.ty)
                     && args.iter().all(|a| ctx.same_repr(elem, &a.ty))
-                    && supported_expr(object, ctx, names)
-                    && args.iter().all(|a| supported_expr(a, ctx, names))
+                    && child_supported(object)
+                    && args.iter().all(child_supported)
             }
             // The builtin collections. `get` yields an `Option<V>`, which the
             // walker represents as of willow-0g8j.2.1.
@@ -4023,9 +4305,7 @@ fn supported_expr<'n>(
                     }
                     _ => false,
                 };
-                shape_ok
-                    && supported_expr(object, ctx, names)
-                    && args.iter().all(|a| supported_expr(a, ctx, names))
+                shape_ok && child_supported(object) && args.iter().all(child_supported)
             }
             // The cancellation handles (willow-0g8j.2.13). `cancel`, `child`
             // and `is_cancelled` read or write the handle alone; `attach`/`add`
@@ -4036,8 +4316,8 @@ fn supported_expr<'n>(
                     return false;
                 };
                 ctx.same_repr(&ret, &e.ty)
-                    && supported_expr(object, ctx, names)
-                    && args.iter().all(|a| supported_expr(a, ctx, names))
+                    && child_supported(object)
+                    && args.iter().all(child_supported)
             }
             // The atomic cells (willow-0g8j.2.13). Every operation is one word
             // read or write inside a cell that already exists, so beyond the
@@ -4051,8 +4331,8 @@ fn supported_expr<'n>(
                 };
                 ctx.same_repr(&ret, &e.ty)
                     && args.iter().all(|a| a.ty == cell.word())
-                    && supported_expr(object, ctx, names)
-                    && args.iter().all(|a| supported_expr(a, ctx, names))
+                    && child_supported(object)
+                    && args.iter().all(child_supported)
             }
             // Virtual dispatch through an interface box (willow-0g8j.6). The
             // receiver's box carries the vtable, so — unlike a class receiver —
@@ -4066,7 +4346,7 @@ fn supported_expr<'n>(
                 // receiver's own class, which the emitter re-boxes with the
                 // receiver's vtable — so the result is the receiver's interface
                 // and nothing else.
-                let ret_ok = if matches!(&sig.ret, Type::Named(n) if n == "Self") {
+                let ret_ok = if matches!(&sig.ret, Type::Named(n) if n == &TypeId::local("Self")) {
                     matches!(&e.ty, Type::Named(n) if n == iface)
                 } else {
                     ctx.same_repr(&sig.ret, &e.ty)
@@ -4084,14 +4364,14 @@ fn supported_expr<'n>(
                                 == matches!(a.kind, HirExprKind::ReferenceArg { .. })
                                 && ctx.storable(p, &a.ty)
                         })
-                    && supported_expr(object, ctx, names)
-                    && args.iter().all(|a| supported_expr(a, ctx, names))
+                    && child_supported(object)
+                    && args.iter().all(child_supported)
             }
             Type::Generic(iface, _) if (ctx.is_interface)(iface) => {
                 let Some(sig) = (ctx.iface_method)(&object.ty, method) else {
                     return false;
                 };
-                let ret_ok = if matches!(&sig.ret, Type::Named(n) if n == "Self") {
+                let ret_ok = if matches!(&sig.ret, Type::Named(n) if n == &TypeId::local("Self")) {
                     sig.ret == e.ty
                 } else {
                     ctx.same_repr(&sig.ret, &e.ty)
@@ -4109,8 +4389,8 @@ fn supported_expr<'n>(
                                 == matches!(a.kind, HirExprKind::ReferenceArg { .. })
                                 && ctx.storable(p, &a.ty)
                         })
-                    && supported_expr(object, ctx, names)
-                    && args.iter().all(|a| supported_expr(a, ctx, names))
+                    && child_supported(object)
+                    && args.iter().all(child_supported)
             }
             // Scalar `toString()` — the only builtin method with a primitive
             // receiver. Which intrinsic a call denotes is answered by the
@@ -4121,7 +4401,7 @@ fn supported_expr<'n>(
                 matches!(
                     scalar_to_string(&object.ty, method, args),
                     Some(ret) if ret == e.ty
-                ) && supported_expr(object, ctx, names)
+                ) && child_supported(object)
             }
             // A class receiver. The implementation is resolved through the
             // receiver's ancestry rather than assumed to be declared on the
@@ -4137,8 +4417,8 @@ fn supported_expr<'n>(
                     && ctx.fn_types.get(&mangled).is_some_and(
                         |t| matches!(t, Type::Fn(_, ret) if ctx.repr_compatible(ret, &e.ty)),
                     )
-                    && supported_expr(object, ctx, names)
-                    && args.iter().all(|a| supported_expr(a, ctx, names))
+                    && child_supported(object)
+                    && args.iter().all(child_supported)
             }
             _ => false,
         },
@@ -4148,10 +4428,10 @@ fn supported_expr<'n>(
         // and so does a real `Class::property`, which loads from module data
         // (willow-0g8j.2.4).
         HirExprKind::StaticField { class, field } => {
-            if ctx.known_modules.contains_key(class) {
+            if ctx.known_modules.contains_key(&class.to_string()) {
                 return false;
             }
-            if ctx.is_enum(class) {
+            if ctx.is_enum(&class.to_string()) {
                 return ctx.supported_enum_type(&e.ty)
                     && ctx.enum_instance(&e.ty).is_some_and(|(name, def)| {
                         name == *class && def.variant(field).is_some_and(|v| v.payloads.is_empty())
@@ -4160,7 +4440,7 @@ fn supported_expr<'n>(
             // `Self::prop` inside a method resolves against the enclosing
             // class, exactly as `emit_static_field_read` resolves it
             // (willow-0g8j.13).
-            (ctx.static_field)(ctx.resolved_class(class), field)
+            (ctx.static_field)(ctx.resolved_class(&class.to_string()), field)
                 .is_some_and(|ty| ctx.supported_type(&ty) && ctx.repr_compatible(&e.ty, &ty))
         }
         // `Class::method(args)` — a static method of a simple class, or an enum
@@ -4177,7 +4457,8 @@ fn supported_expr<'n>(
             // (willow-0g8j.13). Resolved once, here, so every test below —
             // the builtin spellings, the enum path, the class path and the
             // symbol they mangle — sees the one name.
-            let class = ctx.resolved_class(class);
+            let class_spelling = class.to_string();
+            let class = ctx.resolved_class(&class_spelling);
             // `Map::new()` is the one builtin constructor in the subset. The
             // result type decides, not the spelling, so a user class called
             // `Map` cannot reach `willow_map_new`: it would have a `Named` type
@@ -4196,7 +4477,7 @@ fn supported_expr<'n>(
                     || (method == "with_capacity"
                         && args.len() == 1
                         && args[0].ty == Type::I64
-                        && supported_expr(&args[0], ctx, names));
+                        && child_supported(&args[0]));
             }
             // `AtomicI64::new(i64)` / `AtomicBool::new(bool)`
             // (willow-0g8j.2.13). The RESULT type picks the cell, and the
@@ -4212,7 +4493,7 @@ fn supported_expr<'n>(
                 && class == cell.class_name()
             {
                 return matches!(args.as_slice(), [a] if a.ty == cell.word())
-                    && supported_expr(&args[0], ctx, names);
+                    && child_supported(&args[0]);
             }
             // `BlockingCell<T>::new(v)` / `BlockingRwCell<T>::new(v)`
             // (willow-0g8j.2.13). Keyed on the class as well as the result
@@ -4225,7 +4506,7 @@ fn supported_expr<'n>(
                 && class == kind.class_name()
             {
                 return matches!(args.as_slice(), [a] if ctx.same_repr(elem, &a.ty))
-                    && supported_expr(&args[0], ctx, names);
+                    && child_supported(&args[0]);
             }
             // `Mutex<T>::new(v)` / `RwLock<T>::new(v)` (willow-0g8j.2.13).
             // Same shape as the blocking cells above — the handle is a
@@ -4236,7 +4517,7 @@ fn supported_expr<'n>(
                 && matches!(class, "Mutex" | "RwLock")
             {
                 return matches!(args.as_slice(), [a] if ctx.same_repr(protected, &a.ty))
-                    && supported_expr(&args[0], ctx, names);
+                    && child_supported(&args[0]);
             }
             // `CancellationToken::new()` / `TaskScope::new()`
             // (willow-0g8j.2.13). Keyed on the class as well as the result
@@ -4262,7 +4543,7 @@ fn supported_expr<'n>(
                         .all(|(slot, a)| ctx.storable(slot, &a.ty))
                     && ctx.supported_type(&e.ty)
                     && ctx.repr_compatible(&e.ty, &entry.ret)
-                    && args.iter().all(|a| supported_expr(a, ctx, names));
+                    && args.iter().all(child_supported);
             }
             // A call into an imported user module (`math::add(1, 2)`), which
             // HIR spells as a static call whose "class" is the module's access
@@ -4276,14 +4557,14 @@ fn supported_expr<'n>(
                     && ctx.fn_types.get(&mangled).is_some_and(
                         |t| matches!(t, Type::Fn(_, ret) if ctx.same_repr(ret, &e.ty)),
                     )
-                    && args.iter().all(|a| supported_expr(a, ctx, names));
+                    && args.iter().all(child_supported);
             }
             // `Enum::Variant(payload…)`, and the qualified fieldless form,
             // which HIR also spells as a zero-argument static call. The
             // payloads are STORE positions (the emitter coerces each one into
             // its declared slot), so `storable` is the right test, not
             // `assignable_repr`.
-            if ctx.is_enum(class) {
+            if ctx.is_enum(&class.to_string()) {
                 if !ctx.supported_enum_type(&e.ty) {
                     return false;
                 }
@@ -4296,14 +4577,14 @@ fn supported_expr<'n>(
                 let Some(variant) = def.variant(method) else {
                     return false;
                 };
-                return name == *class
+                return name == TypeId::from_source_name(class)
                     && variant.payloads.len() == args.len()
                     && variant
                         .payloads
                         .iter()
                         .zip(args)
                         .all(|(slot, a)| ctx.storable(slot, &a.ty))
-                    && args.iter().all(|a| supported_expr(a, ctx, names));
+                    && args.iter().all(child_supported);
             }
             if !ctx.supported_class(class) {
                 return false;
@@ -4314,7 +4595,7 @@ fn supported_expr<'n>(
                     .fn_types
                     .get(&mangled)
                     .is_some_and(|t| matches!(t, Type::Fn(_, ret) if ctx.same_repr(ret, &e.ty)))
-                && args.iter().all(|a| supported_expr(a, ctx, names))
+                && args.iter().all(child_supported)
         }
         // `start..end` as a VALUE (willow-0g8j.2.10). The bounds are the two
         // words of the object the emitter allocates, so both have to be `i64`
@@ -4324,8 +4605,8 @@ fn supported_expr<'n>(
             range_i64(&e.ty)
                 && start.ty == Type::I64
                 && end.ty == Type::I64
-                && supported_expr(start, ctx, names)
-                && supported_expr(end, ctx, names)
+                && child_supported(start)
+                && child_supported(end)
         }
         // `expr?` on an `Option`/`Result` (willow-0g8j.2.1). Two halves:
         //
@@ -4357,7 +4638,7 @@ fn supported_expr<'n>(
                     Type::Void => resolved.id == B::Result && e.ty == Type::Void,
                     _ => ctx.same_repr(payload, &e.ty),
                 })
-                && supported_expr(inner, ctx, names)
+                && child_supported(inner)
         }
         HirExprKind::Await { inner }
             if builtin_types::unary_arg(&inner.ty, B::Future).is_some()
@@ -4365,10 +4646,10 @@ fn supported_expr<'n>(
         {
             builtin_types::unary_arg(&inner.ty, B::Future) == Some(&e.ty)
                 && ctx.supported_type(&e.ty)
-                && supported_expr(inner, ctx, names)
+                && child_supported(inner)
         }
         HirExprKind::Await { .. } => match lir_await_site(e, ctx.cooperative_leaves) {
-            Some(LirAwaitSite::Sleep(millis)) => supported_expr(millis, ctx, names),
+            Some(LirAwaitSite::Sleep(millis)) => child_supported(millis),
             Some(LirAwaitSite::Yield) => true,
             // `await f(..)` on a cooperative leaf. The constructor call is
             // vetted exactly as a synchronous call to `f` would be — same
@@ -4376,9 +4657,9 @@ fn supported_expr<'n>(
             // read back out of the callee frame's RESULT slot at this node's
             // own type.
             Some(LirAwaitSite::LeafCall { callee, args, .. }) => {
-                ctx.callable(callee, args, false)
+                ctx.callable(&callee.to_string(), args, false)
                     && ctx.supported_type(&e.ty)
-                    && args.iter().all(|a| supported_expr(a, ctx, names))
+                    && args.iter().all(child_supported)
             }
             None => false,
         },
@@ -4422,18 +4703,33 @@ fn lir_reference_place_kind(place: &HirExpr) -> &'static str {
 /// The source-shaped name of a reference place. See [`lir_reference_place_kind`]
 /// for why this must agree with the AST spelling exactly.
 fn lir_reference_place_name(place: &HirExpr) -> String {
-    match &place.kind {
-        HirExprKind::Var(name) => name.clone(),
-        HirExprKind::FieldAccess { object, field } => {
-            format!("{}.{}", lir_reference_place_name(object), field)
+    let mut current = place;
+    let mut suffixes = Vec::new();
+    let mut out = loop {
+        match &current.kind {
+            HirExprKind::Var(name) => break name.clone(),
+            HirExprKind::FieldAccess { object, field } => {
+                suffixes.push((Some(field.as_str()), None));
+                current = object;
+            }
+            HirExprKind::Index { array, index } => {
+                suffixes.push((None, Some(index.as_ref())));
+                current = array;
+            }
+            _ => break "<expression>".to_string(),
         }
-        HirExprKind::Index { array, index } => format!(
-            "{}[{}]",
-            lir_reference_place_name(array),
-            lir_reference_index_name(index)
-        ),
-        _ => "<expression>".to_string(),
+    };
+    for (field, index) in suffixes.into_iter().rev() {
+        if let Some(field) = field {
+            out.push('.');
+            out.push_str(field);
+        } else if let Some(index) = index {
+            out.push('[');
+            out.push_str(&lir_reference_index_name(index));
+            out.push(']');
+        }
     }
+    out
 }
 
 fn lir_reference_index_name(index: &HirExpr) -> String {
@@ -4450,6 +4746,7 @@ fn supported_reference_place<'n>(
     place: &'n HirExpr,
     ctx: &LirTypeCtx<'_>,
     names: &HashMap<&'n str, Cow<'n, Type>>,
+    child_supported: &impl Fn(&'n HirExpr) -> bool,
 ) -> bool {
     match &place.kind {
         HirExprKind::Var(name) => names
@@ -4459,13 +4756,13 @@ fn supported_reference_place<'n>(
             ctx.class_layout_of(&object.ty)
                 .and_then(|layout| layout.iter().find(|(name, _)| name == field))
                 .is_some_and(|(_, ty)| ctx.same_repr(ty, &place.ty))
-                && supported_expr(object, ctx, names)
+                && child_supported(object)
         }
         HirExprKind::Index { array, index } => {
             matches!(&array.ty, Type::Array(elem) if ctx.same_repr(elem, &place.ty))
                 && index.ty == Type::I64
-                && supported_expr(array, ctx, names)
-                && supported_expr(index, ctx, names)
+                && child_supported(array)
+                && child_supported(index)
         }
         _ => false,
     }
@@ -4642,6 +4939,51 @@ fn lir_terminator_needs_preempt_safepoint(
     }
 }
 
+#[willow_continuations::methods(
+    emit_deferred_action,
+    emit_flush_defers_from,
+    emit_lir_args_rooted,
+    emit_lir_arm_body,
+    emit_lir_array_literal,
+    emit_lir_array_method,
+    emit_lir_atomic_method,
+    emit_lir_blocking_cell_method,
+    emit_lir_body_for,
+    emit_lir_body_if,
+    emit_lir_body_stmt,
+    emit_lir_body_while,
+    emit_lir_cancellation_method,
+    emit_lir_channel_method,
+    emit_lir_class_method,
+    emit_lir_collection_method,
+    emit_lir_deferred_stmt,
+    emit_lir_enum_construction,
+    emit_lir_expr,
+    emit_lir_field_access,
+    emit_lir_field_assign,
+    emit_lir_fn_operand,
+    emit_lir_index,
+    emit_lir_index_assign,
+    emit_lir_interface_call,
+    emit_lir_interpolated,
+    emit_lir_match,
+    emit_lir_new,
+    emit_lir_object_literal,
+    emit_lir_option_result_method,
+    emit_lir_panic,
+    emit_lir_range_value,
+    emit_lir_reference_arg_address,
+    emit_lir_return,
+    emit_lir_scalar_to_string,
+    emit_lir_select,
+    emit_lir_static_call,
+    emit_lir_static_field_assign,
+    emit_lir_store_value,
+    emit_lir_string_binop,
+    emit_lir_task_handle_method,
+    emit_lir_try_propagate,
+    emit_sync_try_defer_flush
+)]
 impl<'a, 'b> FuncGen<'a, 'b> {
     /// Emit a whole function body by walking its LIR block graph. The entry
     /// block's instructions land in the already-created Cranelift entry block
@@ -5255,18 +5597,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // the callee task and returns that task's frame. Arguments are
                 // coerced to the declared parameter types, exactly as a
                 // synchronous call to the same function coerces them.
-                let params = self.fn_param_types(callee);
-                let modes = self.func_param_modes.get(callee).cloned();
+                let params = self.fn_param_types(&callee.to_string());
+                let modes = self.func_param_modes.get_id(callee).cloned();
                 // Leaf-call constructors carry no parameter debug metadata.
                 let has_reference_args = lir_has_reference_args(modes.as_deref(), args);
                 let (arg_vals, arg_roots) = self.emit_lir_args_rooted(
                     args,
                     params.as_deref(),
                     modes.as_deref(),
-                    Some(callee),
+                    Some(&callee.to_string()),
                     None,
                 );
-                let ctor_fid = self.func_ids[callee];
+                let ctor_fid = *self
+                    .func_ids
+                    .get_id(callee)
+                    .expect("registered function identity");
                 let ctor_ref = self
                     .module
                     .declare_func_in_func(ctor_fid, self.builder.func);
@@ -5911,7 +6256,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     class,
                     field,
                     value,
-                } => self.emit_lir_static_field_assign(class, field, value),
+                } => self.emit_lir_static_field_assign(&class.to_string(), field, value),
                 // One arm of a `match` lowering split into blocks
                 // (willow-0g8j.2.11.1). Both read the scrutinee back out of
                 // its own local, so every arm tests and destructures the same
@@ -6441,7 +6786,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // A named function used as a value — the address of the compiled
             // function (willow-0g8j.2.2).
             HirExprKind::FnRef(name) => {
-                let fid = self.func_ids[name.as_str()];
+                let fid = *self
+                    .func_ids
+                    .get_id(name)
+                    .expect("registered function identity");
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
                 self.builder
                     .ins()
@@ -6455,7 +6803,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // object instead (willow-0g8j.2.12).
             HirExprKind::Lambda { id, captures, .. } => {
                 let name = self.lambda_names[id].clone();
-                let fid = self.func_ids[name.as_str()];
+                let fid = *self
+                    .func_ids
+                    .get_id(&name)
+                    .expect("registered lambda identity");
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
                 let code = self
                     .builder
@@ -6473,15 +6824,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // callable types are called here; they differ in what is loaded
             // first and in the hidden leading argument (willow-0g8j.2.12).
             HirExprKind::Call { callee, args }
-                if self.vars.contains_key(callee.as_str())
+                if self.vars.contains_key(callee.unqualified_name())
                     && matches!(
-                        self.vars[callee.as_str()].ty(),
+                        self.vars[callee.unqualified_name()].ty(),
                         Type::Fn(..) | Type::Closure(..)
                     ) =>
             {
-                let storage = self.vars[callee.as_str()].clone();
+                let storage = self.vars[callee.unqualified_name()].clone();
                 let (Type::Fn(param_types, ret_type) | Type::Closure(param_types, ret_type)) =
-                    storage.ty().clone()
+                    storage.ty()
                 else {
                     unreachable!("non-callable local call passed eligibility")
                 };
@@ -6503,7 +6854,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     value
                 };
                 let (vals, temp_roots) =
-                    self.emit_lir_args_rooted(args, Some(&param_types), None, None, None);
+                    self.emit_lir_args_rooted(args, Some(param_types), None, None, None);
                 let vals = if is_closure {
                     let mut with_env = Vec::with_capacity(vals.len() + 1);
                     with_env.push(self.load_var(&storage));
@@ -6517,14 +6868,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 if is_closure {
                     sig.params.push(AbiParam::new(types::I64));
                 }
-                for param_type in &param_types {
+                for param_type in param_types {
                     sig.params.push(AbiParam::new(clif_type(param_type)));
                 }
-                if *ret_type != Type::Void {
-                    sig.returns.push(AbiParam::new(clif_type(&ret_type)));
+                if **ret_type != Type::Void {
+                    sig.returns.push(AbiParam::new(clif_type(ret_type)));
                 }
                 let sig_ref = self.builder.import_signature(sig);
-                let pushed = self.emit_callstack_push(callee, e.span);
+                let pushed = self.emit_callstack_push(&callee.to_string(), e.span);
                 // An arbitrary function value has no statically known target,
                 // so panic handling stays conservatively enabled.
                 let panic_depth = self.emit_pre_willow_call_panic_depth();
@@ -6548,66 +6899,72 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // The one `!`-typed expression the walker emits. Eligibility
             // admits it only in statement or match-arm position, where the
             // block-terminating unwind below is legal (willow-0g8j.2.5).
-            HirExprKind::Call { callee, args } if matches!(callee.as_str(), "sleep" | "yield") => {
-                let values: Vec<_> = args.iter().map(|arg| self.emit_lir_expr(arg)).collect();
-                let runtime = if callee == "sleep" {
+            HirExprKind::Call { callee, args }
+                if matches!(callee.unqualified_name(), "sleep" | "yield") =>
+            {
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    values.push(self.emit_lir_expr(arg));
+                }
+                let runtime = if callee.is_free_named("sleep") {
                     "willow_runtime_sleep"
                 } else {
                     "willow_runtime_yield"
                 };
                 self.emit_value_runtime_call(runtime, &values)
             }
-            HirExprKind::Call { callee, args } if callee == "panic" => {
+            HirExprKind::Call { callee, args } if callee.is_free_named("panic") => {
                 self.emit_lir_panic(args, e.span)
             }
-            HirExprKind::Call { callee, .. } if callee == "recover" => self.emit_recover_call(),
-            HirExprKind::Call { callee, args } if callee == "format" => {
+            HirExprKind::Call { callee, .. } if callee.is_free_named("recover") => {
+                self.emit_recover_call()
+            }
+            HirExprKind::Call { callee, args } if callee.is_free_named("format") => {
                 let operands = format_operands(args).expect("format call vetted by eligibility");
                 let HirExprKind::Str(spec) = &args[0].kind else {
                     unreachable!("format spec vetted by eligibility")
                 };
                 let spec = spec.clone();
-                self.emit_interpolated_with(&spec, operands.len(), |this, i| {
-                    (this.emit_lir_expr(&operands[i]), operands[i].ty.clone())
-                })
+                self.emit_lir_interpolated(&spec, operands)
             }
             HirExprKind::Call { callee, args }
-                if callee == "gc_collect" || callee == "gc_minor_collect" =>
+                if callee.is_free_named("gc_collect")
+                    || callee.is_free_named("gc_minor_collect") =>
             {
                 debug_assert!(args.is_empty());
-                let runtime = builtin_call_runtime_name(callee)
+                let runtime = builtin_call_runtime_name(callee.unqualified_name())
                     .expect("the gc collect builtins are part of the backend ABI");
                 self.emit_runtime_call_with_cleanup(runtime, &[], |_| {});
                 self.builder.ins().iconst(types::I8, 0)
             }
             HirExprKind::Call { callee, args }
-                if gc_stat_builtin_runtime_name(callee).is_some() =>
+                if gc_stat_builtin_runtime_name(callee.unqualified_name()).is_some() =>
             {
                 debug_assert!(args.is_empty());
-                let runtime =
-                    gc_stat_builtin_runtime_name(callee).expect("vetted by the guard on this arm");
+                let runtime = gc_stat_builtin_runtime_name(callee.unqualified_name())
+                    .expect("vetted by the guard on this arm");
                 self.emit_value_runtime_call(runtime, &[])
             }
             HirExprKind::Call { callee, args } => {
-                let params = self.fn_param_types(callee);
-                let modes = self.func_param_modes.get(callee.as_str()).cloned();
-                let param_debug = self.func_param_debug.get(callee.as_str()).cloned();
+                let params = self.fn_param_types(&callee.to_string());
+                let modes = self.func_param_modes.get_id(callee).cloned();
+                let param_debug = self.func_param_debug.get_id(callee).cloned();
                 let has_reference_args = lir_has_reference_args(modes.as_deref(), args);
                 let (vals, temp_roots) = self.emit_lir_args_rooted(
                     args,
                     params.as_deref(),
                     modes.as_deref(),
-                    Some(callee),
+                    Some(&callee.to_string()),
                     param_debug.as_deref(),
                 );
-                let fid = *self.func_ids.get(callee.as_str()).unwrap_or_else(|| {
+                let fid = *self.func_ids.get_id(callee).unwrap_or_else(|| {
                     panic!("eligible LIR direct call `{callee}` has no declared function")
                 });
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
                 // Debug builds record the call on the panic call-chain stack,
                 // for diagnostic traces (willow-992h).
-                let pushed = self.emit_callstack_push(callee, e.span);
-                let panic_depth = self.emit_pre_user_call_panic_depth(callee);
+                let pushed = self.emit_callstack_push(&callee.to_string(), e.span);
+                let panic_depth = self.emit_pre_user_call_panic_depth(&callee.to_string());
                 let call = self.builder.ins().call(fref, &vals);
                 let results = self.builder.inst_results(call);
                 let result = results
@@ -6623,9 +6980,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_pop_roots_n(temp_roots);
                 self.gc_root_count -= temp_roots;
                 self.emit_post_willow_call_panic_check(panic_depth);
-                if self.cooperative_leaves.contains(
-                    &crate::semantic::ids::FunctionId::free_from_source_name(callee),
-                ) {
+                if self.cooperative_leaves.contains(&callee.clone()) {
                     let task_id = self.builder.ins().load(
                         types::I64,
                         MemFlagsData::new(),
@@ -6700,9 +7055,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 _ => self.emit_lir_class_method(object, method, args, &e.ty, e.span),
             },
-            HirExprKind::New { class, args } => self.emit_lir_new(class, args, e.span),
+            HirExprKind::New { class, args } => self.emit_lir_new(&class.to_string(), args, e.span),
             HirExprKind::ObjectLiteral { class, fields } => {
-                self.emit_lir_object_literal(class, fields)
+                self.emit_lir_object_literal(&class.to_string(), fields)
             }
             HirExprKind::FieldAccess { object, field } => self.emit_lir_field_access(object, field),
             HirExprKind::Range { start, end } => self.emit_lir_range_value(start, end),
@@ -6710,15 +7065,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 class,
                 method,
                 args,
-            } => self.emit_lir_static_call(class, method, args, &e.ty, e.span),
+            } => self.emit_lir_static_call(&class.to_string(), method, args, &e.ty, e.span),
             // A fieldless variant, written qualified or bare (`Color::Red`,
             // `Red`, the `None` of a non-generic user enum) — or a real static
             // class property, which loads from its global slot.
             HirExprKind::StaticField { class, field } => {
                 if self.enum_infos.contains_key(class) {
-                    self.emit_lir_enum_construction(class, field, &[], &e.ty)
+                    self.emit_lir_enum_construction(&class.to_string(), field, &[], &e.ty)
                 } else {
-                    self.emit_static_field_read(class, field)
+                    self.emit_static_field_read(&class.to_string(), field)
                 }
             }
             HirExprKind::Match { scrutinee, arms } => self.emit_lir_match(scrutinee, arms, &e.ty),
@@ -7170,14 +7525,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let niche = option_inner(&operand_ty).is_some()
             && option_repr(&operand_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer);
         let is_option = option_inner(&operand_ty).is_some();
-        let convert: Option<(String, Type)> = match (
-            result_err_type(&operand_ty),
-            result_err_type(&self.return_type),
+        let convert: Option<(TypeId, Type)> = match (
+            &result_err_type(&operand_ty),
+            &result_err_type(&self.return_type),
         ) {
             (Some(Type::Named(e1)), Some(e2))
-                if Type::Named(e1.clone()) != e2 && e2 != Type::Void =>
+                if Type::Named(e1.clone()) != *e2 && *e2 != Type::Void =>
             {
-                Some((e1, e2))
+                Some((e1.clone(), e2.clone()))
             }
             _ => None,
         };
@@ -7224,7 +7579,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if e1_is_gc {
                 self.emit_push_root(e1_payload);
             }
-            let e2_val = self.emit_into_conversion(e1_payload, e1_name);
+            let e2_val = self.emit_into_conversion(e1_payload, &e1_name.to_string());
             if e1_is_gc {
                 self.emit_pop_roots_n(1);
                 self.gc_root_count -= 1;
@@ -7416,9 +7771,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     unreachable!("panic spec vetted by eligibility")
                 };
                 let spec = spec.clone();
-                self.emit_interpolated_with(&spec, operands.len(), |this, i| {
-                    (this.emit_lir_expr(&operands[i]), operands[i].ty.clone())
-                })
+                self.emit_lir_interpolated(&spec, operands)
             }
         };
         self.emit_panic_with_message(msg, span)
@@ -7662,7 +8015,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 ..
             } => {
                 self.fault_site_span = Some(value.span);
-                self.emit_lir_static_field_assign(class, field, value);
+                self.emit_lir_static_field_assign(&class.to_string(), field, value);
             }
             HirStmt::If {
                 cond,
@@ -7920,7 +8273,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             | HirPattern::EnumVariantTuple {
                 enum_name, variant, ..
             } => {
-                let tag = self.enum_variant_tag(enum_name, variant);
+                let tag = self.enum_variant_tag(&enum_name.to_string(), variant);
                 // The `Option` pointer niche carries no tag word: `Some` is any
                 // non-null payload and `None` is null (willow-0g8j.2.1).
                 if builtin_types::is(scrutinee_ty, B::Option)
@@ -7937,7 +8290,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let expected = self.builder.ins().iconst(types::I64, tag);
                 // A payload-carrying enum is a heap object whose word 0 is the
                 // tag; a fieldless one IS the tag.
-                let actual = if self.enum_is_gc_object_type(enum_name) {
+                let actual = if self.enum_is_gc_object_type(&enum_name.to_string()) {
                     self.emit_load_enum_tag(scrutinee)
                 } else {
                     scrutinee
@@ -8039,8 +8392,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // Read the DECLARED payload types rather than the pattern's
                 // recorded ones, so the load width follows the layout the
                 // constructor wrote.
-                let mut payload_types =
-                    self.resolve_variant_payload_types(enum_name, variant, scrutinee_ty);
+                let mut payload_types = self.resolve_variant_payload_types(
+                    &enum_name.to_string(),
+                    variant,
+                    scrutinee_ty,
+                );
                 normalize_void_payloads(&mut payload_types);
                 let niche = builtin_types::is(scrutinee_ty, B::Option)
                     && option_repr(scrutinee_ty, self.enum_infos)
@@ -8514,7 +8870,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .expect("a constructor binds its receiver before its body is emitted");
         let self_ptr = self.load_var(&self_storage);
 
-        let mangled = class_method_symbol_name(self.known_modules, &base_name, "init");
+        let mangled = class_method_symbol_name(self.known_modules, &base_name.to_string(), "init");
         if let Some(&init_fid) = self.func_ids.get(&mangled) {
             let params = self.method_param_types(&mangled);
             let modes = self.func_param_modes.get(&mangled).cloned();
@@ -8720,7 +9076,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             mangled,
             dispatch_targets,
             virtual_slot,
-        } = self.plan_virtual_call(&class, method);
+        } = self.plan_virtual_call(&class.to_string(), method);
 
         let pushed = self.emit_callstack_push(method, span);
         // The receiver may be a temporary (`make().m(alloc())`) reachable only
@@ -8842,7 +9198,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Type::Generic(_, args) => args.as_slice(),
             _ => &[],
         };
-        let substitutions: HashMap<String, Type> = info
+        let substitutions: HashMap<TypeId, Type> = info
             .type_params
             .iter()
             .cloned()
@@ -8934,7 +9290,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_post_willow_call_panic_check(panic_depth);
         // `-> Self` yields a bare object of the receiver's own class. Re-box it
         // only after the panic edge has rejected the neutral placeholder.
-        if matches!(&ret_type, Type::Named(n) if n == "Self") {
+        if matches!(&ret_type, Type::Named(n) if n == &TypeId::local("Self")) {
             result = self.emit_box_with_vtable(result, vtable);
         }
         result
@@ -9729,7 +10085,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // The runtime builds the option, so it has to be told which
                 // representation to build — the same decision `option_repr`
                 // makes here and in `emit_lir_enum_construction`.
-                let option_ty = Type::Generic("Option".to_string(), vec![val_ty]);
+                let option_ty = Type::Generic("Option".to_string().into(), vec![val_ty]);
                 let niche = self.builder.ins().iconst(
                     types::I64,
                     i64::from(
@@ -9964,7 +10320,7 @@ mod tests {
         known: HashSet<String>,
         class_layouts: TypeMap<Vec<(String, Type)>>,
         static_fields: HashMap<(String, String), Type>,
-        class_base: TypeMap<String>,
+        class_base: TypeMap<TypeId>,
         class_type_ids: TypeMap<i64>,
         interfaces: HashSet<String>,
         iface_type_params: HashMap<String, Vec<String>>,
@@ -10014,17 +10370,25 @@ mod tests {
     }
 
     impl crate::backend::cranelift::vtable_layout::IfaceShapes for TestTables {
-        fn canonical(&self, iface: &str) -> String {
-            iface.to_string()
+        fn canonical(&self, iface: &TypeId) -> TypeId {
+            iface.clone()
         }
 
-        fn supers(&self, iface: &str) -> Vec<String> {
-            self.iface_supers.get(iface).cloned().unwrap_or_default()
+        fn supers(&self, iface: &TypeId) -> Vec<TypeId> {
+            self.iface_supers
+                .get(&iface.to_string())
+                .map(|supers| {
+                    supers
+                        .iter()
+                        .map(|name| TypeId::from_source_name(name))
+                        .collect()
+                })
+                .unwrap_or_default()
         }
 
-        fn methods(&self, iface: &str) -> Vec<String> {
+        fn methods(&self, iface: &TypeId) -> Vec<String> {
             self.iface_methods
-                .get(iface)
+                .get(&iface.to_string())
                 .map(|methods| methods.iter().map(|(name, ..)| name.clone()).collect())
                 .unwrap_or_default()
         }
@@ -10063,7 +10427,7 @@ mod tests {
             // signature its lowered body carries — what `declare_lambda` does
             // in the backend.
             for l in lambdas {
-                let name = l.function.name.clone();
+                let name = l.function.name.to_string();
                 t.known.insert(name.clone());
                 t.fn_types.insert(
                     &name,
@@ -10078,13 +10442,15 @@ mod tests {
                 );
                 t.lambdas.insert(l.id, name);
             }
-            let sig = |params: &[crate::parser::ast::Param], ret: &Type, with_self: bool| {
+            let sig = |params: &[crate::parser::ast::Param],
+                       ret: &crate::parser::ast::Type,
+                       with_self: bool| {
                 let mut ps: Vec<Type> = Vec::new();
                 if with_self {
                     ps.push(Type::I64);
                 }
-                ps.extend(params.iter().map(|p| p.ty.clone()));
-                Type::Fn(ps, Box::new(ret.clone()))
+                ps.extend(params.iter().map(|p| Type::from(&p.ty)));
+                Type::Fn(ps, Box::new(ret.into()))
             };
             let modes = |params: &[crate::parser::ast::Param], with_self: bool| {
                 let mut ms: Vec<ParamMode> = Vec::new();
@@ -10131,9 +10497,9 @@ mod tests {
                                 .map(|m| {
                                     (
                                         m.name.clone(),
-                                        m.params.iter().map(|p| p.ty.clone()).collect(),
+                                        m.params.iter().map(|p| Type::from(&p.ty)).collect(),
                                         m.params.iter().map(|p| p.mode.clone()).collect(),
-                                        m.return_type.clone(),
+                                        m.return_type.clone().into(),
                                     )
                                 })
                                 .collect(),
@@ -10143,14 +10509,14 @@ mod tests {
                         t.enums.insert(
                             e.name.clone(),
                             LirEnumDef {
-                                identity: e.name.clone(),
-                                type_params: e.type_params.clone(),
+                                identity: e.name.clone().into(),
+                                type_params: e.type_params.iter().map(TypeId::local).collect(),
                                 variants: e
                                     .variants
                                     .iter()
                                     .map(|v| LirEnumVariant {
                                         name: v.name.clone(),
-                                        payloads: v.payload.clone(),
+                                        payloads: v.payload.iter().map(Into::into).collect(),
                                     })
                                     .collect(),
                             },
@@ -10158,22 +10524,27 @@ mod tests {
                     }
                     Item::Class(c) => {
                         for field in c.fields.iter().filter(|f| f.is_static) {
-                            t.static_fields
-                                .insert((c.name.clone(), field.name.clone()), field.ty.clone());
+                            t.static_fields.insert(
+                                (c.name.clone(), field.name.clone()),
+                                field.ty.clone().into(),
+                            );
                         }
                         t.class_layouts.insert(
                             c.name.clone(),
                             c.fields
                                 .iter()
                                 .filter(|f| !f.is_static)
-                                .map(|f| (f.name.clone(), f.ty.clone()))
+                                .map(|f| (f.name.clone(), f.ty.clone().into()))
                                 .collect(),
                         );
                         if let Some(base) = &c.base_class {
-                            t.class_base.insert(c.name.clone(), base.name().to_string());
+                            t.class_base
+                                .insert(c.name.clone(), base.name().to_string().into());
                         }
                         for iface in &c.implements {
-                            if let Type::Named(n) | Type::Generic(n, _) = iface {
+                            if let crate::parser::ast::Type::Named(n)
+                            | crate::parser::ast::Type::Generic(n, _) = iface
+                            {
                                 t.vtables.insert((c.name.clone(), n.clone()));
                             }
                         }
@@ -10191,8 +10562,10 @@ mod tests {
                             let mangled =
                                 class_member_symbol(&backend_symbol_component(&c.name), "init");
                             t.known.insert(mangled.clone());
-                            t.fn_types
-                                .insert(&mangled, sig(&ctor.params, &Type::Void, true));
+                            t.fn_types.insert(
+                                &mangled,
+                                sig(&ctor.params, &crate::parser::ast::Type::Void, true),
+                            );
                             t.param_modes.insert(&mangled, modes(&ctor.params, false));
                         }
                         for m in &c.methods {
@@ -10214,7 +10587,7 @@ mod tests {
             let own = t.class_layouts.clone();
             for (class_name, _) in own.iter() {
                 let mut chain = vec![class_name.clone()];
-                let mut seen: HashSet<String> = HashSet::from([class_name.clone()]);
+                let mut seen = HashSet::from([class_name.clone()]);
                 while let Some(base) = t.class_base.get(chain.last().expect("non-empty")) {
                     if !seen.insert(base.clone()) {
                         break;
@@ -10245,32 +10618,32 @@ mod tests {
                 class_layouts: &self.class_layouts,
                 class_base: &self.class_base,
                 class_type_ids: &self.class_type_ids,
-                is_interface: &|n| self.interfaces.contains(n),
-                iface_identity: &|n| self.interfaces.contains(n).then(|| n.to_string()),
+                is_interface: &|n| self.interfaces.contains(&n.to_string()),
+                iface_identity: &|n| self.interfaces.contains(&n.to_string()).then(|| n.clone()),
                 can_box: &|class, iface| {
                     self.vtables
                         .contains(&(class.to_string(), iface.to_string()))
                 },
-                enum_def: &|n| self.enums.get(n).cloned(),
-                lambda_symbol: &|id| self.lambdas.get(&id).cloned(),
+                enum_def: &|n| self.enums.get(&n.to_string()).cloned(),
+                lambda_symbol: &|id| self.lambdas.get(&id).map(FunctionId::free),
                 cooperative_leaves: &self.cooperative_leaves,
                 iface_method: &|iface_ty, method| {
-                    let (iface, args): (&str, &[Type]) = match iface_ty {
+                    let (iface, args): (&TypeId, &[Type]) = match iface_ty {
                         Type::Named(name) => (name, &[]),
                         Type::Generic(name, args) => (name, args),
                         _ => return None,
                     };
-                    let methods = self.iface_methods.get(iface)?;
-                    let type_params = self.iface_type_params.get(iface)?;
+                    let methods = self.iface_methods.get(&iface.to_string())?;
+                    let type_params = self.iface_type_params.get(&iface.to_string())?;
                     if type_params.len() != args.len() {
                         return None;
                     }
-                    let mut substitutions: HashMap<String, Type> = type_params
+                    let mut substitutions: HashMap<TypeId, Type> = type_params
                         .iter()
-                        .cloned()
+                        .map(TypeId::local)
                         .zip(args.iter().cloned())
                         .collect();
-                    substitutions.insert("Self".to_string(), iface_ty.clone());
+                    substitutions.insert(TypeId::local("Self"), iface_ty.clone());
                     let slot = methods.iter().position(|(n, _, _, _)| n == method)?;
                     let (_, params, modes, ret) = &methods[slot];
                     Some(IfaceMethodSig {
@@ -10293,7 +10666,7 @@ mod tests {
                         {
                             return Some(ty.clone());
                         }
-                        search = self.class_base.get(&name).cloned();
+                        search = self.class_base.get(&name).map(ToString::to_string);
                     }
                     None
                 },
@@ -10319,7 +10692,11 @@ mod tests {
         assert!(diags.is_empty(), "{diags:?}");
         let p = crate::ir::lowered::lower_program(&hir);
         let tables = TestTables::build(&program, fns, &p.lambdas);
-        let f = p.functions.iter().find(|f| f.name == name).unwrap();
+        let f = p
+            .functions
+            .iter()
+            .find(|f| f.name.to_string() == name)
+            .unwrap();
         tables.with_ctx(|ctx| lir_supported_function(f, ctx))
     }
 
@@ -10335,7 +10712,7 @@ mod tests {
         }
         let p = crate::ir::lowered::lower_program(&hir);
         let tables = TestTables::build(&program, fns, &p.lambdas);
-        match p.functions.iter().find(|f| f.name == name) {
+        match p.functions.iter().find(|f| f.name.to_string() == name) {
             Some(f) => tables.with_ctx(|ctx| lir_supported_function(f, ctx)),
             None => false,
         }
@@ -10377,7 +10754,7 @@ mod tests {
     /// [`eligible`] for constructs that need the checker's types to lower.
     fn eligible_checked(src: &str, name: &str, fns: &[&str]) -> bool {
         let (p, tables) = checked_lowering(src, fns);
-        match p.functions.iter().find(|f| f.name == name) {
+        match p.functions.iter().find(|f| f.name.to_string() == name) {
             Some(f) => tables.with_ctx(|ctx| lir_supported_function(f, ctx)),
             None => false,
         }
@@ -10391,7 +10768,7 @@ mod tests {
         let f = p
             .functions
             .iter()
-            .find(|f| f.name == name)
+            .find(|f| f.name.to_string() == name)
             .unwrap_or_else(|| panic!("`{name}` has no lowered IR"));
         tables.with_ctx(|ctx| lir_rejection_reason(f, ctx))
     }
@@ -10410,7 +10787,7 @@ mod tests {
         let f = p
             .functions
             .iter()
-            .find(|f| f.name == name)
+            .find(|f| f.name.to_string() == name)
             .expect("function present in lowered IR")
             .clone();
         (f, tables)
@@ -10537,6 +10914,624 @@ mod tests {
         }
     }
 
+    fn eligibility_wrapper_tables() -> TestTables {
+        let tokens = Lexer::new(
+            "class Box { pub value: i64; } fn pair(a: i64, b: i64) -> i64 { return a + b; }",
+        )
+        .tokenize()
+        .unwrap();
+        let (program, errors) = Parser::new(tokens).parse();
+        assert!(errors.is_empty());
+        TestTables::build(&program, &["pair"], &[])
+    }
+
+    fn eligibility_node(kind: HirExprKind, ty: Type) -> HirExpr {
+        HirExpr {
+            kind,
+            ty,
+            span: Span::new(0, 0, 1, 1),
+        }
+    }
+
+    fn eligibility_wrapper(leaf: HirExpr, position: usize) -> HirExpr {
+        let scalar = || eligibility_node(HirExprKind::Int(1), Type::I64);
+        let array = |elements| {
+            eligibility_node(
+                HirExprKind::Array { elements },
+                Type::Array(Box::new(Type::I64)),
+            )
+        };
+        let range = |start, end| {
+            eligibility_node(
+                HirExprKind::Range {
+                    start: Box::new(start),
+                    end: Box::new(end),
+                },
+                Type::Generic("Range".into(), vec![Type::I64]),
+            )
+        };
+        let object = |kind| eligibility_node(kind, Type::Named("Box".into()));
+        match position {
+            0 | 1 => eligibility_node(
+                HirExprKind::Call {
+                    callee: "pair".into(),
+                    args: if position == 0 {
+                        vec![leaf, scalar()]
+                    } else {
+                        vec![scalar(), leaf]
+                    },
+                },
+                Type::I64,
+            ),
+            2 | 3 => eligibility_node(
+                HirExprKind::Index {
+                    array: Box::new(array(if position == 2 {
+                        vec![leaf, scalar()]
+                    } else {
+                        vec![scalar(), leaf]
+                    })),
+                    index: Box::new(scalar()),
+                },
+                Type::I64,
+            ),
+            4 => eligibility_node(
+                HirExprKind::Index {
+                    array: Box::new(array(vec![scalar()])),
+                    index: Box::new(leaf),
+                },
+                Type::I64,
+            ),
+            5 | 6 => eligibility_node(
+                HirExprKind::FieldAccess {
+                    object: Box::new(if position == 5 {
+                        range(leaf, scalar())
+                    } else {
+                        range(scalar(), leaf)
+                    }),
+                    field: "start".into(),
+                },
+                Type::I64,
+            ),
+            7 | 8 => eligibility_node(
+                HirExprKind::FieldAccess {
+                    object: Box::new(object(if position == 7 {
+                        HirExprKind::New {
+                            class: "Box".into(),
+                            args: vec![leaf],
+                        }
+                    } else {
+                        HirExprKind::ObjectLiteral {
+                            class: "Box".into(),
+                            fields: vec![("value".into(), leaf)],
+                        }
+                    })),
+                    field: "value".into(),
+                },
+                Type::I64,
+            ),
+            _ => eligibility_node(
+                HirExprKind::Print {
+                    value: Box::new(leaf),
+                    newline: true,
+                },
+                Type::Void,
+            ),
+        }
+    }
+
+    #[test]
+    fn reference_names_match_ast_and_hir_for_twenty_shapes() {
+        use crate::parser::ast::{Expr, ExprId};
+        let span = Span::dummy();
+        // Four roots times five suffix forms, including both placeholders.
+        for root in 0..4 {
+            for suffix in 0..5 {
+                let (ast, hir, expected) = match root {
+                    0 => (
+                        Expr::Var("root".into(), span, ExprId::fresh()),
+                        HirExprKind::Var("root".into()),
+                        "root",
+                    ),
+                    1 => (
+                        Expr::Var("名".into(), span, ExprId::fresh()),
+                        HirExprKind::Var("名".into()),
+                        "名",
+                    ),
+                    2 => (
+                        Expr::Integer(7, span, ExprId::fresh()),
+                        HirExprKind::Int(7),
+                        "<expression>",
+                    ),
+                    _ => (
+                        Expr::Bool(true, span, ExprId::fresh()),
+                        HirExprKind::Bool(true),
+                        "<expression>",
+                    ),
+                };
+                let mut ast =
+                    Expr::FieldAccess(Box::new(ast), "field".into(), span, ExprId::fresh());
+                let mut hir = eligibility_node(
+                    HirExprKind::FieldAccess {
+                        object: Box::new(eligibility_node(hir, Type::I64)),
+                        field: "field".into(),
+                    },
+                    Type::I64,
+                );
+                let (ast_index, hir_index, index_name) = match suffix {
+                    0 => (
+                        Expr::Integer(0, span, ExprId::fresh()),
+                        HirExprKind::Int(0),
+                        "0",
+                    ),
+                    1 => (
+                        Expr::Integer(-7, span, ExprId::fresh()),
+                        HirExprKind::Int(-7),
+                        "-7",
+                    ),
+                    2 => (
+                        Expr::Var("i".into(), span, ExprId::fresh()),
+                        HirExprKind::Var("i".into()),
+                        "i",
+                    ),
+                    3 => (
+                        Expr::Bool(true, span, ExprId::fresh()),
+                        HirExprKind::Bool(true),
+                        "<expr>",
+                    ),
+                    _ => (
+                        Expr::Var("添字".into(), span, ExprId::fresh()),
+                        HirExprKind::Var("添字".into()),
+                        "添字",
+                    ),
+                };
+                ast = Expr::Index(Box::new(ast), Box::new(ast_index), span, ExprId::fresh());
+                hir = eligibility_node(
+                    HirExprKind::Index {
+                        array: Box::new(hir),
+                        index: Box::new(eligibility_node(hir_index, Type::I64)),
+                    },
+                    Type::I64,
+                );
+                let expected = format!("{expected}.field[{index_name}]");
+                assert_eq!(super::super::reference_place_name(&ast), expected);
+                assert_eq!(lir_reference_place_name(&hir), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn reference_names_use_a_one_megabyte_stack() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                use crate::parser::ast::{Expr, ExprId};
+                let span = Span::dummy();
+                let mut ast = Expr::Var("root".into(), span, ExprId::fresh());
+                let mut hir = eligibility_node(HirExprKind::Var("root".into()), Type::I64);
+                let mut expected = String::from("root");
+                for depth in 0..50_000 {
+                    if depth % 2 == 0 {
+                        ast = Expr::FieldAccess(Box::new(ast), "x".into(), span, ExprId::fresh());
+                        hir = eligibility_node(
+                            HirExprKind::FieldAccess {
+                                object: Box::new(hir),
+                                field: "x".into(),
+                            },
+                            Type::I64,
+                        );
+                        expected.push_str(".x");
+                    } else {
+                        ast = Expr::Index(
+                            Box::new(ast),
+                            Box::new(Expr::Integer(0, span, ExprId::fresh())),
+                            span,
+                            ExprId::fresh(),
+                        );
+                        hir = eligibility_node(
+                            HirExprKind::Index {
+                                array: Box::new(hir),
+                                index: Box::new(eligibility_node(HirExprKind::Int(0), Type::I64)),
+                            },
+                            Type::I64,
+                        );
+                        expected.push_str("[0]");
+                    }
+                }
+                let ast_name = super::super::reference_place_name(&ast);
+                let hir_name = lir_reference_place_name(&hir);
+                drop(ast);
+                drop(hir);
+                assert_eq!(ast_name, expected);
+                assert_eq!(hir_name, expected);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn divergence_nested_if_and_match_use_a_one_megabyte_stack() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let span = Span::dummy();
+                for diverges in [false, true] {
+                    let returns = || HirStmt::Return { value: None, span };
+                    let mut body = if diverges { vec![returns()] } else { vec![] };
+                    for depth in 0..50_000 {
+                        body = if depth % 2 == 0 {
+                            vec![HirStmt::If {
+                                cond: eligibility_node(HirExprKind::Bool(true), Type::Bool),
+                                then_branch: body,
+                                else_branch: Some(vec![returns()]),
+                                span,
+                            }]
+                        } else {
+                            vec![HirStmt::Expr(eligibility_node(
+                                HirExprKind::Match {
+                                    scrutinee: Box::new(eligibility_node(
+                                        HirExprKind::Int(0),
+                                        Type::I64,
+                                    )),
+                                    arms: vec![HirMatchArm {
+                                        pattern: HirPattern::Wildcard,
+                                        body,
+                                        ty: Type::Void,
+                                        span,
+                                    }],
+                                },
+                                Type::Void,
+                            ))]
+                        };
+                    }
+                    let actual = body_diverges(&body);
+
+                    drop(body);
+                    assert_eq!(actual, diverges);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn eligibility_nonoperator_twenty_operand_perspectives() {
+        let tables = eligibility_wrapper_tables();
+        let names = HashMap::from([("value", Cow::Owned(Type::I64))]);
+        // Each operand position must accept a visible local and blame the same
+        // leaf when its binding is absent, through all intervening wrappers.
+        for position in 0..10 {
+            for known in [false, true] {
+                let leaf = eligibility_node(
+                    HirExprKind::Var(if known { "value" } else { "missing" }.into()),
+                    Type::I64,
+                );
+                let expr = eligibility_wrapper(leaf, position);
+                tables.with_ctx(|ctx| {
+                    assert_eq!(supported_expr(&expr, ctx, &names), known, "position={position}");
+                    let rejected = minimal_unsupported_expr(&expr, ctx, &names);
+                    if known {
+                        assert!(rejected.is_none(), "position={position}");
+                    } else {
+                        assert!(matches!(&rejected.unwrap().kind, HirExprKind::Var(n) if n == "missing"), "position={position}");
+                    }
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn eligibility_mixed_nonoperator_chains_use_a_one_megabyte_stack() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let tables = eligibility_wrapper_tables();
+                for known in [false, true] {
+                    let mut expr = eligibility_node(HirExprKind::Var("value".into()), Type::I64);
+                    for depth in 0..50_000 {
+                        expr = eligibility_wrapper(expr, depth % 9);
+                    }
+                    let names = if known {
+                        HashMap::from([("value", Cow::Owned(Type::I64))])
+                    } else {
+                        HashMap::new()
+                    };
+                    let (accepted, reason) = tables.with_ctx(|ctx| {
+                        (
+                            supported_expr(&expr, ctx, &names),
+                            expr_rejection(&expr, ctx, &names),
+                        )
+                    });
+
+                    drop(expr);
+                    assert_eq!(accepted, known);
+                    assert_eq!(reason.is_none(), known);
+                    if let Some(reason) = reason {
+                        assert!(reason.contains("value"));
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn eligibility_deep_scoped_match_and_select_use_one_megabyte() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let tables = eligibility_wrapper_tables();
+                for select in [false, true] {
+                    for known in [false, true] {
+                        let mut expr =
+                            eligibility_node(HirExprKind::Var("value".into()), Type::I64);
+                        for _ in 0..512 {
+                            let span = expr.span;
+                            expr = if select {
+                                eligibility_node(
+                                    HirExprKind::Select {
+                                        cases: vec![HirSelectCase {
+                                            kind: HirSelectCaseKind::Default,
+                                            body: vec![HirStmt::Expr(expr)],
+                                            span,
+                                        }],
+                                    },
+                                    Type::Void,
+                                )
+                            } else {
+                                eligibility_node(
+                                    HirExprKind::Match {
+                                        scrutinee: Box::new(eligibility_node(
+                                            HirExprKind::Int(1),
+                                            Type::I64,
+                                        )),
+                                        arms: vec![HirMatchArm {
+                                            pattern: HirPattern::Wildcard,
+                                            body: vec![HirStmt::Expr(expr)],
+                                            ty: Type::I64,
+                                            span,
+                                        }],
+                                    },
+                                    Type::I64,
+                                )
+                            };
+                        }
+                        let names = if known {
+                            HashMap::from([("value", Cow::Owned(Type::I64))])
+                        } else {
+                            HashMap::new()
+                        };
+                        tables.with_ctx(|ctx| {
+                            assert_eq!(
+                                supported_expr(&expr, ctx, &names),
+                                known,
+                                "select={select}"
+                            );
+                            let reason = expr_rejection(&expr, ctx, &names);
+                            assert_eq!(reason.is_none(), known, "select={select}: {reason:?}");
+                        });
+                        drop(expr);
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn eligibility_operator_positions_preserve_leaf_validation() {
+        let program = crate::parser::ast::Program {
+            module: None,
+            imports: vec![],
+            items: vec![],
+        };
+        let tables = TestTables::build(&program, &[], &[]);
+        let span = Span::new(0, 0, 1, 1);
+        let scalar = || HirExpr {
+            kind: HirExprKind::Int(1),
+            ty: Type::I64,
+            span,
+        };
+        // Twenty perspectives: five operand positions times literal, bound
+        // local, unknown local, and unsupported expression forms.
+        for position in 0..5 {
+            for leaf_case in 0..4 {
+                let leaf = HirExpr {
+                    kind: match leaf_case {
+                        0 => HirExprKind::Int(1),
+                        1 => HirExprKind::Var("bound".into()),
+                        2 => HirExprKind::Var("missing".into()),
+                        _ => HirExprKind::FnRef("missing_function".into()),
+                    },
+                    ty: Type::I64,
+                    span,
+                };
+                let kind = match position {
+                    0 => HirExprKind::Binary {
+                        op: BinOp::Add,
+                        lhs: Box::new(leaf),
+                        rhs: Box::new(scalar()),
+                    },
+                    1 => HirExprKind::Binary {
+                        op: BinOp::Add,
+                        lhs: Box::new(scalar()),
+                        rhs: Box::new(leaf),
+                    },
+                    2 => HirExprKind::Unary {
+                        op: UnaryOp::Neg,
+                        operand: Box::new(leaf),
+                    },
+                    3 => HirExprKind::Ternary {
+                        condition: Box::new(HirExpr {
+                            kind: HirExprKind::Bool(true),
+                            ty: Type::Bool,
+                            span,
+                        }),
+                        then_expr: Box::new(leaf),
+                        else_expr: Box::new(scalar()),
+                    },
+                    _ => HirExprKind::Ternary {
+                        condition: Box::new(HirExpr {
+                            kind: HirExprKind::Bool(true),
+                            ty: Type::Bool,
+                            span,
+                        }),
+                        then_expr: Box::new(scalar()),
+                        else_expr: Box::new(leaf),
+                    },
+                };
+                let expr = HirExpr {
+                    kind,
+                    ty: Type::I64,
+                    span,
+                };
+                let names = HashMap::from([("bound", Cow::Owned(Type::I64))]);
+                assert_eq!(
+                    tables.with_ctx(|ctx| supported_expr(&expr, ctx, &names)),
+                    leaf_case < 2,
+                    "position={position}, leaf={leaf_case}"
+                );
+                let rejected = tables.with_ctx(|ctx| minimal_unsupported_expr(&expr, ctx, &names));
+                if leaf_case < 2 {
+                    assert!(rejected.is_none());
+                } else {
+                    assert!(
+                        matches!(
+                            &rejected.unwrap().kind,
+                            HirExprKind::Var(name) if name == "missing"
+                        ) || matches!(
+                            &rejected.unwrap().kind,
+                            HirExprKind::FnRef(name) if name.is_free_named("missing_function")
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn operator_rejection_preserves_first_child_and_parent_fallback() {
+        let program = crate::parser::ast::Program {
+            module: None,
+            imports: vec![],
+            items: vec![],
+        };
+        let tables = TestTables::build(&program, &[], &[]);
+        let span = Span::new(0, 0, 1, 1);
+        for missing in [None, Some(0), Some(1), Some(2)] {
+            let child = |position, ty| HirExpr {
+                kind: if missing.is_some_and(|first| position >= first) {
+                    HirExprKind::Var(format!("missing{position}"))
+                } else if ty == Type::Bool {
+                    HirExprKind::Bool(true)
+                } else {
+                    HirExprKind::Int(1)
+                },
+                ty,
+                span,
+            };
+            let expr = HirExpr {
+                kind: HirExprKind::Ternary {
+                    condition: Box::new(child(0, Type::Bool)),
+                    then_expr: Box::new(child(1, Type::I64)),
+                    else_expr: Box::new(child(2, Type::I64)),
+                },
+                // The parent itself fails the branch representation check.
+                ty: Type::Bool,
+                span,
+            };
+            let names = HashMap::new();
+            let rejected = tables
+                .with_ctx(|ctx| minimal_unsupported_expr(&expr, ctx, &names))
+                .unwrap();
+            if let Some(first) = missing {
+                assert!(
+                    matches!(&rejected.kind, HirExprKind::Var(name) if name == &format!("missing{first}"))
+                );
+            } else {
+                assert!(std::ptr::eq(rejected, &expr));
+            }
+        }
+    }
+
+    #[test]
+    fn eligibility_operator_chains_use_a_one_megabyte_stack() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let program = crate::parser::ast::Program {
+                    module: None,
+                    imports: vec![],
+                    items: vec![],
+                };
+                let tables = TestTables::build(&program, &[], &[]);
+                let span = Span::new(0, 0, 1, 1);
+                for known in [false, true] {
+                    let mut expr = HirExpr {
+                        kind: HirExprKind::Var("value".into()),
+                        ty: Type::I64,
+                        span,
+                    };
+                    for depth in 0..50_000 {
+                        let kind = match depth % 3 {
+                            0 => HirExprKind::Unary {
+                                op: UnaryOp::Neg,
+                                operand: Box::new(expr),
+                            },
+                            1 => HirExprKind::Binary {
+                                op: BinOp::Add,
+                                lhs: Box::new(expr),
+                                rhs: Box::new(HirExpr {
+                                    kind: HirExprKind::Int(1),
+                                    ty: Type::I64,
+                                    span,
+                                }),
+                            },
+                            _ => HirExprKind::Ternary {
+                                condition: Box::new(HirExpr {
+                                    kind: HirExprKind::Bool(true),
+                                    ty: Type::Bool,
+                                    span,
+                                }),
+                                then_expr: Box::new(expr),
+                                else_expr: Box::new(HirExpr {
+                                    kind: HirExprKind::Int(1),
+                                    ty: Type::I64,
+                                    span,
+                                }),
+                            },
+                        };
+                        expr = HirExpr {
+                            kind,
+                            ty: Type::I64,
+                            span,
+                        };
+                    }
+                    let names = if known {
+                        HashMap::from([("value", Cow::Owned(Type::I64))])
+                    } else {
+                        HashMap::new()
+                    };
+                    let accepted = tables.with_ctx(|ctx| supported_expr(&expr, ctx, &names));
+                    let rejection = tables.with_ctx(|ctx| expr_rejection(&expr, ctx, &names));
+
+                    drop(expr);
+                    assert_eq!(accepted, known);
+                    if known {
+                        assert!(rejection.is_none());
+                    } else {
+                        assert!(rejection.unwrap().contains("value"));
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[test]
     fn may_allocate_uses_a_one_megabyte_stack() {
         std::thread::Builder::new()
@@ -10559,9 +11554,7 @@ mod tests {
                     };
                 }
                 let allocates = may_allocate(&expr);
-                while let HirExprKind::Unary { operand, .. } = expr.kind {
-                    expr = *operand;
-                }
+                drop(expr);
                 assert!(!allocates);
             })
             .unwrap()
@@ -11202,7 +12195,7 @@ mod tests {
         let (layouts, ids) = class_tables(&[("Point", 1), ("a::Point", 2)]);
         assert_eq!(
             resolve_class_key(&layouts, &ids, &modules(&["a"]), &visible(&["a"]), "Point"),
-            Some("Point".to_string())
+            Some(TypeId::from_source_name("Point"))
         );
     }
 
@@ -11211,7 +12204,7 @@ mod tests {
         let (layouts, ids) = class_tables(&[("a::Point", 1)]);
         assert_eq!(
             resolve_class_key(&layouts, &ids, &modules(&["a"]), &visible(&["a"]), "Point"),
-            Some("a::Point".to_string())
+            Some(TypeId::from_source_name("a::Point"))
         );
     }
 
@@ -11229,7 +12222,7 @@ mod tests {
                 &visible(&["a"]),
                 "Point"
             ),
-            Some("a::Point".to_string())
+            Some(TypeId::from_source_name("a::Point"))
         );
     }
 
@@ -11263,7 +12256,10 @@ mod tests {
             "Point",
         )
         .expect("one class, two spellings");
-        assert!(key == "c::Point" || key == "checks::Point", "{key}");
+        assert!(
+            key == "c::Point".into() || key == "checks::Point".into(),
+            "{key}"
+        );
     }
 
     #[test]
@@ -11279,7 +12275,7 @@ mod tests {
                 &visible(&["shallow"]),
                 "Point"
             ),
-            Some("deep::Point".to_string())
+            Some(TypeId::from_source_name("deep::Point"))
         );
     }
 
@@ -11337,7 +12333,7 @@ mod tests {
                 &visible(&["fs", "Point", "a"]),
                 "Point"
             ),
-            Some("a::Point".to_string())
+            Some(TypeId::from_source_name("a::Point"))
         );
     }
 
@@ -11761,7 +12757,11 @@ mod tests {
         let (hir, diags) = crate::ir::lower::lower_program(&program);
         assert!(diags.is_empty(), "{diags:?}");
         let p = crate::ir::lowered::lower_program(&hir);
-        let f = p.functions.iter().find(|f| f.name == "f").unwrap();
+        let f = p
+            .functions
+            .iter()
+            .find(|f| f.name.to_string() == "f")
+            .unwrap();
 
         let mut tables = TestTables::build(&program, &["f"], &[]);
         assert!(tables.with_ctx(|ctx| lir_supported_function(f, ctx)));
@@ -11784,10 +12784,10 @@ mod tests {
             .insert("zoo::Dog".to_string(), animal_layout);
         tables
             .class_base
-            .insert("zoo::Dog".to_string(), "zoo::Animal".to_string());
+            .insert("zoo::Dog".to_string(), "zoo::Animal".to_string().into());
 
-        let dog = Type::Named("zoo::Dog".to_string());
-        let animal = Type::Named("Animal".to_string());
+        let dog = Type::Named("zoo::Dog".to_string().into());
+        let animal = Type::Named("Animal".to_string().into());
         assert!(
             tables.with_ctx(|ctx| ctx.class_widening(&animal, &dog)),
             "a subclass must fit its base's slot through the alias spelling"
@@ -11795,10 +12795,9 @@ mod tests {
         // ... and the relation stays directional: the base does not fit a
         // subclass slot, whichever name it is reached by.
         assert!(!tables.with_ctx(|ctx| ctx.class_widening(&dog, &animal)));
-        assert!(
-            !tables
-                .with_ctx(|ctx| ctx.class_widening(&dog, &Type::Named("zoo::Animal".to_string())))
-        );
+        assert!(!tables.with_ctx(|ctx| {
+            ctx.class_widening(&dog, &Type::Named("zoo::Animal".to_string().into()))
+        }));
     }
 
     // 63. an object literal that names the same field twice is rejected even
@@ -11820,8 +12819,8 @@ mod tests {
         assert!(assignable_repr(&array(Type::I64), &array(Type::I64)));
         assert!(!assignable_repr(&array(Type::I64), &array(Type::String)));
         assert!(!assignable_repr(
-            &array(Type::Named("Point".to_string())),
-            &array(Type::Named("Other".to_string()))
+            &array(Type::Named("Point".to_string().into())),
+            &array(Type::Named("Other".to_string().into()))
         ));
         assert!(!assignable_repr(&array(Type::String), &array(Type::Void)));
     }
@@ -11960,8 +12959,8 @@ mod tests {
         // is why [`assignable_repr`] looks INSIDE an array handle rather than
         // calling any two of them interchangeable.
         assert!(!assignable_repr(
-            &Type::Array(Box::new(Type::Named("Named".to_string()))),
-            &Type::Array(Box::new(Type::Named("Item".to_string())))
+            &Type::Array(Box::new(Type::Named("Named".to_string().into()))),
+            &Type::Array(Box::new(Type::Named("Item".to_string().into())))
         ));
     }
 
@@ -12045,7 +13044,11 @@ mod tests {
         let (hir, diags) = crate::ir::lower::lower_program(&program);
         assert!(diags.is_empty(), "{diags:?}");
         let p = crate::ir::lowered::lower_program(&hir);
-        let f = p.functions.iter().find(|f| f.name == "f").unwrap();
+        let f = p
+            .functions
+            .iter()
+            .find(|f| f.name.to_string() == "f")
+            .unwrap();
 
         let mut tables = TestTables::build(&program, &["f"], &[]);
         assert!(tables.with_ctx(|ctx| lir_supported_function(f, ctx)));
@@ -12293,9 +13296,9 @@ mod tests {
             "itself".to_string(),
             Vec::new(),
             Vec::new(),
-            Type::Named("Self".to_string()),
+            Type::Named("Self".to_string().into()),
         ));
-        let shape = Type::Named("Shape".to_string());
+        let shape = Type::Named("Shape".to_string().into());
         let call = |ty: Type| HirExpr {
             kind: HirExprKind::MethodCall {
                 object: Box::new(HirExpr {
@@ -12468,7 +13471,7 @@ mod tests {
         let (f, mut tables) = lir_fn_and_tables(&src, "f", &["f"]);
         assert!(tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
         let methods = tables.iface_methods.get_mut("Shape").unwrap();
-        methods[1].1[1] = Type::Generic("Map".to_string(), vec![Type::String, Type::I64]);
+        methods[1].1[1] = Type::Generic("Map".to_string().into(), vec![Type::String, Type::I64]);
         assert!(!tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
     }
 
@@ -12735,15 +13738,15 @@ mod tests {
     }
 
     fn map_ty(key: Type, value: Type) -> Type {
-        Type::Generic("Map".to_string(), vec![key, value])
+        Type::Generic("Map".to_string().into(), vec![key, value])
     }
 
     fn frozen_map_ty(key: Type, value: Type) -> Type {
-        Type::Generic("FrozenMap".to_string(), vec![key, value])
+        Type::Generic("FrozenMap".to_string().into(), vec![key, value])
     }
 
     fn frozen_array_ty(elem: Type) -> Type {
-        Type::Generic("FrozenArray".to_string(), vec![elem])
+        Type::Generic("FrozenArray".to_string().into(), vec![elem])
     }
 
     const MAP_IMPORT: &str = "import std::collections::Map;";
@@ -12999,7 +14002,7 @@ mod tests {
         let span = crate::diagnostics::Span::dummy();
         let fresh = HirExpr {
             kind: HirExprKind::StaticCall {
-                class: "Map".to_string(),
+                class: "Map".to_string().into(),
                 method: "new".to_string(),
                 args: Vec::new(),
             },
@@ -13019,7 +14022,7 @@ mod tests {
         // same node, a type that is not the empty map
         let typed = HirExpr {
             kind: HirExprKind::StaticCall {
-                class: "Map".to_string(),
+                class: "Map".to_string().into(),
                 method: "new".to_string(),
                 args: Vec::new(),
             },
@@ -13031,7 +14034,7 @@ mod tests {
         // and a different static call with the empty-map type is not exempt
         let other = HirExpr {
             kind: HirExprKind::StaticCall {
-                class: "Other".to_string(),
+                class: "Other".to_string().into(),
                 method: "new".to_string(),
                 args: Vec::new(),
             },
@@ -13076,15 +14079,15 @@ mod tests {
             // `Range<i64>` is in the subset as of willow-0g8j.2.10; every
             // OTHER instantiation of the name is still out, which is what
             // makes the point that the name alone decides nothing.
-            Type::Generic("Range".to_string(), vec![Type::String]),
-            Type::Generic("Holder".to_string(), vec![Type::I64]),
+            Type::Generic("Range".to_string().into(), vec![Type::String]),
+            Type::Generic("Holder".to_string().into(), vec![Type::I64]),
         ] {
             assert!(lir_collection(&ty).is_none(), "{ty:?} is not a collection");
             let tables = empty_tables();
             tables.with_ctx(|ctx| assert!(!ctx.supported_type(&ty), "{ty:?} is not storable"));
         }
-        let channel = Type::Generic("Channel".to_string(), vec![Type::I64]);
-        let task = Type::Generic("Task".to_string(), vec![Type::I64]);
+        let channel = Type::Generic("Channel".to_string().into(), vec![Type::I64]);
+        let task = Type::Generic("Task".to_string().into(), vec![Type::I64]);
         assert!(lir_collection(&channel).is_none());
         assert!(lir_collection(&task).is_none());
         let tables = empty_tables();
@@ -13096,8 +14099,8 @@ mod tests {
         // ENUMS, not collections: nothing may route them into the map/array
         // emission paths.
         for ty in [
-            Type::Generic("Option".to_string(), vec![Type::I64]),
-            Type::Generic("Result".to_string(), vec![Type::I64, Type::String]),
+            Type::Generic("Option".to_string().into(), vec![Type::I64]),
+            Type::Generic("Result".to_string().into(), vec![Type::I64, Type::String]),
         ] {
             assert!(lir_collection(&ty).is_none(), "{ty:?} is not a collection");
             let tables = empty_tables();
@@ -13111,9 +14114,9 @@ mod tests {
         // shape, so nothing downstream can take it for a usable collection.
         let tables = empty_tables();
         for ty in [
-            Type::Named("Map".to_string()),
-            Type::Generic("Map".to_string(), vec![Type::String]),
-            Type::Generic("FrozenArray".to_string(), vec![Type::I64, Type::I64]),
+            Type::Named("Map".to_string().into()),
+            Type::Generic("Map".to_string().into(), vec![Type::String]),
+            Type::Generic("FrozenArray".to_string().into(), vec![Type::I64, Type::I64]),
         ] {
             tables.with_ctx(|ctx| assert!(!ctx.supported_type(&ty), "{ty:?} is not storable"));
         }
@@ -13479,12 +14482,15 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
     // representation-compatible even though both are `Type::Named`.
     #[test]
     fn m16_two_named_types_are_never_repr_compatible() {
-        let color = Type::Named("Color".to_string());
-        let shape = Type::Named("Shape".to_string());
+        let color = Type::Named("Color".to_string().into());
+        let shape = Type::Named("Shape".to_string().into());
         assert!(assignable_repr(&color, &color));
         assert!(!assignable_repr(&color, &shape));
         assert!(!assignable_repr(&shape, &color));
-        assert!(!assignable_repr(&color, &Type::Named("Cell".to_string())));
+        assert!(!assignable_repr(
+            &color,
+            &Type::Named("Cell".to_string().into())
+        ));
         // and a named type never matches a scalar, in either direction, even
         // when both are one machine word
         assert!(!assignable_repr(&color, &Type::I64));
@@ -13635,7 +14641,7 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         tables.with_ctx(|ctx| {
             assert!(ctx.supported_enum("Color"));
             assert!(ctx.is_enum("Color"));
-            assert!(ctx.supported_type(&Type::Named("Color".to_string())));
+            assert!(ctx.supported_type(&Type::Named("Color".to_string().into())));
         });
         tables.interfaces.insert("Color".to_string());
         tables.with_ctx(|ctx| {
@@ -13702,7 +14708,8 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
     // object, and an enum with none is a bare tag that must NOT be rooted.
     #[test]
     fn m26_representation_follows_the_whole_enum_not_the_variant() {
-        use crate::semantic::symbols::{EnumInfo, EnumVariantInfo};
+        use super::super::EnumInfo;
+        use crate::semantic::symbols::EnumVariantInfo;
         let variant = |name: &str, payloads: Vec<Type>, tag: i64| EnumVariantInfo {
             name: name.to_string(),
             payload_types: payloads,
@@ -13713,7 +14720,7 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         infos.insert(
             "Color".to_string(),
             EnumInfo {
-                name: "Color".to_string(),
+                name: "Color".into(),
                 public: true,
                 type_params: vec![],
                 declaration_span: crate::diagnostics::Span::dummy(),
@@ -13723,7 +14730,7 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         infos.insert(
             "Shape".to_string(),
             EnumInfo {
-                name: "Shape".to_string(),
+                name: "Shape".into(),
                 public: true,
                 type_params: vec![],
                 declaration_span: crate::diagnostics::Span::dummy(),
@@ -13735,10 +14742,19 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
                 ],
             },
         );
-        assert!(!is_gc_managed(&Type::Named("Color".to_string()), &infos));
-        assert!(is_gc_managed(&Type::Named("Shape".to_string()), &infos));
+        assert!(!is_gc_managed(
+            &Type::Named("Color".to_string().into()),
+            &infos
+        ));
+        assert!(is_gc_managed(
+            &Type::Named("Shape".to_string().into()),
+            &infos
+        ));
         // and an undeclared named type is a class, which always is
-        assert!(is_gc_managed(&Type::Named("Cell".to_string()), &infos));
+        assert!(is_gc_managed(
+            &Type::Named("Cell".to_string().into()),
+            &infos
+        ));
     }
 
     // m27. an interface-typed payload slot holds a BOX, and the box is built
@@ -13765,8 +14781,8 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         // is why the store position (and not an arm body) is where the box is
         // allowed to appear
         assert!(!assignable_repr(
-            &Type::Named("Named".to_string()),
-            &Type::Named("Marker".to_string())
+            &Type::Named("Named".to_string().into()),
+            &Type::Named("Marker".to_string().into())
         ));
     }
 
@@ -13932,7 +14948,7 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         assert!(eligible_checked(src, "f", &["f"]));
         // The list is closed against names the language does not have either,
         // so a future `Option::filter` cannot be emitted before it is written.
-        let opt_i64 = Type::Generic("Option".to_string(), vec![Type::I64]);
+        let opt_i64 = Type::Generic("Option".to_string().into(), vec![Type::I64]);
         let pred = Type::Fn(vec![Type::I64], Box::new(Type::Bool));
         assert!(option_result_method(&opt_i64, "filter", &[pred]).is_none());
     }
@@ -13981,7 +14997,7 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         else {
             panic!("the function returns the `get` result");
         };
-        v.ty = Type::Generic("Option".to_string(), vec![Type::I64]);
+        v.ty = Type::Generic("Option".to_string().into(), vec![Type::I64]);
         f.return_type = v.ty.clone();
         assert!(
             tables.with_ctx(|ctx| !lir_supported_function(&f, ctx)),
@@ -14141,9 +15157,9 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
             // and the builtin handles by NAME, never a `Type::Generic` for its
             // shape alone. Not `Future<i64>`: that one IS admitted as of
             // willow-0g8j.3, as an opaque runtime pointer word.
-            Type::Generic("Holder".to_string(), vec![Type::I64]),
+            Type::Generic("Holder".to_string().into(), vec![Type::I64]),
             // Not `Range<i64>`: that one IS admitted as of willow-0g8j.2.10.
-            Type::Generic("Range".to_string(), vec![Type::String]),
+            Type::Generic("Range".to_string().into(), vec![Type::String]),
         ] {
             tables.with_ctx(|ctx| {
                 assert!(!ctx.supported_type(&ty), "{ty:?} is not an admitted enum");
@@ -14159,12 +15175,18 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
     fn p22b_future_is_admitted_and_vets_its_output() {
         let tables = empty_tables();
         tables.with_ctx(|ctx| {
-            assert!(ctx.supported_type(&Type::Generic("Future".to_string(), vec![Type::Void])));
-            assert!(ctx.supported_type(&Type::Generic("Future".to_string(), vec![Type::String])));
+            assert!(ctx.supported_type(&Type::Generic(
+                "Future".to_string().into(),
+                vec![Type::Void]
+            )));
+            assert!(ctx.supported_type(&Type::Generic(
+                "Future".to_string().into(),
+                vec![Type::String]
+            )));
             assert!(
                 !ctx.supported_type(&Type::Generic(
-                    "Future".to_string(),
-                    vec![Type::Generic("Holder".to_string(), vec![Type::I64])]
+                    "Future".to_string().into(),
+                    vec![Type::Generic("Holder".to_string().into(), vec![Type::I64])]
                 )),
                 "an output type outside the subset keeps the future out"
             );
@@ -14468,7 +15490,7 @@ fn f(n: i64) -> Result<i64, String> {
             lock: None,
         };
         let f = LirFunction {
-            name: "f".to_string(),
+            name: "f".to_string().into(),
             params: Vec::new(),
             return_type: Type::Void,
             is_async: false,
@@ -14560,7 +15582,7 @@ fn f() {
     #[test]
     fn r13_super_init_without_a_base_class_reason() {
         let f = LirFunction {
-            name: "Child::init".to_string(),
+            name: FunctionId::method(TypeId::local("Child"), "init"),
             is_async: false,
             params: Vec::new(),
             captures: Vec::new(),
@@ -14906,7 +15928,7 @@ fn f() {
             assert!(ctx.supported_type(&void_ret));
             // an unsupported component sinks the whole type.
             let bad = Type::Fn(
-                vec![Type::Named("Missing".to_string())],
+                vec![Type::Named("Missing".to_string().into())],
                 Box::new(Type::I64),
             );
             assert!(!ctx.supported_type(&bad));
@@ -15034,11 +16056,14 @@ fn f() {
     // decides the new value's representation.
     #[test]
     fn f19_option_map_result_type_follows_the_callable() {
-        let opt_i64 = Type::Generic("Option".to_string(), vec![Type::I64]);
+        let opt_i64 = Type::Generic("Option".to_string().into(), vec![Type::I64]);
         let to_string = Type::Fn(vec![Type::I64], Box::new(Type::String));
         assert_eq!(
             option_result_method(&opt_i64, "map", &[to_string]),
-            Some(Type::Generic("Option".to_string(), vec![Type::String]))
+            Some(Type::Generic(
+                "Option".to_string().into(),
+                vec![Type::String]
+            ))
         );
         // a `void`-returning callable would build a `Some` with no payload slot
         let to_void = Type::Fn(vec![Type::I64], Box::new(Type::Void));
@@ -15055,8 +16080,8 @@ fn f() {
     // same two-word box whatever its type arguments.
     #[test]
     fn f20_and_then_and_or_else_merge_rules() {
-        let opt_i64 = Type::Generic("Option".to_string(), vec![Type::I64]);
-        let opt_str = Type::Generic("Option".to_string(), vec![Type::String]);
+        let opt_i64 = Type::Generic("Option".to_string().into(), vec![Type::I64]);
+        let opt_str = Type::Generic("Option".to_string().into(), vec![Type::String]);
         let to_opt_str = Type::Fn(vec![Type::I64], Box::new(opt_str.clone()));
         assert_eq!(
             option_result_method(&opt_i64, "and_then", &[to_opt_str]),
@@ -15071,8 +16096,9 @@ fn f() {
         let other = Type::Fn(vec![], Box::new(opt_str));
         assert_eq!(option_result_method(&opt_i64, "or_else", &[other]), None);
 
-        let res = Type::Generic("Result".to_string(), vec![Type::I64, Type::String]);
-        let unresolved_err = Type::Generic("Result".to_string(), vec![Type::I64, Type::Void]);
+        let res = Type::Generic("Result".to_string().into(), vec![Type::I64, Type::String]);
+        let unresolved_err =
+            Type::Generic("Result".to_string().into(), vec![Type::I64, Type::Void]);
         let recover = Type::Fn(vec![Type::String], Box::new(unresolved_err.clone()));
         assert_eq!(
             option_result_method(&res, "or_else", &[recover]),
@@ -15082,7 +16108,7 @@ fn f() {
         let mismatched = Type::Fn(
             vec![Type::String],
             Box::new(Type::Generic(
-                "Result".to_string(),
+                "Result".to_string().into(),
                 vec![Type::String, Type::String],
             )),
         );
@@ -15093,13 +16119,13 @@ fn f() {
     // side while passing the ok payload through.
     #[test]
     fn f21_map_err_is_result_only() {
-        let res = Type::Generic("Result".to_string(), vec![Type::I64, Type::String]);
+        let res = Type::Generic("Result".to_string().into(), vec![Type::I64, Type::String]);
         let wrap = Type::Fn(vec![Type::String], Box::new(Type::String));
         assert_eq!(
             option_result_method(&res, "map_err", std::slice::from_ref(&wrap)),
             Some(res.clone())
         );
-        let opt = Type::Generic("Option".to_string(), vec![Type::I64]);
+        let opt = Type::Generic("Option".to_string().into(), vec![Type::I64]);
         assert_eq!(option_result_method(&opt, "map_err", &[wrap]), None);
     }
 
@@ -15108,7 +16134,7 @@ fn f() {
     // unwrap family already followed.
     #[test]
     fn f22_void_payloads_are_excluded_from_combinators() {
-        let res_void = Type::Generic("Result".to_string(), vec![Type::Void, Type::String]);
+        let res_void = Type::Generic("Result".to_string().into(), vec![Type::Void, Type::String]);
         let f = Type::Fn(vec![Type::Void], Box::new(Type::I64));
         for method in ["map", "and_then"] {
             assert_eq!(
@@ -15209,7 +16235,7 @@ fn f() {
     fn d04_non_scalar_receivers_are_not_scalar_to_string() {
         for recv in [
             Type::Array(Box::new(Type::I64)),
-            Type::Named("Widget".to_string()),
+            Type::Named("Widget".to_string().into()),
             Type::Void,
         ] {
             assert_eq!(scalar_to_string(&recv, "toString", &[]), None, "{recv:?}");
@@ -15382,7 +16408,7 @@ fn f() {
         let span = crate::diagnostics::Span::dummy();
         let call = HirExpr {
             kind: HirExprKind::Call {
-                callee: "panic".to_string(),
+                callee: "panic".to_string().into(),
                 args: Vec::new(),
             },
             ty: Type::Never,
@@ -15495,7 +16521,11 @@ fn f() {
                        }
                    }";
         let (p, tables) = checked_lowering(src, &["f"]);
-        let f = p.functions.iter().find(|f| f.name == "f").expect("lowered");
+        let f = p
+            .functions
+            .iter()
+            .find(|f| f.name.to_string() == "f")
+            .expect("lowered");
         tables.with_ctx(|ctx| {
             let ctx = &LirTypeCtx {
                 return_type: &f.return_type,
@@ -15643,7 +16673,7 @@ fn f() {
         };
         let never = HirExpr {
             kind: HirExprKind::Call {
-                callee: "panic".to_string(),
+                callee: "panic".to_string().into(),
                 args: Vec::new(),
             },
             ty: Type::Never,
@@ -16015,7 +17045,7 @@ fn f() {
         let function = hir
             .functions
             .iter()
-            .find(|f| f.name == name)
+            .find(|f| f.name.to_string() == name)
             .expect("function present");
         match function.body.last().expect("return statement") {
             HirStmt::Return {

@@ -1,12 +1,24 @@
 /// Stable source-file identity within one compilation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct FileId(pub u32);
 
 impl FileId {
     pub const ENTRY: Self = Self(0);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Span {
     pub file_id: FileId,
     pub start: usize,

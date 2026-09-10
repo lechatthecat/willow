@@ -448,11 +448,12 @@ mod tests {
                 let Item::Function(function) = &mut program.items[0] else {
                     unreachable!()
                 };
-                let Stmt::Expr(expr) = function.body.stmts.remove(0) else {
+                let Stmt::Expr(expr) = &mut function.body.stmts[0] else {
                     unreachable!()
                 };
                 let span = crate::diagnostics::Span::new(0, 0, 1, 1);
-                let mut expr = expr.expr;
+                let mut expr =
+                    std::mem::replace(&mut expr.expr, crate::parser::ownership::placeholder_expr());
                 for _ in 0..50_000 {
                     expr = Expr::TryPropagate(
                         Box::new(expr),
@@ -467,13 +468,7 @@ mod tests {
                 let mut hazards = HazardVisitor { panics: false };
                 hazards.visit_block(&function.body);
                 assert!(hazards.panics);
-                let Stmt::Expr(expr) = function.body.stmts.remove(0) else {
-                    unreachable!()
-                };
-                let mut expr = expr.expr;
-                while let Expr::TryPropagate(inner, _, _) = expr {
-                    expr = *inner;
-                }
+                drop(program);
             })
             .unwrap()
             .join()

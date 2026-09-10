@@ -41,6 +41,7 @@ fn is_value_type(ty: &Type) -> bool {
     )
 }
 
+#[willow_continuations::checker]
 impl TypeChecker {
     /// True if a value of `ty` may be transferred across worker/task boundaries.
     pub(super) fn is_send(&self, ty: &Type) -> bool {
@@ -148,12 +149,17 @@ impl TypeChecker {
         if !self.enforce_send_sync || self.is_task_send(ret, params, locals) {
             return;
         }
-        let first_bad = params
+        let mut first_bad = ret;
+        for ty in params
             .iter()
             .chain(locals.iter())
             .chain(std::iter::once(ret))
-            .find(|ty| !self.is_send(ty))
-            .unwrap_or(ret);
+        {
+            if !self.is_send(ty) {
+                first_bad = ty;
+                break;
+            }
+        }
         self.push(
             Diagnostic::new(
                 Severity::Error,
@@ -292,6 +298,7 @@ enum Marker {
 }
 
 /// Substitute `Named(param)` occurrences using `subst` (type param → arg).
+#[willow_continuations::function(substitute)]
 fn substitute(ty: &Type, subst: &[(String, Type)]) -> Type {
     match ty {
         Type::Named(n) => subst

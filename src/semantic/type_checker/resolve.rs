@@ -14,6 +14,7 @@ use super::*;
 /// builtin generics (Array/Map/Result/Option/Channel/Future/...) and primitives
 /// untouched. Used so a module function signature that references one of its own
 /// types resolves in the importing file (willow-1js.5).
+#[willow_continuations::function(qualify_local_type, rename_imported_type, rename_module_prefix)]
 pub(crate) fn qualify_local_type(
     ty: &Type,
     module: &str,
@@ -51,6 +52,7 @@ pub(crate) fn qualify_local_type(
 /// only the enum's build-wide identity is a name both units answer to
 /// (willow-0g8j.3). Complements [`qualify_local_type`], which does the same job
 /// for the names a module DECLARES.
+#[willow_continuations::function(qualify_local_type, rename_imported_type, rename_module_prefix)]
 fn rename_imported_type(ty: &Type, renames: &HashMap<String, String>) -> Type {
     let rename_name =
         |n: &str| -> String { renames.get(n).cloned().unwrap_or_else(|| n.to_string()) };
@@ -82,6 +84,7 @@ fn rename_imported_type(ty: &Type, renames: &HashMap<String, String>) -> Type {
 /// nothing here, and the two spellings made one class into two types
 /// (willow-uvlp). Only the leading segment is rewritten: what follows it is the
 /// type's own name, which every unit spells the same way.
+#[willow_continuations::function(qualify_local_type, rename_imported_type, rename_module_prefix)]
 fn rename_module_prefix(ty: &Type, prefixes: &HashMap<String, String>) -> Type {
     let rename_name = |n: &str| -> String {
         match n.split_once("::") {
@@ -135,6 +138,7 @@ fn std_schema_type(ty: crate::stdlib_schema::StdType) -> Type {
     })
 }
 
+#[willow_continuations::checker]
 impl TypeChecker {
     pub(super) fn register_builtin_panic_surface(&mut self) {
         let mut fields = HashMap::new();
@@ -636,7 +640,7 @@ impl TypeChecker {
                 }
                 Item::Class(c) => {
                     let class_name = format!("{name}::{}", c.name);
-                    let info = class_info_from_decl(c, &class_name, &qualify);
+                    let info = imported_class_info_from_decl(c, &class_name, &qualify);
                     self.symbols.define_class(class_name, info);
                 }
                 Item::Enum(e) => self.register_enum_with_module(e, name, canonical, &qualify),

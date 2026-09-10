@@ -56,6 +56,7 @@ fn indent(level: usize, out: &mut String) {
     }
 }
 
+#[willow_continuations::function(format_expr, format_stmt)]
 fn format_stmt(stmt: &HirStmt, level: usize, out: &mut String) {
     indent(level, out);
     match stmt {
@@ -197,13 +198,18 @@ fn format_stmt(stmt: &HirStmt, level: usize, out: &mut String) {
             out.push_str(&format!("{class}::{field} = {};\n", format_expr(value)));
         }
         HirStmt::SuperInit { args, .. } => {
-            let args = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
+            let args = args
+                .iter()
+                .map(|expr| format_expr(expr))
+                .collect::<Vec<_>>()
+                .join(", ");
             out.push_str(&format!("super.init({args});\n"));
         }
     }
 }
 
 /// Render an expression with its resolved type as a `<expr>: <type>` suffix.
+#[willow_continuations::function(format_expr, format_stmt)]
 fn format_expr(e: &HirExpr) -> String {
     let inner = match &e.kind {
         HirExprKind::Int(n) => n.to_string(),
@@ -211,7 +217,7 @@ fn format_expr(e: &HirExpr) -> String {
         HirExprKind::Bool(b) => b.to_string(),
         HirExprKind::Str(s) => format!("{s:?}"),
         HirExprKind::Var(name) => name.clone(),
-        HirExprKind::FnRef(name) => name.clone(),
+        HirExprKind::FnRef(name) => name.to_string(),
         HirExprKind::Binary { op, lhs, rhs } => {
             format!(
                 "({} {} {})",
@@ -224,7 +230,11 @@ fn format_expr(e: &HirExpr) -> String {
             format!("{}{}", unaryop_str(op), format_expr(operand))
         }
         HirExprKind::Call { callee, args } => {
-            let args = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
+            let args = args
+                .iter()
+                .map(|expr| format_expr(expr))
+                .collect::<Vec<_>>()
+                .join(", ");
             format!("{callee}({args})")
         }
         HirExprKind::Print { value, newline } => {
@@ -234,7 +244,7 @@ fn format_expr(e: &HirExpr) -> String {
         HirExprKind::Array { elements } => {
             let items = elements
                 .iter()
-                .map(format_expr)
+                .map(|expr| format_expr(expr))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("[{items}]")
@@ -253,7 +263,11 @@ fn format_expr(e: &HirExpr) -> String {
             format_expr(else_expr)
         ),
         HirExprKind::New { class, args } => {
-            let args = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
+            let args = args
+                .iter()
+                .map(|expr| format_expr(expr))
+                .collect::<Vec<_>>()
+                .join(", ");
             format!("new {class}({args})")
         }
         HirExprKind::FieldAccess { object, field } => {
@@ -264,15 +278,20 @@ fn format_expr(e: &HirExpr) -> String {
             method,
             args,
         } => {
-            let args = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
+            let args = args
+                .iter()
+                .map(|expr| format_expr(expr))
+                .collect::<Vec<_>>()
+                .join(", ");
             format!("{}.{method}({args})", format_expr(object))
         }
         HirExprKind::ObjectLiteral { class, fields } => {
-            let items = fields
-                .iter()
-                .map(|(name, value)| format!("{name}: {}", format_expr(value)))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let mut rendered = Vec::with_capacity(fields.len());
+            for (name, value) in fields {
+                let value = format_expr(value);
+                rendered.push(format!("{name}: {value}"));
+            }
+            let items = rendered.join(", ");
             format!("{class} {{ {items} }}")
         }
         HirExprKind::StaticField { class, field } => format!("{class}::{field}"),
@@ -281,7 +300,11 @@ fn format_expr(e: &HirExpr) -> String {
             method,
             args,
         } => {
-            let args = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
+            let args = args
+                .iter()
+                .map(|expr| format_expr(expr))
+                .collect::<Vec<_>>()
+                .join(", ");
             format!("{class}::{method}({args})")
         }
         HirExprKind::ReferenceArg { place } => format!("&{}", format_expr(place)),
@@ -353,7 +376,7 @@ pub(crate) fn expr_text(e: &HirExpr) -> String {
 }
 
 /// Type rendering shared with the LIR dump (`lowered.rs`).
-pub(crate) fn type_text(ty: &Type) -> String {
+pub(crate) fn type_text<N: std::fmt::Display>(ty: &Type<N>) -> String {
     type_str(ty)
 }
 
@@ -412,29 +435,66 @@ fn unaryop_str(op: &UnaryOp) -> &'static str {
     }
 }
 
-fn type_str(ty: &Type) -> String {
-    match ty {
-        Type::I64 => "i64".to_string(),
-        Type::F64 => "f64".to_string(),
-        Type::Bool => "bool".to_string(),
-        Type::String => "String".to_string(),
-        Type::Void => "void".to_string(),
-        Type::Never => "never".to_string(),
-        Type::Named(name) => name.clone(),
-        Type::Array(inner) => format!("Array<{}>", type_str(inner)),
-        Type::Generic(name, args) => {
-            let args = args.iter().map(type_str).collect::<Vec<_>>().join(", ");
-            format!("{name}<{args}>")
-        }
-        Type::Fn(params, ret) => {
-            let params = params.iter().map(type_str).collect::<Vec<_>>().join(", ");
-            format!("fn({params}) -> {}", type_str(ret))
-        }
-        Type::Closure(params, ret) => {
-            let params = params.iter().map(type_str).collect::<Vec<_>>().join(", ");
-            format!("closure({params}) -> {}", type_str(ret))
+fn type_str<N: std::fmt::Display>(ty: &Type<N>) -> String {
+    enum Part<'a, N> {
+        Ty(&'a Type<N>),
+        Text(&'static str),
+    }
+    let mut pending = vec![Part::Ty(ty)];
+    let mut out = String::new();
+    while let Some(part) = pending.pop() {
+        let ty = match part {
+            Part::Ty(ty) => ty,
+            Part::Text(text) => {
+                out.push_str(text);
+                continue;
+            }
+        };
+        match ty {
+            Type::I64 => out.push_str("i64"),
+            Type::F64 => out.push_str("f64"),
+            Type::Bool => out.push_str("bool"),
+            Type::String => out.push_str("String"),
+            Type::Void => out.push_str("void"),
+            Type::Never => out.push_str("never"),
+            Type::Named(name) => {
+                use std::fmt::Write;
+                write!(out, "{name}").expect("string write");
+            }
+            Type::Array(inner) => {
+                out.push_str("Array<");
+                pending.push(Part::Text(">"));
+                pending.push(Part::Ty(inner));
+            }
+            Type::Generic(name, args) => {
+                use std::fmt::Write;
+                write!(out, "{name}<").expect("string write");
+                pending.push(Part::Text(">"));
+                for (index, arg) in args.iter().enumerate().rev() {
+                    pending.push(Part::Ty(arg));
+                    if index > 0 {
+                        pending.push(Part::Text(", "));
+                    }
+                }
+            }
+            Type::Fn(params, ret) | Type::Closure(params, ret) => {
+                out.push_str(if matches!(ty, Type::Fn(..)) {
+                    "fn("
+                } else {
+                    "closure("
+                });
+                pending.push(Part::Ty(ret));
+                pending.push(Part::Text(") -> "));
+                for (index, param) in params.iter().enumerate().rev() {
+                    pending.push(Part::Ty(param));
+                    if index > 0 {
+                        pending.push(Part::Text(", "));
+                    }
+                }
+            }
         }
     }
+    out
 }
 
 #[cfg(test)]

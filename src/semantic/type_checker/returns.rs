@@ -78,6 +78,7 @@ impl ReturnSite<'_> {
     }
 }
 
+#[willow_continuations::checker]
 impl TypeChecker {
     /// Report E0205 when control can reach the end of a body that owes its
     /// caller a value.
@@ -147,7 +148,12 @@ impl TypeChecker {
     fn block_diverges(&self, block: &Block) -> bool {
         // A diverging statement makes the rest of the block unreachable, so one
         // anywhere is enough.
-        block.stmts.iter().any(|stmt| self.stmt_diverges(stmt))
+        for stmt in &block.stmts {
+            if self.stmt_diverges(stmt) {
+                return true;
+            }
+        }
+        false
     }
 
     fn stmt_diverges(&self, stmt: &Stmt) -> bool {
@@ -204,17 +210,30 @@ impl TypeChecker {
             // A non-exhaustive `match` is E1206, so the arms listed here are
             // the only ways through it.
             Expr::Match(m) => {
-                !m.arms.is_empty()
-                    && m.arms.iter().all(|arm| match &arm.body {
+                if m.arms.is_empty() {
+                    return false;
+                }
+                for arm in &m.arms {
+                    let diverges = match &arm.body {
                         MatchBody::Block(block) => self.block_diverges(block),
-                        MatchBody::Expr(e) => self.expr_diverges(e),
-                    })
+                        MatchBody::Expr(expr) => self.expr_diverges(expr),
+                    };
+                    if !diverges {
+                        return false;
+                    }
+                }
+                true
             }
-            // `select` runs the body of exactly one case, whichever becomes
-            // ready (or `default`, when none does).
             Expr::Select(sel) => {
-                !sel.cases.is_empty()
-                    && sel.cases.iter().all(|case| self.block_diverges(&case.body))
+                if sel.cases.is_empty() {
+                    return false;
+                }
+                for case in &sel.cases {
+                    if !self.block_diverges(&case.body) {
+                        return false;
+                    }
+                }
+                true
             }
             _ => false,
         }
@@ -237,49 +256,54 @@ fn is_result_void(ty: &Type) -> bool {
 /// searched, because a `break` this scan misses would let the caller claim a
 /// loop runs forever when it does not.
 fn block_breaks_enclosing_loop(block: &Block) -> bool {
-    block.stmts.iter().any(stmt_breaks_enclosing_loop)
-}
-
-fn stmt_breaks_enclosing_loop(stmt: &Stmt) -> bool {
-    match stmt {
-        Stmt::Break(_) => true,
-        Stmt::If(s) => {
-            block_breaks_enclosing_loop(&s.then_block)
-                || s.else_block
-                    .as_ref()
-                    .is_some_and(block_breaks_enclosing_loop)
+    enum Node<'a> {
+        Stmt(&'a Stmt),
+        Expr(&'a Expr),
+    }
+    let mut work: Vec<_> = block.stmts.iter().map(Node::Stmt).collect();
+    while let Some(node) = work.pop() {
+        match node {
+            Node::Stmt(stmt) => match stmt {
+                Stmt::Break(_) => return true,
+                Stmt::If(stmt) => {
+                    work.extend(stmt.then_block.stmts.iter().map(Node::Stmt));
+                    if let Some(block) = &stmt.else_block {
+                        work.extend(block.stmts.iter().map(Node::Stmt));
+                    }
+                }
+                Stmt::Lock(stmt) => work.extend(stmt.body.stmts.iter().map(Node::Stmt)),
+                Stmt::Let(stmt) => work.push(Node::Expr(&stmt.init)),
+                Stmt::Assign(stmt) => work.push(Node::Expr(&stmt.value)),
+                Stmt::Expr(stmt) => work.push(Node::Expr(&stmt.expr)),
+                Stmt::While(_)
+                | Stmt::For(_)
+                | Stmt::Defer(_)
+                | Stmt::Return(_)
+                | Stmt::Continue(_)
+                | Stmt::FieldAssign(_)
+                | Stmt::SuperInit(_)
+                | Stmt::StaticFieldAssign(_)
+                | Stmt::IndexAssign(_) => {}
+            },
+            Node::Expr(expr) => match expr {
+                Expr::Match(expr) => {
+                    for arm in &expr.arms {
+                        match &arm.body {
+                            MatchBody::Block(block) => {
+                                work.extend(block.stmts.iter().map(Node::Stmt))
+                            }
+                            MatchBody::Expr(expr) => work.push(Node::Expr(expr)),
+                        }
+                    }
+                }
+                Expr::Select(expr) => {
+                    for case in &expr.cases {
+                        work.extend(case.body.stmts.iter().map(Node::Stmt));
+                    }
+                }
+                _ => {}
+            },
         }
-        Stmt::Lock(s) => block_breaks_enclosing_loop(&s.body),
-        Stmt::Let(s) => expr_breaks_enclosing_loop(&s.init),
-        Stmt::Assign(s) => expr_breaks_enclosing_loop(&s.value),
-        Stmt::Expr(s) => expr_breaks_enclosing_loop(&s.expr),
-        // An inner loop consumes its own `break`s.
-        Stmt::While(_) | Stmt::For(_) => false,
-        // A `defer` body runs at scope exit and cannot break the loop it was
-        // registered in (E0904 rejects one that tries).
-        Stmt::Defer(_) => false,
-        Stmt::Return(_)
-        | Stmt::Continue(_)
-        | Stmt::FieldAssign(_)
-        | Stmt::SuperInit(_)
-        | Stmt::StaticFieldAssign(_)
-        | Stmt::IndexAssign(_) => false,
     }
-}
-
-fn expr_breaks_enclosing_loop(expr: &Expr) -> bool {
-    match expr {
-        // A `match` arm and a `select` case are the expression positions that
-        // hold statements. A lambda body also does, but its `break` belongs to
-        // a loop inside the lambda.
-        Expr::Match(m) => m.arms.iter().any(|arm| match &arm.body {
-            MatchBody::Block(block) => block_breaks_enclosing_loop(block),
-            MatchBody::Expr(e) => expr_breaks_enclosing_loop(e),
-        }),
-        Expr::Select(sel) => sel
-            .cases
-            .iter()
-            .any(|case| block_breaks_enclosing_loop(&case.body)),
-        _ => false,
-    }
+    false
 }

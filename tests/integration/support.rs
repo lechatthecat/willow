@@ -372,6 +372,10 @@ pub(super) fn compile_and_run_with_env(source: &str, env: &[(&str, &str)]) -> (S
         return (stdout, true);
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
+    eprintln!(
+        "runtime failed: status={}, env={env:?}\n{stderr}",
+        out.status
+    );
     (format!("{stdout}{stderr}"), false)
 }
 

@@ -4,6 +4,7 @@ use crate::semantic::symbols::*;
 
 use super::*;
 
+#[willow_continuations::checker]
 impl TypeChecker {
     pub(super) fn check_call_argument_count(
         &mut self,

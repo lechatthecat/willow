@@ -831,6 +831,13 @@ fn test_runnable_example_files_compile_and_run() {
             "x\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n",
         ),
         ("example/compiler_scalability/main.wi", "3\n42\n"),
+        ("example/iterative_scoped_traversal.wi", "value=13\ndone\n"),
+        ("example/frontend_continuations.wi", "42\n"),
+        ("example/current_unit_memory/main.wi", "42\n"),
+        (
+            "example/iterative_operator_validation.wi",
+            "16\n20\ntrue\n19\n",
+        ),
         ("example/import_demo/main.wi", "30\n42\n42\n99\n3\n42\n"),
         ("example/item_import_demo/main.wi", "7\n25\n"),
         ("example/interfaces.wi", "woof\n4\ntweet\n2\nwoof\ntweet\n"),
@@ -998,6 +1005,11 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/prot_demo.wi", "10\n9\n20\n18\n17\n15\n14\n"),
         ("example/result_propagation.wi", "84\n-1\n52\n-1\n-1\n"),
         ("example/print_test.wi", "1230\n42\ntrue\nfalsetrue\n"),
+        (
+            "example/closure_enum_identity/main.wi",
+            "true\ntrue\nfalse\n",
+        ),
+        ("example/native_stack_overflow.wi", "8\n"),
         ("example/recursion.wi", "3628800\n1024\n6\n"),
         ("example/range_value.wi", "2\n6\n4\n14\n0\n1\n2\n"),
         (

@@ -5,6 +5,7 @@ use std::collections::HashSet;
 
 use super::*;
 
+#[willow_continuations::checker]
 impl TypeChecker {
     /// Validate an interface's `extends` clause (willow-1js.2 / willow-1js.8):
     /// each super must be a registered interface, with no cycle.
@@ -522,15 +523,13 @@ impl TypeChecker {
         // particular, `new Holder(Some(new Dog()))` must construct the inner
         // payload as the Holder field's `Option<Greeter>` (willow-glaj.2).
         // Extra arguments have no corresponding context but are still checked.
-        let arg_types: Vec<Type> = n
-            .args
-            .iter()
-            .enumerate()
-            .map(|(idx, arg)| match params.get(idx) {
+        let mut arg_types = Vec::with_capacity(n.args.len());
+        for (idx, arg) in n.args.iter().enumerate() {
+            arg_types.push(match params.get(idx) {
                 Some(ty) => self.check_expr_expecting(&arg.expr, ty),
                 None => self.check_expr(&arg.expr),
-            })
-            .collect();
+            });
+        }
 
         if arg_types.len() != params.len() {
             self.push(
@@ -733,9 +732,11 @@ impl TypeChecker {
                 );
             }
         }
-        walk_subexprs(expr, &mut |sub| {
-            self.check_static_forward_references(sub, class_name, initialized)
-        });
+        let mut children = Vec::new();
+        walk_subexprs(expr, &mut |sub| children.push(sub));
+        for child in children {
+            self.check_static_forward_references(child, class_name, initialized);
+        }
     }
 
     /// Validate a class's `implements` clause: each named interface must exist
@@ -1194,11 +1195,10 @@ impl TypeChecker {
                         );
                     }
 
-                    let method_params = method
-                        .params
-                        .iter()
-                        .map(|param| self.normalize_type(&param.ty, param.type_span))
-                        .collect::<Vec<_>>();
+                    let mut method_params = Vec::with_capacity(method.params.len());
+                    for param in &method.params {
+                        method_params.push(self.normalize_type(&param.ty, param.type_span));
+                    }
                     let method_return_type = self.normalize_type(&method.return_type, method.span);
                     let actual_call_return_type = if method.is_async {
                         Type::Generic("Task".to_string(), vec![method_return_type.clone()])

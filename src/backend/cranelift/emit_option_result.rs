@@ -9,7 +9,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ptr: cranelift_codegen::ir::Value,
         inner_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let option_ty = Type::Generic("Option".to_string(), vec![inner_ty.clone()]);
+        let option_ty = Type::Generic("Option".to_string().into(), vec![inner_ty.clone()]);
         if option_repr(&option_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
             return self.builder.ins().icmp_imm_u(IntCC::NotEqual, ptr, 0);
         }
@@ -26,7 +26,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ptr: cranelift_codegen::ir::Value,
         inner_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let option_ty = Type::Generic("Option".to_string(), vec![inner_ty.clone()]);
+        let option_ty = Type::Generic("Option".to_string().into(), vec![inner_ty.clone()]);
         let raw = if option_repr(&option_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer)
         {
             ptr
@@ -643,7 +643,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         payload_ty: &Type,
         payload_val: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
-        let option_ty = Type::Generic("Option".to_string(), vec![payload_ty.clone()]);
+        let option_ty = Type::Generic("Option".to_string().into(), vec![payload_ty.clone()]);
         if option_repr(&option_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
             payload_val
         } else {
@@ -656,7 +656,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         payload_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let option_ty = Type::Generic("Option".to_string(), vec![payload_ty.clone()]);
+        let option_ty = Type::Generic("Option".to_string().into(), vec![payload_ty.clone()]);
         if option_repr(&option_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
             self.builder.ins().iconst(types::I64, 0)
         } else {

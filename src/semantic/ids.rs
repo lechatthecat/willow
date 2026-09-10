@@ -10,17 +10,19 @@ use std::ops::Index;
 
 use crate::module::ModuleId;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct TypeId {
     namespace: Option<Box<str>>,
     name: Box<str>,
 }
 
 impl TypeId {
-    pub fn local(name: impl Into<Box<str>>) -> Self {
+    pub fn local(name: impl AsRef<str>) -> Self {
         Self {
             namespace: None,
-            name: name.into(),
+            name: name.as_ref().into(),
         }
     }
 
@@ -34,8 +36,8 @@ impl TypeId {
         }
     }
 
-    pub fn in_namespace(mut self, namespace: impl Into<Box<str>>) -> Self {
-        self.namespace = Some(namespace.into());
+    pub fn in_namespace(mut self, namespace: impl AsRef<str>) -> Self {
+        self.namespace = Some(namespace.as_ref().into());
         self
     }
 
@@ -48,6 +50,22 @@ impl TypeId {
     }
 }
 
+impl From<String> for TypeId {
+    fn from(name: String) -> Self {
+        Self::from_source_name(&name)
+    }
+}
+impl From<&str> for TypeId {
+    fn from(name: &str) -> Self {
+        Self::from_source_name(name)
+    }
+}
+impl Default for TypeId {
+    fn default() -> Self {
+        Self::local("")
+    }
+}
+
 impl fmt::Display for TypeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(namespace) = &self.namespace {
@@ -57,7 +75,9 @@ impl fmt::Display for TypeId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct FunctionId {
     namespace: Option<Box<str>>,
     owner: Option<Box<str>>,
@@ -65,11 +85,11 @@ pub struct FunctionId {
 }
 
 impl FunctionId {
-    pub fn free(name: impl Into<Box<str>>) -> Self {
+    pub fn free(name: impl AsRef<str>) -> Self {
         Self {
             namespace: None,
             owner: None,
-            name: name.into(),
+            name: name.as_ref().into(),
         }
     }
 
@@ -82,16 +102,16 @@ impl FunctionId {
         }
     }
 
-    pub fn method(owner: TypeId, name: impl Into<Box<str>>) -> Self {
+    pub fn method(owner: TypeId, name: impl AsRef<str>) -> Self {
         Self {
             namespace: owner.namespace,
             owner: Some(owner.name),
-            name: name.into(),
+            name: name.as_ref().into(),
         }
     }
 
-    pub fn in_namespace(mut self, namespace: impl Into<Box<str>>) -> Self {
-        self.namespace = Some(namespace.into());
+    pub fn in_namespace(mut self, namespace: impl AsRef<str>) -> Self {
+        self.namespace = Some(namespace.as_ref().into());
         self
     }
 
@@ -105,6 +125,21 @@ impl FunctionId {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn unqualified_name(&self) -> &str {
+        if self.namespace.is_none() && self.owner.is_none() {
+            self.name()
+        } else {
+            ""
+        }
+    }
+
+    pub fn owner_type(&self) -> Option<TypeId> {
+        self.owner.as_ref().map(|name| TypeId {
+            namespace: self.namespace.clone(),
+            name: name.clone(),
+        })
     }
 
     pub fn is_free_named(&self, name: &str) -> bool {
@@ -131,6 +166,22 @@ impl FunctionId {
             self.owner = Some(owner.name.clone());
         }
         self
+    }
+}
+
+impl From<String> for FunctionId {
+    fn from(name: String) -> Self {
+        Self::free_from_source_name(&name)
+    }
+}
+impl From<&str> for FunctionId {
+    fn from(name: &str) -> Self {
+        Self::free_from_source_name(name)
+    }
+}
+impl Default for FunctionId {
+    fn default() -> Self {
+        Self::free("")
     }
 }
 
@@ -164,29 +215,56 @@ pub struct ResolvedSymbolId {
 /// One unit's local spellings resolve to canonical function identities.
 /// All signature/ABI tables share this scope instead of copying metadata.
 #[derive(Debug, Clone, Default)]
-pub struct FunctionScope(std::rc::Rc<std::cell::RefCell<HashMap<FunctionId, FunctionId>>>);
+pub struct FunctionScope(std::rc::Rc<std::cell::RefCell<FunctionBindings>>);
+
+#[derive(Debug, Default)]
+struct FunctionBindings {
+    aliases: HashMap<FunctionId, FunctionId>,
+    /// Backend spellings are labels for IDs, never input to an ID parser.
+    declarations: HashMap<String, FunctionId>,
+}
 
 impl FunctionScope {
-    pub fn resolve(&self, id: &FunctionId) -> FunctionId {
+    /// Associate an emitted/lookup spelling with its declaration identity.
+    pub fn declare(&self, spelling: &str, id: FunctionId) {
+        let mut bindings = self.0.borrow_mut();
+        bindings.declarations.insert(id.to_string(), id.clone());
+        bindings.declarations.insert(spelling.to_owned(), id);
+    }
+    pub fn lookup_id(&self, spelling: &str) -> FunctionId {
+        self.resolve(&FunctionId::free(spelling))
+    }
+    fn declaration_id(&self, spelling: &str) -> FunctionId {
         self.0
             .borrow()
-            .get(id)
+            .declarations
+            .get(spelling)
             .cloned()
-            .unwrap_or_else(|| id.clone())
+            .unwrap_or_else(|| FunctionId::free(spelling))
+    }
+    pub fn resolve(&self, id: &FunctionId) -> FunctionId {
+        let bindings = self.0.borrow();
+        bindings.aliases.get(id).cloned().unwrap_or_else(|| {
+            bindings
+                .declarations
+                .get(&id.to_string())
+                .cloned()
+                .unwrap_or_else(|| id.clone())
+        })
     }
 
     pub fn bind(&self, alias: FunctionId, canonical: FunctionId) -> Option<FunctionId> {
         let canonical = self.resolve(&canonical);
-        self.0.borrow_mut().insert(alias, canonical)
+        self.0.borrow_mut().aliases.insert(alias, canonical)
     }
 
     pub fn restore(&self, alias: FunctionId, previous: Option<FunctionId>) {
         match previous {
             Some(id) => {
-                self.0.borrow_mut().insert(alias, id);
+                self.0.borrow_mut().aliases.insert(alias, id);
             }
             None => {
-                self.0.borrow_mut().remove(&alias);
+                self.0.borrow_mut().aliases.remove(&alias);
             }
         }
     }
@@ -221,14 +299,17 @@ impl<V> FunctionMap<V> {
 
     /// Register a declaration; an own declaration shadows a same-named import.
     pub fn insert(&mut self, name: impl AsRef<str>, value: V) -> Option<V> {
-        let id = FunctionId::free_from_source_name(name.as_ref());
+        let id = self.scope.declaration_id(name.as_ref());
         self.scope.restore(id.clone(), None);
         self.values.insert(id, value)
     }
 
     pub fn get(&self, name: &str) -> Option<&V> {
-        self.values
-            .get(&self.scope.resolve(&FunctionId::free_from_source_name(name)))
+        self.values.get(&self.scope.lookup_id(name))
+    }
+
+    pub fn get_id(&self, id: &FunctionId) -> Option<&V> {
+        self.values.get(&self.scope.resolve(id))
     }
 
     pub fn contains_key(&self, name: &str) -> bool {
@@ -334,5 +415,81 @@ mod function_scope_tests {
         scope.restore(alias, old);
         assert_eq!(signatures.get("local"), Some(&"i64"));
         assert_eq!(effects.get("local"), None);
+    }
+}
+
+/// Resolved types keep nominal identities separate from source spellings.
+pub type SemanticType = crate::parser::ast::Type<TypeId>;
+
+impl From<crate::parser::ast::Type> for SemanticType {
+    fn from(ty: crate::parser::ast::Type) -> Self {
+        ty.map_names(|name| TypeId::from_source_name(name))
+    }
+}
+impl From<&crate::parser::ast::Type> for SemanticType {
+    fn from(ty: &crate::parser::ast::Type) -> Self {
+        ty.map_names(|name| TypeId::from_source_name(name))
+    }
+}
+
+impl SemanticType {
+    pub fn to_source(&self) -> crate::parser::ast::Type {
+        self.map_names(ToString::to_string)
+    }
+}
+
+#[cfg(test)]
+mod backend_identity_tests {
+    use super::*;
+    #[test]
+    fn twenty_linker_labels_preserve_structured_declaration_identity() {
+        // 5 namespaces x 4 declaration kinds: free function, instance/static
+        // method, constructor and compiler-generated closure entry.
+        for namespace in [
+            None,
+            Some("one"),
+            Some("one::two"),
+            Some("under__score"),
+            Some("日本"),
+        ] {
+            for kind in 0..4 {
+                let owner = namespace.map_or_else(
+                    || TypeId::local("Owner"),
+                    |n| TypeId::local("Owner").in_namespace(n),
+                );
+                let id = match kind {
+                    0 => namespace.map_or_else(
+                        || FunctionId::free("run"),
+                        |n| FunctionId::free("run").in_namespace(n),
+                    ),
+                    1 => FunctionId::method(owner, "run"),
+                    2 => FunctionId::method(owner, "init"),
+                    _ => namespace.map_or_else(
+                        || FunctionId::free("$lambda.7"),
+                        |n| FunctionId::free("$lambda.7").in_namespace(n),
+                    ),
+                };
+                let scope = FunctionScope::default();
+                let mut signatures = FunctionMap::with_scope(scope.clone());
+                let mut effects = FunctionMap::with_scope(scope.clone());
+                // A deliberately unrelated linker spelling cannot recover
+                // namespace/owner/name by parsing or component splitting.
+                scope.declare("arbitrary.$linker.label", id.clone());
+                signatures.insert("arbitrary.$linker.label", 42);
+                effects.insert("arbitrary.$linker.label", true);
+                assert_eq!(signatures.ids().next(), Some(&id));
+                assert_eq!(signatures.get_id(&id), Some(&42));
+                assert_eq!(effects.get_id(&id), Some(&true));
+                assert_eq!(scope.lookup_id("arbitrary.$linker.label"), id);
+                let alias = FunctionId::free("local_alias");
+                let previous = scope.bind(alias.clone(), id.clone());
+                assert_eq!(signatures.get_id(&alias), Some(&42));
+                assert_eq!(effects.get_id(&alias), Some(&true));
+                scope.restore(alias.clone(), previous);
+                assert_eq!(signatures.get_id(&alias), None);
+                assert_eq!(id.namespace(), namespace);
+                assert_eq!(id.owner().is_some(), matches!(kind, 1 | 2));
+            }
+        }
     }
 }

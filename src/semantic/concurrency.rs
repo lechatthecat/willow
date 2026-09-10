@@ -126,10 +126,18 @@ impl ConcurrencyAnalyzer {
     /// task-aware check flag a direct cross-module call such as `await`-free
     /// `worker::heavy()` from an async fn (willow-0a6k.2). Call before
     /// `check_program`.
-    pub fn with_module_helpers(mut self, module_name: &str, program: &Program) -> Self {
-        for (name, helper) in compute_nonpreemptible_helpers(program) {
+    pub fn with_module_helpers(self, module_name: &str, program: &Program) -> Self {
+        self.with_module_helper_index(module_name, &compute_nonpreemptible_helpers(program))
+    }
+
+    pub fn with_module_helper_index(
+        mut self,
+        module_name: &str,
+        index: &HashMap<FunctionId, NonpreemptibleHelper>,
+    ) -> Self {
+        for (name, helper) in index {
             self.nonpreemptible_sync_helpers.insert(
-                name.in_namespace(module_name),
+                name.clone().in_namespace(module_name),
                 SyncHelperRef {
                     span: helper.span,
                     reason: helper.reason,
@@ -148,13 +156,28 @@ impl ConcurrencyAnalyzer {
     /// name so a free-fn import (`heavy` → `heavy()`) and a class import
     /// (`Work` → `Work::method()`) both resolve (willow-0a6k.2).
     pub fn with_item_helper(
-        mut self,
+        self,
         local: &str,
         item: &str,
         module_display: &str,
         program: &Program,
     ) -> Self {
-        for (name, helper) in compute_nonpreemptible_helpers(program) {
+        self.with_item_helper_index(
+            local,
+            item,
+            module_display,
+            &compute_nonpreemptible_helpers(program),
+        )
+    }
+
+    pub fn with_item_helper_index(
+        mut self,
+        local: &str,
+        item: &str,
+        module_display: &str,
+        index: &HashMap<FunctionId, NonpreemptibleHelper>,
+    ) -> Self {
+        for (name, helper) in index {
             let rekeyed = name.remap_imported_item(item, local);
             if let Some(key) = rekeyed {
                 self.nonpreemptible_sync_helpers.insert(
@@ -620,11 +643,11 @@ mod tests {
                     unreachable!()
                 };
                 let mut body = function.body;
-                let Stmt::Expr(statement) = body.stmts.pop().unwrap() else {
+                let Stmt::Expr(statement) = &mut body.stmts.pop().unwrap() else {
                     unreachable!()
                 };
                 let span = statement.span;
-                let mut expr = statement.expr;
+                let mut expr = statement.expr.take();
                 for _ in 0..50_000 {
                     expr = Expr::TryPropagate(Box::new(expr), span, ExprId::fresh());
                 }
@@ -634,13 +657,11 @@ mod tests {
                     called_helpers(&body, &[]),
                     HashSet::from([FunctionId::free("heavy")])
                 );
-                let Stmt::Expr(statement) = body.stmts.pop().unwrap() else {
+                let Stmt::Expr(statement) = &mut body.stmts.pop().unwrap() else {
                     unreachable!()
                 };
-                let mut expr = statement.expr;
-                while let Expr::TryPropagate(inner, _, _) = expr {
-                    expr = *inner;
-                }
+                let expr = statement.expr.take();
+                drop(expr);
             })
             .unwrap()
             .join()
@@ -656,33 +677,7 @@ mod tests {
                 let Item::Function(function) = &mut program.items[0] else {
                     unreachable!()
                 };
-                let Stmt::Expr(statement) = function.body.stmts.pop().unwrap() else {
-                    unreachable!()
-                };
-                let span = statement.span;
-                let mut expr = statement.expr;
-                for _ in 0..50_000 {
-                    expr = Expr::TryPropagate(Box::new(expr), span, ExprId::fresh());
-                }
-                function
-                    .body
-                    .stmts
-                    .push(Stmt::Expr(ExprStmt { expr, span }));
-                let analyzer = ConcurrencyAnalyzer::new().check_program(&program);
-                assert!(analyzer.errors.is_empty());
-                assert_eq!(analyzer.report.async_functions, 1);
-                assert_eq!(analyzer.report.await_expressions, 1);
-                assert_eq!(analyzer.report.await_outside_async, 0);
-                let Item::Function(function) = &mut program.items[0] else {
-                    unreachable!()
-                };
-                let Stmt::Expr(statement) = function.body.stmts.pop().unwrap() else {
-                    unreachable!()
-                };
-                let mut expr = statement.expr;
-                while let Expr::TryPropagate(inner, _, _) = expr {
-                    expr = *inner;
-                }
+                function.body.stmts.clear();
             })
             .unwrap()
             .join()

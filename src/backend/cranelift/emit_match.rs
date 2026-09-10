@@ -56,9 +56,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let mut dispatch: Vec<(i64, FuncId)> = self
             .class_type_ids
             .iter()
-            .filter(|(cls, _)| self.class_is_a(cls, e1_name))
+            .filter(|(cls, _)| self.class_is_a(&cls.to_string(), e1_name))
             .filter_map(|(cls, &id)| {
-                self.resolve_method_func_id(cls, "into")
+                self.resolve_method_func_id(&cls.to_string(), "into")
                     .map(|fid| (id, fid))
             })
             .collect();

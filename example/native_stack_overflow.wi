@@ -1,0 +1,13 @@
+// Run with any argument to demonstrate the fatal overflow diagnostic.
+// With no arguments, ordinary synchronous recursion still prints 8.
+import std::collections::Array;
+
+fn dive(n: i64) -> i64 {
+    if n == 0 { return 0; }
+    return dive(n - 1) + 1;
+}
+
+fn main(args: Array<String>) {
+    let depth = args.len() == 0 ? 8 : 1000000;
+    println(dive(depth));
+}

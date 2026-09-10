@@ -83,6 +83,7 @@ pub struct CheckerTables<'a> {
     pub lambda_captures: Option<&'a HashMap<ExprId, Vec<LambdaCapture>>>,
 }
 
+#[willow_continuations::methods(normalize)]
 impl<'a> CheckerTables<'a> {
     /// Borrow the relevant tables from a run type checker.
     pub fn from_checker(checker: &'a crate::semantic::TypeChecker) -> Self {
@@ -327,13 +328,13 @@ pub fn lower_program_with(
                                 let return_type = ctx.normalize(&field.ty);
                                 retype_array_literal(&mut value, &return_type);
                                 functions.push(HirFunction {
-                                    name: super::typed_ast::static_initializer_name(
-                                        &c.name,
-                                        &field.name,
+                                    name: crate::semantic::ids::FunctionId::method(
+                                        crate::semantic::ids::TypeId::from_source_name(&c.name),
+                                        format!("$static_init.{}", field.name),
                                     ),
                                     is_async: false,
                                     params: Vec::new(),
-                                    return_type,
+                                    return_type: return_type.into(),
                                     body: vec![HirStmt::Return {
                                         value: Some(value),
                                         span: init.span(),
@@ -346,7 +347,7 @@ pub fn lower_program_with(
                     }
                 }
                 hir_classes.push(HirClass {
-                    name: c.name.clone(),
+                    name: c.name.clone().into(),
                     methods,
                     span: c.span,
                 });
@@ -437,6 +438,7 @@ impl Enums {
 }
 
 /// Substitute symbolic type parameters (`Named(param)`) with concrete types.
+#[willow_continuations::function(subst_type)]
 fn subst_type(ty: &Type, subst: &HashMap<String, Type>) -> Type {
     match ty {
         Type::Named(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
@@ -535,7 +537,7 @@ fn lower_function(
         let name = ctx.bind(p.name.clone(), ty.clone());
         params.push(HirParam {
             name,
-            ty,
+            ty: ty.into(),
             by_reference: !matches!(p.mode, crate::parser::ast::ParamMode::Value),
             span: p.span,
         });
@@ -543,10 +545,10 @@ fn lower_function(
     let return_type = ctx.normalize(&f.return_type);
     let body = lower_block(&f.body, &mut ctx)?;
     Ok(HirFunction {
-        name: f.name.clone(),
+        name: f.name.clone().into(),
         is_async: f.is_async,
         params,
-        return_type,
+        return_type: return_type.into(),
         body,
         span: f.span,
     })
@@ -571,7 +573,7 @@ fn lower_method(
         ctx.bind("self".to_string(), self_ty.clone());
         params.push(HirParam {
             name: "self".to_string(),
-            ty: self_ty,
+            ty: self_ty.into(),
             by_reference: false,
             span: m.span,
         });
@@ -581,7 +583,7 @@ fn lower_method(
         let name = ctx.bind(p.name.clone(), ty.clone());
         params.push(HirParam {
             name,
-            ty,
+            ty: ty.into(),
             by_reference: !matches!(p.mode, crate::parser::ast::ParamMode::Value),
             span: p.span,
         });
@@ -589,10 +591,10 @@ fn lower_method(
     let return_type = ctx.normalize(&m.return_type);
     let body = lower_block(&m.body, &mut ctx)?;
     Ok(HirFunction {
-        name: m.name.clone(),
+        name: m.name.clone().into(),
         is_async: m.is_async,
         params,
-        return_type,
+        return_type: return_type.into(),
         body,
         span: m.span,
     })
@@ -614,7 +616,7 @@ fn lower_constructor(
     let mut params = Vec::with_capacity(ctor.params.len() + 1);
     params.push(HirParam {
         name: "self".to_string(),
-        ty: self_ty,
+        ty: self_ty.into(),
         by_reference: false,
         span: ctor.span,
     });
@@ -623,14 +625,14 @@ fn lower_constructor(
         let name = ctx.bind(p.name.clone(), ty.clone());
         params.push(HirParam {
             name,
-            ty,
+            ty: ty.into(),
             by_reference: !matches!(p.mode, crate::parser::ast::ParamMode::Value),
             span: p.span,
         });
     }
     let body = lower_block(&ctor.body, &mut ctx)?;
     Ok(HirFunction {
-        name: "init".to_string(),
+        name: "init".into(),
         is_async: false,
         params,
         return_type: Type::Void,
@@ -759,18 +761,43 @@ impl<'a> LowerCtx<'a> {
 ///
 /// [`TypeChecker::check_array_literal_expecting`]: crate::semantic::type_checker::TypeChecker
 fn retype_array_literal(value: &mut HirExpr, target: &Type) {
-    let Type::Array(elem) = target else {
-        return;
-    };
-    let HirExprKind::Array { elements } = &mut value.kind else {
-        return;
-    };
-    for el in elements.iter_mut() {
-        retype_array_literal(el, elem);
+    let mut pending = vec![(value, target)];
+    while let Some((value, target)) = pending.pop() {
+        let Type::Array(elem) = target else {
+            continue;
+        };
+        let HirExprKind::Array { elements } = &mut value.kind else {
+            continue;
+        };
+        value.ty = target.into();
+        pending.extend(elements.iter_mut().map(|element| (element, &**elem)));
     }
-    value.ty = target.clone();
 }
 
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_block(block: &Block, ctx: &mut LowerCtx) -> Result<Vec<HirStmt>, Diagnostic> {
     ctx.push_scope();
     let mut out = Vec::with_capacity(block.stmts.len());
@@ -781,6 +808,30 @@ fn lower_block(block: &Block, ctx: &mut LowerCtx) -> Result<Vec<HirStmt>, Diagno
     Ok(out)
 }
 
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
     match stmt {
         Stmt::Let(l) => {
@@ -790,7 +841,7 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
             let binding_ty =
                 l.ty.as_ref()
                     .map(|ty| ctx.normalize(ty))
-                    .unwrap_or_else(|| value.ty.clone());
+                    .unwrap_or_else(|| (value.ty.clone()).to_source());
             // An annotated array literal takes the ANNOTATION's element type,
             // exactly as `check_array_literal_expecting` typed it. Without this
             // the literal keeps the type of its first element, so
@@ -802,7 +853,7 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
             Ok(HirStmt::Let {
                 name,
                 mutable: l.mutable,
-                ty: binding_ty,
+                ty: binding_ty.into(),
                 value,
                 span: l.span,
             })
@@ -863,7 +914,7 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
                 _ => return Err(unsupported(l.span, "lock target type")),
             };
             ctx.push_scope();
-            let binding = ctx.bind(l.binding.clone(), binding_ty);
+            let binding = ctx.bind(l.binding.clone(), (binding_ty).to_source());
             let mut body = Vec::with_capacity(l.body.stmts.len());
             for stmt in &l.body.stmts {
                 body.push(lower_stmt(stmt, ctx)?);
@@ -915,7 +966,7 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
         Stmt::StaticFieldAssign(s) => {
             let value = lower_expr(&s.value, ctx)?;
             Ok(HirStmt::StaticFieldAssign {
-                class: s.class.clone(),
+                class: s.class.clone().into(),
                 field: s.field.clone(),
                 value,
                 span: s.span,
@@ -938,7 +989,7 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
                 Type::Array(inner) => (**inner).clone(),
                 // An i64 range yields i64 elements.
                 Type::Generic(name, args)
-                    if name == "Range" && args.first() == Some(&Type::I64) =>
+                    if name.name() == "Range" && args.first() == Some(&Type::I64) =>
                 {
                     Type::I64
                 }
@@ -950,7 +1001,7 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
                 }
             };
             ctx.push_scope();
-            let name = ctx.bind(s.name.clone(), element_ty);
+            let name = ctx.bind(s.name.clone(), (element_ty).to_source());
             let body = lower_block(&s.body, ctx)?;
             ctx.pop_scope();
             Ok(HirStmt::For {
@@ -963,12 +1014,60 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
     }
 }
 
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     let mut lowered = lower_expr_inner(expr, ctx)?;
-    lowered.ty = ctx.normalize(&lowered.ty);
+    lowered.ty = ctx.normalize(&lowered.ty.to_source()).into();
     Ok(lowered)
 }
 
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_expr_inner(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     match expr {
         Expr::Integer(n, span, _) => Ok(lit(HirExprKind::Int(*n), Type::I64, *span)),
@@ -1018,7 +1117,7 @@ fn lower_var_expr(
     if let Some(binding) = ctx.lookup(name) {
         return Ok(HirExpr {
             kind: HirExprKind::Var(binding.hir_name.to_string()),
-            ty: binding.ty.clone(),
+            ty: binding.ty.clone().into(),
             span,
         });
     }
@@ -1032,10 +1131,10 @@ fn lower_var_expr(
             .unwrap_or_else(|| Type::Named(enum_name.to_string()));
         return Ok(HirExpr {
             kind: HirExprKind::StaticField {
-                class: enum_name.to_string(),
+                class: enum_name.to_string().into(),
                 field: name.to_string(),
             },
-            ty,
+            ty: ty.into(),
             span,
         });
     }
@@ -1048,8 +1147,8 @@ fn lower_var_expr(
         && let Some(ty @ Type::Fn(..)) = ctx.tables.expr_type(&expr.id())
     {
         return Ok(HirExpr {
-            kind: HirExprKind::FnRef(name.to_string()),
-            ty,
+            kind: HirExprKind::FnRef(name.into()),
+            ty: ty.into(),
             span,
         });
     }
@@ -1061,6 +1160,30 @@ fn lower_var_expr(
 
 /// Operator chains have no lexical boundaries. Keep their construction frames
 /// on the heap, delegating other syntax to its context-sensitive lowering.
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_operator_tree(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     enum Step<'a> {
         Enter(&'a Expr),
@@ -1088,32 +1211,22 @@ fn lower_operator_tree(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagn
                     continue;
                 }
                 Err(error) => {
-                    // Completed operator subtrees can be very deep even when
-                    // a later operand fails; discard them without recursive Drop.
-                    while let Some(value) = values.pop() {
-                        match value.kind {
-                            HirExprKind::Binary { lhs, rhs, .. } => {
-                                values.push(*lhs);
-                                values.push(*rhs);
-                            }
-                            HirExprKind::Unary { operand, .. } => values.push(*operand),
-                            _ => {}
-                        }
-                    }
+                    // HIR ownership drains partial results iteratively.
+                    values.clear();
                     return Err(error);
                 }
             },
             Step::Binary(binary) => {
                 let rhs = values.pop().expect("lowered right operand");
                 let lhs = values.pop().expect("lowered left operand");
-                let ty = binary_result_type(&binary.op, &lhs.ty);
+                let ty = binary_result_type(&binary.op, &lhs.ty.to_source());
                 HirExpr {
                     kind: HirExprKind::Binary {
                         op: binary.op.clone(),
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     },
-                    ty,
+                    ty: ty.into(),
                     span: binary.span,
                 }
             }
@@ -1135,7 +1248,7 @@ fn lower_operator_tree(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagn
         };
         // The outer lower_expr normalizes the root once, just as before.
         if !work.is_empty() {
-            value.ty = ctx.normalize(&value.ty);
+            value.ty = ctx.normalize(&value.ty.to_source()).into();
         }
         values.push(value);
     }
@@ -1143,6 +1256,30 @@ fn lower_operator_tree(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagn
 }
 
 #[inline(never)]
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_call_expr(c: &CallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     let args = lower_value_args(&c.args, ctx)?;
     // An unqualified enum-variant construction (`Ok(42)` in an
@@ -1157,11 +1294,11 @@ fn lower_call_expr(c: &CallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
         };
         return Ok(HirExpr {
             kind: HirExprKind::StaticCall {
-                class: enum_name.clone(),
+                class: enum_name.clone().into(),
                 method: c.callee.clone(),
                 args,
             },
-            ty,
+            ty: ty.into(),
             span: c.span,
         });
     }
@@ -1199,13 +1336,40 @@ fn lower_call_expr(c: &CallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnost
             )
         })?;
     Ok(HirExpr {
-        kind: HirExprKind::Call { callee, args },
-        ty,
+        kind: HirExprKind::Call {
+            callee: callee.into(),
+            args,
+        },
+        ty: ty.into(),
         span: c.span,
     })
 }
 
 #[inline(never)]
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_print_expr(
     inner: &Expr,
     newline: bool,
@@ -1224,6 +1388,30 @@ fn lower_print_expr(
 }
 
 #[inline(never)]
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_array_literal_expr(
     expr: &Expr,
     elements: &[Expr],
@@ -1254,7 +1442,8 @@ fn lower_array_literal_expr(
                     "empty array literal with no recorded element type",
                 ));
             }
-        },
+        }
+        .into(),
     };
     Ok(HirExpr {
         kind: HirExprKind::Array { elements: lowered },
@@ -1264,6 +1453,30 @@ fn lower_array_literal_expr(
 }
 
 #[inline(never)]
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_index_expr(
     array: &Expr,
     index: &Expr,
@@ -1295,6 +1508,30 @@ fn lower_index_expr(
 }
 
 #[inline(never)]
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_ternary_expr(t: &TernaryExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     let condition = lower_expr(&t.condition, ctx)?;
     let then_expr = lower_expr(&t.then_expr, ctx)?;
@@ -1314,19 +1551,67 @@ fn lower_ternary_expr(t: &TernaryExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Di
 }
 
 #[inline(never)]
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_new_expr(n: &NewExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     let args = lower_value_args(&n.args, ctx)?;
     Ok(HirExpr {
         kind: HirExprKind::New {
-            class: n.class_name.clone(),
+            class: n.class_name.clone().into(),
             args,
         },
-        ty: Type::Named(n.class_name.clone()),
+        ty: Type::Named(n.class_name.clone().into()),
         span: n.span,
     })
 }
 
 #[inline(never)]
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_field_access_expr(
     expr: &Expr,
     object: &Expr,
@@ -1336,7 +1621,9 @@ fn lower_field_access_expr(
 ) -> Result<HirExpr, Diagnostic> {
     let object = lower_expr(object, ctx)?;
     let ty = {
-        match class_name_of(&object.ty).and_then(|class| ctx.classes.field_type(class, field)) {
+        match class_name_of(&object.ty.to_source())
+            .and_then(|class| ctx.classes.field_type(class, field))
+        {
             Some(ty) => ty,
             None => ctx
                 .tables
@@ -1349,18 +1636,42 @@ fn lower_field_access_expr(
             object: Box::new(object),
             field: field.to_string(),
         },
-        ty,
+        ty: ty.into(),
         span,
     })
 }
 
 #[inline(never)]
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_method_call_expr(m: &MethodCallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     let object = lower_expr(&m.object, ctx)?;
-    let ty = if let Some(ty) = builtin_method_type(&object.ty, &m.method) {
+    let ty = if let Some(ty) = builtin_method_type(&object.ty.to_source(), &m.method) {
         ty
-    } else if let Some(ty) =
-        class_name_of(&object.ty).and_then(|class| ctx.classes.method_type(class, &m.method))
+    } else if let Some(ty) = class_name_of(&object.ty.to_source())
+        .and_then(|class| ctx.classes.method_type(class, &m.method))
     {
         ty
     } else {
@@ -1377,12 +1688,36 @@ fn lower_method_call_expr(m: &MethodCallExpr, ctx: &mut LowerCtx) -> Result<HirE
             method: m.method.clone(),
             args,
         },
-        ty,
+        ty: ty.into(),
         span: m.span,
     })
 }
 
 #[inline(never)]
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_object_literal_expr(
     o: &ObjectLiteralExpr,
     ctx: &mut LowerCtx,
@@ -1393,10 +1728,10 @@ fn lower_object_literal_expr(
     }
     Ok(HirExpr {
         kind: HirExprKind::ObjectLiteral {
-            class: o.class.clone(),
+            class: o.class.clone().into(),
             fields,
         },
-        ty: Type::Named(o.class.clone()),
+        ty: Type::Named(o.class.clone().into()),
         span: o.span,
     })
 }
@@ -1415,15 +1750,39 @@ fn lower_static_field_expr(s: &StaticFieldExpr, ctx: &mut LowerCtx) -> Result<Hi
         .ok_or_else(|| unsupported(s.span, "static property not found"))?;
     Ok(HirExpr {
         kind: HirExprKind::StaticField {
-            class: s.class.clone(),
+            class: s.class.clone().into(),
             field: s.field.clone(),
         },
-        ty,
+        ty: ty.into(),
         span: s.span,
     })
 }
 
 #[inline(never)]
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_static_call_expr(s: &StaticCallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     // `Enum::Variant(args)` construction parses like a static call.
     let variant_ty = enum_variant_value_type(ctx.enums, &s.class, &s.method, false);
@@ -1441,16 +1800,40 @@ fn lower_static_call_expr(s: &StaticCallExpr, ctx: &mut LowerCtx) -> Result<HirE
     let args = lower_value_args(&s.args, ctx)?;
     Ok(HirExpr {
         kind: HirExprKind::StaticCall {
-            class: ctx.tables.static_call_class(&s.id, &s.class),
+            class: ctx.tables.static_call_class(&s.id, &s.class).into(),
             method: s.method.clone(),
             args,
         },
-        ty,
+        ty: ty.into(),
         span: s.span,
     })
 }
 
 #[inline(never)]
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_range_expr(r: &RangeExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     let start = lower_expr(&r.start, ctx)?;
     let end = lower_expr(&r.end, ctx)?;
@@ -1459,12 +1842,36 @@ fn lower_range_expr(r: &RangeExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagno
             start: Box::new(start),
             end: Box::new(end),
         },
-        ty: Type::Generic("Range".to_string(), vec![Type::I64]),
+        ty: Type::Generic("Range".to_string().into(), vec![Type::I64]),
         span: r.span,
     })
 }
 
 #[inline(never)]
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_select_expr(select: &SelectExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     let mut cases = Vec::with_capacity(select.cases.len());
     for case in &select.cases {
@@ -1475,7 +1882,7 @@ fn lower_select_expr(select: &SelectExpr, ctx: &mut LowerCtx) -> Result<HirExpr,
                     .ok_or_else(|| unsupported(case.span, "select receive channel"))?
                     .clone();
                 ctx.push_scope();
-                let binding = ctx.bind(binding.clone(), binding_ty);
+                let binding = ctx.bind(binding.clone(), (binding_ty).to_source());
                 let mut body = Vec::with_capacity(case.body.stmts.len());
                 for stmt in &case.body.stmts {
                     body.push(lower_stmt(stmt, ctx)?);
@@ -1509,7 +1916,7 @@ fn lower_select_expr(select: &SelectExpr, ctx: &mut LowerCtx) -> Result<HirExpr,
                     )
                 })?;
                 ctx.push_scope();
-                let binding = ctx.bind(binding.clone(), binding_ty);
+                let binding = ctx.bind(binding.clone(), (binding_ty).to_source());
                 let mut body = Vec::with_capacity(case.body.stmts.len());
                 for stmt in &case.body.stmts {
                     body.push(lower_stmt(stmt, ctx)?);
@@ -1539,6 +1946,30 @@ fn lower_select_expr(select: &SelectExpr, ctx: &mut LowerCtx) -> Result<HirExpr,
 }
 
 #[inline(never)]
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_await_expr(a: &AwaitExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     let inner = lower_expr(&a.expr, ctx)?;
     let resolved = builtin_types::resolve(&inner.ty)
@@ -1562,6 +1993,30 @@ fn lower_await_expr(a: &AwaitExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagno
 }
 
 #[inline(never)]
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_try_propagate_expr(
     inner: &Expr,
     span: Span,
@@ -1582,6 +2037,30 @@ fn lower_try_propagate_expr(
 }
 
 #[inline(never)]
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     // The checker's inferred full `fn(...) -> ...` type fills in what
     // the AST cannot store: unannotated parameter types and, for
@@ -1628,7 +2107,7 @@ fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diag
         .map(|(source_name, source, ty)| HirCapture {
             name: ctx.bind(source_name, ty.clone()),
             source,
-            ty,
+            ty: ty.into(),
         })
         .collect();
     for (i, p) in l.params.iter().enumerate() {
@@ -1645,7 +2124,7 @@ fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diag
         param_tys.push(ty.clone());
         params.push(HirParam {
             name,
-            ty,
+            ty: ty.into(),
             by_reference: false,
             span: p.span,
         });
@@ -1667,7 +2146,7 @@ fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diag
                 .as_ref()
                 .map(|ty| ctx.normalize(ty))
                 .or(inferred_ret)
-                .unwrap_or_else(|| value.ty.clone());
+                .unwrap_or_else(|| (value.ty.clone()).to_source());
             let span = value.span;
             // A `void` body has no value to return: `|s| println(s)` is
             // a statement, and returning its non-existent value would
@@ -1728,7 +2207,7 @@ fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diag
             captures,
             body,
         },
-        ty,
+        ty: ty.into(),
         span: l.span,
     })
 }
@@ -1772,6 +2251,30 @@ fn enum_variant_value_type(
 /// Lower a `match` expression. Pattern bindings are typed from the scrutinee's
 /// enum (type parameters substituted from its type arguments); the match's type
 /// is the first arm type that is not `Never` (`Void` for block-bodied arms).
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_match(
     m: &crate::parser::ast::MatchExpr,
     ctx: &mut LowerCtx,
@@ -1782,23 +2285,24 @@ fn lower_match(
 
     // The scrutinee's enum context: its EnumInfo plus the substitution from the
     // enum's type parameters to the scrutinee's type arguments.
-    let enum_context: Option<(String, EnumInfo, HashMap<String, Type>)> = match &scrutinee.ty {
-        Type::Named(name) => ctx
-            .enums
-            .map
-            .get(name)
-            .map(|info| (name.clone(), info.clone(), HashMap::new())),
-        Type::Generic(name, args) => ctx.enums.map.get(name).map(|info| {
-            let subst = info
-                .type_params
-                .iter()
-                .cloned()
-                .zip(args.iter().cloned())
-                .collect();
-            (name.clone(), info.clone(), subst)
-        }),
-        _ => None,
-    };
+    let enum_context: Option<(String, EnumInfo, HashMap<String, Type>)> =
+        match &scrutinee.ty.to_source() {
+            Type::Named(name) => ctx
+                .enums
+                .map
+                .get(name)
+                .map(|info| (name.clone(), info.clone(), HashMap::new())),
+            Type::Generic(name, args) => ctx.enums.map.get(name).map(|info| {
+                let subst = info
+                    .type_params
+                    .iter()
+                    .cloned()
+                    .zip(args.iter().cloned())
+                    .collect();
+                (name.clone(), info.clone(), subst)
+            }),
+            _ => None,
+        };
 
     let mut arms = Vec::with_capacity(m.arms.len());
     for arm in &m.arms {
@@ -1823,12 +2327,12 @@ fn lower_match(
                     && info.variants.get(name).is_some_and(Vec::is_empty)
                 {
                     HirPattern::EnumVariant {
-                        enum_name: enum_name.clone(),
+                        enum_name: enum_name.clone().into(),
                         variant: name.clone(),
                     }
                 } else {
                     HirPattern::Binding {
-                        name: ctx.bind(name.clone(), scrutinee.ty.clone()),
+                        name: ctx.bind(name.clone(), (scrutinee.ty.clone()).to_source()),
                         ty: scrutinee.ty.clone(),
                     }
                 }
@@ -1842,7 +2346,7 @@ fn lower_match(
                     ));
                 };
                 HirPattern::EnumVariant {
-                    enum_name: enum_name.clone(),
+                    enum_name: enum_name.clone().into(),
                     variant: variant.clone(),
                 }
             }
@@ -1876,9 +2380,9 @@ fn lower_match(
                         ctx.bind(binding.clone(), binding_ty.clone())
                     };
                     HirPattern::ClassDowncast {
-                        class_name: class_name.clone(),
+                        class_name: class_name.clone().into(),
                         binding,
-                        binding_ty,
+                        binding_ty: binding_ty.into(),
                     }
                 }
             }
@@ -1955,15 +2459,42 @@ fn bind_variant_tuple(
         typed.push((name, ty));
     }
     Ok(HirPattern::EnumVariantTuple {
-        enum_name: enum_name.clone(),
+        enum_name: enum_name.clone().into(),
         variant: variant.to_string(),
-        bindings: typed,
+        bindings: typed
+            .into_iter()
+            .map(|(name, ty)| (name, ty.into()))
+            .collect(),
     })
 }
 
 /// Lower call/constructor arguments. A reference argument retains its place as
 /// a marker expression so eligibility can verify it against the callee mode and
 /// codegen can pass its address rather than its value (willow-0g8j.2.7).
+#[willow_continuations::function(
+    lower_array_literal_expr,
+    lower_await_expr,
+    lower_block,
+    lower_call_expr,
+    lower_expr,
+    lower_expr_inner,
+    lower_field_access_expr,
+    lower_index_expr,
+    lower_lambda_expr,
+    lower_match,
+    lower_method_call_expr,
+    lower_new_expr,
+    lower_object_literal_expr,
+    lower_operator_tree,
+    lower_print_expr,
+    lower_range_expr,
+    lower_select_expr,
+    lower_static_call_expr,
+    lower_stmt,
+    lower_ternary_expr,
+    lower_try_propagate_expr,
+    lower_value_args
+)]
 fn lower_value_args(args: &[CallArg], ctx: &mut LowerCtx) -> Result<Vec<HirExpr>, Diagnostic> {
     let mut out = Vec::with_capacity(args.len());
     for arg in args {
@@ -2054,7 +2585,11 @@ fn binary_result_type(op: &BinOp, lhs_ty: &Type) -> Type {
 }
 
 fn lit(kind: HirExprKind, ty: Type, span: Span) -> HirExpr {
-    HirExpr { kind, ty, span }
+    HirExpr {
+        kind,
+        ty: ty.into(),
+        span,
+    }
 }
 
 fn unsupported(span: Span, what: &str) -> Diagnostic {
@@ -2162,44 +2697,16 @@ mod tests {
                     let (hir, diagnostics) = lower_program(&program);
                     let mut count = 0;
                     let mut root_type = None;
-                    for function in hir.functions {
-                        for statement in function.body {
+                    for function in &hir.functions {
+                        for statement in &function.body {
                             if let HirStmt::Expr(expr) = statement {
                                 count = expr.walk_postorder(true).count();
-                                root_type = Some(expr.ty.clone());
-                                let mut values = vec![expr];
-                                while let Some(value) = values.pop() {
-                                    match value.kind {
-                                        HirExprKind::Binary { lhs, rhs, .. } => {
-                                            values.push(*lhs);
-                                            values.push(*rhs);
-                                        }
-                                        HirExprKind::Unary { operand, .. } => values.push(*operand),
-                                        _ => {}
-                                    }
-                                }
+                                root_type = Some(expr.ty.to_source());
                             }
                         }
                     }
-                    for item in program.items {
-                        if let Item::Function(function) = item {
-                            for statement in function.body.stmts {
-                                if let Stmt::Expr(statement) = statement {
-                                    let mut values = vec![statement.expr];
-                                    while let Some(value) = values.pop() {
-                                        match value {
-                                            Expr::Binary(binary) => {
-                                                values.push(binary.lhs);
-                                                values.push(binary.rhs);
-                                            }
-                                            Expr::Unary(unary) => values.push(unary.expr),
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    drop(hir);
+                    drop(program);
                     if fail_after_left {
                         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
                     } else {
@@ -2248,7 +2755,7 @@ mod tests {
 
     fn return_ty(src: &str) -> Type {
         let body = lower_body(src);
-        first_return(&body).ty.clone()
+        first_return(&body).ty.to_source()
     }
 
     // 1. integer literal → I64
@@ -2390,11 +2897,14 @@ mod tests {
         let f = hir
             .functions
             .iter()
-            .find(|fun| fun.name == "f")
+            .find(|fun| fun.name == crate::semantic::ids::FunctionId::free_from_source_name("f"))
             .expect("function f");
         match &first_return(&f.body).kind {
             HirExprKind::Call { callee, args } => {
-                assert_eq!(callee, "add");
+                assert_eq!(
+                    callee,
+                    &crate::semantic::ids::FunctionId::free_from_source_name("add")
+                );
                 assert_eq!(args.len(), 2);
                 assert_eq!(args[0].ty, Type::I64);
             }
@@ -2525,7 +3035,7 @@ mod tests {
         let (hir, diags) = lower_src("fn f(a: i64, b: bool) -> i64 { return a; }");
         assert!(diags.is_empty(), "{diags:?}");
         let f = &hir.functions[0];
-        assert_eq!(f.name, "f");
+        assert_eq!(f.name.name(), "f");
         assert_eq!(f.params.len(), 2);
         assert_eq!(f.params[0].ty, Type::I64);
         assert_eq!(f.params[1].ty, Type::Bool);
@@ -2638,8 +3148,10 @@ mod tests {
         let body = lower_body("class Box { pub v: i64; } fn f() { let b = new Box(7); }");
         match &body[0] {
             HirStmt::Let { value, .. } => {
-                assert_eq!(value.ty, Type::Named("Box".to_string()));
-                assert!(matches!(&value.kind, HirExprKind::New { class, .. } if class == "Box"));
+                assert_eq!(value.ty, Type::Named("Box".into()));
+                assert!(
+                    matches!(&value.kind, HirExprKind::New { class, .. } if class == &crate::semantic::ids::TypeId::local("Box"))
+                );
             }
             other => panic!("expected let, got {other:?}"),
         }
@@ -2696,12 +3208,12 @@ mod tests {
         assert!(diags.is_empty(), "{diags:?}");
         assert_eq!(hir.classes.len(), 1);
         let class = &hir.classes[0];
-        assert_eq!(class.name, "Box");
+        assert_eq!(class.name, crate::semantic::ids::TypeId::local("Box"));
         assert_eq!(class.methods.len(), 1);
         let m = &class.methods[0];
-        assert_eq!(m.name, "get");
+        assert_eq!(m.name.name(), "get");
         assert_eq!(m.params[0].name, "self");
-        assert_eq!(m.params[0].ty, Type::Named("Box".to_string()));
+        assert_eq!(m.params[0].ty, Type::Named("Box".into()));
     }
 
     // 45. `self.field` inside a method body resolves to the field's type
@@ -2774,7 +3286,7 @@ mod tests {
         let body = lower_body("class P { x: i64; } fn f() { let p = P { x: 1 }; }");
         match &body[0] {
             HirStmt::Let { value, .. } => {
-                assert_eq!(value.ty, Type::Named("P".to_string()));
+                assert_eq!(value.ty, Type::Named("P".into()));
             }
             other => panic!("expected let, got {other:?}"),
         }
@@ -2813,7 +3325,7 @@ mod tests {
         let body = &hir
             .functions
             .iter()
-            .find(|f| f.name == "f")
+            .find(|f| f.name == crate::semantic::ids::FunctionId::free_from_source_name("f"))
             .expect("`f` lowers")
             .body;
         assert!(
@@ -2836,10 +3348,7 @@ mod tests {
         let body = lower_body("fn f() { let r = 0..3; }");
         match &body[0] {
             HirStmt::Let { value, .. } => {
-                assert_eq!(
-                    value.ty,
-                    Type::Generic("Range".to_string(), vec![Type::I64])
-                );
+                assert_eq!(value.ty, Type::Generic("Range".into(), vec![Type::I64]));
             }
             other => panic!("expected let, got {other:?}"),
         }
@@ -2862,11 +3371,15 @@ mod tests {
     fn p58_async_call_yields_task() {
         let (hir, diags) = lower_src("async fn g() -> i64 { return 1; } fn f() { let t = g(); }");
         assert!(diags.is_empty(), "{diags:?}");
-        let f = hir.functions.iter().find(|x| x.name == "f").unwrap();
+        let f = hir
+            .functions
+            .iter()
+            .find(|x| x.name == crate::semantic::ids::FunctionId::free_from_source_name("f"))
+            .unwrap();
         let body = &f.body;
         match &body[0] {
             HirStmt::Let { value, .. } => {
-                assert_eq!(value.ty, Type::Generic("Task".to_string(), vec![Type::I64]));
+                assert_eq!(value.ty, Type::Generic("Task".into(), vec![Type::I64]));
             }
             other => panic!("expected let, got {other:?}"),
         }
@@ -2878,7 +3391,11 @@ mod tests {
         let src = "async fn g() -> i64 { return 1; } async fn f() -> i64 { return await g(); }";
         let (hir, diags) = lower_src(src);
         assert!(diags.is_empty(), "{diags:?}");
-        let f = hir.functions.iter().find(|x| x.name == "f").unwrap();
+        let f = hir
+            .functions
+            .iter()
+            .find(|x| x.name == crate::semantic::ids::FunctionId::free_from_source_name("f"))
+            .unwrap();
         assert_eq!(first_return(&f.body).ty, Type::I64);
     }
 
@@ -2947,9 +3464,13 @@ mod tests {
                    class B extends A { init(self, v: i64) { super.init(v); } }";
         let (hir, diags) = lower_src(src);
         assert!(diags.is_empty(), "{diags:?}");
-        let b = hir.classes.iter().find(|c| c.name == "B").unwrap();
+        let b = hir
+            .classes
+            .iter()
+            .find(|c| c.name == crate::semantic::ids::TypeId::local("B"))
+            .unwrap();
         let init = &b.methods[0];
-        assert_eq!(init.name, "init");
+        assert_eq!(init.name.name(), "init");
         assert_eq!(init.params[0].name, "self");
         assert!(
             init.body
@@ -3002,14 +3523,14 @@ mod tests {
     #[test]
     fn p72_enum_construction() {
         let src = "enum Shape { Circle(i64), } fn f() -> Shape { return Shape::Circle(1); }";
-        assert_eq!(return_ty(src), Type::Named("Shape".to_string()));
+        assert_eq!(return_ty(src), Type::Named("Shape".into()));
     }
 
     // 73. a fieldless variant value read has the enum type
     #[test]
     fn p73_fieldless_variant_value() {
         let src = "enum Color { Red, Blue, } fn f() -> Color { return Color::Red; }";
-        assert_eq!(return_ty(src), Type::Named("Color".to_string()));
+        assert_eq!(return_ty(src), Type::Named("Color".into()));
     }
 
     // 74. builtin array methods: len/pop/freeze types
@@ -3028,7 +3549,7 @@ mod tests {
             HirStmt::Let { value, .. } => {
                 assert_eq!(
                     value.ty,
-                    Type::Generic("FrozenArray".to_string(), vec![Type::I64])
+                    Type::Generic("FrozenArray".into(), vec![Type::I64])
                 );
             }
             other => panic!("expected let, got {other:?}"),
@@ -3045,10 +3566,7 @@ mod tests {
         let body = lower_body("fn f(m: Map<String, i64>) { let v = m.get(\"k\"); }");
         match &body[0] {
             HirStmt::Let { value, .. } => {
-                assert_eq!(
-                    value.ty,
-                    Type::Generic("Option".to_string(), vec![Type::I64])
-                );
+                assert_eq!(value.ty, Type::Generic("Option".into(), vec![Type::I64]));
             }
             other => panic!("expected let, got {other:?}"),
         }
@@ -3094,7 +3612,11 @@ mod tests {
                    fn g() -> i64 { return apply(|x| x * 3, 14); }";
         let (hir, diags) = lower_with_checker(src);
         assert!(diags.is_empty(), "{diags:?}");
-        let g = hir.functions.iter().find(|f| f.name == "g").unwrap();
+        let g = hir
+            .functions
+            .iter()
+            .find(|f| f.name == crate::semantic::ids::FunctionId::free_from_source_name("g"))
+            .unwrap();
         // The lambda argument inside the call carries the full fn type.
         let HirStmt::Return { value: Some(v), .. } = &g.body[0] else {
             panic!("expected return");
@@ -3112,10 +3634,10 @@ mod tests {
         let (hir, diags) = lower_with_checker(src);
         assert!(diags.is_empty(), "{diags:?}");
         let f = &hir.functions[0];
-        assert_eq!(first_return(&f.body).ty, Type::Named("Msg".to_string()));
+        assert_eq!(first_return(&f.body).ty, Type::Named("Msg".into()));
         assert!(matches!(
             &first_return(&f.body).kind,
-            HirExprKind::StaticCall { class, method, .. } if class == "Msg" && method == "Num"
+            HirExprKind::StaticCall { class, method, .. } if class == &crate::semantic::ids::TypeId::local("Msg") && method == "Num"
         ));
     }
 
@@ -3127,7 +3649,7 @@ mod tests {
         let (hir, diags) = lower_with_checker(src);
         assert!(diags.is_empty(), "{diags:?}");
         let f = &hir.functions[0];
-        let expected = Type::Generic("Result".to_string(), vec![Type::I64, Type::String]);
+        let expected = Type::Generic("Result".into(), vec![Type::I64, Type::String]);
         assert_eq!(first_return(&f.body).ty, expected);
     }
 
@@ -3138,10 +3660,10 @@ mod tests {
         let (hir, diags) = lower_with_checker(src);
         assert!(diags.is_empty(), "{diags:?}");
         let ret = first_return(&hir.functions[0].body);
-        assert_eq!(ret.ty, Type::Generic("Option".to_string(), vec![Type::I64]));
+        assert_eq!(ret.ty, Type::Generic("Option".into(), vec![Type::I64]));
         assert!(matches!(
             &ret.kind,
-            HirExprKind::StaticField { class, field } if class == "Option" && field == "None"
+            HirExprKind::StaticField { class, field } if class == &crate::semantic::ids::TypeId::local("Option") && field == "None"
         ));
     }
 
@@ -3153,7 +3675,11 @@ mod tests {
                    fn f(a: Animal) -> i64 { return a.speak(); }";
         let (hir, diags) = lower_with_checker(src);
         assert!(diags.is_empty(), "{diags:?}");
-        let f = hir.functions.iter().find(|x| x.name == "f").unwrap();
+        let f = hir
+            .functions
+            .iter()
+            .find(|x| x.name == crate::semantic::ids::FunctionId::free_from_source_name("f"))
+            .unwrap();
         assert_eq!(first_return(&f.body).ty, Type::I64);
     }
 
@@ -3167,10 +3693,14 @@ mod tests {
         let src = "fn f() -> Result<void, String> { return Result::Ok(); }";
         let (hir, diags) = lower_with_checker(src);
         assert!(diags.is_empty(), "{diags:?}");
-        let f = hir.functions.iter().find(|x| x.name == "f").unwrap();
+        let f = hir
+            .functions
+            .iter()
+            .find(|x| x.name == crate::semantic::ids::FunctionId::free_from_source_name("f"))
+            .unwrap();
         assert_eq!(
             first_return(&f.body).ty,
-            Type::Generic("Result".to_string(), vec![Type::Void, Type::String])
+            Type::Generic("Result".into(), vec![Type::Void, Type::String])
         );
     }
 
@@ -3185,7 +3715,9 @@ mod tests {
         let (hir, diags) = lower_with_checker(src);
         assert!(diags.is_empty(), "{diags:?}");
         assert!(
-            hir.functions.iter().any(|f| f.name == "main"),
+            hir.functions
+                .iter()
+                .any(|f| f.name == crate::semantic::ids::FunctionId::free_from_source_name("main")),
             "main must not be dropped: {:?}",
             hir.functions.iter().map(|f| &f.name).collect::<Vec<_>>()
         );
@@ -3199,10 +3731,14 @@ mod tests {
         let (hir, diags) =
             lower_with_checker("fn f() -> Result<i64, String> { return Result::Ok(7); }");
         assert!(diags.is_empty(), "{diags:?}");
-        let f = hir.functions.iter().find(|x| x.name == "f").unwrap();
+        let f = hir
+            .functions
+            .iter()
+            .find(|x| x.name == crate::semantic::ids::FunctionId::free_from_source_name("f"))
+            .unwrap();
         assert_eq!(
             first_return(&f.body).ty,
-            Type::Generic("Result".to_string(), vec![Type::I64, Type::String])
+            Type::Generic("Result".into(), vec![Type::I64, Type::String])
         );
     }
 

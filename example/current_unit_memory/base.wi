@@ -1,0 +1,19 @@
+module base;
+
+pub interface Measured {
+    fn value(self) -> i64;
+    fn measured(self) -> i64 { return self.value(); }
+}
+
+pub open class Base implements Measured {
+    pub open fn value(self) -> i64 { return 1; }
+}
+
+class Config { pub static offset: i64 = 40; }
+
+pub fn answer() -> i64 {
+    let add = |x: i64| x + Config::offset;
+    return add(2);
+}
+
+pub fn read(value: Base) -> i64 { return value.measured(); }

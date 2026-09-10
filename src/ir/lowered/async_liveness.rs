@@ -431,7 +431,7 @@ fn successors(block: &LirBlock) -> Vec<BlockId> {
 #[cfg(test)]
 mod coalescing_tests {
     use super::*;
-    use crate::parser::ast::Type;
+    use crate::semantic::ids::SemanticType as Type;
 
     #[test]
     fn deep_local_use_collection_uses_a_one_megabyte_stack() {
@@ -461,9 +461,7 @@ mod coalescing_tests {
                 uses.clear();
                 collect_expr_uses(&expr, &names, &mut uses, &HashSet::from([id]));
                 assert!(uses.is_empty());
-                while let HirExprKind::TryPropagate { inner } = expr.kind {
-                    expr = *inner;
-                }
+                drop(expr);
             })
             .unwrap()
             .join()

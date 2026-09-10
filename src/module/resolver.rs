@@ -102,13 +102,34 @@ pub struct ImportResolution {
 /// Returns the resolved modules in dependency order (dependencies before
 /// dependents) together with the entry file's single-item imports.
 pub fn resolve_imports(entry_program: &Program, src_root: &Path) -> ImportResolution {
+    resolve_imports_in_graph(
+        entry_program,
+        src_root,
+        ModuleGraph::new(src_root.to_path_buf()),
+    )
+}
+
+pub(crate) fn resolve_imports_spooled(
+    entry_program: &Program,
+    src_root: &Path,
+    artifacts: super::artifacts::UnitArtifacts,
+) -> ImportResolution {
+    let mut graph = ModuleGraph::new(src_root.to_path_buf());
+    graph.artifacts = Some(artifacts);
+    resolve_imports_in_graph(entry_program, src_root, graph)
+}
+
+fn resolve_imports_in_graph(
+    entry_program: &Program,
+    src_root: &Path,
+    mut graph: ModuleGraph,
+) -> ImportResolution {
     struct BoundImport {
         span: crate::diagnostics::Span,
         path: String,
         alias: Option<String>,
     }
 
-    let mut graph = ModuleGraph::new(src_root.to_path_buf());
     let mut errors: Vec<Diagnostic> = Vec::new();
     let mut item_imports: Vec<ItemImport> = Vec::new();
 
@@ -194,6 +215,7 @@ pub fn resolve_imports(entry_program: &Program, src_root: &Path) -> ImportResolu
 /// dispatch to the right loader. Item imports load the *parent* module and (for
 /// the entry file) record an [`ItemImport`] binding via `item_sink`.
 #[allow(clippy::too_many_arguments)]
+#[willow_continuations::function(resolve_import, resolve_one)]
 fn resolve_import(
     path: &str,
     alias: Option<&str>,
@@ -245,6 +267,7 @@ fn resolve_import(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[willow_continuations::function(resolve_import, resolve_one)]
 fn resolve_one(
     path: &str,
     alias: Option<&str>,
@@ -311,7 +334,25 @@ fn resolve_one(
         }
     };
 
-    let (program, parse_errs) = Parser::new(tokens).parse();
+    let (mut program, parse_errs) = Parser::new(tokens).parse();
+    // Release the current source/body before descending into dependencies.
+    // Only declaration shells and import paths survive on the resolver stack.
+    let mut source = source;
+    if let Some(artifacts) = &mut graph.artifacts {
+        let snapshot = artifacts
+            .snapshot_source(module_id.file_id(), &source)
+            .and_then(|()| artifacts.offload(&mut program));
+        if let Err(error) = snapshot {
+            errors.push(Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0700,
+                format!("cannot store compiler unit: {error:#}"),
+            ));
+            return;
+        }
+        source = String::new();
+    }
+
     if !parse_errs.is_empty() {
         errors.extend(parse_errs);
         // Keep the partially parsed module in the graph long enough for the

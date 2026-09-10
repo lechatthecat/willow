@@ -189,10 +189,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // cannot answer for it, so fall back to every class that supplies
             // the method, which is what this call site emitted before
             // willow-fm7t.
-            let mut names: Vec<&String> = self.class_type_ids.keys().collect();
+            let mut names: Vec<&TypeId> = self.class_type_ids.keys().collect();
             names.sort();
             for cls in names {
-                if let Some(defining) = self.resolve_defining_class(cls, method_name) {
+                if let Some(defining) = self.resolve_defining_class(&cls.to_string(), method_name) {
                     push(&mut out, &mut seen_targets, defining);
                 }
             }
@@ -200,7 +200,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         };
 
         let base_ids = self.class_base_ids();
-        let mut descendants: Vec<(i64, String)> = self
+        let mut descendants: Vec<(i64, TypeId)> = self
             .class_type_ids
             .iter()
             .filter(|&(_, &id)| {
@@ -210,7 +210,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .collect();
         descendants.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         for (_, cls) in descendants {
-            if let Some(defining) = self.resolve_defining_class(&cls, method_name) {
+            if let Some(defining) = self.resolve_defining_class(&cls.to_string(), method_name) {
                 push(&mut out, &mut seen_targets, defining);
             }
         }
@@ -310,7 +310,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if self.func_ids.contains_key(&mangled) {
                 return Some(name);
             }
-            search = self.class_base.get(&name).cloned();
+            search = self.class_base.get(&name).map(ToString::to_string);
         }
         None
     }
@@ -340,12 +340,17 @@ pub(super) fn collection_elem_kind(ty: &Type) -> Option<i64> {
 /// Names with no `type_id` are dropped: a class that has no runtime id is not a
 /// dispatch candidate in the first place.
 pub(super) fn class_base_ids(
-    class_base: &TypeMap<String>,
+    class_base: &TypeMap<TypeId>,
     class_type_ids: &TypeMap<i64>,
 ) -> HashMap<i64, i64> {
     class_base
         .iter()
-        .filter_map(|(child, base)| Some((*class_type_ids.get(child)?, *class_type_ids.get(base)?)))
+        .filter_map(|(child, base)| {
+            Some((
+                *class_type_ids.get_canonical_id(child)?,
+                *class_type_ids.get_canonical_id(base)?,
+            ))
+        })
         .collect()
 }
 
@@ -498,8 +503,11 @@ mod tests {
             ("Dog".to_string(), 2),
         ]);
         let class_base = TypeMap::from([
-            ("zoo::Dog".to_string(), "zoo::Animal".to_string()),
-            ("Dog".to_string(), "zoo::Animal".to_string()),
+            (
+                "zoo::Dog".to_string(),
+                TypeId::from_source_name("zoo::Animal"),
+            ),
+            ("Dog".to_string(), TypeId::from_source_name("zoo::Animal")),
         ]);
 
         let base_ids = class_base_ids(&class_base, &type_ids);
@@ -517,8 +525,8 @@ mod tests {
     fn dispatch_12b_edges_without_ids_are_dropped() {
         let type_ids = TypeMap::from([("Known".to_string(), 1i64)]);
         let class_base = TypeMap::from([
-            ("Known".to_string(), "Vanished".to_string()),
-            ("Vanished".to_string(), "Known".to_string()),
+            ("Known".to_string(), TypeId::from_source_name("Vanished")),
+            ("Vanished".to_string(), TypeId::from_source_name("Known")),
         ]);
         assert!(class_base_ids(&class_base, &type_ids).is_empty());
     }
@@ -568,12 +576,18 @@ fn main() {}
         let mut codegen =
             Codegen::new(&CompilerOptions::debug()).expect("codegen should initialize");
         for (name, info) in &checker.symbols.enums {
-            codegen.register_enum_info(name.to_string(), info.clone());
+            codegen.register_enum_info(name.to_string(), info.to_semantic());
         }
         for (name, info) in &checker.symbols.interfaces {
-            codegen.register_interface_info(name.to_string(), info.clone());
+            codegen.register_interface_info(name.to_string(), info.to_semantic());
         }
-        codegen.register_expr_types(checker.expr_types.clone());
+        codegen.register_expr_types(
+            checker
+                .expr_types
+                .iter()
+                .map(|(id, ty)| (*id, ty.into()))
+                .collect(),
+        );
         let tables = crate::ir::lower::CheckerTables::from_checker(&checker);
         let (hir, gaps) = crate::ir::lower::lower_program_with(&program, &tables);
         assert!(gaps.is_empty(), "fixture lowering gaps: {gaps:?}");

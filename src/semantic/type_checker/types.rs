@@ -4,12 +4,12 @@
 //! existing `crate::semantic::type_checker::*` paths keep working.
 
 use crate::parser::ast::*;
-use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
+use crate::semantic::builtin_types::{self, BuiltinTypeId as B, TypeName};
 use crate::semantic::symbols::*;
 
 /// True for the task-handle generic family produced by spawning/awaiting:
 /// `Task<T>` / `Future<T>` / `JoinHandle<T>` (willow-h2vf case A).
-pub(crate) fn is_task_handle_type(ty: &Type) -> bool {
+pub(crate) fn is_task_handle_type<N: TypeName + Clone>(ty: &Type<N>) -> bool {
     builtin_types::resolve(ty).is_some_and(|resolved| {
         resolved.args.len() == 1 && matches!(resolved.id, B::Task | B::Future | B::JoinHandle)
     })
@@ -18,7 +18,7 @@ pub(crate) fn is_task_handle_type(ty: &Type) -> bool {
 /// The task's own result type `T` behind a panic-on-cancel handle:
 /// `Task<T>` (an async call's eager task) or `JoinHandle<T>`. The frame's slot 0
 /// holds the result (willow-h2vf).
-pub(crate) fn join_handle_result_type(ty: &Type) -> Option<Type> {
+pub(crate) fn join_handle_result_type<N: TypeName + Clone>(ty: &Type<N>) -> Option<Type<N>> {
     let resolved = builtin_types::resolve(ty)?;
     (resolved.args.len() == 1 && matches!(resolved.id, B::JoinHandle | B::Task))
         .then(|| resolved.args[0].clone())
@@ -27,7 +27,7 @@ pub(crate) fn join_handle_result_type(ty: &Type) -> Option<Type> {
 /// `TaskResult<T>` — the cancellation-aware awaitable returned by
 /// `Task<T>.result()` (willow-qrj9). Returns the task's own result type `T`;
 /// awaiting it produces `Result<T, Cancelled>`.
-pub(crate) fn task_result_output_type(ty: &Type) -> Option<Type> {
+pub(crate) fn task_result_output_type<N: TypeName + Clone>(ty: &Type<N>) -> Option<Type<N>> {
     builtin_types::unary_arg(ty, B::TaskResult).cloned()
 }
 
@@ -40,7 +40,7 @@ pub(crate) fn task_result_output_type(ty: &Type) -> Option<Type> {
 /// behave identically (willow-qrj9). This one definition is shared by the type
 /// checker and the Cranelift backend so the two can never disagree about which
 /// handles are awaitable.
-pub(crate) fn awaitable_task_type(ty: &Type) -> Option<(Type, bool)> {
+pub(crate) fn awaitable_task_type<N: TypeName + Clone>(ty: &Type<N>) -> Option<(Type<N>, bool)> {
     join_handle_result_type(ty)
         .map(|t| (t, false))
         .or_else(|| task_result_output_type(ty).map(|t| (t, true)))
@@ -48,7 +48,9 @@ pub(crate) fn awaitable_task_type(ty: &Type) -> Option<(Type, bool)> {
 
 /// The result type produced by `await`ing `ty`: `T` for `Task<T>`/`JoinHandle<T>`
 /// and `Future<T>`, `Result<T, Cancelled>` for `TaskResult<T>`.
-pub(crate) fn await_output_type(ty: &Type) -> Option<Type> {
+pub(crate) fn await_output_type<N: TypeName + Clone + From<&'static str>>(
+    ty: &Type<N>,
+) -> Option<Type<N>> {
     if let Some((task_ty, cancel_aware)) = awaitable_task_type(ty) {
         return Some(if cancel_aware {
             B::Result.apply(vec![task_ty, B::Cancelled.apply(vec![])])
@@ -59,37 +61,72 @@ pub(crate) fn await_output_type(ty: &Type) -> Option<Type> {
     builtin_types::unary_arg(ty, B::Future).cloned()
 }
 
-pub(crate) fn type_name(ty: &Type) -> String {
-    match ty {
-        Type::I64 => "i64".to_string(),
-        Type::F64 => "f64".to_string(),
-        Type::Bool => "bool".to_string(),
-        Type::String => "String".to_string(),
-        Type::Void => "void".to_string(),
-        Type::Never => "!".to_string(),
-        Type::Named(n) => n.clone(),
-        Type::Array(element) => format!("Array<{}>", type_name(element)),
-        Type::Generic(name, args) => {
-            let args = args.iter().map(type_name).collect::<Vec<_>>().join(", ");
-            format!("{name}<{args}>")
-        }
-        Type::Fn(params, ret) => {
-            let param_str = params.iter().map(type_name).collect::<Vec<_>>().join(", ");
-            format!("fn({}) -> {}", param_str, type_name(ret))
-        }
-        Type::Closure(params, ret) => {
-            let param_str = params.iter().map(type_name).collect::<Vec<_>>().join(", ");
-            format!("closure({}) -> {}", param_str, type_name(ret))
+pub(crate) fn type_name<N: std::fmt::Display>(ty: &Type<N>) -> String {
+    enum Part<'a, N> {
+        Type(&'a Type<N>),
+        Text(&'static str),
+        Name(&'a N),
+    }
+    let mut output = String::new();
+    let mut work = vec![Part::Type(ty)];
+    while let Some(part) = work.pop() {
+        match part {
+            Part::Text(text) => output.push_str(text),
+            Part::Name(name) => {
+                use std::fmt::Write;
+                write!(output, "{name}").expect("write into string");
+            }
+            Part::Type(ty) => match ty {
+                Type::I64 => output.push_str("i64"),
+                Type::F64 => output.push_str("f64"),
+                Type::Bool => output.push_str("bool"),
+                Type::String => output.push_str("String"),
+                Type::Void => output.push_str("void"),
+                Type::Never => output.push('!'),
+                Type::Named(name) => work.push(Part::Name(name)),
+                Type::Array(element) => {
+                    work.push(Part::Text(">"));
+                    work.push(Part::Type(element));
+                    work.push(Part::Text("Array<"));
+                }
+                Type::Generic(name, args) => {
+                    work.push(Part::Text(">"));
+                    for (index, arg) in args.iter().enumerate().rev() {
+                        work.push(Part::Type(arg));
+                        if index > 0 {
+                            work.push(Part::Text(", "));
+                        }
+                    }
+                    work.push(Part::Text("<"));
+                    work.push(Part::Name(name));
+                }
+                Type::Fn(params, ret) | Type::Closure(params, ret) => {
+                    work.push(Part::Type(ret));
+                    work.push(Part::Text(") -> "));
+                    for (index, param) in params.iter().enumerate().rev() {
+                        work.push(Part::Type(param));
+                        if index > 0 {
+                            work.push(Part::Text(", "));
+                        }
+                    }
+                    work.push(Part::Text(if matches!(ty, Type::Fn(..)) {
+                        "fn("
+                    } else {
+                        "closure("
+                    }));
+                }
+            },
         }
     }
+    output
 }
 
 pub(crate) fn range_type() -> Type {
     Type::Generic("Range".to_string(), vec![Type::I64])
 }
 
-pub(crate) fn is_i64_range_type(ty: &Type) -> bool {
-    matches!(ty, Type::Generic(name, args) if name == "Range" && args.as_slice() == [Type::I64])
+pub(crate) fn is_i64_range_type<N: TypeName>(ty: &Type<N>) -> bool {
+    matches!(ty, Type::Generic(name, args) if name.builtin_name() == "Range" && matches!(args.as_slice(), [Type::I64]))
 }
 
 pub(crate) fn function_call_return_type(info: &FuncInfo) -> Type {
@@ -108,7 +145,7 @@ pub(crate) fn method_call_return_type(info: &MethodInfo) -> Type {
     }
 }
 
-pub(crate) fn channel_element_type(ty: &Type) -> Option<Type> {
+pub(crate) fn channel_element_type<N: TypeName + Clone>(ty: &Type<N>) -> Option<Type<N>> {
     builtin_types::unary_arg(ty, B::Channel).cloned()
 }
 
@@ -136,6 +173,7 @@ pub(crate) fn is_untyped_channel_ctor_call(expr: &Expr) -> bool {
     }
 }
 
+#[willow_continuations::function(qualify_type_for_module)]
 pub(crate) fn qualify_type_for_module(ty: &Type, module_prefix: Option<&str>) -> Type {
     match ty {
         Type::Named(name) => module_prefix

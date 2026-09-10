@@ -3,6 +3,7 @@ use super::ast::*;
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::lexer::token::TokenKind;
 
+#[willow_continuations::parser]
 impl Parser {
     pub(super) fn parse_expr(&mut self) -> Result<Expr, Diagnostic> {
         self.parse_range()
@@ -27,27 +28,63 @@ impl Parser {
 
     // condition ? then_expr : else_expr  (right-associative, lower than ||)
     pub(super) fn parse_ternary(&mut self) -> Result<Expr, Diagnostic> {
-        let span = self.current_span();
-        let cond = self.parse_or()?;
-        if !self.eat(TokenKind::Question) {
-            return Ok(cond);
+        enum Frame {
+            Then {
+                condition: Expr,
+                span: Span,
+            },
+            Else {
+                condition: Expr,
+                then_expr: Expr,
+                span: Span,
+            },
         }
-        let then_expr = self.parse_ternary()?; // right-associative: recurse for then
-        if !self.eat(TokenKind::Colon) {
-            return Err(self
-                .err(ErrorCode::E0903, "expected `:` in ternary expression")
-                .with_help("write the ternary as `condition ? then_value : else_value`"));
+        let mut frames = Vec::new();
+        loop {
+            let span = self.current_span();
+            let mut value = self.parse_or()?;
+            if self.eat(TokenKind::Question) {
+                frames.push(Frame::Then {
+                    condition: value,
+                    span,
+                });
+                continue;
+            }
+            loop {
+                match frames.pop() {
+                    None => return Ok(value),
+                    Some(Frame::Then { condition, span }) => {
+                        if !self.eat(TokenKind::Colon) {
+                            return Err(self
+                                .err(ErrorCode::E0903, "expected `:` in ternary expression")
+                                .with_help(
+                                    "write the ternary as `condition ? then_value : else_value`",
+                                ));
+                        }
+                        frames.push(Frame::Else {
+                            condition,
+                            then_expr: value,
+                            span,
+                        });
+                        break;
+                    }
+                    Some(Frame::Else {
+                        condition,
+                        then_expr,
+                        span,
+                    }) => {
+                        let span = span.to(value.span());
+                        value = Expr::Ternary(Box::new(TernaryExpr {
+                            condition,
+                            then_expr,
+                            else_expr: value,
+                            span,
+                            id: ExprId::fresh(),
+                        }));
+                    }
+                }
+            }
         }
-        let else_expr = self.parse_ternary()?; // right-associative: recurse for else
-        let end = else_expr.span();
-        let span = span.to(end);
-        Ok(Expr::Ternary(Box::new(TernaryExpr {
-            condition: cond,
-            then_expr,
-            else_expr,
-            span,
-            id: ExprId::fresh(),
-        })))
     }
 
     pub(super) fn parse_or(&mut self) -> Result<Expr, Diagnostic> {
@@ -199,35 +236,59 @@ impl Parser {
     /// (`2 ** 3 ** 2` == `2 ** (3 ** 2)`) and lets the exponent carry a sign
     /// (`2.0 ** -3.0`).
     pub(super) fn parse_pow(&mut self) -> Result<Expr, Diagnostic> {
-        let lhs = self.parse_await()?;
-        if !self.check(TokenKind::StarStar) {
-            return Ok(lhs);
+        let mut operands = Vec::new();
+        let mut lhs = self.parse_await()?;
+        while self.check(TokenKind::StarStar) {
+            let span = self.current_span();
+            self.advance();
+            let prefix = match self.peek_kind() {
+                TokenKind::Minus => Some(UnaryOp::Neg),
+                TokenKind::Bang => Some(UnaryOp::Not),
+                _ => None,
+            };
+            let prefix_span = self.current_span();
+            if prefix.is_some() {
+                self.advance();
+            }
+            operands.push((lhs, span, prefix, prefix_span));
+            lhs = self.parse_await()?;
         }
-        let span = self.current_span();
-        self.advance();
-        let rhs = self.parse_unary()?;
-        Ok(Expr::Binary(Box::new(BinaryExpr {
-            op: BinOp::Pow,
-            lhs,
-            rhs,
-            span,
-            id: ExprId::fresh(),
-        })))
+        while let Some((base, span, prefix, prefix_span)) = operands.pop() {
+            if let Some(op) = prefix {
+                lhs = Expr::Unary(Box::new(UnaryExpr {
+                    op,
+                    expr: lhs,
+                    span: prefix_span,
+                    id: ExprId::fresh(),
+                }));
+            }
+            lhs = Expr::Binary(Box::new(BinaryExpr {
+                op: BinOp::Pow,
+                lhs: base,
+                rhs: lhs,
+                span,
+                id: ExprId::fresh(),
+            }));
+        }
+        Ok(lhs)
     }
 
     /// Prefix `await`, which binds tighter than `**` and looser than postfix.
     pub(super) fn parse_await(&mut self) -> Result<Expr, Diagnostic> {
-        if self.check(TokenKind::Await) {
-            let span = self.current_span();
+        let mut spans = Vec::new();
+        while self.check(TokenKind::Await) {
+            spans.push(self.current_span());
             self.advance();
-            let expr = self.parse_await()?;
-            return Ok(Expr::Await(Box::new(AwaitExpr {
+        }
+        let mut expr = self.parse_postfix()?;
+        for span in spans.into_iter().rev() {
+            expr = Expr::Await(Box::new(AwaitExpr {
                 expr,
                 span,
                 id: ExprId::fresh(),
-            })));
+            }));
         }
-        self.parse_postfix()
+        Ok(expr)
     }
 
     /// Parse a primary expression then consume any postfix `.field` / `.method(args)` chains.
@@ -699,38 +760,38 @@ impl Parser {
                 self.advance();
                 let binding = self.expect_ident()?;
                 self.expect(TokenKind::Eq)?;
-                match self.parse_expr()? {
+                match &mut self.parse_expr()? {
                     // `recv` takes no arguments. Matching on the method name
                     // alone would silently discard `ch.recv(f())` — both the
                     // arity error and the argument's side effects.
                     Expr::MethodCall(m) if m.method == "recv" && m.args.is_empty() => {
                         SelectCaseKind::Recv {
                             binding,
-                            channel: m.object,
+                            channel: m.object.take(),
                         }
                     }
-                    Expr::Await(a) => Self::select_await_case(binding, a.expr),
-                    other => return Err(self.select_let_case_error(&other)),
+                    Expr::Await(a) => Self::select_await_case(binding, a.expr.take()),
+                    other => return Err(self.select_let_case_error(other)),
                 }
             } else if matches!(self.peek_kind(), TokenKind::Ident(name) if name == "default") {
                 self.advance();
                 SelectCaseKind::Default
             } else {
                 // `ch.recv() => ...` (discarded value) or `ch.send(x) => ...`
-                match self.parse_expr()? {
+                match &mut self.parse_expr()? {
                     Expr::MethodCall(m) if m.method == "recv" && m.args.is_empty() => {
                         SelectCaseKind::Recv {
                             binding: "_".to_string(),
-                            channel: m.object,
+                            channel: m.object.take(),
                         }
                     }
-                    Expr::Await(a) => Self::select_await_case("_".to_string(), a.expr),
+                    Expr::Await(a) => Self::select_await_case("_".to_string(), a.expr.take()),
                     // The select case forms drop the `CallArgMode`, so a
                     // reference argument would be silently downgraded to a value
                     // one — rejected here with the same code a plain
                     // `ch.send(&v)` / `sleep(&ms)` gets from the checker.
                     Expr::MethodCall(m) if m.method == "send" && m.args.len() == 1 => {
-                        let arg = m.args.into_iter().next().unwrap();
+                        let arg = m.args.remove(0);
                         if let CallArgMode::Reference { ampersand_span } = arg.mode {
                             return Err(self.err_at(
                                 ErrorCode::E1703,
@@ -739,12 +800,12 @@ impl Parser {
                             ));
                         }
                         SelectCaseKind::Send {
-                            channel: m.object,
+                            channel: m.object.take(),
                             value: arg.expr,
                         }
                     }
                     Expr::Call(c) if c.callee == "sleep" && c.args.len() == 1 => {
-                        let arg = c.args.into_iter().next().unwrap();
+                        let arg = c.args.remove(0);
                         if let CallArgMode::Reference { ampersand_span } = arg.mode {
                             return Err(self.err_at(
                                 ErrorCode::E1703,
@@ -754,7 +815,7 @@ impl Parser {
                         }
                         SelectCaseKind::Timeout { millis: arg.expr }
                     }
-                    other => return Err(self.select_case_error(&other)),
+                    other => return Err(self.select_case_error(other)),
                 }
             };
             self.expect(TokenKind::FatArrow)?;

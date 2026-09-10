@@ -41,6 +41,7 @@ impl BlockingPool {
             std::thread::Builder::new()
                 .name(format!("willow-blocking-{index}"))
                 .spawn(move || {
+                    crate::stack_overflow::protect_current_thread();
                     loop {
                         let work = {
                             let receiver = receiver

@@ -7,9 +7,9 @@ use super::type_index::TypeMap;
 
 use cranelift_codegen::ir::types;
 
-use crate::parser::ast::*;
+use super::EnumInfo;
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
-use crate::semantic::symbols::EnumInfo;
+use crate::semantic::ids::SemanticType as Type;
 
 /// The Cranelift type of a Willow FUNCTION VALUE — the one place the backend
 /// decides how wide a function address is.
@@ -26,19 +26,21 @@ use crate::semantic::symbols::EnumInfo;
 /// matter of editing this line; it is tracked as `willow-d9lm`.
 pub(crate) const FN_ADDR_TYPE: cranelift_codegen::ir::Type = types::I64;
 
-pub(crate) fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
+pub(crate) fn clif_type<N: builtin_types::TypeName>(
+    ty: &crate::parser::ast::Type<N>,
+) -> cranelift_codegen::ir::Type {
     match ty {
-        Type::I64 => types::I64,
-        Type::F64 => types::F64,
-        Type::Bool => types::I8,
-        Type::String => types::I64,
-        Type::Never => types::I64, // bottom type — treated as I64 for codegen purposes
-        Type::Array(_) => types::I64,
+        crate::parser::ast::Type::I64 => types::I64,
+        crate::parser::ast::Type::F64 => types::F64,
+        crate::parser::ast::Type::Bool => types::I8,
+        crate::parser::ast::Type::String => types::I64,
+        crate::parser::ast::Type::Never => types::I64, // bottom type — treated as I64 for codegen purposes
+        crate::parser::ast::Type::Array(_) => types::I64,
         // Task<T>/JoinHandle<T> are pointers to async task frames.
         // `TaskResult<T>` is the SAME pointer viewed cancellation-awarely
         // (willow-qrj9): `result()` is an identity adapter, so it must never
         // gain a distinct representation.
-        Type::Generic(_, _)
+        crate::parser::ast::Type::Generic(_, _)
             if builtin_types::resolve(ty).is_some_and(|resolved| {
                 matches!(resolved.id, B::Task | B::JoinHandle | B::TaskResult)
             }) =>
@@ -46,30 +48,34 @@ pub(crate) fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
             types::I64
         }
         // Future<T> is an opaque runtime future pointer.
-        Type::Generic(_, _) if builtin_types::unary_arg(ty, B::Future).is_some() => types::I64,
-        Type::Generic(_, _) => types::I64,
+        crate::parser::ast::Type::Generic(_, _)
+            if builtin_types::unary_arg(ty, B::Future).is_some() =>
+        {
+            types::I64
+        }
+        crate::parser::ast::Type::Generic(_, _) => types::I64,
         // A function address, a fixed 64-bit word — see [`FN_ADDR_TYPE`].
-        Type::Fn(_, _) => FN_ADDR_TYPE,
+        crate::parser::ast::Type::Fn(_, _) => FN_ADDR_TYPE,
         // A closure VALUE is the environment object, so it is a GC pointer and
         // not a code address; the code pointer lives in its word 0
         // (willow-0g8j.2.12).
-        Type::Closure(_, _) => types::I64,
-        Type::Named(_) => types::I64,
-        Type::Void => types::I8,
+        crate::parser::ast::Type::Closure(_, _) => types::I64,
+        crate::parser::ast::Type::Named(_) => types::I64,
+        crate::parser::ast::Type::Void => types::I8,
     }
 }
 
-pub(crate) fn debug_type_name(ty: &Type) -> String {
+pub(crate) fn debug_type_name<N: std::fmt::Display>(ty: &crate::parser::ast::Type<N>) -> String {
     match ty {
-        Type::I64 => "i64".to_string(),
-        Type::F64 => "f64".to_string(),
-        Type::Bool => "bool".to_string(),
-        Type::String => "String".to_string(),
-        Type::Void => "void".to_string(),
-        Type::Never => "!".to_string(),
-        Type::Named(name) => name.clone(),
-        Type::Array(element) => format!("Array<{}>", debug_type_name(element)),
-        Type::Generic(name, args) => {
+        crate::parser::ast::Type::I64 => "i64".to_string(),
+        crate::parser::ast::Type::F64 => "f64".to_string(),
+        crate::parser::ast::Type::Bool => "bool".to_string(),
+        crate::parser::ast::Type::String => "String".to_string(),
+        crate::parser::ast::Type::Void => "void".to_string(),
+        crate::parser::ast::Type::Never => "!".to_string(),
+        crate::parser::ast::Type::Named(name) => name.to_string(),
+        crate::parser::ast::Type::Array(element) => format!("Array<{}>", debug_type_name(element)),
+        crate::parser::ast::Type::Generic(name, args) => {
             let args = args
                 .iter()
                 .map(debug_type_name)
@@ -77,7 +83,7 @@ pub(crate) fn debug_type_name(ty: &Type) -> String {
                 .join(",");
             format!("{name}<{args}>")
         }
-        Type::Fn(params, ret) => {
+        crate::parser::ast::Type::Fn(params, ret) => {
             let param_str = params
                 .iter()
                 .map(debug_type_name)
@@ -85,7 +91,7 @@ pub(crate) fn debug_type_name(ty: &Type) -> String {
                 .join(",");
             format!("fn({}) -> {}", param_str, debug_type_name(ret))
         }
-        Type::Closure(params, ret) => {
+        crate::parser::ast::Type::Closure(params, ret) => {
             let param_str = params
                 .iter()
                 .map(debug_type_name)
@@ -151,7 +157,7 @@ pub(crate) fn is_gc_managed(ty: &Type, enum_infos: &TypeMap<EnumInfo>) -> bool {
         // Opaque runtime-pointer generics (Future/Blocking* compatibility cells) are NOT
         // GC heap objects (see `is_opaque_runtime_pointer_type`); every other
         // generic — Task/JoinHandle async frames, Range, Map, user generics — is.
-        Type::Generic(name, _) => !is_opaque_runtime_pointer_type(name),
+        Type::Generic(name, _) => !is_opaque_runtime_pointer_type(name.name()),
         // String is now a GC-managed WillowString heap object (payload: len + bytes).
         // It is allocated through the central GC path and has a valid GcHeader.
         Type::String => true,
@@ -224,8 +230,8 @@ mod tests {
         let reference_types = [
             Type::String,
             Type::Array(Box::new(Type::I64)),
-            Type::Named("Point".to_string()),
-            Type::Generic("Option".to_string(), vec![Type::I64]),
+            Type::Named("Point".to_string().into()),
+            Type::Generic("Option".to_string().into(), vec![Type::I64]),
             Type::Fn(vec![Type::I64], Box::new(Type::I64)),
         ];
         for ty in reference_types {

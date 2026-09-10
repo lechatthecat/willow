@@ -5,6 +5,7 @@ use crate::semantic::symbols::*;
 
 use super::*;
 
+#[willow_continuations::checker]
 impl TypeChecker {
     pub(super) fn check_select(&mut self, s: &SelectExpr) {
         let mut default_count = 0;

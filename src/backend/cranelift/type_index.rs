@@ -55,30 +55,23 @@ impl TypeScope {
 
 pub trait TypeKey: Clone {
     type Id: Eq + Hash + Clone;
-    fn canonical(id: &Self::Id) -> Self;
     fn lookup(&self, scope: &TypeScope) -> Self::Id;
     fn declare(&self, scope: &TypeScope) -> Self::Id;
 }
-impl TypeKey for String {
+impl TypeKey for TypeId {
     type Id = TypeId;
-    fn canonical(id: &TypeId) -> Self {
-        id.to_string()
-    }
     fn lookup(&self, scope: &TypeScope) -> TypeId {
-        scope.resolve(&TypeId::from_source_name(self))
+        scope.resolve(self)
     }
     fn declare(&self, scope: &TypeScope) -> TypeId {
-        scope.restore(self, None);
-        TypeId::from_source_name(self)
+        scope.restore(&self.to_string(), None);
+        self.clone()
     }
 }
-impl TypeKey for (String, String) {
+impl TypeKey for (TypeId, TypeId) {
     type Id = (TypeId, TypeId);
-    fn canonical(id: &Self::Id) -> Self {
-        (id.0.to_string(), id.1.to_string())
-    }
     fn lookup(&self, scope: &TypeScope) -> Self::Id {
-        (self.0.lookup(scope), self.1.lookup(scope))
+        (scope.resolve(&self.0), scope.resolve(&self.1))
     }
     fn declare(&self, scope: &TypeScope) -> Self::Id {
         self.lookup(scope)
@@ -87,11 +80,11 @@ impl TypeKey for (String, String) {
 
 #[derive(Clone, Debug)]
 pub struct ScopedTypeMap<K: TypeKey, V> {
-    values: HashMap<K::Id, (K, V)>,
+    values: HashMap<K::Id, V>,
     scope: TypeScope,
 }
-pub type TypeMap<V> = ScopedTypeMap<String, V>;
-pub type VtableMap<V> = ScopedTypeMap<(String, String), V>;
+pub type TypeMap<V> = ScopedTypeMap<TypeId, V>;
+pub type VtableMap<V> = ScopedTypeMap<(TypeId, TypeId), V>;
 impl<K: TypeKey, V> Default for ScopedTypeMap<K, V> {
     fn default() -> Self {
         Self::new()
@@ -107,20 +100,19 @@ impl<K: TypeKey, V> ScopedTypeMap<K, V> {
             scope,
         }
     }
-    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+    pub fn insert(&mut self, key: impl Into<K>, value: V) -> Option<V> {
+        let key = key.into();
         let id = key.declare(&self.scope);
-        self.values
-            .insert(id.clone(), (K::canonical(&id), value))
-            .map(|(_, value)| value)
+        self.values.insert(id, value)
     }
-    pub fn keys(&self) -> impl Iterator<Item = &K> {
-        self.values.values().map(|(key, _)| key)
+    pub fn keys(&self) -> impl Iterator<Item = &K::Id> {
+        self.values.keys()
     }
     pub fn values(&self) -> impl Iterator<Item = &V> {
-        self.values.values().map(|(_, value)| value)
+        self.values.values()
     }
-    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
-        self.values.values().map(|(key, value)| (key, value))
+    pub fn iter(&self) -> impl Iterator<Item = (&K::Id, &V)> {
+        self.values.iter()
     }
     pub fn len(&self) -> usize {
         self.values.len()
@@ -132,13 +124,44 @@ impl<K: TypeKey, V> ScopedTypeMap<K, V> {
         self.values.clear();
     }
 }
-impl<V> TypeMap<V> {
-    pub fn get(&self, key: &str) -> Option<&V> {
-        self.values
-            .get(&self.scope.resolve(&TypeId::from_source_name(key)))
-            .map(|(_, v)| v)
+pub trait TypeLookup {
+    fn type_id(&self) -> TypeId;
+}
+impl<T: TypeLookup + ?Sized> TypeLookup for &T {
+    fn type_id(&self) -> TypeId {
+        (*self).type_id()
     }
-    pub fn contains_key(&self, key: &str) -> bool {
+}
+impl TypeLookup for str {
+    fn type_id(&self) -> TypeId {
+        TypeId::from_source_name(self)
+    }
+}
+impl TypeLookup for String {
+    fn type_id(&self) -> TypeId {
+        TypeId::from_source_name(self)
+    }
+}
+impl TypeLookup for TypeId {
+    fn type_id(&self) -> TypeId {
+        self.clone()
+    }
+}
+
+impl<V> TypeMap<V> {
+    pub fn get_id(&self, id: &TypeId) -> Option<&V> {
+        self.values.get(&self.scope.resolve(id))
+    }
+    pub fn get_canonical_id(&self, id: &TypeId) -> Option<&V> {
+        self.values.get(id)
+    }
+    pub fn insert_canonical_id(&mut self, id: TypeId, value: V) -> Option<V> {
+        self.values.insert(id, value)
+    }
+    pub fn get<Q: TypeLookup + ?Sized>(&self, key: &Q) -> Option<&V> {
+        self.values.get(&self.scope.resolve(&key.type_id()))
+    }
+    pub fn contains_key<Q: TypeLookup + ?Sized>(&self, key: &Q) -> bool {
         self.get(key).is_some()
     }
     /// Look `key` up as a DECLARATION identity, ignoring whatever aliases the
@@ -149,10 +172,8 @@ impl<V> TypeMap<V> {
     /// of them to another module's type — an `import sales as books;` in a
     /// build that also has a real `books` module — must not change what they
     /// mean for every other class in the program.
-    pub fn get_canonical(&self, key: &str) -> Option<&V> {
-        self.values
-            .get(&TypeId::from_source_name(key))
-            .map(|(_, v)| v)
+    pub fn get_canonical<Q: TypeLookup + ?Sized>(&self, key: &Q) -> Option<&V> {
+        self.values.get(&key.type_id())
     }
     /// Write under `key`'s own identity, leaving any alias over it in place.
     ///
@@ -160,33 +181,28 @@ impl<V> TypeMap<V> {
     /// the entries it reads, and must neither follow a unit's alias into
     /// another module's entry (which [`Self::insert`] avoids by tearing the
     /// alias down) nor tear that alias down under the unit still using it.
-    pub fn insert_canonical(&mut self, key: String, value: V) -> Option<V> {
-        let id = TypeId::from_source_name(&key);
-        self.values.insert(id, (key, value)).map(|(_, value)| value)
-    }
-    pub fn entry(&mut self, key: String) -> TypeEntry<'_, V> {
+    pub fn entry(&mut self, key: impl Into<TypeId>) -> TypeEntry<'_, V> {
+        let key = key.into();
         let id = key.declare(&self.scope);
         TypeEntry {
-            key,
             entry: self.values.entry(id),
         }
     }
 }
 impl<V> VtableMap<V> {
-    pub fn get(&self, key: &(String, String)) -> Option<&V> {
-        self.values.get(&key.lookup(&self.scope)).map(|(_, v)| v)
+    pub fn get(&self, key: &(TypeId, TypeId)) -> Option<&V> {
+        self.values.get(&key.lookup(&self.scope))
     }
-    pub fn contains_key(&self, key: &(String, String)) -> bool {
+    pub fn contains_key(&self, key: &(TypeId, TypeId)) -> bool {
         self.get(key).is_some()
     }
 }
 pub struct TypeEntry<'a, V> {
-    key: String,
-    entry: std::collections::hash_map::Entry<'a, TypeId, (String, V)>,
+    entry: std::collections::hash_map::Entry<'a, TypeId, V>,
 }
 impl<'a, V> TypeEntry<'a, V> {
     pub fn or_insert(self, value: V) -> &'a mut V {
-        &mut self.entry.or_insert((self.key, value)).1
+        self.entry.or_insert(value)
     }
 }
 impl<V> Index<&str> for TypeMap<V> {
@@ -201,14 +217,14 @@ impl<V> Index<&String> for TypeMap<V> {
         &self[key.as_str()]
     }
 }
-impl<V> Index<&(String, String)> for VtableMap<V> {
+impl<V> Index<&(TypeId, TypeId)> for VtableMap<V> {
     type Output = V;
-    fn index(&self, key: &(String, String)) -> &V {
+    fn index(&self, key: &(TypeId, TypeId)) -> &V {
         self.get(key).expect("registered canonical vtable")
     }
 }
-impl<K: TypeKey, V> FromIterator<(K, V)> for ScopedTypeMap<K, V> {
-    fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
+impl<K: TypeKey, Q: Into<K>, V> FromIterator<(Q, V)> for ScopedTypeMap<K, V> {
+    fn from_iter<T: IntoIterator<Item = (Q, V)>>(iter: T) -> Self {
         let mut map = Self::new();
         for (k, v) in iter {
             map.insert(k, v);
@@ -217,8 +233,8 @@ impl<K: TypeKey, V> FromIterator<(K, V)> for ScopedTypeMap<K, V> {
     }
 }
 
-impl<K: TypeKey, V, const N: usize> From<[(K, V); N]> for ScopedTypeMap<K, V> {
-    fn from(items: [(K, V); N]) -> Self {
+impl<K: TypeKey, Q: Into<K>, V, const N: usize> From<[(Q, V); N]> for ScopedTypeMap<K, V> {
+    fn from(items: [(Q, V); N]) -> Self {
         items.into_iter().collect()
     }
 }
@@ -258,7 +274,7 @@ mod tests {
         assert_eq!(map.len(), 1);
         assert_eq!(
             map.keys().cloned().collect::<Vec<_>>(),
-            vec!["pal::Color".to_string()]
+            vec![TypeId::from_source_name("pal::Color")]
         );
     }
 
@@ -355,19 +371,40 @@ mod tests {
     fn ti_13_vtable_key_resolves_both_halves() {
         let scope = TypeScope::default();
         let mut vtables = VtableMap::with_scope(scope.clone());
-        vtables.insert(("pal::Color".to_string(), "shape::Draw".to_string()), 5);
+        vtables.insert(
+            (
+                TypeId::from_source_name("pal::Color"),
+                TypeId::from_source_name("shape::Draw"),
+            ),
+            5,
+        );
         assert_eq!(
-            vtables.get(&("Color".to_string(), "Draw".to_string())),
+            vtables.get(&(
+                TypeId::from_source_name("Color"),
+                TypeId::from_source_name("Draw")
+            )),
             None
         );
         scope.bind("Color", "pal::Color");
         scope.bind("Draw", "shape::Draw");
         assert_eq!(
-            vtables.get(&("Color".to_string(), "Draw".to_string())),
+            vtables.get(&(
+                TypeId::from_source_name("Color"),
+                TypeId::from_source_name("Draw")
+            )),
             Some(&5)
         );
-        assert!(vtables.contains_key(&("Color".to_string(), "shape::Draw".to_string())));
-        assert_eq!(vtables[&("Color".to_string(), "Draw".to_string())], 5);
+        assert!(vtables.contains_key(&(
+            TypeId::from_source_name("Color"),
+            TypeId::from_source_name("shape::Draw")
+        )));
+        assert_eq!(
+            vtables[&(
+                TypeId::from_source_name("Color"),
+                TypeId::from_source_name("Draw")
+            )],
+            5
+        );
     }
 
     #[test]
@@ -377,10 +414,19 @@ mod tests {
         scope.bind("Color", "pal::Color");
         // An alias in force when the vtable is registered still lands on the
         // identity, so a later unit without that alias finds it.
-        vtables.insert(("Color".to_string(), "shape::Draw".to_string()), 5);
+        vtables.insert(
+            (
+                TypeId::from_source_name("Color"),
+                TypeId::from_source_name("shape::Draw"),
+            ),
+            5,
+        );
         scope.restore("Color", None);
         assert_eq!(
-            vtables.get(&("pal::Color".to_string(), "shape::Draw".to_string())),
+            vtables.get(&(
+                TypeId::from_source_name("pal::Color"),
+                TypeId::from_source_name("shape::Draw")
+            )),
             Some(&5)
         );
         assert_eq!(vtables.len(), 1);
@@ -405,7 +451,7 @@ mod tests {
         assert_eq!(map.values().copied().collect::<Vec<_>>(), vec![7]);
         assert_eq!(
             map.iter().map(|(k, v)| (k.clone(), *v)).collect::<Vec<_>>(),
-            vec![("pal::Color".to_string(), 7)]
+            vec![(TypeId::from_source_name("pal::Color"), 7)]
         );
     }
 
@@ -452,7 +498,10 @@ mod tests {
         scope.bind("ui::Color", "pal::Color");
         // The written entry is the shadowed one, and the alias survives the
         // write -- where `insert` would both retarget it and tear it down.
-        assert_eq!(map.insert_canonical("ui::Color".to_string(), 11), Some(9));
+        assert_eq!(
+            map.insert_canonical_id(TypeId::from_source_name("ui::Color"), 11),
+            Some(9)
+        );
         assert_eq!(map.get_canonical("ui::Color"), Some(&11));
         assert_eq!(map.get_canonical("pal::Color"), Some(&7));
         assert_eq!(map.get("ui::Color"), Some(&7));
@@ -461,7 +510,7 @@ mod tests {
     #[test]
     fn ti_21_canonical_targets_stop_at_shadowed_declarations() {
         let (scope, mut map) = map_pair();
-        map.insert("ui::Color".into(), 9);
+        map.insert("ui::Color", 9);
         scope.bind_canonical("pal::Color", "ui::Color");
         scope.bind_canonical("Color", "pal::Color");
         scope.bind("Rank", "Color");
@@ -473,7 +522,7 @@ mod tests {
     #[test]
     fn ti_22_restore_preserves_alias_and_terminal_target_kinds() {
         let (scope, mut map) = map_pair();
-        map.insert("ui::Color".into(), 9);
+        map.insert("ui::Color", 9);
         scope.bind_canonical("pal::Color", "ui::Color");
         scope.bind_canonical("Color", "pal::Color");
         let terminal = scope.bind("Color", "pal::Color");
@@ -520,7 +569,7 @@ mod tests {
         let (scope, mut map) = map_pair();
         scope.bind("Rank", "Level");
         scope.bind("Level", "pal::Color");
-        map.insert("Level".into(), 12);
+        map.insert("Level", 12);
         assert_eq!(map.get("Rank"), Some(&12));
         assert_eq!(map.get_canonical("pal::Color"), Some(&7));
     }

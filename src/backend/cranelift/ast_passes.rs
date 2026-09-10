@@ -293,11 +293,7 @@ mod tests {
                 let mut strings = Vec::new();
                 collect_string_literals_in_expr(&expr, &mut strings);
                 assert_eq!(strings, ["deep"]);
-                // The owned AST's destructor is a separate frontend concern.
-                // Tear this test tree down iteratively too.
-                while let Expr::TryPropagate(inner, _, _) = expr {
-                    expr = *inner;
-                }
+                drop(expr);
             })
             .unwrap()
             .join()

@@ -181,3 +181,6 @@ mod toolchain;
 
 #[path = "integration/gc_scalable_bitmap.rs"]
 mod gc_scalable_bitmap;
+
+#[path = "integration/native_stack_overflow.rs"]
+mod native_stack_overflow;

@@ -1,0 +1,20 @@
+// Nested calls, conditional suspension, lexical match bindings and cleanup.
+async fn fetch(value: i64) -> i64 {
+    await yield();
+    return value;
+}
+
+fn apply(f: fn(i64) -> i64, value: i64) -> i64 {
+    return f(value);
+}
+
+async fn main() {
+    defer { println("done"); }
+    let base = apply(|n: i64| n + 1, await fetch(5));
+    let value = false ? await fetch(99) : await fetch(base * 2);
+    let chosen = match value {
+        12 => match base { 6 => value + 1, _ => 0, },
+        _ => 0,
+    };
+    println(format("value={}", chosen));
+}

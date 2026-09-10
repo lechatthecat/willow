@@ -187,7 +187,7 @@ impl Codegen {
             slots.push(AsyncFrameSlot {
                 source_span: Some(f.span),
                 name: "__result".to_string(),
-                ty: f.return_type.clone(),
+                ty: f.return_type.clone().into(),
             });
             async_frame_slot_offset(FRAME_SLOT_RESULT)
         });
@@ -199,7 +199,7 @@ impl Codegen {
         slots.extend(f.params.iter().map(|p| AsyncFrameSlot {
             source_span: Some(p.span),
             name: p.name.clone(),
-            ty: p.ty.clone(),
+            ty: p.ty.clone().into(),
         }));
         let (layout, lir_offsets, lir_defer_offsets) =
             self.lir_async_layout(&lir, slots, first_param_slot)?;
@@ -214,7 +214,7 @@ impl Codegen {
                 (
                     p.name.clone(),
                     async_frame_slot_offset(first_param_slot + i),
-                    p.ty.clone(),
+                    p.ty.clone().into(),
                 )
             })
             .collect();
@@ -283,7 +283,7 @@ impl Codegen {
             AsyncFrameSlot {
                 source_span: Some(f.span),
                 name: "__result".to_string(),
-                ty: f.return_type.clone(),
+                ty: f.return_type.clone().into(),
             },
             AsyncFrameSlot {
                 source_span: None,
@@ -295,7 +295,7 @@ impl Codegen {
             slots.push(AsyncFrameSlot {
                 source_span: Some(p.span),
                 name: p.name.clone(),
-                ty: p.ty.clone(),
+                ty: p.ty.clone().into(),
             });
         }
         // Locals after the params: frame-backed so they survive the task's own
@@ -310,7 +310,13 @@ impl Codegen {
             .params
             .iter()
             .enumerate()
-            .map(|(i, p)| (p.name.clone(), async_frame_slot_offset(2 + i), p.ty.clone()))
+            .map(|(i, p)| {
+                (
+                    p.name.clone(),
+                    async_frame_slot_offset(2 + i),
+                    p.ty.clone().into(),
+                )
+            })
             .collect();
 
         // Constructor = the fn's public symbol: alloc frame, store args into the
@@ -342,7 +348,11 @@ impl Codegen {
             let off = async_frame_slot_offset(2 + i);
             emit_gc_heap_store_raw(
                 &mut builder,
-                is_gc_managed(&p.ty, &self.enum_infos).then_some(barrier_ref),
+                is_gc_managed(
+                    &crate::semantic::ids::SemanticType::from(&p.ty),
+                    &self.enum_infos,
+                )
+                .then_some(barrier_ref),
                 frame,
                 off,
                 arg,
@@ -398,7 +408,12 @@ impl Codegen {
                 lir_defer_offsets,
             },
         )?;
-        self.compile_async_cancel_fn(cancel_fid, &sites, &lock_sites, &f.return_type)?;
+        self.compile_async_cancel_fn(
+            cancel_fid,
+            &sites,
+            &lock_sites,
+            &crate::semantic::ids::SemanticType::from(&f.return_type),
+        )?;
         Ok(())
     }
 
@@ -432,7 +447,7 @@ impl Codegen {
             AsyncFrameSlot {
                 source_span: Some(m.span),
                 name: "__result".to_string(),
-                ty: m.return_type.clone(),
+                ty: m.return_type.clone().into(),
             },
             AsyncFrameSlot {
                 source_span: None,
@@ -447,7 +462,7 @@ impl Codegen {
             slots.push(AsyncFrameSlot {
                 source_span: None,
                 name: "self".to_string(),
-                ty: Type::Named(class_name.to_string()),
+                ty: Type::Named(class_name.to_string().into()),
             });
             Some(offset)
         };
@@ -456,7 +471,7 @@ impl Codegen {
             slots.push(AsyncFrameSlot {
                 source_span: Some(p.span),
                 name: p.name.clone(),
-                ty: p.ty.clone(),
+                ty: p.ty.clone().into(),
             });
         }
 
@@ -485,14 +500,14 @@ impl Codegen {
             param_bindings.push((
                 "self".to_string(),
                 offset,
-                Type::Named(class_name.to_string()),
+                Type::Named(class_name.to_string().into()),
             ));
         }
         param_bindings.extend(m.params.iter().enumerate().map(|(i, p)| {
             (
                 p.name.clone(),
                 async_frame_slot_offset(first_param_slot + i),
-                p.ty.clone(),
+                p.ty.clone().into(),
             )
         }));
 
@@ -536,7 +551,11 @@ impl Codegen {
             let off = async_frame_slot_offset(first_param_slot + i);
             emit_gc_heap_store_raw(
                 &mut builder,
-                is_gc_managed(&p.ty, &self.enum_infos).then_some(barrier_ref),
+                is_gc_managed(
+                    &crate::semantic::ids::SemanticType::from(&p.ty),
+                    &self.enum_infos,
+                )
+                .then_some(barrier_ref),
                 frame,
                 off,
                 arg,
@@ -598,7 +617,12 @@ impl Codegen {
                 lir_defer_offsets,
             },
         )?;
-        self.compile_async_cancel_fn(cancel_fid, &sites, &lock_sites, &m.return_type)?;
+        self.compile_async_cancel_fn(
+            cancel_fid,
+            &sites,
+            &lock_sites,
+            &crate::semantic::ids::SemanticType::from(&m.return_type),
+        )?;
         Ok(())
     }
 
@@ -840,7 +864,7 @@ impl Codegen {
                 lir_hoisted_await: None,
                 main_result_err_ty: None,
                 vars: HashMap::new(),
-                return_type: f.return_type.clone(),
+                return_type: f.return_type.clone().into(),
                 current_class: body.current_class,
                 is_async: false,
                 terminated: false,
@@ -1776,8 +1800,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // `Err(Cancelled)`: an all-fieldless enum value is an IMMEDIATE i64 tag
         // (not a heap object) — variant `Cancelled` = tag 0.
         let cancelled_val = self.builder.ins().iconst(types::I64, 0);
-        let err =
-            self.emit_alloc_enum_variant(1, &Type::Named("Cancelled".to_string()), cancelled_val);
+        let err = self.emit_alloc_enum_variant(
+            1,
+            &Type::Named("Cancelled".to_string().into()),
+            cancelled_val,
+        );
         self.builder.ins().jump(merge_b, &[err.into()]);
 
         self.builder.switch_to_block(ok_b);

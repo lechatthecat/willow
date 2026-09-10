@@ -4,6 +4,7 @@ use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 
 use super::*;
 
+#[willow_continuations::checker]
 impl TypeChecker {
     /// Type-check an array literal `[e0, e1, ...]`. The element type is inferred
     /// from the first element; all elements must agree. An empty literal yields
@@ -308,7 +309,7 @@ impl TypeChecker {
         let key_ty = key_ty.clone();
         let val_ty = val_ty.clone();
 
-        let check_key = |checker: &mut Self, arg: &CallArg| {
+        let check_key = async |checker: &mut Self, arg: &CallArg| {
             let k = checker.check_expr(&arg.expr);
             if key_ty != Type::Void && !checker.types_compatible(&key_ty, &k) {
                 checker.push(
@@ -338,7 +339,7 @@ impl TypeChecker {
                         .with_label(Label::primary(m.span, "expected `insert(key, value)`")),
                     );
                 } else {
-                    check_key(self, &m.args[0]);
+                    check_key(self, &m.args[0]).await;
                     let v = self.check_expr_expecting(&m.args[1].expr, &val_ty);
                     if val_ty != Type::Void && !self.types_compatible(&val_ty, &v) {
                         self.push(
@@ -368,7 +369,7 @@ impl TypeChecker {
                         .with_label(Label::primary(m.span, "expected `get(key)`")),
                     );
                 } else {
-                    check_key(self, &m.args[0]);
+                    check_key(self, &m.args[0]).await;
                 }
                 Some(B::Option.apply(vec![val_ty]))
             }
@@ -383,7 +384,7 @@ impl TypeChecker {
                         .with_label(Label::primary(m.span, "expected `contains(key)`")),
                     );
                 } else {
-                    check_key(self, &m.args[0]);
+                    check_key(self, &m.args[0]).await;
                 }
                 Some(Type::Bool)
             }

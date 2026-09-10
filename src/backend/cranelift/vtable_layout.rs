@@ -63,108 +63,114 @@ use std::collections::HashSet;
 /// walker's eligibility tables answer from the same rules the emitter lays out
 /// vtables with.
 pub(super) trait IfaceShapes {
-    /// The name an interface is registered under, so an import alias and its
-    /// target are recognised as one interface.
-    fn canonical(&self, iface: &str) -> String;
-    /// Direct super-interfaces, in declaration order.
-    fn supers(&self, iface: &str) -> Vec<String>;
-    /// The interface's composed method names (desugaring's list: supers first,
-    /// deduplicated, own methods last).
-    fn methods(&self, iface: &str) -> Vec<String>;
+    fn canonical(&self, iface: &super::TypeId) -> super::TypeId;
+    fn supers(&self, iface: &super::TypeId) -> Vec<super::TypeId>;
+    fn methods(&self, iface: &super::TypeId) -> Vec<String>;
 }
 
-/// The vtable slots of `iface`, in emission order.
-pub(super) fn slots<S: IfaceShapes + ?Sized>(shapes: &S, iface: &str) -> Vec<String> {
-    slots_guarded(shapes, iface, &mut HashSet::new())
-}
-
-/// The slot a call to `iface::method` indexes, or `None` when the interface
-/// does not have that method at all.
-pub(super) fn slot_of<S: IfaceShapes + ?Sized>(
+pub(super) fn slots<S: IfaceShapes + ?Sized, Q: super::type_index::TypeLookup + ?Sized>(
     shapes: &S,
-    iface: &str,
+    iface: &Q,
+) -> Vec<String> {
+    enum Work {
+        Enter(super::TypeId),
+        Exit(super::TypeId, usize),
+    }
+    let mut work = vec![Work::Enter(iface.type_id())];
+    let mut visiting = HashSet::new();
+    let mut results: Vec<Vec<String>> = Vec::new();
+    while let Some(task) = work.pop() {
+        match task {
+            Work::Enter(iface) => {
+                let canonical = shapes.canonical(&iface);
+                if !visiting.insert(canonical.clone()) {
+                    results.push(Vec::new());
+                    continue;
+                }
+                let supers = shapes.supers(&iface);
+                work.push(Work::Exit(iface, supers.len()));
+                work.extend(supers.into_iter().rev().map(Work::Enter));
+            }
+            Work::Exit(iface, count) => {
+                let children = results.split_off(results.len() - count);
+                let mut out: Vec<String> = children.into_iter().flatten().collect();
+                for method in shapes.methods(&iface) {
+                    if !out.contains(&method) {
+                        out.push(method);
+                    }
+                }
+                visiting.remove(&shapes.canonical(&iface));
+                results.push(out);
+            }
+        }
+    }
+    results.pop().unwrap_or_default()
+}
+
+pub(super) fn slot_of<S: IfaceShapes + ?Sized, Q: super::type_index::TypeLookup + ?Sized>(
+    shapes: &S,
+    iface: &Q,
     method: &str,
 ) -> Option<usize> {
-    slots(shapes, iface).iter().position(|n| n == method)
+    slots(shapes, iface).iter().position(|name| name == method)
 }
 
-/// How many slots into `source`'s vtable the embedded `target` table starts, or
-/// `None` when `target` is not a super-interface of `source`.
-///
-/// `Some(0)` — an interface widened to itself, or to the first link of its
-/// `extends` chain — means the source box already IS a target box.
-pub(super) fn super_offset<S: IfaceShapes + ?Sized>(
+pub(super) fn super_offset<
+    S: IfaceShapes + ?Sized,
+    Q: super::type_index::TypeLookup + ?Sized,
+    R: super::type_index::TypeLookup + ?Sized,
+>(
     shapes: &S,
-    source: &str,
-    target: &str,
+    source: &Q,
+    target: &R,
 ) -> Option<usize> {
-    let target = shapes.canonical(target);
-    super_offset_guarded(shapes, source, &target, &mut HashSet::new())
-}
-
-fn slots_guarded<S: IfaceShapes + ?Sized>(
-    shapes: &S,
-    iface: &str,
-    visiting: &mut HashSet<String>,
-) -> Vec<String> {
-    let canonical = shapes.canonical(iface);
-    if !visiting.insert(canonical.clone()) {
-        return Vec::new(); // `extends` cycle: already diagnosed, stop recursing
+    enum Work {
+        Enter(super::TypeId, usize),
+        Exit(super::TypeId),
     }
-    let mut out: Vec<String> = Vec::new();
-    for sup in shapes.supers(iface) {
-        out.extend(slots_guarded(shapes, &sup, visiting));
-    }
-    for method in shapes.methods(iface) {
-        if !out.contains(&method) {
-            out.push(method);
+    let target = shapes.canonical(&target.type_id());
+    let mut work = vec![Work::Enter(source.type_id(), 0)];
+    let mut visiting = HashSet::new();
+    while let Some(task) = work.pop() {
+        match task {
+            Work::Exit(id) => {
+                visiting.remove(&id);
+            }
+            Work::Enter(source, offset) => {
+                let canonical = shapes.canonical(&source);
+                if canonical == target {
+                    return Some(offset);
+                }
+                if !visiting.insert(canonical.clone()) {
+                    continue;
+                }
+                work.push(Work::Exit(canonical));
+                let mut next = offset;
+                let mut children = Vec::new();
+                for sup in shapes.supers(&source) {
+                    children.push(Work::Enter(sup.clone(), next));
+                    next += slots(shapes, &sup).len();
+                }
+                work.extend(children.into_iter().rev());
+            }
         }
     }
-    visiting.remove(&canonical);
-    out
+    None
 }
 
-fn super_offset_guarded<S: IfaceShapes + ?Sized>(
-    shapes: &S,
-    source: &str,
-    target: &str,
-    visiting: &mut HashSet<String>,
-) -> Option<usize> {
-    let canonical = shapes.canonical(source);
-    if canonical == target {
-        return Some(0);
-    }
-    if !visiting.insert(canonical.clone()) {
-        return None; // `extends` cycle: already diagnosed, stop recursing
-    }
-    let mut offset = 0;
-    let mut found = None;
-    for sup in shapes.supers(source) {
-        if let Some(inner) = super_offset_guarded(shapes, &sup, target, visiting) {
-            found = Some(offset + inner);
-            break;
-        }
-        offset += slots(shapes, &sup).len();
-    }
-    visiting.remove(&canonical);
-    found
-}
-
-impl IfaceShapes for super::type_index::TypeMap<crate::semantic::symbols::InterfaceInfo> {
-    fn canonical(&self, iface: &str) -> String {
-        self.get(iface)
+impl IfaceShapes for super::type_index::TypeMap<super::InterfaceInfo> {
+    fn canonical(&self, iface: &super::TypeId) -> super::TypeId {
+        self.get_id(iface)
             .map(|info| info.name.clone())
-            .unwrap_or_else(|| iface.to_string())
+            .unwrap_or_else(|| iface.clone())
     }
-
-    fn supers(&self, iface: &str) -> Vec<String> {
-        self.get(iface)
+    fn supers(&self, iface: &super::TypeId) -> Vec<super::TypeId> {
+        self.get_id(iface)
             .map(|info| info.extends.clone())
             .unwrap_or_default()
     }
-
-    fn methods(&self, iface: &str) -> Vec<String> {
-        self.get(iface)
+    fn methods(&self, iface: &super::TypeId) -> Vec<String> {
+        self.get_id(iface)
             .map(|info| info.method_order.clone())
             .unwrap_or_default()
     }
@@ -189,18 +195,18 @@ mod tests {
     }
 
     impl IfaceShapes for Table {
-        fn canonical(&self, iface: &str) -> String {
-            iface.to_string()
+        fn canonical(&self, iface: &super::super::TypeId) -> super::super::TypeId {
+            iface.clone()
         }
-        fn supers(&self, iface: &str) -> Vec<String> {
+        fn supers(&self, iface: &super::super::TypeId) -> Vec<super::super::TypeId> {
             self.0
-                .get(iface)
-                .map(|(s, _)| s.iter().map(|n| n.to_string()).collect())
+                .get(iface.name())
+                .map(|(s, _)| s.iter().map(super::super::TypeId::local).collect())
                 .unwrap_or_default()
         }
-        fn methods(&self, iface: &str) -> Vec<String> {
+        fn methods(&self, iface: &super::super::TypeId) -> Vec<String> {
             self.0
-                .get(iface)
+                .get(iface.name())
                 .map(|(_, m)| m.iter().map(|n| n.to_string()).collect())
                 .unwrap_or_default()
         }

@@ -79,7 +79,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// executing; ordinary code and helper/lambda bodies construct `None`
     /// without touching panic state (willow-s9ej.3).
     pub(super) fn emit_recover_call(&mut self) -> cranelift_codegen::ir::Value {
-        let panic_info_ty = Type::Named("PanicInfo".to_string());
+        let panic_info_ty = Type::Named("PanicInfo".to_string().into());
         if self.recover_eligible_depth == 0 {
             return self.emit_alloc_option_none(&panic_info_ty);
         }

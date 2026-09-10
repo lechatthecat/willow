@@ -7,7 +7,8 @@
 //! separate migration from typed body emission.
 
 use crate::diagnostics::Span;
-use crate::parser::ast::{BinOp, ExprId, LockMode, Type, UnaryOp};
+use crate::parser::ast::{BinOp, ExprId, LockMode, UnaryOp};
+use crate::semantic::ids::{FunctionId, SemanticType as Type, TypeId};
 
 /// Compiler-owned function identity for one static property's initializer.
 /// `$` cannot occur in a source identifier.
@@ -26,7 +27,7 @@ pub struct HirProgram {
 /// parameter is the receiver `self` (typed as the class) when present.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirClass {
-    pub name: String,
+    pub name: TypeId,
     pub methods: Vec<HirFunction>,
     pub span: Span,
 }
@@ -35,7 +36,7 @@ pub struct HirClass {
 /// type, and a typed statement body.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirFunction {
-    pub name: String,
+    pub name: FunctionId,
     /// Whether this body is compiled as a cooperative poll state machine.
     pub is_async: bool,
     pub params: Vec<HirParam>,
@@ -88,7 +89,7 @@ pub enum HirDeferBody {
 
 /// A statement in typed HIR. Control flow keeps its high-level shape here; the
 /// basic-block lowering happens in a later slice.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum HirStmt {
     /// `let [mut] name: ty = value;` — `ty` is the type the name is *bound*
     /// with: the annotation when written, otherwise the initialiser's inferred
@@ -167,7 +168,7 @@ pub enum HirStmt {
     },
     /// `Class::field = value;`
     StaticFieldAssign {
-        class: String,
+        class: TypeId,
         field: String,
         value: HirExpr,
         span: Span,
@@ -181,7 +182,7 @@ pub enum HirStmt {
 pub struct HirDeferId(pub u32);
 
 /// A typed expression: a [`HirExprKind`] plus its resolved [`Type`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct HirExpr {
     pub kind: HirExprKind,
     pub ty: Type,
@@ -202,6 +203,31 @@ impl HirExpr {
             pending: vec![(self, false)],
             include_lambdas,
         }
+    }
+
+    /// The physical ancestor path to one borrowed node, including both ends.
+    /// Pointer identity distinguishes repeated expressions with equal spans.
+    pub(crate) fn path_to(&self, target: &HirExpr) -> Option<Vec<&HirExpr>> {
+        let mut pending = vec![(self, false)];
+        let mut path = Vec::new();
+        while let Some((node, leaving)) = pending.pop() {
+            if leaving {
+                path.pop();
+                continue;
+            }
+            path.push(node);
+            if std::ptr::eq(node, target) {
+                return Some(path);
+            }
+            pending.push((node, true));
+            pending.extend(
+                node.children()
+                    .into_iter()
+                    .rev()
+                    .map(|child| (child, false)),
+            );
+        }
+        None
     }
 
     /// Every sub-expression one level down, in evaluation order.
@@ -398,7 +424,7 @@ pub enum HirExprKind {
     /// `apply(10, double)` (willow-0g8j.2.2). Spelled as a bare identifier in
     /// source, so it is only distinguishable from [`HirExprKind::Var`] by what
     /// the name resolves to; `ty` is the function's `fn(...) -> ...` type.
-    FnRef(String),
+    FnRef(FunctionId),
     Binary {
         op: BinOp,
         lhs: Box<HirExpr>,
@@ -410,7 +436,7 @@ pub enum HirExprKind {
     },
     /// A free-function call; `ty` is the callee's return type.
     Call {
-        callee: String,
+        callee: FunctionId,
         args: Vec<HirExpr>,
     },
     /// `print(value)` / `println(value)`; always `Void`.
@@ -435,7 +461,7 @@ pub enum HirExprKind {
     },
     /// `new Class(args)`; `ty` is the class type.
     New {
-        class: String,
+        class: TypeId,
         args: Vec<HirExpr>,
     },
     /// `object.field`; `ty` is the field's declared type.
@@ -451,17 +477,17 @@ pub enum HirExprKind {
     },
     /// `Class { field: value, ... }` object literal; `ty` is the class type.
     ObjectLiteral {
-        class: String,
+        class: TypeId,
         fields: Vec<(String, HirExpr)>,
     },
     /// `Class::field` static property read; `ty` is the property's type.
     StaticField {
-        class: String,
+        class: TypeId,
         field: String,
     },
     /// `Class::method(args)` static call; `ty` is the static method's return type.
     StaticCall {
-        class: String,
+        class: TypeId,
         method: String,
         args: Vec<HirExpr>,
     },
@@ -545,13 +571,13 @@ pub enum HirPattern {
     LiteralInt(i64),
     /// `Enum::Variant` — fieldless.
     EnumVariant {
-        enum_name: String,
+        enum_name: TypeId,
         variant: String,
     },
     /// `Enum::Variant(a, b)` — each binding carries its payload type
     /// (type parameters substituted from the scrutinee's type arguments).
     EnumVariantTuple {
-        enum_name: String,
+        enum_name: TypeId,
         variant: String,
         bindings: Vec<(String, Type)>,
     },
@@ -560,8 +586,11 @@ pub enum HirPattern {
     /// consumer that has to name the binding's type must not have to rebuild it
     /// from `class_name` and hope the two agree.
     ClassDowncast {
-        class_name: String,
+        class_name: TypeId,
         binding: String,
         binding_ty: Type,
     },
 }
+
+#[path = "typed_ast/ownership.rs"]
+mod ownership;

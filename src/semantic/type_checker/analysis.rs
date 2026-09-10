@@ -45,7 +45,7 @@ fn walk_constructor_statements(block: &Block, mut visit: impl FnMut(&Stmt)) {
 
 /// Apply `f` to each direct sub-expression of `expr` (one level deep). Used by
 /// the static-initializer forward-reference scan (willow-qsqf §10.4).
-pub(crate) fn walk_subexprs(expr: &Expr, f: &mut impl FnMut(&Expr)) {
+pub(crate) fn walk_subexprs<'a>(expr: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
     match expr {
         Expr::Integer(..)
         | Expr::Float(..)
@@ -116,27 +116,39 @@ pub(crate) fn walk_subexprs(expr: &Expr, f: &mut impl FnMut(&Expr)) {
     }
 }
 
-pub(crate) fn reference_place_key(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Var(name, _, _) => Some(name.clone()),
-        Expr::FieldAccess(obj, field_name, _, _) => {
-            reference_place_key(obj).map(|base| format!("{base}.{field_name}"))
-        }
-        Expr::Index(array, index, _, _) => {
-            let base = reference_place_key(array)?;
-            match &**index {
-                Expr::Integer(value, _, _) => Some(format!("{base}[{value}]")),
-                _ => None,
+pub(crate) fn reference_place_key(mut expr: &Expr) -> Option<String> {
+    let mut suffixes: Vec<String> = Vec::new();
+    loop {
+        match expr {
+            Expr::Var(name, ..) => {
+                let mut result = name.clone();
+                for suffix in suffixes.into_iter().rev() {
+                    result.push_str(&suffix);
+                }
+                return Some(result);
             }
+            Expr::FieldAccess(object, name, ..) => {
+                suffixes.push(format!(".{name}"));
+                expr = object;
+            }
+            Expr::Index(array, index, ..) => {
+                let Expr::Integer(value, ..) = &**index else {
+                    return None;
+                };
+                suffixes.push(format!("[{value}]"));
+                expr = array;
+            }
+            _ => return None,
         }
-        _ => None,
     }
 }
 
+#[willow_continuations::function(block_always_returns, stmt_always_returns)]
 pub(crate) fn block_always_returns(block: &Block) -> bool {
-    block.stmts.iter().any(stmt_always_returns)
+    block.stmts.iter().any(|stmt| stmt_always_returns(stmt))
 }
 
+#[willow_continuations::function(block_always_returns, stmt_always_returns)]
 pub(crate) fn stmt_always_returns(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Defer(_) => false,
@@ -217,10 +229,7 @@ mod tests {
                 let mut fields = HashSet::new();
                 collect_self_field_assigns(&body, &mut fields);
                 assert!(fields.is_empty());
-                // Owned AST destruction is tested separately from these scans.
-                while let Some(Stmt::If(branch)) = body.stmts.pop() {
-                    body = branch.then_block;
-                }
+                drop(body);
             })
             .unwrap()
             .join()

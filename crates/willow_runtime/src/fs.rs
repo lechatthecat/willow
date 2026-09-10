@@ -253,6 +253,14 @@ fn spawn_blocking_fs(
     work: impl FnOnce() -> BlockingFsResult + Send + 'static,
     result_is_gc_ref: bool,
 ) -> *mut c_void {
+    spawn_blocking_fs_after_publication(work, result_is_gc_ref, |_, _, _| {})
+}
+
+fn spawn_blocking_fs_after_publication(
+    work: impl FnOnce() -> BlockingFsResult + Send + 'static,
+    result_is_gc_ref: bool,
+    after_publication: impl FnOnce(u64, *mut c_void, &Arc<BlockingFsState>),
+) -> *mut c_void {
     let frame = if result_is_gc_ref {
         NativeTaskFrame::<FsReferenceFrame>::allocate().map(|frame| frame.as_raw())
     } else {
@@ -263,7 +271,10 @@ fn spawn_blocking_fs(
     };
     let state = Arc::new(BlockingFsState::new());
     let state_for_work = Arc::clone(&state);
-    let state_box = Box::into_raw(Box::new(state));
+    // The task may finish on another worker as soon as it is published.
+    // Keep the caller's Arc alive through the completion recheck; the poll or
+    // cancel callback owns and may already have freed the boxed frame copy.
+    let state_box = Box::into_raw(Box::new(Arc::clone(&state)));
     unsafe { fs_frame(frame) }.store_native(FS_TASK_JOB_SLOT, state_box);
     if !crate::blocking::submit(move || {
         let result = work();
@@ -278,16 +289,19 @@ fn spawn_blocking_fs(
         Some(cancel_blocking_fs),
         |task_id| unsafe {
             fs_frame(frame).store_word(FS_TASK_ID_SLOT, task_id as i64);
-            (&*state_box).task_id.store(task_id, Ordering::Release);
+            state.task_id.store(task_id, Ordering::Release);
         },
     );
+    // The callback is normally a no-op; tests force task cleanup here before
+    // the actual completion recheck to exercise this publication boundary.
+    after_publication(task_id, frame, &state);
     // Close the publication race: if the pool job finished BEFORE the
     // task-id store above, its `finish()` loaded 0 and could not wake us —
     // and the task may already be parked BlockedSyscall with the result
     // sitting in the mutex. Re-check and wake unconditionally; a duplicate
     // wake of a Ready/Running task is a no-op / wake_requested consume.
     {
-        let has_result = unsafe { &*state_box }
+        let has_result = state
             .result
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -446,6 +460,60 @@ mod tests {
         let string = unsafe { *((result as *const i64).add(1)) } as *const u8;
         assert_eq!(unsafe { willow_string_as_str(string) }, "from-pool");
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn published_fs_state_survives_poll_cleanup_before_spawn_returns() {
+        use crate::scheduler::{reset_global_scheduler_for_test, willow_sched_run_until};
+
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let mut observed = false;
+        spawn_blocking_fs_after_publication(
+            || BlockingFsResult::Exists(true),
+            false,
+            |task_id, frame, state| {
+                // Wait until this job has published its result and the pool
+                // has dropped its closure's Arc. No scheduler drive has
+                // started yet, so exactly caller and frame ownership remain.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    let finished = state.result.lock().unwrap().is_some();
+                    if finished && crate::blocking::willow_blocking_active_jobs() == 0 {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "blocking fs job did not finish"
+                    );
+                    std::thread::yield_now();
+                }
+                assert_eq!(
+                    Arc::strong_count(state),
+                    2,
+                    "caller and frame must independently own state"
+                );
+                // The caller has not yet performed its post-publication
+                // recheck. Drive the real published task to completion first,
+                // allowing its poll callback to free the frame's boxed Arc.
+                assert_eq!(willow_sched_run_until(task_id), 1);
+                let frame = unsafe { fs_frame(frame) };
+                assert!(
+                    frame
+                        .load_native::<Arc<BlockingFsState>>(FS_TASK_JOB_SLOT)
+                        .is_null()
+                );
+                assert_eq!(frame.load_word(FS_TASK_RESULT_SLOT), 1);
+                assert!(state.result.lock().unwrap().is_none());
+                assert_eq!(
+                    Arc::strong_count(state),
+                    1,
+                    "spawning caller still owns its state"
+                );
+                observed = true;
+            },
+        );
+        assert!(observed);
     }
 
     #[test]

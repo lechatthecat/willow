@@ -29,10 +29,15 @@ pub(super) fn resolve_vtable_id(
     let canonical_iface = interface_infos
         .get(interface_name)
         .map(|i| i.name.clone())
-        .unwrap_or_else(|| interface_name.to_string());
+        .unwrap_or_else(|| interface_name.to_string().into());
     vtable_ids
-        .get(&(class_name.to_string(), canonical_iface))
-        .or_else(|| vtable_ids.get(&(class_name.to_string(), interface_name.to_string())))
+        .get(&(TypeId::from_source_name(class_name), canonical_iface))
+        .or_else(|| {
+            vtable_ids.get(&(
+                TypeId::from_source_name(class_name),
+                TypeId::from_source_name(interface_name),
+            ))
+        })
         .copied()
         .or_else(|| {
             // The box site may name a module-local generic interface by its
@@ -43,7 +48,7 @@ pub(super) fn resolve_vtable_id(
             let mut found: Option<DataId> = None;
             for (key, id) in vtable_ids.iter() {
                 let (cls, iface) = (&key.0, &key.1);
-                if cls == class_name && iface.rsplit("::").next().unwrap_or(iface) == short {
+                if cls == &TypeId::from_source_name(class_name) && iface.name() == short {
                     if found.is_some() {
                         return None; // ambiguous: more than one match
                     }

@@ -10,9 +10,9 @@
 
 use super::type_index::TypeMap;
 
-use crate::parser::ast::Type;
+use super::EnumInfo;
 use crate::semantic::builtin_types::{self, BuiltinTypeId};
-use crate::semantic::symbols::EnumInfo;
+use crate::semantic::ids::SemanticType as Type;
 
 use super::type_helpers::is_gc_managed;
 
@@ -46,7 +46,7 @@ mod tests {
     use super::*;
 
     fn option(inner: Type) -> Type {
-        Type::Generic("Option".to_string(), vec![inner])
+        Type::Generic("Option".to_string().into(), vec![inner])
     }
 
     #[test]
@@ -61,7 +61,7 @@ mod tests {
             Some(OptionRepr::NullableGcPointer)
         );
         assert_eq!(
-            option_repr(&option(Type::Named("User".to_string())), &enums),
+            option_repr(&option(Type::Named("User".to_string().into())), &enums),
             Some(OptionRepr::NullableGcPointer)
         );
     }

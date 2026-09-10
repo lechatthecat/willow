@@ -162,22 +162,22 @@ pub enum Intrinsic {
 /// structural type walk previously did not know these methods existed and typed
 /// them as `i64`.
 #[derive(Debug, Clone, PartialEq)]
-pub enum IntrinsicReturn {
+pub enum IntrinsicReturn<N = String> {
     /// A type determined by the receiver.
-    Fixed(Type),
+    Fixed(Type<N>),
     /// The type of the argument at this index, passed straight through.
     SameAsArg(usize),
 }
 
 /// A resolved builtin call: what it is, and what it produces.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ResolvedMethod {
+pub struct ResolvedMethod<N = String> {
     pub intrinsic: Intrinsic,
-    pub ret: IntrinsicReturn,
+    pub ret: IntrinsicReturn<N>,
 }
 
-impl ResolvedMethod {
-    fn fixed(intrinsic: Intrinsic, ret: Type) -> Self {
+impl<N: Clone + From<&'static str>> ResolvedMethod<N> {
+    fn fixed(intrinsic: Intrinsic, ret: Type<N>) -> Self {
         Self {
             intrinsic,
             ret: IntrinsicReturn::Fixed(ret),
@@ -196,11 +196,12 @@ impl ResolvedMethod {
     /// two argument-typed intrinsics then fall back to their receiver family's
     /// declared shape (`Task<void>`), which is the same conservative answer the
     /// checker gives for a malformed `add`/`attach`.
-    pub fn return_type(&self, arg_type: impl Fn(usize) -> Option<Type>) -> Type {
+    pub fn return_type(&self, arg_type: impl Fn(usize) -> Option<Type<N>>) -> Type<N> {
         match &self.ret {
             IntrinsicReturn::Fixed(ty) => ty.clone(),
-            IntrinsicReturn::SameAsArg(index) => arg_type(*index)
-                .unwrap_or_else(|| Type::Generic("Task".to_string(), vec![Type::Void])),
+            IntrinsicReturn::SameAsArg(index) => {
+                arg_type(*index).unwrap_or_else(|| Type::Generic("Task".into(), vec![Type::Void]))
+            }
         }
     }
 }
@@ -279,7 +280,11 @@ impl Intrinsic {
 /// Returns `None` when the call is not a builtin — a user class method, an
 /// interface method, an Option/Result combinator, or an error the checker has
 /// already reported.
-pub fn resolve(recv: &Type, method: &str, arity: usize) -> Option<ResolvedMethod> {
+pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
+    recv: &Type<N>,
+    method: &str,
+    arity: usize,
+) -> Option<ResolvedMethod<N>> {
     // Scalar `toString` (willow-fvfc). Checked first because it is the only
     // intrinsic on a primitive receiver, and because `String` is a receiver no
     // other family claims.
@@ -312,7 +317,7 @@ pub fn resolve(recv: &Type, method: &str, arity: usize) -> Option<ResolvedMethod
             )),
             ("freeze", 0) => Some(ResolvedMethod::fixed(
                 Intrinsic::ArrayFreeze,
-                Type::Generic("FrozenArray".to_string(), vec![(**elem).clone()]),
+                Type::Generic("FrozenArray".into(), vec![(**elem).clone()]),
             )),
             _ => None,
         };
@@ -465,13 +470,18 @@ pub fn resolve(recv: &Type, method: &str, arity: usize) -> Option<ResolvedMethod
 }
 
 /// Convenience wrapper for callers that only want the intrinsic identity.
-pub fn resolve_intrinsic(recv: &Type, method: &str, arity: usize) -> Option<Intrinsic> {
+pub fn resolve_intrinsic<N: builtin_types::TypeName + Clone + From<&'static str>>(
+    recv: &Type<N>,
+    method: &str,
+    arity: usize,
+) -> Option<Intrinsic> {
     resolve(recv, method, arity).map(|r| r.intrinsic)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    type Type = crate::parser::ast::Type<String>;
 
     fn array(elem: Type) -> Type {
         Type::Array(Box::new(elem))
@@ -1106,6 +1116,7 @@ mod checker_agreement_tests {
     //! here rather than at some later miscompile.
 
     use super::*;
+    type Type = crate::parser::ast::Type<String>;
     use crate::parser::ast::{Block, Expr, Item, MethodCallExpr, Stmt};
 
     /// Every builtin call the snippets reach. Only the expression and statement

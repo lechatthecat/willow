@@ -6,7 +6,9 @@ use crate::diagnostics::FileId;
 use super::source_file::SourceFile;
 
 /// Stable module identity within one compilation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct ModuleId(pub u32);
 
 impl ModuleId {
@@ -21,6 +23,7 @@ pub struct ModuleGraph {
     pub root: PathBuf,
     /// Dependency-first order, suitable for type registration and codegen.
     pub files: Vec<SourceFile>,
+    pub(crate) artifacts: Option<super::artifacts::UnitArtifacts>,
     by_canonical_path: HashMap<String, ModuleId>,
     resolved: HashSet<String>,
     next_module_id: u32,

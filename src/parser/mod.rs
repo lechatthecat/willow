@@ -1,7 +1,9 @@
 pub mod ast;
 mod decl;
 mod expr;
+mod flat_syntax;
 pub mod iter;
+pub(crate) mod ownership;
 mod pattern;
 mod stmt;
 mod types;
@@ -21,6 +23,7 @@ pub struct Parser {
     recovered_errors: Vec<Diagnostic>,
 }
 
+#[willow_continuations::parser]
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
         Self {

@@ -8,6 +8,17 @@ use crate::module::std_registry;
 use crate::parser::ast::*;
 use crate::stdlib_schema;
 
+#[willow_continuations::function(
+    normalize_std_collection_program,
+    normalize_std_collection_item,
+    normalize_std_collection_function,
+    normalize_std_collection_method,
+    normalize_std_collection_block,
+    normalize_std_collection_stmt,
+    normalize_std_collection_expr,
+    normalize_std_collection_call_arg,
+    normalize_std_collection_type
+)]
 pub(crate) fn normalize_std_collection_program(program: &Program) -> Program {
     let imports = std_collection_imports(program);
     let mut program = program.clone();
@@ -72,6 +83,17 @@ pub(crate) fn builtin_module_aliases(program: &Program) -> HashMap<String, Strin
     std_collection_imports(program).builtin_module_aliases
 }
 
+#[willow_continuations::function(
+    normalize_std_collection_program,
+    normalize_std_collection_item,
+    normalize_std_collection_function,
+    normalize_std_collection_method,
+    normalize_std_collection_block,
+    normalize_std_collection_stmt,
+    normalize_std_collection_expr,
+    normalize_std_collection_call_arg,
+    normalize_std_collection_type
+)]
 pub(crate) fn normalize_std_collection_item(item: &mut Item, imports: &StdCollectionImports) {
     match item {
         Item::Function(function) => normalize_std_collection_function(function, imports),
@@ -101,6 +123,17 @@ pub(crate) fn normalize_std_collection_item(item: &mut Item, imports: &StdCollec
     }
 }
 
+#[willow_continuations::function(
+    normalize_std_collection_program,
+    normalize_std_collection_item,
+    normalize_std_collection_function,
+    normalize_std_collection_method,
+    normalize_std_collection_block,
+    normalize_std_collection_stmt,
+    normalize_std_collection_expr,
+    normalize_std_collection_call_arg,
+    normalize_std_collection_type
+)]
 pub(crate) fn normalize_std_collection_function(
     function: &mut FunctionDecl,
     imports: &StdCollectionImports,
@@ -112,6 +145,17 @@ pub(crate) fn normalize_std_collection_function(
     normalize_std_collection_block(&mut function.body, imports);
 }
 
+#[willow_continuations::function(
+    normalize_std_collection_program,
+    normalize_std_collection_item,
+    normalize_std_collection_function,
+    normalize_std_collection_method,
+    normalize_std_collection_block,
+    normalize_std_collection_stmt,
+    normalize_std_collection_expr,
+    normalize_std_collection_call_arg,
+    normalize_std_collection_type
+)]
 pub(crate) fn normalize_std_collection_method(
     method: &mut MethodDecl,
     imports: &StdCollectionImports,
@@ -123,12 +167,34 @@ pub(crate) fn normalize_std_collection_method(
     normalize_std_collection_block(&mut method.body, imports);
 }
 
+#[willow_continuations::function(
+    normalize_std_collection_program,
+    normalize_std_collection_item,
+    normalize_std_collection_function,
+    normalize_std_collection_method,
+    normalize_std_collection_block,
+    normalize_std_collection_stmt,
+    normalize_std_collection_expr,
+    normalize_std_collection_call_arg,
+    normalize_std_collection_type
+)]
 pub(crate) fn normalize_std_collection_block(block: &mut Block, imports: &StdCollectionImports) {
     for stmt in &mut block.stmts {
         normalize_std_collection_stmt(stmt, imports);
     }
 }
 
+#[willow_continuations::function(
+    normalize_std_collection_program,
+    normalize_std_collection_item,
+    normalize_std_collection_function,
+    normalize_std_collection_method,
+    normalize_std_collection_block,
+    normalize_std_collection_stmt,
+    normalize_std_collection_expr,
+    normalize_std_collection_call_arg,
+    normalize_std_collection_type
+)]
 pub(crate) fn normalize_std_collection_stmt(stmt: &mut Stmt, imports: &StdCollectionImports) {
     match stmt {
         Stmt::Defer(d) => match &mut d.body {
@@ -186,6 +252,17 @@ pub(crate) fn normalize_std_collection_stmt(stmt: &mut Stmt, imports: &StdCollec
     }
 }
 
+#[willow_continuations::function(
+    normalize_std_collection_program,
+    normalize_std_collection_item,
+    normalize_std_collection_function,
+    normalize_std_collection_method,
+    normalize_std_collection_block,
+    normalize_std_collection_stmt,
+    normalize_std_collection_expr,
+    normalize_std_collection_call_arg,
+    normalize_std_collection_type
+)]
 pub(crate) fn normalize_std_collection_expr(expr: &mut Expr, imports: &StdCollectionImports) {
     match expr {
         Expr::StaticField(_) => {}
@@ -312,10 +389,32 @@ pub(crate) fn normalize_std_collection_expr(expr: &mut Expr, imports: &StdCollec
     }
 }
 
+#[willow_continuations::function(
+    normalize_std_collection_program,
+    normalize_std_collection_item,
+    normalize_std_collection_function,
+    normalize_std_collection_method,
+    normalize_std_collection_block,
+    normalize_std_collection_stmt,
+    normalize_std_collection_expr,
+    normalize_std_collection_call_arg,
+    normalize_std_collection_type
+)]
 pub(crate) fn normalize_std_collection_call_arg(arg: &mut CallArg, imports: &StdCollectionImports) {
     normalize_std_collection_expr(&mut arg.expr, imports);
 }
 
+#[willow_continuations::function(
+    normalize_std_collection_program,
+    normalize_std_collection_item,
+    normalize_std_collection_function,
+    normalize_std_collection_method,
+    normalize_std_collection_block,
+    normalize_std_collection_stmt,
+    normalize_std_collection_expr,
+    normalize_std_collection_call_arg,
+    normalize_std_collection_type
+)]
 pub(crate) fn normalize_std_collection_type(ty: &mut Type, imports: &StdCollectionImports) {
     match ty {
         Type::Array(element) => normalize_std_collection_type(element, imports),

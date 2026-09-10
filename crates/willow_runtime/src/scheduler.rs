@@ -2358,6 +2358,7 @@ pub extern "C" fn willow_select_idle_wait() {
 }
 
 fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instant>) -> i64 {
+    crate::stack_overflow::protect_current_thread();
     if crate::panic_context::panic_unwind_cleanup_active() {
         crate::panic_context::fatal_invariant(
             "scheduler re-entry attempted from panic-unwinding defer",
@@ -2505,6 +2506,7 @@ fn run_parallel_worker(
     state: Arc<ParallelRunState>,
     deadline: Option<Instant>,
 ) {
+    crate::stack_overflow::protect_current_thread();
     SCHED_RUN_DEPTH.with(|depth| depth.set(1));
     crate::gc::willow_gc_register_mutator();
     let worker_state = Arc::clone(&state);

@@ -28,7 +28,7 @@ fn closure_env_param(lambda_type: Option<&Type>, span: Span) -> Option<Param> {
     match lambda_type {
         Some(ty @ Type::Closure(..)) => Some(Param {
             name: CLOSURE_ENV_PARAM.to_string(),
-            ty: ty.clone(),
+            ty: (ty.clone()).to_source(),
             mode: ParamMode::Value,
             span,
             type_span: span,
@@ -47,12 +47,17 @@ fn closure_env_param(lambda_type: Option<&Type>, span: Span) -> Option<Param> {
 /// program's class hierarchy. Compiling each module completely in turn made a
 /// module body devirtualize an `open` call against only the classes declared so
 /// far, silently ignoring an override the entry file had not yet contributed.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct DeclaredModule {
     init_unit: InitUnitId,
     mod_name: String,
     /// The module program after the std-collection and coop-suspension
     /// normalizations, i.e. exactly what the declaration phase read.
     program: Program,
+    /// Checked payload types extended by cooperative ANF for its fresh nodes.
+    /// The driver lowers this exact program with these types; original-node
+    /// captures and enum/pattern resolutions still come from its source checker.
+    normalized_expr_types: HashMap<ExprId, crate::parser::ast::Type>,
     module_prefix: String,
     module_classes: Vec<(String, ClassDecl)>,
     /// Lambdas collected and declared by this module's declaration phase, under
@@ -79,8 +84,13 @@ pub struct DeclaredModule {
 }
 
 /// The entry program's counterpart to [`DeclaredModule`].
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct DeclaredProgram {
     program: Program,
+    /// Checked payload types extended by cooperative ANF for its fresh nodes.
+    /// The driver lowers this exact program with these types; original-node
+    /// captures and enum/pattern resolutions still come from its source checker.
+    normalized_expr_types: HashMap<ExprId, crate::parser::ast::Type>,
     /// Lambdas collected and declared by the declaration phase; the body phase
     /// compiles these same symbols, so they are not re-collected (the collector
     /// numbers them by traversal order).
@@ -99,10 +109,28 @@ pub struct DeclaredProgram {
     module_spellings: Vec<ModuleSpelling>,
 }
 
+impl DeclaredModule {
+    pub fn normalized_program(&self) -> &Program {
+        &self.program
+    }
+    pub fn normalized_expr_types(&self) -> &HashMap<ExprId, crate::parser::ast::Type> {
+        &self.normalized_expr_types
+    }
+}
+
+impl DeclaredProgram {
+    pub fn normalized_program(&self) -> &Program {
+        &self.program
+    }
+    pub fn normalized_expr_types(&self) -> &HashMap<ExprId, crate::parser::ast::Type> {
+        &self.normalized_expr_types
+    }
+}
+
 /// A single-item import (`import calc::add;`) as the resolver classified it for
 /// one unit: the local name this file calls it by, the module it comes from,
 /// and the item's own name there.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ItemBinding {
     pub local: String,
     pub module: String,
@@ -118,7 +146,7 @@ pub struct ItemBinding {
 /// that aliased it. Both spellings then name the same module and only one is a
 /// key, so the unit's own spelling is bound to the registered one for the
 /// length of that unit's phase.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModuleSpelling {
     /// The prefix this unit writes (`import sales as biz;` -> `biz`).
     pub access: String,
@@ -146,7 +174,7 @@ pub struct ModuleSpelling {
 /// Installed per unit with [`Codegen::set_unit_imports`] before that unit's
 /// declaration phase, and reinstalled before its bodies: another unit's
 /// declaration phase overwrites both halves.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct UnitImports {
     /// Module access names this file can write. Both spellings of an aliased
     /// import are here, since the back end's tables are keyed by whichever
@@ -177,8 +205,13 @@ macro_rules! lir_type_ctx {
             is_interface: &|n| $me.interface_infos.contains_key(n),
             iface_identity: &|n| $me.interface_infos.get(n).map(|i| i.name.clone()),
             can_box: &|class, iface| {
-                super::emit::resolve_vtable_id(&$me.vtable_ids, &$me.interface_infos, class, iface)
-                    .is_some()
+                super::emit::resolve_vtable_id(
+                    &$me.vtable_ids,
+                    &$me.interface_infos,
+                    &class.to_string(),
+                    &iface.to_string(),
+                )
+                .is_some()
             },
             // The same `enum_infos` table `enum_variant_tag` and
             // `enum_is_gc_object_type` answer from, so the tags and the
@@ -202,7 +235,7 @@ macro_rules! lir_type_ctx {
             // Straight from the table the vtables are emitted from, so the
             // slot the walker vets is the slot it will index.
             iface_method: &|iface_ty, method| {
-                let (iface, args): (&str, &[Type]) = match iface_ty {
+                let (iface, args): (&TypeId, &[Type]) = match iface_ty {
                     Type::Named(name) => (name, &[]),
                     Type::Generic(name, args) => (name, args),
                     _ => return None,
@@ -213,13 +246,13 @@ macro_rules! lir_type_ctx {
                 }
                 super::vtable_layout::slot_of(&$me.interface_infos, iface, method)?;
                 let sig = info.methods.get(method)?;
-                let mut substitutions: HashMap<String, Type> = info
+                let mut substitutions: HashMap<TypeId, Type> = info
                     .type_params
                     .iter()
                     .cloned()
                     .zip(args.iter().cloned())
                     .collect();
-                substitutions.insert("Self".to_string(), iface_ty.clone());
+                substitutions.insert(TypeId::local("Self"), iface_ty.clone());
                 Some(super::lir_gen::IfaceMethodSig {
                     params: sig
                         .params
@@ -413,10 +446,10 @@ impl Codegen {
             // (`resolve_class_key`), but an interface has no such scan: left bare in
             // an exported signature, it made every box site in a consumer that did
             // not itself import the interface fall out of the walker's subset.
-            let qualify_class_type = |ty: &Type| -> Type {
+            let qualify_class_type = |ty: &crate::parser::ast::Type| -> crate::parser::ast::Type {
                 let ty = qualify_module_local_type(ty, mod_name, &local_signature_type_names);
                 let ty = qualify_module_local_type(&ty, canonical_path, &local_enum_names);
-                this.canonical_declared_type(&ty)
+                this.canonical_declared_type(&ty).to_source()
             };
             let module_classes: Vec<(String, ClassDecl)> = program
                 .items
@@ -492,10 +525,14 @@ impl Codegen {
                         // identity the tables hold, not the bare local spelling
                         // (willow-sxcp).
                         for param in &mut qualified.params {
-                            param.ty = this.canonical_declared_type(&param.ty);
+                            param.ty = (this.canonical_declared_type(&param.ty)).to_source();
                         }
                         qualified.return_type =
-                            this.canonical_declared_type(&qualified.return_type);
+                            (this.canonical_declared_type(&qualified.return_type)).to_source();
+                        this.func_ids.scope().declare(
+                            &mangled,
+                            FunctionId::free(&f.name).in_namespace(canonical_path),
+                        );
                         this.declare_function_named(&mangled, &qualified)?;
                     }
                     Item::Enum(_) | Item::Class(_) | Item::Interface(_) => {}
@@ -533,9 +570,14 @@ impl Codegen {
                 .enumerate()
                 .map(|(index, (_, lambda))| (module_lambda_symbol(&module_prefix, index), lambda))
                 .collect();
-            for (name, lambda) in &lambdas {
+            for (index, (name, lambda)) in lambdas.iter().enumerate() {
+                this.func_ids.scope().declare(
+                    name,
+                    FunctionId::free(lambda_symbol(index)).in_namespace(canonical_path),
+                );
                 this.declare_lambda(name, lambda)?;
-                this.lambda_names.insert(lambda.id, name.clone());
+                this.lambda_names
+                    .insert(lambda.id, this.func_ids.scope().lookup_id(name));
             }
 
             // Analyze under canonical backend names before installing the module's
@@ -553,6 +595,11 @@ impl Codegen {
                 init_unit,
                 mod_name: mod_name.to_string(),
                 program: normalized_program,
+                normalized_expr_types: this
+                    .expr_types
+                    .iter()
+                    .map(|(id, ty)| (*id, ty.to_source()))
+                    .collect(),
                 module_prefix,
                 module_classes,
                 lambdas,
@@ -594,16 +641,19 @@ impl Codegen {
         lir: crate::ir::lowered::LirProgram,
     ) {
         for mut f in lir.functions {
-            let key = match f.name.rsplit_once("::") {
-                Some((class, method)) => {
+            let key = match f.name.owner() {
+                Some(class) => {
                     let Some((_, qualified)) =
                         unit.module_classes.iter().find(|(local, _)| local == class)
                     else {
                         continue;
                     };
-                    format!("{}::{}", qualified.name, method)
+                    FunctionId::method(TypeId::from_source_name(&qualified.name), f.name.name())
                 }
-                None => module_item_symbol(&unit.module_prefix, &f.name),
+                None => self
+                    .func_ids
+                    .scope()
+                    .lookup_id(&module_item_symbol(&unit.module_prefix, f.name.name())),
             };
             // The name travels with the key: the walker reads it back to find a
             // method's enclosing class.
@@ -621,7 +671,7 @@ impl Codegen {
                     let name = name.clone();
                     let mut f = l.function;
                     f.name = name.clone();
-                    self.lir_functions.insert(name, f);
+                    self.lir_functions.insert(f.name.clone(), f);
                 }
                 None => {
                     self.lir_lambdas.insert(l.id, l.function);
@@ -825,14 +875,15 @@ impl Codegen {
             let lambdas = collect_lambdas_in_program(program);
             for (name, lambda) in &lambdas {
                 this.declare_lambda(name, lambda)?;
-                this.lambda_names.insert(lambda.id, name.clone());
+                this.lambda_names
+                    .insert(lambda.id, this.func_ids.scope().lookup_id(name));
                 // The lowered body was lifted under a span-derived placeholder
                 // because only this loop knows the symbol (willow-0g8j.2.2). Moving
                 // it into `lir_functions` under that symbol is what lets a lambda be
                 // compiled by the walker like any other function.
                 if let Some(mut lf) = this.lir_lambdas.remove(&lambda.id) {
-                    lf.name = name.clone();
-                    this.lir_functions.insert(name.clone(), lf);
+                    lf.name = this.func_ids.scope().lookup_id(name);
+                    this.lir_functions.insert(lf.name.clone(), lf);
                 }
             }
 
@@ -852,6 +903,11 @@ impl Codegen {
 
             Ok(DeclaredProgram {
                 program: normalized_program,
+                normalized_expr_types: this
+                    .expr_types
+                    .iter()
+                    .map(|(id, ty)| (*id, ty.to_source()))
+                    .collect(),
                 lambdas,
                 source_file: source_file.to_string(),
                 builtin_module_aliases: std::mem::take(&mut this.builtin_module_aliases),
@@ -956,7 +1012,7 @@ impl Codegen {
                 .iter()
                 .map(|p| ParamDebug {
                     name: p.name.clone(),
-                    ty: p.ty.clone(),
+                    ty: p.ty.clone().into(),
                     mode: ParamMode::Value,
                 })
                 .chain(l.params.iter().zip(param_types.iter()).map(|p| ParamDebug {
@@ -1010,7 +1066,7 @@ impl Codegen {
                     .zip(param_types.iter())
                     .map(|(p, ty)| Param {
                         name: p.name.clone(),
-                        ty: ty.clone(),
+                        ty: (ty.clone()).to_source(),
                         mode: ParamMode::Value,
                         span: p.span,
                         type_span: p.span,
@@ -1042,7 +1098,7 @@ impl Codegen {
             public: false,
             is_async: false,
             params,
-            return_type,
+            return_type: return_type.to_source(),
             body,
             span: l.span,
         };
@@ -1211,8 +1267,8 @@ impl Codegen {
         // the Result into its frame and the generated main driver applies the
         // same `emit_main_result_exit` shaping after joining it (willow-4ylu).
         // Any other `main` return type is rejected here.
-        let supported_main =
-            is_main && (f.return_type == Type::Void || main_result_err_type(f).is_some());
+        let supported_main = is_main
+            && (f.return_type == (Type::Void).to_source() || main_result_err_type(f).is_some());
         if is_main && !supported_main {
             anyhow::bail!(
                 "function `{name}` has no valid lowered body: `main` must return `void` or `Result<void, E>`"
@@ -1220,9 +1276,12 @@ impl Codegen {
         }
         let lir_fn = self
             .lir_functions
-            .remove(name)
+            .remove(&self.func_ids.scope().lookup_id(name))
             .ok_or_else(|| anyhow::anyhow!("function `{name}` has no lowered IR"))?;
-        let ctx = lir_type_ctx!(self, &f.return_type);
+        let ctx = lir_type_ctx!(
+            self,
+            &crate::semantic::ids::SemanticType::from(&f.return_type)
+        );
         if let Some(reason) = super::lir_gen::lir_rejection_reason(&lir_fn, &ctx).or_else(|| {
             f.is_async
                 .then(|| super::lir_gen::lir_async_rejection_reason(&lir_fn))
@@ -1326,7 +1385,7 @@ impl Codegen {
             lir_hoisted_await: None,
             main_result_err_ty,
             vars: HashMap::new(),
-            return_type: f.return_type.clone(),
+            return_type: f.return_type.clone().into(),
             current_class: None,
             // Every async function returned above through the cooperative
             // constructor/poll pair, so what is left here is synchronous.
@@ -1352,7 +1411,12 @@ impl Codegen {
                 let arr_ref = fg.module.declare_func_in_func(arr_id, fg.builder.func);
                 let call = fg.builder.ins().call(arr_ref, &[]);
                 let arr = fg.builder.inst_results(call)[0];
-                fg.bind_param(&param.name, &param.ty, &param.mode, arr);
+                fg.bind_param(
+                    &param.name,
+                    &crate::semantic::ids::SemanticType::from(&param.ty),
+                    &param.mode,
+                    arr,
+                );
             }
         } else {
             for (i, param) in f.params.iter().enumerate() {
@@ -1362,10 +1426,20 @@ impl Codegen {
                     .then(|| fg.async_frame_offsets.get(&param.span).copied())
                     .flatten();
                 if let Some(offset) = framed {
-                    fg.bind_param_framed(&param.name, &param.ty, val, offset);
+                    fg.bind_param_framed(
+                        &param.name,
+                        &crate::semantic::ids::SemanticType::from(&param.ty),
+                        val,
+                        offset,
+                    );
                     continue;
                 }
-                fg.bind_param(&param.name, &param.ty, &param.mode, val);
+                fg.bind_param(
+                    &param.name,
+                    &crate::semantic::ids::SemanticType::from(&param.ty),
+                    &param.mode,
+                    val,
+                );
             }
         }
 
@@ -1437,6 +1511,10 @@ impl Codegen {
         }
         for m in &all_methods {
             let mangled = self.class_method_symbol(&c.name, &m.name);
+            self.func_ids.scope().declare(
+                &mangled,
+                FunctionId::method(TypeId::from_source_name(&c.name), &m.name),
+            );
             self.claim_symbol(&mangled, format!("method `{}::{}`", c.name, m.name), m.span)?;
             let mut sig = self.module.make_signature();
             let ptr_ty = self.module.target_config().pointer_type();
@@ -1461,8 +1539,8 @@ impl Codegen {
             );
             self.func_param_debug
                 .insert(mangled.clone(), param_debug_from_params(&m.params));
-            let mut param_types = vec![Type::Named(c.name.clone())]; // self
-            param_types.extend(m.params.iter().map(|p| p.ty.clone()));
+            let mut param_types = vec![Type::Named(c.name.clone().into())]; // self
+            param_types.extend(m.params.iter().map(|p| Type::from(&p.ty)));
             self.fn_types
                 .insert(mangled, Type::Fn(param_types, Box::new(call_return_type)));
         }
@@ -1516,7 +1594,7 @@ impl Codegen {
                     field.name.clone(),
                     StaticStorageInfo {
                         data_id,
-                        ty: field.ty.clone(),
+                        ty: field.ty.clone().into(),
                     },
                 );
             let initializer_name =
@@ -1535,6 +1613,14 @@ impl Codegen {
             };
             let symbol =
                 self.class_method_symbol(class_key, &format!("$static_init.{}", field.name));
+            let identity = FunctionId::method(
+                TypeId::from_source_name(class_key),
+                format!("$static_init.{}", field.name),
+            );
+            self.func_ids
+                .scope()
+                .declare(&initializer_name, identity.clone());
+            self.func_ids.scope().declare(&symbol, identity);
             self.declare_function_symbol(&initializer_name, &symbol, &initializer, false)?;
             self.unit_static_inits
                 .entry(owner)
@@ -1544,7 +1630,7 @@ impl Codegen {
                     class_key: class_key.to_string(),
                     field: field.name.clone(),
                     initializer,
-                    ty: field.ty.clone(),
+                    ty: field.ty.clone().into(),
                 });
         }
         Ok(())
@@ -1776,7 +1862,8 @@ impl Codegen {
                 // a byte-identical vtable and correctly share this single name-keyed
                 // entry — `declare_one_vtable` dedups them (willow-1js.6).
                 let iface_name = match iface_ty {
-                    Type::Named(n) | Type::Generic(n, _) => n.clone(),
+                    crate::parser::ast::Type::Named(n)
+                    | crate::parser::ast::Type::Generic(n, _) => n.clone(),
                     _ => continue,
                 };
                 let Some(iface) = self.interface_infos.get(&iface_name).cloned() else {
@@ -1794,7 +1881,7 @@ impl Codegen {
         iface: &InterfaceInfo,
         span: crate::diagnostics::Span,
     ) -> Result<()> {
-        let key = (class_name.to_string(), iface.name.clone());
+        let key = (TypeId::from_source_name(class_name), iface.name.clone());
         if self.vtable_ids.contains_key(&key) {
             return Ok(());
         }
@@ -1803,7 +1890,7 @@ impl Codegen {
         // widening can reach it by pointer arithmetic (willow-1fc6).
         let slots = super::vtable_layout::slots(&self.interface_infos, &iface.name);
         let slot_count = slots.len().max(1);
-        let symbol = vtable_symbol(class_name, &iface.name);
+        let symbol = vtable_symbol(class_name, &iface.name.to_string());
         // A vtable is data, not a function, but it shares the one linker
         // namespace with every other symbol the backend hands out, so it is
         // claimed like the rest (willow-uqzx, catalog item 8).
@@ -2050,12 +2137,15 @@ impl Codegen {
         // symbol -- and puts the `self` receiver first in the lowered parameter
         // list, exactly where the method ABI passes it. So the receiver and
         // parameter bindings below are what the walker's body reads.
-        let lir_name = format!("{}::{}", c.name, m.name);
+        let lir_name = FunctionId::method(TypeId::from_source_name(&c.name), &m.name);
         let lir_fn = self
             .lir_functions
             .remove(&lir_name)
             .ok_or_else(|| anyhow::anyhow!("method `{lir_name}` has no lowered IR"))?;
-        let ctx = lir_type_ctx!(self, &m.return_type);
+        let ctx = lir_type_ctx!(
+            self,
+            &crate::semantic::ids::SemanticType::from(&m.return_type)
+        );
         if let Some(reason) = super::lir_gen::lir_rejection_reason(&lir_fn, &ctx).or_else(|| {
             m.is_async
                 .then(|| super::lir_gen::lir_async_rejection_reason(&lir_fn))
@@ -2148,7 +2238,7 @@ impl Codegen {
             lir_hoisted_await: None,
             main_result_err_ty: None,
             vars: HashMap::new(),
-            return_type: m.return_type.clone(),
+            return_type: m.return_type.clone().into(),
             current_class: Some(c.name.as_str()),
             // An async method returned above through `compile_cooperative_method`.
             is_async: false,
@@ -2190,7 +2280,7 @@ impl Codegen {
                 fg.builder.ins().call(push_ref, &[addr]);
                 fg.gc_root_count += 1;
             }
-            let receiver_ty = Type::Named(c.name.clone());
+            let receiver_ty = Type::Named(c.name.clone().into());
             let receiver_storage = VarStorage::Stack {
                 slot: self_slot,
                 ty: receiver_ty,
@@ -2201,7 +2291,12 @@ impl Codegen {
         // Bind remaining method params
         for (i, p) in m.params.iter().enumerate() {
             let val = fg.builder.block_params(entry_block)[i + 1];
-            fg.bind_param(&p.name, &p.ty, &p.mode, val);
+            fg.bind_param(
+                &p.name,
+                &crate::semantic::ids::SemanticType::from(&p.ty),
+                &p.mode,
+                val,
+            );
         }
 
         if std::env::var("WILLOW_LIR_LOG").is_ok() {

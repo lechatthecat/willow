@@ -1,0 +1,10 @@
+[package]
+name = "willow_continuations"
+version = "0.1.0"
+edition = "2024"
+[lib]
+proc-macro = true
+[dependencies]
+syn = { version = "2", features = ["full", "visit-mut"] }
+quote = "1"
+proc-macro2 = "1"

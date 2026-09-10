@@ -68,6 +68,7 @@ type IfaceIndex =
 /// originally contributed each effective method. Supers are visited in order,
 /// transitively, then own methods; an own/later method of the same name replaces
 /// an inherited one in place. `visiting` guards against extends-cycles.
+#[willow_continuations::function(iface_compose_methods_with_origin)]
 fn iface_compose_methods_with_origin(
     name: &str,
     snap: &IfaceIndex,
@@ -117,6 +118,7 @@ fn iface_compose_methods(
 }
 
 /// Transitive super-interface names of `name` (in discovery order).
+#[willow_continuations::function(iface_all_supers)]
 fn iface_all_supers(
     name: &str,
     snap: &IfaceIndex,
@@ -507,6 +509,7 @@ struct ClassShape {
 /// Substitute interface generic type parameters (and `Self`) in a type. Used so
 /// a default method inherited into a class that implements `Box<i64>` has its
 /// `T`s replaced by `i64` and `Self` by the class (willow-1js.7).
+#[willow_continuations::function(subst_iface_type)]
 fn subst_iface_type(
     ty: &parser::ast::Type,
     map: &std::collections::HashMap<String, parser::ast::Type>,
@@ -911,6 +914,69 @@ mod tests {
     use crate::lexer::Lexer;
     use crate::parser::Parser;
     use crate::parser::ast::{Item, Type};
+
+    #[test]
+    fn deep_interface_composition_and_type_substitution_use_heap_continuations() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let mut index = IfaceIndex::new();
+                for depth in 0..8_000 {
+                    let supers = if depth == 7_999 {
+                        vec![]
+                    } else {
+                        vec![format!("I{}", depth + 1)]
+                    };
+                    let methods = if depth == 7_999 {
+                        vec![parser::ast::InterfaceMethodDecl {
+                            name: "answer".into(),
+                            params: vec![],
+                            is_static: false,
+                            return_type: Type::I64,
+                            default_body: None,
+                            span: diagnostics::Span::dummy(),
+                        }]
+                    } else {
+                        vec![]
+                    };
+                    index.insert(format!("I{depth}"), (supers, methods));
+                }
+                let methods = iface_compose_methods_with_origin(
+                    "I0",
+                    &index,
+                    &mut std::collections::HashSet::new(),
+                );
+                assert_eq!(methods.len(), 1);
+                assert_eq!(methods[0].1, "I7999");
+                let mut supers = Vec::new();
+                iface_all_supers(
+                    "I0",
+                    &index,
+                    &mut std::collections::HashSet::new(),
+                    &mut supers,
+                );
+                assert_eq!(supers.len(), 7_999);
+                let mut ty = Type::Named("T".into());
+                for _ in 0..8_000 {
+                    ty = Type::Array(Box::new(ty));
+                }
+                let substituted = subst_iface_type(
+                    &ty,
+                    &std::collections::HashMap::from([("T".into(), Type::I64)]),
+                );
+                let mut leaf = &substituted;
+                let mut depth = 0;
+                while let Type::Array(inner) = leaf {
+                    depth += 1;
+                    leaf = inner;
+                }
+                assert_eq!(depth, 8_000);
+                assert_eq!(*leaf, Type::I64);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     fn parse(source: &str) -> parser::ast::Program {
         let tokens = Lexer::new(source).tokenize().unwrap();

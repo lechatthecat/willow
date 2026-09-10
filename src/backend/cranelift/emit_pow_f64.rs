@@ -847,21 +847,30 @@ impl Codegen {
     }
 }
 
-fn const_f64_operand(builder: &FunctionBuilder<'_>, value: Value) -> Option<f64> {
+fn const_f64_operand(builder: &FunctionBuilder<'_>, mut value: Value) -> Option<f64> {
     let dfg = &builder.func.dfg;
-    let ValueDef::Result(inst, 0) = dfg.value_def(value) else {
-        return None;
-    };
-    match dfg.insts[inst] {
-        InstructionData::UnaryIeee64 {
-            opcode: Opcode::F64const,
-            imm,
-        } => Some(f64::from_bits(imm.bits())),
-        InstructionData::Unary {
-            opcode: Opcode::Fneg,
-            arg,
-        } => const_f64_operand(builder, arg).map(|value| -value),
-        _ => None,
+    let mut negative = false;
+    loop {
+        let ValueDef::Result(inst, 0) = dfg.value_def(value) else {
+            return None;
+        };
+        match dfg.insts[inst] {
+            InstructionData::UnaryIeee64 {
+                opcode: Opcode::F64const,
+                imm,
+            } => {
+                let value = f64::from_bits(imm.bits());
+                return Some(if negative { -value } else { value });
+            }
+            InstructionData::Unary {
+                opcode: Opcode::Fneg,
+                arg,
+            } => {
+                negative = !negative;
+                value = arg;
+            }
+            _ => return None,
+        }
     }
 }
 

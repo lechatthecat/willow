@@ -4,12 +4,16 @@ use crate::diagnostics::Span;
 /// preserves its identity; newly constructed syntax always receives a fresh ID,
 /// so a rebuilt or synthesized node never inherits another node's checker entry
 /// the way a shared `Span` used to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct ExprId(u64);
 
 /// The same identity for patterns; `Pattern::id` is what the checker's binding
 /// and match tables are keyed by.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct PatternId(u64);
 
 impl std::fmt::Display for ExprId {
@@ -21,7 +25,7 @@ impl std::fmt::Display for ExprId {
 // Reserve a disjoint range per session (or direct-parser thread). The hot
 // allocation path touches only TLS. A new range also handles counter exhaustion
 // without wrapping identities that may survive in cached/prelude syntax.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 struct NodeIds {
     next: u64,
     end: u64,
@@ -85,6 +89,9 @@ impl Drop for NodeIdSession {
 }
 
 impl ExprId {
+    pub(crate) fn placeholder() -> Self {
+        Self(0)
+    }
     pub fn fresh() -> Self {
         Self(fresh_node_id())
     }
@@ -98,18 +105,17 @@ impl PatternId {
 /// `Eq`/`Hash` so a written type can key the checker's normalization table
 /// (willow-0g8j.3): HIR lowering re-spells an AST annotation with what the
 /// checker made of it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Type {
+pub enum Type<Name = String> {
     I64,
     F64,
     Bool,
     String,
     Void,
-    Named(String),
-    Array(Box<Type>),
-    Generic(String, Vec<Type>),
+    Named(Name),
+    Array(Box<Type<Name>>),
+    Generic(Name, Vec<Type<Name>>),
     /// `fn(T1, T2) -> R` — plain function pointer type (non-capturing)
-    Fn(Vec<Type>, Box<Type>),
+    Fn(Vec<Type<Name>>, Box<Type<Name>>),
     /// `closure(T1, T2) -> R` — a GC-managed closure object: word 0 is the
     /// code pointer and the words after it are the captured environment
     /// (willow-0g8j.2.12). Kept apart from [`Type::Fn`] because the two are
@@ -117,12 +123,15 @@ pub enum Type {
     /// closure value is the object and its code pointer takes that object as a
     /// hidden leading argument, so neither is assignable to the other: a bare
     /// `fn` would need a wrapper object to become a closure value.
-    Closure(Vec<Type>, Box<Type>),
+    Closure(Vec<Type<Name>>, Box<Type<Name>>),
     /// Bottom type — coerces to any type (used for panic/return arms in match)
     Never,
 }
 
-#[derive(Debug, Clone)]
+#[path = "type_tree.rs"]
+mod type_tree;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Program {
     /// Optional `module path;` declaration at the top of the file. The path is
     /// normalized to a `::`-joined canonical form (see ImportDecl.path).
@@ -132,7 +141,7 @@ pub struct Program {
 }
 
 /// `module myapp::util;` — the namespace this source file claims to define.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModuleDecl {
     pub path: String,
     pub span: Span,
@@ -140,14 +149,14 @@ pub struct ModuleDecl {
 
 /// `import math;` or `import math as m;`. The parser expands
 /// `import math::{add, sub};` into two ordinary declarations.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ImportDecl {
     pub path: String,
     pub alias: Option<String>,
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Item {
     Function(FunctionDecl),
     Class(ClassDecl),
@@ -162,7 +171,7 @@ pub enum Item {
 /// An interface is a named set of required instance methods with no bodies,
 /// no fields, and no constructors. Classes declare conformance via an
 /// `implements` clause. See requirements/willow_interface_requirements.md.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)] // fields consumed by the interface type checker (willow-t8b)
 pub struct InterfaceDecl {
     pub name: String,
@@ -179,7 +188,7 @@ pub struct InterfaceDecl {
 }
 
 /// A required method signature inside an interface (no body).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)] // fields consumed by the interface type checker (willow-t8b)
 pub struct InterfaceMethodDecl {
     pub name: String,
@@ -194,7 +203,7 @@ pub struct InterfaceMethodDecl {
 }
 
 /// Qualified type path: `Animal` or `animal::Animal`
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum TypePath {
     Local(String),
     Qualified(Vec<String>),
@@ -209,7 +218,7 @@ impl TypePath {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ClassDecl {
     pub name: String,
     pub public: bool,
@@ -230,7 +239,7 @@ pub struct ClassDecl {
 
 /// An `init(self, params...) { ... }` constructor declaration (willow-scq2). No
 /// return type; `self` is bound in the body and omitted from `params`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConstructorDecl {
     pub public: bool,
     pub protected: bool,
@@ -239,7 +248,7 @@ pub struct ConstructorDecl {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FieldDecl {
     pub name: String,
     pub ty: Type,
@@ -257,7 +266,7 @@ pub struct FieldDecl {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MethodDecl {
     pub name: String,
     pub public: bool,
@@ -288,7 +297,7 @@ pub struct MethodDecl {
     pub is_interface_default: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FunctionDecl {
     pub name: String,
     pub public: bool,
@@ -299,7 +308,7 @@ pub struct FunctionDecl {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Param {
     pub name: String,
     pub ty: Type,
@@ -308,7 +317,7 @@ pub struct Param {
     pub type_span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ParamMode {
     Value,
     Reference {
@@ -318,7 +327,7 @@ pub enum ParamMode {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CallArg {
     pub expr: Expr,
     pub mode: CallArgMode,
@@ -343,19 +352,19 @@ impl std::ops::Deref for CallArg {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CallArgMode {
     Value,
     Reference { ampersand_span: Span },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Stmt {
     Let(LetStmt),
     Assign(AssignStmt),
@@ -410,7 +419,7 @@ impl Stmt {
 }
 
 /// Which lock discipline a `lock` statement acquires (willow-38w.1.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LockMode {
     /// `lock m as [mut] v { ... }` — exclusive access to a `Mutex<T>`.
     Mutex,
@@ -450,7 +459,7 @@ impl LockMode {
 /// `target` is evaluated exactly once, never re-evaluated when a contended
 /// acquisition resumes. V1 allows the statement only inside an `async fn`, and
 /// forbids both an `await` and a nested `lock` inside `body`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LockStmt {
     pub mode: LockMode,
     pub target: Expr,
@@ -519,7 +528,7 @@ impl LockStmt {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LetStmt {
     pub name: String,
     pub mutable: bool,
@@ -528,7 +537,7 @@ pub struct LetStmt {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AssignStmt {
     pub name: String,
     pub value: Expr,
@@ -536,7 +545,7 @@ pub struct AssignStmt {
 }
 
 /// `object.field = value;` — field assignment through self or any object.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FieldAssignStmt {
     pub object: Expr,
     pub field: String,
@@ -546,7 +555,7 @@ pub struct FieldAssignStmt {
 
 /// `super.init(args...);` — calls the base class constructor from inside an
 /// `init` body. The type checker enforces placement and visibility.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SuperInitStmt {
     pub args: Vec<CallArg>,
     pub span: Span,
@@ -554,7 +563,7 @@ pub struct SuperInitStmt {
 
 /// `ClassName::property = value;` — assignment to a `static mut` property
 /// (willow-qsqf). `class` may be module-qualified or `Self`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StaticFieldAssignStmt {
     pub class: String,
     pub field: String,
@@ -563,7 +572,7 @@ pub struct StaticFieldAssignStmt {
 }
 
 /// `array[index] = value;` — array element assignment.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexAssignStmt {
     pub array: Expr,
     pub index: Expr,
@@ -571,7 +580,7 @@ pub struct IndexAssignStmt {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IfStmt {
     pub cond: Expr,
     pub then_block: Block,
@@ -579,13 +588,13 @@ pub struct IfStmt {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeferStmt {
     pub body: DeferBody,
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum DeferBody {
     /// The parser accepts an expression here so the type checker can issue
     /// E0905 for unsupported forms. Valid forms are a direct call/print or a
@@ -603,14 +612,14 @@ impl DeferBody {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WhileStmt {
     pub cond: Expr,
     pub body: Block,
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ForStmt {
     pub name: String,
     pub name_span: Span,
@@ -642,19 +651,19 @@ impl ForStmt {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReturnStmt {
     pub value: Option<Expr>,
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ExprStmt {
     pub expr: Expr,
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Expr {
     Integer(i64, Span, ExprId),
     Float(f64, Span, ExprId),
@@ -700,7 +709,7 @@ pub enum Expr {
     Index(Box<Expr>, Box<Expr>, Span, ExprId),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LambdaExpr {
     pub id: ExprId,
     pub params: Vec<LambdaParam>,
@@ -709,20 +718,20 @@ pub struct LambdaExpr {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LambdaParam {
     pub name: String,
     pub ty: Option<Type>,
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum LambdaBody {
     Expr(Box<Expr>),
     Block(Block),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TernaryExpr {
     pub id: ExprId,
     pub condition: Expr,
@@ -731,7 +740,7 @@ pub struct TernaryExpr {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RangeExpr {
     pub id: ExprId,
     pub start: Expr,
@@ -741,7 +750,7 @@ pub struct RangeExpr {
 
 /// `ClassName::property` — a static property read (willow-qsqf). `class` may be
 /// module-qualified (e.g. `geom::Config`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StaticFieldExpr {
     pub id: ExprId,
     pub class: String,
@@ -750,7 +759,7 @@ pub struct StaticFieldExpr {
 }
 
 /// `new ClassName(args...)` object construction (willow-scq2).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NewExpr {
     pub id: ExprId,
     pub class_name: String,
@@ -760,6 +769,10 @@ pub struct NewExpr {
 }
 
 impl Expr {
+    pub(crate) fn take(&mut self) -> Self {
+        std::mem::replace(self, super::ownership::placeholder_expr())
+    }
+
     pub fn id(&self) -> ExprId {
         match self {
             Self::Integer(_, _, id)
@@ -819,7 +832,7 @@ impl Expr {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BinaryExpr {
     pub id: ExprId,
     pub op: BinOp,
@@ -828,7 +841,7 @@ pub struct BinaryExpr {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UnaryExpr {
     pub id: ExprId,
     pub op: UnaryOp,
@@ -836,7 +849,7 @@ pub struct UnaryExpr {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CallExpr {
     pub id: ExprId,
     pub callee: String,
@@ -844,7 +857,7 @@ pub struct CallExpr {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MethodCallExpr {
     pub id: ExprId,
     pub object: Expr,
@@ -853,7 +866,7 @@ pub struct MethodCallExpr {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StaticCallExpr {
     pub id: ExprId,
     pub class: String,
@@ -863,7 +876,7 @@ pub struct StaticCallExpr {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ObjectLiteralExpr {
     pub id: ExprId,
     pub class: String,
@@ -871,35 +884,35 @@ pub struct ObjectLiteralExpr {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ObjectLiteralField {
     pub name: String,
     pub value: Expr,
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AwaitExpr {
     pub id: ExprId,
     pub expr: Expr,
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SelectExpr {
     pub id: ExprId,
     pub cases: Vec<SelectCase>,
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SelectCase {
     pub kind: SelectCaseKind,
     pub body: Block,
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum SelectCaseKind {
     /// `v = ch.recv() => { ... }` — ready when the channel has a value or is
     /// closed (closed-empty selection raises when the receive executes).
@@ -920,7 +933,7 @@ pub enum SelectCaseKind {
     Default,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EnumDecl {
     pub name: String,
     pub public: bool,
@@ -930,14 +943,14 @@ pub struct EnumDecl {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EnumVariant {
     pub name: String,
     pub payload: Vec<Type>,
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Pattern {
     Wildcard(Span, PatternId),
     Binding {
@@ -999,20 +1012,20 @@ impl Pattern {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum MatchBody {
     Expr(Box<Expr>),
     Block(Block),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MatchArm {
     pub pattern: Pattern,
     pub body: MatchBody,
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MatchExpr {
     pub id: ExprId,
     pub scrutinee: Box<Expr>,
@@ -1020,7 +1033,7 @@ pub struct MatchExpr {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum BinOp {
     Add,
     Sub,
@@ -1061,7 +1074,7 @@ impl BinOp {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum UnaryOp {
     Neg,
     Not,

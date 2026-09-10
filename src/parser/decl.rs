@@ -3,6 +3,7 @@ use super::ast::*;
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity};
 use crate::lexer::token::TokenKind;
 
+#[willow_continuations::parser]
 impl Parser {
     pub(super) fn parse_module_decl(&mut self) -> Result<ModuleDecl, Diagnostic> {
         let span = self.current_span();

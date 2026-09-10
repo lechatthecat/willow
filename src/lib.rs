@@ -4,6 +4,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod backend;
+pub(crate) mod compiler_stack;
 pub mod desugar;
 pub mod diagnostics;
 pub mod errors;
@@ -19,6 +20,7 @@ pub mod stdlib_schema;
 pub mod toolchain;
 
 use anyhow::{Context, Result};
+use module::artifacts::{LiveUnit, UnitArtifacts, UnitKind};
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_WORKERS: usize = 5;
@@ -282,17 +284,22 @@ fn register_prelude(checker: &mut semantic::TypeChecker) -> Result<()> {
 }
 
 /// Front-end artifacts produced by [`run_frontend`] and consumed by
-/// [`run_backend`]: a fully desugared + type-checked program plus its resolved
-/// modules and the type checker (whose symbol tables feed codegen).
+/// [`run_backend`]: checked declaration summaries and lazy, immutable body
+/// artifacts. Checkers and executable trees are owned only by their unit pass.
+type HelperIndex = std::collections::HashMap<
+    String,
+    std::collections::HashMap<
+        semantic::ids::FunctionId,
+        semantic::concurrency::NonpreemptibleHelper,
+    >,
+>;
+
 struct Frontend {
+    // These programs contain declarations only. Their body slots are immutable
+    // references (source spans / syntax IDs) into module_graph.artifacts.
     program: parser::ast::Program,
     module_graph: module::ModuleGraph,
-    checker: semantic::TypeChecker,
-    /// One run type checker per imported module, in `module_graph.files` order.
-    /// The back-end lowers each module's bodies to LIR with its OWN tables
-    /// (willow-0g8j.16); nothing else in the pipeline may read these, because a
-    /// module's scope is not the entry file's.
-    module_checkers: Vec<CheckedModule>,
+    helpers: HelperIndex,
 }
 
 /// A single compilation request. Owns the shared context (paths, options,
@@ -367,37 +374,15 @@ struct ParsePhase {
     outcome: PhaseDiagnostics,
 }
 
+#[cfg(test)]
 struct ImportPhase {
     graph: module::ModuleGraph,
     item_imports: Vec<module::resolver::ItemImport>,
     outcome: PhaseDiagnostics,
-    resolve_error: Option<errors::ResolveError>,
 }
 
 struct TypecheckPhase {
-    checker: semantic::TypeChecker,
-    module_diagnostics: Vec<ModulePhaseDiagnostics>,
-    module_checkers: Vec<CheckedModule>,
-    error_count: usize,
-}
-
-/// An imported module's own run type checker, kept past the diagnostics it
-/// produced so the back-end can lower that module's bodies with the tables the
-/// module was checked against (willow-0g8j.16).
-struct CheckedModule {
-    /// The module's canonical `a::b` path, which is what a `ResolvedModule` is
-    /// matched on everywhere else in the driver.
-    canonical_path: String,
-    checker: semantic::TypeChecker,
-}
-
-struct ModulePhaseDiagnostics {
-    diagnostics: Vec<diagnostics::Diagnostic>,
-}
-
-struct ConcurrencyPhase {
-    entry_diagnostics: Vec<diagnostics::Diagnostic>,
-    module_diagnostics: Vec<ModulePhaseDiagnostics>,
+    checker: LiveUnit<semantic::TypeChecker>,
     error_count: usize,
 }
 
@@ -411,66 +396,72 @@ fn run_frontend(
         diagnostics::emit_all(&errs, map);
         anyhow::anyhow!("aborting due to {} lexer error(s)", errs.len())
     })?;
-
     let ParsePhase {
         mut program,
         outcome: parse,
     } = parse_phase(tokens);
     diagnostics::emit_all(&parse.diagnostics, map);
-
-    let ImportPhase {
-        mut graph,
-        item_imports,
-        outcome: imports,
-        resolve_error,
-    } = import_phase(&program, root);
-    let source_maps = source_maps(map, &graph);
-    diagnostics::emit_all_multi(&imports.diagnostics, &source_maps);
-    if resolve_error.is_some() {
-        // Keep the maps long enough to render import diagnostics, but preserve
-        // the previous policy of not feeding partially resolved modules into
-        // desugaring/type checking after an import error.
+    let mut artifacts = module::artifacts::UnitArtifacts::new()?;
+    artifacts.snapshot_source(diagnostics::FileId::ENTRY, source)?;
+    artifacts.offload(&mut program)?;
+    let resolution = module::resolver::resolve_imports_spooled(&program, root, artifacts);
+    let mut graph = resolution.graph;
+    emit_frontend_diagnostics(&resolution.diagnostics, map, &graph)?;
+    let imports = PhaseDiagnostics::new(resolution.diagnostics);
+    let item_imports = if imports.error_count == 0 {
+        resolution.item_imports
+    } else {
         graph.files.clear();
-    }
-
+        vec![]
+    };
     let desugar = desugar_phase(&mut program, &mut graph.files);
-    diagnostics::emit_all_multi(&desugar.diagnostics, &source_maps);
-
-    let TypecheckPhase {
-        checker,
-        module_diagnostics: typecheck_module_diagnostics,
-        module_checkers,
-        error_count: typecheck_error_count,
-    } = typecheck_phase(&program, &graph.files, &item_imports, options)?;
-    diagnostics::emit_all_multi(&checker.errors, &source_maps);
-    for module_diagnostics in &typecheck_module_diagnostics {
-        diagnostics::emit_all_multi(&module_diagnostics.diagnostics, &source_maps);
+    emit_frontend_diagnostics(&desugar.diagnostics, map, &graph)?;
+    let artifacts = graph.artifacts.as_ref().expect("spooled import graph");
+    let mut helpers = HelperIndex::new();
+    for module in &graph.files {
+        let body = artifacts.hydrate(&module.program)?;
+        helpers.insert(
+            module.canonical_path.clone(),
+            semantic::concurrency::compute_nonpreemptible_helpers(&body),
+        );
     }
-
-    let concurrency = concurrency_phase(&program, &graph.files, &item_imports);
-    diagnostics::emit_all_multi(&concurrency.entry_diagnostics, &source_maps);
-    for module_diagnostics in &concurrency.module_diagnostics {
-        diagnostics::emit_all_multi(&module_diagnostics.diagnostics, &source_maps);
+    let mut error_count = parse.error_count + imports.error_count + desugar.error_count;
+    for module in &graph.files {
+        let body = artifacts.hydrate(&module.program)?;
+        let checker = check_module(&body, module, &graph.files, &helpers, artifacts, options)?;
+        error_count += diagnostic_error_count(&checker.errors);
+        emit_frontend_diagnostics(&checker.errors, map, &graph)?;
+        let concurrency = check_unit_concurrency(&body, &graph.files, &helpers, None);
+        error_count += diagnostic_error_count(&concurrency);
+        emit_frontend_diagnostics(&concurrency, map, &graph)?;
     }
-
-    let entry = PhaseDiagnostics::new(validate_entry_point(&program));
-    diagnostics::emit_all_multi(&entry.diagnostics, &source_maps);
-
-    let error_count = parse.error_count
-        + imports.error_count
-        + desugar.error_count
-        + typecheck_error_count
-        + concurrency.error_count
-        + entry.error_count;
+    {
+        let body = artifacts.hydrate(&program)?;
+        let checked = typecheck_phase(
+            &body,
+            &graph.files,
+            &item_imports,
+            &helpers,
+            artifacts,
+            options,
+        )?;
+        error_count += checked.error_count;
+        emit_frontend_diagnostics(&checked.checker.errors, map, &graph)?;
+        let concurrency =
+            check_unit_concurrency(&body, &graph.files, &helpers, Some(&item_imports));
+        error_count += diagnostic_error_count(&concurrency);
+        emit_frontend_diagnostics(&concurrency, map, &graph)?;
+    }
+    let entry = validate_entry_point(&program);
+    error_count += diagnostic_error_count(&entry);
+    emit_frontend_diagnostics(&entry, map, &graph)?;
     if error_count > 0 {
         anyhow::bail!("aborting due to {} error(s)", error_count);
     }
-
     Ok(Frontend {
         program,
         module_graph: graph,
-        checker,
-        module_checkers,
+        helpers,
     })
 }
 
@@ -492,9 +483,9 @@ fn parse_phase(tokens: Vec<lexer::token::Token>) -> ParsePhase {
 
 /// Resolve imports while preserving diagnostics. Failed import resolution
 /// yields no modules or item bindings, matching the previous pipeline policy.
+#[cfg(test)]
 fn import_phase(program: &parser::ast::Program, root: &std::path::Path) -> ImportPhase {
     let resolution = module::resolve_imports(program, root);
-    let resolve_error = errors::ResolveError::from_diagnostics(&resolution.diagnostics);
     let outcome = PhaseDiagnostics::new(resolution.diagnostics);
     let item_imports = if outcome.error_count == 0 {
         resolution.item_imports
@@ -505,7 +496,6 @@ fn import_phase(program: &parser::ast::Program, root: &std::path::Path) -> Impor
         graph: resolution.graph,
         item_imports,
         outcome,
-        resolve_error,
     }
 }
 
@@ -524,6 +514,8 @@ fn typecheck_phase(
     program: &parser::ast::Program,
     modules: &[module::ResolvedModule],
     item_imports: &[module::resolver::ItemImport],
+    helpers_index: &HelperIndex,
+    artifacts: &UnitArtifacts,
     options: &CompilerOptions,
 ) -> Result<TypecheckPhase> {
     let mut checker = semantic::TypeChecker::new();
@@ -562,7 +554,10 @@ fn typecheck_phase(
         (String, semantic::concurrency::NonpreemptibleReason),
     > = std::collections::HashMap::new();
     for m in modules {
-        let helpers = semantic::concurrency::compute_nonpreemptible_helpers(&m.program);
+        let helpers = helpers_index
+            .get(&m.canonical_path)
+            .cloned()
+            .unwrap_or_default();
         let methods: Vec<(
             &semantic::ids::FunctionId,
             semantic::concurrency::NonpreemptibleReason,
@@ -591,71 +586,31 @@ fn typecheck_phase(
     }
     checker.set_nonpreemptible_module_methods(module_method_owners);
     checker.check_program(program);
-    let mut error_count = diagnostic_error_count(&checker.errors);
-
-    let (module_diagnostics, module_checkers) = typecheck_modules(modules, options)?;
-    for module in &module_diagnostics {
-        error_count += diagnostic_error_count(&module.diagnostics);
-    }
+    let error_count = diagnostic_error_count(&checker.errors);
     Ok(TypecheckPhase {
-        checker,
-        module_diagnostics,
-        module_checkers,
+        checker: artifacts.track(UnitKind::Checker, checker),
         error_count,
     })
 }
 
-/// Type-check every imported module's BODIES, one checker per module.
-///
-/// The entry checker above registers module SIGNATURES so the entry file can
-/// call into them; nothing there ever walks a module's statements. Without
-/// this pass the whole type checker is entry-file-only: a module could annotate
-/// a `let` with the wrong type, fall off the end of a non-void function, or
-/// call a function that does not exist, and still compile and run
-/// (willow-3eo1).
-///
-/// A module is checked in ITS OWN scope, not the entry file's: the prelude,
-/// plus the modules it imports under the names IT uses for them. Sharing the
-/// entry checker would let a module see names it never imported. This mirrors
-/// what `concurrency_phase` already does with a fresh `ConcurrencyAnalyzer` per
-/// module, and the spans render because `source_maps` registers every module
-/// file by `file_id`.
-fn typecheck_modules(
+fn check_module(
+    body: &parser::ast::Program,
+    module: &module::ResolvedModule,
     modules: &[module::ResolvedModule],
+    helpers: &HelperIndex,
+    artifacts: &UnitArtifacts,
     options: &CompilerOptions,
-) -> Result<(Vec<ModulePhaseDiagnostics>, Vec<CheckedModule>)> {
-    let mut out = Vec::new();
-    let mut checked = Vec::with_capacity(modules.len());
-    for m in modules {
-        let mut checker = semantic::TypeChecker::new();
-        if options.enforce_send_sync {
-            checker.set_enforce_send_sync(true);
-        }
-        register_prelude(&mut checker)?;
-        register_module_imports(&mut checker, &m.program, modules);
-        // AFTER the prelude and this module's imports, whose types keep the
-        // names they were registered under, and before the body: from here on
-        // the module's OWN declarations get its canonical identity (willow-itcw).
-        checker.set_module_path(&m.canonical_path);
-        checker.set_nonpreemptible_module_methods(imported_nonpreemptible_method_owners(
-            &m.program, modules,
-        ));
-        checker.check_module_program(&m.program);
-        // The errors are taken out rather than read from the checker, which
-        // outlives them: this pass is also where the back-end's per-module
-        // lowering tables come from (willow-0g8j.16), so the checker is kept.
-        let errors = std::mem::take(&mut checker.errors);
-        if !errors.is_empty() {
-            out.push(ModulePhaseDiagnostics {
-                diagnostics: errors,
-            });
-        }
-        checked.push(CheckedModule {
-            canonical_path: m.canonical_path.clone(),
-            checker,
-        });
-    }
-    Ok((out, checked))
+) -> Result<LiveUnit<semantic::TypeChecker>> {
+    let mut checker = semantic::TypeChecker::new();
+    checker.set_enforce_send_sync(options.enforce_send_sync);
+    register_prelude(&mut checker)?;
+    register_module_imports(&mut checker, body, modules);
+    checker.set_module_path(&module.canonical_path);
+    checker.set_nonpreemptible_module_methods(imported_nonpreemptible_method_owners(
+        body, modules, helpers,
+    ));
+    checker.check_module_program(body);
+    Ok(artifacts.track(UnitKind::Checker, checker))
 }
 
 /// Every spelling the ENTRY file writes for `module`.
@@ -832,6 +787,7 @@ fn dependency_closure<'a>(
 fn imported_nonpreemptible_method_owners(
     program: &parser::ast::Program,
     modules: &[module::ResolvedModule],
+    helpers: &HelperIndex,
 ) -> std::collections::HashMap<
     semantic::ids::FunctionId,
     (String, semantic::concurrency::NonpreemptibleReason),
@@ -867,8 +823,10 @@ fn imported_nonpreemptible_method_owners(
             )
         };
 
-        for (key, helper) in
-            semantic::concurrency::compute_nonpreemptible_helpers(&dependency.program)
+        for (key, helper) in helpers
+            .get(&dependency.canonical_path)
+            .into_iter()
+            .flatten()
         {
             if key.owner().is_none() {
                 continue;
@@ -879,7 +837,7 @@ fn imported_nonpreemptible_method_owners(
                 };
                 remapped
             } else {
-                key.in_namespace(access)
+                key.clone().in_namespace(access)
             };
             out.insert(visible_key, (dependency.name.clone(), helper.reason));
         }
@@ -887,77 +845,79 @@ fn imported_nonpreemptible_method_owners(
     out
 }
 
-/// Run task-aware concurrency checks for the entry program and imported module
-/// bodies, retaining each module's source context for later rendering.
-fn concurrency_phase(
+/// Seed concurrency analysis from immutable body-free helper summaries.
+fn check_unit_concurrency(
     program: &parser::ast::Program,
     modules: &[module::ResolvedModule],
-    item_imports: &[module::resolver::ItemImport],
-) -> ConcurrencyPhase {
-    let mut entry_concurrency = semantic::ConcurrencyAnalyzer::new();
-    for m in modules {
-        entry_concurrency = entry_concurrency.with_module_helpers(&m.name, &m.program);
-    }
-    // Single-item imports (`import worker::heavy;`) bind a module item under a
-    // bare local name; seed it so `heavy()` from an entry async fn is flagged.
-    for item in item_imports {
-        if let Some(m) = modules
-            .iter()
-            .find(|m| m.canonical_path == item.canonical_module)
-        {
-            entry_concurrency = entry_concurrency.with_item_helper(
-                &item.local,
-                &item.item,
-                &item.canonical_module,
-                &m.program,
-            );
-        }
-    }
-    let entry = entry_concurrency.check_program(program);
-    let mut error_count = diagnostic_error_count(&entry.errors);
-    let mut module_diagnostics = Vec::new();
-    for m in modules {
-        let mut module_analyzer = semantic::ConcurrencyAnalyzer::new();
-        for import in &m.program.imports {
-            if let Some(dep) = modules.iter().find(|d| d.canonical_path == import.path) {
-                let access = import.alias.as_deref().unwrap_or_else(|| {
-                    import
-                        .path
-                        .rsplit("::")
-                        .next()
-                        .unwrap_or(import.path.as_str())
-                });
-                module_analyzer = module_analyzer.with_module_helpers(access, &dep.program);
+    helpers: &HelperIndex,
+    entry_items: Option<&[module::resolver::ItemImport]>,
+) -> Vec<diagnostics::Diagnostic> {
+    let mut analyzer = semantic::ConcurrencyAnalyzer::new();
+    if let Some(items) = entry_items {
+        for module in modules {
+            if let Some(index) = helpers.get(&module.canonical_path) {
+                analyzer = analyzer.with_module_helper_index(&module.name, index);
             }
         }
-        let module = module_analyzer.check_program(&m.program);
-        if !module.errors.is_empty() {
-            error_count += diagnostic_error_count(&module.errors);
-            module_diagnostics.push(ModulePhaseDiagnostics {
-                diagnostics: module.errors,
-            });
+        for item in items {
+            if let Some(index) = helpers.get(&item.canonical_module) {
+                analyzer = analyzer.with_item_helper_index(
+                    &item.local,
+                    &item.item,
+                    &item.canonical_module,
+                    index,
+                );
+            }
+        }
+    } else {
+        for import in &program.imports {
+            if let Some(index) = helpers.get(&import.path) {
+                let access = import
+                    .alias
+                    .as_deref()
+                    .unwrap_or_else(|| import.path.rsplit("::").next().unwrap_or(&import.path));
+                analyzer = analyzer.with_module_helper_index(access, index);
+            }
         }
     }
-    ConcurrencyPhase {
-        entry_diagnostics: entry.errors,
-        module_diagnostics,
-        error_count,
-    }
+    analyzer.check_program(program).errors
 }
 
-fn source_maps(
+/// Render only the sources a diagnostic actually references. Successful builds
+/// never materialize a build-wide collection of source strings/source maps.
+fn emit_frontend_diagnostics(
+    diagnostics: &[diagnostics::Diagnostic],
     entry: &diagnostics::SourceMap,
     graph: &module::ModuleGraph,
-) -> diagnostics::SourceMaps {
-    let mut maps = diagnostics::SourceMaps::new(entry.clone());
-    for file in &graph.files {
-        maps.insert(diagnostics::SourceMap::with_file_id(
-            file.id.file_id(),
-            file.path.to_string_lossy().into_owned(),
-            file.source.clone(),
-        ));
+) -> Result<()> {
+    for diagnostic in diagnostics {
+        let mut maps = diagnostics::SourceMaps::new(entry.clone());
+        let ids: std::collections::HashSet<_> = diagnostic
+            .labels
+            .iter()
+            .map(|label| label.span.file_id)
+            .collect();
+        for module in &graph.files {
+            if ids.contains(&module.id.file_id()) {
+                let source = if module.source.is_empty() {
+                    graph
+                        .artifacts
+                        .as_ref()
+                        .expect("spooled sources")
+                        .source(module.id.file_id())?
+                } else {
+                    module.source.clone()
+                };
+                maps.insert(diagnostics::SourceMap::with_file_id(
+                    module.id.file_id(),
+                    module.path.to_string_lossy().into_owned(),
+                    source,
+                ));
+            }
+        }
+        diagnostics::emit_multi(diagnostic, &maps);
     }
-    maps
+    Ok(())
 }
 
 /// One unit's imports in the shape the back end wants them, from the module
@@ -1061,233 +1021,201 @@ fn run_backend(
     // them from `backend_unit_imports` below, the same way every module's are.
     let Frontend {
         program,
-        module_graph,
-        checker,
-        module_checkers,
+        mut module_graph,
+        helpers,
     } = frontend;
     let module_init_plan = ir::module_init::ModuleInitPlan::from_graph(&module_graph);
-    let mut modules = module_graph.files;
-
+    let mut artifacts = module_graph.artifacts.take().expect("spooled frontend");
+    let modules = module_graph.files;
     let debug_metadata = if opts.target.emit_debug_info || opts.target.emit_source_map {
-        Some(debug_source_map_text(map, &program, &modules))
+        let entry = artifacts.hydrate(&program)?;
+        let mut text =
+            diagnostics::DebugSourceMap::from_program(&map.path, map.total_lines(), &entry)
+                .to_text();
+        drop(entry);
+        for module in &modules {
+            let body = artifacts.hydrate(&module.program)?;
+            let source = artifacts.source(module.id.file_id())?;
+            let source_map =
+                diagnostics::SourceMap::new(module.path.to_string_lossy().into_owned(), source);
+            text.push_str("\n---\n");
+            text.push_str(
+                &diagnostics::DebugSourceMap::from_program(
+                    &source_map.path,
+                    source_map.total_lines(),
+                    &body,
+                )
+                .to_text(),
+            );
+        }
+        Some(text)
     } else {
         None
     };
-
-    // Codegen — wrap internal errors in a structured diagnostic.
     let mut codegen = backend::Codegen::new(opts).map_err(|error| {
         emit_codegen_error(
             errors::CodegenError::new(errors::CodegenStage::Initialize, error),
             map,
         )
     })?;
-
     codegen.set_module_init_plan(module_init_plan);
-
-    // Register all enum infos (prelude + user-declared) for the backend.
-    for (name, info) in &checker.symbols.enums {
-        codegen.register_enum_info(name.to_string(), info.clone());
-    }
-    // ...and the names only a MODULE's checker knows. The table above is the
-    // entry file's, and the entry file learns an imported enum under its
-    // qualified spelling alone (`register_enum_with_module`) -- never under the
-    // bare name the declaring module's own body spells it by, and not at all for
-    // a module it does not itself import. The backend's enum table is one flat
-    // namespace for the whole build, so those names stayed unknown, and
-    // `is_gc_managed` answers an unknown named type with "GC-managed": a
-    // fieldless enum's tag was rooted as a pointer and the collector aborted on
-    // it, and the LIR walker refused every body that named one (willow-nm0g).
-    //
-    // Every enum is registered under its CANONICAL name -- `module::Enum` for a
-    // module's, bare for the entry program's and the prelude's (willow-itcw) --
-    // which names one type build-wide however many units can see it, so the
-    // registration holds for the whole build.
-    for module_checker in &module_checkers {
-        for info in module_checker.checker.symbols.enums.values() {
-            if !checker
-                .symbols
-                .enums
-                .contains_key(&semantic::ids::TypeId::from_source_name(&info.name))
-            {
-                codegen.register_enum_info(info.name.clone(), info.clone());
-            }
+    let entry_items = module::resolver::classify_unit_imports(&program, &modules).items;
+    // Immutable global type declarations contain no executable syntax.
+    {
+        let body = artifacts.hydrate(&program)?;
+        let checked = typecheck_phase(&body, &modules, &entry_items, &helpers, &artifacts, opts)?;
+        for (name, info) in &checked.checker.symbols.enums {
+            codegen.register_enum_info(name.to_string(), info.to_semantic());
+        }
+        for (name, info) in &checked.checker.symbols.interfaces {
+            codegen.register_interface_info(name.to_string(), info.to_semantic());
         }
     }
-    // A unit may also SPELL an enum some other way than its canonical name: its
-    // own `Level` for `signal::Level`, `sig::Level` under `import signal as
-    // sig;`, a bare `Level` under `import signal::Level;`. Those spellings are
-    // this unit's alone, so each is installed for the length of that unit's own
-    // compilation and taken back out again -- registering them for the whole
-    // build would let a module's `enum Point` answer for another unit's `class
-    // Point`, and the enum table is consulted first, so a live object would read
-    // as a tag and go untraced. The unit's own checker is the authority on what
-    // it meant by a name, so nothing here is guessed.
-    let unit_enum_aliases =
-        |own_checker: &semantic::TypeChecker| -> Vec<(String, semantic::symbols::EnumInfo)> {
-            own_checker
-                .symbols
-                .enums
-                .iter()
-                .filter(|(name, info)| {
-                    // Never over a name this unit's OWN checker settled as
-                    // something else: it wrote `class Point` or `interface Point`,
-                    // and an enum reached by another name does not answer for it.
-                    name.to_string() != info.name
-                        && !own_checker.symbols.classes.contains_key(*name)
-                        && !own_checker.symbols.interfaces.contains_key(*name)
-                })
-                .map(|(name, info)| (name.to_string(), info.clone()))
-                .collect()
-        };
-    // Register interface metadata for vtable codegen + interface dispatch.
-    for (name, info) in &checker.symbols.interfaces {
-        codegen.register_interface_info(name.to_string(), info.clone());
-    }
-    let mut module_checkers: std::collections::HashMap<_, _> = module_checkers
-        .into_iter()
-        .map(|checker| (checker.canonical_path.clone(), checker))
-        .collect();
-
-    // Declaration and body lowering are two separate sweeps over the units
-    // (willow-4zt8). EVERY unit -- each module and the entry program -- is
-    // declared before any body is lowered, so a module body is lowered against
-    // the whole program's class hierarchy. Compiling each module completely in
-    // turn let a module devirtualize a call to one of its own `open` methods
-    // against the classes declared so far, silently skipping an override the
-    // entry file had not contributed yet.
+    let unit_enum_aliases = |checker: &semantic::TypeChecker| -> Vec<(
+        String,
+        semantic::symbols::EnumInfo<semantic::ids::TypeId>,
+    )> {
+        checker
+            .symbols
+            .enums
+            .iter()
+            .filter(|(name, info)| {
+                name.to_string() != info.name
+                    && !checker.symbols.classes.contains_key(*name)
+                    && !checker.symbols.interfaces.contains_key(*name)
+            })
+            .map(|(name, info)| (name.to_string(), info.to_semantic()))
+            .collect()
+    };
+    // Declare every unit before emitting any body: later overrides must be
+    // visible to devirtualization in earlier modules. Each declaration artifact
+    // is written and dropped immediately, preserving its lambda symbols/IDs.
     let mut declared_modules = Vec::with_capacity(modules.len());
-    for m in &modules {
-        let module_checker = module_checkers.get(&m.canonical_path);
-        // Lambda declarations read this unit's checked callable types. Replace
-        // the previous unit's transient table; declared signatures are global.
-        if let Some(m_checker) = module_checker {
-            codegen.register_module_checker_tables(&m_checker.checker);
+    for module in &modules {
+        let body = artifacts.hydrate(&module.program)?;
+        let checker = check_module(&body, module, &modules, &helpers, &artifacts, opts)?;
+        for info in checker.symbols.enums.values() {
+            codegen.register_enum_info(info.name.clone(), info.to_semantic());
         }
-        // What THIS module's own imports bind (willow-vtlr, willow-28h8): the
-        // modules it can name, and the single items it bound to local names.
-        codegen.set_unit_imports(backend_unit_imports(&m.program, &modules));
-        // ...and the enum names THIS module spells its own way, for the length
-        // of its own declaration phase (willow-nm0g, willow-itcw).
-        let aliases = match module_checker {
-            Some(m_checker) => unit_enum_aliases(&m_checker.checker),
-            None => Vec::new(),
-        };
-        let displaced = codegen.install_enum_aliases(&aliases);
+        codegen.register_module_checker_tables(&checker);
+        codegen.set_unit_imports(backend_unit_imports(&body, &modules));
+        let displaced = codegen.install_enum_aliases(&unit_enum_aliases(&checker));
         let declared = codegen.declare_module(
-            &m.name,
-            &m.canonical_path,
-            &m.program,
-            &m.path.to_string_lossy(),
+            &module.name,
+            &module.canonical_path,
+            &body,
+            &module.path.to_string_lossy(),
         );
-        match declared {
-            Ok(unit) => {
-                codegen.restore_enum_aliases(displaced);
-                declared_modules.push((m.name.clone(), m.canonical_path.clone(), unit));
-            }
-            Err(error) => {
-                codegen.restore_enum_aliases(displaced);
-                return Err(report_backend_failure(
-                    &mut codegen,
-                    errors::CodegenError::new(errors::CodegenStage::Module(m.name.clone()), error),
-                    map,
-                    src,
-                    &source,
-                ));
-            }
-        }
+        codegen.restore_enum_aliases(displaced);
+        let unit = declared.map_err(|error| {
+            report_backend_failure(
+                &mut codegen,
+                errors::CodegenError::new(errors::CodegenStage::Module(module.name.clone()), error),
+                map,
+                &artifacts,
+            )
+        })?;
+        let unit = artifacts.track(UnitKind::Declared, unit);
+        declared_modules.push(artifacts.write(&*unit)?);
     }
-    // The entry file's own imports, in the same shape every module got. Its
-    // single-item imports bind here, after all modules are declared (so the
-    // mangled symbols exist), and rebind before the entry bodies: a module's
-    // body phase runs in between and may hold the same local name.
-    codegen.set_unit_imports(backend_unit_imports(&program, &modules));
-    // The entry file's own enum spellings: the single items it imported under a
-    // local name. Its own declarations are already canonical (willow-nm0g).
-    let entry_aliases = unit_enum_aliases(&checker);
-    let displaced = codegen.install_enum_aliases(&entry_aliases);
-    codegen.register_expr_types(checker.expr_types.clone());
-    let declared_entry = codegen.declare_program(&program, src);
-    codegen.register_expr_types(Default::default());
-    codegen.restore_enum_aliases(displaced);
-    let entry_unit = match declared_entry {
-        Ok(unit) => unit,
-        Err(error) => {
-            return Err(report_backend_failure(
+    let entry_artifact = {
+        let body = artifacts.hydrate(&program)?;
+        let checked = typecheck_phase(&body, &modules, &entry_items, &helpers, &artifacts, opts)?;
+        codegen.set_unit_imports(backend_unit_imports(&body, &modules));
+        let displaced = codegen.install_enum_aliases(&unit_enum_aliases(&checked.checker));
+        codegen.register_expr_types(
+            checked
+                .checker
+                .expr_types
+                .iter()
+                .map(|(id, ty)| (*id, ty.into()))
+                .collect(),
+        );
+        let declared = codegen.declare_program(&body, src);
+        codegen.register_expr_types(Default::default());
+        codegen.restore_enum_aliases(displaced);
+        let unit = declared.map_err(|error| {
+            report_backend_failure(
                 &mut codegen,
                 errors::CodegenError::new(errors::CodegenStage::Entry, error),
                 map,
-                src,
-                &source,
-            ));
-        }
+                &artifacts,
+            )
+        })?;
+        let unit = artifacts.track(UnitKind::Declared, unit);
+        artifacts.write(&*unit)?
     };
-    for (name, canonical_path, unit) in declared_modules {
-        // The module's own enum spellings, again: the body phase resolves the
-        // same names the declaration phase did, and every other unit's phase
-        // runs in between (willow-nm0g).
-        let aliases = match module_checkers.get(&canonical_path) {
-            Some(m_checker) => unit_enum_aliases(&m_checker.checker),
-            None => Vec::new(),
+    for (module, artifact) in modules.iter().zip(declared_modules) {
+        let unit: backend::cranelift::DeclaredModule = artifacts.read(artifact)?;
+        let unit = artifacts.track(UnitKind::Declared, unit);
+        let _lir = artifacts.live(UnitKind::Lir);
+        let aliases = {
+            let body = artifacts.hydrate(&module.program)?;
+            let checker = check_module(&body, module, &modules, &helpers, &artifacts, opts)?;
+            let aliases = unit_enum_aliases(&checker);
+            drop(body);
+            // ANF declarations may hoist a lambda before an await and create
+            // fresh temporary IDs. Preserve source resolutions/captures, but
+            // lower the exact declared tree with its extended payload types.
+            let mut tables = ir::lower::CheckerTables::from_checker(&checker);
+            tables.expr_types = Some(unit.normalized_expr_types());
+            let (hir, gaps) = ir::lower::lower_program_with(unit.normalized_program(), &tables);
+            log_hir_gaps(&gaps);
+            codegen.register_module_lir(&unit, ir::lowered::lower_program(&hir));
+            aliases
         };
         let displaced = codegen.install_enum_aliases(&aliases);
-        // Keep lowered module bodies only while emitting this unit. All symbols
-        // and lambda names are already declared, so cross-unit calls need no
-        // other unit's LIR here.
-        if let Some(m_checker) = module_checkers.remove(&canonical_path) {
-            let module = modules
-                .iter_mut()
-                .find(|m| m.canonical_path == canonical_path)
-                .expect("declared module belongs to the resolved graph");
-            let tables = ir::lower::CheckerTables::from_checker(&m_checker.checker);
-            let (hir, hir_gaps) = ir::lower::lower_program_with(&module.program, &tables);
-            log_hir_gaps(&hir_gaps);
-            codegen.register_module_lir(&unit, ir::lowered::lower_program(&hir));
-            // Imports and module identity remain available; this source tree
-            // and checker have finished their final lowering pass.
-            module.program.items.clear();
-        }
         let compiled = codegen.compile_module_bodies(&unit);
+        codegen.release_unit_transients();
         codegen.restore_enum_aliases(displaced);
-        if let Err(error) = compiled {
-            return Err(report_backend_failure(
+        compiled.map_err(|error| {
+            report_backend_failure(
                 &mut codegen,
-                errors::CodegenError::new(errors::CodegenStage::Module(name.clone()), error),
+                errors::CodegenError::new(errors::CodegenStage::Module(module.name.clone()), error),
                 map,
-                src,
-                &source,
-            ));
-        }
+                &artifacts,
+            )
+        })?;
     }
-    // Lower the entry only after module emission releases each module's LIR.
-    // Lambda symbols have already been declared and can be bound immediately.
-    {
-        let tables = ir::lower::CheckerTables::from_checker(&checker);
-        let (hir, hir_gaps) = ir::lower::lower_program_with(&program, &tables);
-        log_hir_gaps(&hir_gaps);
+    let entry_unit: backend::cranelift::DeclaredProgram = artifacts.read(entry_artifact)?;
+    let entry_unit = artifacts.track(UnitKind::Declared, entry_unit);
+    let _entry_lir = artifacts.live(UnitKind::Lir);
+    let entry_aliases = {
+        let body = artifacts.hydrate(&program)?;
+        let checked = typecheck_phase(&body, &modules, &entry_items, &helpers, &artifacts, opts)?;
+        let aliases = unit_enum_aliases(&checked.checker);
+        drop(body);
+        let mut tables = ir::lower::CheckerTables::from_checker(&checked.checker);
+        tables.expr_types = Some(entry_unit.normalized_expr_types());
+        let (hir, gaps) = ir::lower::lower_program_with(entry_unit.normalized_program(), &tables);
+        log_hir_gaps(&gaps);
         codegen.register_lir_functions(ir::lowered::lower_program(&hir));
-    }
-
-    drop(checker);
-    drop(program);
-
+        aliases
+    };
     let displaced = codegen.install_enum_aliases(&entry_aliases);
-    let compiled_entry = codegen.compile_program_bodies(&entry_unit);
+    let compiled = codegen.compile_program_bodies(&entry_unit);
+    codegen.release_unit_transients();
     codegen.restore_enum_aliases(displaced);
-    if let Err(error) = compiled_entry {
-        return Err(report_backend_failure(
+    compiled.map_err(|error| {
+        report_backend_failure(
             &mut codegen,
             errors::CodegenError::new(errors::CodegenStage::Entry, error),
             map,
-            src,
-            &source,
-        ));
-    }
+            &artifacts,
+        )
+    })?;
+    drop(entry_unit);
 
     for warning in codegen.take_async_frame_size_warnings() {
         let warning_source = if warning.source_file == src {
             source.clone()
         } else {
-            std::fs::read_to_string(&warning.source_file).unwrap_or_default()
+            modules
+                .iter()
+                .find(|module| module.path.to_string_lossy() == warning.source_file)
+                .map(|module| artifacts.source(module.id.file_id()))
+                .transpose()?
+                .unwrap_or_default()
         };
         let warning_map = diagnostics::SourceMap::new(&warning.source_file, &warning_source);
         let point_span = diagnostics::Span::new(
@@ -1406,35 +1334,20 @@ fn report_backend_failure(
     codegen: &mut backend::Codegen,
     fallback: errors::CodegenError,
     map: &diagnostics::SourceMap,
-    entry_path: &str,
-    entry_source: &str,
+    artifacts: &UnitArtifacts,
 ) -> anyhow::Error {
     let conflicts = codegen.take_symbol_conflicts();
     if conflicts.is_empty() {
         return emit_codegen_error(fallback, map);
     }
     for conflict in &conflicts {
-        emit_symbol_conflict(conflict, map, entry_path, entry_source);
+        emit_symbol_conflict(conflict, artifacts);
     }
     anyhow::anyhow!("aborting due to {} error(s)", conflicts.len())
 }
 
-fn emit_symbol_conflict(
-    conflict: &backend::SymbolConflict,
-    map: &diagnostics::SourceMap,
-    entry_path: &str,
-    entry_source: &str,
-) {
+fn emit_symbol_conflict(conflict: &backend::SymbolConflict, artifacts: &UnitArtifacts) {
     use diagnostics::{Diagnostic, ErrorCode, Label, Severity};
-
-    let source_map_for = |path: &str| -> diagnostics::SourceMap {
-        if path == entry_path {
-            diagnostics::SourceMap::new(path, entry_source)
-        } else {
-            let text = std::fs::read_to_string(path).unwrap_or_default();
-            diagnostics::SourceMap::new(path, &text)
-        }
-    };
 
     let symbol = &conflict.symbol;
     let owner = &conflict.owner;
@@ -1465,8 +1378,11 @@ fn emit_symbol_conflict(
         )),
     };
 
-    diagnostics::emit(&diagnostic, &source_map_for(&owner.source_file));
-    let _ = map;
+    let source = artifacts.source(owner.span.file_id).unwrap_or_default();
+    diagnostics::emit(
+        &diagnostic,
+        &diagnostics::SourceMap::new(&owner.source_file, source),
+    );
 }
 
 pub fn compile(
@@ -1496,8 +1412,25 @@ pub fn emit_hir_text(src: &str) -> Result<String> {
     let options = CompilerOptions::debug().resolve_environment();
     let frontend = run_frontend(&source, &root, &map, &options)?;
 
-    let tables = ir::lower::CheckerTables::from_checker(&frontend.checker);
-    let (hir, lowering_diagnostics) = ir::lower::lower_program_with(&frontend.program, &tables);
+    let body = frontend
+        .module_graph
+        .artifacts
+        .as_ref()
+        .expect("spooled frontend")
+        .hydrate(&frontend.program)?;
+    let items =
+        module::resolver::classify_unit_imports(&frontend.program, &frontend.module_graph.files)
+            .items;
+    let checked = typecheck_phase(
+        &body,
+        &frontend.module_graph.files,
+        &items,
+        &frontend.helpers,
+        frontend.module_graph.artifacts.as_ref().unwrap(),
+        &options,
+    )?;
+    let tables = ir::lower::CheckerTables::from_checker(&checked.checker);
+    let (hir, lowering_diagnostics) = ir::lower::lower_program_with(&body, &tables);
     let mut text = ir::dump::format_program(&hir);
     if !lowering_diagnostics.is_empty() {
         text.push_str("\n// constructs not yet lowered to HIR (willow-mb5):\n");
@@ -1524,8 +1457,25 @@ pub fn emit_lir_text(src: &str) -> Result<String> {
     let options = CompilerOptions::debug().resolve_environment();
     let frontend = run_frontend(&source, &root, &map, &options)?;
 
-    let tables = ir::lower::CheckerTables::from_checker(&frontend.checker);
-    let (hir, lowering_diagnostics) = ir::lower::lower_program_with(&frontend.program, &tables);
+    let body = frontend
+        .module_graph
+        .artifacts
+        .as_ref()
+        .expect("spooled frontend")
+        .hydrate(&frontend.program)?;
+    let items =
+        module::resolver::classify_unit_imports(&frontend.program, &frontend.module_graph.files)
+            .items;
+    let checked = typecheck_phase(
+        &body,
+        &frontend.module_graph.files,
+        &items,
+        &frontend.helpers,
+        frontend.module_graph.artifacts.as_ref().unwrap(),
+        &options,
+    )?;
+    let tables = ir::lower::CheckerTables::from_checker(&checked.checker);
+    let (hir, lowering_diagnostics) = ir::lower::lower_program_with(&body, &tables);
     let lir = ir::lowered::lower_program(&hir);
     let mut text = ir::lowered::format_program(&lir);
     if !lowering_diagnostics.is_empty() {
@@ -1620,7 +1570,15 @@ mod frontend_phase_tests {
     #[test]
     fn typecheck_phase_returns_checker_and_error_count() {
         let program = parse_source("fn main() { println(1); }");
-        let phase = typecheck_phase(&program, &[], &[], &CompilerOptions::debug()).unwrap();
+        let phase = typecheck_phase(
+            &program,
+            &[],
+            &[],
+            &HelperIndex::new(),
+            &UnitArtifacts::new().unwrap(),
+            &CompilerOptions::debug(),
+        )
+        .unwrap();
         assert_eq!(phase.error_count, 0);
         assert!(phase.checker.errors.is_empty());
     }
@@ -1629,40 +1587,10 @@ mod frontend_phase_tests {
     fn concurrency_phase_reports_entry_errors_without_rendering() {
         let program =
             parse_source("fn heavy() { while true {} } async fn run() { heavy(); } fn main() {}");
-        let phase = concurrency_phase(&program, &[], &[]);
-        assert!(phase.error_count > 0);
-        assert!(!phase.entry_diagnostics.is_empty());
-        assert!(phase.module_diagnostics.is_empty());
+        let phase = check_unit_concurrency(&program, &[], &HelperIndex::new(), Some(&[]));
+        assert!(diagnostic_error_count(&phase) > 0);
+        assert!(!phase.is_empty());
     }
-}
-
-fn debug_source_map_text(
-    entry_map: &diagnostics::SourceMap,
-    entry_program: &parser::ast::Program,
-    modules: &[module::ResolvedModule],
-) -> String {
-    let mut text = diagnostics::DebugSourceMap::from_program(
-        &entry_map.path,
-        entry_map.total_lines(),
-        entry_program,
-    )
-    .to_text();
-
-    for module in modules {
-        let module_map =
-            diagnostics::SourceMap::new(module.path.to_string_lossy().to_string(), &module.source);
-        text.push_str("\n---\n");
-        text.push_str(
-            &diagnostics::DebugSourceMap::from_program(
-                &module_map.path,
-                module_map.total_lines(),
-                &module.program,
-            )
-            .to_text(),
-        );
-    }
-
-    text
 }
 
 fn validate_entry_point(program: &parser::ast::Program) -> Vec<diagnostics::Diagnostic> {

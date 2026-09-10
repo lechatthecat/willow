@@ -3,6 +3,51 @@ use cranelift_module::Module;
 
 use super::*;
 
+#[willow_continuations::methods(
+    emit_deferred_action,
+    emit_flush_defers_from,
+    emit_lir_args_rooted,
+    emit_lir_arm_body,
+    emit_lir_array_literal,
+    emit_lir_array_method,
+    emit_lir_atomic_method,
+    emit_lir_blocking_cell_method,
+    emit_lir_body_for,
+    emit_lir_body_if,
+    emit_lir_body_stmt,
+    emit_lir_body_while,
+    emit_lir_cancellation_method,
+    emit_lir_channel_method,
+    emit_lir_class_method,
+    emit_lir_collection_method,
+    emit_lir_deferred_stmt,
+    emit_lir_enum_construction,
+    emit_lir_expr,
+    emit_lir_field_access,
+    emit_lir_field_assign,
+    emit_lir_fn_operand,
+    emit_lir_index,
+    emit_lir_index_assign,
+    emit_lir_interface_call,
+    emit_lir_interpolated,
+    emit_lir_match,
+    emit_lir_new,
+    emit_lir_object_literal,
+    emit_lir_option_result_method,
+    emit_lir_panic,
+    emit_lir_range_value,
+    emit_lir_reference_arg_address,
+    emit_lir_return,
+    emit_lir_scalar_to_string,
+    emit_lir_select,
+    emit_lir_static_call,
+    emit_lir_static_field_assign,
+    emit_lir_store_value,
+    emit_lir_string_binop,
+    emit_lir_task_handle_method,
+    emit_lir_try_propagate,
+    emit_sync_try_defer_flush
+)]
 impl<'a, 'b> FuncGen<'a, 'b> {
     /// Allocate one position in the cancellation cleanup stream shared by
     /// deferred actions and lexical lock releases.  A lock takes its position
@@ -273,7 +318,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 LockMode::Mutex => "Mutex",
                 LockMode::Read | LockMode::Write => "RwLock",
             }
-            .to_string(),
+            .to_string()
+            .into(),
             vec![value_ty.clone()],
         );
         self.emit_gc_heap_store(

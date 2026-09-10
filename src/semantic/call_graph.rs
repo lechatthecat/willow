@@ -393,11 +393,11 @@ impl CallSiteCollector<'_> {
             Expr::Var(name, _, _) => self.lookup(name).cloned().flatten(),
             _ => None,
         }?;
-        match ty {
+        match &ty {
             // Deliberately `Named` only. A generic instantiation is not treated
             // as a class receiver, which keeps the answer conservative rather
             // than resolving a dispatch the backend cannot name.
-            Type::Named(name) if self.hierarchy.is_known_class(&name) => Some(name),
+            Type::Named(name) if self.hierarchy.is_known_class(name) => Some(name.clone()),
             _ => None,
         }
     }
@@ -566,11 +566,11 @@ mod tests {
                 let Item::Function(function) = &mut program.items[0] else {
                     unreachable!()
                 };
-                let Stmt::Expr(statement) = function.body.stmts.remove(0) else {
+                let Stmt::Expr(statement) = &mut function.body.stmts.remove(0) else {
                     unreachable!()
                 };
                 let span = statement.span;
-                let mut expr = statement.expr;
+                let mut expr = statement.expr.take();
                 for _ in 0..50_000 {
                     expr = Expr::TryPropagate(Box::new(expr), span, ExprId::fresh());
                 }
@@ -585,13 +585,11 @@ mod tests {
                     &ClassHierarchy::default(),
                     &HashSet::from(["helper"]),
                 );
-                let Stmt::Expr(statement) = function.body.stmts.remove(0) else {
+                let Stmt::Expr(statement) = &mut function.body.stmts.remove(0) else {
                     unreachable!()
                 };
-                let mut expr = statement.expr;
-                while let Expr::TryPropagate(inner, _, _) = expr {
-                    expr = *inner;
-                }
+                let expr = statement.expr.take();
+                drop(expr);
                 assert_eq!(sites.targets, BTreeSet::from([FunctionId::free("helper")]));
                 assert!(!sites.has_unknown);
             })
