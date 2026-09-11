@@ -6,46 +6,6 @@ use super::*;
 #[willow_continuations::methods(
     emit_deferred_action,
     emit_flush_defers_from,
-    emit_lir_args_rooted,
-    emit_lir_arm_body,
-    emit_lir_array_literal,
-    emit_lir_array_method,
-    emit_lir_atomic_method,
-    emit_lir_blocking_cell_method,
-    emit_lir_body_for,
-    emit_lir_body_if,
-    emit_lir_body_stmt,
-    emit_lir_body_while,
-    emit_lir_cancellation_method,
-    emit_lir_channel_method,
-    emit_lir_class_method,
-    emit_lir_collection_method,
-    emit_lir_deferred_stmt,
-    emit_lir_enum_construction,
-    emit_lir_expr,
-    emit_lir_field_access,
-    emit_lir_field_assign,
-    emit_lir_fn_operand,
-    emit_lir_index,
-    emit_lir_index_assign,
-    emit_lir_interface_call,
-    emit_lir_interpolated,
-    emit_lir_match,
-    emit_lir_new,
-    emit_lir_object_literal,
-    emit_lir_option_result_method,
-    emit_lir_panic,
-    emit_lir_range_value,
-    emit_lir_reference_arg_address,
-    emit_lir_return,
-    emit_lir_scalar_to_string,
-    emit_lir_select,
-    emit_lir_static_call,
-    emit_lir_static_field_assign,
-    emit_lir_store_value,
-    emit_lir_string_binop,
-    emit_lir_task_handle_method,
-    emit_lir_try_propagate,
     emit_sync_try_defer_flush
 )]
 impl<'a, 'b> FuncGen<'a, 'b> {
@@ -351,21 +311,51 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// Preserve the native call chain when a synchronous helper exhausts its
-    /// task budget. Outside a task the runtime returns zero immediately.
-    pub(super) fn emit_sync_safepoint(&mut self) {
+    /// task budget. Ordinary synchronous loops only load the live GC gate;
+    /// they enter the runtime when a collector actually requests a stop.
+    pub(super) fn emit_sync_safepoint(
+        &mut self,
+        native_active: cranelift_codegen::ir::Value,
+        gc_stop_flag: cranelift_codegen::ir::Value,
+    ) {
+        // Atomic loads cannot be hoisted out of the source loop. The GC flag
+        // may change concurrently even though native activity is invocation-
+        // constant (nested scheduler drives restore the enclosing context).
+        let stop = self
+            .builder
+            .ins()
+            .atomic_load(types::I8, MemFlagsData::trusted(), gc_stop_flag);
+        let stop = self.builder.ins().uextend(types::I32, stop);
+        let required = self.builder.ins().bor(native_active, stop);
+        let slow = self.builder.create_block();
+        self.builder.set_cold_block(slow);
+        let resume = self.builder.create_block();
+        self.builder.ins().brif(required, slow, &[], resume, &[]);
+        self.builder.switch_to_block(slow);
+        self.builder.seal_block(slow);
         let cancelled = self.emit_value_runtime_call("willow_sync_safepoint", &[]);
         self.emit_sync_cancel_branch(cancelled);
+        self.builder
+            .set_cold_block(self.builder.current_block().expect("poll continuation"));
+        self.builder.ins().jump(resume, &[]);
+        self.builder.switch_to_block(resume);
+        self.builder.seal_block(resume);
     }
 
     fn emit_sync_cancel_check(&mut self) {
-        if self.emitting_sync_cancel_cleanup { return; }
+        if self.emitting_sync_cancel_cleanup {
+            return;
+        }
         let cancelled = self.emit_value_runtime_call("willow_sync_cancelled", &[]);
         self.emit_sync_cancel_branch(cancelled);
     }
 
     fn emit_sync_cancel_branch(&mut self, cancelled: cranelift_codegen::ir::Value) {
-        if self.emitting_sync_cancel_cleanup { return; }
+        if self.emitting_sync_cancel_cleanup {
+            return;
+        }
         let unwind = self.builder.create_block();
+        self.builder.set_cold_block(unwind);
         let resume = self.builder.create_block();
         self.builder.ins().brif(cancelled, unwind, &[], resume, &[]);
         self.builder.switch_to_block(unwind);
@@ -382,7 +372,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         for _ in 0..callstack_depth_before {
             self.emit_callstack_pop();
         }
-        for _ in 0..reference_scopes_before.len() { self.emit_debug_reference_call_clear(); }
+        for _ in 0..reference_scopes_before.len() {
+            self.emit_debug_reference_call_clear();
+        }
         self.panic_defer_codegen_depth = 0;
         self.recover_eligible_depth = 0;
         self.emitting_sync_cancel_cleanup = true;
@@ -447,7 +439,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         for _ in 0..callstack_depth_before {
             self.emit_callstack_pop();
         }
-        for _ in 0..self.lir_reference_scopes.len() { self.emit_debug_reference_call_clear(); }
+        for _ in 0..self.lir_reference_scopes.len() {
+            self.emit_debug_reference_call_clear();
+        }
         self.panic_defer_codegen_depth = 0;
         self.recover_eligible_depth = 0;
         if let Some(scope) = self.panic_scopes.last() {
@@ -602,7 +596,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let active = self.emit_value_runtime_call("willow_panic_active", &[]);
             let propagate = self.builder.create_block();
             let recovered = self.builder.create_block();
-            self.builder.ins().brif(active, propagate, &[], recovered, &[]);
+            self.builder
+                .ins()
+                .brif(active, propagate, &[], recovered, &[]);
             self.builder.switch_to_block(recovered);
             self.builder.seal_block(recovered);
             for (name, span) in &scope.call_frames_at_entry {

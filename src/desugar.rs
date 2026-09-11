@@ -73,14 +73,19 @@ fn iface_compose_methods_with_origin(
     snap: &IfaceIndex,
     visiting: &mut std::collections::HashSet<String>,
 ) -> Vec<(parser::ast::InterfaceMethodDecl, String)> {
-    enum Step<'a> { Enter(&'a str), Leave(&'a str) }
+    enum Step<'a> {
+        Enter(&'a str),
+        Leave(&'a str),
+    }
     let mut work = vec![Step::Enter(name)];
     let mut out: Vec<(parser::ast::InterfaceMethodDecl, String)> = Vec::new();
     let mut positions = std::collections::HashMap::new();
     while let Some(step) = work.pop() {
         match step {
             Step::Enter(name) => {
-                if !visiting.insert(name.to_string()) { continue; }
+                if !visiting.insert(name.to_string()) {
+                    continue;
+                }
                 work.push(Step::Leave(name));
                 if let Some((supers, _)) = snap.get(name) {
                     work.extend(supers.iter().rev().map(|sup| Step::Enter(sup)));
@@ -126,23 +131,33 @@ fn iface_all_supers(
     visiting: &mut std::collections::HashSet<String>,
     out: &mut Vec<String>,
 ) {
-    enum Step<'a> { Enter(&'a str), Super(&'a str), Leave(&'a str) }
+    enum Step<'a> {
+        Enter(&'a str),
+        Super(&'a str),
+        Leave(&'a str),
+    }
     let mut work = vec![Step::Enter(name)];
     let mut seen: std::collections::HashSet<String> = out.iter().cloned().collect();
     while let Some(step) = work.pop() {
         match step {
             Step::Super(name) => {
-                if seen.insert(name.to_string()) { out.push(name.to_string()); }
+                if seen.insert(name.to_string()) {
+                    out.push(name.to_string());
+                }
                 work.push(Step::Enter(name));
             }
             Step::Enter(name) => {
-                if !visiting.insert(name.to_string()) { continue; }
+                if !visiting.insert(name.to_string()) {
+                    continue;
+                }
                 work.push(Step::Leave(name));
                 if let Some((supers, _)) = snap.get(name) {
                     work.extend(supers.iter().rev().map(|sup| Step::Super(sup)));
                 }
             }
-            Step::Leave(name) => { visiting.remove(name); }
+            Step::Leave(name) => {
+                visiting.remove(name);
+            }
         }
     }
 }

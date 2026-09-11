@@ -199,7 +199,6 @@ impl Codegen {
             self.function_may_panic.insert(name, may_panic);
         }
     }
-
 }
 
 impl FuncGen<'_, '_> {

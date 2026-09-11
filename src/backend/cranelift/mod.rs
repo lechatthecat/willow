@@ -32,14 +32,14 @@ mod emit_expr;
 mod emit_interface;
 mod emit_match;
 mod emit_object;
-mod flat_objects;
-mod flat_calls;
-mod flat_references;
-mod flat_control;
 mod emit_option_result;
 mod emit_pow;
 mod emit_pow_f64;
 mod emit_stmt;
+mod flat_calls;
+mod flat_control;
+mod flat_objects;
+mod flat_references;
 mod gc_codegen;
 mod lir_gen;
 mod option_repr;
@@ -537,7 +537,11 @@ impl Codegen {
         self.function_may_panic.set_scope(scope);
     }
 
-    fn bind_function_alias(&mut self, alias: FunctionId, canonical: FunctionId) -> Option<FunctionId> {
+    fn bind_function_alias(
+        &mut self,
+        alias: FunctionId,
+        canonical: FunctionId,
+    ) -> Option<FunctionId> {
         let mut scope = self.func_ids.scope().clone();
         let previous = scope.bind(alias, canonical);
         self.install_function_scope(scope);
@@ -568,7 +572,11 @@ impl Codegen {
         previous
     }
 
-    fn bind_canonical_type_alias(&mut self, alias: &str, target: &str) -> Option<type_index::TypeBinding> {
+    fn bind_canonical_type_alias(
+        &mut self,
+        alias: &str,
+        target: &str,
+    ) -> Option<type_index::TypeBinding> {
         let mut scope = self.type_scope.clone();
         let previous = scope.bind_canonical(alias, target);
         self.install_type_scope(scope);
@@ -607,7 +615,9 @@ impl Codegen {
     /// `Point::Near` reads as an interface and is refused. The alias is this
     /// unit's answer for the name, so nothing else may answer for it here.
     pub fn install_enum_aliases(&mut self, aliases: &[(String, EnumInfo)]) -> EnumAliasScope {
-        let scope = EnumAliasScope { types: self.type_scope.clone() };
+        let scope = EnumAliasScope {
+            types: self.type_scope.clone(),
+        };
         for (name, info) in aliases {
             // The unit checker supplies identity; metadata remains build-wide.
             if self.enum_infos.get_canonical(&info.name).is_none() {
@@ -868,22 +878,14 @@ impl Codegen {
         false
     }
 
-    fn alias_function_symbol(
-        &mut self,
-        alias: &str,
-        canonical: &str,
-    ) {
+    fn alias_function_symbol(&mut self, alias: &str, canonical: &str) {
         if self.func_ids.contains_key(canonical) {
             let alias = FunctionId::free(alias);
             self.bind_function_alias(alias, self.func_ids.scope().lookup_id(canonical));
         }
     }
 
-    fn alias_class_symbol(
-        &mut self,
-        alias: &str,
-        canonical: &str,
-    ) {
+    fn alias_class_symbol(&mut self, alias: &str, canonical: &str) {
         if self.class_layouts.contains_key(canonical) {
             self.bind_type_alias(alias, canonical);
         }
@@ -918,10 +920,7 @@ impl Codegen {
     /// key of something ELSE is a different case and IS bound: `books` in a
     /// file that says `import sales as books;` means sales there, whatever a
     /// real `books` module registered.
-    fn alias_unit_module_spellings(
-        &mut self,
-        spellings: &[compile::ModuleSpelling],
-    ) {
+    fn alias_unit_module_spellings(&mut self, spellings: &[compile::ModuleSpelling]) {
         for spelling in spellings {
             if spelling.access == spelling.graph_name {
                 continue;
@@ -1019,12 +1018,19 @@ impl Codegen {
     ///
     /// Installed BEFORE [`Codegen::alias_module_local_types`] so a module's own
     /// declaration still wins over anything it imported under the same name.
-    fn alias_item_import_types(
-        &mut self,
-        items: &[compile::ItemBinding],
-    ) {
+    fn alias_item_import_types(&mut self, items: &[compile::ItemBinding]) {
         for item in items {
-            let qualified = format!("{}::{}", self.table_module_name(&item.module), item.item);
+            let table_module = self.table_module_name(&item.module);
+            let qualified = format!("{}::{}", table_module, item.item);
+            let source_qualified = format!("{}::{}", item.module, item.item);
+            if table_module != item.module {
+                if let Some(id) = self.known_modules.resolve(&table_module) {
+                    self.known_modules.bind(item.module.clone(), id);
+                }
+                if self.registered_type(&qualified) {
+                    self.bind_type_alias(&source_qualified, &qualified);
+                }
+            }
             if self.interface_infos.contains_key(&qualified)
                 || self.class_layouts.contains_key(&qualified)
                 || self.enum_infos.contains_key(&qualified)
@@ -1050,11 +1056,7 @@ impl Codegen {
     /// checker by `install_enum_aliases`: their identity uses the canonical
     /// path, which can differ from `mod_name`. Rebinding them here would
     /// overwrite that identity and lose variant metadata (willow-wvlw).
-    fn alias_module_local_types(
-        &mut self,
-        program: &Program,
-        mod_name: &str,
-    ) {
+    fn alias_module_local_types(&mut self, program: &Program, mod_name: &str) {
         for item in &program.items {
             let Item::Interface(interface) = item else {
                 continue;
@@ -1484,7 +1486,6 @@ struct FuncGen<'a, 'b> {
     /// compiled (willow-nswv). Only the LIR path reads it.
     builtin_module_aliases: &'a HashMap<String, String>,
     lambda_names: &'a HashMap<ExprId, FunctionId>,
-    cooperative_leaves: &'a std::collections::HashSet<FunctionId>,
     string_literals: &'a HashMap<String, DataId>,
     class_layouts: &'a TypeMap<Vec<(String, Type)>>,
     static_storage: &'a TypeMap<HashMap<String, StaticStorageInfo>>,
@@ -1520,19 +1521,10 @@ struct FuncGen<'a, 'b> {
     /// poll emitter; source spans remain available only for diagnostics.
     lir_frame_offsets: HashMap<crate::ir::lowered::LirLocalId, i32>,
     lir_defer_offsets: HashMap<crate::ir::lowered::LirDeferId, i32>,
-    /// The cooperative LIR emitter splits a value-position `await` out of its
-    /// statement and parks BEFORE emitting the rest of the expression, because
-    /// a Cranelift value computed ahead of the park does not survive the poll
-    /// fn's return. While the statement is being emitted this holds that
-    /// await's span and the value the resume produced, so the `Await` node
-    /// reads back what was already awaited instead of awaiting again
-    /// (willow-0g8j.2.11).
-    lir_hoisted_await: Option<(crate::diagnostics::Span, cranelift_codegen::ir::Value)>,
     /// When compiling `fn main() -> Result<void, E>`: the error payload type `E`.
     /// Each return inspects the Result and exits accordingly (willow-exg).
     main_result_err_ty: Option<Type>,
     vars: HashMap<String, VarStorage>,
-    return_type: Type,
     current_class: Option<&'a str>,
     is_async: bool,
     terminated: bool,
@@ -1585,7 +1577,6 @@ struct FlatReferenceDebug {
 enum VarStorage {
     Value {
         var: Variable,
-        ty: Type,
     },
     Stack {
         slot: cranelift_codegen::ir::StackSlot,
@@ -1602,17 +1593,6 @@ enum VarStorage {
         offset: i32,
         ty: Type,
     },
-}
-
-impl VarStorage {
-    fn ty(&self) -> &Type {
-        match self {
-            VarStorage::Value { ty, .. }
-            | VarStorage::Stack { ty, .. }
-            | VarStorage::ReferencePtr { ty, .. }
-            | VarStorage::Frame { ty, .. } => ty,
-        }
-    }
 }
 
 /// Async-frame layout constants — must match `crates/willow_runtime/src/async_frame.rs`
@@ -1719,13 +1699,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             ParamMode::Value => {
                 let var = self.builder.declare_var(clif_type(ty));
                 self.builder.def_var(var, val);
-                self.vars.insert(
-                    name.to_string(),
-                    VarStorage::Value {
-                        var,
-                        ty: ty.clone(),
-                    },
-                );
+                self.vars
+                    .insert(name.to_string(), VarStorage::Value { var });
             }
             ParamMode::Reference { .. } => {
                 let ptr_ty = self.module.target_config().pointer_type();
@@ -1885,20 +1860,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         value
     }
 
-    /// The declared parameter types of a mangled function/lambda name, exactly
-    /// as recorded — for a class method that INCLUDES the hidden leading
-    /// `self`, so the result aligns with call arguments only for free
-    /// functions. Use [`Self::method_param_types`] to align with a method
-    /// call's explicit arguments. `None` if not a known function.
-    fn fn_param_types(&self, mangled: &str) -> Option<Vec<Type>> {
-        match self.fn_types.get(mangled) {
-            Some(Type::Fn(params, _)) => Some(params.clone()),
-            _ => None,
-        }
-    }
-
-    /// Like [`fn_param_types`] but drops the leading `self` parameter so the
-    /// result aligns with a method call's explicit arguments.
+    /// Declared explicit method parameter types, excluding the receiver.
     fn method_param_types(&self, mangled: &str) -> Option<Vec<Type>> {
         match self.fn_types.get(mangled) {
             Some(Type::Fn(params, _)) if !params.is_empty() => Some(params[1..].to_vec()),
@@ -2270,7 +2232,9 @@ impl AsyncFrameLayout {
         let mut gc_payload_bitmap =
             vec![0u64; (slots.len() + ASYNC_FRAME_HEADER_WORDS).div_ceil(64)];
         for (k, slot) in slots.iter().enumerate() {
-            if slot.storage_kind == crate::ir::lowered::LirStorageKind::GcOwner || is_gc_managed(&slot.ty, enum_infos) {
+            if slot.storage_kind == crate::ir::lowered::LirStorageKind::GcOwner
+                || is_gc_managed(&slot.ty, enum_infos)
+            {
                 let word = k + ASYNC_FRAME_HEADER_WORDS;
                 gc_payload_bitmap[word / 64] |= 1 << (word % 64);
             }
@@ -2280,7 +2244,9 @@ impl AsyncFrameLayout {
             .take(ASYNC_FRAME_GC_SLOT_CAPACITY)
             .enumerate()
             .fold(0u64, |mask, (k, slot)| {
-                if slot.storage_kind == crate::ir::lowered::LirStorageKind::GcOwner || is_gc_managed(&slot.ty, enum_infos) {
+                if slot.storage_kind == crate::ir::lowered::LirStorageKind::GcOwner
+                    || is_gc_managed(&slot.ty, enum_infos)
+                {
                     mask | (1u64 << k)
                 } else {
                     mask
@@ -2321,7 +2287,7 @@ fn collect_async_frame_slots(params: &[Param], body: &Block) -> Vec<AsyncFrameSl
     let mut slots: Vec<AsyncFrameSlot> = params
         .iter()
         .map(|p| AsyncFrameSlot {
-                storage_kind: crate::ir::lowered::LirStorageKind::Value,
+            storage_kind: crate::ir::lowered::LirStorageKind::Value,
             source_span: Some(p.span),
             name: p.name.clone(),
             ty: p.ty.clone().into(),
@@ -2348,7 +2314,7 @@ fn collect_let_slots(
                     && seen.insert(l.span)
                 {
                     out.push(AsyncFrameSlot {
-                storage_kind: crate::ir::lowered::LirStorageKind::Value,
+                        storage_kind: crate::ir::lowered::LirStorageKind::Value,
                         source_span: Some(l.span),
                         name: l.name.clone(),
                         ty: ty.into(),
@@ -2386,19 +2352,6 @@ fn array_element_type(ty: &Type) -> Type {
         }
         _ => Type::Void,
     }
-}
-
-fn try_propagate_payload_type(ty: &Type) -> Type {
-    builtin_types::resolve(ty)
-        .filter(|resolved| matches!(resolved.id, B::Result | B::Option))
-        .and_then(|resolved| resolved.args.first().cloned())
-        .expect("internal compiler error: missing checked payload type")
-}
-
-/// The error type `E` of a `Result<T, E>`, used by `?` automatic error
-/// conversion (willow-1ow).
-fn result_err_type(ty: &Type) -> Option<Type> {
-    builtin_types::binary_args(ty, B::Result).map(|(_, err)| err.clone())
 }
 
 /// The error payload type `E` if `f` returns `Result<void, E>`, else `None`.
@@ -2781,38 +2734,44 @@ mod tests {
                     .resolve(&TypeId::from_source_name("Local"));
                 let before_module = codegen.known_modules.linker_prefix("local").cloned();
                 let result = catch_unwind(AssertUnwindSafe(|| {
-                    codegen.with_unit_resolution(codegen.resolution_context(), |this| -> anyhow::Result<()> {
-                        let repetitions = if binding_shape == 2 { 3 } else { 1 };
-                        for i in 0..repetitions {
-                            let target = format!("temporary{i}");
-                            this.bind_function_alias(function, FunctionId::free_from_source_name(&target));
-                            this.bind_type_alias("Local", &target);
-                            let id = crate::module::ModuleId(10 + i);
-                            this.known_modules.register(id, &target, &target);
-                            this.known_modules.bind("local".into(), id);
-                        }
-                        if binding_shape == 3 {
-                            this.with_unit_resolution(this.resolution_context(), |inner| {
-                                let id = crate::module::ModuleId(100);
-                                inner.known_modules.register(id, "inner", "inner");
-                                inner.known_modules.bind("local".into(), id);
-                            });
-                            assert_eq!(
-                                this.known_modules.linker_prefix("local").unwrap(),
-                                "temporary0"
-                            );
-                        }
-                        match exit {
-                            0 => Ok(()),
-                            1 => Err(anyhow::anyhow!("explicit error")),
-                            2 => {
-                                Err(anyhow::anyhow!("propagated error"))?;
-                                Ok(())
+                    codegen.with_unit_resolution(
+                        codegen.resolution_context(),
+                        |this| -> anyhow::Result<()> {
+                            let repetitions = if binding_shape == 2 { 3 } else { 1 };
+                            for i in 0..repetitions {
+                                let target = format!("temporary{i}");
+                                this.bind_function_alias(
+                                    function,
+                                    FunctionId::free_from_source_name(&target),
+                                );
+                                this.bind_type_alias("Local", &target);
+                                let id = crate::module::ModuleId(10 + i);
+                                this.known_modules.register(id, &target, &target);
+                                this.known_modules.bind("local".into(), id);
                             }
-                            3 => panic!("scope unwind regression"),
-                            _ => Ok(()),
-                        }
-                    })
+                            if binding_shape == 3 {
+                                this.with_unit_resolution(this.resolution_context(), |inner| {
+                                    let id = crate::module::ModuleId(100);
+                                    inner.known_modules.register(id, "inner", "inner");
+                                    inner.known_modules.bind("local".into(), id);
+                                });
+                                assert_eq!(
+                                    this.known_modules.linker_prefix("local").unwrap(),
+                                    "temporary0"
+                                );
+                            }
+                            match exit {
+                                0 => Ok(()),
+                                1 => Err(anyhow::anyhow!("explicit error")),
+                                2 => {
+                                    Err(anyhow::anyhow!("propagated error"))?;
+                                    Ok(())
+                                }
+                                3 => panic!("scope unwind regression"),
+                                _ => Ok(()),
+                            }
+                        },
+                    )
                 }));
                 assert_eq!(result.is_err(), exit == 3);
                 if let Ok(result) = result {
@@ -2942,10 +2901,23 @@ mod tests {
     #[test]
     fn opaque_gc_owner_frame_slots_are_traced_without_language_types() {
         use crate::ir::lowered::LirStorageKind;
-        let layout = AsyncFrameLayout::new(vec![
-            AsyncFrameSlot { storage_kind: LirStorageKind::GcOwner, source_span: None, name: "owner".into(), ty: Type::Void },
-            AsyncFrameSlot { storage_kind: LirStorageKind::Value, source_span: None, name: "unit".into(), ty: Type::Void },
-        ], &TypeMap::new());
+        let layout = AsyncFrameLayout::new(
+            vec![
+                AsyncFrameSlot {
+                    storage_kind: LirStorageKind::GcOwner,
+                    source_span: None,
+                    name: "owner".into(),
+                    ty: Type::Void,
+                },
+                AsyncFrameSlot {
+                    storage_kind: LirStorageKind::Value,
+                    source_span: None,
+                    name: "unit".into(),
+                    ty: Type::Void,
+                },
+            ],
+            &TypeMap::new(),
+        );
         assert!(layout.slot_is_gc_ref(0));
         assert!(!layout.slot_is_gc_ref(1));
         assert_eq!(layout.gc_slot_mask, 1);
@@ -3318,7 +3290,9 @@ mod tests {
 
 /// Address-stable bindings are explicit places in the executable LIR. Include
 /// cleanup regions because their captures may take an outer binding's address.
-pub(super) fn lir_address_taken_locals(function: &crate::ir::lowered::LirFunction) -> HashSet<String> {
+pub(super) fn lir_address_taken_locals(
+    function: &crate::ir::lowered::LirFunction,
+) -> HashSet<String> {
     use crate::ir::lowered::{LirInst, LirOperand, LirPlace};
     let mut names = HashSet::new();
     let mut pending = vec![function];
@@ -3328,7 +3302,11 @@ pub(super) fn lir_address_taken_locals(function: &crate::ir::lowered::LirFunctio
                 match instruction {
                     LirInst::Compute { value, .. } => {
                         for operand in value.operands() {
-                            if let LirOperand::Reference { place: LirPlace::Local(local), .. } = operand {
+                            if let LirOperand::Reference {
+                                place: LirPlace::Local(local),
+                                ..
+                            } = operand
+                            {
                                 names.insert(function.locals[local.0 as usize].name.clone());
                             }
                         }

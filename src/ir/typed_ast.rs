@@ -28,6 +28,9 @@ pub struct HirProgram {
 /// references to the mutable checker or unit-local alias scopes.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HirResolution {
+    /// Unit-visible module spellings and their checked free-function signatures.
+    pub modules: std::collections::HashMap<TypeId, std::collections::HashMap<String, HirSignature>>,
+
     pub enums: std::collections::HashMap<TypeId, HirEnumInfo>,
     pub classes: std::collections::HashMap<TypeId, HirClassInfo>,
     pub interfaces: std::collections::HashMap<TypeId, HirInterfaceInfo>,
@@ -83,15 +86,26 @@ impl HirResolution {
     /// Representation-preserving class upcasts and declared interface
     /// conversions. Lowering uses declarations rather than backend layouts.
     pub(crate) fn can_coerce(&self, source: &Type, target: &Type) -> bool {
-        if source == target { return true; }
+        if source == target {
+            return true;
+        }
         let mut pending = vec![source.clone()];
         let mut seen = std::collections::HashSet::new();
         while let Some(current) = pending.pop() {
-            if current == *target { return true; }
-            if !seen.insert(current.clone()) { continue; }
-            let identity = match &current { Type::Named(id) | Type::Generic(id, _) => *id, _ => continue };
+            if current == *target {
+                return true;
+            }
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            let identity = match &current {
+                Type::Named(id) | Type::Generic(id, _) => *id,
+                _ => continue,
+            };
             if let Some(class) = self.classes.get(&identity) {
-                if let Some(base) = class.base { pending.push(Type::Named(base)); }
+                if let Some(base) = class.base {
+                    pending.push(Type::Named(base));
+                }
                 pending.extend(class.implements.iter().cloned());
             } else if let Some(interface) = self.interfaces.get(&identity) {
                 pending.extend(interface.extends.iter().map(|parent| Type::Named(*parent)));

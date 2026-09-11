@@ -136,23 +136,4 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .ins()
             .load(types::I64, MemFlagsData::new(), ptr, 0i32)
     }
-
-    pub(super) fn emit_static_field_read(
-        &mut self,
-        class: &str,
-        field: &str,
-    ) -> cranelift_codegen::ir::Value {
-        let class_name = self.static_call_class_name(class);
-        if let Some(info) = self.lookup_static_storage(&class_name, field) {
-            let ty = clif_type(&info.ty);
-            let ptr_ty = self.module.target_config().pointer_type();
-            let gv = self
-                .module
-                .declare_data_in_func(info.data_id, self.builder.func);
-            let addr = self.builder.ins().symbol_value(ptr_ty, gv);
-            return self.builder.ins().load(ty, MemFlagsData::new(), addr, 0);
-        }
-        // Should be unreachable after type checking; fall back to a zero value.
-        self.builder.ins().iconst(types::I64, 0)
-    }
 }

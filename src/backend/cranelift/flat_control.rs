@@ -1,24 +1,44 @@
 //! Runtime leaf operations used by the explicit LIR control-flow graph.
 use super::*;
-use cranelift_module::Module;
 use cranelift_codegen::ir::{InstBuilder, Value, types};
+use cranelift_module::Module;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
-    pub(super) fn emit_flat_start_task(&mut self, callee: crate::semantic::ids::FunctionId, args: &[Value], params: &[Type], span: crate::diagnostics::Span) -> Value {
+    pub(super) fn emit_flat_start_task(
+        &mut self,
+        callee: crate::semantic::ids::FunctionId,
+        args: &[Value],
+        params: &[Type],
+        span: crate::diagnostics::Span,
+    ) -> Value {
         let mut roots = 0;
         for (&value, ty) in args.iter().zip(params) {
-            if is_gc_managed(ty, self.enum_infos) { self.emit_push_root(value); roots += 1; }
+            if is_gc_managed(ty, self.enum_infos) {
+                self.emit_push_root(value);
+                roots += 1;
+            }
         }
-        let fid = *self.func_ids.get_id(&callee).expect("task constructor registered");
+        let fid = *self
+            .func_ids
+            .get_id(&callee)
+            .expect("task constructor registered");
         let fref = self.module.declare_func_in_func(fid, self.builder.func);
         let pushed = self.emit_callstack_push(&callee.to_string(), span);
         let depth = self.emit_pre_user_call_panic_depth(&callee.to_string());
         let call = self.builder.ins().call(fref, args);
         let frame = self.builder.inst_results(call)[0];
-        if pushed { self.emit_callstack_pop(); }
-        self.emit_pop_roots_n(roots); self.gc_root_count -= roots;
+        if pushed {
+            self.emit_callstack_pop();
+        }
+        self.emit_pop_roots_n(roots);
+        self.gc_root_count -= roots;
         self.emit_post_willow_call_panic_check(depth);
-        let id = self.builder.ins().load(types::I64, cranelift_codegen::ir::MemFlagsData::new(), frame, super::async_frame_slot_offset(super::FRAME_SLOT_TASK_ID));
+        let id = self.builder.ins().load(
+            types::I64,
+            cranelift_codegen::ir::MemFlagsData::new(),
+            frame,
+            super::async_frame_slot_offset(super::FRAME_SLOT_TASK_ID),
+        );
         self.emit_set_spawn_site(id, span.line);
         frame
     }

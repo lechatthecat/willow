@@ -250,9 +250,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     /// Debug builds: pop the most recent call-chain frame after a call returns.
     pub(super) fn emit_callstack_unwind_edge(&mut self) {
-        for _ in 0..self.lir_reference_scopes.len() { self.emit_debug_reference_call_clear(); }
+        for _ in 0..self.lir_reference_scopes.len() {
+            self.emit_debug_reference_call_clear();
+        }
         let depth = self.callstack_frame_depth;
-        for _ in 0..depth { self.emit_callstack_pop(); }
+        for _ in 0..depth {
+            self.emit_callstack_pop();
+        }
         self.callstack_frame_depth = depth;
     }
 
@@ -269,7 +273,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_replay_reference_scopes(&mut self) {
         for scope in self.lir_reference_scopes.clone() {
             self.emit_debug_reference_call_scope_push();
-            for record in scope { self.emit_flat_reference_debug(&record.argument, &record.callee, record.index); }
+            for record in scope {
+                self.emit_flat_reference_debug(&record.argument, &record.callee, record.index);
+            }
         }
     }
 }

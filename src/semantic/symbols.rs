@@ -305,6 +305,12 @@ impl SymbolTable {
         self.modules.insert(id, info);
     }
 
+    pub fn module_accesses(&self) -> impl Iterator<Item = (&str, &ModuleInfo)> {
+        self.module_names
+            .iter()
+            .filter_map(|(name, id)| self.modules.get(id).map(|info| (name.as_str(), info)))
+    }
+
     pub fn lookup_module(&self, name: &str) -> Option<&ModuleInfo> {
         self.modules.get(self.module_names.get(name)?)
     }

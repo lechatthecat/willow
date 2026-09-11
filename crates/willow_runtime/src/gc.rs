@@ -941,6 +941,14 @@ pub extern "C" fn willow_gc_unregister_mutator() {
     cv.notify_all();
 }
 
+/// Process-lifetime address of the GC stop gate for generated atomic byte loads.
+/// Generated code must reload this flag at every poll, with acquire ordering or
+/// stronger; caching the flag value would prevent a collector from stopping it.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_stop_flag() -> *const u8 {
+    runtime().stop_requested.as_ptr().cast::<u8>()
+}
+
 /// A cooperative GC safepoint (willow-6fv.5.6). Cheap when no collection is
 /// pending. When a stop-the-world collection is in progress, the calling mutator
 /// publishes a snapshot of its roots and parks here until the collector resumes
@@ -3818,7 +3826,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_mutator_stw_keeps_other_thread_roots_alive() {
+    fn multi_mutator_stw_keeps_other_thread_roots_alive_through_generated_gate() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         let _guard = gc_test_guard();
@@ -3840,9 +3848,17 @@ mod tests {
             let b = willow_alloc_object(0, 8);
             let mut b_slot = b;
             willow_push_root(&mut b_slot as *mut *mut u8);
+            assert_eq!(crate::preempt::willow_sync_native_active(), 0);
+            let stop = willow_gc_stop_flag();
+            assert_eq!(stop, willow_gc_stop_flag());
             r2.store(true, Ordering::SeqCst);
             while !d2.load(Ordering::SeqCst) {
-                willow_gc_safepoint();
+                // Model generated non-task code: cache the address, but reload
+                // the atomic gate so a later collector can stop this worker.
+                // SAFETY: the accessor returns this process-lifetime AtomicBool.
+                if unsafe { &*stop.cast::<AtomicBool>() }.load(Ordering::Acquire) {
+                    crate::preempt::willow_sync_safepoint();
+                }
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             willow_pop_root();

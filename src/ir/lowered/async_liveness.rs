@@ -8,7 +8,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ir::typed_ast::{HirExpr, HirExprKind};
 
-use super::{BlockId, SourceBlock, SourceInst, LirLocal, LirLocalId, LirSelectOp, SourceTerminator};
+use super::{
+    BlockId, LirLocal, LirLocalId, LirSelectOp, SourceBlock, SourceInst, SourceTerminator,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameSlot {
@@ -28,7 +30,7 @@ impl LirAsyncFrameLayout {
 }
 
 /// Compute the exact set of locals live across explicit LIR suspension edges.
-pub fn analyze(blocks: &[SourceBlock], locals: &[LirLocal]) -> LirAsyncFrameLayout {
+pub(crate) fn analyze(blocks: &[SourceBlock], locals: &[LirLocal]) -> LirAsyncFrameLayout {
     let names: HashMap<&str, LirLocalId> = locals
         .iter()
         .map(|local| (local.name.as_str(), local.id))
@@ -111,7 +113,8 @@ pub fn analyze(blocks: &[SourceBlock], locals: &[LirLocal]) -> LirAsyncFrameLayo
         {
             let no_defs = HashSet::new();
             match &block.terminator {
-                SourceTerminator::Return(Some(value)) | SourceTerminator::Branch { cond: value, .. } => {
+                SourceTerminator::Return(Some(value))
+                | SourceTerminator::Branch { cond: value, .. } => {
                     collect_expr_uses(value, &names, &mut pinned, &no_defs);
                 }
                 _ => {}
@@ -184,12 +187,13 @@ pub fn analyze(blocks: &[SourceBlock], locals: &[LirLocal]) -> LirAsyncFrameLayo
 }
 
 fn reusable_scalar(local: &LirLocal) -> bool {
-    !local.is_gc_owner() && matches!(
-        local.ty,
-        crate::parser::ast::Type::I64
-            | crate::parser::ast::Type::F64
-            | crate::parser::ast::Type::Bool
-    )
+    !local.is_gc_owner()
+        && matches!(
+            local.ty,
+            crate::parser::ast::Type::I64
+                | crate::parser::ast::Type::F64
+                | crate::parser::ast::Type::Bool
+        )
 }
 
 fn collect_select_locals(operation: &LirSelectOp, out: &mut HashSet<LirLocalId>) {
@@ -235,134 +239,142 @@ pub(crate) fn instruction_use_def(
     defs: &mut HashSet<LirLocalId>,
 ) {
     macro_rules! read {
-        ($expr:expr) => { collect_expr_uses($expr, names, uses, defs) };
+        ($expr:expr) => {
+            collect_expr_uses($expr, names, uses, defs)
+        };
     }
-        match inst {
-            SourceInst::Compute { local, value, .. } => {
-                for operand in value.operands() {
-                    for id in operand.locals() { if !defs.contains(&id) { uses.insert(id); } }
-                }
-                defs.insert(*local);
-            }
-            SourceInst::Let { local, value, .. } => {
-                read!(value);
-                defs.insert(*local);
-            }
-            SourceInst::Assign { local, value, .. } => {
-                read!(value);
-                defs.insert(*local);
-            }
-            SourceInst::FieldAssign { object, value, .. } => {
-                read!(object);
-                read!(value);
-            }
-            SourceInst::IndexAssign {
-                array,
-                index,
-                value,
-            } => {
-                read!(array);
-                read!(index);
-                read!(value);
-            }
-            SourceInst::StaticFieldAssign { value, .. } | SourceInst::Expr(value) => read!(value),
-            SourceInst::SuperInit { args, .. } => {
-                for arg in args {
-                    read!(arg);
-                }
-            }
-            SourceInst::Defer { body, .. } => {
-                for capture in &body.captures {
-                    if !defs.contains(capture) { uses.insert(*capture); }
-                }
-            }
-            SourceInst::SelectInit { operations } => {
-                for operation in operations {
-                    match operation {
-                        LirSelectOp::Timeout { millis, deadline } => {
-                            if !defs.contains(millis) {
-                                uses.insert(*millis);
-                            }
-                            defs.insert(*deadline);
-                        }
-                        _ => select_uses(operation, uses, defs),
+    match inst {
+        SourceInst::Compute { local, value, .. } => {
+            for operand in value.operands() {
+                for id in operand.locals() {
+                    if !defs.contains(&id) {
+                        uses.insert(id);
                     }
                 }
             }
-            SourceInst::SelectProbe { operations, ready } => {
-                for operation in operations {
-                    select_uses(operation, uses, defs);
-                }
-                defs.extend(ready.iter().flatten().copied());
-            }
-            SourceInst::SelectPick { ready, chosen } => {
-                for local in ready.iter().flatten() {
-                    if !defs.contains(local) {
-                        uses.insert(*local);
-                    }
-                }
-                defs.insert(*chosen);
-            }
-            SourceInst::SelectUnregister { operations } => {
-                for operation in operations {
-                    select_uses(operation, uses, defs);
-                }
-            }
-            SourceInst::SelectCommit { operation, success } => {
-                select_uses(operation, uses, defs);
-                match operation {
-                    LirSelectOp::Recv { binding, .. } | LirSelectOp::Join { binding, .. } => {
-                        defs.extend(binding.iter().copied());
-                    }
-                    _ => {}
-                }
-                defs.insert(*success);
-            }
-            // Releasing reads all four of the acquisition's frame slots, so
-            // each one stays live from the `lock` down to every exit that
-            // leaves the section (willow-0g8j.2.13). A `lock` body's scope
-            // reads them too: its panic cleanup is where an unwind releases.
-            SourceInst::ReleaseLock(slots)
-            | SourceInst::EnterDeferScope {
-                lock: Some(slots), ..
-            } => {
-                for local in slots.locals() {
-                    if !defs.contains(&local) {
-                        uses.insert(local);
-                    }
-                }
-            }
-            // The scrutinee is READ by every dispatch block and by the bind at
-            // the top of each arm; the bindings are DEFINED there. That is what
-            // puts a binding an arm reads after suspending into the frame, and
-            // keeps a scrutinee nothing reads again out of it
-            // (willow-0g8j.2.11.1).
-            SourceInst::MatchTest {
-                scrutinee, result, ..
-            } => {
-                if !defs.contains(scrutinee) {
-                    uses.insert(*scrutinee);
-                }
-                defs.insert(*result);
-            }
-            SourceInst::MatchBind {
-                scrutinee,
-                bindings,
-                ..
-            } => {
-                if !defs.contains(scrutinee) {
-                    uses.insert(*scrutinee);
-                }
-                defs.extend(bindings.iter().copied());
-            }
-            // Naming a local does not read it: the instruction drops the GC
-            // root of a scope that ended, so nothing it names is live past it
-            // and nothing it names is redefined either (willow-0g8j.3.3).
-            SourceInst::EnterDeferScope { .. }
-            | SourceInst::LeaveDeferScope { .. }
-            | SourceInst::FlushDefers { .. }
-            | SourceInst::ClearScopeRoots { .. } => {}
+            defs.insert(*local);
         }
+        SourceInst::Let { local, value, .. } => {
+            read!(value);
+            defs.insert(*local);
+        }
+        SourceInst::Assign { local, value, .. } => {
+            read!(value);
+            defs.insert(*local);
+        }
+        SourceInst::FieldAssign { object, value, .. } => {
+            read!(object);
+            read!(value);
+        }
+        SourceInst::IndexAssign {
+            array,
+            index,
+            value,
+        } => {
+            read!(array);
+            read!(index);
+            read!(value);
+        }
+        SourceInst::StaticFieldAssign { value, .. } | SourceInst::Expr(value) => read!(value),
+        SourceInst::SuperInit { args, .. } => {
+            for arg in args {
+                read!(arg);
+            }
+        }
+        SourceInst::Defer { body, .. } => {
+            for capture in &body.captures {
+                if !defs.contains(capture) {
+                    uses.insert(*capture);
+                }
+            }
+        }
+        SourceInst::SelectInit { operations } => {
+            for operation in operations {
+                match operation {
+                    LirSelectOp::Timeout { millis, deadline } => {
+                        if !defs.contains(millis) {
+                            uses.insert(*millis);
+                        }
+                        defs.insert(*deadline);
+                    }
+                    _ => select_uses(operation, uses, defs),
+                }
+            }
+        }
+        SourceInst::SelectProbe { operations, ready } => {
+            for operation in operations {
+                select_uses(operation, uses, defs);
+            }
+            defs.extend(ready.iter().flatten().copied());
+        }
+        SourceInst::SelectPick { ready, chosen } => {
+            for local in ready.iter().flatten() {
+                if !defs.contains(local) {
+                    uses.insert(*local);
+                }
+            }
+            defs.insert(*chosen);
+        }
+        SourceInst::SelectUnregister { operations } => {
+            for operation in operations {
+                select_uses(operation, uses, defs);
+            }
+        }
+        SourceInst::SelectCommit { operation, success } => {
+            select_uses(operation, uses, defs);
+            match operation {
+                LirSelectOp::Recv { binding, .. } | LirSelectOp::Join { binding, .. } => {
+                    defs.extend(binding.iter().copied());
+                }
+                _ => {}
+            }
+            defs.insert(*success);
+        }
+        // Releasing reads all four of the acquisition's frame slots, so
+        // each one stays live from the `lock` down to every exit that
+        // leaves the section (willow-0g8j.2.13). A `lock` body's scope
+        // reads them too: its panic cleanup is where an unwind releases.
+        SourceInst::ReleaseLock(slots)
+        | SourceInst::EnterDeferScope {
+            lock: Some(slots), ..
+        } => {
+            for local in slots.locals() {
+                if !defs.contains(&local) {
+                    uses.insert(local);
+                }
+            }
+        }
+        // The scrutinee is READ by every dispatch block and by the bind at
+        // the top of each arm; the bindings are DEFINED there. That is what
+        // puts a binding an arm reads after suspending into the frame, and
+        // keeps a scrutinee nothing reads again out of it
+        // (willow-0g8j.2.11.1).
+        SourceInst::MatchTest {
+            scrutinee, result, ..
+        } => {
+            if !defs.contains(scrutinee) {
+                uses.insert(*scrutinee);
+            }
+            defs.insert(*result);
+        }
+        SourceInst::MatchBind {
+            scrutinee,
+            bindings,
+            ..
+        } => {
+            if !defs.contains(scrutinee) {
+                uses.insert(*scrutinee);
+            }
+            defs.extend(bindings.iter().copied());
+        }
+        // Naming a local does not read it: the instruction drops the GC
+        // root of a scope that ended, so nothing it names is live past it
+        // and nothing it names is redefined either (willow-0g8j.3.3).
+        SourceInst::EnterDeferScope { .. }
+        | SourceInst::LeaveDeferScope { .. }
+        | SourceInst::FlushDefers { .. }
+        | SourceInst::ClearScopeRoots { .. } => {}
+    }
 }
 
 pub(crate) fn terminator_uses(
@@ -372,13 +384,17 @@ pub(crate) fn terminator_uses(
     defs: &HashSet<LirLocalId>,
 ) {
     macro_rules! read {
-        ($expr:expr) => { collect_expr_uses($expr, names, uses, defs) };
+        ($expr:expr) => {
+            collect_expr_uses($expr, names, uses, defs)
+        };
     }
     match terminator {
         SourceTerminator::Branch { cond, .. } => read!(cond),
         SourceTerminator::Return(Some(value)) => read!(value),
         SourceTerminator::Suspend { operation, .. } => operation.collect_locals(uses),
-        SourceTerminator::Jump(_) | SourceTerminator::Return(None) | SourceTerminator::CleanupReturn => {}
+        SourceTerminator::Jump(_)
+        | SourceTerminator::Return(None)
+        | SourceTerminator::CleanupReturn => {}
     }
 }
 

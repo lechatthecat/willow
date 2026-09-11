@@ -186,6 +186,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     // --- multi-mutator coordination (willow-6fv.5.6) ---
     NONE; "willow_gc_register_mutator" => ([] -> None);
     NONE; "willow_gc_unregister_mutator" => ([] -> None);
+    NONE; "willow_gc_stop_flag" => ([] -> Some(Ptr));
     PREEMPT; "willow_gc_safepoint" => ([] -> None);
     // --- arrays (std::collections::Array) ---
     PANIC_ALLOC; "willow_array_new" => ([I64, I64] -> Some(Word));
@@ -402,6 +403,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_preempt_end" => ([] -> None);
     PREEMPT; "willow_preempt_check" => ([] -> Some(I32));
     PREEMPT; "willow_sync_safepoint" => ([] -> Some(I32));
+    NONE; "willow_sync_native_active" => ([] -> Some(I32));
     NONE; "willow_sync_cancelled" => ([] -> Some(I32));
     NONE; "willow_sync_cleanup_enter" => ([] -> None);
     NONE; "willow_sync_cleanup_leave" => ([] -> None);

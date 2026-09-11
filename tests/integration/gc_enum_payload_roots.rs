@@ -406,6 +406,24 @@ fn main() {
     );
 }
 
+#[test]
+fn gc_enum_interface_payload_dispatch_without_self_with_conditional_argument() {
+    assert_rooted(
+        "interface Greeter { fn hello(n: i64) -> String; }
+class Dog implements Greeter { pub fn hello(n: i64) -> String { return n.toString(); } }
+enum Held { One(Greeter), None }
+fn build() -> Held { return Held::One(new Dog()); }
+fn choose(g: Greeter, yes: bool) -> String { return g.hello(yes ? 17 : 23); }
+fn main() {
+    let held = build();
+    gc_minor_collect();
+    println(match held { Held::One(g) => choose(g, true), Held::None => \"none\" });
+}
+",
+        "17\n",
+    );
+}
+
 // 15. An enum inside an enum: the payload is itself a `[tag | payload]` object
 //     built by the allocation immediately before.
 #[test]

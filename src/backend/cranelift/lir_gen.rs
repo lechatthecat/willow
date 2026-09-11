@@ -1,187 +1,31 @@
-//! LIR-walking code generation — willow-0g8j.
+//! Cranelift code generation from operand-only LIR.
 //!
-//! The emit layer for user function bodies: a function is compiled by walking
-//! its [`LirFunction`] basic blocks directly (typed [`HirExpr`] trees inside),
-//! using the LIR-only body emitter. A missing or invalid lowered body produces
-//! a compile error naming the construct (willow-t0uy.3).
+//! User bodies, lifted lambdas, and cleanup regions are basic-block graphs.
+//! Instructions consume local IDs or immediate values; the backend never
+//! evaluates a HIR expression tree. Lowering owns ternary, match, short-circuit,
+//! propagation, select, and nested-await control flow.
 //!
-//! Supported representations include: `i64`/`f64`/`bool`/`String`/`Array<T>` values,
-//! class objects (including inheritance), plain and generic interface values,
-//! plain and generic enums, function values, `Channel<T>`, `Task<T>` and
-//! `JoinHandle<T>`, plus the builtin collections `Map<K, V>`, `FrozenArray<T>`
-//! and `FrozenMap<K, V>`;
-//! literals, variables, arithmetic/comparison, unary ops, string concatenation
-//! and content comparison; array literals, indexing, index-assignment and the
-//! builtin `len`/`push`/`pop`/`toString`/`freeze` methods; `Map::new()` and the
-//! map methods `insert`/`contains`/`len`/`toString`/`freeze`; `new`, field
-//! reads, field assignment, instance/static/virtual method calls; enum-variant
-//! construction and `match`; direct and indirect calls to known non-async
-//! functions; channel operations and `select`, synchronous or cooperative;
-//! `print`/`println` of a scalar or a string; `let`/assign; and the full block
-//! control flow (jump/branch/return).
+//! Every local is bound at function entry, independently of block emission
+//! order. GC values use rooted storage; async values live in the LIR-computed
+//! frame when they survive suspension. ClearScopeRoots ends temporary lifetimes
+//! without growing the root stack on loop iterations.
 //!
-//! Class layouts include inherited fields in declaration order, while method
-//! calls on a hierarchy use the declared virtual method slots. Canonical
-//! nullable values are supported through `Option<T>`. A `defer` body must be an
-//! effect-only match or straight-line HIR block, but its scope may span blocks
-//! and be left by an early exit. A SYNCHRONOUS function keeps that scope stack
-//! on the Rust side, so the emitter hands each LIR block the state its
-//! predecessor exited with and emits blocks in an order the edges permit rather
-//! than in LIR index order; a function whose blocks disagree about what is open
-//! fails validation. An async function has no such bookkeeping — its scopes are frame
-//! flags and its recovery continuation is a real LIR block.
+//! Reference operands capture their place before later arguments run. Array
+//! references retain the original buffer in an opaque GC-owner local, so resize,
+//! collection, and suspension cannot redirect the reference to a new buffer.
+//! The address is materialized from the rooted owner at the call.
 //!
-//! An async function walks LIR inside the cooperative poll ABI: LIR-owned frame
-//! layout and liveness, compiler preemption/cancellation safepoints, and
-//! suspensions expressed as [`Terminator::Suspend`] over
-//! [`crate::ir::lowered::SuspendOp`] — `sleep`, `yield`, a task await, a
-//! channel send/recv, and the wait of a cooperative `select`, whose probe,
-//! pick, register/unregister and commit steps are LIR instructions over the LIR
-//! CFG (willow-0g8j.2.11). An await nested in an expression is split out in
-//! front of the statement (or the `return`/branch condition) that contains it,
-//! which is legal exactly when everything evaluated before it is
-//! rematerializable. `defer`, `?`, and recovery-capable `defer` are emitted
-//! from LIR as well, and so is `lock` (willow-0g8j.2.13): the acquisition is a
-//! [`crate::ir::lowered::SuspendOp::LockAcquire`] whose four frame slots are
-//! ordinary LIR locals, and every exit that leaves the critical section under
-//! its own power carries a [`crate::ir::lowered::LirInst::ReleaseLock`]. Only
-//! the panic exit has no instruction: an unwind releases the lock from the
-//! section's own cleanup block, which is why the lowerer opens that scope even
-//! for a section that defers nothing.
+//! Calls and stores validate signatures and layouts before emission. Explicit
+//! coercions preserve argument evaluation order, and heap reference writes use
+//! the GC barrier. Option representation follows the shared ABI metadata.
 //!
-//! A capture-free lambda is lifted to its own [`LirFunction`] and materialized
-//! as a function address. A CAPTURING one is lifted the same way, but its value
-//! is the environment object instead (willow-0g8j.2.12): a GC object holding
-//! the code address in word 0 and the captured values after it, which the
-//! lifted body takes as a hidden leading argument and an indirect call passes
-//! back.
-//!
-//! Enums and `match` (willow-0g8j.8) follow one rule for the
-//! representation: an enum is a bare i64 tag when NO variant carries a
-//! payload, and a `[tag | payload…]` GC object otherwise
-//! ([`FuncGen::enum_is_gc_object_type`]). Generic enums came in with
-//! willow-0g8j.2.1 (see the `Option`/`Result` note below), and willow-0g8j.2.5
-//! admitted block-bodied arms in the one shape that needs no merge value: an
-//! arm that DIVERGES, ending in `return` or `panic(...)`.
-//!
-//! willow-0g8j.2.13 opened the rest of the block: a `void` or diverging arm's
-//! body is now a run of statements — `let`, assignment, or an expression. (An
-//! arm that PRODUCES a value is still a single expression, and that is the
-//! grammar's rule rather than the walker's: a block-bodied arm's last statement
-//! needs a `;`, so such an arm is typed `void`.) The `vars` map is flat, so
-//! [`FuncGen::emit_lir_match`] brackets each arm instead: it snapshots `vars`
-//! and the GC root depth before the body and restores both after, which is what
-//! makes an arm-local binding safe to declare. A `select` case gets the same
-//! treatment from its own emitter, so a `let` is admitted there too, and so
-//! does a `defer` block ([`BodyScope`]): [`FuncGen::emit_deferred_action`]
-//! brackets each replay the same way. What still separates a deferred body is
-//! the ENDING — a `return` out of one would pop the whole runtime root depth
-//! mid-unwind, so [`supported_branch_body`] refuses it there.
-//!
-//! willow-0g8j.2.16 added `if` to all three. LIR lowers a function-level `if`
-//! into blocks of the graph, but these bodies stay HIR islands, so an `if`
-//! inside one gets its branch and join blocks from
-//! [`FuncGen::emit_lir_body_if`] instead. That also settled what makes an arm
-//! LEAVE: not the type the checker gave the `match` — it types the same
-//! all-arms-return shape `!` in one position and by its arms in another — but
-//! [`body_diverges`], which reads the arm's tail and sees through an `if` both
-//! of whose branches leave.
-//!
-//! A GC-managed pattern binding gets a rooted stack slot of its own, and the
-//! reason is worth stating because the obvious cheaper rule is wrong
-//! (willow-10zt). Rooting the SCRUTINEE across the arm keeps the payload
-//! REACHABLE, but reachable is not the same as fixed: Willow's minor collector
-//! promotes a direct root in place — that is what lets generated code keep an
-//! SSA alias of an ordinary rooted local — while a young object it reaches only
-//! through a heap slot is copied to the old generation and the owning slot is
-//! fixed up behind it. An enum payload and the object inside an interface box
-//! are that second case, so a binding that merely copied the payload word would
-//! name freed memory as soon as the arm allocated. Rooting the binding makes it
-//! a direct root too, which the collector pins.
-//!
-//! Interface boxing (willow-j260): an interface-typed slot holds a 16-byte
-//! `[object | vtable]` GC box, so storing a class value into one is a real
-//! conversion, not a reinterpretation. The walker now performs it, but only
-//! where a store actually happens — `let` init, assignment, call argument,
-//! `return`, field store, array element, `push` — and only through
-//! [`FuncGen::coerce_to_target`].
-//! Eligibility admits such a store only when
-//! [`super::emit::resolve_vtable_id`] finds the vtable the emitter will need,
-//! because `coerce_to_target` silently yields the raw object when it does not
-//! and an unboxed class pointer in an interface slot would crash dispatch.
-//! Interface dispatch (willow-0g8j.6) is supported: a method call
-//! on an interface-typed receiver loads `[object | vtable]` out of the box,
-//! indexes the vtable by the method's declaration-order slot and issues a
-//! `call_indirect`, re-boxing a `Self`-returning result. Eligibility resolves
-//! that slot through `LirTypeCtx::iface_method` — a method the interface does
-//! not declare has no slot at all, so admitting such a call would miscompile.
-//! `&`/`&mut` parameters use pointer ABI for direct, class, static, constructor
-//! and interface calls. `&place` arguments are supported in debug builds
-//! (willow-0g8j.2.17): the walker emits the reference-call
-//! diagnostic hook and clears it after the call so panic reports identify the
-//! caller. Every string that hook passes is declared once from the AST, which
-//! is why the LIR place kind/name helpers must spell a place exactly as the
-//! AST ones do.
-//! Field access through an interface is rejected: `new` and
-//! field reads go through `class_layout_of`, which has no layout for an
-//! interface name. The boxing allocation is the one coercion that runs
-//! AFTER its value expression, so every site that roots a live temporary
-//! across the value must treat "this store boxes" as allocating too; see
-//! [`FuncGen::lir_store_allocates`].
-//!
-//! GC rooting (willow-0g8j.1): the LIR has no block scopes — it is a flat
-//! basic-block graph — so a per-`let` push/pop pairing
-//! would grow the shadow root stack once per loop iteration. Instead every
-//! GC-managed local gets ONE stack slot allocated and rooted at function
-//! entry, null-initialized so a collection before the `let` runs sees an empty
-//! slot; the slot is both the variable's storage and its root, which keeps
-//! reassignment from leaving a stale root, and all
-//! roots are popped at each `return`. Expression temporaries that must survive
-//! an allocating call are rooted until that call completes.
-//!
-//! Every OTHER local is bound at function entry too (willow-ht1h,
-//! willow-34su). A block's index is not a position in any order control can
-//! flow in: an `if/else` merge is lowered before the arm that jumps to it, and
-//! an async body — emitted in index order — puts a `lock` section's blocks
-//! ahead of the `let` whose value they carry. Binding a local wherever its
-//! [`LirInst::Let`] happened to be emitted therefore dropped stores on the
-//! floor and reached reads with nothing bound at all, so
-//! [`FuncGen::bind_lir_locals`] hands every non-parameter local its storage up
-//! front — a stack slot if its address is taken, a zero-seeded Cranelift
-//! variable otherwise — and `Let` only stores into what is already there.
-//!
-//! Arrays (willow-0g8j.4) ride on the same discipline: an `Array<T>` value is a
-//! GC handle whose pointer is stable across growth (a `push` reallocates only
-//! the buffer), so the entry slot of an array local stays valid for the whole
-//! function. Temporaries are rooted around any sub-expression that can run a
-//! collection, decided by [`may_allocate`] so a literal index or a constant
-//! element list costs no root traffic.
-//!
-//! Maps and frozen collections (willow-0g8j.7) are the same kind of GC handle,
-//! so they reuse that discipline unchanged; what is new is the ABI they read
-//! and write through. A `Map<K, V>` crosses the runtime boundary as raw 64-bit
-//! words plus is-ref flags — `willow_map_insert(map, k, k_ref, v, v_ref)` —
-//! rather than the array's fixed word layout, and `FrozenArray<T>` /
-//! `FrozenMap<K, V>` are the SAME runtime objects as the collections they were
-//! frozen from, so their reads lower to the very same `willow_array_*` /
-//! `willow_map_*` calls. `freeze` is a copy, not a cast.
-//!
-//! One restriction on that subset is deliberate. Map keys are admitted only
-//! as `String` or `i64`, because the runtime's `MapKey` is exactly
-//! `Int(i64) | Str(String)` and it decides between them from the is-ref flag:
-//! any other GC-managed key would be read as a `WillowString` pointer that it
-//! is not.
-//!
-//! `Option<T>` and `Result<T, E>` are ordinary prelude enums, so willow-0g8j.2.1
-//! admits them the same way as any other generic enum: construction, `match`,
-//! the value-taking methods (`unwrap`, `unwrapOr`, `isSome`, …), `Map::get`, and
-//! `?` propagation. The representation choice is NOT re-derived here — every
-//! site asks [`super::option_repr::option_repr`], which defines the runtime
-//! ABI representation, so a niche `Option<String>` and a
-//! boxed `Option<i64>` cannot be confused for one another.
+//! Suspension terminators implement the cooperative poll protocol. Prepared
+//! method frames and reference diagnostic scopes follow CFG edges and are
+//! restored on resume. Defer scopes and recovery edges likewise come from LIR;
+//! cleanup graphs are replayed with their captured locals and fresh region state.
 
-use super::{ModuleSymbols, FlatReferenceDebug};
 use super::type_index::TypeMap;
+use super::{FlatReferenceDebug, ModuleSymbols};
 use crate::semantic::ids::SemanticType as Type;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -193,11 +37,13 @@ use cranelift_codegen::ir::{
 use cranelift_module::Module;
 
 use crate::diagnostics::span::Span;
+#[cfg(test)]
 use crate::ir::dump::binop_str;
 use crate::ir::lowered::{
     BlockId, LirBlock, LirFunction, LirInst, LirLocalId, LirLockSlots, LirSelectOp,
     LirSelectWaitOp, SuspendOp, Terminator,
 };
+#[cfg(test)]
 use crate::ir::typed_ast::{
     HirCapture, HirExpr, HirExprKind, HirMatchArm, HirPattern, HirSelectCase, HirSelectCaseKind,
     HirStmt,
@@ -205,26 +51,24 @@ use crate::ir::typed_ast::{
 use crate::parser::ast::{BinOp, ExprId, ParamMode, UnaryOp};
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::ids::{FunctionId, FunctionMap, TypeId};
-use crate::semantic::intrinsics::{self, Intrinsic};
-use crate::semantic::type_checker::types::{await_output_type, awaitable_task_type, type_name};
+#[cfg(test)]
+use crate::semantic::intrinsics;
+use crate::semantic::intrinsics::Intrinsic;
+#[cfg(test)]
+use crate::semantic::type_checker::types::await_output_type;
+use crate::semantic::type_checker::types::type_name;
 
-use super::channel_element_type;
-use super::emit_interface::{
-    VirtualCallPlan, class_base_ids, collection_elem_kind, is_self_or_descendant,
-};
+use super::emit_interface::{class_base_ids, collection_elem_kind, is_self_or_descendant};
 use super::gc_codegen::{GcLayoutMetadata, GcObjectKind, GcStoreDestination};
-use super::option_repr::{OptionRepr, option_inner, option_repr};
+use super::option_repr::{OptionRepr, option_repr};
 use super::symbols::{class_method_symbol_name, class_name_for_object_type, module_item_symbol};
 use super::type_helpers::{
-    builtin_call_runtime_name, clif_type, debug_type_name, gc_stat_builtin_runtime_name,
-    is_gc_managed,
+    builtin_call_runtime_name, clif_type, gc_stat_builtin_runtime_name, is_gc_managed,
 };
 use super::{
-    CoopSuspendPoint, FRAME_SLOT_TASK_ID, FuncGen, ParamDebug, VarStorage, array_element_type,
-    async_frame_slot_offset, channel_runtime_suffix, reference_mode_name, result_err_type,
-    try_propagate_payload_type,
+    CoopSuspendPoint, FRAME_SLOT_TASK_ID, FuncGen, VarStorage, array_element_type,
+    async_frame_slot_offset, channel_runtime_suffix,
 };
-use crate::BuildMode;
 
 /// Where a defer scope is opened: the LIR block and the position of its
 /// `EnterDeferScope` in it. A scope is opened by exactly one instruction, so
@@ -405,9 +249,16 @@ fn namespace_builtin_call(
     class: &str,
     method: &str,
 ) -> Option<crate::semantic::intrinsics::NamespaceBuiltin> {
-    if class == "f64" { return crate::semantic::intrinsics::namespace_builtin(class, method); }
-    if known_modules.contains_key(class) { return None; }
-    let namespace = builtin_module_aliases.get(class).map(String::as_str).unwrap_or(class);
+    if class == "f64" {
+        return crate::semantic::intrinsics::namespace_builtin(class, method);
+    }
+    if known_modules.contains_key(class) {
+        return None;
+    }
+    let namespace = builtin_module_aliases
+        .get(class)
+        .map(String::as_str)
+        .unwrap_or(class);
     crate::semantic::intrinsics::namespace_builtin(namespace, method)
 }
 
@@ -426,6 +277,7 @@ fn empty_map_type(ty: &Type) -> bool {
 /// `Map<Void, Void>`, so it can never be a parameter, a `let`'s declared type or
 /// a return type; the only way a value of that type can exist in an eligible
 /// function is through this node, which is admitted here and nowhere else.
+#[cfg(test)]
 fn is_fresh_empty_map(e: &HirExpr) -> bool {
     matches!(&e.kind, HirExprKind::StaticCall { class, method, args }
         if class == &TypeId::local("Map") && method == "new" && args.is_empty())
@@ -618,6 +470,7 @@ pub(super) struct LirTypeCtx<'x> {
     /// other field this one is per-FUNCTION, and it is here because a `return`
     /// inside a `match` arm is checked deep inside `supported_expr`, where the
     /// enclosing [`LirFunction`] is out of reach (willow-0g8j.2.5).
+    #[cfg(test)]
     pub return_type: &'x Type,
     /// The class whose body is being vetted, or `None` outside a class. The
     /// second per-FUNCTION field, set the same way `return_type` is, and it is
@@ -1191,7 +1044,7 @@ impl LirTypeCtx<'_> {
             }
             (Type::Array(a), Type::Array(b)) => self.same_repr_inner(a, b, open),
             (Type::Generic(a, ta), Type::Generic(b, tb)) => {
-                a == b
+                (a == b || self.same_iface(a, b) || self.same_enum(a, b, open))
                     && ta.len() == tb.len()
                     && ta
                         .iter()
@@ -1388,6 +1241,7 @@ impl LirTypeCtx<'_> {
     ///
     /// A symbol with no recorded signature has no modes to agree with, so a
     /// `&place` is refused there outright rather than guessed at.
+    #[cfg(test)]
     fn callable(&self, mangled: &str, args: &[HirExpr], skip_self: bool) -> bool {
         if !(self.known_fn)(mangled) {
             return false;
@@ -1427,6 +1281,7 @@ impl LirTypeCtx<'_> {
 /// the forms known to be allocation-free answer `false`; everything else —
 /// including any expression form added later — answers `true`, so a new node
 /// kind cannot silently drop a root.
+#[cfg(test)]
 fn may_allocate(e: &HirExpr) -> bool {
     let mut pending = vec![e];
     while let Some(expr) = pending.pop() {
@@ -1516,6 +1371,51 @@ fn lir_block_successors(block: &LirBlock) -> Vec<usize> {
     }
 }
 
+/// Function entry covers recursion; DFS backedge targets cover every cycle,
+/// including irreducible control flow and recovery edges. Polling ordinary
+/// forward blocks adds overhead without covering additional unbounded work.
+fn lir_sync_poll_blocks(f: &LirFunction) -> Vec<bool> {
+    let mut poll = vec![false; f.blocks.len()];
+    if let Some(entry) = poll.first_mut() {
+        *entry = true;
+    }
+    let edges: Vec<Vec<usize>> = f
+        .blocks
+        .iter()
+        .map(|block| {
+            let mut edges = lir_block_successors(block);
+            edges.extend(block.recovery.iter().map(|target| target.0));
+            edges
+        })
+        .collect();
+    let mut color = vec![0u8; f.blocks.len()];
+    for root in 0..f.blocks.len() {
+        if color[root] != 0 {
+            continue;
+        }
+        color[root] = 1;
+        let mut pending = vec![(root, 0)];
+        while let Some((block, next)) = pending.last_mut() {
+            if *next == edges[*block].len() {
+                color[*block] = 2;
+                pending.pop();
+                continue;
+            }
+            let target = edges[*block][*next];
+            *next += 1;
+            match color[target] {
+                0 => {
+                    color[target] = 1;
+                    pending.push((target, 0));
+                }
+                1 => poll[target] = true,
+                _ => {}
+            }
+        }
+    }
+    poll
+}
+
 /// Argument evaluation may cross basic blocks or a cooperative suspension.
 /// Validate the matching preparations and retain the source frames at each
 /// entry, independently of the order in which machine blocks are emitted.
@@ -1523,7 +1423,9 @@ fn lir_call_frame_entries(f: &LirFunction) -> Option<Vec<Vec<(String, Span)>>> {
     use crate::ir::lowered::{LirOperand, LirRvalue};
     type Stack = Vec<(crate::ir::lowered::LirLocalId, String, Span)>;
     let mut entries: Vec<Option<Stack>> = vec![None; f.blocks.len()];
-    if entries.is_empty() { return Some(Vec::new()); }
+    if entries.is_empty() {
+        return Some(Vec::new());
+    }
     entries[0] = Some(Vec::new());
     let mut work = vec![0];
     while let Some(index) = work.pop() {
@@ -1531,32 +1433,69 @@ fn lir_call_frame_entries(f: &LirFunction) -> Option<Vec<Vec<(String, Span)>>> {
         let mut edges = Vec::new();
         for instruction in &f.blocks[index].instrs {
             match instruction {
-                LirInst::Compute { local, value: LirRvalue::PrepareMethod { method, .. }, span } => stack.push((*local, method.clone(), *span)),
-                LirInst::Compute { value: LirRvalue::MethodCall { receiver, method, .. }, .. } => {
+                LirInst::Compute {
+                    local,
+                    value: LirRvalue::PrepareMethod { method, .. },
+                    span,
+                } => stack.push((*local, method.clone(), *span)),
+                LirInst::Compute {
+                    value:
+                        LirRvalue::MethodCall {
+                            receiver, method, ..
+                        },
+                    ..
+                } => {
                     let (prepared, expected, _) = stack.pop()?;
-                    if *receiver != LirOperand::Local(prepared) || *method != expected { return None; }
+                    if *receiver != LirOperand::Local(prepared) || *method != expected {
+                        return None;
+                    }
                 }
-                LirInst::EnterDeferScope { resume: Some(resume), .. } => edges.push((resume.0, stack.clone())),
+                LirInst::EnterDeferScope {
+                    resume: Some(resume),
+                    ..
+                } => edges.push((resume.0, stack.clone())),
                 _ => {}
             }
         }
-        edges.extend(lir_block_successors(&f.blocks[index]).into_iter().map(|target| (target, stack.clone())));
+        edges.extend(
+            lir_block_successors(&f.blocks[index])
+                .into_iter()
+                .map(|target| (target, stack.clone())),
+        );
         for (target, state) in edges {
             match entries.get_mut(target)? {
                 Some(existing) if *existing != state => return None,
-                Some(_) => {},
-                entry @ None => { *entry = Some(state); work.push(target); }
+                Some(_) => {}
+                entry @ None => {
+                    *entry = Some(state);
+                    work.push(target);
+                }
             }
         }
     }
-    Some(entries.into_iter().map(|entry| entry.unwrap_or_default().into_iter().map(|(_, name, span)| (name, span)).collect()).collect())
+    Some(
+        entries
+            .into_iter()
+            .map(|entry| {
+                entry
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(_, name, span)| (name, span))
+                    .collect()
+            })
+            .collect(),
+    )
 }
 
-fn lir_reference_scope_entries(f: &LirFunction) -> Option<Vec<Vec<Vec<super::FlatReferenceDebug>>>> {
+fn lir_reference_scope_entries(
+    f: &LirFunction,
+) -> Option<Vec<Vec<Vec<super::FlatReferenceDebug>>>> {
     use crate::ir::lowered::{LirOperand, LirRvalue as V};
     type Scopes = Vec<Vec<super::FlatReferenceDebug>>;
     let mut entries: Vec<Option<Scopes>> = vec![None; f.blocks.len()];
-    if entries.is_empty() { return Some(Vec::new()); }
+    if entries.is_empty() {
+        return Some(Vec::new());
+    }
     entries[0] = Some(Vec::new());
     let mut work = vec![0];
     while let Some(index) = work.pop() {
@@ -1564,20 +1503,56 @@ fn lir_reference_scope_entries(f: &LirFunction) -> Option<Vec<Vec<Vec<super::Fla
         let mut edges = Vec::new();
         for instruction in &f.blocks[index].instrs {
             match instruction {
-                LirInst::Compute { value: V::BeginReferenceCall, .. } => scopes.push(Vec::new()),
-                LirInst::Compute { value: V::ReferenceDebug { argument, callee, index }, .. } => scopes.last_mut()?.push(super::FlatReferenceDebug { argument: argument.clone(), callee: *callee, index: *index }),
-                LirInst::Compute { value: V::DirectCall { args, .. } | V::StaticCall { args, .. } | V::MethodCall { args, .. } | V::ConstructorCall { args, .. }, .. }
-                    if args.iter().any(|arg| matches!(arg, LirOperand::Reference { .. })) => { scopes.pop()?; },
-                LirInst::EnterDeferScope { resume: Some(resume), .. } => edges.push((resume.0, scopes.clone())),
+                LirInst::Compute {
+                    value: V::BeginReferenceCall,
+                    ..
+                } => scopes.push(Vec::new()),
+                LirInst::Compute {
+                    value:
+                        V::ReferenceDebug {
+                            argument,
+                            callee,
+                            index,
+                        },
+                    ..
+                } => scopes.last_mut()?.push(super::FlatReferenceDebug {
+                    argument: argument.clone(),
+                    callee: *callee,
+                    index: *index,
+                }),
+                LirInst::Compute {
+                    value:
+                        V::DirectCall { args, .. }
+                        | V::StaticCall { args, .. }
+                        | V::MethodCall { args, .. }
+                        | V::ConstructorCall { args, .. },
+                    ..
+                } if args
+                    .iter()
+                    .any(|arg| matches!(arg, LirOperand::Reference { .. })) =>
+                {
+                    scopes.pop()?;
+                }
+                LirInst::EnterDeferScope {
+                    resume: Some(resume),
+                    ..
+                } => edges.push((resume.0, scopes.clone())),
                 _ => {}
             }
         }
-        edges.extend(lir_block_successors(&f.blocks[index]).into_iter().map(|target| (target, scopes.clone())));
+        edges.extend(
+            lir_block_successors(&f.blocks[index])
+                .into_iter()
+                .map(|target| (target, scopes.clone())),
+        );
         for (target, state) in edges {
             match entries.get_mut(target)? {
                 Some(existing) if *existing != state => return None,
-                Some(_) => {},
-                entry @ None => { *entry = Some(state); work.push(target); }
+                Some(_) => {}
+                entry @ None => {
+                    *entry = Some(state);
+                    work.push(target);
+                }
             }
         }
     }
@@ -1701,6 +1676,27 @@ fn lir_sync_defer_stacks_agree(f: &LirFunction) -> bool {
 /// "something in this function is unsupported" and a construct, a type and a
 /// line to go and fix.
 pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Option<String> {
+    if f.blocks.iter().enumerate().any(|(index, block)| {
+        block.id.0 as usize != index
+            || lir_block_successors(block)
+                .iter()
+                .any(|target| *target >= f.blocks.len())
+            || block
+                .recovery
+                .iter()
+                .any(|target| target.0 as usize >= f.blocks.len())
+    }) {
+        return Some("the LIR graph has an invalid block identity or target".into());
+    }
+    // Entry contains parameter/local initialization and is not a loop header.
+    // Cleanup replay also suppresses its entry cancellation check so cleanup
+    // can begin while cancellation is sticky; cycles need a separate header.
+    if f.blocks.iter().any(|block| {
+        lir_block_successors(block).contains(&0)
+            || block.recovery.iter().any(|target| target.0 == 0)
+    }) {
+        return Some("the LIR entry block must not have incoming edges".into());
+    }
     if lir_call_frame_entries(f).is_none() {
         return Some("method preparation frames disagree across control-flow edges".into());
     }
@@ -1715,11 +1711,18 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
     // and the same class the emitter sets as `FuncGen::current_class`.
     let owner = f.name.owner_type().map(|owner| owner.to_string());
     let ctx = &LirTypeCtx {
+        #[cfg(test)]
         return_type: &f.return_type,
         // `rsplit`, not `split`: a module class is keyed by its qualified
         // name, so the method `shapes::Point::area` has `shapes::Point` as its
         // class and only the LAST separator divides the two (willow-0g8j.16).
-        self_class: owner.as_deref().or_else(|| if f.name.is_free_named("$defer") { ctx.self_class } else { None }),
+        self_class: owner.as_deref().or_else(|| {
+            if f.name.is_free_named("$defer") {
+                ctx.self_class
+            } else {
+                None
+            }
+        }),
         ..*ctx
     };
     if !ctx.supported_type(&f.return_type) {
@@ -1753,7 +1756,9 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
         }
         if local.is_gc_owner() {
             if !local.synthetic || local.parameter || local.ty != Type::Void {
-                return Some("opaque GC owners must be synthetic storage without a language type".into());
+                return Some(
+                    "opaque GC owners must be synthetic storage without a language type".into(),
+                );
             }
         } else {
             names.insert(local.name.as_str(), Cow::Borrowed(&local.ty));
@@ -1766,11 +1771,19 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
     let mut array_captures = HashMap::new();
     for block in &f.blocks {
         for inst in &block.instrs {
-            if let LirInst::Compute { local, value: crate::ir::lowered::LirRvalue::CaptureArrayOwner { array, index }, .. } = inst {
+            if let LirInst::Compute {
+                local,
+                value: crate::ir::lowered::LirRvalue::CaptureArrayOwner { array, index },
+                ..
+            } = inst
+            {
                 let Some(Type::Array(ref element)) = array.ty(&f.locals) else {
                     return Some("array reference owner has no array provenance".into());
                 };
-                if array_captures.insert(*local, ((**element).clone(), index.clone())).is_some() {
+                if array_captures
+                    .insert(*local, ((**element).clone(), index.clone()))
+                    .is_some()
+                {
                     return Some("array reference owner has multiple definitions".into());
                 }
             }
@@ -1784,10 +1797,24 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                     operands.push(argument);
                 }
                 for operand in operands {
-                    if let crate::ir::lowered::LirOperand::Reference { place: crate::ir::lowered::LirPlace::ArrayElement { owner, index, element }, .. } = operand {
-                        if !array_captures.get(owner).is_some_and(|(captured, checked_index)|
-                            ctx.same_repr(captured, element)
-                            && *checked_index == crate::ir::lowered::LirOperand::Local(*index)) {
+                    if let crate::ir::lowered::LirOperand::Reference {
+                        place:
+                            crate::ir::lowered::LirPlace::ArrayElement {
+                                owner,
+                                index,
+                                element,
+                            },
+                        ..
+                    } = operand
+                    {
+                        if !array_captures
+                            .get(owner)
+                            .is_some_and(|(captured, checked_index)| {
+                                ctx.same_repr(captured, element)
+                                    && *checked_index
+                                        == crate::ir::lowered::LirOperand::Local(*index)
+                            })
+                        {
                             return Some("array reference disagrees with its captured buffer or checked index".into());
                         }
                     }
@@ -1810,7 +1837,10 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
         for instruction in &block.instrs {
             if let LirInst::Let { name, ty, .. } = instruction {
                 if !ctx.supported_type(ty) {
-                    return Some(format!("`let {name}` binds type `{}`, outside the walker's subset", type_name(ty)));
+                    return Some(format!(
+                        "`let {name}` binds type `{}`, outside the walker's subset",
+                        type_name(ty)
+                    ));
                 }
             }
         }
@@ -1819,15 +1849,39 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
         for inst in &block.instrs {
             match inst {
                 LirInst::Compute { local, value, span } => {
-                    if let crate::ir::lowered::LirRvalue::DirectCall { callee, args, params, result } = value {
+                    if let crate::ir::lowered::LirRvalue::DirectCall {
+                        callee,
+                        args,
+                        params,
+                        result,
+                    } = value
+                    {
                         if !(ctx.known_fn)(&callee.to_string()) {
-                            return Some(format!("the call to `{callee}` at line {} has no declared function", span.line));
+                            return Some(format!(
+                                "the call to `{callee}` at line {} has no declared function",
+                                span.line
+                            ));
                         }
-                        if let Some(ty) = std::iter::once(result).chain(params).find(|ty| !ctx.supported_type(ty)) {
-                            return Some(format!("the call to `{callee}` at line {} has type `{}`, outside the supported LIR types", span.line, type_name(ty)));
+                        if let Some(ty) = std::iter::once(result)
+                            .chain(params)
+                            .find(|ty| !ctx.supported_type(ty))
+                        {
+                            return Some(format!(
+                                "the call to `{callee}` at line {} has type `{}`, outside the supported LIR types",
+                                span.line,
+                                type_name(ty)
+                            ));
                         }
-                        if !flat_argument_modes_match(args, ctx.func_param_modes.get_id(callee).map(Vec::as_slice).unwrap_or(&[])) {
-                            return Some(format!("the call to `{callee}` has incompatible reference modes"));
+                        if !flat_argument_modes_match(
+                            args,
+                            ctx.func_param_modes
+                                .get_id(callee)
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[]),
+                        ) {
+                            return Some(format!(
+                                "the call to `{callee}` has incompatible reference modes"
+                            ));
                         }
                         if ctx.fn_types.get_id(callee).is_some_and(|signature| !matches!(signature,
                             Type::Fn(declared, output) if declared.len() == params.len()
@@ -1840,153 +1894,130 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                     match value {
                         crate::ir::lowered::LirRvalue::FunctionRef { function, ty } => {
                             if !ctx.fn_value_of(function).is_some_and(|known| known == *ty) {
-                                return Some(format!("the function value `{function}` at line {} has an incompatible signature", span.line));
+                                return Some(format!(
+                                    "the function value `{function}` at line {} has an incompatible signature",
+                                    span.line
+                                ));
                             }
                         }
                         crate::ir::lowered::LirRvalue::Closure { id, captures, ty } => {
                             if captures.len() > super::OBJECT_FIELD_MASK_CAPACITY
-                                || !(ctx.lambda_symbol)(*id).and_then(|symbol| ctx.fn_value_of(&symbol)).is_some_and(|known| known == *ty) {
-                                return Some(format!("a lambda at line {} has an unsupported environment or signature", span.line));
+                                || !(ctx.lambda_symbol)(*id)
+                                    .and_then(|symbol| ctx.fn_value_of(&symbol))
+                                    .is_some_and(|known| known == *ty)
+                            {
+                                return Some(format!(
+                                    "a lambda at line {} has an unsupported environment or signature",
+                                    span.line
+                                ));
                             }
                         }
                         _ => {}
                     }
-                    if let crate::ir::lowered::LirRvalue::IntrinsicCall { intrinsic, receiver_ty, arg_types, result, method, .. } = value {
-                        if !flat_intrinsic_supported(*intrinsic, receiver_ty, arg_types, result, ctx) {
-                            return Some(format!("the `{method}` method at line {} uses an unsupported type", span.line));
+                    if let crate::ir::lowered::LirRvalue::IntrinsicCall {
+                        intrinsic,
+                        receiver_ty,
+                        arg_types,
+                        result,
+                        method,
+                        ..
+                    } = value
+                    {
+                        if !flat_intrinsic_supported(
+                            *intrinsic,
+                            receiver_ty,
+                            arg_types,
+                            result,
+                            ctx,
+                        ) {
+                            return Some(format!(
+                                "the `{method}` method at line {} uses an unsupported type",
+                                span.line
+                            ));
                         }
                     }
-                    if !flat_rvalue_supported(value, &f.locals, ctx) || !value.is_well_typed(&f.locals, *local) {
+                    if !flat_rvalue_supported(value, &f.locals, ctx)
+                        || !value.is_well_typed(&f.locals, *local)
+                    {
                         use crate::ir::lowered::LirRvalue as V;
                         let operation = match value {
-                            V::PrepareMethod { receiver_ty, method, .. } | V::MethodCall { receiver_ty, method, .. }
-                            | V::EnumMethod { receiver_ty, method, .. } => format!("the method `{method}` on a `{}`", type_name(receiver_ty)),
-                            V::StaticField { class, field, .. } | V::StaticStore { class, field, .. } => format!("the static property `{class}::{field}`"),
-                            V::ObjectAlloc { class } | V::ConstructorCall { class, .. } => format!("`new {class}`"),
-                            V::FieldLoad { object_ty, field, .. } | V::FieldStore { object_ty, field, .. } => format!("the field `{field}` on a `{}`", type_name(object_ty)),
-                            V::StaticCall { class, method, .. } => format!("the call to `{class}::{method}`"),
+                            V::PrepareMethod {
+                                receiver_ty,
+                                method,
+                                ..
+                            }
+                            | V::MethodCall {
+                                receiver_ty,
+                                method,
+                                ..
+                            }
+                            | V::EnumMethod {
+                                receiver_ty,
+                                method,
+                                ..
+                            } => format!("the method `{method}` on a `{}`", type_name(receiver_ty)),
+                            V::StaticField { class, field, .. }
+                            | V::StaticStore { class, field, .. } => {
+                                format!("the static property `{class}::{field}`")
+                            }
+                            V::ObjectAlloc { class } | V::ConstructorCall { class, .. } => {
+                                format!("`new {class}`")
+                            }
+                            V::FieldLoad {
+                                object_ty, field, ..
+                            }
+                            | V::FieldStore {
+                                object_ty, field, ..
+                            } => format!("the field `{field}` on a `{}`", type_name(object_ty)),
+                            V::StaticCall { class, method, .. } => {
+                                format!("the call to `{class}::{method}`")
+                            }
+                            V::StartTask { callee, .. } => {
+                                format!("the task constructor `{callee}`")
+                            }
                             _ => "a flat computation".into(),
                         };
-                        return Some(format!("{operation} at line {} has incompatible operands, metadata or destination", span.line));
+                        return Some(format!(
+                            "{operation} at line {} has incompatible operands, metadata or destination",
+                            span.line
+                        ));
                     }
                 }
                 LirInst::Let {
-                    name, ty, value, ..
+                    local,
+                    name,
+                    ty,
+                    value,
+                    ..
                 } => {
-                    // The binding type is the slot's type, so an annotation
-                    // that widens the initialiser (`let a: Animal = new Dog();`)
-                    // is where the boxing coercion goes (willow-j260).
-                    if !ctx.supported_type(ty) {
-                        return Some(format!(
-                            "`let {name}` binds type `{}`, outside the walker's subset",
-                            type_name(ty)
-                        ));
-                    }
-                    if !ctx.storable(ty, &value.ty) {
-                        return Some(store_reason(
-                            &format!("`let {name}`"),
-                            &value.ty,
-                            ty,
-                            value.span,
-                        ));
-                    }
-                    if let Some(reason) = expr_rejection(value, ctx, &names) {
-                        return Some(reason);
-                    }
-                }
-                LirInst::Assign { name, value, .. } => {
-                    let Some(declared) = names.get(name.as_str()) else {
-                        return Some(format!(
-                            "`{name} = ...` at line {} assigns to a name that is not a \
-                             parameter or a `let` of this function",
-                            value.span.line
-                        ));
-                    };
-                    if !ctx.storable(declared, &value.ty) {
-                        return Some(store_reason(
-                            &format!("`{name} = ...`"),
-                            &value.ty,
-                            declared,
-                            value.span,
-                        ));
-                    }
-                    if let Some(reason) = expr_rejection(value, ctx, &names) {
-                        return Some(reason);
-                    }
-                }
-                LirInst::Expr(e) => {
-                    // Statement position is one of the two places a diverging
-                    // `panic(...)` is emittable: the walker ends the Cranelift
-                    // block there and drops the rest of this LIR block, which
-                    // is dead code (willow-0g8j.2.5).
-                    if !supported_divergent_expr(e, ctx, &names)
-                        && let Some(reason) = expr_rejection(e, ctx, &names)
+                    if !f.locals.get(local.0 as usize).is_some_and(|slot| {
+                        slot.name == *name && slot.ty == *ty && !slot.is_gc_owner()
+                    }) || !value
+                        .ty(&f.locals)
+                        .is_some_and(|source| ctx.storable(ty, &source))
+                        || matches!(value, crate::ir::lowered::LirOperand::Reference { .. })
                     {
-                        return Some(reason);
+                        return Some(format!(
+                            "`let {name}` has incompatible LIR storage or operand"
+                        ));
                     }
                 }
-                LirInst::IndexAssign {
-                    array,
-                    index,
-                    value,
-                } => {
-                    let Type::Array(elem) = &array.ty else {
+                LirInst::Assign { local, name, value } => {
+                    if !f.locals.get(local.0 as usize).is_some_and(|slot| {
+                        slot.name == *name
+                            && !slot.is_gc_owner()
+                            && value
+                                .ty(&f.locals)
+                                .is_some_and(|source| ctx.storable(&slot.ty, &source))
+                    }) || matches!(value, crate::ir::lowered::LirOperand::Reference { .. })
+                    {
                         return Some(format!(
-                            "the element store at line {} targets a `{}`, which is not an array",
-                            array.span.line,
-                            type_name(&array.ty)
+                            "`{name} = ...` has incompatible LIR storage or operand"
                         ));
-                    };
-                    if !ctx.storable(elem, &value.ty) {
-                        return Some(store_reason(
-                            "the element store",
-                            &value.ty,
-                            elem,
-                            value.span,
-                        ));
-                    }
-                    if let Some(reason) = expr_rejection(array, ctx, &names) {
-                        return Some(reason);
-                    }
-                    if let Some(reason) = expr_rejection(index, ctx, &names) {
-                        return Some(reason);
-                    }
-                    if let Some(reason) = expr_rejection(value, ctx, &names) {
-                        return Some(reason);
                     }
                 }
-                // `obj.field = value;` on a simple class (willow-0g8j.5).
-                LirInst::FieldAssign {
-                    object,
-                    field,
-                    value,
-                } => {
-                    let Some(field_ty) = ctx
-                        .class_layout_of(&object.ty)
-                        .and_then(|l| l.iter().find(|(n, _)| n == field))
-                        .map(|(_, ty)| ty.clone())
-                    else {
-                        return Some(format!(
-                            "the field store `.{field} = ...` at line {} targets a `{}`, whose \
-                             layout the walker does not have",
-                            object.span.line,
-                            type_name(&object.ty)
-                        ));
-                    };
-                    if !ctx.storable(&field_ty, &value.ty) {
-                        return Some(store_reason(
-                            &format!("the field store `.{field} = ...`"),
-                            &value.ty,
-                            &field_ty,
-                            value.span,
-                        ));
-                    }
-                    if let Some(reason) = expr_rejection(object, ctx, &names) {
-                        return Some(reason);
-                    }
-                    if let Some(reason) = expr_rejection(value, ctx, &names) {
-                        return Some(reason);
-                    }
+                LirInst::Unsupported { span, reason } => {
+                    return Some(format!("{reason} at line {}", span.line));
                 }
                 // Listed rather than caught by `_` so a new instruction has to
                 // be given an explicit validation decision here.
@@ -2003,51 +2034,6 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                     let supported = lir_rejection_reason(&body.function, ctx).is_none();
                     if !supported {
                         return Some("it registers an unsupported `defer` body".to_string());
-                    }
-                }
-                LirInst::StaticFieldAssign {
-                    class,
-                    field,
-                    value,
-                } => {
-                    // `Self::prop = ..` resolves against the enclosing class,
-                    // as `emit_lir_static_field_assign` does (willow-0g8j.13).
-                    let Some(field_ty) =
-                        (ctx.static_field)(ctx.resolved_class(&class.to_string()), field)
-                    else {
-                        return Some(format!(
-                            "the static store `{class}::{field} = ...` at line {} targets \
-                             storage the walker cannot resolve",
-                            value.span.line
-                        ));
-                    };
-                    if !ctx.supported_type(&field_ty) {
-                        return Some(format!(
-                            "the static store `{class}::{field} = ...` targets type `{}`, \
-                             outside the walker's subset",
-                            type_name(&field_ty)
-                        ));
-                    }
-                    if !ctx.storable(&field_ty, &value.ty) {
-                        return Some(store_reason(
-                            &format!("the static store `{class}::{field} = ...`"),
-                            &value.ty,
-                            &field_ty,
-                            value.span,
-                        ));
-                    }
-                    if let Some(reason) = expr_rejection(value, ctx, &names) {
-                        return Some(reason);
-                    }
-                }
-                // `super.init(args)` in a constructor (willow-0g8j.2.18). The
-                // emitter resolves the base from the constructor's OWN class,
-                // so eligibility resolves it the same way -- out of the lowered
-                // `Class::init` name -- and then vets the call exactly as
-                // `new Base(args)` is vetted.
-                LirInst::SuperInit { args, .. } => {
-                    if let Some(reason) = super_init_rejection(f, args, ctx, &names) {
-                        return Some(reason);
                     }
                 }
                 // A `match` lowering split into blocks (willow-0g8j.2.11.1).
@@ -2067,9 +2053,35 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                     span,
                     ..
                 } => {
-                    let scrutinee_ty = &f.locals[scrutinee.0 as usize].ty;
+                    let Some(scrutinee_local) = f
+                        .locals
+                        .get(scrutinee.0 as usize)
+                        .filter(|local| !local.is_gc_owner())
+                    else {
+                        return Some("a match references an invalid scrutinee local".into());
+                    };
+                    let scrutinee_ty = &scrutinee_local.ty;
+                    match inst {
+                        LirInst::MatchTest { result, .. }
+                            if !f.locals.get(result.0 as usize).is_some_and(|local| {
+                                !local.is_gc_owner() && local.ty == Type::Bool
+                            }) =>
+                        {
+                            return Some("a match test has an invalid boolean destination".into());
+                        }
+                        LirInst::MatchBind { bindings, .. }
+                            if bindings.iter().any(|id| {
+                                f.locals
+                                    .get(id.0 as usize)
+                                    .is_none_or(|local| local.is_gc_owner())
+                            }) =>
+                        {
+                            return Some("a match binding references an invalid local".into());
+                        }
+                        _ => {}
+                    }
                     let mut arm_names = names.clone();
-                    if !supported_pattern(pattern, scrutinee_ty, ctx, &mut arm_names) {
+                    if !supported_lir_pattern(pattern, scrutinee_ty, ctx, &mut arm_names) {
                         return Some(format!(
                             "the `match` arm at line {} tests a `{}` with a pattern outside the \
                              walker's subset",
@@ -2087,26 +2099,22 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
         }
         match &block.terminator {
             Terminator::Branch { cond, .. } => {
-                if let Some(reason) = expr_rejection(cond, ctx, &names) {
-                    return Some(reason);
+                if cond.ty(&f.locals) != Some(Type::Bool)
+                    || matches!(cond, crate::ir::lowered::LirOperand::Reference { .. })
+                {
+                    return Some("a branch has an invalid boolean operand".into());
                 }
             }
-            Terminator::Return(Some(v)) => {
-                // A `void`-typed return value has no slot in the Cranelift
-                // signature; the walker would emit `return_(&[v])` on a
-                // zero-result function.
-                if v.ty == Type::Void {
-                    return Some(format!(
-                        "the `return` at line {} yields a `void` value, which has no slot in \
-                         the function's signature",
-                        v.span.line
-                    ));
+            Terminator::Return(Some(value)) => {
+                if value.ty(&f.locals) == Some(Type::Void) {
+                    return Some("the `return` yields a `void` value, which has no slot in the function's signature".into());
                 }
-                if !ctx.storable(&f.return_type, &v.ty) {
-                    return Some(store_reason("the `return`", &v.ty, &f.return_type, v.span));
-                }
-                if let Some(reason) = expr_rejection(v, ctx, &names) {
-                    return Some(reason);
+                if !value
+                    .ty(&f.locals)
+                    .is_some_and(|ty| ty != Type::Void && ctx.storable(&f.return_type, &ty))
+                    || matches!(value, crate::ir::lowered::LirOperand::Reference { .. })
+                {
+                    return Some("a return has an incompatible operand or signature".into());
                 }
             }
             Terminator::Suspend { .. } if !f.is_async => {
@@ -2130,86 +2138,32 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                     ));
                 }
             }
-            Terminator::Jump(_) | Terminator::Suspend { .. } | Terminator::Return(None) | Terminator::CleanupReturn => {}
+            Terminator::Jump(_)
+            | Terminator::Suspend { .. }
+            | Terminator::Return(None)
+            | Terminator::CleanupReturn => {}
         }
     }
     None
 }
 
-/// What an async body may NOT contain on top of [`lir_rejection_reason`]
-/// (willow-0g8j.2.11).
-///
-/// Every suspension an async function performs is a `Terminator::Suspend` or a
-/// select instruction by the time lowering is done, so the one thing checked
-/// here is that none is left buried in an expression: a channel operation or
-/// `select` reads as an ordinary LIR expression in a synchronous function and
-/// as a suspension point in a poll function, and codegen must never rediscover
-/// that difference from HIR shape. The single admitted exception is an await
-/// this walker itself splits out in front of its statement — see
-/// [`lir_await_site`] and [`lir_value_position_await`].
+/// Final LIR cannot embed expression-level suspension trees.
 pub(super) fn lir_async_rejection_reason(f: &LirFunction) -> Option<String> {
-    // Root suspensions have already become `Terminator::Suspend`. Any await,
-    // channel operation, or select still nested inside an expression needs a
-    // later ANF slice and must not be rediscovered from HIR shape in codegen.
-    let suspends = lir_expr_suspends;
-
-    for block in &f.blocks {
-        for inst in &block.instrs {
-            let found = match inst {
-                LirInst::Compute { .. } => false,
-                LirInst::Let { value, .. }
-                | LirInst::Assign { value, .. }
-                | LirInst::Expr(value) => suspends(value),
-                LirInst::FieldAssign { value, .. } | LirInst::StaticFieldAssign { value, .. } => {
-                    suspends(value)
-                }
-                LirInst::IndexAssign {
-                    array,
-                    index,
-                    value,
-                } => suspends(array) || suspends(index) || suspends(value),
-                LirInst::SuperInit { args, .. } => args.iter().any(suspends),
-                // A pattern test and its bindings hold no expression at all:
-                // the scrutinee is a local, and lowering split the arm bodies
-                // into blocks of their own (willow-0g8j.2.11.1).
-                LirInst::EnterDeferScope { .. }
-                | LirInst::LeaveDeferScope { .. }
-                | LirInst::FlushDefers { .. }
-                | LirInst::ClearScopeRoots { .. }
-                | LirInst::ReleaseLock { .. }
-                | LirInst::Defer { .. }
-                | LirInst::MatchTest { .. }
-                | LirInst::MatchBind { .. }
-                | LirInst::SelectInit { .. }
-                | LirInst::SelectProbe { .. }
-                | LirInst::SelectPick { .. }
-                | LirInst::SelectUnregister { .. }
-                | LirInst::SelectCommit { .. } => false,
-            };
-            if found {
-                return Some(
-                    "it contains an async suspension operation not yet split from LIR".to_string(),
-                );
+    f.blocks
+        .iter()
+        .flat_map(|block| &block.instrs)
+        .find_map(|inst| match inst {
+            LirInst::Unsupported { span, reason } => {
+                Some(format!("{reason} at line {}", span.line))
             }
-        }
-        let found = match &block.terminator {
-            Terminator::Return(Some(value)) | Terminator::Branch { cond: value, .. } => {
-                suspends(value)
-            }
-            Terminator::Jump(_) | Terminator::Suspend { .. } | Terminator::Return(None) | Terminator::CleanupReturn => false,
-        };
-        if found {
-            return Some(
-                "it contains an async suspension operation not yet split from LIR".to_string(),
-            );
-        }
-    }
-    None
+            _ => None,
+        })
 }
 
 /// Does this expression suspend the running task where it stands? `await`,
 /// `select`, and a channel `send`/`recv` all return control to the scheduler.
 /// A lambda body is a separate function, so its contents do not count.
+#[cfg(test)]
 fn lir_suspends_here(expr: &HirExpr) -> bool {
     match &expr.kind {
         HirExprKind::Await { inner }
@@ -2234,12 +2188,14 @@ fn lir_suspends_here(expr: &HirExpr) -> bool {
 /// word `i + 1`. The mask has one bit per word, so the last capture it can
 /// describe is number 62 (willow-0g8j.2.12). A wider environment would need a
 /// trace function, which the collector does not have yet.
+#[cfg(test)]
 fn closure_env_representable(captures: &[HirCapture]) -> bool {
     captures.len() <= super::OBJECT_FIELD_MASK_CAPACITY
 }
 
 /// Every suspension point inside `expr`, in evaluation order. An `await`'s own
 /// operands are walked too: `await f(ch.recv())` holds two.
+#[cfg(test)]
 fn lir_collect_suspensions<'e>(expr: &'e HirExpr, out: &mut Vec<&'e HirExpr>) {
     let mut pending = vec![expr];
     while let Some(expr) = pending.pop() {
@@ -2253,6 +2209,7 @@ fn lir_collect_suspensions<'e>(expr: &'e HirExpr, out: &mut Vec<&'e HirExpr>) {
 }
 
 /// Whether `expr` suspends anywhere inside it.
+#[cfg(test)]
 fn lir_expr_suspends(expr: &HirExpr) -> bool {
     let mut found = Vec::new();
     lir_collect_suspensions(expr, &mut found);
@@ -2264,6 +2221,7 @@ fn lir_expr_suspends(expr: &HirExpr) -> bool {
 /// deliberately the same set the former AST suspension normalizer's `bind` refuses to hoist into
 /// a temp, which is what keeps that pass and this one evaluating the same
 /// things in the same order.
+#[cfg(test)]
 fn lir_rematerializable(expr: &HirExpr) -> bool {
     matches!(
         expr.kind,
@@ -2278,6 +2236,7 @@ fn lir_rematerializable(expr: &HirExpr) -> bool {
 /// Forms whose children the emitter may evaluate zero times or on only one
 /// path. A suspension underneath one of these would park on a path the source
 /// never takes, so they end the search.
+#[cfg(test)]
 fn lir_evaluates_children_conditionally(expr: &HirExpr) -> bool {
     match &expr.kind {
         HirExprKind::Ternary { .. }
@@ -2293,6 +2252,7 @@ fn lir_evaluates_children_conditionally(expr: &HirExpr) -> bool {
 /// front of it. `seen` tracks whether the walk has passed `target` yet: what
 /// comes after it is emitted on the resume path and may be anything, while what
 /// comes before it has to survive being moved after the park.
+#[cfg(test)]
 fn lir_hoistable_around(node: &HirExpr, target: &HirExpr, seen: &mut bool) -> bool {
     let Some(path) = node.path_to(target) else {
         return *seen || lir_rematerializable(node);
@@ -2334,6 +2294,7 @@ fn lir_hoistable_around(node: &HirExpr, target: &HirExpr, seen: &mut bool) -> bo
 /// println(t);`), so the statement this one sees is already split.
 ///
 /// A root await is not returned here: `emit_lir_block` splits that one itself.
+#[cfg(test)]
 fn lir_hoisted_await<'e>(
     value: &'e HirExpr,
     cooperative_leaves: &std::collections::HashSet<FunctionId>,
@@ -2365,6 +2326,7 @@ fn lir_hoisted_await<'e>(
 /// it is the exit that
 /// asks whether the tag is `Err`, so the answer is known without building it
 /// (willow-0g8j.2.14).
+#[cfg(test)]
 fn hir_is_zero_arg_result_ok(value: &HirExpr) -> bool {
     matches!(
         &value.kind,
@@ -2377,6 +2339,7 @@ fn hir_is_zero_arg_result_ok(value: &HirExpr) -> bool {
 /// condition - is split around: the root await when the expression IS one,
 /// otherwise the single value-position await inside it. Either way the resume
 /// leaves the result in a Cranelift value the rest of the position then reads.
+#[cfg(test)]
 fn lir_value_position_await<'e>(
     value: &'e HirExpr,
     cooperative_leaves: &std::collections::HashSet<FunctionId>,
@@ -2391,6 +2354,7 @@ fn lir_value_position_await<'e>(
 /// An `await` the cooperative LIR path can split into a suspension
 /// (willow-0g8j.2.11). Classified once, by the function both eligibility and
 /// emission call, so an admitted await is always an emittable one.
+#[cfg(test)]
 enum LirAwaitSite<'a> {
     /// `await sleep(millis)`: a timer registration, no awaited frame.
     Sleep(&'a HirExpr),
@@ -2407,9 +2371,11 @@ enum LirAwaitSite<'a> {
     },
 }
 
+#[cfg(test)]
 impl<'a> LirAwaitSite<'a> {
     /// The sub-expressions evaluated at the await site, before the split. They
     /// are ordinary straight-line LIR, so they may not themselves suspend.
+    #[cfg(test)]
     fn operands(&self) -> &[HirExpr] {
         match self {
             LirAwaitSite::Sleep(millis) => std::slice::from_ref(*millis),
@@ -2425,6 +2391,7 @@ impl<'a> LirAwaitSite<'a> {
 /// [`Terminator::Suspend`] carrying [`crate::ir::lowered::SuspendOp::AwaitTask`],
 /// which delivers its result into a LIR local, so nothing is left inside the
 /// expression for this to find.
+#[cfg(test)]
 fn lir_await_site<'e>(
     expr: &'e HirExpr,
     cooperative_leaves: &std::collections::HashSet<FunctionId>,
@@ -2451,6 +2418,7 @@ fn lir_await_site<'e>(
 /// Recognise the two scheduler builtins whose await result is `void`. Keeping
 /// this structural predicate beside LIR eligibility/emission gives both sides
 /// exactly the same accepted shape.
+#[cfg(test)]
 fn lir_builtin_await(expr: &HirExpr) -> Option<LirAwaitSite<'_>> {
     let HirExprKind::Await { inner } = &expr.kind else {
         return None;
@@ -2473,6 +2441,7 @@ fn lir_builtin_await(expr: &HirExpr) -> Option<LirAwaitSite<'_>> {
 
 /// The message for a value whose type the walker will not convert into the slot
 /// it is being written to. Shared so every store site words it the same way.
+#[cfg(test)]
 fn store_reason(what: &str, from: &Type, to: &Type, span: Span) -> String {
     format!(
         "{what} at line {} puts a `{}` into a `{}` slot, a conversion the walker does not emit",
@@ -2493,6 +2462,7 @@ fn store_reason(what: &str, from: &Type, to: &Type, span: Span) -> String {
 /// `compile_class_method_inner` looks the body up under. That is what lets this
 /// resolve the base class the emitter will resolve at emission time from
 /// `FuncGen::current_class`.
+#[cfg(test)]
 fn super_init_rejection<'e>(
     f: &'e LirFunction,
     args: &'e [HirExpr],
@@ -2571,6 +2541,7 @@ fn super_init_rejection<'e>(
     None
 }
 
+#[cfg(test)]
 fn expr_rejection<'e>(
     e: &'e HirExpr,
     ctx: &LirTypeCtx<'_>,
@@ -2613,6 +2584,7 @@ fn expr_rejection<'e>(
     supported_select,
     validate_expr
 )]
+#[cfg(test)]
 fn minimal_unsupported_expr<'e>(
     e: &'e HirExpr,
     ctx: &LirTypeCtx<'_>,
@@ -2637,6 +2609,7 @@ fn minimal_unsupported_expr<'e>(
     supported_select,
     validate_expr
 )]
+#[cfg(test)]
 fn minimal_unsupported_scoped_expr<'e>(
     e: &'e HirExpr,
     ctx: &LirTypeCtx<'_>,
@@ -2681,6 +2654,7 @@ fn minimal_unsupported_scoped_expr<'e>(
 
 /// How to name an expression in a LIR validation diagnostic. Deliberately short: the line
 /// number locates it, this says what to look for on that line.
+#[cfg(test)]
 fn describe_expr(e: &HirExpr) -> String {
     match &e.kind {
         HirExprKind::Int(_) | HirExprKind::Float(_) | HirExprKind::Bool(_) => {
@@ -2734,6 +2708,129 @@ fn describe_expr(e: &HirExpr) -> String {
 /// `ClassDowncast` tests the boxed object's runtime `type_id`, so it is
 /// admitted only for a class the walker has a `type_id` and a layout for
 /// (willow-0g8j.2.4).
+fn supported_lir_pattern<'n>(
+    pattern: &'n crate::ir::lowered::LirPattern,
+    scrutinee_ty: &Type,
+    ctx: &LirTypeCtx<'_>,
+    names: &mut HashMap<&'n str, Cow<'n, Type>>,
+) -> bool {
+    // The variant lookup every enum pattern needs: the scrutinee must BE this
+    // enum (a pattern naming another enum is a checker bug, not something to
+    // emit a tag compare for) and the enum must be one the walker admits.
+    let variant_of = |enum_name: &str, variant: &str| {
+        if !ctx.supported_enum_type(scrutinee_ty) {
+            return None;
+        }
+        // The payloads come from the SCRUTINEE's type, so a generic enum's
+        // placeholders are already resolved to the types this `match` will
+        // actually load (willow-0g8j.2.1).
+        let (name, def) = ctx.enum_instance(scrutinee_ty)?;
+        if name != TypeId::from_source_name(enum_name) {
+            return None;
+        }
+        def.variant(variant).cloned()
+    };
+    match pattern {
+        crate::ir::lowered::LirPattern::Wildcard => true,
+        crate::ir::lowered::LirPattern::Binding { name, ty } => {
+            // The binding aliases the whole scrutinee, so it must hold the same
+            // machine representation — no widening, no boxing.
+            if !ctx.same_repr(ty, scrutinee_ty) || !ctx.supported_type(ty) {
+                return false;
+            }
+            names.insert(name.as_str(), Cow::Borrowed(ty));
+            true
+        }
+        crate::ir::lowered::LirPattern::LiteralBool(_) => *scrutinee_ty == Type::Bool,
+        crate::ir::lowered::LirPattern::LiteralInt(_) => *scrutinee_ty == Type::I64,
+        crate::ir::lowered::LirPattern::EnumVariant { enum_name, variant } => {
+            variant_of(&enum_name.to_string(), variant).is_some_and(|v| v.payloads.is_empty())
+        }
+        crate::ir::lowered::LirPattern::EnumVariantTuple {
+            enum_name,
+            variant,
+            bindings,
+        } => {
+            let Some(v) = variant_of(&enum_name.to_string(), variant) else {
+                return false;
+            };
+            // A variant whose payloads are ALL `void` carries no word at all:
+            // `enum_instance` normalizes the list away, because there is
+            // nothing to store. The source still spells one binding per
+            // declared payload — `Ok(done)` on a `Result<void, Cancelled>`,
+            // which is what `TaskScope::finish` produces — so the counts differ
+            // by exactly that (willow-0g8j.2.13). The emitter zips bindings
+            // against the same normalized list and so binds nothing here, which
+            // is correct: the name denotes a value that does not exist. An arm
+            // body that reads it finds no binding and fails LIR validation
+            // rather than loading a word that was never written.
+            if !bindings.is_empty()
+                && v.payloads.is_empty()
+                && bindings.iter().all(|(_, ty)| matches!(ty, Type::Void))
+            {
+                return true;
+            }
+            if v.payloads.len() != bindings.len() {
+                return false;
+            }
+            // A payload is LOADED into the binding, so the binding's type has
+            // to match the slot's representation rather than merely be
+            // storable into it.
+            for (slot, (name, ty)) in v.payloads.iter().zip(bindings) {
+                if !ctx.same_repr(ty, slot) || !ctx.supported_type(ty) {
+                    return false;
+                }
+                names.insert(name.as_str(), Cow::Borrowed(ty));
+            }
+            true
+        }
+        // `Iface(x)` — an interface-to-class downcast. The scrutinee is a box
+        // whose word 0 is the concrete object, so the test is an exact
+        // `type_id` compare and the binding is that object, unboxed. Exact, not
+        // "is a descendant of": a downcast arm selects the arm's class itself,
+        // so a descendant of it does not match.
+        crate::ir::lowered::LirPattern::ClassDowncast {
+            class_name,
+            binding,
+            binding_ty,
+        } => {
+            // `Box<i64>` as well as `Shape`: the type arguments name what the
+            // interface's methods produce, and a `type_id` compare against
+            // word 0 does not read them (willow-0g8j.3).
+            let (Type::Named(iface) | Type::Generic(iface, _)) = scrutinee_ty else {
+                return false;
+            };
+            if !(ctx.is_interface)(iface)
+                || !matches!(binding_ty, Type::Named(n) if n == class_name)
+                || !ctx.supported_class(&class_name.to_string())
+                || !ctx.class_type_ids.contains_key(class_name)
+            {
+                return false;
+            }
+            names.insert(binding.as_str(), Cow::Borrowed(binding_ty));
+            true
+        }
+    }
+}
+
+/// The result type of a builtin `Option`/`Result` method the walker emits, or
+/// `None` when the receiver/method pair is outside the subset (willow-0g8j.2.1).
+///
+/// A `void` payload is excluded throughout because the unwrap family would read
+/// a payload slot that an all-`void` variant does not allocate, and the
+/// callable-taking combinators would build one.
+///
+/// The combinators (`map`/`map_err`/`and_then`/`or_else`) came with function
+/// values in willow-0g8j.2.2. Each rule below reconstructs the type the SHARED
+/// emitter actually builds; the caller then compares it against the checker's
+/// own type for the expression, so a disagreement refuses the body rather
+/// than being reinterpreted here.
+///
+/// `args` are the call's argument types, so arity and the default/message
+/// operand are vetted here rather than at two call sites.
+/// The return type of a `fn(...) -> R` value. Eligibility has already proved
+/// every combinator operand is one, so a non-function here is a compiler bug.
+#[cfg(test)]
 fn supported_pattern<'n>(
     pattern: &'n HirPattern,
     scrutinee_ty: &Type,
@@ -2873,6 +2970,7 @@ fn fn_return_type(f_ty: &Type) -> Type {
 /// through `willow_i64_to_string`. The checker enforces the same three rules
 /// (E1401/E0201), so this rejects only synthesized nodes and keeps the walker
 /// from having to trust them.
+#[cfg(test)]
 fn format_operands(args: &[HirExpr]) -> Option<&[HirExpr]> {
     let HirExprKind::Str(spec) = &args.first()?.kind else {
         return None;
@@ -2918,6 +3016,7 @@ fn format_operands(args: &[HirExpr]) -> Option<&[HirExpr]> {
     supported_select,
     validate_expr
 )]
+#[cfg(test)]
 fn supported_panic<'e>(
     e: &'e HirExpr,
     ctx: &LirTypeCtx<'_>,
@@ -2950,6 +3049,7 @@ fn supported_panic<'e>(
 /// The four scalar conversions are the whole set with a primitive receiver, and
 /// they are matched by INTRINSIC rather than by name so that a future builtin
 /// on `i64` does not silently inherit this lowering.
+#[cfg(test)]
 fn scalar_to_string(recv: &Type, method: &str, args: &[HirExpr]) -> Option<Type> {
     let resolved = intrinsics::resolve(recv, method, args.len())?;
     matches!(
@@ -2968,6 +3068,7 @@ fn scalar_to_string(recv: &Type, method: &str, args: &[HirExpr]) -> Option<Type>
 /// Matched by INTRINSIC rather than by name, for the same reason
 /// [`scalar_to_string`] is: a future `Task` builtin spelled `cancel` must not
 /// silently inherit this lowering.
+#[cfg(test)]
 fn task_handle_method(recv: &Type, method: &str, arity: usize) -> Option<Type> {
     let resolved = intrinsics::resolve(recv, method, arity)?;
     matches!(
@@ -3034,6 +3135,7 @@ fn atomic_cell(ty: &Type) -> Option<AtomicCell> {
 /// is also what keeps `AtomicBool::add` out of the walker: the resolver never
 /// produces an arithmetic intrinsic for a bool cell, so the emitter never has
 /// to know which operations each width implements.
+#[cfg(test)]
 fn atomic_method(recv: &Type, method: &str, arity: usize) -> Option<(Intrinsic, Type)> {
     let resolved = intrinsics::resolve(recv, method, arity)?;
     matches!(
@@ -3178,6 +3280,7 @@ fn scheduler_lock(ty: &Type) -> Option<(&'static str, &Type)> {
 /// cells' method names apart without the walker knowing them: the resolver
 /// never answers `get`/`set` for a `BlockingRwCell` or `read`/`write` for a
 /// `BlockingCell`.
+#[cfg(test)]
 fn blocking_cell_method(recv: &Type, method: &str, arity: usize) -> Option<(Intrinsic, Type)> {
     let resolved = intrinsics::resolve(recv, method, arity)?;
     matches!(
@@ -3197,6 +3300,7 @@ fn blocking_cell_method(recv: &Type, method: &str, arity: usize) -> Option<(Intr
 /// `attach` and `add` hand back the very task they were given, so their result
 /// type is their argument's — `args` is what supplies it. Passing a closure that
 /// answers `None` would silently type them `Task<void>`.
+#[cfg(test)]
 fn cancellation_method(recv: &Type, method: &str, args: &[HirExpr]) -> Option<(Intrinsic, Type)> {
     let resolved = intrinsics::resolve(recv, method, args.len())?;
     matches!(
@@ -3316,6 +3420,7 @@ fn option_result_method(recv: &Type, method: &str, args: &[Type]) -> Option<Type
 
 /// Where a `match` sits, which decides whether it may be one that leaves.
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum MatchPosition {
     /// An operand: something after the `match` reads the value it hands to its
     /// merge block, so some path through it has to reach that block.
@@ -3332,6 +3437,7 @@ enum MatchPosition {
 /// where the surrounding code needs that, but the same all-arms-leave `match`
 /// written as a function body's ending is typed by its arms instead, and the
 /// walker used to refuse that shape (willow-0g8j.2.16).
+#[cfg(test)]
 fn match_diverges(arms: &[HirMatchArm]) -> bool {
     !arms.is_empty() && arms.iter().all(arm_diverges)
 }
@@ -3356,6 +3462,7 @@ fn match_diverges(arms: &[HirMatchArm]) -> bool {
     supported_select,
     validate_expr
 )]
+#[cfg(test)]
 fn supported_match<'n>(
     e: &'n HirExpr,
     scrutinee: &'n HirExpr,
@@ -3422,6 +3529,7 @@ fn supported_match<'n>(
 /// Which binding forms a body may contain. This is a property of the EMITTER
 /// that will run the body, not of the statements themselves (willow-0g8j.2.13).
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum BodyScope {
     /// A `match` arm or a `select` case. The emitter snapshots `vars` and the
     /// GC root depth before the body and restores them after, so a `let` is
@@ -3465,6 +3573,7 @@ enum BodyScope {
     supported_select,
     validate_expr
 )]
+#[cfg(test)]
 fn supported_body_stmt<'n>(
     stmt: &'n HirStmt,
     ctx: &LirTypeCtx<'_>,
@@ -3644,6 +3753,7 @@ fn supported_body_stmt<'n>(
     supported_select,
     validate_expr
 )]
+#[cfg(test)]
 fn supported_branch_body<'n>(
     body: &'n [HirStmt],
     ctx: &LirTypeCtx<'_>,
@@ -3677,6 +3787,7 @@ fn supported_branch_body<'n>(
     supported_select,
     validate_expr
 )]
+#[cfg(test)]
 fn supported_effect_body<'n>(
     body: &'n [HirStmt],
     ctx: &LirTypeCtx<'_>,
@@ -3712,6 +3823,7 @@ fn supported_effect_body<'n>(
     supported_select,
     validate_expr
 )]
+#[cfg(test)]
 fn supported_select<'n>(
     cases: &'n [HirSelectCase],
     ctx: &LirTypeCtx<'_>,
@@ -3764,12 +3876,14 @@ fn supported_select<'n>(
         })
 }
 
+#[cfg(test)]
 fn channel_element_type_ref(ty: &Type) -> Option<&Type> {
     builtin_types::unary_arg(ty, B::Channel)
 }
 
 /// This arm ends by leaving the function or by unwinding, so it hands no value
 /// to the merge block.
+#[cfg(test)]
 fn arm_diverges(arm: &HirMatchArm) -> bool {
     body_diverges(&arm.body)
 }
@@ -3781,6 +3895,7 @@ fn arm_diverges(arm: &HirMatchArm) -> bool {
 /// the `if` itself is typed nothing, and the statement after it is unreachable
 /// rather than absent. Reading that shape is what lets an arm guard a path with
 /// an early `return` and still count as leaving (willow-0g8j.2.16).
+#[cfg(test)]
 fn body_diverges(body: &[HirStmt]) -> bool {
     let mut pending = vec![body];
     while let Some(body) = pending.pop() {
@@ -3826,6 +3941,7 @@ fn body_diverges(body: &[HirStmt]) -> bool {
     supported_select,
     validate_expr
 )]
+#[cfg(test)]
 fn supported_divergent_body<'n>(
     body: &'n [HirStmt],
     ctx: &LirTypeCtx<'_>,
@@ -3880,6 +3996,7 @@ fn supported_divergent_body<'n>(
     supported_select,
     validate_expr
 )]
+#[cfg(test)]
 fn supported_divergent_expr<'n>(
     e: &'n HirExpr,
     ctx: &LirTypeCtx<'_>,
@@ -3914,6 +4031,7 @@ fn supported_divergent_expr<'n>(
     supported_select,
     validate_expr
 )]
+#[cfg(test)]
 fn supported_expr<'n>(
     e: &'n HirExpr,
     ctx: &LirTypeCtx<'_>,
@@ -3942,6 +4060,7 @@ fn supported_expr<'n>(
     supported_select,
     validate_expr
 )]
+#[cfg(test)]
 fn validate_expr<'n>(
     e: &'n HirExpr,
     ctx: &LirTypeCtx<'_>,
@@ -3998,6 +4117,7 @@ fn validate_expr<'n>(
     supported_select,
     validate_expr
 )]
+#[cfg(test)]
 fn supported_expr_node<'n>(
     e: &'n HirExpr,
     ctx: &LirTypeCtx<'_>,
@@ -4010,7 +4130,9 @@ fn supported_expr_node<'n>(
     match &e.kind {
         HirExprKind::Int(_) | HirExprKind::Float(_) | HirExprKind::Bool(_) => true,
         HirExprKind::Str(_) => true,
-        HirExprKind::Var(name) => names.get(name.as_str()).is_some_and(|bound| ctx.same_repr(bound, &e.ty)),
+        HirExprKind::Var(name) => names
+            .get(name.as_str())
+            .is_some_and(|bound| ctx.same_repr(bound, &e.ty)),
         HirExprKind::ReferenceArg { place } => {
             ctx.same_repr(&place.ty, &e.ty)
                 && supported_reference_place(place, ctx, names, child_supported)
@@ -4742,6 +4864,7 @@ fn supported_expr_node<'n>(
 /// Whether this call passes at least one `&place` into a reference parameter —
 /// the condition under which the debug reference-call context must be cleared
 /// once the call returns.
+#[cfg(test)]
 fn lir_has_reference_args(modes: Option<&[ParamMode]>, args: &[HirExpr]) -> bool {
     args.iter().enumerate().any(|(idx, arg)| {
         matches!(
@@ -4763,6 +4886,7 @@ fn lir_has_reference_args(modes: Option<&[ParamMode]>, args: &[HirExpr]) -> bool
 /// once, from the AST, by `collect_reference_debug_strings_in_program`, so a
 /// string only this path can invent is undeclared and would reach the runtime
 /// as a null pointer (willow-0g8j.2.17).
+#[cfg(test)]
 fn lir_reference_place_kind(place: &HirExpr) -> &'static str {
     match &place.kind {
         HirExprKind::Var(_) => "local",
@@ -4774,6 +4898,7 @@ fn lir_reference_place_kind(place: &HirExpr) -> &'static str {
 
 /// The source-shaped name of a reference place. See [`lir_reference_place_kind`]
 /// for why this must agree with the AST spelling exactly.
+#[cfg(test)]
 fn lir_reference_place_name(place: &HirExpr) -> String {
     let mut current = place;
     let mut suffixes = Vec::new();
@@ -4804,6 +4929,7 @@ fn lir_reference_place_name(place: &HirExpr) -> String {
     out
 }
 
+#[cfg(test)]
 fn lir_reference_index_name(index: &HirExpr) -> String {
     match &index.kind {
         HirExprKind::Int(value) => value.to_string(),
@@ -4814,6 +4940,7 @@ fn lir_reference_index_name(index: &HirExpr) -> String {
 
 /// Whether `place` has stable address semantics for a `&`/`&mut` call
 /// argument: a local/reference parameter, a class field, or an array element.
+#[cfg(test)]
 fn supported_reference_place<'n>(
     place: &'n HirExpr,
     ctx: &LirTypeCtx<'_>,
@@ -4844,28 +4971,15 @@ fn supported_reference_place<'n>(
 /// instructions carry no span of their own, so this takes the span of the
 /// sub-expression that actually runs the fault-capable code: the indexed array
 /// for an element store, the stored value otherwise.
-fn lir_inst_span(inst: &LirInst) -> Option<crate::diagnostics::Span> {
+fn lir_inst_span(inst: &LirInst) -> Option<Span> {
     match inst {
-        LirInst::Compute { span, .. } => Some(*span),
-        LirInst::Expr(e) => Some(e.span),
-        LirInst::Defer { span, .. } => Some(*span),
-        LirInst::EnterDeferScope { .. }
-        | LirInst::LeaveDeferScope { .. }
-        | LirInst::FlushDefers { .. }
-        | LirInst::ClearScopeRoots { .. }
-        | LirInst::ReleaseLock { .. } => None,
-        LirInst::Let { value, .. }
-        | LirInst::Assign { value, .. }
-        | LirInst::FieldAssign { value, .. }
-        | LirInst::StaticFieldAssign { value, .. } => Some(value.span),
-        LirInst::IndexAssign { array, .. } => Some(array.span),
-        LirInst::SuperInit { span, .. } => Some(*span),
-        LirInst::MatchTest { span, .. } | LirInst::MatchBind { span, .. } => Some(*span),
-        LirInst::SelectInit { .. }
-        | LirInst::SelectProbe { .. }
-        | LirInst::SelectPick { .. }
-        | LirInst::SelectUnregister { .. }
-        | LirInst::SelectCommit { .. } => None,
+        LirInst::Compute { span, .. }
+        | LirInst::Let { span, .. }
+        | LirInst::Defer { span, .. }
+        | LirInst::MatchTest { span, .. }
+        | LirInst::MatchBind { span, .. }
+        | LirInst::Unsupported { span, .. } => Some(*span),
+        _ => None,
     }
 }
 
@@ -4997,17 +5111,15 @@ fn lir_terminator_needs_preempt_safepoint(
     block: &LirBlock,
     back_edges: &std::collections::HashSet<(usize, usize)>,
 ) -> bool {
-    use hir_expression_executes_call as calls;
-
     let closes_loop = |target: &BlockId| back_edges.contains(&(block.id.0, target.0));
     match &block.terminator {
         Terminator::Jump(target) => closes_loop(target),
         Terminator::Branch {
-            cond,
+            cond: _,
             then_block,
             else_block,
-        } => calls(cond) || closes_loop(then_block) || closes_loop(else_block),
-        Terminator::Return(Some(value)) => calls(value),
+        } => closes_loop(then_block) || closes_loop(else_block),
+        Terminator::Return(Some(_)) => false,
         Terminator::Suspend { .. } | Terminator::Return(None) | Terminator::CleanupReturn => false,
     }
 }
@@ -5015,45 +5127,6 @@ fn lir_terminator_needs_preempt_safepoint(
 #[willow_continuations::methods(
     emit_deferred_action,
     emit_flush_defers_from,
-    emit_lir_args_rooted,
-    emit_lir_arm_body,
-    emit_lir_array_literal,
-    emit_lir_array_method,
-    emit_lir_atomic_method,
-    emit_lir_blocking_cell_method,
-    emit_lir_body_for,
-    emit_lir_body_if,
-    emit_lir_body_stmt,
-    emit_lir_body_while,
-    emit_lir_cancellation_method,
-    emit_lir_channel_method,
-    emit_lir_class_method,
-    emit_lir_collection_method,
-    emit_lir_enum_construction,
-    emit_lir_expr,
-    emit_lir_field_access,
-    emit_lir_field_assign,
-    emit_lir_fn_operand,
-    emit_lir_index,
-    emit_lir_index_assign,
-    emit_lir_interface_call,
-    emit_lir_interpolated,
-    emit_lir_match,
-    emit_lir_new,
-    emit_lir_object_literal,
-    emit_lir_option_result_method,
-    emit_lir_panic,
-    emit_lir_range_value,
-    emit_lir_reference_arg_address,
-    emit_lir_return,
-    emit_lir_scalar_to_string,
-    emit_lir_select,
-    emit_lir_static_call,
-    emit_lir_static_field_assign,
-    emit_lir_store_value,
-    emit_lir_string_binop,
-    emit_lir_task_handle_method,
-    emit_lir_try_propagate,
     emit_sync_try_defer_flush
 )]
 impl<'a, 'b> FuncGen<'a, 'b> {
@@ -5071,7 +5144,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_lir_cleanup_region(&mut self, region: &LirFunction) {
         let vars = self.vars.clone();
         let roots = self.gc_root_count;
-        let active_roots = self.coop_shadow_roots.as_ref().map(|roots| roots.active.clone());
+        let active_roots = self
+            .coop_shadow_roots
+            .as_ref()
+            .map(|roots| roots.active.clone());
         let defers = self.defer_stack.clone();
         let panic_scopes = self.panic_scopes.clone();
         let flags = self.sync_defer_flags.clone();
@@ -5121,12 +5197,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f: &LirFunction,
         mut coop: Option<(&mut Vec<CoopSuspendPoint>, cranelift_codegen::ir::Value)>,
     ) {
-        let incoming_frames = lir_call_frame_entries(f).expect("validated method preparation frames");
-        let incoming_references = lir_reference_scope_entries(f).expect("validated reference argument scopes");
+        let incoming_frames =
+            lir_call_frame_entries(f).expect("validated method preparation frames");
+        let incoming_references =
+            lir_reference_scope_entries(f).expect("validated reference argument scopes");
         let outer_references = self.lir_reference_scopes.clone();
         let outer_frames = self.lir_call_frames.clone();
         let outer_frame_depth = self.callstack_frame_depth;
         let entry = self.builder.current_block().expect("entry block active");
+        let sync_poll = coop.is_none().then(|| {
+            let active = self.emit_value_runtime_call("willow_sync_native_active", &[]);
+            let stop = self.emit_value_runtime_call("willow_gc_stop_flag", &[]);
+            (active, stop)
+        });
+        let poll_blocks = lir_sync_poll_blocks(f);
         if coop.is_some() {
             self.bind_coop_lir_locals(f);
             // GC locals that are dead at every suspension deliberately stay
@@ -5150,10 +5234,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let sync_defers = coop.is_none();
         let mut block_state: Vec<Option<LirDeferState>> = vec![None; f.blocks.len()];
         let initial_state = if self.lir_cleanup_exit.is_some() {
-            LirDeferState { scopes: Vec::new(), entries: self.defer_stack.clone(),
-                panic_scopes: self.panic_scopes.clone(), flags: self.sync_defer_flags.clone() }
-        } else { LirDeferState::default() };
-        if sync_defers { block_state[0] = Some(initial_state.clone()); }
+            LirDeferState {
+                scopes: Vec::new(),
+                entries: self.defer_stack.clone(),
+                panic_scopes: self.panic_scopes.clone(),
+                flags: self.sync_defer_flags.clone(),
+            }
+        } else {
+            LirDeferState::default()
+        };
+        if sync_defers {
+            block_state[0] = Some(initial_state.clone());
+        }
         // Emission ORDER. A LIR block index is not a position in any order
         // control can flow in: `if/else` lowers the merge block before the
         // `else` arm, so index order emits the merge before the only
@@ -5195,7 +5287,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.switch_to_block(blocks[i]);
             }
             if sync_defers {
-                let state = block_state[i].clone().unwrap_or_else(|| initial_state.clone());
+                let state = block_state[i]
+                    .clone()
+                    .unwrap_or_else(|| initial_state.clone());
                 lir_defer_scopes = state.scopes;
                 self.defer_stack = state.entries;
                 self.panic_scopes = state.panic_scopes;
@@ -5207,10 +5301,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.terminated = false;
             self.lir_call_frames = outer_frames.clone();
             self.lir_reference_scopes = outer_references.clone();
-            self.lir_reference_scopes.extend(incoming_references[i].clone());
-            let frames: Vec<_> = incoming_frames[i].iter().filter(|(method, _)| self.flat_method_frame_enabled(method)).cloned().collect();
+            self.lir_reference_scopes
+                .extend(incoming_references[i].clone());
+            let frames: Vec<_> = incoming_frames[i]
+                .iter()
+                .filter(|(method, _)| self.flat_method_frame_enabled(method))
+                .cloned()
+                .collect();
             self.lir_call_frames.extend(frames);
-            self.callstack_frame_depth = outer_frame_depth + self.lir_call_frames.len() - outer_frames.len();
+            self.callstack_frame_depth =
+                outer_frame_depth + self.lir_call_frames.len() - outer_frames.len();
             let block_coop = coop
                 .as_mut()
                 .map(|(suspends, frame)| (&mut **suspends, *frame));
@@ -5225,6 +5325,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 &blocks,
                 &f.return_type,
                 block_coop,
+                sync_poll.filter(|_| poll_blocks[i]),
                 &mut defer_ctx,
             );
             if sync_defers {
@@ -5325,7 +5426,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let ptr_ty = self.module.target_config().pointer_type();
             return match storage {
                 VarStorage::Stack { slot, .. } => self.stack_load(ptr_ty, slot),
-                VarStorage::Frame { offset, .. } => self.builder.ins().load(ptr_ty, MemFlagsData::new(), self.async_frame.expect("GC owner frame"), offset),
+                VarStorage::Frame { offset, .. } => self.builder.ins().load(
+                    ptr_ty,
+                    MemFlagsData::new(),
+                    self.async_frame.expect("GC owner frame"),
+                    offset,
+                ),
                 _ => panic!("opaque GC owner must occupy rooted storage"),
             };
         }
@@ -5347,7 +5453,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if function.locals[local.0 as usize].is_gc_owner() {
             match storage {
                 VarStorage::Stack { slot, .. } => self.stack_store(value, slot),
-                VarStorage::Frame { offset, .. } => self.emit_gc_heap_store_classified(self.async_frame.expect("GC owner frame"), offset, value, true, GcStoreDestination::AsyncFrameSlot),
+                VarStorage::Frame { offset, .. } => self.emit_gc_heap_store_classified(
+                    self.async_frame.expect("GC owner frame"),
+                    offset,
+                    value,
+                    true,
+                    GcStoreDestination::AsyncFrameSlot,
+                ),
                 _ => panic!("opaque GC owner must occupy rooted storage"),
             }
             return;
@@ -5711,144 +5823,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().jump(blocks[resume.0], &[]);
     }
 
-    /// Emit one cooperative suspension using HIR operands and the scheduler
-    /// protocol (willow-0g8j.2.11). `None` is returned for a `void` await.
-    ///
-    /// On return the builder is positioned in the resume block, so everything
-    /// the enclosing LIR block emits afterwards belongs to the resumed state.
-    fn emit_lir_coop_await(
-        &mut self,
-        site: LirAwaitSite<'_>,
-        result_ty: &Type,
-        suspends: &mut Vec<CoopSuspendPoint>,
-        frame: cranelift_codegen::ir::Value,
-    ) -> Option<cranelift_codegen::ir::Value> {
-        match site {
-            LirAwaitSite::Sleep(millis) => {
-                let millis = self.emit_lir_expr(millis);
-                self.emit_coop_sleep_value(millis, suspends, frame);
-                None
-            }
-            LirAwaitSite::Yield => {
-                self.emit_coop_yield(suspends, frame);
-                None
-            }
-            LirAwaitSite::LeafCall { callee, args, span } => {
-                // The callee's public symbol is its CONSTRUCTOR: it schedules
-                // the callee task and returns that task's frame. Arguments are
-                // coerced to the declared parameter types, exactly as a
-                // synchronous call to the same function coerces them.
-                let params = self.fn_param_types(&callee.to_string());
-                let modes = self.func_param_modes.get_id(callee).cloned();
-                // Leaf-call constructors carry no parameter debug metadata.
-                let has_reference_args = lir_has_reference_args(modes.as_deref(), args);
-                let (arg_vals, arg_roots) = self.emit_lir_args_rooted(
-                    args,
-                    params.as_deref(),
-                    modes.as_deref(),
-                    Some(&callee.to_string()),
-                    None,
-                );
-                let ctor_fid = *self
-                    .func_ids
-                    .get_id(callee)
-                    .expect("registered function identity");
-                let ctor_ref = self
-                    .module
-                    .declare_func_in_func(ctor_fid, self.builder.func);
-                let call = self.builder.ins().call(ctor_ref, &arg_vals);
-                let callee_frame = self.builder.inst_results(call)[0];
-                // Clear any reference-call context. This is unreachable for
-                // checked code: E1707 refuses a reference
-                // parameter on an async function (willow-0g8j.11).
-                if has_reference_args {
-                    self.emit_debug_reference_call_clear();
-                }
-                if arg_roots > 0 {
-                    self.emit_pop_roots_n(arg_roots);
-                    self.gc_root_count -= arg_roots;
-                }
-                // The callee frame must outlive the park, so it is stashed in
-                // the slot the liveness pass reserved for this await site and
-                // reloaded on resume — never re-evaluated, which would spawn a
-                // second task (willow-0a6k.6).
-                let callee_off = self.async_frame_offsets[&span];
-                let reloaded = self
-                    .emit_coop_frame_await(
-                        callee_frame,
-                        Some(callee_off),
-                        Some(span.line),
-                        suspends,
-                        frame,
-                    )
-                    .expect("a call-await always stashes its callee frame");
-                let wanted = (*result_ty != Type::Void).then_some(result_ty);
-                // Awaiting a call directly: the operand is the `Task<T>` the
-                // constructor just returned, never a `TaskResult<T>` adapter.
-                self.emit_coop_awaited_result(reloaded, wanted, false)
-            }
-        }
-    }
-
-    /// Split the value-position `await` out of a statement's value, if it has
-    /// one the walker admits, and park on it before anything else of the
-    /// statement is emitted. `false` outside a cooperative poll function, or
-    /// for a statement with nothing to split.
-    fn begin_lir_statement_hoist(
-        &mut self,
-        value: &HirExpr,
-        coop: Option<&mut (&mut Vec<CoopSuspendPoint>, cranelift_codegen::ir::Value)>,
-    ) -> bool {
-        let Some((suspends, frame)) = coop else {
-            return false;
-        };
-        let Some((target, site)) = lir_hoisted_await(value, self.cooperative_leaves) else {
-            return false;
-        };
-        let frame = *frame;
-        self.begin_lir_hoisted_await(target, site, suspends, frame)
-    }
-
-    /// Park on a value-position `await` before the statement that consumes it
-    /// (willow-0g8j.2.11) and stash the resumed result, so the `Await` node
-    /// reached during the statement's own emission reads it back instead of
-    /// awaiting a second time. Returns whether a GC root was pushed for it.
-    fn begin_lir_hoisted_await(
-        &mut self,
-        target: &HirExpr,
-        site: LirAwaitSite<'_>,
-        suspends: &mut Vec<CoopSuspendPoint>,
-        frame: cranelift_codegen::ir::Value,
-    ) -> bool {
-        let awaited = self
-            .emit_lir_coop_await(site, &target.ty, suspends, frame)
-            .expect("a value-position await has a value");
-        // Everything the statement evaluates after the resume runs while this
-        // value is live, and any of it may allocate, so it needs a root of its
-        // own until the statement consumes it.
-        let rooted = is_gc_managed(&target.ty, self.enum_infos);
-        if rooted {
-            // `emit_push_root` maintains `gc_root_count` itself.
-            self.emit_push_root(awaited);
-        }
-        self.lir_hoisted_await = Some((target.span, awaited));
-        rooted
-    }
-
-    /// Release the stashed value once its statement is emitted. `emit_pop` is
-    /// false for a `return`, whose own epilogue already popped the full runtime
-    /// root depth; a statement that diverged has done the same, so the pop is
-    /// skipped there too and only the compile-time count unwinds.
-    fn end_lir_hoisted_await(&mut self, rooted: bool, emit_pop: bool) {
-        self.lir_hoisted_await = None;
-        if rooted {
-            if emit_pop && !self.terminated {
-                self.emit_pop_roots_n(1);
-            }
-            self.gc_root_count -= 1;
-        }
-    }
-
     /// Give every GC-managed `let` of this function one entry-allocated, rooted
     /// stack slot (see the module docs). The slot is null-initialized so a
     /// collection that happens before the `let` executes reads an empty root
@@ -5930,10 +5904,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .iter()
             .filter_map(|local| function.locals.get(local.0 as usize))
             .filter_map(|local| match self.vars.get(local.name.as_str()) {
-                Some(VarStorage::Stack { slot, ty }) if local.is_gc_owner() || is_gc_managed(ty, self.enum_infos) => {
+                Some(VarStorage::Stack { slot, ty })
+                    if local.is_gc_owner() || is_gc_managed(ty, self.enum_infos) =>
+                {
                     Some(Root::Slot(*slot))
                 }
-                Some(VarStorage::Frame { offset, ty }) if local.is_gc_owner() || is_gc_managed(ty, self.enum_infos) => {
+                Some(VarStorage::Frame { offset, ty })
+                    if local.is_gc_owner() || is_gc_managed(ty, self.enum_infos) =>
+                {
                     Some(Root::Frame(*offset))
                 }
                 _ => None,
@@ -5953,7 +5931,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 Root::Frame(offset) => {
                     if let Some(base) = frame_base {
                         let slot = self.builder.ins().iadd_imm_s(base, i64::from(offset));
-                        self.builder.ins().atomic_store(MemFlagsData::new(), zero, slot);
+                        self.builder
+                            .ins()
+                            .atomic_store(MemFlagsData::new(), zero, slot);
                     }
                 }
             }
@@ -5987,13 +5967,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// skipped here — and that set is exactly the one that has to survive a
     /// poll return, so a Cranelift variable is sound for everything left.
     fn bind_lir_locals(&mut self, f: &LirFunction) {
-        for block in &f.blocks { for inst in &block.instrs {
-            if let LirInst::Compute { value, .. } = inst { for operand in value.operands() {
-                if let crate::ir::lowered::LirOperand::Reference { place: crate::ir::lowered::LirPlace::Local(id), .. } = operand {
-                    self.address_taken.insert(f.locals[id.0 as usize].name.clone());
+        for block in &f.blocks {
+            for inst in &block.instrs {
+                if let LirInst::Compute { value, .. } = inst {
+                    for operand in value.operands() {
+                        if let crate::ir::lowered::LirOperand::Reference {
+                            place: crate::ir::lowered::LirPlace::Local(id),
+                            ..
+                        } = operand
+                        {
+                            self.address_taken
+                                .insert(f.locals[id.0 as usize].name.clone());
+                        }
+                    }
                 }
-            }}
-        }}
+            }
+        }
         let mut null = None;
         for local in &f.locals {
             if local.parameter || self.vars.contains_key(local.name.as_str()) {
@@ -6028,13 +6017,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 ty => self.builder.ins().iconst(ty, 0),
             };
             self.builder.def_var(var, zero);
-            self.vars.insert(
-                local.name.clone(),
-                VarStorage::Value {
-                    var,
-                    ty: local.ty.clone(),
-                },
-            );
+            self.vars
+                .insert(local.name.clone(), VarStorage::Value { var });
         }
     }
 
@@ -6045,13 +6029,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         blocks: &[cranelift_codegen::ir::Block],
         return_type: &Type,
         mut coop: Option<(&mut Vec<CoopSuspendPoint>, cranelift_codegen::ir::Value)>,
+        sync_poll: Option<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value)>,
         defers: &mut LirBlockDeferCtx<'_>,
     ) -> Vec<(usize, LirDeferState)> {
         let mut recovery_states = Vec::new();
-        if coop.is_none() && (self.lir_cleanup_exit.is_none() || block.id.0 != 0) {
+        if let Some((active, stop)) = sync_poll
+            && (self.lir_cleanup_exit.is_none() || block.id.0 != 0)
+        {
             // Native stacks preserve SSA values and roots across this hook;
-            // every block entry includes all function and loop re-entries.
-            self.emit_sync_safepoint();
+            // function entry and cycle headers cover recursion and loops.
+            self.emit_sync_safepoint(active, stop);
         }
         for (inst_index, inst) in block.instrs.iter().enumerate() {
             // A panic/return has terminated the source path, but a
@@ -6080,7 +6067,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             match inst {
                 LirInst::Compute { local, value, span } => {
                     let result = self.emit_lir_rvalue(function, value, *span);
-                    if !self.terminated && (function.locals[local.0 as usize].is_gc_owner() || !matches!(function.locals[local.0 as usize].ty, Type::Void | Type::Never)) {
+                    if !self.terminated
+                        && (function.locals[local.0 as usize].is_gc_owner()
+                            || !matches!(
+                                function.locals[local.0 as usize].ty,
+                                Type::Void | Type::Never
+                            ))
+                    {
                         self.store_lir_local(function, *local, result);
                     }
                 }
@@ -6297,112 +6290,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.emit_lock_frame_cleanup(slots.mode, offsets, &slots.value_ty, false);
                 }
                 LirInst::Let {
-                    name, ty, value, ..
+                    local, ty, value, ..
                 } => {
-                    let hoisted = self.begin_lir_statement_hoist(value, coop.as_mut());
-                    let val = match coop.as_mut().and_then(|(s, f)| {
-                        lir_await_site(value, self.cooperative_leaves).map(|site| (site, s, *f))
-                    }) {
-                        Some((site, suspends, frame)) => {
-                            let awaited = self
-                                .emit_lir_coop_await(site, &value.ty, suspends, frame)
-                                .expect("a `let` initialiser await has a value");
-                            self.coerce_to_target(awaited, &value.ty, ty)
-                        }
-                        None => self.emit_lir_store_value(value, ty),
-                    };
-                    // The binding itself was made at function entry — by
-                    // `bind_lir_gc_locals` for a GC-managed local, by
-                    // `bind_lir_locals` for the rest — so storing into it is
-                    // the whole `let` (willow-34su). The two branches below
-                    // only cover a name no local of this function declares.
-                    if let Some(storage) = self.vars.get(name.as_str()).cloned()
-                        && matches!(
-                            storage,
-                            VarStorage::Value { .. }
-                                | VarStorage::Stack { .. }
-                                | VarStorage::Frame { .. }
-                        )
-                    {
-                        self.store_var(&storage, val);
-                    } else if self.address_taken.contains(name.as_str()) {
-                        // Address-taken: bind straight to a stack slot.
-                        // Promoting at the `&` instead
-                        // would put the initialising store wherever that use sits
-                        // — re-running it every loop iteration, or skipping it
-                        // entirely on a branch that takes no address.
-                        let storage = self.create_local_stack_slot(ty, val);
-                        self.vars.insert(name.clone(), storage);
-                    } else {
-                        let var = self.builder.declare_var(clif_type(ty));
-                        self.builder.def_var(var, val);
-                        self.vars.insert(
-                            name.clone(),
-                            VarStorage::Value {
-                                var,
-                                ty: ty.clone(),
-                            },
-                        );
-                    }
-                    self.end_lir_hoisted_await(hoisted, true);
+                    let val = self.emit_lir_operand_store(function, value, ty);
+                    self.store_lir_local(function, *local, val);
                 }
-                LirInst::Assign { name, value, .. } => {
-                    // The declared slot type — not the value's — decides
-                    // whether this store boxes (`a = new Dog();` where `a` is
-                    // an `Animal` local).
-                    let hoisted = self.begin_lir_statement_hoist(value, coop.as_mut());
-                    match self.vars.get(name.as_str()).cloned() {
-                        None => {
-                            self.emit_lir_expr(value);
-                        }
-                        Some(storage) => {
-                            let target = storage.ty().clone();
-                            let val = match coop.as_mut().and_then(|(s, f)| {
-                                lir_await_site(value, self.cooperative_leaves)
-                                    .map(|site| (site, s, *f))
-                            }) {
-                                Some((site, suspends, frame)) => {
-                                    let awaited = self
-                                        .emit_lir_coop_await(site, &value.ty, suspends, frame)
-                                        .expect("an assigned await has a value");
-                                    self.coerce_to_target(awaited, &value.ty, &target)
-                                }
-                                None => self.emit_lir_store_value(value, &target),
-                            };
-                            self.store_var(&storage, val);
-                        }
-                    }
-                    self.end_lir_hoisted_await(hoisted, true);
+                LirInst::Assign { local, value, .. } => {
+                    let target = function.locals[local.0 as usize].ty.clone();
+                    let val = self.emit_lir_operand_store(function, value, &target);
+                    self.store_lir_local(function, *local, val);
                 }
-                LirInst::Expr(e) => {
-                    if let Some((suspends, frame)) = coop.as_mut()
-                        && let Some(site) = lir_await_site(e, self.cooperative_leaves)
-                    {
-                        let frame = *frame;
-                        self.emit_lir_coop_await(site, &e.ty, suspends, frame);
-                        continue;
-                    }
-                    let hoisted = self.begin_lir_statement_hoist(e, coop.as_mut());
-                    self.emit_lir_expr(e);
-                    self.end_lir_hoisted_await(hoisted, true);
+                LirInst::Unsupported { reason, .. } => {
+                    unreachable!("rejected LIR reached backend: {reason}")
                 }
-                LirInst::IndexAssign {
-                    array,
-                    index,
-                    value,
-                } => {
-                    self.emit_lir_index_assign(array, index, value);
-                }
-                LirInst::FieldAssign {
-                    object,
-                    field,
-                    value,
-                } => self.emit_lir_field_assign(object, field, value),
-                LirInst::StaticFieldAssign {
-                    class,
-                    field,
-                    value,
-                } => self.emit_lir_static_field_assign(&class.to_string(), field, value),
                 // One arm of a `match` lowering split into blocks
                 // (willow-0g8j.2.11.1). Both read the scrutinee back out of
                 // its own local, so every arm tests and destructures the same
@@ -6415,7 +6315,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 } => {
                     let scrutinee_ty = function.locals[scrutinee.0 as usize].ty.clone();
                     let value = self.load_lir_local(function, *scrutinee);
-                    let matched = self.emit_lir_pattern_check(value, &scrutinee_ty, pattern);
+                    let matched = self.emit_flat_pattern_check(value, &scrutinee_ty, pattern);
                     self.store_lir_local(function, *result, matched);
                 }
                 LirInst::MatchBind {
@@ -6426,7 +6326,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 } => {
                     let scrutinee_ty = function.locals[scrutinee.0 as usize].ty.clone();
                     let value = self.load_lir_local(function, *scrutinee);
-                    let bound = self.lir_pattern_binding_values(value, &scrutinee_ty, pattern);
+                    let bound = self.flat_pattern_binding_values(value, &scrutinee_ty, pattern);
                     debug_assert_eq!(
                         bound.len(),
                         bindings.len(),
@@ -6436,7 +6336,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         self.store_lir_local(function, *local, val);
                     }
                 }
-                LirInst::SuperInit { args, span } => self.emit_lir_super_init(args, *span),
                 LirInst::SelectInit { .. }
                 | LirInst::SelectProbe { .. }
                 | LirInst::SelectPick { .. }
@@ -6456,51 +6355,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 then_block,
                 else_block,
             } => {
-                self.fault_site_span = Some(cond.span);
-                // A loop header re-runs its condition on every iteration, so an
-                // awaited condition parks once per iteration (willow-0g8j.2.11).
-                let split = coop.as_mut().and_then(|(s, f)| {
-                    lir_value_position_await(cond, self.cooperative_leaves)
-                        .map(|(target, site)| (target, site, s, *f))
-                });
-                let hoisted = match split {
-                    Some((target, site, suspends, frame)) => {
-                        self.begin_lir_hoisted_await(target, site, suspends, frame)
-                    }
-                    None => false,
-                };
-                let c = self.emit_lir_expr(cond);
-                self.end_lir_hoisted_await(hoisted, true);
+                let c = self.emit_lir_operand(function, cond);
                 self.builder
                     .ins()
                     .brif(c, blocks[then_block.0], &[], blocks[else_block.0], &[]);
             }
             Terminator::CleanupReturn => {
-                let (exit, roots, _) = self.lir_cleanup_exit.expect("cleanup terminator outside cleanup region");
+                let (exit, roots, _) = self
+                    .lir_cleanup_exit
+                    .expect("cleanup terminator outside cleanup region");
                 self.emit_pop_roots_n(self.gc_root_count - roots);
                 self.builder.ins().jump(exit, &[]);
                 self.lir_cleanup_exit.as_mut().unwrap().2 = true;
                 self.terminated = true;
             }
             Terminator::Return(v) => {
-                // A returned await is split like any other statement's, so the
-                // result slot is written on the resume path with a value the
-                // park could not have destroyed (willow-0g8j.2.11).
-                let split = v.as_ref().and_then(|value| {
-                    coop.as_mut().and_then(|(s, f)| {
-                        lir_value_position_await(value, self.cooperative_leaves)
-                            .map(|(target, site)| (target, site, s, *f))
-                    })
-                });
-                let hoisted = match split {
-                    Some((target, site, suspends, frame)) => {
-                        self.begin_lir_hoisted_await(target, site, suspends, frame)
-                    }
-                    None => false,
-                };
-                self.emit_lir_return(v.as_ref(), return_type);
-                // The poll return already popped the full runtime root depth.
-                self.end_lir_hoisted_await(hoisted, false);
+                self.emit_lir_operand_return(function, v.as_ref(), return_type);
             }
             Terminator::Suspend { operation, resume } => {
                 let Some((suspends, frame)) = coop.as_mut() else {
@@ -6700,11 +6570,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.defer_stack.pop();
     }
 
-    fn emit_lir_return(&mut self, value: Option<&HirExpr>, return_type: &Type) {
+    fn emit_lir_operand_store(
+        &mut self,
+        function: &LirFunction,
+        value: &crate::ir::lowered::LirOperand,
+        target: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let source = value.ty(&function.locals).expect("validated value operand");
+        let result = self.emit_lir_operand(function, value);
+        self.coerce_to_target(result, &source, target)
+    }
+
+    fn emit_lir_operand_return(
+        &mut self,
+        function: &LirFunction,
+        value: Option<&crate::ir::lowered::LirOperand>,
+        return_type: &Type,
+    ) {
         if let Some(frame) = self.coop_frame {
             if let (Some(value), Some(offset)) = (value, self.coop_result_offset) {
-                self.fault_site_span = Some(value.span);
-                let result = self.emit_lir_store_value(value, return_type);
+                let result = self.emit_lir_operand_store(function, value, return_type);
                 self.emit_gc_heap_store(
                     frame,
                     offset,
@@ -6715,7 +6600,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             } else if let Some(value) = value {
                 // Async main is `void`, but preserve source evaluation if a
                 // future front-end shape carries a value with no result slot.
-                self.emit_lir_expr(value);
+                self.emit_lir_operand(function, value);
             }
             self.emit_flush_defers_from(0);
             if !self.terminated {
@@ -6736,10 +6621,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // `return` is an EXIT rather than a value handed back -- `Err` reports
         // its payload and exits non-zero, `Ok` exits 0 (willow-exg, willow-0g8j.2.14).
         if self.main_result_err_ty.is_some() {
-            match value.filter(|value| !hir_is_zero_arg_result_ok(value)) {
+            match value {
                 Some(value) => {
-                    self.fault_site_span = Some(value.span);
-                    let result = self.emit_lir_expr(value);
+                    let result = self.emit_lir_operand(function, value);
                     // The `Result` object outlives any allocating defer between
                     // here and the exit that reads its tag.
                     self.emit_push_root(result);
@@ -6772,8 +6656,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Some(v) => {
                 // Evaluate (and box, for an interface-typed return) first: the
                 // value may read through a rooted local, and the box allocates.
-                self.fault_site_span = Some(v.span);
-                let val = self.emit_lir_store_value(v, return_type);
+
+                let val = self.emit_lir_operand_store(function, v, return_type);
                 self.emit_callstack_unwind_edge();
                 self.emit_pop_roots_n(self.gc_root_count);
                 self.builder.ins().return_(&[val]);
@@ -6797,1845 +6681,27 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.terminated = true;
     }
 
-    /// Store a value into the global slot backing a `static mut` property.
-    ///
-    /// The slot is declared and initialized by the shared static-property path,
-    /// before `willow_user_main` runs. GC-managed slots are permanent roots, so
-    /// stores use the shared heap-store/write-barrier helper.
-    fn emit_lir_static_field_assign(&mut self, class: &str, field: &str, value: &HirExpr) {
-        let class_name = self.static_call_class_name(class);
-        let info = self
-            .lookup_static_storage(&class_name, field)
-            .unwrap_or_else(|| {
-                panic!(
-                    "compiler invariant violated: eligible static store `{class_name}::{field}` \
-                     has no storage"
-                )
-            });
-        let val = self.emit_lir_store_value(value, &info.ty);
-        let ptr_ty = self.module.target_config().pointer_type();
-        let gv = self
-            .module
-            .declare_data_in_func(info.data_id, self.builder.func);
-        let addr = self.builder.ins().symbol_value(ptr_ty, gv);
-        self.emit_gc_heap_store(addr, 0, val, &info.ty, GcStoreDestination::GlobalStatic);
-    }
-
-    pub(super) fn emit_lir_operand(&mut self, function: &LirFunction, operand: &crate::ir::lowered::LirOperand) -> cranelift_codegen::ir::Value {
-        use crate::ir::lowered::LirOperand;
-        match operand {
-            LirOperand::Local(local) => self.load_lir_local(function, *local),
-            LirOperand::Int(value) => self.builder.ins().iconst(types::I64, *value),
-            LirOperand::Float(value) => self.builder.ins().f64const(*value),
-            LirOperand::Bool(value) => self.builder.ins().iconst(types::I8, i64::from(*value)),
-            LirOperand::Reference { place, .. } => self.emit_flat_reference_address(function, place),
-        }
-    }
-
-    fn emit_lir_rvalue(&mut self, function: &LirFunction, value: &crate::ir::lowered::LirRvalue, span: Span) -> cranelift_codegen::ir::Value {
-        use crate::ir::lowered::LirRvalue;
-        match value {
-            LirRvalue::BeginReferenceCall => { self.emit_debug_reference_call_scope_push(); self.lir_reference_scopes.push(Vec::new()); self.builder.ins().iconst(types::I8, 0) }
-            LirRvalue::ReferenceDebug { argument, callee, index } => { self.emit_flat_reference_debug(argument, callee, *index); self.lir_reference_scopes.last_mut().expect("prepared reference scope").push(FlatReferenceDebug { argument: argument.clone(), callee: *callee, index: *index }); self.builder.ins().iconst(types::I8, 0) }
-            LirRvalue::StartTask { callee, args, params, .. } => {
-                let args: Vec<_> = args.iter().map(|arg| self.emit_lir_operand(function, arg)).collect();
-                self.emit_flat_start_task(*callee, &args, params, span)
-            }
-            LirRvalue::AwaitFuture { future, result } => {
-                let future = self.emit_lir_operand(function, future);
-                self.emit_flat_await_future(future, result)
-            }
-            LirRvalue::SelectIdleWait { deadlines } => {
-                let deadlines: Vec<_> = deadlines.iter().map(|deadline| self.emit_lir_operand(function, deadline)).collect();
-                self.emit_flat_select_idle_wait(&deadlines)
-            }
-            LirRvalue::PrepareMethod { receiver, receiver_ty, method } => {
-                let receiver = self.emit_lir_operand(function, receiver);
-                let receiver = self.emit_flat_prepare_method(receiver, receiver_ty, method, span, true);
-                if self.flat_method_frame_enabled(method) { self.lir_call_frames.push((method.clone(), span)); }
-                receiver
-            }
-            LirRvalue::MethodCall { receiver, receiver_ty, method, args, result, .. } => {
-                if self.flat_method_frame_enabled(method) {
-                    let (prepared, _) = self.lir_call_frames.pop().expect("prepared method frame");
-                    assert_eq!(prepared, *method);
-                }
-                let receiver = self.emit_lir_operand(function, receiver);
-                let (args, roots) = self.emit_flat_call_operands(function, args);
-                let result = if matches!(receiver_ty, Type::Named(name) | Type::Generic(name, _) if self.interface_infos.contains_key(name)) {
-                    self.emit_flat_interface_call(receiver, receiver_ty, method, &args, span, true, true)
-                } else {
-                    self.emit_flat_class_method(receiver, receiver_ty, method, &args, result, span, true, true)
-                };
-                self.emit_pop_roots_n(roots); self.gc_root_count -= roots;
-                result
-            }
-            LirRvalue::Coerce { value, source, target } => {
-                let value = self.emit_lir_operand(function, value);
-                self.coerce_to_target(value, source, target)
-            }
-            LirRvalue::ArrayAlloc { length, element } => self.emit_flat_array_alloc(*length, element),
-            LirRvalue::CaptureArrayOwner { array, index } => self.emit_flat_capture_array_owner(function, array, index),
-            LirRvalue::ArrayStore { array, index, value, element } => self.emit_flat_array_store(function, array, index, value, element),
-            LirRvalue::Index { array, index, element } => self.emit_flat_index(function, array, index, element),
-            LirRvalue::ObjectAlloc { class } => self.emit_flat_object_alloc(class),
-            LirRvalue::FieldLoad { object, object_ty, field, .. } => self.emit_flat_field(function, object, field, object_ty),
-            LirRvalue::FieldStore { object, object_ty, field, value } => self.emit_flat_field_store(function, object, field, value, object_ty),
-            LirRvalue::StaticField { class, field, .. } => self.emit_flat_static_field(&class.to_string(), field),
-            LirRvalue::StaticStore { class, field, value } => self.emit_flat_static_store(function, &class.to_string(), field, value),
-            LirRvalue::StaticCall { class, method, args, arg_types, result } => {
-                let (args, roots) = self.emit_flat_call_operands(function, args);
-                let result = self.emit_lir_static_call_values(&class.to_string(), method, &args, arg_types, result, span);
-                if !self.terminated { self.emit_pop_roots_n(roots); }
-                self.gc_root_count -= roots;
-                result
-            }
-            LirRvalue::EnumAlloc { class, variant, enum_ty } => self.emit_flat_enum_alloc(&class.to_string(), variant, enum_ty),
-            LirRvalue::EnumPayloadStore { object, class, variant, index, value, source, enum_ty } => {
-                let object = self.emit_lir_operand(function, object);
-                let value = self.emit_lir_operand(function, value);
-                self.emit_flat_enum_payload_store(object, &class.to_string(), variant, *index, value, source, enum_ty)
-            }
-            LirRvalue::ConstructorCall { object, class, args, arg_types } => self.emit_flat_constructor_call(function, object, class, args, arg_types, span),
-            LirRvalue::Range { start, end } => {
-                let start = self.emit_lir_operand(function, start);
-                let end = self.emit_lir_operand(function, end);
-                let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(GcObjectKind::Range, 16, 0, 0));
-                self.builder.ins().store(MemFlagsData::new(), start, ptr, 0);
-                self.builder.ins().store(MemFlagsData::new(), end, ptr, 8);
-                ptr
-            }
-            LirRvalue::EnumMethod { receiver, receiver_ty, method, args, arg_types, .. } => {
-                let receiver = self.emit_lir_operand(function, receiver);
-                let args: Vec<_> = args.iter().map(|arg| self.emit_lir_operand(function, arg)).collect();
-                self.emit_flat_enum_method(receiver, receiver_ty, method, &args, arg_types, span)
-            }
-            LirRvalue::BuiltinCall { callee, args, .. } => {
-                let args: Vec<_> = args.iter().map(|arg| self.emit_lir_operand(function, arg)).collect();
-                self.emit_flat_builtin_call(callee, &args)
-            }
-            LirRvalue::FormatScalar { value, ty, format } => {
-                let value = self.emit_lir_operand(function, value);
-                self.emit_flat_format_scalar(value, ty, *format)
-            }
-            LirRvalue::Panic { message } => {
-                let message = self.emit_lir_operand(function, message);
-                self.emit_panic_with_message(message, span)
-            }
-            LirRvalue::Recover => self.emit_recover_call(),
-            LirRvalue::RebindResultError { value, .. } => self.emit_lir_operand(function, value),
-            LirRvalue::IntoError { value, source, .. } => {
-                let value = self.emit_lir_operand(function, value);
-                self.emit_push_root(value);
-                let panic_depth = self.emit_pre_willow_call_panic_depth();
-                let Type::Named(class) = source else { unreachable!("Into error source class validated"); };
-                let converted = self.emit_into_conversion(value, &class.to_string());
-                self.emit_pop_roots_n(1); self.gc_root_count -= 1;
-                self.emit_post_willow_call_panic_check(panic_depth);
-                converted
-            }
-            LirRvalue::IntrinsicCall { intrinsic, receiver, receiver_ty, args, arg_types, result, .. } => {
-                let receiver = self.emit_lir_operand(function, receiver);
-                let args: Vec<_> = args.iter().map(|arg| self.emit_lir_operand(function, arg)).collect();
-                self.emit_flat_intrinsic(*intrinsic, receiver, receiver_ty, &args, arg_types, result, span)
-            }
-            LirRvalue::Use(operand) => self.emit_lir_operand(function, operand),
-            LirRvalue::StringLiteral(value) => self.emit_string_literal(value),
-            LirRvalue::FunctionRef { function, .. } => {
-                let fid = *self.func_ids.get_id(function).expect("registered function reference");
-                let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                self.builder.ins().func_addr(super::type_helpers::FN_ADDR_TYPE, fref)
-            }
-            LirRvalue::Closure { id, captures, ty } => {
-                let name = self.lambda_names[id].clone();
-                let fid = *self.func_ids.get_id(&name).expect("registered lambda");
-                let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                let code = self.builder.ins().func_addr(super::type_helpers::FN_ADDR_TYPE, fref);
-                if !matches!(ty, Type::Closure(..)) { return code; }
-                let mut mask = 0u64;
-                for (i, capture) in captures.iter().enumerate() {
-                    if is_gc_managed(&capture.ty(&function.locals).expect("capture type"), self.enum_infos) { mask |= 1u64 << (i + 1); }
-                }
-                let env = self.emit_gc_alloc(GcLayoutMetadata::new(GcObjectKind::Closure, (captures.len() as i64 + 1) * 8, 0, mask));
-                self.emit_gc_heap_store_classified(env, 0, code, false, GcStoreDestination::ObjectField);
-                for (i, capture) in captures.iter().enumerate() {
-                    let value = self.emit_lir_operand(function, capture);
-                    let ty = capture.ty(&function.locals).expect("capture type");
-                    self.emit_gc_heap_store(env, (i as i32 + 1) * 8, value, &ty, GcStoreDestination::ObjectField);
-                }
-                env
-            }
-            LirRvalue::Print { value, ty, newline } => {
-                let value = self.emit_lir_operand(function, value);
-                let name = match (ty, newline) {
-                    (Type::I64, false) => "willow_print_i64", (Type::I64, true) => "willow_println_i64",
-                    (Type::F64, false) => "willow_print_f64", (Type::F64, true) => "willow_println_f64",
-                    (Type::Bool, false) => "willow_print_bool", (Type::Bool, true) => "willow_println_bool",
-                    (Type::String, false) => "willow_print_string", (Type::String, true) => "willow_println_string",
-                    _ => unreachable!("print type validated"),
-                };
-                self.emit_void_runtime_call(name, &[value]);
-                self.builder.ins().iconst(types::I8, 0)
-            }
-            LirRvalue::DirectCall { callee, args, .. } => {
-                let has_references = args.iter().any(|arg| matches!(arg, crate::ir::lowered::LirOperand::Reference { .. }));
-                let (values, roots) = self.emit_flat_call_operands(function, args);
-                let fid = *self.func_ids.get_id(callee).expect("flat direct call is registered");
-                let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                let pushed = self.emit_callstack_push(&callee.to_string(), span);
-                let panic_depth = self.emit_pre_user_call_panic_depth(&callee.to_string());
-                let call = self.builder.ins().call(fref, &values);
-                let result = self.builder.inst_results(call).first().copied().unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0));
-                if pushed { self.emit_callstack_pop(); }
-                if has_references { self.emit_flat_reference_call_end(); }
-                self.emit_pop_roots_n(roots); self.gc_root_count -= roots;
-                self.emit_post_willow_call_panic_check(panic_depth);
-                result
-            }
-            LirRvalue::Unary { op, operand, ty } => {
-                let operand = self.emit_lir_operand(function, operand);
-                match op {
-                    UnaryOp::Neg if *ty == Type::F64 => self.builder.ins().fneg(operand),
-                    UnaryOp::Neg => self.builder.ins().ineg(operand),
-                    UnaryOp::Not => { let one = self.builder.ins().iconst(types::I8, 1); self.builder.ins().bxor(operand, one) }
-                }
-            }
-            LirRvalue::IndirectCall { callee, name, args, params, result } => {
-                let closure = matches!(callee.ty(&function.locals), Some(Type::Closure(..)));
-                let target = self.emit_lir_operand(function, callee);
-                let mut roots = 0;
-                if closure { self.emit_push_root(target); roots += 1; }
-                let code = if closure { self.builder.ins().load(super::type_helpers::FN_ADDR_TYPE, MemFlagsData::trusted(), target, 0) } else { target };
-                let mut values = Vec::with_capacity(args.len() + usize::from(closure));
-                if closure { values.push(target); }
-                for (argument, ty) in args.iter().zip(params) {
-                    let value = self.emit_lir_operand(function, argument);
-                    if is_gc_managed(ty, self.enum_infos) { self.emit_push_root(value); roots += 1; }
-                    values.push(value);
-                }
-                let mut signature = self.module.make_signature();
-                if closure { signature.params.push(AbiParam::new(types::I64)); }
-                signature.params.extend(params.iter().map(|ty| AbiParam::new(clif_type(ty))));
-                if *result != Type::Void { signature.returns.push(AbiParam::new(clif_type(result))); }
-                let signature = self.builder.import_signature(signature);
-                let pushed = self.emit_callstack_push(&name.to_string(), span);
-                let panic_depth = self.emit_pre_willow_call_panic_depth();
-                let call = self.builder.ins().call_indirect(signature, code, &values);
-                let result = self.builder.inst_results(call).first().copied().unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0));
-                if pushed { self.emit_callstack_pop(); }
-                self.emit_pop_roots_n(roots); self.gc_root_count -= roots;
-                self.emit_post_willow_call_panic_check(panic_depth);
-                result
-            }
-            LirRvalue::Binary { op, lhs, rhs, operand_ty } => {
-                let lhs = self.emit_lir_operand(function, lhs);
-                let rhs = self.emit_lir_operand(function, rhs);
-                if *operand_ty == Type::String {
-                    let name = if matches!(op, BinOp::Add) { "willow_string_concat" } else { "willow_string_eq" };
-                    self.emit_push_root(lhs); self.emit_push_root(rhs);
-                    let raw = self.emit_value_runtime_call(name, &[lhs, rhs]);
-                    self.emit_pop_roots_n(2); self.gc_root_count -= 2;
-                    return match op {
-                        BinOp::Add => raw,
-                        BinOp::Eq => self.builder.ins().ireduce(types::I8, raw),
-                        BinOp::Ne => { let raw = self.builder.ins().bxor_imm_s(raw, 1); self.builder.ins().ireduce(types::I8, raw) }
-                        _ => unreachable!("string operator validated"),
-                    };
-                }
-                let float = *operand_ty == Type::F64;
-                if !float && matches!(op, BinOp::Div | BinOp::Rem) {
-                    self.emit_int_div_guard(lhs, rhs, matches!(op, BinOp::Rem), span);
-                }
-                if matches!(op, BinOp::Pow) {
-                    if float { self.emit_pow_f64(lhs, rhs) } else { self.emit_pow_i64(lhs, rhs, span) }
-                } else {
-                    self.emit_lir_binop(op, lhs, rhs, float)
-                }
-            }
-        }
-    }
-
-    pub(super) fn emit_lir_expr(&mut self, e: &HirExpr) -> cranelift_codegen::ir::Value {
-        match &e.kind {
-            HirExprKind::Int(n) => self.builder.ins().iconst(types::I64, *n),
-            HirExprKind::Float(x) => self.builder.ins().f64const(*x),
-            HirExprKind::Bool(b) => self.builder.ins().iconst(types::I8, i64::from(*b)),
-            HirExprKind::Str(s) => self.emit_string_literal(s),
-            HirExprKind::Var(name) => match self.vars.get(name.as_str()).cloned() {
-                Some(storage) => self.load_var(&storage),
-                // Fail loudly (willow-thqe class): a
-                // variable the eligibility check admitted must be bound.
-                None => {
-                    panic!("internal compiler error: variable `{name}` reached LIR codegen unbound")
-                }
-            },
-            HirExprKind::Binary { op, lhs, rhs } if lhs.ty == Type::String => {
-                self.emit_lir_string_binop(op, lhs, rhs)
-            }
-            HirExprKind::Binary { op, lhs, rhs } => match op {
-                // Short-circuit: the rhs must not evaluate when the lhs decides.
-                BinOp::And | BinOp::Or => {
-                    let l = self.emit_lir_expr(lhs);
-                    let result_var = self.builder.declare_var(types::I8);
-                    let rhs_block = self.builder.create_block();
-                    let short_block = self.builder.create_block();
-                    let merge_block = self.builder.create_block();
-                    if matches!(op, BinOp::And) {
-                        self.builder.ins().brif(l, rhs_block, &[], short_block, &[]);
-                    } else {
-                        self.builder.ins().brif(l, short_block, &[], rhs_block, &[]);
-                    }
-
-                    self.builder.switch_to_block(rhs_block);
-                    self.builder.seal_block(rhs_block);
-                    let r = self.emit_lir_expr(rhs);
-                    self.builder.def_var(result_var, r);
-                    self.builder.ins().jump(merge_block, &[]);
-
-                    self.builder.switch_to_block(short_block);
-                    self.builder.seal_block(short_block);
-                    let short_val = self
-                        .builder
-                        .ins()
-                        .iconst(types::I8, i64::from(matches!(op, BinOp::Or)));
-                    self.builder.def_var(result_var, short_val);
-                    self.builder.ins().jump(merge_block, &[]);
-
-                    self.builder.switch_to_block(merge_block);
-                    self.builder.seal_block(merge_block);
-                    self.builder.use_var(result_var)
-                }
-                _ => {
-                    let float = lhs.ty == Type::F64;
-                    let l = self.emit_lir_expr(lhs);
-                    let r = self.emit_lir_expr(rhs);
-                    if !float && matches!(op, BinOp::Div | BinOp::Rem) {
-                        self.emit_int_div_guard(l, r, matches!(op, BinOp::Rem), e.span);
-                    }
-                    // `**` needs control flow for a dynamic exponent, so it is
-                    // lowered before the straight-line operator table
-                    // (willow-n5yv.3).
-                    if matches!(op, BinOp::Pow) {
-                        if float {
-                            self.emit_pow_f64(l, r)
-                        } else {
-                            self.emit_pow_i64(l, r, e.span)
-                        }
-                    } else {
-                        self.emit_lir_binop(op, l, r, float)
-                    }
-                }
-            },
-            HirExprKind::Ternary {
-                condition,
-                then_expr,
-                else_expr,
-            } => {
-                let result_var = self.builder.declare_var(clif_type(&e.ty));
-                let then_block = self.builder.create_block();
-                let else_block = self.builder.create_block();
-                let merge_block = self.builder.create_block();
-
-                let cond = self.emit_lir_expr(condition);
-                self.builder
-                    .ins()
-                    .brif(cond, then_block, &[], else_block, &[]);
-
-                self.builder.switch_to_block(then_block);
-                self.builder.seal_block(then_block);
-                let t = self.emit_lir_expr(then_expr);
-                self.builder.def_var(result_var, t);
-                self.builder.ins().jump(merge_block, &[]);
-
-                self.builder.switch_to_block(else_block);
-                self.builder.seal_block(else_block);
-                let f = self.emit_lir_expr(else_expr);
-                self.builder.def_var(result_var, f);
-                self.builder.ins().jump(merge_block, &[]);
-
-                self.builder.switch_to_block(merge_block);
-                self.builder.seal_block(merge_block);
-                self.builder.use_var(result_var)
-            }
-            HirExprKind::Unary { op, operand } => {
-                let val = self.emit_lir_expr(operand);
-                match op {
-                    UnaryOp::Neg if operand.ty == Type::F64 => self.builder.ins().fneg(val),
-                    UnaryOp::Neg => self.builder.ins().ineg(val),
-                    UnaryOp::Not => {
-                        let one = self.builder.ins().iconst(types::I8, 1);
-                        self.builder.ins().bxor(val, one)
-                    }
-                }
-            }
-            // A named function used as a value — the address of the compiled
-            // function (willow-0g8j.2.2).
-            HirExprKind::FnRef(name) => {
-                let fid = *self
-                    .func_ids
-                    .get_id(name)
-                    .expect("registered function identity");
-                let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                self.builder
-                    .ins()
-                    .func_addr(super::type_helpers::FN_ADDR_TYPE, fref)
-            }
-            // A `fn`-typed lambda is a lifted top-level function with no
-            // captured environment, so its value is just that function's
-            // address. The expression ID maps to its declared symbol, which
-            // lets the walker name a symbol it never invented
-            // (willow-0g8j.2.2). A `closure`-typed one builds its environment
-            // object instead (willow-0g8j.2.12).
-            HirExprKind::Lambda { id, captures, .. } => {
-                let name = self.lambda_names[id].clone();
-                let fid = *self
-                    .func_ids
-                    .get_id(&name)
-                    .expect("registered lambda identity");
-                let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                let code = self
-                    .builder
-                    .ins()
-                    .func_addr(super::type_helpers::FN_ADDR_TYPE, fref);
-                if matches!(e.ty, Type::Closure(..)) {
-                    self.emit_closure_env(code, captures)
-                } else {
-                    code
-                }
-            }
-            // A call through a local function value shadows every top-level
-            // name, so it is tested before the direct-call path — the same
-            // order eligibility uses (willow-bv9.1). Both
-            // callable types are called here; they differ in what is loaded
-            // first and in the hidden leading argument (willow-0g8j.2.12).
-            HirExprKind::Call { callee, args }
-                if self.vars.contains_key(callee.unqualified_name())
-                    && matches!(
-                        self.vars[callee.unqualified_name()].ty(),
-                        Type::Fn(..) | Type::Closure(..)
-                    ) =>
-            {
-                let storage = self.vars[callee.unqualified_name()].clone();
-                let (Type::Fn(param_types, ret_type) | Type::Closure(param_types, ret_type)) =
-                    storage.ty()
-                else {
-                    unreachable!("non-callable local call passed eligibility")
-                };
-                let is_closure = matches!(storage.ty(), Type::Closure(..));
-                let value = self.load_var(&storage);
-                // A closure value IS the environment object; the address to
-                // jump to is its word 0. Loading it before the arguments is
-                // deliberate: an argument can allocate, and the object is
-                // rooted through the local while a raw code address would not
-                // need to be.
-                let callee_val = if is_closure {
-                    self.builder.ins().load(
-                        super::type_helpers::FN_ADDR_TYPE,
-                        MemFlagsData::trusted(),
-                        value,
-                        0,
-                    )
-                } else {
-                    value
-                };
-                let (vals, temp_roots) =
-                    self.emit_lir_args_rooted(args, Some(param_types), None, None, None);
-                let vals = if is_closure {
-                    let mut with_env = Vec::with_capacity(vals.len() + 1);
-                    with_env.push(self.load_var(&storage));
-                    with_env.extend(vals);
-                    with_env
-                } else {
-                    vals
-                };
-
-                let mut sig = self.module.make_signature();
-                if is_closure {
-                    sig.params.push(AbiParam::new(types::I64));
-                }
-                for param_type in param_types {
-                    sig.params.push(AbiParam::new(clif_type(param_type)));
-                }
-                if **ret_type != Type::Void {
-                    sig.returns.push(AbiParam::new(clif_type(ret_type)));
-                }
-                let sig_ref = self.builder.import_signature(sig);
-                let pushed = self.emit_callstack_push(&callee.to_string(), e.span);
-                // An arbitrary function value has no statically known target,
-                // so panic handling stays conservatively enabled.
-                let panic_depth = self.emit_pre_willow_call_panic_depth();
-                let call = self.builder.ins().call_indirect(sig_ref, callee_val, &vals);
-                let result = self
-                    .builder
-                    .inst_results(call)
-                    .first()
-                    .copied()
-                    .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0));
-                if pushed {
-                    self.emit_callstack_pop();
-                }
-                self.emit_pop_roots_n(temp_roots);
-                self.gc_root_count -= temp_roots;
-                self.emit_post_willow_call_panic_check(panic_depth);
-                result
-            }
-            // `format(spec, ..)` has no callee symbol — it assembles its
-            // result at the call site through the formatting emitter (willow-0g8j.2.5).
-            // The one `!`-typed expression the walker emits. Eligibility
-            // admits it only in statement or match-arm position, where the
-            // block-terminating unwind below is legal (willow-0g8j.2.5).
-            HirExprKind::Call { callee, args }
-                if matches!(callee.unqualified_name(), "sleep" | "yield") =>
-            {
-                let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    values.push(self.emit_lir_expr(arg));
-                }
-                let runtime = if callee.is_free_named("sleep") {
-                    "willow_runtime_sleep"
-                } else {
-                    "willow_runtime_yield"
-                };
-                self.emit_value_runtime_call(runtime, &values)
-            }
-            HirExprKind::Call { callee, args } if callee.is_free_named("panic") => {
-                self.emit_lir_panic(args, e.span)
-            }
-            HirExprKind::Call { callee, .. } if callee.is_free_named("recover") => {
-                self.emit_recover_call()
-            }
-            HirExprKind::Call { callee, args } if callee.is_free_named("format") => {
-                let operands = format_operands(args).expect("format call vetted by eligibility");
-                let HirExprKind::Str(spec) = &args[0].kind else {
-                    unreachable!("format spec vetted by eligibility")
-                };
-                let spec = spec.clone();
-                self.emit_lir_interpolated(&spec, operands)
-            }
-            HirExprKind::Call { callee, args }
-                if callee.is_free_named("gc_collect")
-                    || callee.is_free_named("gc_minor_collect") =>
-            {
-                debug_assert!(args.is_empty());
-                let runtime = builtin_call_runtime_name(callee.unqualified_name())
-                    .expect("the gc collect builtins are part of the backend ABI");
-                self.emit_runtime_call_with_cleanup(runtime, &[], |_| {});
-                self.builder.ins().iconst(types::I8, 0)
-            }
-            HirExprKind::Call { callee, args }
-                if gc_stat_builtin_runtime_name(callee.unqualified_name()).is_some() =>
-            {
-                debug_assert!(args.is_empty());
-                let runtime = gc_stat_builtin_runtime_name(callee.unqualified_name())
-                    .expect("vetted by the guard on this arm");
-                self.emit_value_runtime_call(runtime, &[])
-            }
-            HirExprKind::Call { callee, args } => {
-                let params = self.fn_param_types(&callee.to_string());
-                let modes = self.func_param_modes.get_id(callee).cloned();
-                let param_debug = self.func_param_debug.get_id(callee).cloned();
-                let has_reference_args = lir_has_reference_args(modes.as_deref(), args);
-                let (vals, temp_roots) = self.emit_lir_args_rooted(
-                    args,
-                    params.as_deref(),
-                    modes.as_deref(),
-                    Some(&callee.to_string()),
-                    param_debug.as_deref(),
-                );
-                let fid = *self.func_ids.get_id(callee).unwrap_or_else(|| {
-                    panic!("eligible LIR direct call `{callee}` has no declared function")
-                });
-                let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                // Debug builds record the call on the panic call-chain stack,
-                // for diagnostic traces (willow-992h).
-                let pushed = self.emit_callstack_push(&callee.to_string(), e.span);
-                let panic_depth = self.emit_pre_user_call_panic_depth(&callee.to_string());
-                let call = self.builder.ins().call(fref, &vals);
-                let results = self.builder.inst_results(call);
-                let result = results
-                    .first()
-                    .copied()
-                    .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0));
-                if pushed {
-                    self.emit_callstack_pop();
-                }
-                if has_reference_args {
-                    self.emit_debug_reference_call_clear();
-                }
-                self.emit_pop_roots_n(temp_roots);
-                self.gc_root_count -= temp_roots;
-                self.emit_post_willow_call_panic_check(panic_depth);
-                if self.cooperative_leaves.contains(&callee.clone()) {
-                    let task_id = self.builder.ins().load(
-                        types::I64,
-                        MemFlagsData::new(),
-                        result,
-                        super::async_frame_slot_offset(super::FRAME_SLOT_TASK_ID),
-                    );
-                    self.emit_set_spawn_site(task_id, e.span.line);
-                }
-                result
-            }
-            HirExprKind::Print { value, newline } => {
-                let val = self.emit_lir_expr(value);
-                let fn_name = match (&value.ty, newline) {
-                    (Type::I64, false) => "willow_print_i64",
-                    (Type::I64, true) => "willow_println_i64",
-                    (Type::F64, false) => "willow_print_f64",
-                    (Type::F64, true) => "willow_println_f64",
-                    (Type::Bool, false) => "willow_print_bool",
-                    (Type::Bool, true) => "willow_println_bool",
-                    (Type::String, false) => "willow_print_string",
-                    (Type::String, true) => "willow_println_string",
-                    _ => unreachable!("unsupported print type passed eligibility"),
-                };
-                self.emit_void_runtime_call(fn_name, &[val]);
-                self.builder.ins().iconst(types::I8, 0)
-            }
-            HirExprKind::Array { elements } => {
-                self.emit_lir_array_literal(elements, &array_element_type(&e.ty))
-            }
-            HirExprKind::Index { array, index } => self.emit_lir_index(array, index),
-            HirExprKind::MethodCall {
-                object,
-                method,
-                args,
-            } => match &object.ty {
-                Type::Array(_) => self.emit_lir_array_method(object, method, args),
-                Type::Generic(..) if lir_collection(&object.ty).is_some() => {
-                    self.emit_lir_collection_method(object, method, args)
-                }
-                Type::Generic(n, _) if self.interface_infos.contains_key(n) => {
-                    self.emit_lir_interface_call(object, method, args, e.span)
-                }
-                Type::Generic(_, type_args)
-                    if builtin_types::unary_arg(&object.ty, B::Channel).is_some() =>
-                {
-                    self.emit_lir_channel_method(object, method, args, &type_args[0])
-                }
-                Type::Generic(_, _)
-                    if builtin_types::resolve(&object.ty)
-                        .is_some_and(|resolved| matches!(resolved.id, B::Task | B::JoinHandle))
-                        && task_handle_method(&object.ty, method, args.len()).is_some() =>
-                {
-                    self.emit_lir_task_handle_method(object, method, args.len())
-                }
-                Type::Generic(..) if blocking_cell(&object.ty).is_some() => {
-                    self.emit_lir_blocking_cell_method(object, method, args)
-                }
-                Type::Generic(..) => {
-                    self.emit_lir_option_result_method(object, method, args, e.span)
-                }
-                Type::Named(_) if atomic_cell(&object.ty).is_some() => {
-                    self.emit_lir_atomic_method(object, method, args)
-                }
-                Type::Named(_) if cancellation_handle(&object.ty).is_some() => {
-                    self.emit_lir_cancellation_method(object, method, args)
-                }
-                Type::Named(n) if self.interface_infos.contains_key(n) => {
-                    self.emit_lir_interface_call(object, method, args, e.span)
-                }
-                Type::I64 | Type::F64 | Type::Bool | Type::String => {
-                    self.emit_lir_scalar_to_string(object, method, args)
-                }
-                _ => self.emit_lir_class_method(object, method, args, &e.ty, e.span),
-            },
-            HirExprKind::New { class, args } => self.emit_lir_new(&class.to_string(), args, e.span),
-            HirExprKind::ObjectLiteral { class, fields } => {
-                self.emit_lir_object_literal(&class.to_string(), fields)
-            }
-            HirExprKind::FieldAccess { object, field } => self.emit_lir_field_access(object, field),
-            HirExprKind::Range { start, end } => self.emit_lir_range_value(start, end),
-            HirExprKind::StaticCall {
-                class,
-                method,
-                args,
-            } => self.emit_lir_static_call(&class.to_string(), method, args, &e.ty, e.span),
-            // A fieldless variant, written qualified or bare (`Color::Red`,
-            // `Red`, the `None` of a non-generic user enum) — or a real static
-            // class property, which loads from its global slot.
-            HirExprKind::StaticField { class, field } => {
-                if self.enum_infos.contains_key(class) {
-                    self.emit_lir_enum_construction(&class.to_string(), field, &[], &e.ty)
-                } else {
-                    self.emit_static_field_read(&class.to_string(), field)
-                }
-            }
-            HirExprKind::Match { scrutinee, arms } => self.emit_lir_match(scrutinee, arms, &e.ty),
-            HirExprKind::Select { cases } => self.emit_lir_select(cases),
-            HirExprKind::TryPropagate { inner } => self.emit_lir_try_propagate(inner),
-            // This statement's suspension already ran: the enclosing statement
-            // parked on it before emitting anything else, so what is left here
-            // is reading back the value the resume produced (willow-0g8j.2.11).
-            HirExprKind::Await { inner } if !lir_suspends_here(e) => {
-                let future = self.emit_lir_expr(inner);
-                self.emit_value_runtime_call(
-                    super::type_helpers::future_await_runtime_name(&e.ty),
-                    &[future],
-                )
-            }
-            HirExprKind::Await { .. } => {
-                let hoisted = self
-                    .lir_hoisted_await
-                    .filter(|(span, _)| *span == e.span)
-                    .map(|(_, value)| value);
-                hoisted.expect("a LIR value-position await reached emission unsplit")
-            }
-            _ => unreachable!("unsupported LIR expression reached emission"),
-        }
-    }
-
-    fn emit_lir_index_assign(&mut self, array: &HirExpr, index: &HirExpr, value: &HirExpr) {
-        // Null and out-of-bounds are checked inside `willow_array_set`.
-        let elem_ty = array_element_type(&array.ty);
-        let arr = self.emit_lir_expr(array);
-        // The index and the value are evaluated after the array
-        // handle is in hand, so the handle needs a root if either
-        // of them can collect.
-        let rooted = may_allocate(index) || self.lir_value_allocates(value, &elem_ty);
-        if rooted {
-            self.emit_push_root(arr);
-        }
-        let idx = self.emit_lir_expr(index);
-        let val = self.emit_lir_store_value(value, &elem_ty);
-        let word = self.coerce_to_i64(val, &elem_ty);
-        self.emit_runtime_call_with_cleanup("willow_array_set", &[arr, idx, word], |this| {
-            if rooted {
-                this.emit_pop_roots_n(1);
-                this.gc_root_count -= 1;
-            }
-        });
-    }
-
-    fn emit_lir_select(&mut self, cases: &[HirSelectCase]) -> cranelift_codegen::ir::Value {
-        let roots_before = self.gc_root_count;
-        let mut channel_slots = Vec::with_capacity(cases.len());
-        let mut deadline_slots = Vec::with_capacity(cases.len());
-        for case in cases {
-            match &case.kind {
-                HirSelectCaseKind::Recv { channel, .. } => {
-                    let channel_value = self.emit_lir_expr(channel);
-                    let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        8,
-                        0,
-                    ));
-                    self.stack_store(channel_value, slot);
-                    self.emit_push_root_slot(slot);
-                    channel_slots.push(Some(slot));
-                    deadline_slots.push(None);
-                }
-                HirSelectCaseKind::Send { channel, value } => {
-                    let channel_value = self.emit_lir_expr(channel);
-                    let channel_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        8,
-                        0,
-                    ));
-                    self.stack_store(channel_value, channel_slot);
-                    self.emit_push_root_slot(channel_slot);
-                    channel_slots.push(Some(channel_slot));
-                    let elem_ty = channel_element_type_ref(&channel.ty).expect("channel vetted");
-                    let value = self.emit_lir_store_value(value, elem_ty);
-                    let value_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        8,
-                        0,
-                    ));
-                    self.stack_store(value, value_slot);
-                    if is_gc_managed(elem_ty, self.enum_infos) {
-                        self.emit_push_root_slot(value_slot);
-                    }
-                    deadline_slots.push(Some(value_slot));
-                }
-                HirSelectCaseKind::Timeout { millis } => {
-                    let duration = self.emit_lir_expr(millis);
-                    let now = self.emit_value_runtime_call("willow_monotonic_millis", &[]);
-                    let deadline = self.builder.ins().iadd(now, duration);
-                    let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        8,
-                        0,
-                    ));
-                    self.stack_store(deadline, slot);
-                    channel_slots.push(None);
-                    deadline_slots.push(Some(slot));
-                }
-                HirSelectCaseKind::Default => {
-                    channel_slots.push(None);
-                    deadline_slots.push(None);
-                }
-                HirSelectCaseKind::Join { task, .. } => {
-                    let task_value = self.emit_lir_expr(task);
-                    let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        8,
-                        0,
-                    ));
-                    self.stack_store(task_value, slot);
-                    self.emit_push_root_slot(slot);
-                    channel_slots.push(None);
-                    deadline_slots.push(Some(slot));
-                }
-            }
-        }
-
-        let probe = self.builder.create_block();
-        let idle = self.builder.create_block();
-        let done = self.builder.create_block();
-        let case_blocks: Vec<_> = cases.iter().map(|_| self.builder.create_block()).collect();
-        let default = cases
-            .iter()
-            .position(|case| matches!(case.kind, HirSelectCaseKind::Default));
-        self.builder.ins().jump(probe, &[]);
-        self.builder.switch_to_block(probe);
-
-        let mut ready_flags = Vec::with_capacity(cases.len());
-        for (index, case) in cases.iter().enumerate() {
-            if matches!(case.kind, HirSelectCaseKind::Default) {
-                ready_flags.push(None);
-                continue;
-            }
-            let ready = match &case.kind {
-                HirSelectCaseKind::Recv { .. } => {
-                    let channel = self
-                        .stack_load(types::I64, channel_slots[index].expect("recv channel slot"));
-                    let raw = self.emit_value_runtime_call("willow_channel_recv_ready", &[channel]);
-                    self.builder.ins().icmp_imm_s(IntCC::NotEqual, raw, 0)
-                }
-                HirSelectCaseKind::Send { .. } => {
-                    let channel = self
-                        .stack_load(types::I64, channel_slots[index].expect("send channel slot"));
-                    let raw = self.emit_value_runtime_call("willow_channel_send_ready", &[channel]);
-                    self.builder.ins().icmp_imm_s(IntCC::NotEqual, raw, 0)
-                }
-                HirSelectCaseKind::Timeout { .. } => {
-                    let deadline = self.stack_load(
-                        types::I64,
-                        deadline_slots[index].expect("timeout deadline slot"),
-                    );
-                    let now = self.emit_value_runtime_call("willow_monotonic_millis", &[]);
-                    self.builder
-                        .ins()
-                        .icmp(IntCC::SignedGreaterThanOrEqual, now, deadline)
-                }
-                HirSelectCaseKind::Join { .. } => {
-                    let task =
-                        self.stack_load(types::I64, deadline_slots[index].expect("join task slot"));
-                    let id = self.builder.ins().load(
-                        types::I64,
-                        MemFlagsData::new(),
-                        task,
-                        async_frame_slot_offset(FRAME_SLOT_TASK_ID),
-                    );
-                    let raw = self.emit_value_runtime_call("willow_frame_await", &[task, id]);
-                    self.builder.ins().icmp_imm_s(IntCC::NotEqual, raw, 0)
-                }
-                _ => unreachable!(),
-            };
-            ready_flags.push(Some(self.builder.ins().uextend(types::I64, ready)));
-        }
-        let mut ready_count = self.builder.ins().iconst(types::I64, 0);
-        for flag in ready_flags.iter().flatten() {
-            ready_count = self.builder.ins().iadd(ready_count, *flag);
-        }
-        let none_ready = self.builder.ins().icmp_imm_s(IntCC::Equal, ready_count, 0);
-        let pick = self.builder.create_block();
-        self.builder.ins().brif(none_ready, idle, &[], pick, &[]);
-
-        self.builder.switch_to_block(pick);
-        self.builder.seal_block(pick);
-        let rotation = self.emit_value_runtime_call("willow_select_rotation", &[]);
-        let chosen_rank = self.builder.ins().urem(rotation, ready_count);
-        let chosen_rank_one = self.builder.ins().iadd_imm_s(chosen_rank, 1);
-        let one = self.builder.ins().iconst(types::I64, 1);
-        let mut cumulative = self.builder.ins().iconst(types::I64, 0);
-        let mut choice_blocks = Vec::new();
-        for (index, flag) in ready_flags.iter().enumerate() {
-            let Some(flag) = flag else { continue };
-            let next_cumulative = self.builder.ins().iadd(cumulative, *flag);
-            let rank_matches =
-                self.builder
-                    .ins()
-                    .icmp(IntCC::Equal, next_cumulative, chosen_rank_one);
-            let ready_now = self
-                .builder
-                .ins()
-                .icmp(IntCC::SignedGreaterThanOrEqual, *flag, one);
-            let chosen = self.builder.ins().band(rank_matches, ready_now);
-            let next = self.builder.create_block();
-            choice_blocks.push(next);
-            self.builder
-                .ins()
-                .brif(chosen, case_blocks[index], &[], next, &[]);
-            self.builder.switch_to_block(next);
-            cumulative = next_cumulative;
-        }
-        self.builder
-            .ins()
-            .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
-
-        self.builder.switch_to_block(idle);
-        self.builder.seal_block(idle);
-        if let Some(index) = default {
-            self.builder.ins().jump(case_blocks[index], &[]);
-        } else {
-            let deadlines: Vec<_> = cases
-                .iter()
-                .enumerate()
-                .filter_map(|(index, case)| {
-                    matches!(case.kind, HirSelectCaseKind::Timeout { .. })
-                        .then(|| deadline_slots[index])
-                        .flatten()
-                })
-                .collect();
-            if deadlines.is_empty() {
-                let completed = self.emit_value_runtime_call("willow_sched_run", &[]);
-                let progressed = self.builder.ins().icmp_imm_s(IntCC::NotEqual, completed, 0);
-                let wait = self.builder.create_block();
-                self.builder.ins().brif(progressed, probe, &[], wait, &[]);
-                self.builder.switch_to_block(wait);
-                self.builder.seal_block(wait);
-                self.emit_void_runtime_call("willow_select_idle_wait", &[]);
-                self.builder.ins().jump(probe, &[]);
-            } else {
-                let mut minimum = None;
-                for slot in deadlines {
-                    let deadline = self.stack_load(types::I64, slot);
-                    minimum = Some(match minimum {
-                        None => deadline,
-                        Some(current) => {
-                            let before =
-                                self.builder
-                                    .ins()
-                                    .icmp(IntCC::SignedLessThan, deadline, current);
-                            self.builder.ins().select(before, deadline, current)
-                        }
-                    });
-                }
-                let minimum = minimum.expect("timeout select has a deadline");
-                let completed =
-                    self.emit_value_runtime_call("willow_sched_run_until_deadline", &[minimum]);
-                let progressed = self.builder.ins().icmp_imm_s(IntCC::NotEqual, completed, 0);
-                let wait = self.builder.create_block();
-                self.builder.ins().brif(progressed, probe, &[], wait, &[]);
-                self.builder.switch_to_block(wait);
-                self.builder.seal_block(wait);
-                self.emit_void_runtime_call("willow_sleep_until_monotonic", &[minimum]);
-                self.builder.ins().jump(probe, &[]);
-            }
-        }
-
-        for (index, case) in cases.iter().enumerate() {
-            self.builder.switch_to_block(case_blocks[index]);
-            self.builder.seal_block(case_blocks[index]);
-            let saved_vars = self.vars.clone();
-            let saved_roots = self.gc_root_count;
-            match &case.kind {
-                HirSelectCaseKind::Recv { binding, channel } => {
-                    let elem_ty = channel_element_type(&channel.ty).expect("channel type vetted");
-                    let channel_value = self
-                        .stack_load(types::I64, channel_slots[index].expect("recv channel slot"));
-                    let runtime =
-                        format!("willow_channel_recv_{}", channel_runtime_suffix(&elem_ty));
-                    let value = self.emit_value_runtime_call(&runtime, &[channel_value]);
-                    if binding != "_" {
-                        let storage = self.create_local_stack_slot(&elem_ty, value);
-                        if let VarStorage::Stack { slot, .. } = &storage
-                            && is_gc_managed(&elem_ty, self.enum_infos)
-                        {
-                            self.emit_push_root_slot(*slot);
-                        }
-                        self.vars.insert(binding.clone(), storage);
-                    }
-                }
-                HirSelectCaseKind::Send { channel, .. } => {
-                    let elem_ty = channel_element_type_ref(&channel.ty).expect("channel vetted");
-                    let channel_value = self
-                        .stack_load(types::I64, channel_slots[index].expect("send channel slot"));
-                    let value = self.stack_load(
-                        clif_type(elem_ty),
-                        deadline_slots[index].expect("send value slot"),
-                    );
-                    let runtime = format!(
-                        "willow_channel_try_send_{}",
-                        channel_runtime_suffix(elem_ty)
-                    );
-                    let sent = self.emit_value_runtime_call(&runtime, &[channel_value, value]);
-                    let body = self.builder.create_block();
-                    let sent = self.builder.ins().icmp_imm_s(IntCC::NotEqual, sent, 0);
-                    self.builder.ins().brif(sent, body, &[], probe, &[]);
-                    self.builder.switch_to_block(body);
-                    self.builder.seal_block(body);
-                }
-                HirSelectCaseKind::Join { binding, task } => {
-                    let task_value =
-                        self.stack_load(types::I64, deadline_slots[index].expect("join task slot"));
-                    let id = self.builder.ins().load(
-                        types::I64,
-                        MemFlagsData::new(),
-                        task_value,
-                        async_frame_slot_offset(FRAME_SLOT_TASK_ID),
-                    );
-                    // `willow_frame_await` reports every terminal state as
-                    // ready, so the terminal status still has to be resolved:
-                    // `await t` turns cancellation into a located panic, while
-                    // `await t.result()` binds `Err(Cancelled)`. Both live in
-                    // `emit_task_terminal_value`, which takes the PAYLOAD type
-                    // and builds the wrapper itself.
-                    let (payload_ty, cancel_aware) =
-                        awaitable_task_type(&task.ty).expect("task type vetted");
-                    let bound_ty = await_output_type(&task.ty).expect("task type vetted");
-                    let value =
-                        self.emit_task_terminal_value(task_value, id, &payload_ty, cancel_aware);
-                    if binding != "_"
-                        && let Some(value) = value
-                    {
-                        let storage = self.create_local_stack_slot(&bound_ty, value);
-                        if let VarStorage::Stack { slot, .. } = &storage
-                            && is_gc_managed(&bound_ty, self.enum_infos)
-                        {
-                            self.emit_push_root_slot(*slot);
-                        }
-                        self.vars.insert(binding.clone(), storage);
-                    }
-                }
-                HirSelectCaseKind::Timeout { .. } | HirSelectCaseKind::Default => {}
-            }
-            self.emit_lir_arm_body(&case.body);
-            if self.terminated {
-                // The case left through a `return` or a `panic`, which popped
-                // what it had to itself; it never reaches the merge, and the
-                // sibling cases start from an unterminated block of their own.
-                self.terminated = false;
-            } else {
-                let case_roots = self.gc_root_count - saved_roots;
-                if case_roots > 0 {
-                    self.emit_pop_roots_n(case_roots);
-                }
-                self.builder.ins().jump(done, &[]);
-            }
-            self.vars = saved_vars;
-            self.gc_root_count = saved_roots;
-        }
-        self.builder.seal_block(probe);
-        for block in choice_blocks {
-            self.builder.seal_block(block);
-        }
-        self.builder.seal_block(done);
-        self.builder.switch_to_block(done);
-        self.terminated = false;
-        let roots = self.gc_root_count - roots_before;
-        if roots > 0 {
-            self.emit_pop_roots_n(roots);
-            self.gc_root_count = roots_before;
-        }
-        self.builder.ins().iconst(types::I8, 0)
-    }
-
-    /// `inner?` — extract the `Ok`/`Some` payload, or early-return the failure
-    /// as this function's own return value (willow-0g8j.2.1).
-    ///
-    /// Mirrors [`FuncGen::emit_try_propagate`] minus the exits eligibility has
-    /// already ruled out, which is why this is a separate emitter rather than a
-    /// shared one: a `defer` combined with `?` is rejected before this point, so
-    /// the failure path here is either the plain synchronous "pop this
-    /// function's roots and return", the cooperative "publish and finish the
-    /// poll", or -- in a `Result<void, E>` main -- the report-and-exit
-    /// (willow-0g8j.2.14).
-    ///
-    /// The failure value is REBUILT rather than forwarded whenever the two sides
-    /// can disagree about representation:
-    ///
-    /// * `Option`: the operand and the return type each pick their own niche
-    ///   (`Option<String>` is a nullable pointer, `Option<i64>` is boxed), so
-    ///   the destination's `None` is constructed from `self.return_type`.
-    /// * `Result` with automatic error conversion (willow-1ow): when the
-    ///   operand's `E1` differs from the function's `E2`, the payload goes
-    ///   through `into()` and is re-wrapped as `Err(e2)`. Eligibility admits the
-    ///   operand only if `Result<T, E1>` is a supported type, which excludes a
-    ///   class in an inheritance hierarchy — so the dispatch inside
-    ///   [`FuncGen::emit_into_conversion`] resolves to a single direct call.
-    ///
-    /// Only when `E1 == E2` is the operand pointer returned unchanged: both
-    /// sides are then the same boxed `[tag | payload]` object.
-    /// Run the pending `defer`s of every scope a synchronous `?` is leaving,
-    /// keeping the propagated value reachable across cleanup that may allocate.
-    fn emit_sync_try_defer_flush(&mut self, return_ptr: cranelift_codegen::ir::Value) {
-        if self.defer_stack.iter().all(|frame| frame.is_empty()) {
-            return;
-        }
-        let rooted = is_gc_managed(&self.return_type, self.enum_infos);
-        if rooted {
-            self.emit_push_root(return_ptr);
-        }
-        self.emit_flush_defers_from(0);
-        if self.terminated {
-            return;
-        }
-        if rooted {
-            self.emit_pop_roots_n(1);
-            self.gc_root_count -= 1;
-        }
-    }
-
-    fn emit_lir_try_propagate(&mut self, inner: &HirExpr) -> cranelift_codegen::ir::Value {
-        let operand_ty = inner.ty.clone();
-        let result_ptr = self.emit_lir_expr(inner);
-        let payload_ty = try_propagate_payload_type(&operand_ty);
-        // `Some(x)` IS `x` and `None` is 0 under the niche, so both the test and
-        // the payload read below become pointer arithmetic instead of loads.
-        let niche = option_inner(&operand_ty).is_some()
-            && option_repr(&operand_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer);
-        let is_option = option_inner(&operand_ty).is_some();
-        let convert: Option<(TypeId, Type)> = match (
-            &result_err_type(&operand_ty),
-            &result_err_type(&self.return_type),
-        ) {
-            (Some(Type::Named(e1)), Some(e2))
-                if Type::Named(e1.clone()) != *e2 && *e2 != Type::Void =>
-            {
-                Some((e1.clone(), e2.clone()))
-            }
-            _ => None,
-        };
-
-        let is_ok = if niche {
-            self.builder
-                .ins()
-                .icmp_imm_u(IntCC::NotEqual, result_ptr, 0)
-        } else {
-            // Boxed `Result` and boxed `Option` both use tag 0 for Ok/Some.
-            let tag = self
-                .builder
-                .ins()
-                .load(types::I64, MemFlagsData::new(), result_ptr, 0i32);
-            let ok_tag = self.builder.ins().iconst(types::I64, 0);
-            self.builder.ins().icmp(IntCC::Equal, tag, ok_tag)
-        };
-
-        let ok_block = self.builder.create_block();
-        let err_block = self.builder.create_block();
-        // The success arm is an independent predecessor: it continues with the
-        // root depth from BEFORE the branch, not the one the failure arm left.
-        let branch_root_depth = self.gc_root_count;
-        self.builder
-            .ins()
-            .brif(is_ok, ok_block, &[], err_block, &[]);
-
-        // ── Failure: build this function's return value and leave ────────────
-        self.builder.switch_to_block(err_block);
-        self.builder.seal_block(err_block);
-        let return_ptr = if is_option {
-            let return_inner = option_inner(&self.return_type)
-                .cloned()
-                .expect("`?` on an Option is only checked inside an Option-returning function");
-            self.emit_alloc_option_none(&return_inner)
-        } else if let Some((e1_name, e2_ty)) = &convert {
-            let e1_payload =
-                self.builder
-                    .ins()
-                    .load(types::I64, MemFlagsData::new(), result_ptr, 8i32);
-            let e1_is_gc = is_gc_managed(&Type::Named(e1_name.clone()), self.enum_infos);
-            // `into` and the re-wrap both allocate, so a GC-managed payload has
-            // to be reachable across them.
-            if e1_is_gc {
-                self.emit_push_root(e1_payload);
-            }
-            let e2_val = self.emit_into_conversion(e1_payload, &e1_name.to_string());
-            if e1_is_gc {
-                self.emit_pop_roots_n(1);
-                self.gc_root_count -= 1;
-            }
-            self.emit_alloc_enum_variant(1, e2_ty, e2_val)
-        } else {
-            result_ptr
-        };
-        if let Some(frame) = self.coop_frame {
-            // Publish the propagated Option/Result before cleanup. The frame
-            // slot is a GC root while runtime-registered LIR defers allocate.
-            if let Some(offset) = self.coop_result_offset {
-                let return_type = self.return_type.clone();
-                self.emit_gc_heap_store(
-                    frame,
-                    offset,
-                    return_ptr,
-                    &return_type,
-                    GcStoreDestination::AsyncFrameSlot,
-                );
-            }
-            self.emit_flush_defers_from(0);
-            if !self.terminated {
-                self.emit_coop_unwind_poll_roots();
-                let ready = self.builder.ins().iconst(types::I32, 1);
-                self.builder.ins().return_(&[ready]);
-            }
-        } else if self.main_result_err_ty.is_some() {
-            // `?` leaving a `Result<void, E>` main does not return the failure:
-            // `willow_user_main` is void, so the Err is reported and the process
-            // exits non-zero (willow-exg, willow-0g8j.2.14). Roots are popped
-            // inside the exit.
-            self.emit_sync_try_defer_flush(return_ptr);
-            if !self.terminated {
-                self.emit_main_result_exit(return_ptr);
-            }
-        } else {
-            // Same epilogue as `Terminator::Return`: the roots are live until
-            // the value is built (it may allocate), and only then does the
-            // synchronous frame go. A `?` is an exit like any other, so the
-            // `defer` scopes it leaves run first (willow-0g8j.2.15).
-            self.emit_sync_try_defer_flush(return_ptr);
-            if !self.terminated {
-                self.emit_pop_roots_n(self.gc_root_count);
-                self.builder.ins().return_(&[return_ptr]);
-            }
-        }
-
-        // ── Success: the payload becomes this expression's value ─────────────
-        self.gc_root_count = branch_root_depth;
-        self.terminated = false;
-        self.builder.switch_to_block(ok_block);
-        self.builder.seal_block(ok_block);
-        let payload = if payload_ty == Type::Void {
-            // `Result<void, E>`: the `Ok` object is the tag word alone, so
-            // there is nothing at word 1 to read. Statement position discards
-            // this value; it exists only because every expression emitter
-            // returns one.
-            self.builder.ins().iconst(types::I64, 0)
-        } else if niche {
-            result_ptr
-        } else {
-            self.builder
-                .ins()
-                .load(types::I64, MemFlagsData::new(), result_ptr, 8i32)
-        };
-        self.coerce_i64_to(payload, &payload_ty)
-    }
-
-    /// Build an enum value: a bare tag when NO variant of the enum carries a
-    /// payload, the `Option` pointer niche when the instance uses it, and a
-    /// `[tag | payload…]` GC object otherwise. Mirrors
-    /// [`FuncGen::emit_enum_variant_alloc`] case for case (willow-0g8j.2.1).
-    ///
-    /// `enum_ty` is the type of the expression BEING BUILT, not the bare enum
-    /// name: it is what instantiates a generic enum's payloads and what
-    /// [`option_repr`] reads, so passing anything else would pick a different
-    /// representation than the value's runtime ABI requires.
-    fn emit_lir_enum_construction(
-        &mut self,
-        enum_name: &str,
-        variant: &str,
-        args: &[HirExpr],
-        enum_ty: &Type,
-    ) -> cranelift_codegen::ir::Value {
-        let tag = self.enum_variant_tag(enum_name, variant);
-        // `Option<T>` over a non-nullable GC payload: `Some(x)` IS `x` and
-        // `None` is the null word. No tag, and `None` allocates nothing.
-        if option_repr(enum_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
-            return match tag {
-                0 => {
-                    let arg = args
-                        .first()
-                        .expect("eligibility admits `Option::Some` only with its one payload");
-                    // The niche stores the payload directly, so a class value
-                    // going into an interface-typed `Option` must still be
-                    // boxed here — the same coercion the boxed layout does.
-                    let stored_ty = option_inner(enum_ty)
-                        .cloned()
-                        .unwrap_or_else(|| arg.ty.clone());
-                    self.emit_lir_store_value(arg, &stored_ty)
-                }
-                _ => self.builder.ins().iconst(types::I64, 0),
-            };
-        }
-        if !self.enum_is_gc_object_type(enum_name) {
-            return self.builder.ins().iconst(types::I64, tag);
-        }
-
-        let mut payload_types = self.resolve_variant_payload_types(enum_name, variant, enum_ty);
-        // `Result<void, E>::Ok()` carries a substituted `void` payload and no
-        // argument; eligibility normalises that list away, so emission must
-        // too or the two would describe different objects.
-        normalize_void_payloads(&mut payload_types);
-        let slot_kinds = payload_types
-            .iter()
-            .map(|ty| {
-                if is_gc_managed(ty, self.enum_infos) {
-                    willow_abi::SlotKind::GcRef
-                } else {
-                    willow_abi::SlotKind::Word
-                }
-            })
-            .collect::<Vec<_>>();
-        let layout = willow_abi::EnumVariantLayout::new(tag as u32, &slot_kinds);
-        let pointer_bytes = self.module.target_config().pointer_type().bytes();
-        let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
-            GcObjectKind::Enum,
-            i64::from(layout.payload_bytes(pointer_bytes)),
-            0,
-            layout.gc_ref_mask(),
-        ));
-        let tag_val = self.builder.ins().iconst(types::I64, tag);
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), tag_val, ptr, 0i32);
-        // Root the half-built enum across payload evaluation: an argument can
-        // allocate and collect, and the object is otherwise only in an SSA
-        // register. The payload is alloc_zeroed, so tracing it before every
-        // slot is stored is safe — an unstored ref slot reads as null.
-        let needs_root = !args.is_empty();
-        if needs_root {
-            self.emit_push_root(ptr);
-        }
-        for (i, (arg, stored_ty)) in args.iter().zip(payload_types.iter()).enumerate() {
-            let offset = layout.payload_byte_offset(pointer_bytes) as i32
-                + (i as i32 * pointer_bytes as i32);
-            // The declared payload is the STORAGE type: a class argument going
-            // into an interface-typed slot must be boxed, not stored raw.
-            let val = self.emit_lir_store_value(arg, stored_ty);
-            let val_i64 = if matches!(stored_ty, Type::F64) {
-                self.builder
-                    .ins()
-                    .bitcast(types::I64, MemFlagsData::new(), val)
-            } else {
-                val
-            };
-            self.emit_gc_heap_store(
-                ptr,
-                offset,
-                val_i64,
-                stored_ty,
-                GcStoreDestination::EnumPayload,
-            );
-        }
-        if needs_root {
-            self.emit_pop_roots_n(1);
-            self.gc_root_count -= 1;
-        }
-        ptr
-    }
-
-    /// `panic(...)`: assemble the message, then hand off to the shared unwind
-    /// using the common panic protocol.
-    ///
-    /// The returned value is the unreachable placeholder every `panic` yields;
-    /// `self.terminated` is set, and the caller must not emit anything more
-    /// into this block.
-    fn emit_lir_panic(
-        &mut self,
-        args: &[HirExpr],
-        span: crate::diagnostics::Span,
-    ) -> cranelift_codegen::ir::Value {
-        let msg = match args {
-            [] => self.emit_string_literal("explicit panic"),
-            [message] => self.emit_lir_expr(message),
-            [_spec, operands @ ..] => {
-                let HirExprKind::Str(spec) = &args[0].kind else {
-                    unreachable!("panic spec vetted by eligibility")
-                };
-                let spec = spec.clone();
-                self.emit_lir_interpolated(&spec, operands)
-            }
-        };
-        self.emit_panic_with_message(msg, span)
-    }
-
-    fn emit_lir_match(
-        &mut self,
-        scrutinee: &HirExpr,
-        arms: &[HirMatchArm],
-        result_ty: &Type,
-    ) -> cranelift_codegen::ir::Value {
-        let scrutinee_val = self.emit_lir_expr(scrutinee);
-        // A GC enum scrutinee owns the payloads the arm bindings alias, and an
-        // arm body may allocate before it reads one. Keep it rooted across
-        // every arm.
-        let rooted_scrutinee = is_gc_managed(&scrutinee.ty, self.enum_infos);
-        if rooted_scrutinee {
-            self.emit_push_root(scrutinee_val);
-        }
-
-        let result_clif = clif_type(result_ty);
-        let result_var = self.builder.declare_var(result_clif);
-        // Seed the result so a scrutinee matching no arm still leaves the
-        // variable defined on the path into the merge block.
-        let zero = match result_clif {
-            types::F64 => self.builder.ins().f64const(0.0),
-            ty => self.builder.ins().iconst(ty, 0),
-        };
-        self.builder.def_var(result_var, zero);
-
-        let merge_block = self.builder.create_block();
-        // A `match` whose every arm leaves the function (or unwinds) is typed
-        // `!` and its merge block is unreachable — there is no reaching
-        // definition of the result to read there, so it must not be read.
-        let mut merge_reachable = false;
-        for (i, arm) in arms.iter().enumerate() {
-            let is_last = i + 1 == arms.len();
-            let always_matches = matches!(
-                arm.pattern,
-                HirPattern::Wildcard | HirPattern::Binding { .. }
-            );
-            let arm_block = self.builder.create_block();
-            let next_block = if always_matches || is_last {
-                None
-            } else {
-                Some(self.builder.create_block())
-            };
-
-            if always_matches {
-                self.builder.ins().jump(arm_block, &[]);
-            } else {
-                let cond = self.emit_lir_pattern_check(scrutinee_val, &scrutinee.ty, &arm.pattern);
-                let fallthrough = next_block.unwrap_or(merge_block);
-                merge_reachable |= fallthrough == merge_block;
-                self.builder
-                    .ins()
-                    .brif(cond, arm_block, &[], fallthrough, &[]);
-            }
-
-            self.builder.switch_to_block(arm_block);
-            self.builder.seal_block(arm_block);
-
-            // The arm's bracket (willow-0g8j.2.13). `vars` is snapshotted
-            // unconditionally — not only when the pattern binds — because an
-            // arm body may declare a local of its own, and the flat map has no
-            // other way to scope it. The root depth is snapshotted with it: a
-            // GC-managed arm-local pushes a rooted slot that must be popped
-            // before the merge, and the compile-time count restored for the
-            // sibling arms that share the same starting depth.
-            let vars_before = self.vars.clone();
-            let roots_before = self.gc_root_count;
-            self.bind_lir_pattern(scrutinee_val, &scrutinee.ty, &arm.pattern);
-            match self.emit_lir_arm_body(&arm.body) {
-                // No coercion: eligibility required `assignable_repr` between
-                // the match's type and every arm's, exactly as it does for a
-                // ternary, so an arm's value already has the result variable's
-                // representation.
-                Some(arm_val) => {
-                    // A `match` in statement position has no merge value, and
-                    // an arm of one may still end in an expression that has one
-                    // — `Some(n) => { helper(n); }` where `helper` returns an
-                    // `i64`. Handing that word to the result variable, which a
-                    // Void match declares `I8`, is a Cranelift type error and
-                    // aborts the compiler, so drop it (willow-vdfj).
-                    if let Some(arm_val) = arm_val
-                        && *result_ty != Type::Void
-                    {
-                        self.builder.def_var(result_var, arm_val);
-                    }
-                    // Before the jump: the merge block continues at the depth
-                    // the match started from.
-                    self.emit_pop_roots_n(self.gc_root_count - roots_before);
-                    self.builder.ins().jump(merge_block, &[]);
-                    merge_reachable = true;
-                }
-                // `_ => panic("...")`, or an arm that returns: the arm's own
-                // block is already terminated, so it neither defines the result
-                // nor reaches the merge. A `return` popped the full runtime
-                // depth itself; a `panic` traps without unwinding this stack.
-                None => self.terminated = false,
-            }
-            self.vars = vars_before;
-            self.gc_root_count = roots_before;
-
-            if let Some(next) = next_block {
-                self.builder.switch_to_block(next);
-                self.builder.seal_block(next);
-            }
-            if always_matches {
-                break;
-            }
-        }
-
-        self.builder.switch_to_block(merge_block);
-        self.builder.seal_block(merge_block);
-        // The root pops happen on both paths so the compile-time root count
-        // stays balanced for whatever follows; on the unreachable path they are
-        // dead code, like the block that holds them.
-        let result = if merge_reachable && result_ty != &Type::Void {
-            self.builder.use_var(result_var)
-        } else {
-            match result_clif {
-                types::F64 => self.builder.ins().f64const(0.0),
-                ty => self.builder.ins().iconst(ty, 0),
-            }
-        };
-        if rooted_scrutinee {
-            self.emit_pop_roots_n(1);
-            self.gc_root_count -= 1;
-        }
-        if !merge_reachable {
-            // Nothing branches here, but the block still needs a terminator,
-            // and the caller must be told the match diverged so it stops
-            // emitting into it.
-            self.builder
-                .ins()
-                .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
-            self.terminated = true;
-        }
-        result
-    }
-
-    /// Emit the statements of a bracketed body — a `match` arm, or a branch of
-    /// an `if` inside one. Returns the value it hands to the merge block, or
-    /// `None` when the body left: a `return`, a `panic(...)`, a nested
-    /// all-diverging `match`, or an `if` both of whose branches do. In that case
-    /// it terminated its own Cranelift block and the caller must not emit into
-    /// it.
-    fn emit_lir_arm_body(
-        &mut self,
-        body: &[HirStmt],
-    ) -> Option<Option<cranelift_codegen::ir::Value>> {
-        let mut value = None;
-        for stmt in body {
-            match stmt {
-                HirStmt::Expr(e) => {
-                    self.fault_site_span = Some(e.span);
-                    value = Some(self.emit_lir_expr(e));
-                }
-                HirStmt::Return {
-                    value: returned, ..
-                } => {
-                    let return_type = self.return_type.clone();
-                    self.emit_lir_return(returned.as_ref(), &return_type);
-                }
-                // A binding form is an effect, so it clears the pending arm
-                // value: an arm ending in one hands nothing to the merge block
-                // and the seeded result stands (willow-0g8j.2.13).
-                _ => {
-                    self.emit_lir_body_stmt(stmt);
-                    value = None;
-                }
-            }
-            if self.terminated {
-                return None;
-            }
-        }
-        Some(value)
-    }
-
-    /// Emit one statement of a body the walker runs for its effect — a `match`
-    /// arm, a `select` case, or a `defer` block (willow-0g8j.2.13). The
-    /// value-producing tail of an arm is not routed here; its own emitter keeps
-    /// that value.
-    ///
-    /// A GC-managed `let` gets a rooted slot HERE rather than from
-    /// [`FuncGen::bind_lir_gc_locals`], which only sees function-level
-    /// `LirInst::Let`s. The caller is what makes that safe:
-    /// [`BodyScope::Bracketed`] is admitted only where the emitter brackets the
-    /// root depth, so the entry this pushes is popped when the body ends.
-    fn emit_lir_body_stmt(&mut self, stmt: &HirStmt) {
-        match stmt {
-            HirStmt::Let {
-                name, ty, value, ..
-            } => {
-                self.fault_site_span = Some(value.span);
-                let val = self.emit_lir_store_value(value, ty);
-                let storage = self.create_local_stack_slot(ty, val);
-                if let VarStorage::Stack { slot, .. } = &storage
-                    && is_gc_managed(ty, self.enum_infos)
-                {
-                    self.emit_push_root_slot(*slot);
-                }
-                self.vars.insert(name.clone(), storage);
-            }
-            HirStmt::Assign { name, value, .. } => {
-                self.fault_site_span = Some(value.span);
-                // The declared slot type — not the value's — decides whether
-                // this store boxes, exactly as `LirInst::Assign` does.
-                let storage = self
-                    .vars
-                    .get(name.as_str())
-                    .cloned()
-                    .expect("eligibility proved the assignment target is in scope");
-                let target = storage.ty().clone();
-                let val = self.emit_lir_store_value(value, &target);
-                self.store_var(&storage, val);
-            }
-            HirStmt::IndexAssign {
-                array,
-                index,
-                value,
-                ..
-            } => {
-                self.fault_site_span = Some(value.span);
-                self.emit_lir_index_assign(array, index, value);
-            }
-            HirStmt::FieldAssign {
-                object,
-                field,
-                value,
-                ..
-            } => {
-                self.fault_site_span = Some(value.span);
-                self.emit_lir_field_assign(object, field, value);
-            }
-            HirStmt::StaticFieldAssign {
-                class,
-                field,
-                value,
-                ..
-            } => {
-                self.fault_site_span = Some(value.span);
-                self.emit_lir_static_field_assign(&class.to_string(), field, value);
-            }
-            HirStmt::If {
-                cond,
-                then_branch,
-                else_branch,
-                ..
-            } => self.emit_lir_body_if(cond, then_branch, else_branch.as_deref()),
-            HirStmt::While { cond, body, .. } => self.emit_lir_body_while(cond, body),
-            HirStmt::For {
-                name,
-                iterable,
-                body,
-                span,
-            } => self.emit_lir_body_for(name, iterable, body, *span),
-            _ => unreachable!("unsupported body statement reached emission"),
-        }
-    }
-
-    /// Emit an `if` inside a body the walker keeps as an HIR island
-    /// (willow-0g8j.2.16). A function-level `if` never reaches here: LIR lowers
-    /// that one into blocks of its own, and this builds the equivalent Cranelift
-    /// blocks for the ones an arm body still holds in HIR shape.
-    fn emit_lir_body_if(
-        &mut self,
-        cond: &HirExpr,
-        then_branch: &[HirStmt],
-        else_branch: Option<&[HirStmt]>,
-    ) {
-        self.fault_site_span = Some(cond.span);
-        let cond_val = self.emit_lir_expr(cond);
-        let then_block = self.builder.create_block();
-        let else_block = self.builder.create_block();
-        let join_block = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(cond_val, then_block, &[], else_block, &[]);
-
-        // Each branch is bracketed exactly as a `match` arm is: a `let` in it is
-        // scoped to the branch, and a GC-managed one's rooted slot is popped
-        // before the join so the sibling branch and the join agree on the depth.
-        let vars_before = self.vars.clone();
-        let roots_before = self.gc_root_count;
-        let mut join_reachable = false;
-        for (block, body) in [(then_block, Some(then_branch)), (else_block, else_branch)] {
-            self.builder.switch_to_block(block);
-            self.builder.seal_block(block);
-            if let Some(body) = body {
-                self.emit_lir_arm_body(body);
-            }
-            if self.terminated {
-                // The branch left through a `return` or a `panic`, which popped
-                // what it had to itself.
-                self.terminated = false;
-            } else {
-                self.emit_pop_roots_n(self.gc_root_count - roots_before);
-                self.builder.ins().jump(join_block, &[]);
-                join_reachable = true;
-            }
-            self.vars.clone_from(&vars_before);
-            self.gc_root_count = roots_before;
-        }
-
-        self.builder.switch_to_block(join_block);
-        self.builder.seal_block(join_block);
-        if !join_reachable {
-            // Both branches left. Nothing jumps here, but the block still needs
-            // a terminator, and the caller has to be told to stop emitting into
-            // it — the same ending [`FuncGen::emit_lir_match`] gives a `match`
-            // whose merge block no arm reaches.
-            self.builder
-                .ins()
-                .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
-            self.terminated = true;
-        }
-    }
-
-    /// Emit a `while` inside a body the walker keeps as an HIR island
-    /// (willow-0g8j.3). A function-level loop is blocks of the LIR graph; the
-    /// one a `defer` block or a `match` arm still holds in HIR shape is built
-    /// here, the way [`FuncGen::emit_lir_body_if`] builds an `if`.
-    ///
-    /// `break` and `continue` are not admitted into these bodies, so the loop
-    /// has exactly two edges out of its header and needs no loop context of its
-    /// own.
-    fn emit_lir_body_while(&mut self, cond: &HirExpr, body: &[HirStmt]) {
-        let header = self.builder.create_block();
-        let body_block = self.builder.create_block();
-        let exit_block = self.builder.create_block();
-        self.builder.ins().jump(header, &[]);
-
-        // The header stays UNSEALED until the back edge is emitted: it is the
-        // one block here with a predecessor that does not exist yet.
-        self.builder.switch_to_block(header);
-        self.emit_sync_safepoint();
-        self.fault_site_span = Some(cond.span);
-        let cond_val = self.emit_lir_expr(cond);
-        self.builder
-            .ins()
-            .brif(cond_val, body_block, &[], exit_block, &[]);
-
-        self.builder.switch_to_block(body_block);
-        self.builder.seal_block(body_block);
-        // The iteration's bracket, the same one each branch of an island `if`
-        // gets: a `let` in the body is scoped to one iteration, and its rooted
-        // slot is popped before the back edge so every iteration re-enters the
-        // header at the depth it was emitted for.
-        let vars_before = self.vars.clone();
-        let roots_before = self.gc_root_count;
-        self.emit_lir_arm_body(body);
-        if self.terminated {
-            // The body left through a `return` or a `panic`, which popped what
-            // it had to itself; there is no back edge.
-            self.terminated = false;
-        } else {
-            self.emit_pop_roots_n(self.gc_root_count - roots_before);
-            self.builder.ins().jump(header, &[]);
-        }
-        self.vars = vars_before;
-        self.gc_root_count = roots_before;
-        self.builder.seal_block(header);
-
-        self.builder.switch_to_block(exit_block);
-        self.builder.seal_block(exit_block);
-    }
-
-    /// Emit a `for` inside a deferred/body island. The full LIR lowerer owns
-    /// ordinary function-level loops; this mirrors its array/range desugaring
-    /// for the HIR bodies deliberately retained by `LirDeferBody::Block`.
-    fn emit_lir_body_for(&mut self, name: &str, iterable: &HirExpr, body: &[HirStmt], span: Span) {
-        let vars_before = self.vars.clone();
-        let roots_before = self.gc_root_count;
-        // `$` cannot occur in a source identifier, and the current variable
-        // count separates nested loops while allowing sequential loops to
-        // reuse a name after their brackets restore `vars`.
-        let synth = format!("$lir_for_{}_{}_{}", span.line, span.col, self.vars.len());
-        let iterable_name = format!("{synth}_iter");
-        let index_name = format!("{synth}_index");
-
-        self.fault_site_span = Some(iterable.span);
-        let iterable_value = self.emit_lir_expr(iterable);
-        let iterable_storage = self.create_local_stack_slot(&iterable.ty, iterable_value);
-        if let VarStorage::Stack { slot, .. } = &iterable_storage
-            && is_gc_managed(&iterable.ty, self.enum_infos)
-        {
-            self.emit_push_root_slot(*slot);
-        }
-        self.vars
-            .insert(iterable_name.clone(), iterable_storage.clone());
-
-        let iterable_var = HirExpr {
-            kind: HirExprKind::Var(iterable_name),
-            ty: iterable.ty.clone(),
-            span,
-        };
-        let (initial_index, fixed_end, element_ty) = match &iterable.ty {
-            Type::Array(element) => (
-                self.builder.ins().iconst(types::I64, 0),
-                None,
-                (**element).clone(),
-            ),
-            ty if range_i64(ty) => {
-                let start = self.emit_lir_field_access(&iterable_var, "start");
-                let end = self.emit_lir_field_access(&iterable_var, "end");
-                (start, Some(end), Type::I64)
-            }
-            _ => unreachable!("for iterable vetted by island eligibility"),
-        };
-        let index_storage = self.create_local_stack_slot(&Type::I64, initial_index);
-        self.vars.insert(index_name.clone(), index_storage.clone());
-        let index_var = HirExpr {
-            kind: HirExprKind::Var(index_name),
-            ty: Type::I64,
-            span,
-        };
-
-        let header = self.builder.create_block();
-        let body_block = self.builder.create_block();
-        let exit_block = self.builder.create_block();
-        self.builder.ins().jump(header, &[]);
-
-        self.builder.switch_to_block(header);
-        self.emit_sync_safepoint();
-        let index = self.load_var(&index_storage);
-        let end = match fixed_end {
-            Some(end) => end,
-            None => {
-                let array = self.load_var(&iterable_storage);
-                self.emit_value_runtime_call("willow_array_len", &[array])
-            }
-        };
-        let keep_going = self.builder.ins().icmp(IntCC::SignedLessThan, index, end);
-        self.builder
-            .ins()
-            .brif(keep_going, body_block, &[], exit_block, &[]);
-
-        self.builder.switch_to_block(body_block);
-        self.builder.seal_block(body_block);
-        let iteration_vars = self.vars.clone();
-        let iteration_roots = self.gc_root_count;
-        let element = match &iterable.ty {
-            Type::Array(_) => self.emit_lir_index(&iterable_var, &index_var),
-            _ => self.load_var(&index_storage),
-        };
-        let element_storage = self.create_local_stack_slot(&element_ty, element);
-        if let VarStorage::Stack { slot, .. } = &element_storage
-            && is_gc_managed(&element_ty, self.enum_infos)
-        {
-            self.emit_push_root_slot(*slot);
-        }
-        self.vars.insert(name.to_string(), element_storage);
-        self.emit_lir_arm_body(body);
-        if self.terminated {
-            // The terminating path handled its own roots. The header's false
-            // edge still reaches the exit at the construct depth.
-            self.terminated = false;
-        } else {
-            self.emit_pop_roots_n(self.gc_root_count - iteration_roots);
-            let current = self.load_var(&index_storage);
-            let one = self.builder.ins().iconst(types::I64, 1);
-            let next = self.builder.ins().iadd(current, one);
-            self.store_var(&index_storage, next);
-            self.builder.ins().jump(header, &[]);
-        }
-        self.vars = iteration_vars;
-        self.gc_root_count = iteration_roots;
-        self.builder.seal_block(header);
-
-        self.builder.switch_to_block(exit_block);
-        self.builder.seal_block(exit_block);
-        self.emit_pop_roots_n(self.gc_root_count - roots_before);
-        self.vars = vars_before;
-        self.gc_root_count = roots_before;
-    }
-
-    /// The `i8` "does this arm apply?" test. Mirrors
-    /// [`FuncGen::emit_pattern_check`] without `ClassDowncast`, which
-    /// eligibility does not admit.
-    fn emit_lir_pattern_check(
+    fn emit_flat_pattern_check(
         &mut self,
         scrutinee: cranelift_codegen::ir::Value,
         scrutinee_ty: &Type,
-        pattern: &HirPattern,
+        pattern: &crate::ir::lowered::LirPattern,
     ) -> cranelift_codegen::ir::Value {
         match pattern {
-            HirPattern::Wildcard | HirPattern::Binding { .. } => {
+            crate::ir::lowered::LirPattern::Wildcard
+            | crate::ir::lowered::LirPattern::Binding { .. } => {
                 self.builder.ins().iconst(types::I8, 1)
             }
-            HirPattern::LiteralBool(b) => {
+            crate::ir::lowered::LirPattern::LiteralBool(b) => {
                 let expected = self.builder.ins().iconst(types::I8, i64::from(*b));
                 self.builder.ins().icmp(IntCC::Equal, scrutinee, expected)
             }
-            HirPattern::LiteralInt(n) => {
+            crate::ir::lowered::LirPattern::LiteralInt(n) => {
                 let expected = self.builder.ins().iconst(types::I64, *n);
                 self.builder.ins().icmp(IntCC::Equal, scrutinee, expected)
             }
-            HirPattern::EnumVariant { enum_name, variant }
-            | HirPattern::EnumVariantTuple {
+            crate::ir::lowered::LirPattern::EnumVariant { enum_name, variant }
+            | crate::ir::lowered::LirPattern::EnumVariantTuple {
                 enum_name, variant, ..
             } => {
                 let tag = self.enum_variant_tag(&enum_name.to_string(), variant);
@@ -8668,7 +6734,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // class's. Exactly [`FuncGen::emit_pattern_check`]'s
             // `Pattern::ClassDowncast`, including its exactness: a subclass
             // instance does NOT match its base's arm on either backend.
-            HirPattern::ClassDowncast { class_name, .. } => {
+            crate::ir::lowered::LirPattern::ClassDowncast { class_name, .. } => {
                 let type_id = self.class_type_ids.get(class_name).copied().unwrap_or_else(|| {
                     panic!(
                         "compiler invariant violated: checked downcast pattern class `{class_name}` has no type id"
@@ -8685,71 +6751,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
-    /// Bring a pattern's bindings into scope for its arm body. The caller
-    /// restores `vars` when the arm ends — unconditionally, because an arm body
-    /// may declare a local whether or not the pattern binds anything
-    /// (willow-0g8j.2.13).
-    ///
-    /// A GC-managed binding gets a ROOTED STACK SLOT. An address-taken scalar
-    /// gets an unrooted slot at the binding; anything else keeps a plain
-    /// Cranelift variable (willow-0g8j.12).
-    ///
-    /// Rooting the scrutinee is not enough (willow-10zt). The minor collector
-    /// promotes a DIRECT root in place, which is what makes an SSA alias of one
-    /// safe, but it EVACUATES a young object it reaches only through a heap
-    /// slot: the object is copied to an old region, the owning slot is fixed up,
-    /// and the source is reclaimed. An enum payload and the object inside an
-    /// interface box are exactly that — the scrutinee stays put while its child
-    /// moves — so a binding that copied the payload address would be left
-    /// naming freed memory after the arm's first allocation. A rooted binding is
-    /// a direct root of its own, so the collector pins it too.
-    ///
-    /// Rooting a non-GC binding would be wrong, not merely wasteful: the
-    /// collector would trace the scalar word as an object pointer.
-    ///
-    /// [`FuncGen::emit_lir_match`] pops what this pushes when it closes the
-    /// arm's bracket.
-    fn bind_lir_pattern(
+    fn flat_pattern_binding_values(
         &mut self,
         scrutinee: cranelift_codegen::ir::Value,
         scrutinee_ty: &Type,
-        pattern: &HirPattern,
-    ) {
-        for (name, ty, val) in self.lir_pattern_binding_values(scrutinee, scrutinee_ty, pattern) {
-            let rooted = is_gc_managed(&ty, self.enum_infos);
-            let storage = if rooted || self.address_taken.contains(name.as_str()) {
-                let storage = self.create_local_stack_slot(&ty, val);
-                if rooted && let VarStorage::Stack { slot, .. } = &storage {
-                    self.emit_push_root_slot(*slot);
-                }
-                storage
-            } else {
-                let var = self.builder.declare_var(clif_type(&ty));
-                self.builder.def_var(var, val);
-                VarStorage::Value { var, ty }
-            };
-            self.vars.insert(name, storage);
-        }
-    }
-
-    /// Destructure `scrutinee` according to `pattern`: one `(name, type, value)`
-    /// per binding, in the order [`HirPattern`] lists them.
-    ///
-    /// Split out from [`FuncGen::bind_lir_pattern`] because a `match` whose arm
-    /// suspends destructures into LIR LOCALS instead — the binding has to live
-    /// in the async frame to survive the poll return (willow-0g8j.2.11.1) — and
-    /// the two paths must read exactly the same words.
-    fn lir_pattern_binding_values(
-        &mut self,
-        scrutinee: cranelift_codegen::ir::Value,
-        scrutinee_ty: &Type,
-        pattern: &HirPattern,
+        pattern: &crate::ir::lowered::LirPattern,
     ) -> Vec<(String, Type, cranelift_codegen::ir::Value)> {
         match pattern {
-            HirPattern::Binding { name, ty } => {
+            crate::ir::lowered::LirPattern::Binding { name, ty } => {
                 vec![(name.clone(), ty.clone(), scrutinee)]
             }
-            HirPattern::EnumVariantTuple {
+            crate::ir::lowered::LirPattern::EnumVariantTuple {
                 enum_name,
                 variant,
                 bindings,
@@ -8797,7 +6809,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // The arm only runs when the check above proved the box holds this
             // class, so the binding is the box's object word, unboxed. It stays
             // reachable through the rooted scrutinee for the whole arm.
-            HirPattern::ClassDowncast {
+            crate::ir::lowered::LirPattern::ClassDowncast {
                 binding,
                 binding_ty,
                 ..
@@ -8808,300 +6820,538 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .load(types::I64, MemFlagsData::new(), scrutinee, 0i32);
                 vec![(binding.clone(), binding_ty.clone(), obj)]
             }
-            HirPattern::Wildcard
-            | HirPattern::LiteralBool(_)
-            | HirPattern::LiteralInt(_)
-            | HirPattern::EnumVariant { .. } => Vec::new(),
+            crate::ir::lowered::LirPattern::Wildcard
+            | crate::ir::lowered::LirPattern::LiteralBool(_)
+            | crate::ir::lowered::LirPattern::LiteralInt(_)
+            | crate::ir::lowered::LirPattern::EnumVariant { .. } => Vec::new(),
         }
     }
 
-    /// Build a closure value: a GC object whose word 0 is the lifted function's
-    /// code address and whose word `i + 1` holds capture `i` (willow-0g8j.2.12).
-    ///
-    /// The layout is deliberately the class layout — word 0 non-reference,
-    /// payload words after it — so the collector traces a closure with the
-    /// machinery it already has and `gc_ref_mask` means the same thing here as
-    /// it does for an object.
-    ///
-    /// Captures are read from the ENCLOSING function's locals, which are
-    /// already rooted there, so the allocation below cannot lose them even
-    /// when it takes the collecting slow path.
-    fn emit_closure_env(
+    pub(super) fn emit_lir_operand(
         &mut self,
-        code: cranelift_codegen::ir::Value,
-        captures: &[HirCapture],
+        function: &LirFunction,
+        operand: &crate::ir::lowered::LirOperand,
     ) -> cranelift_codegen::ir::Value {
-        let mut gc_ref_mask = 0u64;
-        for (i, capture) in captures.iter().enumerate() {
-            if is_gc_managed(&capture.ty, self.enum_infos) {
-                gc_ref_mask |= 1u64 << (i + 1);
+        use crate::ir::lowered::LirOperand;
+        match operand {
+            LirOperand::Local(local) => self.load_lir_local(function, *local),
+            LirOperand::Int(value) => self.builder.ins().iconst(types::I64, *value),
+            LirOperand::Float(value) => self.builder.ins().f64const(*value),
+            LirOperand::Bool(value) => self.builder.ins().iconst(types::I8, i64::from(*value)),
+            LirOperand::Reference { place, .. } => {
+                self.emit_flat_reference_address(function, place)
             }
         }
-        let layout = GcLayoutMetadata::new(
-            GcObjectKind::Closure,
-            (captures.len() as i64 + 1) * 8,
-            0,
-            gc_ref_mask,
-        );
-        let env = self.emit_gc_alloc(layout);
-        // Word 0 is a code address, never a heap reference, so it is stored
-        // without a write barrier exactly like a class descriptor word.
-        self.emit_gc_heap_store_classified(env, 0, code, false, GcStoreDestination::ObjectField);
-        for (i, capture) in captures.iter().enumerate() {
-            let storage = self.vars[capture.source.as_str()].clone();
-            let value = self.load_var(&storage);
-            self.emit_gc_heap_store(
-                env,
-                (i as i32 + 1) * 8,
-                value,
-                &capture.ty,
-                GcStoreDestination::ObjectField,
-            );
-        }
-        env
     }
 
-    /// Evaluate call arguments left to right, rooting each GC-managed one as it
-    /// is produced: a later argument (or the callee itself) can allocate and
-    /// collect, and an already-evaluated argument is otherwise only held in an
-    /// SSA register the GC cannot see. Returns the
-    /// values and the number of roots the caller must pop after the call.
-    ///
-    /// `params` are the callee's declared parameter types with the hidden
-    /// receiver already dropped, so an argument passed into an interface-typed
-    /// parameter is boxed here. The box is what gets rooted (the raw object it
-    /// wraps is rooted inside [`FuncGen::emit_interface_box`] across its own
-    /// allocation), and every earlier argument is already rooted, so that
-    /// allocation is safe. `None` when the callee has no recorded signature —
-    /// eligibility then admits no argument that could need a coercion.
-    ///
-    /// `callee` and `param_debug` are what the debug reference-call hook needs
-    /// to name a `&place` argument in a panic report.
-    fn emit_lir_args_rooted(
+    fn emit_lir_rvalue(
         &mut self,
-        args: &[HirExpr],
-        params: Option<&[Type]>,
-        modes: Option<&[ParamMode]>,
-        callee: Option<&str>,
-        param_debug: Option<&[ParamDebug]>,
-    ) -> (Vec<cranelift_codegen::ir::Value>, usize) {
-        if lir_has_reference_args(modes, args) {
-            self.emit_debug_reference_call_scope_push();
-        }
-        let mut vals = Vec::with_capacity(args.len());
-        let mut temp_roots = 0usize;
-        for (i, a) in args.iter().enumerate() {
-            let is_reference = matches!(
-                modes.and_then(|all| all.get(i)),
-                Some(ParamMode::Reference { .. })
-            );
-            let (val, reference_roots) = if is_reference {
-                let HirExprKind::ReferenceArg { place } = &a.kind else {
-                    unreachable!(
-                        "reference parameter without reference argument passed eligibility"
+        function: &LirFunction,
+        value: &crate::ir::lowered::LirRvalue,
+        span: Span,
+    ) -> cranelift_codegen::ir::Value {
+        use crate::ir::lowered::LirRvalue;
+        match value {
+            LirRvalue::BeginReferenceCall => {
+                self.emit_debug_reference_call_scope_push();
+                self.lir_reference_scopes.push(Vec::new());
+                self.builder.ins().iconst(types::I8, 0)
+            }
+            LirRvalue::ReferenceDebug {
+                argument,
+                callee,
+                index,
+            } => {
+                self.emit_flat_reference_debug(argument, callee, *index);
+                self.lir_reference_scopes
+                    .last_mut()
+                    .expect("prepared reference scope")
+                    .push(FlatReferenceDebug {
+                        argument: argument.clone(),
+                        callee: *callee,
+                        index: *index,
+                    });
+                self.builder.ins().iconst(types::I8, 0)
+            }
+            LirRvalue::StartTask {
+                callee,
+                args,
+                params,
+                ..
+            } => {
+                let args: Vec<_> = args
+                    .iter()
+                    .map(|arg| self.emit_lir_operand(function, arg))
+                    .collect();
+                self.emit_flat_start_task(*callee, &args, params, span)
+            }
+            LirRvalue::AwaitFuture { future, result } => {
+                let future = self.emit_lir_operand(function, future);
+                self.emit_flat_await_future(future, result)
+            }
+            LirRvalue::SelectIdleWait { deadlines } => {
+                let deadlines: Vec<_> = deadlines
+                    .iter()
+                    .map(|deadline| self.emit_lir_operand(function, deadline))
+                    .collect();
+                self.emit_flat_select_idle_wait(&deadlines)
+            }
+            LirRvalue::PrepareMethod {
+                receiver,
+                receiver_ty,
+                method,
+            } => {
+                let receiver = self.emit_lir_operand(function, receiver);
+                let receiver =
+                    self.emit_flat_prepare_method(receiver, receiver_ty, method, span, true);
+                if self.flat_method_frame_enabled(method) {
+                    self.lir_call_frames.push((method.clone(), span));
+                }
+                receiver
+            }
+            LirRvalue::MethodCall {
+                receiver,
+                receiver_ty,
+                method,
+                args,
+                result,
+                ..
+            } => {
+                if self.flat_method_frame_enabled(method) {
+                    let (prepared, _) = self.lir_call_frames.pop().expect("prepared method frame");
+                    assert_eq!(prepared, *method);
+                }
+                let receiver = self.emit_lir_operand(function, receiver);
+                let (args, roots) = self.emit_flat_call_operands(function, args);
+                let result = if matches!(receiver_ty, Type::Named(name) | Type::Generic(name, _) if self.interface_infos.contains_key(name))
+                {
+                    self.emit_flat_interface_call(
+                        receiver,
+                        receiver_ty,
+                        method,
+                        &args,
+                        span,
+                        true,
+                        true,
+                    )
+                } else {
+                    self.emit_flat_class_method(
+                        receiver,
+                        receiver_ty,
+                        method,
+                        &args,
+                        result,
+                        span,
+                        true,
+                        true,
                     )
                 };
-                self.emit_lir_debug_reference_call_hook(callee, i, a, modes, param_debug);
-                self.emit_lir_reference_arg_address(place)
-            } else {
-                let val = match params.and_then(|p| p.get(i)) {
-                    Some(target) => self.emit_lir_store_value(a, &target.clone()),
-                    None => self.emit_lir_expr(a),
-                };
-                (val, 0)
-            };
-            temp_roots += reference_roots;
-            if !is_reference && is_gc_managed(&a.ty, self.enum_infos) {
-                self.emit_push_root(val);
-                temp_roots += 1;
+                self.emit_pop_roots_n(roots);
+                self.gc_root_count -= roots;
+                result
             }
-            vals.push(val);
-        }
-        (vals, temp_roots)
-    }
-
-    /// Debug builds: record the `&place` about to be passed, so a panic inside
-    /// the callee can name the reference the caller handed it. Every payload
-    /// field is derived from the lowered reference node.
-    fn emit_lir_debug_reference_call_hook(
-        &mut self,
-        callee: Option<&str>,
-        idx: usize,
-        arg: &HirExpr,
-        modes: Option<&[ParamMode]>,
-        param_debug: Option<&[ParamDebug]>,
-    ) {
-        if self.build_mode != BuildMode::Debug {
-            return;
-        }
-        let HirExprKind::ReferenceArg { place } = &arg.kind else {
-            return;
-        };
-        // `&place` lowers under the span the parser built from the ampersand
-        // onwards, so this node's line/col ARE the ampersand's — the position
-        // recorded in the source `CallArgMode::Reference`.
-        let ampersand_span = arg.span;
-
-        let param = param_debug.and_then(|params| params.get(idx));
-        let param_mode = param
-            .map(|param| &param.mode)
-            .or_else(|| modes.and_then(|modes| modes.get(idx)));
-        let mode = param_mode.map(reference_mode_name).unwrap_or("&");
-        let param_name = param
-            .map(|param| param.name.as_str())
-            .unwrap_or("<unknown>");
-        let param_type = param
-            .map(|param| debug_type_name(&param.ty))
-            .unwrap_or_else(|| "<unknown>".to_string());
-        let callee = callee.unwrap_or("<unknown>");
-        let place_kind = lir_reference_place_kind(place);
-        let place_name = lir_reference_place_name(place);
-
-        let source_file = self.source_file.to_string();
-        let file_ptr = self.emit_string_literal(&source_file);
-        let line_val = self
-            .builder
-            .ins()
-            .iconst(types::I32, ampersand_span.line as i64);
-        let col_val = self
-            .builder
-            .ins()
-            .iconst(types::I32, ampersand_span.col as i64);
-        let callee_ptr = self.emit_string_literal(callee);
-        let param_ptr = self.emit_string_literal(param_name);
-        let param_type_ptr = self.emit_string_literal(&param_type);
-        let mode_ptr = self.emit_string_literal(mode);
-        let place_kind_ptr = self.emit_string_literal(place_kind);
-        let place_name_ptr = self.emit_string_literal(&place_name);
-        let hook_id = self.func_id("willow_debug_reference_call");
-        let hook_ref = self.module.declare_func_in_func(hook_id, self.builder.func);
-        self.builder.ins().call(
-            hook_ref,
-            &[
-                file_ptr,
-                line_val,
-                col_val,
-                callee_ptr,
-                param_ptr,
-                param_type_ptr,
-                mode_ptr,
-                place_kind_ptr,
-                place_name_ptr,
-            ],
-        );
-    }
-
-    fn emit_lir_reference_arg_address(
-        &mut self,
-        place: &HirExpr,
-    ) -> (cranelift_codegen::ir::Value, usize) {
-        match &place.kind {
-            HirExprKind::Var(name) => match self.vars.get(name.as_str()).cloned() {
-                Some(VarStorage::Stack { slot, .. }) => {
-                    let ptr_ty = self.module.target_config().pointer_type();
-                    (self.builder.ins().stack_addr(ptr_ty, slot, 0), 0)
+            LirRvalue::Coerce {
+                value,
+                source,
+                target,
+            } => {
+                let value = self.emit_lir_operand(function, value);
+                self.coerce_to_target(value, source, target)
+            }
+            LirRvalue::ArrayAlloc { length, element } => {
+                self.emit_flat_array_alloc(*length, element)
+            }
+            LirRvalue::CaptureArrayOwner { array, index } => {
+                self.emit_flat_capture_array_owner(function, array, index)
+            }
+            LirRvalue::ArrayStore {
+                array,
+                index,
+                value,
+                element,
+            } => self.emit_flat_array_store(function, array, index, value, element),
+            LirRvalue::Index {
+                array,
+                index,
+                element,
+            } => self.emit_flat_index(function, array, index, element),
+            LirRvalue::ObjectAlloc { class } => self.emit_flat_object_alloc(class),
+            LirRvalue::FieldLoad {
+                object,
+                object_ty,
+                field,
+                ..
+            } => self.emit_flat_field(function, object, field, object_ty),
+            LirRvalue::FieldStore {
+                object,
+                object_ty,
+                field,
+                value,
+            } => self.emit_flat_field_store(function, object, field, value, object_ty),
+            LirRvalue::StaticField { class, field, .. } => {
+                self.emit_flat_static_field(&class.to_string(), field)
+            }
+            LirRvalue::StaticStore {
+                class,
+                field,
+                value,
+            } => self.emit_flat_static_store(function, &class.to_string(), field, value),
+            LirRvalue::StaticCall {
+                class,
+                method,
+                args,
+                arg_types,
+                result,
+            } => {
+                let (args, roots) = self.emit_flat_call_operands(function, args);
+                let result = self.emit_lir_static_call_values(
+                    &class.to_string(),
+                    method,
+                    &args,
+                    arg_types,
+                    result,
+                    span,
+                );
+                if !self.terminated {
+                    self.emit_pop_roots_n(roots);
                 }
-                Some(VarStorage::Value { var, ty }) => {
-                    let val = self.builder.use_var(var);
-                    let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        8,
-                        0,
-                    ));
-                    self.stack_store(val, slot);
-                    self.vars
-                        .insert(name.clone(), VarStorage::Stack { slot, ty });
-                    let ptr_ty = self.module.target_config().pointer_type();
-                    (self.builder.ins().stack_addr(ptr_ty, slot, 0), 0)
-                }
-                Some(VarStorage::ReferencePtr { var, .. }) => (self.builder.use_var(var), 0),
-                Some(VarStorage::Frame { offset, .. }) => {
-                    let base = self
-                        .async_frame
-                        .expect("frame-backed reference place requires async frame");
-                    (self.builder.ins().iadd_imm_s(base, offset as i64), 0)
-                }
-                None => unreachable!("reference local vetted by eligibility"),
-            },
-            HirExprKind::FieldAccess { object, field } => {
-                let layout = self.lir_class_layout(&object.ty);
-                let idx = layout
-                    .iter()
-                    .position(|(name, _)| name == field)
-                    .expect("reference field vetted by eligibility");
-                let object = self.emit_lir_expr(object);
-                (
-                    self.builder.ins().iadd_imm_s(object, (idx as i64 + 1) * 8),
-                    0,
+                self.gc_root_count -= roots;
+                result
+            }
+            LirRvalue::EnumAlloc {
+                class,
+                variant,
+                enum_ty,
+            } => self.emit_flat_enum_alloc(&class.to_string(), variant, enum_ty),
+            LirRvalue::EnumPayloadStore {
+                object,
+                class,
+                variant,
+                index,
+                value,
+                source,
+                enum_ty,
+            } => {
+                let object = self.emit_lir_operand(function, object);
+                let value = self.emit_lir_operand(function, value);
+                self.emit_flat_enum_payload_store(
+                    object,
+                    &class.to_string(),
+                    variant,
+                    *index,
+                    value,
+                    source,
+                    enum_ty,
                 )
             }
-            HirExprKind::Index { array, index } => {
-                let array = self.emit_lir_expr(array);
-                self.emit_push_root(array);
-                let index = self.emit_lir_expr(index);
-                let address =
-                    self.emit_value_runtime_call("willow_array_element_addr", &[array, index]);
-                (address, 1)
+            LirRvalue::ConstructorCall {
+                object,
+                class,
+                args,
+                arg_types,
+            } => self.emit_flat_constructor_call(function, object, class, args, arg_types, span),
+            LirRvalue::Range { start, end } => {
+                let start = self.emit_lir_operand(function, start);
+                let end = self.emit_lir_operand(function, end);
+                let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(GcObjectKind::Range, 16, 0, 0));
+                self.builder.ins().store(MemFlagsData::new(), start, ptr, 0);
+                self.builder.ins().store(MemFlagsData::new(), end, ptr, 8);
+                ptr
             }
-            _ => unreachable!("non-place reference argument passed eligibility"),
+            LirRvalue::EnumMethod {
+                receiver,
+                receiver_ty,
+                method,
+                args,
+                arg_types,
+                ..
+            } => {
+                let receiver = self.emit_lir_operand(function, receiver);
+                let args: Vec<_> = args
+                    .iter()
+                    .map(|arg| self.emit_lir_operand(function, arg))
+                    .collect();
+                self.emit_flat_enum_method(receiver, receiver_ty, method, &args, arg_types, span)
+            }
+            LirRvalue::BuiltinCall { callee, args, .. } => {
+                let args: Vec<_> = args
+                    .iter()
+                    .map(|arg| self.emit_lir_operand(function, arg))
+                    .collect();
+                self.emit_flat_builtin_call(callee, &args)
+            }
+            LirRvalue::FormatScalar { value, ty, format } => {
+                let value = self.emit_lir_operand(function, value);
+                self.emit_flat_format_scalar(value, ty, *format)
+            }
+            LirRvalue::Panic { message } => {
+                let message = self.emit_lir_operand(function, message);
+                self.emit_panic_with_message(message, span)
+            }
+            LirRvalue::Recover => self.emit_recover_call(),
+            LirRvalue::RebindResultError { value, .. } => self.emit_lir_operand(function, value),
+            LirRvalue::IntoError { value, source, .. } => {
+                let value = self.emit_lir_operand(function, value);
+                self.emit_push_root(value);
+                let panic_depth = self.emit_pre_willow_call_panic_depth();
+                let Type::Named(class) = source else {
+                    unreachable!("Into error source class validated");
+                };
+                let converted = self.emit_into_conversion(value, &class.to_string());
+                self.emit_pop_roots_n(1);
+                self.gc_root_count -= 1;
+                self.emit_post_willow_call_panic_check(panic_depth);
+                converted
+            }
+            LirRvalue::IntrinsicCall {
+                intrinsic,
+                receiver,
+                receiver_ty,
+                args,
+                arg_types,
+                result,
+                ..
+            } => {
+                let receiver = self.emit_lir_operand(function, receiver);
+                let args: Vec<_> = args
+                    .iter()
+                    .map(|arg| self.emit_lir_operand(function, arg))
+                    .collect();
+                self.emit_flat_intrinsic(
+                    *intrinsic,
+                    receiver,
+                    receiver_ty,
+                    &args,
+                    arg_types,
+                    result,
+                    span,
+                )
+            }
+            LirRvalue::Use(operand) => self.emit_lir_operand(function, operand),
+            LirRvalue::StringLiteral(value) => self.emit_string_literal(value),
+            LirRvalue::FunctionRef { function, .. } => {
+                let fid = *self
+                    .func_ids
+                    .get_id(function)
+                    .expect("registered function reference");
+                let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                self.builder
+                    .ins()
+                    .func_addr(super::type_helpers::FN_ADDR_TYPE, fref)
+            }
+            LirRvalue::Closure { id, captures, ty } => {
+                let name = self.lambda_names[id].clone();
+                let fid = *self.func_ids.get_id(&name).expect("registered lambda");
+                let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                let code = self
+                    .builder
+                    .ins()
+                    .func_addr(super::type_helpers::FN_ADDR_TYPE, fref);
+                if !matches!(ty, Type::Closure(..)) {
+                    return code;
+                }
+                let mut mask = 0u64;
+                for (i, capture) in captures.iter().enumerate() {
+                    if is_gc_managed(
+                        &capture.ty(&function.locals).expect("capture type"),
+                        self.enum_infos,
+                    ) {
+                        mask |= 1u64 << (i + 1);
+                    }
+                }
+                let env = self.emit_gc_alloc(GcLayoutMetadata::new(
+                    GcObjectKind::Closure,
+                    (captures.len() as i64 + 1) * 8,
+                    0,
+                    mask,
+                ));
+                self.emit_gc_heap_store_classified(
+                    env,
+                    0,
+                    code,
+                    false,
+                    GcStoreDestination::ObjectField,
+                );
+                for (i, capture) in captures.iter().enumerate() {
+                    let value = self.emit_lir_operand(function, capture);
+                    let ty = capture.ty(&function.locals).expect("capture type");
+                    self.emit_gc_heap_store(
+                        env,
+                        (i as i32 + 1) * 8,
+                        value,
+                        &ty,
+                        GcStoreDestination::ObjectField,
+                    );
+                }
+                env
+            }
+            LirRvalue::Print { value, ty, newline } => {
+                let value = self.emit_lir_operand(function, value);
+                let name = match (ty, newline) {
+                    (Type::I64, false) => "willow_print_i64",
+                    (Type::I64, true) => "willow_println_i64",
+                    (Type::F64, false) => "willow_print_f64",
+                    (Type::F64, true) => "willow_println_f64",
+                    (Type::Bool, false) => "willow_print_bool",
+                    (Type::Bool, true) => "willow_println_bool",
+                    (Type::String, false) => "willow_print_string",
+                    (Type::String, true) => "willow_println_string",
+                    _ => unreachable!("print type validated"),
+                };
+                self.emit_void_runtime_call(name, &[value]);
+                self.builder.ins().iconst(types::I8, 0)
+            }
+            LirRvalue::DirectCall { callee, args, .. } => {
+                let has_references = args
+                    .iter()
+                    .any(|arg| matches!(arg, crate::ir::lowered::LirOperand::Reference { .. }));
+                let (values, roots) = self.emit_flat_call_operands(function, args);
+                let fid = *self
+                    .func_ids
+                    .get_id(callee)
+                    .expect("flat direct call is registered");
+                let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                let pushed = self.emit_callstack_push(&callee.to_string(), span);
+                let panic_depth = self.emit_pre_user_call_panic_depth(&callee.to_string());
+                let call = self.builder.ins().call(fref, &values);
+                let result = self
+                    .builder
+                    .inst_results(call)
+                    .first()
+                    .copied()
+                    .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0));
+                if pushed {
+                    self.emit_callstack_pop();
+                }
+                if has_references {
+                    self.emit_flat_reference_call_end();
+                }
+                self.emit_pop_roots_n(roots);
+                self.gc_root_count -= roots;
+                self.emit_post_willow_call_panic_check(panic_depth);
+                result
+            }
+            LirRvalue::Unary { op, operand, ty } => {
+                let operand = self.emit_lir_operand(function, operand);
+                match op {
+                    UnaryOp::Neg if *ty == Type::F64 => self.builder.ins().fneg(operand),
+                    UnaryOp::Neg => self.builder.ins().ineg(operand),
+                    UnaryOp::Not => {
+                        let one = self.builder.ins().iconst(types::I8, 1);
+                        self.builder.ins().bxor(operand, one)
+                    }
+                }
+            }
+            LirRvalue::IndirectCall {
+                callee,
+                name,
+                args,
+                params,
+                result,
+            } => {
+                let closure = matches!(callee.ty(&function.locals), Some(Type::Closure(..)));
+                let target = self.emit_lir_operand(function, callee);
+                let mut roots = 0;
+                if closure {
+                    self.emit_push_root(target);
+                    roots += 1;
+                }
+                let code = if closure {
+                    self.builder.ins().load(
+                        super::type_helpers::FN_ADDR_TYPE,
+                        MemFlagsData::trusted(),
+                        target,
+                        0,
+                    )
+                } else {
+                    target
+                };
+                let mut values = Vec::with_capacity(args.len() + usize::from(closure));
+                if closure {
+                    values.push(target);
+                }
+                for (argument, ty) in args.iter().zip(params) {
+                    let value = self.emit_lir_operand(function, argument);
+                    if is_gc_managed(ty, self.enum_infos) {
+                        self.emit_push_root(value);
+                        roots += 1;
+                    }
+                    values.push(value);
+                }
+                let mut signature = self.module.make_signature();
+                if closure {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature
+                    .params
+                    .extend(params.iter().map(|ty| AbiParam::new(clif_type(ty))));
+                if *result != Type::Void {
+                    signature.returns.push(AbiParam::new(clif_type(result)));
+                }
+                let signature = self.builder.import_signature(signature);
+                let pushed = self.emit_callstack_push(&name.to_string(), span);
+                let panic_depth = self.emit_pre_willow_call_panic_depth();
+                let call = self.builder.ins().call_indirect(signature, code, &values);
+                let result = self
+                    .builder
+                    .inst_results(call)
+                    .first()
+                    .copied()
+                    .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0));
+                if pushed {
+                    self.emit_callstack_pop();
+                }
+                self.emit_pop_roots_n(roots);
+                self.gc_root_count -= roots;
+                self.emit_post_willow_call_panic_check(panic_depth);
+                result
+            }
+            LirRvalue::Binary {
+                op,
+                lhs,
+                rhs,
+                operand_ty,
+            } => {
+                let lhs = self.emit_lir_operand(function, lhs);
+                let rhs = self.emit_lir_operand(function, rhs);
+                if *operand_ty == Type::String {
+                    let name = if matches!(op, BinOp::Add) {
+                        "willow_string_concat"
+                    } else {
+                        "willow_string_eq"
+                    };
+                    self.emit_push_root(lhs);
+                    self.emit_push_root(rhs);
+                    let raw = self.emit_value_runtime_call(name, &[lhs, rhs]);
+                    self.emit_pop_roots_n(2);
+                    self.gc_root_count -= 2;
+                    return match op {
+                        BinOp::Add => raw,
+                        BinOp::Eq => self.builder.ins().ireduce(types::I8, raw),
+                        BinOp::Ne => {
+                            let raw = self.builder.ins().bxor_imm_s(raw, 1);
+                            self.builder.ins().ireduce(types::I8, raw)
+                        }
+                        _ => unreachable!("string operator validated"),
+                    };
+                }
+                let float = *operand_ty == Type::F64;
+                if !float && matches!(op, BinOp::Div | BinOp::Rem) {
+                    self.emit_int_div_guard(lhs, rhs, matches!(op, BinOp::Rem), span);
+                }
+                if matches!(op, BinOp::Pow) {
+                    if float {
+                        self.emit_pow_f64(lhs, rhs)
+                    } else {
+                        self.emit_pow_i64(lhs, rhs, span)
+                    }
+                } else {
+                    self.emit_lir_binop(op, lhs, rhs, float)
+                }
+            }
         }
     }
 
-    /// Emit `value` and convert it to `target_ty`, which for the walker means
-    /// exactly one thing: boxing a class instance into an interface. Routed
-    /// through the shared [`FuncGen::coerce_to_target`] so a boxed value has
-    /// one layout and one vtable selection. Eligibility has
-    /// already proved the vtable exists, so this never silently passes an
-    /// unboxed object into an interface slot.
-    fn emit_lir_store_value(
-        &mut self,
-        value: &HirExpr,
-        target_ty: &Type,
-    ) -> cranelift_codegen::ir::Value {
-        if is_fresh_empty_map(value) {
-            let (key, element) = builtin_types::binary_args(target_ty, B::Map)
-                .expect("a fresh map requires its checked destination type");
-            return self.emit_map_new(key, element);
-        }
-        let val = self.emit_lir_expr(value);
-        self.coerce_to_target(val, &value.ty, target_ty)
-    }
-
-    /// Whether storing a `value_ty` into a `target_ty` slot runs an allocation.
-    /// Mirrors [`FuncGen::coerce_to_target`]'s decision: a *different* named
-    /// or generic interface target and a named source class with a layout.
-    fn lir_store_allocates(&self, value_ty: &Type, target_ty: &Type) -> bool {
-        let iface = match target_ty {
-            Type::Named(name) | Type::Generic(name, _) => name,
-            _ => return false,
-        };
-        if let Type::Named(source) | Type::Generic(source, _) = value_ty
-            && self.interface_infos.contains_key(source)
-        {
-            return matches!(
-                super::vtable_layout::super_offset(self.interface_infos, source, iface),
-                Some(offset) if offset > 0
-            );
-        }
-        let Type::Named(class) = value_ty else {
-            return false;
-        };
-        iface != class
-            && self.interface_infos.contains_key(iface)
-            && self.class_layouts.contains_key(class)
-    }
-
-    /// Whether producing `value` for a `target_ty` slot can run a collection —
-    /// evaluating it, or the interface box the store puts on top of it. Sites
-    /// that root a live temporary across the value must use this, not
-    /// [`may_allocate`] alone: the box allocates *after* the value expression
-    /// is done, which `may_allocate` cannot see (willow-j260).
-    fn lir_value_allocates(&self, value: &HirExpr, target_ty: &Type) -> bool {
-        may_allocate(value) || self.lir_store_allocates(&value.ty, target_ty)
-    }
-
-    /// The class layout for a receiver/field-owner type. Eligibility already
-    /// proved the type is a simple class with a registered layout.
     pub(super) fn lir_class_layout(&self, ty: &Type) -> Vec<(String, Type)> {
         let class =
             class_name_for_object_type(ty).expect("class receiver type vetted by LIR eligibility");
@@ -9120,1499 +7370,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .cloned()
             .expect("class layout vetted by LIR eligibility")
     }
-
-    /// `new Class(args)`: allocate the object with its GC ref mask, stamp the
-    /// runtime `type_id` into word 0, then run the explicit `Class__init` or —
-    /// when the class has none — store the positional arguments memberwise.
-    ///
-    /// The fresh object is rooted for the whole construction: argument
-    /// evaluation and the constructor body can both allocate, and until this
-    /// returns nothing else refers to it.
-    fn emit_lir_new(
-        &mut self,
-        class: &str,
-        args: &[HirExpr],
-        span: crate::diagnostics::Span,
-    ) -> cranelift_codegen::ir::Value {
-        let layout = self
-            .class_layouts
-            .get(class)
-            .cloned()
-            .expect("class layout vetted by LIR eligibility");
-        // Runtime type ids start at 1, so 0 is not a class — falling back to it
-        // would stamp a bogus id into the descriptor and make every later
-        // `is`/downcast on the object answer wrong instead of failing here. The
-        // former AST emitter also rejected a missing id (willow-uqzx, catalog
-        // item 14). The id still selects the GC layout; word 0 of the object
-        // itself holds the descriptor (willow-fm7t).
-        let type_id = self.class_type_ids.get(class).copied().unwrap_or_else(|| {
-            panic!("compiler invariant violated: checked class `{class}` has no type id")
-        });
-        let gc_layout = GcLayoutMetadata::class(class, type_id, &layout, self.enum_infos);
-        let ptr = self.emit_gc_alloc(gc_layout);
-        self.emit_store_class_descriptor(ptr, class);
-        self.emit_push_root(ptr);
-
-        let mangled = class_method_symbol_name(self.known_modules, class, "init");
-        if let Some(&init_fid) = self.func_ids.get(&mangled) {
-            let params = self.method_param_types(&mangled);
-            let modes = self.func_param_modes.get(&mangled).cloned();
-            // Pass parameter debug metadata (willow-0g8j.10), so
-            // a trace names the constructor's parameter rather than `<unknown>`.
-            let param_debug = self.func_param_debug.get(&mangled).cloned();
-            let has_reference_args = lir_has_reference_args(modes.as_deref(), args);
-            let (arg_vals, arg_roots) = self.emit_lir_args_rooted(
-                args,
-                params.as_deref(),
-                modes.as_deref(),
-                Some(&mangled),
-                param_debug.as_deref(),
-            );
-            let init_ref = self
-                .module
-                .declare_func_in_func(init_fid, self.builder.func);
-            let mut call_args = vec![ptr];
-            call_args.extend(arg_vals);
-            // Arguments are evaluated before the constructor call-chain frame is
-            // installed, matching ordinary calls: a panic in an argument is not
-            // attributed to an `init` body that never started.
-            let pushed = self.emit_callstack_push("init", span);
-            let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
-            self.builder.ins().call(init_ref, &call_args);
-            if pushed {
-                self.emit_callstack_pop();
-            }
-            // A record left standing would name this constructor's `&place` in a
-            // LATER, unrelated panic in the same function (willow-0g8j.11).
-            if has_reference_args {
-                self.emit_debug_reference_call_clear();
-            }
-            if arg_roots > 0 {
-                self.emit_pop_roots_n(arg_roots);
-                self.gc_root_count -= arg_roots;
-            }
-            self.emit_post_willow_call_panic_check(panic_depth);
-        } else {
-            // Implicit memberwise constructor. Each value is stored the instant
-            // it exists, so it is unrooted only across an allocation-free window.
-            for (i, arg) in args.iter().enumerate() {
-                let field_ty = layout[i].1.clone();
-                let val = self.emit_lir_store_value(arg, &field_ty);
-                self.emit_gc_heap_store(
-                    ptr,
-                    (i as i32 + 1) * 8,
-                    val,
-                    &field_ty,
-                    GcStoreDestination::ObjectField,
-                );
-            }
-        }
-
-        self.emit_pop_roots_n(1);
-        self.gc_root_count -= 1;
-        ptr
-    }
-
-    /// `super.init(args)` inside a constructor: run the base class's `init` on
-    /// the already-allocated receiver, or -- when the base declares no
-    /// constructor -- store the arguments into its memberwise field slots.
-    ///
-    /// The twin of [`FuncGen::emit_super_init`], step for step, so a
-    /// constructor initializes the declared base state (willow-0g8j.2.18).
-    fn emit_lir_super_init(&mut self, args: &[HirExpr], span: Span) {
-        let current_class = self
-            .current_class
-            .expect("eligibility admits `super.init` only inside a class body");
-        let base_name = self
-            .class_base
-            .get(current_class)
-            .cloned()
-            .expect("eligibility admits `super.init` only with a resolved base class");
-        let self_storage = self
-            .vars
-            .get("self")
-            .cloned()
-            .expect("a constructor binds its receiver before its body is emitted");
-        let self_ptr = self.load_var(&self_storage);
-
-        let mangled = class_method_symbol_name(self.known_modules, &base_name.to_string(), "init");
-        if let Some(&init_fid) = self.func_ids.get(&mangled) {
-            let params = self.method_param_types(&mangled);
-            let modes = self.func_param_modes.get(&mangled).cloned();
-            let param_debug = self.func_param_debug.get(&mangled).cloned();
-            let has_reference_args = lir_has_reference_args(modes.as_deref(), args);
-            let (arg_vals, arg_roots) = self.emit_lir_args_rooted(
-                args,
-                params.as_deref(),
-                modes.as_deref(),
-                Some(&mangled),
-                param_debug.as_deref(),
-            );
-            let init_ref = self
-                .module
-                .declare_func_in_func(init_fid, self.builder.func);
-            let mut call_args = vec![self_ptr];
-            call_args.extend(arg_vals);
-            let pushed = self.emit_callstack_push("init", span);
-            let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
-            self.builder.ins().call(init_ref, &call_args);
-            if pushed {
-                self.emit_callstack_pop();
-            }
-            if has_reference_args {
-                self.emit_debug_reference_call_clear();
-            }
-            if arg_roots > 0 {
-                self.emit_pop_roots_n(arg_roots);
-                self.gc_root_count -= arg_roots;
-            }
-            self.emit_post_willow_call_panic_check(panic_depth);
-            return;
-        }
-
-        // Implicit memberwise base constructor: positional arguments fill the
-        // base's declared fields, which occupy the object's leading slots.
-        let layout = self
-            .class_layouts
-            .get(&base_name)
-            .cloned()
-            .expect("eligibility admits `super.init` only with a resolved base layout");
-        for (i, arg) in args.iter().enumerate() {
-            let field_ty = layout[i].1.clone();
-            let val = self.emit_lir_store_value(arg, &field_ty);
-            self.emit_gc_heap_store(
-                self_ptr,
-                (i as i32 + 1) * 8,
-                val,
-                &field_ty,
-                GcStoreDestination::ObjectField,
-            );
-        }
-    }
-
-    /// `Class { field: value, ... }`: the same allocation as `new`, with the
-    /// fields addressed by name instead of position.
-    fn emit_lir_object_literal(
-        &mut self,
-        class: &str,
-        fields: &[(String, HirExpr)],
-    ) -> cranelift_codegen::ir::Value {
-        let layout = self
-            .class_layouts
-            .get(class)
-            .cloned()
-            .expect("class layout vetted by LIR eligibility");
-        let type_id = self.class_type_ids.get(class).copied().unwrap_or_else(|| {
-            panic!(
-                "compiler invariant violated: checked object literal class `{class}` has no type id"
-            )
-        });
-        let gc_layout = GcLayoutMetadata::class(class, type_id, &layout, self.enum_infos);
-        let ptr = self.emit_gc_alloc(gc_layout);
-        self.emit_store_class_descriptor(ptr, class);
-        self.emit_push_root(ptr);
-
-        for (name, value) in fields {
-            let idx = layout
-                .iter()
-                .position(|(n, _)| n == name)
-                .expect("object-literal field vetted by LIR eligibility");
-            let field_ty = layout[idx].1.clone();
-            let val = self.emit_lir_store_value(value, &field_ty);
-            self.emit_gc_heap_store(
-                ptr,
-                (idx as i32 + 1) * 8,
-                val,
-                &field_ty,
-                GcStoreDestination::ObjectField,
-            );
-        }
-
-        self.emit_pop_roots_n(1);
-        self.gc_root_count -= 1;
-        ptr
-    }
-
-    /// `object.field`: a plain load at `(index + 1) * 8` — word 0 holds the
-    /// runtime type_id. The type system guarantees a direct class value here.
-    fn emit_lir_field_access(
-        &mut self,
-        object: &HirExpr,
-        field: &str,
-    ) -> cranelift_codegen::ir::Value {
-        // `Range<i64>` bounds: word 0 = start, word 1 = end — the layout
-        // used by range construction and field loads (willow-0g8j.2.10).
-        if range_i64(&object.ty) {
-            let ptr = self.emit_lir_expr(object);
-            let offset = if field == "end" { 8i32 } else { 0i32 };
-            return self
-                .builder
-                .ins()
-                .load(types::I64, MemFlagsData::new(), ptr, offset);
-        }
-        let layout = self.lir_class_layout(&object.ty);
-        let ptr = self.emit_lir_expr(object);
-        let idx = layout
-            .iter()
-            .position(|(n, _)| n == field)
-            .expect("field vetted by LIR eligibility");
-        let load_ty = clif_type(&layout[idx].1);
-        self.builder
-            .ins()
-            .load(load_ty, MemFlagsData::new(), ptr, (idx as i32 + 1) * 8)
-    }
-
-    /// `start..end` as a VALUE: a two-word GC object `[start, end]`
-    /// (willow-0g8j.2.10), with the `GcObjectKind::Range` header and two
-    /// payload words shared by range construction and field loads.
-    ///
-    /// Both bounds are `i64` scalars, so they survive the one allocation in
-    /// registers with nothing to root.
-    fn emit_lir_range_value(
-        &mut self,
-        start: &HirExpr,
-        end: &HirExpr,
-    ) -> cranelift_codegen::ir::Value {
-        let start = self.emit_lir_expr(start);
-        let end = self.emit_lir_expr(end);
-        let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(GcObjectKind::Range, 16, 0, 0));
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), start, ptr, 0i32);
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), end, ptr, 8i32);
-        ptr
-    }
-
-    /// `object.field = value;` through the GC write barrier, so an old-space
-    /// object that gains a young reference lands in the remembered set.
-    fn emit_lir_field_assign(&mut self, object: &HirExpr, field: &str, value: &HirExpr) {
-        let layout = self.lir_class_layout(&object.ty);
-        let idx = layout
-            .iter()
-            .position(|(n, _)| n == field)
-            .expect("field vetted by LIR eligibility");
-        let field_ty = layout[idx].1.clone();
-        let ptr = self.emit_lir_expr(object);
-        // The owner is evaluated first, so it needs a root whenever producing
-        // the value — including the interface box a widening store adds on top
-        // of it — can collect.
-        let rooted = self.lir_value_allocates(value, &field_ty);
-        if rooted {
-            self.emit_push_root(ptr);
-        }
-        let val = self.emit_lir_store_value(value, &field_ty);
-        self.emit_gc_heap_store(
-            ptr,
-            (idx as i32 + 1) * 8,
-            val,
-            &field_ty,
-            GcStoreDestination::ObjectField,
-        );
-        if rooted {
-            self.emit_pop_roots_n(1);
-            self.gc_root_count -= 1;
-        }
-    }
-
-    /// `object.method(args)` on a class receiver.
-    ///
-    /// Which implementation runs is NOT decided here: [`Self::plan_virtual_call`]
-    /// decides it, and every call site asks that function for its receiver, so whether a
-    /// call is virtual, which descriptor slot it uses, and which symbol a
-    /// devirtualized call names are one answer (willow-0g8j.2.4). A method with
-    /// one implementation in the
-    /// hierarchy becomes a direct call; anything else loads the address out of
-    /// the receiver's class descriptor and calls it indirectly.
-    fn emit_lir_class_method(
-        &mut self,
-        object: &HirExpr,
-        method: &str,
-        args: &[HirExpr],
-        ret_ty: &Type,
-        span: crate::diagnostics::Span,
-    ) -> cranelift_codegen::ir::Value {
-        let class = class_name_for_object_type(&object.ty)
-            .expect("class receiver type vetted by LIR eligibility");
-        let self_ptr = self.emit_lir_expr(object);
-        let VirtualCallPlan {
-            static_class,
-            mangled,
-            dispatch_targets,
-            virtual_slot,
-        } = self.plan_virtual_call(&class.to_string(), method);
-
-        let pushed = self.emit_callstack_push(method, span);
-        // The receiver may be a temporary (`make().m(alloc())`) reachable only
-        // through this register; an allocating argument could collect it.
-        self.emit_push_root(self_ptr);
-        // An indirect call cannot be cleared by one implementation's summary:
-        // any reachable target's panic is this call site's panic.
-        let panic_depth = match virtual_slot {
-            None => self.emit_pre_user_call_panic_depth(&mangled),
-            Some(_) => {
-                self.emit_pre_user_dispatch_panic_depth(dispatch_targets.iter().map(String::as_str))
-            }
-        };
-        // Read the descriptor before the arguments run, so the two dependent
-        // loads stay adjacent and no allocation separates them.
-        let fnptr = virtual_slot.map(|slot| self.emit_vtable_slot_load(self_ptr, slot));
-        let params = self.method_param_types(&mangled);
-        let modes = self.func_param_modes.get(&mangled).cloned();
-        let param_debug = self.func_param_debug.get(&mangled).cloned();
-        let has_reference_args = lir_has_reference_args(modes.as_deref(), args);
-        // The callee name a reference report shows is the STATIC class the
-        // method resolved on, since the override is only known at runtime.
-        let user_callee = format!("{static_class}::{method}");
-        let (arg_vals, arg_roots) = self.emit_lir_args_rooted(
-            args,
-            params.as_deref(),
-            modes.as_deref(),
-            Some(&user_callee),
-            param_debug.as_deref(),
-        );
-        let mut call_args = vec![self_ptr];
-        call_args.extend(arg_vals);
-        let call = match fnptr {
-            None => {
-                let fid = self.func_ids[&mangled];
-                let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                self.builder.ins().call(fref, &call_args)
-            }
-            Some(fnptr) => {
-                // Every implementation in the hierarchy shares one signature —
-                // an `override` may not change it — so the resolved method's
-                // ABI describes them all, `&`/`&mut` slots included: those take
-                // the pointer ABI their declaration gave them.
-                let ret_type = self
-                    .func_return_types
-                    .get(&mangled)
-                    .cloned()
-                    .unwrap_or(Type::Void);
-                let mut sig = self.module.make_signature();
-                sig.params.push(AbiParam::new(types::I64));
-                let ptr_ty = self.module.target_config().pointer_type();
-                for (idx, pt) in params.iter().flat_map(|p| p.iter()).enumerate() {
-                    let abi = match modes.as_ref().and_then(|all| all.get(idx)) {
-                        Some(ParamMode::Reference { .. }) => ptr_ty,
-                        _ => clif_type(pt),
-                    };
-                    sig.params.push(AbiParam::new(abi));
-                }
-                if ret_type != Type::Void {
-                    sig.returns.push(AbiParam::new(clif_type(&ret_type)));
-                }
-                let sig_ref = self.builder.import_signature(sig);
-                self.builder.ins().call_indirect(sig_ref, fnptr, &call_args)
-            }
-        };
-        let result = self
-            .builder
-            .inst_results(call)
-            .first()
-            .copied()
-            .unwrap_or_else(|| self.builder.ins().iconst(clif_type(ret_ty), 0));
-        if has_reference_args {
-            self.emit_debug_reference_call_clear();
-        }
-        if pushed {
-            self.emit_callstack_pop();
-        }
-        self.emit_pop_roots_n(arg_roots + 1);
-        self.gc_root_count -= arg_roots + 1;
-        self.emit_post_willow_call_panic_check(panic_depth);
-        result
-    }
-
-    /// `iface.method(args)` on an interface-typed receiver: an indirect call
-    /// through the receiver box's vtable (willow-0g8j.6).
-    ///
-    /// The box is `[object | vtable]`, so the concrete class is not known
-    /// statically and there is nothing to inline: load the object and the
-    /// vtable, load the slot's function pointer, and call it with the object as
-    /// the hidden receiver. Eligibility proved the interface declares the method
-    /// and so fixed its slot; the argument types come from the interface's
-    /// declaration, which is what a class argument gets boxed against.
-    ///
-    /// The OBJECT is rooted across argument evaluation, not the box: the callee
-    /// receives the object, and a box whose only reference is this register can
-    /// be collected without harming the call.
-    fn emit_lir_interface_call(
-        &mut self,
-        object: &HirExpr,
-        method: &str,
-        args: &[HirExpr],
-        span: crate::diagnostics::Span,
-    ) -> cranelift_codegen::ir::Value {
-        let iface_name = match &object.ty {
-            Type::Named(name) | Type::Generic(name, _) => name.clone(),
-            _ => unreachable!("interface receiver type vetted by LIR eligibility"),
-        };
-        let info = self
-            .interface_infos
-            .get(&iface_name)
-            .cloned()
-            .expect("interface info vetted by LIR eligibility");
-        // The embedded-region layout the vtables are emitted from, so the slot
-        // indexed here is the slot the data object holds (willow-1fc6).
-        let slot = super::vtable_layout::slot_of(self.interface_infos, &info.name, method)
-            .expect("interface method slot vetted by LIR eligibility");
-        let sig_info = info.methods[method].clone();
-        let type_args = match &object.ty {
-            Type::Generic(_, args) => args.as_slice(),
-            _ => &[],
-        };
-        let substitutions: HashMap<TypeId, Type> = info
-            .type_params
-            .iter()
-            .cloned()
-            .zip(type_args.iter().cloned())
-            .collect();
-        let param_types: Vec<Type> = sig_info
-            .params
-            .iter()
-            .map(|ty| crate::semantic::symbols::substitute_type(ty, &substitutions))
-            .collect();
-        let param_modes: Vec<ParamMode> = sig_info
-            .param_infos
-            .iter()
-            .map(|p| p.mode.clone())
-            .collect();
-        let ret_type =
-            crate::semantic::symbols::substitute_type(&sig_info.return_type, &substitutions);
-
-        let box_ptr = self.emit_lir_expr(object);
-        self.emit_interface_dispatch_nil_check(box_ptr, object.span, method);
-        // Install the method frame before validating the concrete object so a
-        // invalid boxed receiver retains the method context in its diagnostic.
-        let pushed = self.emit_callstack_push(method, span);
-        let obj = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), box_ptr, 0i32);
-        self.emit_interface_dispatch_nil_check(obj, object.span, method);
-        let vtable = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), box_ptr, 8i32);
-        let fnptr =
-            self.builder
-                .ins()
-                .load(types::I64, MemFlagsData::new(), vtable, (slot * 8) as i32);
-
-        // The frame was installed before receiver validation and remains active
-        // through arguments, as it is for a direct instance-method call.
-        self.emit_push_root(obj);
-        // The callee is named by its bare method name, and no parameter debug
-        // is recorded for it.
-        let has_reference_args = lir_has_reference_args(Some(&param_modes), args);
-        let (arg_vals, arg_roots) = self.emit_lir_args_rooted(
-            args,
-            Some(&param_types),
-            Some(&param_modes),
-            Some(method),
-            None,
-        );
-
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        let ptr_ty = self.module.target_config().pointer_type();
-        for (idx, pt) in param_types.iter().enumerate() {
-            let abi = match param_modes.get(idx) {
-                Some(ParamMode::Reference { .. }) => ptr_ty,
-                _ => clif_type(pt),
-            };
-            sig.params.push(AbiParam::new(abi));
-        }
-        if ret_type != Type::Void {
-            sig.returns.push(AbiParam::new(clif_type(&ret_type)));
-        }
-        let sig_ref = self.builder.import_signature(sig);
-
-        let mut call_args = vec![obj];
-        call_args.extend(arg_vals);
-        // Interface dispatch is indirect; one implementation body being safe
-        // cannot prove the runtime-selected target safe.
-        let panic_depth = self.emit_pre_willow_call_panic_depth();
-        let call = self.builder.ins().call_indirect(sig_ref, fnptr, &call_args);
-        let mut result = if ret_type != Type::Void {
-            self.builder.inst_results(call)[0]
-        } else {
-            self.builder.ins().iconst(types::I64, 0)
-        };
-
-        if pushed {
-            self.emit_callstack_pop();
-        }
-        // The record naming this call's `&place` must not outlive the call
-        // (willow-0g8j.11).
-        if has_reference_args {
-            self.emit_debug_reference_call_clear();
-        }
-        self.emit_pop_roots_n(arg_roots + 1);
-        self.gc_root_count -= arg_roots + 1;
-        self.emit_post_willow_call_panic_check(panic_depth);
-        // `-> Self` yields a bare object of the receiver's own class. Re-box it
-        // only after the panic edge has rejected the neutral placeholder.
-        if matches!(&ret_type, Type::Named(n) if n == &TypeId::local("Self")) {
-            result = self.emit_box_with_vtable(result, vtable);
-        }
-        result
-    }
-
-    /// `Class::method(args)`: class methods always carry a hidden receiver
-    /// parameter, so a static call passes a null `self`.
-    fn emit_lir_static_call(
-        &mut self,
-        class: &str,
-        method: &str,
-        args: &[HirExpr],
-        ret_ty: &Type,
-        span: crate::diagnostics::Span,
-    ) -> cranelift_codegen::ir::Value {
-        // `Self::method(..)` names the class this body is declared in
-        // (willow-0g8j.13). Resolved once, before any dispatch, so the symbol
-        // emitted here is the symbol eligibility vetted — which resolves `Self`
-        // the same way, through `LirTypeCtx::resolved_class`.
-        let resolved_class = self.static_call_class_name(class);
-        let class = resolved_class.as_str();
-        // The one builtin constructor in the subset (willow-0g8j.7). It takes
-        // no arguments and allocates nothing that needs rooting first.
-        if class == "Map" && method == "new" {
-            let (key, value) = builtin_types::binary_args(ret_ty, B::Map)
-                .expect("map constructor must carry checked type arguments");
-            return self.emit_map_new(key, value);
-        }
-        if class == "Channel"
-            && let Type::Generic(_, type_args) = ret_ty
-            && let Some(element_ty) = type_args.first()
-        {
-            let is_ref = self.builder.ins().iconst(
-                types::I64,
-                i64::from(is_gc_managed(element_ty, self.enum_infos)),
-            );
-            if method == "new" {
-                return self.emit_value_runtime_call("willow_channel_new", &[is_ref]);
-            }
-            if method == "with_capacity" {
-                let capacity = self.emit_lir_expr(&args[0]);
-                return self
-                    .emit_value_runtime_call("willow_channel_new_bounded", &[is_ref, capacity]);
-            }
-        }
-        // `AtomicI64::new(x)` / `AtomicBool::new(b)` (willow-0g8j.2.13): the
-        // runtime allocates the cell and stores the initial word into it. The
-        // operand is a scalar, so nothing has to be rooted across the call.
-        //
-        // Keyed on the CLASS as well as the result type, exactly as eligibility
-        // is: a user `static fn new` returning a cell has the same result type
-        // and the same method name, and matching on those alone would replace
-        // its body with the runtime constructor.
-        // `CancellationToken::new()` / `TaskScope::new()` (willow-0g8j.2.13):
-        // the runtime allocates the handle and takes nothing.
-        if let Some(handle) = cancellation_handle(ret_ty)
-            && method == "new"
-            && class == handle.class_name()
-        {
-            let runtime = format!("{}_new", handle.prefix());
-            return self.emit_value_runtime_call(&runtime, &[]);
-        }
-        if let Some(cell) = atomic_cell(ret_ty)
-            && method == "new"
-            && class == cell.class_name()
-        {
-            let initial = self.emit_lir_expr(&args[0]);
-            let runtime = format!("willow_atomic_{}_new", cell.suffix());
-            return self.emit_value_runtime_call(&runtime, &[initial]);
-        }
-        // `BlockingCell<T>::new(v)` / `BlockingRwCell<T>::new(v)`
-        // (willow-0g8j.2.13): the runtime allocates the cell and stores the
-        // initial WORD into it, with a flag saying whether that word is a GC
-        // reference the collector has to trace through the cell.
-        //
-        // Nothing is rooted across the call because the constructor cannot
-        // collect — it is a plain allocation with no GC effects, unlike the
-        // scheduler-aware locks, whose handle is itself a GC object.
-        if let Some((kind, elem)) = blocking_cell(ret_ty)
-            && method == "new"
-            && class == kind.class_name()
-        {
-            let elem = elem.clone();
-            let initial = self.emit_lir_expr(&args[0]);
-            let word = self.coerce_to_i64(initial, &elem);
-            let is_ref = is_gc_managed(&elem, self.enum_infos);
-            let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
-            let runtime = format!("{}_new", kind.prefix());
-            return self.emit_value_runtime_call(&runtime, &[word, flag]);
-        }
-        // `Mutex<T>::new(v)` / `RwLock<T>::new(v)` (willow-0g8j.2.13). Unlike
-        // the blocking cells above, the handle IS a GC object, so building it
-        // can collect: a freshly produced protected reference is rooted until
-        // the runtime has installed it in the handle's traced value slot.
-        if let Some((prefix, protected)) = scheduler_lock(ret_ty)
-            && method == "new"
-            && matches!(class, "Mutex" | "RwLock")
-        {
-            let protected = protected.clone();
-            let mut initial = self.emit_lir_expr(&args[0]);
-            let is_ref = is_gc_managed(&protected, self.enum_infos);
-            if is_ref {
-                let slot = self.emit_push_root(initial);
-                initial = self.stack_load(self.module.target_config().pointer_type(), slot);
-            }
-            let word = self.coerce_to_i64(initial, &protected);
-            let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
-            let runtime = format!("{prefix}_new");
-            let handle = self.emit_value_runtime_call(&runtime, &[word, flag]);
-            if is_ref {
-                self.emit_pop_roots_n(1);
-                self.gc_root_count -= 1;
-            }
-            return handle;
-        }
-        // `Enum::Variant(payload…)`, and the qualified fieldless form, which
-        // HIR also spells as a zero-argument static call (willow-0g8j.8).
-        if self.enum_infos.contains_key(class) {
-            return self.emit_lir_enum_construction(class, method, args, ret_ty);
-        }
-        // The `env`, `fs` and `net` builtin namespaces and the two `f64::`
-        // calls (willow-0g8j.2.10, willow-0g8j.2.13): a plain runtime call, with a
-        // user module of the same name winning over the builtin.
-        if let Some(entry) = namespace_builtin_call(
-            self.known_modules,
-            self.builtin_module_aliases,
-            class,
-            method,
-        ) {
-            let (arg_vals, arg_roots) =
-                self.emit_lir_args_rooted(args, Some(&entry.params), None, None, None);
-            let result = self
-                .emit_runtime_call_with_cleanup(entry.runtime, &arg_vals, |this| {
-                    if arg_roots > 0 {
-                        this.emit_pop_roots_n(arg_roots);
-                        this.gc_root_count -= arg_roots;
-                    }
-                })
-                .expect("every builtin namespace entry returns a value");
-            return if entry.narrow_to_bool {
-                self.builder.ins().ireduce(types::I8, result)
-            } else {
-                result
-            };
-        }
-        // A call into an imported user module (`math::add(1, 2)`): a free
-        // function under the module item symbol, with NO hidden receiver
-        // (willow-7nc6). The class path below would both mangle the wrong
-        // symbol and prepend a `self` the callee does not take.
-        if let Some(module_prefix) = self.known_modules.linker_prefix(class).cloned() {
-            let mangled = module_item_symbol(&module_prefix, method);
-            let params = self.fn_param_types(&mangled);
-            let modes = self.func_param_modes.get(&mangled).cloned();
-            let param_debug = self.func_param_debug.get(&mangled).cloned();
-            let has_reference_args = lir_has_reference_args(modes.as_deref(), args);
-            // A reference report names the callee as the SOURCE spells it —
-            // `math::add`, not the mangled module symbol.
-            let user_callee = format!("{class}::{method}");
-            let (arg_vals, arg_roots) = self.emit_lir_args_rooted(
-                args,
-                params.as_deref(),
-                modes.as_deref(),
-                Some(&user_callee),
-                param_debug.as_deref(),
-            );
-            let fid = *self.func_ids.get(mangled.as_str()).unwrap_or_else(|| {
-                panic!("eligible LIR module call `{class}::{method}` has no declared function")
-            });
-            let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            // Use the source spelling in debug panic traces (willow-0g8j.2.20).
-            let pushed = self.emit_callstack_push(&user_callee, span);
-            let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
-            let call = self.builder.ins().call(fref, &arg_vals);
-            let result = self
-                .builder
-                .inst_results(call)
-                .first()
-                .copied()
-                .unwrap_or_else(|| self.builder.ins().iconst(clif_type(ret_ty), 0));
-            if pushed {
-                self.emit_callstack_pop();
-            }
-            if has_reference_args {
-                self.emit_debug_reference_call_clear();
-            }
-            if arg_roots > 0 {
-                self.emit_pop_roots_n(arg_roots);
-                self.gc_root_count -= arg_roots;
-            }
-            self.emit_post_willow_call_panic_check(panic_depth);
-            return result;
-        }
-        let mangled = class_method_symbol_name(self.known_modules, class, method);
-        let fid = self.func_ids[&mangled];
-        let dummy_self = self.builder.ins().iconst(types::I64, 0);
-        let params = self.method_param_types(&mangled);
-        let modes = self.func_param_modes.get(&mangled).cloned();
-        let param_debug = self.func_param_debug.get(&mangled).cloned();
-        let has_reference_args = lir_has_reference_args(modes.as_deref(), args);
-        let user_callee = format!("{class}::{method}");
-        let (arg_vals, arg_roots) = self.emit_lir_args_rooted(
-            args,
-            params.as_deref(),
-            modes.as_deref(),
-            Some(&user_callee),
-            param_debug.as_deref(),
-        );
-        let fref = self.module.declare_func_in_func(fid, self.builder.func);
-        let mut call_args = vec![dummy_self];
-        call_args.extend(arg_vals);
-        let pushed = self.emit_callstack_push(method, span);
-        let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
-        let call = self.builder.ins().call(fref, &call_args);
-        let result = self
-            .builder
-            .inst_results(call)
-            .first()
-            .copied()
-            .unwrap_or_else(|| self.builder.ins().iconst(clif_type(ret_ty), 0));
-        if pushed {
-            self.emit_callstack_pop();
-        }
-        if has_reference_args {
-            self.emit_debug_reference_call_clear();
-        }
-        if arg_roots > 0 {
-            self.emit_pop_roots_n(arg_roots);
-            self.gc_root_count -= arg_roots;
-        }
-        self.emit_post_willow_call_panic_check(panic_depth);
-        result
-    }
-
-    fn emit_lir_channel_method(
-        &mut self,
-        object: &HirExpr,
-        method: &str,
-        args: &[HirExpr],
-        element_ty: &Type,
-    ) -> cranelift_codegen::ir::Value {
-        let ptr_ty = self.module.target_config().pointer_type();
-        let channel = self.emit_lir_expr(object);
-        match method {
-            "send" => {
-                let channel_slot = self.emit_push_root(channel);
-                let mut roots = 1;
-                let mut value = self.emit_lir_expr(&args[0]);
-                if is_gc_managed(element_ty, self.enum_infos) {
-                    let value_slot = self.emit_push_root(value);
-                    roots += 1;
-                    value = self.stack_load(ptr_ty, value_slot);
-                }
-                let channel = self.stack_load(ptr_ty, channel_slot);
-                let runtime = format!("willow_channel_send_{}", channel_runtime_suffix(element_ty));
-                self.emit_runtime_call_with_cleanup(&runtime, &[channel, value], |this| {
-                    this.emit_pop_roots_n(roots);
-                    this.gc_root_count -= roots;
-                });
-                self.builder.ins().iconst(types::I8, 0)
-            }
-            "recv" => {
-                let channel_slot = self.emit_push_root(channel);
-                let channel = self.stack_load(ptr_ty, channel_slot);
-                let runtime = format!("willow_channel_recv_{}", channel_runtime_suffix(element_ty));
-                self.emit_runtime_call_with_cleanup(&runtime, &[channel], |this| {
-                    this.emit_pop_roots_n(1);
-                    this.gc_root_count -= 1;
-                })
-                .expect("channel recv returns a value")
-            }
-            "close" => {
-                self.emit_void_runtime_call("willow_channel_close", &[channel]);
-                self.builder.ins().iconst(types::I8, 0)
-            }
-            _ => unreachable!("unsupported Channel method passed eligibility"),
-        }
-    }
-
-    /// `CancellationToken` / `TaskScope` methods (willow-0g8j.2.13).
-    ///
-    /// The operation name comes
-    /// from the RESOLVED intrinsic and the object it belongs to supplies the
-    /// symbol prefix, so a token and a scope share this one emitter without the
-    /// walker learning which operations each of them has.
-    ///
-    /// Cancellation fans out through the scheduler, which allocates, so the
-    /// handle is rooted across every call that can collect — and across
-    /// evaluation of the task argument, which can allocate on its own.
-    fn emit_lir_cancellation_method(
-        &mut self,
-        object: &HirExpr,
-        method: &str,
-        args: &[HirExpr],
-    ) -> cranelift_codegen::ir::Value {
-        let handle_kind =
-            cancellation_handle(&object.ty).expect("cancellation receiver vetted by eligibility");
-        let (intrinsic, _) =
-            cancellation_method(&object.ty, method, args).expect("cancellation method vetted");
-        let prefix = handle_kind.prefix();
-        let ptr_ty = self.module.target_config().pointer_type();
-        let handle = self.emit_lir_expr(object);
-        match intrinsic {
-            // One Acquire load in the runtime; nothing here can collect, so the
-            // handle needs no root.
-            Intrinsic::TokenIsCancelled | Intrinsic::ScopeIsCancelled => {
-                let raw =
-                    self.emit_value_runtime_call(&format!("{prefix}_is_cancelled"), &[handle]);
-                self.builder.ins().ireduce(types::I8, raw)
-            }
-            Intrinsic::TokenCancel | Intrinsic::ScopeCancel => {
-                self.emit_push_root(handle);
-                self.emit_runtime_call_with_cleanup(
-                    &format!("{prefix}_cancel"),
-                    &[handle],
-                    |this| {
-                        this.emit_pop_roots_n(1);
-                        this.gc_root_count -= 1;
-                    },
-                );
-                // `cancel` returns nothing; the expression node still needs a
-                // placeholder value.
-                self.builder.ins().iconst(types::I8, 0)
-            }
-            Intrinsic::TokenChild | Intrinsic::ScopeChild => {
-                self.emit_push_root(handle);
-                self.emit_runtime_call_with_cleanup(&format!("{prefix}_child"), &[handle], |this| {
-                    this.emit_pop_roots_n(1);
-                    this.gc_root_count -= 1;
-                })
-                .expect("child token/scope call returns a handle")
-            }
-            // `attach`/`add` hand back the very task they were given. The
-            // handle is only an SSA temporary while the task argument is
-            // evaluated, so it is rooted across it and reloaded afterwards.
-            Intrinsic::TokenAttach | Intrinsic::ScopeAdd => {
-                let handle_slot = self.emit_push_root(handle);
-                let task = self.emit_lir_expr(&args[0]);
-                let handle = self.stack_load(ptr_ty, handle_slot);
-                self.emit_push_root(task);
-                let runtime = if handle_kind.is_token {
-                    "willow_cancellation_token_attach"
-                } else {
-                    "willow_task_scope_add"
-                };
-                self.emit_runtime_call_with_cleanup(runtime, &[handle, task], |this| {
-                    this.emit_pop_roots_n(2);
-                    this.gc_root_count -= 2;
-                })
-                .expect("attach/add returns the same Task handle")
-            }
-            Intrinsic::ScopeFinish => {
-                self.emit_push_root(handle);
-                self.emit_runtime_call_with_cleanup("willow_task_scope_finish", &[handle], |this| {
-                    this.emit_pop_roots_n(1);
-                    this.gc_root_count -= 1;
-                })
-                .expect("scope finish returns a Task handle")
-            }
-            other => unreachable!("`{other:?}` is not a cancellation-handle method"),
-        }
-    }
-
-    /// `AtomicI64`/`AtomicBool` load/store/swap/add/sub (willow-0g8j.2.13).
-    ///
-    /// Roots the receiver across argument evaluation. The runtime symbol is
-    /// built from the resolved intrinsic and the cell's
-    /// width, never from the source spelling: interpolating the method name
-    /// would turn an operation the runtime does not implement into a link error
-    /// instead of a diagnostic.
-    ///
-    /// The atomic call itself never allocates, but the OPERAND expression can,
-    /// and the receiver is only an SSA temporary until it is stored somewhere —
-    /// so it is rooted across that evaluation, exactly as a channel `send`
-    /// roots its channel, including receivers that are temporary expressions.
-    fn emit_lir_atomic_method(
-        &mut self,
-        object: &HirExpr,
-        method: &str,
-        args: &[HirExpr],
-    ) -> cranelift_codegen::ir::Value {
-        let cell = atomic_cell(&object.ty).expect("atomic receiver vetted by eligibility");
-        let (intrinsic, _) =
-            atomic_method(&object.ty, method, args.len()).expect("atomic method vetted");
-        let op = match intrinsic {
-            Intrinsic::AtomicLoad => "load",
-            Intrinsic::AtomicStore => "store",
-            Intrinsic::AtomicSwap => "swap",
-            Intrinsic::AtomicAdd => "add",
-            Intrinsic::AtomicSub => "sub",
-            other => unreachable!("`{other:?}` is not an atomic method"),
-        };
-        let ptr_ty = self.module.target_config().pointer_type();
-        let mut cell_value = self.emit_lir_expr(object);
-        let mut call_args = Vec::with_capacity(2);
-        let mut roots = 0;
-        if let Some(arg) = args.first() {
-            let cell_slot = self.emit_push_root(cell_value);
-            roots += 1;
-            let operand = self.emit_lir_expr(arg);
-            cell_value = self.stack_load(ptr_ty, cell_slot);
-            call_args.push(cell_value);
-            call_args.push(operand);
-        } else {
-            call_args.push(cell_value);
-        }
-        let runtime = format!("willow_atomic_{}_{op}", cell.suffix());
-        self.emit_runtime_call_with_cleanup(&runtime, &call_args, |this| {
-            if roots > 0 {
-                this.emit_pop_roots_n(roots);
-                this.gc_root_count -= roots;
-            }
-        })
-        // `store` returns nothing; the expression node still needs a value,
-        // represented by an unused placeholder.
-        .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
-    }
-
-    /// A `BlockingCell<T>` or `BlockingRwCell<T>` accessor (willow-0g8j.2.13).
-    ///
-    /// The operation name comes from the RESOLVED intrinsic and the receiver
-    /// supplies the symbol prefix, so a spelling the runtime does not implement
-    /// becomes a diagnostic rather than a link error.
-    ///
-    /// The ABI is word-based, so the stored value is coerced into a word on the
-    /// way in and back out of one on the way out — that is the whole difference
-    /// from [`Self::emit_lir_atomic_method`], whose cells are already words.
-    ///
-    /// The receiver is deliberately NOT rooted across the operand, unlike the
-    /// atomic cell's: a blocking cell is a leaked raw runtime pointer rather
-    /// than a GC object ([`is_opaque_runtime_pointer_type`]), so the collector
-    /// must never be handed one to trace. Nothing can reclaim it either, which
-    /// is why an SSA temporary is all the receiver needs to be.
-    fn emit_lir_blocking_cell_method(
-        &mut self,
-        object: &HirExpr,
-        method: &str,
-        args: &[HirExpr],
-    ) -> cranelift_codegen::ir::Value {
-        let (kind, elem) =
-            blocking_cell(&object.ty).expect("blocking-cell receiver vetted by eligibility");
-        let elem = elem.clone();
-        let (intrinsic, _) = blocking_cell_method(&object.ty, method, args.len())
-            .expect("blocking-cell method vetted by eligibility");
-        let op = match intrinsic {
-            Intrinsic::CellGet => "get",
-            Intrinsic::CellSet => "set",
-            Intrinsic::RwCellRead => "read",
-            Intrinsic::RwCellWrite => "write",
-            other => unreachable!("`{other:?}` is not a blocking-cell method"),
-        };
-        let cell_value = self.emit_lir_expr(object);
-        let mut call_args = vec![cell_value];
-        if let Some(arg) = args.first() {
-            let stored = self.emit_lir_expr(arg);
-            call_args.push(self.coerce_to_i64(stored, &elem));
-        }
-        let runtime = format!("{}_{op}", kind.prefix());
-        match self.emit_runtime_call_with_cleanup(&runtime, &call_args, |_| {}) {
-            // `get` / `read` hand back a word — coerce it to the element type.
-            Some(result) => self.coerce_i64_to(result, &elem),
-            // `set` / `write` return nothing; the expression node still needs a
-            // placeholder value.
-            None => self.builder.ins().iconst(types::I8, 0),
-        }
-    }
-
-    /// `Task<T>`/`JoinHandle<T>` cancellation (willow-0g8j.2.11). Both spellings
-    /// ARE the async frame pointer, so neither call needs the scheduler's task
-    /// table and neither allocates: `is_cancelled` is one Acquire load of the
-    /// frame header (willow-ezs.1.3), and `cancel` reads the task id out of the
-    /// frame before handing it to the scheduler. Neither operation needs
-    /// a root push: the receiver is
-    /// consumed by the call itself and is dead immediately after it.
-    fn emit_lir_task_handle_method(
-        &mut self,
-        object: &HirExpr,
-        method: &str,
-        arity: usize,
-    ) -> cranelift_codegen::ir::Value {
-        let handle = self.emit_lir_expr(object);
-        match task_handle_method(&object.ty, method, arity)
-            .and_then(|_| intrinsics::resolve(&object.ty, method, arity))
-            .map(|resolved| resolved.intrinsic)
-        {
-            Some(Intrinsic::TaskCancel) => {
-                let task_id = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::new(),
-                    handle,
-                    async_frame_slot_offset(FRAME_SLOT_TASK_ID),
-                );
-                self.emit_void_runtime_call("willow_sched_cancel", &[task_id]);
-                self.builder.ins().iconst(types::I8, 0)
-            }
-            Some(Intrinsic::TaskIsCancelled) => {
-                let raw = self.emit_value_runtime_call("willow_frame_is_cancelled", &[handle]);
-                self.builder.ins().ireduce(types::I8, raw)
-            }
-            // `t.result()` starts nothing and waits for nothing: `TaskResult<T>`
-            // is represented by the same frame pointer `Task<T>` already is, so
-            // the adapter is the identity and only the type checker separates
-            // them. What the distinction buys is paid out at the `await`, which
-            // carries `cancel_aware` from lowering.
-            Some(Intrinsic::TaskResult) => handle,
-            _ => unreachable!("unsupported Task method passed eligibility"),
-        }
-    }
-
-    /// `String` `+` / `==` / `!=`. Concatenation allocates; equality only
-    /// compares bytes. The left operand is rooted across evaluation of the
-    /// right operand because that expression may allocate. Keeping that root
-    /// through the allocation-free equality call is conservative.
-    fn emit_lir_string_binop(
-        &mut self,
-        op: &BinOp,
-        lhs: &HirExpr,
-        rhs: &HirExpr,
-    ) -> cranelift_codegen::ir::Value {
-        let l = self.emit_lir_expr(lhs);
-        self.emit_push_root(l);
-        let r = self.emit_lir_expr(rhs);
-        let (rt, roots) = match op {
-            BinOp::Add => {
-                // The concat call allocates, so the right operand must be a
-                // root too — it may itself be a fresh temporary.
-                self.emit_push_root(r);
-                ("willow_string_concat", 2)
-            }
-            BinOp::Eq | BinOp::Ne => ("willow_string_eq", 1),
-            _ => unreachable!("non-concat/compare string operator passed eligibility"),
-        };
-        let fid = self.func_id(rt);
-        let fref = self.module.declare_func_in_func(fid, self.builder.func);
-        let call = self.builder.ins().call(fref, &[l, r]);
-        let raw = self.builder.inst_results(call)[0];
-        self.emit_pop_roots_n(roots);
-        self.gc_root_count -= roots;
-        match op {
-            BinOp::Add => raw,
-            // `willow_string_eq` answers in a word; the language's bool is i8.
-            BinOp::Eq => self.builder.ins().ireduce(types::I8, raw),
-            _ => {
-                let inv = self.builder.ins().bxor_imm_s(raw, 1);
-                self.builder.ins().ireduce(types::I8, inv)
-            }
-        }
-    }
-
-    /// `[e0, e1, ...]`: allocate the handle, then fill it in place. Elements
-    /// cross the runtime ABI as raw 64-bit words. The fresh array is rooted
-    /// while the elements are evaluated, but only when one of them can actually
-    /// collect — a list of constants cannot.
-    fn emit_lir_array_literal(
-        &mut self,
-        elements: &[HirExpr],
-        elem_ty: &Type,
-    ) -> cranelift_codegen::ir::Value {
-        let len_val = self.builder.ins().iconst(types::I64, elements.len() as i64);
-        let is_ref = i64::from(is_gc_managed(elem_ty, self.enum_infos));
-        let is_ref_val = self.builder.ins().iconst(types::I64, is_ref);
-        let arr = self.emit_value_runtime_call("willow_array_new", &[len_val, is_ref_val]);
-
-        let rooted = elements
-            .iter()
-            .any(|el| self.lir_value_allocates(el, elem_ty));
-        if rooted {
-            self.emit_push_root(arr);
-        }
-        for (i, el) in elements.iter().enumerate() {
-            // Each element is stored immediately, so it is only unrooted for
-            // the allocation-free window between its own value and the `set`.
-            let val = self.emit_lir_store_value(el, elem_ty);
-            let word = self.coerce_to_i64(val, elem_ty);
-            let idx_val = self.builder.ins().iconst(types::I64, i as i64);
-            self.emit_void_runtime_call("willow_array_set", &[arr, idx_val, word]);
-        }
-        if rooted {
-            self.emit_pop_roots_n(1);
-            self.gc_root_count -= 1;
-        }
-        arr
-    }
-
-    /// `arr[index]`: bounds-checked element read, converted back from the
-    /// uniform 64-bit word to the element type.
-    fn emit_lir_index(&mut self, array: &HirExpr, index: &HirExpr) -> cranelift_codegen::ir::Value {
-        let elem_ty = array_element_type(&array.ty);
-        let arr = self.emit_lir_expr(array);
-        // The array may be a temporary (`build()[i]`) that nothing else roots.
-        let rooted = may_allocate(index);
-        if rooted {
-            self.emit_push_root(arr);
-        }
-        let idx = self.emit_lir_expr(index);
-        let word = self
-            .emit_runtime_call_with_cleanup("willow_array_get", &[arr, idx], |this| {
-                if rooted {
-                    this.emit_pop_roots_n(1);
-                    this.gc_root_count -= 1;
-                }
-            })
-            .expect("willow_array_get returns a value");
-        self.coerce_i64_to(word, &elem_ty)
-    }
-
-    /// `42.toString()` and friends. `String::toString` is the identity and
-    /// emits no code at all, which is why the receiver's value is returned
-    /// rather than passed through a runtime call.
-    fn emit_lir_scalar_to_string(
-        &mut self,
-        object: &HirExpr,
-        method: &str,
-        args: &[HirExpr],
-    ) -> cranelift_codegen::ir::Value {
-        let intrinsic = intrinsics::resolve(&object.ty, method, args.len())
-            .expect("scalar `toString` vetted by eligibility")
-            .intrinsic;
-        let value = self.emit_lir_expr(object);
-        match intrinsic {
-            Intrinsic::StringToString => value,
-            Intrinsic::I64ToString => {
-                self.emit_value_runtime_call("willow_i64_to_string", &[value])
-            }
-            Intrinsic::F64ToString => {
-                self.emit_value_runtime_call("willow_f64_to_string", &[value])
-            }
-            Intrinsic::BoolToString => {
-                self.emit_value_runtime_call("willow_bool_to_string", &[value])
-            }
-            other => unreachable!("`{other:?}` is not a scalar `toString`"),
-        }
-    }
-
-    /// The builtin `Array<T>` methods admitted by eligibility. `push` can grow
-    /// the buffer, but the runtime roots both the handle and the pushed word
-    /// across that reallocation, and the handle pointer itself never moves.
-    fn emit_lir_array_method(
-        &mut self,
-        object: &HirExpr,
-        method: &str,
-        args: &[HirExpr],
-    ) -> cranelift_codegen::ir::Value {
-        let elem_ty = array_element_type(&object.ty);
-        let arr = self.emit_lir_expr(object);
-        match method {
-            "len" => self.emit_value_runtime_call("willow_array_len", &[arr]),
-            "push" => {
-                let rooted = self.lir_value_allocates(&args[0], &elem_ty);
-                if rooted {
-                    self.emit_push_root(arr);
-                }
-                let v = self.emit_lir_store_value(&args[0], &elem_ty);
-                let word = self.coerce_to_i64(v, &elem_ty);
-                self.emit_runtime_call_with_cleanup("willow_array_push", &[arr, word], |this| {
-                    if rooted {
-                        this.emit_pop_roots_n(1);
-                        this.gc_root_count -= 1;
-                    }
-                });
-                self.builder.ins().iconst(types::I8, 0) // void
-            }
-            "pop" => {
-                let word = self.emit_value_runtime_call("willow_array_pop", &[arr]);
-                self.coerce_i64_to(word, &elem_ty)
-            }
-            "toString" => {
-                let kind = collection_elem_kind(&elem_ty)
-                    .expect("array toString element kind vetted by eligibility");
-                let kind_val = self.builder.ins().iconst(types::I64, kind);
-                // The receiver is rooted across the call: it builds a String,
-                // and a receiver that is only a temporary (`build().toString()`)
-                // is otherwise reachable only from a machine register the
-                // collector does not scan.
-                self.emit_push_root(arr);
-                let s = self.emit_runtime_call_with_cleanup(
-                    "willow_array_to_string",
-                    &[arr, kind_val],
-                    |this| {
-                        this.emit_pop_roots_n(1);
-                        this.gc_root_count -= 1;
-                    },
-                );
-                s.expect("willow_array_to_string returns a value")
-            }
-            // `arr.freeze()` -> an independent immutable copy over the same
-            // runtime array representation (willow-dgwo.7). The copy allocates,
-            // so the source is rooted across it for the same reason.
-            "freeze" => {
-                self.emit_push_root(arr);
-                let copy =
-                    self.emit_runtime_call_with_cleanup("willow_array_copy", &[arr], |this| {
-                        this.emit_pop_roots_n(1);
-                        this.gc_root_count -= 1;
-                    });
-                copy.expect("willow_array_copy returns a value")
-            }
-            _ => unreachable!("unsupported array method passed eligibility"),
-        }
-    }
-
-    /// The builtin `Map<K, V>`, `FrozenMap<K, V>` and `FrozenArray<T>` methods
-    /// admitted by eligibility (willow-0g8j.7).
-    ///
-    /// A frozen collection IS the collection it was frozen from as far as the
-    /// runtime is concerned — `freeze` copies, and the copy has the same shape —
-    /// so the read methods of both kinds lower to one call each. Keys and values
-    /// cross as raw 64-bit words with an is-ref flag telling the runtime whether
-    /// to treat the word as a GC reference; the flags are computed from the
-    /// collection's DECLARED type arguments, never from the argument
-    /// expression's, so a boxed interface value is still flagged as a reference.
-    fn emit_lir_collection_method(
-        &mut self,
-        object: &HirExpr,
-        method: &str,
-        args: &[HirExpr],
-    ) -> cranelift_codegen::ir::Value {
-        let (kind, targs) =
-            lir_collection(&object.ty).expect("collection receiver vetted by eligibility");
-        let handle = self.emit_lir_expr(object);
-        match (kind, method) {
-            // A `FrozenArray<T>` is backed by the same handle as the `Array<T>`
-            // it was frozen from, so its length is the array length.
-            (LirCollection::FrozenArray, "len") => {
-                self.emit_value_runtime_call("willow_array_len", &[handle])
-            }
-            (LirCollection::Map | LirCollection::FrozenMap, "len") => {
-                self.emit_value_runtime_call("willow_map_len", &[handle])
-            }
-            (LirCollection::Map | LirCollection::FrozenMap, "contains") => {
-                let key_ty = targs[0].clone();
-                // The map is rooted only while an allocating key expression
-                // runs; the lookup itself allocates nothing.
-                let rooted = self.lir_value_allocates(&args[0], &key_ty);
-                if rooted {
-                    self.emit_push_root(handle);
-                }
-                let k = self.emit_lir_expr(&args[0]);
-                let k_word = self.coerce_to_i64(k, &key_ty);
-                let k_ref = self.map_is_ref_flag(&key_ty);
-                let raw =
-                    self.emit_value_runtime_call("willow_map_contains", &[handle, k_word, k_ref]);
-                if rooted {
-                    self.emit_pop_roots_n(1);
-                    self.gc_root_count -= 1;
-                }
-                self.builder.ins().ireduce(types::I8, raw) // bool
-            }
-            (LirCollection::Map, "insert") => {
-                let (key_ty, val_ty) = (targs[0].clone(), targs[1].clone());
-                // Everything stays rooted until the insert returns. The map is
-                // rooted because evaluating either argument can collect; the key
-                // is rooted because evaluating the VALUE can; and both are rooted
-                // across the call itself, which may grow the table and collect
-                // before it has stored them (willow-oewp.6).
-                self.emit_push_root(handle);
-                let mut roots = 1usize;
-                let k = self.emit_lir_expr(&args[0]);
-                let k_word = self.coerce_to_i64(k, &key_ty);
-                if is_gc_managed(&key_ty, self.enum_infos) {
-                    self.emit_push_root(k);
-                    roots += 1;
-                }
-                let v = self.emit_lir_store_value(&args[1], &val_ty);
-                let v_word = self.coerce_to_i64(v, &val_ty);
-                if is_gc_managed(&val_ty, self.enum_infos) {
-                    self.emit_push_root(v);
-                    roots += 1;
-                }
-                let k_ref = self.map_is_ref_flag(&key_ty);
-                let v_ref = self.map_is_ref_flag(&val_ty);
-                self.emit_runtime_call_with_cleanup(
-                    "willow_map_insert",
-                    &[handle, k_word, k_ref, v_word, v_ref],
-                    |this| {
-                        this.emit_pop_roots_n(roots);
-                        this.gc_root_count -= roots;
-                    },
-                );
-                self.builder.ins().iconst(types::I8, 0) // void
-            }
-            (LirCollection::Map | LirCollection::FrozenMap, "get") => {
-                let (key_ty, val_ty) = (targs[0].clone(), targs[1].clone());
-                // Rooted across the whole call, not just an allocating key: the
-                // lookup itself allocates the `Option<V>` result, and a
-                // temporary map reachable only here must survive that
-                // collection or the value it holds is reclaimed
-                // (willow-oewp.6).
-                self.emit_push_root(handle);
-                let k = self.emit_lir_expr(&args[0]);
-                let k_word = self.coerce_to_i64(k, &key_ty);
-                let k_ref = self.map_is_ref_flag(&key_ty);
-                // The runtime builds the option, so it has to be told which
-                // representation to build — the same decision `option_repr`
-                // makes here and in `emit_lir_enum_construction`.
-                let option_ty = Type::Generic("Option".to_string().into(), vec![val_ty]);
-                let niche = self.builder.ins().iconst(
-                    types::I64,
-                    i64::from(
-                        option_repr(&option_ty, self.enum_infos)
-                            == Some(OptionRepr::NullableGcPointer),
-                    ),
-                );
-                let got = self.emit_runtime_call_with_cleanup(
-                    "willow_map_get",
-                    &[handle, k_word, k_ref, niche],
-                    |this| {
-                        this.emit_pop_roots_n(1);
-                        this.gc_root_count -= 1;
-                    },
-                );
-                got.expect("willow_map_get returns a value")
-            }
-            (LirCollection::Map, "toString") => {
-                self.emit_push_root(handle);
-                let s = self.emit_runtime_call_with_cleanup(
-                    "willow_map_to_string",
-                    &[handle],
-                    |this| {
-                        this.emit_pop_roots_n(1);
-                        this.gc_root_count -= 1;
-                    },
-                );
-                s.expect("willow_map_to_string returns a value")
-            }
-            (LirCollection::Map, "freeze") => {
-                self.emit_push_root(handle);
-                let copy =
-                    self.emit_runtime_call_with_cleanup("willow_map_copy", &[handle], |this| {
-                        this.emit_pop_roots_n(1);
-                        this.gc_root_count -= 1;
-                    });
-                copy.expect("willow_map_copy returns a value")
-            }
-            _ => unreachable!("unsupported collection method `{method}` passed eligibility"),
-        }
-    }
-
-    /// The value-taking `Option`/`Result` methods, routed through the same
-    /// helpers [`FuncGen::emit_option_result_method_call`] uses so the two
-    /// emitters cannot disagree about the niche, the tag or the panic message
-    /// (willow-0g8j.2.1).
-    fn emit_lir_option_result_method(
-        &mut self,
-        object: &HirExpr,
-        method: &str,
-        args: &[HirExpr],
-        span: Span,
-    ) -> cranelift_codegen::ir::Value {
-        const OK_TAG: i64 = 0;
-        const ERR_TAG: i64 = 1;
-        let resolved = builtin_types::resolve(&object.ty)
-            .expect("Option/Result receiver vetted by eligibility");
-        let id = resolved.id;
-        let payload = |i: usize| resolved.args.get(i).cloned().unwrap_or(Type::Void);
-        let (ok_ty, err_ty) = (payload(0), payload(1));
-        let recv = self.emit_lir_expr(object);
-        // Every branch below either allocates a panic message or evaluates an
-        // argument that may allocate, and the receiver is otherwise live only
-        // in an SSA register — so it is rooted for the whole method.
-        self.emit_push_root(recv);
-        let value = match (id, method) {
-            (B::Option, "is_some") => self.emit_option_is_some(recv, &ok_ty),
-            (B::Option, "is_none") => {
-                let some = self.emit_option_is_some(recv, &ok_ty);
-                let zero = self.builder.ins().iconst(types::I8, 0);
-                self.builder.ins().icmp(IntCC::Equal, some, zero)
-            }
-            (B::Option, "unwrap") => {
-                let msg = self.emit_string_literal("called `Option::unwrap()` on a `None` value");
-                self.emit_option_unwrap(recv, &ok_ty, msg, Some(span))
-            }
-            (B::Option, "expect") => {
-                let msg = self.emit_lir_expr(&args[0]);
-                self.emit_option_unwrap(recv, &ok_ty, msg, Some(span))
-            }
-            (B::Option, "unwrap_or") => {
-                let default_val = self.emit_lir_expr(&args[0]);
-                self.emit_option_unwrap_or(recv, &ok_ty, default_val)
-            }
-            (B::Result, "is_ok") | (B::Result, "is_err") => {
-                let tag = self.emit_load_enum_tag(recv);
-                let want = self
-                    .builder
-                    .ins()
-                    .iconst(types::I64, if method == "is_ok" { OK_TAG } else { ERR_TAG });
-                self.builder.ins().icmp(IntCC::Equal, tag, want)
-            }
-            (B::Result, "unwrap") => {
-                let msg = self.emit_string_literal("called `Result::unwrap()` on an `Err` value");
-                self.emit_enum_unwrap(recv, &ok_ty, OK_TAG, msg, Some(span))
-            }
-            (B::Result, "unwrap_err") => {
-                let msg =
-                    self.emit_string_literal("called `Result::unwrap_err()` on an `Ok` value");
-                self.emit_enum_unwrap(recv, &err_ty, ERR_TAG, msg, Some(span))
-            }
-            (B::Result, "expect") => {
-                let msg = self.emit_lir_expr(&args[0]);
-                self.emit_enum_unwrap(recv, &ok_ty, OK_TAG, msg, Some(span))
-            }
-            (B::Result, "unwrap_or") => {
-                let default_val = self.emit_lir_expr(&args[0]);
-                self.emit_enum_unwrap_or(recv, &ok_ty, OK_TAG, default_val)
-            }
-            // The callable-taking combinators (willow-0g8j.2.2). The receiver
-            // is already rooted above, which is what makes calling an arbitrary
-            // function — and allocating the new enum around its result — safe
-            // here. Shared helpers enforce tag layout, the pointer niche,
-            // and the indirect-call ABI.
-            (B::Option, "map") => {
-                let (f_val, f_ty) = self.emit_lir_fn_operand(&args[0]);
-                let produced = fn_return_type(&f_ty);
-                self.emit_option_map(recv, &ok_ty, &produced, f_val, &f_ty)
-            }
-            (B::Option, "and_then") => {
-                let (f_val, f_ty) = self.emit_lir_fn_operand(&args[0]);
-                self.emit_option_and_then(recv, &ok_ty, f_val, &f_ty)
-            }
-            (B::Option, "or_else") => {
-                let (f_val, f_ty) = self.emit_lir_fn_operand(&args[0]);
-                self.emit_option_or_else(recv, &ok_ty, f_val, &f_ty)
-            }
-            (B::Result, "map") => {
-                let (f_val, f_ty) = self.emit_lir_fn_operand(&args[0]);
-                let produced = fn_return_type(&f_ty);
-                self.emit_result_map(recv, &ok_ty, &err_ty, &produced, f_val, &f_ty)
-            }
-            (B::Result, "map_err") => {
-                let (f_val, f_ty) = self.emit_lir_fn_operand(&args[0]);
-                let produced = fn_return_type(&f_ty);
-                self.emit_result_map_err(recv, &ok_ty, &err_ty, &produced, f_val, &f_ty)
-            }
-            (B::Result, "and_then") => {
-                let (f_val, f_ty) = self.emit_lir_fn_operand(&args[0]);
-                self.emit_result_and_then(recv, &ok_ty, f_val, &f_ty)
-            }
-            (B::Result, "or_else") => {
-                let (f_val, f_ty) = self.emit_lir_fn_operand(&args[0]);
-                self.emit_result_or_else(recv, &err_ty, f_val, &f_ty)
-            }
-            _ => unreachable!("unsupported `{method}` on an Option/Result passed eligibility"),
-        };
-        self.emit_pop_roots_n(1);
-        self.gc_root_count -= 1;
-        value
-    }
-
-    /// Emit a combinator's callable operand and hand back its function type,
-    /// which the shared emitters need to build the indirect-call signature
-    /// (willow-0g8j.2.2).
-    fn emit_lir_fn_operand(&mut self, arg: &HirExpr) -> (cranelift_codegen::ir::Value, Type) {
-        (self.emit_lir_expr(arg), arg.ty.clone())
-    }
-
-    /// The is-ref flag a map key or value crosses the ABI with: 1 when the word
-    /// is a GC reference the collector must trace (and, for a key, the pointer
-    /// the runtime reads a `String` out of), 0 when it is a plain word.
     fn map_is_ref_flag(&mut self, ty: &Type) -> cranelift_codegen::ir::Value {
         let flag = i64::from(is_gc_managed(ty, self.enum_infos));
         self.builder.ins().iconst(types::I64, flag)
@@ -11117,13 +7874,36 @@ mod tests {
     }
 
     #[test]
+    fn flat_graph_rejects_normal_and_recovery_edges_to_entry() {
+        let (program, tables) = checked_lowering("fn main() {}", &["main"]);
+        let original = &program.functions[0];
+        for recovery in [false, true] {
+            let mut function = original.clone();
+            if recovery {
+                function.blocks[0].recovery = vec![BlockId(0)];
+            } else {
+                function.blocks[0].terminator = Terminator::Jump(BlockId(0));
+            }
+            let reason = tables.with_ctx(|ctx| lir_rejection_reason(&function, ctx));
+            assert_eq!(
+                reason.as_deref(),
+                Some("the LIR entry block must not have incoming edges")
+            );
+        }
+    }
+
+    #[test]
     fn flat_array_references_reject_forged_capture_metadata() {
         use crate::ir::lowered::{LirOperand as O, LirPlace, LirRvalue as V};
         let (program, tables) = checked_lowering(
             "import std::collections::Array; fn read(x: & i64) -> i64 { return x; } fn f(a: Array<i64>, i: i64) -> i64 { return read(&a[i]); }",
             &["read", "f"],
         );
-        let original = program.functions.iter().find(|f| f.name.to_string() == "f").unwrap();
+        let original = program
+            .functions
+            .iter()
+            .find(|f| f.name.to_string() == "f")
+            .unwrap();
         let original_reason = tables.with_ctx(|ctx| lir_rejection_reason(original, ctx));
         assert!(original_reason.is_none(), "{original_reason:?}");
         for forge_element in [false, true] {
@@ -11131,11 +7911,27 @@ mod tests {
             let mut changed = false;
             for block in &mut function.blocks {
                 for inst in &mut block.instrs {
-                    if let LirInst::Compute { value: V::DirectCall { args, .. }, .. } = inst {
+                    if let LirInst::Compute {
+                        value: V::DirectCall { args, .. },
+                        ..
+                    } = inst
+                    {
                         for argument in args {
-                            if let O::Reference { place: LirPlace::ArrayElement { index, element, .. }, .. } = argument {
-                                if forge_element { *element = Type::String; }
-                                else { *index = original.locals.iter().find(|local| local.parameter && local.ty == Type::I64).unwrap().id; }
+                            if let O::Reference {
+                                place: LirPlace::ArrayElement { index, element, .. },
+                                ..
+                            } = argument
+                            {
+                                if forge_element {
+                                    *element = Type::String;
+                                } else {
+                                    *index = original
+                                        .locals
+                                        .iter()
+                                        .find(|local| local.parameter && local.ty == Type::I64)
+                                        .unwrap()
+                                        .id;
+                                }
                                 changed = true;
                             }
                         }
@@ -11143,27 +7939,99 @@ mod tests {
                 }
             }
             assert!(changed);
-            let reason = tables.with_ctx(|ctx| lir_rejection_reason(&function, ctx)).expect("forged reference rejected");
-            assert!(reason.contains("captured buffer or checked index"), "{reason}");
+            let reason = tables
+                .with_ctx(|ctx| lir_rejection_reason(&function, ctx))
+                .expect("forged reference rejected");
+            assert!(
+                reason.contains("captured buffer or checked index"),
+                "{reason}"
+            );
         }
     }
 
     #[test]
     fn flat_rvalues_reject_unknown_layouts_and_invalid_coercions() {
         use crate::ir::lowered::{LirOperand as O, LirRvalue as V};
-        let (_, tables) = checked_lowering("class Point { pub x: i64; pub fn get(self) -> i64 { return self.x; } } fn main() {}", &["main"]);
+        let (_, tables) = checked_lowering(
+            "class Point { pub x: i64; pub fn get(self) -> i64 { return self.x; } } fn main() {}",
+            &["main"],
+        );
         tables.with_ctx(|ctx| {
             let point = Type::Named(TypeId::local("Point"));
             assert!(flat_method_signature(&point, "get", ctx).is_some());
             assert!(flat_method_signature(&point, "absent", ctx).is_none());
-            assert!(!flat_rvalue_supported(&V::MethodCall { receiver: O::Int(0), receiver_ty: point.clone(), method: "get".into(), args: vec![], arg_types: vec![], result: Type::String }, &[], ctx));
-            assert!(flat_rvalue_supported(&V::ObjectAlloc { class: TypeId::local("Point") }, &[], ctx));
-            assert!(!flat_rvalue_supported(&V::ObjectAlloc { class: TypeId::local("Missing") }, &[], ctx));
-            assert!(!flat_rvalue_supported(&V::Coerce { value: O::Int(1), source: Type::I64, target: Type::String }, &[], ctx));
-            assert!(!flat_rvalue_supported(&V::FieldLoad { object: O::Int(0), object_ty: point.clone(), field: "missing".into(), result: Type::I64 }, &[], ctx));
-            assert!(!flat_rvalue_supported(&V::FieldLoad { object: O::Int(0), object_ty: point, field: "x".into(), result: Type::String }, &[], ctx));
-            assert!(!flat_rvalue_supported(&V::ArrayAlloc { length: 1, element: Type::Void }, &[], ctx));
-            assert!(!flat_rvalue_supported(&V::StaticField { class: TypeId::local("Point"), field: "missing".into(), result: Type::I64 }, &[], ctx));
+            assert!(!flat_rvalue_supported(
+                &V::MethodCall {
+                    receiver: O::Int(0),
+                    receiver_ty: point.clone(),
+                    method: "get".into(),
+                    args: vec![],
+                    arg_types: vec![],
+                    result: Type::String
+                },
+                &[],
+                ctx
+            ));
+            assert!(flat_rvalue_supported(
+                &V::ObjectAlloc {
+                    class: TypeId::local("Point")
+                },
+                &[],
+                ctx
+            ));
+            assert!(!flat_rvalue_supported(
+                &V::ObjectAlloc {
+                    class: TypeId::local("Missing")
+                },
+                &[],
+                ctx
+            ));
+            assert!(!flat_rvalue_supported(
+                &V::Coerce {
+                    value: O::Int(1),
+                    source: Type::I64,
+                    target: Type::String
+                },
+                &[],
+                ctx
+            ));
+            assert!(!flat_rvalue_supported(
+                &V::FieldLoad {
+                    object: O::Int(0),
+                    object_ty: point.clone(),
+                    field: "missing".into(),
+                    result: Type::I64
+                },
+                &[],
+                ctx
+            ));
+            assert!(!flat_rvalue_supported(
+                &V::FieldLoad {
+                    object: O::Int(0),
+                    object_ty: point,
+                    field: "x".into(),
+                    result: Type::String
+                },
+                &[],
+                ctx
+            ));
+            assert!(!flat_rvalue_supported(
+                &V::ArrayAlloc {
+                    length: 1,
+                    element: Type::Void
+                },
+                &[],
+                ctx
+            ));
+            assert!(!flat_rvalue_supported(
+                &V::StaticField {
+                    class: TypeId::local("Point"),
+                    field: "missing".into(),
+                    result: Type::I64
+                },
+                &[],
+                ctx
+            ));
         });
     }
 
@@ -11172,11 +8040,57 @@ mod tests {
         use crate::ir::lowered::{LirOperand as O, LirRvalue as V};
         let (_, tables) = checked_lowering("fn main() {}", &["main"]);
         tables.with_ctx(|ctx| {
-            assert!(flat_rvalue_supported(&V::BuiltinCall { callee: FunctionId::free("gc_collect"), args: vec![], params: vec![], result: Type::Void }, &[], ctx));
-            assert!(!flat_rvalue_supported(&V::BuiltinCall { callee: FunctionId::free("gc_collect"), args: vec![], params: vec![], result: Type::I64 }, &[], ctx));
-            assert!(!flat_rvalue_supported(&V::BuiltinCall { callee: FunctionId::free("unknown"), args: vec![], params: vec![], result: Type::Void }, &[], ctx));
-            assert!(!flat_rvalue_supported(&V::EnumAlloc { class: TypeId::local("Missing"), variant: "Some".into(), enum_ty: Type::Named(TypeId::local("Missing")) }, &[], ctx));
-            assert!(!flat_rvalue_supported(&V::EnumMethod { receiver: O::Int(0), receiver_ty: Type::I64, method: "unwrap".into(), args: vec![], arg_types: vec![], result: Type::I64 }, &[], ctx));
+            assert!(flat_rvalue_supported(
+                &V::BuiltinCall {
+                    callee: FunctionId::free("gc_collect"),
+                    args: vec![],
+                    params: vec![],
+                    result: Type::Void
+                },
+                &[],
+                ctx
+            ));
+            assert!(!flat_rvalue_supported(
+                &V::BuiltinCall {
+                    callee: FunctionId::free("gc_collect"),
+                    args: vec![],
+                    params: vec![],
+                    result: Type::I64
+                },
+                &[],
+                ctx
+            ));
+            assert!(!flat_rvalue_supported(
+                &V::BuiltinCall {
+                    callee: FunctionId::free("unknown"),
+                    args: vec![],
+                    params: vec![],
+                    result: Type::Void
+                },
+                &[],
+                ctx
+            ));
+            assert!(!flat_rvalue_supported(
+                &V::EnumAlloc {
+                    class: TypeId::local("Missing"),
+                    variant: "Some".into(),
+                    enum_ty: Type::Named(TypeId::local("Missing"))
+                },
+                &[],
+                ctx
+            ));
+            assert!(!flat_rvalue_supported(
+                &V::EnumMethod {
+                    receiver: O::Int(0),
+                    receiver_ty: Type::I64,
+                    method: "unwrap".into(),
+                    args: vec![],
+                    arg_types: vec![],
+                    result: Type::I64
+                },
+                &[],
+                ctx
+            ));
         });
     }
 
@@ -13112,7 +10026,11 @@ mod tests {
         let src = "class Counter { pub n: i64; \
                    pub fn bump(self, v: &mut i64) { v = v + 1; } } \
                    fn f(c: Counter) -> i64 { let mut k = 1; c.bump(&k); return k; }";
-        assert!(eligible_lenient(src, "f", &["f"]), "{:?}", reason_of(src, "f", &["f"]));
+        assert!(
+            eligible_lenient(src, "f", &["f"]),
+            "{:?}",
+            reason_of(src, "f", &["f"])
+        );
     }
 
     // 58. calling a method ON the interface a method returned is rejected. The
@@ -13977,7 +10895,11 @@ mod tests {
                    fn f() -> i64 { let mut x = 1; bump(&x); return x; }";
         let diags = checked_lowering_diags(src);
         assert!(diags.is_empty(), "reference lowering failed: {diags:?}");
-        assert!(eligible_lenient(src, "f", &["bump", "f"]), "{:?}", reason_of(src, "f", &["bump", "f"]));
+        assert!(
+            eligible_lenient(src, "f", &["bump", "f"]),
+            "{:?}",
+            reason_of(src, "f", &["bump", "f"])
+        );
     }
 
     // k25. TABLE DRIFT, `&mut` parameter: a by-value argument must not be sent
@@ -15423,8 +12345,12 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         else {
             panic!("the function returns the `get` result");
         };
-        v.ty = Type::Generic("Option".to_string().into(), vec![Type::I64]);
-        f.return_type = v.ty.clone();
+        let crate::ir::lowered::LirOperand::Local(result) = v else {
+            panic!("materialized map result");
+        };
+        let forged = Type::Generic("Option".to_string().into(), vec![Type::I64]);
+        f.locals[result.0 as usize].ty = forged.clone();
+        f.return_type = forged;
         assert!(
             tables.with_ctx(|ctx| !lir_supported_function(&f, ctx)),
             "a `get` typed over a different value type must fall back"
@@ -15919,11 +12845,7 @@ fn f(n: i64) -> Result<i64, String> {
                     0,
                     Vec::new(),
                     Terminator::Branch {
-                        cond: HirExpr {
-                            kind: HirExprKind::Bool(true),
-                            ty: Type::Bool,
-                            span: Span::dummy(),
-                        },
+                        cond: crate::ir::lowered::LirOperand::Bool(true),
                         then_block: BlockId(1),
                         else_block: BlockId(2),
                     },
@@ -15991,37 +12913,28 @@ fn f() {
         assert!(reason.contains("Counter::total"), "{reason}");
     }
 
-    // r13. `super.init(...)` in a class with no registered base is reported as
-    // that, rather than admitted. Built by hand because the front end cannot
-    // produce it: `super.init` outside a subclass is a type error, and this arm
-    // guards the emitter, which would evaluate the arguments and store nothing
-    // (willow-0g8j.2.18).
+    // A lowered super constructor still requires its registered class layout.
+    // Corrupt backend metadata after valid source lowering to exercise that gate.
     #[test]
-    fn r13_super_init_without_a_base_class_reason() {
-        let f = LirFunction {
-            name: FunctionId::method(TypeId::local("Child"), "init"),
-            is_async: false,
-            params: Vec::new(),
-            captures: Vec::new(),
-            return_type: Type::Void,
-            blocks: vec![LirBlock {
-                id: crate::ir::lowered::BlockId(0),
-                instrs: vec![LirInst::SuperInit {
-                    args: Vec::new(),
-                    span: Span::new(0, 0, 1, 1),
-                }],
-                terminator: Terminator::Return(None),
-                recovery: Vec::new(),
-            }],
-            locals: Vec::new(),
-            async_frame: Default::default(),
-        };
-        let (program, errs) = Parser::new(Lexer::new("fn f() {}").tokenize().expect("lex")).parse();
-        assert!(errs.is_empty(), "{errs:?}");
-        let tables = TestTables::build(&program, &[], &[]);
-        assert_eq!(
-            tables.with_ctx(|ctx| lir_rejection_reason(&f, ctx)),
-            Some("it calls `super.init(...)`, but class `Child` has no base class".to_string())
+    fn r13_super_init_without_registered_base_layout_is_rejected() {
+        let source = "open class Base { pub init(self) {} } class Child extends Base { pub init(self) { super.init(); } }";
+        let (function, mut tables) = lir_fn_and_tables(source, "Child::init", &[]);
+        assert!(tables.with_ctx(|ctx| lir_supported_function(&function, ctx)));
+        let retained: Vec<_> = tables
+            .class_layouts
+            .iter()
+            .filter(|(id, _)| **id != TypeId::local("Base"))
+            .map(|(id, layout)| (*id, layout.clone()))
+            .collect();
+        tables.class_layouts.clear();
+        for (id, layout) in retained {
+            tables.class_layouts.insert(id, layout);
+        }
+        assert!(
+            tables
+                .with_ctx(|ctx| lir_rejection_reason(&function, ctx))
+                .is_some(),
+            "an unregistered constructor layout must reject"
         );
     }
 
@@ -16423,7 +13336,10 @@ fn f() {
                 f.blocks[0].terminator
             );
         };
-        call.ty = Type::String;
+        let crate::ir::lowered::LirOperand::Local(result) = call else {
+            panic!("materialized indirect call result");
+        };
+        f.locals[result.0 as usize].ty = Type::String;
         assert!(tables.with_ctx(|ctx| !lir_supported_function(&f, ctx)));
     }
 
@@ -16962,13 +13878,7 @@ fn f() {
                 !f.blocks
                     .iter()
                     .flat_map(|block| &block.instrs)
-                    .any(|inst| matches!(
-                        inst,
-                        LirInst::Expr(HirExpr {
-                            kind: HirExprKind::Match { .. },
-                            ..
-                        })
-                    ))
+                    .any(|inst| matches!(inst, LirInst::Unsupported { .. }))
             );
             // The expression validator still rejects a divergent match as an
             // operand; lowering only moves its statement control flow to CFG.
@@ -17449,14 +14359,37 @@ fn f() {
     #[test]
     fn s9_a_call_in_return_still_asks_for_a_safepoint() {
         for asynchronous in [false, true] {
-            let source = format!("fn g(x: i64) -> i64 {{ return 1 / x; }} {}fn f() -> i64 {{ return g(1); }}", if asynchronous { "async " } else { "" });
+            let source = format!(
+                "fn g(x: i64) -> i64 {{ return 1 / x; }} {}fn f() -> i64 {{ return g(1); }}",
+                if asynchronous { "async " } else { "" }
+            );
             let (program, _) = checked_lowering(&source, &["f", "g"]);
-            let function = program.functions.iter().find(|f| f.name.is_free_named("f")).unwrap();
-            assert!(function.blocks.iter().flat_map(|block| &block.instrs).any(|inst| matches!(inst,
-                LirInst::Compute { value: crate::ir::lowered::LirRvalue::DirectCall { .. }, .. })));
+            let function = program
+                .functions
+                .iter()
+                .find(|f| f.name.is_free_named("f"))
+                .unwrap();
+            assert!(
+                function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.instrs)
+                    .any(|inst| matches!(
+                        inst,
+                        LirInst::Compute {
+                            value: crate::ir::lowered::LirRvalue::DirectCall { .. },
+                            ..
+                        }
+                    ))
+            );
             if asynchronous {
-                assert!(function.blocks.iter().any(|block| matches!(block.terminator,
-                    Terminator::Suspend { operation: SuspendOp::Preempt, .. })));
+                assert!(function.blocks.iter().any(|block| matches!(
+                    block.terminator,
+                    Terminator::Suspend {
+                        operation: SuspendOp::Preempt,
+                        ..
+                    }
+                )));
             }
         }
     }
@@ -17620,32 +14553,58 @@ fn f() {
     }
 }
 
-
 /// Representation checks for resolved flat builtin methods. Receiver/result
 /// identity and arity are checked against the semantic intrinsic table first.
-fn flat_intrinsic_supported(intrinsic: Intrinsic, receiver: &Type, args: &[Type], result: &Type, ctx: &LirTypeCtx<'_>) -> bool {
+fn flat_intrinsic_supported(
+    intrinsic: Intrinsic,
+    receiver: &Type,
+    args: &[Type],
+    result: &Type,
+    ctx: &LirTypeCtx<'_>,
+) -> bool {
     use Intrinsic::*;
-    if !ctx.supported_type(receiver) || !ctx.supported_type(result) || !args.iter().all(|ty| ctx.supported_type(ty)) { return false; }
+    if !ctx.supported_type(receiver)
+        || !ctx.supported_type(result)
+        || !args.iter().all(|ty| ctx.supported_type(ty))
+    {
+        return false;
+    }
     match intrinsic {
         ArrayPush | ChannelSend => {
             let element = match receiver {
                 Type::Array(element) => &**element,
-                _ => match builtin_types::unary_arg(receiver, B::Channel) { Some(element) => element, None => return false },
+                _ => match builtin_types::unary_arg(receiver, B::Channel) {
+                    Some(element) => element,
+                    None => return false,
+                },
             };
             args.len() == 1 && ctx.storable(element, &args[0])
         }
-        ArrayToString => matches!(receiver, Type::Array(element) if collection_elem_kind(element).is_some()),
+        ArrayToString => {
+            matches!(receiver, Type::Array(element) if collection_elem_kind(element).is_some())
+        }
         MapContains | FrozenMapContains | MapGet | FrozenMapGet | MapInsert | MapToString => {
-            let Some((_, types)) = lir_collection(receiver) else { return false; };
-            if types.len() != 2 { return false; }
+            let Some((_, types)) = lir_collection(receiver) else {
+                return false;
+            };
+            if types.len() != 2 {
+                return false;
+            }
             match intrinsic {
                 MapToString => types.iter().all(|ty| collection_elem_kind(ty).is_some()),
-                MapInsert => args.len() == 2 && ctx.same_repr(&types[0], &args[0]) && ctx.storable(&types[1], &args[1]),
+                MapInsert => {
+                    args.len() == 2
+                        && ctx.same_repr(&types[0], &args[0])
+                        && ctx.storable(&types[1], &args[1])
+                }
                 _ => args.len() == 1 && ctx.same_repr(&types[0], &args[0]),
             }
         }
-        AtomicLoad | AtomicStore | AtomicSwap | AtomicAdd | AtomicSub => atomic_cell(receiver).is_some_and(|cell| args.iter().all(|arg| *arg == cell.word())),
-        CellGet | CellSet | RwCellRead | RwCellWrite => blocking_cell(receiver).is_some_and(|(_, elem)| args.iter().all(|arg| ctx.same_repr(elem, arg))),
+        AtomicLoad | AtomicStore | AtomicSwap | AtomicAdd | AtomicSub => {
+            atomic_cell(receiver).is_some_and(|cell| args.iter().all(|arg| *arg == cell.word()))
+        }
+        CellGet | CellSet | RwCellRead | RwCellWrite => blocking_cell(receiver)
+            .is_some_and(|(_, elem)| args.iter().all(|arg| ctx.same_repr(elem, arg))),
         _ => true,
     }
 }
@@ -17653,21 +14612,51 @@ fn flat_intrinsic_supported(intrinsic: Intrinsic, receiver: &Type, args: &[Type]
 impl<'a, 'b> FuncGen<'a, 'b> {
     /// Operands are already evaluated, typed, and rooted by LIR. This emitter
     /// performs one resolved operation; it never walks executable syntax.
-    fn emit_flat_intrinsic(&mut self, intrinsic: Intrinsic, receiver: cranelift_codegen::ir::Value, receiver_ty: &Type, args: &[cranelift_codegen::ir::Value], arg_types: &[Type], result: &Type, span: Span) -> cranelift_codegen::ir::Value {
+    fn emit_flat_intrinsic(
+        &mut self,
+        intrinsic: Intrinsic,
+        receiver: cranelift_codegen::ir::Value,
+        receiver_ty: &Type,
+        args: &[cranelift_codegen::ir::Value],
+        arg_types: &[Type],
+        result: &Type,
+        span: Span,
+    ) -> cranelift_codegen::ir::Value {
         // Frame-backed references can otherwise move during a coercion or a
         // blocking runtime call. Direct roots pin every loaded SSA operand.
         let roots_before = self.gc_root_count;
-        if is_gc_managed(receiver_ty, self.enum_infos) { self.emit_push_root(receiver); }
-        for (&value, ty) in args.iter().zip(arg_types) {
-            if is_gc_managed(ty, self.enum_infos) { self.emit_push_root(value); }
+        if is_gc_managed(receiver_ty, self.enum_infos) {
+            self.emit_push_root(receiver);
         }
-        let value = self.emit_flat_intrinsic_inner(intrinsic, receiver, receiver_ty, args, arg_types, result, span);
+        for (&value, ty) in args.iter().zip(arg_types) {
+            if is_gc_managed(ty, self.enum_infos) {
+                self.emit_push_root(value);
+            }
+        }
+        let value = self.emit_flat_intrinsic_inner(
+            intrinsic,
+            receiver,
+            receiver_ty,
+            args,
+            arg_types,
+            result,
+            span,
+        );
         self.emit_pop_roots_n(self.gc_root_count - roots_before);
         self.gc_root_count = roots_before;
         value
     }
 
-    fn emit_flat_intrinsic_inner(&mut self, intrinsic: Intrinsic, receiver: cranelift_codegen::ir::Value, receiver_ty: &Type, args: &[cranelift_codegen::ir::Value], arg_types: &[Type], _result: &Type, _span: Span) -> cranelift_codegen::ir::Value {
+    fn emit_flat_intrinsic_inner(
+        &mut self,
+        intrinsic: Intrinsic,
+        receiver: cranelift_codegen::ir::Value,
+        receiver_ty: &Type,
+        args: &[cranelift_codegen::ir::Value],
+        arg_types: &[Type],
+        _result: &Type,
+        _span: Span,
+    ) -> cranelift_codegen::ir::Value {
         use Intrinsic::*;
         match intrinsic {
             StringToString | TaskResult => receiver,
@@ -17675,7 +14664,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             F64ToString => self.emit_value_runtime_call("willow_f64_to_string", &[receiver]),
             BoolToString => self.emit_value_runtime_call("willow_bool_to_string", &[receiver]),
             TaskCancel => {
-                let id = self.builder.ins().load(types::I64, MemFlagsData::new(), receiver, async_frame_slot_offset(FRAME_SLOT_TASK_ID));
+                let id = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    receiver,
+                    async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+                );
                 self.emit_void_runtime_call("willow_sched_cancel", &[id]);
                 self.builder.ins().iconst(types::I8, 0)
             }
@@ -17683,58 +14677,108 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let raw = self.emit_value_runtime_call("willow_frame_is_cancelled", &[receiver]);
                 self.builder.ins().ireduce(types::I8, raw)
             }
-            TokenIsCancelled | ScopeIsCancelled | TokenCancel | ScopeCancel | TokenChild | ScopeChild | TokenAttach | ScopeAdd | ScopeFinish => {
-                let handle = cancellation_handle(receiver_ty).expect("validated cancellation intrinsic");
+            TokenIsCancelled | ScopeIsCancelled | TokenCancel | ScopeCancel | TokenChild
+            | ScopeChild | TokenAttach | ScopeAdd | ScopeFinish => {
+                let handle =
+                    cancellation_handle(receiver_ty).expect("validated cancellation intrinsic");
                 let suffix = match intrinsic {
                     TokenIsCancelled | ScopeIsCancelled => "is_cancelled",
                     TokenCancel | ScopeCancel => "cancel",
                     TokenChild | ScopeChild => "child",
-                    TokenAttach => "attach", ScopeAdd => "add", ScopeFinish => "finish",
+                    TokenAttach => "attach",
+                    ScopeAdd => "add",
+                    ScopeFinish => "finish",
                     _ => unreachable!(),
                 };
-                let mut values = vec![receiver]; values.extend_from_slice(args);
+                let mut values = vec![receiver];
+                values.extend_from_slice(args);
                 let symbol = format!("{}_{suffix}", handle.prefix());
                 let value = self.emit_runtime_call_with_cleanup(&symbol, &values, |_| {});
                 match intrinsic {
-                    TokenIsCancelled | ScopeIsCancelled => self.builder.ins().ireduce(types::I8, value.unwrap()),
+                    TokenIsCancelled | ScopeIsCancelled => {
+                        self.builder.ins().ireduce(types::I8, value.unwrap())
+                    }
                     _ => value.unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0)),
                 }
             }
             AtomicLoad | AtomicStore | AtomicSwap | AtomicAdd | AtomicSub => {
                 let cell = atomic_cell(receiver_ty).expect("validated atomic intrinsic");
-                let operation = match intrinsic { AtomicLoad => "load", AtomicStore => "store", AtomicSwap => "swap", AtomicAdd => "add", AtomicSub => "sub", _ => unreachable!() };
-                let mut values = vec![receiver]; values.extend_from_slice(args);
-                self.emit_runtime_call_with_cleanup(&format!("willow_atomic_{}_{operation}", cell.suffix()), &values, |_| {})
-                    .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
+                let operation = match intrinsic {
+                    AtomicLoad => "load",
+                    AtomicStore => "store",
+                    AtomicSwap => "swap",
+                    AtomicAdd => "add",
+                    AtomicSub => "sub",
+                    _ => unreachable!(),
+                };
+                let mut values = vec![receiver];
+                values.extend_from_slice(args);
+                self.emit_runtime_call_with_cleanup(
+                    &format!("willow_atomic_{}_{operation}", cell.suffix()),
+                    &values,
+                    |_| {},
+                )
+                .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
             }
             CellGet | CellSet | RwCellRead | RwCellWrite => {
                 let (kind, element) = blocking_cell(receiver_ty).expect("validated cell intrinsic");
-                let operation = match intrinsic { CellGet => "get", CellSet => "set", RwCellRead => "read", RwCellWrite => "write", _ => unreachable!() };
+                let operation = match intrinsic {
+                    CellGet => "get",
+                    CellSet => "set",
+                    RwCellRead => "read",
+                    RwCellWrite => "write",
+                    _ => unreachable!(),
+                };
                 let mut values = vec![receiver];
-                if let Some(&value) = args.first() { values.push(self.coerce_to_i64(value, element)); }
-                match self.emit_runtime_call_with_cleanup(&format!("{}_{operation}", kind.prefix()), &values, |_| {}) {
+                if let Some(&value) = args.first() {
+                    values.push(self.coerce_to_i64(value, element));
+                }
+                match self.emit_runtime_call_with_cleanup(
+                    &format!("{}_{operation}", kind.prefix()),
+                    &values,
+                    |_| {},
+                ) {
                     Some(value) => self.coerce_i64_to(value, element),
                     None => self.builder.ins().iconst(types::I8, 0),
                 }
             }
             ChannelSend | ChannelRecv | ChannelClose => {
-                let element = builtin_types::unary_arg(receiver_ty, B::Channel).expect("validated channel intrinsic");
-                let operation = match intrinsic { ChannelSend => "send", ChannelRecv => "recv", ChannelClose => "close", _ => unreachable!() };
-                let symbol = if intrinsic == ChannelClose { "willow_channel_close".to_string() } else { format!("willow_channel_{operation}_{}", channel_runtime_suffix(element)) };
+                let element = builtin_types::unary_arg(receiver_ty, B::Channel)
+                    .expect("validated channel intrinsic");
+                let operation = match intrinsic {
+                    ChannelSend => "send",
+                    ChannelRecv => "recv",
+                    ChannelClose => "close",
+                    _ => unreachable!(),
+                };
+                let symbol = if intrinsic == ChannelClose {
+                    "willow_channel_close".to_string()
+                } else {
+                    format!(
+                        "willow_channel_{operation}_{}",
+                        channel_runtime_suffix(element)
+                    )
+                };
                 let mut values = vec![receiver];
                 if let Some(&value) = args.first() {
                     let value = self.coerce_to_target(value, &arg_types[0], element);
-                    if is_gc_managed(element, self.enum_infos) { self.emit_push_root(value); }
+                    if is_gc_managed(element, self.enum_infos) {
+                        self.emit_push_root(value);
+                    }
                     values.push(value);
                 }
                 self.emit_runtime_call_with_cleanup(&symbol, &values, |_| {})
                     .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
             }
-            ArrayLen | FrozenArrayLen => self.emit_value_runtime_call("willow_array_len", &[receiver]),
+            ArrayLen | FrozenArrayLen => {
+                self.emit_value_runtime_call("willow_array_len", &[receiver])
+            }
             ArrayPush => {
                 let element = array_element_type(receiver_ty);
                 let value = self.coerce_to_target(args[0], &arg_types[0], &element);
-                if is_gc_managed(&element, self.enum_infos) { self.emit_push_root(value); }
+                if is_gc_managed(&element, self.enum_infos) {
+                    self.emit_push_root(value);
+                }
                 let word = self.coerce_to_i64(value, &element);
                 self.emit_void_runtime_call("willow_array_push", &[receiver, word]);
                 self.builder.ins().iconst(types::I8, 0)
@@ -17744,7 +14788,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.coerce_i64_to(word, &array_element_type(receiver_ty))
             }
             ArrayToString => {
-                let kind = collection_elem_kind(&array_element_type(receiver_ty)).expect("validated array rendering kind");
+                let kind = collection_elem_kind(&array_element_type(receiver_ty))
+                    .expect("validated array rendering kind");
                 let kind = self.builder.ins().iconst(types::I64, kind);
                 self.emit_value_runtime_call("willow_array_to_string", &[receiver, kind])
             }
@@ -17759,20 +14804,37 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let key_ref = self.map_is_ref_flag(key_ty);
                 match intrinsic {
                     MapContains | FrozenMapContains => {
-                        let value = self.emit_value_runtime_call("willow_map_contains", &[receiver, key, key_ref]);
+                        let value = self.emit_value_runtime_call(
+                            "willow_map_contains",
+                            &[receiver, key, key_ref],
+                        );
                         self.builder.ins().ireduce(types::I8, value)
                     }
                     MapGet | FrozenMapGet => {
                         let option = Type::Generic("Option".into(), vec![value_ty.clone()]);
-                        let niche = self.builder.ins().iconst(types::I64, i64::from(option_repr(&option, self.enum_infos) == Some(OptionRepr::NullableGcPointer)));
-                        self.emit_value_runtime_call("willow_map_get", &[receiver, key, key_ref, niche])
+                        let niche = self.builder.ins().iconst(
+                            types::I64,
+                            i64::from(
+                                option_repr(&option, self.enum_infos)
+                                    == Some(OptionRepr::NullableGcPointer),
+                            ),
+                        );
+                        self.emit_value_runtime_call(
+                            "willow_map_get",
+                            &[receiver, key, key_ref, niche],
+                        )
                     }
                     MapInsert => {
                         let value = self.coerce_to_target(args[1], &arg_types[1], value_ty);
-                        if is_gc_managed(value_ty, self.enum_infos) { self.emit_push_root(value); }
+                        if is_gc_managed(value_ty, self.enum_infos) {
+                            self.emit_push_root(value);
+                        }
                         let word = self.coerce_to_i64(value, value_ty);
                         let value_ref = self.map_is_ref_flag(value_ty);
-                        self.emit_void_runtime_call("willow_map_insert", &[receiver, key, key_ref, word, value_ref]);
+                        self.emit_void_runtime_call(
+                            "willow_map_insert",
+                            &[receiver, key, key_ref, word, value_ref],
+                        );
                         self.builder.ins().iconst(types::I8, 0)
                     }
                     _ => unreachable!(),
@@ -17781,7 +14843,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 }
-
 
 impl<'a, 'b> FuncGen<'a, 'b> {
     /// Resolved enum combinators consume already-evaluated, typed operands.
@@ -17804,7 +14865,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let recv = receiver;
         let roots_before = self.gc_root_count;
         for (&value, ty) in args.iter().zip(arg_types) {
-            if is_gc_managed(ty, self.enum_infos) { self.emit_push_root(value); }
+            if is_gc_managed(ty, self.enum_infos) {
+                self.emit_push_root(value);
+            }
         }
         // Every branch below either allocates a panic message or evaluates an
         // argument that may allocate, and the receiver is otherwise live only
@@ -17896,12 +14959,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.gc_root_count = roots_before;
         value
     }
-
 }
 
-
 impl<'a, 'b> FuncGen<'a, 'b> {
-    fn emit_flat_format_scalar(&mut self, value: cranelift_codegen::ir::Value, ty: &Type, format: Option<crate::interpolate::F64Format>) -> cranelift_codegen::ir::Value {
+    fn emit_flat_format_scalar(
+        &mut self,
+        value: cranelift_codegen::ir::Value,
+        ty: &Type,
+        format: Option<crate::interpolate::F64Format>,
+    ) -> cranelift_codegen::ir::Value {
         if let Some(format) = format {
             assert_eq!(*ty, Type::F64, "validated f64 format operand");
             return self.emit_value_runtime_call(format.runtime_symbol(), &[value]);
@@ -17915,15 +14981,28 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
-    fn emit_flat_builtin_call(&mut self, callee: &crate::semantic::ids::FunctionId, args: &[cranelift_codegen::ir::Value]) -> cranelift_codegen::ir::Value {
-        let runtime = builtin_call_runtime_name(callee.unqualified_name()).expect("resolved builtin function");
+    fn emit_flat_builtin_call(
+        &mut self,
+        callee: &crate::semantic::ids::FunctionId,
+        args: &[cranelift_codegen::ir::Value],
+    ) -> cranelift_codegen::ir::Value {
+        let runtime = builtin_call_runtime_name(callee.unqualified_name())
+            .expect("resolved builtin function");
         self.emit_runtime_call_with_cleanup(runtime, args, |_| {})
             .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
     }
 }
 
 impl<'a, 'b> FuncGen<'a, 'b> {
-    fn emit_lir_static_call_values(&mut self, class: &str, method: &str, args: &[cranelift_codegen::ir::Value], arg_types: &[Type], ret_ty: &Type, span: Span) -> cranelift_codegen::ir::Value {
+    fn emit_lir_static_call_values(
+        &mut self,
+        class: &str,
+        method: &str,
+        args: &[cranelift_codegen::ir::Value],
+        arg_types: &[Type],
+        ret_ty: &Type,
+        span: Span,
+    ) -> cranelift_codegen::ir::Value {
         self.emit_lir_static_call_values_inner(class, method, args, arg_types, ret_ty, span)
     }
     fn emit_lir_static_call_values_inner(
@@ -18016,8 +15095,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             class,
             method,
         ) {
-            let (arg_vals, arg_roots) =
-                (args.to_vec(), 0usize);
+            let (arg_vals, arg_roots) = (args.to_vec(), 0usize);
             let result = self
                 .emit_runtime_call_with_cleanup(entry.runtime, &arg_vals, |this| {
                     if arg_roots > 0 {
@@ -18034,7 +15112,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         if let Some(module_prefix) = self.known_modules.linker_prefix(class).cloned() {
             let mangled = module_item_symbol(&module_prefix, method);
-            let has_reference_args = self.func_param_modes.get(&mangled).is_some_and(|modes| modes.iter().any(|mode| matches!(mode, ParamMode::Reference { .. })));
+            let has_reference_args = self.func_param_modes.get(&mangled).is_some_and(|modes| {
+                modes
+                    .iter()
+                    .any(|mode| matches!(mode, ParamMode::Reference { .. }))
+            });
             let user_callee = format!("{class}::{method}");
             let (arg_vals, arg_roots) = (args.to_vec(), 0usize);
             let fid = *self.func_ids.get(mangled.as_str()).unwrap_or_else(|| {
@@ -18066,7 +15148,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let mangled = class_method_symbol_name(self.known_modules, class, method);
         let fid = self.func_ids[&mangled];
         let dummy_self = self.builder.ins().iconst(types::I64, 0);
-        let has_reference_args = self.func_param_modes.get(&mangled).is_some_and(|modes| modes.iter().any(|mode| matches!(mode, ParamMode::Reference { .. })));
+        let has_reference_args = self.func_param_modes.get(&mangled).is_some_and(|modes| {
+            modes
+                .iter()
+                .any(|mode| matches!(mode, ParamMode::Reference { .. }))
+        });
         let (arg_vals, arg_roots) = (args.to_vec(), 0usize);
         let fref = self.module.declare_func_in_func(fid, self.builder.func);
         let mut call_args = vec![dummy_self];
@@ -18094,104 +15180,258 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         result
     }
 
-
-    fn emit_lir_enum_construction_values(&mut self, enum_name: &str, variant: &str, args: &[cranelift_codegen::ir::Value], enum_ty: &Type) -> cranelift_codegen::ir::Value {
+    fn emit_lir_enum_construction_values(
+        &mut self,
+        enum_name: &str,
+        variant: &str,
+        args: &[cranelift_codegen::ir::Value],
+        enum_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
         let tag = self.enum_variant_tag(enum_name, variant);
         if option_repr(enum_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
-            return if tag == 0 { args[0] } else { self.builder.ins().iconst(types::I64, 0) };
+            return if tag == 0 {
+                args[0]
+            } else {
+                self.builder.ins().iconst(types::I64, 0)
+            };
         }
-        if !self.enum_is_gc_object_type(enum_name) { return self.builder.ins().iconst(types::I64, tag); }
+        if !self.enum_is_gc_object_type(enum_name) {
+            return self.builder.ins().iconst(types::I64, tag);
+        }
         let mut payloads = self.resolve_variant_payload_types(enum_name, variant, enum_ty);
         normalize_void_payloads(&mut payloads);
-        let kinds = payloads.iter().map(|ty| if is_gc_managed(ty, self.enum_infos) { willow_abi::SlotKind::GcRef } else { willow_abi::SlotKind::Word }).collect::<Vec<_>>();
+        let kinds = payloads
+            .iter()
+            .map(|ty| {
+                if is_gc_managed(ty, self.enum_infos) {
+                    willow_abi::SlotKind::GcRef
+                } else {
+                    willow_abi::SlotKind::Word
+                }
+            })
+            .collect::<Vec<_>>();
         let layout = willow_abi::EnumVariantLayout::new(tag as u32, &kinds);
         let bytes = self.module.target_config().pointer_type().bytes();
-        let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(GcObjectKind::Enum, i64::from(layout.payload_bytes(bytes)), 0, layout.gc_ref_mask()));
+        let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
+            GcObjectKind::Enum,
+            i64::from(layout.payload_bytes(bytes)),
+            0,
+            layout.gc_ref_mask(),
+        ));
         let tag_value = self.builder.ins().iconst(types::I64, tag);
-        self.builder.ins().store(MemFlagsData::new(), tag_value, ptr, 0i32);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), tag_value, ptr, 0i32);
         for (index, (&value, ty)) in args.iter().zip(&payloads).enumerate() {
             let word = self.coerce_to_i64(value, ty);
-            self.emit_gc_heap_store(ptr, layout.payload_byte_offset(bytes) as i32 + index as i32 * bytes as i32, word, ty, GcStoreDestination::EnumPayload);
+            self.emit_gc_heap_store(
+                ptr,
+                layout.payload_byte_offset(bytes) as i32 + index as i32 * bytes as i32,
+                word,
+                ty,
+                GcStoreDestination::EnumPayload,
+            );
         }
         ptr
     }
 }
 
-fn flat_static_call_supported(class: &str, method: &str, args: &[Type], result: &Type, ctx: &LirTypeCtx<'_>) -> bool {
+fn flat_static_call_supported(
+    class: &str,
+    method: &str,
+    args: &[Type],
+    result: &Type,
+    ctx: &LirTypeCtx<'_>,
+) -> bool {
     let class = ctx.resolved_class(class);
-    if !ctx.supported_type(result) || args.iter().any(|ty| !ctx.supported_type(ty)) { return false; }
-    if class == "Map" && method == "new" && args.is_empty() { return matches!(lir_collection(result), Some((LirCollection::Map, _))); }
-    if class == "Channel" && builtin_types::unary_arg(result, B::Channel).is_some() {
-        return (method == "new" && args.is_empty()) || (method == "with_capacity" && args == [Type::I64]);
+    if !ctx.supported_type(result) || args.iter().any(|ty| !ctx.supported_type(ty)) {
+        return false;
     }
-    if let Some(cell) = atomic_cell(result) && class == cell.class_name() && method == "new" { return args == [cell.word()]; }
-    if let Some((kind, elem)) = blocking_cell(result) && class == kind.class_name() && method == "new" { return args.len() == 1 && ctx.same_repr(elem, &args[0]); }
-    if let Some((_, elem)) = scheduler_lock(result) && matches!(class, "Mutex" | "RwLock") && method == "new" { return args.len() == 1 && ctx.same_repr(elem, &args[0]); }
-    if let Some(handle) = cancellation_handle(result) && class == handle.class_name() && method == "new" { return args.is_empty(); }
-    if let Some(entry) = namespace_builtin_call(ctx.known_modules, ctx.builtin_module_aliases, class, method) {
+    if class == "Map" && method == "new" && args.is_empty() {
+        return matches!(lir_collection(result), Some((LirCollection::Map, _)));
+    }
+    if class == "Channel" && builtin_types::unary_arg(result, B::Channel).is_some() {
+        return (method == "new" && args.is_empty())
+            || (method == "with_capacity" && args == [Type::I64]);
+    }
+    if let Some(cell) = atomic_cell(result)
+        && class == cell.class_name()
+        && method == "new"
+    {
+        return args == [cell.word()];
+    }
+    if let Some((kind, elem)) = blocking_cell(result)
+        && class == kind.class_name()
+        && method == "new"
+    {
+        return args.len() == 1 && ctx.same_repr(elem, &args[0]);
+    }
+    if let Some((_, elem)) = scheduler_lock(result)
+        && matches!(class, "Mutex" | "RwLock")
+        && method == "new"
+    {
+        return args.len() == 1 && ctx.same_repr(elem, &args[0]);
+    }
+    if let Some(handle) = cancellation_handle(result)
+        && class == handle.class_name()
+        && method == "new"
+    {
+        return args.is_empty();
+    }
+    if let Some(entry) =
+        namespace_builtin_call(ctx.known_modules, ctx.builtin_module_aliases, class, method)
+    {
         return entry.params == args && ctx.repr_compatible(result, &entry.ret);
     }
     if ctx.is_enum(class) {
-        let Some((name, definition)) = ctx.enum_instance(result) else { return false; };
-        let Some(variant) = definition.variant(method) else { return false; };
-        return name == TypeId::from_source_name(class) && variant.payloads.len() == args.len()
-            && variant.payloads.iter().zip(args).all(|(slot, arg)| ctx.same_repr(slot, arg));
+        let Some((name, definition)) = ctx.enum_instance(result) else {
+            return false;
+        };
+        let Some(variant) = definition.variant(method) else {
+            return false;
+        };
+        return name == TypeId::from_source_name(class)
+            && variant.payloads.len() == args.len()
+            && variant
+                .payloads
+                .iter()
+                .zip(args)
+                .all(|(slot, arg)| ctx.same_repr(slot, arg));
     }
     let (symbol, skip_self) = if let Some(prefix) = ctx.known_modules.linker_prefix(class) {
         (module_item_symbol(prefix, method), false)
     } else {
-        if !ctx.supported_class(class) { return false; }
-        (class_method_symbol_name(ctx.known_modules, class, method), true)
+        if !ctx.supported_class(class) {
+            return false;
+        }
+        (
+            class_method_symbol_name(ctx.known_modules, class, method),
+            true,
+        )
     };
-    if !(ctx.known_fn)(&symbol) { return false; }
-    if ctx.func_param_modes.get(&symbol).is_some_and(|modes| modes.iter().any(|mode| !matches!(mode, ParamMode::Value))) { return false; }
-    let Some(Type::Fn(params, ret)) = ctx.fn_types.get(&symbol) else { return false; };
-    let params = if skip_self { let Some((_, params)) = params.split_first() else { return false; }; params } else { params.as_slice() };
-    params == args && ctx.same_repr(ret, result)
+    if !(ctx.known_fn)(&symbol) {
+        return false;
+    }
+    if ctx
+        .func_param_modes
+        .get(&symbol)
+        .is_some_and(|modes| modes.iter().any(|mode| !matches!(mode, ParamMode::Value)))
+    {
+        return false;
+    }
+    let Some(Type::Fn(params, ret)) = ctx.fn_types.get(&symbol) else {
+        return false;
+    };
+    let params = if skip_self {
+        let Some((_, params)) = params.split_first() else {
+            return false;
+        };
+        params
+    } else {
+        params.as_slice()
+    };
+    params.len() == args.len()
+        && params
+            .iter()
+            .zip(args)
+            .all(|(param, arg)| ctx.same_repr(param, arg))
+        && ctx.same_repr(ret, result)
 }
 
 impl<'a, 'b> FuncGen<'a, 'b> {
     /// Allocate and initialise the tag before evaluating any source payload.
     /// Nullable Option representations reserve no object: the payload store
     /// below replaces this null placeholder with the actual pointer.
-    fn emit_flat_enum_alloc(&mut self, class: &str, variant: &str, enum_ty: &Type) -> cranelift_codegen::ir::Value {
+    fn emit_flat_enum_alloc(
+        &mut self,
+        class: &str,
+        variant: &str,
+        enum_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
         let tag = self.enum_variant_tag(class, variant);
         if option_repr(enum_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
             return self.builder.ins().iconst(types::I64, 0);
         }
-        if !self.enum_is_gc_object_type(class) { return self.builder.ins().iconst(types::I64, tag); }
+        if !self.enum_is_gc_object_type(class) {
+            return self.builder.ins().iconst(types::I64, tag);
+        }
         let mut payloads = self.resolve_variant_payload_types(class, variant, enum_ty);
         normalize_void_payloads(&mut payloads);
-        let kinds = payloads.iter().map(|ty| if is_gc_managed(ty, self.enum_infos) { willow_abi::SlotKind::GcRef } else { willow_abi::SlotKind::Word }).collect::<Vec<_>>();
+        let kinds = payloads
+            .iter()
+            .map(|ty| {
+                if is_gc_managed(ty, self.enum_infos) {
+                    willow_abi::SlotKind::GcRef
+                } else {
+                    willow_abi::SlotKind::Word
+                }
+            })
+            .collect::<Vec<_>>();
         let layout = willow_abi::EnumVariantLayout::new(tag as u32, &kinds);
         let bytes = self.module.target_config().pointer_type().bytes();
-        let object = self.emit_gc_alloc(GcLayoutMetadata::new(GcObjectKind::Enum, i64::from(layout.payload_bytes(bytes)), 0, layout.gc_ref_mask()));
+        let object = self.emit_gc_alloc(GcLayoutMetadata::new(
+            GcObjectKind::Enum,
+            i64::from(layout.payload_bytes(bytes)),
+            0,
+            layout.gc_ref_mask(),
+        ));
         let tag_value = self.builder.ins().iconst(types::I64, tag);
-        self.builder.ins().store(MemFlagsData::new(), tag_value, object, 0i32);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), tag_value, object, 0i32);
         object
     }
 
     /// A payload store is its own LIR operation so coercion occurs before the
     /// next payload is evaluated. The returned representation is written back
     /// to the enum local (necessary for nullable Option::Some).
-    fn emit_flat_enum_payload_store(&mut self, object: cranelift_codegen::ir::Value, class: &str, variant: &str, index: usize, value: cranelift_codegen::ir::Value, source_ty: &Type, enum_ty: &Type) -> cranelift_codegen::ir::Value {
+    fn emit_flat_enum_payload_store(
+        &mut self,
+        object: cranelift_codegen::ir::Value,
+        class: &str,
+        variant: &str,
+        index: usize,
+        value: cranelift_codegen::ir::Value,
+        source_ty: &Type,
+        enum_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
         let before = self.gc_root_count;
-        if is_gc_managed(enum_ty, self.enum_infos) { self.emit_push_root(object); }
-        if is_gc_managed(source_ty, self.enum_infos) { self.emit_push_root(value); }
+        if is_gc_managed(enum_ty, self.enum_infos) {
+            self.emit_push_root(object);
+        }
+        if is_gc_managed(source_ty, self.enum_infos) {
+            self.emit_push_root(value);
+        }
         let mut payloads = self.resolve_variant_payload_types(class, variant, enum_ty);
         normalize_void_payloads(&mut payloads);
         let target = &payloads[index];
         let value = self.coerce_to_target(value, source_ty, target);
-        let result = if option_repr(enum_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
+        let result = if option_repr(enum_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer)
+        {
             assert_eq!(index, 0);
             value
         } else {
-            let kinds = payloads.iter().map(|ty| if is_gc_managed(ty, self.enum_infos) { willow_abi::SlotKind::GcRef } else { willow_abi::SlotKind::Word }).collect::<Vec<_>>();
+            let kinds = payloads
+                .iter()
+                .map(|ty| {
+                    if is_gc_managed(ty, self.enum_infos) {
+                        willow_abi::SlotKind::GcRef
+                    } else {
+                        willow_abi::SlotKind::Word
+                    }
+                })
+                .collect::<Vec<_>>();
             let tag = self.enum_variant_tag(class, variant);
             let layout = willow_abi::EnumVariantLayout::new(tag as u32, &kinds);
             let bytes = self.module.target_config().pointer_type().bytes();
             let word = self.coerce_to_i64(value, target);
-            self.emit_gc_heap_store(object, layout.payload_byte_offset(bytes) as i32 + index as i32 * bytes as i32, word, target, GcStoreDestination::EnumPayload);
+            self.emit_gc_heap_store(
+                object,
+                layout.payload_byte_offset(bytes) as i32 + index as i32 * bytes as i32,
+                word,
+                target,
+                GcStoreDestination::EnumPayload,
+            );
             object
         };
         self.emit_pop_roots_n(self.gc_root_count - before);
@@ -18201,17 +15441,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 }
 
 /// Validate metadata that operand type equality alone cannot establish.
-fn flat_rvalue_supported(value: &crate::ir::lowered::LirRvalue, locals: &[crate::ir::lowered::LirLocal], ctx: &LirTypeCtx<'_>) -> bool {
+fn flat_rvalue_supported(
+    value: &crate::ir::lowered::LirRvalue,
+    locals: &[crate::ir::lowered::LirLocal],
+    ctx: &LirTypeCtx<'_>,
+) -> bool {
     use crate::ir::lowered::LirRvalue as V;
     let ty = |operand: &crate::ir::lowered::LirOperand| operand.ty(locals);
     let field_type = |object: &Type, field: &str| -> Option<Type> {
-        if range_i64(object) { return matches!(field, "start" | "end").then_some(Type::I64); }
-        ctx.class_layout_of(object)?.iter().find(|(name, _)| name == field).map(|(_, ty)| ty.clone())
+        if range_i64(object) {
+            return matches!(field, "start" | "end").then_some(Type::I64);
+        }
+        ctx.class_layout_of(object)?
+            .iter()
+            .find(|(name, _)| name == field)
+            .map(|(_, ty)| ty.clone())
     };
     if value.operands().iter().any(|operand| matches!(operand, crate::ir::lowered::LirOperand::Reference { place, .. } if !flat_reference_place_supported(place, locals, ctx))) { return false; }
     match value {
         V::ReferenceDebug { argument, .. } => matches!(argument, crate::ir::lowered::LirOperand::Reference { place, .. } if flat_reference_place_supported(place, locals, ctx)),
-        V::StartTask { callee, params, output, .. } => ctx.cooperative_leaves.contains(callee)
+        V::StartTask { callee, params, output, .. } => ctx.cooperative_leaves.contains(&ctx.fn_types.scope().resolve(callee))
             && (ctx.known_fn)(&callee.to_string())
             && ctx.supported_type(output) && params.iter().all(|ty| ctx.supported_type(ty))
             && ctx.fn_types.get_id(callee).is_some_and(|signature| matches!(signature, Type::Fn(declared, result) if declared.len() == params.len() && declared.iter().zip(params).all(|(expected, actual)| ctx.same_repr(expected, actual)) && builtin_types::unary_arg(result, B::Task).is_some_and(|payload| ctx.same_repr(payload, output))))
@@ -18264,52 +15513,137 @@ fn flat_rvalue_supported(value: &crate::ir::lowered::LirRvalue, locals: &[crate:
         }
         V::FormatScalar { ty, format, .. } => matches!(ty, Type::I64 | Type::F64 | Type::Bool | Type::String) && (format.is_none() || *ty == Type::F64),
         V::Panic { message } => ty(message) == Some(Type::String),
+        V::Binary { op, operand_ty, .. } if matches!(operand_ty, Type::Named(_) | Type::Generic(..)) => matches!(op, BinOp::Eq | BinOp::Ne) && ctx.tag_immediate_enum(operand_ty),
         V::Recover => true,
         _ => true,
     }
 }
 
 /// The by-value dispatch ABI, including inherited methods and interface Self.
-fn flat_method_signature(receiver: &Type, method: &str, ctx: &LirTypeCtx<'_>) -> Option<(Vec<Type>, Type)> {
-    if !ctx.supported_type(receiver) { return None; }
-    let name = match receiver { Type::Named(name) | Type::Generic(name, _) => name, _ => return None };
+fn flat_method_signature(
+    receiver: &Type,
+    method: &str,
+    ctx: &LirTypeCtx<'_>,
+) -> Option<(Vec<Type>, Type)> {
+    if !ctx.supported_type(receiver) {
+        return None;
+    }
+    let name = match receiver {
+        Type::Named(name) | Type::Generic(name, _) => name,
+        _ => return None,
+    };
     let (params, ret) = if (ctx.is_interface)(name) {
         let sig = (ctx.iface_method)(receiver, method)?;
-        let ret = if matches!(&sig.ret, Type::Named(name) if *name == TypeId::local("Self")) { receiver.clone() } else { sig.ret };
+        let ret = if matches!(&sig.ret, Type::Named(name) if *name == TypeId::local("Self")) {
+            receiver.clone()
+        } else {
+            sig.ret
+        };
         (sig.params, ret)
     } else {
-        if !ctx.supported_class(name) { return None; }
+        if !ctx.supported_class(name) {
+            return None;
+        }
         let symbol = ctx.resolve_class_method(name, method)?;
-        let Type::Fn(params, ret) = ctx.fn_types.get(&symbol)? else { return None; };
+        let Type::Fn(params, ret) = ctx.fn_types.get(&symbol)? else {
+            return None;
+        };
         let (_, params) = params.split_first()?;
         (params.to_vec(), (**ret).clone())
     };
-    (ctx.supported_type(&ret) && params.iter().all(|param| ctx.supported_type(param))).then_some((params, ret))
+    (ctx.supported_type(&ret) && params.iter().all(|param| ctx.supported_type(param)))
+        .then_some((params, ret))
 }
 
 fn flat_argument_modes_match(args: &[crate::ir::lowered::LirOperand], modes: &[ParamMode]) -> bool {
-    args.iter().enumerate().all(|(index, arg)| matches!(arg, crate::ir::lowered::LirOperand::Reference { .. }) == matches!(modes.get(index), Some(ParamMode::Reference { .. })))
+    args.iter().enumerate().all(|(index, arg)| {
+        matches!(arg, crate::ir::lowered::LirOperand::Reference { .. })
+            == matches!(modes.get(index), Some(ParamMode::Reference { .. }))
+    })
 }
 fn flat_method_modes(receiver: &Type, method: &str, ctx: &LirTypeCtx<'_>) -> Vec<ParamMode> {
-    let name = match receiver { Type::Named(name) | Type::Generic(name, _) => name, _ => return vec![] };
-    if (ctx.is_interface)(name) { return (ctx.iface_method)(receiver, method).map(|sig| sig.modes).unwrap_or_default(); }
-    ctx.resolve_class_method(name, method).and_then(|symbol| ctx.func_param_modes.get(&symbol).cloned()).unwrap_or_default()
+    let name = match receiver {
+        Type::Named(name) | Type::Generic(name, _) => name,
+        _ => return vec![],
+    };
+    if (ctx.is_interface)(name) {
+        return (ctx.iface_method)(receiver, method)
+            .map(|sig| sig.modes)
+            .unwrap_or_default();
+    }
+    ctx.resolve_class_method(name, method)
+        .and_then(|symbol| ctx.func_param_modes.get(&symbol).cloned())
+        .unwrap_or_default()
 }
-fn flat_reference_place_supported(place: &crate::ir::lowered::LirPlace, locals: &[crate::ir::lowered::LirLocal], ctx: &LirTypeCtx<'_>) -> bool {
+fn flat_reference_place_supported(
+    place: &crate::ir::lowered::LirPlace,
+    locals: &[crate::ir::lowered::LirLocal],
+    ctx: &LirTypeCtx<'_>,
+) -> bool {
     use crate::ir::lowered::LirPlace;
-    let Some(ty) = place.ty(locals) else { return false; };
-    if !ctx.supported_type(&ty) || matches!(ty, Type::Void | Type::Never) { return false; }
+    let Some(ty) = place.ty(locals) else {
+        return false;
+    };
+    if !ctx.supported_type(&ty) || matches!(ty, Type::Void | Type::Never) {
+        return false;
+    }
     match place {
         LirPlace::Local(_) | LirPlace::ArrayElement { .. } => true,
-        LirPlace::Field { object_ty, field, .. } => ctx.class_layout_of(object_ty).is_some_and(|layout| layout.iter().any(|(name, field_ty)| name == field && ctx.same_repr(field_ty, &ty))),
+        LirPlace::Field {
+            object_ty, field, ..
+        } => ctx.class_layout_of(object_ty).is_some_and(|layout| {
+            layout
+                .iter()
+                .any(|(name, field_ty)| name == field && ctx.same_repr(field_ty, &ty))
+        }),
     }
 }
-fn flat_static_reference_call_supported(class: &str, method: &str, args: &[crate::ir::lowered::LirOperand], types: &[Type], result: &Type, ctx: &LirTypeCtx<'_>) -> bool {
+fn flat_static_reference_call_supported(
+    class: &str,
+    method: &str,
+    args: &[crate::ir::lowered::LirOperand],
+    types: &[Type],
+    result: &Type,
+    ctx: &LirTypeCtx<'_>,
+) -> bool {
     let class = ctx.resolved_class(class);
-    let (symbol, skip_self) = if let Some(prefix) = ctx.known_modules.linker_prefix(class) { (module_item_symbol(prefix, method), false) }
-        else { if !ctx.supported_class(class) { return false; } (class_method_symbol_name(ctx.known_modules, class, method), true) };
-    if !(ctx.known_fn)(&symbol) || !flat_argument_modes_match(args, ctx.func_param_modes.get(&symbol).map(Vec::as_slice).unwrap_or(&[])) { return false; }
-    let Some(Type::Fn(params, ret)) = ctx.fn_types.get(&symbol) else { return false; };
-    let params = if skip_self { let Some((_, tail)) = params.split_first() else { return false; }; tail } else { params.as_slice() };
-    params.len() == types.len() && params.iter().zip(types).all(|(param, arg)| ctx.supported_type(param) && ctx.same_repr(param, arg)) && ctx.same_repr(ret, result)
+    let (symbol, skip_self) = if let Some(prefix) = ctx.known_modules.linker_prefix(class) {
+        (module_item_symbol(prefix, method), false)
+    } else {
+        if !ctx.supported_class(class) {
+            return false;
+        }
+        (
+            class_method_symbol_name(ctx.known_modules, class, method),
+            true,
+        )
+    };
+    if !(ctx.known_fn)(&symbol)
+        || !flat_argument_modes_match(
+            args,
+            ctx.func_param_modes
+                .get(&symbol)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        )
+    {
+        return false;
+    }
+    let Some(Type::Fn(params, ret)) = ctx.fn_types.get(&symbol) else {
+        return false;
+    };
+    let params = if skip_self {
+        let Some((_, tail)) = params.split_first() else {
+            return false;
+        };
+        tail
+    } else {
+        params.as_slice()
+    };
+    params.len() == types.len()
+        && params
+            .iter()
+            .zip(types)
+            .all(|(param, arg)| ctx.supported_type(param) && ctx.same_repr(param, arg))
+        && ctx.same_repr(ret, result)
 }

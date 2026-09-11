@@ -193,7 +193,8 @@ async fn main() {
 
 #[test]
 fn prepared_method_frame_survives_await_and_ternary_argument_panic() {
-    let (out, ok, timed_out) = compile_and_run_with_env_timeout(r#"
+    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        r#"
 class Sink { pub init(self) {} pub fn consume(self, value: i64) -> i64 { return value; } }
 async fn number() -> i64 { await yield(); return 1; }
 fn explode() -> i64 { panic("prepared-argument"); return 0; }
@@ -201,7 +202,10 @@ async fn main() {
     let sink = new Sink();
     println(sink.consume((await number()) == 1 ? explode() : 0));
 }
-"#, &[("WILLOW_TASK_BUDGET", "1")], Duration::from_secs(20));
+"#,
+        &[("WILLOW_TASK_BUDGET", "1")],
+        Duration::from_secs(20),
+    );
     assert!(!ok, "{out}");
     assert!(!timed_out, "{out}");
     assert!(out.contains("runtime panic: prepared-argument"), "{out}");
@@ -211,13 +215,17 @@ async fn main() {
 
 #[test]
 fn prepared_method_frame_does_not_leak_from_suspended_task() {
-    let (out, ok, timed_out) = compile_and_run_with_env_timeout(r#"
+    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        r#"
 class Sink { pub init(self) {} pub fn waiting_method(self, value: i64) -> i64 { return value; } }
 async fn slow() -> i64 { await sleep(10000); return 1; }
 async fn parked() { let sink = new Sink(); println(sink.waiting_method(await slow())); }
 fn unrelated_failure() { panic("separate-task"); }
 async fn main() { let task = parked(); await sleep(20); unrelated_failure(); }
-"#, &[("WILLOW_WORKERS", "1"), ("WILLOW_TASK_BUDGET", "1")], Duration::from_secs(20));
+"#,
+        &[("WILLOW_WORKERS", "1"), ("WILLOW_TASK_BUDGET", "1")],
+        Duration::from_secs(20),
+    );
     assert!(!ok, "{out}");
     assert!(!timed_out, "{out}");
     assert!(out.contains("runtime panic: separate-task"), "{out}");

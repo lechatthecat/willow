@@ -754,20 +754,6 @@ impl HirExpr {
     }
 }
 
-impl HirStmt {
-    /// Visit expression roots in a statement tree without native recursion.
-    /// The callback owns traversal within each expression (including its bodies).
-    pub(crate) fn visit_expr_roots_mut(&mut self, mut visit: impl FnMut(&mut HirExpr)) {
-        let mut pending = vec![NodeMut::Stmt(self)];
-        while let Some(node) = pending.pop() {
-            match node {
-                NodeMut::Expr(expr) => visit(expr),
-                NodeMut::Stmt(stmt) => pending.extend(stmt_children_mut(stmt).into_iter().rev()),
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

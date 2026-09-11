@@ -799,7 +799,6 @@ fn reference_args_34_a_whole_binding_reference_in_a_branch() {
     );
 }
 
-
 #[test]
 fn reference_capture_keeps_original_array_buffer_after_later_argument_resize() {
     let source = r#"

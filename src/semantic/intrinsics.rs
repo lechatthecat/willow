@@ -1646,7 +1646,6 @@ pub(crate) struct NamespaceBuiltin {
     pub narrow_to_bool: bool,
 }
 
-
 pub(crate) fn namespace_builtin(class: &str, method: &str) -> Option<NamespaceBuiltin> {
     use crate::semantic::ids::SemanticType as Type;
     use crate::stdlib_schema::{self, StdItemKind};

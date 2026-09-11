@@ -105,29 +105,6 @@ pub(crate) fn collect_reference_debug_strings_in_block(block: &Block, out: &mut 
     });
 }
 
-/// Names of the locals whose address is taken somewhere in `body`.
-///
-/// Such a local cannot live in a Cranelift SSA variable that is promoted to a
-/// stack slot at the `&` itself: the promoting store lands wherever the `&`
-/// sits in the CFG, so it re-initialises the slot on every iteration of an
-/// enclosing loop and never runs at all on a branch that does not take the
-/// address. Binding these to a stack slot from the start makes the storage
-/// decision a property of the declaration rather than of one use
-/// (willow-0g8j.2.17).
-///
-/// The set over-approximates: a `&x` inside a nested lambda names the lambda's
-/// own local, and marking the enclosing function's same-named local is merely a
-/// slot it did not need.
-pub(crate) fn collect_address_taken_locals(body: &Block) -> HashSet<String> {
-    let mut out = HashSet::new();
-    walk_reference_args_in_block(body, &mut |_, arg| {
-        if let Expr::Var(name, _, _) = &arg.expr {
-            out.insert(name.clone());
-        }
-    });
-    out
-}
-
 pub(crate) fn collect_string_literals_in_program(program: &Program) -> Vec<String> {
     let mut out = Vec::new();
     for item in &program.items {

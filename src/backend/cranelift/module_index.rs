@@ -53,7 +53,11 @@ impl ModuleSymbols {
     }
 
     pub(super) fn resolve(&self, access: &str) -> Option<ModuleId> {
-        self.context.0.get(access).or_else(|| self.bindings.get(access)).copied()
+        self.context
+            .0
+            .get(access)
+            .or_else(|| self.bindings.get(access))
+            .copied()
     }
 
     pub(super) fn bind(&mut self, access: String, id: ModuleId) -> Option<ModuleId> {
@@ -87,7 +91,9 @@ impl ModuleSymbols {
 
     pub(super) fn keys(&self) -> impl Iterator<Item = &String> {
         self.context.0.keys().chain(
-            self.bindings.keys().filter(|access| !self.context.0.contains_key(*access)),
+            self.bindings
+                .keys()
+                .filter(|access| !self.context.0.contains_key(*access)),
         )
     }
 
@@ -194,7 +200,10 @@ mod tests {
         symbols.register(ModuleId(1), "pkg::b", "b");
         assert_eq!(symbols.bind("a".into(), ModuleId(1)), Some(ModuleId(0)));
         assert_eq!(symbols.resolve("a"), Some(ModuleId(1)));
-        assert_eq!(symbols.keys().filter(|name| name.as_str() == "a").count(), 1);
+        assert_eq!(
+            symbols.keys().filter(|name| name.as_str() == "a").count(),
+            1
+        );
         symbols.restore("a".into(), None);
         assert_eq!(symbols.resolve("a"), Some(ModuleId(0)));
         assert!(symbols.contains_key("a"));

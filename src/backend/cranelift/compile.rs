@@ -285,6 +285,7 @@ macro_rules! lir_type_ctx {
             // which module a name means.
             visible_modules: &$me.visible_modules,
             builtin_module_aliases: &$me.builtin_module_aliases,
+            #[cfg(test)]
             return_type: $return_type,
             // Per-FUNCTION, like `return_type`: `lir_rejection_reason` sets it
             // from the function it is vetting, so nothing here can get it
@@ -688,13 +689,6 @@ impl Codegen {
         // (willow-28h8).
         self.rebind_item_import_functions(&unit.item_imports);
         self.source_file = unit.source_file.clone();
-        // `cooperative_leaves` holds the ENTRY program's eager-task functions,
-        // which are not this module's: a module body has always been lowered
-        // with the set empty (it used to be compiled before the entry program
-        // filled it), and an entry function sharing a module function's name
-        // would otherwise change how the module's calls are lowered.
-        let entry_leaves = std::mem::take(&mut self.cooperative_leaves);
-
         let program = &unit.program;
         let result = self.with_unit_resolution(self.resolution_context(), |this| {
             // Bind the types this unit imported by single-item import under the
@@ -715,6 +709,11 @@ impl Codegen {
             }
             for (local_name, qualified) in &unit.module_classes {
                 this.alias_class_symbol(local_name, &qualified.name);
+                if !qualified.constructors.is_empty() {
+                    let local = class_member_symbol(local_name, "init");
+                    let canonical = this.class_method_symbol(&qualified.name, "init");
+                    this.alias_function_symbol(&local, &canonical);
+                }
                 for method in &qualified.methods {
                     let local_mangled = class_member_symbol(local_name, &method.name);
                     let qualified_mangled = this.class_method_symbol(&qualified.name, &method.name);
@@ -747,7 +746,6 @@ impl Codegen {
                 Ok(())
             })()
         });
-        self.cooperative_leaves = entry_leaves;
         result
     }
 
@@ -828,20 +826,6 @@ impl Codegen {
                 }
             }
             this.validate_gc_ref_mask_layouts()?;
-
-            // Async calls are eager tasks (willow-h2vf): every non-main async fn is
-            // exposed as a constructor that schedules its poll fn and returns the
-            // async frame (`Task<T>`).
-            this.cooperative_leaves.clear();
-            for item in &program.items {
-                if let Item::Function(f) = item
-                    && f.is_async
-                    && f.name != "main"
-                {
-                    this.cooperative_leaves
-                        .insert(crate::semantic::ids::FunctionId::free(f.name.as_str()));
-                }
-            }
 
             // Forward-declare all user functions first
             for item in &program.items {
@@ -1210,6 +1194,12 @@ impl Codegen {
         self.claim_symbol(symbol_name, format!("function `{}`", f.name), f.span)?;
         let id = self.module.declare_function(symbol_name, linkage, &sig)?;
         self.func_ids.insert(lookup_name, id);
+        // Task constructors are global declarations. Unit aliases resolve to
+        // these canonical identities, including calls within another module.
+        if f.is_async && symbol_name != USER_MAIN_SYMBOL {
+            self.cooperative_leaves
+                .insert(self.func_ids.scope().lookup_id(lookup_name));
+        }
         self.func_return_types
             .insert(lookup_name, call_return_type.clone());
         self.func_param_modes.insert(
@@ -1368,7 +1358,6 @@ impl Codegen {
             visible_modules: &self.visible_modules,
             builtin_module_aliases: &self.builtin_module_aliases,
             lambda_names: &self.lambda_names,
-            cooperative_leaves: &self.cooperative_leaves,
             string_literals: &self.string_literals,
             class_layouts: &self.class_layouts,
             static_storage: &self.static_storage,
@@ -1385,10 +1374,8 @@ impl Codegen {
             async_frame_offsets: HashMap::new(),
             lir_frame_offsets: HashMap::new(),
             lir_defer_offsets: HashMap::new(),
-            lir_hoisted_await: None,
             main_result_err_ty,
             vars: HashMap::new(),
-            return_type: f.return_type.clone().into(),
             current_class: None,
             // Every async function returned above through the cooperative
             // constructor/poll pair, so what is left here is synchronous.
@@ -1756,7 +1743,6 @@ impl Codegen {
             visible_modules: &self.visible_modules,
             builtin_module_aliases: &self.builtin_module_aliases,
             lambda_names: &self.lambda_names,
-            cooperative_leaves: &self.cooperative_leaves,
             string_literals: &self.string_literals,
             class_layouts: &self.class_layouts,
             static_storage: &self.static_storage,
@@ -1773,10 +1759,8 @@ impl Codegen {
             async_frame_offsets: HashMap::new(),
             lir_frame_offsets: HashMap::new(),
             lir_defer_offsets: HashMap::new(),
-            lir_hoisted_await: None,
             main_result_err_ty: None,
             vars: HashMap::new(),
-            return_type: Type::Void,
             current_class: None,
             is_async: false,
             terminated: false,
@@ -2227,7 +2211,6 @@ impl Codegen {
             visible_modules: &self.visible_modules,
             builtin_module_aliases: &self.builtin_module_aliases,
             lambda_names: &self.lambda_names,
-            cooperative_leaves: &self.cooperative_leaves,
             string_literals: &self.string_literals,
             class_layouts: &self.class_layouts,
             static_storage: &self.static_storage,
@@ -2244,10 +2227,8 @@ impl Codegen {
             async_frame_offsets: HashMap::new(),
             lir_frame_offsets: HashMap::new(),
             lir_defer_offsets: HashMap::new(),
-            lir_hoisted_await: None,
             main_result_err_ty: None,
             vars: HashMap::new(),
-            return_type: m.return_type.clone().into(),
             current_class: Some(c.name.as_str()),
             // An async method returned above through `compile_cooperative_method`.
             is_async: false,

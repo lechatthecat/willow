@@ -105,18 +105,36 @@ impl<'a> CheckerTables<'a> {
     /// spelling inside a type argument is rewritten even when the whole type
     /// was never written that way.
     pub(crate) fn normalize(&self, ty: &Type) -> Type {
-        if let Some(normalized) = self.normalized_types.and_then(|m| m.get(ty)) {
-            return normalized.clone();
-        }
+        let ty = self.normalized_types.and_then(|m| m.get(ty)).unwrap_or(ty);
         let rebuilt = match ty {
             Type::Named(name) => self
                 .enums
                 .and_then(|enums| enums.get(&crate::semantic::ids::TypeId::from_source_name(name)))
                 .map(|info| Type::Named(info.name.clone()))
+                .or_else(|| {
+                    self.symbols
+                        .and_then(|symbols| symbols.lookup_class(name))
+                        .map(|info| Type::Named(info.name.clone()))
+                })
+                .or_else(|| {
+                    self.symbols
+                        .and_then(|symbols| symbols.lookup_interface(name))
+                        .map(|info| Type::Named(info.name.clone()))
+                })
                 .unwrap_or_else(|| ty.clone()),
             Type::Array(elem) => Type::Array(Box::new(self.normalize(elem))),
             Type::Generic(name, args) => Type::Generic(
-                name.clone(),
+                self.symbols
+                    .and_then(|symbols| symbols.lookup_interface(name))
+                    .map(|info| info.name.clone())
+                    .or_else(|| {
+                        self.enums
+                            .and_then(|enums| {
+                                enums.get(&crate::semantic::ids::TypeId::from_source_name(name))
+                            })
+                            .map(|info| info.name.clone())
+                    })
+                    .unwrap_or_else(|| name.clone()),
                 args.iter().map(|a| self.normalize(a)).collect(),
             ),
             Type::Fn(params, ret) => Type::Fn(
@@ -557,10 +575,11 @@ fn lower_method(
     tables: &CheckerTables,
 ) -> Result<HirFunction, Diagnostic> {
     let mut ctx = LowerCtx::new(fn_returns, classes, enums, tables);
+    ctx.current_class = Some(class_name.to_owned());
     let mut params = Vec::with_capacity(m.params.len() + 1);
     // Explicit and implicit `self` spellings normalize to the same receiver.
     if !m.is_static {
-        let self_ty = Type::Named(class_name.to_string());
+        let self_ty = ctx.normalize(&Type::Named(class_name.to_string()));
         ctx.bind("self".to_string(), self_ty.clone());
         params.push(HirParam {
             name: "self".to_string(),
@@ -602,7 +621,8 @@ fn lower_constructor(
     tables: &CheckerTables,
 ) -> Result<HirFunction, Diagnostic> {
     let mut ctx = LowerCtx::new(fn_returns, classes, enums, tables);
-    let self_ty = Type::Named(class_name.to_string());
+    ctx.current_class = Some(class_name.to_owned());
+    let self_ty = ctx.normalize(&Type::Named(class_name.to_string()));
     ctx.bind("self".to_string(), self_ty.clone());
     let mut params = Vec::with_capacity(ctor.params.len() + 1);
     params.push(HirParam {
@@ -658,6 +678,7 @@ struct LowerCtx<'a> {
     /// function, not only across the scopes currently open.
     binds_seen: HashMap<String, usize>,
     next_defer_id: u32,
+    current_class: Option<String>,
     fn_returns: &'a HashMap<String, Type>,
     classes: &'a Classes,
     enums: &'a Enums,
@@ -676,6 +697,7 @@ impl<'a> LowerCtx<'a> {
             namespace_scope_base: 1,
             binds_seen: HashMap::new(),
             next_defer_id: 0,
+            current_class: None,
             fn_returns,
             classes,
             enums,
@@ -956,8 +978,17 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
         }
         Stmt::StaticFieldAssign(s) => {
             let value = lower_expr(&s.value, ctx)?;
+            let source = if s.class == "Self" {
+                ctx.current_class.as_deref().unwrap_or(&s.class)
+            } else {
+                &s.class
+            };
+            let class = match ctx.normalize(&Type::Named(source.to_owned())) {
+                Type::Named(ref name) => name.clone(),
+                _ => source.to_owned(),
+            };
             Ok(HirStmt::StaticFieldAssign {
-                class: s.class.clone().into(),
+                class: class.into(),
                 field: s.field.clone(),
                 value,
                 span: s.span,
@@ -1032,11 +1063,29 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
 fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     let mut lowered = lower_expr_inner(expr, ctx)?;
     lowered.ty = ctx.normalize(&lowered.ty.to_source()).into();
+    match &mut lowered.kind {
+        HirExprKind::StaticCall { class, .. } | HirExprKind::StaticField { class, .. } => {
+            let source = if *class == crate::semantic::ids::TypeId::local("Self") {
+                ctx.current_class
+                    .as_deref()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| class.to_string())
+            } else {
+                class.to_string()
+            };
+            if let Type::Named(name) = &ctx.normalize(&Type::Named(source)) {
+                *class = name.as_str().into();
+            }
+        }
+        _ => {}
+    }
     // Construction records the identity being allocated, not the source's
     // import alias. Keep it identical to the canonical result type.
     if let crate::semantic::ids::SemanticType::Named(identity) = &lowered.ty {
         match &mut lowered.kind {
-            HirExprKind::New { class, .. } | HirExprKind::ObjectLiteral { class, .. } => *class = *identity,
+            HirExprKind::New { class, .. } | HirExprKind::ObjectLiteral { class, .. } => {
+                *class = *identity
+            }
             _ => {}
         }
     }
@@ -1738,9 +1787,14 @@ fn lower_object_literal_expr(
 #[inline(never)]
 fn lower_static_field_expr(s: &StaticFieldExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     // `Enum::Variant` (fieldless) parses like a static property read.
-    let variant_ty = enum_variant_value_type(ctx.enums, &s.class, &s.field, true);
+    let class = if s.class == "Self" {
+        ctx.current_class.as_deref().unwrap_or(&s.class)
+    } else {
+        &s.class
+    };
+    let variant_ty = enum_variant_value_type(ctx.enums, class, &s.field, true);
     let ty = variant_ty
-        .or_else(|| ctx.classes.static_field_type(&s.class, &s.field))
+        .or_else(|| ctx.classes.static_field_type(class, &s.field))
         // Checker authority, exactly as the static-CALL arm below uses
         // it: `Self::prop` inside a class body names a class the
         // registry has no entry for, and the checker has already
@@ -1784,9 +1838,14 @@ fn lower_static_field_expr(s: &StaticFieldExpr, ctx: &mut LowerCtx) -> Result<Hi
 )]
 fn lower_static_call_expr(s: &StaticCallExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     // `Enum::Variant(args)` construction parses like a static call.
-    let variant_ty = enum_variant_value_type(ctx.enums, &s.class, &s.method, false);
+    let class = if s.class == "Self" {
+        ctx.current_class.as_deref().unwrap_or(&s.class)
+    } else {
+        &s.class
+    };
+    let variant_ty = enum_variant_value_type(ctx.enums, class, &s.method, false);
     let ty = variant_ty
-        .or_else(|| ctx.classes.static_method_type(&s.class, &s.method))
+        .or_else(|| ctx.classes.static_method_type(class, &s.method))
         // Checker authority: generic-enum construction, `Self::`,
         // module-qualified statics, constructors.
         .or_else(|| ctx.tables.expr_type(&s.id))
@@ -2618,16 +2677,30 @@ mod tests {
     #[test]
     fn construction_identity_uses_normalized_type_alias() {
         use crate::semantic::ids::{SemanticType, TypeId};
-        let tokens = Lexer::new("class Alias { n: i64; } fn f() { let a = new Alias(1); let b = Alias { n: 2 }; }").tokenize().unwrap();
+        let tokens = Lexer::new(
+            "class Alias { n: i64; } fn f() { let a = new Alias(1); let b = Alias { n: 2 }; }",
+        )
+        .tokenize()
+        .unwrap();
         let (program, errors) = Parser::new(tokens).parse();
         assert!(errors.is_empty());
-        let normalized = HashMap::from([(Type::Named("Alias".into()), Type::Named("sales::Amount".into()))]);
-        let tables = CheckerTables { normalized_types: Some(&normalized), ..Default::default() };
+        let normalized = HashMap::from([(
+            Type::Named("Alias".into()),
+            Type::Named("sales::Amount".into()),
+        )]);
+        let tables = CheckerTables {
+            normalized_types: Some(&normalized),
+            ..Default::default()
+        };
         let (hir, diagnostics) = lower_program_with(&program, &tables);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         for statement in &hir.functions[0].body {
             if let HirStmt::Let { value, .. } = statement {
-                let (HirExprKind::New { class, .. } | HirExprKind::ObjectLiteral { class, .. }) = &value.kind else { panic!("constructor expected"); };
+                let (HirExprKind::New { class, .. } | HirExprKind::ObjectLiteral { class, .. }) =
+                    &value.kind
+                else {
+                    panic!("constructor expected");
+                };
                 assert_eq!(*class, TypeId::from_source_name("sales::Amount"));
                 assert_eq!(value.ty, SemanticType::Named(*class));
             }
@@ -2635,24 +2708,82 @@ mod tests {
     }
 
     #[test]
+    fn resolution_inherits_static_fields_and_resolves_self() {
+        let (hir, diagnostics) = lower_src(
+            "open class Base { pub static value: i64 = 7; } class Child extends Base { pub static fn read() -> i64 { return Self::value; } }",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let child = crate::semantic::ids::TypeId::local("Child");
+        assert_eq!(
+            hir.resolution.classes[&child].static_fields["value"],
+            crate::semantic::ids::SemanticType::I64
+        );
+        let method = hir
+            .classes
+            .iter()
+            .find(|class| class.name == child)
+            .unwrap()
+            .methods
+            .iter()
+            .find(|method| method.name.unqualified_name() == "read")
+            .unwrap();
+        let HirStmt::Return {
+            value: Some(value), ..
+        } = &method.body[0]
+        else {
+            panic!("return expected")
+        };
+        assert!(matches!(&value.kind, HirExprKind::StaticField { class, .. } if *class == child));
+    }
+
+    #[test]
     fn resolution_snapshot_preserves_payload_order_and_parameter_modes() {
-        use crate::semantic::ids::{TypeId, FunctionId};
-        let (hir, diagnostics) = lower_src("interface Reader<T> { fn read(self) -> T; } interface NamedReader extends Reader { fn name(self) -> String; } enum Pair { Empty, Values(i64, String) } class Item { pub z: i64; pub a: String; pub init(self, n: i64) { self.z = n; self.a = \"x\"; } pub static fn twice(n: i64) -> i64 { return n + n; } } fn touch(x: &mut i64) { x = 1; }");
+        use crate::semantic::ids::{FunctionId, TypeId};
+        let (hir, diagnostics) = lower_src(
+            "interface Reader<T> { fn read(self) -> T; } interface NamedReader extends Reader { fn name(self) -> String; } enum Pair { Empty, Values(i64, String) } class Item { pub z: i64; pub a: String; pub init(self, n: i64) { self.z = n; self.a = \"x\"; } pub static fn twice(n: i64) -> i64 { return n + n; } } fn touch(x: &mut i64) { x = 1; }",
+        );
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let reader = &hir.resolution.interfaces[&TypeId::local("Reader")];
         assert_eq!(reader.type_params, vec![TypeId::local("T")]);
-        assert_eq!(reader.methods["read"].return_type, crate::semantic::ids::SemanticType::Named(TypeId::local("T")));
-        assert_eq!(hir.resolution.interfaces[&TypeId::local("NamedReader")].extends, vec![TypeId::local("Reader")]);
+        assert_eq!(
+            reader.methods["read"].return_type,
+            crate::semantic::ids::SemanticType::Named(TypeId::local("T"))
+        );
+        assert_eq!(
+            hir.resolution.interfaces[&TypeId::local("NamedReader")].extends,
+            vec![TypeId::local("Reader")]
+        );
         let pair = &hir.resolution.enums[&TypeId::local("Pair")];
         assert_eq!(pair.variants[1].name, "Values");
         assert_eq!(pair.variants[1].tag, 1);
-        assert_eq!(pair.variants[1].payloads, vec![crate::semantic::ids::SemanticType::I64, crate::semantic::ids::SemanticType::String]);
+        assert_eq!(
+            pair.variants[1].payloads,
+            vec![
+                crate::semantic::ids::SemanticType::I64,
+                crate::semantic::ids::SemanticType::String
+            ]
+        );
         let item = &hir.resolution.classes[&TypeId::local("Item")];
-        assert_eq!(item.fields.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["z", "a"]);
-        assert_eq!(item.constructor.as_ref().unwrap().params, vec![crate::semantic::ids::SemanticType::I64]);
+        assert_eq!(
+            item.fields
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["z", "a"]
+        );
+        assert_eq!(
+            item.constructor.as_ref().unwrap().params,
+            vec![crate::semantic::ids::SemanticType::I64]
+        );
         assert!(item.methods["twice"].is_static);
-        assert!(matches!(hir.resolution.functions[&FunctionId::free("touch")].param_modes[0], crate::parser::ast::ParamMode::Reference { mutable: true, .. }));
-        assert_eq!(hir.resolution.enums[&TypeId::local("Option")].variants[0].name, "Some");
+        assert!(matches!(
+            hir.resolution.functions[&FunctionId::free("touch")].param_modes[0],
+            crate::parser::ast::ParamMode::Reference { mutable: true, .. }
+        ));
+        assert_eq!(
+            hir.resolution.enums[&TypeId::local("Option")].variants[0].name,
+            "Some"
+        );
     }
 
     /// Deeply nested expressions must lower without exhausting a modest
@@ -3799,40 +3930,64 @@ mod tests {
 /// Freeze declaration facts before control-flow lowering. Source declarations
 /// provide a complete fallback for checkerless tools/tests; checker entries
 /// then replace them with the canonical, globally resolved definitions.
-fn lower_resolution(program: &Program, tables: &CheckerTables<'_>) -> super::typed_ast::HirResolution {
-    use super::typed_ast::{HirResolution, HirEnumInfo, HirEnumVariant, HirClassInfo, HirInterfaceInfo, HirSignature};
-    use crate::semantic::ids::{TypeId, FunctionId};
+fn lower_resolution(
+    program: &Program,
+    tables: &CheckerTables<'_>,
+) -> super::typed_ast::HirResolution {
+    use super::typed_ast::{
+        HirClassInfo, HirEnumInfo, HirEnumVariant, HirInterfaceInfo, HirResolution, HirSignature,
+    };
     use crate::parser::ast::ParamMode;
+    use crate::semantic::ids::{FunctionId, TypeId};
     let canonical = |name: &str| match tables.normalize(&Type::Named(name.to_owned())) {
         Type::Named(ref name) => TypeId::from_source_name(name),
         _ => TypeId::from_source_name(name),
     };
-    let signature = |params: &[crate::parser::ast::Param], result: &Type, is_static, is_async| HirSignature {
-        params: params.iter().map(|p| tables.normalize(&p.ty).into()).collect(),
-        param_modes: params.iter().map(|p| p.mode.clone()).collect(),
-        return_type: tables.normalize(result).into(), is_static, is_async,
-    };
+    let signature =
+        |params: &[crate::parser::ast::Param], result: &Type, is_static, is_async| HirSignature {
+            params: params
+                .iter()
+                .map(|p| tables.normalize(&p.ty).into())
+                .collect(),
+            param_modes: params.iter().map(|p| p.mode.clone()).collect(),
+            return_type: tables.normalize(result).into(),
+            is_static,
+            is_async,
+        };
     let mut out = HirResolution::default();
     for namespace in ["env", "fs", "net", "parallel", "f64"] {
-        out.namespaces.insert(TypeId::local(namespace), namespace.to_owned());
+        out.namespaces
+            .insert(TypeId::local(namespace), namespace.to_owned());
     }
     for import in &program.imports {
         use crate::module::std_registry;
         if std_registry::is_std_path(&import.path) {
-            if let Ok(std_registry::StdImport::Module { module }) = std_registry::resolve_std_import(&import.path, import.span) {
+            if let Ok(std_registry::StdImport::Module { module }) =
+                std_registry::resolve_std_import(&import.path, import.span)
+            {
                 if matches!(module.as_str(), "env" | "fs" | "net" | "parallel") {
-                    out.namespaces.insert(TypeId::local(import.alias.as_deref().unwrap_or(&module)), module);
+                    out.namespaces.insert(
+                        TypeId::local(import.alias.as_deref().unwrap_or(&module)),
+                        module,
+                    );
                 }
             }
         } else {
-            let access = import.alias.as_deref().unwrap_or_else(|| import.path.rsplit("::").next().unwrap_or(&import.path));
-            if access != "f64" { out.namespaces.remove(&TypeId::local(access)); }
+            let access = import
+                .alias
+                .as_deref()
+                .unwrap_or_else(|| import.path.rsplit("::").next().unwrap_or(&import.path));
+            if access != "f64" {
+                out.namespaces.remove(&TypeId::local(access));
+            }
         }
     }
     // Preserve declaration order for builtin enum discriminants too.
     static PRELUDE: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
     let prelude = PRELUDE.get_or_init(|| {
-        let tokens = crate::lexer::Lexer::new(crate::prelude::PRELUDE_SOURCE).tokenize().expect("prelude lexes");
+        let tokens = crate::lexer::Lexer::new(crate::prelude::PRELUDE_SOURCE)
+            .tokenize()
+            .expect("prelude lexes");
         let (prelude, errors) = crate::parser::Parser::new(tokens).parse();
         assert!(errors.is_empty(), "prelude parses: {errors:?}");
         prelude
@@ -3840,72 +3995,295 @@ fn lower_resolution(program: &Program, tables: &CheckerTables<'_>) -> super::typ
     for item in prelude.items.iter().chain(&program.items) {
         match item {
             Item::Enum(e) => {
-                out.enums.insert(canonical(&e.name), HirEnumInfo {
-                    type_params: e.type_params.iter().map(|name| TypeId::from_source_name(name)).collect(),
-                    variants: e.variants.iter().enumerate().map(|(tag, variant)| HirEnumVariant {
-                        name: variant.name.clone(), tag: tag as i64,
-                        payloads: variant.payload.iter().map(|ty| tables.normalize(ty).into()).collect(),
-                    }).collect(),
-                });
+                out.enums.insert(
+                    canonical(&e.name),
+                    HirEnumInfo {
+                        type_params: e
+                            .type_params
+                            .iter()
+                            .map(|name| TypeId::from_source_name(name))
+                            .collect(),
+                        variants: e
+                            .variants
+                            .iter()
+                            .enumerate()
+                            .map(|(tag, variant)| HirEnumVariant {
+                                name: variant.name.clone(),
+                                tag: tag as i64,
+                                payloads: variant
+                                    .payload
+                                    .iter()
+                                    .map(|ty| tables.normalize(ty).into())
+                                    .collect(),
+                            })
+                            .collect(),
+                    },
+                );
             }
-            Item::Function(f) => { out.functions.insert(FunctionId::free_from_source_name(&f.name), signature(&f.params, &f.return_type, true, f.is_async)); }
+            Item::Function(f) => {
+                out.functions.insert(
+                    FunctionId::free_from_source_name(&f.name),
+                    signature(&f.params, &f.return_type, true, f.is_async),
+                );
+            }
             Item::Class(c) => {
-                let mut info = HirClassInfo { implements: c.implements.iter().map(|ty| tables.normalize(ty).into()).collect(), base: c.base_class.as_ref().map(|base| canonical(&match base { crate::parser::ast::TypePath::Local(name) => name.clone(), crate::parser::ast::TypePath::Qualified(parts) => parts.join("::") })), ..HirClassInfo::default() };
+                let mut info = HirClassInfo {
+                    implements: c
+                        .implements
+                        .iter()
+                        .map(|ty| tables.normalize(ty).into())
+                        .collect(),
+                    base: c.base_class.as_ref().map(|base| {
+                        canonical(&match base {
+                            crate::parser::ast::TypePath::Local(name) => name.clone(),
+                            crate::parser::ast::TypePath::Qualified(parts) => parts.join("::"),
+                        })
+                    }),
+                    ..HirClassInfo::default()
+                };
                 for field in &c.fields {
                     let ty = tables.normalize(&field.ty).into();
-                    if field.is_static { info.static_fields.insert(field.name.clone(), ty); }
-                    else { info.fields.push((field.name.clone(), ty)); }
+                    if field.is_static {
+                        info.static_fields.insert(field.name.clone(), ty);
+                    } else {
+                        info.fields.push((field.name.clone(), ty));
+                    }
                 }
-                info.constructor = c.constructors.first().map(|ctor| signature(&ctor.params, &Type::Void, false, false));
-                for method in &c.methods { info.methods.insert(method.name.clone(), signature(&method.params, &method.return_type, method.is_static, method.is_async)); }
+                info.constructor = c
+                    .constructors
+                    .first()
+                    .map(|ctor| signature(&ctor.params, &Type::Void, false, false));
+                for method in &c.methods {
+                    info.methods.insert(
+                        method.name.clone(),
+                        signature(
+                            &method.params,
+                            &method.return_type,
+                            method.is_static,
+                            method.is_async,
+                        ),
+                    );
+                }
                 out.classes.insert(canonical(&c.name), info);
             }
             Item::Interface(interface) => {
-                out.interfaces.insert(canonical(&interface.name), HirInterfaceInfo {
-                    type_params: interface.type_params.iter().map(|name| TypeId::from_source_name(name)).collect(),
-                    extends: interface.extends.iter().map(|name| canonical(name)).collect(),
-                    methods: interface.methods.iter().map(|method| (method.name.clone(), signature(&method.params, &method.return_type, method.is_static, false))).collect(),
-                });
+                out.interfaces.insert(
+                    canonical(&interface.name),
+                    HirInterfaceInfo {
+                        type_params: interface
+                            .type_params
+                            .iter()
+                            .map(|name| TypeId::from_source_name(name))
+                            .collect(),
+                        extends: interface
+                            .extends
+                            .iter()
+                            .map(|name| canonical(name))
+                            .collect(),
+                        methods: interface
+                            .methods
+                            .iter()
+                            .map(|method| {
+                                (
+                                    method.name.clone(),
+                                    signature(
+                                        &method.params,
+                                        &method.return_type,
+                                        method.is_static,
+                                        false,
+                                    ),
+                                )
+                            })
+                            .collect(),
+                    },
+                );
             }
         }
     }
-    let checked_signature = |params: &[Type], infos: &[symbols::ParamInfo], result: &Type, is_static, is_async| HirSignature {
-        params: params.iter().map(|ty| tables.normalize(ty).into()).collect(),
-        param_modes: params.iter().enumerate().map(|(i, _)| infos.get(i).map_or(ParamMode::Value, |p| p.mode.clone())).collect(),
-        return_type: tables.normalize(result).into(), is_static, is_async,
-    };
+    let checked_signature =
+        |params: &[Type], infos: &[symbols::ParamInfo], result: &Type, is_static, is_async| {
+            HirSignature {
+                params: params
+                    .iter()
+                    .map(|ty| tables.normalize(ty).into())
+                    .collect(),
+                param_modes: params
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| infos.get(i).map_or(ParamMode::Value, |p| p.mode.clone()))
+                    .collect(),
+                return_type: tables.normalize(result).into(),
+                is_static,
+                is_async,
+            }
+        };
     if let Some(enums) = tables.enums {
         for info in enums.values() {
-            out.enums.insert(TypeId::from_source_name(&info.name), HirEnumInfo {
-                type_params: info.type_params.iter().map(|name| TypeId::from_source_name(name)).collect(),
-                variants: info.variants.iter().map(|variant| HirEnumVariant {
-                    name: variant.name.clone(), tag: variant.tag,
-                    payloads: variant.payload_types.iter().map(|ty| tables.normalize(ty).into()).collect(),
-                }).collect(),
-            });
+            out.enums.insert(
+                TypeId::from_source_name(&info.name),
+                HirEnumInfo {
+                    type_params: info
+                        .type_params
+                        .iter()
+                        .map(|name| TypeId::from_source_name(name))
+                        .collect(),
+                    variants: info
+                        .variants
+                        .iter()
+                        .map(|variant| HirEnumVariant {
+                            name: variant.name.clone(),
+                            tag: variant.tag,
+                            payloads: variant
+                                .payload_types
+                                .iter()
+                                .map(|ty| tables.normalize(ty).into())
+                                .collect(),
+                        })
+                        .collect(),
+                },
+            );
         }
     }
     if let Some(symbols) = tables.symbols {
+        for (access, module) in symbols.module_accesses() {
+            let functions = module
+                .functions
+                .ids()
+                .map(|id| {
+                    let function = module
+                        .functions
+                        .get_id(id)
+                        .expect("declared module function");
+                    (
+                        id.unqualified_name().to_owned(),
+                        checked_signature(
+                            &function.params,
+                            &function.param_infos,
+                            &function.return_type,
+                            true,
+                            function.is_async,
+                        ),
+                    )
+                })
+                .collect();
+            out.modules
+                .insert(TypeId::from_source_name(access), functions);
+        }
         for (id, function) in &symbols.functions {
-            out.functions.insert(id.clone(), checked_signature(&function.params, &function.param_infos, &function.return_type, true, function.is_async));
+            out.functions.insert(
+                id.clone(),
+                checked_signature(
+                    &function.params,
+                    &function.param_infos,
+                    &function.return_type,
+                    true,
+                    function.is_async,
+                ),
+            );
         }
         for interface in symbols.interfaces.values() {
-            out.interfaces.insert(TypeId::from_source_name(&interface.name), HirInterfaceInfo {
-                type_params: interface.type_params.iter().map(|name| TypeId::from_source_name(name)).collect(),
-                extends: interface.extends.iter().map(|name| TypeId::from_source_name(name)).collect(),
-                methods: interface.methods.iter().map(|(name, method)| (name.clone(), checked_signature(&method.params, &method.param_infos, &method.return_type, method.is_static, false))).collect(),
-            });
+            out.interfaces.insert(
+                TypeId::from_source_name(&interface.name),
+                HirInterfaceInfo {
+                    type_params: interface
+                        .type_params
+                        .iter()
+                        .map(|name| TypeId::from_source_name(name))
+                        .collect(),
+                    extends: interface
+                        .extends
+                        .iter()
+                        .map(|name| canonical(name))
+                        .collect(),
+                    methods: interface
+                        .methods
+                        .iter()
+                        .map(|(name, method)| {
+                            (
+                                name.clone(),
+                                checked_signature(
+                                    &method.params,
+                                    &method.param_infos,
+                                    &method.return_type,
+                                    method.is_static,
+                                    false,
+                                ),
+                            )
+                        })
+                        .collect(),
+                },
+            );
         }
         for class in symbols.classes.values() {
-            out.classes.insert(TypeId::from_source_name(&class.name), HirClassInfo {
-                base: class.base_class.as_ref().map(|name| TypeId::from_source_name(name)),
-                implements: class.implements.iter().map(|ty| tables.normalize(ty).into()).collect(),
-                fields: class.instance_field_order.iter().map(|(name, ty)| (name.clone(), tables.normalize(ty).into())).collect(),
-                static_fields: class.static_props.iter().map(|(name, field)| (name.clone(), tables.normalize(&field.ty).into())).collect(),
-                constructor: class.constructor.as_ref().map(|ctor| checked_signature(&ctor.params, &ctor.param_infos, &Type::Void, false, false)),
-                methods: class.methods.iter().map(|(name, method)| (name.clone(), checked_signature(&method.params, &method.param_infos, &method.return_type, method.is_static, method.is_async))).collect(),
-            });
+            out.classes.insert(
+                TypeId::from_source_name(&class.name),
+                HirClassInfo {
+                    base: class.base_class.as_ref().map(|name| canonical(name)),
+                    implements: class
+                        .implements
+                        .iter()
+                        .map(|ty| tables.normalize(ty).into())
+                        .collect(),
+                    fields: class
+                        .instance_field_order
+                        .iter()
+                        .map(|(name, ty)| (name.clone(), tables.normalize(ty).into()))
+                        .collect(),
+                    static_fields: class
+                        .static_props
+                        .iter()
+                        .map(|(name, field)| (name.clone(), tables.normalize(&field.ty).into()))
+                        .collect(),
+                    constructor: class.constructor.as_ref().map(|ctor| {
+                        checked_signature(
+                            &ctor.params,
+                            &ctor.param_infos,
+                            &Type::Void,
+                            false,
+                            false,
+                        )
+                    }),
+                    methods: class
+                        .methods
+                        .iter()
+                        .map(|(name, method)| {
+                            (
+                                name.clone(),
+                                checked_signature(
+                                    &method.params,
+                                    &method.param_infos,
+                                    &method.return_type,
+                                    method.is_static,
+                                    method.is_async,
+                                ),
+                            )
+                        })
+                        .collect(),
+                },
+            );
         }
     }
+    // A static property keeps its ancestor's storage while remaining visible
+    // through a derived class. Preserve own-property shadowing in the snapshot.
+    let declared = out.classes.clone();
+    for (identity, info) in &mut out.classes {
+        let mut visited = std::collections::HashSet::from([*identity]);
+        let mut base = info.base;
+        while let Some(parent) = base {
+            if !visited.insert(parent) {
+                break;
+            }
+            let Some(parent_info) = declared.get(&parent) else {
+                break;
+            };
+            for (name, ty) in &parent_info.static_fields {
+                info.static_fields
+                    .entry(name.clone())
+                    .or_insert_with(|| ty.clone());
+            }
+            base = parent_info.base;
+        }
+    }
+
     out
 }

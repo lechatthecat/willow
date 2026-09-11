@@ -189,7 +189,11 @@ fn always_returns(mut node: ReturnNode<'_>) -> bool {
                 Stmt::Expr(expr) => {
                     if let Expr::Match(matched) = &expr.expr {
                         let mut arms = matched.arms.iter();
-                        if let Some(MatchArm { body: MatchBody::Block(block), .. }) = arms.next() {
+                        if let Some(MatchArm {
+                            body: MatchBody::Block(block),
+                            ..
+                        }) = arms.next()
+                        {
                             frames.push(Frame::All(arms));
                             node = ReturnNode::Block(block);
                             continue;
@@ -199,10 +203,17 @@ fn always_returns(mut node: ReturnNode<'_>) -> bool {
                 }
                 // Loops need not execute; deferred bodies run later. Neither
                 // break nor continue guarantees a return from the function.
-                Stmt::Defer(_) | Stmt::Break(_) | Stmt::Continue(_)
-                | Stmt::Let(_) | Stmt::Assign(_) | Stmt::FieldAssign(_)
-                | Stmt::SuperInit(_) | Stmt::StaticFieldAssign(_)
-                | Stmt::IndexAssign(_) | Stmt::While(_) | Stmt::For(_) => false,
+                Stmt::Defer(_)
+                | Stmt::Break(_)
+                | Stmt::Continue(_)
+                | Stmt::Let(_)
+                | Stmt::Assign(_)
+                | Stmt::FieldAssign(_)
+                | Stmt::SuperInit(_)
+                | Stmt::StaticFieldAssign(_)
+                | Stmt::IndexAssign(_)
+                | Stmt::While(_)
+                | Stmt::For(_) => false,
             },
         };
         while let Some(frame) = frames.pop() {
@@ -215,7 +226,10 @@ fn always_returns(mut node: ReturnNode<'_>) -> bool {
                     }
                 }
                 Frame::All(mut arms) if result => match arms.next() {
-                    Some(MatchArm { body: MatchBody::Block(block), .. }) => {
+                    Some(MatchArm {
+                        body: MatchBody::Block(block),
+                        ..
+                    }) => {
                         frames.push(Frame::All(arms));
                         node = ReturnNode::Block(block);
                         continue 'evaluate;
@@ -249,27 +263,36 @@ mod tests {
 
     #[test]
     fn return_analysis_handles_fifty_thousand_branches_on_small_stack() {
-        std::thread::Builder::new().stack_size(1024 * 1024).spawn(|| {
-            let span = Span::new(0, 0, 1, 1);
-            let returning = || Block {
-                stmts: vec![Stmt::Return(ReturnStmt { value: None, span })], span,
-            };
-            let mut body = returning();
-            for _ in 0..50_000 {
-                body = Block {
-                    stmts: vec![Stmt::If(IfStmt {
-                        cond: Expr::Bool(true, span, ExprId::fresh()),
-                        then_block: body, else_block: Some(returning()), span,
-                    })], span,
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let span = Span::new(0, 0, 1, 1);
+                let returning = || Block {
+                    stmts: vec![Stmt::Return(ReturnStmt { value: None, span })],
+                    span,
                 };
-            }
-            assert!(block_always_returns(&body));
-            // The outer else must also return, even when every then branch does.
-            if let Stmt::If(branch) = &mut body.stmts[0] {
-                branch.else_block.as_mut().unwrap().stmts.clear();
-            }
-            assert!(!block_always_returns(&body));
-        }).unwrap().join().unwrap();
+                let mut body = returning();
+                for _ in 0..50_000 {
+                    body = Block {
+                        stmts: vec![Stmt::If(IfStmt {
+                            cond: Expr::Bool(true, span, ExprId::fresh()),
+                            then_block: body,
+                            else_block: Some(returning()),
+                            span,
+                        })],
+                        span,
+                    };
+                }
+                assert!(block_always_returns(&body));
+                // The outer else must also return, even when every then branch does.
+                if let Stmt::If(branch) = &mut body.stmts[0] {
+                    branch.else_block.as_mut().unwrap().stmts.clear();
+                }
+                assert!(!block_always_returns(&body));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

@@ -1585,8 +1585,7 @@ mod frontend_phase_tests {
 
     #[test]
     fn concurrency_phase_reports_entry_errors_without_rendering() {
-        let program =
-            parse_source("async fn update(x: &mut i64) {} fn main() {}");
+        let program = parse_source("async fn update(x: &mut i64) {} fn main() {}");
         let phase = check_unit_concurrency(&program, &[], &HelperIndex::new(), Some(&[]));
         assert!(diagnostic_error_count(&phase) > 0);
         assert!(!phase.is_empty());

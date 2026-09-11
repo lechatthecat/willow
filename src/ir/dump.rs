@@ -370,7 +370,8 @@ fn format_expr(e: &HirExpr) -> String {
     format!("{inner}: {}", type_str(&e.ty))
 }
 
-/// Expression rendering shared with the LIR dump (`lowered.rs`).
+/// Expression rendering for private source-graph regression fixtures.
+#[cfg(test)]
 pub(crate) fn expr_text(e: &HirExpr) -> String {
     format_expr(e)
 }

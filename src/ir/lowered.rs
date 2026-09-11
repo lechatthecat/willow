@@ -11,12 +11,15 @@
 //!         variable (index-based for arrays, bound-based for ranges)
 //! ```
 //!
-//! Root ternary, `match`, and short-circuit expressions become explicit CFG.
-//! Other expressions still use typed [`HirExpr`] trees inside instructions;
-//! nested expression control flow remains a backend responsibility.
-//! Every user body, including static
-//! initializers, is emitted from this IR (`backend::cranelift::lir_gen`).
-//! Unsupported lowering is diagnosed; `--emit-lir` renders the lowered program.
+//! Expression control flow, including nested ternaries, matches, short-circuit
+//! operators and propagation, becomes explicit CFG before backend emission.
+//! A private `Source*` construction graph temporarily retains typed expressions
+//! while the worklist schedules operands, captures, coercions and allocations.
+//! The public executable graph in `final_ir` contains only local/immediate
+//! operands and shallow rvalues; lambdas are lifted functions and defers own
+//! reusable cleanup CFG regions. No HIR expression reaches backend emission.
+//! Every user body, including static initializers, uses this graph.
+//! Unsupported lowering is diagnosed; `--emit-lir` renders the final program.
 
 use crate::diagnostics::Span;
 use crate::parser::ast::{ExprId, LockMode};
@@ -30,8 +33,8 @@ use super::typed_ast::{
 };
 
 pub mod async_liveness;
-pub mod value;
 mod lifetime;
+pub mod value;
 pub use value::{LirOperand, LirPlace, LirRvalue};
 
 use async_liveness::LirAsyncFrameLayout;
@@ -96,27 +99,52 @@ impl SourceFunction {
     pub(crate) fn visit_expr_roots_mut(&mut self, mut visit: impl FnMut(&mut HirExpr)) {
         let mut functions = vec![self];
         while let Some(function) = functions.pop() {
-        for block in &mut function.blocks {
-            for instruction in &mut block.instrs {
-                match instruction {
-                    SourceInst::Let { value, .. } | SourceInst::Assign { value, .. }
-                    | SourceInst::StaticFieldAssign { value, .. } | SourceInst::Expr(value) => visit(value),
-                    SourceInst::FieldAssign { object, value, .. } => { visit(object); visit(value); }
-                    SourceInst::IndexAssign { array, index, value } => { visit(array); visit(index); visit(value); }
-                    SourceInst::SuperInit { args, .. } => args.iter_mut().for_each(&mut visit),
-                    SourceInst::Defer { body, .. } => functions.push(body.function.as_mut()),
-                    SourceInst::Compute { .. } | SourceInst::EnterDeferScope { .. } | SourceInst::LeaveDeferScope { .. }
-                    | SourceInst::FlushDefers { .. } | SourceInst::ClearScopeRoots { .. }
-                    | SourceInst::ReleaseLock(_) | SourceInst::MatchTest { .. } | SourceInst::MatchBind { .. }
-                    | SourceInst::SelectInit { .. } | SourceInst::SelectProbe { .. } | SourceInst::SelectPick { .. }
-                    | SourceInst::SelectUnregister { .. } | SourceInst::SelectCommit { .. } => {}
+            for block in &mut function.blocks {
+                for instruction in &mut block.instrs {
+                    match instruction {
+                        SourceInst::Let { value, .. }
+                        | SourceInst::Assign { value, .. }
+                        | SourceInst::StaticFieldAssign { value, .. }
+                        | SourceInst::Expr(value) => visit(value),
+                        SourceInst::FieldAssign { object, value, .. } => {
+                            visit(object);
+                            visit(value);
+                        }
+                        SourceInst::IndexAssign {
+                            array,
+                            index,
+                            value,
+                        } => {
+                            visit(array);
+                            visit(index);
+                            visit(value);
+                        }
+                        SourceInst::SuperInit { args, .. } => args.iter_mut().for_each(&mut visit),
+                        SourceInst::Defer { body, .. } => functions.push(body.function.as_mut()),
+                        SourceInst::Compute { .. }
+                        | SourceInst::EnterDeferScope { .. }
+                        | SourceInst::LeaveDeferScope { .. }
+                        | SourceInst::FlushDefers { .. }
+                        | SourceInst::ClearScopeRoots { .. }
+                        | SourceInst::ReleaseLock(_)
+                        | SourceInst::MatchTest { .. }
+                        | SourceInst::MatchBind { .. }
+                        | SourceInst::SelectInit { .. }
+                        | SourceInst::SelectProbe { .. }
+                        | SourceInst::SelectPick { .. }
+                        | SourceInst::SelectUnregister { .. }
+                        | SourceInst::SelectCommit { .. } => {}
+                    }
+                }
+                match &mut block.terminator {
+                    SourceTerminator::Branch { cond, .. }
+                    | SourceTerminator::Return(Some(cond)) => visit(cond),
+                    SourceTerminator::Jump(_)
+                    | SourceTerminator::Suspend { .. }
+                    | SourceTerminator::Return(None)
+                    | SourceTerminator::CleanupReturn => {}
                 }
             }
-            match &mut block.terminator {
-                SourceTerminator::Branch { cond, .. } | SourceTerminator::Return(Some(cond)) => visit(cond),
-                SourceTerminator::Jump(_) | SourceTerminator::Suspend { .. } | SourceTerminator::Return(None) | SourceTerminator::CleanupReturn => {}
-            }
-        }
         }
     }
 
@@ -184,7 +212,9 @@ pub struct LirLocal {
 }
 
 impl LirLocal {
-    pub fn is_gc_owner(&self) -> bool { self.storage_kind == LirStorageKind::GcOwner }
+    pub fn is_gc_owner(&self) -> bool {
+        self.storage_kind == LirStorageKind::GcOwner
+    }
 }
 
 /// A basic-block index into [`SourceFunction::blocks`].
@@ -421,7 +451,11 @@ impl LirLockSlots {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum SourceInst {
     /// One flat computation with explicit scalar operands.
-    Compute { local: LirLocalId, value: LirRvalue, span: Span },
+    Compute {
+        local: LirLocalId,
+        value: LirRvalue,
+        span: Span,
+    },
     /// Open a lexical scope that owns `sites` defer registrations
     /// (willow-0g8j.2.3).
     ///
@@ -567,9 +601,8 @@ pub(crate) enum SourceInst {
     /// Does the scrutinee match one arm's pattern? (willow-0g8j.2.11.1)
     ///
     /// Emitted only when lowering has split a `match` into blocks because an
-    /// arm suspends. A `match` whose arms all run to completion stays an
-    /// [`HirExprKind::Match`] tree, so this is never the only way a pattern
-    /// test reaches the backend.
+    /// arm suspends. Nonsuspending matches use the same explicit pattern
+    /// instructions and branch structure.
     ///
     /// The scrutinee is a local rather than an expression because every arm
     /// tests the SAME value: the source evaluates it once, and the tests are
@@ -644,17 +677,23 @@ pub(crate) fn lower_source_program(program: &HirProgram) -> SourceProgram {
     super::optimize::inline_scalar_leaves(&mut functions);
     // The lifted graph is the sole owner of each executable lambda body.
     // Enclosing expressions retain only closure construction metadata.
-    for function in functions.iter_mut().chain(lambdas.iter_mut().map(|lambda| &mut lambda.function)) {
+    for function in functions
+        .iter_mut()
+        .chain(lambdas.iter_mut().map(|lambda| &mut lambda.function))
+    {
+        super::optimize::unroll_scalar_loops(function);
         lifetime::clear_dead_temporaries(function);
         function.async_frame = async_liveness::analyze(&function.blocks, &function.locals);
-        function.visit_expr_roots_mut(|expr| expr.visit_mut_preorder(true, |node| {
-            if let HirExprKind::Lambda { body, .. } = &mut node.kind {
-                body.clear();
-                false
-            } else {
-                true
-            }
-        }));
+        function.visit_expr_roots_mut(|expr| {
+            expr.visit_mut_preorder(true, |node| {
+                if let HirExprKind::Lambda { body, .. } = &mut node.kind {
+                    body.clear();
+                    false
+                } else {
+                    true
+                }
+            })
+        });
     }
     SourceProgram { functions, lambdas }
 }
@@ -668,7 +707,11 @@ pub(crate) fn lower_source_program(program: &HirProgram) -> SourceProgram {
 /// [`HirExpr::children`], whose `Lambda` case yields the body's expressions, so
 /// a lambda nested inside another lambda is reached the same way as one nested
 /// in a call argument.
-fn collect_lambdas(body: &[HirStmt], out: &mut Vec<SourceLambda>, resolution: &std::rc::Rc<super::typed_ast::HirResolution>) {
+fn collect_lambdas(
+    body: &[HirStmt],
+    out: &mut Vec<SourceLambda>,
+    resolution: &std::rc::Rc<super::typed_ast::HirResolution>,
+) {
     for stmt in body {
         for expr in stmt.child_exprs() {
             collect_lambdas_in_expr(expr, out, resolution);
@@ -676,13 +719,21 @@ fn collect_lambdas(body: &[HirStmt], out: &mut Vec<SourceLambda>, resolution: &s
     }
 }
 
-fn collect_lambdas_in_expr(expr: &HirExpr, out: &mut Vec<SourceLambda>, resolution: &std::rc::Rc<super::typed_ast::HirResolution>) {
+fn collect_lambdas_in_expr(
+    expr: &HirExpr,
+    out: &mut Vec<SourceLambda>,
+    resolution: &std::rc::Rc<super::typed_ast::HirResolution>,
+) {
     for expr in expr.walk_postorder(true) {
         collect_lambda(expr, out, resolution);
     }
 }
 
-fn collect_lambda(expr: &HirExpr, out: &mut Vec<SourceLambda>, resolution: &std::rc::Rc<super::typed_ast::HirResolution>) {
+fn collect_lambda(
+    expr: &HirExpr,
+    out: &mut Vec<SourceLambda>,
+    resolution: &std::rc::Rc<super::typed_ast::HirResolution>,
+) {
     if let HirExprKind::Lambda {
         id,
         params,
@@ -743,16 +794,28 @@ pub(crate) fn reference_place_name(place: &HirExpr) -> String {
     let mut out = loop {
         match &current.kind {
             HirExprKind::Var(name) => break name.clone(),
-            HirExprKind::FieldAccess { object, field } => { suffixes.push((Some(field.as_str()), None)); current = object; }
-            HirExprKind::Index { array, index } => { suffixes.push((None, Some(index.as_ref()))); current = array; }
+            HirExprKind::FieldAccess { object, field } => {
+                suffixes.push((Some(field.as_str()), None));
+                current = object;
+            }
+            HirExprKind::Index { array, index } => {
+                suffixes.push((None, Some(index.as_ref())));
+                current = array;
+            }
             _ => break "<expression>".into(),
         }
     };
     for (field, index) in suffixes.into_iter().rev() {
-        if let Some(field) = field { out.push('.'); out.push_str(field); }
-        else if let Some(index) = index {
+        if let Some(field) = field {
+            out.push('.');
+            out.push_str(field);
+        } else if let Some(index) = index {
             out.push('[');
-            match &index.kind { HirExprKind::Int(value) => out.push_str(&value.to_string()), HirExprKind::Var(name) => out.push_str(name), _ => out.push_str("<expr>") }
+            match &index.kind {
+                HirExprKind::Int(value) => out.push_str(&value.to_string()),
+                HirExprKind::Var(name) => out.push_str(name),
+                _ => out.push_str("<expr>"),
+            }
             out.push(']');
         }
     }
@@ -761,51 +824,132 @@ pub(crate) fn reference_place_name(place: &HirExpr) -> String {
 
 fn format_segments(args: &[HirExpr]) -> Option<Vec<crate::interpolate::Segment>> {
     use crate::interpolate::Segment;
-    let HirExprKind::Str(spec) = &args.first()?.kind else { return None; };
+    let HirExprKind::Str(spec) = &args.first()?.kind else {
+        return None;
+    };
     let segments = crate::interpolate::parse_spec(spec).ok()?;
     let mut operands = args[1..].iter();
     for segment in &segments {
         match segment {
-            Segment::Literal(_) => {},
-            Segment::Display => if !matches!(operands.next()?.ty, Type::I64 | Type::F64 | Type::Bool | Type::String) { return None; },
-            Segment::F64(_) => if operands.next()?.ty != Type::F64 { return None; },
+            Segment::Literal(_) => {}
+            Segment::Display => {
+                if !matches!(
+                    operands.next()?.ty,
+                    Type::I64 | Type::F64 | Type::Bool | Type::String
+                ) {
+                    return None;
+                }
+            }
+            Segment::F64(_) => {
+                if operands.next()?.ty != Type::F64 {
+                    return None;
+                }
+            }
         }
     }
     operands.next().is_none().then_some(segments)
 }
 
-fn class_fields(resolution: &super::typed_ast::HirResolution, class: &TypeId) -> Option<Vec<(String, Type)>> {
+fn class_fields(
+    resolution: &super::typed_ast::HirResolution,
+    class: &TypeId,
+) -> Option<Vec<(String, Type)>> {
     let mut chain = Vec::new();
     let mut next = Some(*class);
     let mut seen = std::collections::HashSet::new();
     while let Some(class) = next {
-        if !seen.insert(class) { return None; }
+        if !seen.insert(class) {
+            return None;
+        }
         let info = resolution.classes.get(&class)?;
         chain.push(info);
         next = info.base;
     }
-    Some(chain.into_iter().rev().flat_map(|info| info.fields.clone()).collect())
+    let mut fields = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    for info in chain.into_iter().rev() {
+        for (name, ty) in &info.fields {
+            if names.insert(name.clone()) {
+                fields.push((name.clone(), ty.clone()));
+            }
+        }
+    }
+    Some(fields)
 }
 
-fn method_signature(resolution: &super::typed_ast::HirResolution, receiver: &Type, method: &str) -> Option<super::typed_ast::HirSignature> {
-    let (Type::Named(class) | Type::Generic(class, _)) = receiver else { return None; };
+fn arguments_compatible(
+    resolution: &super::typed_ast::HirResolution,
+    params: &[Type],
+    args: &[HirExpr],
+) -> bool {
+    params.len() == args.len()
+        && params.iter().zip(args).all(|(target, argument)| {
+            if matches!(argument.kind, HirExprKind::ReferenceArg { .. }) {
+                *target == argument.ty
+            } else {
+                resolution.can_coerce(&argument.ty, target)
+            }
+        })
+}
+
+fn static_signature(
+    resolution: &super::typed_ast::HirResolution,
+    class: &TypeId,
+    method: &str,
+) -> Option<super::typed_ast::HirSignature> {
+    resolution
+        .modules
+        .get(class)
+        .and_then(|functions| functions.get(method))
+        .cloned()
+        .or_else(|| method_signature(resolution, &Type::Named(*class), method))
+}
+
+fn method_signature(
+    resolution: &super::typed_ast::HirResolution,
+    receiver: &Type,
+    method: &str,
+) -> Option<super::typed_ast::HirSignature> {
+    let (Type::Named(class) | Type::Generic(class, _)) = receiver else {
+        return None;
+    };
     let mut next = Some(*class);
     let mut seen = std::collections::HashSet::new();
     while let Some(class) = next {
-        if !seen.insert(class) { return None; }
+        if !seen.insert(class) {
+            return None;
+        }
         if let Some(interface) = resolution.interfaces.get(&class) {
             let mut signature = interface.methods.get(method)?.clone();
-            let mut substitutions = std::collections::HashMap::from([(TypeId::local("Self"), receiver.clone())]);
+            let mut substitutions =
+                std::collections::HashMap::from([(TypeId::local("Self"), receiver.clone())]);
             if let Type::Generic(_, args) = receiver {
-                if interface.type_params.len() != args.len() { return None; }
-                substitutions.extend(interface.type_params.iter().copied().zip(args.iter().cloned()));
-            } else if !interface.type_params.is_empty() { return None; }
-            signature.params = signature.params.iter().map(|ty| crate::semantic::symbols::substitute_type(ty, &substitutions)).collect();
-            signature.return_type = crate::semantic::symbols::substitute_type(&signature.return_type, &substitutions);
+                if interface.type_params.len() != args.len() {
+                    return None;
+                }
+                substitutions.extend(
+                    interface
+                        .type_params
+                        .iter()
+                        .copied()
+                        .zip(args.iter().cloned()),
+                );
+            } else if !interface.type_params.is_empty() {
+                return None;
+            }
+            signature.params = signature
+                .params
+                .iter()
+                .map(|ty| crate::semantic::symbols::substitute_type(ty, &substitutions))
+                .collect();
+            signature.return_type =
+                crate::semantic::symbols::substitute_type(&signature.return_type, &substitutions);
             return Some(signature);
         }
         let info = resolution.classes.get(&class)?;
-        if let Some(signature) = info.methods.get(method) { return Some(signature.clone()); }
+        if let Some(signature) = info.methods.get(method) {
+            return Some(signature.clone());
+        }
         next = info.base;
     }
     None
@@ -824,10 +968,6 @@ pub(crate) fn defer_body_contains_recover(body: &HirDeferBody) -> bool {
     }
 }
 
-impl SourceDeferBody {
-    pub fn contains_recover(&self) -> bool { self.recovery_capable }
-}
-
 fn expr_has_recover(expr: &HirExpr) -> bool {
     expr.walk_postorder(false)
         .any(|expr| matches!(&expr.kind, HirExprKind::Call { callee, .. } if callee.is_free_named("recover")))
@@ -841,7 +981,11 @@ fn block_has_recover(stmts: &[HirStmt]) -> bool {
 }
 
 /// Lower one function's statement tree into a block graph.
-fn lower_function(f: &HirFunction, class: Option<&TypeId>, resolution: std::rc::Rc<super::typed_ast::HirResolution>) -> SourceFunction {
+fn lower_function(
+    f: &HirFunction,
+    class: Option<&TypeId>,
+    resolution: std::rc::Rc<super::typed_ast::HirResolution>,
+) -> SourceFunction {
     let mut b = Builder::new(&f.params, f.is_async);
     b.resolution = resolution;
     b.return_type = f.return_type.clone();
@@ -914,7 +1058,8 @@ impl LirScopeMark {
 /// Block-graph builder: appends instructions to a current block and seals
 /// blocks with terminators as control flow branches and rejoins.
 struct Builder {
-    return_type: Type,    resolution: std::rc::Rc<super::typed_ast::HirResolution>,
+    return_type: Type,
+    resolution: std::rc::Rc<super::typed_ast::HirResolution>,
     blocks: Vec<(Vec<SourceInst>, Option<SourceTerminator>)>,
     /// Per-block [`SourceBlock::recovery`], filled in by `lower_scope` once it
     /// knows the scope's resume block.
@@ -1149,7 +1294,8 @@ fn instruction_executes_call(inst: &SourceInst) -> bool {
         // back. Cleanup unwinding also emits release without a safepoint.
         // A pattern test and its bindings are loads and integer compares on a
         // value the enclosing block already holds. No call, so no safepoint.
-        SourceInst::Compute { .. } | SourceInst::ReleaseLock { .. }
+        SourceInst::Compute { .. }
+        | SourceInst::ReleaseLock { .. }
         | SourceInst::EnterDeferScope { .. }
         | SourceInst::LeaveDeferScope { .. }
         | SourceInst::FlushDefers { .. }
@@ -1247,16 +1393,24 @@ impl Builder {
         let mut region = Self::new(&[], false);
         region.resolution = self.resolution.clone();
         region.locals = self.locals.clone();
-        region.locals.iter_mut().for_each(|local| local.parameter = true);
+        region
+            .locals
+            .iter_mut()
+            .for_each(|local| local.parameter = true);
         region.local_by_name = self.local_by_name.clone();
         region.suspend_counter = self.suspend_counter;
         region.for_counter = self.for_counter;
         region.lower_scope(stmts);
         for (_, terminator) in &mut region.blocks {
-            if terminator.is_none() { *terminator = Some(SourceTerminator::CleanupReturn); }
+            if terminator.is_none() {
+                *terminator = Some(SourceTerminator::CleanupReturn);
+            }
         }
         let (blocks, locals) = region.finish();
-        let names = locals.iter().map(|local| (local.name.as_str(), local.id)).collect();
+        let names = locals
+            .iter()
+            .map(|local| (local.name.as_str(), local.id))
+            .collect();
         let mut referenced = std::collections::HashSet::new();
         for block in &blocks {
             for inst in &block.instrs {
@@ -1264,16 +1418,41 @@ impl Builder {
                 async_liveness::instruction_use_def(inst, &names, &mut referenced, &mut writes);
                 referenced.extend(writes);
             }
-            async_liveness::terminator_uses(&block.terminator, &names, &mut referenced, &std::collections::HashSet::new());
+            async_liveness::terminator_uses(
+                &block.terminator,
+                &names,
+                &mut referenced,
+                &std::collections::HashSet::new(),
+            );
         }
-        let mut captures: Vec<_> = referenced.into_iter().filter(|local| (local.0 as usize) < self.locals.len()).collect();
+        let mut captures: Vec<_> = referenced
+            .into_iter()
+            .filter(|local| (local.0 as usize) < self.locals.len())
+            .collect();
         captures.sort_by_key(|local| local.0);
-        let name = self.locals.iter().find(|local| local.name == "self")
-            .and_then(|local| if let Type::Named(owner) = &local.ty { Some(FunctionId::method(*owner, "$defer")) } else { None })
+        let name = self
+            .locals
+            .iter()
+            .find(|local| local.name == "self")
+            .and_then(|local| {
+                if let Type::Named(owner) = &local.ty {
+                    Some(FunctionId::method(*owner, "$defer"))
+                } else {
+                    None
+                }
+            })
             .unwrap_or_else(|| FunctionId::free("$defer"));
         SourceDeferBody {
-            function: Box::new(SourceFunction { name, is_async: false, params: Vec::new(),
-                return_type: Type::Void, blocks, locals, async_frame: LirAsyncFrameLayout::default(), captures: Vec::new() }),
+            function: Box::new(SourceFunction {
+                name,
+                is_async: false,
+                params: Vec::new(),
+                return_type: Type::Void,
+                blocks,
+                locals,
+                async_frame: LirAsyncFrameLayout::default(),
+                captures: Vec::new(),
+            }),
             captures,
             recovery_capable,
         }
@@ -1414,7 +1593,9 @@ impl Builder {
         value: &HirExpr,
         destination: Option<LirLocalId>,
     ) -> Option<Option<HirExpr>> {
-        if let Some(lowered) = self.lower_try_propagate(value, destination) { return Some(lowered); }
+        if let Some(lowered) = self.lower_try_propagate(value, destination) {
+            return Some(lowered);
+        }
         if let Some(lowered) = self.lower_match_arms_cfg(value, destination) {
             return Some(lowered);
         }
@@ -1648,39 +1829,158 @@ impl Builder {
         local
     }
 
-    fn lower_try_propagate(&mut self, expression: &HirExpr, destination: Option<LirLocalId>) -> Option<Option<HirExpr>> {
-        let HirExprKind::TryPropagate { inner } = &expression.kind else { return None; };
+    fn lower_try_propagate(
+        &mut self,
+        expression: &HirExpr,
+        destination: Option<LirLocalId>,
+    ) -> Option<Option<HirExpr>> {
+        let HirExprKind::TryPropagate { inner } = &expression.kind else {
+            return None;
+        };
         let resolved = builtin_types::resolve(&inner.ty)?;
         let returning = builtin_types::resolve(&self.return_type)?;
-        if !matches!(resolved.id, B::Option | B::Result) || resolved.id != returning.id { return None; }
+        if !matches!(resolved.id, B::Option | B::Result) || resolved.id != returning.id {
+            return None;
+        }
         let is_option = resolved.id == B::Option;
-        let source_error = (!is_option).then(|| resolved.args.get(1).cloned()).flatten();
-        let target_error = (!is_option).then(|| returning.args.get(1).cloned()).flatten();
+        let source_error = (!is_option)
+            .then(|| resolved.args.get(1).cloned())
+            .flatten();
+        let target_error = (!is_option)
+            .then(|| returning.args.get(1).cloned())
+            .flatten();
         let name = self.synthetic_name("try_operand");
         let operand = self.declare_local(name, inner.ty.clone(), None, true, false);
         self.lower_value_into(operand, inner);
         let receiver = LirOperand::Local(operand);
-        let condition = self.push_compute(LirRvalue::EnumMethod { receiver: receiver.clone(), receiver_ty: inner.ty.clone(), method: if is_option { "is_some" } else { "is_ok" }.into(), args: Vec::new(), arg_types: Vec::new(), result: Type::Bool }, Type::Bool, expression.span, "try_success");
+        let condition = self.push_compute(
+            LirRvalue::EnumMethod {
+                receiver: receiver.clone(),
+                receiver_ty: inner.ty.clone(),
+                method: if is_option { "is_some" } else { "is_ok" }.into(),
+                args: Vec::new(),
+                arg_types: Vec::new(),
+                result: Type::Bool,
+            },
+            Type::Bool,
+            expression.span,
+            "try_success",
+        );
         let success = self.new_block();
         let failure = self.new_block();
-        self.terminate(SourceTerminator::Branch { cond: self.local_expr(condition, expression.span), then_block: success, else_block: failure });
+        self.terminate(SourceTerminator::Branch {
+            cond: self.local_expr(condition, expression.span),
+            then_block: success,
+            else_block: failure,
+        });
         self.switch_to(failure);
         let return_type = self.return_type.clone();
         let failure_value = if is_option {
-            self.push_compute(LirRvalue::EnumAlloc { class: TypeId::local("Option"), variant: "None".into(), enum_ty: return_type.clone() }, return_type.clone(), expression.span, "try_none")
-        } else if let (Some(source_error @ Type::Named(_)), Some(target_error)) = (&source_error, &target_error) {
+            self.push_compute(
+                LirRvalue::EnumAlloc {
+                    class: TypeId::local("Option"),
+                    variant: "None".into(),
+                    enum_ty: return_type.clone(),
+                },
+                return_type.clone(),
+                expression.span,
+                "try_none",
+            )
+        } else if let (Some(source_error @ Type::Named(_)), Some(target_error)) =
+            (&source_error, &target_error)
+        {
             if source_error != target_error && *target_error != Type::Void {
-                let error = self.push_compute(LirRvalue::EnumMethod { receiver: receiver.clone(), receiver_ty: inner.ty.clone(), method: "unwrap_err".into(), args: Vec::new(), arg_types: Vec::new(), result: source_error.clone() }, source_error.clone(), expression.span, "try_error");
-                let converted = self.push_compute(LirRvalue::IntoError { value: LirOperand::Local(error), source: source_error.clone(), target: target_error.clone() }, target_error.clone(), expression.span, "try_converted_error");
-                let result = self.push_compute(LirRvalue::EnumAlloc { class: TypeId::local("Result"), variant: "Err".into(), enum_ty: return_type.clone() }, return_type.clone(), expression.span, "try_failure");
-                self.push(SourceInst::Compute { local: result, value: LirRvalue::EnumPayloadStore { object: LirOperand::Local(result), class: TypeId::local("Result"), variant: "Err".into(), index: 0, value: LirOperand::Local(converted), source: target_error.clone(), enum_ty: return_type.clone() }, span: expression.span });
+                let error = self.push_compute(
+                    LirRvalue::EnumMethod {
+                        receiver: receiver.clone(),
+                        receiver_ty: inner.ty.clone(),
+                        method: "unwrap_err".into(),
+                        args: Vec::new(),
+                        arg_types: Vec::new(),
+                        result: source_error.clone(),
+                    },
+                    source_error.clone(),
+                    expression.span,
+                    "try_error",
+                );
+                let converted = self.push_compute(
+                    LirRvalue::IntoError {
+                        value: LirOperand::Local(error),
+                        source: source_error.clone(),
+                        target: target_error.clone(),
+                    },
+                    target_error.clone(),
+                    expression.span,
+                    "try_converted_error",
+                );
+                let result = self.push_compute(
+                    LirRvalue::EnumAlloc {
+                        class: TypeId::local("Result"),
+                        variant: "Err".into(),
+                        enum_ty: return_type.clone(),
+                    },
+                    return_type.clone(),
+                    expression.span,
+                    "try_failure",
+                );
+                self.push(SourceInst::Compute {
+                    local: result,
+                    value: LirRvalue::EnumPayloadStore {
+                        object: LirOperand::Local(result),
+                        class: TypeId::local("Result"),
+                        variant: "Err".into(),
+                        index: 0,
+                        value: LirOperand::Local(converted),
+                        source: target_error.clone(),
+                        enum_ty: return_type.clone(),
+                    },
+                    span: expression.span,
+                });
                 result
-            } else { self.push_compute(LirRvalue::RebindResultError { value: receiver.clone(), source: inner.ty.clone(), target: return_type.clone() }, return_type.clone(), expression.span, "try_failure") }
-        } else { self.push_compute(LirRvalue::RebindResultError { value: receiver.clone(), source: inner.ty.clone(), target: return_type.clone() }, return_type.clone(), expression.span, "try_failure") };
-        self.lower_stmt(&HirStmt::Return { value: Some(self.local_expr(failure_value, expression.span)), span: expression.span });
+            } else {
+                self.push_compute(
+                    LirRvalue::RebindResultError {
+                        value: receiver.clone(),
+                        source: inner.ty.clone(),
+                        target: return_type.clone(),
+                    },
+                    return_type.clone(),
+                    expression.span,
+                    "try_failure",
+                )
+            }
+        } else {
+            self.push_compute(
+                LirRvalue::RebindResultError {
+                    value: receiver.clone(),
+                    source: inner.ty.clone(),
+                    target: return_type.clone(),
+                },
+                return_type.clone(),
+                expression.span,
+                "try_failure",
+            )
+        };
+        self.lower_stmt(&HirStmt::Return {
+            value: Some(self.local_expr(failure_value, expression.span)),
+            span: expression.span,
+        });
         self.switch_to(success);
-        if let Some(local) = destination && expression.ty != Type::Void {
-            self.push(SourceInst::Compute { local, value: LirRvalue::EnumMethod { receiver, receiver_ty: inner.ty.clone(), method: "unwrap".into(), args: Vec::new(), arg_types: Vec::new(), result: expression.ty.clone() }, span: expression.span });
+        if let Some(local) = destination
+            && expression.ty != Type::Void
+        {
+            self.push(SourceInst::Compute {
+                local,
+                value: LirRvalue::EnumMethod {
+                    receiver,
+                    receiver_ty: inner.ty.clone(),
+                    method: "unwrap".into(),
+                    args: Vec::new(),
+                    arg_types: Vec::new(),
+                    result: expression.ty.clone(),
+                },
+                span: expression.span,
+            });
             return Some(Some(self.local_expr(local, expression.span)));
         }
         Some(None)
@@ -1808,143 +2108,392 @@ impl Builder {
             StaticCall(&'a HirExpr),
             CaptureReference(&'a HirExpr, FunctionId, usize),
             FinishReference(&'a HirExpr, LirOperand),
+            CoerceArgument(Type),
             FormatLiteral(LirLocalId, String, bool, Span),
-            FormatValue(LirLocalId, Option<crate::interpolate::F64Format>, bool, Span),
+            FormatValue(
+                LirLocalId,
+                Option<crate::interpolate::F64Format>,
+                bool,
+                Span,
+            ),
         }
         let mut control_flow = std::collections::HashSet::new();
         for node in value.walk_postorder(false) {
             if matches!(
                 node.kind,
-                HirExprKind::TryPropagate { .. } | HirExprKind::Ternary { .. }
+                HirExprKind::TryPropagate { .. }
+                    | HirExprKind::Ternary { .. }
                     | HirExprKind::Match { .. }
                     | HirExprKind::Binary {
                         op: crate::parser::ast::BinOp::And | crate::parser::ast::BinOp::Or,
                         ..
                     }
-            ) || (self.is_async && expr_suspends_here(node)) || (!matches!(node.kind, HirExprKind::Lambda { .. })
-                && node
-                    .children()
-                    .iter()
-                    .any(|child| control_flow.contains(&std::ptr::from_ref(*child))))
+            ) || (self.is_async && expr_suspends_here(node))
+                || (!matches!(node.kind, HirExprKind::Lambda { .. })
+                    && node
+                        .children()
+                        .iter()
+                        .any(|child| control_flow.contains(&std::ptr::from_ref(*child))))
             {
                 control_flow.insert(std::ptr::from_ref(node));
             }
         }
-        fn arguments<'a>(callee: FunctionId, args: &'a [HirExpr]) -> Vec<Work<'a>> {
-            args.iter().enumerate().map(|(index, arg)| if matches!(arg.kind, HirExprKind::ReferenceArg { .. }) { Work::CaptureReference(arg, callee, index) } else { Work::Eval(arg, false, false) }).collect()
+        fn arguments<'a>(
+            callee: FunctionId,
+            args: &'a [HirExpr],
+            params: &[Type],
+        ) -> Vec<Work<'a>> {
+            let mut pending = Vec::new();
+            for (index, arg) in args.iter().enumerate() {
+                if matches!(arg.kind, HirExprKind::ReferenceArg { .. }) {
+                    pending.push(Work::CaptureReference(arg, callee, index));
+                } else {
+                    pending.push(Work::Eval(arg, false, false));
+                    if let Some(target) = params.get(index)
+                        && *target != arg.ty
+                    {
+                        pending.push(Work::CoerceArgument(target.clone()));
+                    }
+                }
+            }
+            pending
         }
         let mut pending = vec![Work::Eval(value, false, true)];
         let mut values = Vec::new();
-        let mut references: std::collections::HashMap<*const HirExpr, LirOperand> = std::collections::HashMap::new();
+        let mut references: std::collections::HashMap<*const HirExpr, LirOperand> =
+            std::collections::HashMap::new();
         while let Some(work) = pending.pop() {
             match work {
                 Work::Eval(expr, place, root) => {
                     if !place && control_flow.contains(&std::ptr::from_ref(expr)) {
                         match &expr.kind {
-                            HirExprKind::Call { callee, args } if !self.local_by_name.contains_key(callee.unqualified_name()) && self.resolution.functions.get(callee).is_some_and(|signature| !signature.is_async && signature.params.len() == args.len() && signature.params.iter().zip(args).all(|(ty, arg)| *ty == arg.ty)) => {
+                            HirExprKind::Call { callee, args }
+                                if !self.local_by_name.contains_key(callee.unqualified_name())
+                                    && self.resolution.functions.get(callee).is_some_and(
+                                        |signature| {
+                                            !signature.is_async
+                                                && arguments_compatible(
+                                                    &self.resolution,
+                                                    &signature.params,
+                                                    args,
+                                                )
+                                        },
+                                    ) =>
+                            {
                                 let signature = self.resolution.functions[callee].clone();
-                                if args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. })) { self.push_compute(LirRvalue::BeginReferenceCall, Type::Void, expr.span, "reference_call"); }
-                                pending.push(Work::DirectCall(expr, *callee, signature.params, signature.return_type));
-                                pending.extend(arguments(*callee, args).into_iter().rev());
+                                if args
+                                    .iter()
+                                    .any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. }))
+                                {
+                                    self.push_compute(
+                                        LirRvalue::BeginReferenceCall,
+                                        Type::Void,
+                                        expr.span,
+                                        "reference_call",
+                                    );
+                                }
+                                pending.push(Work::DirectCall(
+                                    expr,
+                                    *callee,
+                                    signature.params.clone(),
+                                    signature.return_type,
+                                ));
+                                pending.extend(
+                                    arguments(*callee, args, &signature.params)
+                                        .into_iter()
+                                        .rev(),
+                                );
                                 continue;
                             }
-                            HirExprKind::StaticCall { class, method, args } if method_signature(&self.resolution, &Type::Named(*class), method).is_some_and(|signature| signature.is_static && !signature.is_async && signature.params.len() == args.len() && signature.params.iter().zip(args).all(|(ty, arg)| *ty == arg.ty)) => {
-                                if args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. })) { self.push_compute(LirRvalue::BeginReferenceCall, Type::Void, expr.span, "reference_call"); }
+                            HirExprKind::StaticCall {
+                                class,
+                                method,
+                                args,
+                            } if static_signature(&self.resolution, class, method).is_some_and(
+                                |signature| {
+                                    signature.is_static
+                                        && arguments_compatible(
+                                            &self.resolution,
+                                            &signature.params,
+                                            args,
+                                        )
+                                },
+                            ) =>
+                            {
+                                if args
+                                    .iter()
+                                    .any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. }))
+                                {
+                                    self.push_compute(
+                                        LirRvalue::BeginReferenceCall,
+                                        Type::Void,
+                                        expr.span,
+                                        "reference_call",
+                                    );
+                                }
+                                let signature = static_signature(&self.resolution, class, method)
+                                    .expect("static signature");
                                 pending.push(Work::StaticCall(expr));
-                                pending.extend(arguments(FunctionId::method(*class, method), args).into_iter().rev());
+                                pending.extend(
+                                    arguments(
+                                        FunctionId::method(*class, method),
+                                        args,
+                                        &signature.params,
+                                    )
+                                    .into_iter()
+                                    .rev(),
+                                );
                                 continue;
                             }
-                            HirExprKind::Call { callee, args } if callee.is_free_named("format") && !self.local_by_name.contains_key("format") && format_segments(args).is_some() => {
+                            HirExprKind::Call { callee, args }
+                                if callee.is_free_named("format")
+                                    && !self.local_by_name.contains_key("format")
+                                    && format_segments(args).is_some() =>
+                            {
                                 let mut segments = format_segments(args).expect("validated format");
-                                if segments.is_empty() { segments.push(crate::interpolate::Segment::Literal(String::new())); }
+                                if segments.is_empty() {
+                                    segments
+                                        .push(crate::interpolate::Segment::Literal(String::new()));
+                                }
                                 let name = self.synthetic_name("format_result");
-                                let local = self.declare_local(name, Type::String, None, true, false);
+                                let local =
+                                    self.declare_local(name, Type::String, None, true, false);
                                 values.push(self.local_expr(local, expr.span));
                                 let mut children = args[1..].iter();
                                 let mut actions = Vec::new();
                                 for (index, segment) in segments.into_iter().enumerate() {
                                     match segment {
-                                        crate::interpolate::Segment::Literal(text) => actions.push(Work::FormatLiteral(local, text, index == 0, expr.span)),
+                                        crate::interpolate::Segment::Literal(text) => actions.push(
+                                            Work::FormatLiteral(local, text, index == 0, expr.span),
+                                        ),
                                         segment => {
                                             let child = children.next().expect("format operand");
-                                            let format = match segment { crate::interpolate::Segment::F64(format) => Some(format), _ => None };
+                                            let format = match segment {
+                                                crate::interpolate::Segment::F64(format) => {
+                                                    Some(format)
+                                                }
+                                                _ => None,
+                                            };
                                             actions.push(Work::Eval(child, false, false));
-                                            actions.push(Work::FormatValue(local, format, index == 0, child.span));
+                                            actions.push(Work::FormatValue(
+                                                local,
+                                                format,
+                                                index == 0,
+                                                child.span,
+                                            ));
                                         }
                                     }
                                 }
                                 pending.extend(actions.into_iter().rev());
                                 continue;
                             }
-                            HirExprKind::Call { callee, args } if self.local_by_name.contains_key(callee.unqualified_name()) => {
+                            HirExprKind::Call { callee, args }
+                                if self.local_by_name.contains_key(callee.unqualified_name()) =>
+                            {
                                 let source = self.local_by_name[callee.unqualified_name()];
                                 let ty = self.locals[source.0 as usize].ty.clone();
-                                if let Type::Fn(params, result) | Type::Closure(params, result) = &ty {
-                                    if params.len() == args.len() && params.iter().zip(args).all(|(ty, arg)| *ty == arg.ty) {
+                                if let Type::Fn(params, result) | Type::Closure(params, result) =
+                                    &ty
+                                {
+                                    if !args.iter().any(|arg| {
+                                        matches!(arg.kind, HirExprKind::ReferenceArg { .. })
+                                    }) && arguments_compatible(&self.resolution, params, args)
+                                    {
                                         let name = self.synthetic_name("callable_snapshot");
-                                        let local = self.declare_local(name, ty.clone(), None, true, false);
-                                        self.push(SourceInst::Compute { local, value: LirRvalue::Use(LirOperand::Local(source)), span: expr.span });
-                                        pending.push(Work::IndirectCall(expr, local, params.clone(), (**result).clone()));
-                                        pending.extend(args.iter().rev().map(|child| Work::Eval(child, false, false)));
+                                        let local =
+                                            self.declare_local(name, ty.clone(), None, true, false);
+                                        self.push(SourceInst::Compute {
+                                            local,
+                                            value: LirRvalue::Use(LirOperand::Local(source)),
+                                            span: expr.span,
+                                        });
+                                        pending.push(Work::IndirectCall(
+                                            expr,
+                                            local,
+                                            params.clone(),
+                                            (**result).clone(),
+                                        ));
+                                        pending.extend(
+                                            arguments(*callee, args, params).into_iter().rev(),
+                                        );
                                         continue;
                                     }
                                 }
                             }
-                            HirExprKind::MethodCall { object, method, args } if method_signature(&self.resolution, &object.ty, method).is_some_and(|signature| !signature.is_static && !signature.is_async && signature.params.len() == args.len() && signature.params.iter().zip(args).all(|(ty, arg)| *ty == arg.ty)) => {
+                            HirExprKind::MethodCall {
+                                object,
+                                method,
+                                args,
+                            } if method_signature(&self.resolution, &object.ty, method)
+                                .is_some_and(|signature| {
+                                    (!signature.is_static || matches!(&object.ty, Type::Named(name) | Type::Generic(name, _) if self.resolution.interfaces.contains_key(name)))
+                                        && arguments_compatible(
+                                            &self.resolution,
+                                            &signature.params,
+                                            args,
+                                        )
+                                }) =>
+                            {
                                 pending.push(Work::PrepareMethod(expr));
                                 pending.push(Work::Eval(object, false, false));
                                 continue;
                             }
                             HirExprKind::Array { elements } => {
-                                let Type::Array(element) = &expr.ty else { return None; };
+                                let Type::Array(element) = &expr.ty else {
+                                    return None;
+                                };
                                 let name = self.synthetic_name("array_shell");
-                                let local = self.declare_local(name, expr.ty.clone(), None, true, false);
-                                self.push(SourceInst::Compute { local, value: LirRvalue::ArrayAlloc { length: elements.len(), element: (**element).clone() }, span: expr.span });
+                                let local =
+                                    self.declare_local(name, expr.ty.clone(), None, true, false);
+                                self.push(SourceInst::Compute {
+                                    local,
+                                    value: LirRvalue::ArrayAlloc {
+                                        length: elements.len(),
+                                        element: (**element).clone(),
+                                    },
+                                    span: expr.span,
+                                });
                                 values.push(self.local_expr(local, expr.span));
                                 for (index, child) in elements.iter().enumerate().rev() {
-                                    pending.push(Work::ArrayStore(local, index, (**element).clone(), child.span));
+                                    pending.push(Work::ArrayStore(
+                                        local,
+                                        index,
+                                        (**element).clone(),
+                                        child.span,
+                                    ));
                                     pending.push(Work::Eval(child, false, false));
                                 }
                                 continue;
                             }
-                            HirExprKind::StaticCall { class, method, args } if self.resolution.enums.get(class).is_some_and(|info| info.variants.iter().any(|variant| variant.name == *method && variant.payloads.len() == args.len())) => {
+                            HirExprKind::StaticCall {
+                                class,
+                                method,
+                                args,
+                            } if self.resolution.enums.get(class).is_some_and(|info| {
+                                info.variants.iter().any(|variant| {
+                                    variant.name == *method && variant.payloads.len() == args.len()
+                                })
+                            }) =>
+                            {
                                 let name = self.synthetic_name("enum_shell");
-                                let local = self.declare_local(name, expr.ty.clone(), None, true, false);
-                                self.push(SourceInst::Compute { local, value: LirRvalue::EnumAlloc { class: *class, variant: method.clone(), enum_ty: expr.ty.clone() }, span: expr.span });
+                                let local =
+                                    self.declare_local(name, expr.ty.clone(), None, true, false);
+                                self.push(SourceInst::Compute {
+                                    local,
+                                    value: LirRvalue::EnumAlloc {
+                                        class: *class,
+                                        variant: method.clone(),
+                                        enum_ty: expr.ty.clone(),
+                                    },
+                                    span: expr.span,
+                                });
                                 values.push(self.local_expr(local, expr.span));
                                 for (index, child) in args.iter().enumerate().rev() {
-                                    pending.push(Work::EnumStore(local, *class, method.clone(), index, expr.ty.clone(), child.span));
+                                    pending.push(Work::EnumStore(
+                                        local,
+                                        *class,
+                                        method.clone(),
+                                        index,
+                                        expr.ty.clone(),
+                                        child.span,
+                                    ));
                                     pending.push(Work::Eval(child, false, false));
                                 }
                                 continue;
                             }
-                            HirExprKind::ObjectLiteral { class, fields } if class_fields(&self.resolution, class).is_some_and(|declared| declared.len() == fields.len() && declared.iter().all(|(name, _)| fields.iter().filter(|(field, _)| field == name).count() == 1)) => {
+                            HirExprKind::ObjectLiteral { class, fields }
+                                if class_fields(&self.resolution, class).is_some_and(
+                                    |declared| {
+                                        declared.len() == fields.len()
+                                            && declared.iter().all(|(name, _)| {
+                                                fields
+                                                    .iter()
+                                                    .filter(|(field, _)| field == name)
+                                                    .count()
+                                                    == 1
+                                            })
+                                    },
+                                ) =>
+                            {
                                 let name = self.synthetic_name("object_shell");
-                                let local = self.declare_local(name, expr.ty.clone(), None, true, false);
-                                self.push(SourceInst::Compute { local, value: LirRvalue::ObjectAlloc { class: *class }, span: expr.span });
+                                let local =
+                                    self.declare_local(name, expr.ty.clone(), None, true, false);
+                                self.push(SourceInst::Compute {
+                                    local,
+                                    value: LirRvalue::ObjectAlloc { class: *class },
+                                    span: expr.span,
+                                });
                                 values.push(self.local_expr(local, expr.span));
                                 for (field, child) in fields.iter().rev() {
-                                    pending.push(Work::FieldStore(local, expr.ty.clone(), field.clone(), child.span));
+                                    pending.push(Work::FieldStore(
+                                        local,
+                                        expr.ty.clone(),
+                                        field.clone(),
+                                        child.span,
+                                    ));
                                     pending.push(Work::Eval(child, false, false));
                                 }
                                 continue;
                             }
-                            HirExprKind::New { class, args } if self.resolution.classes.contains_key(class) => {
+                            HirExprKind::New { class, args }
+                                if self.resolution.classes.contains_key(class) =>
+                            {
                                 let info = self.resolution.classes[class].clone();
-                                if info.constructor.as_ref().is_some_and(|signature| signature.params.len() != args.len() || signature.params.iter().zip(args).any(|(ty, arg)| *ty != arg.ty)) { return None; }
-                                let fields = if info.constructor.is_none() { class_fields(&self.resolution, class) } else { Some(Vec::new()) }?;
-                                if info.constructor.is_none() && fields.len() != args.len() { return None; }
+                                if info.constructor.as_ref().is_some_and(|signature| {
+                                    !arguments_compatible(&self.resolution, &signature.params, args)
+                                }) {
+                                    return None;
+                                }
+                                let fields = if info.constructor.is_none() {
+                                    class_fields(&self.resolution, class)
+                                } else {
+                                    Some(Vec::new())
+                                }?;
+                                if info.constructor.is_none() && fields.len() != args.len() {
+                                    return None;
+                                }
                                 let name = self.synthetic_name("object_shell");
-                                let local = self.declare_local(name, expr.ty.clone(), None, true, false);
-                                self.push(SourceInst::Compute { local, value: LirRvalue::ObjectAlloc { class: *class }, span: expr.span });
+                                let local =
+                                    self.declare_local(name, expr.ty.clone(), None, true, false);
+                                self.push(SourceInst::Compute {
+                                    local,
+                                    value: LirRvalue::ObjectAlloc { class: *class },
+                                    span: expr.span,
+                                });
                                 values.push(self.local_expr(local, expr.span));
                                 if info.constructor.is_some() {
-                                    if args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. })) { self.push_compute(LirRvalue::BeginReferenceCall, Type::Void, expr.span, "reference_call"); }
+                                    if args.iter().any(|arg| {
+                                        matches!(arg.kind, HirExprKind::ReferenceArg { .. })
+                                    }) {
+                                        self.push_compute(
+                                            LirRvalue::BeginReferenceCall,
+                                            Type::Void,
+                                            expr.span,
+                                            "reference_call",
+                                        );
+                                    }
                                     pending.push(Work::Constructor(local, expr));
-                                    pending.extend(arguments(FunctionId::method(*class, "init"), args).into_iter().rev());
+                                    pending.extend(
+                                        arguments(
+                                            FunctionId::method(*class, "init"),
+                                            args,
+                                            &info
+                                                .constructor
+                                                .as_ref()
+                                                .expect("explicit constructor")
+                                                .params,
+                                        )
+                                        .into_iter()
+                                        .rev(),
+                                    );
                                 } else {
                                     for ((field, _), child) in fields.into_iter().zip(args).rev() {
-                                        pending.push(Work::FieldStore(local, expr.ty.clone(), field, child.span));
+                                        pending.push(Work::FieldStore(
+                                            local,
+                                            expr.ty.clone(),
+                                            field,
+                                            child.span,
+                                        ));
                                         pending.push(Work::Eval(child, false, false));
                                     }
                                 }
@@ -1955,13 +2504,15 @@ impl Builder {
                     }
                     if matches!(
                         expr.kind,
-                        HirExprKind::TryPropagate { .. } | HirExprKind::Ternary { .. }
+                        HirExprKind::TryPropagate { .. }
+                            | HirExprKind::Ternary { .. }
                             | HirExprKind::Match { .. }
                             | HirExprKind::Binary {
                                 op: crate::parser::ast::BinOp::And | crate::parser::ast::BinOp::Or,
                                 ..
                             }
-                    ) || (self.is_async && expr_suspends_here(expr)) {
+                    ) || (self.is_async && expr_suspends_here(expr))
+                    {
                         let name = self.synthetic_name("expression");
                         let result = self.declare_local(name, expr.ty.clone(), None, true, false);
                         self.lower_root_suspend(expr, Some(result))?;
@@ -2009,49 +2560,124 @@ impl Builder {
                         );
                     }
                 }
+                Work::CoerceArgument(target) => {
+                    let source = values.pop().expect("argument value");
+                    let value = self.flat_operand(&source);
+                    let local = self.push_compute(
+                        LirRvalue::Coerce {
+                            value,
+                            source: source.ty.clone(),
+                            target: target.clone(),
+                        },
+                        target,
+                        source.span,
+                        "coerced_argument",
+                    );
+                    values.push(self.local_expr(local, source.span));
+                }
                 Work::CaptureReference(expr, callee, index) => {
-                    let HirExprKind::ReferenceArg { place } = &expr.kind else { unreachable!() };
+                    let HirExprKind::ReferenceArg { place } = &expr.kind else {
+                        unreachable!()
+                    };
                     let captured = match &place.kind {
                         HirExprKind::Var(name) => LirPlace::Local(*self.local_by_name.get(name)?),
                         HirExprKind::FieldAccess { object, field } => {
                             let name = self.synthetic_name("reference_object");
-                            LirPlace::Field { object: self.declare_local(name, object.ty.clone(), None, true, false), object_ty: object.ty.clone(), field: field.clone(), ty: place.ty.clone() }
+                            LirPlace::Field {
+                                object: self.declare_local(
+                                    name,
+                                    object.ty.clone(),
+                                    None,
+                                    true,
+                                    false,
+                                ),
+                                object_ty: object.ty.clone(),
+                                field: field.clone(),
+                                ty: place.ty.clone(),
+                            }
                         }
                         HirExprKind::Index { .. } => {
                             let name = self.synthetic_name("reference_owner");
                             let owner = self.declare_local(name, Type::Void, None, true, false);
                             self.locals[owner.0 as usize].storage_kind = LirStorageKind::GcOwner;
                             let name = self.synthetic_name("reference_index");
-                            LirPlace::ArrayElement { owner, index: self.declare_local(name, Type::I64, None, true, false), element: place.ty.clone() }
+                            LirPlace::ArrayElement {
+                                owner,
+                                index: self.declare_local(name, Type::I64, None, true, false),
+                                element: place.ty.clone(),
+                            }
                         }
                         _ => return None,
                     };
-                    let argument = LirOperand::Reference { place: captured, span: expr.span, display: reference_place_name(place) };
-                    self.push_compute(LirRvalue::ReferenceDebug { argument: argument.clone(), callee, index }, Type::Void, expr.span, "reference_debug");
+                    let argument = LirOperand::Reference {
+                        place: captured,
+                        span: expr.span,
+                        display: reference_place_name(place),
+                    };
+                    self.push_compute(
+                        LirRvalue::ReferenceDebug {
+                            argument: argument.clone(),
+                            callee,
+                            index,
+                        },
+                        Type::Void,
+                        expr.span,
+                        "reference_debug",
+                    );
                     pending.push(Work::FinishReference(expr, argument));
                     match &place.kind {
-                        HirExprKind::FieldAccess { object, .. } => pending.push(Work::Eval(object, false, false)),
-                        HirExprKind::Index { array, index } => { pending.push(Work::Eval(index, false, false)); pending.push(Work::Eval(array, false, false)); }
+                        HirExprKind::FieldAccess { object, .. } => {
+                            pending.push(Work::Eval(object, false, false))
+                        }
+                        HirExprKind::Index { array, index } => {
+                            pending.push(Work::Eval(index, false, false));
+                            pending.push(Work::Eval(array, false, false));
+                        }
                         _ => {}
                     }
                 }
                 Work::FinishReference(expr, argument) => {
-                    let HirExprKind::ReferenceArg { place } = &expr.kind else { unreachable!() };
-                    let LirOperand::Reference { place: captured, .. } = &argument else { unreachable!() };
+                    let HirExprKind::ReferenceArg { place } = &expr.kind else {
+                        unreachable!()
+                    };
+                    let LirOperand::Reference {
+                        place: captured, ..
+                    } = &argument
+                    else {
+                        unreachable!()
+                    };
                     match (&place.kind, captured) {
-                        (HirExprKind::Var(_), LirPlace::Local(_)) => {},
+                        (HirExprKind::Var(_), LirPlace::Local(_)) => {}
                         (HirExprKind::FieldAccess { .. }, LirPlace::Field { object, .. }) => {
                             let child = values.pop().expect("reference receiver");
                             let value = self.flat_operand(&child);
-                            self.push(SourceInst::Compute { local: *object, value: LirRvalue::Use(value), span: place.span });
+                            self.push(SourceInst::Compute {
+                                local: *object,
+                                value: LirRvalue::Use(value),
+                                span: place.span,
+                            });
                         }
-                        (HirExprKind::Index { .. }, LirPlace::ArrayElement { owner, index, .. }) => {
+                        (
+                            HirExprKind::Index { .. },
+                            LirPlace::ArrayElement { owner, index, .. },
+                        ) => {
                             let index_expr = values.pop().expect("reference index");
                             let array_expr = values.pop().expect("reference array");
                             let index_value = self.flat_operand(&index_expr);
                             let array_value = self.flat_operand(&array_expr);
-                            self.push(SourceInst::Compute { local: *index, value: LirRvalue::Use(index_value.clone()), span: place.span });
-                            self.push(SourceInst::Compute { local: *owner, value: LirRvalue::CaptureArrayOwner { array: array_value, index: LirOperand::Local(*index) }, span: place.span });
+                            self.push(SourceInst::Compute {
+                                local: *index,
+                                value: LirRvalue::Use(index_value.clone()),
+                                span: place.span,
+                            });
+                            self.push(SourceInst::Compute {
+                                local: *owner,
+                                value: LirRvalue::CaptureArrayOwner {
+                                    array: array_value,
+                                    index: LirOperand::Local(*index),
+                                },
+                                span: place.span,
+                            });
                         }
                         _ => unreachable!(),
                     }
@@ -2059,23 +2685,73 @@ impl Builder {
                     values.push(expr.clone());
                 }
                 Work::DirectCall(expr, callee, params, result) => {
-                    let HirExprKind::Call { args, .. } = &expr.kind else { unreachable!() };
+                    let HirExprKind::Call { args, .. } = &expr.kind else {
+                        unreachable!()
+                    };
                     let children = values.split_off(values.len() - args.len());
-                    let operands = args.iter().zip(&children).map(|(original, child)| references.remove(&std::ptr::from_ref(original)).unwrap_or_else(|| self.flat_operand(child))).collect();
-                    let local = self.push_compute(LirRvalue::DirectCall { callee, args: operands, params, result: result.clone() }, result, expr.span, "call_result");
+                    let operands = args
+                        .iter()
+                        .zip(&children)
+                        .map(|(original, child)| {
+                            references
+                                .remove(&std::ptr::from_ref(original))
+                                .unwrap_or_else(|| self.flat_operand(child))
+                        })
+                        .collect();
+                    let local = self.push_compute(
+                        LirRvalue::DirectCall {
+                            callee,
+                            args: operands,
+                            params,
+                            result: result.clone(),
+                        },
+                        result,
+                        expr.span,
+                        "call_result",
+                    );
                     values.push(self.local_expr(local, expr.span));
                 }
                 Work::StaticCall(expr) => {
-                    let HirExprKind::StaticCall { class, method, args } = &expr.kind else { unreachable!() };
+                    let HirExprKind::StaticCall {
+                        class,
+                        method,
+                        args,
+                    } = &expr.kind
+                    else {
+                        unreachable!()
+                    };
                     let children = values.split_off(values.len() - args.len());
-                    let operands = args.iter().zip(&children).map(|(original, child)| references.remove(&std::ptr::from_ref(original)).unwrap_or_else(|| self.flat_operand(child))).collect();
-                    let local = self.push_compute(LirRvalue::StaticCall { class: *class, method: method.clone(), args: operands, arg_types: args.iter().map(|arg| arg.ty.clone()).collect(), result: expr.ty.clone() }, expr.ty.clone(), expr.span, "static_result");
+                    let operands = args
+                        .iter()
+                        .zip(&children)
+                        .map(|(original, child)| {
+                            references
+                                .remove(&std::ptr::from_ref(original))
+                                .unwrap_or_else(|| self.flat_operand(child))
+                        })
+                        .collect();
+                    let local = self.push_compute(
+                        LirRvalue::StaticCall {
+                            class: *class,
+                            method: method.clone(),
+                            args: operands,
+                            arg_types: children.iter().map(|arg| arg.ty.clone()).collect(),
+                            result: expr.ty.clone(),
+                        },
+                        expr.ty.clone(),
+                        expr.span,
+                        "static_result",
+                    );
                     values.push(self.local_expr(local, expr.span));
                 }
                 Work::FormatLiteral(local, text, first, span) => {
                     let name = self.synthetic_name("format_literal");
                     let piece = self.declare_local(name, Type::String, None, true, false);
-                    self.push(SourceInst::Compute { local: piece, value: LirRvalue::StringLiteral(text), span });
+                    self.push(SourceInst::Compute {
+                        local: piece,
+                        value: LirRvalue::StringLiteral(text),
+                        span,
+                    });
                     self.append_format_piece(local, LirOperand::Local(piece), first, span);
                 }
                 Work::FormatValue(local, format, first, span) => {
@@ -2083,38 +2759,124 @@ impl Builder {
                     let value = self.flat_operand(&child);
                     let name = self.synthetic_name("format_piece");
                     let piece = self.declare_local(name, Type::String, None, true, false);
-                    self.push(SourceInst::Compute { local: piece, value: LirRvalue::FormatScalar { value, ty: child.ty.clone(), format }, span });
+                    self.push(SourceInst::Compute {
+                        local: piece,
+                        value: LirRvalue::FormatScalar {
+                            value,
+                            ty: child.ty.clone(),
+                            format,
+                        },
+                        span,
+                    });
                     self.append_format_piece(local, LirOperand::Local(piece), first, span);
                 }
                 Work::IndirectCall(expr, callee, params, result) => {
-                    let HirExprKind::Call { callee: name, args } = &expr.kind else { unreachable!() };
+                    let HirExprKind::Call { callee: name, args } = &expr.kind else {
+                        unreachable!()
+                    };
                     let children = values.split_off(values.len() - args.len());
-                    let args = children.iter().map(|child| self.flat_operand(child)).collect();
+                    let args = children
+                        .iter()
+                        .map(|child| self.flat_operand(child))
+                        .collect();
                     let local_name = self.synthetic_name("indirect_result");
                     let local = self.declare_local(local_name, result.clone(), None, true, false);
-                    self.push(SourceInst::Compute { local, value: LirRvalue::IndirectCall { callee: LirOperand::Local(callee), name: *name, args, params, result }, span: expr.span });
+                    self.push(SourceInst::Compute {
+                        local,
+                        value: LirRvalue::IndirectCall {
+                            callee: LirOperand::Local(callee),
+                            name: *name,
+                            args,
+                            params,
+                            result,
+                        },
+                        span: expr.span,
+                    });
                     values.push(self.local_expr(local, expr.span));
                 }
                 Work::PrepareMethod(expr) => {
-                    let HirExprKind::MethodCall { object, method, args } = &expr.kind else { unreachable!() };
+                    let HirExprKind::MethodCall {
+                        object,
+                        method,
+                        args,
+                    } = &expr.kind
+                    else {
+                        unreachable!()
+                    };
                     let receiver = values.pop().expect("method receiver");
                     let receiver = self.flat_operand(&receiver);
                     let name = self.synthetic_name("method_receiver");
                     let local = self.declare_local(name, object.ty.clone(), None, true, false);
-                    self.push(SourceInst::Compute { local, value: LirRvalue::PrepareMethod { receiver, receiver_ty: object.ty.clone(), method: method.clone() }, span: expr.span });
-                    if args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. })) { self.push_compute(LirRvalue::BeginReferenceCall, Type::Void, expr.span, "reference_call"); }
+                    self.push(SourceInst::Compute {
+                        local,
+                        value: LirRvalue::PrepareMethod {
+                            receiver,
+                            receiver_ty: object.ty.clone(),
+                            method: method.clone(),
+                        },
+                        span: expr.span,
+                    });
+                    if args
+                        .iter()
+                        .any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. }))
+                    {
+                        self.push_compute(
+                            LirRvalue::BeginReferenceCall,
+                            Type::Void,
+                            expr.span,
+                            "reference_call",
+                        );
+                    }
                     pending.push(Work::MethodCall(expr, local));
-                    let (Type::Named(owner) | Type::Generic(owner, _)) = &object.ty else { unreachable!() };
-                    pending.extend(arguments(FunctionId::method(*owner, method), args).into_iter().rev());
+                    let (Type::Named(owner) | Type::Generic(owner, _)) = &object.ty else {
+                        unreachable!()
+                    };
+                    pending.extend(
+                        arguments(
+                            FunctionId::method(*owner, method),
+                            args,
+                            &method_signature(&self.resolution, &object.ty, method)
+                                .expect("method signature")
+                                .params,
+                        )
+                        .into_iter()
+                        .rev(),
+                    );
                 }
                 Work::MethodCall(expr, receiver) => {
-                    let HirExprKind::MethodCall { object, method, args } = &expr.kind else { unreachable!() };
+                    let HirExprKind::MethodCall {
+                        object,
+                        method,
+                        args,
+                    } = &expr.kind
+                    else {
+                        unreachable!()
+                    };
                     let children = values.split_off(values.len() - args.len());
-                    let args = args.iter().zip(&children).map(|(original, child)| references.remove(&std::ptr::from_ref(original)).unwrap_or_else(|| self.flat_operand(child))).collect();
+                    let args = args
+                        .iter()
+                        .zip(&children)
+                        .map(|(original, child)| {
+                            references
+                                .remove(&std::ptr::from_ref(original))
+                                .unwrap_or_else(|| self.flat_operand(child))
+                        })
+                        .collect();
                     let arg_types = children.iter().map(|child| child.ty.clone()).collect();
                     let name = self.synthetic_name("method_result");
                     let local = self.declare_local(name, expr.ty.clone(), None, true, false);
-                    self.push(SourceInst::Compute { local, value: LirRvalue::MethodCall { receiver: LirOperand::Local(receiver), receiver_ty: object.ty.clone(), method: method.clone(), args, arg_types, result: expr.ty.clone() }, span: expr.span });
+                    self.push(SourceInst::Compute {
+                        local,
+                        value: LirRvalue::MethodCall {
+                            receiver: LirOperand::Local(receiver),
+                            receiver_ty: object.ty.clone(),
+                            method: method.clone(),
+                            args,
+                            arg_types,
+                            result: expr.ty.clone(),
+                        },
+                        span: expr.span,
+                    });
                     values.push(self.local_expr(local, expr.span));
                 }
                 Work::ArrayStore(array, index, element, span) => {
@@ -2122,26 +2884,76 @@ impl Builder {
                     let value = self.flat_operand(&child);
                     let name = self.synthetic_name("array_store");
                     let local = self.declare_local(name, Type::Void, None, true, false);
-                    self.push(SourceInst::Compute { local, value: LirRvalue::ArrayStore { array: LirOperand::Local(array), index: LirOperand::Int(index as i64), value, element }, span });
+                    self.push(SourceInst::Compute {
+                        local,
+                        value: LirRvalue::ArrayStore {
+                            array: LirOperand::Local(array),
+                            index: LirOperand::Int(index as i64),
+                            value,
+                            element,
+                        },
+                        span,
+                    });
                 }
                 Work::FieldStore(object, object_ty, field, span) => {
                     let child = values.pop().expect("field value");
                     let value = self.flat_operand(&child);
                     let name = self.synthetic_name("field_store");
                     let local = self.declare_local(name, Type::Void, None, true, false);
-                    self.push(SourceInst::Compute { local, value: LirRvalue::FieldStore { object: LirOperand::Local(object), object_ty, field, value }, span });
+                    self.push(SourceInst::Compute {
+                        local,
+                        value: LirRvalue::FieldStore {
+                            object: LirOperand::Local(object),
+                            object_ty,
+                            field,
+                            value,
+                        },
+                        span,
+                    });
                 }
                 Work::EnumStore(local, class, variant, index, enum_ty, span) => {
                     let child = values.pop().expect("enum payload");
                     let value = self.flat_operand(&child);
-                    self.push(SourceInst::Compute { local, value: LirRvalue::EnumPayloadStore { object: LirOperand::Local(local), class, variant, index, value, source: child.ty.clone(), enum_ty }, span });
+                    self.push(SourceInst::Compute {
+                        local,
+                        value: LirRvalue::EnumPayloadStore {
+                            object: LirOperand::Local(local),
+                            class,
+                            variant,
+                            index,
+                            value,
+                            source: child.ty.clone(),
+                            enum_ty,
+                        },
+                        span,
+                    });
                 }
                 Work::Constructor(object, expr) => {
-                    let HirExprKind::New { class, args } = &expr.kind else { unreachable!() };
+                    let HirExprKind::New { class, args } = &expr.kind else {
+                        unreachable!()
+                    };
                     let children = values.split_off(values.len() - args.len());
-                    let operands = args.iter().zip(&children).map(|(original, child)| references.remove(&std::ptr::from_ref(original)).unwrap_or_else(|| self.flat_operand(child))).collect();
+                    let operands = args
+                        .iter()
+                        .zip(&children)
+                        .map(|(original, child)| {
+                            references
+                                .remove(&std::ptr::from_ref(original))
+                                .unwrap_or_else(|| self.flat_operand(child))
+                        })
+                        .collect();
                     let arg_types = children.iter().map(|child| child.ty.clone()).collect();
-                    self.push_compute(LirRvalue::ConstructorCall { object: LirOperand::Local(object), class: *class, args: operands, arg_types }, Type::Void, expr.span, "constructor_call");
+                    self.push_compute(
+                        LirRvalue::ConstructorCall {
+                            object: LirOperand::Local(object),
+                            class: *class,
+                            args: operands,
+                            arg_types,
+                        },
+                        Type::Void,
+                        expr.span,
+                        "constructor_call",
+                    );
                 }
                 Work::Finish(expr, count, place, root) => {
                     let operands = values.split_off(values.len() - count);
@@ -2160,8 +2972,23 @@ impl Builder {
         values.pop()
     }
 
-    fn append_format_piece(&mut self, local: LirLocalId, piece: LirOperand, first: bool, span: Span) {
-        let value = if first { LirRvalue::Use(piece) } else { LirRvalue::Binary { op: crate::parser::ast::BinOp::Add, lhs: LirOperand::Local(local), rhs: piece, operand_ty: Type::String } };
+    fn append_format_piece(
+        &mut self,
+        local: LirLocalId,
+        piece: LirOperand,
+        first: bool,
+        span: Span,
+    ) {
+        let value = if first {
+            LirRvalue::Use(piece)
+        } else {
+            LirRvalue::Binary {
+                op: crate::parser::ast::BinOp::Add,
+                lhs: LirOperand::Local(local),
+                rhs: piece,
+                operand_ty: Type::String,
+            }
+        };
         self.push(SourceInst::Compute { local, value, span });
     }
 
@@ -2170,7 +2997,9 @@ impl Builder {
             HirExprKind::Int(value) => LirOperand::Int(*value),
             HirExprKind::Float(value) => LirOperand::Float(*value),
             HirExprKind::Bool(value) => LirOperand::Bool(*value),
-            HirExprKind::Var(name) if self.local_by_name.contains_key(name) => LirOperand::Local(self.local_by_name[name]),
+            HirExprKind::Var(name) if self.local_by_name.contains_key(name) => {
+                LirOperand::Local(self.local_by_name[name])
+            }
             _ => {
                 let name = self.synthetic_name("operand");
                 let local = self.declare_local(name, value.ty.clone(), None, true, false);
@@ -2181,7 +3010,9 @@ impl Builder {
     }
 
     fn lower_nested_suspend(&mut self, value: &HirExpr) -> Option<HirExpr> {
-        if expression_needs_cfg(value) || (self.is_async && suspends_anywhere(value) && !expr_suspends_here(value)) {
+        if expression_needs_cfg(value)
+            || (self.is_async && suspends_anywhere(value) && !expr_suspends_here(value))
+        {
             return self.lower_nested_cfg(value);
         }
         if !self.is_async || expr_suspends_here(value) {
@@ -2381,53 +3212,203 @@ impl Builder {
         }
     }
 
+    /// Capture a reference at its source evaluation point. Array references retain
+    /// the backing buffer, so later arguments may resize the array safely.
+    fn lower_reference_argument(
+        &mut self,
+        expr: &HirExpr,
+        callee: FunctionId,
+        index: usize,
+    ) -> Option<LirOperand> {
+        let HirExprKind::ReferenceArg { place } = &expr.kind else {
+            return None;
+        };
+        let captured = match &place.kind {
+            HirExprKind::Var(name) => LirPlace::Local(*self.local_by_name.get(name)?),
+            HirExprKind::FieldAccess { object, field } => {
+                let name = self.synthetic_name("reference_object");
+                LirPlace::Field {
+                    object: self.declare_local(name, object.ty.clone(), None, true, false),
+                    object_ty: object.ty.clone(),
+                    field: field.clone(),
+                    ty: place.ty.clone(),
+                }
+            }
+            HirExprKind::Index { .. } => {
+                let name = self.synthetic_name("reference_owner");
+                let owner = self.declare_local(name, Type::Void, None, true, false);
+                self.locals[owner.0 as usize].storage_kind = LirStorageKind::GcOwner;
+                let name = self.synthetic_name("reference_index");
+                LirPlace::ArrayElement {
+                    owner,
+                    index: self.declare_local(name, Type::I64, None, true, false),
+                    element: place.ty.clone(),
+                }
+            }
+            _ => return None,
+        };
+        let argument = LirOperand::Reference {
+            place: captured.clone(),
+            span: expr.span,
+            display: reference_place_name(place),
+        };
+        self.push_compute(
+            LirRvalue::ReferenceDebug {
+                argument: argument.clone(),
+                callee,
+                index,
+            },
+            Type::Void,
+            expr.span,
+            "reference_debug",
+        );
+        match (&place.kind, captured) {
+            (
+                HirExprKind::FieldAccess { object, .. },
+                LirPlace::Field {
+                    object: destination,
+                    ..
+                },
+            ) => self.lower_value_into(destination, object),
+            (
+                HirExprKind::Index { array, index },
+                LirPlace::ArrayElement {
+                    owner,
+                    index: saved_index,
+                    ..
+                },
+            ) => {
+                let name = self.synthetic_name("reference_array");
+                let array = self.push_synth_let(&name, false, (**array).clone());
+                self.lower_value_into(saved_index, index);
+                self.push(SourceInst::Compute {
+                    local: owner,
+                    value: LirRvalue::CaptureArrayOwner {
+                        array: LirOperand::Local(array),
+                        index: LirOperand::Local(saved_index),
+                    },
+                    span: place.span,
+                });
+            }
+            (HirExprKind::Var(_), LirPlace::Local(_)) => {}
+            _ => unreachable!(),
+        }
+        Some(argument)
+    }
+
     fn lower_super_init_values(&mut self, args: &[HirExpr], span: Span) -> bool {
-        let Some(&receiver) = self.local_by_name.get("self") else { return false; };
+        let Some(&receiver) = self.local_by_name.get("self") else {
+            return false;
+        };
         let receiver_ty = self.locals[receiver.0 as usize].ty.clone();
-        let Type::Named(owner) = &receiver_ty else { return false; };
-        let Some(base) = self.resolution.classes.get(owner).and_then(|info| info.base) else { return false; };
-        let Some(info) = self.resolution.classes.get(&base).cloned() else { return false; };
+        let Type::Named(owner) = &receiver_ty else {
+            return false;
+        };
+        let Some(base) = self
+            .resolution
+            .classes
+            .get(owner)
+            .and_then(|info| info.base)
+        else {
+            return false;
+        };
+        let Some(info) = self.resolution.classes.get(&base).cloned() else {
+            return false;
+        };
         let explicit = info.constructor.is_some();
         let mut fields = Vec::new();
         let params = if let Some(signature) = &info.constructor {
-            if signature.param_modes.iter().any(|mode| !matches!(mode, crate::parser::ast::ParamMode::Value)) { return false; }
             signature.params.clone()
         } else {
-            let mut chain = Vec::new();
-            let mut next = Some(base);
-            let mut seen = std::collections::HashSet::new();
-            while let Some(class) = next {
-                if !seen.insert(class) { return false; }
-                let Some(info) = self.resolution.classes.get(&class) else { return false; };
-                chain.push(info.fields.clone()); next = info.base;
-            }
-            for own_fields in chain.into_iter().rev() { fields.extend(own_fields); }
+            let Some(inherited) = class_fields(&self.resolution, &base) else {
+                return false;
+            };
+            fields = inherited;
             fields.iter().map(|(_, ty)| ty.clone()).collect()
         };
-        if args.len() != params.len() { return false; }
+        if !arguments_compatible(&self.resolution, &params, args) {
+            return false;
+        }
         let name = self.synthetic_name("base_receiver");
         let base_ty = Type::Named(base);
         let base_local = self.declare_local(name, base_ty.clone(), None, true, false);
-        self.push(SourceInst::Compute { local: base_local, value: LirRvalue::Coerce { value: LirOperand::Local(receiver), source: receiver_ty, target: base_ty.clone() }, span });
+        self.push(SourceInst::Compute {
+            local: base_local,
+            value: LirRvalue::Coerce {
+                value: LirOperand::Local(receiver),
+                source: receiver_ty,
+                target: base_ty.clone(),
+            },
+            span,
+        });
         let mut operands = Vec::new();
+        if args
+            .iter()
+            .any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. }))
+        {
+            self.push_compute(
+                LirRvalue::BeginReferenceCall,
+                Type::Void,
+                span,
+                "reference_call",
+            );
+        }
         for (index, (arg, target)) in args.iter().zip(&params).enumerate() {
-            let value = self.lower_nested_suspend(arg).unwrap_or_else(|| arg.clone());
+            if matches!(arg.kind, HirExprKind::ReferenceArg { .. }) {
+                let Some(reference) =
+                    self.lower_reference_argument(arg, FunctionId::method(base, "init"), index)
+                else {
+                    return false;
+                };
+                operands.push(reference);
+                continue;
+            }
+            let value = self
+                .lower_nested_suspend(arg)
+                .unwrap_or_else(|| arg.clone());
             let name = self.synthetic_name("base_argument");
             let source = self.push_synth_let(&name, false, value);
             let name = self.synthetic_name("base_coerced");
             let coerced = self.declare_local(name, target.clone(), None, true, false);
-            self.push(SourceInst::Compute { local: coerced, value: LirRvalue::Coerce { value: LirOperand::Local(source), source: arg.ty.clone(), target: target.clone() }, span: arg.span });
-            if explicit { operands.push(LirOperand::Local(coerced)); }
-            else {
+            self.push(SourceInst::Compute {
+                local: coerced,
+                value: LirRvalue::Coerce {
+                    value: LirOperand::Local(source),
+                    source: arg.ty.clone(),
+                    target: target.clone(),
+                },
+                span: arg.span,
+            });
+            if explicit {
+                operands.push(LirOperand::Local(coerced));
+            } else {
                 let name = self.synthetic_name("base_store");
                 let local = self.declare_local(name, Type::Void, None, true, false);
-                self.push(SourceInst::Compute { local, value: LirRvalue::FieldStore { object: LirOperand::Local(base_local), object_ty: base_ty.clone(), field: fields[index].0.clone(), value: LirOperand::Local(coerced) }, span: arg.span });
+                self.push(SourceInst::Compute {
+                    local,
+                    value: LirRvalue::FieldStore {
+                        object: LirOperand::Local(base_local),
+                        object_ty: base_ty.clone(),
+                        field: fields[index].0.clone(),
+                        value: LirOperand::Local(coerced),
+                    },
+                    span: arg.span,
+                });
             }
         }
         if explicit {
             let name = self.synthetic_name("base_init");
             let local = self.declare_local(name, Type::Void, None, true, false);
-            self.push(SourceInst::Compute { local, value: LirRvalue::ConstructorCall { object: LirOperand::Local(base_local), class: base, args: operands, arg_types: params }, span });
+            self.push(SourceInst::Compute {
+                local,
+                value: LirRvalue::ConstructorCall {
+                    object: LirOperand::Local(base_local),
+                    class: base,
+                    args: operands,
+                    arg_types: params,
+                },
+                span,
+            });
         }
         true
     }
@@ -2467,10 +3448,20 @@ impl Builder {
                     let elem_ty = builtin_types::unary_arg(&channel.ty, B::Channel)
                         .expect("select send channel was type checked")
                         .clone();
-                    let value_local = if self.is_async { value_local } else {
+                    let value_local = if self.is_async {
+                        value_local
+                    } else {
                         let name = self.synthetic_name("select_stored_value");
                         let stored = self.declare_local(name, elem_ty.clone(), None, true, false);
-                        self.push(SourceInst::Compute { local: stored, value: LirRvalue::Coerce { value: LirOperand::Local(value_local), source: value.ty.clone(), target: elem_ty.clone() }, span: value.span });
+                        self.push(SourceInst::Compute {
+                            local: stored,
+                            value: LirRvalue::Coerce {
+                                value: LirOperand::Local(value_local),
+                                source: value.ty.clone(),
+                                target: elem_ty.clone(),
+                            },
+                            span: value.span,
+                        });
                         stored
                     };
                     LirSelectOp::Send {
@@ -2519,13 +3510,17 @@ impl Builder {
                 HirSelectCaseKind::Default => LirSelectOp::Default,
             };
             if !self.is_async && matches!(operation, LirSelectOp::Timeout { .. }) {
-                self.push(SourceInst::SelectInit { operations: vec![operation.clone()] });
+                self.push(SourceInst::SelectInit {
+                    operations: vec![operation.clone()],
+                });
             }
             operations.push(operation);
         }
 
         if self.is_async {
-            self.push(SourceInst::SelectInit { operations: operations.clone() });
+            self.push(SourceInst::SelectInit {
+                operations: operations.clone(),
+            });
         }
         let probe = self.new_block();
         let idle = self.new_block();
@@ -2586,11 +3581,18 @@ impl Builder {
         } else {
             let name = self.synthetic_name("select_idle");
             let local = self.declare_local(name, Type::Void, None, true, false);
-            let deadlines = operations.iter().filter_map(|operation| match operation {
-                LirSelectOp::Timeout { deadline, .. } => Some(LirOperand::Local(*deadline)),
-                _ => None,
-            }).collect();
-            self.push(SourceInst::Compute { local, value: LirRvalue::SelectIdleWait { deadlines }, span });
+            let deadlines = operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    LirSelectOp::Timeout { deadline, .. } => Some(LirOperand::Local(*deadline)),
+                    _ => None,
+                })
+                .collect();
+            self.push(SourceInst::Compute {
+                local,
+                value: LirRvalue::SelectIdleWait { deadlines },
+                span,
+            });
             self.terminate(SourceTerminator::Jump(probe));
         }
 
@@ -3051,12 +4053,14 @@ impl Builder {
             }
             HirStmt::SuperInit { args, span } => {
                 if !self.lower_super_init_values(args, *span) {
-                    self.push(SourceInst::SuperInit { args: args.clone(), span: *span });
+                    self.push(SourceInst::SuperInit {
+                        args: args.clone(),
+                        span: *span,
+                    });
                 }
             }
             HirStmt::Expr(e) => {
-                if let HirExprKind::Select { cases } = &e.kind
-                {
+                if let HirExprKind::Select { cases } = &e.kind {
                     self.lower_select(cases, e.span);
                 } else if self.lower_root_suspend(e, None).is_none() {
                     let value = self.lower_nested_suspend(e).unwrap_or_else(|| e.clone());
@@ -3160,7 +4164,9 @@ impl Builder {
                     .expect("defer outside its LIR scope");
                 let recovery_capable = defer_body_contains_recover(body);
                 let stmts = match body {
-                    HirDeferBody::Expr(expr) => vec![HirStmt::Expr(self.capture_defer_expr(id, expr))],
+                    HirDeferBody::Expr(expr) => {
+                        vec![HirStmt::Expr(self.capture_defer_expr(id, expr))]
+                    }
                     HirDeferBody::Block(stmts) => stmts.clone(),
                 };
                 let body = self.lower_defer_region(&stmts, recovery_capable);
@@ -3686,6 +4692,7 @@ fn prune_unreachable(blocks: Vec<SourceBlock>) -> Vec<SourceBlock> {
 // ---------------------------------------------------------------------------
 
 /// Render a lowered program as labeled basic blocks.
+#[cfg(test)]
 pub(crate) fn format_source_program(program: &SourceProgram) -> String {
     let mut out = String::new();
     for f in program
@@ -3726,6 +4733,7 @@ pub(crate) fn format_source_program(program: &SourceProgram) -> String {
     out
 }
 
+#[cfg(test)]
 fn format_inst(inst: &SourceInst) -> String {
     let e = super::dump::expr_text;
     match inst {
@@ -3751,11 +4759,18 @@ fn format_inst(inst: &SourceInst) -> String {
         }
         SourceInst::ReleaseLock(slots) => format!("release {};", slots.mode.keyword()),
         SourceInst::Defer { body, .. } => {
-            let captures = body.captures.iter().map(|id| format!("l{}", id.0)).collect::<Vec<_>>().join(", ");
+            let captures = body
+                .captures
+                .iter()
+                .map(|id| format!("l{}", id.0))
+                .collect::<Vec<_>>()
+                .join(", ");
             let mut text = format!("defer cleanup captures ({captures}) {{\n");
             for block in &body.function.blocks {
                 text.push_str(&format!("    bb{}:\n", block.id.0));
-                for inst in &block.instrs { text.push_str(&format!("      {}\n", format_inst(inst))); }
+                for inst in &block.instrs {
+                    text.push_str(&format!("      {}\n", format_inst(inst)));
+                }
                 text.push_str(&format!("      {}\n", format_terminator(&block.terminator)));
             }
             text.push_str("  }");
@@ -3826,6 +4841,7 @@ fn format_inst(inst: &SourceInst) -> String {
     }
 }
 
+#[cfg(test)]
 fn format_terminator(t: &SourceTerminator) -> String {
     let e = super::dump::expr_text;
     match t {
@@ -3882,24 +4898,61 @@ mod tests {
 
     #[test]
     fn deep_expression_cfg_lowering_uses_a_one_megabyte_stack() {
-        std::thread::Builder::new().stack_size(1024 * 1024).spawn(|| {
-            let span = Span::dummy();
-            let int = |n| HirExpr { kind: HirExprKind::Int(n), ty: Type::I64, span };
-            let mut expr = HirExpr {
-                kind: HirExprKind::Ternary {
-                    condition: Box::new(HirExpr { kind: HirExprKind::Bool(true), ty: Type::Bool, span }),
-                    then_expr: Box::new(int(1)), else_expr: Box::new(int(2)),
-                }, ty: Type::I64, span,
-            };
-            for _ in 0..50_000 {
-                expr = HirExpr { kind: HirExprKind::Unary { op: crate::parser::ast::UnaryOp::Neg, operand: Box::new(expr) }, ty: Type::I64, span };
-            }
-            let mut builder = Builder::new(&[], false);
-            let lowered = builder.lower_nested_cfg(&expr).expect("nested control flow");
-            assert!(!expression_needs_cfg(&lowered));
-            assert!(builder.blocks.iter().any(|(_, term)| matches!(term, Some(SourceTerminator::Branch { .. }))));
-            assert!(builder.blocks.iter().map(|(insts, _)| insts.len()).sum::<usize>() >= 50_000);
-        }).unwrap().join().unwrap();
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let span = Span::dummy();
+                let int = |n| HirExpr {
+                    kind: HirExprKind::Int(n),
+                    ty: Type::I64,
+                    span,
+                };
+                let mut expr = HirExpr {
+                    kind: HirExprKind::Ternary {
+                        condition: Box::new(HirExpr {
+                            kind: HirExprKind::Bool(true),
+                            ty: Type::Bool,
+                            span,
+                        }),
+                        then_expr: Box::new(int(1)),
+                        else_expr: Box::new(int(2)),
+                    },
+                    ty: Type::I64,
+                    span,
+                };
+                for _ in 0..50_000 {
+                    expr = HirExpr {
+                        kind: HirExprKind::Unary {
+                            op: crate::parser::ast::UnaryOp::Neg,
+                            operand: Box::new(expr),
+                        },
+                        ty: Type::I64,
+                        span,
+                    };
+                }
+                let mut builder = Builder::new(&[], false);
+                let lowered = builder
+                    .lower_nested_cfg(&expr)
+                    .expect("nested control flow");
+                assert!(!expression_needs_cfg(&lowered));
+                assert!(
+                    builder
+                        .blocks
+                        .iter()
+                        .any(|(_, term)| matches!(term, Some(SourceTerminator::Branch { .. })))
+                );
+                assert!(
+                    builder
+                        .blocks
+                        .iter()
+                        .map(|(insts, _)| insts.len())
+                        .sum::<usize>()
+                        >= 50_000
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
@@ -4006,19 +5059,68 @@ mod tests {
 
     #[test]
     fn defer_cleanup_region_owns_cfg_and_captures_only_outer_reads_or_writes() {
-        let program = lir("fn f(flag: bool) { let mut used = 1; let unused = 2; defer { let own = 3; while flag { used = own; } } }");
+        let program = lir(
+            "fn f(flag: bool) { let mut used = 1; let unused = 2; defer { let own = 3; while flag { used = own; } } }",
+        );
         let outer = func(&program, "f");
-        let cleanup = outer.blocks.iter().flat_map(|block| &block.instrs).find_map(|inst|
-            if let SourceInst::Defer { body, .. } = inst { Some(body) } else { None }).unwrap();
-        let captures: Vec<_> = cleanup.captures.iter().map(|id| outer.locals[id.0 as usize].name.as_str()).collect();
+        let cleanup = outer
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instrs)
+            .find_map(|inst| {
+                if let SourceInst::Defer { body, .. } = inst {
+                    Some(body)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let captures: Vec<_> = cleanup
+            .captures
+            .iter()
+            .map(|id| outer.locals[id.0 as usize].name.as_str())
+            .collect();
         assert_eq!(captures, ["flag", "used"]);
-        assert!(cleanup.function.blocks.iter().any(|block| matches!(block.terminator, SourceTerminator::Branch { .. })));
-        assert!(cleanup.function.blocks.iter().any(|block| block.terminator == SourceTerminator::CleanupReturn));
-        assert!(!cleanup.function.blocks.iter().any(|block| matches!(block.terminator, SourceTerminator::Return(_))));
-        assert!(cleanup.function.locals.iter().any(|local| local.name == "own" && !local.parameter));
-        for inst in cleanup.function.blocks.iter().flat_map(|block| &block.instrs) {
+        assert!(
+            cleanup
+                .function
+                .blocks
+                .iter()
+                .any(|block| matches!(block.terminator, SourceTerminator::Branch { .. }))
+        );
+        assert!(
+            cleanup
+                .function
+                .blocks
+                .iter()
+                .any(|block| block.terminator == SourceTerminator::CleanupReturn)
+        );
+        assert!(
+            !cleanup
+                .function
+                .blocks
+                .iter()
+                .any(|block| matches!(block.terminator, SourceTerminator::Return(_)))
+        );
+        assert!(
+            cleanup
+                .function
+                .locals
+                .iter()
+                .any(|local| local.name == "own" && !local.parameter)
+        );
+        for inst in cleanup
+            .function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instrs)
+        {
             if let SourceInst::ClearScopeRoots { locals } = inst {
-                assert!(locals.iter().all(|id| !cleanup.function.locals[id.0 as usize].parameter));
+                assert!(
+                    locals
+                        .iter()
+                        .all(|id| !cleanup.function.locals[id.0 as usize].parameter)
+                );
             }
         }
     }
@@ -4027,8 +5129,18 @@ mod tests {
     fn expression_cleanup_region_captures_registration_time_operand() {
         let program = lir("fn f() { let mut value = 1; defer println(value); value = 2; }");
         let outer = func(&program, "f");
-        let cleanup = outer.blocks.iter().flat_map(|block| &block.instrs).find_map(|inst|
-            if let SourceInst::Defer { body, .. } = inst { Some(body) } else { None }).unwrap();
+        let cleanup = outer
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instrs)
+            .find_map(|inst| {
+                if let SourceInst::Defer { body, .. } = inst {
+                    Some(body)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
         assert_eq!(cleanup.captures.len(), 1);
         let captured = &outer.locals[cleanup.captures[0].0 as usize];
         assert!(captured.synthetic);
@@ -4041,7 +5153,13 @@ mod tests {
         let p = lir("fn f() { let a = 1; print(a); }");
         let f = func(&p, "f");
         assert_eq!(f.blocks[0].instrs.len(), 3);
-        assert!(matches!(&f.blocks[0].instrs[1], SourceInst::Compute { value: LirRvalue::Print { .. }, .. }));
+        assert!(matches!(
+            &f.blocks[0].instrs[1],
+            SourceInst::Compute {
+                value: LirRvalue::Print { .. },
+                ..
+            }
+        ));
         assert_eq!(f.blocks[0].terminator, SourceTerminator::Return(None));
     }
 
@@ -4067,7 +5185,10 @@ mod tests {
     #[test]
     fn l04_empty_fn_implicit_return() {
         let p = lir("fn f() { }");
-        assert_eq!(func(&p, "f").blocks[0].terminator, SourceTerminator::Return(None));
+        assert_eq!(
+            func(&p, "f").blocks[0].terminator,
+            SourceTerminator::Return(None)
+        );
     }
 
     // 5. `if` without else: entry branches then/merge, then jumps to merge
@@ -4089,8 +5210,16 @@ mod tests {
             SourceTerminator::Jump(*else_block)
         );
         // The merge block holds the trailing statement.
-        assert!(f.blocks[else_block.0].instrs.iter().any(|inst| matches!(inst,
-            SourceInst::Compute { value: LirRvalue::Print { value: LirOperand::Int(2), .. }, .. })));
+        assert!(f.blocks[else_block.0].instrs.iter().any(|inst| matches!(
+            inst,
+            SourceInst::Compute {
+                value: LirRvalue::Print {
+                    value: LirOperand::Int(2),
+                    ..
+                },
+                ..
+            }
+        )));
     }
 
     // 6. `if`/`else`: both arms jump to the same merge block
@@ -4241,7 +5370,9 @@ mod tests {
             panic!("header must branch");
         };
         // The bound is a fresh `__for0_arr.len()` call in the header itself.
-        let HirExprKind::Var(condition) = &cond.kind else { panic!("header condition must be a flat value"); };
+        let HirExprKind::Var(condition) = &cond.kind else {
+            panic!("header condition must be a flat value");
+        };
         let header_instructions = &f.blocks[header.0].instrs;
         assert!(header_instructions.iter().any(|inst| matches!(inst,
             SourceInst::Compute { value: LirRvalue::IntrinsicCall { method, .. }, .. } if method == "len")));
@@ -4249,11 +5380,18 @@ mod tests {
             SourceInst::Compute { local, value: LirRvalue::Binary { op: crate::parser::ast::BinOp::Lt, .. }, .. }
                 if f.locals[local.0 as usize].name == *condition)));
         // v = __for0_arr[__for0_i], typed with the element type.
-        let (name, value) = f.blocks[body.0].instrs.iter().find_map(|inst| match inst {
-            SourceInst::Let { name, value, .. } if name == "v" => Some((name, value)), _ => None,
-        }).expect("body binds the loop variable");
+        let (name, value) = f.blocks[body.0]
+            .instrs
+            .iter()
+            .find_map(|inst| match inst {
+                SourceInst::Let { name, value, .. } if name == "v" => Some((name, value)),
+                _ => None,
+            })
+            .expect("body binds the loop variable");
         assert_eq!(name, "v");
-        let HirExprKind::Var(index_result) = &value.kind else { panic!("index must be a flat value"); };
+        let HirExprKind::Var(index_result) = &value.kind else {
+            panic!("index must be a flat value");
+        };
         assert!(f.blocks[body.0].instrs.iter().any(|inst| matches!(inst,
             SourceInst::Compute { local, value: LirRvalue::Index { .. }, .. } if f.locals[local.0 as usize].name == *index_result)));
         assert_eq!(value.ty, Type::I64);
@@ -4288,7 +5426,8 @@ mod tests {
                 SourceTerminator::Jump(_)
                 | SourceTerminator::Branch { .. }
                 | SourceTerminator::Suspend { .. }
-                | SourceTerminator::Return(_) | SourceTerminator::CleanupReturn => {}
+                | SourceTerminator::Return(_)
+                | SourceTerminator::CleanupReturn => {}
             }
         }
         // The then-arm's return survives as a Return terminator.
@@ -4311,8 +5450,14 @@ mod tests {
             .iter()
             .map(|i| match i {
                 SourceInst::Let { name, .. } => format!("let {name}"),
-                SourceInst::Compute { value: LirRvalue::Binary { .. }, .. } => "binary".to_string(),
-                SourceInst::Compute { value: LirRvalue::Print { .. }, .. } => "print".to_string(),
+                SourceInst::Compute {
+                    value: LirRvalue::Binary { .. },
+                    ..
+                } => "binary".to_string(),
+                SourceInst::Compute {
+                    value: LirRvalue::Print { .. },
+                    ..
+                } => "print".to_string(),
                 SourceInst::Expr(_) => "expr".to_string(),
                 SourceInst::ClearScopeRoots { .. } => "clear roots".to_string(),
                 _ => "other".to_string(),
@@ -4328,21 +5473,27 @@ mod tests {
              fn f() { let p = new C(1); p.x = 2; let xs = [1]; xs[0] = 9; C::t = 5; }");
         let f = func(&p, "f");
         let instrs = &f.blocks[0].instrs;
-        assert!(
-            instrs
-                .iter()
-                .any(|i| matches!(i, SourceInst::Compute { value: LirRvalue::FieldStore { .. }, .. }))
-        );
-        assert!(
-            instrs
-                .iter()
-                .any(|i| matches!(i, SourceInst::Compute { value: LirRvalue::ArrayStore { .. }, .. }))
-        );
-        assert!(
-            instrs
-                .iter()
-                .any(|i| matches!(i, SourceInst::Compute { value: LirRvalue::StaticStore { .. }, .. }))
-        );
+        assert!(instrs.iter().any(|i| matches!(
+            i,
+            SourceInst::Compute {
+                value: LirRvalue::FieldStore { .. },
+                ..
+            }
+        )));
+        assert!(instrs.iter().any(|i| matches!(
+            i,
+            SourceInst::Compute {
+                value: LirRvalue::ArrayStore { .. },
+                ..
+            }
+        )));
+        assert!(instrs.iter().any(|i| matches!(
+            i,
+            SourceInst::Compute {
+                value: LirRvalue::StaticStore { .. },
+                ..
+            }
+        )));
     }
 
     // 17. class methods are flattened as `Class::method`
@@ -4416,7 +5567,10 @@ mod tests {
     fn l22_expression_control_flow_becomes_blocks() {
         let p = lir("fn f(c: bool) -> i64 { return c ? 1 : 2; }");
         let f = func(&p, "f");
-        assert!(matches!(&f.blocks[0].terminator, SourceTerminator::Branch { .. }));
+        assert!(matches!(
+            &f.blocks[0].terminator,
+            SourceTerminator::Branch { .. }
+        ));
         assert!(f.blocks.iter().any(|block| matches!(&block.terminator,
             SourceTerminator::Return(Some(v)) if matches!(v.kind, HirExprKind::Var(_)))));
     }
@@ -4545,8 +5699,13 @@ async fn f() -> i64 {
             .iter()
             .position(|inst| matches!(inst, SourceInst::FlushDefers { .. }))
             .unwrap();
-        assert!(block.instrs[..flush_index].iter().any(|inst| matches!(inst,
-            SourceInst::Compute { value: LirRvalue::Binary { .. }, .. })));
+        assert!(block.instrs[..flush_index].iter().any(|inst| matches!(
+            inst,
+            SourceInst::Compute {
+                value: LirRvalue::Binary { .. },
+                ..
+            }
+        )));
         let (return_local, return_name) = block.instrs[..flush_index]
             .iter()
             .find_map(|inst| match inst {
@@ -4733,8 +5892,8 @@ async fn f(shape: Shape) -> i64 {
                 "{source}"
             );
             for block in &f.blocks {
-                if let SourceTerminator::Return(Some(value)) | SourceTerminator::Branch { cond: value, .. } =
-                    &block.terminator
+                if let SourceTerminator::Return(Some(value))
+                | SourceTerminator::Branch { cond: value, .. } = &block.terminator
                 {
                     assert!(
                         !matches!(
@@ -4791,9 +5950,8 @@ async fn f(shape: Shape) -> i64 {
                     }
                 }
                 match &block.terminator {
-                    SourceTerminator::Return(Some(value)) | SourceTerminator::Branch { cond: value, .. } => {
-                        check(value)
-                    }
+                    SourceTerminator::Return(Some(value))
+                    | SourceTerminator::Branch { cond: value, .. } => check(value),
                     _ => {}
                 }
             }
@@ -4802,12 +5960,31 @@ async fn f(shape: Shape) -> i64 {
 
     #[test]
     fn lifted_lambdas_exclusively_own_their_bodies() {
-        let mut program = lir("fn f() -> i64 { let apply = |x: i64| -> i64 { let next = |y: i64| y + 1; return next(x); }; return apply(10); }");
+        let mut program = lir(
+            "fn f() -> i64 { let apply = |x: i64| -> i64 { let next = |y: i64| y + 1; return next(x); }; return apply(10); }",
+        );
         assert_eq!(program.lambdas.len(), 2);
         let mut constructions = 0;
-        for function in program.functions.iter_mut().chain(program.lambdas.iter_mut().map(|lambda| &mut lambda.function)) {
-            constructions += function.blocks.iter().flat_map(|block| &block.instrs).filter(|inst|
-                matches!(inst, SourceInst::Compute { value: LirRvalue::Closure { .. }, .. })).count();
+        for function in program.functions.iter_mut().chain(
+            program
+                .lambdas
+                .iter_mut()
+                .map(|lambda| &mut lambda.function),
+        ) {
+            constructions += function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instrs)
+                .filter(|inst| {
+                    matches!(
+                        inst,
+                        SourceInst::Compute {
+                            value: LirRvalue::Closure { .. },
+                            ..
+                        }
+                    )
+                })
+                .count();
             function.visit_expr_roots_mut(|expr| {
                 for node in expr.walk_postorder(true) {
                     if let HirExprKind::Lambda { body, .. } = &node.kind {
@@ -4839,7 +6016,10 @@ async fn f(which: i64) -> i64 {
             f.blocks
                 .iter()
                 .flat_map(|block| &block.instrs)
-                .any(|inst| matches!(inst, SourceInst::MatchTest { .. } | SourceInst::MatchBind { .. }))
+                .any(|inst| matches!(
+                    inst,
+                    SourceInst::MatchTest { .. } | SourceInst::MatchBind { .. }
+                ))
         );
     }
 
@@ -4925,7 +6105,10 @@ fn f(which: i64) -> i64 {
             f.blocks
                 .iter()
                 .flat_map(|block| &block.instrs)
-                .any(|inst| matches!(inst, SourceInst::MatchTest { .. } | SourceInst::MatchBind { .. }))
+                .any(|inst| matches!(
+                    inst,
+                    SourceInst::MatchTest { .. } | SourceInst::MatchBind { .. }
+                ))
         );
     }
 }
@@ -5041,7 +6224,10 @@ mod prune_and_corpus_tests {
 }
 
 mod final_ir;
-pub use final_ir::{LirProgram, LirFunction, LirLambda, LirBlock, LirInst, LirDeferBody, LirParam, LirPattern, Terminator};
+pub use final_ir::{
+    LirBlock, LirDeferBody, LirFunction, LirInst, LirLambda, LirParam, LirPattern, LirProgram,
+    Terminator,
+};
 
 pub fn lower_program(program: &HirProgram) -> LirProgram {
     final_ir::finish_program(lower_source_program(program))
@@ -5049,11 +6235,40 @@ pub fn lower_program(program: &HirProgram) -> LirProgram {
 
 pub fn format_program(program: &LirProgram) -> String {
     let mut output = String::new();
-    for function in program.functions.iter().chain(program.lambdas.iter().map(|lambda| &lambda.function)) {
-        output.push_str(&format!("fn {}() -> {:?} {{\n", function.name, function.return_type));
+    let mut pending: std::collections::VecDeque<_> = program
+        .functions
+        .iter()
+        .chain(program.lambdas.iter().map(|lambda| &lambda.function))
+        .map(|function| (None, function))
+        .collect();
+    let mut next_region = 0usize;
+    while let Some((region, function)) = pending.pop_front() {
+        if let Some(region) = region {
+            output.push_str(&format!("cleanup region {region}:\n"));
+        }
+        output.push_str(&format!(
+            "fn {}({}) -> {} {{\n",
+            function.name,
+            function
+                .params
+                .iter()
+                .map(|param| format!("{}: {}", param.name, super::dump::type_text(&param.ty)))
+                .collect::<Vec<_>>()
+                .join(", "),
+            super::dump::type_text(&function.return_type)
+        ));
         for block in &function.blocks {
             output.push_str(&format!("bb{}:\n", block.id.0));
-            for instruction in &block.instrs { output.push_str(&format!("  {instruction:?}\n")); }
+            for instruction in &block.instrs {
+                if let LirInst::Defer { id, body, span } = instruction {
+                    let region = next_region;
+                    next_region += 1;
+                    output.push_str(&format!("  Defer {{ id: {id:?}, region: {region}, captures: {:?}, recovery_capable: {}, span: {span:?} }}\n", body.captures, body.recovery_capable));
+                    pending.push_back((Some(region), &body.function));
+                } else {
+                    output.push_str(&format!("  {instruction:?}\n"));
+                }
+            }
             output.push_str(&format!("  {:?}\n", block.terminator));
         }
         output.push_str("}\n");

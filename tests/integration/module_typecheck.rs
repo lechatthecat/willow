@@ -705,7 +705,11 @@ pub fn run() -> i64 {
 // 25. Each module checker needs the same imported typed-receiver index as the
 //     entry checker. Otherwise `w.heavy()` is invisible to the AST-only
 //     concurrency analysis and bypasses E0810 inside an async module body.
-#[cfg(not(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+#[cfg(not(all(
+    target_os = "linux",
+    target_env = "gnu",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 #[test]
 fn module_typecheck_25_imported_typed_receiver_reports_e0810() {
     let stderr = module_error(&[

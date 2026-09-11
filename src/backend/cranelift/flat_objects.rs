@@ -9,7 +9,9 @@ use cranelift_module::Module;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
     fn flat_operand_type(function: &LirFunction, operand: &LirOperand) -> Type {
-        operand.ty(&function.locals).expect("typed language operand")
+        operand
+            .ty(&function.locals)
+            .expect("typed language operand")
     }
 
     pub(super) fn emit_flat_capture_array_owner(
@@ -225,7 +227,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .and_then(|params| params.get(index))
                 .unwrap_or(source_ty);
             let reference = matches!(operand, LirOperand::Reference { .. });
-            let value = if reference { value } else { self.coerce_to_target(value, source_ty, target_ty) };
+            let value = if reference {
+                value
+            } else {
+                self.coerce_to_target(value, source_ty, target_ty)
+            };
             // Interface coercions can allocate new boxes not held by the source
             // locals; retain them across later coercions and the constructor.
             if !reference && is_gc_managed(target_ty, self.enum_infos) {
@@ -243,7 +249,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if pushed {
             self.emit_callstack_pop();
         }
-        if args.iter().any(|arg| matches!(arg, LirOperand::Reference { .. })) { self.emit_flat_reference_call_end(); }
+        if args
+            .iter()
+            .any(|arg| matches!(arg, LirOperand::Reference { .. }))
+        {
+            self.emit_flat_reference_call_end();
+        }
         if roots > 0 {
             self.emit_pop_roots_n(roots);
             self.gc_root_count -= roots;

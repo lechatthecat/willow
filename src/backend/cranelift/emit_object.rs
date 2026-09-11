@@ -3,7 +3,6 @@ use cranelift_module::Module;
 
 use super::*;
 
-#[willow_continuations::methods(emit_lir_interpolated, emit_lir_expr)]
 impl<'a, 'b> FuncGen<'a, 'b> {
     /// The address of `class`'s DESCRIPTOR: the value that lives in word 0 of
     /// every object of that class (willow-fm7t).
@@ -56,100 +55,5 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder
             .ins()
             .load(types::I64, MemFlagsData::new(), descriptor, 0i32)
-    }
-}
-
-#[willow_continuations::methods(emit_lir_interpolated, emit_lir_expr)]
-impl<'a, 'b> FuncGen<'a, 'b> {
-    /// The body of [`FuncGen::emit_interpolated_string`], with the arguments
-    /// supplied by a callback rather than read from the AST.
-    ///
-    /// The callback exists so the LIR walker can reach the same emitter with
-    /// typed HIR operands (willow-0g8j.2.5): a format string that assembled its
-    /// pieces differently on the two paths would produce two different strings
-    /// for one program. Arguments stay LAZY — each is emitted only when its
-    /// placeholder is reached — because an operand that has not been evaluated
-    /// yet cannot be collected, which is what lets the rooting below be exactly
-    /// one push per live piece.
-    pub(super) fn emit_lir_interpolated(
-        &mut self,
-        spec: &str,
-        operands: &[crate::ir::typed_ast::HirExpr],
-    ) -> cranelift_codegen::ir::Value {
-        let segments = match crate::interpolate::parse_spec(spec) {
-            Ok(segments) => segments,
-            // The checker rejected invalid specs; only synthesized nodes could
-            // land here.
-            Err(_) => return self.emit_string_literal(spec),
-        };
-        let mut next_arg = 0usize;
-        let mut acc: Option<cranelift_codegen::ir::Value> = None;
-        let mut temp_roots = 0usize;
-        for segment in &segments {
-            // Every step below can allocate (toString / concat), and any
-            // allocation can collect — so each live string is rooted the
-            // instant it exists, and stays rooted until the final pop.
-            let piece = match segment {
-                crate::interpolate::Segment::Literal(text) => {
-                    // Literals are permanent (runtime-rooted) — no root needed.
-                    let text = text.clone();
-                    self.emit_string_literal(&text)
-                }
-                crate::interpolate::Segment::Display => {
-                    if next_arg >= operands.len() {
-                        break;
-                    }
-                    let val = self.emit_lir_expr(&operands[next_arg]);
-                    let ty = operands[next_arg].ty.clone();
-                    next_arg += 1;
-                    let converted = match ty {
-                        Type::String => val,
-                        Type::F64 => self.emit_runtime_call1("willow_f64_to_string", val),
-                        Type::Bool => self.emit_runtime_call1("willow_bool_to_string", val),
-                        _ => self.emit_runtime_call1("willow_i64_to_string", val),
-                    };
-                    self.emit_push_root(converted);
-                    temp_roots += 1;
-                    converted
-                }
-                crate::interpolate::Segment::F64(format) => {
-                    if next_arg >= operands.len() {
-                        break;
-                    }
-                    let val = self.emit_lir_expr(&operands[next_arg]);
-                    next_arg += 1;
-                    let converted = self.emit_runtime_call1(format.runtime_symbol(), val);
-                    self.emit_push_root(converted);
-                    temp_roots += 1;
-                    converted
-                }
-            };
-            acc = Some(match acc {
-                None => piece,
-                Some(prev) => {
-                    // Both operands are rooted; the result gets rooted too so
-                    // it survives the NEXT piece's allocations.
-                    let joined =
-                        self.emit_value_runtime_call("willow_string_concat", &[prev, piece]);
-                    self.emit_push_root(joined);
-                    temp_roots += 1;
-                    joined
-                }
-            });
-        }
-        if temp_roots > 0 {
-            self.emit_pop_roots_n(temp_roots);
-            self.gc_root_count -= temp_roots;
-        }
-        acc.unwrap_or_else(|| self.emit_string_literal(""))
-    }
-
-    /// Call a one-argument runtime function and return its single result.
-    fn emit_runtime_call1(
-        &mut self,
-        symbol: &str,
-        arg: cranelift_codegen::ir::Value,
-    ) -> cranelift_codegen::ir::Value {
-        self.emit_value_runtime_call(symbol, &[arg])
     }
 }

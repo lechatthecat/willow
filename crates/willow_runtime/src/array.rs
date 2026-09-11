@@ -254,7 +254,9 @@ pub extern "C" fn willow_array_element_addr(arr: *mut u8, index: i64) -> *mut u8
 /// recomputes the interior address after any moving collection or suspension.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_array_reference_owner(arr: *mut u8, index: i64) -> *mut u8 {
-    if !check_bounds(arr, index) { return std::ptr::null_mut(); }
+    if !check_bounds(arr, index) {
+        return std::ptr::null_mut();
+    }
     unsafe { handle_buffer(arr) }
 }
 

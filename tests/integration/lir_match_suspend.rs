@@ -805,7 +805,8 @@ fn lir_suspend_25_the_example_is_fully_lir() {
 /// LIR coverage: every await must occur once and retain its operand position.
 #[test]
 fn lir_await_twenty_operand_positions_execute_in_order() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 import std::collections::Array;
 class Item {
     pub field: i64;
@@ -841,7 +842,11 @@ async fn main() {
     println(true ? (await one()) : 9);
     println(false ? 9 : (await one()));
 }
-"#);
+"#,
+    );
     assert!(ok, "{out}");
-    assert_eq!(out, "-1\n2\n2\n1\n1\n2\n3\n4\n4\n1\n1\n1\n1\n1\n7\n8\n3\n0\n1\n1\n");
+    assert_eq!(
+        out,
+        "-1\n2\n2\n1\n1\n2\n3\n4\n4\n1\n1\n1\n1\n1\n7\n8\n3\n0\n1\n1\n"
+    );
 }

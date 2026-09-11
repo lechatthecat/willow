@@ -41,11 +41,22 @@ none is available. A completed poll returns the stack to that worker's cache.
 A poll suspended inside a synchronous helper retains its stack in `RuntimeTask`.
 This avoids mapping/unmapping a stack on every ordinary async poll.
 
-Synchronous LIR block entries check the task quantum, covering function entry
-and loop backedges. On expiration the runtime preserves the entire native call
+Synchronous function entries and cycle headers check the task quantum, covering
+recursion and loops. Iterative DFS identifies backedge targets, including recovery
+edges and irreducible cycles. On expiration the runtime preserves the entire native call
 chain and returns `Preempted` to the scheduler. Resumption continues after the
 same check. Existing async frame dispatch and cooperative suspension remain in
 use when the poll itself returns.
+The optimizer may expand a small, nonfaulting scalar loop four iterations at a
+time. Every original condition remains, and the expanded cycle retains its poll;
+this adds at most three bounded scalar iterations between interruption checks.
+
+Each generated invocation caches whether it runs on a task-owned native stack
+and the stable address of the GC stop gate. Polls atomically reload that gate and
+call the runtime only when a native task is active or a collector requests a
+stop. Ordinary synchronous loops therefore avoid repeated TLS/runtime calls
+while remaining visible to concurrent GC. The gate's value is never cached;
+nested scheduler drives restore native activity before returning to the caller.
 
 **Suspended native stacks do not migrate between OS threads.** Source-level
 Send checks alone do not prove that Rust callback frames, TLS state, or native

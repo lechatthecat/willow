@@ -104,7 +104,10 @@ impl Codegen {
         let selected: Vec<_> = if frame_all {
             lir.locals
                 .iter()
-                .filter(|local| !local.parameter && (local.is_gc_owner() || !matches!(local.ty, Type::Void | Type::Never)))
+                .filter(|local| {
+                    !local.parameter
+                        && (local.is_gc_owner() || !matches!(local.ty, Type::Void | Type::Never))
+                })
                 .map(|local| local.id)
                 .collect()
         } else {
@@ -200,7 +203,7 @@ impl Codegen {
         // suspension; only GC-managed slots are in `gc_slot_mask` (traced), so
         // non-GC slots hold plain scalars (willow-lpn.5.3 slice 3b).
         slots.extend(f.params.iter().map(|p| AsyncFrameSlot {
-                storage_kind: crate::ir::lowered::LirStorageKind::Value,
+            storage_kind: crate::ir::lowered::LirStorageKind::Value,
             source_span: Some(p.span),
             name: p.name.clone(),
             ty: p.ty.clone().into(),
@@ -415,12 +418,7 @@ impl Codegen {
                 lir_defer_offsets,
             },
         )?;
-        self.compile_async_cancel_fn(
-            cancel_fid,
-            &sites,
-            &lock_sites,
-            &crate::semantic::ids::SemanticType::from(&f.return_type),
-        )?;
+        self.compile_async_cancel_fn(cancel_fid, &sites, &lock_sites)?;
         Ok(())
     }
 
@@ -612,7 +610,10 @@ impl Codegen {
             is_async: true,
             params: m.params.clone(),
             return_type: m.return_type.clone(),
-            body: Block { stmts: Vec::new(), span: m.span },
+            body: Block {
+                stmts: Vec::new(),
+                span: m.span,
+            },
             span: m.span,
         };
         let (sites, lock_sites) = self.compile_coop_main_poll(
@@ -628,12 +629,7 @@ impl Codegen {
                 lir_defer_offsets,
             },
         )?;
-        self.compile_async_cancel_fn(
-            cancel_fid,
-            &sites,
-            &lock_sites,
-            &crate::semantic::ids::SemanticType::from(&m.return_type),
-        )?;
+        self.compile_async_cancel_fn(cancel_fid, &sites, &lock_sites)?;
         Ok(())
     }
 
@@ -834,8 +830,8 @@ impl Codegen {
                 panic_recovery_targets: HashSet::new(),
                 panic_return_block: None,
                 panic_function_root_depth: Some(poll_root_depth),
-            emitting_sync_cancel_cleanup: false,
-            lir_cleanup_exit: None,
+                emitting_sync_cancel_cleanup: false,
+                lir_cleanup_exit: None,
                 callstack_frame_depth: 0,
                 lir_call_frames: Vec::new(),
                 lir_reference_scopes: Vec::new(),
@@ -856,7 +852,6 @@ impl Codegen {
                 visible_modules: &self.visible_modules,
                 builtin_module_aliases: &self.builtin_module_aliases,
                 lambda_names: &self.lambda_names,
-                cooperative_leaves: &self.cooperative_leaves,
                 string_literals: &self.string_literals,
                 class_layouts: &self.class_layouts,
                 static_storage: &self.static_storage,
@@ -876,10 +871,8 @@ impl Codegen {
                 async_frame_offsets: offsets,
                 lir_frame_offsets: lir_offsets,
                 lir_defer_offsets: body.lir_defer_offsets.clone(),
-                lir_hoisted_await: None,
                 main_result_err_ty: None,
                 vars: HashMap::new(),
-                return_type: f.return_type.clone().into(),
                 current_class: body.current_class,
                 is_async: false,
                 terminated: false,
@@ -946,21 +939,33 @@ impl Codegen {
                 builder.ins().call(push_ref, &[addr]);
             }
             for (method, span) in &suspend.call_frames {
-                let name_data = *self.string_literals.get(method).expect("prepared method name registered");
-                let file_data = *self.string_literals.get(self.source_file.as_str()).expect("prepared source file registered");
+                let name_data = *self
+                    .string_literals
+                    .get(method)
+                    .expect("prepared method name registered");
+                let file_data = *self
+                    .string_literals
+                    .get(self.source_file.as_str())
+                    .expect("prepared source file registered");
                 let name_global = self.module.declare_data_in_func(name_data, builder.func);
                 let file_global = self.module.declare_data_in_func(file_data, builder.func);
                 let name = builder.ins().symbol_value(ptr_ty, name_global);
                 let file = builder.ins().symbol_value(ptr_ty, file_global);
                 let name_len = builder.ins().iconst(types::I64, method.len() as i64);
-                let file_len = builder.ins().iconst(types::I64, self.source_file.len() as i64);
+                let file_len = builder
+                    .ins()
+                    .iconst(types::I64, self.source_file.len() as i64);
                 let line = builder.ins().iconst(types::I32, span.line as i64);
                 let col = builder.ins().iconst(types::I32, span.col as i64);
                 let push = self.func_id("willow_callstack_push");
                 let push = self.module.declare_func_in_func(push, builder.func);
-                builder.ins().call(push, &[name, name_len, file, file_len, line, col]);
+                builder
+                    .ins()
+                    .call(push, &[name, name_len, file, file_len, line, col]);
             }
-            builder.ins().jump(suspend.reference_restore.unwrap_or(suspend.resume), &[]);
+            builder
+                .ins()
+                .jump(suspend.reference_restore.unwrap_or(suspend.resume), &[]);
             builder.switch_to_block(next);
         }
         builder.ins().jump(body_start, &[]);
@@ -990,7 +995,6 @@ impl Codegen {
         cancel_fid: cranelift_module::FuncId,
         sites: &[AsyncDeferSite],
         lock_sites: &[AsyncLockSite],
-        return_type: &Type,
     ) -> Result<()> {
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::I64));
@@ -1016,8 +1020,8 @@ impl Codegen {
                 panic_recovery_targets: HashSet::new(),
                 panic_return_block: None,
                 panic_function_root_depth: None,
-            emitting_sync_cancel_cleanup: false,
-            lir_cleanup_exit: None,
+                emitting_sync_cancel_cleanup: false,
+                lir_cleanup_exit: None,
                 callstack_frame_depth: 0,
                 lir_call_frames: Vec::new(),
                 lir_reference_scopes: Vec::new(),
@@ -1038,7 +1042,6 @@ impl Codegen {
                 visible_modules: &self.visible_modules,
                 builtin_module_aliases: &self.builtin_module_aliases,
                 lambda_names: &self.lambda_names,
-                cooperative_leaves: &self.cooperative_leaves,
                 string_literals: &self.string_literals,
                 class_layouts: &self.class_layouts,
                 static_storage: &self.static_storage,
@@ -1055,10 +1058,8 @@ impl Codegen {
                 async_frame_offsets: HashMap::new(),
                 lir_frame_offsets: HashMap::new(),
                 lir_defer_offsets: HashMap::new(),
-                lir_hoisted_await: None,
                 main_result_err_ty: None,
                 vars: HashMap::new(),
-                return_type: return_type.clone(),
                 current_class: None,
                 is_async: false,
                 terminated: false,
@@ -1192,11 +1193,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// non-suspending CFG edge still reaches the common continuation with those
     /// roots registered, while the dispatch trampoline restores them on re-poll.
     pub(super) fn emit_coop_unwind_poll_roots(&mut self) {
-        for _ in 0..self.lir_reference_scopes.len() { self.emit_debug_reference_call_clear(); }
+        for _ in 0..self.lir_reference_scopes.len() {
+            self.emit_debug_reference_call_clear();
+        }
         // This is only the returning edge; the ready edge and the compiler's
         // frame state retain their preparations. Dispatch replays them later.
         let depth = self.callstack_frame_depth;
-        for _ in 0..self.lir_call_frames.len() { self.emit_callstack_pop(); }
+        for _ in 0..self.lir_call_frames.len() {
+            self.emit_callstack_pop();
+        }
         self.callstack_frame_depth = depth;
         let active = self.coop_root_depth();
         assert_eq!(
@@ -1217,16 +1222,24 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .expect("cooperative suspend outside a poll function")
             .active
             .clone();
-        let reference_restore = if self.build_mode == BuildMode::Debug && !self.lir_reference_scopes.is_empty() {
-            let restore = self.builder.create_block();
-            self.builder.switch_to_block(restore);
-            self.emit_replay_reference_scopes();
-            self.builder.ins().jump(resume, &[]);
-            // Every caller records after a jump/return and then selects its
-            // continuation. Returning to that already-filled block is illegal.
-            Some(restore)
-        } else { None };
-        suspends.push(CoopSuspendPoint { resume, roots, call_frames: self.lir_call_frames.clone(), reference_restore });
+        let reference_restore =
+            if self.build_mode == BuildMode::Debug && !self.lir_reference_scopes.is_empty() {
+                let restore = self.builder.create_block();
+                self.builder.switch_to_block(restore);
+                self.emit_replay_reference_scopes();
+                self.builder.ins().jump(resume, &[]);
+                // Every caller records after a jump/return and then selects its
+                // continuation. Returning to that already-filled block is illegal.
+                Some(restore)
+            } else {
+                None
+            };
+        suspends.push(CoopSuspendPoint {
+            resume,
+            roots,
+            call_frames: self.lir_call_frames.clone(),
+            reference_restore,
+        });
     }
 
     /// Emit a preemption check whose resumed poll continues at `resume`. A

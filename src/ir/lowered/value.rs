@@ -1,10 +1,10 @@
 //! Flat value operations. Operands refer to locals or immediate constants;
 //! evaluation order is represented by the surrounding instruction sequence.
-use super::{SourceBlock, SourceInst, LirLocal, LirLocalId, SourceTerminator};
+use super::{LirLocal, LirLocalId, SourceBlock, SourceInst, SourceTerminator};
 use crate::diagnostics::Span;
 use crate::ir::typed_ast::{HirExpr, HirExprKind};
-use crate::parser::ast::{BinOp, UnaryOp, ExprId};
-use crate::semantic::ids::{FunctionId, TypeId, SemanticType as Type};
+use crate::parser::ast::{BinOp, ExprId, UnaryOp};
+use crate::semantic::ids::{FunctionId, SemanticType as Type, TypeId};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -13,39 +13,85 @@ pub enum LirOperand {
     Int(i64),
     Float(f64),
     Bool(bool),
-    Reference { place: LirPlace, span: Span, display: String },
+    Reference {
+        place: LirPlace,
+        span: Span,
+        display: String,
+    },
 }
 
 /// Captured storage identity, independent of subsequent array resizing.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LirPlace {
     Local(LirLocalId),
-    Field { object: LirLocalId, object_ty: Type, field: String, ty: Type },
-    ArrayElement { owner: LirLocalId, index: LirLocalId, element: Type },
+    Field {
+        object: LirLocalId,
+        object_ty: Type,
+        field: String,
+        ty: Type,
+    },
+    ArrayElement {
+        owner: LirLocalId,
+        index: LirLocalId,
+        element: Type,
+    },
 }
 
 impl LirPlace {
     pub fn locals(&self) -> Vec<LirLocalId> {
-        match self { Self::Local(local) => vec![*local], Self::Field { object, .. } => vec![*object], Self::ArrayElement { owner, index, .. } => vec![*owner, *index] }
+        match self {
+            Self::Local(local) => vec![*local],
+            Self::Field { object, .. } => vec![*object],
+            Self::ArrayElement { owner, index, .. } => vec![*owner, *index],
+        }
     }
     pub fn ty(&self, locals: &[LirLocal]) -> Option<Type> {
         match self {
-            Self::Local(local) => locals.get(local.0 as usize).filter(|local| !local.is_gc_owner()).map(|local| local.ty.clone()),
-            Self::Field { object, object_ty, ty, .. } => locals.get(object.0 as usize).filter(|local| !local.is_gc_owner() && local.ty == *object_ty).map(|_| ty.clone()),
-            Self::ArrayElement { owner, index, element } => (locals.get(owner.0 as usize).is_some_and(LirLocal::is_gc_owner)
-                && locals.get(index.0 as usize).is_some_and(|local| !local.is_gc_owner() && local.ty == Type::I64)).then(|| element.clone()),
+            Self::Local(local) => locals
+                .get(local.0 as usize)
+                .filter(|local| !local.is_gc_owner())
+                .map(|local| local.ty.clone()),
+            Self::Field {
+                object,
+                object_ty,
+                ty,
+                ..
+            } => locals
+                .get(object.0 as usize)
+                .filter(|local| !local.is_gc_owner() && local.ty == *object_ty)
+                .map(|_| ty.clone()),
+            Self::ArrayElement {
+                owner,
+                index,
+                element,
+            } => (locals
+                .get(owner.0 as usize)
+                .is_some_and(LirLocal::is_gc_owner)
+                && locals
+                    .get(index.0 as usize)
+                    .is_some_and(|local| !local.is_gc_owner() && local.ty == Type::I64))
+            .then(|| element.clone()),
         }
     }
 }
 
 impl LirOperand {
     pub fn locals(&self) -> Vec<LirLocalId> {
-        match self { Self::Local(local) => vec![*local], Self::Reference { place, .. } => place.locals(), _ => Vec::new() }
+        match self {
+            Self::Local(local) => vec![*local],
+            Self::Reference { place, .. } => place.locals(),
+            _ => Vec::new(),
+        }
     }
     pub fn ty(&self, locals: &[LirLocal]) -> Option<Type> {
         match self {
-            Self::Local(id) => locals.get(id.0 as usize).filter(|local| !local.is_gc_owner()).map(|local| local.ty.clone()),
-            Self::Int(_) => Some(Type::I64), Self::Float(_) => Some(Type::F64), Self::Bool(_) => Some(Type::Bool),
+            Self::Local(id) => locals
+                .get(id.0 as usize)
+                .filter(|local| !local.is_gc_owner())
+                .map(|local| local.ty.clone()),
+            Self::Int(_) => Some(Type::I64),
+            Self::Float(_) => Some(Type::F64),
+            Self::Bool(_) => Some(Type::Bool),
             Self::Reference { place, .. } => place.ty(locals),
         }
     }
@@ -55,42 +101,187 @@ impl LirOperand {
 pub enum LirRvalue {
     BeginReferenceCall,
     Use(LirOperand),
-    AwaitFuture { future: LirOperand, result: Type },
-    StartTask { callee: FunctionId, args: Vec<LirOperand>, params: Vec<Type>, output: Type },
-    SelectIdleWait { deadlines: Vec<LirOperand> },
-    Coerce { value: LirOperand, source: Type, target: Type },
-    ArrayAlloc { length: usize, element: Type },
-    CaptureArrayOwner { array: LirOperand, index: LirOperand },
-    ArrayStore { array: LirOperand, index: LirOperand, value: LirOperand, element: Type },
-    Index { array: LirOperand, index: LirOperand, element: Type },
-    ObjectAlloc { class: TypeId },
-    FieldLoad { object: LirOperand, object_ty: Type, field: String, result: Type },
-    FieldStore { object: LirOperand, object_ty: Type, field: String, value: LirOperand },
-    StaticField { class: TypeId, field: String, result: Type },
-    StaticStore { class: TypeId, field: String, value: LirOperand },
-    StaticCall { class: TypeId, method: String, args: Vec<LirOperand>, arg_types: Vec<Type>, result: Type },
-    EnumAlloc { class: TypeId, variant: String, enum_ty: Type },
-    EnumPayloadStore { object: LirOperand, class: TypeId, variant: String, index: usize, value: LirOperand, source: Type, enum_ty: Type },
-    ConstructorCall { object: LirOperand, class: TypeId, args: Vec<LirOperand>, arg_types: Vec<Type> },
-    Range { start: LirOperand, end: LirOperand },
-    EnumMethod { receiver: LirOperand, receiver_ty: Type, method: String, args: Vec<LirOperand>, arg_types: Vec<Type>, result: Type },
-    BuiltinCall { callee: FunctionId, args: Vec<LirOperand>, params: Vec<Type>, result: Type },
-    FormatScalar { value: LirOperand, ty: Type, format: Option<crate::interpolate::F64Format> },
-    Panic { message: LirOperand },
+    AwaitFuture {
+        future: LirOperand,
+        result: Type,
+    },
+    StartTask {
+        callee: FunctionId,
+        args: Vec<LirOperand>,
+        params: Vec<Type>,
+        output: Type,
+    },
+    SelectIdleWait {
+        deadlines: Vec<LirOperand>,
+    },
+    Coerce {
+        value: LirOperand,
+        source: Type,
+        target: Type,
+    },
+    ArrayAlloc {
+        length: usize,
+        element: Type,
+    },
+    CaptureArrayOwner {
+        array: LirOperand,
+        index: LirOperand,
+    },
+    ArrayStore {
+        array: LirOperand,
+        index: LirOperand,
+        value: LirOperand,
+        element: Type,
+    },
+    Index {
+        array: LirOperand,
+        index: LirOperand,
+        element: Type,
+    },
+    ObjectAlloc {
+        class: TypeId,
+    },
+    FieldLoad {
+        object: LirOperand,
+        object_ty: Type,
+        field: String,
+        result: Type,
+    },
+    FieldStore {
+        object: LirOperand,
+        object_ty: Type,
+        field: String,
+        value: LirOperand,
+    },
+    StaticField {
+        class: TypeId,
+        field: String,
+        result: Type,
+    },
+    StaticStore {
+        class: TypeId,
+        field: String,
+        value: LirOperand,
+    },
+    StaticCall {
+        class: TypeId,
+        method: String,
+        args: Vec<LirOperand>,
+        arg_types: Vec<Type>,
+        result: Type,
+    },
+    EnumAlloc {
+        class: TypeId,
+        variant: String,
+        enum_ty: Type,
+    },
+    EnumPayloadStore {
+        object: LirOperand,
+        class: TypeId,
+        variant: String,
+        index: usize,
+        value: LirOperand,
+        source: Type,
+        enum_ty: Type,
+    },
+    ConstructorCall {
+        object: LirOperand,
+        class: TypeId,
+        args: Vec<LirOperand>,
+        arg_types: Vec<Type>,
+    },
+    Range {
+        start: LirOperand,
+        end: LirOperand,
+    },
+    EnumMethod {
+        receiver: LirOperand,
+        receiver_ty: Type,
+        method: String,
+        args: Vec<LirOperand>,
+        arg_types: Vec<Type>,
+        result: Type,
+    },
+    BuiltinCall {
+        callee: FunctionId,
+        args: Vec<LirOperand>,
+        params: Vec<Type>,
+        result: Type,
+    },
+    FormatScalar {
+        value: LirOperand,
+        ty: Type,
+        format: Option<crate::interpolate::F64Format>,
+    },
+    Panic {
+        message: LirOperand,
+    },
     Recover,
-    ReferenceDebug { argument: LirOperand, callee: FunctionId, index: usize },
-    RebindResultError { value: LirOperand, source: Type, target: Type },
-    IntoError { value: LirOperand, source: Type, target: Type },
-    PrepareMethod { receiver: LirOperand, receiver_ty: Type, method: String },
-    MethodCall { receiver: LirOperand, receiver_ty: Type, method: String, args: Vec<LirOperand>, arg_types: Vec<Type>, result: Type },
+    ReferenceDebug {
+        argument: LirOperand,
+        callee: FunctionId,
+        index: usize,
+    },
+    RebindResultError {
+        value: LirOperand,
+        source: Type,
+        target: Type,
+    },
+    IntoError {
+        value: LirOperand,
+        source: Type,
+        target: Type,
+    },
+    PrepareMethod {
+        receiver: LirOperand,
+        receiver_ty: Type,
+        method: String,
+    },
+    MethodCall {
+        receiver: LirOperand,
+        receiver_ty: Type,
+        method: String,
+        args: Vec<LirOperand>,
+        arg_types: Vec<Type>,
+        result: Type,
+    },
     StringLiteral(String),
-    FunctionRef { function: FunctionId, ty: Type },
-    Closure { id: ExprId, captures: Vec<LirOperand>, ty: Type },
-    Print { value: LirOperand, ty: Type, newline: bool },
-    IntrinsicCall { intrinsic: crate::semantic::intrinsics::Intrinsic, method: String,
-        receiver: LirOperand, receiver_ty: Type, args: Vec<LirOperand>, arg_types: Vec<Type>, result: Type },
-    DirectCall { callee: FunctionId, args: Vec<LirOperand>, params: Vec<Type>, result: Type },
-    IndirectCall { callee: LirOperand, name: FunctionId, args: Vec<LirOperand>, params: Vec<Type>, result: Type },
+    FunctionRef {
+        function: FunctionId,
+        ty: Type,
+    },
+    Closure {
+        id: ExprId,
+        captures: Vec<LirOperand>,
+        ty: Type,
+    },
+    Print {
+        value: LirOperand,
+        ty: Type,
+        newline: bool,
+    },
+    IntrinsicCall {
+        intrinsic: crate::semantic::intrinsics::Intrinsic,
+        method: String,
+        receiver: LirOperand,
+        receiver_ty: Type,
+        args: Vec<LirOperand>,
+        arg_types: Vec<Type>,
+        result: Type,
+    },
+    DirectCall {
+        callee: FunctionId,
+        args: Vec<LirOperand>,
+        params: Vec<Type>,
+        result: Type,
+    },
+    IndirectCall {
+        callee: LirOperand,
+        name: FunctionId,
+        args: Vec<LirOperand>,
+        params: Vec<Type>,
+        result: Type,
+    },
     Unary {
         op: UnaryOp,
         operand: LirOperand,
@@ -110,11 +301,28 @@ impl LirRvalue {
             return false;
         };
         if let Self::CaptureArrayOwner { array, index } = self {
-            return destination.is_gc_owner() && matches!(array.ty(locals), Some(Type::Array(_))) && index.ty(locals) == Some(Type::I64);
+            return destination.is_gc_owner()
+                && matches!(array.ty(locals), Some(Type::Array(_)))
+                && index.ty(locals) == Some(Type::I64);
         }
-        if destination.is_gc_owner() { return false; }
-        if self.operands().iter().any(|operand| matches!(operand, LirOperand::Reference { .. }))
-            && !matches!(self, Self::DirectCall { .. } | Self::MethodCall { .. } | Self::StaticCall { .. } | Self::ConstructorCall { .. } | Self::ReferenceDebug { .. }) { return false; }
+        if destination.is_gc_owner() {
+            return false;
+        }
+        if self
+            .operands()
+            .iter()
+            .any(|operand| matches!(operand, LirOperand::Reference { .. }))
+            && !matches!(
+                self,
+                Self::DirectCall { .. }
+                    | Self::MethodCall { .. }
+                    | Self::StaticCall { .. }
+                    | Self::ConstructorCall { .. }
+                    | Self::ReferenceDebug { .. }
+            )
+        {
+            return false;
+        }
         let ty = |operand: &LirOperand| operand.ty(locals);
         match self {
             Self::BeginReferenceCall => destination.ty == Type::Void,
@@ -198,6 +406,7 @@ impl LirRvalue {
                         Type::I64 | Type::F64 => true,
                         Type::Bool => matches!(op, BinOp::Eq | BinOp::Ne),
                         Type::String => matches!(op, BinOp::Add | BinOp::Eq | BinOp::Ne),
+                        Type::Named(_) | Type::Generic(_, _) => matches!(op, BinOp::Eq | BinOp::Ne),
                         _ => false,
                     }
             }
@@ -213,15 +422,29 @@ impl LirRvalue {
             Self::AwaitFuture { future, .. } => vec![future],
             Self::SelectIdleWait { deadlines } => deadlines.iter().collect(),
             Self::Use(operand) => vec![operand],
-            Self::Coerce { value, .. } | Self::StaticStore { value, .. } | Self::FormatScalar { value, .. } => vec![value],
-            Self::ArrayAlloc { .. } | Self::ObjectAlloc { .. } | Self::StaticField { .. } | Self::Recover => vec![],
-            Self::ArrayStore { array, index, value, .. } => vec![array, index, value],
+            Self::Coerce { value, .. }
+            | Self::StaticStore { value, .. }
+            | Self::FormatScalar { value, .. } => vec![value],
+            Self::ArrayAlloc { .. }
+            | Self::ObjectAlloc { .. }
+            | Self::StaticField { .. }
+            | Self::Recover => vec![],
+            Self::ArrayStore {
+                array,
+                index,
+                value,
+                ..
+            } => vec![array, index, value],
             Self::Index { array, index, .. } => vec![array, index],
             Self::FieldLoad { object, .. } => vec![object],
             Self::FieldStore { object, value, .. } => vec![object, value],
-            Self::ConstructorCall { object, args, .. } => std::iter::once(object).chain(args).collect(),
+            Self::ConstructorCall { object, args, .. } => {
+                std::iter::once(object).chain(args).collect()
+            }
             Self::Range { start, end } => vec![start, end],
-            Self::EnumMethod { receiver, args, .. } => std::iter::once(receiver).chain(args).collect(),
+            Self::EnumMethod { receiver, args, .. } => {
+                std::iter::once(receiver).chain(args).collect()
+            }
             Self::BuiltinCall { args, .. } => args.iter().collect(),
             Self::StaticCall { args, .. } => args.iter().collect(),
             Self::EnumAlloc { .. } => vec![],
@@ -229,13 +452,19 @@ impl LirRvalue {
             Self::Panic { message } => vec![message],
             Self::RebindResultError { value, .. } | Self::IntoError { value, .. } => vec![value],
             Self::PrepareMethod { receiver, .. } => vec![receiver],
-            Self::MethodCall { receiver, args, .. } => std::iter::once(receiver).chain(args).collect(),
-            Self::IntrinsicCall { receiver, args, .. } => std::iter::once(receiver).chain(args).collect(),
+            Self::MethodCall { receiver, args, .. } => {
+                std::iter::once(receiver).chain(args).collect()
+            }
+            Self::IntrinsicCall { receiver, args, .. } => {
+                std::iter::once(receiver).chain(args).collect()
+            }
             Self::StringLiteral(_) | Self::FunctionRef { .. } => vec![],
             Self::Closure { captures, .. } => captures.iter().collect(),
             Self::Print { value, .. } => vec![value],
             Self::DirectCall { args, .. } => args.iter().collect(),
-            Self::IndirectCall { callee, args, .. } => std::iter::once(callee).chain(args).collect(),
+            Self::IndirectCall { callee, args, .. } => {
+                std::iter::once(callee).chain(args).collect()
+            }
             Self::Unary { operand, .. } => vec![operand],
             Self::Binary { lhs, rhs, .. } => vec![lhs, rhs],
         }
@@ -287,7 +516,15 @@ mod tests {
 mod opaque_owner_tests {
     #[test]
     fn an_opaque_owner_is_not_a_language_operand() {
-        let local = super::LirLocal { storage_kind: super::super::LirStorageKind::GcOwner, id: super::LirLocalId(0), name: "owner".into(), ty: super::Type::Void, source_span: None, synthetic: true, parameter: false };
+        let local = super::LirLocal {
+            storage_kind: super::super::LirStorageKind::GcOwner,
+            id: super::LirLocalId(0),
+            name: "owner".into(),
+            ty: super::Type::Void,
+            source_span: None,
+            synthetic: true,
+            parameter: false,
+        };
         assert!(super::LirOperand::Local(local.id).ty(&[local]).is_none());
     }
 }

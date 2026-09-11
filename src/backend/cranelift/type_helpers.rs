@@ -112,6 +112,7 @@ pub(crate) fn future_await_runtime_name(ty: &Type) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn channel_element_type(ty: &Type) -> Option<Type> {
     builtin_types::unary_arg(ty, B::Channel).cloned()
 }
@@ -171,7 +172,9 @@ pub(crate) fn is_gc_managed(ty: &Type, enum_infos: &TypeMap<EnumInfo>) -> bool {
 }
 
 // Runtime identity belongs to semantic lowering; backend consumers share it.
-pub(crate) use crate::semantic::intrinsics::{builtin_call_runtime_name, gc_stat_builtin_runtime_name};
+pub(crate) use crate::semantic::intrinsics::{
+    builtin_call_runtime_name, gc_stat_builtin_runtime_name,
+};
 
 #[cfg(test)]
 mod tests {

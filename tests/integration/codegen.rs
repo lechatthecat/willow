@@ -17888,7 +17888,9 @@ fn lirreq_55b_an_unsupported_lambda_body_fails_the_build() {
         "a lambda whose body leaves the subset must fail the build, not be claimed by the walker"
     );
     assert!(
-        stderr.contains("outside the walker's subset"),
+        stderr.contains("function `$lambda.")
+            && stderr.contains("the static property `Config::bad`")
+            && stderr.contains("invalid lowered IR"),
         "the refusal must name the construct that blocked it: {stderr}"
     );
 }

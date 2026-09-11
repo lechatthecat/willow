@@ -349,7 +349,11 @@ impl TypeChecker {
             lambda_return_stack: Vec::new(),
             current_class: None,
             current_async_context: false,
-            task_sync_preemption: cfg!(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64"))),
+            task_sync_preemption: cfg!(all(
+                target_os = "linux",
+                target_env = "gnu",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )),
             in_static_method: false,
             in_static_initializer: false,
             in_constructor: false,

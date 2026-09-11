@@ -79,12 +79,11 @@ impl NonpreemptibleReason {
 /// Help text shared by every E0810. It names both remedies: the one available
 /// today, and the pending toolchain work that retires the rejection.
 pub(crate) const NONPREEMPTIBLE_HELP: &str =
-    "make the helper async, or wait for task-aware sync-stack preemption support";
+    "make the helper async, or wait for task-aware sync-stack preemption support on this target";
 
 /// Note attached to every E0810, so the rejection does not read as permanent
 /// language policy (§2.2.1 of the async completion spec).
-pub(crate) const NONPREEMPTIBLE_NOTE: &str =
-    "this rejection is temporary: it is lifted once task-aware synchronous-stack preemption ships";
+pub(crate) const NONPREEMPTIBLE_NOTE: &str = "this rejection is temporary: it is lifted once task-aware synchronous-stack preemption is supported on this target";
 
 /// A synchronous helper that cannot be preempted when called from a task
 /// context, with the reason and the span of its definition.

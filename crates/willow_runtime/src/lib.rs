@@ -31,6 +31,12 @@ pub mod lock_wait;
 pub mod map;
 pub mod math;
 pub(crate) mod native_frame;
+#[cfg(all(
+    target_os = "linux",
+    target_env = "gnu",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod native_stack;
 pub mod net;
 pub mod netpoll;
 pub mod object;
@@ -39,8 +45,6 @@ pub mod panic;
 pub mod panic_context;
 pub mod parallel;
 pub mod preempt;
-#[cfg(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")))]
-mod native_stack;
 pub mod print;
 pub mod reference_debug;
 pub mod scheduler;

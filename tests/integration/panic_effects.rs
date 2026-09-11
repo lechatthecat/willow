@@ -75,7 +75,9 @@ fn main() {}
 fn pe_03_proven_pure_call_graph_emits_no_panic_depth_relocation() {
     let targets = compile_and_collect_relocation_targets(PURE_RECURSION, &[]);
     assert!(!has_target(&targets, "willow_panic_depth"), "{targets:?}");
-    assert!(!has_target(&targets, "willow_root_depth"), "{targets:?}");
+    // Task-aware synchronous cancellation restores GC roots independently of
+    // panic propagation. Its root-depth relocation does not make this pure
+    // call graph require a panic-depth check.
 }
 
 #[test]

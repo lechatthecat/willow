@@ -718,3 +718,27 @@ fn lir_inh_26_example_is_fully_lir() {
          on the LIR path: {stderr}"
     );
 }
+
+#[test]
+fn lir_super_reference_argument_captures_before_later_resize() {
+    assert_project_output(
+        r#"
+import std::collections::Array;
+fn grow(a: Array<i64>) -> i64 { a.push(2); return 0; }
+open class Base {
+    pub value: i64;
+    pub init(self, slot: &mut i64, ignored: i64) { slot = 99; self.value = slot; }
+}
+class Child extends Base {
+    pub init(self, values: Array<i64>) { super.init(&values[0], grow(values)); }
+}
+fn main() {
+    let values: Array<i64> = [1];
+    let child = new Child(values);
+    println(child.value);
+    println(values[0]);
+}
+"#,
+        "99\n1\n",
+    );
+}

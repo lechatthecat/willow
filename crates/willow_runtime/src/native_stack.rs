@@ -161,7 +161,9 @@ impl NativeStack {
             (*stack).root_depth = crate::gc::gc_thread_root_depth();
             if (*stack).suspended {
                 crate::stack_trace::replace_current(std::mem::take(&mut (*stack).trace));
-                crate::reference_debug::replace_current(std::mem::take(&mut (*stack).reference_context));
+                crate::reference_debug::replace_current(std::mem::take(
+                    &mut (*stack).reference_context,
+                ));
                 if let Some(token) = (*stack).parked_roots.take() {
                     crate::gc::resume_parked_roots(token);
                 }
@@ -252,6 +254,11 @@ pub(crate) fn suspend() -> bool {
     true
 }
 
+/// Whether the current invocation owns a scheduler-managed native stack.
+pub(crate) fn is_active() -> bool {
+    CURRENT.with(|current| !current.get().is_null())
+}
+
 /// Sticky task cancellation, suppressed while generated defer cleanup executes.
 pub(crate) fn cancelled() -> i32 {
     let stack = CURRENT.with(Cell::get);
@@ -338,7 +345,9 @@ mod tests {
 
     fn set_reference(name: &str) {
         let ptr = crate::string::willow_string_alloc(name.as_bytes().as_ptr(), name.len() as i64);
-        crate::reference_debug::willow_debug_reference_call(ptr, 1, 1, ptr, ptr, ptr, ptr, ptr, ptr);
+        crate::reference_debug::willow_debug_reference_call(
+            ptr, 1, 1, ptr, ptr, ptr, ptr, ptr, ptr,
+        );
     }
 
     unsafe extern "C" fn reference_poll(_: *mut c_void) -> i32 {
@@ -347,9 +356,19 @@ mod tests {
         crate::reference_debug::willow_debug_reference_call_scope_push();
         set_reference("inner-task-call");
         assert!(suspend());
-        assert_eq!(crate::reference_debug::current_reference_call().unwrap().callee, "inner-task-call");
+        assert_eq!(
+            crate::reference_debug::current_reference_call()
+                .unwrap()
+                .callee,
+            "inner-task-call"
+        );
         crate::reference_debug::clear_current_reference_call();
-        assert_eq!(crate::reference_debug::current_reference_call().unwrap().callee, "outer-task-call");
+        assert_eq!(
+            crate::reference_debug::current_reference_call()
+                .unwrap()
+                .callee,
+            "outer-task-call"
+        );
         crate::reference_debug::clear_current_reference_call();
         RUNTIME_POLL_READY
     }
@@ -360,11 +379,22 @@ mod tests {
         crate::gc::willow_gc_init();
         let saved = crate::reference_debug::replace_current(Default::default());
         let mut stack = NativeStack::new(reference_poll, std::ptr::null_mut());
-        assert_eq!(unsafe { NativeStack::resume(&mut *stack) }, RUNTIME_POLL_PREEMPTED);
+        assert_eq!(
+            unsafe { NativeStack::resume(&mut *stack) },
+            RUNTIME_POLL_PREEMPTED
+        );
         assert!(crate::reference_debug::current_reference_call().is_none());
         set_reference("scheduler-context");
-        assert_eq!(unsafe { NativeStack::resume(&mut *stack) }, RUNTIME_POLL_READY);
-        assert_eq!(crate::reference_debug::current_reference_call().unwrap().callee, "scheduler-context");
+        assert_eq!(
+            unsafe { NativeStack::resume(&mut *stack) },
+            RUNTIME_POLL_READY
+        );
+        assert_eq!(
+            crate::reference_debug::current_reference_call()
+                .unwrap()
+                .callee,
+            "scheduler-context"
+        );
         crate::reference_debug::replace_current(saved);
     }
 
