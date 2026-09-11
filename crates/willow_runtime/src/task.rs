@@ -124,6 +124,12 @@ pub(crate) struct TaskDebugInfo {
 
 #[derive(Debug)]
 pub struct RuntimeTask {
+    #[cfg(all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(crate) native_stack: Option<Box<crate::native_stack::NativeStack>>,
     pub id: RuntimeTaskId,
     /// Atomic lifecycle and run-queue ownership. This is the only source of
     /// truth for Ready/Running/Parked/BlockedSyscall/Cancelling and replaces
@@ -172,6 +178,12 @@ unsafe impl Send for RuntimeTask {}
 impl Clone for RuntimeTask {
     fn clone(&self) -> Self {
         Self {
+            #[cfg(all(
+                target_os = "linux",
+                target_env = "gnu",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            native_stack: None,
             id: self.id,
             state: self.state.clone(),
             poll: self.poll,
@@ -191,6 +203,12 @@ impl Clone for RuntimeTask {
 impl RuntimeTask {
     pub fn new(id: RuntimeTaskId) -> Self {
         Self {
+            #[cfg(all(
+                target_os = "linux",
+                target_env = "gnu",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            native_stack: None,
             id,
             state: AtomicTaskState::new(),
             poll: None,

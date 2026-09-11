@@ -198,6 +198,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     PANIC_ALLOC; "willow_array_to_string" => ([Word, I64] -> Some(Word));
     ALLOC; "willow_map_to_string" => ([Word] -> Some(Word));
     PANIC_ALLOC; "willow_array_element_addr" => ([Word, I64] -> Some(Ptr));
+    PANIC_ALLOC; "willow_array_reference_owner" => ([Word, I64] -> Some(Ptr));
     // --- maps (std::collections::Map) ---
     ALLOC; "willow_map_new" => ([I64, I64, I64] -> Some(Word));
     ALLOC; "willow_map_copy" => ([Word] -> Some(Word));
@@ -400,6 +401,11 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_preempt_begin" => ([Ptr] -> None);
     NONE; "willow_preempt_end" => ([] -> None);
     PREEMPT; "willow_preempt_check" => ([] -> Some(I32));
+    PREEMPT; "willow_sync_safepoint" => ([] -> Some(I32));
+    NONE; "willow_sync_cancelled" => ([] -> Some(I32));
+    NONE; "willow_sync_cleanup_enter" => ([] -> None);
+    NONE; "willow_sync_cleanup_leave" => ([] -> None);
+    PREEMPT; "willow_sync_poll_cancel_cleanup" => ([] -> None);
     NONE; "willow_preempt_enter_no_preempt" => ([] -> None);
     NONE; "willow_preempt_leave_no_preempt" => ([] -> None);
 };
@@ -730,6 +736,7 @@ mod alloc_effects_tests {
         "willow_array_to_string",
         "willow_map_to_string",
         "willow_array_element_addr",
+        "willow_array_reference_owner",
         "willow_map_new",
         "willow_map_copy",
         "willow_map_get",

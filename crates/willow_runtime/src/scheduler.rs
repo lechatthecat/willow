@@ -144,7 +144,7 @@ fn park_until_fatal_abort() -> ! {
 static TEST_SINGLE_WORKER: AtomicUsize = AtomicUsize::new(0);
 
 /// Test-only: make the worker config report a single worker while the guard is
-/// alive, so process-global drives take the single-threaded run loop.
+/// alive, so process-global drives dispatch to one persistent worker.
 ///
 /// `from_env_value` clamps every override up to `DEFAULT_WORKERS`, so a test
 /// cannot request a single-threaded drive through `WILLOW_WORKERS`. A test that
@@ -820,6 +820,18 @@ impl RuntimeScheduler {
     ) -> Option<(RuntimeCancelFn, *mut c_void)> {
         self.tasks
             .with_mut(id, |task| {
+                #[cfg(all(
+                    target_os = "linux",
+                    target_env = "gnu",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ))]
+                if task
+                    .native_stack
+                    .as_ref()
+                    .is_some_and(|stack| stack.is_suspended())
+                {
+                    return None;
+                }
                 if task.state.lifecycle() != TaskLifecycle::Cancelling {
                     return None;
                 }
@@ -1557,6 +1569,18 @@ fn finish_global_poll_boundary(id: RuntimeTaskId, boundary: GlobalPollBoundary) 
 fn take_global_cancel_work(id: RuntimeTaskId) -> Option<(RuntimeCancelFn, *mut c_void)> {
     global_task_table()
         .with_mut(id, |task| {
+            #[cfg(all(
+                target_os = "linux",
+                target_env = "gnu",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            if task
+                .native_stack
+                .as_ref()
+                .is_some_and(|stack| stack.is_suspended())
+            {
+                return None;
+            }
             if task.state.lifecycle() != TaskLifecycle::Cancelling {
                 return None;
             }
@@ -1595,7 +1619,7 @@ fn set_current_task_context(id: RuntimeTaskId, context: Arc<crate::panic_context
     crate::panic_context::replace_current_context(Some(context));
 }
 
-fn current_worker() -> usize {
+pub(crate) fn current_worker() -> usize {
     CURRENT_WORKER.with(Cell::get)
 }
 
@@ -2386,7 +2410,7 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instan
         crate::gc::willow_gc_register_mutator();
     }
     let active_workers = runtime_worker_config().active_workers();
-    let completed = if outermost && active_workers > 1 {
+    let completed = if outermost {
         willow_sched_run_parallel(target, active_workers, deadline)
     } else if let Some(state) = shared_state.as_deref() {
         scheduler_run_loop(target, current_worker(), Some(state), false, deadline)
@@ -2461,42 +2485,82 @@ struct ParallelRunState {
     completed: AtomicI64,
 }
 
+struct WorkerDrive {
+    target: Option<RuntimeTaskId>,
+    state: Arc<ParallelRunState>,
+    deadline: Option<Instant>,
+    finished: Arc<AtomicUsize>,
+}
+
+#[derive(Default)]
+struct PersistentWorkers {
+    senders: Vec<std::sync::mpsc::Sender<WorkerDrive>>,
+}
+
+static PERSISTENT_WORKERS: std::sync::LazyLock<Mutex<PersistentWorkers>> =
+    std::sync::LazyLock::new(|| Mutex::new(PersistentWorkers::default()));
+
 fn willow_sched_run_parallel(
     target: Option<RuntimeTaskId>,
     workers: usize,
     deadline: Option<Instant>,
 ) -> i64 {
+    // Hold drive ownership until all workers finish. Wait cooperatively because
+    // another driver may be collecting while this caller is a registered mutator.
+    let mut pool = loop {
+        match PERSISTENT_WORKERS.try_lock() {
+            Ok(pool) => break pool,
+            Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                crate::gc::willow_gc_safepoint();
+                std::thread::yield_now();
+            }
+        }
+    };
+    let mut workers = workers.max(1);
+    #[cfg(all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    for shard in &global_task_table().shards {
+        let tasks = shard.lock().unwrap_or_else(|error| error.into_inner());
+        for task in tasks.values() {
+            if let Some(stack) = task.native_stack.as_ref() {
+                workers = workers.max(stack.worker + 1);
+            }
+        }
+    }
+    while pool.senders.len() < workers {
+        let worker = pool.senders.len();
+        let (sender, receiver) = std::sync::mpsc::channel::<WorkerDrive>();
+        std::thread::Builder::new()
+            .name(format!("willow-worker-{worker}"))
+            .spawn(move || {
+                while let Ok(drive) = receiver.recv() {
+                    run_parallel_worker(worker, drive.target, drive.state, drive.deadline);
+                    drive.finished.fetch_add(1, Ordering::Release);
+                }
+            })
+            .expect("cannot start persistent scheduler worker");
+        pool.senders.push(sender);
+    }
     let state = Arc::new(ParallelRunState::default());
-    std::thread::scope(|scope| {
-        for worker in 1..workers {
-            let state = Arc::clone(&state);
-            scope.spawn(move || {
-                run_parallel_worker(worker, target, state, deadline);
-            });
-        }
-        let main_state = Arc::clone(&state);
-        with_parallel_context(0, main_state, || {
-            scheduler_run_loop(target, 0, Some(state.as_ref()), true, deadline);
-        });
-        state.stop.store(true, Ordering::Release);
-        // A worker can pass its loop-level stop check immediately before worker
-        // 0 publishes the stop. Synchronize with the claim gate so no task can
-        // become active after this barrier, then remain
-        // a cooperating mutator until every in-flight/nested poll has crossed
-        // its post-poll GC boundaries.
-        drop(
-            state
-                .claim_gate
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-        while state.active_polls.load(Ordering::Acquire) > 0
-            || state.paused_polls.load(Ordering::Acquire) > 0
-        {
-            crate::gc::willow_gc_safepoint();
-            std::thread::yield_now();
-        }
-    });
+    let finished = Arc::new(AtomicUsize::new(0));
+    for sender in pool.senders.iter().take(workers) {
+        sender
+            .send(WorkerDrive {
+                target,
+                state: Arc::clone(&state),
+                deadline,
+                finished: Arc::clone(&finished),
+            })
+            .expect("scheduler worker terminated");
+    }
+    while finished.load(Ordering::Acquire) < workers {
+        crate::gc::willow_gc_safepoint();
+        std::thread::yield_now();
+    }
     state.completed.load(Ordering::Acquire)
 }
 
@@ -2560,6 +2624,42 @@ fn record_completed_task(completed: &mut i64, shared: Option<&ParallelRunState>)
     }
 }
 
+fn task_requires_cancel_poll(task: &RuntimeTask) -> bool {
+    #[cfg(all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    if task
+        .native_stack
+        .as_ref()
+        .is_some_and(|stack| stack.is_suspended())
+    {
+        return true;
+    }
+    task.cancel.is_some() && !task.frame.is_null()
+}
+
+/// Run the async frame cleanup after native synchronous callers have unwound.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sync_poll_cancel_cleanup() {
+    let Some(id) = current_task_id() else {
+        return;
+    };
+    let cleanup = global_task_table()
+        .with_mut(id, |task| {
+            task.cancel.take().map(|cancel| (cancel, task.frame))
+        })
+        .flatten();
+    if let Some((cancel, frame)) = cleanup {
+        crate::preempt::willow_sync_cleanup_enter();
+        unsafe {
+            cancel(frame);
+        }
+        crate::preempt::willow_sync_cleanup_leave();
+    }
+}
+
 /// Pop/steal without the scheduler metadata mutex, then take only the task
 /// shard needed for atomic state validation and task-work lookup (willow-8agm).
 fn claim_global_ready_for_worker(
@@ -2580,6 +2680,22 @@ fn claim_global_ready_for_worker(
         // a requeue (willow-atth).
         let _in_flight = ClaimInFlight::enter();
         let id = queues.pop_for_worker(worker)?;
+        #[cfg(all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        if let Some(owner) = tasks
+            .with(id, |task| {
+                task.native_stack.as_ref().map(|stack| stack.worker)
+            })
+            .flatten()
+        {
+            if owner != worker {
+                queues.push_local(owner, id);
+                return None;
+            }
+        }
         let claim_guard = shared.map(|state| {
             state
                 .claim_gate
@@ -2603,13 +2719,11 @@ fn claim_global_ready_for_worker(
                         task.panic_context(),
                     )
                 }
-                ClaimOutcome::Cancel if task.cancel.is_some() && !task.frame.is_null() => {
-                    Claim::Work(
-                        task.poll
-                            .map(|poll| (poll, task.frame, task.preempt_flag_ptr())),
-                        task.panic_context(),
-                    )
-                }
+                ClaimOutcome::Cancel if task_requires_cancel_poll(task) => Claim::Work(
+                    task.poll
+                        .map(|poll| (poll, task.frame, task.preempt_flag_ptr())),
+                    task.panic_context(),
+                ),
                 ClaimOutcome::Cancel => Claim::FinalizeCancelled,
             })
             .unwrap_or(Claim::Drop);
@@ -2985,7 +3099,45 @@ fn scheduler_run_loop(
         // (willow-vynv.3). The frame stays rooted until finalization.
         let cancel_work = take_global_cancel_work(id);
         if let Some((cancel_fn, cancel_frame)) = cancel_work {
-            unsafe { cancel_fn(cancel_frame) };
+            #[cfg(all(
+                target_os = "linux",
+                target_env = "gnu",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            {
+                let mut stack =
+                    crate::native_stack::NativeStack::acquire_cleanup(cancel_fn, cancel_frame);
+                let flag = global_task_table()
+                    .with(id, RuntimeTask::preempt_flag_ptr)
+                    .unwrap_or(std::ptr::null());
+                crate::preempt::willow_preempt_begin(flag);
+                unsafe {
+                    crate::native_stack::NativeStack::resume(&mut *stack);
+                }
+                crate::preempt::willow_preempt_end();
+                if stack.is_suspended() {
+                    global_task_table().with_mut(id, |task| task.native_stack = Some(stack));
+                    finish_global_poll_boundary(id, GlobalPollBoundary::Runnable);
+                    crate::observability::record(
+                        crate::observability::RuntimeEventKind::TaskPreempt,
+                        Some(worker),
+                        id,
+                        i64::from(RUNTIME_POLL_PREEMPTED),
+                    );
+                    set_current_task(None);
+                    finish_active_poll(shared);
+                    continue;
+                }
+                crate::native_stack::NativeStack::recycle(stack);
+            }
+            #[cfg(not(all(
+                target_os = "linux",
+                target_env = "gnu",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )))]
+            unsafe {
+                cancel_fn(cancel_frame)
+            };
             let cleanup_panicked = crate::panic_context::willow_panic_active() != 0;
             let panic_chain = cleanup_panicked.then(async_chain_text);
             if cleanup_panicked {
@@ -3048,13 +3200,56 @@ fn scheduler_run_loop(
             0,
         );
         crate::preempt::willow_preempt_begin(preempt_flag);
-        let result = unsafe { poll(frame) };
+        #[cfg(all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        let (result, native_cancelled) = {
+            let mut stack = global_task_table()
+                .with_mut(id, |task| task.native_stack.take())
+                .flatten()
+                .unwrap_or_else(|| crate::native_stack::NativeStack::acquire(poll, frame));
+            let result = unsafe { crate::native_stack::NativeStack::resume(&mut *stack) };
+            let cancelled = stack.is_cancelled();
+            if stack.is_suspended() {
+                global_task_table().with_mut(id, |task| task.native_stack = Some(stack));
+            } else {
+                crate::native_stack::NativeStack::recycle(stack);
+            }
+            (result, cancelled)
+        };
+        #[cfg(not(all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        let (result, native_cancelled) = (unsafe { poll(frame) }, false);
         crate::preempt::willow_preempt_end();
+        // Native runtime polls (e.g. parallel-map chunks) need not implement
+        // the generated async cancellation epilogue. Preserve their registered
+        // cleanup callback and requeue into the ordinary cancellation entry.
+        let result = if native_cancelled
+            && result != RUNTIME_POLL_PANICKED
+            && global_task_table()
+                .with(id, |task| task.cancel.is_some())
+                .unwrap_or(false)
+        {
+            RUNTIME_POLL_PREEMPTED
+        } else {
+            result
+        };
         let outcome = classify_poll_result(result);
         let fatal_chain = matches!(outcome, PollOutcome::Panicked | PollOutcome::Invalid(_))
             .then(async_chain_text);
         match outcome {
-            PollOutcome::Ready => with_global(|sched| sched.complete(id)),
+            PollOutcome::Ready => with_global(|sched| {
+                if native_cancelled {
+                    sched.finalize_cancelled(id);
+                } else {
+                    sched.complete(id);
+                }
+            }),
             PollOutcome::Yield | PollOutcome::Preempted => {
                 // Runnable outcome (spec §7): gave up the worker but is not
                 // waiting on an event. This hot boundary stays off the global
@@ -4730,33 +4925,24 @@ mod tests {
     }
 
     #[test]
-    fn single_worker_guard_polls_on_the_calling_thread() {
-        thread_local! {
-            static IS_DRIVER_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-        }
-        static POLLED_ON_DRIVER: AtomicBool = AtomicBool::new(false);
-        static POLLED_AT_ALL: AtomicBool = AtomicBool::new(false);
-
+    fn single_worker_guard_reuses_the_same_os_worker_across_drives() {
+        static THREADS: TestMutex<Vec<std::thread::ThreadId>> = TestMutex::new(Vec::new());
         unsafe extern "C" fn poll_records_thread(_frame: *mut c_void) -> i32 {
-            POLLED_AT_ALL.store(true, Ordering::Release);
-            POLLED_ON_DRIVER.store(IS_DRIVER_THREAD.with(|f| f.get()), Ordering::Release);
+            THREADS.lock().unwrap().push(std::thread::current().id());
             RUNTIME_POLL_READY
         }
-
         let _guard = runtime_test_guard();
         let _single = single_worker_for_test();
         reset_global_scheduler_for_test();
-        IS_DRIVER_THREAD.with(|f| f.set(true));
-        POLLED_ON_DRIVER.store(false, Ordering::Release);
-        POLLED_AT_ALL.store(false, Ordering::Release);
-
-        let id = willow_sched_spawn(poll_records_thread, std::ptr::null_mut());
-        // Perspective 11: an ordinary ready task still completes and counts.
-        assert_eq!(willow_sched_run_until(id), 1, "perspective 11");
-        assert!(POLLED_AT_ALL.load(Ordering::Acquire));
-        // Perspective 10: the poll ran inline, not on a pool worker thread.
-        assert!(POLLED_ON_DRIVER.load(Ordering::Acquire), "perspective 10");
-        IS_DRIVER_THREAD.with(|f| f.set(false));
+        THREADS.lock().unwrap().clear();
+        for _ in 0..2 {
+            let id = willow_sched_spawn(poll_records_thread, std::ptr::null_mut());
+            assert_eq!(willow_sched_run_until(id), 1);
+        }
+        let threads = THREADS.lock().unwrap();
+        assert_eq!(threads.len(), 2);
+        assert_eq!(threads[0], threads[1]);
+        assert_ne!(threads[0], std::thread::current().id());
     }
 
     #[test]

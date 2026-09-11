@@ -277,6 +277,13 @@ impl AsyncMutex {
         if self.validated_state().owner() != Some((task, token)) {
             return false;
         }
+        if self.is_ref {
+            crate::gc::willow_gc_write_barrier(
+                self as *const Self as *mut u8,
+                value as *mut u8,
+                crate::gc::GcStoreDestination::AsyncMutexCell as i64,
+            );
+        }
         self.value.store(value, Ordering::Release);
         true
     }
@@ -444,6 +451,13 @@ pub const MUTEX_STATUS_CANCELLED: i32 = willow_abi::LockAcquireStatus::Cancelled
 pub const MUTEX_STATUS_PHASE_ACQUIRE: i32 = willow_abi::LockStatusPhase::Acquire as i32;
 pub const MUTEX_STATUS_PHASE_POLL: i32 = willow_abi::LockStatusPhase::Poll as i32;
 
+unsafe fn snapshot_async_mutex(payload: *mut u8, children: &mut Vec<*mut u8>) {
+    let value = unsafe { &*(payload as *const AsyncMutex) };
+    if value.is_ref {
+        children.push(value.value.load(Ordering::Acquire) as *mut u8);
+    }
+}
+
 unsafe fn trace_async_mutex(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     let mutex = unsafe { &*(payload as *const AsyncMutex) };
     mutex.validated_state();
@@ -473,7 +487,8 @@ const ASYNC_MUTEX_GC_TYPES: &[crate::gc::NativeGcType] = &[crate::gc::NativeGcTy
     ASYNC_MUTEX_TYPE_ID,
     Some(trace_async_mutex),
     Some(drop_async_mutex),
-)];
+)
+.with_concurrent_trace(snapshot_async_mutex)];
 
 fn ensure_async_mutex_registered() {
     ASYNC_MUTEX_REGISTRATION.ensure(ASYNC_MUTEX_GC_TYPES);

@@ -2286,7 +2286,7 @@ async fn main() {
 
 #[test]
 fn test_looping_sync_helper_in_task_context_reports_e0810() {
-    assert_compile_error_contains(
+    assert_sync_preemption_capability(
         r#"
 fn heavy(n: i64) -> i64 {
     let mut i = 0;
@@ -2321,7 +2321,7 @@ async fn main() {
 
 #[test]
 fn test_typed_receiver_looping_method_reports_e0810() {
-    assert_compile_error_contains(
+    assert_sync_preemption_capability(
         r#"
 class Work {
     pub fn heavy(self, n: i64) -> i64 {
@@ -2347,7 +2347,7 @@ async fn run(w: Work) -> i64 {
 
 #[test]
 fn test_typed_receiver_transitive_looping_method_reports_e0810() {
-    assert_compile_error_contains(
+    assert_sync_preemption_capability(
         r#"
 class Work {
     pub fn heavy(self, n: i64) -> i64 {
@@ -2375,7 +2375,7 @@ async fn run(w: Work) -> i64 {
 
 #[test]
 fn test_typed_receiver_looping_method_via_local_reports_e0810() {
-    assert_compile_error_contains(
+    assert_sync_preemption_capability(
         r#"
 class Work {
     pub init(self) {}
@@ -2455,6 +2455,7 @@ fn main() {
     assert_eq!(out, "3\n");
 }
 
+#[cfg(not(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 #[test]
 fn test_self_looping_method_reports_single_e0810() {
     // `self.heavy()` is handled by the AST-level ConcurrencyAnalyzer; the
@@ -2487,7 +2488,7 @@ class Work {
 fn test_typed_receiver_inherited_looping_method_reports_e0810() {
     // The looping method is INHERITED from `Base`; calling it through a
     // `Derived` receiver must still be flagged, attributed to `Base::heavy`.
-    assert_compile_error_contains(
+    assert_sync_preemption_capability(
         r#"
 open class Base {
     pub fn heavy(self, n: i64) -> i64 {
@@ -2552,6 +2553,7 @@ async fn main() {
 // through a typed receiver in a task context, is flagged with a module note
 // (willow-0a6k.2). The receiver-class key differs by import style.
 
+#[cfg(not(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 #[test]
 fn test_cross_module_typed_receiver_item_import_reports_e0810() {
     let m = r#"
@@ -2590,6 +2592,7 @@ fn main() {
     }
 }
 
+#[cfg(not(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 #[test]
 fn test_cross_module_typed_receiver_whole_module_import_reports_e0810() {
     let m = r#"
@@ -2659,6 +2662,7 @@ async fn main() {
 // the absence of false positives for loop-free module helpers.
 // ---------------------------------------------------------------------------
 
+#[cfg(not(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 #[test]
 fn test_module_async_fn_calling_looping_helper_reports_e0810() {
     let worker = r#"
@@ -2700,6 +2704,7 @@ fn main() {
     }
 }
 
+#[cfg(not(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 #[test]
 fn test_module_transitive_looping_helper_reports_e0810() {
     let worker = r#"
@@ -2767,6 +2772,7 @@ fn main() {
     assert_eq!(out, "1\n");
 }
 
+#[cfg(not(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 #[test]
 fn test_entry_async_calling_module_looping_helper_reports_e0810() {
     let worker = r#"
@@ -2805,6 +2811,7 @@ async fn main() {
     }
 }
 
+#[cfg(not(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 #[test]
 fn test_entry_async_calling_module_transitive_helper_reports_e0810() {
     let worker = r#"
@@ -2868,6 +2875,7 @@ async fn main() {
     assert_eq!(out, "42\n");
 }
 
+#[cfg(not(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 #[test]
 fn test_item_imported_looping_helper_from_async_reports_e0810() {
     let worker = r#"
@@ -2931,6 +2939,7 @@ async fn main() {
     assert_eq!(out, "42\n");
 }
 
+#[cfg(not(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 #[test]
 fn test_module_to_module_looping_call_from_async_reports_e0810() {
     // main -> a (async) -> b::heavy (looping). The call lives in module `a`, so
@@ -5032,6 +5041,7 @@ fn psp_04_fn_value_cannot_enter_task() {
     assert!(stderr.contains("E2402"), "{stderr}");
 }
 
+#[cfg(not(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 #[test]
 fn psp_05_sync_helper_loop_rejected() {
     let (ok, stderr) = compile_with_compiler_env(
@@ -5086,6 +5096,7 @@ fn psp_07_call_boundary_safepoints() {
     assert_eq!(out, "7\n");
 }
 
+#[cfg(not(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 #[test]
 fn psp_07b_recursive_sync_helper_rejected() {
     // Stage A-prime (willow-38w.2.1): recursion contains no loop but still runs
@@ -8578,6 +8589,7 @@ async fn main() {
 /// helper cannot run in task context — and that is the point: the two analyses
 /// now share one fixpoint and must still reach *different* conclusions about
 /// the same cycle.
+#[cfg(not(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 #[test]
 fn lock_lower_47_a_pure_recursive_cycle_is_still_provably_wait_free() {
     let stderr = compile_error_stderr(
@@ -8655,7 +8667,7 @@ async fn main() {
 /// recursive helper into a phantom `while`.
 #[test]
 fn lock_lower_49_recursion_witness_survives_the_shared_fixpoint() {
-    assert_compile_error_contains(
+    assert_sync_preemption_capability(
         r#"
 fn fib(n: i64) -> i64 {
     if n <= 1 {
@@ -8677,7 +8689,7 @@ async fn main() {
 /// `min`, which is what preserves the long-standing wording.
 #[test]
 fn lock_lower_50_loop_dominates_recursion_in_the_witness_join() {
-    assert_compile_error_contains(
+    assert_sync_preemption_capability(
         r#"
 fn spin(n: i64) -> i64 {
     if n <= 0 {
@@ -9632,4 +9644,16 @@ async fn main() {
     assert!(out.contains("[task]"), "{out}");
     assert!(out.contains("event=task_cancel_requested"), "{out}");
     assert!(out.contains("event=task_cancelled"), "{out}");
+}
+
+// The same source remains rejected on runtimes without native task stacks.
+fn assert_sync_preemption_capability(source: &str, expected: &[&str]) {
+    if cfg!(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64"))) {
+        let source = if source.contains("fn main(") { source.to_owned() }
+            else { format!("{source}\nfn main() {{}}") };
+        let (ok, diagnostics) = compile_with_compiler_env(&source, &[]);
+        assert!(ok, "{diagnostics}");
+    } else {
+        assert_compile_error_contains(source, expected);
+    }
 }

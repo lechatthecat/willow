@@ -14,36 +14,18 @@ use super::*;
 /// builtin generics (Array/Map/Result/Option/Channel/Future/...) and primitives
 /// untouched. Used so a module function signature that references one of its own
 /// types resolves in the importing file (willow-1js.5).
-#[willow_continuations::function(qualify_local_type, rename_imported_type, rename_module_prefix)]
 pub(crate) fn qualify_local_type(
     ty: &Type,
     module: &str,
     local: &std::collections::HashSet<String>,
 ) -> Type {
-    let qualify_name = |n: &str| -> String {
-        if !n.contains("::") && local.contains(n) {
-            format!("{module}::{n}")
+    ty.map_names(|name| {
+        if !name.contains("::") && local.contains(name) {
+            format!("{module}::{name}")
         } else {
-            n.to_string()
+            name.clone()
         }
-    };
-    match ty {
-        Type::Named(n) => Type::Named(qualify_name(n)),
-        Type::Generic(n, args) => Type::Generic(
-            qualify_name(n),
-            args.iter()
-                .map(|a| qualify_local_type(a, module, local))
-                .collect(),
-        ),
-        Type::Array(e) => Type::Array(Box::new(qualify_local_type(e, module, local))),
-        Type::Fn(ps, r) => Type::Fn(
-            ps.iter()
-                .map(|p| qualify_local_type(p, module, local))
-                .collect(),
-            Box::new(qualify_local_type(r, module, local)),
-        ),
-        _ => ty.clone(),
-    }
+    })
 }
 
 /// Replace type names a module reached through its OWN item imports with the
@@ -52,27 +34,8 @@ pub(crate) fn qualify_local_type(
 /// only the enum's build-wide identity is a name both units answer to
 /// (willow-0g8j.3). Complements [`qualify_local_type`], which does the same job
 /// for the names a module DECLARES.
-#[willow_continuations::function(qualify_local_type, rename_imported_type, rename_module_prefix)]
 fn rename_imported_type(ty: &Type, renames: &HashMap<String, String>) -> Type {
-    let rename_name =
-        |n: &str| -> String { renames.get(n).cloned().unwrap_or_else(|| n.to_string()) };
-    match ty {
-        Type::Named(n) => Type::Named(rename_name(n)),
-        Type::Generic(n, args) => Type::Generic(
-            rename_name(n),
-            args.iter()
-                .map(|a| rename_imported_type(a, renames))
-                .collect(),
-        ),
-        Type::Array(e) => Type::Array(Box::new(rename_imported_type(e, renames))),
-        Type::Fn(ps, r) => Type::Fn(
-            ps.iter()
-                .map(|p| rename_imported_type(p, renames))
-                .collect(),
-            Box::new(rename_imported_type(r, renames)),
-        ),
-        _ => ty.clone(),
-    }
+    ty.map_names(|name| renames.get(name).cloned().unwrap_or_else(|| name.clone()))
 }
 
 /// Translate a module-qualified path out of the spelling the module that WROTE
@@ -84,34 +47,14 @@ fn rename_imported_type(ty: &Type, renames: &HashMap<String, String>) -> Type {
 /// nothing here, and the two spellings made one class into two types
 /// (willow-uvlp). Only the leading segment is rewritten: what follows it is the
 /// type's own name, which every unit spells the same way.
-#[willow_continuations::function(qualify_local_type, rename_imported_type, rename_module_prefix)]
 fn rename_module_prefix(ty: &Type, prefixes: &HashMap<String, String>) -> Type {
-    let rename_name = |n: &str| -> String {
-        match n.split_once("::") {
-            Some((module, item)) => match prefixes.get(module) {
-                Some(registered) => format!("{registered}::{item}"),
-                None => n.to_string(),
-            },
-            None => n.to_string(),
-        }
-    };
-    match ty {
-        Type::Named(n) => Type::Named(rename_name(n)),
-        Type::Generic(n, args) => Type::Generic(
-            rename_name(n),
-            args.iter()
-                .map(|a| rename_module_prefix(a, prefixes))
-                .collect(),
-        ),
-        Type::Array(e) => Type::Array(Box::new(rename_module_prefix(e, prefixes))),
-        Type::Fn(ps, r) => Type::Fn(
-            ps.iter()
-                .map(|p| rename_module_prefix(p, prefixes))
-                .collect(),
-            Box::new(rename_module_prefix(r, prefixes)),
-        ),
-        _ => ty.clone(),
-    }
+    ty.map_names(|name| match name.split_once("::") {
+        Some((module, item)) => prefixes
+            .get(module)
+            .map(|registered| format!("{registered}::{item}"))
+            .unwrap_or_else(|| name.clone()),
+        None => name.clone(),
+    })
 }
 
 /// How much of a module one registration brings into a checker.
@@ -2520,5 +2463,39 @@ impl TypeChecker {
             }
             _ => ty.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod iterative_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn deep_module_signature_resolution_includes_closures() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let mut ty = Type::Named("Item".into());
+                for i in 0..50_000 {
+                    ty = if i % 2 == 0 {
+                        Type::Array(Box::new(ty))
+                    } else {
+                        Type::Closure(vec![], Box::new(ty))
+                    };
+                }
+                let qualified = qualify_local_type(&ty, "local", &HashSet::from(["Item".into()]));
+                let renamed = rename_module_prefix(
+                    &qualified,
+                    &HashMap::from([("local".into(), "canonical".into())]),
+                );
+                let imported = rename_imported_type(
+                    &renamed,
+                    &HashMap::from([("canonical::Item".into(), "Resolved".into())]),
+                );
+                assert_eq!(imported, ty.map_names(|_| "Resolved".to_string()));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

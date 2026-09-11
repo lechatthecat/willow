@@ -1,9 +1,10 @@
 # GC telemetry V1
 
 The runtime exports `willow_gc_stats_snapshot_v1(WillowGcStatsV1 *out)` and
-`willow_runtime::gc_telemetry::snapshot()`. These measure the current minor and
-major stop-the-world collectors and provide the observation window needed by
-future pacing work. They do not change collection policy.
+`willow_runtime::gc_telemetry::snapshot()`. These measure the current
+minor stop-the-world and concurrent major collectors. Major cycles use an
+initial root/index stop, concurrent live-heap traversal, and a final remark/sweep
+stop. Allocation assistance and growth pacing use the same work accounting.
 
 The C declaration is in
 [`willow_gc_stats.h`](../crates/willow_runtime/include/willow_gc_stats.h).
@@ -23,19 +24,20 @@ records `(Ptr) -> I32`, with no GC allocation or safepoint effect.
 | `minor_cycles`, `major_cycles` | Completed cycles, consistent with their pause histogram counts. |
 | `marked_bytes` | Cumulative header plus payload bytes of objects visited, once per object per traversal. A minor cycle includes remembered old objects it scans. |
 | `scanned_bytes` | Reference slots inspected, including null references, multiplied by pointer width. Custom trace callbacks contribute their non-null slot addresses. |
-| `root_scan_bytes` | Non-null root addresses submitted to tracing, multiplied by pointer width. Duplicate roots count here but do not double-count object traversal. This is not the size of all allocated root-stack slots. |
+| `root_scan_bytes` | Non-null root addresses submitted to tracing, multiplied by pointer width. Initial and remark root scans both count; duplicate roots count here but do not double-count object traversal. This is not the size of all allocated root-stack slots. |
 | `mark_ns` | Elapsed traversal time. Minor traversal includes pinning, scanning and copying, but excludes nursery inventory construction and sweeping. This is elapsed time, not CPU time. |
 | `pauses`, `minor_pauses`, `major_pauses` | Count, cumulative nanoseconds, maximum, and 65 logarithmic buckets. Bucket 0 is zero; bucket b > 0 is `[2^(b-1), 2^b)` ns. |
-| `last_cycle` | Complete most recent cycle: identity, kind, timestamps, latency, work, occupied bytes before/after and their reclaimed difference. |
+| `last_cycle` | Complete most recent cycle: identity, kind, timestamps, latency, work, occupied bytes before/after and actual swept bytes. Concurrent allocations can offset reclamation in the before/after difference. |
 | `last_major_cycle` | Most recent whole-heap liveness measurement. A minor cycle leaves this record intact. |
-| `phase`, `epoch` | Coherent cycle state: phase 0 = idle, 1 = minor STW, 2 = major STW. Epoch advances for elected collections; skipped collection requests do not create cycles. |
+| `phase`, `epoch` | Coherent cycle state: phase 0 = idle, 1 = minor STW, 2 = major cycle (including concurrent traversal). Epoch advances for elected collections; skipped collection requests do not create cycles. |
 | `reset_generation` | Advances on runtime reset. Cumulative counters reset together. `GcRates::between` rejects windows across resets. |
 | `process_resident_bytes`, `resident_valid` | Best-effort process RSS, including memory outside the GC. Only the C snapshot samples the OS. |
 | `trace_errors` | Process-lifetime failed trace opens/writes/flushes. A failed sink is disabled after one failure. |
 
 Occupied bytes include unreachable objects until a collection discovers them.
-`last_major_cycle.heap_after_bytes` is measured live storage at the end of that
-major collection. A minor cycle's retained storage includes old objects that the
+`last_major_cycle.heap_after_bytes` is retained storage at the end of that
+major collection. It includes newly allocated objects and floating garbage
+conservatively retained by the insertion barrier until a later cycle. A minor cycle's retained storage includes old objects that the
 minor collector did not collect. Those quantities are not interchangeable.
 
 Reservations include GC region/TLAB backing storage; they exclude Rust container
@@ -44,10 +46,11 @@ backing storage with `alloc_zeroed`, so allocator commitment equals reservation.
 Neither is process RSS. Released bytes mean returned to the allocator, not a
 promise that the OS has reclaimed those pages.
 
-A pause spans the elected collection, including safepoint handshake and root
-preparation, through world resumption. Trace I/O is outside this interval. This
-is the maximum affected-mutator interval, not just the interval when every
-mutator is simultaneously parked.
+Minor pause time spans the elected collection. Major pause time is the sum of
+the initial and remark/sweep stops, including their safepoint handshakes and
+root preparation. Concurrent traversal is excluded, so `mark_ns` can exceed
+`pause_ns`. Histograms contain one summed pause sample per cycle. Trace I/O is
+outside these intervals.
 
 Heap fields are captured together under the existing heap mutex; cycle fields
 are captured together under a separate telemetry mutex. The two groups may
@@ -65,9 +68,38 @@ runtime call. Traversal work accumulates locally and publishes once per cycle.
 bytes/second over the observation window, and mark bytes/second of traversal.
 It rejects zero/reversed windows, unknown versions and reset/decreasing-counter
 windows. `snapshot()` omits OS RSS sampling so a future controller can poll it
-without filesystem or platform calls. Concurrent marking, assist debt/latency,
-CPU accounting and memory-limit policy require their own implementation before
-measurements for those features can be defined.
+without filesystem or platform calls. Assist work contributes to graph work;
+V1 does not report separate assist latency or CPU time.
+
+## Concurrent marking and allocation policy
+
+Generated GC-reference stores publish atomically after an incremental-update
+barrier. The barrier queues every new candidate reference, including old-to-old
+edges; its generational remembered-set behavior remains in place. Runtime maps
+and channels snapshot child values while holding their own locks, and arrays,
+frames and lock cells publish references atomically. The initial stop copies
+allocation metadata, not heap graph edges. Allocations after that snapshot are
+excluded from the current sweep. Legacy extension trace callbacks without a
+concurrent snapshot hook execute during remark under their existing STW contract.
+
+An elected collector owns the epoch through both stops and sweep. Allocation
+and TLAB-refill slow paths assist up to eight queued objects. Before termination,
+all mutators (including assistants) park, local queues flush, roots are rescanned,
+and outstanding work drains to zero. Minor relocation cannot overlap a major
+epoch. The next automatic major trigger is twice retained occupied bytes with
+a 1 MiB floor, capped at 75% of the configured region budget.
+
+`WILLOW_GC_MEMORY_LIMIT` optionally sets a positive decimal byte count limiting
+GC-owned old-region and nursery-TLAB reservations. It is checked before obtaining
+new backing regions. Reservation pressure first attempts collection, or cooperates
+with an already active epoch, then retries. An exhausted allocation budget reports `runtime fatal: GC
+memory limit exceeded` and exits with status 1 before an unchecked generated
+caller can dereference a null result.
+Old regular regions use 256 KiB and nursery TLAB chunks use 32 KiB;
+budgets below the corresponding region size cannot serve that allocation path. Existing region free spans can still be reused. Minor collection pins survivors
+in place when the budget cannot fund evacuation storage. This cap excludes native
+task stacks (including their mmap reservations), Rust map/channel buffers,
+allocator metadata and all other non-GC memory; it is not an RSS limit.
 
 ## Cycle trace
 

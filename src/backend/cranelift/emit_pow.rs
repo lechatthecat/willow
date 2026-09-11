@@ -6,14 +6,9 @@
 //! multiplication is a Cranelift `imul`, so overflow wraps modulo 2^64 exactly
 //! like an ordinary Willow `*`.
 //!
-//! "Literal" is meant strictly. The unroll decision reads the Cranelift
-//! definition of the already-emitted exponent and fires only when that
-//! definition is an `iconst`, which today means an integer literal wrote it.
-//! There is no constant-folding pass in this compiler, so a constant
-//! *expression* such as `x ** (1 + 2)` is an `iadd` at this point and takes the
-//! dynamic path — same result, one loop instead of two `imul`s. Widening the
-//! unroll to folded expressions needs a folding pass first; when one lands,
-//! this decision picks it up with no change here.
+//! The unroll decision reads the already-emitted exponent's `iconst`.
+//! LIR constant folding reduces pure integer expressions first, so both `3`
+//! and `(1 + 2)` select the multiplication chain without backend AST analysis.
 //!
 //! A negative exponent has no integer result. Negative literals are rejected by
 //! the type checker (E0204); every other negative enters the normal language
@@ -77,9 +72,7 @@ pub(crate) fn pow_unroll_imul_count(steps: &[PowStep]) -> usize {
 /// Is `value` an `iconst`, and if so what does it hold?
 ///
 /// Inspect the emitted definition to make the unroll decision. This recognizes
-/// exactly what an earlier stage already reduced to an `iconst` —
-/// today only an integer literal, since nothing folds constant expressions, so
-/// `x ** (1 + 2)` answers `None` here and takes the dynamic path.
+/// literals and integer expressions reduced by LIR constant folding.
 pub(crate) fn const_i64_operand(builder: &FunctionBuilder, value: Value) -> Option<i64> {
     let dfg = &builder.func.dfg;
     let ValueDef::Result(inst, 0) = dfg.value_def(value) else {

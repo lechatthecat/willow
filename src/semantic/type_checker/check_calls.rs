@@ -582,7 +582,7 @@ impl TypeChecker {
     /// AST-level `ConcurrencyAnalyzer`; this covers the typed-receiver case it
     /// cannot resolve, so the two never overlap (willow-0a6k.2).
     pub(super) fn check_task_method_call(&mut self, obj_ty: &Type, m: &MethodCallExpr) {
-        if !self.current_async_context {
+        if self.task_sync_preemption || !self.current_async_context {
             return;
         }
         if matches!(&m.object, Expr::Var(name, _, _) if name == "self") {

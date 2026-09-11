@@ -184,3 +184,10 @@ mod gc_scalable_bitmap;
 
 #[path = "integration/native_stack_overflow.rs"]
 mod native_stack_overflow;
+
+#[path = "integration/lir_constant_folding.rs"]
+mod lir_constant_folding;
+
+#[cfg(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[path = "integration/native_sync_stack.rs"]
+mod native_sync_stack;

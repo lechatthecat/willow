@@ -561,3 +561,70 @@ mod tests {
         willow_preempt_flag_free(flag);
     }
 }
+
+/// Native-stack counterpart of the async poll safepoint. Cancellation returns
+/// through compiler-generated cleanup edges; yielding preserves the call chain.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sync_safepoint() -> i32 {
+    #[cfg(all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    {
+        if crate::native_stack::cancelled() != 0 {
+            return 1;
+        }
+        crate::gc::willow_gc_safepoint();
+        if willow_preempt_check() != 0 {
+            crate::native_stack::suspend();
+        }
+        return crate::native_stack::cancelled();
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sync_cancelled() -> i32 {
+    #[cfg(all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    {
+        crate::native_stack::cancelled()
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    {
+        0
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sync_cleanup_enter() {
+    #[cfg(all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    crate::native_stack::cleanup_enter();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sync_cleanup_leave() {
+    #[cfg(all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    crate::native_stack::cleanup_leave();
+}

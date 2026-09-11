@@ -440,6 +440,20 @@ unsafe fn trace_task_scope(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     handle.core.trace_frames(slots);
 }
 
+unsafe fn snapshot_task_scope(payload: *mut u8, children: &mut Vec<*mut u8>) {
+    let mut slots = Vec::new();
+    // ScopeCore retains root cells until finalization; logical release is an
+    // atomic null store, so slot lifetime extends beyond these traversal locks.
+    unsafe {
+        trace_task_scope(payload, &mut slots);
+    }
+    children.extend(
+        slots
+            .into_iter()
+            .map(|slot| unsafe { crate::gc::load_gc_reference(slot) }),
+    );
+}
+
 unsafe fn drop_cancellation_token(payload: *mut u8) {
     unsafe { std::ptr::drop_in_place(payload.cast::<CancellationTokenHandle>()) };
 }
@@ -460,7 +474,8 @@ const CANCELLATION_GC_TYPES: &[crate::gc::NativeGcType] = &[
         TASK_SCOPE_TYPE_ID,
         Some(trace_task_scope),
         Some(drop_task_scope),
-    ),
+    )
+    .with_concurrent_trace(snapshot_task_scope),
 ];
 
 fn ensure_registered() {

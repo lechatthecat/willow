@@ -155,6 +155,13 @@ impl AsyncRwLock {
         if self.validated_state().active_access(task, token) != Some(LockAccess::Write) {
             return false;
         }
+        if self.is_ref {
+            crate::gc::willow_gc_write_barrier(
+                self as *const Self as *mut u8,
+                value as *mut u8,
+                crate::gc::GcStoreDestination::AsyncRwLockCell as i64,
+            );
+        }
         self.value.store(value, Ordering::Release);
         true
     }
@@ -211,6 +218,13 @@ impl AsyncRwLock {
     }
 }
 
+unsafe fn snapshot_async_rwlock(payload: *mut u8, children: &mut Vec<*mut u8>) {
+    let value = unsafe { &*(payload as *const AsyncRwLock) };
+    if value.is_ref {
+        children.push(value.value.load(Ordering::Acquire) as *mut u8);
+    }
+}
+
 unsafe fn trace_async_rwlock(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     let lock = unsafe { &*(payload as *const AsyncRwLock) };
     lock.validated_state();
@@ -239,7 +253,8 @@ const ASYNC_RWLOCK_GC_TYPES: &[crate::gc::NativeGcType] = &[crate::gc::NativeGcT
     ASYNC_RWLOCK_TYPE_ID,
     Some(trace_async_rwlock),
     Some(drop_async_rwlock),
-)];
+)
+.with_concurrent_trace(snapshot_async_rwlock)];
 
 fn ensure_async_rwlock_registered() {
     ASYNC_RWLOCK_REGISTRATION.ensure(ASYNC_RWLOCK_GC_TYPES);

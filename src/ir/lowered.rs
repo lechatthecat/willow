@@ -11,9 +11,10 @@
 //!         variable (index-based for arrays, bound-based for ranges)
 //! ```
 //!
-//! Expressions stay as typed [`HirExpr`] trees inside instructions; lowering
-//! expression-level control flow (ternary, `match`, short-circuit operators)
-//! into blocks is the backend's job. Every user body, including static
+//! Root ternary, `match`, and short-circuit expressions become explicit CFG.
+//! Other expressions still use typed [`HirExpr`] trees inside instructions;
+//! nested expression control flow remains a backend responsibility.
+//! Every user body, including static
 //! initializers, is emitted from this IR (`backend::cranelift::lir_gen`).
 //! Unsupported lowering is diagnosed; `--emit-lir` renders the lowered program.
 
@@ -29,37 +30,40 @@ use super::typed_ast::{
 };
 
 pub mod async_liveness;
+pub mod value;
+mod lifetime;
+pub use value::{LirOperand, LirPlace, LirRvalue};
 
 use async_liveness::LirAsyncFrameLayout;
 
 /// A whole program in lowered IR.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LirProgram {
-    pub functions: Vec<LirFunction>,
+pub(crate) struct SourceProgram {
+    pub functions: Vec<SourceFunction>,
     /// Lambda bodies, lifted out of the expressions that contain them
     /// (willow-0g8j.2.2). They are kept apart from `functions` because the LIR
     /// cannot name them: the backend assigns each lambda its `$lambda.N`
     /// symbol, so the pairing is by span and the name is filled in there.
-    pub lambdas: Vec<LirLambda>,
+    pub lambdas: Vec<SourceLambda>,
 }
 
 /// One lifted lambda body, keyed by the span of the lambda expression it came
 /// from — the same key the backend's own lambda table uses.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LirLambda {
+pub(crate) struct SourceLambda {
     pub id: ExprId,
     pub span: Span,
-    pub function: LirFunction,
+    pub function: SourceFunction,
 }
 
 /// One function as a basic-block graph. `blocks[0]` is the entry block.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LirFunction {
+pub(crate) struct SourceFunction {
     pub name: FunctionId,
     pub is_async: bool,
     pub params: Vec<HirParam>,
     pub return_type: Type,
-    pub blocks: Vec<LirBlock>,
+    pub blocks: Vec<SourceBlock>,
     /// Stable identities for parameters, source locals, and LIR-synthesized
     /// temporaries. Source spans are diagnostic metadata only.
     pub locals: Vec<LirLocal>,
@@ -86,7 +90,36 @@ pub struct LirCapture {
     pub source: String,
 }
 
-impl LirFunction {
+impl SourceFunction {
+    /// Visit executable expression roots, including deferred statement bodies.
+    /// Consumers decide whether to descend into each expression's operands.
+    pub(crate) fn visit_expr_roots_mut(&mut self, mut visit: impl FnMut(&mut HirExpr)) {
+        let mut functions = vec![self];
+        while let Some(function) = functions.pop() {
+        for block in &mut function.blocks {
+            for instruction in &mut block.instrs {
+                match instruction {
+                    SourceInst::Let { value, .. } | SourceInst::Assign { value, .. }
+                    | SourceInst::StaticFieldAssign { value, .. } | SourceInst::Expr(value) => visit(value),
+                    SourceInst::FieldAssign { object, value, .. } => { visit(object); visit(value); }
+                    SourceInst::IndexAssign { array, index, value } => { visit(array); visit(index); visit(value); }
+                    SourceInst::SuperInit { args, .. } => args.iter_mut().for_each(&mut visit),
+                    SourceInst::Defer { body, .. } => functions.push(body.function.as_mut()),
+                    SourceInst::Compute { .. } | SourceInst::EnterDeferScope { .. } | SourceInst::LeaveDeferScope { .. }
+                    | SourceInst::FlushDefers { .. } | SourceInst::ClearScopeRoots { .. }
+                    | SourceInst::ReleaseLock(_) | SourceInst::MatchTest { .. } | SourceInst::MatchBind { .. }
+                    | SourceInst::SelectInit { .. } | SourceInst::SelectProbe { .. } | SourceInst::SelectPick { .. }
+                    | SourceInst::SelectUnregister { .. } | SourceInst::SelectCommit { .. } => {}
+                }
+            }
+            match &mut block.terminator {
+                SourceTerminator::Branch { cond, .. } | SourceTerminator::Return(Some(cond)) => visit(cond),
+                SourceTerminator::Jump(_) | SourceTerminator::Suspend { .. } | SourceTerminator::Return(None) | SourceTerminator::CleanupReturn => {}
+            }
+        }
+        }
+    }
+
     /// Local names are unique within a function, so resolving a
     /// `HirExprKind::Var` by name yields exactly one [`LirLocalId`].
     ///
@@ -130,8 +163,18 @@ pub struct LirLocalId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LirDeferId(pub u32);
 
+/// Physical storage is independent of source-language types. GcOwner holds
+/// an opaque managed allocation base used only by lowered reference places.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LirStorageKind {
+    #[default]
+    Value,
+    GcOwner,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LirLocal {
+    pub storage_kind: LirStorageKind,
     pub id: LirLocalId,
     pub name: String,
     pub ty: Type,
@@ -140,16 +183,20 @@ pub struct LirLocal {
     pub parameter: bool,
 }
 
-/// A basic-block index into [`LirFunction::blocks`].
+impl LirLocal {
+    pub fn is_gc_owner(&self) -> bool { self.storage_kind == LirStorageKind::GcOwner }
+}
+
+/// A basic-block index into [`SourceFunction::blocks`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockId(pub usize);
 
 /// A straight-line run of instructions ended by exactly one terminator.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LirBlock {
+pub(crate) struct SourceBlock {
     pub id: BlockId,
-    pub instrs: Vec<LirInst>,
-    pub terminator: Terminator,
+    pub instrs: Vec<SourceInst>,
+    pub terminator: SourceTerminator,
     /// Where a panic raised in this block can continue: the resume block of
     /// every enclosing recovery-capable `defer` scope, innermost first
     /// (willow-0g8j.2.11).
@@ -328,17 +375,14 @@ impl SuspendOp {
     }
 }
 
-/// What a registered `defer` runs, carried through unchanged from the HIR
-/// (willow-0g8j.2.3).
-///
-/// A deferred body is NOT lowered into blocks of its own: it runs at scope
-/// exit, and every exit path — fallthrough, `return`, panic unwinding — has to
-/// splice it in at a different place. Keeping it as a statement tree lets each
-/// of those paths emit it where it belongs.
+/// A cleanup CFG replayed at each exit where this registration is live.
+/// Captures name enclosing locals; region parameter locals reuse their names
+/// and storage. Region-owned locals receive fresh storage at each replay.
 #[derive(Debug, Clone, PartialEq)]
-pub enum LirDeferBody {
-    Expr(HirExpr),
-    Block(Vec<HirStmt>),
+pub(crate) struct SourceDeferBody {
+    pub function: Box<SourceFunction>,
+    pub captures: Vec<LirLocalId>,
+    pub recovery_capable: bool,
 }
 
 /// The frame-backed slots one critical section owns (willow-0g8j.2.13).
@@ -375,16 +419,18 @@ impl LirLockSlots {
 
 /// A non-branching instruction. Values are typed HIR expression trees.
 #[derive(Debug, Clone, PartialEq)]
-pub enum LirInst {
+pub(crate) enum SourceInst {
+    /// One flat computation with explicit scalar operands.
+    Compute { local: LirLocalId, value: LirRvalue, span: Span },
     /// Open a lexical scope that owns `sites` defer registrations
     /// (willow-0g8j.2.3).
     ///
     /// `defer` is a LEXICAL construct — a defer in a loop body runs once per
     /// iteration — but the LIR is a flat block graph with no scopes of its
     /// own, so the boundaries are instructions. Every scope opened here is
-    /// closed by exactly one [`LirInst::LeaveDeferScope`] on the fallthrough
+    /// closed by exactly one [`SourceInst::LeaveDeferScope`] on the fallthrough
     /// path, and every early exit out of it is preceded by a
-    /// [`LirInst::FlushDefers`].
+    /// [`SourceInst::FlushDefers`].
     ///
     /// `sites` are the spans of the `defer` statements this scope contains, in
     /// source order. A consumer needs them BEFORE the first registration runs:
@@ -404,9 +450,9 @@ pub enum LirInst {
         /// reorder relative to the source, and only this pairing survives that.
         lock: Option<LirLockSlots>,
     },
-    /// Close the scope opened by the matching [`LirInst::EnterDeferScope`]:
+    /// Close the scope opened by the matching [`SourceInst::EnterDeferScope`]:
     /// run its registrations (newest first) and pop it. This is the
-    /// FALLTHROUGH exit — an early exit uses [`LirInst::FlushDefers`] and
+    /// FALLTHROUGH exit — an early exit uses [`SourceInst::FlushDefers`] and
     /// leaves the scope structure in place for the paths that did not take it.
     LeaveDeferScope {
         sites: Vec<LirDeferId>,
@@ -431,7 +477,7 @@ pub enum LirInst {
     /// Compiler-generated temporaries are deliberately left out; some of them
     /// carry a value out of the scope that declared them.
     ///
-    /// Fallthrough only, exactly like [`LirInst::LeaveDeferScope`]: a `break`,
+    /// Fallthrough only, exactly like [`SourceInst::LeaveDeferScope`]: a `break`,
     /// `continue` or `return` leaves without passing this instruction, and a
     /// `return` pops every root anyway.
     ClearScopeRoots {
@@ -442,7 +488,7 @@ pub enum LirInst {
     /// must match the entry in the enclosing `EnterDeferScope::sites`.
     Defer {
         id: LirDeferId,
-        body: LirDeferBody,
+        body: SourceDeferBody,
         span: Span,
     },
     Let {
@@ -511,7 +557,7 @@ pub enum LirInst {
     /// fallthrough off the end, and a `return`/`break`/`continue` that jumps
     /// past it. The section's own `defer`s run first — still holding the lock —
     /// and the enclosing scopes' `defer`s run after, which is what a
-    /// [`LirInst::FlushDefers`] on either side of this instruction expresses.
+    /// [`SourceInst::FlushDefers`] on either side of this instruction expresses.
     ///
     /// The panic path is deliberately absent: an unwind releases the lock from
     /// the section's cleanup block instead, so it needs no instruction of its
@@ -528,7 +574,7 @@ pub enum LirInst {
     /// The scrutinee is a local rather than an expression because every arm
     /// tests the SAME value: the source evaluates it once, and the tests are
     /// spread over a chain of dispatch blocks. `result` is a `Bool` local, not
-    /// a value, for the same reason [`Terminator::Branch`] reads one — the
+    /// a value, for the same reason [`SourceTerminator::Branch`] reads one — the
     /// branch that consumes it is the block's terminator.
     MatchTest {
         scrutinee: LirLocalId,
@@ -558,7 +604,7 @@ pub enum LirInst {
 
 /// How a block ends.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Terminator {
+pub(crate) enum SourceTerminator {
     /// Unconditional jump.
     Jump(BlockId),
     /// Two-way branch on a `Bool` condition.
@@ -574,24 +620,43 @@ pub enum Terminator {
     },
     /// Function return.
     Return(Option<HirExpr>),
+    /// Exit a replayed cleanup region, not the enclosing user function.
+    CleanupReturn,
 }
 
 /// Lower every function (free functions and class methods, flattened as
 /// `Class::method`) of a typed-HIR program to basic blocks.
-pub fn lower_program(program: &HirProgram) -> LirProgram {
+pub(crate) fn lower_source_program(program: &HirProgram) -> SourceProgram {
+    let resolution = std::rc::Rc::new(program.resolution.clone());
     let mut functions = Vec::with_capacity(program.functions.len());
     let mut lambdas = Vec::new();
     for f in &program.functions {
-        functions.push(lower_function(f, None));
-        collect_lambdas(&f.body, &mut lambdas);
+        functions.push(lower_function(f, None, resolution.clone()));
+        collect_lambdas(&f.body, &mut lambdas, &resolution);
     }
     for c in &program.classes {
         for m in &c.methods {
-            functions.push(lower_function(m, Some(&c.name)));
-            collect_lambdas(&m.body, &mut lambdas);
+            functions.push(lower_function(m, Some(&c.name), resolution.clone()));
+            collect_lambdas(&m.body, &mut lambdas, &resolution);
         }
     }
-    LirProgram { functions, lambdas }
+    value::lower_calls(&mut functions, &mut lambdas, &program.resolution);
+    super::optimize::inline_scalar_leaves(&mut functions);
+    // The lifted graph is the sole owner of each executable lambda body.
+    // Enclosing expressions retain only closure construction metadata.
+    for function in functions.iter_mut().chain(lambdas.iter_mut().map(|lambda| &mut lambda.function)) {
+        lifetime::clear_dead_temporaries(function);
+        function.async_frame = async_liveness::analyze(&function.blocks, &function.locals);
+        function.visit_expr_roots_mut(|expr| expr.visit_mut_preorder(true, |node| {
+            if let HirExprKind::Lambda { body, .. } = &mut node.kind {
+                body.clear();
+                false
+            } else {
+                true
+            }
+        }));
+    }
+    SourceProgram { functions, lambdas }
 }
 
 /// Lift every lambda in a statement body, innermost first, into its own block
@@ -603,21 +668,21 @@ pub fn lower_program(program: &HirProgram) -> LirProgram {
 /// [`HirExpr::children`], whose `Lambda` case yields the body's expressions, so
 /// a lambda nested inside another lambda is reached the same way as one nested
 /// in a call argument.
-fn collect_lambdas(body: &[HirStmt], out: &mut Vec<LirLambda>) {
+fn collect_lambdas(body: &[HirStmt], out: &mut Vec<SourceLambda>, resolution: &std::rc::Rc<super::typed_ast::HirResolution>) {
     for stmt in body {
         for expr in stmt.child_exprs() {
-            collect_lambdas_in_expr(expr, out);
+            collect_lambdas_in_expr(expr, out, resolution);
         }
     }
 }
 
-fn collect_lambdas_in_expr(expr: &HirExpr, out: &mut Vec<LirLambda>) {
+fn collect_lambdas_in_expr(expr: &HirExpr, out: &mut Vec<SourceLambda>, resolution: &std::rc::Rc<super::typed_ast::HirResolution>) {
     for expr in expr.walk_postorder(true) {
-        collect_lambda(expr, out);
+        collect_lambda(expr, out, resolution);
     }
 }
 
-fn collect_lambda(expr: &HirExpr, out: &mut Vec<LirLambda>) {
+fn collect_lambda(expr: &HirExpr, out: &mut Vec<SourceLambda>, resolution: &std::rc::Rc<super::typed_ast::HirResolution>) {
     if let HirExprKind::Lambda {
         id,
         params,
@@ -632,12 +697,14 @@ fn collect_lambda(expr: &HirExpr, out: &mut Vec<LirLambda>) {
             return;
         };
         let mut b = Builder::new_lambda(params, captures);
+        b.resolution = resolution.clone();
+        b.return_type = (**ret).clone();
         // A lifted lambda owns a function scope just like a named function.
         // Lowering only its statements would leave top-level defer sites
         // without the scope metadata that assigns their stable identities.
         b.lower_scope(body);
         let (blocks, locals) = b.finish();
-        let function = LirFunction {
+        let function = SourceFunction {
             name: FunctionId::free(lambda_placeholder_name(*id)),
             is_async: false,
             params: params.clone(),
@@ -655,7 +722,7 @@ fn collect_lambda(expr: &HirExpr, out: &mut Vec<LirLambda>) {
                 .collect(),
         };
         function.assert_unique_local_names();
-        out.push(LirLambda {
+        out.push(SourceLambda {
             id: *id,
             span: expr.span,
             function,
@@ -668,6 +735,80 @@ fn collect_lambda(expr: &HirExpr, out: &mut Vec<LirLambda>) {
 /// is stable and two lambdas never collide.
 pub fn lambda_placeholder_name(id: ExprId) -> String {
     format!("$lambda@{id}")
+}
+
+pub(crate) fn reference_place_name(place: &HirExpr) -> String {
+    let mut current = place;
+    let mut suffixes = Vec::new();
+    let mut out = loop {
+        match &current.kind {
+            HirExprKind::Var(name) => break name.clone(),
+            HirExprKind::FieldAccess { object, field } => { suffixes.push((Some(field.as_str()), None)); current = object; }
+            HirExprKind::Index { array, index } => { suffixes.push((None, Some(index.as_ref()))); current = array; }
+            _ => break "<expression>".into(),
+        }
+    };
+    for (field, index) in suffixes.into_iter().rev() {
+        if let Some(field) = field { out.push('.'); out.push_str(field); }
+        else if let Some(index) = index {
+            out.push('[');
+            match &index.kind { HirExprKind::Int(value) => out.push_str(&value.to_string()), HirExprKind::Var(name) => out.push_str(name), _ => out.push_str("<expr>") }
+            out.push(']');
+        }
+    }
+    out
+}
+
+fn format_segments(args: &[HirExpr]) -> Option<Vec<crate::interpolate::Segment>> {
+    use crate::interpolate::Segment;
+    let HirExprKind::Str(spec) = &args.first()?.kind else { return None; };
+    let segments = crate::interpolate::parse_spec(spec).ok()?;
+    let mut operands = args[1..].iter();
+    for segment in &segments {
+        match segment {
+            Segment::Literal(_) => {},
+            Segment::Display => if !matches!(operands.next()?.ty, Type::I64 | Type::F64 | Type::Bool | Type::String) { return None; },
+            Segment::F64(_) => if operands.next()?.ty != Type::F64 { return None; },
+        }
+    }
+    operands.next().is_none().then_some(segments)
+}
+
+fn class_fields(resolution: &super::typed_ast::HirResolution, class: &TypeId) -> Option<Vec<(String, Type)>> {
+    let mut chain = Vec::new();
+    let mut next = Some(*class);
+    let mut seen = std::collections::HashSet::new();
+    while let Some(class) = next {
+        if !seen.insert(class) { return None; }
+        let info = resolution.classes.get(&class)?;
+        chain.push(info);
+        next = info.base;
+    }
+    Some(chain.into_iter().rev().flat_map(|info| info.fields.clone()).collect())
+}
+
+fn method_signature(resolution: &super::typed_ast::HirResolution, receiver: &Type, method: &str) -> Option<super::typed_ast::HirSignature> {
+    let (Type::Named(class) | Type::Generic(class, _)) = receiver else { return None; };
+    let mut next = Some(*class);
+    let mut seen = std::collections::HashSet::new();
+    while let Some(class) = next {
+        if !seen.insert(class) { return None; }
+        if let Some(interface) = resolution.interfaces.get(&class) {
+            let mut signature = interface.methods.get(method)?.clone();
+            let mut substitutions = std::collections::HashMap::from([(TypeId::local("Self"), receiver.clone())]);
+            if let Type::Generic(_, args) = receiver {
+                if interface.type_params.len() != args.len() { return None; }
+                substitutions.extend(interface.type_params.iter().copied().zip(args.iter().cloned()));
+            } else if !interface.type_params.is_empty() { return None; }
+            signature.params = signature.params.iter().map(|ty| crate::semantic::symbols::substitute_type(ty, &substitutions)).collect();
+            signature.return_type = crate::semantic::symbols::substitute_type(&signature.return_type, &substitutions);
+            return Some(signature);
+        }
+        let info = resolution.classes.get(&class)?;
+        if let Some(signature) = info.methods.get(method) { return Some(signature.clone()); }
+        next = info.base;
+    }
+    None
 }
 
 /// Whether running `body` can END a panic rather than just clean up after one:
@@ -683,17 +824,8 @@ pub(crate) fn defer_body_contains_recover(body: &HirDeferBody) -> bool {
     }
 }
 
-impl LirDeferBody {
-    /// The lowered form of the same question [`defer_body_contains_recover`]
-    /// asks of the HIR. The backend has only this form by the time it emits
-    /// the cleanup CFG, and the two must agree: lowering records the panic
-    /// edge for a scope exactly when the backend arms recovery in it.
-    pub fn contains_recover(&self) -> bool {
-        match self {
-            LirDeferBody::Expr(expr) => expr_has_recover(expr),
-            LirDeferBody::Block(stmts) => block_has_recover(stmts),
-        }
-    }
+impl SourceDeferBody {
+    pub fn contains_recover(&self) -> bool { self.recovery_capable }
 }
 
 fn expr_has_recover(expr: &HirExpr) -> bool {
@@ -709,8 +841,10 @@ fn block_has_recover(stmts: &[HirStmt]) -> bool {
 }
 
 /// Lower one function's statement tree into a block graph.
-fn lower_function(f: &HirFunction, class: Option<&TypeId>) -> LirFunction {
+fn lower_function(f: &HirFunction, class: Option<&TypeId>, resolution: std::rc::Rc<super::typed_ast::HirResolution>) -> SourceFunction {
     let mut b = Builder::new(&f.params, f.is_async);
+    b.resolution = resolution;
+    b.return_type = f.return_type.clone();
     b.lower_scope(&f.body);
     b.materialize_preemption_safepoints();
     // The fall-through end of a function is an implicit `return;` (the type
@@ -720,7 +854,7 @@ fn lower_function(f: &HirFunction, class: Option<&TypeId>) -> LirFunction {
         Some(class) => FunctionId::method(class.clone(), f.name.name()),
         None => f.name.clone(),
     };
-    let function = LirFunction {
+    let function = SourceFunction {
         name,
         is_async: f.is_async,
         params: f.params.clone(),
@@ -780,8 +914,9 @@ impl LirScopeMark {
 /// Block-graph builder: appends instructions to a current block and seals
 /// blocks with terminators as control flow branches and rejoins.
 struct Builder {
-    blocks: Vec<(Vec<LirInst>, Option<Terminator>)>,
-    /// Per-block [`LirBlock::recovery`], filled in by `lower_scope` once it
+    return_type: Type,    resolution: std::rc::Rc<super::typed_ast::HirResolution>,
+    blocks: Vec<(Vec<SourceInst>, Option<SourceTerminator>)>,
+    /// Per-block [`SourceBlock::recovery`], filled in by `lower_scope` once it
     /// knows the scope's resume block.
     block_recovery: Vec<Vec<BlockId>>,
     current: usize,
@@ -805,7 +940,7 @@ struct Builder {
     /// binding to `name$n` before lowering runs. That invariant is what lets a
     /// `HirExprKind::Var` node resolve to exactly one [`LirLocalId`] here and
     /// in `async_liveness`; without it two frame slots would silently alias.
-    /// [`LirFunction::assert_unique_local_names`] pins it.
+    /// [`SourceFunction::assert_unique_local_names`] pins it.
     local_by_name: std::collections::HashMap<String, LirLocalId>,
     /// The critical section currently being lowered, if any (willow-0g8j.2.13).
     ///
@@ -852,71 +987,6 @@ fn collect_suspensions<'a>(expr: &'a HirExpr, out: &mut Vec<&'a HirExpr>) {
 /// Does a suspension live anywhere inside this expression?
 fn suspends_anywhere(expr: &HirExpr) -> bool {
     expr.walk_postorder(false).any(expr_suspends_here)
-}
-
-/// Does any statement of this body suspend? Used to decide whether a `match`
-/// has to become blocks: an arm that never returns control to the scheduler is
-/// emittable as part of an expression tree, and staying a tree keeps the
-/// existing `match` emission (willow-0g8j.2.11.1).
-fn body_suspends(body: &[HirStmt]) -> bool {
-    body.iter()
-        .flat_map(HirStmt::child_exprs)
-        .any(suspends_anywhere)
-}
-
-/// Does this body contain a statement that cannot remain inside a match arm's
-/// HIR island? Lowering the enclosing match into the LIR graph lets the normal
-/// statement path own place stores and defer scopes as well as loop blocks,
-/// resolving `break`/`continue` against the loop stack active at the match site
-/// (willow-o3xi).
-fn body_needs_match_cfg(body: &[HirStmt]) -> bool {
-    needs_match_cfg(body.iter().map(MatchCfgNode::Stmt).collect())
-}
-
-enum MatchCfgNode<'a> {
-    Stmt(&'a HirStmt),
-    Expr(&'a HirExpr),
-}
-
-fn needs_match_cfg(mut pending: Vec<MatchCfgNode<'_>>) -> bool {
-    while let Some(node) = pending.pop() {
-        match node {
-            MatchCfgNode::Stmt(stmt) => match stmt {
-                HirStmt::While { .. }
-                | HirStmt::For { .. }
-                | HirStmt::Break { .. }
-                | HirStmt::Continue { .. }
-                | HirStmt::Defer { .. }
-                | HirStmt::Lock { .. }
-                | HirStmt::IndexAssign { .. }
-                | HirStmt::StaticFieldAssign { .. } => return true,
-                HirStmt::If {
-                    then_branch,
-                    else_branch,
-                    ..
-                } => {
-                    // Preserve the predicate's existing branch-only treatment
-                    // of statement conditions.
-                    pending.extend(then_branch.iter().map(MatchCfgNode::Stmt));
-                    if let Some(body) = else_branch {
-                        pending.extend(body.iter().map(MatchCfgNode::Stmt));
-                    }
-                }
-                _ => pending.extend(stmt.child_exprs().into_iter().map(MatchCfgNode::Expr)),
-            },
-            MatchCfgNode::Expr(expr) => match &expr.kind {
-                HirExprKind::Match { scrutinee, arms } => {
-                    pending.push(MatchCfgNode::Expr(scrutinee));
-                    for arm in arms {
-                        pending.extend(arm.body.iter().map(MatchCfgNode::Stmt));
-                    }
-                }
-                HirExprKind::Lambda { .. } => {}
-                _ => pending.extend(expr.children().into_iter().map(MatchCfgNode::Expr)),
-            },
-        }
-    }
-    false
 }
 
 /// The names a pattern binds, with the type each is bound at, in the order the
@@ -1021,6 +1091,21 @@ fn replace_suspension(expr: &HirExpr, target_span: Span, replacement: &HirExpr) 
     out
 }
 
+fn expression_needs_cfg(expr: &HirExpr) -> bool {
+    expr.walk_postorder(false).any(|node| {
+        matches!(
+            node.kind,
+            HirExprKind::TryPropagate { .. }
+                | HirExprKind::Ternary { .. }
+                | HirExprKind::Match { .. }
+                | HirExprKind::Binary {
+                    op: crate::parser::ast::BinOp::And | crate::parser::ast::BinOp::Or,
+                    ..
+                }
+        )
+    })
+}
+
 fn expression_executes_call(expr: &HirExpr) -> bool {
     expr.walk_postorder(false).any(|expr| {
         matches!(
@@ -1038,16 +1123,16 @@ fn expression_executes_call(expr: &HirExpr) -> bool {
     })
 }
 
-fn instruction_executes_call(inst: &LirInst) -> bool {
+fn instruction_executes_call(inst: &SourceInst) -> bool {
     match inst {
-        LirInst::Let { value, .. }
-        | LirInst::Assign { value, .. }
-        | LirInst::StaticFieldAssign { value, .. }
-        | LirInst::Expr(value) => expression_executes_call(value),
-        LirInst::FieldAssign { object, value, .. } => {
+        SourceInst::Let { value, .. }
+        | SourceInst::Assign { value, .. }
+        | SourceInst::StaticFieldAssign { value, .. }
+        | SourceInst::Expr(value) => expression_executes_call(value),
+        SourceInst::FieldAssign { object, value, .. } => {
             expression_executes_call(object) || expression_executes_call(value)
         }
-        LirInst::IndexAssign {
+        SourceInst::IndexAssign {
             array,
             index,
             value,
@@ -1056,32 +1141,26 @@ fn instruction_executes_call(inst: &LirInst) -> bool {
                 || expression_executes_call(index)
                 || expression_executes_call(value)
         }
-        LirInst::SuperInit { .. } => true,
-        LirInst::Defer { body, .. } => match body {
-            LirDeferBody::Expr(expr) => expression_executes_call(expr),
-            LirDeferBody::Block(stmts) => stmts
-                .iter()
-                .flat_map(HirStmt::child_exprs)
-                .any(expression_executes_call),
-        },
+        SourceInst::SuperInit { .. } => true,
+        SourceInst::Defer { .. } => false,
         // The release calls the runtime, but it is compiler-owned bookkeeping
         // rather than a user statement, and a preemption edge in front of it
         // would park the task holding a lock it is one instruction from giving
         // back. Cleanup unwinding also emits release without a safepoint.
         // A pattern test and its bindings are loads and integer compares on a
         // value the enclosing block already holds. No call, so no safepoint.
-        LirInst::ReleaseLock { .. }
-        | LirInst::EnterDeferScope { .. }
-        | LirInst::LeaveDeferScope { .. }
-        | LirInst::FlushDefers { .. }
-        | LirInst::ClearScopeRoots { .. }
-        | LirInst::MatchTest { .. }
-        | LirInst::MatchBind { .. }
-        | LirInst::SelectInit { .. }
-        | LirInst::SelectProbe { .. }
-        | LirInst::SelectPick { .. }
-        | LirInst::SelectUnregister { .. }
-        | LirInst::SelectCommit { .. } => false,
+        SourceInst::Compute { .. } | SourceInst::ReleaseLock { .. }
+        | SourceInst::EnterDeferScope { .. }
+        | SourceInst::LeaveDeferScope { .. }
+        | SourceInst::FlushDefers { .. }
+        | SourceInst::ClearScopeRoots { .. }
+        | SourceInst::MatchTest { .. }
+        | SourceInst::MatchBind { .. }
+        | SourceInst::SelectInit { .. }
+        | SourceInst::SelectProbe { .. }
+        | SourceInst::SelectPick { .. }
+        | SourceInst::SelectUnregister { .. }
+        | SourceInst::SelectCommit { .. } => false,
     }
 }
 
@@ -1092,14 +1171,17 @@ fn instruction_executes_call(inst: &LirInst) -> bool {
     lower_conditional_suspend,
     lower_for,
     lower_lock,
+    lower_defer_region,
     lower_match_arm_body,
     lower_match_arms_cfg,
     lower_nested_suspend,
+    lower_nested_cfg,
     lower_operand_before_suspend,
     lower_root_suspend,
     lower_scope,
     lower_scope_inner,
     lower_select,
+    lower_super_init_values,
     lower_stmt,
     lower_stmts,
     lower_suspending_operand,
@@ -1108,6 +1190,8 @@ fn instruction_executes_call(inst: &LirInst) -> bool {
 impl Builder {
     fn new(params: &[HirParam], is_async: bool) -> Self {
         let mut builder = Self {
+            return_type: Type::Void,
+            resolution: Default::default(),
             blocks: vec![(Vec::new(), None)],
             block_recovery: vec![Vec::new()],
             current: 0,
@@ -1159,6 +1243,42 @@ impl Builder {
         builder
     }
 
+    fn lower_defer_region(&mut self, stmts: &[HirStmt], recovery_capable: bool) -> SourceDeferBody {
+        let mut region = Self::new(&[], false);
+        region.resolution = self.resolution.clone();
+        region.locals = self.locals.clone();
+        region.locals.iter_mut().for_each(|local| local.parameter = true);
+        region.local_by_name = self.local_by_name.clone();
+        region.suspend_counter = self.suspend_counter;
+        region.for_counter = self.for_counter;
+        region.lower_scope(stmts);
+        for (_, terminator) in &mut region.blocks {
+            if terminator.is_none() { *terminator = Some(SourceTerminator::CleanupReturn); }
+        }
+        let (blocks, locals) = region.finish();
+        let names = locals.iter().map(|local| (local.name.as_str(), local.id)).collect();
+        let mut referenced = std::collections::HashSet::new();
+        for block in &blocks {
+            for inst in &block.instrs {
+                let mut writes = std::collections::HashSet::new();
+                async_liveness::instruction_use_def(inst, &names, &mut referenced, &mut writes);
+                referenced.extend(writes);
+            }
+            async_liveness::terminator_uses(&block.terminator, &names, &mut referenced, &std::collections::HashSet::new());
+        }
+        let mut captures: Vec<_> = referenced.into_iter().filter(|local| (local.0 as usize) < self.locals.len()).collect();
+        captures.sort_by_key(|local| local.0);
+        let name = self.locals.iter().find(|local| local.name == "self")
+            .and_then(|local| if let Type::Named(owner) = &local.ty { Some(FunctionId::method(*owner, "$defer")) } else { None })
+            .unwrap_or_else(|| FunctionId::free("$defer"));
+        SourceDeferBody {
+            function: Box::new(SourceFunction { name, is_async: false, params: Vec::new(),
+                return_type: Type::Void, blocks, locals, async_frame: LirAsyncFrameLayout::default(), captures: Vec::new() }),
+            captures,
+            recovery_capable,
+        }
+    }
+
     fn declare_local(
         &mut self,
         name: String,
@@ -1169,6 +1289,7 @@ impl Builder {
     ) -> LirLocalId {
         let id = LirLocalId(self.locals.len() as u32);
         self.locals.push(LirLocal {
+            storage_kind: LirStorageKind::Value,
             id,
             name: name.clone(),
             ty,
@@ -1203,7 +1324,7 @@ impl Builder {
         value: HirExpr,
         source_span: Option<Span>,
     ) {
-        self.push(LirInst::Let {
+        self.push(SourceInst::Let {
             local,
             name,
             mutable,
@@ -1214,6 +1335,11 @@ impl Builder {
     }
 
     fn push_synth_let(&mut self, name: &str, mutable: bool, value: HirExpr) -> LirLocalId {
+        if expression_needs_cfg(&value) || (self.is_async && suspends_anywhere(&value)) {
+            let local = self.declare_local(name.to_string(), value.ty.clone(), None, true, false);
+            self.lower_value_into(local, &value);
+            return local;
+        }
         self.push_let(
             name.to_string(),
             mutable,
@@ -1280,16 +1406,29 @@ impl Builder {
         out
     }
 
-    /// Split a root suspension into an explicit CFG edge. The operand is
-    /// evaluated once into a synthetic local before parking; the optional
-    /// result local is populated by the resume transition.
+    /// Lower root expression control flow or a scheduler suspension.
+    /// Suspension operands are evaluated once before parking; an optional
+    /// destination receives the selected branch value or resumed result.
     fn lower_root_suspend(
         &mut self,
         value: &HirExpr,
         destination: Option<LirLocalId>,
     ) -> Option<Option<HirExpr>> {
+        if let Some(lowered) = self.lower_try_propagate(value, destination) { return Some(lowered); }
         if let Some(lowered) = self.lower_match_arms_cfg(value, destination) {
             return Some(lowered);
+        }
+        if let Some(lowered) = self.lower_conditional_suspend(value) {
+            if let Some(destination) = destination {
+                let local = &self.locals[destination.0 as usize];
+                self.push(SourceInst::Assign {
+                    local: destination,
+                    name: local.name.clone(),
+                    value: lowered,
+                });
+                return Some(Some(self.local_expr(destination, value.span)));
+            }
+            return Some(None);
         }
         if !self.is_async {
             return None;
@@ -1389,29 +1528,14 @@ impl Builder {
             _ => return None,
         };
         let resume = self.new_block();
-        self.terminate(Terminator::Suspend { operation, resume });
+        self.terminate(SourceTerminator::Suspend { operation, resume });
         self.switch_to(resume);
         Some(destination.map(|local| self.local_expr(local, value.span)))
     }
 
-    /// Split a `match` whose arm suspends or needs structural statement
-    /// lowering into an explicit dispatch chain (willow-0g8j.2.11.1,
-    /// willow-o3xi).
-    ///
-    /// `match` is an HIR EXPRESSION and stays a tree through lowering, so an
-    /// `await`, a channel operation or a `select` written inside an arm would
-    /// never become a [`Terminator::Suspend`]. This turns the whole `match`
-    /// into blocks — scrutinee, one dispatch block per testable arm, one block
-    /// per arm body, and a merge — so the arm body is lowered by the ordinary
-    /// statement path and its suspension splits like any other.
-    ///
-    /// Deliberately narrow: a `match` whose arms neither suspend nor need this
-    /// structural path stays a tree and keeps the existing emission. This is
-    /// the same shape [`Builder::lower_conditional_branches`] gives a ternary,
-    /// one arm wider.
-    ///
-    /// `None` when this is not such a `match`; otherwise the value the caller
-    /// should use, which is `None` for a `void` match.
+    /// Split every root `match` into a dispatch chain with scoped arm bodies.
+    /// The scrutinee is evaluated once and an optional destination receives
+    /// the selected arm's value. Suspensions use the ordinary statement path.
     fn lower_match_arms_cfg(
         &mut self,
         value: &HirExpr,
@@ -1420,11 +1544,6 @@ impl Builder {
         let HirExprKind::Match { scrutinee, arms } = &value.kind else {
             return None;
         };
-        if !arms.iter().any(|arm| {
-            body_needs_match_cfg(&arm.body) || (self.is_async && body_suspends(&arm.body))
-        }) {
-            return None;
-        }
 
         // Evaluated once, before any test. A suspension in the scrutinee itself
         // splits here, in front of the whole dispatch.
@@ -1453,11 +1572,11 @@ impl Builder {
             let arm_block = self.new_block();
             let next = (!always_matches && !is_last).then(|| self.new_block());
             if always_matches {
-                self.terminate(Terminator::Jump(arm_block));
+                self.terminate(SourceTerminator::Jump(arm_block));
             } else {
                 let test_name = self.synthetic_name("match_test");
                 let test = self.declare_local(test_name, Type::Bool, None, true, false);
-                self.push(LirInst::MatchTest {
+                self.push(SourceInst::MatchTest {
                     scrutinee: scrutinee_local,
                     pattern: arm.pattern.clone(),
                     result: test,
@@ -1466,7 +1585,7 @@ impl Builder {
                 // The last arm falling through means the scrutinee matched
                 // nothing; the merge keeps the result at its seeded value,
                 // exactly as the tree-shaped `match` does.
-                self.terminate(Terminator::Branch {
+                self.terminate(SourceTerminator::Branch {
                     cond: self.local_expr(test, arm.span),
                     then_block: arm_block,
                     else_block: next.unwrap_or(merge),
@@ -1482,10 +1601,19 @@ impl Builder {
                 .push(LirScopeMark::opening_at(self.locals.len()));
             let bindings: Vec<_> = pattern_bindings(&arm.pattern)
                 .into_iter()
-                .map(|(name, ty)| self.declare_local(name, ty, Some(arm.span), false, false))
+                .map(|(name, ty)| {
+                    // Discarded payloads still occupy binding positions but
+                    // must not alias another arm's discarded payload local.
+                    let name = if name == "_" {
+                        self.synthetic_name("discard")
+                    } else {
+                        name
+                    };
+                    self.declare_local(name, ty, Some(arm.span), false, false)
+                })
                 .collect();
             if !bindings.is_empty() {
-                self.push(LirInst::MatchBind {
+                self.push(SourceInst::MatchBind {
                     scrutinee: scrutinee_local,
                     pattern: arm.pattern.clone(),
                     bindings,
@@ -1497,7 +1625,7 @@ impl Builder {
             // into `destination`, which has a rooted slot of its own.
             self.push_scope_root_clears(arm_scope);
             self.scope_starts.pop();
-            self.terminate(Terminator::Jump(merge));
+            self.terminate(SourceTerminator::Jump(merge));
 
             if let Some(next) = next {
                 self.switch_to(next);
@@ -1513,6 +1641,51 @@ impl Builder {
         Some(destination.map(|local| self.local_expr(local, value.span)))
     }
 
+    fn push_compute(&mut self, value: LirRvalue, ty: Type, span: Span, label: &str) -> LirLocalId {
+        let name = self.synthetic_name(label);
+        let local = self.declare_local(name, ty, None, true, false);
+        self.push(SourceInst::Compute { local, value, span });
+        local
+    }
+
+    fn lower_try_propagate(&mut self, expression: &HirExpr, destination: Option<LirLocalId>) -> Option<Option<HirExpr>> {
+        let HirExprKind::TryPropagate { inner } = &expression.kind else { return None; };
+        let resolved = builtin_types::resolve(&inner.ty)?;
+        let returning = builtin_types::resolve(&self.return_type)?;
+        if !matches!(resolved.id, B::Option | B::Result) || resolved.id != returning.id { return None; }
+        let is_option = resolved.id == B::Option;
+        let source_error = (!is_option).then(|| resolved.args.get(1).cloned()).flatten();
+        let target_error = (!is_option).then(|| returning.args.get(1).cloned()).flatten();
+        let name = self.synthetic_name("try_operand");
+        let operand = self.declare_local(name, inner.ty.clone(), None, true, false);
+        self.lower_value_into(operand, inner);
+        let receiver = LirOperand::Local(operand);
+        let condition = self.push_compute(LirRvalue::EnumMethod { receiver: receiver.clone(), receiver_ty: inner.ty.clone(), method: if is_option { "is_some" } else { "is_ok" }.into(), args: Vec::new(), arg_types: Vec::new(), result: Type::Bool }, Type::Bool, expression.span, "try_success");
+        let success = self.new_block();
+        let failure = self.new_block();
+        self.terminate(SourceTerminator::Branch { cond: self.local_expr(condition, expression.span), then_block: success, else_block: failure });
+        self.switch_to(failure);
+        let return_type = self.return_type.clone();
+        let failure_value = if is_option {
+            self.push_compute(LirRvalue::EnumAlloc { class: TypeId::local("Option"), variant: "None".into(), enum_ty: return_type.clone() }, return_type.clone(), expression.span, "try_none")
+        } else if let (Some(source_error @ Type::Named(_)), Some(target_error)) = (&source_error, &target_error) {
+            if source_error != target_error && *target_error != Type::Void {
+                let error = self.push_compute(LirRvalue::EnumMethod { receiver: receiver.clone(), receiver_ty: inner.ty.clone(), method: "unwrap_err".into(), args: Vec::new(), arg_types: Vec::new(), result: source_error.clone() }, source_error.clone(), expression.span, "try_error");
+                let converted = self.push_compute(LirRvalue::IntoError { value: LirOperand::Local(error), source: source_error.clone(), target: target_error.clone() }, target_error.clone(), expression.span, "try_converted_error");
+                let result = self.push_compute(LirRvalue::EnumAlloc { class: TypeId::local("Result"), variant: "Err".into(), enum_ty: return_type.clone() }, return_type.clone(), expression.span, "try_failure");
+                self.push(SourceInst::Compute { local: result, value: LirRvalue::EnumPayloadStore { object: LirOperand::Local(result), class: TypeId::local("Result"), variant: "Err".into(), index: 0, value: LirOperand::Local(converted), source: target_error.clone(), enum_ty: return_type.clone() }, span: expression.span });
+                result
+            } else { self.push_compute(LirRvalue::RebindResultError { value: receiver.clone(), source: inner.ty.clone(), target: return_type.clone() }, return_type.clone(), expression.span, "try_failure") }
+        } else { self.push_compute(LirRvalue::RebindResultError { value: receiver.clone(), source: inner.ty.clone(), target: return_type.clone() }, return_type.clone(), expression.span, "try_failure") };
+        self.lower_stmt(&HirStmt::Return { value: Some(self.local_expr(failure_value, expression.span)), span: expression.span });
+        self.switch_to(success);
+        if let Some(local) = destination && expression.ty != Type::Void {
+            self.push(SourceInst::Compute { local, value: LirRvalue::EnumMethod { receiver, receiver_ty: inner.ty.clone(), method: "unwrap".into(), args: Vec::new(), arg_types: Vec::new(), result: expression.ty.clone() }, span: expression.span });
+            return Some(Some(self.local_expr(local, expression.span)));
+        }
+        Some(None)
+    }
+
     /// Lower one arm's body into the block already switched to.
     ///
     /// An arm that produces a value ends in an expression statement, and that
@@ -1525,7 +1698,8 @@ impl Builder {
             // A `defer` anywhere in the body needs the scope brackets
             // `lower_scope` puts around it, so those arms take the plain path.
             Some((HirStmt::Expr(value), rest))
-                if !body.iter().any(|s| matches!(s, HirStmt::Defer { .. })) =>
+                if value.ty != Type::Never
+                    && !body.iter().any(|s| matches!(s, HirStmt::Defer { .. })) =>
             {
                 Some((destination, value, rest))
             }
@@ -1561,6 +1735,9 @@ impl Builder {
     /// no nested suspension (willow-0g8j.3). `done.send(work.recv())` parks on
     /// the recv and sends the value it resumed with.
     fn lower_operand_before_suspend(&mut self, operand: &HirExpr) -> Option<HirExpr> {
+        if expression_needs_cfg(operand) {
+            return self.lower_nested_cfg(operand);
+        }
         if !suspends_anywhere(operand) {
             return Some(operand.clone());
         }
@@ -1571,7 +1748,7 @@ impl Builder {
     ///
     /// `obj.field = await task;` and `xs[i] = await task;` park in the middle of
     /// a store, so their operands are ANF'd here the way a `let`'s initialiser
-    /// is: the suspension becomes a [`Terminator::Suspend`] of its own and the
+    /// is: the suspension becomes a [`SourceTerminator::Suspend`] of its own and the
     /// store reads the local the resume filled. Operands are evaluated left to
     /// right, so every operand before the parking one is frozen into a local
     /// first — a resume must not re-run `obj` or `i`.
@@ -1583,19 +1760,23 @@ impl Builder {
     /// synthetic locals a partial split already pushed are harmless: the whole
     /// lowered function is discarded with it.
     fn lower_assign_operands(&mut self, operands: &[&HirExpr]) -> Option<Vec<HirExpr>> {
-        if !self.is_async {
-            return None;
-        }
-        let last = operands
-            .iter()
-            .rposition(|operand| suspends_anywhere(operand))?;
+        let last = operands.iter().rposition(|operand| {
+            expression_needs_cfg(operand) || (self.is_async && suspends_anywhere(operand))
+        })?;
         let mut out = Vec::with_capacity(operands.len());
         for (index, operand) in operands.iter().enumerate() {
-            let lowered = if suspends_anywhere(operand) {
-                self.lower_suspending_operand(operand)?
-            } else if index < last && !rematerializable(operand) {
+            let lowered = if index <= last
+                && !matches!(
+                    operand.kind,
+                    HirExprKind::Int(_)
+                        | HirExprKind::Float(_)
+                        | HirExprKind::Bool(_)
+                        | HirExprKind::Str(_)
+                        | HirExprKind::FnRef(_)
+                ) {
                 let name = self.synthetic_name("operand");
-                let local = self.push_synth_let(&name, false, (*operand).clone());
+                let local = self.declare_local(name, operand.ty.clone(), None, true, false);
+                self.lower_value_into(local, operand);
                 self.local_expr(local, operand.span)
             } else {
                 (*operand).clone()
@@ -1605,7 +1786,404 @@ impl Builder {
         Some(out)
     }
 
+    /// Evaluate eager operands in order around nested source control flow.
+    /// The worklist keeps eager expression depth off the native stack. Place
+    /// operands retain their address identity; only their receiver/index values
+    /// are materialized, never the referenced slot's contents.
+    fn lower_nested_cfg(&mut self, value: &HirExpr) -> Option<HirExpr> {
+        if !expression_needs_cfg(value) && !(self.is_async && suspends_anywhere(value)) {
+            return None;
+        }
+        enum Work<'a> {
+            Eval(&'a HirExpr, bool, bool), // expression, place, root
+            Finish(&'a HirExpr, usize, bool, bool),
+            ArrayStore(LirLocalId, usize, Type, Span),
+            FieldStore(LirLocalId, Type, String, Span),
+            EnumStore(LirLocalId, TypeId, String, usize, Type, Span),
+            Constructor(LirLocalId, &'a HirExpr),
+            PrepareMethod(&'a HirExpr),
+            MethodCall(&'a HirExpr, LirLocalId),
+            IndirectCall(&'a HirExpr, LirLocalId, Vec<Type>, Type),
+            DirectCall(&'a HirExpr, FunctionId, Vec<Type>, Type),
+            StaticCall(&'a HirExpr),
+            CaptureReference(&'a HirExpr, FunctionId, usize),
+            FinishReference(&'a HirExpr, LirOperand),
+            FormatLiteral(LirLocalId, String, bool, Span),
+            FormatValue(LirLocalId, Option<crate::interpolate::F64Format>, bool, Span),
+        }
+        let mut control_flow = std::collections::HashSet::new();
+        for node in value.walk_postorder(false) {
+            if matches!(
+                node.kind,
+                HirExprKind::TryPropagate { .. } | HirExprKind::Ternary { .. }
+                    | HirExprKind::Match { .. }
+                    | HirExprKind::Binary {
+                        op: crate::parser::ast::BinOp::And | crate::parser::ast::BinOp::Or,
+                        ..
+                    }
+            ) || (self.is_async && expr_suspends_here(node)) || (!matches!(node.kind, HirExprKind::Lambda { .. })
+                && node
+                    .children()
+                    .iter()
+                    .any(|child| control_flow.contains(&std::ptr::from_ref(*child))))
+            {
+                control_flow.insert(std::ptr::from_ref(node));
+            }
+        }
+        fn arguments<'a>(callee: FunctionId, args: &'a [HirExpr]) -> Vec<Work<'a>> {
+            args.iter().enumerate().map(|(index, arg)| if matches!(arg.kind, HirExprKind::ReferenceArg { .. }) { Work::CaptureReference(arg, callee, index) } else { Work::Eval(arg, false, false) }).collect()
+        }
+        let mut pending = vec![Work::Eval(value, false, true)];
+        let mut values = Vec::new();
+        let mut references: std::collections::HashMap<*const HirExpr, LirOperand> = std::collections::HashMap::new();
+        while let Some(work) = pending.pop() {
+            match work {
+                Work::Eval(expr, place, root) => {
+                    if !place && control_flow.contains(&std::ptr::from_ref(expr)) {
+                        match &expr.kind {
+                            HirExprKind::Call { callee, args } if !self.local_by_name.contains_key(callee.unqualified_name()) && self.resolution.functions.get(callee).is_some_and(|signature| !signature.is_async && signature.params.len() == args.len() && signature.params.iter().zip(args).all(|(ty, arg)| *ty == arg.ty)) => {
+                                let signature = self.resolution.functions[callee].clone();
+                                if args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. })) { self.push_compute(LirRvalue::BeginReferenceCall, Type::Void, expr.span, "reference_call"); }
+                                pending.push(Work::DirectCall(expr, *callee, signature.params, signature.return_type));
+                                pending.extend(arguments(*callee, args).into_iter().rev());
+                                continue;
+                            }
+                            HirExprKind::StaticCall { class, method, args } if method_signature(&self.resolution, &Type::Named(*class), method).is_some_and(|signature| signature.is_static && !signature.is_async && signature.params.len() == args.len() && signature.params.iter().zip(args).all(|(ty, arg)| *ty == arg.ty)) => {
+                                if args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. })) { self.push_compute(LirRvalue::BeginReferenceCall, Type::Void, expr.span, "reference_call"); }
+                                pending.push(Work::StaticCall(expr));
+                                pending.extend(arguments(FunctionId::method(*class, method), args).into_iter().rev());
+                                continue;
+                            }
+                            HirExprKind::Call { callee, args } if callee.is_free_named("format") && !self.local_by_name.contains_key("format") && format_segments(args).is_some() => {
+                                let mut segments = format_segments(args).expect("validated format");
+                                if segments.is_empty() { segments.push(crate::interpolate::Segment::Literal(String::new())); }
+                                let name = self.synthetic_name("format_result");
+                                let local = self.declare_local(name, Type::String, None, true, false);
+                                values.push(self.local_expr(local, expr.span));
+                                let mut children = args[1..].iter();
+                                let mut actions = Vec::new();
+                                for (index, segment) in segments.into_iter().enumerate() {
+                                    match segment {
+                                        crate::interpolate::Segment::Literal(text) => actions.push(Work::FormatLiteral(local, text, index == 0, expr.span)),
+                                        segment => {
+                                            let child = children.next().expect("format operand");
+                                            let format = match segment { crate::interpolate::Segment::F64(format) => Some(format), _ => None };
+                                            actions.push(Work::Eval(child, false, false));
+                                            actions.push(Work::FormatValue(local, format, index == 0, child.span));
+                                        }
+                                    }
+                                }
+                                pending.extend(actions.into_iter().rev());
+                                continue;
+                            }
+                            HirExprKind::Call { callee, args } if self.local_by_name.contains_key(callee.unqualified_name()) => {
+                                let source = self.local_by_name[callee.unqualified_name()];
+                                let ty = self.locals[source.0 as usize].ty.clone();
+                                if let Type::Fn(params, result) | Type::Closure(params, result) = &ty {
+                                    if params.len() == args.len() && params.iter().zip(args).all(|(ty, arg)| *ty == arg.ty) {
+                                        let name = self.synthetic_name("callable_snapshot");
+                                        let local = self.declare_local(name, ty.clone(), None, true, false);
+                                        self.push(SourceInst::Compute { local, value: LirRvalue::Use(LirOperand::Local(source)), span: expr.span });
+                                        pending.push(Work::IndirectCall(expr, local, params.clone(), (**result).clone()));
+                                        pending.extend(args.iter().rev().map(|child| Work::Eval(child, false, false)));
+                                        continue;
+                                    }
+                                }
+                            }
+                            HirExprKind::MethodCall { object, method, args } if method_signature(&self.resolution, &object.ty, method).is_some_and(|signature| !signature.is_static && !signature.is_async && signature.params.len() == args.len() && signature.params.iter().zip(args).all(|(ty, arg)| *ty == arg.ty)) => {
+                                pending.push(Work::PrepareMethod(expr));
+                                pending.push(Work::Eval(object, false, false));
+                                continue;
+                            }
+                            HirExprKind::Array { elements } => {
+                                let Type::Array(element) = &expr.ty else { return None; };
+                                let name = self.synthetic_name("array_shell");
+                                let local = self.declare_local(name, expr.ty.clone(), None, true, false);
+                                self.push(SourceInst::Compute { local, value: LirRvalue::ArrayAlloc { length: elements.len(), element: (**element).clone() }, span: expr.span });
+                                values.push(self.local_expr(local, expr.span));
+                                for (index, child) in elements.iter().enumerate().rev() {
+                                    pending.push(Work::ArrayStore(local, index, (**element).clone(), child.span));
+                                    pending.push(Work::Eval(child, false, false));
+                                }
+                                continue;
+                            }
+                            HirExprKind::StaticCall { class, method, args } if self.resolution.enums.get(class).is_some_and(|info| info.variants.iter().any(|variant| variant.name == *method && variant.payloads.len() == args.len())) => {
+                                let name = self.synthetic_name("enum_shell");
+                                let local = self.declare_local(name, expr.ty.clone(), None, true, false);
+                                self.push(SourceInst::Compute { local, value: LirRvalue::EnumAlloc { class: *class, variant: method.clone(), enum_ty: expr.ty.clone() }, span: expr.span });
+                                values.push(self.local_expr(local, expr.span));
+                                for (index, child) in args.iter().enumerate().rev() {
+                                    pending.push(Work::EnumStore(local, *class, method.clone(), index, expr.ty.clone(), child.span));
+                                    pending.push(Work::Eval(child, false, false));
+                                }
+                                continue;
+                            }
+                            HirExprKind::ObjectLiteral { class, fields } if class_fields(&self.resolution, class).is_some_and(|declared| declared.len() == fields.len() && declared.iter().all(|(name, _)| fields.iter().filter(|(field, _)| field == name).count() == 1)) => {
+                                let name = self.synthetic_name("object_shell");
+                                let local = self.declare_local(name, expr.ty.clone(), None, true, false);
+                                self.push(SourceInst::Compute { local, value: LirRvalue::ObjectAlloc { class: *class }, span: expr.span });
+                                values.push(self.local_expr(local, expr.span));
+                                for (field, child) in fields.iter().rev() {
+                                    pending.push(Work::FieldStore(local, expr.ty.clone(), field.clone(), child.span));
+                                    pending.push(Work::Eval(child, false, false));
+                                }
+                                continue;
+                            }
+                            HirExprKind::New { class, args } if self.resolution.classes.contains_key(class) => {
+                                let info = self.resolution.classes[class].clone();
+                                if info.constructor.as_ref().is_some_and(|signature| signature.params.len() != args.len() || signature.params.iter().zip(args).any(|(ty, arg)| *ty != arg.ty)) { return None; }
+                                let fields = if info.constructor.is_none() { class_fields(&self.resolution, class) } else { Some(Vec::new()) }?;
+                                if info.constructor.is_none() && fields.len() != args.len() { return None; }
+                                let name = self.synthetic_name("object_shell");
+                                let local = self.declare_local(name, expr.ty.clone(), None, true, false);
+                                self.push(SourceInst::Compute { local, value: LirRvalue::ObjectAlloc { class: *class }, span: expr.span });
+                                values.push(self.local_expr(local, expr.span));
+                                if info.constructor.is_some() {
+                                    if args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. })) { self.push_compute(LirRvalue::BeginReferenceCall, Type::Void, expr.span, "reference_call"); }
+                                    pending.push(Work::Constructor(local, expr));
+                                    pending.extend(arguments(FunctionId::method(*class, "init"), args).into_iter().rev());
+                                } else {
+                                    for ((field, _), child) in fields.into_iter().zip(args).rev() {
+                                        pending.push(Work::FieldStore(local, expr.ty.clone(), field, child.span));
+                                        pending.push(Work::Eval(child, false, false));
+                                    }
+                                }
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if matches!(
+                        expr.kind,
+                        HirExprKind::TryPropagate { .. } | HirExprKind::Ternary { .. }
+                            | HirExprKind::Match { .. }
+                            | HirExprKind::Binary {
+                                op: crate::parser::ast::BinOp::And | crate::parser::ast::BinOp::Or,
+                                ..
+                            }
+                    ) || (self.is_async && expr_suspends_here(expr)) {
+                        let name = self.synthetic_name("expression");
+                        let result = self.declare_local(name, expr.ty.clone(), None, true, false);
+                        self.lower_root_suspend(expr, Some(result))?;
+                        values.push(self.local_expr(result, expr.span));
+                    } else if matches!(
+                        expr.kind,
+                        HirExprKind::Lambda { .. } | HirExprKind::Select { .. }
+                    ) || (!control_flow.contains(&std::ptr::from_ref(expr))
+                        && !matches!(expr.kind, HirExprKind::ReferenceArg { .. })
+                        && !(place
+                            && matches!(
+                                expr.kind,
+                                HirExprKind::Index { .. } | HirExprKind::FieldAccess { .. }
+                            )))
+                    {
+                        if root
+                            || place
+                            || matches!(
+                                expr.kind,
+                                HirExprKind::Int(_)
+                                    | HirExprKind::Float(_)
+                                    | HirExprKind::Bool(_)
+                                    | HirExprKind::Str(_)
+                                    | HirExprKind::FnRef(_)
+                                    | HirExprKind::ReferenceArg { .. }
+                            )
+                        {
+                            values.push(expr.clone());
+                        } else {
+                            let name = self.synthetic_name("expression_operand");
+                            let local =
+                                self.declare_local(name, expr.ty.clone(), None, true, false);
+                            self.lower_value_into(local, expr);
+                            values.push(self.local_expr(local, expr.span));
+                        }
+                    } else {
+                        let operands = expr.children();
+                        pending.push(Work::Finish(expr, operands.len(), place, root));
+                        let reference = matches!(expr.kind, HirExprKind::ReferenceArg { .. });
+                        pending.extend(
+                            operands
+                                .into_iter()
+                                .rev()
+                                .map(|operand| Work::Eval(operand, reference, false)),
+                        );
+                    }
+                }
+                Work::CaptureReference(expr, callee, index) => {
+                    let HirExprKind::ReferenceArg { place } = &expr.kind else { unreachable!() };
+                    let captured = match &place.kind {
+                        HirExprKind::Var(name) => LirPlace::Local(*self.local_by_name.get(name)?),
+                        HirExprKind::FieldAccess { object, field } => {
+                            let name = self.synthetic_name("reference_object");
+                            LirPlace::Field { object: self.declare_local(name, object.ty.clone(), None, true, false), object_ty: object.ty.clone(), field: field.clone(), ty: place.ty.clone() }
+                        }
+                        HirExprKind::Index { .. } => {
+                            let name = self.synthetic_name("reference_owner");
+                            let owner = self.declare_local(name, Type::Void, None, true, false);
+                            self.locals[owner.0 as usize].storage_kind = LirStorageKind::GcOwner;
+                            let name = self.synthetic_name("reference_index");
+                            LirPlace::ArrayElement { owner, index: self.declare_local(name, Type::I64, None, true, false), element: place.ty.clone() }
+                        }
+                        _ => return None,
+                    };
+                    let argument = LirOperand::Reference { place: captured, span: expr.span, display: reference_place_name(place) };
+                    self.push_compute(LirRvalue::ReferenceDebug { argument: argument.clone(), callee, index }, Type::Void, expr.span, "reference_debug");
+                    pending.push(Work::FinishReference(expr, argument));
+                    match &place.kind {
+                        HirExprKind::FieldAccess { object, .. } => pending.push(Work::Eval(object, false, false)),
+                        HirExprKind::Index { array, index } => { pending.push(Work::Eval(index, false, false)); pending.push(Work::Eval(array, false, false)); }
+                        _ => {}
+                    }
+                }
+                Work::FinishReference(expr, argument) => {
+                    let HirExprKind::ReferenceArg { place } = &expr.kind else { unreachable!() };
+                    let LirOperand::Reference { place: captured, .. } = &argument else { unreachable!() };
+                    match (&place.kind, captured) {
+                        (HirExprKind::Var(_), LirPlace::Local(_)) => {},
+                        (HirExprKind::FieldAccess { .. }, LirPlace::Field { object, .. }) => {
+                            let child = values.pop().expect("reference receiver");
+                            let value = self.flat_operand(&child);
+                            self.push(SourceInst::Compute { local: *object, value: LirRvalue::Use(value), span: place.span });
+                        }
+                        (HirExprKind::Index { .. }, LirPlace::ArrayElement { owner, index, .. }) => {
+                            let index_expr = values.pop().expect("reference index");
+                            let array_expr = values.pop().expect("reference array");
+                            let index_value = self.flat_operand(&index_expr);
+                            let array_value = self.flat_operand(&array_expr);
+                            self.push(SourceInst::Compute { local: *index, value: LirRvalue::Use(index_value.clone()), span: place.span });
+                            self.push(SourceInst::Compute { local: *owner, value: LirRvalue::CaptureArrayOwner { array: array_value, index: LirOperand::Local(*index) }, span: place.span });
+                        }
+                        _ => unreachable!(),
+                    }
+                    references.insert(std::ptr::from_ref(expr), argument);
+                    values.push(expr.clone());
+                }
+                Work::DirectCall(expr, callee, params, result) => {
+                    let HirExprKind::Call { args, .. } = &expr.kind else { unreachable!() };
+                    let children = values.split_off(values.len() - args.len());
+                    let operands = args.iter().zip(&children).map(|(original, child)| references.remove(&std::ptr::from_ref(original)).unwrap_or_else(|| self.flat_operand(child))).collect();
+                    let local = self.push_compute(LirRvalue::DirectCall { callee, args: operands, params, result: result.clone() }, result, expr.span, "call_result");
+                    values.push(self.local_expr(local, expr.span));
+                }
+                Work::StaticCall(expr) => {
+                    let HirExprKind::StaticCall { class, method, args } = &expr.kind else { unreachable!() };
+                    let children = values.split_off(values.len() - args.len());
+                    let operands = args.iter().zip(&children).map(|(original, child)| references.remove(&std::ptr::from_ref(original)).unwrap_or_else(|| self.flat_operand(child))).collect();
+                    let local = self.push_compute(LirRvalue::StaticCall { class: *class, method: method.clone(), args: operands, arg_types: args.iter().map(|arg| arg.ty.clone()).collect(), result: expr.ty.clone() }, expr.ty.clone(), expr.span, "static_result");
+                    values.push(self.local_expr(local, expr.span));
+                }
+                Work::FormatLiteral(local, text, first, span) => {
+                    let name = self.synthetic_name("format_literal");
+                    let piece = self.declare_local(name, Type::String, None, true, false);
+                    self.push(SourceInst::Compute { local: piece, value: LirRvalue::StringLiteral(text), span });
+                    self.append_format_piece(local, LirOperand::Local(piece), first, span);
+                }
+                Work::FormatValue(local, format, first, span) => {
+                    let child = values.pop().expect("format operand");
+                    let value = self.flat_operand(&child);
+                    let name = self.synthetic_name("format_piece");
+                    let piece = self.declare_local(name, Type::String, None, true, false);
+                    self.push(SourceInst::Compute { local: piece, value: LirRvalue::FormatScalar { value, ty: child.ty.clone(), format }, span });
+                    self.append_format_piece(local, LirOperand::Local(piece), first, span);
+                }
+                Work::IndirectCall(expr, callee, params, result) => {
+                    let HirExprKind::Call { callee: name, args } = &expr.kind else { unreachable!() };
+                    let children = values.split_off(values.len() - args.len());
+                    let args = children.iter().map(|child| self.flat_operand(child)).collect();
+                    let local_name = self.synthetic_name("indirect_result");
+                    let local = self.declare_local(local_name, result.clone(), None, true, false);
+                    self.push(SourceInst::Compute { local, value: LirRvalue::IndirectCall { callee: LirOperand::Local(callee), name: *name, args, params, result }, span: expr.span });
+                    values.push(self.local_expr(local, expr.span));
+                }
+                Work::PrepareMethod(expr) => {
+                    let HirExprKind::MethodCall { object, method, args } = &expr.kind else { unreachable!() };
+                    let receiver = values.pop().expect("method receiver");
+                    let receiver = self.flat_operand(&receiver);
+                    let name = self.synthetic_name("method_receiver");
+                    let local = self.declare_local(name, object.ty.clone(), None, true, false);
+                    self.push(SourceInst::Compute { local, value: LirRvalue::PrepareMethod { receiver, receiver_ty: object.ty.clone(), method: method.clone() }, span: expr.span });
+                    if args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. })) { self.push_compute(LirRvalue::BeginReferenceCall, Type::Void, expr.span, "reference_call"); }
+                    pending.push(Work::MethodCall(expr, local));
+                    let (Type::Named(owner) | Type::Generic(owner, _)) = &object.ty else { unreachable!() };
+                    pending.extend(arguments(FunctionId::method(*owner, method), args).into_iter().rev());
+                }
+                Work::MethodCall(expr, receiver) => {
+                    let HirExprKind::MethodCall { object, method, args } = &expr.kind else { unreachable!() };
+                    let children = values.split_off(values.len() - args.len());
+                    let args = args.iter().zip(&children).map(|(original, child)| references.remove(&std::ptr::from_ref(original)).unwrap_or_else(|| self.flat_operand(child))).collect();
+                    let arg_types = children.iter().map(|child| child.ty.clone()).collect();
+                    let name = self.synthetic_name("method_result");
+                    let local = self.declare_local(name, expr.ty.clone(), None, true, false);
+                    self.push(SourceInst::Compute { local, value: LirRvalue::MethodCall { receiver: LirOperand::Local(receiver), receiver_ty: object.ty.clone(), method: method.clone(), args, arg_types, result: expr.ty.clone() }, span: expr.span });
+                    values.push(self.local_expr(local, expr.span));
+                }
+                Work::ArrayStore(array, index, element, span) => {
+                    let child = values.pop().expect("array element");
+                    let value = self.flat_operand(&child);
+                    let name = self.synthetic_name("array_store");
+                    let local = self.declare_local(name, Type::Void, None, true, false);
+                    self.push(SourceInst::Compute { local, value: LirRvalue::ArrayStore { array: LirOperand::Local(array), index: LirOperand::Int(index as i64), value, element }, span });
+                }
+                Work::FieldStore(object, object_ty, field, span) => {
+                    let child = values.pop().expect("field value");
+                    let value = self.flat_operand(&child);
+                    let name = self.synthetic_name("field_store");
+                    let local = self.declare_local(name, Type::Void, None, true, false);
+                    self.push(SourceInst::Compute { local, value: LirRvalue::FieldStore { object: LirOperand::Local(object), object_ty, field, value }, span });
+                }
+                Work::EnumStore(local, class, variant, index, enum_ty, span) => {
+                    let child = values.pop().expect("enum payload");
+                    let value = self.flat_operand(&child);
+                    self.push(SourceInst::Compute { local, value: LirRvalue::EnumPayloadStore { object: LirOperand::Local(local), class, variant, index, value, source: child.ty.clone(), enum_ty }, span });
+                }
+                Work::Constructor(object, expr) => {
+                    let HirExprKind::New { class, args } = &expr.kind else { unreachable!() };
+                    let children = values.split_off(values.len() - args.len());
+                    let operands = args.iter().zip(&children).map(|(original, child)| references.remove(&std::ptr::from_ref(original)).unwrap_or_else(|| self.flat_operand(child))).collect();
+                    let arg_types = children.iter().map(|child| child.ty.clone()).collect();
+                    self.push_compute(LirRvalue::ConstructorCall { object: LirOperand::Local(object), class: *class, args: operands, arg_types }, Type::Void, expr.span, "constructor_call");
+                }
+                Work::Finish(expr, count, place, root) => {
+                    let operands = values.split_off(values.len() - count);
+                    let lowered = expr.with_eager_operands(operands);
+                    if root || place || matches!(lowered.kind, HirExprKind::ReferenceArg { .. }) {
+                        values.push(lowered);
+                    } else {
+                        let name = self.synthetic_name("expression_operand");
+                        let local = self.declare_local(name, lowered.ty.clone(), None, true, false);
+                        self.lower_value_into(local, &lowered);
+                        values.push(self.local_expr(local, expr.span));
+                    }
+                }
+            }
+        }
+        values.pop()
+    }
+
+    fn append_format_piece(&mut self, local: LirLocalId, piece: LirOperand, first: bool, span: Span) {
+        let value = if first { LirRvalue::Use(piece) } else { LirRvalue::Binary { op: crate::parser::ast::BinOp::Add, lhs: LirOperand::Local(local), rhs: piece, operand_ty: Type::String } };
+        self.push(SourceInst::Compute { local, value, span });
+    }
+
+    fn flat_operand(&mut self, value: &HirExpr) -> LirOperand {
+        match &value.kind {
+            HirExprKind::Int(value) => LirOperand::Int(*value),
+            HirExprKind::Float(value) => LirOperand::Float(*value),
+            HirExprKind::Bool(value) => LirOperand::Bool(*value),
+            HirExprKind::Var(name) if self.local_by_name.contains_key(name) => LirOperand::Local(self.local_by_name[name]),
+            _ => {
+                let name = self.synthetic_name("operand");
+                let local = self.declare_local(name, value.ty.clone(), None, true, false);
+                self.lower_value_into(local, value);
+                LirOperand::Local(local)
+            }
+        }
+    }
+
     fn lower_nested_suspend(&mut self, value: &HirExpr) -> Option<HirExpr> {
+        if expression_needs_cfg(value) || (self.is_async && suspends_anywhere(value) && !expr_suspends_here(value)) {
+            return self.lower_nested_cfg(value);
+        }
         if !self.is_async || expr_suspends_here(value) {
             return None;
         }
@@ -1719,12 +2297,6 @@ impl Builder {
     }
 
     fn lower_conditional_suspend(&mut self, value: &HirExpr) -> Option<HirExpr> {
-        let mut suspensions = Vec::new();
-        collect_suspensions(value, &mut suspensions);
-        if suspensions.is_empty() {
-            return None;
-        }
-
         let (condition, then_expr, else_expr) = match &value.kind {
             HirExprKind::Ternary {
                 condition,
@@ -1765,7 +2337,7 @@ impl Builder {
         let then_block = self.new_block();
         let else_block = self.new_block();
         let merge = self.new_block();
-        self.terminate(Terminator::Branch {
+        self.terminate(SourceTerminator::Branch {
             cond: condition,
             then_block,
             else_block,
@@ -1773,11 +2345,11 @@ impl Builder {
 
         self.switch_to(then_block);
         self.lower_value_into(result, then_expr);
-        self.terminate(Terminator::Jump(merge));
+        self.terminate(SourceTerminator::Jump(merge));
 
         self.switch_to(else_block);
         self.lower_value_into(result, else_expr);
-        self.terminate(Terminator::Jump(merge));
+        self.terminate(SourceTerminator::Jump(merge));
 
         self.switch_to(merge);
         Some(self.local_expr(result, whole.span))
@@ -1791,7 +2363,7 @@ impl Builder {
             .lower_nested_suspend(value)
             .unwrap_or_else(|| value.clone());
         let local = &self.locals[destination.0 as usize];
-        self.push(LirInst::Assign {
+        self.push(SourceInst::Assign {
             local: destination,
             name: local.name.clone(),
             value,
@@ -1799,9 +2371,6 @@ impl Builder {
     }
 
     fn lower_condition(&mut self, condition: &HirExpr) -> HirExpr {
-        if !self.is_async {
-            return condition.clone();
-        }
         let name = self.synthetic_name("condition");
         let local = self.declare_local(name, Type::Bool, None, true, false);
         match self.lower_root_suspend(condition, Some(local)) {
@@ -1810,6 +2379,57 @@ impl Builder {
                 .lower_nested_suspend(condition)
                 .unwrap_or_else(|| condition.clone()),
         }
+    }
+
+    fn lower_super_init_values(&mut self, args: &[HirExpr], span: Span) -> bool {
+        let Some(&receiver) = self.local_by_name.get("self") else { return false; };
+        let receiver_ty = self.locals[receiver.0 as usize].ty.clone();
+        let Type::Named(owner) = &receiver_ty else { return false; };
+        let Some(base) = self.resolution.classes.get(owner).and_then(|info| info.base) else { return false; };
+        let Some(info) = self.resolution.classes.get(&base).cloned() else { return false; };
+        let explicit = info.constructor.is_some();
+        let mut fields = Vec::new();
+        let params = if let Some(signature) = &info.constructor {
+            if signature.param_modes.iter().any(|mode| !matches!(mode, crate::parser::ast::ParamMode::Value)) { return false; }
+            signature.params.clone()
+        } else {
+            let mut chain = Vec::new();
+            let mut next = Some(base);
+            let mut seen = std::collections::HashSet::new();
+            while let Some(class) = next {
+                if !seen.insert(class) { return false; }
+                let Some(info) = self.resolution.classes.get(&class) else { return false; };
+                chain.push(info.fields.clone()); next = info.base;
+            }
+            for own_fields in chain.into_iter().rev() { fields.extend(own_fields); }
+            fields.iter().map(|(_, ty)| ty.clone()).collect()
+        };
+        if args.len() != params.len() { return false; }
+        let name = self.synthetic_name("base_receiver");
+        let base_ty = Type::Named(base);
+        let base_local = self.declare_local(name, base_ty.clone(), None, true, false);
+        self.push(SourceInst::Compute { local: base_local, value: LirRvalue::Coerce { value: LirOperand::Local(receiver), source: receiver_ty, target: base_ty.clone() }, span });
+        let mut operands = Vec::new();
+        for (index, (arg, target)) in args.iter().zip(&params).enumerate() {
+            let value = self.lower_nested_suspend(arg).unwrap_or_else(|| arg.clone());
+            let name = self.synthetic_name("base_argument");
+            let source = self.push_synth_let(&name, false, value);
+            let name = self.synthetic_name("base_coerced");
+            let coerced = self.declare_local(name, target.clone(), None, true, false);
+            self.push(SourceInst::Compute { local: coerced, value: LirRvalue::Coerce { value: LirOperand::Local(source), source: arg.ty.clone(), target: target.clone() }, span: arg.span });
+            if explicit { operands.push(LirOperand::Local(coerced)); }
+            else {
+                let name = self.synthetic_name("base_store");
+                let local = self.declare_local(name, Type::Void, None, true, false);
+                self.push(SourceInst::Compute { local, value: LirRvalue::FieldStore { object: LirOperand::Local(base_local), object_ty: base_ty.clone(), field: fields[index].0.clone(), value: LirOperand::Local(coerced) }, span: arg.span });
+            }
+        }
+        if explicit {
+            let name = self.synthetic_name("base_init");
+            let local = self.declare_local(name, Type::Void, None, true, false);
+            self.push(SourceInst::Compute { local, value: LirRvalue::ConstructorCall { object: LirOperand::Local(base_local), class: base, args: operands, arg_types: params }, span });
+        }
+        true
     }
 
     fn lower_select(&mut self, cases: &[super::typed_ast::HirSelectCase], span: Span) {
@@ -1847,6 +2467,12 @@ impl Builder {
                     let elem_ty = builtin_types::unary_arg(&channel.ty, B::Channel)
                         .expect("select send channel was type checked")
                         .clone();
+                    let value_local = if self.is_async { value_local } else {
+                        let name = self.synthetic_name("select_stored_value");
+                        let stored = self.declare_local(name, elem_ty.clone(), None, true, false);
+                        self.push(SourceInst::Compute { local: stored, value: LirRvalue::Coerce { value: LirOperand::Local(value_local), source: value.ty.clone(), target: elem_ty.clone() }, span: value.span });
+                        stored
+                    };
                     LirSelectOp::Send {
                         channel: channel_local,
                         value: value_local,
@@ -1892,18 +2518,21 @@ impl Builder {
                 }
                 HirSelectCaseKind::Default => LirSelectOp::Default,
             };
+            if !self.is_async && matches!(operation, LirSelectOp::Timeout { .. }) {
+                self.push(SourceInst::SelectInit { operations: vec![operation.clone()] });
+            }
             operations.push(operation);
         }
 
-        self.push(LirInst::SelectInit {
-            operations: operations.clone(),
-        });
+        if self.is_async {
+            self.push(SourceInst::SelectInit { operations: operations.clone() });
+        }
         let probe = self.new_block();
         let idle = self.new_block();
         let dispatch = self.new_block();
         let done = self.new_block();
         let case_blocks: Vec<_> = cases.iter().map(|_| self.new_block()).collect();
-        self.terminate(Terminator::Jump(probe));
+        self.terminate(SourceTerminator::Jump(probe));
 
         self.switch_to(probe);
         let ready: Vec<_> = operations
@@ -1917,13 +2546,13 @@ impl Builder {
             .collect();
         let chosen_name = self.synthetic_name("select_chosen");
         let chosen = self.declare_local(chosen_name, Type::I64, None, true, false);
-        self.push(LirInst::SelectProbe {
+        self.push(SourceInst::SelectProbe {
             operations: operations.clone(),
             ready: ready.clone(),
         });
-        self.push(LirInst::SelectPick { ready, chosen });
+        self.push(SourceInst::SelectPick { ready, chosen });
         let chosen_expr = self.local_expr(chosen, span);
-        self.terminate(Terminator::Branch {
+        self.terminate(SourceTerminator::Branch {
             cond: HirExpr {
                 kind: HirExprKind::Binary {
                     op: crate::parser::ast::BinOp::Ge,
@@ -1946,14 +2575,23 @@ impl Builder {
             .iter()
             .position(|operation| matches!(operation, LirSelectOp::Default))
         {
-            self.terminate(Terminator::Jump(case_blocks[default]));
-        } else {
-            self.terminate(Terminator::Suspend {
+            self.terminate(SourceTerminator::Jump(case_blocks[default]));
+        } else if self.is_async {
+            self.terminate(SourceTerminator::Suspend {
                 operation: SuspendOp::SelectWait {
                     operations: operations.iter().filter_map(LirSelectOp::wait_op).collect(),
                 },
                 resume: probe,
             });
+        } else {
+            let name = self.synthetic_name("select_idle");
+            let local = self.declare_local(name, Type::Void, None, true, false);
+            let deadlines = operations.iter().filter_map(|operation| match operation {
+                LirSelectOp::Timeout { deadline, .. } => Some(LirOperand::Local(*deadline)),
+                _ => None,
+            }).collect();
+            self.push(SourceInst::Compute { local, value: LirRvalue::SelectIdleWait { deadlines }, span });
+            self.terminate(SourceTerminator::Jump(probe));
         }
 
         self.switch_to(dispatch);
@@ -1969,7 +2607,7 @@ impl Builder {
             } else {
                 self.new_block()
             };
-            self.terminate(Terminator::Branch {
+            self.terminate(SourceTerminator::Branch {
                 cond: HirExpr {
                     kind: HirExprKind::Binary {
                         op: crate::parser::ast::BinOp::Eq,
@@ -1993,18 +2631,18 @@ impl Builder {
 
         for (index, case) in cases.iter().enumerate() {
             self.switch_to(case_blocks[index]);
-            self.push(LirInst::SelectUnregister {
+            self.push(SourceInst::SelectUnregister {
                 operations: operations.clone(),
             });
             let success_name = self.synthetic_name("select_success");
             let success = self.declare_local(success_name, Type::Bool, None, true, false);
-            self.push(LirInst::SelectCommit {
+            self.push(SourceInst::SelectCommit {
                 operation: operations[index].clone(),
                 success,
             });
             if matches!(operations[index], LirSelectOp::Send { .. }) {
                 let body = self.new_block();
-                self.terminate(Terminator::Branch {
+                self.terminate(SourceTerminator::Branch {
                     cond: self.local_expr(success, case.span),
                     then_block: body,
                     else_block: probe,
@@ -2012,7 +2650,7 @@ impl Builder {
                 self.switch_to(body);
             }
             self.lower_scope(&case.body);
-            self.terminate(Terminator::Jump(done));
+            self.terminate(SourceTerminator::Jump(done));
         }
         self.switch_to(done);
     }
@@ -2027,14 +2665,14 @@ impl Builder {
         self.current = block.0;
     }
 
-    fn push(&mut self, inst: LirInst) {
+    fn push(&mut self, inst: SourceInst) {
         self.blocks[self.current].0.push(inst);
     }
 
     /// Seal the current block. A block already sealed by an inner `return`
     /// keeps its first terminator (trailing unreachable code was appended to a
     /// fresh block by `terminate`).
-    fn terminate(&mut self, terminator: Terminator) {
+    fn terminate(&mut self, terminator: SourceTerminator) {
         let slot = &mut self.blocks[self.current].1;
         if slot.is_none() {
             *slot = Some(terminator);
@@ -2059,7 +2697,7 @@ impl Builder {
                 if instruction_executes_call(&inst) {
                     let resume = self.new_block();
                     self.block_recovery[resume.0] = recovery.clone();
-                    self.blocks[current].1 = Some(Terminator::Suspend {
+                    self.blocks[current].1 = Some(SourceTerminator::Suspend {
                         operation: SuspendOp::Preempt,
                         resume,
                     });
@@ -2067,16 +2705,16 @@ impl Builder {
                 }
                 self.blocks[current].0.push(inst);
             }
-            let terminator = terminator.unwrap_or(Terminator::Return(None));
+            let terminator = terminator.unwrap_or(SourceTerminator::Return(None));
             let terminator_calls = match &terminator {
-                Terminator::Branch { cond, .. } => expression_executes_call(cond),
-                Terminator::Return(Some(value)) => expression_executes_call(value),
+                SourceTerminator::Branch { cond, .. } => expression_executes_call(cond),
+                SourceTerminator::Return(Some(value)) => expression_executes_call(value),
                 _ => false,
             };
             if terminator_calls {
                 let resume = self.new_block();
                 self.block_recovery[resume.0] = recovery.clone();
-                self.blocks[current].1 = Some(Terminator::Suspend {
+                self.blocks[current].1 = Some(SourceTerminator::Suspend {
                     operation: SuspendOp::Preempt,
                     resume,
                 });
@@ -2086,21 +2724,26 @@ impl Builder {
         }
     }
 
-    fn finish(self) -> (Vec<LirBlock>, Vec<LirLocal>) {
-        let locals = self.locals;
+    fn finish(self) -> (Vec<SourceBlock>, Vec<LirLocal>) {
+        let mut locals = self.locals;
         let mut recovery = self.block_recovery;
-        let blocks: Vec<LirBlock> = self
+        let mut blocks: Vec<SourceBlock> = self
             .blocks
             .into_iter()
             .enumerate()
-            .map(|(i, (instrs, terminator))| LirBlock {
+            .map(|(i, (instrs, terminator))| SourceBlock {
                 id: BlockId(i),
                 instrs,
-                terminator: terminator.unwrap_or(Terminator::Return(None)),
+                terminator: terminator.unwrap_or(SourceTerminator::Return(None)),
                 recovery: std::mem::take(&mut recovery[i]),
             })
             .collect();
-        (prune_unreachable(blocks), locals)
+        super::optimize::fold_blocks(&mut blocks);
+        value::lower_blocks(&mut blocks, &mut locals, self.is_async);
+        super::optimize::simplify_cfg(&mut blocks);
+        let mut blocks = prune_unreachable(blocks);
+        super::optimize::eliminate_dead_values(&mut blocks, &locals);
+        (blocks, locals)
     }
 
     fn lower_stmts(&mut self, stmts: &[HirStmt]) {
@@ -2110,7 +2753,7 @@ impl Builder {
     }
 
     /// Lower a statement list as a lexical scope: if it registers any `defer`,
-    /// bracket it with [`LirInst::EnterDeferScope`]/[`LirInst::LeaveDeferScope`]
+    /// bracket it with [`SourceInst::EnterDeferScope`]/[`SourceInst::LeaveDeferScope`]
     /// (willow-0g8j.2.3).
     ///
     /// Scopes without a `defer` get no markers at all because nothing would
@@ -2166,7 +2809,7 @@ impl Builder {
         let recovers = stmts.iter().any(
             |stmt| matches!(stmt, HirStmt::Defer { body, .. } if defer_body_contains_recover(body)),
         );
-        self.push(LirInst::EnterDeferScope {
+        self.push(SourceInst::EnterDeferScope {
             sites: sites.clone(),
             resume: None,
             lock,
@@ -2185,13 +2828,13 @@ impl Builder {
         sites.sort_unstable();
         // The fallthrough close. If the scope ended in a `return`, this lands
         // in the dead block `terminate` switched to and is pruned.
-        self.push(LirInst::LeaveDeferScope { sites });
+        self.push(SourceInst::LeaveDeferScope { sites });
         if self.is_async || recovers {
             // Recovery must branch to a real LIR continuation, not a backend-
             // invented block after the whole poll body has been emitted.
             let resume = self.new_block();
-            self.terminate(Terminator::Jump(resume));
-            let LirInst::EnterDeferScope {
+            self.terminate(SourceTerminator::Jump(resume));
+            let SourceInst::EnterDeferScope {
                 resume: entry_resume,
                 ..
             } = &mut self.blocks[enter_block].0[enter_index]
@@ -2251,7 +2894,7 @@ impl Builder {
         locals.sort_unstable();
         locals.dedup();
         if !locals.is_empty() {
-            self.push(LirInst::ClearScopeRoots { locals });
+            self.push(SourceInst::ClearScopeRoots { locals });
         }
     }
 
@@ -2260,8 +2903,8 @@ impl Builder {
     ///
     /// `break` and `continue` jump out without passing the fallthrough close,
     /// so the boundary that close marks has to be re-stated here — the same
-    /// reason [`LirInst::FlushDefers`] exists beside
-    /// [`LirInst::LeaveDeferScope`]. `return` needs nothing, because the emitter
+    /// reason [`SourceInst::FlushDefers`] exists beside
+    /// [`SourceInst::LeaveDeferScope`]. `return` needs nothing, because the emitter
     /// pops every root there.
     fn clear_scope_roots_down_to(&mut self, depth: usize) {
         self.push_scope_root_clears(depth);
@@ -2280,7 +2923,7 @@ impl Builder {
         match self.active_lock.clone() {
             Some(lock) if lock.defer_depth >= depth => {
                 self.flush_defer_scopes(lock.defer_depth, self.defer_scopes.len());
-                self.push(LirInst::ReleaseLock(lock.slots));
+                self.push(SourceInst::ReleaseLock(lock.slots));
                 self.flush_defer_scopes(depth, lock.defer_depth);
             }
             _ => self.flush_defer_scopes(depth, self.defer_scopes.len()),
@@ -2296,7 +2939,7 @@ impl Builder {
             sites.extend(scope_sites);
         }
         if !sites.is_empty() {
-            self.push(LirInst::FlushDefers { sites });
+            self.push(SourceInst::FlushDefers { sites });
         }
     }
 
@@ -2345,7 +2988,7 @@ impl Builder {
                     let value = self
                         .lower_nested_suspend(value)
                         .unwrap_or_else(|| value.clone());
-                    self.push(LirInst::Assign {
+                    self.push(SourceInst::Assign {
                         local,
                         name: name.clone(),
                         value,
@@ -2364,7 +3007,7 @@ impl Builder {
                 let [object, value] = operands
                     .try_into()
                     .unwrap_or_else(|_| unreachable!("two operands in, two operands out"));
-                self.push(LirInst::FieldAssign {
+                self.push(SourceInst::FieldAssign {
                     object,
                     field: field.clone(),
                     value,
@@ -2382,7 +3025,7 @@ impl Builder {
                 let [array, index, value] = operands
                     .try_into()
                     .unwrap_or_else(|_| unreachable!("three operands in, three operands out"));
-                self.push(LirInst::IndexAssign {
+                self.push(SourceInst::IndexAssign {
                     array,
                     index,
                     value,
@@ -2400,24 +3043,24 @@ impl Builder {
                 let [value] = operands
                     .try_into()
                     .unwrap_or_else(|_| unreachable!("one operand in, one operand out"));
-                self.push(LirInst::StaticFieldAssign {
+                self.push(SourceInst::StaticFieldAssign {
                     class: class.clone(),
                     field: field.clone(),
                     value,
                 });
             }
-            HirStmt::SuperInit { args, span } => self.push(LirInst::SuperInit {
-                args: args.clone(),
-                span: *span,
-            }),
+            HirStmt::SuperInit { args, span } => {
+                if !self.lower_super_init_values(args, *span) {
+                    self.push(SourceInst::SuperInit { args: args.clone(), span: *span });
+                }
+            }
             HirStmt::Expr(e) => {
                 if let HirExprKind::Select { cases } = &e.kind
-                    && self.is_async
                 {
                     self.lower_select(cases, e.span);
                 } else if self.lower_root_suspend(e, None).is_none() {
                     let value = self.lower_nested_suspend(e).unwrap_or_else(|| e.clone());
-                    self.push(LirInst::Expr(value));
+                    self.push(SourceInst::Expr(value));
                 }
             }
             HirStmt::Return { value, .. } => {
@@ -2457,7 +3100,7 @@ impl Builder {
                                     let value = self
                                         .lower_nested_suspend(value)
                                         .unwrap_or_else(|| value.clone());
-                                    self.push(LirInst::Expr(value));
+                                    self.push(SourceInst::Expr(value));
                                 }
                                 break 'returned None;
                             }
@@ -2490,7 +3133,7 @@ impl Builder {
                     }
                 };
                 self.flush_defers_down_to(0);
-                self.terminate(Terminator::Return(value));
+                self.terminate(SourceTerminator::Return(value));
                 // Anything after a return is unreachable; give it a fresh
                 // predecessor-less block rather than corrupting this one.
                 let dead = self.new_block();
@@ -2500,7 +3143,7 @@ impl Builder {
                 let frame = *self.loop_stack.last().expect("break outside loop");
                 self.flush_defers_down_to(frame.defer_depth);
                 self.clear_scope_roots_down_to(frame.scope_depth);
-                self.terminate(Terminator::Jump(frame.exit));
+                self.terminate(SourceTerminator::Jump(frame.exit));
                 let dead = self.new_block();
                 self.switch_to(dead);
             }
@@ -2515,11 +3158,13 @@ impl Builder {
                     .and_then(|scope| scope.get(hir_id))
                     .copied()
                     .expect("defer outside its LIR scope");
-                let body = match body {
-                    HirDeferBody::Expr(e) => LirDeferBody::Expr(self.capture_defer_expr(id, e)),
-                    HirDeferBody::Block(stmts) => LirDeferBody::Block(stmts.clone()),
+                let recovery_capable = defer_body_contains_recover(body);
+                let stmts = match body {
+                    HirDeferBody::Expr(expr) => vec![HirStmt::Expr(self.capture_defer_expr(id, expr))],
+                    HirDeferBody::Block(stmts) => stmts.clone(),
                 };
-                self.push(LirInst::Defer {
+                let body = self.lower_defer_region(&stmts, recovery_capable);
+                self.push(SourceInst::Defer {
                     id,
                     body,
                     span: *span,
@@ -2529,7 +3174,7 @@ impl Builder {
                 let frame = *self.loop_stack.last().expect("continue outside loop");
                 self.flush_defers_down_to(frame.defer_depth);
                 self.clear_scope_roots_down_to(frame.scope_depth);
-                self.terminate(Terminator::Jump(frame.next));
+                self.terminate(SourceTerminator::Jump(frame.next));
                 let dead = self.new_block();
                 self.switch_to(dead);
             }
@@ -2554,7 +3199,7 @@ impl Builder {
                     Some(_) => self.new_block(),
                     None => merge_block,
                 };
-                self.terminate(Terminator::Branch {
+                self.terminate(SourceTerminator::Branch {
                     cond,
                     then_block,
                     else_block,
@@ -2562,12 +3207,12 @@ impl Builder {
 
                 self.switch_to(then_block);
                 self.lower_scope(then_branch);
-                self.terminate(Terminator::Jump(merge_block));
+                self.terminate(SourceTerminator::Jump(merge_block));
 
                 if let Some(else_branch) = else_branch {
                     self.switch_to(else_block);
                     self.lower_scope(else_branch);
-                    self.terminate(Terminator::Jump(merge_block));
+                    self.terminate(SourceTerminator::Jump(merge_block));
                 }
 
                 self.switch_to(merge_block);
@@ -2582,10 +3227,10 @@ impl Builder {
                 };
                 let exit = self.new_block();
 
-                self.terminate(Terminator::Jump(header));
+                self.terminate(SourceTerminator::Jump(header));
                 self.switch_to(header);
                 let cond = self.lower_condition(cond);
-                self.terminate(Terminator::Branch {
+                self.terminate(SourceTerminator::Branch {
                     cond,
                     then_block: body_block,
                     else_block: exit,
@@ -2600,11 +3245,11 @@ impl Builder {
                 });
                 self.lower_scope(body);
                 self.loop_stack.pop();
-                self.terminate(Terminator::Jump(backedge));
+                self.terminate(SourceTerminator::Jump(backedge));
 
                 if self.is_async {
                     self.switch_to(backedge);
-                    self.terminate(Terminator::Suspend {
+                    self.terminate(SourceTerminator::Suspend {
                         operation: SuspendOp::Preempt,
                         resume: header,
                     });
@@ -2652,7 +3297,7 @@ impl Builder {
     /// The scope is forced open even for a section that defers nothing, because
     /// the section's cleanup block is what releases the lock when a panic
     /// leaves it. Every other exit carries an explicit
-    /// [`LirInst::ReleaseLock`]: the fallthrough one is emitted here, and
+    /// [`SourceInst::ReleaseLock`]: the fallthrough one is emitted here, and
     /// `return`/`break`/`continue` get theirs from
     /// [`Self::flush_defers_down_to`].
     fn lower_lock(
@@ -2713,7 +3358,7 @@ impl Builder {
         };
 
         let entry = self.new_block();
-        self.terminate(Terminator::Suspend {
+        self.terminate(SourceTerminator::Suspend {
             operation: SuspendOp::LockAcquire {
                 slots: slots.clone(),
                 span,
@@ -2728,7 +3373,7 @@ impl Builder {
         });
         self.lower_scope_inner(body, Some(slots.clone()));
         self.active_lock = outer;
-        self.push(LirInst::ReleaseLock(slots));
+        self.push(SourceInst::ReleaseLock(slots));
     }
 
     /// Desugar `for` into a while-shaped header/body/exit with an induction
@@ -2888,9 +3533,9 @@ impl Builder {
         let inc_block = self.new_block();
         let exit = self.new_block();
 
-        self.terminate(Terminator::Jump(header));
+        self.terminate(SourceTerminator::Jump(header));
         self.switch_to(header);
-        self.terminate(Terminator::Branch {
+        self.terminate(SourceTerminator::Branch {
             cond: lt(i64_var(&i_name), bound_expr),
             then_block: body_block,
             else_block: exit,
@@ -2917,22 +3562,22 @@ impl Builder {
         self.loop_stack.pop();
         self.push_scope_root_clears(iteration);
         self.scope_starts.pop();
-        self.terminate(Terminator::Jump(inc_block));
+        self.terminate(SourceTerminator::Jump(inc_block));
 
         self.switch_to(inc_block);
         let local = self.local_by_name[&i_name];
-        self.push(LirInst::Assign {
+        self.push(SourceInst::Assign {
             local,
             name: i_name.clone(),
             value: plus_one(i64_var(&i_name)),
         });
         if self.is_async {
-            self.terminate(Terminator::Suspend {
+            self.terminate(SourceTerminator::Suspend {
                 operation: SuspendOp::Preempt,
                 resume: header,
             });
         } else {
-            self.terminate(Terminator::Jump(header));
+            self.terminate(SourceTerminator::Jump(header));
         }
 
         self.switch_to(exit);
@@ -2946,7 +3591,7 @@ impl Builder {
 
 /// Drop blocks unreachable from the entry (dead blocks created after
 /// mid-block `return`s) and renumber the survivors densely.
-fn prune_unreachable(blocks: Vec<LirBlock>) -> Vec<LirBlock> {
+fn prune_unreachable(blocks: Vec<SourceBlock>) -> Vec<SourceBlock> {
     let mut reachable = vec![false; blocks.len()];
     let mut stack = vec![0usize];
     while let Some(i) = stack.pop() {
@@ -2954,7 +3599,7 @@ fn prune_unreachable(blocks: Vec<LirBlock>) -> Vec<LirBlock> {
             continue;
         }
         for inst in &blocks[i].instrs {
-            if let LirInst::EnterDeferScope {
+            if let SourceInst::EnterDeferScope {
                 resume: Some(resume),
                 ..
             } = inst
@@ -2965,8 +3610,8 @@ fn prune_unreachable(blocks: Vec<LirBlock>) -> Vec<LirBlock> {
             }
         }
         match &blocks[i].terminator {
-            Terminator::Jump(b) => stack.push(b.0),
-            Terminator::Branch {
+            SourceTerminator::Jump(b) => stack.push(b.0),
+            SourceTerminator::Branch {
                 then_block,
                 else_block,
                 ..
@@ -2974,8 +3619,8 @@ fn prune_unreachable(blocks: Vec<LirBlock>) -> Vec<LirBlock> {
                 stack.push(then_block.0);
                 stack.push(else_block.0);
             }
-            Terminator::Suspend { resume, .. } => stack.push(resume.0),
-            Terminator::Return(_) => {}
+            SourceTerminator::Suspend { resume, .. } => stack.push(resume.0),
+            SourceTerminator::Return(_) | SourceTerminator::CleanupReturn => {}
         }
     }
 
@@ -3006,7 +3651,7 @@ fn prune_unreachable(blocks: Vec<LirBlock>) -> Vec<LirBlock> {
                 *target = BlockId(remap[target.0]);
             }
             for inst in &mut block.instrs {
-                if let LirInst::EnterDeferScope {
+                if let SourceInst::EnterDeferScope {
                     resume: Some(resume),
                     ..
                 } = inst
@@ -3015,21 +3660,21 @@ fn prune_unreachable(blocks: Vec<LirBlock>) -> Vec<LirBlock> {
                 }
             }
             block.terminator = match block.terminator {
-                Terminator::Jump(b) => Terminator::Jump(BlockId(remap[b.0])),
-                Terminator::Branch {
+                SourceTerminator::Jump(b) => SourceTerminator::Jump(BlockId(remap[b.0])),
+                SourceTerminator::Branch {
                     cond,
                     then_block,
                     else_block,
-                } => Terminator::Branch {
+                } => SourceTerminator::Branch {
                     cond,
                     then_block: BlockId(remap[then_block.0]),
                     else_block: BlockId(remap[else_block.0]),
                 },
-                Terminator::Suspend { operation, resume } => Terminator::Suspend {
+                SourceTerminator::Suspend { operation, resume } => SourceTerminator::Suspend {
                     operation,
                     resume: BlockId(remap[resume.0]),
                 },
-                ret @ Terminator::Return(_) => ret,
+                ret @ (SourceTerminator::Return(_) | SourceTerminator::CleanupReturn) => ret,
             };
             block
         })
@@ -3041,7 +3686,7 @@ fn prune_unreachable(blocks: Vec<LirBlock>) -> Vec<LirBlock> {
 // ---------------------------------------------------------------------------
 
 /// Render a lowered program as labeled basic blocks.
-pub fn format_program(program: &LirProgram) -> String {
+pub(crate) fn format_source_program(program: &SourceProgram) -> String {
     let mut out = String::new();
     for f in program
         .functions
@@ -3081,21 +3726,22 @@ pub fn format_program(program: &LirProgram) -> String {
     out
 }
 
-fn format_inst(inst: &LirInst) -> String {
+fn format_inst(inst: &SourceInst) -> String {
     let e = super::dump::expr_text;
     match inst {
-        LirInst::EnterDeferScope { sites, lock, .. } => {
+        SourceInst::Compute { local, value, .. } => format!("%{} = {value:?}", local.0),
+        SourceInst::EnterDeferScope { sites, lock, .. } => {
             let owns = match lock {
                 Some(slots) => format!(", holds {}", slots.mode.keyword()),
                 None => String::new(),
             };
             format!("enter defer scope ({} sites{owns});", sites.len())
         }
-        LirInst::LeaveDeferScope { sites } => {
+        SourceInst::LeaveDeferScope { sites } => {
             format!("leave defer scope ({} sites);", sites.len())
         }
-        LirInst::FlushDefers { sites } => format!("flush defers ({} sites);", sites.len()),
-        LirInst::ClearScopeRoots { locals } => {
+        SourceInst::FlushDefers { sites } => format!("flush defers ({} sites);", sites.len()),
+        SourceInst::ClearScopeRoots { locals } => {
             let names = locals
                 .iter()
                 .map(|l| format!("l{}", l.0))
@@ -3103,12 +3749,20 @@ fn format_inst(inst: &LirInst) -> String {
                 .join(", ");
             format!("clear scope roots ({names});")
         }
-        LirInst::ReleaseLock(slots) => format!("release {};", slots.mode.keyword()),
-        LirInst::Defer { body, .. } => match body {
-            LirDeferBody::Expr(call) => format!("defer {};", e(call)),
-            LirDeferBody::Block(stmts) => format!("defer {{ .. }} ({} stmts);", stmts.len()),
-        },
-        LirInst::Let {
+        SourceInst::ReleaseLock(slots) => format!("release {};", slots.mode.keyword()),
+        SourceInst::Defer { body, .. } => {
+            let captures = body.captures.iter().map(|id| format!("l{}", id.0)).collect::<Vec<_>>().join(", ");
+            let mut text = format!("defer cleanup captures ({captures}) {{\n");
+            for block in &body.function.blocks {
+                text.push_str(&format!("    bb{}:\n", block.id.0));
+                for inst in &block.instrs { text.push_str(&format!("      {}\n", format_inst(inst))); }
+                text.push_str(&format!("      {}\n", format_terminator(&block.terminator)));
+            }
+            text.push_str("  }");
+            text
+        }
+
+        SourceInst::Let {
             name,
             mutable,
             ty,
@@ -3128,30 +3782,30 @@ fn format_inst(inst: &LirInst) -> String {
                 )
             }
         }
-        LirInst::Assign { name, value, .. } => format!("{name} = {};", e(value)),
-        LirInst::FieldAssign {
+        SourceInst::Assign { name, value, .. } => format!("{name} = {};", e(value)),
+        SourceInst::FieldAssign {
             object,
             field,
             value,
         } => format!("{}.{field} = {};", e(object), e(value)),
-        LirInst::IndexAssign {
+        SourceInst::IndexAssign {
             array,
             index,
             value,
         } => format!("{}[{}] = {};", e(array), e(index), e(value)),
-        LirInst::StaticFieldAssign {
+        SourceInst::StaticFieldAssign {
             class,
             field,
             value,
         } => format!("{class}::{field} = {};", e(value)),
-        LirInst::SuperInit { args, .. } => {
+        SourceInst::SuperInit { args, .. } => {
             let args = args.iter().map(e).collect::<Vec<_>>().join(", ");
             format!("super.init({args});")
         }
-        LirInst::MatchTest {
+        SourceInst::MatchTest {
             scrutinee, result, ..
         } => format!("l{} = match.test l{};", result.0, scrutinee.0),
-        LirInst::MatchBind {
+        SourceInst::MatchBind {
             scrutinee,
             bindings,
             ..
@@ -3163,29 +3817,30 @@ fn format_inst(inst: &LirInst) -> String {
                 .join(", ");
             format!("({names}) = match.bind l{};", scrutinee.0)
         }
-        LirInst::SelectInit { .. } => "select.init;".to_string(),
-        LirInst::SelectProbe { .. } => "select.probe;".to_string(),
-        LirInst::SelectPick { .. } => "select.pick;".to_string(),
-        LirInst::SelectUnregister { .. } => "select.unregister;".to_string(),
-        LirInst::SelectCommit { .. } => "select.commit;".to_string(),
-        LirInst::Expr(expr) => format!("{};", e(expr)),
+        SourceInst::SelectInit { .. } => "select.init;".to_string(),
+        SourceInst::SelectProbe { .. } => "select.probe;".to_string(),
+        SourceInst::SelectPick { .. } => "select.pick;".to_string(),
+        SourceInst::SelectUnregister { .. } => "select.unregister;".to_string(),
+        SourceInst::SelectCommit { .. } => "select.commit;".to_string(),
+        SourceInst::Expr(expr) => format!("{};", e(expr)),
     }
 }
 
-fn format_terminator(t: &Terminator) -> String {
+fn format_terminator(t: &SourceTerminator) -> String {
     let e = super::dump::expr_text;
     match t {
-        Terminator::Jump(b) => format!("jump bb{}", b.0),
-        Terminator::Branch {
+        SourceTerminator::Jump(b) => format!("jump bb{}", b.0),
+        SourceTerminator::Branch {
             cond,
             then_block,
             else_block,
         } => format!("branch {} bb{} bb{}", e(cond), then_block.0, else_block.0),
-        Terminator::Suspend { operation, resume } => {
+        SourceTerminator::Suspend { operation, resume } => {
             format!("suspend {operation:?} -> bb{}", resume.0)
         }
-        Terminator::Return(Some(v)) => format!("return {}", e(v)),
-        Terminator::Return(None) => "return".to_string(),
+        SourceTerminator::Return(Some(v)) => format!("return {}", e(v)),
+        SourceTerminator::Return(None) => "return".to_string(),
+        SourceTerminator::CleanupReturn => "cleanup return".to_string(),
     }
 }
 
@@ -3208,13 +3863,13 @@ mod tests {
             }
             let (hir, errors) = crate::ir::lower::lower_program(&ast);
             assert!(errors.is_empty(), "{errors:?}");
-            let lir = lower_program(&hir);
+            let lir = lower_source_program(&hir);
             let ids: std::collections::HashSet<_> = lir.functions[0]
                 .blocks
                 .iter()
                 .flat_map(|block| &block.instrs)
                 .filter_map(|inst| {
-                    if let LirInst::Defer { id, .. } = inst {
+                    if let SourceInst::Defer { id, .. } = inst {
                         Some(*id)
                     } else {
                         None
@@ -3226,51 +3881,25 @@ mod tests {
     }
 
     #[test]
-    fn deep_match_cfg_predicate_uses_a_one_megabyte_stack() {
-        std::thread::Builder::new()
-            .stack_size(1024 * 1024)
-            .spawn(|| {
-                for hazard in [false, true] {
-                    let span = Span::new(0, 0, 1, 1);
-                    let leaf = HirExpr {
-                        kind: HirExprKind::Int(1),
-                        ty: Type::I64,
-                        span,
-                    };
-                    let mut expr = HirExpr {
-                        kind: HirExprKind::Match {
-                            scrutinee: Box::new(leaf),
-                            arms: vec![crate::ir::typed_ast::HirMatchArm {
-                                pattern: HirPattern::Wildcard,
-                                ty: Type::I64,
-                                body: if hazard {
-                                    vec![HirStmt::Break { span }]
-                                } else {
-                                    Vec::new()
-                                },
-                                span,
-                            }],
-                        },
-                        ty: Type::I64,
-                        span,
-                    };
-                    for _ in 0..50_000 {
-                        expr = HirExpr {
-                            kind: HirExprKind::TryPropagate {
-                                inner: Box::new(expr),
-                            },
-                            ty: Type::I64,
-                            span,
-                        };
-                    }
-                    let found = needs_match_cfg(vec![MatchCfgNode::Expr(&expr)]);
-                    drop(expr);
-                    assert_eq!(found, hazard);
-                }
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+    fn deep_expression_cfg_lowering_uses_a_one_megabyte_stack() {
+        std::thread::Builder::new().stack_size(1024 * 1024).spawn(|| {
+            let span = Span::dummy();
+            let int = |n| HirExpr { kind: HirExprKind::Int(n), ty: Type::I64, span };
+            let mut expr = HirExpr {
+                kind: HirExprKind::Ternary {
+                    condition: Box::new(HirExpr { kind: HirExprKind::Bool(true), ty: Type::Bool, span }),
+                    then_expr: Box::new(int(1)), else_expr: Box::new(int(2)),
+                }, ty: Type::I64, span,
+            };
+            for _ in 0..50_000 {
+                expr = HirExpr { kind: HirExprKind::Unary { op: crate::parser::ast::UnaryOp::Neg, operand: Box::new(expr) }, ty: Type::I64, span };
+            }
+            let mut builder = Builder::new(&[], false);
+            let lowered = builder.lower_nested_cfg(&expr).expect("nested control flow");
+            assert!(!expression_needs_cfg(&lowered));
+            assert!(builder.blocks.iter().any(|(_, term)| matches!(term, Some(SourceTerminator::Branch { .. }))));
+            assert!(builder.blocks.iter().map(|(insts, _)| insts.len()).sum::<usize>() >= 50_000);
+        }).unwrap().join().unwrap();
     }
 
     #[test]
@@ -3304,7 +3933,7 @@ mod tests {
                     assert_eq!(expr_has_recover(&expr), has_call);
                     assert_eq!(expression_executes_call(&expr), has_call);
                     let mut lambdas = Vec::new();
-                    collect_lambdas_in_expr(&expr, &mut lambdas);
+                    collect_lambdas_in_expr(&expr, &mut lambdas, &Default::default());
                     assert!(lambdas.is_empty());
                     drop(expr);
                 }
@@ -3359,20 +3988,51 @@ mod tests {
     use crate::parser::Parser;
 
     /// Parse + HIR-lower + LIR-lower; assert no HIR diagnostics.
-    fn lir(src: &str) -> LirProgram {
+    fn lir(src: &str) -> SourceProgram {
         let tokens = Lexer::new(src).tokenize().expect("lexing failed");
         let (program, errs) = Parser::new(tokens).parse();
         assert!(errs.is_empty(), "parse errors: {errs:?}");
         let (hir, diags) = super::super::lower::lower_program(&program);
         assert!(diags.is_empty(), "HIR diagnostics: {diags:?}");
-        lower_program(&hir)
+        lower_source_program(&hir)
     }
 
-    fn func<'a>(p: &'a LirProgram, name: &str) -> &'a LirFunction {
+    fn func<'a>(p: &'a SourceProgram, name: &str) -> &'a SourceFunction {
         p.functions
             .iter()
             .find(|f| f.name.to_string() == name)
             .unwrap_or_else(|| panic!("no function {name}"))
+    }
+
+    #[test]
+    fn defer_cleanup_region_owns_cfg_and_captures_only_outer_reads_or_writes() {
+        let program = lir("fn f(flag: bool) { let mut used = 1; let unused = 2; defer { let own = 3; while flag { used = own; } } }");
+        let outer = func(&program, "f");
+        let cleanup = outer.blocks.iter().flat_map(|block| &block.instrs).find_map(|inst|
+            if let SourceInst::Defer { body, .. } = inst { Some(body) } else { None }).unwrap();
+        let captures: Vec<_> = cleanup.captures.iter().map(|id| outer.locals[id.0 as usize].name.as_str()).collect();
+        assert_eq!(captures, ["flag", "used"]);
+        assert!(cleanup.function.blocks.iter().any(|block| matches!(block.terminator, SourceTerminator::Branch { .. })));
+        assert!(cleanup.function.blocks.iter().any(|block| block.terminator == SourceTerminator::CleanupReturn));
+        assert!(!cleanup.function.blocks.iter().any(|block| matches!(block.terminator, SourceTerminator::Return(_))));
+        assert!(cleanup.function.locals.iter().any(|local| local.name == "own" && !local.parameter));
+        for inst in cleanup.function.blocks.iter().flat_map(|block| &block.instrs) {
+            if let SourceInst::ClearScopeRoots { locals } = inst {
+                assert!(locals.iter().all(|id| !cleanup.function.locals[id.0 as usize].parameter));
+            }
+        }
+    }
+
+    #[test]
+    fn expression_cleanup_region_captures_registration_time_operand() {
+        let program = lir("fn f() { let mut value = 1; defer println(value); value = 2; }");
+        let outer = func(&program, "f");
+        let cleanup = outer.blocks.iter().flat_map(|block| &block.instrs).find_map(|inst|
+            if let SourceInst::Defer { body, .. } = inst { Some(body) } else { None }).unwrap();
+        assert_eq!(cleanup.captures.len(), 1);
+        let captured = &outer.locals[cleanup.captures[0].0 as usize];
+        assert!(captured.synthetic);
+        assert_ne!(captured.name, "value");
     }
 
     // 1. a straight-line body is a single entry block
@@ -3380,10 +4040,9 @@ mod tests {
     fn l01_straight_line_single_block() {
         let p = lir("fn f() { let a = 1; print(a); }");
         let f = func(&p, "f");
-        // The two statements, plus the body scope's root close
-        // (willow-0g8j.3.3).
         assert_eq!(f.blocks[0].instrs.len(), 3);
-        assert_eq!(f.blocks[0].terminator, Terminator::Return(None));
+        assert!(matches!(&f.blocks[0].instrs[1], SourceInst::Compute { value: LirRvalue::Print { .. }, .. }));
+        assert_eq!(f.blocks[0].terminator, SourceTerminator::Return(None));
     }
 
     // 2. entry block is always id 0
@@ -3400,7 +4059,7 @@ mod tests {
         let f = func(&p, "f");
         assert!(matches!(
             &f.blocks[0].terminator,
-            Terminator::Return(Some(v)) if matches!(v.kind, HirExprKind::Int(7))
+            SourceTerminator::Return(Some(v)) if matches!(v.kind, HirExprKind::Int(7))
         ));
     }
 
@@ -3408,7 +4067,7 @@ mod tests {
     #[test]
     fn l04_empty_fn_implicit_return() {
         let p = lir("fn f() { }");
-        assert_eq!(func(&p, "f").blocks[0].terminator, Terminator::Return(None));
+        assert_eq!(func(&p, "f").blocks[0].terminator, SourceTerminator::Return(None));
     }
 
     // 5. `if` without else: entry branches then/merge, then jumps to merge
@@ -3416,7 +4075,7 @@ mod tests {
     fn l05_if_without_else_shape() {
         let p = lir("fn f(c: bool) { if c { print(1); } print(2); }");
         let f = func(&p, "f");
-        let Terminator::Branch {
+        let SourceTerminator::Branch {
             then_block,
             else_block,
             ..
@@ -3427,10 +4086,11 @@ mod tests {
         // No else → the false edge goes straight to the merge block.
         assert_eq!(
             f.blocks[then_block.0].terminator,
-            Terminator::Jump(*else_block)
+            SourceTerminator::Jump(*else_block)
         );
         // The merge block holds the trailing statement.
-        assert_eq!(f.blocks[else_block.0].instrs.len(), 1);
+        assert!(f.blocks[else_block.0].instrs.iter().any(|inst| matches!(inst,
+            SourceInst::Compute { value: LirRvalue::Print { value: LirOperand::Int(2), .. }, .. })));
     }
 
     // 6. `if`/`else`: both arms jump to the same merge block
@@ -3438,7 +4098,7 @@ mod tests {
     fn l06_if_else_merges() {
         let p = lir("fn f(c: bool) { if c { print(1); } else { print(2); } print(3); }");
         let f = func(&p, "f");
-        let Terminator::Branch {
+        let SourceTerminator::Branch {
             then_block,
             else_block,
             ..
@@ -3446,10 +4106,10 @@ mod tests {
         else {
             panic!("entry must branch");
         };
-        let Terminator::Jump(merge_a) = f.blocks[then_block.0].terminator else {
+        let SourceTerminator::Jump(merge_a) = f.blocks[then_block.0].terminator else {
             panic!("then must jump to merge");
         };
-        let Terminator::Jump(merge_b) = f.blocks[else_block.0].terminator else {
+        let SourceTerminator::Jump(merge_b) = f.blocks[else_block.0].terminator else {
             panic!("else must jump to merge");
         };
         assert_eq!(merge_a, merge_b);
@@ -3462,7 +4122,7 @@ mod tests {
     fn l07_branch_cond_is_bool() {
         let p = lir("fn f(a: i64) { if a > 0 { print(1); } }");
         let f = func(&p, "f");
-        let Terminator::Branch { cond, .. } = &f.blocks[0].terminator else {
+        let SourceTerminator::Branch { cond, .. } = &f.blocks[0].terminator else {
             panic!("entry must branch");
         };
         assert_eq!(cond.ty, Type::Bool);
@@ -3473,17 +4133,17 @@ mod tests {
     fn l08_while_header_shape() {
         let p = lir("fn f(c: bool) { while c { print(1); } }");
         let f = func(&p, "f");
-        let Terminator::Jump(header) = f.blocks[0].terminator else {
+        let SourceTerminator::Jump(header) = f.blocks[0].terminator else {
             panic!("entry must jump to the loop header");
         };
-        let Terminator::Branch {
+        let SourceTerminator::Branch {
             then_block: body, ..
         } = &f.blocks[header.0].terminator
         else {
             panic!("header must branch");
         };
         // The body jumps back to the header (the loop backedge).
-        assert_eq!(f.blocks[body.0].terminator, Terminator::Jump(header));
+        assert_eq!(f.blocks[body.0].terminator, SourceTerminator::Jump(header));
     }
 
     // 9. the `while` condition lives in the header, not the entry block
@@ -3491,13 +4151,13 @@ mod tests {
     fn l09_while_cond_in_header() {
         let p = lir("fn f(a: i64) { while a > 0 { print(1); } }");
         let f = func(&p, "f");
-        assert!(matches!(f.blocks[0].terminator, Terminator::Jump(_)));
-        let Terminator::Jump(header) = f.blocks[0].terminator else {
+        assert!(matches!(f.blocks[0].terminator, SourceTerminator::Jump(_)));
+        let SourceTerminator::Jump(header) = f.blocks[0].terminator else {
             unreachable!()
         };
         assert!(matches!(
             f.blocks[header.0].terminator,
-            Terminator::Branch { .. }
+            SourceTerminator::Branch { .. }
         ));
     }
 
@@ -3510,7 +4170,7 @@ mod tests {
             .instrs
             .iter()
             .filter_map(|i| match i {
-                LirInst::Let { name, .. } => Some(name.as_str()),
+                SourceInst::Let { name, .. } => Some(name.as_str()),
                 _ => None,
             })
             .collect();
@@ -3523,10 +4183,10 @@ mod tests {
     fn l11_range_for_body_binding_and_increment() {
         let p = lir("fn f() { for i in 0..3 { print(i); } }");
         let f = func(&p, "f");
-        let Terminator::Jump(header) = f.blocks[0].terminator else {
+        let SourceTerminator::Jump(header) = f.blocks[0].terminator else {
             unreachable!()
         };
-        let Terminator::Branch {
+        let SourceTerminator::Branch {
             then_block: body, ..
         } = &f.blocks[header.0].terminator
         else {
@@ -3535,19 +4195,19 @@ mod tests {
         let body = &f.blocks[body.0];
         assert!(matches!(
             &body.instrs[0],
-            LirInst::Let { name, .. } if name == "i"
+            SourceInst::Let { name, .. } if name == "i"
         ));
         // The increment lives in a dedicated block (the `continue` target,
         // willow-kzka): body jumps to it, and it assigns the induction var.
-        let Terminator::Jump(inc) = body.terminator else {
+        let SourceTerminator::Jump(inc) = body.terminator else {
             panic!("body must jump to the increment block");
         };
         let inc = &f.blocks[inc.0];
         assert!(matches!(
             inc.instrs.last(),
-            Some(LirInst::Assign { name, .. }) if name == "__for0_i"
+            Some(SourceInst::Assign { name, .. }) if name == "__for0_i"
         ));
-        assert!(matches!(inc.terminator, Terminator::Jump(h) if h == header));
+        assert!(matches!(inc.terminator, SourceTerminator::Jump(h) if h == header));
     }
 
     // 12. array-for desugars to arr/index lets, a header that RE-READS `len()`
@@ -3561,7 +4221,7 @@ mod tests {
             .instrs
             .iter()
             .filter_map(|i| match i {
-                LirInst::Let { name, .. } => Some(name.as_str()),
+                SourceInst::Let { name, .. } => Some(name.as_str()),
                 _ => None,
             })
             .collect();
@@ -3569,10 +4229,10 @@ mod tests {
         assert!(names.contains(&"__for0_i"), "{names:?}");
         // The length is NOT hoisted into a `let`.
         assert!(!names.contains(&"__for0_len"), "{names:?}");
-        let Terminator::Jump(header) = f.blocks[0].terminator else {
+        let SourceTerminator::Jump(header) = f.blocks[0].terminator else {
             unreachable!()
         };
-        let Terminator::Branch {
+        let SourceTerminator::Branch {
             cond,
             then_block: body,
             ..
@@ -3581,20 +4241,21 @@ mod tests {
             panic!("header must branch");
         };
         // The bound is a fresh `__for0_arr.len()` call in the header itself.
-        let HirExprKind::Binary { rhs, .. } = &cond.kind else {
-            panic!("header condition must be `i < bound`");
-        };
-        assert!(
-            matches!(&rhs.kind, HirExprKind::MethodCall { method, .. } if method == "len"),
-            "{:?}",
-            rhs.kind
-        );
+        let HirExprKind::Var(condition) = &cond.kind else { panic!("header condition must be a flat value"); };
+        let header_instructions = &f.blocks[header.0].instrs;
+        assert!(header_instructions.iter().any(|inst| matches!(inst,
+            SourceInst::Compute { value: LirRvalue::IntrinsicCall { method, .. }, .. } if method == "len")));
+        assert!(header_instructions.iter().any(|inst| matches!(inst,
+            SourceInst::Compute { local, value: LirRvalue::Binary { op: crate::parser::ast::BinOp::Lt, .. }, .. }
+                if f.locals[local.0 as usize].name == *condition)));
         // v = __for0_arr[__for0_i], typed with the element type.
-        let LirInst::Let { name, value, .. } = &f.blocks[body.0].instrs[0] else {
-            panic!("body must bind the loop variable first");
-        };
+        let (name, value) = f.blocks[body.0].instrs.iter().find_map(|inst| match inst {
+            SourceInst::Let { name, value, .. } if name == "v" => Some((name, value)), _ => None,
+        }).expect("body binds the loop variable");
         assert_eq!(name, "v");
-        assert!(matches!(value.kind, HirExprKind::Index { .. }));
+        let HirExprKind::Var(index_result) = &value.kind else { panic!("index must be a flat value"); };
+        assert!(f.blocks[body.0].instrs.iter().any(|inst| matches!(inst,
+            SourceInst::Compute { local, value: LirRvalue::Index { .. }, .. } if f.locals[local.0 as usize].name == *index_result)));
         assert_eq!(value.ty, Type::I64);
     }
 
@@ -3608,7 +4269,7 @@ mod tests {
             .iter()
             .flat_map(|b| &b.instrs)
             .filter_map(|i| match i {
-                LirInst::Let { name, .. } => Some(name.clone()),
+                SourceInst::Let { name, .. } => Some(name.clone()),
                 _ => None,
             })
             .collect();
@@ -3624,19 +4285,19 @@ mod tests {
         // Every block has a terminator (no panics, no fallthrough corruption).
         for b in &f.blocks {
             match &b.terminator {
-                Terminator::Jump(_)
-                | Terminator::Branch { .. }
-                | Terminator::Suspend { .. }
-                | Terminator::Return(_) => {}
+                SourceTerminator::Jump(_)
+                | SourceTerminator::Branch { .. }
+                | SourceTerminator::Suspend { .. }
+                | SourceTerminator::Return(_) | SourceTerminator::CleanupReturn => {}
             }
         }
         // The then-arm's return survives as a Return terminator.
-        let Terminator::Branch { then_block, .. } = &f.blocks[0].terminator else {
+        let SourceTerminator::Branch { then_block, .. } = &f.blocks[0].terminator else {
             panic!("entry must branch");
         };
         assert!(matches!(
             f.blocks[then_block.0].terminator,
-            Terminator::Return(Some(_))
+            SourceTerminator::Return(Some(_))
         ));
     }
 
@@ -3649,13 +4310,15 @@ mod tests {
             .instrs
             .iter()
             .map(|i| match i {
-                LirInst::Let { name, .. } => format!("let {name}"),
-                LirInst::Expr(_) => "expr".to_string(),
-                LirInst::ClearScopeRoots { .. } => "clear roots".to_string(),
+                SourceInst::Let { name, .. } => format!("let {name}"),
+                SourceInst::Compute { value: LirRvalue::Binary { .. }, .. } => "binary".to_string(),
+                SourceInst::Compute { value: LirRvalue::Print { .. }, .. } => "print".to_string(),
+                SourceInst::Expr(_) => "expr".to_string(),
+                SourceInst::ClearScopeRoots { .. } => "clear roots".to_string(),
                 _ => "other".to_string(),
             })
             .collect();
-        assert_eq!(kinds, ["let a", "let b", "expr", "clear roots"]);
+        assert_eq!(kinds, ["let a", "let b", "binary", "print", "clear roots"]);
     }
 
     // 16. field/index/static assignments lower to their instructions
@@ -3668,17 +4331,17 @@ mod tests {
         assert!(
             instrs
                 .iter()
-                .any(|i| matches!(i, LirInst::FieldAssign { .. }))
+                .any(|i| matches!(i, SourceInst::Compute { value: LirRvalue::FieldStore { .. }, .. }))
         );
         assert!(
             instrs
                 .iter()
-                .any(|i| matches!(i, LirInst::IndexAssign { .. }))
+                .any(|i| matches!(i, SourceInst::Compute { value: LirRvalue::ArrayStore { .. }, .. }))
         );
         assert!(
             instrs
                 .iter()
-                .any(|i| matches!(i, LirInst::StaticFieldAssign { .. }))
+                .any(|i| matches!(i, SourceInst::Compute { value: LirRvalue::StaticStore { .. }, .. }))
         );
     }
 
@@ -3693,7 +4356,7 @@ mod tests {
         );
     }
 
-    // 18. a constructor flattens as `Class::init` and keeps super.init
+    // 18. super.init becomes an explicit base constructor call.
     #[test]
     fn l18_constructor_flattened_with_super_init() {
         let p = lir(
@@ -3705,7 +4368,7 @@ mod tests {
             init.blocks[0]
                 .instrs
                 .iter()
-                .any(|i| matches!(i, LirInst::SuperInit { .. }))
+                .any(|i| matches!(i, SourceInst::Compute { value: LirRvalue::ConstructorCall { class, .. }, .. } if *class == TypeId::local("A")))
         );
     }
 
@@ -3725,7 +4388,7 @@ mod tests {
             "fn f(n: i64) { let mut i = 0; while i < n { if i > 2 { print(i); } i = i + 1; } }",
         );
         let f = func(&p, "f");
-        let Terminator::Jump(header) = f.blocks[0].terminator else {
+        let SourceTerminator::Jump(header) = f.blocks[0].terminator else {
             unreachable!()
         };
         // Some block jumps back to the header — the loop backedge survives the
@@ -3733,7 +4396,7 @@ mod tests {
         let backedges = f
             .blocks
             .iter()
-            .filter(|b| b.id != BlockId(0) && b.terminator == Terminator::Jump(header))
+            .filter(|b| b.id != BlockId(0) && b.terminator == SourceTerminator::Jump(header))
             .count();
         assert!(backedges >= 1);
     }
@@ -3742,7 +4405,7 @@ mod tests {
     #[test]
     fn l21_text_dump_shape() {
         let p = lir("fn f(c: bool) -> i64 { if c { return 1; } return 2; }");
-        let text = format_program(&p);
+        let text = format_source_program(&p);
         assert!(text.contains("bb0:"), "{text}");
         assert!(text.contains("branch c: bool bb"), "{text}");
         assert!(text.contains("return 1: i64"), "{text}");
@@ -3750,14 +4413,12 @@ mod tests {
 
     // 22. expression-level control flow (ternary/match) stays in instructions
     #[test]
-    fn l22_expression_control_flow_stays_in_tree() {
+    fn l22_expression_control_flow_becomes_blocks() {
         let p = lir("fn f(c: bool) -> i64 { return c ? 1 : 2; }");
         let f = func(&p, "f");
-        // A single block: the ternary is a value inside the return, not blocks.
-        assert!(matches!(
-            &f.blocks[0].terminator,
-            Terminator::Return(Some(v)) if matches!(v.kind, HirExprKind::Ternary { .. })
-        ));
+        assert!(matches!(&f.blocks[0].terminator, SourceTerminator::Branch { .. }));
+        assert!(f.blocks.iter().any(|block| matches!(&block.terminator,
+            SourceTerminator::Return(Some(v)) if matches!(v.kind, HirExprKind::Var(_)))));
     }
 
     #[test]
@@ -3767,7 +4428,7 @@ mod tests {
         assert!(f.is_async);
         assert!(f.blocks.iter().any(|block| matches!(
             block.terminator,
-            Terminator::Suspend {
+            SourceTerminator::Suspend {
                 operation: SuspendOp::Sleep { .. },
                 ..
             }
@@ -3822,36 +4483,36 @@ async fn f(ch: Channel<i64>) {
             block
                 .instrs
                 .iter()
-                .any(|inst| matches!(inst, LirInst::SelectProbe { .. }))
+                .any(|inst| matches!(inst, SourceInst::SelectProbe { .. }))
         }));
         assert!(f.blocks.iter().any(|block| {
             block
                 .instrs
                 .iter()
-                .any(|inst| matches!(inst, LirInst::SelectPick { .. }))
+                .any(|inst| matches!(inst, SourceInst::SelectPick { .. }))
         }));
         assert!(f.blocks.iter().any(|block| {
             block
                 .instrs
                 .iter()
-                .any(|inst| matches!(inst, LirInst::SelectUnregister { .. }))
+                .any(|inst| matches!(inst, SourceInst::SelectUnregister { .. }))
         }));
         assert!(f.blocks.iter().any(|block| {
             block
                 .instrs
                 .iter()
-                .any(|inst| matches!(inst, LirInst::SelectCommit { .. }))
+                .any(|inst| matches!(inst, SourceInst::SelectCommit { .. }))
         }));
         assert!(f.blocks.iter().any(|block| matches!(
             block.terminator,
-            Terminator::Suspend {
+            SourceTerminator::Suspend {
                 operation: SuspendOp::SelectWait { .. },
                 ..
             }
         )));
         assert!(f.blocks.iter().any(|block| matches!(
             block.terminator,
-            Terminator::Suspend {
+            SourceTerminator::Suspend {
                 operation: SuspendOp::Yield,
                 ..
             }
@@ -3876,21 +4537,23 @@ async fn f() -> i64 {
                 block
                     .instrs
                     .iter()
-                    .any(|inst| matches!(inst, LirInst::FlushDefers { .. }))
+                    .any(|inst| matches!(inst, SourceInst::FlushDefers { .. }))
             })
             .expect("return block must flush its defer");
         let flush_index = block
             .instrs
             .iter()
-            .position(|inst| matches!(inst, LirInst::FlushDefers { .. }))
+            .position(|inst| matches!(inst, SourceInst::FlushDefers { .. }))
             .unwrap();
+        assert!(block.instrs[..flush_index].iter().any(|inst| matches!(inst,
+            SourceInst::Compute { value: LirRvalue::Binary { .. }, .. })));
         let (return_local, return_name) = block.instrs[..flush_index]
             .iter()
             .find_map(|inst| match inst {
-                LirInst::Let {
+                SourceInst::Let {
                     local, name, value, ..
                 } if name.starts_with("__async_return_")
-                    && matches!(value.kind, HirExprKind::Binary { .. }) =>
+                    && matches!(value.kind, HirExprKind::Var(_)) =>
                 {
                     Some((*local, name.as_str()))
                 }
@@ -3899,7 +4562,7 @@ async fn f() -> i64 {
             .expect("the complete return expression must be stored before flushing defers");
         assert!(matches!(
             &block.terminator,
-            Terminator::Return(Some(HirExpr {
+            SourceTerminator::Return(Some(HirExpr {
                 kind: HirExprKind::Var(name),
                 ..
             })) if name == return_name
@@ -3928,14 +4591,14 @@ async fn f(which: i64) -> i64 {
             f.blocks
                 .iter()
                 .flat_map(|block| &block.instrs)
-                .filter(|inst| matches!(inst, LirInst::MatchTest { .. }))
+                .filter(|inst| matches!(inst, SourceInst::MatchTest { .. }))
                 .count(),
             1
         );
         assert!(
             f.blocks
                 .iter()
-                .any(|block| matches!(block.terminator, Terminator::Branch { .. }))
+                .any(|block| matches!(block.terminator, SourceTerminator::Branch { .. }))
         );
         // Both arms suspend, so each one ends up behind its own suspend edge.
         assert_eq!(
@@ -3943,7 +4606,7 @@ async fn f(which: i64) -> i64 {
                 .iter()
                 .filter(|block| matches!(
                     block.terminator,
-                    Terminator::Suspend {
+                    SourceTerminator::Suspend {
                         operation: SuspendOp::AwaitTask { .. },
                         ..
                     }
@@ -3974,7 +4637,7 @@ async fn f(which: i64) -> i64 {
             .iter()
             .flat_map(|block| &block.instrs)
             .filter_map(|inst| match inst {
-                LirInst::MatchTest { scrutinee, .. } => Some(*scrutinee),
+                SourceInst::MatchTest { scrutinee, .. } => Some(*scrutinee),
                 _ => None,
             })
             .collect();
@@ -4002,15 +4665,15 @@ async fn f(which: i64) -> i64 {
             !f.blocks
                 .iter()
                 .flat_map(|block| &block.instrs)
-                .any(|inst| matches!(inst, LirInst::MatchTest { .. }))
+                .any(|inst| matches!(inst, SourceInst::MatchTest { .. }))
         );
-        assert_eq!(f.blocks[0].terminator, Terminator::Jump(BlockId(1)));
+        assert_eq!(f.blocks[0].terminator, SourceTerminator::Jump(BlockId(1)));
         // The catch-all still binds the whole scrutinee.
         assert!(
             f.blocks
                 .iter()
                 .flat_map(|block| &block.instrs)
-                .any(|inst| matches!(inst, LirInst::MatchBind { .. }))
+                .any(|inst| matches!(inst, SourceInst::MatchBind { .. }))
         );
     }
 
@@ -4036,7 +4699,7 @@ async fn f(shape: Shape) -> i64 {
             .iter()
             .flat_map(|block| &block.instrs)
             .filter_map(|inst| match inst {
-                LirInst::MatchBind { bindings, .. } => Some(bindings.clone()),
+                SourceInst::MatchBind { bindings, .. } => Some(bindings.clone()),
                 _ => None,
             })
             .collect();
@@ -4052,11 +4715,114 @@ async fn f(shape: Shape) -> i64 {
         assert!(f.async_frame.slot(local("r")).is_none());
     }
 
-    /// A `match` no arm of which suspends keeps its arms in the HIR tree. The
-    /// split exists to give a suspension a resume point, and paying for blocks
-    /// where nothing suspends would cost the walker its cheaper shape.
     #[test]
-    fn l35_non_suspending_match_is_not_split() {
+    fn synchronous_root_conditionals_are_cfg() {
+        for source in [
+            "fn f(c: bool) -> i64 { return c ? 10 : 20; }",
+            "fn f(c: bool, d: bool) -> bool { return c && d; }",
+            "fn f(c: bool, d: bool) -> bool { return c || d; }",
+            "fn f(c: bool, d: bool) -> i64 { if c && d { return 10; } return 20; }",
+            "fn f(c: bool) -> i64 { let v = c ? 10 : 20; return v; }",
+        ] {
+            let p = lir(source);
+            let f = func(&p, "f");
+            assert!(
+                f.blocks
+                    .iter()
+                    .any(|block| matches!(block.terminator, SourceTerminator::Branch { .. })),
+                "{source}"
+            );
+            for block in &f.blocks {
+                if let SourceTerminator::Return(Some(value)) | SourceTerminator::Branch { cond: value, .. } =
+                    &block.terminator
+                {
+                    assert!(
+                        !matches!(
+                            value.kind,
+                            HirExprKind::Ternary { .. }
+                                | HirExprKind::Binary {
+                                    op: crate::parser::ast::BinOp::And
+                                        | crate::parser::ast::BinOp::Or,
+                                    ..
+                                }
+                        ),
+                        "{source}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_conditionals_are_evaluated_before_eager_parents() {
+        for source in [
+            "fn f(c: bool, x: i64) -> i64 { return x + (c ? 10 : 20); }",
+            "fn g(a: i64, b: i64) -> i64 { return a + b; } fn f(c: bool, x: i64) -> i64 { return g(x, c ? 10 : 20); }",
+            "fn f(c: bool, xs: Array<i64>) -> i64 { return xs[c ? 0 : 1]; }",
+            "fn f(c: bool, xs: Array<i64>) { xs[c ? 0 : 1] = c ? 10 : 20; }",
+            "fn g(a: &mut i64, b: i64) { a = b; } fn f(c: bool, xs: Array<i64>) { g(&xs[c ? 0 : 1], c ? 10 : 20); }",
+        ] {
+            let p = lir(source);
+            let f = func(&p, "f");
+            assert!(
+                f.blocks
+                    .iter()
+                    .any(|block| matches!(block.terminator, SourceTerminator::Branch { .. })),
+                "{source}"
+            );
+            let check =
+                |value: &HirExpr| assert!(!expression_needs_cfg(value), "{source}: {value:?}");
+            for block in &f.blocks {
+                for inst in &block.instrs {
+                    match inst {
+                        SourceInst::Let { value, .. }
+                        | SourceInst::Assign { value, .. }
+                        | SourceInst::Expr(value) => check(value),
+                        SourceInst::IndexAssign {
+                            array,
+                            index,
+                            value,
+                        } => {
+                            check(array);
+                            check(index);
+                            check(value);
+                        }
+                        _ => {}
+                    }
+                }
+                match &block.terminator {
+                    SourceTerminator::Return(Some(value)) | SourceTerminator::Branch { cond: value, .. } => {
+                        check(value)
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lifted_lambdas_exclusively_own_their_bodies() {
+        let mut program = lir("fn f() -> i64 { let apply = |x: i64| -> i64 { let next = |y: i64| y + 1; return next(x); }; return apply(10); }");
+        assert_eq!(program.lambdas.len(), 2);
+        let mut constructions = 0;
+        for function in program.functions.iter_mut().chain(program.lambdas.iter_mut().map(|lambda| &mut lambda.function)) {
+            constructions += function.blocks.iter().flat_map(|block| &block.instrs).filter(|inst|
+                matches!(inst, SourceInst::Compute { value: LirRvalue::Closure { .. }, .. })).count();
+            function.visit_expr_roots_mut(|expr| {
+                for node in expr.walk_postorder(true) {
+                    if let HirExprKind::Lambda { body, .. } = &node.kind {
+                        constructions += 1;
+                        assert!(body.is_empty());
+                    }
+                }
+            });
+        }
+        assert_eq!(constructions, 2);
+    }
+
+    /// Ordinary match arms also belong to the explicit control-flow graph.
+    #[test]
+    fn l35_non_suspending_match_is_split() {
         let p = lir(r#"
 async fn f(which: i64) -> i64 {
     let mut out = 0;
@@ -4070,17 +4836,17 @@ async fn f(which: i64) -> i64 {
 "#);
         let f = func(&p, "f");
         assert!(
-            !f.blocks
+            f.blocks
                 .iter()
                 .flat_map(|block| &block.instrs)
-                .any(|inst| matches!(inst, LirInst::MatchTest { .. } | LirInst::MatchBind { .. }))
+                .any(|inst| matches!(inst, SourceInst::MatchTest { .. } | SourceInst::MatchBind { .. }))
         );
     }
 
     // 37. a `lock` body and its continuation are emitted BEFORE the block
     // that holds the `let` they read (willow-34su).
     //
-    // This is the shape that made lazy binding at `LirInst::Let` wrong: the
+    // This is the shape that made lazy binding at `SourceInst::Let` wrong: the
     // assignment in the section and the read after it both land in blocks of
     // lower index than the `let`, so codegen reaches them first. The backend
     // answers it by binding every local at function entry; this pins the
@@ -4101,15 +4867,15 @@ async fn peek(m: Mutex<i64>) -> i64 {
 }
 "#);
         let f = func(&p, "peek");
-        let block_of = |pick: &dyn Fn(&LirInst) -> bool| {
+        let block_of = |pick: &dyn Fn(&SourceInst) -> bool| {
             f.blocks
                 .iter()
                 .position(|block| block.instrs.iter().any(pick))
                 .expect("no block holds the instruction")
         };
-        let binds = block_of(&|inst| matches!(inst, LirInst::Let { name, .. } if name == "got"));
+        let binds = block_of(&|inst| matches!(inst, SourceInst::Let { name, .. } if name == "got"));
         let writes =
-            block_of(&|inst| matches!(inst, LirInst::Assign { name, .. } if name == "got"));
+            block_of(&|inst| matches!(inst, SourceInst::Assign { name, .. } if name == "got"));
         assert!(
             writes < binds,
             "the section writes `got` in bb{writes} and binds it in bb{binds}; \
@@ -4124,14 +4890,14 @@ async fn peek(m: Mutex<i64>) -> i64 {
     fn l38_if_else_merge_is_emitted_before_its_predecessor() {
         let p = lir("fn f(c: bool) -> i64 { if c { return 1; } else { print(2); } return 3; }");
         let f = func(&p, "f");
-        let Terminator::Branch { else_block, .. } = &f.blocks[0].terminator else {
+        let SourceTerminator::Branch { else_block, .. } = &f.blocks[0].terminator else {
             panic!("entry does not branch");
         };
         let merge = f
             .blocks
             .iter()
             .position(|block| {
-                matches!(&block.terminator, Terminator::Return(Some(v))
+                matches!(&block.terminator, SourceTerminator::Return(Some(v))
                     if matches!(v.kind, HirExprKind::Int(3)))
             })
             .expect("no merge block");
@@ -4143,10 +4909,9 @@ async fn peek(m: Mutex<i64>) -> i64 {
         );
     }
 
-    /// A synchronous function never suspends, so the split never applies to
-    /// one however its arms are written.
+    /// Synchronous matches use the same dispatch graph as async matches.
     #[test]
-    fn l36_sync_match_is_never_split() {
+    fn l36_sync_match_is_split() {
         let p = lir(r#"
 fn f(which: i64) -> i64 {
     match which {
@@ -4157,10 +4922,10 @@ fn f(which: i64) -> i64 {
 "#);
         let f = func(&p, "f");
         assert!(
-            !f.blocks
+            f.blocks
                 .iter()
                 .flat_map(|block| &block.instrs)
-                .any(|inst| matches!(inst, LirInst::MatchTest { .. } | LirInst::MatchBind { .. }))
+                .any(|inst| matches!(inst, SourceInst::MatchTest { .. } | SourceInst::MatchBind { .. }))
         );
     }
 }
@@ -4171,13 +4936,13 @@ mod prune_and_corpus_tests {
     use crate::lexer::Lexer;
     use crate::parser::Parser;
 
-    fn lir(src: &str) -> LirProgram {
+    fn lir(src: &str) -> SourceProgram {
         let tokens = Lexer::new(src).tokenize().expect("lexing failed");
         let (program, errs) = Parser::new(tokens).parse();
         assert!(errs.is_empty(), "parse errors: {errs:?}");
         let (hir, diags) = super::super::lower::lower_program(&program);
         assert!(diags.is_empty(), "HIR diagnostics: {diags:?}");
-        lower_program(&hir)
+        lower_source_program(&hir)
     }
 
     // 23. dead blocks after mid-block returns are pruned
@@ -4190,8 +4955,8 @@ mod prune_and_corpus_tests {
         // Every edge stays in range after renumbering.
         for b in &f.blocks {
             match &b.terminator {
-                Terminator::Jump(t) => assert!(t.0 < f.blocks.len()),
-                Terminator::Branch {
+                SourceTerminator::Jump(t) => assert!(t.0 < f.blocks.len()),
+                SourceTerminator::Branch {
                     then_block,
                     else_block,
                     ..
@@ -4199,8 +4964,8 @@ mod prune_and_corpus_tests {
                     assert!(then_block.0 < f.blocks.len());
                     assert!(else_block.0 < f.blocks.len());
                 }
-                Terminator::Suspend { resume, .. } => assert!(resume.0 < f.blocks.len()),
-                Terminator::Return(_) => {}
+                SourceTerminator::Suspend { resume, .. } => assert!(resume.0 < f.blocks.len()),
+                SourceTerminator::Return(_) | SourceTerminator::CleanupReturn => {}
             }
         }
     }
@@ -4246,7 +5011,7 @@ mod prune_and_corpus_tests {
             checker.check_program(&program);
             let tables = super::super::lower::CheckerTables::from_checker(&checker);
             let (hir, diags) = super::super::lower::lower_program_with(&program, &tables);
-            let _ = lower_program(&hir); // must not panic
+            let _ = lower_source_program(&hir); // must not panic
             if diags.is_empty() {
                 fully_covered += 1;
             }
@@ -4273,4 +5038,25 @@ mod prune_and_corpus_tests {
             }
         }
     }
+}
+
+mod final_ir;
+pub use final_ir::{LirProgram, LirFunction, LirLambda, LirBlock, LirInst, LirDeferBody, LirParam, LirPattern, Terminator};
+
+pub fn lower_program(program: &HirProgram) -> LirProgram {
+    final_ir::finish_program(lower_source_program(program))
+}
+
+pub fn format_program(program: &LirProgram) -> String {
+    let mut output = String::new();
+    for function in program.functions.iter().chain(program.lambdas.iter().map(|lambda| &lambda.function)) {
+        output.push_str(&format!("fn {}() -> {:?} {{\n", function.name, function.return_type));
+        for block in &function.blocks {
+            output.push_str(&format!("bb{}:\n", block.id.0));
+            for instruction in &block.instrs { output.push_str(&format!("  {instruction:?}\n")); }
+            output.push_str(&format!("  {:?}\n", block.terminator));
+        }
+        output.push_str("}\n");
+    }
+    output
 }

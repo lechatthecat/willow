@@ -101,7 +101,7 @@ impl<S: NativeFrameSpec> NativeTaskFrame<S> {
     pub fn load_gc(&self, slot: usize) -> *mut u8 {
         self.check(slot, SlotKind::GcRef);
         // SAFETY: checked slot is a GC reference in this live frame.
-        unsafe { *self.slot::<*mut u8>(slot) }
+        unsafe { crate::gc::load_gc_reference(self.slot::<*mut u8>(slot)) }
     }
 
     pub fn store_gc(&self, slot: usize, value: *mut u8) {
@@ -112,7 +112,7 @@ impl<S: NativeFrameSpec> NativeTaskFrame<S> {
             GcStoreDestination::AsyncFrameSlot as i64,
         );
         // SAFETY: checked slot is a GC reference in this live frame.
-        unsafe { *self.slot::<*mut u8>(slot) = value };
+        unsafe { crate::gc::store_gc_reference(self.slot::<*mut u8>(slot), value) };
     }
 
     pub fn load_native<T>(&self, slot: usize) -> *mut T {

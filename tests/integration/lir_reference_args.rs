@@ -798,3 +798,39 @@ fn reference_args_34_a_whole_binding_reference_in_a_branch() {
         &["update", "read", "main"],
     );
 }
+
+
+#[test]
+fn reference_capture_keeps_original_array_buffer_after_later_argument_resize() {
+    let source = r#"
+import std::collections::Array;
+fn grow(a: Array<i64>) -> i64 { a.push(2); gc_minor_collect(); return 0; }
+fn write(x: &mut i64, ignored: i64) { x = 99; }
+fn main() {
+    let a: Array<i64> = [1];
+    write(&a[0], grow(a));
+    println(a[0]);
+}
+"#;
+    let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_GC_STRESS", "all")]);
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n");
+}
+
+#[test]
+fn reference_capture_survives_resize_collection_and_await() {
+    let source = r#"
+import std::collections::Array;
+class Point { pub n: i64; }
+fn grow(a: Array<Point>) -> i64 { a.push(new Point(23)); return 0; }
+async fn pause(n: i64) -> i64 { await yield(); gc_minor_collect(); return n; }
+fn read(p: & Point, ignored: i64) -> i64 { gc_minor_collect(); return p.n; }
+async fn main() {
+    let a: Array<Point> = [new Point(17)];
+    println(read(&a[0], await pause(grow(a))));
+}
+"#;
+    let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_GC_STRESS", "all")]);
+    assert!(ok, "{out}");
+    assert_eq!(out, "17\n");
+}

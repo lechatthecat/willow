@@ -347,41 +347,95 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     pub(super) fn emit_deferred_action(&mut self, action: &super::DeferredAction) {
-        match action {
-            super::DeferredAction::HirExpr(expr) => {
-                self.emit_lir_expr(expr);
-            }
-            super::DeferredAction::HirBlock(body) => {
-                // The block's own bracket, the same one a `match` arm gets
-                // (willow-0g8j.3). The unwinder replays this body at every exit
-                // the registration is live for, so a `let` in it takes a fresh
-                // rooted slot each time; popping the slots it pushed and
-                // restoring the compile-time depth is what keeps the code after
-                // the flush -- and the sibling replay sites -- at the depth they
-                // were emitted for.
-                let vars_before = self.vars.clone();
-                let roots_before = self.gc_root_count;
-                for stmt in body {
-                    self.emit_lir_deferred_stmt(stmt);
-                    if self.terminated {
-                        break;
-                    }
-                }
-                // A body that left through a panic never reaches the pop; the
-                // trap does not unwind this stack.
-                if !self.terminated {
-                    self.emit_pop_roots_n(self.gc_root_count - roots_before);
-                }
-                self.vars = vars_before;
-                self.gc_root_count = roots_before;
-            }
+        self.emit_lir_cleanup_region(&action.function);
+    }
+
+    /// Preserve the native call chain when a synchronous helper exhausts its
+    /// task budget. Outside a task the runtime returns zero immediately.
+    pub(super) fn emit_sync_safepoint(&mut self) {
+        let cancelled = self.emit_value_runtime_call("willow_sync_safepoint", &[]);
+        self.emit_sync_cancel_branch(cancelled);
+    }
+
+    fn emit_sync_cancel_check(&mut self) {
+        if self.emitting_sync_cancel_cleanup { return; }
+        let cancelled = self.emit_value_runtime_call("willow_sync_cancelled", &[]);
+        self.emit_sync_cancel_branch(cancelled);
+    }
+
+    fn emit_sync_cancel_branch(&mut self, cancelled: cranelift_codegen::ir::Value) {
+        if self.emitting_sync_cancel_cleanup { return; }
+        let unwind = self.builder.create_block();
+        let resume = self.builder.create_block();
+        self.builder.ins().brif(cancelled, unwind, &[], resume, &[]);
+        self.builder.switch_to_block(unwind);
+        self.builder.seal_block(unwind);
+        let roots_before = self.gc_root_count;
+        let defer_depth_before = self.panic_defer_codegen_depth;
+        let eligible_depth_before = self.recover_eligible_depth;
+        let callstack_depth_before = self.callstack_frame_depth;
+        let prepared_frames_before = std::mem::take(&mut self.lir_call_frames);
+        let reference_scopes_before = std::mem::take(&mut self.lir_reference_scopes);
+        for _ in 0..defer_depth_before {
+            self.emit_void_runtime_call("willow_panic_leave_defer", &[]);
         }
+        for _ in 0..callstack_depth_before {
+            self.emit_callstack_pop();
+        }
+        for _ in 0..reference_scopes_before.len() { self.emit_debug_reference_call_clear(); }
+        self.panic_defer_codegen_depth = 0;
+        self.recover_eligible_depth = 0;
+        self.emitting_sync_cancel_cleanup = true;
+        self.emit_void_runtime_call("willow_sync_cleanup_enter", &[]);
+        if self.coop_frame.is_some() {
+            // The runtime invokes this poll's collected cleanup entry, whose
+            // frame flags cover every registration on the actual runtime path.
+            self.emit_void_runtime_call("willow_sync_poll_cancel_cleanup", &[]);
+            self.emit_void_runtime_call("willow_sync_cleanup_leave", &[]);
+            // Cancellation abandons this poll rather than resuming at a LIR
+            // suspension point. Constructor/call temporaries can still be
+            // rooted here; pop them together with lexical binding roots.
+            self.emit_pop_roots_n(self.gc_root_count);
+            // Cleanup can raise a panic even while cancellation is sticky.
+            // Publish that outcome before the scheduler wakes any awaiter.
+            let active = self.emit_value_runtime_call("willow_panic_active", &[]);
+            let ready = self.builder.ins().iconst(types::I32, 1);
+            let panicked = self.builder.ins().iconst(types::I32, COOP_POLL_PANICKED);
+            let outcome = self.builder.ins().select(active, panicked, ready);
+            self.builder.ins().return_(&[outcome]);
+        } else if let Some(return_block) = self.panic_return_block {
+            self.emit_flush_defers_from(0);
+            if !self.terminated {
+                self.emit_void_runtime_call("willow_sync_cleanup_leave", &[]);
+                self.builder.ins().jump(return_block, &[]);
+            }
+        } else {
+            // Compiler-owned init/cleanup entries cannot originate a native
+            // task safepoint. They only execute under their caller's cleanup.
+            self.emit_void_runtime_call("willow_sync_cleanup_leave", &[]);
+            self.builder.ins().jump(resume, &[]);
+        }
+        self.emitting_sync_cancel_cleanup = false;
+        self.gc_root_count = roots_before;
+        self.panic_defer_codegen_depth = defer_depth_before;
+        self.recover_eligible_depth = eligible_depth_before;
+        self.callstack_frame_depth = callstack_depth_before;
+        self.lir_call_frames = prepared_frames_before;
+        self.lir_reference_scopes = reference_scopes_before;
+        self.builder.switch_to_block(resume);
+        self.builder.seal_block(resume);
+        self.terminated = false;
     }
 
     /// Branch an already-raised synchronous language panic to the nearest
     /// shared lexical cleanup. The cleanup flags, rather than duplicated AST,
     /// decide which registrations were active at this exact panic site.
     pub(super) fn emit_sync_panic_unwind(&mut self) {
+        if self.emitting_sync_cancel_cleanup {
+            // A panic exits the cancellation cleanup path before its normal
+            // epilogue. Balance suppression even if a defer later recovers it.
+            self.emit_void_runtime_call("willow_sync_cleanup_leave", &[]);
+        }
         let codegen_depth_before = self.panic_defer_codegen_depth;
         let eligible_depth_before = self.recover_eligible_depth;
         let callstack_depth_before = self.callstack_frame_depth;
@@ -393,9 +447,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         for _ in 0..callstack_depth_before {
             self.emit_callstack_pop();
         }
-        if self.build_mode == BuildMode::Debug {
-            self.emit_debug_reference_call_clear();
-        }
+        for _ in 0..self.lir_reference_scopes.len() { self.emit_debug_reference_call_clear(); }
         self.panic_defer_codegen_depth = 0;
         self.recover_eligible_depth = 0;
         if let Some(scope) = self.panic_scopes.last() {
@@ -424,6 +476,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// panic cannot run the same action twice.
     pub(super) fn emit_shared_panic_cleanup(&mut self, scope: &super::PanicScope) {
         let vars_before = self.vars.clone();
+        // Every incoming panic edge already removed the function-owned frames.
+        // Cleanup calls therefore start with an empty native debug stack suffix.
+        let prepared_frames_before = std::mem::take(&mut self.lir_call_frames);
+        let reference_scopes_before = std::mem::take(&mut self.lir_reference_scopes);
+        let callstack_depth_before = std::mem::replace(&mut self.callstack_frame_depth, 0);
         let roots_before = self.gc_root_count;
         let coop_active_before = self
             .coop_shadow_roots
@@ -544,9 +601,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let propagate = if scope_can_recover {
             let active = self.emit_value_runtime_call("willow_panic_active", &[]);
             let propagate = self.builder.create_block();
-            self.builder
-                .ins()
-                .brif(active, propagate, &[], scope.resume, &[]);
+            let recovered = self.builder.create_block();
+            self.builder.ins().brif(active, propagate, &[], recovered, &[]);
+            self.builder.switch_to_block(recovered);
+            self.builder.seal_block(recovered);
+            for (name, span) in &scope.call_frames_at_entry {
+                self.emit_callstack_push(name, *span);
+            }
+            self.lir_reference_scopes = scope.reference_scopes_at_entry.clone();
+            self.emit_replay_reference_scopes();
+            self.builder.ins().jump(scope.resume, &[]);
+            // The propagation edge still has no prepared frames.
+            self.callstack_frame_depth = 0;
+            self.lir_reference_scopes.clear();
             self.panic_recovery_targets.insert(scope.resume);
             self.builder.switch_to_block(propagate);
             self.builder.seal_block(propagate);
@@ -569,6 +636,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_unhandled_panic_exit();
         }
         let _ = propagate;
+        self.lir_call_frames = prepared_frames_before;
+        self.lir_reference_scopes = reference_scopes_before;
+        self.callstack_frame_depth = callstack_depth_before;
         self.vars = vars_before;
         self.gc_root_count = roots_before;
         self.unavailable_defer_ids = unavailable_before;
@@ -724,6 +794,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         depth_before: Option<cranelift_codegen::ir::Value>,
     ) {
+        // Cancellation is sticky even through functions whose panic summary
+        // is empty, and is intentionally independent of recoverable panics.
+        self.emit_sync_cancel_check();
         let Some(depth_before) = depth_before else {
             return;
         };

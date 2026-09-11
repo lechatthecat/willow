@@ -21,13 +21,20 @@ fn assert_consistent(s: &WillowGcStatsV1) {
         s.heap.reserved_bytes,
         s.heap.old_reserved_bytes + s.heap.nursery_reserved_bytes
     );
-    assert!(s.last_cycle.mark_ns <= s.last_cycle.pause_ns);
-    assert_eq!(
-        s.last_cycle
-            .heap_before_bytes
-            .saturating_sub(s.last_cycle.heap_after_bytes),
-        s.last_cycle.reclaimed_bytes
-    );
+    let elapsed = s.last_cycle.end_ns.saturating_sub(s.last_cycle.start_ns);
+    assert!(s.last_cycle.mark_ns <= elapsed);
+    assert!(s.last_cycle.pause_ns <= elapsed);
+    // Concurrent allocations may offset actual reclamation in the before/
+    // after samples. Minor STW cycles retain the exact subtraction identity.
+    let shrink = s
+        .last_cycle
+        .heap_before_bytes
+        .saturating_sub(s.last_cycle.heap_after_bytes);
+    if s.last_cycle.kind == 1 {
+        assert_eq!(shrink, s.last_cycle.reclaimed_bytes);
+    } else {
+        assert!(shrink <= s.last_cycle.reclaimed_bytes);
+    }
 }
 
 #[test]
@@ -126,7 +133,8 @@ fn major_cycle_reports_live_graph_null_slots_and_duplicate_roots() {
         2 * GC_HEADER_SIZE as u64 + 24
     );
     assert_eq!(after.last_cycle.scanned_bytes, 16);
-    assert_eq!(after.last_cycle.root_scan_bytes, 16);
+    // Major collection scans roots at the initial stop and final remark.
+    assert_eq!(after.last_cycle.root_scan_bytes, 32);
     assert_eq!(
         after.last_cycle.heap_after_bytes,
         after.last_cycle.marked_bytes

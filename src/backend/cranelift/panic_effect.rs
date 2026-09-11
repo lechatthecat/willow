@@ -200,9 +200,6 @@ impl Codegen {
         }
     }
 
-    pub(super) fn user_function_may_panic(&self, name: &str) -> bool {
-        !optimization_enabled() || self.function_may_panic.get(name).copied().unwrap_or(true)
-    }
 }
 
 impl FuncGen<'_, '_> {

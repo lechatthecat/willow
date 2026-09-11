@@ -461,3 +461,29 @@ fn main() {
         "dog:dispatch-arg\n"
     );
 }
+
+// Receiver and argument survive suspension in the async frame. Interface
+// boxing must preserve the loaded argument and keep the fresh box alive.
+#[test]
+fn option_iface_28_frame_operands_survive_allocating_intrinsic_coercion() {
+    let source = r#"
+interface SendGreeter extends Send { fn greet(self) -> String; }
+class FrameDog implements SendGreeter {
+    pub name: String;
+    pub fn greet(self) -> String { return "dog:" + self.name; }
+}
+async fn exercise() -> String {
+    let values: Channel<SendGreeter> = Channel::new();
+    let dog = new FrameDog("frame");
+    await yield();
+    values.send(dog);
+    await yield();
+    gc_minor_collect();
+    return values.recv().greet() + ":" + dog.name;
+}
+async fn main() { println(await exercise()); }
+"#;
+    let (output, success) = compile_and_run_gc_stress_all(source);
+    assert!(success, "{output}");
+    assert_eq!(output.trim(), "dog:frame:frame");
+}

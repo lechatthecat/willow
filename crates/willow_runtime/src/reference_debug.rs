@@ -14,8 +14,8 @@ pub struct ReferenceCallContext {
     pub place_name: String,
 }
 
-#[derive(Debug, Default)]
-struct ReferenceCallState {
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ReferenceCallState {
     current: Option<ReferenceCallContext>,
     parents: Vec<Option<ReferenceCallContext>>,
 }
@@ -26,6 +26,14 @@ std::thread_local! {
             current: None,
             parents: Vec::new(),
         }) };
+}
+
+pub(crate) fn snapshot_current() -> ReferenceCallState {
+    REFERENCE_CALL_STATE.with(|state| state.borrow().clone())
+}
+
+pub(crate) fn replace_current(context: ReferenceCallState) -> ReferenceCallState {
+    REFERENCE_CALL_STATE.with(|state| std::mem::replace(&mut *state.borrow_mut(), context))
 }
 
 fn ws(ptr: *const u8) -> String {

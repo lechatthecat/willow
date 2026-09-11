@@ -26,6 +26,13 @@ pub(crate) fn protect_current_thread() {
     });
 }
 
+/// Change the signal handler's guard range while entering a task-owned stack.
+#[cfg(target_os = "linux")]
+pub(crate) fn replace_guard(lower: usize, upper: usize) -> (usize, usize) {
+    protect_current_thread();
+    PROTECTION.with(|slot| slot.borrow().as_ref().unwrap().replace_guard(lower, upper))
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod platform {
     use std::io;
@@ -360,6 +367,18 @@ mod platform {
     }
 
     impl Protection {
+        #[cfg(target_os = "linux")]
+        pub(super) fn replace_guard(&self, lower: usize, upper: usize) -> (usize, usize) {
+            let slot = unsafe { &*self.slot };
+            let previous = (
+                slot.lower.load(Ordering::Relaxed),
+                slot.upper.load(Ordering::Relaxed),
+            );
+            slot.lower.store(lower, Ordering::Relaxed);
+            slot.upper.store(upper, Ordering::Relaxed);
+            previous
+        }
+
         pub(super) fn new() -> Result<Self, String> {
             let page = page_size()?;
             let bounds = current_bounds(page)?;

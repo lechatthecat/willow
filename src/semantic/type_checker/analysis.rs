@@ -143,49 +143,94 @@ pub(crate) fn reference_place_key(mut expr: &Expr) -> Option<String> {
     }
 }
 
-#[willow_continuations::function(block_always_returns, stmt_always_returns)]
 pub(crate) fn block_always_returns(block: &Block) -> bool {
-    block.stmts.iter().any(|stmt| stmt_always_returns(stmt))
+    always_returns(ReturnNode::Block(block))
 }
 
-#[willow_continuations::function(block_always_returns, stmt_always_returns)]
-pub(crate) fn stmt_always_returns(stmt: &Stmt) -> bool {
-    match stmt {
-        Stmt::Defer(_) => false,
-        // break/continue divert control flow but never RETURN (willow-kzka).
-        Stmt::Break(_) | Stmt::Continue(_) => false,
-        Stmt::Return(_) => true,
-        // A statement-position `match` whose every arm diverges (all arms are
-        // blocks that always return) guarantees a return (willow-zvkv).
-        Stmt::Expr(e) => match &e.expr {
-            crate::parser::ast::Expr::Match(m) => {
-                !m.arms.is_empty()
-                    && m.arms.iter().all(|arm| match &arm.body {
-                        crate::parser::ast::MatchBody::Block(b) => block_always_returns(b),
-                        crate::parser::ast::MatchBody::Expr(_) => false,
-                    })
+enum ReturnNode<'a> {
+    Block(&'a Block),
+    Stmt(&'a Stmt),
+}
+
+/// A small boolean evaluator preserves short-circuit traversal without using
+/// native recursion or the type-erased compiler continuation stack.
+fn always_returns(mut node: ReturnNode<'_>) -> bool {
+    enum Frame<'a> {
+        Any(std::slice::Iter<'a, Stmt>),
+        All(std::slice::Iter<'a, MatchArm>),
+        ThenElse(&'a Block),
+    }
+    let mut frames = Vec::new();
+    'evaluate: loop {
+        let mut result = match node {
+            ReturnNode::Block(block) => {
+                let mut stmts = block.stmts.iter();
+                if let Some(stmt) = stmts.next() {
+                    frames.push(Frame::Any(stmts));
+                    node = ReturnNode::Stmt(stmt);
+                    continue;
+                }
+                false
             }
-            _ => false,
-        },
-        Stmt::If(s) => s
-            .else_block
-            .as_ref()
-            .map(|else_block| {
-                block_always_returns(&s.then_block) && block_always_returns(else_block)
-            })
-            .unwrap_or(false),
-        // A critical section runs unconditionally, so a `return` inside it
-        // returns from the enclosing function (after the compiler-inserted
-        // release, willow-38w.1.3).
-        Stmt::Lock(s) => block_always_returns(&s.body),
-        Stmt::Let(_)
-        | Stmt::Assign(_)
-        | Stmt::FieldAssign(_)
-        | Stmt::SuperInit(_)
-        | Stmt::StaticFieldAssign(_)
-        | Stmt::IndexAssign(_)
-        | Stmt::While(_)
-        | Stmt::For(_) => false,
+            ReturnNode::Stmt(stmt) => match stmt {
+                Stmt::Return(_) => true,
+                Stmt::If(branch) => {
+                    if let Some(other) = &branch.else_block {
+                        frames.push(Frame::ThenElse(other));
+                        node = ReturnNode::Block(&branch.then_block);
+                        continue;
+                    }
+                    false
+                }
+                Stmt::Lock(lock) => {
+                    node = ReturnNode::Block(&lock.body);
+                    continue;
+                }
+                Stmt::Expr(expr) => {
+                    if let Expr::Match(matched) = &expr.expr {
+                        let mut arms = matched.arms.iter();
+                        if let Some(MatchArm { body: MatchBody::Block(block), .. }) = arms.next() {
+                            frames.push(Frame::All(arms));
+                            node = ReturnNode::Block(block);
+                            continue;
+                        }
+                    }
+                    false
+                }
+                // Loops need not execute; deferred bodies run later. Neither
+                // break nor continue guarantees a return from the function.
+                Stmt::Defer(_) | Stmt::Break(_) | Stmt::Continue(_)
+                | Stmt::Let(_) | Stmt::Assign(_) | Stmt::FieldAssign(_)
+                | Stmt::SuperInit(_) | Stmt::StaticFieldAssign(_)
+                | Stmt::IndexAssign(_) | Stmt::While(_) | Stmt::For(_) => false,
+            },
+        };
+        while let Some(frame) = frames.pop() {
+            match frame {
+                Frame::Any(mut stmts) if !result => {
+                    if let Some(stmt) = stmts.next() {
+                        frames.push(Frame::Any(stmts));
+                        node = ReturnNode::Stmt(stmt);
+                        continue 'evaluate;
+                    }
+                }
+                Frame::All(mut arms) if result => match arms.next() {
+                    Some(MatchArm { body: MatchBody::Block(block), .. }) => {
+                        frames.push(Frame::All(arms));
+                        node = ReturnNode::Block(block);
+                        continue 'evaluate;
+                    }
+                    Some(_) => result = false,
+                    None => {}
+                },
+                Frame::ThenElse(other) if result => {
+                    node = ReturnNode::Block(other);
+                    continue 'evaluate;
+                }
+                _ => {}
+            }
+        }
+        return result;
     }
 }
 
@@ -201,6 +246,31 @@ mod tests {
     //! source order including one inside a branch, a7 a `super.init` in a
     //! `defer` body is skipped.
     use super::*;
+
+    #[test]
+    fn return_analysis_handles_fifty_thousand_branches_on_small_stack() {
+        std::thread::Builder::new().stack_size(1024 * 1024).spawn(|| {
+            let span = Span::new(0, 0, 1, 1);
+            let returning = || Block {
+                stmts: vec![Stmt::Return(ReturnStmt { value: None, span })], span,
+            };
+            let mut body = returning();
+            for _ in 0..50_000 {
+                body = Block {
+                    stmts: vec![Stmt::If(IfStmt {
+                        cond: Expr::Bool(true, span, ExprId::fresh()),
+                        then_block: body, else_block: Some(returning()), span,
+                    })], span,
+                };
+            }
+            assert!(block_always_returns(&body));
+            // The outer else must also return, even when every then branch does.
+            if let Stmt::If(branch) = &mut body.stmts[0] {
+                branch.else_block.as_mut().unwrap().stmts.clear();
+            }
+            assert!(!block_always_returns(&body));
+        }).unwrap().join().unwrap();
+    }
 
     #[test]
     fn constructor_scans_use_a_one_megabyte_stack() {

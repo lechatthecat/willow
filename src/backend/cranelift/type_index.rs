@@ -1,6 +1,6 @@
-//! Canonical type metadata with one shared unit-local alias scope.
+//! Canonical type metadata with immutable unit-local alias snapshots.
 use crate::semantic::ids::TypeId;
-use std::{cell::RefCell, collections::HashMap, hash::Hash, ops::Index, rc::Rc};
+use std::{collections::HashMap, hash::Hash, ops::Index, rc::Rc};
 
 /// Alias spellings can refer forward to other spellings. Declaration targets
 /// are terminal, even when another source alias shadows that declaration name.
@@ -11,10 +11,10 @@ pub enum TypeBinding {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct TypeScope(Rc<RefCell<HashMap<TypeId, TypeBinding>>>);
+pub struct TypeScope(Rc<HashMap<TypeId, TypeBinding>>);
 impl TypeScope {
     pub fn resolve(&self, id: &TypeId) -> TypeId {
-        let bindings = self.0.borrow();
+        let bindings = &self.0;
         let mut current = id.clone();
         // At most one visit per binding before reaching a terminal or a cycle.
         // Cyclic aliases have no declaration identity: preserve the original
@@ -28,26 +28,30 @@ impl TypeScope {
         }
         id.clone()
     }
-    pub fn bind(&self, alias: &str, target: &str) -> Option<TypeBinding> {
-        self.0.borrow_mut().insert(
+    pub fn bind(&mut self, alias: &str, target: &str) -> Option<TypeBinding> {
+        Rc::make_mut(&mut self.0).insert(
             TypeId::from_source_name(alias),
             TypeBinding::Alias(TypeId::from_source_name(target)),
         )
     }
-    pub fn bind_canonical(&self, alias: &str, canonical: &str) -> Option<TypeBinding> {
-        self.0.borrow_mut().insert(
+    pub fn bind_canonical(&mut self, alias: &str, canonical: &str) -> Option<TypeBinding> {
+        Rc::make_mut(&mut self.0).insert(
             TypeId::from_source_name(alias),
             TypeBinding::Canonical(TypeId::from_source_name(canonical)),
         )
     }
-    pub fn restore(&self, alias: &str, previous: Option<TypeBinding>) {
+    pub fn restore(&mut self, alias: &str, previous: Option<TypeBinding>) {
         let id = TypeId::from_source_name(alias);
         match previous {
             Some(previous) => {
-                self.0.borrow_mut().insert(id, previous);
+                Rc::make_mut(&mut self.0).insert(id, previous);
             }
             None => {
-                self.0.borrow_mut().remove(&id);
+                // Most declarations have no alias; preserve shared snapshots
+                // without copying the bindings for this no-op.
+                if self.0.contains_key(&id) {
+                    Rc::make_mut(&mut self.0).remove(&id);
+                }
             }
         }
     }
@@ -56,14 +60,14 @@ impl TypeScope {
 pub trait TypeKey: Clone {
     type Id: Eq + Hash + Clone;
     fn lookup(&self, scope: &TypeScope) -> Self::Id;
-    fn declare(&self, scope: &TypeScope) -> Self::Id;
+    fn declare(&self, scope: &mut TypeScope) -> Self::Id;
 }
 impl TypeKey for TypeId {
     type Id = TypeId;
     fn lookup(&self, scope: &TypeScope) -> TypeId {
         scope.resolve(self)
     }
-    fn declare(&self, scope: &TypeScope) -> TypeId {
+    fn declare(&self, scope: &mut TypeScope) -> TypeId {
         scope.restore(&self.to_string(), None);
         self.clone()
     }
@@ -73,7 +77,7 @@ impl TypeKey for (TypeId, TypeId) {
     fn lookup(&self, scope: &TypeScope) -> Self::Id {
         (scope.resolve(&self.0), scope.resolve(&self.1))
     }
-    fn declare(&self, scope: &TypeScope) -> Self::Id {
+    fn declare(&self, scope: &mut TypeScope) -> Self::Id {
         self.lookup(scope)
     }
 }
@@ -100,9 +104,13 @@ impl<K: TypeKey, V> ScopedTypeMap<K, V> {
             scope,
         }
     }
+    /// Attach an immutable resolution snapshot for this compile unit.
+    pub fn set_scope(&mut self, scope: TypeScope) {
+        self.scope = scope;
+    }
     pub fn insert(&mut self, key: impl Into<K>, value: V) -> Option<V> {
         let key = key.into();
-        let id = key.declare(&self.scope);
+        let id = key.declare(&mut self.scope);
         self.values.insert(id, value)
     }
     pub fn keys(&self) -> impl Iterator<Item = &K::Id> {
@@ -183,7 +191,7 @@ impl<V> TypeMap<V> {
     /// alias down) nor tear that alias down under the unit still using it.
     pub fn entry(&mut self, key: impl Into<TypeId>) -> TypeEntry<'_, V> {
         let key = key.into();
-        let id = key.declare(&self.scope);
+        let id = key.declare(&mut self.scope);
         TypeEntry {
             entry: self.values.entry(id),
         }
@@ -259,16 +267,18 @@ mod tests {
 
     #[test]
     fn ti_02_alias_reads_the_canonical_entry() {
-        let (scope, map) = map_pair();
+        let (mut scope, mut map) = map_pair();
         assert_eq!(map.get("Color"), None);
         scope.bind("Color", "pal::Color");
+        map.set_scope(scope.clone());
         assert_eq!(map.get("Color"), Some(&7));
     }
 
     #[test]
     fn ti_03_alias_does_not_duplicate_metadata() {
-        let (scope, map) = map_pair();
+        let (mut scope, mut map) = map_pair();
         scope.bind("Color", "pal::Color");
+        map.set_scope(scope.clone());
         // One entry, spelled by its identity: the alias is a lookup rule, not a
         // second copy of the enum's metadata.
         assert_eq!(map.len(), 1);
@@ -280,31 +290,37 @@ mod tests {
 
     #[test]
     fn ti_04_restore_none_drops_the_binding() {
-        let (scope, map) = map_pair();
+        let (mut scope, mut map) = map_pair();
         let previous = scope.bind("Color", "pal::Color");
+        map.set_scope(scope.clone());
         assert_eq!(previous, None);
         scope.restore("Color", previous);
+        map.set_scope(scope.clone());
         assert_eq!(map.get("Color"), None);
     }
 
     #[test]
     fn ti_05_restore_reinstates_an_outer_binding() {
-        let scope = TypeScope::default();
+        let mut scope = TypeScope::default();
         let mut map = TypeMap::with_scope(scope.clone());
         map.insert("pal::Color".to_string(), 7);
         map.insert("ui::Color".to_string(), 9);
         scope.bind("Color", "pal::Color");
+        map.set_scope(scope.clone());
         // A nested unit rebinds the same spelling, then hands it back.
         let saved = scope.bind("Color", "ui::Color");
+        map.set_scope(scope.clone());
         assert_eq!(map.get("Color"), Some(&9));
         scope.restore("Color", saved);
+        map.set_scope(scope.clone());
         assert_eq!(map.get("Color"), Some(&7));
     }
 
     #[test]
     fn ti_06_declaring_a_name_clears_its_alias() {
-        let (scope, mut map) = map_pair();
+        let (mut scope, mut map) = map_pair();
         scope.bind("Color", "pal::Color");
+        map.set_scope(scope.clone());
         // A unit that declares its own `Color` shadows the alias it inherited.
         map.insert("Color".to_string(), 42);
         assert_eq!(map.get("Color"), Some(&42));
@@ -321,17 +337,19 @@ mod tests {
 
     #[test]
     fn ti_08_contains_key_follows_the_alias() {
-        let (scope, map) = map_pair();
+        let (mut scope, mut map) = map_pair();
         assert!(!map.contains_key("Color"));
         scope.bind("Color", "pal::Color");
+        map.set_scope(scope.clone());
         assert!(map.contains_key("Color"));
         assert!(map.contains_key("pal::Color"));
     }
 
     #[test]
     fn ti_09_index_follows_the_alias() {
-        let (scope, map) = map_pair();
+        let (mut scope, mut map) = map_pair();
         scope.bind("Color", "pal::Color");
+        map.set_scope(scope.clone());
         assert_eq!(map["Color"], 7);
         assert_eq!(map[&"pal::Color".to_string()], 7);
     }
@@ -344,22 +362,33 @@ mod tests {
     }
 
     #[test]
-    fn ti_11_maps_sharing_a_scope_see_one_binding() {
-        let scope = TypeScope::default();
+    fn ti_11_scope_snapshots_isolate_units_and_declarations() {
+        let mut scope = TypeScope::default();
+        scope.bind("Color", "pal::Color");
         let mut enums = TypeMap::with_scope(scope.clone());
         let mut layouts = TypeMap::with_scope(scope.clone());
-        enums.insert("pal::Color".to_string(), 7);
-        layouts.insert("pal::Color".to_string(), 3);
-        scope.bind("Color", "pal::Color");
-        // One bind, every table that shares the scope: no per-table alias pass.
+        enums.insert_canonical_id("pal::Color".into(), 7);
+        layouts.insert_canonical_id("pal::Color".into(), 3);
+        let snapshot = scope.clone();
+        scope.bind("Color", "ui::Color");
+        assert_eq!(
+            snapshot.resolve(&"Color".into()),
+            TypeId::from("pal::Color")
+        );
         assert_eq!(enums.get("Color"), Some(&7));
         assert_eq!(layouts.get("Color"), Some(&3));
+        enums.insert("Color", 42);
+        assert_eq!(enums.get("Color"), Some(&42));
+        assert_eq!(layouts.get("Color"), Some(&3));
+        layouts.set_scope(scope);
+        assert_eq!(layouts.get("Color"), None);
     }
 
     #[test]
     fn ti_12_entry_inserts_under_the_identity() {
-        let (scope, mut map) = map_pair();
+        let (mut scope, mut map) = map_pair();
         scope.bind("Color", "pal::Color");
+        map.set_scope(scope.clone());
         // `entry` declares, so it addresses the written name itself.
         *map.entry("Color".to_string()).or_insert(1) += 1;
         assert_eq!(map.get("Color"), Some(&2));
@@ -369,7 +398,7 @@ mod tests {
 
     #[test]
     fn ti_13_vtable_key_resolves_both_halves() {
-        let scope = TypeScope::default();
+        let mut scope = TypeScope::default();
         let mut vtables = VtableMap::with_scope(scope.clone());
         vtables.insert(
             (
@@ -386,7 +415,9 @@ mod tests {
             None
         );
         scope.bind("Color", "pal::Color");
+        vtables.set_scope(scope.clone());
         scope.bind("Draw", "shape::Draw");
+        vtables.set_scope(scope.clone());
         assert_eq!(
             vtables.get(&(
                 TypeId::from_source_name("Color"),
@@ -409,9 +440,10 @@ mod tests {
 
     #[test]
     fn ti_14_vtable_insert_stores_the_written_pair_once() {
-        let scope = TypeScope::default();
+        let mut scope = TypeScope::default();
         let mut vtables = VtableMap::with_scope(scope.clone());
         scope.bind("Color", "pal::Color");
+        vtables.set_scope(scope.clone());
         // An alias in force when the vtable is registered still lands on the
         // identity, so a later unit without that alias finds it.
         vtables.insert(
@@ -422,6 +454,7 @@ mod tests {
             5,
         );
         scope.restore("Color", None);
+        vtables.set_scope(scope.clone());
         assert_eq!(
             vtables.get(&(
                 TypeId::from_source_name("pal::Color"),
@@ -434,8 +467,9 @@ mod tests {
 
     #[test]
     fn ti_15_clear_empties_the_table_but_not_the_scope() {
-        let (scope, mut map) = map_pair();
+        let (mut scope, mut map) = map_pair();
         scope.bind("Color", "pal::Color");
+        map.set_scope(scope.clone());
         map.clear();
         assert!(map.is_empty());
         assert_eq!(map.get("Color"), None);
@@ -465,11 +499,13 @@ mod tests {
 
     #[test]
     fn ti_18_forward_binding_chains_reach_the_canonical_entry() {
-        let scope = TypeScope::default();
+        let mut scope = TypeScope::default();
         let mut map = TypeMap::with_scope(scope.clone());
         map.insert("pal::Color".to_string(), 7);
         scope.bind("Rank", "Level");
+        map.set_scope(scope.clone());
         scope.bind("Level", "pal::Color");
+        map.set_scope(scope.clone());
         // Forward spelling aliases resolve after their target is installed.
         assert_eq!(map.get("Level"), Some(&7));
         assert_eq!(map.get("Rank"), Some(&7));
@@ -477,12 +513,13 @@ mod tests {
 
     #[test]
     fn ti_19_a_canonical_read_ignores_an_installed_binding() {
-        let scope = TypeScope::default();
+        let mut scope = TypeScope::default();
         let mut map = TypeMap::with_scope(scope.clone());
         map.insert("pal::Color".to_string(), 7);
         map.insert("ui::Color".to_string(), 9);
         // One unit reaches `ui` under a spelling that is another module's key.
         scope.bind("ui::Color", "pal::Color");
+        map.set_scope(scope.clone());
         assert_eq!(map.get("ui::Color"), Some(&7));
         // A build-wide pass walking recorded names must still see the entry it
         // recorded (willow-kd1v).
@@ -491,11 +528,12 @@ mod tests {
 
     #[test]
     fn ti_20_a_canonical_write_leaves_the_binding_standing() {
-        let scope = TypeScope::default();
+        let mut scope = TypeScope::default();
         let mut map = TypeMap::with_scope(scope.clone());
         map.insert("pal::Color".to_string(), 7);
         map.insert("ui::Color".to_string(), 9);
         scope.bind("ui::Color", "pal::Color");
+        map.set_scope(scope.clone());
         // The written entry is the shadowed one, and the alias survives the
         // write -- where `insert` would both retarget it and tear it down.
         assert_eq!(
@@ -509,11 +547,14 @@ mod tests {
     }
     #[test]
     fn ti_21_canonical_targets_stop_at_shadowed_declarations() {
-        let (scope, mut map) = map_pair();
+        let (mut scope, mut map) = map_pair();
         map.insert("ui::Color", 9);
         scope.bind_canonical("pal::Color", "ui::Color");
+        map.set_scope(scope.clone());
         scope.bind_canonical("Color", "pal::Color");
+        map.set_scope(scope.clone());
         scope.bind("Rank", "Color");
+        map.set_scope(scope.clone());
         assert_eq!(map.get("pal::Color"), Some(&9));
         assert_eq!(map.get("Color"), Some(&7));
         assert_eq!(map.get("Rank"), Some(&7));
@@ -521,26 +562,34 @@ mod tests {
 
     #[test]
     fn ti_22_restore_preserves_alias_and_terminal_target_kinds() {
-        let (scope, mut map) = map_pair();
+        let (mut scope, mut map) = map_pair();
         map.insert("ui::Color", 9);
         scope.bind_canonical("pal::Color", "ui::Color");
+        map.set_scope(scope.clone());
         scope.bind_canonical("Color", "pal::Color");
+        map.set_scope(scope.clone());
         let terminal = scope.bind("Color", "pal::Color");
+        map.set_scope(scope.clone());
         assert_eq!(map.get("Color"), Some(&9));
         scope.restore("Color", terminal);
+        map.set_scope(scope.clone());
         assert_eq!(map.get("Color"), Some(&7));
         scope.bind("Rank", "Color");
+        map.set_scope(scope.clone());
         let alias = scope.bind_canonical("Rank", "ui::Color");
+        map.set_scope(scope.clone());
         scope.restore("Rank", alias);
+        map.set_scope(scope.clone());
         assert_eq!(map.get("Rank"), Some(&7));
     }
 
     #[test]
     fn ti_23_cycles_terminate_and_can_be_repaired() {
         for count in 1..=20 {
-            let (scope, map) = map_pair();
+            let (mut scope, mut map) = map_pair();
             for index in 0..count {
                 scope.bind(&format!("A{index}"), &format!("A{}", (index + 1) % count));
+                map.set_scope(scope.clone());
             }
             assert_eq!(
                 scope.resolve(&TypeId::from_source_name("A0")).to_string(),
@@ -548,27 +597,32 @@ mod tests {
             );
             assert_eq!(map.get("A0"), None);
             scope.bind_canonical(&format!("A{}", count - 1), "pal::Color");
+            map.set_scope(scope.clone());
             assert_eq!(map.get("A0"), Some(&7));
         }
     }
 
     #[test]
     fn ti_24_long_forward_chain_has_no_depth_limit() {
-        let (scope, map) = map_pair();
+        let (mut scope, mut map) = map_pair();
         for index in 0..1024 {
             scope.bind(&format!("A{index}"), &format!("A{}", index + 1));
+            map.set_scope(scope.clone());
         }
         assert_eq!(map.get("A0"), None);
         scope.bind_canonical("A1024", "pal::Color");
+        map.set_scope(scope.clone());
         assert_eq!(map.get("A0"), Some(&7));
         assert_eq!(map.len(), 1);
     }
 
     #[test]
     fn ti_25_declaration_replaces_a_forward_alias() {
-        let (scope, mut map) = map_pair();
+        let (mut scope, mut map) = map_pair();
         scope.bind("Rank", "Level");
+        map.set_scope(scope.clone());
         scope.bind("Level", "pal::Color");
+        map.set_scope(scope.clone());
         map.insert("Level", 12);
         assert_eq!(map.get("Rank"), Some(&12));
         assert_eq!(map.get_canonical("pal::Color"), Some(&7));
@@ -576,13 +630,17 @@ mod tests {
 
     #[test]
     fn ti_26_vtables_resolve_chains_on_both_sides() {
-        let scope = TypeScope::default();
+        let mut scope = TypeScope::default();
         let mut map = VtableMap::with_scope(scope.clone());
         map.insert(("pal::Color".into(), "shape::Draw".into()), 3);
         scope.bind("Color", "C");
+        map.set_scope(scope.clone());
         scope.bind_canonical("C", "pal::Color");
+        map.set_scope(scope.clone());
         scope.bind("Draw", "D");
+        map.set_scope(scope.clone());
         scope.bind_canonical("D", "shape::Draw");
+        map.set_scope(scope.clone());
         assert_eq!(map.get(&("Color".into(), "Draw".into())), Some(&3));
     }
 }

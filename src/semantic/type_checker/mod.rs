@@ -118,6 +118,7 @@ pub struct TypeChecker {
     /// private function, so `lock` and `await` written there are E2603/E0801
     /// however the enclosing function was declared (willow-3kty).
     current_async_context: bool,
+    task_sync_preemption: bool,
     /// Set while checking a `static fn` body — `self` is unavailable there
     /// (willow-qsqf §9.2 → E0831).
     in_static_method: bool,
@@ -196,9 +197,8 @@ pub struct TypeChecker {
     /// A direct blocking/suspending operation in each callable. One witness is
     /// enough to reject every lock-held call that reaches it.
     lock_direct_effects: HashMap<FunctionId, LockEffectCause>,
-    /// Direct effects physically written in a critical section. The legacy
-    /// typed syntax walker still reports await/select/channel sites; this list
-    /// additionally covers blocking stdlib calls and is deduplicated by span.
+    /// All direct waits physically written in a critical section, recorded
+    /// during type checking and diagnosed alongside call-graph effects.
     lock_direct_effect_callsites: Vec<LockEffectCause>,
     /// Calls written in a lock body. They are diagnosed after all bodies have
     /// been checked and the call graph fixpoint is complete, which also covers
@@ -321,6 +321,12 @@ impl Default for TypeChecker {
 
 #[willow_continuations::checker]
 impl TypeChecker {
+    /// Configure native synchronous-stack support for the compilation target.
+    pub fn with_sync_stack_preemption(mut self, supported: bool) -> Self {
+        self.task_sync_preemption = supported;
+        self
+    }
+
     pub fn new() -> Self {
         let mut checker = Self {
             symbols: SymbolTable::default(),
@@ -343,6 +349,7 @@ impl TypeChecker {
             lambda_return_stack: Vec::new(),
             current_class: None,
             current_async_context: false,
+            task_sync_preemption: cfg!(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64"))),
             in_static_method: false,
             in_static_initializer: false,
             in_constructor: false,

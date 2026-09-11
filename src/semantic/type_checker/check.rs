@@ -468,16 +468,17 @@ impl TypeChecker {
         operation: &'static str,
         kind: LockEffectKind,
     ) {
-        let Some(caller) = self.current_effect_callable.clone() else {
-            return;
-        };
-        self.lock_direct_effects
-            .entry(caller)
-            .or_insert(LockEffectCause {
-                span,
-                operation,
-                kind,
-            });
+        // A lambda has no named call-graph node, but a lock inside its own
+        // body still needs direct-site diagnostics.
+        if let Some(caller) = self.current_effect_callable.clone() {
+            self.lock_direct_effects
+                .entry(caller)
+                .or_insert(LockEffectCause {
+                    span,
+                    operation,
+                    kind,
+                });
+        }
         if self.lock_depth > 0 {
             self.lock_direct_effect_callsites.push(LockEffectCause {
                 span,
@@ -590,15 +591,12 @@ impl TypeChecker {
         }
         let facts = problem.solve(&graph);
 
-        // `report_lock_suspensions` already emits the direct typed
-        // await/select/channel/native-lock diagnostics while each lock body is
-        // checked. Keep those diagnostics (they participate in the staged gate)
-        // and add only direct effects that walker does not own, notably sync
-        // std::fs calls.
+        // Direct and transitive waits use the same typed effect inventory.
+        // Deferred-body validation owns E0905; do not report its sites twice.
         let already_reported = self
             .errors
             .iter()
-            .filter(|diagnostic| matches!(diagnostic.code, ErrorCode::E2604 | ErrorCode::E0905))
+            .filter(|diagnostic| diagnostic.code == ErrorCode::E0905)
             .flat_map(|diagnostic| diagnostic.labels.iter().map(|label| label.span))
             .collect::<Vec<_>>();
         let mut direct_callsites = self.lock_direct_effect_callsites.clone();
@@ -725,13 +723,11 @@ impl TypeChecker {
         } else {
             self.lock_protected_type(s, &target_ty)
         };
-        let mut well_formed = protected.is_some();
 
         // The lock statement parks the task on contention, so it needs an async
         // frame to resume into. The blocking primitive is a separate type
         // (`BlockingCell<T>`); `Mutex<T>` never changes meaning by context.
         if !self.current_async_context {
-            well_formed = false;
             self.push(
                 Diagnostic::new(
                     Severity::Error,
@@ -750,7 +746,6 @@ impl TypeChecker {
 
         let outermost = self.lock_depth == 0;
         if !outermost {
-            well_formed = false;
             self.push(
                 Diagnostic::new(
                     Severity::Error,
@@ -792,7 +787,6 @@ impl TypeChecker {
         );
         self.lock_depth += 1;
         self.lexical_block_depth += 1;
-        let body_errors_start = self.errors.len();
         for stmt in &s.body.stmts {
             self.check_stmt(stmt);
         }
@@ -800,81 +794,8 @@ impl TypeChecker {
         self.lock_depth -= 1;
         self.symbols.pop_scope();
 
-        // The suspension scan needs `expr_types`, so it runs after the body is
-        // checked. Only the OUTERMOST lock scans, so one `await` inside two
-        // nested locks is still reported once.
-        if outermost && !self.report_lock_suspensions(s, body_errors_start) {
-            well_formed = false;
-        }
-
-        let _ = well_formed;
-    }
-
-    /// Report E2604 for every suspension inside `s`'s critical section, and
-    /// return whether the section was clean.
-    ///
-    /// `body_errors_start` indexes `self.errors` just before the body was
-    /// checked, so a suspension the `defer` rules already rejected (E0905
-    /// covers `await`/`select`, channel operations, and nested `lock` inside a
-    /// deferred body) is dropped instead of reported twice. Anything a future
-    /// suspension form leaves uncovered there still surfaces here.
-    fn report_lock_suspensions(&mut self, s: &LockStmt, body_errors_start: usize) -> bool {
-        let suspends = lock_body_suspend_spans(&s.body, &self.expr_types);
-        if suspends.is_empty() {
-            return true;
-        }
-        let body_errors: Vec<Span> = self.errors[body_errors_start..]
-            .iter()
-            .flat_map(|d| d.labels.iter().map(|l| l.span))
-            .collect();
-        let mut clean = true;
-        for suspend in suspends {
-            if suspend.deferred_by.is_some()
-                && body_errors
-                    .iter()
-                    .any(|reported| reported.contains(suspend.span))
-            {
-                // The defer rules (E0905) already reported this exact site; a
-                // second diagnostic on the same mistake would only be noise.
-                // The section is still not clean, so the lock stays gated.
-                // Suspensions the defer rules do NOT cover — a `Channel.send`
-                // in a deferred call, say — still get their own E2604 below.
-                clean = false;
-                continue;
-            }
-            clean = false;
-            let LockSuspend {
-                span,
-                operation,
-                kind,
-                deferred_by,
-            } = suspend;
-            let action = match kind {
-                LockEffectKind::Suspend => "suspends the task",
-                LockEffectKind::Block => "blocks the scheduler worker",
-                LockEffectKind::SuspendOrBlock => {
-                    "may suspend the task or block the scheduler worker"
-                }
-            };
-            let help = if deferred_by.is_some() {
-                format!("`{operation}` cannot be deferred out of a critical section either")
-            } else {
-                format!("move the `{operation}` outside the critical section")
-            };
-            self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E2604,
-                    "cannot suspend or block while holding a Willow lock",
-                )
-                .with_label(Label::primary(
-                    span,
-                    format!("`{operation}` {action} inside the critical section"),
-                ))
-                .with_help(help),
-            );
-        }
-        clean
+        // Direct waits were recorded while checking the body. They are
+        // diagnosed with transitive effects after all callable bodies exist.
     }
 
     /// The protected value type `T` when `target_ty` is the lock type `s.mode`
@@ -2199,385 +2120,28 @@ fn walk_defer_body(
     on_stmt: &mut impl FnMut(&Stmt),
     on_expr: &mut impl FnMut(&Expr),
 ) {
-    match body {
-        DeferBody::Expr(expr) => walk_defer_expr(expr, on_stmt, on_expr),
-        DeferBody::Block(block) => walk_defer_block(block, on_stmt, on_expr),
-    }
-}
-
-#[willow_continuations::function(
-    collect_lock_suspends_in_block,
-    collect_lock_suspends_in_expr,
-    walk_defer_block,
-    walk_defer_expr,
-    walk_defer_stmt
-)]
-fn walk_defer_block<'tree>(
-    block: &'tree Block,
-    on_stmt: &mut impl FnMut(&'tree Stmt),
-    on_expr: &mut impl FnMut(&'tree Expr),
-) {
-    for stmt in &block.stmts {
-        walk_defer_stmt(stmt, on_stmt, on_expr);
-    }
-}
-
-#[willow_continuations::function(
-    collect_lock_suspends_in_block,
-    collect_lock_suspends_in_expr,
-    walk_defer_block,
-    walk_defer_expr,
-    walk_defer_stmt
-)]
-fn walk_defer_stmt<'tree>(
-    stmt: &'tree Stmt,
-    on_stmt: &mut impl FnMut(&'tree Stmt),
-    on_expr: &mut impl FnMut(&'tree Expr),
-) {
-    on_stmt(stmt);
-    match stmt {
-        Stmt::Let(stmt) => walk_defer_expr(&stmt.init, on_stmt, on_expr),
-        Stmt::Assign(stmt) => walk_defer_expr(&stmt.value, on_stmt, on_expr),
-        Stmt::FieldAssign(stmt) => {
-            walk_defer_expr(&stmt.object, on_stmt, on_expr);
-            walk_defer_expr(&stmt.value, on_stmt, on_expr);
-        }
-        Stmt::SuperInit(stmt) => {
-            for arg in &stmt.args {
-                walk_defer_expr(&arg.expr, on_stmt, on_expr);
-            }
-        }
-        Stmt::StaticFieldAssign(stmt) => walk_defer_expr(&stmt.value, on_stmt, on_expr),
-        Stmt::IndexAssign(stmt) => {
-            walk_defer_expr(&stmt.array, on_stmt, on_expr);
-            walk_defer_expr(&stmt.index, on_stmt, on_expr);
-            walk_defer_expr(&stmt.value, on_stmt, on_expr);
-        }
-        Stmt::If(stmt) => {
-            walk_defer_expr(&stmt.cond, on_stmt, on_expr);
-            walk_defer_block(&stmt.then_block, on_stmt, on_expr);
-            if let Some(block) = &stmt.else_block {
-                walk_defer_block(block, on_stmt, on_expr);
-            }
-        }
-        Stmt::While(stmt) => {
-            walk_defer_expr(&stmt.cond, on_stmt, on_expr);
-            walk_defer_block(&stmt.body, on_stmt, on_expr);
-        }
-        Stmt::For(stmt) => {
-            walk_defer_expr(&stmt.iterable, on_stmt, on_expr);
-            walk_defer_block(&stmt.body, on_stmt, on_expr);
-        }
-        Stmt::Return(stmt) => {
-            if let Some(value) = &stmt.value {
-                walk_defer_expr(value, on_stmt, on_expr);
-            }
-        }
-        Stmt::Expr(stmt) => walk_defer_expr(&stmt.expr, on_stmt, on_expr),
-        Stmt::Lock(stmt) => {
-            walk_defer_expr(&stmt.target, on_stmt, on_expr);
-            walk_defer_block(&stmt.body, on_stmt, on_expr);
-        }
-        Stmt::Break(_) | Stmt::Continue(_) | Stmt::Defer(_) => {}
-    }
-}
-
-/// One user-visible suspension found inside a lock's critical section.
-struct LockSuspend {
-    /// The offending expression.
-    span: Span,
-    /// Operation name for the diagnostic, e.g. `await` or `Channel.recv`.
-    operation: &'static str,
-    /// Whether the operation parks only this task or blocks its native worker.
-    kind: LockEffectKind,
-    /// The enclosing `defer` statement, when the suspension is deferred rather
-    /// than inline. `defer` runs its body at scope exit, still holding the
-    /// lock, so it is in scope for E2604 — but the defer rules reject the same
-    /// operations themselves, so `check_lock_stmt` suppresses the duplicate.
-    deferred_by: Option<Span>,
-}
-
-/// Every user-visible suspension inside a lock's critical section, in source
-/// order (willow-38w.1.4).
-///
-/// Stage 1 (willow-38w.1.1) scanned for `await`/`select` syntactically. That
-/// missed typed wait operations: `Channel.send`/`recv` suspend the task, while
-/// the compatibility `BlockingCell` and `RwLock` accessors block the native
-/// worker. Recognising either category needs the receiver's type, so this scan
-/// runs AFTER the body has been checked and `expr_types` is populated.
-///
-/// The task-suspending set below matches the non-preemption
-/// `record_coop_suspend` call sites in `backend/cranelift/async_codegen.rs`:
-/// `await`, `select`, channel send and channel recv. Native-blocking accessors
-/// are included separately because waiting on them stalls a scheduler worker.
-/// Compiler-inserted preemption stays legal — it re-polls the same task and
-/// never hands the lock to another one. A nested `lock` is its own suspension
-/// edge but is already reported as E2605.
-fn lock_body_suspend_spans(body: &Block, expr_types: &HashMap<ExprId, Type>) -> Vec<LockSuspend> {
-    let mut found = Vec::new();
-    collect_lock_suspends_in_block(body, expr_types, None, &mut found);
-    found.sort_by_key(|s| (s.span.start, s.span.end));
-    found
-}
-
-#[willow_continuations::function(
-    collect_lock_suspends_in_block,
-    collect_lock_suspends_in_expr,
-    walk_defer_block,
-    walk_defer_expr,
-    walk_defer_stmt
-)]
-fn collect_lock_suspends_in_block(
-    block: &Block,
-    expr_types: &HashMap<ExprId, Type>,
-    deferred_by: Option<Span>,
-    out: &mut Vec<LockSuspend>,
-) {
-    // Two accumulators, because the statement and expression callbacks are live
-    // at the same time and cannot both borrow `out`.
-    let mut direct = Vec::new();
-    let mut from_defers = Vec::new();
-    let mut deferred = Vec::new();
-    walk_defer_block(
-        block,
-        &mut |stmt| {
-            if let Stmt::Defer(d) = stmt {
-                deferred.push(d);
-            }
-        },
-        &mut |expr| {
-            if let Some((operation, kind)) = lock_suspend_operation(expr, expr_types) {
-                direct.push(LockSuspend {
-                    span: expr.span(),
-                    operation,
-                    kind,
-                    deferred_by,
-                });
-            }
-        },
-    );
-    for d in deferred {
-        let owner = deferred_by.or(Some(d.span));
-        match &d.body {
-            DeferBody::Expr(expr) => {
-                collect_lock_suspends_in_expr(expr, expr_types, owner, &mut from_defers)
-            }
-            DeferBody::Block(body) => {
-                collect_lock_suspends_in_block(body, expr_types, owner, &mut from_defers)
-            }
-        }
-    }
-    out.append(&mut direct);
-    out.append(&mut from_defers);
-}
-
-#[willow_continuations::function(
-    collect_lock_suspends_in_block,
-    collect_lock_suspends_in_expr,
-    walk_defer_block,
-    walk_defer_expr,
-    walk_defer_stmt
-)]
-fn collect_lock_suspends_in_expr(
-    expr: &Expr,
-    expr_types: &HashMap<ExprId, Type>,
-    deferred_by: Option<Span>,
-    out: &mut Vec<LockSuspend>,
-) {
-    let mut direct = Vec::new();
-    let mut from_defers = Vec::new();
-    let mut deferred = Vec::new();
-    walk_defer_expr(
-        expr,
-        &mut |stmt| {
-            if let Stmt::Defer(d) = stmt {
-                deferred.push(d);
-            }
-        },
-        &mut |expr| {
-            if let Some((operation, kind)) = lock_suspend_operation(expr, expr_types) {
-                direct.push(LockSuspend {
-                    span: expr.span(),
-                    operation,
-                    kind,
-                    deferred_by,
-                });
-            }
-        },
-    );
-    for d in deferred {
-        let owner = deferred_by.or(Some(d.span));
-        match &d.body {
-            DeferBody::Expr(expr) => {
-                collect_lock_suspends_in_expr(expr, expr_types, owner, &mut from_defers)
-            }
-            DeferBody::Block(body) => {
-                collect_lock_suspends_in_block(body, expr_types, owner, &mut from_defers)
-            }
-        }
-    }
-    out.append(&mut direct);
-    out.append(&mut from_defers);
-}
-
-/// The suspension this expression performs, or `None` when it never parks the
-/// task. Keep in step with the suspension edges the cooperative backend emits.
-fn lock_suspend_operation(
-    expr: &Expr,
-    expr_types: &HashMap<ExprId, Type>,
-) -> Option<(&'static str, LockEffectKind)> {
-    match expr {
-        Expr::Await(_) => Some(("await", LockEffectKind::Suspend)),
-        Expr::Select(_) => Some(("select", LockEffectKind::Suspend)),
-        // A channel operation parks whenever the channel is full/empty, and the
-        // scheduler may then run a task that wants the same lock.
-        Expr::MethodCall(call) if matches!(call.method.as_str(), "send" | "recv") => {
-            let on_channel = expr_types
-                .get(&call.object.id())
-                .is_some_and(|ty| builtin_types::is(ty, B::Channel));
-            if !on_channel {
-                return None;
-            }
-            Some((
-                if call.method == "send" {
-                    "Channel.send"
-                } else {
-                    "Channel.recv"
-                },
-                LockEffectKind::Suspend,
-            ))
-        }
-        Expr::MethodCall(call) if matches!(call.method.as_str(), "get" | "set") => {
-            let on_blocking_cell = expr_types
-                .get(&call.object.id())
-                .is_some_and(|ty| builtin_types::unary_arg(ty, B::BlockingCell).is_some());
-            on_blocking_cell.then_some((
-                if call.method == "get" {
-                    "BlockingCell.get"
-                } else {
-                    "BlockingCell.set"
-                },
-                LockEffectKind::Block,
-            ))
-        }
-        Expr::MethodCall(call) if matches!(call.method.as_str(), "read" | "write") => {
-            let on_rwlock = expr_types
-                .get(&call.object.id())
-                .is_some_and(|ty| builtin_types::unary_arg(ty, B::BlockingRwCell).is_some());
-            on_rwlock.then_some((
-                if call.method == "read" {
-                    "BlockingRwCell.read"
-                } else {
-                    "BlockingRwCell.write"
-                },
-                LockEffectKind::Block,
-            ))
-        }
-        _ => None,
-    }
-}
-
-#[willow_continuations::function(
-    collect_lock_suspends_in_block,
-    collect_lock_suspends_in_expr,
-    walk_defer_block,
-    walk_defer_expr,
-    walk_defer_stmt
-)]
-fn walk_defer_expr<'tree>(
-    expr: &'tree Expr,
-    on_stmt: &mut impl FnMut(&'tree Stmt),
-    on_expr: &mut impl FnMut(&'tree Expr),
-) {
-    on_expr(expr);
-    match expr {
-        Expr::Call(call) => {
-            for arg in &call.args {
-                walk_defer_expr(&arg.expr, on_stmt, on_expr);
-            }
-        }
-        Expr::MethodCall(call) => {
-            walk_defer_expr(&call.object, on_stmt, on_expr);
-            for arg in &call.args {
-                walk_defer_expr(&arg.expr, on_stmt, on_expr);
-            }
-        }
-        Expr::StaticCall(call) => {
-            for arg in &call.args {
-                walk_defer_expr(&arg.expr, on_stmt, on_expr);
-            }
-        }
-        Expr::New(new) => {
-            for arg in &new.args {
-                walk_defer_expr(&arg.expr, on_stmt, on_expr);
-            }
-        }
-        Expr::ObjectLiteral(object) => {
-            for field in &object.fields {
-                walk_defer_expr(&field.value, on_stmt, on_expr);
-            }
-        }
-        Expr::Await(awaited) => walk_defer_expr(&awaited.expr, on_stmt, on_expr),
-        Expr::Select(select) => {
-            for case in &select.cases {
-                match &case.kind {
-                    SelectCaseKind::Recv { channel, .. } => {
-                        walk_defer_expr(channel, on_stmt, on_expr)
-                    }
-                    SelectCaseKind::Send { channel, value } => {
-                        walk_defer_expr(channel, on_stmt, on_expr);
-                        walk_defer_expr(value, on_stmt, on_expr);
-                    }
-                    SelectCaseKind::Timeout { millis } => walk_defer_expr(millis, on_stmt, on_expr),
-                    SelectCaseKind::Join { task, .. } => walk_defer_expr(task, on_stmt, on_expr),
-                    SelectCaseKind::Default => {}
-                }
-                walk_defer_block(&case.body, on_stmt, on_expr);
-            }
-        }
-        Expr::Binary(binary) => {
-            walk_defer_expr(&binary.lhs, on_stmt, on_expr);
-            walk_defer_expr(&binary.rhs, on_stmt, on_expr);
-        }
-        Expr::Unary(unary) => walk_defer_expr(&unary.expr, on_stmt, on_expr),
-        Expr::FieldAccess(object, ..) => walk_defer_expr(object, on_stmt, on_expr),
-        Expr::Print(arg, ..) => walk_defer_expr(arg, on_stmt, on_expr),
-        Expr::Ternary(ternary) => {
-            walk_defer_expr(&ternary.condition, on_stmt, on_expr);
-            walk_defer_expr(&ternary.then_expr, on_stmt, on_expr);
-            walk_defer_expr(&ternary.else_expr, on_stmt, on_expr);
-        }
-        Expr::Range(range) => {
-            walk_defer_expr(&range.start, on_stmt, on_expr);
-            walk_defer_expr(&range.end, on_stmt, on_expr);
-        }
-        Expr::Match(matched) => {
-            walk_defer_expr(&matched.scrutinee, on_stmt, on_expr);
-            for arm in &matched.arms {
-                match &arm.body {
-                    MatchBody::Expr(expr) => walk_defer_expr(expr, on_stmt, on_expr),
-                    MatchBody::Block(block) => walk_defer_block(block, on_stmt, on_expr),
+    use crate::parser::iter::{AstEvent, AstWalk};
+    let root = match body {
+        DeferBody::Expr(expr) => AstEvent::Expr(expr),
+        DeferBody::Block(block) => AstEvent::Block(block),
+    };
+    let mut walk = AstWalk::new(root);
+    while let Some(event) = walk.next() {
+        match event {
+            AstEvent::Stmt(stmt) => {
+                on_stmt(stmt);
+                if matches!(stmt, Stmt::Defer(_)) {
+                    walk.skip_children();
                 }
             }
-        }
-        Expr::TryPropagate(inner, _, _) => walk_defer_expr(inner, on_stmt, on_expr),
-        Expr::ArrayLiteral(elements, _, _) => {
-            for element in elements {
-                walk_defer_expr(element, on_stmt, on_expr);
+            AstEvent::Expr(expr) => {
+                on_expr(expr);
+                if matches!(expr, Expr::Lambda(_)) {
+                    walk.skip_children();
+                }
             }
+            _ => {}
         }
-        Expr::Index(array, index, _, _) => {
-            walk_defer_expr(array, on_stmt, on_expr);
-            walk_defer_expr(index, on_stmt, on_expr);
-        }
-        // A lambda is a separate function. Scalar leaves contain no children.
-        Expr::Lambda(_)
-        | Expr::Integer(..)
-        | Expr::Float(..)
-        | Expr::Bool(..)
-        | Expr::String(..)
-        | Expr::Var(..)
-        | Expr::StaticField(_) => {}
     }
 }
 

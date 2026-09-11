@@ -45,6 +45,8 @@ use super::typed_ast::{
 /// the same tables the checker already hands to the backend.
 #[derive(Default)]
 pub struct CheckerTables<'a> {
+    /// Canonical global declarations copied into the owned HIR snapshot.
+    pub symbols: Option<&'a symbols::SymbolTable>,
     /// Unqualified enum-variant constructions (`Ok(42)` in an expected-enum
     /// position), keyed by the call's node ID; the value is the resolved enum
     /// name and the variant is the call's callee.
@@ -88,6 +90,7 @@ impl<'a> CheckerTables<'a> {
     /// Borrow the relevant tables from a run type checker.
     pub fn from_checker(checker: &'a crate::semantic::TypeChecker) -> Self {
         Self {
+            symbols: Some(&checker.symbols),
             enum_variant_resolutions: Some(&checker.enum_variant_resolutions),
             pattern_resolutions: Some(&checker.pattern_resolutions),
             expr_types: Some(&checker.expr_types),
@@ -359,6 +362,7 @@ pub fn lower_program_with(
         HirProgram {
             functions,
             classes: hir_classes,
+            resolution: lower_resolution(program, tables),
         },
         diagnostics,
     )
@@ -438,21 +442,8 @@ impl Enums {
 }
 
 /// Substitute symbolic type parameters (`Named(param)`) with concrete types.
-#[willow_continuations::function(subst_type)]
 fn subst_type(ty: &Type, subst: &HashMap<String, Type>) -> Type {
-    match ty {
-        Type::Named(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
-        Type::Array(inner) => Type::Array(Box::new(subst_type(inner, subst))),
-        Type::Generic(name, args) => Type::Generic(
-            name.clone(),
-            args.iter().map(|a| subst_type(a, subst)).collect(),
-        ),
-        Type::Fn(params, ret) => Type::Fn(
-            params.iter().map(|p| subst_type(p, subst)).collect(),
-            Box::new(subst_type(ret, subst)),
-        ),
-        _ => ty.clone(),
-    }
+    ty.substitute_names(|name| subst.get(name).cloned())
 }
 
 /// Type information for one class, collected from its declaration.
@@ -1041,6 +1032,14 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
 fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     let mut lowered = lower_expr_inner(expr, ctx)?;
     lowered.ty = ctx.normalize(&lowered.ty.to_source()).into();
+    // Construction records the identity being allocated, not the source's
+    // import alias. Keep it identical to the canonical result type.
+    if let crate::semantic::ids::SemanticType::Named(identity) = &lowered.ty {
+        match &mut lowered.kind {
+            HirExprKind::New { class, .. } | HirExprKind::ObjectLiteral { class, .. } => *class = *identity,
+            _ => {}
+        }
+    }
     Ok(lowered)
 }
 
@@ -2616,6 +2615,46 @@ mod tests {
     use crate::lexer::Lexer;
     use crate::parser::Parser;
 
+    #[test]
+    fn construction_identity_uses_normalized_type_alias() {
+        use crate::semantic::ids::{SemanticType, TypeId};
+        let tokens = Lexer::new("class Alias { n: i64; } fn f() { let a = new Alias(1); let b = Alias { n: 2 }; }").tokenize().unwrap();
+        let (program, errors) = Parser::new(tokens).parse();
+        assert!(errors.is_empty());
+        let normalized = HashMap::from([(Type::Named("Alias".into()), Type::Named("sales::Amount".into()))]);
+        let tables = CheckerTables { normalized_types: Some(&normalized), ..Default::default() };
+        let (hir, diagnostics) = lower_program_with(&program, &tables);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for statement in &hir.functions[0].body {
+            if let HirStmt::Let { value, .. } = statement {
+                let (HirExprKind::New { class, .. } | HirExprKind::ObjectLiteral { class, .. }) = &value.kind else { panic!("constructor expected"); };
+                assert_eq!(*class, TypeId::from_source_name("sales::Amount"));
+                assert_eq!(value.ty, SemanticType::Named(*class));
+            }
+        }
+    }
+
+    #[test]
+    fn resolution_snapshot_preserves_payload_order_and_parameter_modes() {
+        use crate::semantic::ids::{TypeId, FunctionId};
+        let (hir, diagnostics) = lower_src("interface Reader<T> { fn read(self) -> T; } interface NamedReader extends Reader { fn name(self) -> String; } enum Pair { Empty, Values(i64, String) } class Item { pub z: i64; pub a: String; pub init(self, n: i64) { self.z = n; self.a = \"x\"; } pub static fn twice(n: i64) -> i64 { return n + n; } } fn touch(x: &mut i64) { x = 1; }");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let reader = &hir.resolution.interfaces[&TypeId::local("Reader")];
+        assert_eq!(reader.type_params, vec![TypeId::local("T")]);
+        assert_eq!(reader.methods["read"].return_type, crate::semantic::ids::SemanticType::Named(TypeId::local("T")));
+        assert_eq!(hir.resolution.interfaces[&TypeId::local("NamedReader")].extends, vec![TypeId::local("Reader")]);
+        let pair = &hir.resolution.enums[&TypeId::local("Pair")];
+        assert_eq!(pair.variants[1].name, "Values");
+        assert_eq!(pair.variants[1].tag, 1);
+        assert_eq!(pair.variants[1].payloads, vec![crate::semantic::ids::SemanticType::I64, crate::semantic::ids::SemanticType::String]);
+        let item = &hir.resolution.classes[&TypeId::local("Item")];
+        assert_eq!(item.fields.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["z", "a"]);
+        assert_eq!(item.constructor.as_ref().unwrap().params, vec![crate::semantic::ids::SemanticType::I64]);
+        assert!(item.methods["twice"].is_static);
+        assert!(matches!(hir.resolution.functions[&FunctionId::free("touch")].param_modes[0], crate::parser::ast::ParamMode::Reference { mutable: true, .. }));
+        assert_eq!(hir.resolution.enums[&TypeId::local("Option")].variants[0].name, "Some");
+    }
+
     /// Deeply nested expressions must lower without exhausting a modest
     /// stack. Lowering is recursive, so the cost that matters is the size of
     /// ONE level: the arms of `lower_expr_inner` live in their own functions
@@ -3755,4 +3794,118 @@ mod tests {
         let (_, diags) = lower_src("enum Msg { Num(i64), } fn f() -> Msg { return Num(7); }");
         assert!(!diags.is_empty(), "unresolved construction must report");
     }
+}
+
+/// Freeze declaration facts before control-flow lowering. Source declarations
+/// provide a complete fallback for checkerless tools/tests; checker entries
+/// then replace them with the canonical, globally resolved definitions.
+fn lower_resolution(program: &Program, tables: &CheckerTables<'_>) -> super::typed_ast::HirResolution {
+    use super::typed_ast::{HirResolution, HirEnumInfo, HirEnumVariant, HirClassInfo, HirInterfaceInfo, HirSignature};
+    use crate::semantic::ids::{TypeId, FunctionId};
+    use crate::parser::ast::ParamMode;
+    let canonical = |name: &str| match tables.normalize(&Type::Named(name.to_owned())) {
+        Type::Named(ref name) => TypeId::from_source_name(name),
+        _ => TypeId::from_source_name(name),
+    };
+    let signature = |params: &[crate::parser::ast::Param], result: &Type, is_static, is_async| HirSignature {
+        params: params.iter().map(|p| tables.normalize(&p.ty).into()).collect(),
+        param_modes: params.iter().map(|p| p.mode.clone()).collect(),
+        return_type: tables.normalize(result).into(), is_static, is_async,
+    };
+    let mut out = HirResolution::default();
+    for namespace in ["env", "fs", "net", "parallel", "f64"] {
+        out.namespaces.insert(TypeId::local(namespace), namespace.to_owned());
+    }
+    for import in &program.imports {
+        use crate::module::std_registry;
+        if std_registry::is_std_path(&import.path) {
+            if let Ok(std_registry::StdImport::Module { module }) = std_registry::resolve_std_import(&import.path, import.span) {
+                if matches!(module.as_str(), "env" | "fs" | "net" | "parallel") {
+                    out.namespaces.insert(TypeId::local(import.alias.as_deref().unwrap_or(&module)), module);
+                }
+            }
+        } else {
+            let access = import.alias.as_deref().unwrap_or_else(|| import.path.rsplit("::").next().unwrap_or(&import.path));
+            if access != "f64" { out.namespaces.remove(&TypeId::local(access)); }
+        }
+    }
+    // Preserve declaration order for builtin enum discriminants too.
+    static PRELUDE: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
+    let prelude = PRELUDE.get_or_init(|| {
+        let tokens = crate::lexer::Lexer::new(crate::prelude::PRELUDE_SOURCE).tokenize().expect("prelude lexes");
+        let (prelude, errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(errors.is_empty(), "prelude parses: {errors:?}");
+        prelude
+    });
+    for item in prelude.items.iter().chain(&program.items) {
+        match item {
+            Item::Enum(e) => {
+                out.enums.insert(canonical(&e.name), HirEnumInfo {
+                    type_params: e.type_params.iter().map(|name| TypeId::from_source_name(name)).collect(),
+                    variants: e.variants.iter().enumerate().map(|(tag, variant)| HirEnumVariant {
+                        name: variant.name.clone(), tag: tag as i64,
+                        payloads: variant.payload.iter().map(|ty| tables.normalize(ty).into()).collect(),
+                    }).collect(),
+                });
+            }
+            Item::Function(f) => { out.functions.insert(FunctionId::free_from_source_name(&f.name), signature(&f.params, &f.return_type, true, f.is_async)); }
+            Item::Class(c) => {
+                let mut info = HirClassInfo { implements: c.implements.iter().map(|ty| tables.normalize(ty).into()).collect(), base: c.base_class.as_ref().map(|base| canonical(&match base { crate::parser::ast::TypePath::Local(name) => name.clone(), crate::parser::ast::TypePath::Qualified(parts) => parts.join("::") })), ..HirClassInfo::default() };
+                for field in &c.fields {
+                    let ty = tables.normalize(&field.ty).into();
+                    if field.is_static { info.static_fields.insert(field.name.clone(), ty); }
+                    else { info.fields.push((field.name.clone(), ty)); }
+                }
+                info.constructor = c.constructors.first().map(|ctor| signature(&ctor.params, &Type::Void, false, false));
+                for method in &c.methods { info.methods.insert(method.name.clone(), signature(&method.params, &method.return_type, method.is_static, method.is_async)); }
+                out.classes.insert(canonical(&c.name), info);
+            }
+            Item::Interface(interface) => {
+                out.interfaces.insert(canonical(&interface.name), HirInterfaceInfo {
+                    type_params: interface.type_params.iter().map(|name| TypeId::from_source_name(name)).collect(),
+                    extends: interface.extends.iter().map(|name| canonical(name)).collect(),
+                    methods: interface.methods.iter().map(|method| (method.name.clone(), signature(&method.params, &method.return_type, method.is_static, false))).collect(),
+                });
+            }
+        }
+    }
+    let checked_signature = |params: &[Type], infos: &[symbols::ParamInfo], result: &Type, is_static, is_async| HirSignature {
+        params: params.iter().map(|ty| tables.normalize(ty).into()).collect(),
+        param_modes: params.iter().enumerate().map(|(i, _)| infos.get(i).map_or(ParamMode::Value, |p| p.mode.clone())).collect(),
+        return_type: tables.normalize(result).into(), is_static, is_async,
+    };
+    if let Some(enums) = tables.enums {
+        for info in enums.values() {
+            out.enums.insert(TypeId::from_source_name(&info.name), HirEnumInfo {
+                type_params: info.type_params.iter().map(|name| TypeId::from_source_name(name)).collect(),
+                variants: info.variants.iter().map(|variant| HirEnumVariant {
+                    name: variant.name.clone(), tag: variant.tag,
+                    payloads: variant.payload_types.iter().map(|ty| tables.normalize(ty).into()).collect(),
+                }).collect(),
+            });
+        }
+    }
+    if let Some(symbols) = tables.symbols {
+        for (id, function) in &symbols.functions {
+            out.functions.insert(id.clone(), checked_signature(&function.params, &function.param_infos, &function.return_type, true, function.is_async));
+        }
+        for interface in symbols.interfaces.values() {
+            out.interfaces.insert(TypeId::from_source_name(&interface.name), HirInterfaceInfo {
+                type_params: interface.type_params.iter().map(|name| TypeId::from_source_name(name)).collect(),
+                extends: interface.extends.iter().map(|name| TypeId::from_source_name(name)).collect(),
+                methods: interface.methods.iter().map(|(name, method)| (name.clone(), checked_signature(&method.params, &method.param_infos, &method.return_type, method.is_static, false))).collect(),
+            });
+        }
+        for class in symbols.classes.values() {
+            out.classes.insert(TypeId::from_source_name(&class.name), HirClassInfo {
+                base: class.base_class.as_ref().map(|name| TypeId::from_source_name(name)),
+                implements: class.implements.iter().map(|ty| tables.normalize(ty).into()).collect(),
+                fields: class.instance_field_order.iter().map(|(name, ty)| (name.clone(), tables.normalize(ty).into())).collect(),
+                static_fields: class.static_props.iter().map(|(name, field)| (name.clone(), tables.normalize(&field.ty).into())).collect(),
+                constructor: class.constructor.as_ref().map(|ctor| checked_signature(&ctor.params, &ctor.param_infos, &Type::Void, false, false)),
+                methods: class.methods.iter().map(|(name, method)| (name.clone(), checked_signature(&method.params, &method.param_infos, &method.return_type, method.is_static, method.is_async))).collect(),
+            });
+        }
+    }
+    out
 }

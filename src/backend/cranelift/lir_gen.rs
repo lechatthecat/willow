@@ -180,7 +180,7 @@
 //! ABI representation, so a niche `Option<String>` and a
 //! boxed `Option<i64>` cannot be confused for one another.
 
-use super::ModuleSymbols;
+use super::{ModuleSymbols, FlatReferenceDebug};
 use super::type_index::TypeMap;
 use crate::semantic::ids::SemanticType as Type;
 use std::borrow::Cow;
@@ -207,7 +207,6 @@ use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::ids::{FunctionId, FunctionMap, TypeId};
 use crate::semantic::intrinsics::{self, Intrinsic};
 use crate::semantic::type_checker::types::{await_output_type, awaitable_task_type, type_name};
-use crate::stdlib_schema::{self, StdItemKind};
 
 use super::channel_element_type;
 use super::emit_interface::{
@@ -375,14 +374,6 @@ fn range_i64(ty: &Type) -> bool {
 /// One entry of a builtin namespace: the runtime symbol a call lowers to, its
 /// parameter types, its result type, and whether the runtime's word has to be
 /// narrowed to a `bool` (willow-0g8j.2.10, willow-0g8j.2.13).
-struct NamespaceBuiltin {
-    runtime: &'static str,
-    params: Vec<Type>,
-    ret: Type,
-    /// `fs::exists` is the one entry whose runtime returns a full word for a
-    /// `bool` result; emission narrows that word to a boolean.
-    narrow_to_bool: bool,
-}
 
 /// The builtin namespace call `class::method` names, or `None` if it is not one.
 ///
@@ -413,89 +404,11 @@ fn namespace_builtin_call(
     builtin_module_aliases: &HashMap<String, String>,
     class: &str,
     method: &str,
-) -> Option<NamespaceBuiltin> {
-    if class == "f64" {
-        return match method {
-            "to_string" => Some(NamespaceBuiltin {
-                runtime: "willow_f64_to_string",
-                params: vec![Type::F64],
-                ret: Type::String,
-                narrow_to_bool: false,
-            }),
-            "parse" => Some(NamespaceBuiltin {
-                runtime: "willow_f64_parse",
-                params: vec![Type::String],
-                ret: Type::Generic(
-                    "Result".to_string().into(),
-                    vec![Type::F64, Type::Named("ParseFloatError".to_string().into())],
-                ),
-                narrow_to_bool: false,
-            }),
-            _ => None,
-        };
-    }
-    // A user module wins only when the call was WRITTEN through that module's
-    // access name. Under `import std::fs as files; import fs;`, `fs::exists`
-    // belongs to the user module while `files::exists` still names the std
-    // namespace. Mapping `files -> fs` before this gate confused access with
-    // identity and rejected the latter as if it had been written `fs`
-    // (willow-0g8j.3).
-    if known_modules.contains_key(class) {
-        return None;
-    }
-    let class = builtin_module_aliases
-        .get(class)
-        .map(String::as_str)
-        .unwrap_or(class);
-    let runtime = match (class, method) {
-        ("env", "args_len") => "willow_runtime_args_len",
-        ("env", "args") => "willow_runtime_args_array",
-        ("env", "program_name") => "willow_runtime_program_name",
-        ("env", "arg") => "willow_runtime_arg",
-
-        ("fs", "temp_path") => "willow_fs_temp_path",
-        ("fs", "read_to_string") => "willow_fs_read_to_string",
-        ("fs", "write_string") => "willow_fs_write_string",
-        ("fs", "exists") => "willow_fs_exists",
-        ("fs", "remove_file") => "willow_fs_remove_file",
-        ("fs", "read_to_string_async") => "willow_fs_read_to_string_async",
-        ("fs", "write_string_async") => "willow_fs_write_string_async",
-        ("fs", "exists_async") => "willow_fs_exists_async",
-        ("fs", "remove_file_async") => "willow_fs_remove_file_async",
-
-        // `parallel::map(frozen, f)` (willow-0g8j.2.13). Its two arguments are
-        // the only ones in this table that are not scalars or strings: a
-        // `FrozenArray<i64>`, which is rooted like any other heap handle, and a
-        // FUNCTION VALUE, which is a bare code address and so is deliberately
-        // not. The runtime owns the chunking, so from here it is one call.
-        ("parallel", "map") => "willow_parallel_map_i64",
-
-        ("net", "bind") => "willow_net_bind",
-        ("net", "local_addr") => "willow_net_local_addr",
-        ("net", "peer_addr") => "willow_net_peer_addr",
-        ("net", "shutdown") => "willow_net_shutdown",
-        ("net", "connect_async") => "willow_net_connect_async",
-        ("net", "accept_async") => "willow_net_accept_async",
-        ("net", "read_async") => "willow_net_read_async",
-        ("net", "write_async") => "willow_net_write_async",
-        _ => return None,
-    };
-    let StdItemKind::Function {
-        params,
-        return_type,
-    } = stdlib_schema::item(class, method)?.kind
-    else {
-        return None;
-    };
-    Some(NamespaceBuiltin {
-        runtime,
-        params: params
-            .iter()
-            .map(|ty| ty.to_ast_type().map(Into::into))
-            .collect::<Option<Vec<_>>>()?,
-        ret: return_type.to_ast_type()?.into(),
-        narrow_to_bool: (class, method) == ("fs", "exists"),
-    })
+) -> Option<crate::semantic::intrinsics::NamespaceBuiltin> {
+    if class == "f64" { return crate::semantic::intrinsics::namespace_builtin(class, method); }
+    if known_modules.contains_key(class) { return None; }
+    let namespace = builtin_module_aliases.get(class).map(String::as_str).unwrap_or(class);
+    crate::semantic::intrinsics::namespace_builtin(namespace, method)
 }
 
 /// A context-dependent empty map constructor. Eligibility admits it only as
@@ -1599,8 +1512,76 @@ fn lir_block_successors(block: &LirBlock) -> Vec<usize> {
             ..
         } => vec![then_block.0, else_block.0],
         Terminator::Suspend { resume, .. } => vec![resume.0],
-        Terminator::Return(_) => Vec::new(),
+        Terminator::Return(_) | Terminator::CleanupReturn => Vec::new(),
     }
+}
+
+/// Argument evaluation may cross basic blocks or a cooperative suspension.
+/// Validate the matching preparations and retain the source frames at each
+/// entry, independently of the order in which machine blocks are emitted.
+fn lir_call_frame_entries(f: &LirFunction) -> Option<Vec<Vec<(String, Span)>>> {
+    use crate::ir::lowered::{LirOperand, LirRvalue};
+    type Stack = Vec<(crate::ir::lowered::LirLocalId, String, Span)>;
+    let mut entries: Vec<Option<Stack>> = vec![None; f.blocks.len()];
+    if entries.is_empty() { return Some(Vec::new()); }
+    entries[0] = Some(Vec::new());
+    let mut work = vec![0];
+    while let Some(index) = work.pop() {
+        let mut stack = entries.get(index)?.clone()?;
+        let mut edges = Vec::new();
+        for instruction in &f.blocks[index].instrs {
+            match instruction {
+                LirInst::Compute { local, value: LirRvalue::PrepareMethod { method, .. }, span } => stack.push((*local, method.clone(), *span)),
+                LirInst::Compute { value: LirRvalue::MethodCall { receiver, method, .. }, .. } => {
+                    let (prepared, expected, _) = stack.pop()?;
+                    if *receiver != LirOperand::Local(prepared) || *method != expected { return None; }
+                }
+                LirInst::EnterDeferScope { resume: Some(resume), .. } => edges.push((resume.0, stack.clone())),
+                _ => {}
+            }
+        }
+        edges.extend(lir_block_successors(&f.blocks[index]).into_iter().map(|target| (target, stack.clone())));
+        for (target, state) in edges {
+            match entries.get_mut(target)? {
+                Some(existing) if *existing != state => return None,
+                Some(_) => {},
+                entry @ None => { *entry = Some(state); work.push(target); }
+            }
+        }
+    }
+    Some(entries.into_iter().map(|entry| entry.unwrap_or_default().into_iter().map(|(_, name, span)| (name, span)).collect()).collect())
+}
+
+fn lir_reference_scope_entries(f: &LirFunction) -> Option<Vec<Vec<Vec<super::FlatReferenceDebug>>>> {
+    use crate::ir::lowered::{LirOperand, LirRvalue as V};
+    type Scopes = Vec<Vec<super::FlatReferenceDebug>>;
+    let mut entries: Vec<Option<Scopes>> = vec![None; f.blocks.len()];
+    if entries.is_empty() { return Some(Vec::new()); }
+    entries[0] = Some(Vec::new());
+    let mut work = vec![0];
+    while let Some(index) = work.pop() {
+        let mut scopes = entries.get(index)?.clone()?;
+        let mut edges = Vec::new();
+        for instruction in &f.blocks[index].instrs {
+            match instruction {
+                LirInst::Compute { value: V::BeginReferenceCall, .. } => scopes.push(Vec::new()),
+                LirInst::Compute { value: V::ReferenceDebug { argument, callee, index }, .. } => scopes.last_mut()?.push(super::FlatReferenceDebug { argument: argument.clone(), callee: *callee, index: *index }),
+                LirInst::Compute { value: V::DirectCall { args, .. } | V::StaticCall { args, .. } | V::MethodCall { args, .. } | V::ConstructorCall { args, .. }, .. }
+                    if args.iter().any(|arg| matches!(arg, LirOperand::Reference { .. })) => { scopes.pop()?; },
+                LirInst::EnterDeferScope { resume: Some(resume), .. } => edges.push((resume.0, scopes.clone())),
+                _ => {}
+            }
+        }
+        edges.extend(lir_block_successors(&f.blocks[index]).into_iter().map(|target| (target, scopes.clone())));
+        for (target, state) in edges {
+            match entries.get_mut(target)? {
+                Some(existing) if *existing != state => return None,
+                Some(_) => {},
+                entry @ None => { *entry = Some(state); work.push(target); }
+            }
+        }
+    }
+    Some(entries.into_iter().map(Option::unwrap_or_default).collect())
 }
 
 /// How many of the innermost open scopes a `FlushDefers` naming `sites` covers.
@@ -1720,6 +1701,12 @@ fn lir_sync_defer_stacks_agree(f: &LirFunction) -> bool {
 /// "something in this function is unsupported" and a construct, a type and a
 /// line to go and fix.
 pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Option<String> {
+    if lir_call_frame_entries(f).is_none() {
+        return Some("method preparation frames disagree across control-flow edges".into());
+    }
+    if lir_reference_scope_entries(f).is_none() {
+        return Some("reference argument scopes disagree across control-flow edges".into());
+    }
     // The two per-function fields, taken from the function under test rather
     // than from the caller, so a `return` inside a `match` arm is checked
     // against this function's declared type and no caller can get it wrong.
@@ -1732,7 +1719,7 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
         // `rsplit`, not `split`: a module class is keyed by its qualified
         // name, so the method `shapes::Point::area` has `shapes::Point` as its
         // class and only the LAST separator divides the two (willow-0g8j.16).
-        self_class: owner.as_deref(),
+        self_class: owner.as_deref().or_else(|| if f.name.is_free_named("$defer") { ctx.self_class } else { None }),
         ..*ctx
     };
     if !ctx.supported_type(&f.return_type) {
@@ -1756,15 +1743,56 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
     // a bare enum variant, a function used as a value — so an unresolved
     // form fails validation (willow-0g8j.1).
     let mut names: HashMap<&str, Cow<'_, Type>> = HashMap::new();
+    let mut physical_names = HashSet::new();
     for local in &f.locals {
-        if names
-            .insert(local.name.as_str(), Cow::Borrowed(&local.ty))
-            .is_some()
-        {
+        if !physical_names.insert(local.name.as_str()) {
             return Some(format!(
                 "LIR local `{}` reuses an existing lowered name",
                 local.name
             ));
+        }
+        if local.is_gc_owner() {
+            if !local.synthetic || local.parameter || local.ty != Type::Void {
+                return Some("opaque GC owners must be synthetic storage without a language type".into());
+            }
+        } else {
+            names.insert(local.name.as_str(), Cow::Borrowed(&local.ty));
+        }
+    }
+
+    // Opaque owners carry no language type. Recover their checked capture
+    // provenance so malformed LIR cannot reinterpret a buffer or replace its
+    // bounds-checked index with another local.
+    let mut array_captures = HashMap::new();
+    for block in &f.blocks {
+        for inst in &block.instrs {
+            if let LirInst::Compute { local, value: crate::ir::lowered::LirRvalue::CaptureArrayOwner { array, index }, .. } = inst {
+                let Some(Type::Array(ref element)) = array.ty(&f.locals) else {
+                    return Some("array reference owner has no array provenance".into());
+                };
+                if array_captures.insert(*local, ((**element).clone(), index.clone())).is_some() {
+                    return Some("array reference owner has multiple definitions".into());
+                }
+            }
+        }
+    }
+    for block in &f.blocks {
+        for inst in &block.instrs {
+            if let LirInst::Compute { value, .. } = inst {
+                let mut operands = value.operands();
+                if let crate::ir::lowered::LirRvalue::ReferenceDebug { argument, .. } = value {
+                    operands.push(argument);
+                }
+                for operand in operands {
+                    if let crate::ir::lowered::LirOperand::Reference { place: crate::ir::lowered::LirPlace::ArrayElement { owner, index, element }, .. } = operand {
+                        if !array_captures.get(owner).is_some_and(|(captured, checked_index)|
+                            ctx.same_repr(captured, element)
+                            && *checked_index == crate::ir::lowered::LirOperand::Local(*index)) {
+                            return Some("array reference disagrees with its captured buffer or checked index".into());
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1776,9 +1804,72 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
         return Some("its defer scope crosses LIR blocks".to_string());
     }
 
+    // User binding types remain the primary diagnostic even after their
+    // initializers have been split into preceding Compute instructions.
+    for block in &f.blocks {
+        for instruction in &block.instrs {
+            if let LirInst::Let { name, ty, .. } = instruction {
+                if !ctx.supported_type(ty) {
+                    return Some(format!("`let {name}` binds type `{}`, outside the walker's subset", type_name(ty)));
+                }
+            }
+        }
+    }
     for block in &f.blocks {
         for inst in &block.instrs {
             match inst {
+                LirInst::Compute { local, value, span } => {
+                    if let crate::ir::lowered::LirRvalue::DirectCall { callee, args, params, result } = value {
+                        if !(ctx.known_fn)(&callee.to_string()) {
+                            return Some(format!("the call to `{callee}` at line {} has no declared function", span.line));
+                        }
+                        if let Some(ty) = std::iter::once(result).chain(params).find(|ty| !ctx.supported_type(ty)) {
+                            return Some(format!("the call to `{callee}` at line {} has type `{}`, outside the supported LIR types", span.line, type_name(ty)));
+                        }
+                        if !flat_argument_modes_match(args, ctx.func_param_modes.get_id(callee).map(Vec::as_slice).unwrap_or(&[])) {
+                            return Some(format!("the call to `{callee}` has incompatible reference modes"));
+                        }
+                        if ctx.fn_types.get_id(callee).is_some_and(|signature| !matches!(signature,
+                            Type::Fn(declared, output) if declared.len() == params.len()
+                                && declared.iter().zip(params).all(|(declared, actual)| ctx.same_repr(declared, actual))
+                                && ctx.same_repr(output, result)))
+                             {
+                            return Some(format!("the call to `{callee}` at line {} has an incompatible signature", span.line));
+                        }
+                    }
+                    match value {
+                        crate::ir::lowered::LirRvalue::FunctionRef { function, ty } => {
+                            if !ctx.fn_value_of(function).is_some_and(|known| known == *ty) {
+                                return Some(format!("the function value `{function}` at line {} has an incompatible signature", span.line));
+                            }
+                        }
+                        crate::ir::lowered::LirRvalue::Closure { id, captures, ty } => {
+                            if captures.len() > super::OBJECT_FIELD_MASK_CAPACITY
+                                || !(ctx.lambda_symbol)(*id).and_then(|symbol| ctx.fn_value_of(&symbol)).is_some_and(|known| known == *ty) {
+                                return Some(format!("a lambda at line {} has an unsupported environment or signature", span.line));
+                            }
+                        }
+                        _ => {}
+                    }
+                    if let crate::ir::lowered::LirRvalue::IntrinsicCall { intrinsic, receiver_ty, arg_types, result, method, .. } = value {
+                        if !flat_intrinsic_supported(*intrinsic, receiver_ty, arg_types, result, ctx) {
+                            return Some(format!("the `{method}` method at line {} uses an unsupported type", span.line));
+                        }
+                    }
+                    if !flat_rvalue_supported(value, &f.locals, ctx) || !value.is_well_typed(&f.locals, *local) {
+                        use crate::ir::lowered::LirRvalue as V;
+                        let operation = match value {
+                            V::PrepareMethod { receiver_ty, method, .. } | V::MethodCall { receiver_ty, method, .. }
+                            | V::EnumMethod { receiver_ty, method, .. } => format!("the method `{method}` on a `{}`", type_name(receiver_ty)),
+                            V::StaticField { class, field, .. } | V::StaticStore { class, field, .. } => format!("the static property `{class}::{field}`"),
+                            V::ObjectAlloc { class } | V::ConstructorCall { class, .. } => format!("`new {class}`"),
+                            V::FieldLoad { object_ty, field, .. } | V::FieldStore { object_ty, field, .. } => format!("the field `{field}` on a `{}`", type_name(object_ty)),
+                            V::StaticCall { class, method, .. } => format!("the call to `{class}::{method}`"),
+                            _ => "a flat computation".into(),
+                        };
+                        return Some(format!("{operation} at line {} has incompatible operands, metadata or destination", span.line));
+                    }
+                }
                 LirInst::Let {
                     name, ty, value, ..
                 } => {
@@ -1909,15 +2000,7 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                 // that carries the type this reads back (willow-0g8j.2.13).
                 LirInst::ReleaseLock { .. } => {}
                 LirInst::Defer { body, .. } => {
-                    let supported = match body {
-                        crate::ir::lowered::LirDeferBody::Expr(expr) => {
-                            supported_expr(expr, ctx, &names)
-                                || supported_divergent_expr(expr, ctx, &names)
-                        }
-                        crate::ir::lowered::LirDeferBody::Block(body) => {
-                            supported_effect_body(body, ctx, &names, BodyScope::Deferred)
-                        }
-                    };
+                    let supported = lir_rejection_reason(&body.function, ctx).is_none();
                     if !supported {
                         return Some("it registers an unsupported `defer` body".to_string());
                     }
@@ -2047,7 +2130,7 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                     ));
                 }
             }
-            Terminator::Jump(_) | Terminator::Suspend { .. } | Terminator::Return(None) => {}
+            Terminator::Jump(_) | Terminator::Suspend { .. } | Terminator::Return(None) | Terminator::CleanupReturn => {}
         }
     }
     None
@@ -2073,6 +2156,7 @@ pub(super) fn lir_async_rejection_reason(f: &LirFunction) -> Option<String> {
     for block in &f.blocks {
         for inst in &block.instrs {
             let found = match inst {
+                LirInst::Compute { .. } => false,
                 LirInst::Let { value, .. }
                 | LirInst::Assign { value, .. }
                 | LirInst::Expr(value) => suspends(value),
@@ -2112,7 +2196,7 @@ pub(super) fn lir_async_rejection_reason(f: &LirFunction) -> Option<String> {
             Terminator::Return(Some(value)) | Terminator::Branch { cond: value, .. } => {
                 suspends(value)
             }
-            Terminator::Jump(_) | Terminator::Suspend { .. } | Terminator::Return(None) => false,
+            Terminator::Jump(_) | Terminator::Suspend { .. } | Terminator::Return(None) | Terminator::CleanupReturn => false,
         };
         if found {
             return Some(
@@ -2177,7 +2261,7 @@ fn lir_expr_suspends(expr: &HirExpr) -> bool {
 
 /// Values the emitter can produce twice with the same result, so evaluating
 /// them AFTER a park that the source ran them before is not observable. This is
-/// deliberately the same set [`super::coop_anf`]'s `bind` refuses to hoist into
+/// deliberately the same set the former AST suspension normalizer's `bind` refuses to hoist into
 /// a temp, which is what keeps that pass and this one evaluating the same
 /// things in the same order.
 fn lir_rematerializable(expr: &HirExpr) -> bool {
@@ -2242,7 +2326,7 @@ fn lir_hoistable_around(node: &HirExpr, target: &HirExpr, seen: &mut bool) -> bo
 /// after the resume. `println(await twice(21))` becomes "await, park, resume,
 /// then print what came back".
 ///
-/// That reorder is exactly the one [`super::coop_anf`] performs on the AST
+/// That reorder is exactly the one the former AST suspension normalizer performs on the AST
 /// before lowering, which is why the two agree: the liveness pass runs on the
 /// normalized AST, so any local this path re-reads after the resume was already
 /// planned a frame slot. Anything ahead of the await that is NOT re-evaluable
@@ -3345,13 +3429,6 @@ enum BodyScope {
     /// path by the bracket and on a `return` by [`FuncGen::emit_lir_return`]'s
     /// full-depth pop.
     Bracketed,
-    /// A `defer` block, replayed by the unwinder through
-    /// [`FuncGen::emit_lir_deferred_stmt`] inside the bracket
-    /// [`FuncGen::emit_deferred_action`] opens for it, so a `let` is admitted
-    /// here too (willow-0g8j.3). What separates the two scopes is the ENDING: a
-    /// `return` out of a replayed body would pop the whole runtime root depth
-    /// mid-unwind, so [`supported_branch_body`] still refuses one here.
-    Deferred,
 }
 
 /// One statement of a body the walker runs for its effect.
@@ -3576,12 +3653,7 @@ fn supported_branch_body<'n>(
     if supported_effect_body(body, ctx, names, scope) {
         return true;
     }
-    // Leaving through a `return` is admitted only where a bracket owns the root
-    // depth. [`FuncGen::emit_lir_return`] pops the whole runtime depth, which is
-    // wrong inside a [`BodyScope::Deferred`] body the unwinder is replaying — and
-    // the checker refuses a `return` there anyway. A `panic(...)` ending is not
-    // this case: [`supported_effect_body`] already admits one in either scope.
-    scope == BodyScope::Bracketed && supported_divergent_body(body, ctx, names, scope)
+    supported_divergent_body(body, ctx, names, scope)
 }
 
 /// Whether the walker can emit `body` for its EFFECT: nothing reads a value
@@ -3938,7 +4010,7 @@ fn supported_expr_node<'n>(
     match &e.kind {
         HirExprKind::Int(_) | HirExprKind::Float(_) | HirExprKind::Bool(_) => true,
         HirExprKind::Str(_) => true,
-        HirExprKind::Var(name) => names.contains_key(name.as_str()),
+        HirExprKind::Var(name) => names.get(name.as_str()).is_some_and(|bound| ctx.same_repr(bound, &e.ty)),
         HirExprKind::ReferenceArg { place } => {
             ctx.same_repr(&place.ty, &e.ty)
                 && supported_reference_place(place, ctx, names, child_supported)
@@ -4774,6 +4846,7 @@ fn supported_reference_place<'n>(
 /// for an element store, the stored value otherwise.
 fn lir_inst_span(inst: &LirInst) -> Option<crate::diagnostics::Span> {
     match inst {
+        LirInst::Compute { span, .. } => Some(*span),
         LirInst::Expr(e) => Some(e.span),
         LirInst::Defer { span, .. } => Some(*span),
         LirInst::EnterDeferScope { .. }
@@ -4822,7 +4895,7 @@ fn lir_back_edges(f: &LirFunction) -> std::collections::HashSet<(usize, usize)> 
                 ..
             } => vec![then_block.0, else_block.0],
             Terminator::Suspend { resume, .. } => vec![resume.0],
-            Terminator::Return(_) => Vec::new(),
+            Terminator::Return(_) | Terminator::CleanupReturn => Vec::new(),
         }
     }
 
@@ -4935,7 +5008,7 @@ fn lir_terminator_needs_preempt_safepoint(
             else_block,
         } => calls(cond) || closes_loop(then_block) || closes_loop(else_block),
         Terminator::Return(Some(value)) => calls(value),
-        Terminator::Suspend { .. } | Terminator::Return(None) => false,
+        Terminator::Suspend { .. } | Terminator::Return(None) | Terminator::CleanupReturn => false,
     }
 }
 
@@ -4956,7 +5029,6 @@ fn lir_terminator_needs_preempt_safepoint(
     emit_lir_channel_method,
     emit_lir_class_method,
     emit_lir_collection_method,
-    emit_lir_deferred_stmt,
     emit_lir_enum_construction,
     emit_lir_expr,
     emit_lir_field_access,
@@ -4994,6 +5066,43 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_lir_function_inner(f, None);
     }
 
+    /// Replay a cleanup graph with fresh region storage and the enclosing
+    /// panic/defer state. CleanupReturn rejoins this replay's continuation.
+    pub(super) fn emit_lir_cleanup_region(&mut self, region: &LirFunction) {
+        let vars = self.vars.clone();
+        let roots = self.gc_root_count;
+        let active_roots = self.coop_shadow_roots.as_ref().map(|roots| roots.active.clone());
+        let defers = self.defer_stack.clone();
+        let panic_scopes = self.panic_scopes.clone();
+        let flags = self.sync_defer_flags.clone();
+        let frame_offsets = std::mem::take(&mut self.lir_frame_offsets);
+        let before_exit = self.lir_cleanup_exit;
+        let exit = self.builder.create_block();
+        self.lir_cleanup_exit = Some((exit, roots, false));
+        // Region temporaries can share a spelling with a subsequently declared
+        // outer temporary; their lifetimes and storage are independent.
+        for local in region.locals.iter().filter(|local| !local.parameter) {
+            self.vars.remove(&local.name);
+        }
+        self.emit_lir_function_inner(region, None);
+        let reached = self.lir_cleanup_exit.expect("cleanup exit installed").2;
+        self.lir_cleanup_exit = before_exit;
+        self.vars = vars;
+        self.gc_root_count = roots;
+        self.defer_stack = defers;
+        self.panic_scopes = panic_scopes;
+        self.sync_defer_flags = flags;
+        self.lir_frame_offsets = frame_offsets;
+        if let (Some(active), Some(state)) = (active_roots, self.coop_shadow_roots.as_mut()) {
+            state.active = active;
+        }
+        if reached {
+            self.builder.switch_to_block(exit);
+            self.builder.seal_block(exit);
+        }
+        self.terminated = !reached;
+    }
+
     /// Emit an async poll body from LIR while retaining the established
     /// cooperative ABI. Each instruction boundary gets a cancellable
     /// preemption transition; locals selected
@@ -5012,6 +5121,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f: &LirFunction,
         mut coop: Option<(&mut Vec<CoopSuspendPoint>, cranelift_codegen::ir::Value)>,
     ) {
+        let incoming_frames = lir_call_frame_entries(f).expect("validated method preparation frames");
+        let incoming_references = lir_reference_scope_entries(f).expect("validated reference argument scopes");
+        let outer_references = self.lir_reference_scopes.clone();
+        let outer_frames = self.lir_call_frames.clone();
+        let outer_frame_depth = self.callstack_frame_depth;
         let entry = self.builder.current_block().expect("entry block active");
         if coop.is_some() {
             self.bind_coop_lir_locals(f);
@@ -5035,9 +5149,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // from the LIR at each exit, so they do not need it.
         let sync_defers = coop.is_none();
         let mut block_state: Vec<Option<LirDeferState>> = vec![None; f.blocks.len()];
-        if sync_defers {
-            block_state[0] = Some(LirDeferState::default());
-        }
+        let initial_state = if self.lir_cleanup_exit.is_some() {
+            LirDeferState { scopes: Vec::new(), entries: self.defer_stack.clone(),
+                panic_scopes: self.panic_scopes.clone(), flags: self.sync_defer_flags.clone() }
+        } else { LirDeferState::default() };
+        if sync_defers { block_state[0] = Some(initial_state.clone()); }
         // Emission ORDER. A LIR block index is not a position in any order
         // control can flow in: `if/else` lowers the merge block before the
         // `else` arm, so index order emits the merge before the only
@@ -5079,7 +5195,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.switch_to_block(blocks[i]);
             }
             if sync_defers {
-                let state = block_state[i].clone().unwrap_or_default();
+                let state = block_state[i].clone().unwrap_or_else(|| initial_state.clone());
                 lir_defer_scopes = state.scopes;
                 self.defer_stack = state.entries;
                 self.panic_scopes = state.panic_scopes;
@@ -5089,6 +5205,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // previous one ended with (a `return`, a diverging statement) says
             // nothing about this one.
             self.terminated = false;
+            self.lir_call_frames = outer_frames.clone();
+            self.lir_reference_scopes = outer_references.clone();
+            self.lir_reference_scopes.extend(incoming_references[i].clone());
+            let frames: Vec<_> = incoming_frames[i].iter().filter(|(method, _)| self.flat_method_frame_enabled(method)).cloned().collect();
+            self.lir_call_frames.extend(frames);
+            self.callstack_frame_depth = outer_frame_depth + self.lir_call_frames.len() - outer_frames.len();
             let block_coop = coop
                 .as_mut()
                 .map(|(suspends, frame)| (&mut **suspends, *frame));
@@ -5138,6 +5260,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
             }
         }
+        self.lir_call_frames = outer_frames;
+        self.lir_reference_scopes = outer_references;
+        self.callstack_frame_depth = outer_frame_depth;
         self.terminated = true;
         if sync_defers {
             // Scopes only ever left by a `return`, `break`, `continue` or `?`
@@ -5185,7 +5310,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
-    fn load_lir_local(
+    pub(super) fn load_lir_local(
         &mut self,
         function: &LirFunction,
         local: LirLocalId,
@@ -5196,6 +5321,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .get(name)
             .cloned()
             .unwrap_or_else(|| panic!("LIR local `{name}` has no storage"));
+        if function.locals[local.0 as usize].is_gc_owner() {
+            let ptr_ty = self.module.target_config().pointer_type();
+            return match storage {
+                VarStorage::Stack { slot, .. } => self.stack_load(ptr_ty, slot),
+                VarStorage::Frame { offset, .. } => self.builder.ins().load(ptr_ty, MemFlagsData::new(), self.async_frame.expect("GC owner frame"), offset),
+                _ => panic!("opaque GC owner must occupy rooted storage"),
+            };
+        }
         self.load_var(&storage)
     }
 
@@ -5211,6 +5344,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .get(name)
             .cloned()
             .unwrap_or_else(|| panic!("LIR local `{name}` has no storage"));
+        if function.locals[local.0 as usize].is_gc_owner() {
+            match storage {
+                VarStorage::Stack { slot, .. } => self.stack_store(value, slot),
+                VarStorage::Frame { offset, .. } => self.emit_gc_heap_store_classified(self.async_frame.expect("GC owner frame"), offset, value, true, GcStoreDestination::AsyncFrameSlot),
+                _ => panic!("opaque GC owner must occupy rooted storage"),
+            }
+            return;
+        }
         self.store_var(&storage, value);
     }
 
@@ -5789,10 +5930,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .iter()
             .filter_map(|local| function.locals.get(local.0 as usize))
             .filter_map(|local| match self.vars.get(local.name.as_str()) {
-                Some(VarStorage::Stack { slot, ty }) if is_gc_managed(ty, self.enum_infos) => {
+                Some(VarStorage::Stack { slot, ty }) if local.is_gc_owner() || is_gc_managed(ty, self.enum_infos) => {
                     Some(Root::Slot(*slot))
                 }
-                Some(VarStorage::Frame { offset, ty }) if is_gc_managed(ty, self.enum_infos) => {
+                Some(VarStorage::Frame { offset, ty }) if local.is_gc_owner() || is_gc_managed(ty, self.enum_infos) => {
                     Some(Root::Frame(*offset))
                 }
                 _ => None,
@@ -5807,13 +5948,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         for root in roots {
             match root {
                 Root::Slot(slot) => self.stack_store(zero, slot),
-                // A plain store, not `emit_gc_heap_store`: the write barrier
-                // exists to record an old-to-young edge, and null creates none.
+                // Null creates no edge and needs no write barrier, but the
+                // reference slot still synchronizes with concurrent GC readers.
                 Root::Frame(offset) => {
                     if let Some(base) = frame_base {
-                        self.builder
-                            .ins()
-                            .store(MemFlagsData::new(), zero, base, offset);
+                        let slot = self.builder.ins().iadd_imm_s(base, i64::from(offset));
+                        self.builder.ins().atomic_store(MemFlagsData::new(), zero, slot);
                     }
                 }
             }
@@ -5847,12 +5987,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// skipped here — and that set is exactly the one that has to survive a
     /// poll return, so a Cranelift variable is sound for everything left.
     fn bind_lir_locals(&mut self, f: &LirFunction) {
+        for block in &f.blocks { for inst in &block.instrs {
+            if let LirInst::Compute { value, .. } = inst { for operand in value.operands() {
+                if let crate::ir::lowered::LirOperand::Reference { place: crate::ir::lowered::LirPlace::Local(id), .. } = operand {
+                    self.address_taken.insert(f.locals[id.0 as usize].name.clone());
+                }
+            }}
+        }}
         let mut null = None;
         for local in &f.locals {
             if local.parameter || self.vars.contains_key(local.name.as_str()) {
                 continue;
             }
-            if is_gc_managed(&local.ty, self.enum_infos) {
+            if local.is_gc_owner() || is_gc_managed(&local.ty, self.enum_infos) {
                 self.bind_lir_rooted_slot(&local.name, &local.ty, &mut null);
                 continue;
             }
@@ -5901,6 +6048,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         defers: &mut LirBlockDeferCtx<'_>,
     ) -> Vec<(usize, LirDeferState)> {
         let mut recovery_states = Vec::new();
+        if coop.is_none() && (self.lir_cleanup_exit.is_none() || block.id.0 != 0) {
+            // Native stacks preserve SSA values and roots across this hook;
+            // every block entry includes all function and loop re-entries.
+            self.emit_sync_safepoint();
+        }
         for (inst_index, inst) in block.instrs.iter().enumerate() {
             // A panic/return has terminated the source path, but a
             // SYNCHRONOUS lexical scope still has to be closed here:
@@ -5926,6 +6078,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.fault_site_span = Some(span);
             }
             match inst {
+                LirInst::Compute { local, value, span } => {
+                    let result = self.emit_lir_rvalue(function, value, *span);
+                    if !self.terminated && (function.locals[local.0 as usize].is_gc_owner() || !matches!(function.locals[local.0 as usize].ty, Type::Void | Type::Never)) {
+                        self.store_lir_local(function, *local, result);
+                    }
+                }
                 LirInst::EnterDeferScope {
                     sites,
                     resume,
@@ -6008,14 +6166,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                                     _ => None,
                                 })
                                 .expect("LIR defer site has no registration instruction");
-                            let action = match body {
-                                crate::ir::lowered::LirDeferBody::Expr(expr) => {
-                                    super::DeferredAction::HirExpr(expr.clone())
-                                }
-                                crate::ir::lowered::LirDeferBody::Block(body) => {
-                                    super::DeferredAction::HirBlock(body.clone())
-                                }
-                            };
+                            let action = body.clone();
                             let bindings: Vec<_> = self
                                 .vars
                                 .iter()
@@ -6052,6 +6203,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.defer_stack.push(entries);
                     let normal_resume = self.builder.create_block();
                     let scope = super::PanicScope {
+                        call_frames_at_entry: self.lir_call_frames.clone(),
+                        reference_scopes_at_entry: self.lir_reference_scopes.clone(),
                         cleanup: self.builder.create_block(),
                         resume: resume
                             .map(|resume| blocks[resume.0])
@@ -6082,14 +6235,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     defers.scopes.push(frame);
                 }
                 LirInst::Defer { id, body, span } => {
-                    let action = match body {
-                        crate::ir::lowered::LirDeferBody::Expr(expr) => {
-                            super::DeferredAction::HirExpr(expr.clone())
-                        }
-                        crate::ir::lowered::LirDeferBody::Block(body) => {
-                            super::DeferredAction::HirBlock(body.clone())
-                        }
-                    };
+                    let action = body.clone();
                     let slot = coop
                         .is_none()
                         .then(|| self.sync_defer_flags.get(span).copied())
@@ -6329,6 +6475,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .ins()
                     .brif(c, blocks[then_block.0], &[], blocks[else_block.0], &[]);
             }
+            Terminator::CleanupReturn => {
+                let (exit, roots, _) = self.lir_cleanup_exit.expect("cleanup terminator outside cleanup region");
+                self.emit_pop_roots_n(self.gc_root_count - roots);
+                self.builder.ins().jump(exit, &[]);
+                self.lir_cleanup_exit.as_mut().unwrap().2 = true;
+                self.terminated = true;
+            }
             Terminator::Return(v) => {
                 // A returned await is split like any other statement's, so the
                 // result slot is written on the resume path with a value the
@@ -6520,14 +6673,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     _ => None,
                 })
                 .expect("LIR defer exit references an unknown site");
-            let action = match body {
-                crate::ir::lowered::LirDeferBody::Expr(expr) => {
-                    super::DeferredAction::HirExpr(expr.clone())
-                }
-                crate::ir::lowered::LirDeferBody::Block(body) => {
-                    super::DeferredAction::HirBlock(body.clone())
-                }
-            };
+            let action = body.clone();
             let bindings = self
                 .vars
                 .iter()
@@ -6578,6 +6724,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // roots owned by that expression. They do not survive this
                 // poll return, so pop the complete runtime depth here; keep
                 // the compile-time count intact for sibling CFG paths.
+                self.emit_callstack_unwind_edge();
                 self.emit_pop_roots_n(self.gc_root_count);
                 let ready = self.builder.ins().iconst(types::I32, 1);
                 self.builder.ins().return_(&[ready]);
@@ -6603,6 +6750,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.emit_pop_roots_n(1);
                     self.gc_root_count -= 1;
                     // Pops the function's remaining roots on both of its arms.
+                    self.emit_callstack_unwind_edge();
                     self.emit_main_result_exit(result);
                 }
                 // `return Result::Ok();` and a bare `return` are the same
@@ -6612,6 +6760,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     if self.terminated {
                         return;
                     }
+                    self.emit_callstack_unwind_edge();
                     self.emit_pop_roots_n(self.gc_root_count);
                     self.builder.ins().return_(&[]);
                 }
@@ -6625,10 +6774,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // value may read through a rooted local, and the box allocates.
                 self.fault_site_span = Some(v.span);
                 let val = self.emit_lir_store_value(v, return_type);
+                self.emit_callstack_unwind_edge();
                 self.emit_pop_roots_n(self.gc_root_count);
                 self.builder.ins().return_(&[val]);
             }
             None => {
+                self.emit_callstack_unwind_edge();
                 self.emit_pop_roots_n(self.gc_root_count);
                 if *return_type == Type::Void {
                     self.builder.ins().return_(&[]);
@@ -6668,6 +6819,240 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .declare_data_in_func(info.data_id, self.builder.func);
         let addr = self.builder.ins().symbol_value(ptr_ty, gv);
         self.emit_gc_heap_store(addr, 0, val, &info.ty, GcStoreDestination::GlobalStatic);
+    }
+
+    pub(super) fn emit_lir_operand(&mut self, function: &LirFunction, operand: &crate::ir::lowered::LirOperand) -> cranelift_codegen::ir::Value {
+        use crate::ir::lowered::LirOperand;
+        match operand {
+            LirOperand::Local(local) => self.load_lir_local(function, *local),
+            LirOperand::Int(value) => self.builder.ins().iconst(types::I64, *value),
+            LirOperand::Float(value) => self.builder.ins().f64const(*value),
+            LirOperand::Bool(value) => self.builder.ins().iconst(types::I8, i64::from(*value)),
+            LirOperand::Reference { place, .. } => self.emit_flat_reference_address(function, place),
+        }
+    }
+
+    fn emit_lir_rvalue(&mut self, function: &LirFunction, value: &crate::ir::lowered::LirRvalue, span: Span) -> cranelift_codegen::ir::Value {
+        use crate::ir::lowered::LirRvalue;
+        match value {
+            LirRvalue::BeginReferenceCall => { self.emit_debug_reference_call_scope_push(); self.lir_reference_scopes.push(Vec::new()); self.builder.ins().iconst(types::I8, 0) }
+            LirRvalue::ReferenceDebug { argument, callee, index } => { self.emit_flat_reference_debug(argument, callee, *index); self.lir_reference_scopes.last_mut().expect("prepared reference scope").push(FlatReferenceDebug { argument: argument.clone(), callee: *callee, index: *index }); self.builder.ins().iconst(types::I8, 0) }
+            LirRvalue::StartTask { callee, args, params, .. } => {
+                let args: Vec<_> = args.iter().map(|arg| self.emit_lir_operand(function, arg)).collect();
+                self.emit_flat_start_task(*callee, &args, params, span)
+            }
+            LirRvalue::AwaitFuture { future, result } => {
+                let future = self.emit_lir_operand(function, future);
+                self.emit_flat_await_future(future, result)
+            }
+            LirRvalue::SelectIdleWait { deadlines } => {
+                let deadlines: Vec<_> = deadlines.iter().map(|deadline| self.emit_lir_operand(function, deadline)).collect();
+                self.emit_flat_select_idle_wait(&deadlines)
+            }
+            LirRvalue::PrepareMethod { receiver, receiver_ty, method } => {
+                let receiver = self.emit_lir_operand(function, receiver);
+                let receiver = self.emit_flat_prepare_method(receiver, receiver_ty, method, span, true);
+                if self.flat_method_frame_enabled(method) { self.lir_call_frames.push((method.clone(), span)); }
+                receiver
+            }
+            LirRvalue::MethodCall { receiver, receiver_ty, method, args, result, .. } => {
+                if self.flat_method_frame_enabled(method) {
+                    let (prepared, _) = self.lir_call_frames.pop().expect("prepared method frame");
+                    assert_eq!(prepared, *method);
+                }
+                let receiver = self.emit_lir_operand(function, receiver);
+                let (args, roots) = self.emit_flat_call_operands(function, args);
+                let result = if matches!(receiver_ty, Type::Named(name) | Type::Generic(name, _) if self.interface_infos.contains_key(name)) {
+                    self.emit_flat_interface_call(receiver, receiver_ty, method, &args, span, true, true)
+                } else {
+                    self.emit_flat_class_method(receiver, receiver_ty, method, &args, result, span, true, true)
+                };
+                self.emit_pop_roots_n(roots); self.gc_root_count -= roots;
+                result
+            }
+            LirRvalue::Coerce { value, source, target } => {
+                let value = self.emit_lir_operand(function, value);
+                self.coerce_to_target(value, source, target)
+            }
+            LirRvalue::ArrayAlloc { length, element } => self.emit_flat_array_alloc(*length, element),
+            LirRvalue::CaptureArrayOwner { array, index } => self.emit_flat_capture_array_owner(function, array, index),
+            LirRvalue::ArrayStore { array, index, value, element } => self.emit_flat_array_store(function, array, index, value, element),
+            LirRvalue::Index { array, index, element } => self.emit_flat_index(function, array, index, element),
+            LirRvalue::ObjectAlloc { class } => self.emit_flat_object_alloc(class),
+            LirRvalue::FieldLoad { object, object_ty, field, .. } => self.emit_flat_field(function, object, field, object_ty),
+            LirRvalue::FieldStore { object, object_ty, field, value } => self.emit_flat_field_store(function, object, field, value, object_ty),
+            LirRvalue::StaticField { class, field, .. } => self.emit_flat_static_field(&class.to_string(), field),
+            LirRvalue::StaticStore { class, field, value } => self.emit_flat_static_store(function, &class.to_string(), field, value),
+            LirRvalue::StaticCall { class, method, args, arg_types, result } => {
+                let (args, roots) = self.emit_flat_call_operands(function, args);
+                let result = self.emit_lir_static_call_values(&class.to_string(), method, &args, arg_types, result, span);
+                if !self.terminated { self.emit_pop_roots_n(roots); }
+                self.gc_root_count -= roots;
+                result
+            }
+            LirRvalue::EnumAlloc { class, variant, enum_ty } => self.emit_flat_enum_alloc(&class.to_string(), variant, enum_ty),
+            LirRvalue::EnumPayloadStore { object, class, variant, index, value, source, enum_ty } => {
+                let object = self.emit_lir_operand(function, object);
+                let value = self.emit_lir_operand(function, value);
+                self.emit_flat_enum_payload_store(object, &class.to_string(), variant, *index, value, source, enum_ty)
+            }
+            LirRvalue::ConstructorCall { object, class, args, arg_types } => self.emit_flat_constructor_call(function, object, class, args, arg_types, span),
+            LirRvalue::Range { start, end } => {
+                let start = self.emit_lir_operand(function, start);
+                let end = self.emit_lir_operand(function, end);
+                let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(GcObjectKind::Range, 16, 0, 0));
+                self.builder.ins().store(MemFlagsData::new(), start, ptr, 0);
+                self.builder.ins().store(MemFlagsData::new(), end, ptr, 8);
+                ptr
+            }
+            LirRvalue::EnumMethod { receiver, receiver_ty, method, args, arg_types, .. } => {
+                let receiver = self.emit_lir_operand(function, receiver);
+                let args: Vec<_> = args.iter().map(|arg| self.emit_lir_operand(function, arg)).collect();
+                self.emit_flat_enum_method(receiver, receiver_ty, method, &args, arg_types, span)
+            }
+            LirRvalue::BuiltinCall { callee, args, .. } => {
+                let args: Vec<_> = args.iter().map(|arg| self.emit_lir_operand(function, arg)).collect();
+                self.emit_flat_builtin_call(callee, &args)
+            }
+            LirRvalue::FormatScalar { value, ty, format } => {
+                let value = self.emit_lir_operand(function, value);
+                self.emit_flat_format_scalar(value, ty, *format)
+            }
+            LirRvalue::Panic { message } => {
+                let message = self.emit_lir_operand(function, message);
+                self.emit_panic_with_message(message, span)
+            }
+            LirRvalue::Recover => self.emit_recover_call(),
+            LirRvalue::RebindResultError { value, .. } => self.emit_lir_operand(function, value),
+            LirRvalue::IntoError { value, source, .. } => {
+                let value = self.emit_lir_operand(function, value);
+                self.emit_push_root(value);
+                let panic_depth = self.emit_pre_willow_call_panic_depth();
+                let Type::Named(class) = source else { unreachable!("Into error source class validated"); };
+                let converted = self.emit_into_conversion(value, &class.to_string());
+                self.emit_pop_roots_n(1); self.gc_root_count -= 1;
+                self.emit_post_willow_call_panic_check(panic_depth);
+                converted
+            }
+            LirRvalue::IntrinsicCall { intrinsic, receiver, receiver_ty, args, arg_types, result, .. } => {
+                let receiver = self.emit_lir_operand(function, receiver);
+                let args: Vec<_> = args.iter().map(|arg| self.emit_lir_operand(function, arg)).collect();
+                self.emit_flat_intrinsic(*intrinsic, receiver, receiver_ty, &args, arg_types, result, span)
+            }
+            LirRvalue::Use(operand) => self.emit_lir_operand(function, operand),
+            LirRvalue::StringLiteral(value) => self.emit_string_literal(value),
+            LirRvalue::FunctionRef { function, .. } => {
+                let fid = *self.func_ids.get_id(function).expect("registered function reference");
+                let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                self.builder.ins().func_addr(super::type_helpers::FN_ADDR_TYPE, fref)
+            }
+            LirRvalue::Closure { id, captures, ty } => {
+                let name = self.lambda_names[id].clone();
+                let fid = *self.func_ids.get_id(&name).expect("registered lambda");
+                let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                let code = self.builder.ins().func_addr(super::type_helpers::FN_ADDR_TYPE, fref);
+                if !matches!(ty, Type::Closure(..)) { return code; }
+                let mut mask = 0u64;
+                for (i, capture) in captures.iter().enumerate() {
+                    if is_gc_managed(&capture.ty(&function.locals).expect("capture type"), self.enum_infos) { mask |= 1u64 << (i + 1); }
+                }
+                let env = self.emit_gc_alloc(GcLayoutMetadata::new(GcObjectKind::Closure, (captures.len() as i64 + 1) * 8, 0, mask));
+                self.emit_gc_heap_store_classified(env, 0, code, false, GcStoreDestination::ObjectField);
+                for (i, capture) in captures.iter().enumerate() {
+                    let value = self.emit_lir_operand(function, capture);
+                    let ty = capture.ty(&function.locals).expect("capture type");
+                    self.emit_gc_heap_store(env, (i as i32 + 1) * 8, value, &ty, GcStoreDestination::ObjectField);
+                }
+                env
+            }
+            LirRvalue::Print { value, ty, newline } => {
+                let value = self.emit_lir_operand(function, value);
+                let name = match (ty, newline) {
+                    (Type::I64, false) => "willow_print_i64", (Type::I64, true) => "willow_println_i64",
+                    (Type::F64, false) => "willow_print_f64", (Type::F64, true) => "willow_println_f64",
+                    (Type::Bool, false) => "willow_print_bool", (Type::Bool, true) => "willow_println_bool",
+                    (Type::String, false) => "willow_print_string", (Type::String, true) => "willow_println_string",
+                    _ => unreachable!("print type validated"),
+                };
+                self.emit_void_runtime_call(name, &[value]);
+                self.builder.ins().iconst(types::I8, 0)
+            }
+            LirRvalue::DirectCall { callee, args, .. } => {
+                let has_references = args.iter().any(|arg| matches!(arg, crate::ir::lowered::LirOperand::Reference { .. }));
+                let (values, roots) = self.emit_flat_call_operands(function, args);
+                let fid = *self.func_ids.get_id(callee).expect("flat direct call is registered");
+                let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                let pushed = self.emit_callstack_push(&callee.to_string(), span);
+                let panic_depth = self.emit_pre_user_call_panic_depth(&callee.to_string());
+                let call = self.builder.ins().call(fref, &values);
+                let result = self.builder.inst_results(call).first().copied().unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0));
+                if pushed { self.emit_callstack_pop(); }
+                if has_references { self.emit_flat_reference_call_end(); }
+                self.emit_pop_roots_n(roots); self.gc_root_count -= roots;
+                self.emit_post_willow_call_panic_check(panic_depth);
+                result
+            }
+            LirRvalue::Unary { op, operand, ty } => {
+                let operand = self.emit_lir_operand(function, operand);
+                match op {
+                    UnaryOp::Neg if *ty == Type::F64 => self.builder.ins().fneg(operand),
+                    UnaryOp::Neg => self.builder.ins().ineg(operand),
+                    UnaryOp::Not => { let one = self.builder.ins().iconst(types::I8, 1); self.builder.ins().bxor(operand, one) }
+                }
+            }
+            LirRvalue::IndirectCall { callee, name, args, params, result } => {
+                let closure = matches!(callee.ty(&function.locals), Some(Type::Closure(..)));
+                let target = self.emit_lir_operand(function, callee);
+                let mut roots = 0;
+                if closure { self.emit_push_root(target); roots += 1; }
+                let code = if closure { self.builder.ins().load(super::type_helpers::FN_ADDR_TYPE, MemFlagsData::trusted(), target, 0) } else { target };
+                let mut values = Vec::with_capacity(args.len() + usize::from(closure));
+                if closure { values.push(target); }
+                for (argument, ty) in args.iter().zip(params) {
+                    let value = self.emit_lir_operand(function, argument);
+                    if is_gc_managed(ty, self.enum_infos) { self.emit_push_root(value); roots += 1; }
+                    values.push(value);
+                }
+                let mut signature = self.module.make_signature();
+                if closure { signature.params.push(AbiParam::new(types::I64)); }
+                signature.params.extend(params.iter().map(|ty| AbiParam::new(clif_type(ty))));
+                if *result != Type::Void { signature.returns.push(AbiParam::new(clif_type(result))); }
+                let signature = self.builder.import_signature(signature);
+                let pushed = self.emit_callstack_push(&name.to_string(), span);
+                let panic_depth = self.emit_pre_willow_call_panic_depth();
+                let call = self.builder.ins().call_indirect(signature, code, &values);
+                let result = self.builder.inst_results(call).first().copied().unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0));
+                if pushed { self.emit_callstack_pop(); }
+                self.emit_pop_roots_n(roots); self.gc_root_count -= roots;
+                self.emit_post_willow_call_panic_check(panic_depth);
+                result
+            }
+            LirRvalue::Binary { op, lhs, rhs, operand_ty } => {
+                let lhs = self.emit_lir_operand(function, lhs);
+                let rhs = self.emit_lir_operand(function, rhs);
+                if *operand_ty == Type::String {
+                    let name = if matches!(op, BinOp::Add) { "willow_string_concat" } else { "willow_string_eq" };
+                    self.emit_push_root(lhs); self.emit_push_root(rhs);
+                    let raw = self.emit_value_runtime_call(name, &[lhs, rhs]);
+                    self.emit_pop_roots_n(2); self.gc_root_count -= 2;
+                    return match op {
+                        BinOp::Add => raw,
+                        BinOp::Eq => self.builder.ins().ireduce(types::I8, raw),
+                        BinOp::Ne => { let raw = self.builder.ins().bxor_imm_s(raw, 1); self.builder.ins().ireduce(types::I8, raw) }
+                        _ => unreachable!("string operator validated"),
+                    };
+                }
+                let float = *operand_ty == Type::F64;
+                if !float && matches!(op, BinOp::Div | BinOp::Rem) {
+                    self.emit_int_div_guard(lhs, rhs, matches!(op, BinOp::Rem), span);
+                }
+                if matches!(op, BinOp::Pow) {
+                    if float { self.emit_pow_f64(lhs, rhs) } else { self.emit_pow_i64(lhs, rhs, span) }
+                } else {
+                    self.emit_lir_binop(op, lhs, rhs, float)
+                }
+            }
+        }
     }
 
     pub(super) fn emit_lir_expr(&mut self, e: &HirExpr) -> cranelift_codegen::ir::Value {
@@ -7120,28 +7505,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 this.gc_root_count -= 1;
             }
         });
-    }
-
-    pub(super) fn emit_lir_deferred_stmt(&mut self, stmt: &HirStmt) {
-        match stmt {
-            HirStmt::Expr(expr) => {
-                self.fault_site_span = Some(expr.span);
-                self.emit_lir_expr(expr);
-            }
-            // Assignment to an enclosing name, an `if` around one, a store into
-            // a class's static property (willow-0g8j.15) -- and a `let`, whose
-            // rooted slot [`FuncGen::emit_deferred_action`] now brackets the
-            // same way a `match` arm's is bracketed (willow-0g8j.3).
-            HirStmt::Assign { .. }
-            | HirStmt::If { .. }
-            | HirStmt::While { .. }
-            | HirStmt::For { .. }
-            | HirStmt::StaticFieldAssign { .. }
-            | HirStmt::FieldAssign { .. }
-            | HirStmt::IndexAssign { .. }
-            | HirStmt::Let { .. } => self.emit_lir_body_stmt(stmt),
-            _ => unreachable!("unsupported deferred HIR statement reached emission"),
-        }
     }
 
     fn emit_lir_select(&mut self, cases: &[HirSelectCase]) -> cranelift_codegen::ir::Value {
@@ -8109,6 +8472,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // The header stays UNSEALED until the back edge is emitted: it is the
         // one block here with a predecessor that does not exist yet.
         self.builder.switch_to_block(header);
+        self.emit_sync_safepoint();
         self.fault_site_span = Some(cond.span);
         let cond_val = self.emit_lir_expr(cond);
         self.builder
@@ -8196,6 +8560,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().jump(header, &[]);
 
         self.builder.switch_to_block(header);
+        self.emit_sync_safepoint();
         let index = self.load_var(&index_storage);
         let end = match fixed_end {
             Some(end) => end,
@@ -8737,7 +9102,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     /// The class layout for a receiver/field-owner type. Eligibility already
     /// proved the type is a simple class with a registered layout.
-    fn lir_class_layout(&self, ty: &Type) -> Vec<(String, Type)> {
+    pub(super) fn lir_class_layout(&self, ty: &Type) -> Vec<(String, Type)> {
         let class =
             class_name_for_object_type(ty).expect("class receiver type vetted by LIR eligibility");
         // Resolved exactly as eligibility resolved it, so a bare module class
@@ -10751,6 +11116,70 @@ mod tests {
         (lir, tables)
     }
 
+    #[test]
+    fn flat_array_references_reject_forged_capture_metadata() {
+        use crate::ir::lowered::{LirOperand as O, LirPlace, LirRvalue as V};
+        let (program, tables) = checked_lowering(
+            "import std::collections::Array; fn read(x: & i64) -> i64 { return x; } fn f(a: Array<i64>, i: i64) -> i64 { return read(&a[i]); }",
+            &["read", "f"],
+        );
+        let original = program.functions.iter().find(|f| f.name.to_string() == "f").unwrap();
+        let original_reason = tables.with_ctx(|ctx| lir_rejection_reason(original, ctx));
+        assert!(original_reason.is_none(), "{original_reason:?}");
+        for forge_element in [false, true] {
+            let mut function = original.clone();
+            let mut changed = false;
+            for block in &mut function.blocks {
+                for inst in &mut block.instrs {
+                    if let LirInst::Compute { value: V::DirectCall { args, .. }, .. } = inst {
+                        for argument in args {
+                            if let O::Reference { place: LirPlace::ArrayElement { index, element, .. }, .. } = argument {
+                                if forge_element { *element = Type::String; }
+                                else { *index = original.locals.iter().find(|local| local.parameter && local.ty == Type::I64).unwrap().id; }
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(changed);
+            let reason = tables.with_ctx(|ctx| lir_rejection_reason(&function, ctx)).expect("forged reference rejected");
+            assert!(reason.contains("captured buffer or checked index"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn flat_rvalues_reject_unknown_layouts_and_invalid_coercions() {
+        use crate::ir::lowered::{LirOperand as O, LirRvalue as V};
+        let (_, tables) = checked_lowering("class Point { pub x: i64; pub fn get(self) -> i64 { return self.x; } } fn main() {}", &["main"]);
+        tables.with_ctx(|ctx| {
+            let point = Type::Named(TypeId::local("Point"));
+            assert!(flat_method_signature(&point, "get", ctx).is_some());
+            assert!(flat_method_signature(&point, "absent", ctx).is_none());
+            assert!(!flat_rvalue_supported(&V::MethodCall { receiver: O::Int(0), receiver_ty: point.clone(), method: "get".into(), args: vec![], arg_types: vec![], result: Type::String }, &[], ctx));
+            assert!(flat_rvalue_supported(&V::ObjectAlloc { class: TypeId::local("Point") }, &[], ctx));
+            assert!(!flat_rvalue_supported(&V::ObjectAlloc { class: TypeId::local("Missing") }, &[], ctx));
+            assert!(!flat_rvalue_supported(&V::Coerce { value: O::Int(1), source: Type::I64, target: Type::String }, &[], ctx));
+            assert!(!flat_rvalue_supported(&V::FieldLoad { object: O::Int(0), object_ty: point.clone(), field: "missing".into(), result: Type::I64 }, &[], ctx));
+            assert!(!flat_rvalue_supported(&V::FieldLoad { object: O::Int(0), object_ty: point, field: "x".into(), result: Type::String }, &[], ctx));
+            assert!(!flat_rvalue_supported(&V::ArrayAlloc { length: 1, element: Type::Void }, &[], ctx));
+            assert!(!flat_rvalue_supported(&V::StaticField { class: TypeId::local("Point"), field: "missing".into(), result: Type::I64 }, &[], ctx));
+        });
+    }
+
+    #[test]
+    fn flat_rvalues_reject_forged_runtime_and_enum_metadata() {
+        use crate::ir::lowered::{LirOperand as O, LirRvalue as V};
+        let (_, tables) = checked_lowering("fn main() {}", &["main"]);
+        tables.with_ctx(|ctx| {
+            assert!(flat_rvalue_supported(&V::BuiltinCall { callee: FunctionId::free("gc_collect"), args: vec![], params: vec![], result: Type::Void }, &[], ctx));
+            assert!(!flat_rvalue_supported(&V::BuiltinCall { callee: FunctionId::free("gc_collect"), args: vec![], params: vec![], result: Type::I64 }, &[], ctx));
+            assert!(!flat_rvalue_supported(&V::BuiltinCall { callee: FunctionId::free("unknown"), args: vec![], params: vec![], result: Type::Void }, &[], ctx));
+            assert!(!flat_rvalue_supported(&V::EnumAlloc { class: TypeId::local("Missing"), variant: "Some".into(), enum_ty: Type::Named(TypeId::local("Missing")) }, &[], ctx));
+            assert!(!flat_rvalue_supported(&V::EnumMethod { receiver: O::Int(0), receiver_ty: Type::I64, method: "unwrap".into(), args: vec![], arg_types: vec![], result: Type::I64 }, &[], ctx));
+        });
+    }
+
     /// [`eligible`] for constructs that need the checker's types to lower.
     fn eligible_checked(src: &str, name: &str, fns: &[&str]) -> bool {
         let (p, tables) = checked_lowering(src, fns);
@@ -11627,7 +12056,7 @@ mod tests {
     #[test]
     fn e06_unknown_callee_ineligible() {
         assert!(!eligible(
-            "fn g() -> i64 { return 1; } fn f() -> i64 { return g(); }",
+            "fn g() -> i64 { println(0); return 1; } fn f() -> i64 { return g(); }",
             "f",
             &[] // g not in the known set
         ));
@@ -12683,7 +13112,7 @@ mod tests {
         let src = "class Counter { pub n: i64; \
                    pub fn bump(self, v: &mut i64) { v = v + 1; } } \
                    fn f(c: Counter) -> i64 { let mut k = 1; c.bump(&k); return k; }";
-        assert!(eligible_lenient(src, "f", &["f"]));
+        assert!(eligible_lenient(src, "f", &["f"]), "{:?}", reason_of(src, "f", &["f"]));
     }
 
     // 58. calling a method ON the interface a method returned is rejected. The
@@ -13548,7 +13977,7 @@ mod tests {
                    fn f() -> i64 { let mut x = 1; bump(&x); return x; }";
         let diags = checked_lowering_diags(src);
         assert!(diags.is_empty(), "reference lowering failed: {diags:?}");
-        assert!(eligible_lenient(src, "f", &["bump", "f"]));
+        assert!(eligible_lenient(src, "f", &["bump", "f"]), "{:?}", reason_of(src, "f", &["bump", "f"]));
     }
 
     // k25. TABLE DRIFT, `&mut` parameter: a by-value argument must not be sent
@@ -14351,31 +14780,28 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         assert!(!tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
     }
 
-    // m09. a String scrutinee is out even when every arm is unconditional: the
-    // walker admits a scrutinee only when it can TEST one, and a String test
-    // would be a content comparison rather than the integer compare the arm
-    // chain emits.
+    // An unconditional CFG binding copies the scrutinee without comparing it.
+    // String content-pattern comparisons are still outside the pattern subset.
     #[test]
-    fn m09_string_scrutinee_ineligible() {
+    fn m09_unconditional_string_scrutinee_eligible() {
         let src = "fn f(s: String) -> i64 {
                 return match s {
                     other => 1
                 };
             }";
-        refused(src, "f", &[]);
+        assert!(eligible_checked(src, "f", &[]));
     }
 
-    // m10. a class scrutinee would compare object identity, which no arm
-    // pattern in the subset means to express.
+    // An unconditional class binding needs no object identity comparison.
     #[test]
-    fn m10_class_scrutinee_ineligible() {
+    fn m10_unconditional_class_scrutinee_eligible() {
         let src = "class Cell { pub v: i64; }
             fn f(c: Cell) -> i64 {
                 return match c {
                     other => other.v
                 };
             }";
-        refused(src, "f", &[]);
+        assert!(eligible_checked(src, "f", &[]));
     }
 
     // m11. an `i64` scrutinee with literal arms: no tag load, the arm test
@@ -15110,24 +15536,15 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         assert!(eligible_checked(src, "f", &["step", "f"]));
     }
 
-    // p20. the validation reason names the `?` itself when the `?` is what
-    // blocked the function, rather than blaming the enclosing statement.
+    // p20. Option<void> propagation now has explicit tag-based LIR control flow.
     #[test]
-    fn p20_try_propagate_is_named_in_the_reason() {
-        // `Option<void>` is the one `?` shape still outside the subset: unlike
-        // `Result<void, E>` the niche question is open — an `Option` over a
-        // payload-free `Some` has no word to distinguish it from `None` — so
-        // the walker refuses rather than pick a representation.
+    fn p20_void_option_propagation_is_eligible() {
         let src = "fn unit(n: i64) -> Option<void> { return Some(); }
             fn f(n: i64) -> Option<i64> {
                 unit(n)?;
                 return Some(1);
             }";
-        let reason = rejected(src, "f", &["unit", "f"]);
-        assert!(
-            reason.contains("`?` propagation"),
-            "the reason must name the `?`: {reason}"
-        );
+        assert!(eligible_checked(src, "f", &["unit", "f"]));
     }
 
     // p21. `Option` and `Result` are enums by REGISTRATION, not by name. With
@@ -15362,7 +15779,7 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
     fn r8_reason_blames_the_innermost_node() {
         // `g` exists for the type checker but is NOT in the walker's known
         // symbols, which is what makes the call the unsupported node.
-        let src = "fn g() -> i64 { return 2; } fn f() -> i64 { let a = 1 + (2 * g()); return a; }";
+        let src = "fn g() -> i64 { println(0); return 2; } fn f() -> i64 { let a = 1 + (2 * g()); return a; }";
         let reason = rejected(src, "f", &["f"]);
         assert!(reason.starts_with("the call to `g` at line"), "{reason}");
     }
@@ -15371,7 +15788,7 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
     // statement's — the whole point is to be able to jump to it.
     #[test]
     fn r9_reason_reports_the_node_line() {
-        let src = "fn g() -> i64 { return 2; }\n\
+        let src = "fn g() -> i64 { println(0); return 2; }\n\
                    fn f() -> i64 {\n\
                        let a = 1;\n\
                        let b = a + g();\n\
@@ -15651,7 +16068,10 @@ fn f() {
                    } \
                    fn pick(s: Shape) -> i64 { return match s { Sq(q) => 1, _ => 0 }; }";
         let reason = rejected(src, "pick", &["pick"]);
-        assert!(reason.starts_with("the `match` on a `Shape`"), "{reason}");
+        assert!(
+            reason.starts_with("the `match` arm") && reason.contains("pattern outside"),
+            "{reason}"
+        );
     }
 
     // r17. when the scrutinee is the problem, the scrutinee is blamed — the
@@ -15670,7 +16090,7 @@ fn f() {
     #[test]
     fn r18_arm_body_expression_is_blamed() {
         let src = "enum Color { Red, Green } \
-                   fn g() -> i64 { return 1; } \
+                   fn g() -> i64 { println(0); return 1; } \
                    fn f(c: Color) -> i64 { return match c { Color::Red => g(), _ => 0 }; }";
         let reason = rejected(src, "f", &["f"]);
         assert!(reason.starts_with("the call to `g`"), "{reason}");
@@ -15681,7 +16101,7 @@ fn f() {
     #[test]
     fn r19_arm_binding_is_in_scope_for_the_body() {
         let src = "enum Shape { Circle(i64) } \
-                   fn g() -> i64 { return 1; } \
+                   fn g() -> i64 { println(0); return 1; } \
                    fn f(s: Shape) -> i64 { return match s { Shape::Circle(r) => r + g() }; }";
         let reason = rejected(src, "f", &["f"]);
         assert!(!reason.contains("the variable `r`"), "{reason}");
@@ -15692,8 +16112,8 @@ fn f() {
     // whole-corpus histogram of reasons is stable between runs.
     #[test]
     fn r20_first_blocker_in_program_order_wins() {
-        let src = "fn g() -> i64 { return 1; }\n\
-                   fn h() -> i64 { return 2; }\n\
+        let src = "fn g() -> i64 { println(0); return 1; }\n\
+                   fn h() -> i64 { println(0); return 2; }\n\
                    fn f() -> i64 {\n\
                        let a = g();\n\
                        let b = h();\n\
@@ -16531,21 +16951,35 @@ fn f() {
                 return_type: &f.return_type,
                 ..*ctx
             };
-            let inst = f
-                .blocks
-                .iter()
-                .flat_map(|b| b.instrs.iter())
-                .find_map(|i| match i {
-                    LirInst::Expr(e) if matches!(e.kind, HirExprKind::Match { .. }) => Some(e),
-                    _ => None,
-                })
-                .expect("the match survives as a statement");
-            assert_eq!(inst.ty, Type::Never);
+            assert!(lir_supported_function(f, ctx));
+            assert!(
+                f.blocks
+                    .iter()
+                    .flat_map(|block| &block.instrs)
+                    .any(|inst| matches!(inst, LirInst::MatchTest { .. }))
+            );
+            assert!(
+                !f.blocks
+                    .iter()
+                    .flat_map(|block| &block.instrs)
+                    .any(|inst| matches!(
+                        inst,
+                        LirInst::Expr(HirExpr {
+                            kind: HirExprKind::Match { .. },
+                            ..
+                        })
+                    ))
+            );
+            // The expression validator still rejects a divergent match as an
+            // operand; lowering only moves its statement control flow to CFG.
+            let inst = returned_hir_expr(
+                "fn f(n: i64) -> i64 { return match n { 0 => return 1, _ => return 2 }; }",
+            );
             let i64_ty = Type::I64;
-            let names: HashMap<&str, Cow<'_, Type>> =
-                HashMap::from([("n", Cow::Borrowed(&i64_ty))]);
-            assert!(supported_divergent_expr(inst, ctx, &names));
-            assert!(!supported_expr(inst, ctx, &names));
+            let names = HashMap::from([("n", Cow::Borrowed(&i64_ty))]);
+            assert_eq!(inst.ty, Type::Never);
+            assert!(supported_divergent_expr(&inst, ctx, &names));
+            assert!(!supported_expr(&inst, ctx, &names));
         });
     }
 
@@ -16571,7 +17005,7 @@ fn f() {
     #[test]
     fn d23_the_reason_does_not_blame_an_admitted_diverging_arm() {
         let src = "class Config { pub static version: i64 = 7; }
-                   fn unknown() -> i64 { return 9; }
+                   fn unknown() -> i64 { println(0); return 9; }
                    fn f(n: i64) -> i64 {
                        match n {
                            0 => return unknown(),
@@ -16755,7 +17189,7 @@ fn f() {
     #[test]
     fn d30_an_arm_guard_is_still_checked_through() {
         let src = "class Config { pub static version: i64 = 7; }
-                   fn unknown() -> i64 { return 9; }
+                   fn unknown() -> i64 { println(0); return 9; }
                    fn f(n: i64) -> i64 {
                        match n {
                            0 => { if n > 0 { return unknown(); } return 1; }
@@ -17010,13 +17444,21 @@ fn f() {
         assert_eq!(edges.len(), 1, "only the loop itself closes: {edges:?}");
     }
 
-    // s9. a call in a `return` still asks for a safepoint — that predicate is
-    // the AST statement rule and is untouched by back-edge detection.
+    // Calls move out of return expressions into flat instructions. Async
+    // functions still have the explicit preemption edge inserted before them.
     #[test]
     fn s9_a_call_in_return_still_asks_for_a_safepoint() {
-        let src = "fn g(x: i64) -> i64 { return x; }
-                   fn f() -> i64 { return g(1); }";
-        assert!(!terminator_safepoints(src, "f", &["f", "g"]).is_empty());
+        for asynchronous in [false, true] {
+            let source = format!("fn g(x: i64) -> i64 {{ return 1 / x; }} {}fn f() -> i64 {{ return g(1); }}", if asynchronous { "async " } else { "" });
+            let (program, _) = checked_lowering(&source, &["f", "g"]);
+            let function = program.functions.iter().find(|f| f.name.is_free_named("f")).unwrap();
+            assert!(function.blocks.iter().flat_map(|block| &block.instrs).any(|inst| matches!(inst,
+                LirInst::Compute { value: crate::ir::lowered::LirRvalue::DirectCall { .. }, .. })));
+            if asynchronous {
+                assert!(function.blocks.iter().any(|block| matches!(block.terminator,
+                    Terminator::Suspend { operation: SuspendOp::Preempt, .. })));
+            }
+        }
     }
 
     // s10. a plain `return` of a value that calls nothing asks for none.
@@ -17069,8 +17511,7 @@ fn f() {
     const LEAF: &str = "async fn g() -> i64 { return 1; }\n";
 
     // v1. only values the emitter can produce twice with the same result are
-    // rematerializable - deliberately the set `coop_anf`'s `bind` refuses to
-    // hoist, so they can be re-read after a suspension.
+    // rematerializable, so they can be re-read after a suspension.
     #[test]
     fn v1_literals_and_variables_are_rematerializable() {
         let src = "fn f(a: i64) -> i64 { return a; }
@@ -17177,4 +17618,698 @@ fn f() {
         );
         assert!(!hoistable_in_main(&no));
     }
+}
+
+
+/// Representation checks for resolved flat builtin methods. Receiver/result
+/// identity and arity are checked against the semantic intrinsic table first.
+fn flat_intrinsic_supported(intrinsic: Intrinsic, receiver: &Type, args: &[Type], result: &Type, ctx: &LirTypeCtx<'_>) -> bool {
+    use Intrinsic::*;
+    if !ctx.supported_type(receiver) || !ctx.supported_type(result) || !args.iter().all(|ty| ctx.supported_type(ty)) { return false; }
+    match intrinsic {
+        ArrayPush | ChannelSend => {
+            let element = match receiver {
+                Type::Array(element) => &**element,
+                _ => match builtin_types::unary_arg(receiver, B::Channel) { Some(element) => element, None => return false },
+            };
+            args.len() == 1 && ctx.storable(element, &args[0])
+        }
+        ArrayToString => matches!(receiver, Type::Array(element) if collection_elem_kind(element).is_some()),
+        MapContains | FrozenMapContains | MapGet | FrozenMapGet | MapInsert | MapToString => {
+            let Some((_, types)) = lir_collection(receiver) else { return false; };
+            if types.len() != 2 { return false; }
+            match intrinsic {
+                MapToString => types.iter().all(|ty| collection_elem_kind(ty).is_some()),
+                MapInsert => args.len() == 2 && ctx.same_repr(&types[0], &args[0]) && ctx.storable(&types[1], &args[1]),
+                _ => args.len() == 1 && ctx.same_repr(&types[0], &args[0]),
+            }
+        }
+        AtomicLoad | AtomicStore | AtomicSwap | AtomicAdd | AtomicSub => atomic_cell(receiver).is_some_and(|cell| args.iter().all(|arg| *arg == cell.word())),
+        CellGet | CellSet | RwCellRead | RwCellWrite => blocking_cell(receiver).is_some_and(|(_, elem)| args.iter().all(|arg| ctx.same_repr(elem, arg))),
+        _ => true,
+    }
+}
+
+impl<'a, 'b> FuncGen<'a, 'b> {
+    /// Operands are already evaluated, typed, and rooted by LIR. This emitter
+    /// performs one resolved operation; it never walks executable syntax.
+    fn emit_flat_intrinsic(&mut self, intrinsic: Intrinsic, receiver: cranelift_codegen::ir::Value, receiver_ty: &Type, args: &[cranelift_codegen::ir::Value], arg_types: &[Type], result: &Type, span: Span) -> cranelift_codegen::ir::Value {
+        // Frame-backed references can otherwise move during a coercion or a
+        // blocking runtime call. Direct roots pin every loaded SSA operand.
+        let roots_before = self.gc_root_count;
+        if is_gc_managed(receiver_ty, self.enum_infos) { self.emit_push_root(receiver); }
+        for (&value, ty) in args.iter().zip(arg_types) {
+            if is_gc_managed(ty, self.enum_infos) { self.emit_push_root(value); }
+        }
+        let value = self.emit_flat_intrinsic_inner(intrinsic, receiver, receiver_ty, args, arg_types, result, span);
+        self.emit_pop_roots_n(self.gc_root_count - roots_before);
+        self.gc_root_count = roots_before;
+        value
+    }
+
+    fn emit_flat_intrinsic_inner(&mut self, intrinsic: Intrinsic, receiver: cranelift_codegen::ir::Value, receiver_ty: &Type, args: &[cranelift_codegen::ir::Value], arg_types: &[Type], _result: &Type, _span: Span) -> cranelift_codegen::ir::Value {
+        use Intrinsic::*;
+        match intrinsic {
+            StringToString | TaskResult => receiver,
+            I64ToString => self.emit_value_runtime_call("willow_i64_to_string", &[receiver]),
+            F64ToString => self.emit_value_runtime_call("willow_f64_to_string", &[receiver]),
+            BoolToString => self.emit_value_runtime_call("willow_bool_to_string", &[receiver]),
+            TaskCancel => {
+                let id = self.builder.ins().load(types::I64, MemFlagsData::new(), receiver, async_frame_slot_offset(FRAME_SLOT_TASK_ID));
+                self.emit_void_runtime_call("willow_sched_cancel", &[id]);
+                self.builder.ins().iconst(types::I8, 0)
+            }
+            TaskIsCancelled => {
+                let raw = self.emit_value_runtime_call("willow_frame_is_cancelled", &[receiver]);
+                self.builder.ins().ireduce(types::I8, raw)
+            }
+            TokenIsCancelled | ScopeIsCancelled | TokenCancel | ScopeCancel | TokenChild | ScopeChild | TokenAttach | ScopeAdd | ScopeFinish => {
+                let handle = cancellation_handle(receiver_ty).expect("validated cancellation intrinsic");
+                let suffix = match intrinsic {
+                    TokenIsCancelled | ScopeIsCancelled => "is_cancelled",
+                    TokenCancel | ScopeCancel => "cancel",
+                    TokenChild | ScopeChild => "child",
+                    TokenAttach => "attach", ScopeAdd => "add", ScopeFinish => "finish",
+                    _ => unreachable!(),
+                };
+                let mut values = vec![receiver]; values.extend_from_slice(args);
+                let symbol = format!("{}_{suffix}", handle.prefix());
+                let value = self.emit_runtime_call_with_cleanup(&symbol, &values, |_| {});
+                match intrinsic {
+                    TokenIsCancelled | ScopeIsCancelled => self.builder.ins().ireduce(types::I8, value.unwrap()),
+                    _ => value.unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0)),
+                }
+            }
+            AtomicLoad | AtomicStore | AtomicSwap | AtomicAdd | AtomicSub => {
+                let cell = atomic_cell(receiver_ty).expect("validated atomic intrinsic");
+                let operation = match intrinsic { AtomicLoad => "load", AtomicStore => "store", AtomicSwap => "swap", AtomicAdd => "add", AtomicSub => "sub", _ => unreachable!() };
+                let mut values = vec![receiver]; values.extend_from_slice(args);
+                self.emit_runtime_call_with_cleanup(&format!("willow_atomic_{}_{operation}", cell.suffix()), &values, |_| {})
+                    .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
+            }
+            CellGet | CellSet | RwCellRead | RwCellWrite => {
+                let (kind, element) = blocking_cell(receiver_ty).expect("validated cell intrinsic");
+                let operation = match intrinsic { CellGet => "get", CellSet => "set", RwCellRead => "read", RwCellWrite => "write", _ => unreachable!() };
+                let mut values = vec![receiver];
+                if let Some(&value) = args.first() { values.push(self.coerce_to_i64(value, element)); }
+                match self.emit_runtime_call_with_cleanup(&format!("{}_{operation}", kind.prefix()), &values, |_| {}) {
+                    Some(value) => self.coerce_i64_to(value, element),
+                    None => self.builder.ins().iconst(types::I8, 0),
+                }
+            }
+            ChannelSend | ChannelRecv | ChannelClose => {
+                let element = builtin_types::unary_arg(receiver_ty, B::Channel).expect("validated channel intrinsic");
+                let operation = match intrinsic { ChannelSend => "send", ChannelRecv => "recv", ChannelClose => "close", _ => unreachable!() };
+                let symbol = if intrinsic == ChannelClose { "willow_channel_close".to_string() } else { format!("willow_channel_{operation}_{}", channel_runtime_suffix(element)) };
+                let mut values = vec![receiver];
+                if let Some(&value) = args.first() {
+                    let value = self.coerce_to_target(value, &arg_types[0], element);
+                    if is_gc_managed(element, self.enum_infos) { self.emit_push_root(value); }
+                    values.push(value);
+                }
+                self.emit_runtime_call_with_cleanup(&symbol, &values, |_| {})
+                    .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
+            }
+            ArrayLen | FrozenArrayLen => self.emit_value_runtime_call("willow_array_len", &[receiver]),
+            ArrayPush => {
+                let element = array_element_type(receiver_ty);
+                let value = self.coerce_to_target(args[0], &arg_types[0], &element);
+                if is_gc_managed(&element, self.enum_infos) { self.emit_push_root(value); }
+                let word = self.coerce_to_i64(value, &element);
+                self.emit_void_runtime_call("willow_array_push", &[receiver, word]);
+                self.builder.ins().iconst(types::I8, 0)
+            }
+            ArrayPop => {
+                let word = self.emit_value_runtime_call("willow_array_pop", &[receiver]);
+                self.coerce_i64_to(word, &array_element_type(receiver_ty))
+            }
+            ArrayToString => {
+                let kind = collection_elem_kind(&array_element_type(receiver_ty)).expect("validated array rendering kind");
+                let kind = self.builder.ins().iconst(types::I64, kind);
+                self.emit_value_runtime_call("willow_array_to_string", &[receiver, kind])
+            }
+            ArrayFreeze => self.emit_value_runtime_call("willow_array_copy", &[receiver]),
+            MapLen | FrozenMapLen => self.emit_value_runtime_call("willow_map_len", &[receiver]),
+            MapToString => self.emit_value_runtime_call("willow_map_to_string", &[receiver]),
+            MapFreeze => self.emit_value_runtime_call("willow_map_copy", &[receiver]),
+            MapContains | FrozenMapContains | MapGet | FrozenMapGet | MapInsert => {
+                let (_, parameters) = lir_collection(receiver_ty).expect("validated map intrinsic");
+                let (key_ty, value_ty) = (&parameters[0], &parameters[1]);
+                let key = self.coerce_to_i64(args[0], key_ty);
+                let key_ref = self.map_is_ref_flag(key_ty);
+                match intrinsic {
+                    MapContains | FrozenMapContains => {
+                        let value = self.emit_value_runtime_call("willow_map_contains", &[receiver, key, key_ref]);
+                        self.builder.ins().ireduce(types::I8, value)
+                    }
+                    MapGet | FrozenMapGet => {
+                        let option = Type::Generic("Option".into(), vec![value_ty.clone()]);
+                        let niche = self.builder.ins().iconst(types::I64, i64::from(option_repr(&option, self.enum_infos) == Some(OptionRepr::NullableGcPointer)));
+                        self.emit_value_runtime_call("willow_map_get", &[receiver, key, key_ref, niche])
+                    }
+                    MapInsert => {
+                        let value = self.coerce_to_target(args[1], &arg_types[1], value_ty);
+                        if is_gc_managed(value_ty, self.enum_infos) { self.emit_push_root(value); }
+                        let word = self.coerce_to_i64(value, value_ty);
+                        let value_ref = self.map_is_ref_flag(value_ty);
+                        self.emit_void_runtime_call("willow_map_insert", &[receiver, key, key_ref, word, value_ref]);
+                        self.builder.ins().iconst(types::I8, 0)
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
+
+impl<'a, 'b> FuncGen<'a, 'b> {
+    /// Resolved enum combinators consume already-evaluated, typed operands.
+    fn emit_flat_enum_method(
+        &mut self,
+        receiver: cranelift_codegen::ir::Value,
+        receiver_ty: &Type,
+        method: &str,
+        args: &[cranelift_codegen::ir::Value],
+        arg_types: &[Type],
+        span: Span,
+    ) -> cranelift_codegen::ir::Value {
+        const OK_TAG: i64 = 0;
+        const ERR_TAG: i64 = 1;
+        let resolved = builtin_types::resolve(receiver_ty)
+            .expect("Option/Result receiver vetted by eligibility");
+        let id = resolved.id;
+        let payload = |i: usize| resolved.args.get(i).cloned().unwrap_or(Type::Void);
+        let (ok_ty, err_ty) = (payload(0), payload(1));
+        let recv = receiver;
+        let roots_before = self.gc_root_count;
+        for (&value, ty) in args.iter().zip(arg_types) {
+            if is_gc_managed(ty, self.enum_infos) { self.emit_push_root(value); }
+        }
+        // Every branch below either allocates a panic message or evaluates an
+        // argument that may allocate, and the receiver is otherwise live only
+        // in an SSA register — so it is rooted for the whole method.
+        self.emit_push_root(recv);
+        let value = match (id, method) {
+            (B::Option, "is_some") => self.emit_option_is_some(recv, &ok_ty),
+            (B::Option, "is_none") => {
+                let some = self.emit_option_is_some(recv, &ok_ty);
+                let zero = self.builder.ins().iconst(types::I8, 0);
+                self.builder.ins().icmp(IntCC::Equal, some, zero)
+            }
+            (B::Option, "unwrap") => {
+                let msg = self.emit_string_literal("called `Option::unwrap()` on a `None` value");
+                self.emit_option_unwrap(recv, &ok_ty, msg, Some(span))
+            }
+            (B::Option, "expect") => {
+                let msg = args[0];
+                self.emit_option_unwrap(recv, &ok_ty, msg, Some(span))
+            }
+            (B::Option, "unwrap_or") => {
+                let default_val = args[0];
+                self.emit_option_unwrap_or(recv, &ok_ty, default_val)
+            }
+            (B::Result, "is_ok") | (B::Result, "is_err") => {
+                let tag = self.emit_load_enum_tag(recv);
+                let want = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, if method == "is_ok" { OK_TAG } else { ERR_TAG });
+                self.builder.ins().icmp(IntCC::Equal, tag, want)
+            }
+            (B::Result, "unwrap") => {
+                let msg = self.emit_string_literal("called `Result::unwrap()` on an `Err` value");
+                self.emit_enum_unwrap(recv, &ok_ty, OK_TAG, msg, Some(span))
+            }
+            (B::Result, "unwrap_err") => {
+                let msg =
+                    self.emit_string_literal("called `Result::unwrap_err()` on an `Ok` value");
+                self.emit_enum_unwrap(recv, &err_ty, ERR_TAG, msg, Some(span))
+            }
+            (B::Result, "expect") => {
+                let msg = args[0];
+                self.emit_enum_unwrap(recv, &ok_ty, OK_TAG, msg, Some(span))
+            }
+            (B::Result, "unwrap_or") => {
+                let default_val = args[0];
+                self.emit_enum_unwrap_or(recv, &ok_ty, OK_TAG, default_val)
+            }
+            // The callable-taking combinators (willow-0g8j.2.2). The receiver
+            // is already rooted above, which is what makes calling an arbitrary
+            // function — and allocating the new enum around its result — safe
+            // here. Shared helpers enforce tag layout, the pointer niche,
+            // and the indirect-call ABI.
+            (B::Option, "map") => {
+                let (f_val, f_ty) = (args[0], arg_types[0].clone());
+                let produced = fn_return_type(&f_ty);
+                self.emit_option_map(recv, &ok_ty, &produced, f_val, &f_ty)
+            }
+            (B::Option, "and_then") => {
+                let (f_val, f_ty) = (args[0], arg_types[0].clone());
+                self.emit_option_and_then(recv, &ok_ty, f_val, &f_ty)
+            }
+            (B::Option, "or_else") => {
+                let (f_val, f_ty) = (args[0], arg_types[0].clone());
+                self.emit_option_or_else(recv, &ok_ty, f_val, &f_ty)
+            }
+            (B::Result, "map") => {
+                let (f_val, f_ty) = (args[0], arg_types[0].clone());
+                let produced = fn_return_type(&f_ty);
+                self.emit_result_map(recv, &ok_ty, &err_ty, &produced, f_val, &f_ty)
+            }
+            (B::Result, "map_err") => {
+                let (f_val, f_ty) = (args[0], arg_types[0].clone());
+                let produced = fn_return_type(&f_ty);
+                self.emit_result_map_err(recv, &ok_ty, &err_ty, &produced, f_val, &f_ty)
+            }
+            (B::Result, "and_then") => {
+                let (f_val, f_ty) = (args[0], arg_types[0].clone());
+                self.emit_result_and_then(recv, &ok_ty, f_val, &f_ty)
+            }
+            (B::Result, "or_else") => {
+                let (f_val, f_ty) = (args[0], arg_types[0].clone());
+                self.emit_result_or_else(recv, &err_ty, f_val, &f_ty)
+            }
+            _ => unreachable!("unsupported `{method}` on an Option/Result passed eligibility"),
+        };
+        self.emit_pop_roots_n(self.gc_root_count - roots_before);
+        self.gc_root_count = roots_before;
+        value
+    }
+
+}
+
+
+impl<'a, 'b> FuncGen<'a, 'b> {
+    fn emit_flat_format_scalar(&mut self, value: cranelift_codegen::ir::Value, ty: &Type, format: Option<crate::interpolate::F64Format>) -> cranelift_codegen::ir::Value {
+        if let Some(format) = format {
+            assert_eq!(*ty, Type::F64, "validated f64 format operand");
+            return self.emit_value_runtime_call(format.runtime_symbol(), &[value]);
+        }
+        match ty {
+            Type::String => value,
+            Type::I64 => self.emit_value_runtime_call("willow_i64_to_string", &[value]),
+            Type::F64 => self.emit_value_runtime_call("willow_f64_to_string", &[value]),
+            Type::Bool => self.emit_value_runtime_call("willow_bool_to_string", &[value]),
+            _ => unreachable!("validated display format operand"),
+        }
+    }
+
+    fn emit_flat_builtin_call(&mut self, callee: &crate::semantic::ids::FunctionId, args: &[cranelift_codegen::ir::Value]) -> cranelift_codegen::ir::Value {
+        let runtime = builtin_call_runtime_name(callee.unqualified_name()).expect("resolved builtin function");
+        self.emit_runtime_call_with_cleanup(runtime, args, |_| {})
+            .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
+    }
+}
+
+impl<'a, 'b> FuncGen<'a, 'b> {
+    fn emit_lir_static_call_values(&mut self, class: &str, method: &str, args: &[cranelift_codegen::ir::Value], arg_types: &[Type], ret_ty: &Type, span: Span) -> cranelift_codegen::ir::Value {
+        self.emit_lir_static_call_values_inner(class, method, args, arg_types, ret_ty, span)
+    }
+    fn emit_lir_static_call_values_inner(
+        &mut self,
+        class: &str,
+        method: &str,
+        args: &[cranelift_codegen::ir::Value],
+        _arg_types: &[Type],
+        ret_ty: &Type,
+        span: crate::diagnostics::Span,
+    ) -> cranelift_codegen::ir::Value {
+        let resolved_class = self.static_call_class_name(class);
+        let class = resolved_class.as_str();
+        if class == "Map" && method == "new" {
+            let (key, value) = builtin_types::binary_args(ret_ty, B::Map)
+                .expect("map constructor must carry checked type arguments");
+            return self.emit_map_new(key, value);
+        }
+        if class == "Channel"
+            && let Type::Generic(_, type_args) = ret_ty
+            && let Some(element_ty) = type_args.first()
+        {
+            let is_ref = self.builder.ins().iconst(
+                types::I64,
+                i64::from(is_gc_managed(element_ty, self.enum_infos)),
+            );
+            if method == "new" {
+                return self.emit_value_runtime_call("willow_channel_new", &[is_ref]);
+            }
+            if method == "with_capacity" {
+                let capacity = args[0];
+                return self
+                    .emit_value_runtime_call("willow_channel_new_bounded", &[is_ref, capacity]);
+            }
+        }
+        if let Some(handle) = cancellation_handle(ret_ty)
+            && method == "new"
+            && class == handle.class_name()
+        {
+            let runtime = format!("{}_new", handle.prefix());
+            return self.emit_value_runtime_call(&runtime, &[]);
+        }
+        if let Some(cell) = atomic_cell(ret_ty)
+            && method == "new"
+            && class == cell.class_name()
+        {
+            let initial = args[0];
+            let runtime = format!("willow_atomic_{}_new", cell.suffix());
+            return self.emit_value_runtime_call(&runtime, &[initial]);
+        }
+        if let Some((kind, elem)) = blocking_cell(ret_ty)
+            && method == "new"
+            && class == kind.class_name()
+        {
+            let elem = elem.clone();
+            let initial = args[0];
+            let word = self.coerce_to_i64(initial, &elem);
+            let is_ref = is_gc_managed(&elem, self.enum_infos);
+            let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
+            let runtime = format!("{}_new", kind.prefix());
+            return self.emit_value_runtime_call(&runtime, &[word, flag]);
+        }
+        if let Some((prefix, protected)) = scheduler_lock(ret_ty)
+            && method == "new"
+            && matches!(class, "Mutex" | "RwLock")
+        {
+            let protected = protected.clone();
+            let mut initial = args[0];
+            let is_ref = is_gc_managed(&protected, self.enum_infos);
+            if is_ref {
+                let slot = self.emit_push_root(initial);
+                initial = self.stack_load(self.module.target_config().pointer_type(), slot);
+            }
+            let word = self.coerce_to_i64(initial, &protected);
+            let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
+            let runtime = format!("{prefix}_new");
+            let handle = self.emit_value_runtime_call(&runtime, &[word, flag]);
+            if is_ref {
+                self.emit_pop_roots_n(1);
+                self.gc_root_count -= 1;
+            }
+            return handle;
+        }
+        if self.enum_infos.contains_key(class) {
+            return self.emit_lir_enum_construction_values(class, method, args, ret_ty);
+        }
+        if let Some(entry) = namespace_builtin_call(
+            self.known_modules,
+            self.builtin_module_aliases,
+            class,
+            method,
+        ) {
+            let (arg_vals, arg_roots) =
+                (args.to_vec(), 0usize);
+            let result = self
+                .emit_runtime_call_with_cleanup(entry.runtime, &arg_vals, |this| {
+                    if arg_roots > 0 {
+                        this.emit_pop_roots_n(arg_roots);
+                        this.gc_root_count -= arg_roots;
+                    }
+                })
+                .expect("every builtin namespace entry returns a value");
+            return if entry.narrow_to_bool {
+                self.builder.ins().ireduce(types::I8, result)
+            } else {
+                result
+            };
+        }
+        if let Some(module_prefix) = self.known_modules.linker_prefix(class).cloned() {
+            let mangled = module_item_symbol(&module_prefix, method);
+            let has_reference_args = self.func_param_modes.get(&mangled).is_some_and(|modes| modes.iter().any(|mode| matches!(mode, ParamMode::Reference { .. })));
+            let user_callee = format!("{class}::{method}");
+            let (arg_vals, arg_roots) = (args.to_vec(), 0usize);
+            let fid = *self.func_ids.get(mangled.as_str()).unwrap_or_else(|| {
+                panic!("eligible LIR module call `{class}::{method}` has no declared function")
+            });
+            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+            let pushed = self.emit_callstack_push(&user_callee, span);
+            let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
+            let call = self.builder.ins().call(fref, &arg_vals);
+            let result = self
+                .builder
+                .inst_results(call)
+                .first()
+                .copied()
+                .unwrap_or_else(|| self.builder.ins().iconst(clif_type(ret_ty), 0));
+            if pushed {
+                self.emit_callstack_pop();
+            }
+            if has_reference_args {
+                self.emit_flat_reference_call_end();
+            }
+            if arg_roots > 0 {
+                self.emit_pop_roots_n(arg_roots);
+                self.gc_root_count -= arg_roots;
+            }
+            self.emit_post_willow_call_panic_check(panic_depth);
+            return result;
+        }
+        let mangled = class_method_symbol_name(self.known_modules, class, method);
+        let fid = self.func_ids[&mangled];
+        let dummy_self = self.builder.ins().iconst(types::I64, 0);
+        let has_reference_args = self.func_param_modes.get(&mangled).is_some_and(|modes| modes.iter().any(|mode| matches!(mode, ParamMode::Reference { .. })));
+        let (arg_vals, arg_roots) = (args.to_vec(), 0usize);
+        let fref = self.module.declare_func_in_func(fid, self.builder.func);
+        let mut call_args = vec![dummy_self];
+        call_args.extend(arg_vals);
+        let pushed = self.emit_callstack_push(method, span);
+        let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
+        let call = self.builder.ins().call(fref, &call_args);
+        let result = self
+            .builder
+            .inst_results(call)
+            .first()
+            .copied()
+            .unwrap_or_else(|| self.builder.ins().iconst(clif_type(ret_ty), 0));
+        if pushed {
+            self.emit_callstack_pop();
+        }
+        if has_reference_args {
+            self.emit_flat_reference_call_end();
+        }
+        if arg_roots > 0 {
+            self.emit_pop_roots_n(arg_roots);
+            self.gc_root_count -= arg_roots;
+        }
+        self.emit_post_willow_call_panic_check(panic_depth);
+        result
+    }
+
+
+    fn emit_lir_enum_construction_values(&mut self, enum_name: &str, variant: &str, args: &[cranelift_codegen::ir::Value], enum_ty: &Type) -> cranelift_codegen::ir::Value {
+        let tag = self.enum_variant_tag(enum_name, variant);
+        if option_repr(enum_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
+            return if tag == 0 { args[0] } else { self.builder.ins().iconst(types::I64, 0) };
+        }
+        if !self.enum_is_gc_object_type(enum_name) { return self.builder.ins().iconst(types::I64, tag); }
+        let mut payloads = self.resolve_variant_payload_types(enum_name, variant, enum_ty);
+        normalize_void_payloads(&mut payloads);
+        let kinds = payloads.iter().map(|ty| if is_gc_managed(ty, self.enum_infos) { willow_abi::SlotKind::GcRef } else { willow_abi::SlotKind::Word }).collect::<Vec<_>>();
+        let layout = willow_abi::EnumVariantLayout::new(tag as u32, &kinds);
+        let bytes = self.module.target_config().pointer_type().bytes();
+        let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(GcObjectKind::Enum, i64::from(layout.payload_bytes(bytes)), 0, layout.gc_ref_mask()));
+        let tag_value = self.builder.ins().iconst(types::I64, tag);
+        self.builder.ins().store(MemFlagsData::new(), tag_value, ptr, 0i32);
+        for (index, (&value, ty)) in args.iter().zip(&payloads).enumerate() {
+            let word = self.coerce_to_i64(value, ty);
+            self.emit_gc_heap_store(ptr, layout.payload_byte_offset(bytes) as i32 + index as i32 * bytes as i32, word, ty, GcStoreDestination::EnumPayload);
+        }
+        ptr
+    }
+}
+
+fn flat_static_call_supported(class: &str, method: &str, args: &[Type], result: &Type, ctx: &LirTypeCtx<'_>) -> bool {
+    let class = ctx.resolved_class(class);
+    if !ctx.supported_type(result) || args.iter().any(|ty| !ctx.supported_type(ty)) { return false; }
+    if class == "Map" && method == "new" && args.is_empty() { return matches!(lir_collection(result), Some((LirCollection::Map, _))); }
+    if class == "Channel" && builtin_types::unary_arg(result, B::Channel).is_some() {
+        return (method == "new" && args.is_empty()) || (method == "with_capacity" && args == [Type::I64]);
+    }
+    if let Some(cell) = atomic_cell(result) && class == cell.class_name() && method == "new" { return args == [cell.word()]; }
+    if let Some((kind, elem)) = blocking_cell(result) && class == kind.class_name() && method == "new" { return args.len() == 1 && ctx.same_repr(elem, &args[0]); }
+    if let Some((_, elem)) = scheduler_lock(result) && matches!(class, "Mutex" | "RwLock") && method == "new" { return args.len() == 1 && ctx.same_repr(elem, &args[0]); }
+    if let Some(handle) = cancellation_handle(result) && class == handle.class_name() && method == "new" { return args.is_empty(); }
+    if let Some(entry) = namespace_builtin_call(ctx.known_modules, ctx.builtin_module_aliases, class, method) {
+        return entry.params == args && ctx.repr_compatible(result, &entry.ret);
+    }
+    if ctx.is_enum(class) {
+        let Some((name, definition)) = ctx.enum_instance(result) else { return false; };
+        let Some(variant) = definition.variant(method) else { return false; };
+        return name == TypeId::from_source_name(class) && variant.payloads.len() == args.len()
+            && variant.payloads.iter().zip(args).all(|(slot, arg)| ctx.same_repr(slot, arg));
+    }
+    let (symbol, skip_self) = if let Some(prefix) = ctx.known_modules.linker_prefix(class) {
+        (module_item_symbol(prefix, method), false)
+    } else {
+        if !ctx.supported_class(class) { return false; }
+        (class_method_symbol_name(ctx.known_modules, class, method), true)
+    };
+    if !(ctx.known_fn)(&symbol) { return false; }
+    if ctx.func_param_modes.get(&symbol).is_some_and(|modes| modes.iter().any(|mode| !matches!(mode, ParamMode::Value))) { return false; }
+    let Some(Type::Fn(params, ret)) = ctx.fn_types.get(&symbol) else { return false; };
+    let params = if skip_self { let Some((_, params)) = params.split_first() else { return false; }; params } else { params.as_slice() };
+    params == args && ctx.same_repr(ret, result)
+}
+
+impl<'a, 'b> FuncGen<'a, 'b> {
+    /// Allocate and initialise the tag before evaluating any source payload.
+    /// Nullable Option representations reserve no object: the payload store
+    /// below replaces this null placeholder with the actual pointer.
+    fn emit_flat_enum_alloc(&mut self, class: &str, variant: &str, enum_ty: &Type) -> cranelift_codegen::ir::Value {
+        let tag = self.enum_variant_tag(class, variant);
+        if option_repr(enum_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
+            return self.builder.ins().iconst(types::I64, 0);
+        }
+        if !self.enum_is_gc_object_type(class) { return self.builder.ins().iconst(types::I64, tag); }
+        let mut payloads = self.resolve_variant_payload_types(class, variant, enum_ty);
+        normalize_void_payloads(&mut payloads);
+        let kinds = payloads.iter().map(|ty| if is_gc_managed(ty, self.enum_infos) { willow_abi::SlotKind::GcRef } else { willow_abi::SlotKind::Word }).collect::<Vec<_>>();
+        let layout = willow_abi::EnumVariantLayout::new(tag as u32, &kinds);
+        let bytes = self.module.target_config().pointer_type().bytes();
+        let object = self.emit_gc_alloc(GcLayoutMetadata::new(GcObjectKind::Enum, i64::from(layout.payload_bytes(bytes)), 0, layout.gc_ref_mask()));
+        let tag_value = self.builder.ins().iconst(types::I64, tag);
+        self.builder.ins().store(MemFlagsData::new(), tag_value, object, 0i32);
+        object
+    }
+
+    /// A payload store is its own LIR operation so coercion occurs before the
+    /// next payload is evaluated. The returned representation is written back
+    /// to the enum local (necessary for nullable Option::Some).
+    fn emit_flat_enum_payload_store(&mut self, object: cranelift_codegen::ir::Value, class: &str, variant: &str, index: usize, value: cranelift_codegen::ir::Value, source_ty: &Type, enum_ty: &Type) -> cranelift_codegen::ir::Value {
+        let before = self.gc_root_count;
+        if is_gc_managed(enum_ty, self.enum_infos) { self.emit_push_root(object); }
+        if is_gc_managed(source_ty, self.enum_infos) { self.emit_push_root(value); }
+        let mut payloads = self.resolve_variant_payload_types(class, variant, enum_ty);
+        normalize_void_payloads(&mut payloads);
+        let target = &payloads[index];
+        let value = self.coerce_to_target(value, source_ty, target);
+        let result = if option_repr(enum_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
+            assert_eq!(index, 0);
+            value
+        } else {
+            let kinds = payloads.iter().map(|ty| if is_gc_managed(ty, self.enum_infos) { willow_abi::SlotKind::GcRef } else { willow_abi::SlotKind::Word }).collect::<Vec<_>>();
+            let tag = self.enum_variant_tag(class, variant);
+            let layout = willow_abi::EnumVariantLayout::new(tag as u32, &kinds);
+            let bytes = self.module.target_config().pointer_type().bytes();
+            let word = self.coerce_to_i64(value, target);
+            self.emit_gc_heap_store(object, layout.payload_byte_offset(bytes) as i32 + index as i32 * bytes as i32, word, target, GcStoreDestination::EnumPayload);
+            object
+        };
+        self.emit_pop_roots_n(self.gc_root_count - before);
+        self.gc_root_count = before;
+        result
+    }
+}
+
+/// Validate metadata that operand type equality alone cannot establish.
+fn flat_rvalue_supported(value: &crate::ir::lowered::LirRvalue, locals: &[crate::ir::lowered::LirLocal], ctx: &LirTypeCtx<'_>) -> bool {
+    use crate::ir::lowered::LirRvalue as V;
+    let ty = |operand: &crate::ir::lowered::LirOperand| operand.ty(locals);
+    let field_type = |object: &Type, field: &str| -> Option<Type> {
+        if range_i64(object) { return matches!(field, "start" | "end").then_some(Type::I64); }
+        ctx.class_layout_of(object)?.iter().find(|(name, _)| name == field).map(|(_, ty)| ty.clone())
+    };
+    if value.operands().iter().any(|operand| matches!(operand, crate::ir::lowered::LirOperand::Reference { place, .. } if !flat_reference_place_supported(place, locals, ctx))) { return false; }
+    match value {
+        V::ReferenceDebug { argument, .. } => matches!(argument, crate::ir::lowered::LirOperand::Reference { place, .. } if flat_reference_place_supported(place, locals, ctx)),
+        V::StartTask { callee, params, output, .. } => ctx.cooperative_leaves.contains(callee)
+            && (ctx.known_fn)(&callee.to_string())
+            && ctx.supported_type(output) && params.iter().all(|ty| ctx.supported_type(ty))
+            && ctx.fn_types.get_id(callee).is_some_and(|signature| matches!(signature, Type::Fn(declared, result) if declared.len() == params.len() && declared.iter().zip(params).all(|(expected, actual)| ctx.same_repr(expected, actual)) && builtin_types::unary_arg(result, B::Task).is_some_and(|payload| ctx.same_repr(payload, output))))
+            && ctx.func_param_modes.get_id(callee).is_none_or(|modes| modes.iter().all(|mode| matches!(mode, ParamMode::Value))),
+        V::AwaitFuture { result, .. } => ctx.supported_type(result),
+        V::SelectIdleWait { .. } => true,
+        V::PrepareMethod { receiver_ty, method, .. } => flat_method_signature(receiver_ty, method, ctx).is_some(),
+        V::MethodCall { receiver_ty, method, args, arg_types, result, .. } => flat_argument_modes_match(args, &flat_method_modes(receiver_ty, method, ctx)) && flat_method_signature(receiver_ty, method, ctx).is_some_and(|(params, ret)| params.len() == arg_types.len() && params.iter().zip(arg_types).all(|(param, arg)| ctx.same_repr(param, arg)) && ctx.same_repr(&ret, result)),
+        V::IndirectCall { callee, params, result, .. } => ty(callee).is_some_and(|callee| ctx.supported_type(&callee)) && params.iter().all(|param| ctx.supported_type(param)) && ctx.supported_type(result),
+        V::RebindResultError { source, target, .. } => ctx.supported_enum_type(source) && ctx.supported_enum_type(target)
+            && builtin_types::binary_args(source, B::Result).zip(builtin_types::binary_args(target, B::Result)).is_some_and(|((_, source), (_, target))| ctx.same_repr(source, target)),
+        V::IntoError { source, target, .. } => {
+            let Type::Named(class) = source else { return false; };
+            ctx.supported_class(class) && ctx.supported_type(target) && ctx.resolve_class_method(class, "into").is_some_and(|symbol|
+                ctx.fn_types.get(&symbol).is_some_and(|signature| matches!(signature, Type::Fn(params, result) if params.len() == 1 && ctx.same_repr(result, target))))
+        }
+        V::Coerce { source, target, .. } => ctx.supported_type(source) && ctx.supported_type(target) && ctx.storable(target, source),
+        V::CaptureArrayOwner { array, index } => ty(array).is_some_and(|array| matches!(array, Type::Array(_)) && ctx.supported_type(&array)) && ty(index) == Some(Type::I64),
+        V::ArrayAlloc { length, element } => *length <= i64::MAX as usize && ctx.supported_type(&Type::Array(Box::new(element.clone()))),
+        V::ArrayStore { array, value, element, .. } => ty(array).is_some_and(|array| ctx.supported_type(&array) && matches!(&array, Type::Array(inner) if ctx.same_repr(inner, element))) && ctx.supported_type(element) && ty(value).is_some_and(|value| ctx.storable(element, &value)),
+        V::Index { array, element, .. } => ctx.supported_type(element) && ty(array).is_some_and(|array| ctx.supported_type(&array) && (matches!(&array, Type::Array(_)) || matches!(lir_collection(&array), Some((LirCollection::FrozenArray, _)))) && ctx.same_repr(&array_element_type(&array), element)),
+        V::ObjectAlloc { class } => ctx.supported_class(class) && ctx.class_layouts.get(class).is_some() && ctx.class_type_ids.get(class).is_some(),
+        V::FieldLoad { object_ty, field, result, .. } => ctx.supported_type(object_ty) && ctx.supported_type(result) && field_type(object_ty, field).is_some_and(|field| ctx.same_repr(&field, result)),
+        V::FieldStore { object_ty, field, value, .. } => ctx.class_layout_of(object_ty).is_some() && field_type(object_ty, field).is_some_and(|field| ty(value).is_some_and(|value| ctx.supported_type(&value) && ctx.storable(&field, &value))),
+        V::StaticField { class, field, result } => (ctx.static_field)(ctx.resolved_class(&class.to_string()), field).is_some_and(|field| ctx.supported_type(&field) && ctx.same_repr(&field, result)),
+        V::StaticStore { class, field, value } => (ctx.static_field)(ctx.resolved_class(&class.to_string()), field).is_some_and(|field| ctx.supported_type(&field) && ty(value).is_some_and(|value| ctx.supported_type(&value) && ctx.storable(&field, &value))),
+        V::ConstructorCall { class, object, args, arg_types } => {
+            if !ctx.supported_class(class) || !ty(object).is_some_and(|ty| matches!(&ty, Type::Named(name) if name == class)) || args.len() != arg_types.len() { return false; }
+            let symbol = class_method_symbol_name(ctx.known_modules, &class.to_string(), "init");
+            if !(ctx.known_fn)(&symbol) || !flat_argument_modes_match(args, ctx.func_param_modes.get(&symbol).map(Vec::as_slice).unwrap_or(&[])) { return false; }
+            let Some(Type::Fn(params, result)) = ctx.fn_types.get(&symbol) else { return false; };
+            let Some((_, params)) = params.split_first() else { return false; };
+            **result == Type::Void && params.len() == arg_types.len() && params.iter().zip(arg_types).all(|(param, arg)| ctx.supported_type(param) && ctx.same_repr(param, arg))
+        }
+        V::StaticCall { class, method, args, arg_types, result } => {
+            if args.iter().any(|arg| matches!(arg, crate::ir::lowered::LirOperand::Reference { .. })) { flat_static_reference_call_supported(&class.to_string(), method, args, arg_types, result, ctx) }
+            else { flat_static_call_supported(&class.to_string(), method, arg_types, result, ctx) }
+        },
+        V::EnumAlloc { class, variant, enum_ty } => ctx.supported_enum_type(enum_ty) && ctx.enum_instance(enum_ty).is_some_and(|(name, definition)| name == *class && definition.variant(variant).is_some()),
+        V::EnumPayloadStore { class, variant, index, source, enum_ty, .. } => ctx.supported_enum_type(enum_ty) && ctx.supported_type(source) && ctx.enum_instance(enum_ty).is_some_and(|(name, definition)| name == *class && definition.variant(variant).and_then(|variant| variant.payloads.get(*index)).is_some_and(|slot| ctx.storable(slot, source))),
+        V::Range { start, end } => ty(start) == Some(Type::I64) && ty(end) == Some(Type::I64),
+        V::EnumMethod { receiver_ty, method, arg_types, result, .. } => ctx.supported_enum_type(receiver_ty) && ctx.supported_type(result) && arg_types.iter().all(|ty| ctx.supported_type(ty)) && option_result_method(receiver_ty, method, arg_types).is_some_and(|ret| ctx.same_repr(&ret, result)),
+        V::BuiltinCall { callee, params, result, .. } => {
+            let void_future = *result == Type::Void || builtin_types::unary_arg(result, B::Future) == Some(&Type::Void);
+            if callee.is_free_named("sleep") { return params == &[Type::I64] && void_future; }
+            if callee.is_free_named("yield") { return params.is_empty() && void_future; }
+            if !params.is_empty() { return false; }
+            if callee.is_free_named("gc_collect") || callee.is_free_named("gc_minor_collect") { *result == Type::Void }
+            else { callee.is_free_named(callee.unqualified_name()) && gc_stat_builtin_runtime_name(callee.unqualified_name()).is_some() && *result == Type::I64 }
+        }
+        V::FormatScalar { ty, format, .. } => matches!(ty, Type::I64 | Type::F64 | Type::Bool | Type::String) && (format.is_none() || *ty == Type::F64),
+        V::Panic { message } => ty(message) == Some(Type::String),
+        V::Recover => true,
+        _ => true,
+    }
+}
+
+/// The by-value dispatch ABI, including inherited methods and interface Self.
+fn flat_method_signature(receiver: &Type, method: &str, ctx: &LirTypeCtx<'_>) -> Option<(Vec<Type>, Type)> {
+    if !ctx.supported_type(receiver) { return None; }
+    let name = match receiver { Type::Named(name) | Type::Generic(name, _) => name, _ => return None };
+    let (params, ret) = if (ctx.is_interface)(name) {
+        let sig = (ctx.iface_method)(receiver, method)?;
+        let ret = if matches!(&sig.ret, Type::Named(name) if *name == TypeId::local("Self")) { receiver.clone() } else { sig.ret };
+        (sig.params, ret)
+    } else {
+        if !ctx.supported_class(name) { return None; }
+        let symbol = ctx.resolve_class_method(name, method)?;
+        let Type::Fn(params, ret) = ctx.fn_types.get(&symbol)? else { return None; };
+        let (_, params) = params.split_first()?;
+        (params.to_vec(), (**ret).clone())
+    };
+    (ctx.supported_type(&ret) && params.iter().all(|param| ctx.supported_type(param))).then_some((params, ret))
+}
+
+fn flat_argument_modes_match(args: &[crate::ir::lowered::LirOperand], modes: &[ParamMode]) -> bool {
+    args.iter().enumerate().all(|(index, arg)| matches!(arg, crate::ir::lowered::LirOperand::Reference { .. }) == matches!(modes.get(index), Some(ParamMode::Reference { .. })))
+}
+fn flat_method_modes(receiver: &Type, method: &str, ctx: &LirTypeCtx<'_>) -> Vec<ParamMode> {
+    let name = match receiver { Type::Named(name) | Type::Generic(name, _) => name, _ => return vec![] };
+    if (ctx.is_interface)(name) { return (ctx.iface_method)(receiver, method).map(|sig| sig.modes).unwrap_or_default(); }
+    ctx.resolve_class_method(name, method).and_then(|symbol| ctx.func_param_modes.get(&symbol).cloned()).unwrap_or_default()
+}
+fn flat_reference_place_supported(place: &crate::ir::lowered::LirPlace, locals: &[crate::ir::lowered::LirLocal], ctx: &LirTypeCtx<'_>) -> bool {
+    use crate::ir::lowered::LirPlace;
+    let Some(ty) = place.ty(locals) else { return false; };
+    if !ctx.supported_type(&ty) || matches!(ty, Type::Void | Type::Never) { return false; }
+    match place {
+        LirPlace::Local(_) | LirPlace::ArrayElement { .. } => true,
+        LirPlace::Field { object_ty, field, .. } => ctx.class_layout_of(object_ty).is_some_and(|layout| layout.iter().any(|(name, field_ty)| name == field && ctx.same_repr(field_ty, &ty))),
+    }
+}
+fn flat_static_reference_call_supported(class: &str, method: &str, args: &[crate::ir::lowered::LirOperand], types: &[Type], result: &Type, ctx: &LirTypeCtx<'_>) -> bool {
+    let class = ctx.resolved_class(class);
+    let (symbol, skip_self) = if let Some(prefix) = ctx.known_modules.linker_prefix(class) { (module_item_symbol(prefix, method), false) }
+        else { if !ctx.supported_class(class) { return false; } (class_method_symbol_name(ctx.known_modules, class, method), true) };
+    if !(ctx.known_fn)(&symbol) || !flat_argument_modes_match(args, ctx.func_param_modes.get(&symbol).map(Vec::as_slice).unwrap_or(&[])) { return false; }
+    let Some(Type::Fn(params, ret)) = ctx.fn_types.get(&symbol) else { return false; };
+    let params = if skip_self { let Some((_, tail)) = params.split_first() else { return false; }; tail } else { params.as_slice() };
+    params.len() == types.len() && params.iter().zip(types).all(|(param, arg)| ctx.supported_type(param) && ctx.same_repr(param, arg)) && ctx.same_repr(ret, result)
 }

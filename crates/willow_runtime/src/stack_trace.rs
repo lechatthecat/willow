@@ -36,6 +36,15 @@ thread_local! {
     static CALL_STACK: RefCell<RuntimeStackTrace> = RefCell::new(RuntimeStackTrace::default());
 }
 
+/// Exchange the native call trace at a task stack suspension boundary.
+pub(crate) fn replace_current(trace: RuntimeStackTrace) -> RuntimeStackTrace {
+    CALL_STACK.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), trace))
+}
+
+pub(crate) fn snapshot_current() -> RuntimeStackTrace {
+    CALL_STACK.with(|slot| slot.borrow().clone())
+}
+
 /// Read `len` raw UTF-8 bytes at `ptr` into an owned (Rust-heap) String. Used
 /// for call-frame names/paths so the call stack never allocates on the Willow
 /// GC heap (which would pollute `gc_allocated_bytes`).

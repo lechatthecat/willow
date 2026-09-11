@@ -36,7 +36,7 @@
 //!  12 nested match inside an arm          25 the example is fully LIR
 //!  13 channel send/recv inside an arm
 
-use super::support::{compile_with_compiler_env, compile_with_env_and_run};
+use super::support::{compile_and_run, compile_with_compiler_env, compile_with_env_and_run};
 
 /// No extra compiler environment: the ordinary build.
 const PLAIN: [(&str, &str); 0] = [];
@@ -799,4 +799,49 @@ fn lir_suspend_25_the_example_is_fully_lir() {
             "main",
         ],
     );
+}
+
+/// Replaces the retired backend ANF's syntactic extraction test with executed
+/// LIR coverage: every await must occur once and retain its operand position.
+#[test]
+fn lir_await_twenty_operand_positions_execute_in_order() {
+    let (out, ok) = compile_and_run(r#"
+import std::collections::Array;
+class Item {
+    pub field: i64;
+    pub fn add(self, n: i64) -> i64 { return self.field + n; }
+    pub static fn echo(n: i64) -> i64 { return n; }
+}
+async fn one() -> i64 { await yield(); return 1; }
+async fn forwarded() -> i64 { return await one(); }
+async fn item() -> Item { await yield(); return new Item(3); }
+async fn array() -> Array<i64> { await yield(); return [7, 8]; }
+fn echo(n: i64) -> i64 { return n; }
+fn sum(a: i64, b: i64) -> i64 { return a + b; }
+async fn main() {
+    let obj = new Item(3);
+    println(-(await one()));
+    println((await one()) + 1);
+    println(1 + (await one()));
+    println(await one());
+    println(echo(await one()));
+    println(sum(1, await one()));
+    println((await item()).field);
+    println((await item()).add(1));
+    println(obj.add(await one()));
+    println(Item::echo(await one()));
+    println((new Item(await one())).field);
+    println(await forwarded());
+    println([await one(), 2][0]);
+    println([2, await one()][1]);
+    println((await array())[0]);
+    println([7, 8][await one()]);
+    let mut left = 0; for n in (await one())..3 { left = left + n; } println(left);
+    let mut right = 0; for n in 0..(await one()) { right = right + n; } println(right);
+    println(true ? (await one()) : 9);
+    println(false ? 9 : (await one()));
+}
+"#);
+    assert!(ok, "{out}");
+    assert_eq!(out, "-1\n2\n2\n1\n1\n2\n3\n4\n4\n1\n1\n1\n1\n1\n7\n8\n3\n0\n1\n1\n");
 }

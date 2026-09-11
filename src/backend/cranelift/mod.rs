@@ -26,13 +26,16 @@ mod ast_passes;
 mod async_codegen;
 mod compile;
 pub use compile::{DeclaredModule, DeclaredProgram, ItemBinding, ModuleSpelling, UnitImports};
-mod coop_anf;
 mod emit;
 mod emit_collections;
 mod emit_expr;
 mod emit_interface;
 mod emit_match;
 mod emit_object;
+mod flat_objects;
+mod flat_calls;
+mod flat_references;
+mod flat_control;
 mod emit_option_result;
 mod emit_pow;
 mod emit_pow_f64;
@@ -79,26 +82,14 @@ struct ParamDebug {
     mode: ParamMode,
 }
 
-#[derive(Default)]
-struct ModuleAliasSnapshot {
-    functions: Vec<(FunctionId, Option<FunctionId>)>,
-    types: Vec<(String, Option<type_index::TypeBinding>)>,
-    /// Module access names temporarily bound to a ModuleId for one unit
-    /// (willow-kd1v), together with their previous identity bindings.
-    modules: Vec<(String, Option<crate::module::ModuleId>)>,
-}
-
-/// Owns restoration even when a unit returns an error or unwinds.
-struct ModuleAliasScope<'a> {
-    codegen: &'a mut Codegen,
-    aliases: ModuleAliasSnapshot,
-}
-
-impl Drop for ModuleAliasScope<'_> {
-    fn drop(&mut self) {
-        self.codegen
-            .restore_module_aliases(std::mem::take(&mut self.aliases));
-    }
+/// Immutable name-resolution views for one compilation unit. Declaration
+/// metadata remains in the build-wide indexes; switching units only switches
+/// these snapshots, never rewrites another unit's aliases.
+#[derive(Clone)]
+struct UnitResolutionContext {
+    types: TypeScope,
+    functions: crate::semantic::ids::FunctionScope,
+    modules: module_index::ModuleResolutionContext,
 }
 
 /// Bytes before the first virtual method slot in a class descriptor: the
@@ -110,7 +101,7 @@ pub(super) const CLASS_DESCRIPTOR_HEADER_BYTES: u32 = 8;
 /// the way the next unit needs them (willow-nm0g).
 #[derive(Default)]
 pub struct EnumAliasScope {
-    types: Vec<(String, Option<type_index::TypeBinding>)>,
+    types: TypeScope,
 }
 
 pub struct Codegen {
@@ -537,12 +528,66 @@ impl Codegen {
         Ok(())
     }
 
+    fn install_function_scope(&mut self, scope: crate::semantic::ids::FunctionScope) {
+        self.func_ids.set_scope(scope.clone());
+        self.func_return_types.set_scope(scope.clone());
+        self.fn_types.set_scope(scope.clone());
+        self.func_param_modes.set_scope(scope.clone());
+        self.func_param_debug.set_scope(scope.clone());
+        self.function_may_panic.set_scope(scope);
+    }
+
+    fn bind_function_alias(&mut self, alias: FunctionId, canonical: FunctionId) -> Option<FunctionId> {
+        let mut scope = self.func_ids.scope().clone();
+        let previous = scope.bind(alias, canonical);
+        self.install_function_scope(scope);
+        previous
+    }
+
+    /// Install one immutable resolution snapshot in every type-index view.
+    /// Updating another unit's snapshot never mutates a previously held view.
+    fn install_type_scope(&mut self, scope: TypeScope) {
+        self.type_scope = scope.clone();
+        self.class_layouts.set_scope(scope.clone());
+        self.enum_infos.set_scope(scope.clone());
+        self.class_base.set_scope(scope.clone());
+        self.class_type_ids.set_scope(scope.clone());
+        self.class_own_fields.set_scope(scope.clone());
+        self.class_own_vmethods.set_scope(scope.clone());
+        self.class_vslots.set_scope(scope.clone());
+        self.class_descriptor_ids.set_scope(scope.clone());
+        self.interface_infos.set_scope(scope.clone());
+        self.vtable_ids.set_scope(scope.clone());
+        self.static_storage.set_scope(scope);
+    }
+
+    fn bind_type_alias(&mut self, alias: &str, target: &str) -> Option<type_index::TypeBinding> {
+        let mut scope = self.type_scope.clone();
+        let previous = scope.bind(alias, target);
+        self.install_type_scope(scope);
+        previous
+    }
+
+    fn bind_canonical_type_alias(&mut self, alias: &str, target: &str) -> Option<type_index::TypeBinding> {
+        let mut scope = self.type_scope.clone();
+        let previous = scope.bind_canonical(alias, target);
+        self.install_type_scope(scope);
+        previous
+    }
+
+    fn restore_type_alias(&mut self, alias: &str, previous: Option<type_index::TypeBinding>) {
+        let mut scope = self.type_scope.clone();
+        scope.restore(alias, previous);
+        self.install_type_scope(scope);
+    }
+
     /// Register enum info so the backend can lower enum variant construction.
     pub fn register_enum_info(&mut self, name: String, info: EnumInfo) {
         let identity = info.name.clone();
+        self.restore_type_alias(&identity.to_string(), None);
         self.enum_infos.insert(identity.clone(), info);
         if TypeId::from_source_name(&name) != identity {
-            self.type_scope.bind_canonical(&name, &identity.to_string());
+            self.bind_canonical_type_alias(&name, &identity.to_string());
         }
     }
 
@@ -562,32 +607,28 @@ impl Codegen {
     /// `Point::Near` reads as an interface and is refused. The alias is this
     /// unit's answer for the name, so nothing else may answer for it here.
     pub fn install_enum_aliases(&mut self, aliases: &[(String, EnumInfo)]) -> EnumAliasScope {
-        let mut scope = EnumAliasScope::default();
+        let scope = EnumAliasScope { types: self.type_scope.clone() };
         for (name, info) in aliases {
             // The unit checker supplies identity; metadata remains build-wide.
             if self.enum_infos.get_canonical(&info.name).is_none() {
                 self.enum_infos.insert(info.name.clone(), info.clone());
             }
-            scope.types.push((
-                name.clone(),
-                self.type_scope.bind_canonical(name, &info.name.to_string()),
-            ));
+            self.bind_canonical_type_alias(name, &info.name.to_string());
         }
         scope
     }
 
     pub fn restore_enum_aliases(&mut self, scope: EnumAliasScope) {
-        for (name, previous) in scope.types.into_iter().rev() {
-            self.type_scope.restore(&name, previous);
-        }
+        self.install_type_scope(scope.types);
     }
 
     /// Register interface metadata for vtable generation and method dispatch.
     pub fn register_interface_info(&mut self, name: String, info: InterfaceInfo) {
         let identity = info.name.clone();
+        self.restore_type_alias(&identity.to_string(), None);
         self.interface_infos.insert(identity.clone(), info);
         if TypeId::from_source_name(&name) != identity {
-            self.type_scope.bind_canonical(&name, &identity.to_string());
+            self.bind_canonical_type_alias(&name, &identity.to_string());
         }
     }
 
@@ -740,10 +781,10 @@ impl Codegen {
             || self.enum_infos.contains_key(&qualified)
             || self.interface_infos.contains_key(&qualified)
         {
-            self.type_scope.bind(local, &qualified);
+            self.bind_type_alias(local, &qualified);
         }
         for (alias, full) in self.item_import_method_aliases(local, module, item) {
-            self.func_ids.scope().bind(
+            self.bind_function_alias(
                 FunctionId::free(&alias),
                 self.func_ids.scope().lookup_id(&full),
             );
@@ -817,7 +858,7 @@ impl Codegen {
             .unwrap_or_else(|| module_symbol_prefix(module));
         let mangled = module_item_symbol(&module_prefix, item);
         if self.func_ids.contains_key(&mangled) {
-            self.func_ids.scope().bind(
+            self.bind_function_alias(
                 FunctionId::free(local),
                 self.func_ids.scope().lookup_id(&mangled),
             );
@@ -831,15 +872,10 @@ impl Codegen {
         &mut self,
         alias: &str,
         canonical: &str,
-        aliases: &mut ModuleAliasSnapshot,
     ) {
         if self.func_ids.contains_key(canonical) {
             let alias = FunctionId::free(alias);
-            let previous = self
-                .func_ids
-                .scope()
-                .bind(alias.clone(), self.func_ids.scope().lookup_id(canonical));
-            aliases.functions.push((alias, previous));
+            self.bind_function_alias(alias, self.func_ids.scope().lookup_id(canonical));
         }
     }
 
@@ -847,12 +883,9 @@ impl Codegen {
         &mut self,
         alias: &str,
         canonical: &str,
-        aliases: &mut ModuleAliasSnapshot,
     ) {
         if self.class_layouts.contains_key(canonical) {
-            aliases
-                .types
-                .push((alias.to_string(), self.type_scope.bind(alias, canonical)));
+            self.bind_type_alias(alias, canonical);
         }
     }
 
@@ -888,15 +921,13 @@ impl Codegen {
     fn alias_unit_module_spellings(
         &mut self,
         spellings: &[compile::ModuleSpelling],
-        aliases: &mut ModuleAliasSnapshot,
     ) {
         for spelling in spellings {
             if spelling.access == spelling.graph_name {
                 continue;
             }
             if let Some(id) = self.known_modules.resolve(&spelling.graph_name) {
-                let previous = self.known_modules.bind(spelling.access.clone(), id);
-                aliases.modules.push((spelling.access.clone(), previous));
+                self.known_modules.bind(spelling.access.clone(), id);
             }
             for name in &spelling.types {
                 let alias = format!("{}::{name}", spelling.access);
@@ -915,10 +946,7 @@ impl Codegen {
                 if self.resolved_name(&alias) == canonical {
                     continue;
                 }
-                aliases.types.push((
-                    alias.clone(),
-                    self.type_scope.bind_canonical(&alias, &canonical),
-                ));
+                self.bind_canonical_type_alias(&alias, &canonical);
             }
         }
     }
@@ -939,26 +967,32 @@ impl Codegen {
             || self.interface_infos.contains_key(name)
     }
 
-    fn with_module_aliases<R>(
-        &mut self,
-        body: impl FnOnce(&mut Self, &mut ModuleAliasSnapshot) -> R,
-    ) -> R {
-        let mut scope = ModuleAliasScope {
-            codegen: self,
-            aliases: ModuleAliasSnapshot::default(),
-        };
-        body(scope.codegen, &mut scope.aliases)
+    fn resolution_context(&self) -> UnitResolutionContext {
+        UnitResolutionContext {
+            types: self.type_scope.clone(),
+            functions: self.func_ids.scope().clone(),
+            modules: self.known_modules.resolution_context(),
+        }
     }
 
-    fn restore_module_aliases(&mut self, aliases: ModuleAliasSnapshot) {
-        for (alias, previous) in aliases.functions.into_iter().rev() {
-            self.func_ids.scope().restore(alias, previous);
-        }
-        for (alias, previous) in aliases.types.into_iter().rev() {
-            self.type_scope.restore(&alias, previous);
-        }
-        for (access, previous) in aliases.modules.into_iter().rev() {
-            self.known_modules.restore(access, previous);
+    fn install_resolution_context(&mut self, context: UnitResolutionContext) {
+        self.install_type_scope(context.types);
+        self.install_function_scope(context.functions);
+        self.known_modules.set_resolution_context(context.modules);
+    }
+
+    fn with_unit_resolution<R>(
+        &mut self,
+        context: UnitResolutionContext,
+        body: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous = self.resolution_context();
+        self.install_resolution_context(context);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(self)));
+        self.install_resolution_context(previous);
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
         }
     }
 
@@ -988,7 +1022,6 @@ impl Codegen {
     fn alias_item_import_types(
         &mut self,
         items: &[compile::ItemBinding],
-        aliases: &mut ModuleAliasSnapshot,
     ) {
         for item in items {
             let qualified = format!("{}::{}", self.table_module_name(&item.module), item.item);
@@ -996,10 +1029,7 @@ impl Codegen {
                 || self.class_layouts.contains_key(&qualified)
                 || self.enum_infos.contains_key(&qualified)
             {
-                aliases.types.push((
-                    item.local.clone(),
-                    self.type_scope.bind(&item.local, &qualified),
-                ));
+                self.bind_type_alias(&item.local, &qualified);
             }
             // A class's methods travel with the name: `import leaf::Box;` then
             // `b.get()` mangles to `Box.get`, which is nothing this build
@@ -1010,7 +1040,7 @@ impl Codegen {
             for (alias, full) in
                 self.item_import_method_aliases(&item.local, &item.module, &item.item)
             {
-                self.alias_function_symbol(&alias, &full, aliases);
+                self.alias_function_symbol(&alias, &full);
             }
         }
     }
@@ -1024,7 +1054,6 @@ impl Codegen {
         &mut self,
         program: &Program,
         mod_name: &str,
-        aliases: &mut ModuleAliasSnapshot,
     ) {
         for item in &program.items {
             let Item::Interface(interface) = item else {
@@ -1032,9 +1061,7 @@ impl Codegen {
             };
             let name = &interface.name;
             let qualified = format!("{mod_name}::{name}");
-            aliases
-                .types
-                .push((name.clone(), self.type_scope.bind(name, &qualified)));
+            self.bind_type_alias(name, &qualified);
         }
     }
 
@@ -1045,6 +1072,7 @@ impl Codegen {
     // ── Class helpers ─────────────────────────────────────────────────────────
 
     fn register_class_layout(&mut self, c: &ClassDecl) {
+        self.restore_type_alias(&c.name, None);
         let own: Vec<(String, Type)> = c
             .fields
             .iter()
@@ -1272,13 +1300,8 @@ impl Codegen {
     }
 }
 
-/// Typed code executed by one queued defer. Captured operands retain their
-/// registration-time values; block bodies retain their checked HIR.
-#[derive(Clone)]
-pub(super) enum DeferredAction {
-    HirExpr(crate::ir::typed_ast::HirExpr),
-    HirBlock(Vec<crate::ir::typed_ast::HirStmt>),
-}
+/// A fully lowered cleanup region and its lexical capture identities.
+pub(super) type DeferredAction = crate::ir::lowered::LirDeferBody;
 
 /// One queued defer: the deferred action, the async
 /// registration-flag offset (None for sync), and the hidden frame bindings to
@@ -1301,6 +1324,9 @@ pub(super) struct DeferEntry {
 
 #[derive(Clone)]
 pub(super) struct PanicScope {
+    /// Preparations live before this lexical scope must be replayed on recovery.
+    call_frames_at_entry: Vec<(String, crate::diagnostics::Span)>,
+    reference_scopes_at_entry: Vec<Vec<FlatReferenceDebug>>,
     cleanup: cranelift_codegen::ir::Block,
     resume: cranelift_codegen::ir::Block,
     root_depth_at_entry: cranelift_codegen::ir::Value,
@@ -1415,9 +1441,15 @@ struct FuncGen<'a, 'b> {
     panic_return_block: Option<cranelift_codegen::ir::Block>,
     /// Shadow-root depth inherited from the caller at function entry.
     panic_function_root_depth: Option<cranelift_codegen::ir::Value>,
+    emitting_sync_cancel_cleanup: bool,
+    lir_cleanup_exit: Option<(cranelift_codegen::ir::Block, usize, bool)>,
     /// Debug call-chain frames installed by this generated function and not
     /// yet popped on the source path currently being emitted.
     callstack_frame_depth: usize,
+    /// Source call frames opened before their argument expressions. They can
+    /// span LIR edges and must be replayed when a cooperative poll resumes.
+    lir_call_frames: Vec<(String, crate::diagnostics::Span)>,
+    lir_reference_scopes: Vec<Vec<FlatReferenceDebug>>,
     /// Source span of the statement being emitted. Debug builds publish it as
     /// the runtime fault site before every runtime call that can raise, so a
     /// fault with no location of its own (array bounds, a blocked channel op,
@@ -1538,6 +1570,15 @@ struct CoopShadowRoots {
 struct CoopSuspendPoint {
     resume: cranelift_codegen::ir::Block,
     roots: Vec<cranelift_codegen::ir::StackSlot>,
+    call_frames: Vec<(String, crate::diagnostics::Span)>,
+    reference_restore: Option<cranelift_codegen::ir::Block>,
+}
+
+#[derive(Clone, PartialEq)]
+struct FlatReferenceDebug {
+    argument: crate::ir::lowered::LirOperand,
+    callee: FunctionId,
+    index: usize,
 }
 
 #[derive(Clone)]
@@ -2189,6 +2230,7 @@ fn try_gc_ref_mask_for_layout(
 #[allow(dead_code)] // Consumed by willow-lpn.5 (async frame emission + state machine).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AsyncFrameSlot {
+    pub storage_kind: crate::ir::lowered::LirStorageKind,
     /// Diagnostic location only. Physical identity is the slot's index;
     /// logical local/defer identities live in the LIR layout's offset maps.
     pub source_span: Option<crate::diagnostics::Span>,
@@ -2228,7 +2270,7 @@ impl AsyncFrameLayout {
         let mut gc_payload_bitmap =
             vec![0u64; (slots.len() + ASYNC_FRAME_HEADER_WORDS).div_ceil(64)];
         for (k, slot) in slots.iter().enumerate() {
-            if is_gc_managed(&slot.ty, enum_infos) {
+            if slot.storage_kind == crate::ir::lowered::LirStorageKind::GcOwner || is_gc_managed(&slot.ty, enum_infos) {
                 let word = k + ASYNC_FRAME_HEADER_WORDS;
                 gc_payload_bitmap[word / 64] |= 1 << (word % 64);
             }
@@ -2238,7 +2280,7 @@ impl AsyncFrameLayout {
             .take(ASYNC_FRAME_GC_SLOT_CAPACITY)
             .enumerate()
             .fold(0u64, |mask, (k, slot)| {
-                if is_gc_managed(&slot.ty, enum_infos) {
+                if slot.storage_kind == crate::ir::lowered::LirStorageKind::GcOwner || is_gc_managed(&slot.ty, enum_infos) {
                     mask | (1u64 << k)
                 } else {
                     mask
@@ -2279,6 +2321,7 @@ fn collect_async_frame_slots(params: &[Param], body: &Block) -> Vec<AsyncFrameSl
     let mut slots: Vec<AsyncFrameSlot> = params
         .iter()
         .map(|p| AsyncFrameSlot {
+                storage_kind: crate::ir::lowered::LirStorageKind::Value,
             source_span: Some(p.span),
             name: p.name.clone(),
             ty: p.ty.clone().into(),
@@ -2305,6 +2348,7 @@ fn collect_let_slots(
                     && seen.insert(l.span)
                 {
                     out.push(AsyncFrameSlot {
+                storage_kind: crate::ir::lowered::LirStorageKind::Value,
                         source_span: Some(l.span),
                         name: l.name.clone(),
                         ty: ty.into(),
@@ -2523,12 +2567,10 @@ mod tests {
                 variants: vec![],
             },
         );
-        codegen.type_scope.bind_canonical("Alias", "origin::Choice");
-        codegen.type_scope.bind("Forward", "Alias");
+        codegen.bind_canonical_type_alias("Alias", "origin::Choice");
+        codegen.bind_type_alias("Forward", "Alias");
         codegen.class_layouts.insert("origin::Record", vec![]);
-        codegen
-            .type_scope
-            .bind_canonical("Record", "origin::Record");
+        codegen.bind_canonical_type_alias("Record", "origin::Record");
 
         let named = |name: &str| Type::Named(name.into());
         let closure = |params, ret| Type::Closure(params, Box::new(ret));
@@ -2715,7 +2757,7 @@ mod tests {
     }
 
     #[test]
-    fn module_alias_scope_restores_all_tables_on_every_exit() {
+    fn unit_resolution_context_restores_all_views_on_every_exit() {
         use crate::semantic::ids::TypeId;
         use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -2727,11 +2769,8 @@ mod tests {
                 let function = FunctionId::free_from_source_name("local");
                 let original = FunctionId::free_from_source_name("original");
                 if binding_shape != 0 {
-                    codegen
-                        .func_ids
-                        .scope()
-                        .bind(function.clone(), original.clone());
-                    codegen.type_scope.bind("Local", "Original");
+                    codegen.bind_function_alias(function.clone(), original.clone());
+                    codegen.bind_type_alias("Local", "Original");
                     codegen
                         .known_modules
                         .insert("local".into(), "original".into());
@@ -2742,29 +2781,21 @@ mod tests {
                     .resolve(&TypeId::from_source_name("Local"));
                 let before_module = codegen.known_modules.linker_prefix("local").cloned();
                 let result = catch_unwind(AssertUnwindSafe(|| {
-                    codegen.with_module_aliases(|this, aliases| -> anyhow::Result<()> {
+                    codegen.with_unit_resolution(codegen.resolution_context(), |this| -> anyhow::Result<()> {
                         let repetitions = if binding_shape == 2 { 3 } else { 1 };
                         for i in 0..repetitions {
                             let target = format!("temporary{i}");
-                            aliases.functions.push((
-                                function.clone(),
-                                this.func_ids.scope().bind(
-                                    function.clone(),
-                                    FunctionId::free_from_source_name(&target),
-                                ),
-                            ));
-                            aliases
-                                .types
-                                .push(("Local".into(), this.type_scope.bind("Local", &target)));
-                            let previous = this.known_modules.resolve("local");
-                            this.known_modules.insert("local".into(), target);
-                            aliases.modules.push(("local".into(), previous));
+                            this.bind_function_alias(function, FunctionId::free_from_source_name(&target));
+                            this.bind_type_alias("Local", &target);
+                            let id = crate::module::ModuleId(10 + i);
+                            this.known_modules.register(id, &target, &target);
+                            this.known_modules.bind("local".into(), id);
                         }
                         if binding_shape == 3 {
-                            this.with_module_aliases(|inner, aliases| {
-                                let previous = inner.known_modules.resolve("local");
-                                inner.known_modules.insert("local".into(), "inner".into());
-                                aliases.modules.push(("local".into(), previous));
+                            this.with_unit_resolution(this.resolution_context(), |inner| {
+                                let id = crate::module::ModuleId(100);
+                                inner.known_modules.register(id, "inner", "inner");
+                                inner.known_modules.bind("local".into(), id);
                             });
                             assert_eq!(
                                 this.known_modules.linker_prefix("local").unwrap(),
@@ -2908,6 +2939,18 @@ mod tests {
     // Each test is one perspective on the GC reference mask the compiler must
     // hand to willow_async_frame_alloc: which frame slots are heap references.
 
+    #[test]
+    fn opaque_gc_owner_frame_slots_are_traced_without_language_types() {
+        use crate::ir::lowered::LirStorageKind;
+        let layout = AsyncFrameLayout::new(vec![
+            AsyncFrameSlot { storage_kind: LirStorageKind::GcOwner, source_span: None, name: "owner".into(), ty: Type::Void },
+            AsyncFrameSlot { storage_kind: LirStorageKind::Value, source_span: None, name: "unit".into(), ty: Type::Void },
+        ], &TypeMap::new());
+        assert!(layout.slot_is_gc_ref(0));
+        assert!(!layout.slot_is_gc_ref(1));
+        assert_eq!(layout.gc_slot_mask, 1);
+    }
+
     /// Helper: build a layout from `(name, ty)` slots with no enum registry.
     fn frame_layout(slots: &[(&str, Type)]) -> AsyncFrameLayout {
         let enum_infos: TypeMap<EnumInfo> = TypeMap::new();
@@ -2921,6 +2964,7 @@ mod tests {
         let slots = slots
             .iter()
             .map(|(n, t)| AsyncFrameSlot {
+                storage_kind: crate::ir::lowered::LirStorageKind::Value,
                 source_span: None,
                 name: (*n).to_string(),
                 ty: t.clone(),
@@ -3135,6 +3179,7 @@ mod tests {
 
         let too_many_slots: Vec<AsyncFrameSlot> = (0..=ASYNC_FRAME_GC_SLOT_CAPACITY)
             .map(|i| AsyncFrameSlot {
+                storage_kind: crate::ir::lowered::LirStorageKind::Value,
                 source_span: None,
                 name: format!("r{i}"),
                 ty: Type::String,
@@ -3270,3 +3315,29 @@ mod tests {
 // ── Nil-check string pre-scan ─────────────────────────────────────────────────
 // Collect all field names and method names referenced in the program so their
 // string literals can be pre-declared before any function is compiled.
+
+/// Address-stable bindings are explicit places in the executable LIR. Include
+/// cleanup regions because their captures may take an outer binding's address.
+pub(super) fn lir_address_taken_locals(function: &crate::ir::lowered::LirFunction) -> HashSet<String> {
+    use crate::ir::lowered::{LirInst, LirOperand, LirPlace};
+    let mut names = HashSet::new();
+    let mut pending = vec![function];
+    while let Some(function) = pending.pop() {
+        for block in &function.blocks {
+            for instruction in &block.instrs {
+                match instruction {
+                    LirInst::Compute { value, .. } => {
+                        for operand in value.operands() {
+                            if let LirOperand::Reference { place: LirPlace::Local(local), .. } = operand {
+                                names.insert(function.locals[local.0 as usize].name.clone());
+                            }
+                        }
+                    }
+                    LirInst::Defer { body, .. } => pending.push(&body.function),
+                    _ => {}
+                }
+            }
+        }
+    }
+    names
+}

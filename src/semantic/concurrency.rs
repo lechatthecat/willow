@@ -106,18 +106,42 @@ struct SyncHelperRef {
     module: Option<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ConcurrencyAnalyzer {
     pub errors: Vec<Diagnostic>,
     pub report: ConcurrencyReport,
     current_async_context: bool,
+    sync_stack_preemption: bool,
     current_class: Option<TypeId>,
     nonpreemptible_sync_helpers: HashMap<FunctionId, SyncHelperRef>,
+}
+
+impl Default for ConcurrencyAnalyzer {
+    fn default() -> Self {
+        Self {
+            errors: Vec::new(),
+            report: ConcurrencyReport::default(),
+            current_async_context: false,
+            sync_stack_preemption: cfg!(all(
+                target_os = "linux",
+                target_env = "gnu",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )),
+            current_class: None,
+            nonpreemptible_sync_helpers: HashMap::new(),
+        }
+    }
 }
 
 impl ConcurrencyAnalyzer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Select the target runtime capability independently of source effects.
+    pub fn with_sync_stack_preemption(mut self, supported: bool) -> Self {
+        self.sync_stack_preemption = supported;
+        self
     }
 
     /// Seed the nonpreemptible-helper index with the non-preemptible sync
@@ -369,7 +393,7 @@ impl ConcurrencyAnalyzer {
     }
 
     fn check_task_sync_helper_call(&mut self, callee: &FunctionId, call_span: Span) {
-        if !self.current_async_context {
+        if self.sync_stack_preemption || !self.current_async_context {
             return;
         }
         let Some(helper) = self.nonpreemptible_sync_helpers.get(callee) else {
@@ -691,14 +715,44 @@ mod tests {
         program
     }
 
+    #[test]
+    fn native_stack_capability_accepts_task_calls_to_recursive_and_looping_helpers() {
+        let program = parse(
+            "fn recurse(n: i64) -> i64 { if n == 0 { return 0; } return recurse(n - 1); } fn spin() { while true {} } async fn task() { recurse(10); spin(); }",
+        );
+        let supported = ConcurrencyAnalyzer::new()
+            .with_sync_stack_preemption(true)
+            .check_program(&program);
+        assert!(
+            !supported
+                .errors
+                .iter()
+                .any(|error| error.code == ErrorCode::E0810)
+        );
+        let unsupported = ConcurrencyAnalyzer::new()
+            .with_sync_stack_preemption(false)
+            .check_program(&program);
+        assert_eq!(
+            unsupported
+                .errors
+                .iter()
+                .filter(|error| error.code == ErrorCode::E0810)
+                .count(),
+            2
+        );
+    }
+
     fn analyze(source: &str) -> ConcurrencyAnalyzer {
-        ConcurrencyAnalyzer::new().check_program(&parse(source))
+        ConcurrencyAnalyzer::new()
+            .with_sync_stack_preemption(false)
+            .check_program(&parse(source))
     }
 
     /// Analyze `entry` with one imported module's looping sync helpers seeded
     /// under `module_name::*`, mirroring the entry-program path in `main.rs`.
     fn analyze_with_module(entry: &str, module_name: &str, module: &str) -> ConcurrencyAnalyzer {
         ConcurrencyAnalyzer::new()
+            .with_sync_stack_preemption(false)
             .with_module_helpers(module_name, &parse(module))
             .check_program(&parse(entry))
     }
@@ -1249,6 +1303,7 @@ async fn run() -> i64 {
         module_src: &str,
     ) -> ConcurrencyAnalyzer {
         ConcurrencyAnalyzer::new()
+            .with_sync_stack_preemption(false)
             .with_item_helper(local, item, module, &parse(module_src))
             .check_program(&parse(entry))
     }

@@ -249,6 +249,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// Debug builds: pop the most recent call-chain frame after a call returns.
+    pub(super) fn emit_callstack_unwind_edge(&mut self) {
+        for _ in 0..self.lir_reference_scopes.len() { self.emit_debug_reference_call_clear(); }
+        let depth = self.callstack_frame_depth;
+        for _ in 0..depth { self.emit_callstack_pop(); }
+        self.callstack_frame_depth = depth;
+    }
+
     pub(super) fn emit_callstack_pop(&mut self) {
         self.callstack_frame_depth = self
             .callstack_frame_depth
@@ -257,5 +264,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let pop_id = self.func_id("willow_callstack_pop");
         let pop_ref = self.module.declare_func_in_func(pop_id, self.builder.func);
         self.builder.ins().call(pop_ref, &[]);
+    }
+
+    pub(super) fn emit_replay_reference_scopes(&mut self) {
+        for scope in self.lir_reference_scopes.clone() {
+            self.emit_debug_reference_call_scope_push();
+            for record in scope { self.emit_flat_reference_debug(&record.argument, &record.callee, record.index); }
+        }
     }
 }

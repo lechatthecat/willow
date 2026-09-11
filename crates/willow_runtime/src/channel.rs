@@ -85,6 +85,19 @@ unsafe fn trace_channel(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     }
 }
 
+unsafe fn snapshot_channel(payload: *mut u8, children: &mut Vec<*mut u8>) {
+    let channel = unsafe { &*(payload as *const WillowAbiChannel) };
+    if channel.is_ref {
+        let state = channel.state.lock().unwrap();
+        children.extend(
+            state
+                .values
+                .iter()
+                .map(|value| unsafe { value.ptr_value as *mut u8 }),
+        );
+    }
+}
+
 /// Drop a channel payload before the GC releases its allocation. The channel
 /// state owns Rust-allocated `VecDeque` buffers, so deallocating only the GC
 /// block would leak those buffers.
@@ -104,11 +117,11 @@ static CHANNEL_DROP_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 
 static CHANNEL_REGISTRATION: crate::gc::NativeGcRegistration =
     crate::gc::NativeGcRegistration::new();
-const CHANNEL_GC_TYPES: &[crate::gc::NativeGcType] = &[crate::gc::NativeGcType::new(
-    CHANNEL_TYPE_ID,
-    Some(trace_channel),
-    Some(drop_channel),
-)];
+const CHANNEL_GC_TYPES: &[crate::gc::NativeGcType] =
+    &[
+        crate::gc::NativeGcType::new(CHANNEL_TYPE_ID, Some(trace_channel), Some(drop_channel))
+            .with_concurrent_trace(snapshot_channel),
+    ];
 
 #[cfg(test)]
 static CHANNEL_REGISTRATION_COUNT: std::sync::atomic::AtomicUsize =

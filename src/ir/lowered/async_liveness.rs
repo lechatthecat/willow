@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ir::typed_ast::{HirExpr, HirExprKind};
 
-use super::{BlockId, LirBlock, LirInst, LirLocal, LirLocalId, LirSelectOp, Terminator};
+use super::{BlockId, SourceBlock, SourceInst, LirLocal, LirLocalId, LirSelectOp, SourceTerminator};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameSlot {
@@ -28,7 +28,7 @@ impl LirAsyncFrameLayout {
 }
 
 /// Compute the exact set of locals live across explicit LIR suspension edges.
-pub fn analyze(blocks: &[LirBlock], locals: &[LirLocal]) -> LirAsyncFrameLayout {
+pub fn analyze(blocks: &[SourceBlock], locals: &[LirLocal]) -> LirAsyncFrameLayout {
     let names: HashMap<&str, LirLocalId> = locals
         .iter()
         .map(|local| (local.name.as_str(), local.id))
@@ -62,13 +62,13 @@ pub fn analyze(blocks: &[LirBlock], locals: &[LirLocal]) -> LirAsyncFrameLayout 
     let mut framed = HashSet::new();
     let mut pinned = HashSet::new();
     for block in blocks {
-        if let Terminator::Suspend { operation, .. } = &block.terminator {
+        if let SourceTerminator::Suspend { operation, .. } = &block.terminator {
             framed.extend(live_out[block.id.0].iter().copied());
             operation.collect_locals(&mut pinned);
         }
         for inst in &block.instrs {
             match inst {
-                LirInst::SelectInit { operations } => {
+                SourceInst::SelectInit { operations } => {
                     for operation in operations {
                         collect_select_locals(operation, &mut pinned);
                         if let LirSelectOp::Timeout { deadline, .. } = operation {
@@ -76,21 +76,21 @@ pub fn analyze(blocks: &[LirBlock], locals: &[LirLocal]) -> LirAsyncFrameLayout 
                         }
                     }
                 }
-                LirInst::SelectProbe { operations, ready } => {
+                SourceInst::SelectProbe { operations, ready } => {
                     for operation in operations {
                         collect_select_locals(operation, &mut pinned);
                     }
                     pinned.extend(ready.iter().flatten().copied());
                 }
-                LirInst::SelectPick { chosen, .. } => {
+                SourceInst::SelectPick { chosen, .. } => {
                     pinned.insert(*chosen);
                 }
-                LirInst::SelectUnregister { operations } => {
+                SourceInst::SelectUnregister { operations } => {
                     for operation in operations {
                         collect_select_locals(operation, &mut pinned);
                     }
                 }
-                LirInst::SelectCommit { operation, success } => {
+                SourceInst::SelectCommit { operation, success } => {
                     collect_select_locals(operation, &mut pinned);
                     pinned.insert(*success);
                     match operation {
@@ -100,30 +100,18 @@ pub fn analyze(blocks: &[LirBlock], locals: &[LirLocal]) -> LirAsyncFrameLayout 
                         _ => {}
                     }
                 }
-                LirInst::Defer { body, .. } => {
-                    let no_defs = HashSet::new();
-                    match body {
-                        super::LirDeferBody::Expr(expr) => {
-                            collect_expr_uses(expr, &names, &mut pinned, &no_defs)
-                        }
-                        super::LirDeferBody::Block(stmts) => {
-                            for expr in stmts.iter().flat_map(|stmt| stmt.child_exprs()) {
-                                collect_expr_uses(expr, &names, &mut pinned, &no_defs);
-                            }
-                        }
-                    }
-                }
+                SourceInst::Defer { body, .. } => pinned.extend(body.captures.iter().copied()),
                 _ => {}
             }
         }
         if block
             .instrs
             .iter()
-            .any(|inst| matches!(inst, LirInst::FlushDefers { .. }))
+            .any(|inst| matches!(inst, SourceInst::FlushDefers { .. }))
         {
             let no_defs = HashSet::new();
             match &block.terminator {
-                Terminator::Return(Some(value)) | Terminator::Branch { cond: value, .. } => {
+                SourceTerminator::Return(Some(value)) | SourceTerminator::Branch { cond: value, .. } => {
                     collect_expr_uses(value, &names, &mut pinned, &no_defs);
                 }
                 _ => {}
@@ -147,7 +135,7 @@ pub fn analyze(blocks: &[LirBlock], locals: &[LirLocal]) -> LirAsyncFrameLayout 
         touched.extend(&uses[block.id.0]);
         touched.extend(&defs[block.id.0]);
         for inst in &block.instrs {
-            if let LirInst::ClearScopeRoots { locals: cleared } = inst {
+            if let SourceInst::ClearScopeRoots { locals: cleared } = inst {
                 // Primitive locals have no root to clear; the backend emits
                 // no store for them. Scope-exit lists include all source
                 // locals, including scalars whose lifetimes already ended.
@@ -196,7 +184,7 @@ pub fn analyze(blocks: &[LirBlock], locals: &[LirLocal]) -> LirAsyncFrameLayout 
 }
 
 fn reusable_scalar(local: &LirLocal) -> bool {
-    matches!(
+    !local.is_gc_owner() && matches!(
         local.ty,
         crate::parser::ast::Type::I64
             | crate::parser::ast::Type::F64
@@ -229,31 +217,46 @@ fn collect_select_locals(operation: &LirSelectOp, out: &mut HashSet<LirLocalId>)
 }
 
 fn block_use_def(
-    block: &LirBlock,
+    block: &SourceBlock,
+    names: &HashMap<&str, LirLocalId>,
+    uses: &mut HashSet<LirLocalId>,
+    defs: &mut HashSet<LirLocalId>,
+) {
+    for inst in &block.instrs {
+        instruction_use_def(inst, names, uses, defs);
+    }
+    terminator_uses(&block.terminator, names, uses, defs);
+}
+
+pub(crate) fn instruction_use_def(
+    inst: &SourceInst,
     names: &HashMap<&str, LirLocalId>,
     uses: &mut HashSet<LirLocalId>,
     defs: &mut HashSet<LirLocalId>,
 ) {
     macro_rules! read {
-        ($expr:expr) => {
-            collect_expr_uses($expr, names, uses, defs)
-        };
+        ($expr:expr) => { collect_expr_uses($expr, names, uses, defs) };
     }
-    for inst in &block.instrs {
         match inst {
-            LirInst::Let { local, value, .. } => {
+            SourceInst::Compute { local, value, .. } => {
+                for operand in value.operands() {
+                    for id in operand.locals() { if !defs.contains(&id) { uses.insert(id); } }
+                }
+                defs.insert(*local);
+            }
+            SourceInst::Let { local, value, .. } => {
                 read!(value);
                 defs.insert(*local);
             }
-            LirInst::Assign { local, value, .. } => {
+            SourceInst::Assign { local, value, .. } => {
                 read!(value);
                 defs.insert(*local);
             }
-            LirInst::FieldAssign { object, value, .. } => {
+            SourceInst::FieldAssign { object, value, .. } => {
                 read!(object);
                 read!(value);
             }
-            LirInst::IndexAssign {
+            SourceInst::IndexAssign {
                 array,
                 index,
                 value,
@@ -262,21 +265,18 @@ fn block_use_def(
                 read!(index);
                 read!(value);
             }
-            LirInst::StaticFieldAssign { value, .. } | LirInst::Expr(value) => read!(value),
-            LirInst::SuperInit { args, .. } => {
+            SourceInst::StaticFieldAssign { value, .. } | SourceInst::Expr(value) => read!(value),
+            SourceInst::SuperInit { args, .. } => {
                 for arg in args {
                     read!(arg);
                 }
             }
-            LirInst::Defer { body, .. } => match body {
-                super::LirDeferBody::Expr(expr) => read!(expr),
-                super::LirDeferBody::Block(stmts) => {
-                    for expr in stmts.iter().flat_map(|stmt| stmt.child_exprs()) {
-                        read!(expr);
-                    }
+            SourceInst::Defer { body, .. } => {
+                for capture in &body.captures {
+                    if !defs.contains(capture) { uses.insert(*capture); }
                 }
-            },
-            LirInst::SelectInit { operations } => {
+            }
+            SourceInst::SelectInit { operations } => {
                 for operation in operations {
                     match operation {
                         LirSelectOp::Timeout { millis, deadline } => {
@@ -289,13 +289,13 @@ fn block_use_def(
                     }
                 }
             }
-            LirInst::SelectProbe { operations, ready } => {
+            SourceInst::SelectProbe { operations, ready } => {
                 for operation in operations {
                     select_uses(operation, uses, defs);
                 }
                 defs.extend(ready.iter().flatten().copied());
             }
-            LirInst::SelectPick { ready, chosen } => {
+            SourceInst::SelectPick { ready, chosen } => {
                 for local in ready.iter().flatten() {
                     if !defs.contains(local) {
                         uses.insert(*local);
@@ -303,12 +303,12 @@ fn block_use_def(
                 }
                 defs.insert(*chosen);
             }
-            LirInst::SelectUnregister { operations } => {
+            SourceInst::SelectUnregister { operations } => {
                 for operation in operations {
                     select_uses(operation, uses, defs);
                 }
             }
-            LirInst::SelectCommit { operation, success } => {
+            SourceInst::SelectCommit { operation, success } => {
                 select_uses(operation, uses, defs);
                 match operation {
                     LirSelectOp::Recv { binding, .. } | LirSelectOp::Join { binding, .. } => {
@@ -322,8 +322,8 @@ fn block_use_def(
             // each one stays live from the `lock` down to every exit that
             // leaves the section (willow-0g8j.2.13). A `lock` body's scope
             // reads them too: its panic cleanup is where an unwind releases.
-            LirInst::ReleaseLock(slots)
-            | LirInst::EnterDeferScope {
+            SourceInst::ReleaseLock(slots)
+            | SourceInst::EnterDeferScope {
                 lock: Some(slots), ..
             } => {
                 for local in slots.locals() {
@@ -337,7 +337,7 @@ fn block_use_def(
             // puts a binding an arm reads after suspending into the frame, and
             // keeps a scrutinee nothing reads again out of it
             // (willow-0g8j.2.11.1).
-            LirInst::MatchTest {
+            SourceInst::MatchTest {
                 scrutinee, result, ..
             } => {
                 if !defs.contains(scrutinee) {
@@ -345,7 +345,7 @@ fn block_use_def(
                 }
                 defs.insert(*result);
             }
-            LirInst::MatchBind {
+            SourceInst::MatchBind {
                 scrutinee,
                 bindings,
                 ..
@@ -358,17 +358,27 @@ fn block_use_def(
             // Naming a local does not read it: the instruction drops the GC
             // root of a scope that ended, so nothing it names is live past it
             // and nothing it names is redefined either (willow-0g8j.3.3).
-            LirInst::EnterDeferScope { .. }
-            | LirInst::LeaveDeferScope { .. }
-            | LirInst::FlushDefers { .. }
-            | LirInst::ClearScopeRoots { .. } => {}
+            SourceInst::EnterDeferScope { .. }
+            | SourceInst::LeaveDeferScope { .. }
+            | SourceInst::FlushDefers { .. }
+            | SourceInst::ClearScopeRoots { .. } => {}
         }
+}
+
+pub(crate) fn terminator_uses(
+    terminator: &SourceTerminator,
+    names: &HashMap<&str, LirLocalId>,
+    uses: &mut HashSet<LirLocalId>,
+    defs: &HashSet<LirLocalId>,
+) {
+    macro_rules! read {
+        ($expr:expr) => { collect_expr_uses($expr, names, uses, defs) };
     }
-    match &block.terminator {
-        Terminator::Branch { cond, .. } => read!(cond),
-        Terminator::Return(Some(value)) => read!(value),
-        Terminator::Suspend { operation, .. } => operation.collect_locals(uses),
-        Terminator::Jump(_) | Terminator::Return(None) => {}
+    match terminator {
+        SourceTerminator::Branch { cond, .. } => read!(cond),
+        SourceTerminator::Return(Some(value)) => read!(value),
+        SourceTerminator::Suspend { operation, .. } => operation.collect_locals(uses),
+        SourceTerminator::Jump(_) | SourceTerminator::Return(None) | SourceTerminator::CleanupReturn => {}
     }
 }
 
@@ -413,16 +423,16 @@ fn collect_expr_uses(
 /// Control-flow successors INCLUDING the panic edges: a value whose only later
 /// use is after a recovered panic is still live here, and the whole point of
 /// this pass is to decide what must survive a poll return.
-fn successors(block: &LirBlock) -> Vec<BlockId> {
+fn successors(block: &SourceBlock) -> Vec<BlockId> {
     let mut out = match &block.terminator {
-        Terminator::Jump(target) => vec![*target],
-        Terminator::Branch {
+        SourceTerminator::Jump(target) => vec![*target],
+        SourceTerminator::Branch {
             then_block,
             else_block,
             ..
         } => vec![*then_block, *else_block],
-        Terminator::Suspend { resume, .. } => vec![*resume],
-        Terminator::Return(_) => Vec::new(),
+        SourceTerminator::Suspend { resume, .. } => vec![*resume],
+        SourceTerminator::Return(_) | SourceTerminator::CleanupReturn => Vec::new(),
     };
     out.extend(block.recovery.iter().copied());
     out
@@ -474,7 +484,7 @@ mod coalescing_tests {
         assert!(errors.is_empty(), "{errors:?}");
         let (hir, errors) = crate::ir::lower::lower_program(&ast);
         assert!(errors.is_empty(), "{errors:?}");
-        let mut program = super::super::lower_program(&hir);
+        let mut program = super::super::lower_source_program(&hir);
         let f = program.functions.remove(0);
         (f.async_frame, f.locals)
     }

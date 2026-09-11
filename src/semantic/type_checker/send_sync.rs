@@ -298,20 +298,13 @@ enum Marker {
 }
 
 /// Substitute `Named(param)` occurrences using `subst` (type param → arg).
-#[willow_continuations::function(substitute)]
 fn substitute(ty: &Type, subst: &[(String, Type)]) -> Type {
-    match ty {
-        Type::Named(n) => subst
+    ty.substitute_names(|name| {
+        subst
             .iter()
-            .find(|(p, _)| p == n)
-            .map(|(_, t)| t.clone())
-            .unwrap_or_else(|| ty.clone()),
-        Type::Array(e) => Type::Array(Box::new(substitute(e, subst))),
-        Type::Generic(n, a) => {
-            Type::Generic(n.clone(), a.iter().map(|x| substitute(x, subst)).collect())
-        }
-        other => other.clone(),
-    }
+            .find(|(param, _)| param == name)
+            .map(|(_, ty)| ty.clone())
+    })
 }
 
 #[cfg(test)]

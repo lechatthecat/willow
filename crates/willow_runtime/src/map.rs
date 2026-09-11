@@ -18,6 +18,7 @@ use crate::gc::{
 };
 use crate::string::willow_string_as_str;
 use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard};
 
 /// `type_id` for maps. Distinct from the array type id and well above the
 /// small, sequentially-assigned class type ids.
@@ -65,14 +66,14 @@ unsafe fn key_from_word(word: i64, key_is_ref: i64) -> MapKey {
 ///
 /// # Safety
 /// `map` must be a non-null map payload produced by [`willow_map_new`].
-unsafe fn map_data<'a>(map: *mut u8) -> &'a mut MapData {
-    let boxed = unsafe { *(map as *mut *mut MapData) };
-    unsafe { &mut *boxed }
+unsafe fn map_data<'a>(map: *mut u8) -> MutexGuard<'a, MapData> {
+    let boxed = unsafe { *(map as *mut *mut Mutex<MapData>) };
+    unsafe { &*boxed }.lock().unwrap()
 }
 
 /// Trace hook: report reference-typed values as GC children.
 unsafe fn trace_map(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
-    let data = unsafe { map_data(payload) };
+    let mut data = unsafe { map_data(payload) };
     if data.layout.value_is_ref {
         for value in data.entries.values_mut() {
             slots.push((value as *mut i64).cast::<*mut u8>());
@@ -80,9 +81,16 @@ unsafe fn trace_map(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     }
 }
 
+unsafe fn snapshot_map(payload: *mut u8, children: &mut Vec<*mut u8>) {
+    let data = unsafe { map_data(payload) };
+    if data.layout.value_is_ref {
+        children.extend(data.entries.values().map(|value| *value as *mut u8));
+    }
+}
+
 /// Finalizer hook: free the boxed `MapData` when the map is swept.
 unsafe fn drop_map(payload: *mut u8) {
-    let boxed = unsafe { *(payload as *mut *mut MapData) };
+    let boxed = unsafe { *(payload as *mut *mut Mutex<MapData>) };
     if !boxed.is_null() {
         drop(unsafe { Box::from_raw(boxed) });
     }
@@ -93,11 +101,11 @@ unsafe fn drop_map(payload: *mut u8) {
 /// `Once` would fail to re-register after the first reset (e.g. in multi-init
 /// test runs). Real programs init once, so the repeated insert is harmless.
 static MAP_REGISTRATION: crate::gc::NativeGcRegistration = crate::gc::NativeGcRegistration::new();
-const MAP_GC_TYPES: &[crate::gc::NativeGcType] = &[crate::gc::NativeGcType::new(
-    MAP_TYPE_ID,
-    Some(trace_map),
-    Some(drop_map),
-)];
+const MAP_GC_TYPES: &[crate::gc::NativeGcType] =
+    &[
+        crate::gc::NativeGcType::new(MAP_TYPE_ID, Some(trace_map), Some(drop_map))
+            .with_concurrent_trace(snapshot_map),
+    ];
 
 fn ensure_registered() {
     MAP_REGISTRATION.ensure(MAP_GC_TYPES);
@@ -109,21 +117,21 @@ fn ensure_registered() {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_map_new(key_kind: i64, value_kind: i64, value_is_ref: i64) -> *mut u8 {
     ensure_registered();
-    let data = Box::into_raw(Box::new(MapData {
+    let data = Box::into_raw(Box::new(Mutex::new(MapData {
         layout: MapLayout {
             key_kind,
             value_kind,
             value_is_ref: value_is_ref != 0,
         },
         entries: HashMap::new(),
-    }));
+    })));
     let map = willow_alloc_with_layout(GcObjectKind::Map, MAP_TYPE_ID, 8, 0);
     if map.is_null() {
         // Reclaim the box rather than leaking it.
         drop(unsafe { Box::from_raw(data) });
         return std::ptr::null_mut();
     }
-    unsafe { *(map as *mut *mut MapData) = data };
+    unsafe { *(map as *mut *mut Mutex<MapData>) = data };
     map
 }
 
@@ -140,7 +148,7 @@ pub extern "C" fn willow_map_insert(
     if map.is_null() {
         return;
     }
-    let data = unsafe { map_data(map) };
+    let mut data = unsafe { map_data(map) };
     debug_assert_eq!(data.layout.value_is_ref, val_is_ref != 0);
     debug_assert_eq!(data.layout.key_kind == 3, key_is_ref != 0);
     let key = unsafe { key_from_word(key_word, key_is_ref) };
@@ -175,9 +183,12 @@ pub extern "C" fn willow_map_get(
     }
     let data = unsafe { map_data(map) };
     let key = unsafe { key_from_word(key_word, key_is_ref) };
-    match data.entries.get(&key) {
-        Some(&v) if use_niche != 0 => v as *mut u8,
-        Some(&v) => alloc_some(v, data.layout.value_is_ref),
+    let value = data.entries.get(&key).copied();
+    let is_ref = data.layout.value_is_ref;
+    drop(data);
+    match value {
+        Some(v) if use_niche != 0 => v as *mut u8,
+        Some(v) => alloc_some(v, is_ref),
         None if use_niche != 0 => std::ptr::null_mut(),
         None => alloc_none(),
     }
@@ -209,7 +220,7 @@ pub extern "C" fn willow_map_copy(map: *mut u8) -> *mut u8 {
     if copy.is_null() {
         return std::ptr::null_mut();
     }
-    let dst = unsafe { map_data(copy) };
+    let mut dst = unsafe { map_data(copy) };
     for (k, v) in entries {
         if layout.value_is_ref {
             willow_gc_write_barrier(copy, v as *mut u8, GcStoreDestination::MapValue as i64);

@@ -240,20 +240,42 @@ impl Cycle {
     /// Called after resuming mutators; returns the trace record for publication
     /// after releasing collector election. `before/after` were sampled under STW.
     pub(crate) fn finish(self, before: u64, after: u64, work: MarkWork) -> GcCycleV1 {
+        self.finish_metrics(before, after, work, None, None)
+    }
+    /// Concurrent cycles measure only the initial and remark stops as pauses;
+    /// allocations between them mean reclaimed bytes cannot be before - after.
+    pub(crate) fn finish_concurrent(
+        self,
+        before: u64,
+        after: u64,
+        work: MarkWork,
+        pause_ns: u64,
+        reclaimed: u64,
+    ) -> GcCycleV1 {
+        self.finish_metrics(before, after, work, Some(pause_ns), Some(reclaimed))
+    }
+    fn finish_metrics(
+        self,
+        before: u64,
+        after: u64,
+        work: MarkWork,
+        pause_ns: Option<u64>,
+        reclaimed: Option<u64>,
+    ) -> GcCycleV1 {
         let end_ns = timestamp_ns();
         let cycle = GcCycleV1 {
             epoch: self.epoch,
             kind: self.kind as u32,
             start_ns: self.start_ns,
             end_ns,
-            pause_ns: end_ns.saturating_sub(self.start_ns),
+            pause_ns: pause_ns.unwrap_or_else(|| end_ns.saturating_sub(self.start_ns)),
             mark_ns: work.mark_ns,
             marked_bytes: work.marked_bytes,
             scanned_bytes: work.scanned_bytes,
             root_scan_bytes: work.root_scan_bytes,
             heap_before_bytes: before,
             heap_after_bytes: after,
-            reclaimed_bytes: before.saturating_sub(after),
+            reclaimed_bytes: reclaimed.unwrap_or_else(|| before.saturating_sub(after)),
             reserved: 0,
         };
         TELEMETRY

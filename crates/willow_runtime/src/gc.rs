@@ -117,7 +117,11 @@ pub(crate) fn willow_alloc_enum_variant(
                     GcStoreDestination::EnumPayload as i64,
                 );
             }
-            *value.cast::<i64>().add(1 + index) = word;
+            if matches!(kind, willow_abi::SlotKind::GcRef) {
+                store_gc_reference(value.cast::<i64>().add(1 + index).cast(), word as *mut u8);
+            } else {
+                *value.cast::<i64>().add(1 + index) = word;
+            }
         }
     }
     value
@@ -367,6 +371,7 @@ use raw_heap::{Object as HeapObject, Payload as GcPayload, RootSlot};
 struct GcState {
     /// Head of the live region-backed old-object index.
     heap_head: *mut GcHeader,
+    concurrent_cycle: Option<Arc<ConcurrentCycle>>,
     /// Bump-allocation chunks. Active chunks are owned by one TLS state;
     /// collection retires them before walking their object headers.
     tlab_chunks: Vec<TlabChunk>,
@@ -380,6 +385,8 @@ struct GcState {
     allocated_bytes: usize,
     /// Trigger a collection when allocated_bytes exceeds this threshold.
     threshold_bytes: usize,
+    /// Hard cap on GC-owned region reservations; native container storage is excluded.
+    memory_limit_bytes: Option<usize>,
     /// Bytes occupied by allocated young objects in retired or active TLABs.
     young_allocated_bytes: usize,
     /// Trigger a minor collection at the next TLAB refill after this threshold.
@@ -674,15 +681,83 @@ impl Drop for OldRegion {
     }
 }
 
+fn gc_memory_limit_from_env() -> Option<usize> {
+    let value = std::env::var("WILLOW_GC_MEMORY_LIMIT").ok()?;
+    Some(
+        value
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0)
+            .expect("WILLOW_GC_MEMORY_LIMIT must be a positive byte count"),
+    )
+}
+
+fn can_reserve(state: &GcState, additional: usize) -> bool {
+    state.memory_limit_bytes.is_none_or(|limit| {
+        state
+            .old_regions
+            .iter()
+            .fold(state.tlab_reserved_bytes, |total, region| {
+                total.saturating_add(region.capacity)
+            })
+            .checked_add(additional)
+            .is_some_and(|total| total <= limit)
+    })
+}
+
+/// Give reclamation one opportunity before treating reservation pressure as
+/// exhaustion. Waiting mutators cooperate with the elected collector's remark.
+fn collect_for_budget() {
+    let active = runtime().heap.lock().unwrap().concurrent_cycle.clone();
+    if let Some(cycle) = active {
+        // Registered trace callbacks must not allocate. Never deadlock a
+        // misbehaving callback by waiting for its own collection to finish.
+        if cycle.collector == std::thread::current().id() {
+            return;
+        }
+        loop {
+            willow_gc_safepoint();
+            if runtime().heap.lock().unwrap().concurrent_cycle.is_none() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+    } else {
+        collect_internal();
+    }
+}
+
+fn allocation_failure(state: &GcState) -> *mut u8 {
+    if let Some(limit) = state.memory_limit_bytes {
+        eprintln!(
+            "runtime fatal: GC memory limit exceeded ({limit} bytes of managed region reservations)"
+        );
+        std::process::exit(1);
+    }
+    std::ptr::null_mut()
+}
+
+fn major_trigger(state: &GcState) -> usize {
+    state
+        .memory_limit_bytes
+        .map_or(state.threshold_bytes, |limit| {
+            state
+                .threshold_bytes
+                .min((limit / 4).saturating_mul(3).max(1))
+        })
+}
+
 impl Default for GcState {
     fn default() -> Self {
         Self {
             heap_head: std::ptr::null_mut(),
+            concurrent_cycle: None,
             tlab_chunks: Vec::new(),
             old_regions: Vec::new(),
             tlab_states: HashMap::new(),
             allocated_bytes: 0,
             threshold_bytes: 1024 * 1024,
+            memory_limit_bytes: gc_memory_limit_from_env(),
             young_allocated_bytes: 0,
             nursery_threshold_bytes: GC_NURSERY_THRESHOLD_BYTES,
             total_allocs: 0,
@@ -712,8 +787,8 @@ impl Default for GcState {
 }
 
 // SAFETY: the raw list head is owned by `GcRuntime::heap`. Allocation/sweep/reset
-// hold that mutex; marking is serialized by `collect_lock` and either runs on
-// the sole mutator or while all registered mutators are parked.
+// hold that mutex. Concurrent marking reads an immutable allocation-metadata
+// snapshot; header mutations and relocation remain serialized by STW/election.
 unsafe impl Send for GcState {}
 
 #[cfg(test)]
@@ -739,8 +814,9 @@ std::thread_local! {
 // TLS/RefCell aliasing — the shared state is just `Vec<usize>` address snapshots
 // behind a mutex.
 //
-// Concurrent marking (tracing while mutators run, with write barriers) is NOT
-// part of this slice; this is the stop-the-world coordination layer it builds on.
+// Major collection uses this protocol for initial snapshot and final remark;
+// graph tracing between those stops reads atomic references and concurrent
+// container snapshots while insertion barriers publish new edges.
 #[derive(Default)]
 struct GcCoord {
     /// Registered mutator threads → their most recently published root snapshot
@@ -763,10 +839,13 @@ struct GcRuntime {
     root_stack_owner: Mutex<Option<ThreadId>>,
     skipped_foreign_owner_collections: std::sync::atomic::AtomicU64,
     runtime_roots: Mutex<HashMap<usize, usize>>,
+    parked_stack_roots: Mutex<HashMap<u64, Vec<usize>>>,
+    next_parked_stack: AtomicU64,
     coord: (Mutex<GcCoord>, Condvar),
     /// Lock-free fast-path mirror of `GcCoord::stop_requested`.
     stop_requested: std::sync::atomic::AtomicBool,
     trace_registry: Mutex<HashMap<u32, TraceFn>>,
+    concurrent_trace_registry: Mutex<HashMap<u32, ConcurrentTraceFn>>,
     drop_registry: Mutex<HashMap<u32, DropFn>>,
     /// Advances only when registered hooks are invalidated. Runtime container
     /// types use this to cache per-generation registration without taking the
@@ -782,9 +861,12 @@ impl Default for GcRuntime {
             root_stack_owner: Mutex::new(None),
             skipped_foreign_owner_collections: std::sync::atomic::AtomicU64::new(0),
             runtime_roots: Mutex::new(HashMap::new()),
+            parked_stack_roots: Mutex::new(HashMap::new()),
+            next_parked_stack: AtomicU64::new(1),
             coord: (Mutex::new(GcCoord::default()), Condvar::new()),
             stop_requested: std::sync::atomic::AtomicBool::new(false),
             trace_registry: Mutex::new(HashMap::new()),
+            concurrent_trace_registry: Mutex::new(HashMap::new()),
             drop_registry: Mutex::new(HashMap::new()),
             registry_generation: std::sync::atomic::AtomicU64::new(1),
         }
@@ -962,6 +1044,161 @@ fn all_registered_stack_roots(coord: &GcCoord) -> Vec<*mut u8> {
 /// Trace the GC graph from `worklist` (the marked-set fixpoint via the TypeInfo
 /// registry + gc_ref_mask interior pointers). Shared by the single-mutator and
 /// stop-the-world collection paths.
+/// An epoch owns only allocation metadata captured at the initial safepoint;
+/// references are read from the live heap while other mutators execute. New
+/// allocations are outside this candidate set and survive this cycle.
+struct ConcurrentCycle {
+    collector: ThreadId,
+    objects: HashMap<usize, raw_heap::TraceMetadata>,
+    legacy_traces: HashSet<u32>,
+    traces: HashMap<u32, ConcurrentTraceFn>,
+    visited: Mutex<HashSet<usize>>,
+    deferred: Mutex<Vec<usize>>,
+    unindexed: Mutex<HashSet<usize>>,
+    queue: Arc<crate::gc_mark_queue::MarkWorkQueue>,
+    work: Mutex<crate::gc_telemetry::MarkWork>,
+}
+
+impl ConcurrentCycle {
+    fn enqueue(&self, value: *mut u8) {
+        use crate::gc_mark_queue::{MarkWork, ObjectRef};
+        if self.objects.contains_key(&(value as usize)) {
+            let object = ObjectRef::from_ptr(value).expect("candidate is non-null");
+            self.queue
+                .inject(MarkWork::object(self.queue.current_epoch(), object))
+                .expect("mark publication belongs to active cycle");
+        }
+    }
+
+    fn trace(&self, value: usize) {
+        let Some(metadata) = self.objects.get(&value) else {
+            return;
+        };
+        if !self.visited.lock().unwrap().insert(value) {
+            return;
+        }
+        if self.legacy_traces.contains(&metadata.type_id)
+            && !self.traces.contains_key(&metadata.type_id)
+        {
+            // Legacy extension callbacks expose mutable slots with an STW-only
+            // contract. Preserve that contract instead of racing their payloads.
+            self.deferred.lock().unwrap().push(value);
+            return;
+        }
+        let payload = value as *mut u8;
+        let mut children = Vec::new();
+        let words = metadata.payload_size / std::mem::size_of::<usize>();
+        let mut slots = 0;
+        for index in 0..words.min(64) {
+            if metadata.gc_ref_mask & (1u64 << index) != 0 {
+                // SAFETY: immutable epoch metadata bounds the live allocation;
+                // generated and native reference stores use atomic publication.
+                children.push(unsafe { load_gc_reference(payload.cast::<*mut u8>().add(index)) });
+                slots += 1;
+            }
+        }
+        if metadata.type_id == willow_abi::GC_BITMAP_TYPE_ID {
+            let descriptor = metadata.layout_id as *const u64;
+            // SAFETY: bitmap descriptors are validated immutable static data.
+            let count = unsafe { *descriptor } as usize;
+            for word in 1..count {
+                let mut bits = unsafe { *descriptor.add(word + 1) };
+                while bits != 0 {
+                    let index = word * 64 + bits.trailing_zeros() as usize;
+                    if index < words {
+                        children.push(unsafe {
+                            load_gc_reference(payload.cast::<*mut u8>().add(index))
+                        });
+                        slots += 1;
+                    }
+                    bits &= bits - 1;
+                }
+            }
+        }
+        if let Some(trace) = self.traces.get(&metadata.type_id) {
+            let before = children.len();
+            // SAFETY: concurrent hooks copy values under their own locks or
+            // atomics, and no object is reclaimed before final remark.
+            unsafe {
+                trace(payload, &mut children);
+            }
+            slots += children.len() - before;
+        }
+        for child in children {
+            if !child.is_null() && !self.objects.contains_key(&(child as usize)) {
+                self.unindexed.lock().unwrap().insert(child as usize);
+            }
+            self.enqueue(child);
+        }
+        self.work
+            .lock()
+            .unwrap()
+            .object(GC_HEADER_SIZE + metadata.payload_size, slots);
+    }
+
+    fn drain(&self, limit: usize) {
+        use crate::gc_mark_queue::MarkWorkItem;
+        let mut worker = self.queue.register_assist();
+        for _ in 0..limit {
+            let Some(work) = worker.next_work() else {
+                break;
+            };
+            match work.item {
+                MarkWorkItem::Object(object) => self.trace(object.addr()),
+                MarkWorkItem::ObjectBatch(objects) => {
+                    for object in objects {
+                        self.trace(object.addr());
+                    }
+                }
+                _ => unreachable!("major marker queues only object work"),
+            }
+        }
+        // Drop completes the in-hand item and publishes private work before a
+        // mutator can reach its next safepoint.
+    }
+}
+
+/// Enumerate allocation headers only, never payload graph edges. All generated
+/// TLABs must be retired and mutators stopped while this index is captured.
+fn epoch_objects(state: &GcState) -> Vec<HeapObject> {
+    let mut objects = Vec::new();
+    let mut current = HeapObject::from_raw(state.heap_head);
+    while let Some(object) = current {
+        objects.push(object);
+        current = object.next();
+    }
+    for chunk in &state.tlab_chunks {
+        assert!(
+            chunk.owner_state.is_none(),
+            "epoch index requires retired TLABs"
+        );
+        let mut offset = 0;
+        while offset < chunk.used {
+            let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast()).unwrap();
+            let size = object.size();
+            assert!(
+                size >= GC_HEADER_SIZE
+                    && size <= chunk.used - offset
+                    && size.is_multiple_of(GC_REGION_MARK_GRANULE),
+                "corrupt TLAB epoch header"
+            );
+            if object.allocated() {
+                objects.push(object);
+            }
+            offset += size;
+        }
+    }
+    objects
+}
+
+/// Bounded allocation assistance. Only call outside runtime container locks.
+fn assist_concurrent_mark() {
+    let cycle = runtime().heap.lock().unwrap().concurrent_cycle.clone();
+    if let Some(cycle) = cycle {
+        cycle.drain(8);
+    }
+}
+
 fn mark_worklist(mut worklist: Vec<*mut u8>) -> crate::gc_telemetry::MarkWork {
     let started = std::time::Instant::now();
     let mut work = crate::gc_telemetry::MarkWork::roots(worklist.len());
@@ -1025,6 +1262,27 @@ fn mark_worklist(mut worklist: Vec<*mut u8>) -> crate::gc_telemetry::MarkWork {
 /// can additionally replace a moved young pointer in place.
 pub type TraceFn = unsafe fn(payload: *mut u8, slots: &mut Vec<*mut *mut u8>);
 
+/// Snapshot child VALUES while holding any required container locks. Unlike
+/// TraceFn this callback must be safe while mutators run; exported slots cannot
+/// outlive a lock guard. It must not allocate GC memory or reach a safepoint.
+/// Objects without this hook are traced during remark.
+pub type ConcurrentTraceFn = unsafe fn(payload: *mut u8, children: &mut Vec<*mut u8>);
+
+/// Load a GC reference shared with the concurrent marker.
+/// # Safety
+/// The aligned slot must stay allocated; all concurrent writes must be atomic.
+pub(crate) unsafe fn load_gc_reference(slot: *mut *mut u8) -> *mut u8 {
+    unsafe { std::sync::atomic::AtomicPtr::from_ptr(slot).load(Ordering::Acquire) }
+}
+
+/// Publish a GC reference shared with the concurrent marker. Call the write
+/// barrier before publishing any non-null edge.
+/// # Safety
+/// The aligned slot must stay allocated and contain a reference-sized word.
+pub(crate) unsafe fn store_gc_reference(slot: *mut *mut u8, value: *mut u8) {
+    unsafe { std::sync::atomic::AtomicPtr::from_ptr(slot).store(value, Ordering::Release) }
+}
+
 fn type_registry() -> &'static Mutex<HashMap<u32, TraceFn>> {
     &runtime().trace_registry
 }
@@ -1032,11 +1290,23 @@ fn type_registry() -> &'static Mutex<HashMap<u32, TraceFn>> {
 /// Register a trace function for `type_id`.  Call once per class at startup.
 pub fn willow_register_type(type_id: u32, trace: TraceFn) {
     type_registry().lock().unwrap().insert(type_id, trace);
+    // A replacement legacy hook must not inherit another implementation's
+    // concurrent contract. Native registration installs its matched hook next.
+    runtime()
+        .concurrent_trace_registry
+        .lock()
+        .unwrap()
+        .remove(&type_id);
 }
 
 /// Unregister the trace function for `type_id`.
 pub fn willow_unregister_type(type_id: u32) {
     type_registry().lock().unwrap().remove(&type_id);
+    runtime()
+        .concurrent_trace_registry
+        .lock()
+        .unwrap()
+        .remove(&type_id);
     runtime()
         .registry_generation
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -1057,6 +1327,7 @@ pub struct NativeGcType {
     pub type_id: u32,
     pub trace: Option<TraceFn>,
     pub drop_fn: Option<DropFn>,
+    pub concurrent_trace: Option<ConcurrentTraceFn>,
 }
 
 impl NativeGcType {
@@ -1065,7 +1336,12 @@ impl NativeGcType {
             type_id,
             trace,
             drop_fn,
+            concurrent_trace: None,
         }
+    }
+    pub const fn with_concurrent_trace(mut self, trace: ConcurrentTraceFn) -> Self {
+        self.concurrent_trace = Some(trace);
+        self
     }
 }
 
@@ -1106,6 +1382,13 @@ impl NativeGcRegistration {
             if let Some(trace) = native.trace {
                 willow_register_type(native.type_id, trace);
             }
+            if let Some(trace) = native.concurrent_trace {
+                runtime()
+                    .concurrent_trace_registry
+                    .lock()
+                    .unwrap()
+                    .insert(native.type_id, trace);
+            }
             if let Some(drop_fn) = native.drop_fn {
                 willow_register_drop(native.type_id, drop_fn);
             }
@@ -1127,13 +1410,10 @@ impl Default for NativeGcRegistration {
 /// The collector receives the address of `value` and may rewrite it when a
 /// young object moves. `Arc` ownership makes that address independent of arena
 /// vector growth and keeps it alive after a logical root is released.
-struct GcRootCell(std::cell::UnsafeCell<*mut u8>);
+struct GcRootCell(std::sync::atomic::AtomicPtr<u8>);
 
-// SAFETY: mutation follows Willow's GC safepoint contract: mutators release or
-// load their root slots only while running, and collection reads/rewrites them
-// while those mutators are stopped. The cell allocation is stable under Arc.
-unsafe impl Send for GcRootCell {}
-unsafe impl Sync for GcRootCell {}
+// Atomic publication permits concurrent marking; the Arc allocation keeps
+// slot addresses stable until owner finalization. Relocation writes stay STW.
 
 /// Handle for one slot in a [`GcRootArena`]. Dropping the handle does not free
 /// the slot because the arena retains its own Arc until the owning runtime
@@ -1145,13 +1425,13 @@ pub(crate) struct GcRootHandle {
 impl GcRootHandle {
     pub(crate) fn load(&self) -> *mut u8 {
         // SAFETY: see `GcRootCell`'s synchronization contract.
-        unsafe { *self.cell.0.get() }
+        self.cell.0.load(Ordering::Acquire)
     }
 
     pub(crate) fn release(&self) {
         // SAFETY: see `GcRootCell`'s synchronization contract. Null is the GC
         // root protocol's explicit inactive-slot value.
-        unsafe { *self.cell.0.get() = std::ptr::null_mut() };
+        self.cell.0.store(std::ptr::null_mut(), Ordering::Release);
     }
 }
 
@@ -1168,7 +1448,10 @@ pub(crate) struct GcRootArena {
 
 impl GcRootArena {
     pub(crate) fn insert(&self, value: *mut u8) -> GcRootHandle {
-        let cell = Arc::new(GcRootCell(std::cell::UnsafeCell::new(value)));
+        if let Some(cycle) = runtime().heap.lock().unwrap().concurrent_cycle.as_ref() {
+            cycle.enqueue(value);
+        }
+        let cell = Arc::new(GcRootCell(std::sync::atomic::AtomicPtr::new(value)));
         self.cells
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1181,7 +1464,7 @@ impl GcRootArena {
             .cells
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        slots.extend(cells.iter().map(|cell| cell.0.get()));
+        slots.extend(cells.iter().map(|cell| cell.0.as_ptr()));
     }
 
     #[cfg(test)]
@@ -1308,6 +1591,9 @@ fn retire_tlabs_for_thread(owner: ThreadId) {
 }
 
 fn allocate_tlab_chunk(state: &mut GcState, owner_state: usize) -> Option<*mut u8> {
+    if !can_reserve(state, GC_TLAB_CHUNK_SIZE) {
+        return None;
+    }
     let layout =
         Layout::from_size_align(GC_TLAB_CHUNK_SIZE, std::mem::align_of::<GcHeader>()).ok()?;
     // SAFETY: the layout is nonzero and valid. Fresh zeroing makes every
@@ -1356,7 +1642,7 @@ fn allocation_should_collect() -> bool {
     let stress = gc_stress_enabled("alloc");
     let mut state = runtime().heap.lock().unwrap();
     sync_tlab_accounting(&mut state);
-    stress || state.allocated_bytes >= state.threshold_bytes
+    stress || state.allocated_bytes >= major_trigger(&state)
 }
 
 fn allocation_should_minor_collect() -> bool {
@@ -1429,6 +1715,64 @@ pub extern "C" fn willow_root_depth() -> i32 {
     })
 }
 
+/// Number of shadow roots on the running native stack.
+pub(crate) fn gc_thread_root_depth() -> usize {
+    ROOT_STACK.with(|roots| roots.borrow().len())
+}
+
+/// Transfer a native task stack's roots to the collector before suspending it.
+///
+/// # Safety
+/// Every slot in the suffix must remain allocated and unchanged until resume
+/// or discard. The caller must switch stacks without a intervening safepoint.
+pub(crate) unsafe fn park_current_roots(depth: usize) -> u64 {
+    let token = runtime().next_parked_stack.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(token, 0, "parked native stack token exhausted");
+    let mut parked = runtime().parked_stack_roots.lock().unwrap();
+    ROOT_STACK.with(|roots| {
+        let mut roots = roots.borrow_mut();
+        assert!(depth <= roots.len(), "native stack root depth mismatch");
+        parked.insert(
+            token,
+            roots[depth..].iter().map(|slot| *slot as usize).collect(),
+        );
+        roots.truncate(depth);
+    });
+    release_root_stack_owner_if_empty();
+    token
+}
+
+/// Reattach a suspended stack's shadow roots immediately before resuming it.
+///
+/// # Safety
+/// `token` must own a still-live suspended native stack. The caller must resume
+/// that stack without executing a safepoint against the wrong stack's slots.
+pub(crate) unsafe fn resume_parked_roots(token: u64) {
+    let mut parked = runtime().parked_stack_roots.lock().unwrap();
+    let slots = parked.remove(&token).expect("unknown parked native stack");
+    if !slots.is_empty() {
+        claim_root_stack_owner();
+    }
+    ROOT_STACK.with(|roots| {
+        roots
+            .borrow_mut()
+            .extend(slots.into_iter().map(|slot| slot as *mut *mut u8))
+    });
+}
+
+/// Release roots only after the corresponding suspended stack was unwound.
+///
+/// # Safety
+/// No live Willow frame may still depend on any root belonging to `token`.
+pub(crate) unsafe fn discard_parked_roots(token: u64) {
+    runtime()
+        .parked_stack_roots
+        .lock()
+        .unwrap()
+        .remove(&token)
+        .expect("unknown parked native stack");
+}
+
 /// Keep a GC-managed object alive through a runtime-owned structure such as a
 /// scheduler task, future frame, task handle, or wait queue.
 #[unsafe(no_mangle)]
@@ -1438,6 +1782,9 @@ pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
     }
 
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+    if let Some(cycle) = runtime().heap.lock().unwrap().concurrent_cycle.as_ref() {
+        cycle.enqueue(object);
+    }
     let mut roots = runtime().runtime_roots.lock().unwrap();
     let root = object as usize;
     *roots.entry(root).or_insert(0) += 1;
@@ -1550,6 +1897,7 @@ pub extern "C" fn willow_gc_alloc_slow(
     let state_address = tlab_state as usize;
     let stress = gc_stress_enabled("alloc");
     let small = total_size <= GC_TLAB_MAX_OBJECT_SIZE;
+    assist_concurrent_mark();
 
     {
         let mut state = runtime().heap.lock().unwrap();
@@ -1576,8 +1924,16 @@ pub extern "C" fn willow_gc_alloc_slow(
 
     let mut state = runtime().heap.lock().unwrap();
     register_tlab_state(&mut state, state_address);
-    let Some(base) = allocate_tlab_chunk(&mut state, state_address) else {
-        return std::ptr::null_mut();
+    let mut base = allocate_tlab_chunk(&mut state, state_address);
+    if base.is_none() && state.memory_limit_bytes.is_some() {
+        drop(state);
+        collect_for_budget();
+        state = runtime().heap.lock().unwrap();
+        register_tlab_state(&mut state, state_address);
+        base = allocate_tlab_chunk(&mut state, state_address);
+    }
+    let Some(base) = base else {
+        return allocation_failure(&state);
     };
     let Some(header) =
         initialize_object_at(base, total_size, type_id as u32, layout_id, gc_ref_mask)
@@ -1714,16 +2070,20 @@ fn barrier_owner_payload(
     None
 }
 
-/// Generational write barrier. The initial implementation deliberately uses an
-/// unconditional runtime call from compiler-generated reference stores. It
-/// records only old-to-young edges; scalar stores and young owners remain cheap
-/// compiler-side skips.
+/// Reference insertion barrier, called before atomic publication of every
+/// non-null heap edge. During concurrent marking it queues candidate targets
+/// regardless of owner/target generation, including old-to-old and young-owner
+/// stores. It additionally remembers old-to-young edges for minor collection.
+/// Only scalar stores and null values may skip candidate publication.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_write_barrier(owner: *mut u8, value: *mut u8, destination_kind: i64) {
     if value.is_null() {
         return;
     }
     let mut state = runtime().heap.lock().unwrap();
+    if let Some(cycle) = &state.concurrent_cycle {
+        cycle.enqueue(value);
+    }
     state.write_barrier_calls = state.write_barrier_calls.saturating_add(1);
     if payload_generation(&state, value) != Some(GC_GENERATION_YOUNG) {
         return;
@@ -1752,6 +2112,7 @@ fn forget_remembered_owner(state: &mut GcState, owner_payload: usize) {
 }
 
 fn allocate_object(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8 {
+    assist_concurrent_mark();
     if payload_size < 0 {
         return std::ptr::null_mut();
     }
@@ -1774,6 +2135,9 @@ fn allocate_old_region_object_locked(
     let large = total_size > GC_LARGE_OBJECT_THRESHOLD;
 
     let (object, reused) = if large {
+        if !can_reserve(state, span_size) {
+            return None;
+        }
         let mut region = OldRegion::new(RegionKind::LargeObject, span_size)?;
         let allocated = region.allocate_object(type_id, layout_id, gc_ref_mask, payload_size)?;
         state.old_regions.push(region);
@@ -1786,6 +2150,9 @@ fn allocate_old_region_object_locked(
     {
         allocated
     } else {
+        if !can_reserve(state, GC_OLD_REGION_SIZE) {
+            return None;
+        }
         let mut region = OldRegion::new(RegionKind::Old, GC_OLD_REGION_SIZE)?;
         let allocated = region.allocate_object(type_id, layout_id, gc_ref_mask, payload_size)?;
         state.old_regions.push(region);
@@ -1815,15 +2182,29 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
     let payload_size = payload_size as usize;
     let mut state = runtime().heap.lock().unwrap();
     sync_tlab_accounting(&mut state);
-    let Some(header) = allocate_old_region_object_locked(
+    let mut header = allocate_old_region_object_locked(
         &mut state,
         layout_id,
         type_id,
         payload_size,
         gc_ref_mask,
         true,
-    ) else {
-        return std::ptr::null_mut();
+    );
+    if header.is_none() && state.memory_limit_bytes.is_some() {
+        drop(state);
+        collect_for_budget();
+        state = runtime().heap.lock().unwrap();
+        header = allocate_old_region_object_locked(
+            &mut state,
+            layout_id,
+            type_id,
+            payload_size,
+            gc_ref_mask,
+            true,
+        );
+    }
+    let Some(header) = header else {
+        return allocation_failure(&state);
     };
     state.tlab_slow_allocations = state.tlab_slow_allocations.saturating_add(1);
     if header.size() > GC_TLAB_MAX_OBJECT_SIZE {
@@ -1835,7 +2216,7 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
     header.payload().as_ptr()
 }
 
-/// Trigger a full stop-the-world mark-and-sweep collection.
+/// Trigger a full collection with concurrent marking and STW remark/sweep.
 ///
 /// # GC root semantics — why local objects survive an inner gc_collect()
 ///
@@ -1938,7 +2319,7 @@ pub(crate) fn telemetry_heap_snapshot() -> (
             old_regions: state.old_regions.len() as u64,
             remembered_objects: state.remembered_set.len() as u64,
             dirty_cards: state.dirty_cards.len() as u64,
-            major_trigger_bytes: state.threshold_bytes as u64,
+            major_trigger_bytes: major_trigger(&state) as u64,
             minor_trigger_bytes: state.nursery_threshold_bytes as u64,
         },
     )
@@ -2478,6 +2859,13 @@ impl<'a> MinorCollector<'a> {
             metadata.gc_ref_mask,
             false,
         ) else {
+            if self.state.memory_limit_bytes.is_some() {
+                // A hard region budget must not require extra evacuation
+                // storage. Retain this nursery object in place, using the same
+                // promotion path as SSA-pinned roots, and keep tracing it.
+                self.pin_root(payload);
+                return payload;
+            }
             std::process::abort();
         };
         // SAFETY: source and target are distinct allocations with identical
@@ -2727,42 +3115,136 @@ fn collect_internal() {
 
     let cycle = crate::gc_telemetry::Cycle::begin(crate::gc_telemetry::CycleKind::Major);
 
-    // ---- Mark phase --------------------------------------------------------
-    // Gather the root set, then trace. Every collection stops the world and
-    // scans EVERY registered mutator's root stack, plus runtime roots and
-    // channel buffers (willow-6fv.5.6).
-    //
-    // Mark AND sweep both run with the world stopped. If sweep ran after the
-    // world resumed, another mutator could, in the gap, allocate an object
-    // (prepended to the heap, hence unmarked) and even install a runtime root
-    // on it before sweep walked the heap — sweep would then free that live,
-    // already-rooted object, leaving a dangling runtime root that the next
-    // collection traces and aborts on (willow-w5e2).
-    //
-    // There is no "only this thread is registered, so scan just my stack" fast
-    // path: `multi_mutator_active` is a snapshot, and a thread that registers
-    // between that check and the sweep runs unseen. Its brand-new objects are
-    // unmarked and unreachable from this thread's roots, so the sweep frees
-    // them under it, and the dangling shadow roots left behind abort the next
-    // collection (willow-v6k0). `with_stw` holds the mutator registry lock for
-    // the whole cycle, so a registration either lands before the scan (and is
-    // scanned) or blocks until the cycle is over.
-    let (heap_before, heap_after, freed, work) = with_stw(|coord| {
-        {
+    // Initial stop captures roots and immutable allocation metadata only.
+    // Live payload graph traversal runs after mutators resume; insertion
+    // barriers retain every new edge until the final stop drains producers.
+    let started = std::time::Instant::now();
+    let (heap_before, marking) = with_stw(|coord| {
+        let mut state = runtime().heap.lock().unwrap();
+        retire_all_tlabs_locked(&mut state);
+        let before = state.allocated_bytes as u64;
+        let objects = epoch_objects(&state)
+            .into_iter()
+            .map(|object| (object.payload().as_ptr() as usize, object.trace_metadata()))
+            .collect();
+        drop(state);
+        let mut roots = all_registered_stack_roots(coord);
+        roots.extend(runtime_roots_snapshot());
+        roots.extend(crate::lock::lock_gc_roots());
+        for &root in &roots {
+            checked_payload_to_header(root, "GC root graph");
+        }
+        let queue = crate::gc_mark_queue::MarkWorkQueue::new(1);
+        queue.begin_epoch();
+        let marking = Arc::new(ConcurrentCycle {
+            collector: std::thread::current().id(),
+            objects,
+            legacy_traces: type_registry().lock().unwrap().keys().copied().collect(),
+            traces: runtime().concurrent_trace_registry.lock().unwrap().clone(),
+            visited: Mutex::new(HashSet::new()),
+            deferred: Mutex::new(Vec::new()),
+            unindexed: Mutex::new(HashSet::new()),
+            queue,
+            work: Mutex::new(crate::gc_telemetry::MarkWork::roots(roots.len())),
+        });
+        for root in roots {
+            marking.enqueue(root);
+        }
+        runtime().heap.lock().unwrap().concurrent_cycle = Some(Arc::clone(&marking));
+        (before, marking)
+    });
+    let initial_pause_ns = crate::gc_telemetry::elapsed_ns(started);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Bounded chunks allow a producer-heavy workload to reach remark;
+        // finishing relies on quiescing producers, never a racy empty sample.
+        let budget = marking.objects.len().saturating_mul(4).max(1024);
+        marking.drain(budget);
+        let remark_started = std::time::Instant::now();
+        let result = with_stw(|coord| {
             let mut state = runtime().heap.lock().unwrap();
             retire_all_tlabs_locked(&mut state);
+            drop(state);
+            let mut roots = all_registered_stack_roots(coord);
+            roots.extend(runtime_roots_snapshot());
+            roots.extend(crate::lock::lock_gc_roots());
+            for &root in &roots {
+                checked_payload_to_header(root, "GC remark root");
+                marking.enqueue(root);
+            }
+            marking.queue.flush_all_locals();
+            marking.drain(usize::MAX);
+            assert!(
+                marking.queue.snapshot().is_drained(),
+                "remark left outstanding marking work"
+            );
+            for &address in marking.unindexed.lock().unwrap().iter() {
+                checked_payload_to_header(address as *mut u8, "GC concurrent graph edge");
+            }
+            let visited = marking.visited.lock().unwrap();
+            let deferred = marking.deferred.lock().unwrap().clone();
+            let deferred_set: HashSet<_> = deferred.iter().copied().collect();
+            {
+                let state = runtime().heap.lock().unwrap();
+                for object in epoch_objects(&state) {
+                    let address = object.payload().as_ptr() as usize;
+                    if (!marking.objects.contains_key(&address) || visited.contains(&address))
+                        && !deferred_set.contains(&address)
+                    {
+                        object.begin_trace();
+                    }
+                }
+            }
+            drop(visited);
+            // Extension callbacks without a concurrent contract remain sound.
+            let legacy =
+                mark_worklist(deferred.into_iter().map(|value| value as *mut u8).collect());
+            let mut work = *marking.work.lock().unwrap();
+            work.marked_bytes = work.marked_bytes.saturating_add(legacy.marked_bytes);
+            work.scanned_bytes = work.scanned_bytes.saturating_add(legacy.scanned_bytes);
+            work.root_scan_bytes = work
+                .root_scan_bytes
+                .saturating_add(roots.len() as u64 * std::mem::size_of::<usize>() as u64);
+            work.mark_ns = crate::gc_telemetry::elapsed_ns(started);
+            runtime().heap.lock().unwrap().concurrent_cycle = None;
+            assert_eq!(
+                marking.queue.end_epoch(),
+                0,
+                "completed mark epoch retained work"
+            );
+            let freed = sweep();
+            let mut state = runtime().heap.lock().unwrap();
+            let after = state.allocated_bytes as u64;
+            // Reset growth debt from measured survivors instead of retaining a
+            // historical high-water threshold after a burst has died.
+            state.threshold_bytes = state.allocated_bytes.saturating_mul(2).max(1024 * 1024);
+            drop(state);
+            (after, freed, work)
+        });
+        (
+            result.0,
+            result.1,
+            result.2,
+            initial_pause_ns.saturating_add(crate::gc_telemetry::elapsed_ns(remark_started)),
+        )
+    }));
+    let (heap_after, freed, work, pause_ns) = match result {
+        Ok(result) => result,
+        Err(payload) => {
+            // Failure leaves the graph allocated. Remove transient marks under
+            // another stop so the next collection can safely retry.
+            with_stw(|_| {
+                let mut state = runtime().heap.lock().unwrap();
+                state.concurrent_cycle = None;
+                retire_all_tlabs_locked(&mut state);
+                for object in epoch_objects(&state) {
+                    object.clear_mark();
+                }
+                marking.queue.end_epoch();
+            });
+            std::panic::resume_unwind(payload)
         }
-        let before = runtime().heap.lock().unwrap().allocated_bytes as u64;
-        let mut worklist = all_registered_stack_roots(coord);
-        worklist.extend(runtime_roots_snapshot());
-        // GC-element channel buffers hold live references (willow-dsw).
-        worklist.extend(crate::lock::lock_gc_roots());
-        let work = mark_worklist(worklist);
-        let freed = sweep();
-        let after = runtime().heap.lock().unwrap().allocated_bytes as u64;
-        (before, after, freed, work)
-    });
-    let event = cycle.finish(heap_before, heap_after, work);
+    };
+    let event = cycle.finish_concurrent(heap_before, heap_after, work, pause_ns, freed as u64);
 
     if gc_log {
         let state = runtime().heap.lock().unwrap();
@@ -3096,14 +3578,29 @@ pub fn runtime_root_count() -> usize {
 }
 
 fn runtime_roots_snapshot() -> Vec<*mut u8> {
-    runtime()
+    let mut roots: Vec<_> = runtime()
         .runtime_roots
         .lock()
         .unwrap()
         .keys()
         .map(|&root| root as *mut u8)
         .filter(|root| !root.is_null())
-        .collect()
+        .collect();
+    let parked = runtime().parked_stack_roots.lock().unwrap();
+    for slots in parked.values() {
+        for &slot in slots {
+            // SAFETY: the park contract retains these immutable stack slots;
+            // active stack transitions and collection are serialized by STW.
+            if slot == 0 {
+                continue;
+            }
+            let value = unsafe { *(slot as *mut *mut u8) };
+            if !value.is_null() {
+                roots.push(value);
+            }
+        }
+    }
+    roots
 }
 
 fn reset_internal() {
@@ -3133,6 +3630,7 @@ fn reset_internal() {
     state.tlab_states.clear();
     state.allocated_bytes = 0;
     state.threshold_bytes = 1024 * 1024;
+    state.memory_limit_bytes = gc_memory_limit_from_env();
     state.young_allocated_bytes = 0;
     state.nursery_threshold_bytes = GC_NURSERY_THRESHOLD_BYTES;
     state.total_allocs = 0;
@@ -3159,6 +3657,7 @@ fn reset_internal() {
     state.old_regions_released = 0;
     state.major_collections = 0;
     runtime().runtime_roots.lock().unwrap().clear();
+    runtime().parked_stack_roots.lock().unwrap().clear();
     *runtime().root_stack_owner.lock().unwrap() = None;
     {
         let (lock, cv) = &runtime().coord;
@@ -3170,6 +3669,7 @@ fn reset_internal() {
         cv.notify_all();
     }
     type_registry().lock().unwrap().clear();
+    runtime().concurrent_trace_registry.lock().unwrap().clear();
     drop_registry().lock().unwrap().clear();
     runtime()
         .registry_generation
@@ -5917,3 +6417,7 @@ mod tests {
         reset_gc();
     }
 }
+
+#[cfg(test)]
+#[path = "gc_concurrent_tests.rs"]
+mod concurrent_tests;

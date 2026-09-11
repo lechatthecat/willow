@@ -710,6 +710,25 @@ fn stmt_children(source: &HirStmt) -> Vec<NodeRef<'_>> {
 }
 
 impl HirExpr {
+    /// Rebuild an eager expression from already evaluated direct operands.
+    /// Scoped expression bodies are lowered separately and cannot use this API.
+    pub(crate) fn with_eager_operands(&self, operands: Vec<HirExpr>) -> HirExpr {
+        assert!(!matches!(
+            self.kind,
+            HirExprKind::Lambda { .. } | HirExprKind::Match { .. } | HirExprKind::Select { .. }
+        ));
+        let mut result = shallow_expr(self);
+        let slots = expr_children_mut(&mut result);
+        assert_eq!(slots.len(), operands.len());
+        for (slot, value) in slots.into_iter().zip(operands) {
+            match slot {
+                NodeMut::Expr(slot) => *slot = value,
+                NodeMut::Stmt(_) => unreachable!("eager expressions have no statement operands"),
+            }
+        }
+        result
+    }
+
     /// Rewrite a tree before its children with heap-owned continuation slots.
     /// Returning false prunes the replaced subtree. When scoped bodies are
     /// excluded, match scrutinees remain visible but their statements do not.
@@ -731,6 +750,20 @@ impl HirExpr {
                 NodeMut::Stmt(_) => continue,
             };
             pending.extend(children.into_iter().rev());
+        }
+    }
+}
+
+impl HirStmt {
+    /// Visit expression roots in a statement tree without native recursion.
+    /// The callback owns traversal within each expression (including its bodies).
+    pub(crate) fn visit_expr_roots_mut(&mut self, mut visit: impl FnMut(&mut HirExpr)) {
+        let mut pending = vec![NodeMut::Stmt(self)];
+        while let Some(node) = pending.pop() {
+            match node {
+                NodeMut::Expr(expr) => visit(expr),
+                NodeMut::Stmt(stmt) => pending.extend(stmt_children_mut(stmt).into_iter().rev()),
+            }
         }
     }
 }

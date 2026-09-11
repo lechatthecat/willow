@@ -170,52 +170,8 @@ pub(crate) fn is_gc_managed(ty: &Type, enum_infos: &TypeMap<EnumInfo>) -> bool {
     }
 }
 
-/// The zero-argument GC statistic builtins: `() -> i64` reads of a runtime
-/// counter. Their ABI entries are all `NONE; ([] -> Some(I64))`, so LIR
-/// emission needs only the runtime call (willow-0g8j.3.1).
-///
-/// Derived from `builtin_call_runtime_name` rather than repeating its list:
-/// `gc_collect` / `gc_minor_collect` are the void pair beside these, and
-/// `sleep` / `yield` are futures, not reads.
-pub(crate) fn gc_stat_builtin_runtime_name(callee: &str) -> Option<&'static str> {
-    if callee == "gc_collect" || callee == "gc_minor_collect" {
-        return None;
-    }
-    callee.strip_prefix("gc_")?;
-    builtin_call_runtime_name(callee)
-}
-
-pub(crate) fn builtin_call_runtime_name(callee: &str) -> Option<&'static str> {
-    match callee {
-        "gc_collect" => Some("willow_gc_collect"),
-        "gc_minor_collect" => Some("willow_gc_minor_collect"),
-        "gc_allocated_bytes" => Some("willow_gc_allocated_bytes"),
-        "gc_tlab_fast_allocations" => Some("willow_gc_tlab_fast_allocations"),
-        "gc_tlab_slow_allocations" => Some("willow_gc_tlab_slow_allocations"),
-        "gc_tlab_refills" => Some("willow_gc_tlab_refills"),
-        "gc_tlab_large_allocations" => Some("willow_gc_tlab_large_allocations"),
-        "gc_tlab_reserved_bytes" => Some("willow_gc_tlab_reserved_bytes"),
-        "gc_minor_collections" => Some("willow_gc_minor_collections"),
-        "gc_promoted_objects" => Some("willow_gc_promoted_objects"),
-        "gc_moved_objects" => Some("willow_gc_moved_objects"),
-        "gc_remembered_set_size" => Some("willow_gc_remembered_set_size"),
-        "gc_dirty_card_count" => Some("willow_gc_dirty_card_count"),
-        "gc_write_barrier_hits" => Some("willow_gc_write_barrier_hits"),
-        "gc_old_region_count" => Some("willow_gc_old_region_count"),
-        "gc_old_region_reserved_bytes" => Some("willow_gc_old_region_reserved_bytes"),
-        "gc_old_region_live_bytes" => Some("willow_gc_old_region_live_bytes"),
-        "gc_old_region_fragmentation_bytes" => Some("willow_gc_old_region_fragmentation_bytes"),
-        "gc_large_object_region_count" => Some("willow_gc_large_object_region_count"),
-        "gc_pinned_region_count" => Some("willow_gc_pinned_region_count"),
-        "gc_old_region_allocations" => Some("willow_gc_old_region_allocations"),
-        "gc_old_region_reuses" => Some("willow_gc_old_region_reuses"),
-        "gc_old_regions_released" => Some("willow_gc_old_regions_released"),
-        "gc_major_collections" => Some("willow_gc_major_collections"),
-        "sleep" => Some("willow_runtime_sleep"),
-        "yield" => Some("willow_runtime_yield"),
-        _ => None,
-    }
-}
+// Runtime identity belongs to semantic lowering; backend consumers share it.
+pub(crate) use crate::semantic::intrinsics::{builtin_call_runtime_name, gc_stat_builtin_runtime_name};
 
 #[cfg(test)]
 mod tests {

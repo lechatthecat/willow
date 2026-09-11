@@ -104,7 +104,7 @@ impl Codegen {
         let selected: Vec<_> = if frame_all {
             lir.locals
                 .iter()
-                .filter(|local| !local.parameter)
+                .filter(|local| !local.parameter && (local.is_gc_owner() || !matches!(local.ty, Type::Void | Type::Never)))
                 .map(|local| local.id)
                 .collect()
         } else {
@@ -118,6 +118,7 @@ impl Codegen {
             let index = reserved.len();
             offsets.insert(local.id, async_frame_slot_offset(index));
             reserved.push(AsyncFrameSlot {
+                storage_kind: local.storage_kind,
                 source_span: local.source_span,
                 name: local.name.clone(),
                 ty: local.ty.clone(),
@@ -146,6 +147,7 @@ impl Codegen {
             let index = reserved.len();
             defer_offsets.insert(id, async_frame_slot_offset(index));
             reserved.push(AsyncFrameSlot {
+                storage_kind: crate::ir::lowered::LirStorageKind::Value,
                 source_span: Some(span),
                 name: format!("__lir_defer_flag_{}", id.0),
                 ty: Type::I64,
@@ -185,6 +187,7 @@ impl Codegen {
         let mut slots = Vec::new();
         let result_offset = main_result_err_ty.as_ref().map(|_| {
             slots.push(AsyncFrameSlot {
+                storage_kind: crate::ir::lowered::LirStorageKind::Value,
                 source_span: Some(f.span),
                 name: "__result".to_string(),
                 ty: f.return_type.clone().into(),
@@ -197,6 +200,7 @@ impl Codegen {
         // suspension; only GC-managed slots are in `gc_slot_mask` (traced), so
         // non-GC slots hold plain scalars (willow-lpn.5.3 slice 3b).
         slots.extend(f.params.iter().map(|p| AsyncFrameSlot {
+                storage_kind: crate::ir::lowered::LirStorageKind::Value,
             source_span: Some(p.span),
             name: p.name.clone(),
             ty: p.ty.clone().into(),
@@ -281,11 +285,13 @@ impl Codegen {
         // marks GC-ref slots only.
         let mut slots = vec![
             AsyncFrameSlot {
+                storage_kind: crate::ir::lowered::LirStorageKind::Value,
                 source_span: Some(f.span),
                 name: "__result".to_string(),
                 ty: f.return_type.clone().into(),
             },
             AsyncFrameSlot {
+                storage_kind: crate::ir::lowered::LirStorageKind::Value,
                 source_span: None,
                 name: "__task_id".to_string(),
                 ty: Type::I64,
@@ -293,6 +299,7 @@ impl Codegen {
         ];
         for p in &f.params {
             slots.push(AsyncFrameSlot {
+                storage_kind: crate::ir::lowered::LirStorageKind::Value,
                 source_span: Some(p.span),
                 name: p.name.clone(),
                 ty: p.ty.clone().into(),
@@ -445,11 +452,13 @@ impl Codegen {
 
         let mut slots = vec![
             AsyncFrameSlot {
+                storage_kind: crate::ir::lowered::LirStorageKind::Value,
                 source_span: Some(m.span),
                 name: "__result".to_string(),
                 ty: m.return_type.clone().into(),
             },
             AsyncFrameSlot {
+                storage_kind: crate::ir::lowered::LirStorageKind::Value,
                 source_span: None,
                 name: "__task_id".to_string(),
                 ty: Type::I64,
@@ -460,6 +469,7 @@ impl Codegen {
         } else {
             let offset = async_frame_slot_offset(slots.len());
             slots.push(AsyncFrameSlot {
+                storage_kind: crate::ir::lowered::LirStorageKind::Value,
                 source_span: None,
                 name: "self".to_string(),
                 ty: Type::Named(class_name.to_string().into()),
@@ -469,6 +479,7 @@ impl Codegen {
         let first_param_slot = slots.len();
         for p in &m.params {
             slots.push(AsyncFrameSlot {
+                storage_kind: crate::ir::lowered::LirStorageKind::Value,
                 source_span: Some(p.span),
                 name: p.name.clone(),
                 ty: p.ty.clone().into(),
@@ -601,7 +612,7 @@ impl Codegen {
             is_async: true,
             params: m.params.clone(),
             return_type: m.return_type.clone(),
-            body: m.body.clone(),
+            body: Block { stmts: Vec::new(), span: m.span },
             span: m.span,
         };
         let (sites, lock_sites) = self.compile_coop_main_poll(
@@ -823,7 +834,11 @@ impl Codegen {
                 panic_recovery_targets: HashSet::new(),
                 panic_return_block: None,
                 panic_function_root_depth: Some(poll_root_depth),
+            emitting_sync_cancel_cleanup: false,
+            lir_cleanup_exit: None,
                 callstack_frame_depth: 0,
+                lir_call_frames: Vec::new(),
+                lir_reference_scopes: Vec::new(),
                 fault_site_span: None,
                 collected_defer_sites: Vec::new(),
                 lock_scopes: Vec::new(),
@@ -872,7 +887,7 @@ impl Codegen {
                 coop_shadow_roots: Some(CoopShadowRoots::default()),
                 build_mode: self.build_mode,
                 source_file: &self.source_file,
-                address_taken: collect_address_taken_locals(&f.body),
+                address_taken: super::lir_address_taken_locals(body.lir),
             };
             // Bind params from their frame slots (cooperative leaf, slice 4b):
             // the constructor stored the args there before spawning.
@@ -888,83 +903,9 @@ impl Codegen {
             fg.builder.switch_to_block(body_start);
             fg.coop_frame = Some(frame);
             fg.coop_result_offset = result_offset;
-            // The outer function body owns one lexical defer frame. Nested
-            // statement bodies create their own frames in `emit_coop_stmts`;
-            // return/`?` flush every active frame, while fallthrough,
-            // break, and continue flush only the scopes they leave
-            // (willow-s9ej.1).
-            let outer_defer_depth = fg.defer_stack.len();
-            let outer_root_depth = fg.coop_root_depth();
-            let owns_outer_defer = f
-                .body
-                .stmts
-                .iter()
-                .any(|stmt| matches!(stmt, Stmt::Defer(_)));
-            let outer_panic_scope = owns_outer_defer.then(|| PanicScope {
-                cleanup: fg.builder.create_block(),
-                resume: fg.builder.create_block(),
-                root_depth_at_entry: fg
-                    .panic_function_root_depth
-                    .expect("poll root depth snapshot"),
-                defer_depth: outer_defer_depth,
-                vars_before: fg.vars.clone(),
-                coop_root_depth_at_entry: Some(outer_root_depth),
-            });
-            fg.defer_stack.push(Vec::new());
-            if let Some(scope) = outer_panic_scope.clone() {
-                fg.panic_scopes.push(scope);
-            }
-            // The function body is the outermost root scope. Its fallthrough
-            // defers must run before those roots are popped, so call the inner
-            // emitter directly; nested blocks use `emit_coop_stmts`, which
-            // balances their lexical roots on exit.
+            // Lexical scopes, recovery edges and every return are explicit in
+            // LIR; no source-body wrapper is needed around the poll graph.
             fg.emit_coop_lir_function(body.lir, &mut suspends, frame);
-            let source_falls_through = false;
-            let mut normal_reaches_resume = false;
-            if source_falls_through {
-                fg.emit_flush_defers_from(0);
-                if !fg.terminated {
-                    if let Some(scope) = &outer_panic_scope {
-                        let active = fg.coop_root_depth();
-                        assert_eq!(fg.gc_root_count, active);
-                        let extra = active - outer_root_depth;
-                        if extra > 0 {
-                            fg.emit_pop_roots_n(extra);
-                        }
-                        fg.builder.ins().jump(scope.resume, &[]);
-                    }
-                    normal_reaches_resume = true;
-                }
-            }
-            if let Some(scope) = &outer_panic_scope {
-                fg.emit_shared_panic_cleanup(scope);
-                fg.builder.seal_block(scope.cleanup);
-                fg.panic_scopes.pop();
-            }
-            let recovery_reaches_resume = outer_panic_scope
-                .as_ref()
-                .is_some_and(|scope| fg.panic_recovery_targets.remove(&scope.resume));
-            let falls_through = normal_reaches_resume || recovery_reaches_resume;
-            if let Some(scope) = outer_panic_scope {
-                fg.gc_root_count = outer_root_depth;
-                fg.coop_shadow_roots
-                    .as_mut()
-                    .expect("poll function root tracker")
-                    .active
-                    .truncate(outer_root_depth);
-                if falls_through {
-                    fg.builder.switch_to_block(scope.resume);
-                    fg.builder.seal_block(scope.resume);
-                    fg.terminated = false;
-                }
-            }
-            // Fell off the end of the body → the task is Ready.
-            if falls_through {
-                fg.emit_coop_unwind_poll_roots();
-                let ready = fg.builder.ins().iconst(types::I32, 1);
-                fg.builder.ins().return_(&[ready]);
-            }
-            fg.defer_stack.pop();
             defer_sites = std::mem::take(&mut fg.collected_defer_sites);
             lock_sites = std::mem::take(&mut fg.collected_lock_sites);
             coop_root_slots = std::mem::take(
@@ -1004,7 +945,22 @@ impl Codegen {
                 let addr = builder.ins().stack_addr(ptr_ty, *slot, 0);
                 builder.ins().call(push_ref, &[addr]);
             }
-            builder.ins().jump(suspend.resume, &[]);
+            for (method, span) in &suspend.call_frames {
+                let name_data = *self.string_literals.get(method).expect("prepared method name registered");
+                let file_data = *self.string_literals.get(self.source_file.as_str()).expect("prepared source file registered");
+                let name_global = self.module.declare_data_in_func(name_data, builder.func);
+                let file_global = self.module.declare_data_in_func(file_data, builder.func);
+                let name = builder.ins().symbol_value(ptr_ty, name_global);
+                let file = builder.ins().symbol_value(ptr_ty, file_global);
+                let name_len = builder.ins().iconst(types::I64, method.len() as i64);
+                let file_len = builder.ins().iconst(types::I64, self.source_file.len() as i64);
+                let line = builder.ins().iconst(types::I32, span.line as i64);
+                let col = builder.ins().iconst(types::I32, span.col as i64);
+                let push = self.func_id("willow_callstack_push");
+                let push = self.module.declare_func_in_func(push, builder.func);
+                builder.ins().call(push, &[name, name_len, file, file_len, line, col]);
+            }
+            builder.ins().jump(suspend.reference_restore.unwrap_or(suspend.resume), &[]);
             builder.switch_to_block(next);
         }
         builder.ins().jump(body_start, &[]);
@@ -1060,7 +1016,11 @@ impl Codegen {
                 panic_recovery_targets: HashSet::new(),
                 panic_return_block: None,
                 panic_function_root_depth: None,
+            emitting_sync_cancel_cleanup: false,
+            lir_cleanup_exit: None,
                 callstack_frame_depth: 0,
+                lir_call_frames: Vec::new(),
+                lir_reference_scopes: Vec::new(),
                 fault_site_span: None,
                 collected_defer_sites: Vec::new(),
                 lock_scopes: Vec::new(),
@@ -1232,6 +1192,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// non-suspending CFG edge still reaches the common continuation with those
     /// roots registered, while the dispatch trampoline restores them on re-poll.
     pub(super) fn emit_coop_unwind_poll_roots(&mut self) {
+        for _ in 0..self.lir_reference_scopes.len() { self.emit_debug_reference_call_clear(); }
+        // This is only the returning edge; the ready edge and the compiler's
+        // frame state retain their preparations. Dispatch replays them later.
+        let depth = self.callstack_frame_depth;
+        for _ in 0..self.lir_call_frames.len() { self.emit_callstack_pop(); }
+        self.callstack_frame_depth = depth;
         let active = self.coop_root_depth();
         assert_eq!(
             self.gc_root_count, active,
@@ -1251,7 +1217,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .expect("cooperative suspend outside a poll function")
             .active
             .clone();
-        suspends.push(CoopSuspendPoint { resume, roots });
+        let reference_restore = if self.build_mode == BuildMode::Debug && !self.lir_reference_scopes.is_empty() {
+            let restore = self.builder.create_block();
+            self.builder.switch_to_block(restore);
+            self.emit_replay_reference_scopes();
+            self.builder.ins().jump(resume, &[]);
+            // Every caller records after a jump/return and then selects its
+            // continuation. Returning to that already-filled block is illegal.
+            Some(restore)
+        } else { None };
+        suspends.push(CoopSuspendPoint { resume, roots, call_frames: self.lir_call_frames.clone(), reference_restore });
     }
 
     /// Emit a preemption check whose resumed poll continues at `resume`. A

@@ -56,16 +56,26 @@ unsafe fn trace_array_ref(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     }
 }
 
+/// The buffer capacity is immutable; elements use atomic GC publication.
+unsafe fn snapshot_array_ref(payload: *mut u8, children: &mut Vec<*mut u8>) {
+    let cap = unsafe { *(payload as *const i64) };
+    for index in 0..cap.max(0) as usize {
+        children.push(unsafe {
+            crate::gc::load_gc_reference(payload.cast::<*mut u8>().add(index + 1))
+        });
+    }
+}
+
 /// Register the ref-buffer trace. Called on every reference-buffer allocation
 /// (idempotent): `willow_gc_init` clears the type registry, so a process-global
 /// `Once` would fail to re-register after the first reset (e.g. in multi-init
 /// test runs). Real programs init once, so the repeated insert is harmless.
 static ARRAY_REGISTRATION: crate::gc::NativeGcRegistration = crate::gc::NativeGcRegistration::new();
-const ARRAY_GC_TYPES: &[crate::gc::NativeGcType] = &[crate::gc::NativeGcType::new(
-    ARRAY_REF_TYPE_ID,
-    Some(trace_array_ref),
-    None,
-)];
+const ARRAY_GC_TYPES: &[crate::gc::NativeGcType] =
+    &[
+        crate::gc::NativeGcType::new(ARRAY_REF_TYPE_ID, Some(trace_array_ref), None)
+            .with_concurrent_trace(snapshot_array_ref),
+    ];
 
 fn ensure_trace_registered() {
     ARRAY_REGISTRATION.ensure(ARRAY_GC_TYPES);
@@ -109,14 +119,22 @@ unsafe fn store_buffer_slot(buffer: *mut u8, index: i64, value: i64, is_ref: boo
             GcStoreDestination::ArrayElement as i64,
         );
     }
-    unsafe { *buf_slot(buffer, index) = value };
+    if is_ref {
+        unsafe { crate::gc::store_gc_reference(buf_slot(buffer, index).cast(), value as *mut u8) };
+    } else {
+        unsafe { *buf_slot(buffer, index) = value };
+    }
 }
 
 unsafe fn handle_word(arr: *mut u8, w: usize) -> i64 {
     unsafe { *((arr as *const i64).add(w)) }
 }
 unsafe fn set_handle_word(arr: *mut u8, w: usize, v: i64) {
-    unsafe { *((arr as *mut i64).add(w)) = v };
+    if w == H_BUF {
+        unsafe { crate::gc::store_gc_reference((arr as *mut i64).add(w).cast(), v as *mut u8) };
+    } else {
+        unsafe { *((arr as *mut i64).add(w)) = v };
+    }
 }
 unsafe fn handle_buffer(arr: *mut u8) -> *mut u8 {
     unsafe { handle_word(arr, H_BUF) as *mut u8 }
@@ -228,6 +246,16 @@ pub extern "C" fn willow_array_element_addr(arr: *mut u8, index: i64) -> *mut u8
         return std::ptr::null_mut();
     }
     unsafe { buf_slot(handle_buffer(arr), index) as *mut u8 }
+}
+
+/// Capture the allocation that currently owns an indexed reference. Unlike
+/// the array handle, this allocation remains the same owner after a resize.
+/// Generated code roots the returned base and keeps the original index, then
+/// recomputes the interior address after any moving collection or suspension.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_array_reference_owner(arr: *mut u8, index: i64) -> *mut u8 {
+    if !check_bounds(arr, index) { return std::ptr::null_mut(); }
+    unsafe { handle_buffer(arr) }
 }
 
 /// Append `value`, growing the buffer (doubling, min 4) when full.

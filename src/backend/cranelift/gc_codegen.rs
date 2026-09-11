@@ -148,8 +148,17 @@ pub(super) fn emit_gc_heap_store_raw(
     if let Some(barrier) = barrier {
         let destination = builder.ins().iconst(types::I64, destination as i64);
         builder.ins().call(barrier, &[owner, value, destination]);
+        // The concurrent marker reads reference slots atomically. Publication
+        // follows the incremental-update barrier, including null replacements.
+        let slot = if offset == 0 {
+            owner
+        } else {
+            builder.ins().iadd_imm_s(owner, i64::from(offset))
+        };
+        builder.ins().atomic_store(flags, value, slot);
+    } else {
+        builder.ins().store(flags, value, owner, offset);
     }
-    builder.ins().store(flags, value, owner, offset);
 }
 
 impl<'a, 'b> FuncGen<'a, 'b> {

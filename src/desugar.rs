@@ -68,38 +68,40 @@ type IfaceIndex =
 /// originally contributed each effective method. Supers are visited in order,
 /// transitively, then own methods; an own/later method of the same name replaces
 /// an inherited one in place. `visiting` guards against extends-cycles.
-#[willow_continuations::function(iface_compose_methods_with_origin)]
 fn iface_compose_methods_with_origin(
     name: &str,
     snap: &IfaceIndex,
     visiting: &mut std::collections::HashSet<String>,
 ) -> Vec<(parser::ast::InterfaceMethodDecl, String)> {
-    fn upsert(
-        out: &mut Vec<(parser::ast::InterfaceMethodDecl, String)>,
-        m: parser::ast::InterfaceMethodDecl,
-        origin: String,
-    ) {
-        if let Some(existing) = out.iter_mut().find(|(e, _)| e.name == m.name) {
-            *existing = (m, origin);
-        } else {
-            out.push((m, origin));
-        }
-    }
+    enum Step<'a> { Enter(&'a str), Leave(&'a str) }
+    let mut work = vec![Step::Enter(name)];
     let mut out: Vec<(parser::ast::InterfaceMethodDecl, String)> = Vec::new();
-    if !visiting.insert(name.to_string()) {
-        return out; // cycle: stop recursing
-    }
-    if let Some((extends, own)) = snap.get(name) {
-        for sup in extends {
-            for (m, origin) in iface_compose_methods_with_origin(sup, snap, visiting) {
-                upsert(&mut out, m, origin);
+    let mut positions = std::collections::HashMap::new();
+    while let Some(step) = work.pop() {
+        match step {
+            Step::Enter(name) => {
+                if !visiting.insert(name.to_string()) { continue; }
+                work.push(Step::Leave(name));
+                if let Some((supers, _)) = snap.get(name) {
+                    work.extend(supers.iter().rev().map(|sup| Step::Enter(sup)));
+                }
+            }
+            Step::Leave(name) => {
+                if let Some((_, own)) = snap.get(name) {
+                    for method in own {
+                        let value = (method.clone(), name.to_string());
+                        if let Some(&position) = positions.get(&method.name) {
+                            out[position] = value;
+                        } else {
+                            positions.insert(method.name.clone(), out.len());
+                            out.push(value);
+                        }
+                    }
+                }
+                visiting.remove(name);
             }
         }
-        for m in own {
-            upsert(&mut out, m.clone(), name.to_string());
-        }
     }
-    visiting.remove(name);
     out
 }
 
@@ -118,25 +120,31 @@ fn iface_compose_methods(
 }
 
 /// Transitive super-interface names of `name` (in discovery order).
-#[willow_continuations::function(iface_all_supers)]
 fn iface_all_supers(
     name: &str,
     snap: &IfaceIndex,
     visiting: &mut std::collections::HashSet<String>,
     out: &mut Vec<String>,
 ) {
-    if !visiting.insert(name.to_string()) {
-        return;
-    }
-    if let Some((extends, _)) = snap.get(name) {
-        for sup in extends {
-            if !out.contains(sup) {
-                out.push(sup.clone());
+    enum Step<'a> { Enter(&'a str), Super(&'a str), Leave(&'a str) }
+    let mut work = vec![Step::Enter(name)];
+    let mut seen: std::collections::HashSet<String> = out.iter().cloned().collect();
+    while let Some(step) = work.pop() {
+        match step {
+            Step::Super(name) => {
+                if seen.insert(name.to_string()) { out.push(name.to_string()); }
+                work.push(Step::Enter(name));
             }
-            iface_all_supers(sup, snap, visiting, out);
+            Step::Enter(name) => {
+                if !visiting.insert(name.to_string()) { continue; }
+                work.push(Step::Leave(name));
+                if let Some((supers, _)) = snap.get(name) {
+                    work.extend(supers.iter().rev().map(|sup| Step::Super(sup)));
+                }
+            }
+            Step::Leave(name) => { visiting.remove(name); }
         }
     }
-    visiting.remove(name);
 }
 
 fn iface_names_related(name: &str, other: &str, snap: &IfaceIndex) -> bool {
@@ -509,27 +517,11 @@ struct ClassShape {
 /// Substitute interface generic type parameters (and `Self`) in a type. Used so
 /// a default method inherited into a class that implements `Box<i64>` has its
 /// `T`s replaced by `i64` and `Self` by the class (willow-1js.7).
-#[willow_continuations::function(subst_iface_type)]
 fn subst_iface_type(
     ty: &parser::ast::Type,
     map: &std::collections::HashMap<String, parser::ast::Type>,
 ) -> parser::ast::Type {
-    use parser::ast::Type;
-    match ty {
-        Type::Named(n) => map.get(n).cloned().unwrap_or_else(|| ty.clone()),
-        Type::Generic(n, args) => {
-            let args = args.iter().map(|a| subst_iface_type(a, map)).collect();
-            // A bare type-parameter used as a generic head is unusual; keep the
-            // head name (only its args are substituted).
-            Type::Generic(n.clone(), args)
-        }
-        Type::Array(e) => Type::Array(Box::new(subst_iface_type(e, map))),
-        Type::Fn(ps, r) => Type::Fn(
-            ps.iter().map(|p| subst_iface_type(p, map)).collect(),
-            Box::new(subst_iface_type(r, map)),
-        ),
-        _ => ty.clone(),
-    }
+    ty.substitute_names(|name| map.get(name).cloned())
 }
 
 /// Build the cross-module default-method index: for every interface declared in
@@ -916,7 +908,7 @@ mod tests {
     use crate::parser::ast::{Item, Type};
 
     #[test]
-    fn deep_interface_composition_and_type_substitution_use_heap_continuations() {
+    fn deep_interface_composition_and_type_substitution_use_explicit_worklists() {
         std::thread::Builder::new()
             .stack_size(1024 * 1024)
             .spawn(|| {

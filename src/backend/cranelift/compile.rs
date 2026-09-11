@@ -8,7 +8,6 @@ use cranelift_codegen::ir::{AbiParam, InstBuilder, UserFuncName, types};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{Linkage, Module};
 
-use super::coop_anf::normalize_coop_suspensions;
 use super::*;
 
 /// The name of a lifted closure's hidden leading parameter — the environment
@@ -354,11 +353,9 @@ impl Codegen {
         // the vtable was silently skipped, and every later boxing site fell back
         // to the raw object (willow-0g8j.3). Installed under a snapshot and taken
         // back out below, so nothing declared after this unit sees it.
-        self.with_module_aliases(|this, import_aliases| {
-            this.alias_item_import_types(&item_imports, import_aliases);
+        self.with_unit_resolution(self.resolution_context(), |this| {
+            this.alias_item_import_types(&item_imports);
             let normalized_program = normalize_std_collection_program(program);
-            let normalized_program =
-                normalize_coop_suspensions(&normalized_program, &mut this.expr_types);
             let program = &normalized_program;
             this.source_file = source_file.to_string();
             let module_prefix = module_symbol_prefix(canonical_path);
@@ -371,7 +368,7 @@ impl Codegen {
             // registered under some other spelling (willow-kd1v). Every module this
             // one imports is already declared — dependencies are declared before
             // their dependents — so the tables the aliases point at exist.
-            this.alias_unit_module_spellings(&module_spellings, import_aliases);
+            this.alias_unit_module_spellings(&module_spellings);
             this.declare_runtime()?;
             this.declare_string_literals(program)?;
             // The source path backs `PanicInfo.file` for every panic, so it is a
@@ -699,29 +696,29 @@ impl Codegen {
         let entry_leaves = std::mem::take(&mut self.cooperative_leaves);
 
         let program = &unit.program;
-        let result = self.with_module_aliases(|this, aliases| {
+        let result = self.with_unit_resolution(self.resolution_context(), |this| {
             // Bind the types this unit imported by single-item import under the
             // local names it spells them by (willow-0g8j.3), then the module's own
             // enums/interfaces under their unqualified names so the module body
             // resolves its own types internally (willow-64gs.1). Own declarations
             // are installed second, so they win.
-            this.alias_item_import_types(&unit.item_imports, aliases);
+            this.alias_item_import_types(&unit.item_imports);
             // Before the unit's own names, so a module reached under two spellings
             // still loses to a type this module declares itself (willow-kd1v).
-            this.alias_unit_module_spellings(&unit.module_spellings, aliases);
-            this.alias_module_local_types(program, &unit.mod_name, aliases);
+            this.alias_unit_module_spellings(&unit.module_spellings);
+            this.alias_module_local_types(program, &unit.mod_name);
             for item in &program.items {
                 if let Item::Function(f) = item {
                     let mangled = module_item_symbol(&unit.module_prefix, &f.name);
-                    this.alias_function_symbol(&f.name, &mangled, aliases);
+                    this.alias_function_symbol(&f.name, &mangled);
                 }
             }
             for (local_name, qualified) in &unit.module_classes {
-                this.alias_class_symbol(local_name, &qualified.name, aliases);
+                this.alias_class_symbol(local_name, &qualified.name);
                 for method in &qualified.methods {
                     let local_mangled = class_member_symbol(local_name, &method.name);
                     let qualified_mangled = this.class_method_symbol(&qualified.name, &method.name);
-                    this.alias_function_symbol(&local_mangled, &qualified_mangled, aliases);
+                    this.alias_function_symbol(&local_mangled, &qualified_mangled);
                 }
             }
 
@@ -788,11 +785,9 @@ impl Codegen {
         // different name (willow-kd1v). Snapshotted and taken back out below:
         // every module's BODY phase runs between this declaration and the
         // entry's own, and those units spell the same modules their own way.
-        self.with_module_aliases(|this, module_aliases| {
-            this.alias_unit_module_spellings(&module_spellings, module_aliases);
+        self.with_unit_resolution(self.resolution_context(), |this| {
+            this.alias_unit_module_spellings(&module_spellings);
             let normalized_program = normalize_std_collection_program(program);
-            let normalized_program =
-                normalize_coop_suspensions(&normalized_program, &mut this.expr_types);
             let program = &normalized_program;
             this.source_file = source_file.to_string();
             this.declare_runtime()?;
@@ -931,8 +926,11 @@ impl Codegen {
         let program = &unit.program;
         // The entry's own module spellings again: the last module body phase
         // took its own back out (willow-kd1v).
-        self.with_module_aliases(|this, aliases| {
-            this.alias_unit_module_spellings(&unit.module_spellings, aliases);
+        self.with_unit_resolution(self.resolution_context(), |this| {
+            // Declarations no longer leak their unit aliases into later body
+            // phases. Install this entry unit's type imports explicitly too.
+            this.alias_item_import_types(&unit.item_imports);
+            this.alias_unit_module_spellings(&unit.module_spellings);
 
             (|| -> Result<()> {
                 // Compile lambdas first (user functions are already declared, so calls inside work).
@@ -1332,8 +1330,9 @@ impl Codegen {
         builder.append_block_params_for_function_params(entry_block);
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
-        let panic_return_block =
-            (!is_main && self.user_function_may_panic(name)).then(|| builder.create_block());
+        // Native task cancellation also uses the neutral synchronous ABI return.
+        // Main has no generated caller to finish an unhandled panic.
+        let panic_return_block = (!is_main).then(|| builder.create_block());
 
         let mut fg = FuncGen {
             builder: &mut builder,
@@ -1347,7 +1346,11 @@ impl Codegen {
             panic_recovery_targets: HashSet::new(),
             panic_return_block,
             panic_function_root_depth: None,
+            emitting_sync_cancel_cleanup: false,
+            lir_cleanup_exit: None,
             callstack_frame_depth: 0,
+            lir_call_frames: Vec::new(),
+            lir_reference_scopes: Vec::new(),
             fault_site_span: None,
             collected_defer_sites: Vec::new(),
             lock_scopes: Vec::new(),
@@ -1395,7 +1398,7 @@ impl Codegen {
             coop_shadow_roots: None,
             build_mode: self.build_mode,
             source_file: &self.source_file,
-            address_taken: collect_address_taken_locals(&f.body),
+            address_taken: super::lir_address_taken_locals(&lir_fn),
         };
         if panic_return_block.is_some() {
             fg.panic_function_root_depth =
@@ -1731,7 +1734,11 @@ impl Codegen {
             panic_recovery_targets: HashSet::new(),
             panic_return_block: None,
             panic_function_root_depth: None,
+            emitting_sync_cancel_cleanup: false,
+            lir_cleanup_exit: None,
             callstack_frame_depth: 0,
+            lir_call_frames: Vec::new(),
+            lir_reference_scopes: Vec::new(),
             fault_site_span: None,
             collected_defer_sites: Vec::new(),
             lock_scopes: Vec::new(),
@@ -2184,9 +2191,7 @@ impl Codegen {
         builder.append_block_params_for_function_params(entry_block);
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
-        let panic_return_block = self
-            .user_function_may_panic(&mangled)
-            .then(|| builder.create_block());
+        let panic_return_block = Some(builder.create_block());
 
         let mut fg = FuncGen {
             builder: &mut builder,
@@ -2200,7 +2205,11 @@ impl Codegen {
             panic_recovery_targets: HashSet::new(),
             panic_return_block,
             panic_function_root_depth: None,
+            emitting_sync_cancel_cleanup: false,
+            lir_cleanup_exit: None,
             callstack_frame_depth: 0,
+            lir_call_frames: Vec::new(),
+            lir_reference_scopes: Vec::new(),
             fault_site_span: None,
             collected_defer_sites: Vec::new(),
             lock_scopes: Vec::new(),
@@ -2247,7 +2256,7 @@ impl Codegen {
             coop_shadow_roots: None,
             build_mode: self.build_mode,
             source_file: &self.source_file,
-            address_taken: collect_address_taken_locals(&m.body),
+            address_taken: super::lir_address_taken_locals(&lir_fn),
         };
         if panic_return_block.is_some() {
             fg.panic_function_root_depth =

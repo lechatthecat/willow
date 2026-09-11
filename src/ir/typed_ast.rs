@@ -21,6 +21,84 @@ pub fn static_initializer_name(class: &str, field: &str) -> String {
 pub struct HirProgram {
     pub functions: Vec<HirFunction>,
     pub classes: Vec<HirClass>,
+    pub resolution: HirResolution,
+}
+
+/// Owned, canonical declaration metadata used by LIR lowering. It has no
+/// references to the mutable checker or unit-local alias scopes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HirResolution {
+    pub enums: std::collections::HashMap<TypeId, HirEnumInfo>,
+    pub classes: std::collections::HashMap<TypeId, HirClassInfo>,
+    pub interfaces: std::collections::HashMap<TypeId, HirInterfaceInfo>,
+    pub functions: std::collections::HashMap<FunctionId, HirSignature>,
+    /// Unit access spelling to canonical builtin namespace; user imports win
+    /// over a canonical spelling without displacing an explicit std alias.
+    pub namespaces: std::collections::HashMap<TypeId, String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HirEnumInfo {
+    pub type_params: Vec<TypeId>,
+    pub variants: Vec<HirEnumVariant>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HirEnumVariant {
+    pub name: String,
+    pub tag: i64,
+    pub payloads: Vec<Type>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HirClassInfo {
+    pub base: Option<TypeId>,
+    pub implements: Vec<Type>,
+    /// Fields declared by this class, in declaration order. Inherited fields
+    /// are obtained by following `base`, from the oldest ancestor first.
+    pub fields: Vec<(String, Type)>,
+    pub static_fields: std::collections::HashMap<String, Type>,
+    pub constructor: Option<HirSignature>,
+    pub methods: std::collections::HashMap<String, HirSignature>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HirInterfaceInfo {
+    pub type_params: Vec<TypeId>,
+    pub extends: Vec<TypeId>,
+    pub methods: std::collections::HashMap<String, HirSignature>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HirSignature {
+    /// Source parameters, excluding any implicit receiver.
+    pub params: Vec<Type>,
+    pub param_modes: Vec<crate::parser::ast::ParamMode>,
+    pub return_type: Type,
+    pub is_static: bool,
+    pub is_async: bool,
+}
+
+impl HirResolution {
+    /// Representation-preserving class upcasts and declared interface
+    /// conversions. Lowering uses declarations rather than backend layouts.
+    pub(crate) fn can_coerce(&self, source: &Type, target: &Type) -> bool {
+        if source == target { return true; }
+        let mut pending = vec![source.clone()];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(current) = pending.pop() {
+            if current == *target { return true; }
+            if !seen.insert(current.clone()) { continue; }
+            let identity = match &current { Type::Named(id) | Type::Generic(id, _) => *id, _ => continue };
+            if let Some(class) = self.classes.get(&identity) {
+                if let Some(base) = class.base { pending.push(Type::Named(base)); }
+                pending.extend(class.implements.iter().cloned());
+            } else if let Some(interface) = self.interfaces.get(&identity) {
+                pending.extend(interface.extends.iter().map(|parent| Type::Named(*parent)));
+            }
+        }
+        false
+    }
 }
 
 /// A class and its lowered methods. Each method is a [`HirFunction`] whose first

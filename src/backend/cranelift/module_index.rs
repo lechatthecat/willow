@@ -1,6 +1,7 @@
 //! Module aliases bind semantic identities; linker spelling belongs to definitions.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::module::ModuleId;
 
@@ -11,14 +12,27 @@ struct ModuleDefinition {
     linker_prefix: String,
 }
 
+/// Immutable snapshot of the aliases visible within one compile unit.
+#[derive(Default, Clone, Debug)]
+pub(super) struct ModuleResolutionContext(Rc<HashMap<String, ModuleId>>);
+
 #[derive(Default, Clone, Debug)]
 pub(super) struct ModuleSymbols {
+    context: ModuleResolutionContext,
     bindings: HashMap<String, ModuleId>,
     definitions: HashMap<ModuleId, ModuleDefinition>,
     canonical: HashMap<String, ModuleId>,
 }
 
 impl ModuleSymbols {
+    pub(super) fn resolution_context(&self) -> ModuleResolutionContext {
+        self.context.clone()
+    }
+
+    pub(super) fn set_resolution_context(&mut self, context: ModuleResolutionContext) {
+        self.context = context;
+    }
+
     pub(super) fn register(&mut self, id: ModuleId, canonical_path: &str, access: &str) {
         let definition = self
             .definitions
@@ -39,7 +53,7 @@ impl ModuleSymbols {
     }
 
     pub(super) fn resolve(&self, access: &str) -> Option<ModuleId> {
-        self.bindings.get(access).copied()
+        self.context.0.get(access).or_else(|| self.bindings.get(access)).copied()
     }
 
     pub(super) fn bind(&mut self, access: String, id: ModuleId) -> Option<ModuleId> {
@@ -47,16 +61,19 @@ impl ModuleSymbols {
             self.definitions.contains_key(&id),
             "alias target must be registered"
         );
-        self.bindings.insert(access, id)
+        let previous = self.resolve(&access);
+        Rc::make_mut(&mut self.context.0).insert(access, id);
+        previous
     }
 
+    #[cfg(test)]
     pub(super) fn restore(&mut self, access: String, previous: Option<ModuleId>) {
         match previous {
             Some(id) => {
                 self.bind(access, id);
             }
             None => {
-                self.bindings.remove(&access);
+                Rc::make_mut(&mut self.context.0).remove(&access);
             }
         }
     }
@@ -69,11 +86,13 @@ impl ModuleSymbols {
     }
 
     pub(super) fn keys(&self) -> impl Iterator<Item = &String> {
-        self.bindings.keys()
+        self.context.0.keys().chain(
+            self.bindings.keys().filter(|access| !self.context.0.contains_key(*access)),
+        )
     }
 
     pub(super) fn contains_key(&self, access: &str) -> bool {
-        self.bindings.contains_key(access)
+        self.resolve(access).is_some()
     }
 
     pub(super) fn table_name(&self, canonical_path: &str) -> Option<&str> {
@@ -138,6 +157,49 @@ impl FromIterator<(String, String)> for ModuleSymbols {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restoring_unit_context_preserves_new_global_registrations() {
+        let mut symbols = ModuleSymbols::default();
+        symbols.register(ModuleId(0), "pkg::base", "base");
+        let outer = symbols.resolution_context();
+        symbols.bind("local".into(), ModuleId(0));
+        symbols.register(ModuleId(1), "pkg::new", "new");
+        symbols.set_resolution_context(outer);
+        assert_eq!(symbols.resolve("local"), None);
+        assert_eq!(symbols.resolve("new"), Some(ModuleId(1)));
+        assert_eq!(symbols.table_name("pkg::new"), Some("new"));
+    }
+
+    #[test]
+    fn snapshots_and_clones_keep_aliases_isolated() {
+        let mut symbols = ModuleSymbols::default();
+        symbols.register(ModuleId(0), "pkg::a", "a");
+        symbols.register(ModuleId(1), "pkg::b", "b");
+        symbols.bind("local".into(), ModuleId(0));
+        let snapshot = symbols.resolution_context();
+        let mut other = symbols.clone();
+        symbols.bind("local".into(), ModuleId(1));
+        other.restore("local".into(), None);
+        assert_eq!(symbols.resolve("local"), Some(ModuleId(1)));
+        assert_eq!(other.resolve("local"), None);
+        other.set_resolution_context(snapshot);
+        assert_eq!(other.resolve("local"), Some(ModuleId(0)));
+    }
+
+    #[test]
+    fn overlay_shadows_global_names_without_duplicate_keys() {
+        let mut symbols = ModuleSymbols::default();
+        symbols.register(ModuleId(0), "pkg::a", "a");
+        symbols.register(ModuleId(1), "pkg::b", "b");
+        assert_eq!(symbols.bind("a".into(), ModuleId(1)), Some(ModuleId(0)));
+        assert_eq!(symbols.resolve("a"), Some(ModuleId(1)));
+        assert_eq!(symbols.keys().filter(|name| name.as_str() == "a").count(), 1);
+        symbols.restore("a".into(), None);
+        assert_eq!(symbols.resolve("a"), Some(ModuleId(0)));
+        assert!(symbols.contains_key("a"));
+        assert_eq!(symbols.keys().count(), 2);
+    }
 
     #[test]
     fn module_aliases_preserve_identity_and_original_table_names() {

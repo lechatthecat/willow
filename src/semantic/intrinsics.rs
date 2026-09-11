@@ -1589,3 +1589,134 @@ fn f() {
         );
     }
 }
+
+/// The zero-argument GC statistic builtins: `() -> i64` reads of a runtime
+/// counter. Their ABI entries are all `NONE; ([] -> Some(I64))`, so LIR
+/// emission needs only the runtime call (willow-0g8j.3.1).
+///
+/// Derived from `builtin_call_runtime_name` rather than repeating its list:
+/// `gc_collect` / `gc_minor_collect` are the void pair beside these, and
+/// `sleep` / `yield` are futures, not reads.
+pub(crate) fn gc_stat_builtin_runtime_name(callee: &str) -> Option<&'static str> {
+    if callee == "gc_collect" || callee == "gc_minor_collect" {
+        return None;
+    }
+    callee.strip_prefix("gc_")?;
+    builtin_call_runtime_name(callee)
+}
+
+pub(crate) fn builtin_call_runtime_name(callee: &str) -> Option<&'static str> {
+    match callee {
+        "gc_collect" => Some("willow_gc_collect"),
+        "gc_minor_collect" => Some("willow_gc_minor_collect"),
+        "gc_allocated_bytes" => Some("willow_gc_allocated_bytes"),
+        "gc_tlab_fast_allocations" => Some("willow_gc_tlab_fast_allocations"),
+        "gc_tlab_slow_allocations" => Some("willow_gc_tlab_slow_allocations"),
+        "gc_tlab_refills" => Some("willow_gc_tlab_refills"),
+        "gc_tlab_large_allocations" => Some("willow_gc_tlab_large_allocations"),
+        "gc_tlab_reserved_bytes" => Some("willow_gc_tlab_reserved_bytes"),
+        "gc_minor_collections" => Some("willow_gc_minor_collections"),
+        "gc_promoted_objects" => Some("willow_gc_promoted_objects"),
+        "gc_moved_objects" => Some("willow_gc_moved_objects"),
+        "gc_remembered_set_size" => Some("willow_gc_remembered_set_size"),
+        "gc_dirty_card_count" => Some("willow_gc_dirty_card_count"),
+        "gc_write_barrier_hits" => Some("willow_gc_write_barrier_hits"),
+        "gc_old_region_count" => Some("willow_gc_old_region_count"),
+        "gc_old_region_reserved_bytes" => Some("willow_gc_old_region_reserved_bytes"),
+        "gc_old_region_live_bytes" => Some("willow_gc_old_region_live_bytes"),
+        "gc_old_region_fragmentation_bytes" => Some("willow_gc_old_region_fragmentation_bytes"),
+        "gc_large_object_region_count" => Some("willow_gc_large_object_region_count"),
+        "gc_pinned_region_count" => Some("willow_gc_pinned_region_count"),
+        "gc_old_region_allocations" => Some("willow_gc_old_region_allocations"),
+        "gc_old_region_reuses" => Some("willow_gc_old_region_reuses"),
+        "gc_old_regions_released" => Some("willow_gc_old_regions_released"),
+        "gc_major_collections" => Some("willow_gc_major_collections"),
+        "sleep" => Some("willow_runtime_sleep"),
+        "yield" => Some("willow_runtime_yield"),
+        _ => None,
+    }
+}
+
+pub(crate) struct NamespaceBuiltin {
+    pub runtime: &'static str,
+    pub params: Vec<crate::semantic::ids::SemanticType>,
+    pub ret: crate::semantic::ids::SemanticType,
+    /// `fs::exists` is the one entry whose runtime returns a full word for a
+    /// `bool` result; emission narrows that word to a boolean.
+    pub narrow_to_bool: bool,
+}
+
+
+pub(crate) fn namespace_builtin(class: &str, method: &str) -> Option<NamespaceBuiltin> {
+    use crate::semantic::ids::SemanticType as Type;
+    use crate::stdlib_schema::{self, StdItemKind};
+    if class == "f64" {
+        return match method {
+            "to_string" => Some(NamespaceBuiltin {
+                runtime: "willow_f64_to_string",
+                params: vec![Type::F64],
+                ret: Type::String,
+                narrow_to_bool: false,
+            }),
+            "parse" => Some(NamespaceBuiltin {
+                runtime: "willow_f64_parse",
+                params: vec![Type::String],
+                ret: Type::Generic(
+                    "Result".to_string().into(),
+                    vec![Type::F64, Type::Named("ParseFloatError".to_string().into())],
+                ),
+                narrow_to_bool: false,
+            }),
+            _ => None,
+        };
+    }
+    let runtime = match (class, method) {
+        ("env", "args_len") => "willow_runtime_args_len",
+        ("env", "args") => "willow_runtime_args_array",
+        ("env", "program_name") => "willow_runtime_program_name",
+        ("env", "arg") => "willow_runtime_arg",
+
+        ("fs", "temp_path") => "willow_fs_temp_path",
+        ("fs", "read_to_string") => "willow_fs_read_to_string",
+        ("fs", "write_string") => "willow_fs_write_string",
+        ("fs", "exists") => "willow_fs_exists",
+        ("fs", "remove_file") => "willow_fs_remove_file",
+        ("fs", "read_to_string_async") => "willow_fs_read_to_string_async",
+        ("fs", "write_string_async") => "willow_fs_write_string_async",
+        ("fs", "exists_async") => "willow_fs_exists_async",
+        ("fs", "remove_file_async") => "willow_fs_remove_file_async",
+
+        // `parallel::map(frozen, f)` (willow-0g8j.2.13). Its two arguments are
+        // the only ones in this table that are not scalars or strings: a
+        // `FrozenArray<i64>`, which is rooted like any other heap handle, and a
+        // FUNCTION VALUE, which is a bare code address and so is deliberately
+        // not. The runtime owns the chunking, so from here it is one call.
+        ("parallel", "map") => "willow_parallel_map_i64",
+
+        ("net", "bind") => "willow_net_bind",
+        ("net", "local_addr") => "willow_net_local_addr",
+        ("net", "peer_addr") => "willow_net_peer_addr",
+        ("net", "shutdown") => "willow_net_shutdown",
+        ("net", "connect_async") => "willow_net_connect_async",
+        ("net", "accept_async") => "willow_net_accept_async",
+        ("net", "read_async") => "willow_net_read_async",
+        ("net", "write_async") => "willow_net_write_async",
+        _ => return None,
+    };
+    let StdItemKind::Function {
+        params,
+        return_type,
+    } = stdlib_schema::item(class, method)?.kind
+    else {
+        return None;
+    };
+    Some(NamespaceBuiltin {
+        runtime,
+        params: params
+            .iter()
+            .map(|ty| ty.to_ast_type().map(Into::into))
+            .collect::<Option<Vec<_>>>()?,
+        ret: return_type.to_ast_type()?.into(),
+        narrow_to_bool: (class, method) == ("fs", "exists"),
+    })
+}

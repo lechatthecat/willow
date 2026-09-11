@@ -173,41 +173,13 @@ pub(crate) fn is_untyped_channel_ctor_call(expr: &Expr) -> bool {
     }
 }
 
-#[willow_continuations::function(qualify_type_for_module)]
 pub(crate) fn qualify_type_for_module(ty: &Type, module_prefix: Option<&str>) -> Type {
-    match ty {
-        Type::Named(name) => module_prefix
+    ty.map_names(|name| {
+        module_prefix
             .filter(|_| !name.contains("::"))
-            .map(|module| Type::Named(format!("{module}::{name}")))
-            .unwrap_or_else(|| ty.clone()),
-        Type::Array(element) => {
-            Type::Array(Box::new(qualify_type_for_module(element, module_prefix)))
-        }
-        Type::Generic(name, args) => Type::Generic(
-            module_prefix
-                .filter(|_| !name.contains("::"))
-                .map(|module| format!("{module}::{name}"))
-                .unwrap_or_else(|| name.clone()),
-            args.iter()
-                .map(|arg| qualify_type_for_module(arg, module_prefix))
-                .collect(),
-        ),
-        Type::Fn(params, ret) => Type::Fn(
-            params
-                .iter()
-                .map(|param| qualify_type_for_module(param, module_prefix))
-                .collect(),
-            Box::new(qualify_type_for_module(ret, module_prefix)),
-        ),
-        Type::Closure(params, ret) => Type::Closure(
-            params
-                .iter()
-                .map(|param| qualify_type_for_module(param, module_prefix))
-                .collect(),
-            Box::new(qualify_type_for_module(ret, module_prefix)),
-        ),
-        Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Void | Type::Never => ty.clone(),
-    }
+            .map(|module| format!("{module}::{name}"))
+            .unwrap_or_else(|| name.clone())
+    })
 }
 
 pub(crate) fn type_path_name(path: &TypePath) -> String {

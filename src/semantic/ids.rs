@@ -1,199 +1,239 @@
-//! Typed identities for compiler symbols.
+//! Interned identities for compiler symbols.
 //!
-//! Source names remain strings at the parser boundary, but compiler indexes use
-//! these structured IDs so a module, type, and function cannot be mixed up and
-//! `module::Type::method` is never interpreted by ad-hoc string slicing.
+//! IDs are process-local 32-bit handles. The process symbol table owns names;
+//! source/artifact boundaries serialize the structured names, never handles.
+//! Interned names live for the process so IDs remain valid across independent
+//! compiler sessions, builtin caches, and threads. Repeated compilations of the
+//! same names reuse storage; distinct names extend the process symbol table.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Index;
-
+use std::sync::{LazyLock, RwLock};
 use crate::module::ModuleId;
 
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
-pub struct TypeId {
-    namespace: Option<Box<str>>,
-    name: Box<str>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename = "TypeId")]
+struct TypeName {
+    namespace: Option<&'static str>,
+    name: &'static str,
 }
-
-impl TypeId {
-    pub fn local(name: impl AsRef<str>) -> Self {
-        Self {
-            namespace: None,
-            name: name.as_ref().into(),
-        }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename = "FunctionId")]
+struct FunctionName {
+    namespace: Option<&'static str>,
+    owner: Option<&'static str>,
+    name: &'static str,
+}
+#[derive(Default)]
+struct SymbolTable {
+    strings: HashSet<&'static str>,
+    types: Vec<TypeName>,
+    type_ids: HashMap<TypeName, TypeId>,
+    functions: Vec<FunctionName>,
+    function_ids: HashMap<FunctionName, FunctionId>,
+}
+static SYMBOLS: LazyLock<RwLock<SymbolTable>> = LazyLock::new(|| RwLock::new(SymbolTable::default()));
+impl SymbolTable {
+    fn find_type(&self, namespace: Option<&str>, name: &str) -> Option<TypeId> {
+        let namespace = match namespace { Some(n) => Some(*self.strings.get(n)?), None => None };
+        self.type_ids.get(&TypeName { namespace, name: self.strings.get(name)? }).copied()
+    }
+    fn find_function(&self, namespace: Option<&str>, owner: Option<&str>, name: &str) -> Option<FunctionId> {
+        let namespace = match namespace { Some(n) => Some(*self.strings.get(n)?), None => None };
+        let owner = match owner { Some(n) => Some(*self.strings.get(n)?), None => None };
+        self.function_ids.get(&FunctionName { namespace, owner, name: self.strings.get(name)? }).copied()
     }
 
+    fn string(&mut self, name: &str) -> &'static str {
+        if let Some(value) = self.strings.get(name) { return value; }
+        let value = Box::leak(name.to_owned().into_boxed_str());
+        self.strings.insert(value);
+        value
+    }
+    fn type_id(&mut self, namespace: Option<&str>, name: &str) -> TypeId {
+        let key = TypeName { namespace: namespace.map(|n| self.string(n)), name: self.string(name) };
+        if let Some(id) = self.type_ids.get(&key) { return *id; }
+        let id = TypeId(u32::try_from(self.types.len()).expect("type symbol table exhausted"));
+        self.types.push(key);
+        self.type_ids.insert(key, id);
+        id
+    }
+    fn function_id(&mut self, namespace: Option<&str>, owner: Option<&str>, name: &str) -> FunctionId {
+        let key = FunctionName {
+            namespace: namespace.map(|n| self.string(n)),
+            owner: owner.map(|n| self.string(n)), name: self.string(name),
+        };
+        if let Some(id) = self.function_ids.get(&key) { return *id; }
+        let id = FunctionId(u32::try_from(self.functions.len()).expect("function symbol table exhausted"));
+        self.functions.push(key);
+        self.function_ids.insert(key, id);
+        id
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct TypeId(u32);
+impl TypeId {
+    fn intern(namespace: Option<&str>, name: &str) -> Self {
+        if let Some(id) = SYMBOLS.read().expect("symbol table poisoned").find_type(namespace, name) { return id; }
+        SYMBOLS.write().expect("symbol table poisoned").type_id(namespace, name)
+    }
+    fn spelling(&self) -> TypeName {
+        SYMBOLS.read().expect("symbol table poisoned").types[self.0 as usize]
+    }
+    pub fn local(name: impl AsRef<str>) -> Self { Self::intern(None, name.as_ref()) }
     pub fn from_source_name(name: &str) -> Self {
         match name.rsplit_once("::") {
-            Some((namespace, name)) => Self {
-                namespace: Some(namespace.into()),
-                name: name.into(),
-            },
+            Some((namespace, name)) => Self::intern(Some(namespace), name),
             None => Self::local(name),
         }
     }
-
-    pub fn in_namespace(mut self, namespace: impl AsRef<str>) -> Self {
-        self.namespace = Some(namespace.as_ref().into());
-        self
+    pub fn in_namespace(self, namespace: impl AsRef<str>) -> Self {
+        Self::intern(Some(namespace.as_ref()), self.name())
     }
-
-    pub fn namespace(&self) -> Option<&str> {
-        self.namespace.as_deref()
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
+    pub fn namespace(&self) -> Option<&str> { self.spelling().namespace }
+    pub fn name(&self) -> &str { self.spelling().name }
 }
-
 impl From<String> for TypeId {
-    fn from(name: String) -> Self {
-        Self::from_source_name(&name)
-    }
+    fn from(name: String) -> Self { Self::from_source_name(&name) }
 }
 impl From<&str> for TypeId {
-    fn from(name: &str) -> Self {
-        Self::from_source_name(name)
-    }
+    fn from(name: &str) -> Self { Self::from_source_name(name) }
 }
-impl Default for TypeId {
-    fn default() -> Self {
-        Self::local("")
-    }
-}
-
+impl Default for TypeId { fn default() -> Self { Self::local("") } }
 impl fmt::Display for TypeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(namespace) = &self.namespace {
-            write!(f, "{namespace}::")?;
-        }
-        f.write_str(&self.name)
+        let spelling = self.spelling();
+        if let Some(namespace) = spelling.namespace { write!(f, "{namespace}::")?; }
+        f.write_str(spelling.name)
+    }
+}
+impl fmt::Debug for TypeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let spelling = self.spelling();
+        f.debug_struct("TypeId").field("namespace", &spelling.namespace).field("name", &spelling.name).finish()
+    }
+}
+// Ordering is lexical rather than allocation-order-dependent, preserving
+// deterministic diagnostics and artifacts across concurrent compilations.
+impl Ord for TypeId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering { self.spelling().cmp(&other.spelling()) }
+}
+impl PartialOrd for TypeId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+impl serde::Serialize for TypeId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&self.spelling(), serializer)
+    }
+}
+impl<'de> serde::Deserialize<'de> for TypeId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename = "TypeId")]
+        struct Name { namespace: Option<String>, name: String }
+        let spelling = <Name as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Self::intern(spelling.namespace.as_deref(), &spelling.name))
     }
 }
 
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
-pub struct FunctionId {
-    namespace: Option<Box<str>>,
-    owner: Option<Box<str>>,
-    name: Box<str>,
-}
-
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct FunctionId(u32);
 impl FunctionId {
-    pub fn free(name: impl AsRef<str>) -> Self {
-        Self {
-            namespace: None,
-            owner: None,
-            name: name.as_ref().into(),
-        }
+    fn intern(namespace: Option<&str>, owner: Option<&str>, name: &str) -> Self {
+        if let Some(id) = SYMBOLS.read().expect("symbol table poisoned").find_function(namespace, owner, name) { return id; }
+        SYMBOLS.write().expect("symbol table poisoned").function_id(namespace, owner, name)
     }
-
-    /// Build a free-function ID from a parser call name. The last path segment
-    /// is the function and preceding segments form its module namespace.
+    fn spelling(&self) -> FunctionName {
+        SYMBOLS.read().expect("symbol table poisoned").functions[self.0 as usize]
+    }
+    pub fn free(name: impl AsRef<str>) -> Self { Self::intern(None, None, name.as_ref()) }
     pub fn free_from_source_name(name: &str) -> Self {
         match name.rsplit_once("::") {
-            Some((namespace, name)) => Self::free(name).in_namespace(namespace),
+            Some((namespace, name)) => Self::intern(Some(namespace), None, name),
             None => Self::free(name),
         }
     }
-
     pub fn method(owner: TypeId, name: impl AsRef<str>) -> Self {
-        Self {
-            namespace: owner.namespace,
-            owner: Some(owner.name),
-            name: name.as_ref().into(),
-        }
+        let owner = owner.spelling();
+        Self::intern(owner.namespace, Some(owner.name), name.as_ref())
     }
-
-    pub fn in_namespace(mut self, namespace: impl AsRef<str>) -> Self {
-        self.namespace = Some(namespace.as_ref().into());
-        self
+    pub fn in_namespace(self, namespace: impl AsRef<str>) -> Self {
+        let name = self.spelling();
+        Self::intern(Some(namespace.as_ref()), name.owner, name.name)
     }
-
-    pub fn namespace(&self) -> Option<&str> {
-        self.namespace.as_deref()
-    }
-
-    pub fn owner(&self) -> Option<&str> {
-        self.owner.as_deref()
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
+    pub fn namespace(&self) -> Option<&str> { self.spelling().namespace }
+    pub fn owner(&self) -> Option<&str> { self.spelling().owner }
+    pub fn name(&self) -> &str { self.spelling().name }
     pub fn unqualified_name(&self) -> &str {
-        if self.namespace.is_none() && self.owner.is_none() {
-            self.name()
-        } else {
-            ""
-        }
+        let name = self.spelling();
+        if name.namespace.is_none() && name.owner.is_none() { name.name } else { "" }
     }
-
     pub fn owner_type(&self) -> Option<TypeId> {
-        self.owner.as_ref().map(|name| TypeId {
-            namespace: self.namespace.clone(),
-            name: name.clone(),
-        })
+        let name = self.spelling();
+        name.owner.map(|owner| TypeId::intern(name.namespace, owner))
     }
-
-    pub fn is_free_named(&self, name: &str) -> bool {
-        self.namespace.is_none() && self.owner.is_none() && self.name() == name
+    pub fn is_free_named(&self, expected: &str) -> bool {
+        let name = self.spelling();
+        name.namespace.is_none() && name.owner.is_none() && name.name == expected
     }
-
-    pub fn is_method_of(&self, owner: &str) -> bool {
-        self.namespace.is_none() && self.owner() == Some(owner)
+    pub fn is_method_of(&self, expected: &str) -> bool {
+        let name = self.spelling();
+        name.namespace.is_none() && name.owner == Some(expected)
     }
-
     pub fn remap_imported_item(&self, item: &str, local: &str) -> Option<Self> {
-        if self.is_free_named(item) {
-            Some(Self::free(local))
-        } else if self.is_method_of(item) {
-            Some(Self::method(TypeId::local(local), self.name.as_ref()))
-        } else {
-            None
-        }
+        if self.is_free_named(item) { Some(Self::free(local)) }
+        else if self.is_method_of(item) { Some(Self::method(TypeId::local(local), self.name())) }
+        else { None }
     }
-
-    pub fn resolve_self_owner(mut self, owner: &TypeId) -> Self {
-        if self.owner() == Some("Self") || self.owner() == Some("self") {
-            self.namespace = owner.namespace.clone();
-            self.owner = Some(owner.name.clone());
-        }
-        self
+    pub fn resolve_self_owner(self, owner: &TypeId) -> Self {
+        if matches!(self.owner(), Some("Self" | "self")) { Self::method(*owner, self.name()) }
+        else { self }
     }
 }
-
 impl From<String> for FunctionId {
-    fn from(name: String) -> Self {
-        Self::free_from_source_name(&name)
-    }
+    fn from(name: String) -> Self { Self::free_from_source_name(&name) }
 }
 impl From<&str> for FunctionId {
-    fn from(name: &str) -> Self {
-        Self::free_from_source_name(name)
-    }
+    fn from(name: &str) -> Self { Self::free_from_source_name(name) }
 }
-impl Default for FunctionId {
-    fn default() -> Self {
-        Self::free("")
-    }
-}
-
+impl Default for FunctionId { fn default() -> Self { Self::free("") } }
 impl fmt::Display for FunctionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(namespace) = &self.namespace {
-            write!(f, "{namespace}::")?;
-        }
-        if let Some(owner) = &self.owner {
-            write!(f, "{owner}::")?;
-        }
-        f.write_str(&self.name)
+        let name = self.spelling();
+        if let Some(namespace) = name.namespace { write!(f, "{namespace}::")?; }
+        if let Some(owner) = name.owner { write!(f, "{owner}::")?; }
+        f.write_str(name.name)
+    }
+}
+impl fmt::Debug for FunctionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = self.spelling();
+        f.debug_struct("FunctionId").field("namespace", &name.namespace)
+            .field("owner", &name.owner).field("name", &name.name).finish()
+    }
+}
+impl Ord for FunctionId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering { self.spelling().cmp(&other.spelling()) }
+}
+impl PartialOrd for FunctionId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+impl serde::Serialize for FunctionId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&self.spelling(), serializer)
+    }
+}
+impl<'de> serde::Deserialize<'de> for FunctionId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename = "FunctionId")]
+        struct Name { namespace: Option<String>, owner: Option<String>, name: String }
+        let name = <Name as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Self::intern(name.namespace.as_deref(), name.owner.as_deref(), &name.name))
     }
 }
 
@@ -213,58 +253,54 @@ pub struct ResolvedSymbolId {
 }
 
 /// One unit's local spellings resolve to canonical function identities.
-/// All signature/ABI tables share this scope instead of copying metadata.
+/// Clones retain immutable alias snapshots while sharing build-wide declarations.
 #[derive(Debug, Clone, Default)]
-pub struct FunctionScope(std::rc::Rc<std::cell::RefCell<FunctionBindings>>);
-
-#[derive(Debug, Default)]
-struct FunctionBindings {
-    aliases: HashMap<FunctionId, FunctionId>,
+pub struct FunctionScope {
+    aliases: std::rc::Rc<HashMap<FunctionId, FunctionId>>,
     /// Backend spellings are labels for IDs, never input to an ID parser.
-    declarations: HashMap<String, FunctionId>,
+    declarations: std::rc::Rc<std::cell::RefCell<HashMap<String, FunctionId>>>,
 }
 
 impl FunctionScope {
     /// Associate an emitted/lookup spelling with its declaration identity.
     pub fn declare(&self, spelling: &str, id: FunctionId) {
-        let mut bindings = self.0.borrow_mut();
-        bindings.declarations.insert(id.to_string(), id.clone());
-        bindings.declarations.insert(spelling.to_owned(), id);
+        let mut declarations = self.declarations.borrow_mut();
+        declarations.insert(id.to_string(), id);
+        declarations.insert(spelling.to_owned(), id);
     }
     pub fn lookup_id(&self, spelling: &str) -> FunctionId {
         self.resolve(&FunctionId::free(spelling))
     }
     fn declaration_id(&self, spelling: &str) -> FunctionId {
-        self.0
+        self.declarations
             .borrow()
-            .declarations
             .get(spelling)
-            .cloned()
+            .copied()
             .unwrap_or_else(|| FunctionId::free(spelling))
     }
     pub fn resolve(&self, id: &FunctionId) -> FunctionId {
-        let bindings = self.0.borrow();
-        bindings.aliases.get(id).cloned().unwrap_or_else(|| {
-            bindings
-                .declarations
+        self.aliases.get(id).copied().unwrap_or_else(|| {
+            self.declarations
+                .borrow()
                 .get(&id.to_string())
-                .cloned()
-                .unwrap_or_else(|| id.clone())
+                .copied()
+                .unwrap_or(*id)
         })
     }
 
-    pub fn bind(&self, alias: FunctionId, canonical: FunctionId) -> Option<FunctionId> {
+    pub fn bind(&mut self, alias: FunctionId, canonical: FunctionId) -> Option<FunctionId> {
         let canonical = self.resolve(&canonical);
-        self.0.borrow_mut().aliases.insert(alias, canonical)
+        std::rc::Rc::make_mut(&mut self.aliases).insert(alias, canonical)
     }
 
-    pub fn restore(&self, alias: FunctionId, previous: Option<FunctionId>) {
+    pub fn restore(&mut self, alias: FunctionId, previous: Option<FunctionId>) {
+        let aliases = std::rc::Rc::make_mut(&mut self.aliases);
         match previous {
             Some(id) => {
-                self.0.borrow_mut().aliases.insert(alias, id);
+                aliases.insert(alias, id);
             }
             None => {
-                self.0.borrow_mut().aliases.remove(&alias);
+                aliases.remove(&alias);
             }
         }
     }
@@ -295,6 +331,11 @@ impl<V> FunctionMap<V> {
 
     pub fn scope(&self) -> &FunctionScope {
         &self.scope
+    }
+
+    /// Install the resolution snapshot for the unit being compiled.
+    pub fn set_scope(&mut self, scope: FunctionScope) {
+        self.scope = scope;
     }
 
     /// Register a declaration; an own declaration shadows a same-named import.
@@ -396,8 +437,44 @@ mod function_scope_tests {
     use super::*;
 
     #[test]
+    fn unit_alias_snapshots_are_isolated_but_declarations_are_shared() {
+        let global = FunctionScope::default();
+        let mut first = global.clone();
+        let mut second = global.clone();
+        let alias = FunctionId::free("run");
+        let a = FunctionId::free("run").in_namespace("a");
+        let b = FunctionId::free("run").in_namespace("b");
+        first.bind(alias, a);
+        let snapshot = first.clone();
+        second.bind(alias, b);
+        first.restore(alias, None);
+        assert_eq!(global.resolve(&alias), alias);
+        assert_eq!(first.resolve(&alias), alias);
+        assert_eq!(snapshot.resolve(&alias), a);
+        assert_eq!(second.resolve(&alias), b);
+        global.declare("shared_linker_label", a);
+        assert_eq!(snapshot.lookup_id("shared_linker_label"), a);
+        assert_eq!(second.lookup_id("shared_linker_label"), a);
+    }
+
+    #[test]
+    fn declaration_shadowing_changes_only_the_receiving_map() {
+        let mut scope = FunctionScope::default();
+        let target = FunctionId::free("target");
+        scope.bind(FunctionId::free("local"), target);
+        let mut first = FunctionMap::with_scope(scope.clone());
+        let mut second = FunctionMap::with_scope(scope.clone());
+        first.insert_id(target, 1);
+        second.insert_id(target, 2);
+        first.insert("local", 3);
+        assert_eq!(first.get("local"), Some(&3));
+        assert_eq!(second.get("local"), Some(&2));
+        assert_eq!(scope.lookup_id("local"), target);
+    }
+
+    #[test]
     fn aliases_share_identity_and_restore_shadowed_declarations() {
-        let scope = FunctionScope::default();
+        let mut scope = FunctionScope::default();
         let mut signatures = FunctionMap::with_scope(scope.clone());
         let mut effects = FunctionMap::with_scope(scope.clone());
         signatures.insert("module.target", "String");
@@ -408,11 +485,15 @@ mod function_scope_tests {
             alias.clone(),
             FunctionId::free_from_source_name("module.target"),
         );
+        signatures.set_scope(scope.clone());
+        effects.set_scope(scope.clone());
         assert_eq!(signatures.get("local"), Some(&"String"));
         assert_eq!(effects.get("local"), Some(&true));
         signatures.insert("module.target", "bool");
         assert_eq!(signatures.get("local"), Some(&"bool"));
         scope.restore(alias, old);
+        signatures.set_scope(scope.clone());
+        effects.set_scope(scope.clone());
         assert_eq!(signatures.get("local"), Some(&"i64"));
         assert_eq!(effects.get("local"), None);
     }
@@ -469,7 +550,7 @@ mod backend_identity_tests {
                         |n| FunctionId::free("$lambda.7").in_namespace(n),
                     ),
                 };
-                let scope = FunctionScope::default();
+                let mut scope = FunctionScope::default();
                 let mut signatures = FunctionMap::with_scope(scope.clone());
                 let mut effects = FunctionMap::with_scope(scope.clone());
                 // A deliberately unrelated linker spelling cannot recover
@@ -483,13 +564,55 @@ mod backend_identity_tests {
                 assert_eq!(scope.lookup_id("arbitrary.$linker.label"), id);
                 let alias = FunctionId::free("local_alias");
                 let previous = scope.bind(alias.clone(), id.clone());
+                signatures.set_scope(scope.clone());
+                effects.set_scope(scope.clone());
                 assert_eq!(signatures.get_id(&alias), Some(&42));
                 assert_eq!(effects.get_id(&alias), Some(&true));
                 scope.restore(alias.clone(), previous);
+                signatures.set_scope(scope.clone());
+                effects.set_scope(scope.clone());
                 assert_eq!(signatures.get_id(&alias), None);
                 assert_eq!(id.namespace(), namespace);
                 assert_eq!(id.owner().is_some(), matches!(kind, 1 | 2));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod intern_tests {
+    use super::*;
+
+    #[test]
+    fn handles_are_four_bytes_and_preserve_structural_identity() {
+        assert_eq!(std::mem::size_of::<TypeId>(), 4);
+        assert_eq!(std::mem::size_of::<FunctionId>(), 4);
+        let ty = TypeId::from_source_name("ns::Owner");
+        assert_eq!(ty, TypeId::local("Owner").in_namespace("ns"));
+        let method = FunctionId::method(ty, "call");
+        assert_eq!(method.owner_type(), Some(ty));
+        assert_ne!(method, FunctionId::free_from_source_name("ns::Owner::call"));
+        assert_eq!(method.to_string(), "ns::Owner::call");
+    }
+
+    #[test]
+    fn artifact_roundtrip_uses_names_not_allocation_order() {
+        let source = r#"{"namespace":"日本::nested","owner":"Owner","name":"run"}"#;
+        let id: FunctionId = serde_json::from_str(source).unwrap();
+        assert_eq!(serde_json::to_string(&id).unwrap(), source);
+        assert_eq!(id, FunctionId::method(TypeId::local("Owner").in_namespace("日本::nested"), "run"));
+        let source = r#"{"namespace":null,"name":"Item"}"#;
+        let id: TypeId = serde_json::from_str(source).unwrap();
+        assert_eq!(serde_json::to_string(&id).unwrap(), source);
+        assert!(TypeId::local("a") < TypeId::local("z"));
+    }
+
+    #[test]
+    fn concurrent_sessions_reuse_the_same_handles() {
+        let threads: Vec<_> = (0..8).map(|_| std::thread::spawn(|| {
+            (0..500).map(|i| FunctionId::method(TypeId::local(format!("intern_test_{i}")), "run")).collect::<Vec<_>>()
+        })).collect();
+        let values: Vec<_> = threads.into_iter().map(|thread| thread.join().unwrap()).collect();
+        assert!(values.windows(2).all(|pair| pair[0] == pair[1]));
     }
 }
