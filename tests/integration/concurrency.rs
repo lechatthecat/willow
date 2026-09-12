@@ -320,29 +320,38 @@ fn async_frame_narrowing_drops_dead_gc_locals_beyond_frame_mask_capacity() {
 
 #[test]
 fn preempt_loop_backedge_allows_ready_task_to_run() {
+    // More busy tasks than workers must reach their loop before the quick
+    // task releases them. This proves progress without assuming print order
+    // between independently scheduled finite tasks.
     let source = r#"
-async fn cpu_bound() -> i64 {
-    let mut i = 0;
-    while i < 100 {
-        i = i + 1;
-    }
-    println(1);
-    return i;
+async fn cpu_bound(started: AtomicI64, done: AtomicBool) {
+    started.add(1);
+    while !done.load() { }
 }
-async fn quick() -> i64 {
+async fn quick(done: AtomicBool) {
     println(2);
-    return 0;
+    done.store(true);
 }
 async fn main() {
-    let slow = cpu_bound();
-    let fast = quick();
-    await slow;
-    await fast;
+    let started = AtomicI64::new(0);
+    let done = AtomicBool::new(false);
+    let a = cpu_bound(started, done); let b = cpu_bound(started, done);
+    let c = cpu_bound(started, done); let d = cpu_bound(started, done);
+    let e = cpu_bound(started, done); let f = cpu_bound(started, done);
+    while started.load() < 6 { await yield(); }
+    await quick(done);
+    await a; await b; await c; await d; await e; await f;
+    println(1);
 }
 "#;
 
-    let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_TASK_BUDGET", "1")]);
-    assert!(ok, "tiny-budget preemption program should run");
+    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        source,
+        &[("WILLOW_TASK_BUDGET", "1"), ("WILLOW_WORKERS", "5")],
+        std::time::Duration::from_secs(15),
+    );
+    assert!(!timed_out, "loop backedges failed to yield: {out}");
+    assert!(ok, "tiny-budget preemption program should run: {out}");
     assert_eq!(out, "2\n1\n");
 }
 
