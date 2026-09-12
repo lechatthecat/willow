@@ -42,8 +42,8 @@ measurements and suite status are recorded below.
 ## willow-8hq4.2: runtime freshness proof
 
 A stamp is published only after successful Cargo completion with unchanged
-source/configuration inputs. It includes an archive metadata signature and an
-input fingerprint; file contents plus metadata detect same-mtime edits and
+source/configuration inputs. It includes an archive metadata signature, a streamed BLAKE3 content digest,
+and an input fingerprint; file contents plus metadata detect same-mtime edits and
 ordinary touches. The scan includes local dependency sources, nested new files,
 workspace/runtime manifests, and the lockfile. Failed builds invalidate prior
 proof before Cargo runs. Missing, wrong-kind, unreadable, or malformed state
@@ -73,6 +73,17 @@ nested sources. Every successful binary printed `42`. Nine-sample medians were
 probe, recorded in `runtime_cache_cli.json`. Tests for unreadable/uncertain state,
 coarse timestamps, and failed publication cover the conservative failure paths.
 Native platform validation is recorded below.
+
+A later Windows run exposed a same-size archive replacement with unchanged
+mtime. A deterministic restored-mtime regression reproduced it. Version 3
+stamps now require the full archive content digest, byte count, and stable
+before/after metadata. Old stamps fail validation. Hashing is deferred until
+the cheaper input/version checks pass. The first full-content implementation
+used DefaultHasher and raised warm debug compilation to 398.33 ms; replacing
+it with BLAKE3 reduced that to 240.43 ms. Forced builds measured 298.86 ms and
+no-op Cargo 31.50 ms. All 37 CLI assertions and 12 cache unit tests pass.
+Both intermediate and final raw results are retained in
+`runtime_cache_content_cli.json` and `runtime_cache_blake3_cli.json`.
 
 ## willow-8hq4.4: panic and root depth
 
@@ -276,10 +287,16 @@ https://github.com/lechatthecat/willow/actions/runs/34690503325 .
 | willow-s9ej | Completed panic epic after all children closed | Closed |
 | willow-8hq4.5 | Reused panic snapshots only across proven stable regions | Closed |
 | willow-8hq4.8 | Added exact channel ownership and linear wake accounting | Closed |
-| willow-8hq4.2 | Cached successful runtime freshness proofs conservatively | Closed |
+| willow-8hq4.2 | Cached successful runtime freshness proofs conservatively | Content-digest native gate pending |
 | willow-8hq4.4 | Reduced panic/root depth access cost with native evidence | Closed |
 | willow-8hq4.1 | Dead stripping with metadata retention and native link measurements | Final full-suite gate pending |
 
 The additional runtime FuncRef colocation implementation belongs to
 `willow-8hq4.6`; it remains open for explicit range proof and is not counted
 among these ten. GC, async, and generics implementation gaps remain open.
+
+The Windows job in run 34690503325 exposed the archive metadata ambiguity
+described above. The cache ticket was reopened rather than treating the
+failure as flaky. The corrected digest implementation at `3c50d9a` has fresh
+native performance/toolchain gates in run 34690931372 and full CI in
+run 34690932635. Formatting and strict workspace Clippy passed locally.
