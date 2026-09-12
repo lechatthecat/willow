@@ -2345,19 +2345,30 @@ pub extern "C" fn willow_sched_run_until_deadline(deadline_ms: i64) -> i64 {
 }
 
 /// True while some source can still make a parked or blocked task runnable:
-/// queued work, a claim in flight, an armed timer, a parked netpoll waiter, or
-/// an outstanding blocking-pool syscall.
+/// queued work, a claim in flight, another actively polling task, an armed
+/// timer, a parked netpoll waiter, or an outstanding blocking-pool syscall.
 ///
 /// A drive returning "no task completed" is NOT the same as "nothing can ever
 /// happen": the drive may simply have raced a claim, or stopped on its own
 /// deadline. Callers that turn quiescence into a blocking-forever diagnostic
 /// must consult this first (willow-atth).
 pub(crate) fn scheduler_has_wake_source() -> bool {
-    claims_in_flight()
-        || global_run_queues().len() > 0
-        || global_next_timer_deadline().is_some()
-        || crate::netpoll::has_waiters()
+    // Read producers before their destination queues, then claims and polls,
+    // just as the parallel idle snapshot does. A deadline-limited nested drive
+    // can return while another worker is still polling a producer.
+    global_next_timer_deadline().is_some()
         || global_task_table().blocked_syscall_count() > 0
+        || global_run_queues().len() > 0
+        || claims_in_flight()
+        || CURRENT_RUN_STATE.with(|slot| {
+            slot.borrow().as_ref().is_some_and(|state| {
+                // This caller may itself be a running task blocked in recv or
+                // send. Counting it would turn genuine deadlocks into spins.
+                let caller = usize::from(current_task_id().is_some());
+                state.active_polls.load(Ordering::Acquire) > caller
+            })
+        })
+        || crate::netpoll::has_waiters()
 }
 
 /// Park a synchronous caller briefly while it waits for a wake source to fire.
@@ -7440,6 +7451,28 @@ mod tests {
         assert!(
             scheduler_has_wake_source(),
             "a popped-but-unclaimed task is pending work"
+        );
+    }
+
+    #[test]
+    fn sched_wake_running_peer_is_a_wake_source_but_current_poll_is_not() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let current = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
+        let state = Arc::new(ParallelRunState::default());
+        state.active_polls.store(2, Ordering::Release);
+        let (peer_can_progress, caller_alone_can_progress) =
+            with_parallel_context(0, Arc::clone(&state), || {
+                with_current_task_for_test(current, || {
+                    let peer_can_progress = scheduler_has_wake_source();
+                    state.active_polls.store(1, Ordering::Release);
+                    (peer_can_progress, scheduler_has_wake_source())
+                })
+            });
+        assert!(peer_can_progress, "a running peer can still send a value");
+        assert!(
+            !caller_alone_can_progress,
+            "the blocked caller must not keep itself alive forever"
         );
     }
 
