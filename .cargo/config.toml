@@ -1,0 +1,3 @@
+[env]
+# Preserve diagnostics when a native runtime test aborts before libtest reports it.
+RUST_TEST_NOCAPTURE = "1"
