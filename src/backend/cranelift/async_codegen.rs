@@ -1131,6 +1131,8 @@ impl Codegen {
                 fg.builder
                     .ins()
                     .store(MemFlagsData::new(), zero, frame, site.flag_offset);
+                let roots_before = fg.gc_root_count;
+                let root_depth = fg.emit_value_runtime_call("willow_root_depth", &[]);
                 let panic_next = fg.builder.create_block();
                 fg.panic_return_block = Some(panic_next);
                 fg.emit_void_runtime_call("willow_panic_enter_defer", &[]);
@@ -1144,6 +1146,13 @@ impl Codegen {
                 fg.builder.switch_to_block(panic_next);
                 fg.builder.seal_block(panic_next);
                 fg.terminated = false;
+                // A panic can bypass the action's normal local/temporary root
+                // pops. Restore its entry depth before another action runs or
+                // this native cleanup frame returns, on both exit paths.
+                let current_depth = fg.emit_value_runtime_call("willow_root_depth", &[]);
+                let roots_to_pop = fg.builder.ins().isub(current_depth, root_depth);
+                fg.emit_void_runtime_call("willow_pop_roots", &[roots_to_pop]);
+                fg.gc_root_count = roots_before;
                 fg.panic_return_block = None;
                 fg.panic_defer_codegen_depth = 0;
                 fg.recover_eligible_depth = 0;

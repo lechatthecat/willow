@@ -762,18 +762,20 @@ async fn main() {
 #[test]
 fn prm_matrix_171_180_cancellation_cleanup_panic_recovery() {
     let source = r#"
-async fn cancel_panic(tag: i64) {
+async fn cancel_panic(tag: i64, ready: Channel<i64>) {
     defer match recover() {
         Some(info) => println("prm-" + tag.toString() + ":" + info.message),
         None => println("prm-" + tag.toString() + ":none")
     }
     defer panic("cleanup-" + tag.toString());
+    ready.send(tag);
     await sleep(10000);
 }
 
 async fn run_case(tag: i64) {
-    let task = cancel_panic(tag);
-    await sleep(1);
+    let ready = Channel<i64>::new();
+    let task = cancel_panic(tag, ready);
+    ready.recv();
     task.cancel();
     match await task.result() { Ok(_) => {}, Err(Cancelled) => {} }
 }
@@ -794,7 +796,20 @@ async fn main() {
     let expected = (171..=180)
         .map(|id| format!("prm-{id}:cleanup-{id}\n"))
         .collect::<String>();
-    run_matrix(source, &[("WILLOW_WORKERS", "4")], &expected);
+    // willow-ikoh: a panic used to bypass cancellation cleanup's root pops,
+    // leaving native stack slots registered after the cleanup function returned.
+    // The handshake ensures both defers are registered before cancellation.
+    for workers in ["1", "4"] {
+        run_matrix(
+            source,
+            &[
+                ("WILLOW_WORKERS", workers),
+                ("WILLOW_GC_STRESS", "alloc"),
+                ("WILLOW_GC_VERIFY_BARRIER", "1"),
+            ],
+            &expected,
+        );
+    }
 }
 
 #[test]
