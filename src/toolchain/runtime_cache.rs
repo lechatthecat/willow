@@ -42,12 +42,12 @@ struct BuildStamp {
     archive: ArchiveStamp,
 }
 
-const BUILD_STAMP_VERSION: u32 = 2;
+const BUILD_STAMP_VERSION: u32 = 3;
 
 #[derive(PartialEq, Eq, Serialize, Deserialize)]
 struct ArchiveStamp {
     metadata: FileStamp,
-    digest: u64,
+    digest: [u8; 32],
 }
 
 impl ArchiveStamp {
@@ -55,7 +55,7 @@ impl ArchiveStamp {
         let metadata = FileStamp::read(path)?;
         anyhow::ensure!(metadata.len > 0, "empty runtime archive");
         let mut file = fs::File::open(path)?;
-        let mut hash = DefaultHasher::new();
+        let mut hash = blake3::Hasher::new();
         let mut buffer = [0_u8; 64 * 1024];
         let mut bytes = 0_u64;
         loop {
@@ -66,7 +66,7 @@ impl ArchiveStamp {
             if count == 0 {
                 break;
             }
-            hash.write(&buffer[..count]);
+            hash.update(&buffer[..count]);
             bytes += count as u64;
         }
         anyhow::ensure!(
@@ -75,7 +75,7 @@ impl ArchiveStamp {
         );
         Ok(Self {
             metadata,
-            digest: hash.finish(),
+            digest: *hash.finalize().as_bytes(),
         })
     }
 }

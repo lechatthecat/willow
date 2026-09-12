@@ -36,3 +36,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 willow_abi = { path = "crates/willow_abi" }
 willow_continuations = { path = "crates/willow_continuations" }
+blake3 = "1.8.7"

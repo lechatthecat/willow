@@ -1,0 +1,305 @@
+{
+  "date": "2026-09-12",
+  "qualification": "Final content-digest archive validation; no concurrent full local workspace suite. Isolated Cargo target and fixed spy PATH. All successful binaries printed 42. Touches restored in finally; temporary unused source removed.",
+  "cases": [
+    {
+      "name": "first_debug",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 2538.778543999797
+    },
+    {
+      "name": "fresh_debug",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 245.774500999687
+    },
+    {
+      "name": "forced_debug",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 301.37818699950003
+    },
+    {
+      "name": "forced_debug_again",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 321.7023180004617
+    },
+    {
+      "name": "explicit_flag_forced",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 217.7569970008335
+    },
+    {
+      "name": "explicit_env_forced",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 205.08342799803359
+    },
+    {
+      "name": "first_release",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 3203.9771679992555
+    },
+    {
+      "name": "fresh_release",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 121.65474799985532
+    },
+    {
+      "name": "debug_after_release",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 244.74515900146798
+    },
+    {
+      "name": "missing_archive",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 300.5534149997402
+    },
+    {
+      "name": "explicit_directory",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": false,
+      "elapsed_ms": 19.944042000133777
+    },
+    {
+      "name": "runtime_source_touch",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 300.2528840006562
+    },
+    {
+      "name": "runtime_source_touch_restored",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 303.6866599977657
+    },
+    {
+      "name": "runtime_manifest_touch",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 301.37942799774464
+    },
+    {
+      "name": "runtime_manifest_touch_restored",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 305.4945369985944
+    },
+    {
+      "name": "workspace_lock_touch",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 297.73707300046226
+    },
+    {
+      "name": "workspace_lock_touch_restored",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 295.109203998436
+    },
+    {
+      "name": "nested_unused_source_added",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 296.6128639964154
+    },
+    {
+      "name": "nested_unused_source_removed",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 309.7976760000165
+    },
+    {
+      "name": "warm_0",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 260.935205998976
+    },
+    {
+      "name": "forced_0",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 313.94177000038326
+    },
+    {
+      "name": "warm_1",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 267.68306399753783
+    },
+    {
+      "name": "forced_1",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 315.70212800215813
+    },
+    {
+      "name": "warm_2",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 247.16027099930216
+    },
+    {
+      "name": "forced_2",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 310.3132500000356
+    },
+    {
+      "name": "warm_3",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 239.45505600204342
+    },
+    {
+      "name": "forced_3",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 296.9913600027212
+    },
+    {
+      "name": "warm_4",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 242.84729300052277
+    },
+    {
+      "name": "forced_4",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 298.1669770015287
+    },
+    {
+      "name": "warm_5",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 240.4259290015034
+    },
+    {
+      "name": "forced_5",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 298.85654499958036
+    },
+    {
+      "name": "warm_6",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 240.3840709994256
+    },
+    {
+      "name": "forced_6",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 309.20680300187087
+    },
+    {
+      "name": "warm_7",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 238.3656800011522
+    },
+    {
+      "name": "forced_7",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 295.05272900132695
+    },
+    {
+      "name": "warm_8",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 239.60297200028435
+    },
+    {
+      "name": "forced_8",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 294.4284420009353
+    }
+  ],
+  "timing_ms": {
+    "warm": [
+      260.935205998976,
+      267.68306399753783,
+      247.16027099930216,
+      239.45505600204342,
+      242.84729300052277,
+      240.4259290015034,
+      240.3840709994256,
+      238.3656800011522,
+      239.60297200028435
+    ],
+    "forced": [
+      313.94177000038326,
+      315.70212800215813,
+      310.3132500000356,
+      296.9913600027212,
+      298.1669770015287,
+      298.85654499958036,
+      309.20680300187087,
+      295.05272900132695,
+      294.4284420009353
+    ],
+    "noop_cargo": [
+      31.838933999097208,
+      34.37497300183168,
+      31.118849998165388,
+      31.08706000057282,
+      31.27019200110226,
+      31.02994400251191,
+      31.61442599957809,
+      31.500122000579722,
+      31.543744000373408
+    ]
+  },
+  "medians_ms": {
+    "warm": 240.4259290015034,
+    "forced": 298.85654499958036,
+    "noop_cargo": 31.500122000579722
+  }
+}

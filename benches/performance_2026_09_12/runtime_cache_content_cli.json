@@ -1,0 +1,305 @@
+{
+  "date": "2026-09-12",
+  "qualification": "Final content-digest archive validation; no concurrent full local workspace suite. Isolated Cargo target and fixed spy PATH. All successful binaries printed 42. Touches restored in finally; temporary unused source removed.",
+  "cases": [
+    {
+      "name": "first_debug",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 2663.795767999545
+    },
+    {
+      "name": "fresh_debug",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 392.52368899906287
+    },
+    {
+      "name": "forced_debug",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 445.43790700117825
+    },
+    {
+      "name": "forced_debug_again",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 455.50248400104465
+    },
+    {
+      "name": "explicit_flag_forced",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 192.91542100108927
+    },
+    {
+      "name": "explicit_env_forced",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 188.35334599862108
+    },
+    {
+      "name": "first_release",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 3140.6165289990895
+    },
+    {
+      "name": "fresh_release",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 191.9702250015689
+    },
+    {
+      "name": "debug_after_release",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 386.84174100126256
+    },
+    {
+      "name": "missing_archive",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 443.3280149969505
+    },
+    {
+      "name": "explicit_directory",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": false,
+      "elapsed_ms": 18.40524300132529
+    },
+    {
+      "name": "runtime_source_touch",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 439.83227200078545
+    },
+    {
+      "name": "runtime_source_touch_restored",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 443.690312000399
+    },
+    {
+      "name": "runtime_manifest_touch",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 442.7311790022941
+    },
+    {
+      "name": "runtime_manifest_touch_restored",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 441.1766540033568
+    },
+    {
+      "name": "workspace_lock_touch",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 442.48249400334316
+    },
+    {
+      "name": "workspace_lock_touch_restored",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 439.73284700041404
+    },
+    {
+      "name": "nested_unused_source_added",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 444.0742279984988
+    },
+    {
+      "name": "nested_unused_source_removed",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 438.7855050008511
+    },
+    {
+      "name": "warm_0",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 389.2872409996926
+    },
+    {
+      "name": "forced_0",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 469.75128000121913
+    },
+    {
+      "name": "warm_1",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 391.3506869976118
+    },
+    {
+      "name": "forced_1",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 450.6094200005464
+    },
+    {
+      "name": "warm_2",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 407.4373379989993
+    },
+    {
+      "name": "forced_2",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 451.74919099736144
+    },
+    {
+      "name": "warm_3",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 403.0328369990457
+    },
+    {
+      "name": "forced_3",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 462.4594650013023
+    },
+    {
+      "name": "warm_4",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 397.24379899780615
+    },
+    {
+      "name": "forced_4",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 490.9517660016718
+    },
+    {
+      "name": "warm_5",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 395.2391729981173
+    },
+    {
+      "name": "forced_5",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 460.0152259990864
+    },
+    {
+      "name": "warm_6",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 398.3272530022077
+    },
+    {
+      "name": "forced_6",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 456.5198349991988
+    },
+    {
+      "name": "warm_7",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 398.7387429988303
+    },
+    {
+      "name": "forced_7",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 468.7233990007371
+    },
+    {
+      "name": "warm_8",
+      "cargo_calls": 0,
+      "expected_cargo_calls": 0,
+      "success": true,
+      "elapsed_ms": 400.9439939982258
+    },
+    {
+      "name": "forced_8",
+      "cargo_calls": 1,
+      "expected_cargo_calls": 1,
+      "success": true,
+      "elapsed_ms": 453.94915100041544
+    }
+  ],
+  "timing_ms": {
+    "warm": [
+      389.2872409996926,
+      391.3506869976118,
+      407.4373379989993,
+      403.0328369990457,
+      397.24379899780615,
+      395.2391729981173,
+      398.3272530022077,
+      398.7387429988303,
+      400.9439939982258
+    ],
+    "forced": [
+      469.75128000121913,
+      450.6094200005464,
+      451.74919099736144,
+      462.4594650013023,
+      490.9517660016718,
+      460.0152259990864,
+      456.5198349991988,
+      468.7233990007371,
+      453.94915100041544
+    ],
+    "noop_cargo": [
+      31.608494999090908,
+      31.680770000093617,
+      32.036655000410974,
+      32.13217300071847,
+      30.818338000244694,
+      31.35983099855366,
+      31.822065000596922,
+      31.663398000091547,
+      31.595400996593526
+    ]
+  },
+  "medians_ms": {
+    "warm": 398.3272530022077,
+    "forced": 460.0152259990864,
+    "noop_cargo": 31.663398000091547
+  }
+}
