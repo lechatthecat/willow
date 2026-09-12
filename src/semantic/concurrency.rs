@@ -115,6 +115,9 @@ pub struct ConcurrencyAnalyzer {
     nonpreemptible_sync_helpers: HashMap<FunctionId, SyncHelperRef>,
 }
 
+// The preemption default is true on supported Linux targets, so deriving
+// Default would change behavior even though this looks derivable elsewhere.
+#[allow(clippy::derivable_impls)]
 impl Default for ConcurrencyAnalyzer {
     fn default() -> Self {
         Self {

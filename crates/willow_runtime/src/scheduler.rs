@@ -2517,20 +2517,24 @@ fn willow_sched_run_parallel(
             }
         }
     };
-    let mut workers = workers.max(1);
+    let workers = workers.max(1);
     #[cfg(all(
         target_os = "linux",
         target_env = "gnu",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
-    for shard in &global_task_table().shards {
-        let tasks = shard.lock().unwrap_or_else(|error| error.into_inner());
-        for task in tasks.values() {
-            if let Some(stack) = task.native_stack.as_ref() {
-                workers = workers.max(stack.worker + 1);
+    let workers = {
+        let mut workers = workers;
+        for shard in &global_task_table().shards {
+            let tasks = shard.lock().unwrap_or_else(|error| error.into_inner());
+            for task in tasks.values() {
+                if let Some(stack) = task.native_stack.as_ref() {
+                    workers = workers.max(stack.worker + 1);
+                }
             }
         }
-    }
+        workers
+    };
     while pool.senders.len() < workers {
         let worker = pool.senders.len();
         let (sender, receiver) = std::sync::mpsc::channel::<WorkerDrive>();

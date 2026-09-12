@@ -218,7 +218,7 @@ fn connect_in_progress(error: &std::io::Error) -> bool {
     #[cfg(windows)]
     {
         // WSAEINPROGRESS / WSAEALREADY / WSAEWOULDBLOCK.
-        matches!(error.raw_os_error(), Some(10036 | 10037 | 10035))
+        matches!(error.raw_os_error(), Some(10035..=10037))
     }
     #[cfg(not(any(unix, windows)))]
     {

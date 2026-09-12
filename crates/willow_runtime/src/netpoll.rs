@@ -1348,7 +1348,7 @@ mod tests {
             while NETPOLL_TEST_LAST_REGISTER.load(Ordering::SeqCst) == i32::MIN {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            sender.send(&[b'x']).unwrap();
+            sender.send(b"x").unwrap();
         });
 
         assert_eq!(willow_sched_run(), 1);
