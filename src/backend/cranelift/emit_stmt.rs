@@ -345,8 +345,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if self.emitting_sync_cancel_cleanup {
             return;
         }
+        // Synchronous main/thread execution has no cancellable native task.
+        // Nested scheduler drives restore the enclosing native context, so
+        // the activity value obtained before a user call is still valid here.
+        let resume = self.sync_native_active.map(|active| {
+            let check = self.builder.create_block();
+            self.builder.set_cold_block(check);
+            let resume = self.builder.create_block();
+            self.builder.ins().brif(active, check, &[], resume, &[]);
+            self.builder.switch_to_block(check);
+            self.builder.seal_block(check);
+            resume
+        });
         let cancelled = self.emit_value_runtime_call("willow_sync_cancelled", &[]);
         self.emit_sync_cancel_branch(cancelled);
+        if let Some(resume) = resume {
+            self.builder.ins().jump(resume, &[]);
+            self.builder.switch_to_block(resume);
+            self.builder.seal_block(resume);
+        }
     }
 
     fn emit_sync_cancel_branch(&mut self, cancelled: cranelift_codegen::ir::Value) {

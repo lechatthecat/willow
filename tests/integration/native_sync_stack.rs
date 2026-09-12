@@ -232,3 +232,33 @@ async fn main() { let task = parked(); await sleep(20); unrelated_failure(); }
     assert!(out.contains(": unrelated_failure"), "{out}");
     assert!(!out.contains(": waiting_method"), "{out}");
 }
+
+#[test]
+fn native_sync_stack_scalar_recursion_remains_cancellable() {
+    let (out, ok) = compile_and_run_with_runtime_env(
+        r#"
+fn fib(n: i64) -> i64 {
+    if n < 2 { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn run(ready: Channel<i64>) {
+    defer { println("sync cleanup"); }
+    ready.send(1);
+    println(fib(40));
+}
+async fn worker(ready: Channel<i64>) { defer { println("async cleanup"); } run(ready); }
+async fn main() {
+    let ready = Channel<i64>::new();
+    let task = worker(ready);
+    ready.recv();
+    task.cancel();
+    await task.result();
+    println("done");
+}
+"#,
+        &[("WILLOW_WORKERS", "1"), ("WILLOW_TASK_BUDGET", "3")],
+        Duration::from_secs(20),
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "sync cleanup\nasync cleanup\ndone\n");
+}

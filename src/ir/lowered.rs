@@ -682,6 +682,8 @@ pub(crate) fn lower_source_program(program: &HirProgram) -> SourceProgram {
         .iter_mut()
         .chain(lambdas.iter_mut().map(|lambda| &mut lambda.function))
     {
+        super::optimize::eliminate_tail_recursion(function);
+        super::optimize::inline_scalar_recursion(function);
         super::optimize::unroll_scalar_loops(function);
         lifetime::clear_dead_temporaries(function);
         function.async_frame = async_liveness::analyze(&function.blocks, &function.locals);

@@ -2,6 +2,9 @@
 //!
 //! Only pure scalar subtrees are replaced. Faulting arithmetic stays in the IR
 //! so runtime panic/recovery behavior and source locations remain intact.
+mod recursive_inline;
+pub(crate) use recursive_inline::inline_scalar_recursion;
+
 use std::collections::HashMap;
 
 use super::lowered::{SourceBlock, SourceInst, SourceTerminator};
@@ -336,6 +339,190 @@ pub(crate) fn simplify_cfg(blocks: &mut [SourceBlock]) {
                 SourceTerminator::Jump(if value { *then_block } else { *else_block });
         }
     }
+}
+
+/// Eliminate direct self tail calls in synchronous scalar bodies. Restrict the
+/// whole body so reusing a frame cannot retain references, roots or cleanup.
+pub(crate) fn eliminate_tail_recursion(function: &mut super::lowered::SourceFunction) {
+    use super::lowered::{BlockId, LirLocal, LirLocalId, LirOperand, LirRvalue, LirStorageKind};
+    let scalar = |ty: &Type| matches!(ty, Type::I64 | Type::F64 | Type::Bool);
+    if function.is_async
+        || !function.captures.is_empty()
+        || !scalar(&function.return_type)
+        || function
+            .params
+            .iter()
+            .any(|p| p.by_reference || !scalar(&p.ty))
+        || function
+            .locals
+            .iter()
+            .any(|l| l.is_gc_owner() || !scalar(&l.ty))
+        || function.blocks.is_empty()
+    {
+        return;
+    }
+    let leaf = |e: &HirExpr| {
+        scalar(&e.ty)
+            && matches!(
+                e.kind,
+                HirExprKind::Var(_)
+                    | HirExprKind::Int(_)
+                    | HirExprKind::Float(_)
+                    | HirExprKind::Bool(_)
+            )
+    };
+    for block in &function.blocks {
+        if !block.recovery.is_empty()
+            || !match &block.terminator {
+                SourceTerminator::Jump(_) => true,
+                SourceTerminator::Branch { cond, .. } => leaf(cond),
+                SourceTerminator::Return(Some(e)) => leaf(e),
+                _ => false,
+            }
+        {
+            return;
+        }
+        for inst in &block.instrs {
+            let safe = match inst {
+                SourceInst::Compute { value, .. } => {
+                    matches!(
+                        value,
+                        LirRvalue::Use(_) | LirRvalue::Unary { .. } | LirRvalue::Binary { .. }
+                    ) || matches!(value, LirRvalue::DirectCall { callee, .. } if *callee == function.name)
+                }
+                SourceInst::Let { value, .. } | SourceInst::Assign { value, .. } => leaf(value),
+                SourceInst::ClearScopeRoots { .. } => true,
+                _ => false,
+            };
+            if !safe
+                || matches!(inst, SourceInst::Compute { value, .. }
+                if value.operands().iter().any(|op| matches!(op, LirOperand::Reference { .. })))
+            {
+                return;
+            }
+        }
+    }
+    let names: HashMap<_, _> = function
+        .locals
+        .iter()
+        .map(|l| (l.name.clone(), l.id))
+        .collect();
+    let Some(params) = function
+        .params
+        .iter()
+        .map(|p| names.get(&p.name).copied())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return;
+    };
+    let mut sites = Vec::new();
+    for block in &function.blocks {
+        let SourceTerminator::Return(Some(HirExpr {
+            kind: HirExprKind::Var(name),
+            ..
+        })) = &block.terminator
+        else {
+            continue;
+        };
+        let Some(mut returned) = names.get(name).copied() else {
+            continue;
+        };
+        for (index, inst) in block.instrs.iter().enumerate().rev() {
+            match inst {
+                SourceInst::ClearScopeRoots { .. } => {}
+                SourceInst::Compute {
+                    local,
+                    value: LirRvalue::Use(LirOperand::Local(input)),
+                    ..
+                } if *local == returned => returned = *input,
+                SourceInst::Compute {
+                    local,
+                    value: LirRvalue::DirectCall { callee, args, .. },
+                    span,
+                } if *local == returned
+                    && *callee == function.name
+                    && args.len() == params.len() =>
+                {
+                    sites.push((block.id, index, args.clone(), *span));
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+    if sites.is_empty() {
+        return;
+    }
+    // Keep block zero as a one-time entry. The old body becomes a loop header,
+    // after the backend's ABI parameter initialization.
+    let header = BlockId(function.blocks.len());
+    let mut used_names: std::collections::HashSet<_> = names.into_keys().collect();
+    for (block, index, args, span) in sites {
+        let instrs = &mut function.blocks[block.0].instrs;
+        instrs.truncate(index);
+        // Snapshot ALL arguments before rebinding any parameter (parallel copy).
+        let mut copies = Vec::new();
+        for (arg, param) in args.into_iter().zip(&params) {
+            let id = LirLocalId(function.locals.len() as u32);
+            let mut name = format!("__lir_tail_{}", id.0);
+            while !used_names.insert(name.clone()) {
+                name.push('_');
+            }
+            function.locals.push(LirLocal {
+                storage_kind: LirStorageKind::Value,
+                id,
+                name,
+                ty: function.locals[param.0 as usize].ty.clone(),
+                source_span: Some(span),
+                synthetic: true,
+                parameter: false,
+            });
+            instrs.push(SourceInst::Compute {
+                local: id,
+                value: LirRvalue::Use(arg),
+                span,
+            });
+            copies.push(id);
+        }
+        for (param, copy) in params.iter().zip(copies) {
+            instrs.push(SourceInst::Compute {
+                local: *param,
+                value: LirRvalue::Use(LirOperand::Local(copy)),
+                span,
+            });
+        }
+        function.blocks[block.0].terminator = SourceTerminator::Jump(header);
+    }
+    for block in &mut function.blocks {
+        let remap = |id: &mut BlockId| {
+            if id.0 == 0 {
+                *id = header;
+            }
+        };
+        match &mut block.terminator {
+            SourceTerminator::Jump(id) => remap(id),
+            SourceTerminator::Branch {
+                then_block,
+                else_block,
+                ..
+            } => {
+                remap(then_block);
+                remap(else_block);
+            }
+            _ => {}
+        }
+    }
+    let mut body = std::mem::replace(
+        &mut function.blocks[0],
+        SourceBlock {
+            id: BlockId(0),
+            instrs: vec![],
+            terminator: SourceTerminator::Jump(header),
+            recovery: vec![],
+        },
+    );
+    body.id = header;
+    function.blocks.push(body);
 }
 
 /// Unroll small, straight-line scalar loops without changing arithmetic order.
@@ -887,6 +1074,68 @@ mod tests {
         let (hir, errors) = crate::ir::lower::lower_program(&ast);
         assert!(errors.is_empty(), "{errors:?}");
         super::super::lowered::lower_source_program(&hir)
+    }
+
+    #[test]
+    fn tail_recursion_removes_only_safe_tail_calls() {
+        use super::super::lowered::LirRvalue;
+        let program = lowered(
+            r#"
+fn sum(n: i64, acc: i64) -> i64 { if n == 0 { return acc; } return sum(n - 1, acc + n); }
+fn fib(n: i64) -> i64 { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); }
+fn cleanup(n: i64) -> i64 { defer { println(n); } if n == 0 { return n; } return cleanup(n - 1); }
+fn reference(n: i64, acc: & i64) -> i64 { if n == 0 { return acc; } return reference(n - 1, &acc); }
+fn managed(n: i64, s: String) -> String { if n == 0 { return s; } return managed(n - 1, s); }
+"#,
+        );
+        for (name, expected) in [
+            ("sum", 0),
+            ("fib", 16),
+            ("cleanup", 1),
+            ("reference", 1),
+            ("managed", 1),
+        ] {
+            let f = program
+                .functions
+                .iter()
+                .find(|f| f.name.is_free_named(name))
+                .unwrap();
+            let calls = f.blocks.iter().flat_map(|b| &b.instrs).filter(|i| matches!(i,
+                SourceInst::Compute { value: LirRvalue::DirectCall { callee, .. }, .. } if *callee == f.name)).count();
+            assert_eq!(calls, expected, "{name}: {:#?}", f.blocks);
+        }
+    }
+
+    #[test]
+    fn recursive_inlining_is_bounded_and_excludes_effects_faults_and_large_bodies() {
+        use super::super::lowered::LirRvalue;
+        let program = lowered(
+            r#"
+fn small(n: i64) -> i64 { if n < 2 { return n; } return small(n-1) + small(n-2); }
+fn fault(n: i64) -> i64 { if n < 2 { return n; } return fault(n-1) / n; }
+fn effect(n: i64) -> i64 { println(n); if n < 2 { return n; } return effect(n-1) + 1; }
+fn wide(n: i64) -> i64 { if n < 2 { return n; } return wide(n-1) + wide(n-2) + wide(n-3); }
+fn cycle(n: i64) -> i64 { let mut x = n; while x > 2 { x = x-1; } if n < 2 { return n; } return cycle(n-1) + x; }
+"#,
+        );
+        for (name, expected) in [
+            ("small", 16),
+            ("fault", 1),
+            ("effect", 1),
+            ("wide", 3),
+            ("cycle", 1),
+        ] {
+            let f = program
+                .functions
+                .iter()
+                .find(|f| f.name.is_free_named(name))
+                .unwrap();
+            let calls = f.blocks.iter().flat_map(|b| &b.instrs).filter(|inst| matches!(inst,
+                SourceInst::Compute { value: LirRvalue::DirectCall { callee, .. }, .. } if *callee == f.name)).count();
+            assert_eq!(calls, expected, "{name}");
+            assert!(f.blocks.len() <= 64);
+            assert!(f.blocks.iter().map(|b| b.instrs.len()).sum::<usize>() <= 256);
+        }
     }
 
     #[test]

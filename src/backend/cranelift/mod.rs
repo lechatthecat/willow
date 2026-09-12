@@ -1452,6 +1452,8 @@ struct FuncGen<'a, 'b> {
     /// is restricted to this block before any intervening call instruction.
     panic_depth_snapshot: Option<(cranelift_codegen::ir::Block, cranelift_codegen::ir::Value)>,
     emitting_sync_cancel_cleanup: bool,
+    /// Invocation-constant native activity known to dominate the current LIR block.
+    sync_native_active: Option<cranelift_codegen::ir::Value>,
     lir_cleanup_exit: Option<(cranelift_codegen::ir::Block, usize, bool)>,
     /// Debug call-chain frames installed by this generated function and not
     /// yet popped on the source path currently being emitted.

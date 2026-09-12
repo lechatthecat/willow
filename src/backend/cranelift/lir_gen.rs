@@ -1412,6 +1412,62 @@ fn lir_sync_poll_blocks(f: &LirFunction) -> Vec<bool> {
     poll
 }
 
+/// A bounded scalar early return needs no safepoint. Move the entry poll to
+/// the other branch, including its runtime address/context lookups. Restrict
+/// this to acyclic bodies so loop guards keep their invocation-cached inputs.
+fn lir_defer_entry_poll(f: &LirFunction, poll: &mut [bool]) -> bool {
+    use crate::ir::lowered::LirRvalue as V;
+    let scalar = |ty: &Type| matches!(ty, Type::I64 | Type::F64 | Type::Bool);
+    if f.is_async
+        || f.params.iter().any(|p| p.by_reference)
+        || f.locals.iter().any(|l| l.is_gc_owner() || !scalar(&l.ty))
+        || poll.iter().skip(1).any(|p| *p)
+        || f.blocks
+            .iter()
+            .any(|b| !b.recovery.is_empty() || lir_block_successors(b).contains(&0))
+    {
+        return false;
+    }
+    let Some(entry) = f.blocks.first() else {
+        return false;
+    };
+    let Terminator::Branch {
+        then_block,
+        else_block,
+        ..
+    } = &entry.terminator
+    else {
+        return false;
+    };
+    let bounded = |block: &LirBlock| {
+        block.instrs.len() <= 8
+            && block.instrs.iter().all(|inst| match inst {
+                LirInst::Compute { value, .. } => match value {
+                    V::Use(_) | V::Unary { .. } => true,
+                    V::Binary { op, .. } => !matches!(op, BinOp::Div | BinOp::Rem | BinOp::Pow),
+                    _ => false,
+                },
+                LirInst::Let { .. } | LirInst::Assign { .. } | LirInst::ClearScopeRoots { .. } => {
+                    true
+                }
+                _ => false,
+            })
+    };
+    let returns = |id: BlockId| {
+        f.blocks
+            .get(id.0)
+            .is_some_and(|b| matches!(b.terminator, Terminator::Return(_)) && bounded(b))
+    };
+    if !bounded(entry) || (!returns(*then_block) && !returns(*else_block)) {
+        return false;
+    }
+    poll[0] = false;
+    for target in [*then_block, *else_block] {
+        poll[target.0] = !returns(target);
+    }
+    true
+}
+
 /// Argument evaluation may cross basic blocks or a cooperative suspension.
 /// Validate the matching preparations and retain the source frames at each
 /// entry, independently of the order in which machine blocks are emitted.
@@ -4928,12 +4984,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let outer_frames = self.lir_call_frames.clone();
         let outer_frame_depth = self.callstack_frame_depth;
         let entry = self.builder.current_block().expect("entry block active");
-        let sync_poll = coop.is_none().then(|| {
+        let mut poll_blocks = lir_sync_poll_blocks(f);
+        let deferred_poll = coop.is_none() && lir_defer_entry_poll(f, &mut poll_blocks);
+        // SSA carries the delayed activity lookup through later joins and
+        // inlined recursive bodies. The zero entry value is used only on the
+        // bounded return path; every path containing calls crosses a poll.
+        let deferred_active = deferred_poll.then(|| {
+            let var = self.builder.declare_var(types::I32);
+            let zero = self.builder.ins().iconst(types::I32, 0);
+            self.builder.def_var(var, zero);
+            var
+        });
+        let sync_poll = (coop.is_none() && !deferred_poll).then(|| {
             let active = self.emit_value_runtime_call("willow_sync_native_active", &[]);
             let stop = self.emit_value_runtime_call("willow_gc_stop_flag", &[]);
             (active, stop)
         });
-        let poll_blocks = lir_sync_poll_blocks(f);
         if coop.is_some() {
             self.bind_coop_lir_locals(f);
             // GC locals that are dead at every suspension deliberately stay
@@ -5042,15 +5108,30 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 scopes: &mut lir_defer_scopes,
                 ledger: &mut ledger,
             };
+            let block_poll = if deferred_poll && poll_blocks[i] {
+                let active = self.emit_value_runtime_call("willow_sync_native_active", &[]);
+                let stop = self.emit_value_runtime_call("willow_gc_stop_flag", &[]);
+                self.builder
+                    .def_var(deferred_active.expect("delayed poll activity"), active);
+                Some((active, stop))
+            } else {
+                sync_poll.filter(|_| poll_blocks[i])
+            };
+            let outer_active = self.sync_native_active;
+            self.sync_native_active = block_poll
+                .or(sync_poll)
+                .map(|(active, _)| active)
+                .or_else(|| deferred_active.map(|var| self.builder.use_var(var)));
             let recovery_states = self.emit_lir_block(
                 f,
                 block,
                 &blocks,
                 &f.return_type,
                 block_coop,
-                sync_poll.filter(|_| poll_blocks[i]),
+                block_poll,
                 &mut defer_ctx,
             );
+            self.sync_native_active = outer_active;
             if sync_defers {
                 let exit = LirDeferState {
                     scopes: lir_defer_scopes.clone(),
@@ -8992,6 +9073,52 @@ mod tests {
     /// that need to perturb a table the way a registration or desugaring bug
     /// would and re-ask the predicate. Source alone cannot produce such a state
     /// — the type checker rejects it long before lowering.
+    #[test]
+    fn bounded_scalar_return_defers_poll_but_preserves_recursive_path() {
+        let (f, _) = lir_fn_and_tables(
+            "fn fib(n: i64) -> i64 { if n < 2 { return n; } return fib(n-1) + fib(n-2); }",
+            "fib",
+            &["fib"],
+        );
+        let mut poll = lir_sync_poll_blocks(&f);
+        assert!(lir_defer_entry_poll(&f, &mut poll));
+        assert!(!poll[0]);
+        let mut pending = vec![0];
+        let mut visited = HashSet::new();
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id) || poll[id] {
+                continue;
+            }
+            let block = &f.blocks[id];
+            assert!(
+                !block.instrs.iter().any(|i| matches!(
+                    i,
+                    LirInst::Compute {
+                        value: crate::ir::lowered::LirRvalue::DirectCall { .. },
+                        ..
+                    }
+                )),
+                "a recursive call must be preceded by a poll"
+            );
+            pending.extend(lir_block_successors(block));
+        }
+    }
+
+    #[test]
+    fn entry_poll_stays_before_faults_cleanup_and_cycles() {
+        for source in [
+            "fn f(n: i64) -> i64 { if 10 / n < 2 { return n; } return f(n-1) + 1; }",
+            "fn f(n: i64) -> i64 { defer { println(n); } if n < 2 { return n; } return f(n-1) + 1; }",
+            "fn f(n: i64) -> i64 { if n < 2 { return n; } while true {} return n; }",
+        ] {
+            let (f, _) = lir_fn_and_tables(source, "f", &["f"]);
+            let mut poll = lir_sync_poll_blocks(&f);
+            let original = poll.clone();
+            assert!(!lir_defer_entry_poll(&f, &mut poll), "{source}");
+            assert_eq!(poll, original);
+        }
+    }
+
     fn lir_fn_and_tables(src: &str, name: &str, fns: &[&str]) -> (LirFunction, TestTables) {
         let (p, tables) = checked_lowering(src, fns);
         let f = p
