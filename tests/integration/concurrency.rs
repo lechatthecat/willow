@@ -4392,8 +4392,9 @@ fn adfr_24_break_flushes_iteration_before_function_scope() {
 
 #[test]
 fn adfr_25_cancel_unwinds_active_nested_scopes() {
+    // Synchronize on registered defers and terminal cleanup, not wall-clock sleeps.
     let (out, ok) = compile_and_run(
-        "fn c(n: i64) { println(n); }\nasync fn w() { defer c(1); if true { defer c(2); await sleep(5000); } }\nasync fn main() { let task = w(); await sleep(20); task.cancel(); await sleep(50); println(task.is_cancelled()); }",
+        "fn c(n: i64) { println(n); }\nasync fn w(ready: AtomicBool) { defer c(1); if true { defer c(2); ready.store(true); await sleep(5000); } }\nasync fn main() { let ready = AtomicBool::new(false); let task = w(ready); while !ready.load() { await yield(); } task.cancel(); await task.result(); println(task.is_cancelled()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "2\n1\ntrue\n");
@@ -4401,8 +4402,9 @@ fn adfr_25_cancel_unwinds_active_nested_scopes() {
 
 #[test]
 fn adfr_26_cancel_does_not_rerun_completed_inner_scope() {
+    // Synchronize on registered defers and terminal cleanup, not wall-clock sleeps.
     let (out, ok) = compile_and_run(
-        "fn c(n: i64) { println(n); }\nasync fn w() { defer c(1); if true { defer c(2); } await sleep(5000); }\nasync fn main() { let task = w(); await sleep(20); task.cancel(); await sleep(50); println(task.is_cancelled()); }",
+        "fn c(n: i64) { println(n); }\nasync fn w(ready: AtomicBool) { defer c(1); if true { defer c(2); } ready.store(true); await sleep(5000); }\nasync fn main() { let ready = AtomicBool::new(false); let task = w(ready); while !ready.load() { await yield(); } task.cancel(); await task.result(); println(task.is_cancelled()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "2\n1\ntrue\n");
@@ -4420,8 +4422,9 @@ fn adfr_27_block_capture_survives_gc_and_preemption_stress() {
 
 #[test]
 fn adfr_28_repeated_site_is_consumed_then_cancellable() {
+    // Synchronize on registered defers and terminal cleanup, not wall-clock sleeps.
     let (out, ok) = compile_and_run(
-        "fn c(n: i64) { println(n); }\nasync fn w() { for i in 0..3 { defer c(i); if i == 1 { await sleep(5000); } } }\nasync fn main() { let task = w(); await sleep(20); task.cancel(); await sleep(50); println(task.is_cancelled()); }",
+        "fn c(n: i64) { println(n); }\nasync fn w(ready: AtomicBool) { for i in 0..3 { defer c(i); if i == 1 { ready.store(true); await sleep(5000); } } }\nasync fn main() { let ready = AtomicBool::new(false); let task = w(ready); while !ready.load() { await yield(); } task.cancel(); await task.result(); println(task.is_cancelled()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "0\n1\ntrue\n");
