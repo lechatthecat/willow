@@ -363,14 +363,12 @@ pub(super) fn compile_and_run_with_env(source: &str, env: &[(&str, &str)]) -> (S
     if !compiled.status.success() {
         let _ = fs::remove_file(&src_path);
         remove_output_artifacts(&bin_path);
-        return (
-            format!(
-                "{}{}",
-                String::from_utf8_lossy(&compiled.stdout),
-                String::from_utf8_lossy(&compiled.stderr)
-            ),
-            false,
+        eprintln!(
+            "compiler failed: {}{}",
+            String::from_utf8_lossy(&compiled.stdout),
+            String::from_utf8_lossy(&compiled.stderr)
         );
+        return (String::new(), false);
     }
 
     let mut cmd = Command::new(&bin_path);
