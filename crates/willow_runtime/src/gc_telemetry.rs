@@ -330,16 +330,52 @@ pub extern "C" fn willow_gc_stats_snapshot_v1(out: *mut WillowGcStatsV1) -> i32 
     if out.is_null() {
         return -1;
     }
-    let mut stats = snapshot();
-    if let Some(resident) = resident_bytes() {
-        stats.process_resident_bytes = resident;
-        stats.resident_valid = 1;
-    }
+    let stats = snapshot_with_resident();
     // SAFETY: the caller supplies one writable, aligned V1 object.
     unsafe {
         out.write(stats);
     }
     0
+}
+
+fn snapshot_with_resident() -> WillowGcStatsV1 {
+    let mut stats = snapshot();
+    if let Some(resident) = resident_bytes() {
+        stats.process_resident_bytes = resident;
+        stats.resident_valid = 1;
+    }
+    stats
+}
+
+/// Required output bytes, or -1 for an unsupported version.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_stats_size(version: i64) -> i64 {
+    if version == i64::from(GC_STATS_VERSION) {
+        std::mem::size_of::<WillowGcStatsV1>() as i64
+    } else {
+        -1
+    }
+}
+
+/// Returns bytes written, 0 for insufficient length, or -1 for an unknown
+/// version or null output. Errors never write. On success the caller supplies
+/// writable storage for the required size; alignment is not required.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_stats_snapshot(version: i64, out: *mut u8, out_len: i64) -> i64 {
+    let size = willow_gc_stats_size(version);
+    if size < 0 {
+        return -1;
+    }
+    if out_len < size {
+        return 0;
+    }
+    if out.is_null() {
+        return -1;
+    }
+    let stats = snapshot_with_resident();
+    // SAFETY: the caller supplies writable storage of at least `size` bytes.
+    unsafe { out.cast::<WillowGcStatsV1>().write_unaligned(stats) };
+    size
 }
 
 struct TraceSink {

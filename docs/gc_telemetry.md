@@ -15,6 +15,18 @@ writable storage for the complete V1 structure. Its first two fields are
 or extended layout needs a new versioned symbol. The compiler ABI registry
 records `(Ptr) -> I32`, with no GC allocation or safepoint effect.
 
+For version and buffer-size negotiation, use `willow_gc_stats_size(version)`
+and `willow_gc_stats_snapshot(version, out, out_len)`, both returning `int64_t`.
+Version 1 uses the same immutable V1 layout and sampling semantics above.
+The size query returns 2,112 for V1 or `-1` for an unsupported version.
+The snapshot checks the version first (`-1` if unsupported), then length (`0`
+if negative or insufficient), then output (`-1` if null). Failed calls write
+nothing. Success writes exactly the required bytes and returns that byte count;
+the output may be unaligned and any trailing bytes remain untouched. The caller
+must supply writable storage for the required size. These symbols have ABI
+signatures `(I64) -> I64` and `(I64, Ptr, I64) -> I64`, respectively, with no GC
+allocation or safepoint effect. The legacy V1 symbol retains its return convention.
+
 ## Reading measurements
 
 | Group | Meaning |

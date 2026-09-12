@@ -111,6 +111,43 @@ fn fixed_v1_header_and_symbol_write_one_struct() {
 }
 
 #[test]
+fn negotiated_snapshot_validates_before_writing_and_accepts_byte_buffers() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    let size = std::mem::size_of::<WillowGcStatsV1>();
+    assert_eq!(willow_gc_stats_size(1), size as i64);
+    let mut bytes = vec![0xa5u8; size + 17];
+    let out = unsafe { bytes.as_mut_ptr().add(1) };
+    for version in [i64::MIN, -1, 0, 2, i64::MAX] {
+        assert_eq!(willow_gc_stats_size(version), -1);
+        assert_eq!(willow_gc_stats_snapshot(version, out, size as i64), -1);
+        assert_eq!(
+            willow_gc_stats_snapshot(version, std::ptr::null_mut(), 0),
+            -1
+        );
+    }
+    for len in [i64::MIN, -1, 0, size as i64 - 1] {
+        assert_eq!(willow_gc_stats_snapshot(1, out, len), 0);
+        assert_eq!(willow_gc_stats_snapshot(1, std::ptr::null_mut(), len), 0);
+    }
+    assert_eq!(
+        willow_gc_stats_snapshot(1, std::ptr::null_mut(), size as i64),
+        -1
+    );
+    assert!(bytes.iter().all(|&byte| byte == 0xa5));
+    for len in [size as i64, size as i64 + 16] {
+        assert_eq!(willow_gc_stats_snapshot(1, out, len), size as i64);
+        // SAFETY: the successful call initialized one V1 at this byte address.
+        let stats = unsafe { out.cast::<WillowGcStatsV1>().read_unaligned() };
+        assert_eq!(stats.version, 1);
+        assert_eq!(stats.struct_size as usize, size);
+        assert_consistent(&stats);
+        assert_eq!(bytes[0], 0xa5);
+        assert!(bytes[size + 1..].iter().all(|&byte| byte == 0xa5));
+    }
+}
+
+#[test]
 fn major_cycle_reports_live_graph_null_slots_and_duplicate_roots() {
     let _guard = runtime_test_guard();
     reset_internal_for_test();

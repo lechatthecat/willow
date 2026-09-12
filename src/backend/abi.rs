@@ -161,6 +161,8 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     PREEMPT; "willow_gc_collect" => ([] -> None);
     PREEMPT; "willow_gc_minor_collect" => ([] -> None);
     NONE; "willow_gc_stats_snapshot_v1" => ([Ptr] -> Some(I32));
+    NONE; "willow_gc_stats_size" => ([I64] -> Some(I64));
+    NONE; "willow_gc_stats_snapshot" => ([I64, Ptr, I64] -> Some(I64));
     NONE; "willow_gc_allocated_bytes" => ([] -> Some(I64));
     NONE; "willow_gc_tlab_fast_allocations" => ([] -> Some(I64));
     NONE; "willow_gc_tlab_slow_allocations" => ([] -> Some(I64));
@@ -962,6 +964,22 @@ mod alloc_effects_tests {
         assert_eq!(symbol.params, &[AbiTy::Ptr]);
         assert_eq!(symbol.ret, Some(AbiTy::I32));
         assert_eq!(symbol.effects, RuntimeEffects::NONE);
+    }
+
+    #[test]
+    fn gc_stats_negotiation_signatures_match_runtime() {
+        for (name, params) in [
+            ("willow_gc_stats_size", &[AbiTy::I64][..]),
+            (
+                "willow_gc_stats_snapshot",
+                &[AbiTy::I64, AbiTy::Ptr, AbiTy::I64][..],
+            ),
+        ] {
+            let symbol = runtime_symbol(name).unwrap();
+            assert_eq!(symbol.params, params);
+            assert_eq!(symbol.ret, Some(AbiTy::I64));
+            assert_eq!(symbol.effects, RuntimeEffects::NONE);
+        }
     }
 
     #[test]

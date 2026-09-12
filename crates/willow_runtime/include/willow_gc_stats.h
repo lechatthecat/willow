@@ -44,6 +44,12 @@ extern "C" {
 #endif
 /* out must point to a full, aligned, writable V1 object. 0 = success, -1 = null. */
 int32_t willow_gc_stats_snapshot_v1(WillowGcStatsV1 *out);
+/* Required bytes, or -1 for an unsupported version. */
+int64_t willow_gc_stats_size(int64_t version);
+/* Bytes written; 0 for short/negative length; -1 for unsupported version or
+ * null output with sufficient length. Failures leave output untouched.
+ * Output need not be aligned; bytes beyond the required size are untouched. */
+int64_t willow_gc_stats_snapshot(int64_t version, void *out, int64_t out_len);
 #ifdef __cplusplus
 }
 #endif
