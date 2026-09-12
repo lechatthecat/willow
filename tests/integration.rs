@@ -188,6 +188,9 @@ mod native_stack_overflow;
 #[path = "integration/lir_constant_folding.rs"]
 mod lir_constant_folding;
 
+#[path = "integration/type_argument_arity.rs"]
+mod type_argument_arity;
+
 #[cfg(all(
     target_os = "linux",
     target_env = "gnu",

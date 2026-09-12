@@ -98,6 +98,19 @@ impl TypeChecker {
         self.nonpreemptible_methods =
             crate::semantic::concurrency::compute_nonpreemptible_helpers(program);
 
+        // Pass 0: enum identities. Normalizing a written type canonicalizes a
+        // bare enum name by lookup, so every enum must be findable before any
+        // declaration's types are normalized: a class field, interface
+        // signature or payload may name an enum declared later in the file
+        // (willow-rlq9). The reserved name is left to pass 1's diagnostic.
+        for item in &program.items {
+            if let Item::Enum(e) = item
+                && e.name != "PanicInfo"
+            {
+                self.predeclare_enum(e);
+            }
+        }
+
         // Pass 1: register class shapes, enum declarations, and interfaces.
         // Interfaces share the top-level namespace with classes/enums/functions
         // and must be registered before class conformance is validated.
@@ -195,8 +208,8 @@ impl TypeChecker {
             match item {
                 Item::Function(f) => self.check_function(f),
                 Item::Class(c) => self.check_class(c),
-                Item::Enum(_) => {} // already registered
-                Item::Interface(i) => self.check_interface(i), // validate `extends`
+                Item::Enum(e) => self.check_enum(e), // validate payload types
+                Item::Interface(i) => self.check_interface(i), // validate `extends` + signatures
             }
         }
 
@@ -845,7 +858,14 @@ impl TypeChecker {
     pub(super) fn check_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Let(s) => {
-                let annotation = s.ty.as_ref().map(|ty| self.normalize_type(ty, s.span));
+                // The annotation is judged before the initializer so a
+                // malformed one (`let x: Option = ...`) is reported ahead of
+                // the mismatches it goes on to cause (willow-rlq9).
+                let annotation = s.ty.as_ref().map(|ty| {
+                    let annotation = self.normalize_type(ty, s.span);
+                    self.validate_type(&annotation, s.span);
+                    annotation
+                });
                 // A `let xs: Array<I> = [..]` literal is checked element-wise
                 // against `I`, so classes implementing interface `I` are accepted.
                 let inferred = match (&annotation, &s.init) {
@@ -855,7 +875,6 @@ impl TypeChecker {
                     _ => self.check_expr(&s.init),
                 };
                 let ty = if let Some(ann) = &annotation {
-                    self.validate_type(ann, s.span);
                     let channel_ctor_infers_from_annotation = channel_element_type(ann).is_some()
                         && is_untyped_channel_ctor_call(&s.init);
                     if channel_ctor_infers_from_annotation {

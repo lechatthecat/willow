@@ -11,6 +11,8 @@ mod diagnostics;
 mod resolve;
 mod returns;
 mod send_sync;
+#[cfg(test)]
+mod type_arity_tests;
 pub(crate) mod types;
 pub(crate) use analysis::*;
 #[cfg(test)]
@@ -65,6 +67,12 @@ pub struct TypeChecker {
     /// temporaries. Each occurrence has its own slot, independent of source
     /// spans; callable checking drains its slots after checking Send.
     async_local_types: Vec<Type>,
+    /// The type parameters of the generic declaration whose written types are
+    /// being normalized or validated (`T` inside `enum Wrap<T>` or `interface Conv<T>`).
+    /// A bare `T` there names a parameter, not a missing type, so
+    /// [`Self::validate_type`] accepts it; every other position sees an empty
+    /// list and reports the name as unknown (willow-rlq9).
+    declared_type_params: Vec<String>,
     /// Maps the ID of an UNQUALIFIED enum-variant construction (`Ok(42)` in an
     /// expected-enum position) to the enum it resolved to. The backend consults
     /// this to lower such a `Call` as a variant allocation instead of a function
@@ -337,6 +345,7 @@ impl TypeChecker {
             lock_depth: 0,
             lexical_block_depth: 0,
             async_local_types: Vec::new(),
+            declared_type_params: Vec::new(),
             enum_variant_resolutions: HashMap::new(),
             pattern_resolutions: HashMap::new(),
             expr_types: HashMap::new(),
@@ -484,6 +493,13 @@ impl TypeChecker {
     }
 
     fn normalize_type(&mut self, ty: &Type, span: Span) -> Type {
+        // Declaration parameters shadow module types, including enum names
+        // predeclared before registration. Preserve them for substitution.
+        if let Type::Named(name) = ty
+            && self.declared_type_params.contains(name)
+        {
+            return ty.clone();
+        }
         if let Type::Named(name) | Type::Generic(name, _) = ty
             && !self.check_source_type_name(name, span)
         {
@@ -1032,10 +1048,14 @@ impl TypeChecker {
                 self.check_collection_type_imported("Array", span);
                 self.validate_type(element, span);
             }
-            Type::Generic(_, args) => {
+            Type::Generic(name, args) => {
                 if builtin_types::is(ty, B::Map) {
                     self.check_collection_type_imported("Map", span);
                 }
+                self.check_type_argument_count(name, args.len(), span);
+                // A private generic is as private as a private plain type:
+                // `m::Hidden<i64>` answers to the same rule as `m::Hidden`.
+                self.check_type_visibility(name, span);
                 for arg in args {
                     self.validate_type(arg, span);
                 }
@@ -1062,6 +1082,9 @@ impl TypeChecker {
                 // Compiler-known runtime primitives. TCP handles are opaque,
                 // GC-managed objects constructed only by `std::net`.
             }
+            // A type parameter of the declaration under validation: `T` in
+            // `enum Wrap<T> { Val(T) }` is bound by the declaration itself.
+            Type::Named(name) if self.declared_type_params.iter().any(|p| p == name) => {}
             Type::Named(name) => {
                 // A named type must resolve to a known class or enum (including
                 // module-qualified ones like `geometry::Point`, which are
@@ -1092,9 +1115,117 @@ impl TypeChecker {
                     };
                     self.push(diag);
                 }
+                // A generic enum or interface is a type family, not a type: the
+                // bare name supplies no type arguments, so nothing downstream can
+                // instantiate it (willow-rlq9).
+                self.check_type_argument_count(name, 0, span);
                 self.check_type_visibility(name, span);
             }
         }
+    }
+
+    fn normalize_declared_type(&mut self, ty: &Type, type_params: &[String], span: Span) -> Type {
+        let outer = std::mem::replace(&mut self.declared_type_params, type_params.to_vec());
+        let normalized = self.normalize_type(ty, span);
+        self.declared_type_params = outer;
+        normalized
+    }
+
+    /// Validate `ty` as written inside a declaration that binds `type_params`
+    /// (willow-rlq9). Runs after every declaration is registered, so a
+    /// forward reference resolves, and with the parameters in scope, so `T`
+    /// is a parameter rather than an unknown type.
+    pub(super) fn validate_declared_type(&mut self, ty: &Type, type_params: &[String], span: Span) {
+        let outer = std::mem::replace(&mut self.declared_type_params, type_params.to_vec());
+        self.validate_type(ty, span);
+        self.declared_type_params = outer;
+    }
+
+    /// Check a written type's type-argument count against the declaration
+    /// its head names (willow-rlq9). Only declarations the symbol table owns
+    /// are judged here; a compiler-known generic (`Map<K, V>`, `Task<T>`,
+    /// `Mutex<T>`, ...) is not a symbol, and the std ones already have their
+    /// arity checked when the spelling is normalized.
+    ///
+    /// Silently accepting a wrong count is what let `Option`, `Option<i64, i64>`
+    /// and `Foo<i64>` reach codegen: the checker treated the first as an
+    /// uninstantiated `Type::Named` (so `Some(..)` failed to resolve against it)
+    /// and handed the others to the walker, which rejected them as an ICE.
+    fn check_type_argument_count(&mut self, name: &str, given: usize, span: Span) {
+        let (kind, params): (&str, Vec<String>) = if let Some(info) = self.symbols.lookup_enum(name)
+        {
+            ("enum", info.type_params.clone())
+        } else if let Some(info) = self.symbols.lookup_interface(name) {
+            ("interface", info.type_params.clone())
+        } else if self.symbols.lookup_class(name).is_some() {
+            ("class", Vec::new())
+        } else if given > 0 && !compiler_known_generic_head(name) {
+            // `Type::Named` reports its own unknown names; a generic head
+            // that resolves to nothing is the same defect one spelling wider.
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0350,
+                    format!("cannot find type `{name}`"),
+                )
+                .with_label(Label::primary(span, "not a known type"))
+                .with_help(
+                    "define a class, enum, or interface with this name, or check the spelling",
+                ),
+            );
+            return;
+        } else {
+            return;
+        };
+        let expected = params.len();
+        if given == expected {
+            return;
+        }
+        let plural = |n: usize| if n == 1 { "" } else { "s" };
+        let verb = |n: usize| if n == 1 { "was" } else { "were" };
+        let spelled = format!("{name}<{}>", params.join(", "));
+        let diag = if expected == 0 {
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0201,
+                format!(
+                    "{kind} `{name}` is not generic, but {given} type argument{} {} given",
+                    plural(given),
+                    verb(given)
+                ),
+            )
+            .with_label(Label::primary(span, "unexpected type arguments"))
+            .with_help(format!("write `{name}` without type arguments"))
+        } else if given == 0 {
+            let example = std::iter::repeat_n("i64", expected)
+                .collect::<Vec<_>>()
+                .join(", ");
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0201,
+                format!(
+                    "{kind} `{name}` expects {expected} type argument{}, but none were given",
+                    plural(expected)
+                ),
+            )
+            .with_label(Label::primary(span, "missing type arguments"))
+            .with_help(format!(
+                "write `{spelled}` with concrete types, e.g. `{name}<{example}>`"
+            ))
+        } else {
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0201,
+                format!(
+                    "{kind} `{name}` expects {expected} type argument{}, but {given} {} given",
+                    plural(expected),
+                    verb(given)
+                ),
+            )
+            .with_label(Label::primary(span, "wrong number of type arguments"))
+            .with_help(format!("write `{spelled}`"))
+        };
+        self.push(diag);
     }
 
     /// When a `let` has no type annotation, a bare `Option`/`Result` variant
@@ -1489,6 +1620,13 @@ fn imported_class_info_from_decl(
         instance_field_order,
         constructor,
     }
+}
+
+/// Whether `name` heads a generic type the compiler knows without a symbol
+/// table entry: the builtin families plus the lock handles and the
+/// range type that `for` loops produce (willow-rlq9).
+fn compiler_known_generic_head(name: &str) -> bool {
+    B::from_name(name).is_some() || matches!(name, "Mutex" | "RwLock" | "Range")
 }
 
 #[cfg(test)]

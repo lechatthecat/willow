@@ -1,0 +1,71 @@
+// shapes.wi -- the generic and non-generic declarations the entry file names.
+//
+// Every type here is written in the entry file both as a parameter/return
+// type and, in comments, in the spellings the compiler rejects (willow-rlq9).
+module shapes;
+
+// Declarations are judged once the whole module is registered, so this
+// interface may name `Wrap<i64>` before `Wrap` is declared, and `Self`
+// stands for whichever class implements it.
+pub interface Labelled {
+    fn label(self, w: Wrap<i64>) -> String;
+    fn me(self) -> Self;
+}
+
+// A generic enum: one type parameter, so every use must supply exactly one.
+// Inside the declaration `T` is bound, so a payload may be `T` or nest it
+// (`Option<T>`); a payload's own type arguments are checked like any other
+// written type, so `Val(Option<T, T>)` would be rejected here.
+pub enum Wrap<T> {
+    Val(T),
+    Maybe(Option<T>),
+    Empty,
+}
+
+// A plain enum: no type parameters, so a use must not supply any.
+pub enum Color {
+    Red,
+    Blue,
+}
+
+// A generic interface, instantiated by the class that implements it.
+pub interface Conv<T> {
+    fn conv(self) -> T;
+}
+
+pub class Doubler implements Conv<i64>, Labelled {
+    n: i64;
+    pub init(self, n: i64) { self.n = n; }
+    pub fn conv(self) -> i64 { return self.n * 2; }
+    pub fn label(self, w: Wrap<i64>) -> String {
+        return match w {
+            Wrap::Val(_) => "val",
+            Wrap::Maybe(_) => "maybe",
+            Wrap::Empty => "empty",
+        };
+    }
+    pub fn me(self) -> Doubler { return new Doubler(self.n); }
+}
+
+// A module function whose return type is a prelude generic. The original
+// report (willow-53hg) spelled this `-> Option` with no type argument; the
+// compiler now rejects that spelling with a message naming the missing
+// argument instead of leaving `Some(n)` unresolvable.
+pub fn only_some(n: i64) -> Option<i64> {
+    if n > 0 {
+        return Some(n);
+    }
+    return None;
+}
+
+pub fn wrap(n: i64) -> Wrap<i64> {
+    return Wrap::Val(n);
+}
+
+pub fn empty() -> Wrap<i64> {
+    return Wrap::Empty;
+}
+
+pub fn maybe(n: i64) -> Wrap<i64> {
+    return Wrap::Maybe(only_some(n));
+}

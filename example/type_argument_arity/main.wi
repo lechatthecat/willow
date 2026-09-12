@@ -1,0 +1,137 @@
+// type_argument_arity -- a written type must carry exactly the type arguments
+// its declaration takes (willow-rlq9).
+//
+// The checker validates every annotation position -- parameters, return
+// types, `let` annotations, class fields, lambda parameters, and the
+// components of `fn(..) -> ..` and collection types -- against the declaration
+// the head names. Each of the following spellings is a compile error:
+//
+//   fn f(o: Option) -> i64 { .. }
+//     error[E0201]: enum `Option` expects 1 type argument, but none were given
+//     help: write `Option<T>` with concrete types, e.g. `Option<i64>`
+//
+//   fn f() -> Result<i64> { .. }
+//     error[E0201]: enum `Result` expects 2 type arguments, but 1 was given
+//     help: write `Result<T, E>`
+//
+//   fn f(w: shapes::Wrap<i64, i64>) -> i64 { .. }
+//     error[E0201]: enum `shapes::Wrap` expects 1 type argument, but 2 were given
+//
+//   fn f(c: shapes::Color<i64>) -> i64 { .. }
+//     error[E0201]: enum `shapes::Color` is not generic, but 1 type argument was given
+//     help: write `shapes::Color` without type arguments
+//
+//   fn f(c: shapes::Conv) -> i64 { .. }
+//     error[E0201]: interface `shapes::Conv` expects 1 type argument, but none were given
+//
+//   fn f(d: shapes::Doubler<i64>) -> i64 { .. }
+//     error[E0201]: class `shapes::Doubler` is not generic, but 1 type argument was given
+//
+//   fn f(b: Bogus<i64>) -> i64 { .. }
+//     error[E0350]: cannot find type `Bogus`
+//
+//   enum Box { Value(Option<i64, i64>), Empty }
+//     error[E0201]: enum `Option` expects 1 type argument, but 2 were given
+//
+// Before this check, the bare `Option` spelling made `Some(n)` in the body
+// fail with "cannot find function `Some`", and the other shapes passed the
+// checker only to crash code generation. The program below is the same code
+// with every type argument in place.
+//
+// Declarations are judged after the whole file is registered: `Later` may
+// carry `Early` in a payload before `Early` is declared, and `shapes.wi`
+// declares an interface naming `Wrap<i64>` ahead of `Wrap` itself.
+import shapes;
+
+enum Later {
+    First(Early),
+    Second(Option<Early>),
+}
+
+enum Early {
+    X,
+    Y,
+}
+
+fn early_code(e: Early) -> i64 {
+    return match e {
+        Early::X => 1,
+        Early::Y => 2,
+    };
+}
+
+fn later_code(l: Later) -> i64 {
+    return match l {
+        Later::First(e) => early_code(e),
+        Later::Second(o) => match o {
+            Some(e) => 10 + early_code(e),
+            None => 0,
+        },
+    };
+}
+
+fn unwrap_or(o: Option<i64>, fallback: i64) -> i64 {
+    return match o {
+        Some(v) => v,
+        None => fallback,
+    };
+}
+
+fn describe(w: shapes::Wrap<i64>) -> Result<i64, String> {
+    return match w {
+        shapes::Wrap::Val(v) => Ok(v),
+        shapes::Wrap::Maybe(o) => match o {
+            Some(v) => Ok(v),
+            None => Err("none"),
+        },
+        shapes::Wrap::Empty => Err("empty"),
+    };
+}
+
+fn code(c: shapes::Color) -> i64 {
+    return match c {
+        shapes::Color::Red => 1,
+        shapes::Color::Blue => 2,
+    };
+}
+
+fn convert(c: shapes::Conv<i64>) -> i64 {
+    return c.conv();
+}
+
+fn main() {
+    // Option<i64> across the module boundary, Some and None paths.
+    println(unwrap_or(shapes::only_some(5), 0));
+    println(unwrap_or(shapes::only_some(-1), 0));
+
+    // A user generic enum instantiated at i64, returned into Result<i64, String>.
+    let r: Result<i64, String> = describe(shapes::wrap(7));
+    match r {
+        Ok(v) => println(v),
+        Err(e) => println(e),
+    }
+    match describe(shapes::empty()) {
+        Ok(v) => println(v),
+        Err(e) => println(e),
+    }
+    match describe(shapes::maybe(-3)) {
+        Ok(v) => println(v),
+        Err(e) => println(e),
+    }
+
+    // A plain enum, written without type arguments.
+    println(code(shapes::Color::Blue));
+
+    // A generic interface instantiated at i64, through a class that implements it.
+    println(convert(new shapes::Doubler(21)));
+
+    // An interface declared before the enum its signature names, with `Self`
+    // resolving to the implementing class.
+    let d = new shapes::Doubler(1);
+    println(d.me().label(shapes::maybe(3)));
+
+    // Payloads naming a type declared later in this file.
+    let second: Option<Early> = Some(Early::Y);
+    println(later_code(Later::First(Early::X)));
+    println(later_code(Later::Second(second)));
+}

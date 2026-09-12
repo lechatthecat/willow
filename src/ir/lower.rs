@@ -105,6 +105,16 @@ impl<'a> CheckerTables<'a> {
     /// spelling inside a type argument is rewritten even when the whole type
     /// was never written that way.
     pub(crate) fn normalize(&self, ty: &Type) -> Type {
+        self.normalize_declared(ty, &[])
+    }
+
+    /// Symbolic declaration parameters must survive until instantiation.
+    fn normalize_declared(&self, ty: &Type, bound: &[String]) -> Type {
+        if let Type::Named(name) = ty
+            && bound.contains(name)
+        {
+            return ty.clone();
+        }
         let ty = self.normalized_types.and_then(|m| m.get(ty)).unwrap_or(ty);
         let rebuilt = match ty {
             Type::Named(name) => self
@@ -122,7 +132,7 @@ impl<'a> CheckerTables<'a> {
                         .map(|info| Type::Named(info.name.clone()))
                 })
                 .unwrap_or_else(|| ty.clone()),
-            Type::Array(elem) => Type::Array(Box::new(self.normalize(elem))),
+            Type::Array(elem) => Type::Array(Box::new(self.normalize_declared(elem, bound))),
             Type::Generic(name, args) => Type::Generic(
                 self.symbols
                     .and_then(|symbols| symbols.lookup_interface(name))
@@ -135,15 +145,23 @@ impl<'a> CheckerTables<'a> {
                             .map(|info| info.name.clone())
                     })
                     .unwrap_or_else(|| name.clone()),
-                args.iter().map(|a| self.normalize(a)).collect(),
+                args.iter()
+                    .map(|a| self.normalize_declared(a, bound))
+                    .collect(),
             ),
             Type::Fn(params, ret) => Type::Fn(
-                params.iter().map(|p| self.normalize(p)).collect(),
-                Box::new(self.normalize(ret)),
+                params
+                    .iter()
+                    .map(|p| self.normalize_declared(p, bound))
+                    .collect(),
+                Box::new(self.normalize_declared(ret, bound)),
             ),
             Type::Closure(params, ret) => Type::Closure(
-                params.iter().map(|p| self.normalize(p)).collect(),
-                Box::new(self.normalize(ret)),
+                params
+                    .iter()
+                    .map(|p| self.normalize_declared(p, bound))
+                    .collect(),
+                Box::new(self.normalize_declared(ret, bound)),
             ),
             other => other.clone(),
         };
@@ -3943,17 +3961,20 @@ fn lower_resolution(
         Type::Named(ref name) => TypeId::from_source_name(name),
         _ => TypeId::from_source_name(name),
     };
-    let signature =
-        |params: &[crate::parser::ast::Param], result: &Type, is_static, is_async| HirSignature {
-            params: params
-                .iter()
-                .map(|p| tables.normalize(&p.ty).into())
-                .collect(),
-            param_modes: params.iter().map(|p| p.mode.clone()).collect(),
-            return_type: tables.normalize(result).into(),
-            is_static,
-            is_async,
-        };
+    let signature = |params: &[crate::parser::ast::Param],
+                     result: &Type,
+                     is_static,
+                     is_async,
+                     bound: &[String]| HirSignature {
+        params: params
+            .iter()
+            .map(|p| tables.normalize_declared(&p.ty, bound).into())
+            .collect(),
+        param_modes: params.iter().map(|p| p.mode.clone()).collect(),
+        return_type: tables.normalize_declared(result, bound).into(),
+        is_static,
+        is_async,
+    };
     let mut out = HirResolution::default();
     for namespace in ["env", "fs", "net", "parallel", "f64"] {
         out.namespaces
@@ -4013,7 +4034,7 @@ fn lower_resolution(
                                 payloads: variant
                                     .payload
                                     .iter()
-                                    .map(|ty| tables.normalize(ty).into())
+                                    .map(|ty| tables.normalize_declared(ty, &e.type_params).into())
                                     .collect(),
                             })
                             .collect(),
@@ -4023,7 +4044,7 @@ fn lower_resolution(
             Item::Function(f) => {
                 out.functions.insert(
                     FunctionId::free_from_source_name(&f.name),
-                    signature(&f.params, &f.return_type, true, f.is_async),
+                    signature(&f.params, &f.return_type, true, f.is_async, &[]),
                 );
             }
             Item::Class(c) => {
@@ -4052,7 +4073,7 @@ fn lower_resolution(
                 info.constructor = c
                     .constructors
                     .first()
-                    .map(|ctor| signature(&ctor.params, &Type::Void, false, false));
+                    .map(|ctor| signature(&ctor.params, &Type::Void, false, false, &[]));
                 for method in &c.methods {
                     info.methods.insert(
                         method.name.clone(),
@@ -4061,6 +4082,7 @@ fn lower_resolution(
                             &method.return_type,
                             method.is_static,
                             method.is_async,
+                            &[],
                         ),
                     );
                 }
@@ -4091,6 +4113,12 @@ fn lower_resolution(
                                         &method.return_type,
                                         method.is_static,
                                         false,
+                                        &interface
+                                            .type_params
+                                            .iter()
+                                            .cloned()
+                                            .chain(std::iter::once("Self".to_string()))
+                                            .collect::<Vec<_>>(),
                                     ),
                                 )
                             })
@@ -4100,23 +4128,27 @@ fn lower_resolution(
             }
         }
     }
-    let checked_signature =
-        |params: &[Type], infos: &[symbols::ParamInfo], result: &Type, is_static, is_async| {
-            HirSignature {
-                params: params
-                    .iter()
-                    .map(|ty| tables.normalize(ty).into())
-                    .collect(),
-                param_modes: params
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _)| infos.get(i).map_or(ParamMode::Value, |p| p.mode.clone()))
-                    .collect(),
-                return_type: tables.normalize(result).into(),
-                is_static,
-                is_async,
-            }
-        };
+    let checked_signature = |params: &[Type],
+                             infos: &[symbols::ParamInfo],
+                             result: &Type,
+                             is_static,
+                             is_async,
+                             bound: &[String]| {
+        HirSignature {
+            params: params
+                .iter()
+                .map(|ty| tables.normalize_declared(ty, bound).into())
+                .collect(),
+            param_modes: params
+                .iter()
+                .enumerate()
+                .map(|(i, _)| infos.get(i).map_or(ParamMode::Value, |p| p.mode.clone()))
+                .collect(),
+            return_type: tables.normalize_declared(result, bound).into(),
+            is_static,
+            is_async,
+        }
+    };
     if let Some(enums) = tables.enums {
         for info in enums.values() {
             out.enums.insert(
@@ -4136,7 +4168,7 @@ fn lower_resolution(
                             payloads: variant
                                 .payload_types
                                 .iter()
-                                .map(|ty| tables.normalize(ty).into())
+                                .map(|ty| tables.normalize_declared(ty, &info.type_params).into())
                                 .collect(),
                         })
                         .collect(),
@@ -4162,6 +4194,7 @@ fn lower_resolution(
                             &function.return_type,
                             true,
                             function.is_async,
+                            &[],
                         ),
                     )
                 })
@@ -4178,6 +4211,7 @@ fn lower_resolution(
                     &function.return_type,
                     true,
                     function.is_async,
+                    &[],
                 ),
             );
         }
@@ -4207,6 +4241,12 @@ fn lower_resolution(
                                     &method.return_type,
                                     method.is_static,
                                     false,
+                                    &interface
+                                        .type_params
+                                        .iter()
+                                        .cloned()
+                                        .chain(std::iter::once("Self".to_string()))
+                                        .collect::<Vec<_>>(),
                                 ),
                             )
                         })
@@ -4241,6 +4281,7 @@ fn lower_resolution(
                             &Type::Void,
                             false,
                             false,
+                            &[],
                         )
                     }),
                     methods: class
@@ -4255,6 +4296,7 @@ fn lower_resolution(
                                     &method.return_type,
                                     method.is_static,
                                     method.is_async,
+                                    &[],
                                 ),
                             )
                         })

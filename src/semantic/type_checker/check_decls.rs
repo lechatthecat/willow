@@ -7,9 +7,49 @@ use super::*;
 
 #[willow_continuations::checker]
 impl TypeChecker {
+    /// Validate an enum's payload types once every declaration is registered
+    /// (willow-rlq9): `enum Box { Value(Option<i64, i64>) }` and
+    /// `enum Box { Value(Bogus) }` are errors of the payload, and the
+    /// declaration's own parameters (`enum Wrap<T> { Val(T) }`) are the one
+    /// kind of bare name a payload may use without declaring it. Registration
+    /// cannot judge this: a payload may name a type declared later in the file.
+    pub(super) fn check_enum(&mut self, decl: &EnumDecl) {
+        // A declaration that failed to register (a reserved name) has nothing
+        // to validate; the registration diagnostic already owns it.
+        let Some(info) = self.symbols.lookup_enum(&decl.name).cloned() else {
+            return;
+        };
+        for variant in &info.variants {
+            for payload in &variant.payload_types {
+                self.validate_declared_type(payload, &decl.type_params, variant.declaration_span);
+            }
+        }
+    }
+
     /// Validate an interface's `extends` clause (willow-1js.2 / willow-1js.8):
-    /// each super must be a registered interface, with no cycle.
+    /// each super must be a registered interface, with no cycle, and its
+    /// method signatures against the registered types (willow-rlq9).
     pub(super) fn check_interface(&mut self, decl: &InterfaceDecl) {
+        // Signature types were normalized at registration and are judged here,
+        // once a later declaration can be named and the interface's own
+        // parameters are known to be parameters (`fn from(e: E) -> Self` in
+        // `interface From<E>`).
+        if let Some(info) = self.symbols.lookup_interface(&decl.name).cloned() {
+            // `Self` is bound by the interface too: `instantiate_interface`
+            // substitutes the receiver for it at every use, so a signature
+            // may name it as freely as a type parameter.
+            let mut bound = decl.type_params.clone();
+            bound.push("Self".to_string());
+            for name in &info.method_order {
+                let Some(m) = info.methods.get(name) else {
+                    continue;
+                };
+                self.validate_declared_type(&m.return_type, &bound, m.declaration_span);
+                for param in &m.param_infos {
+                    self.validate_declared_type(&param.ty, &bound, param.span);
+                }
+            }
+        }
         // Each super-interface must exist and be an interface.
         for sup in &decl.extends {
             if self.symbols.lookup_interface(sup).is_none() {

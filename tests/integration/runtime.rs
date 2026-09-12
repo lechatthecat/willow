@@ -937,6 +937,12 @@ fn test_runnable_example_files_compile_and_run() {
             "3\n30\n6\n60\n60\n13\n",
         ),
         ("example/module_enum_demo/main.wi", "1\n2\n42\n"),
+        // Option<i64> Some/None across a module, Wrap<i64> Val/Empty into
+        // Result<i64, String>, a plain enum, a generic interface at i64.
+        (
+            "example/type_argument_arity/main.wi",
+            "5\n0\n7\nempty\nnone\n2\n42\nmaybe\n1\n12\n",
+        ),
         (
             "example/module_lir_bodies/main.wi",
             "12\n10\n7\nwin:rect\n1\n9\n30\n90\n12\n12\n12\n20\n13\n",

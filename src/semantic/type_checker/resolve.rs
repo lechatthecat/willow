@@ -818,12 +818,27 @@ impl TypeChecker {
                 payload_types: variant
                     .payload
                     .iter()
-                    .map(|ty| self.normalize_type(ty, variant.span))
+                    .map(|ty| self.normalize_declared_type(ty, &decl.type_params, variant.span))
                     .collect(),
                 tag: tag as i64,
                 declaration_span: variant.span,
             });
         }
+        self.define_declared_enum(decl, variant_infos);
+    }
+
+    /// Register an enum's IDENTITY ahead of every declaration's types
+    /// (willow-rlq9). `normalize_type` rewrites a bare enum name to its
+    /// canonical `module::Enum` spelling by looking the name up, so a class
+    /// field, interface signature or payload written before the enum's
+    /// declaration used to keep the bare spelling and then mismatch every
+    /// `module::Enum` value. [`Self::register_enum`] replaces this entry with
+    /// the full declaration, payloads included.
+    pub(super) fn predeclare_enum(&mut self, decl: &EnumDecl) {
+        self.define_declared_enum(decl, Vec::new());
+    }
+
+    fn define_declared_enum(&mut self, decl: &EnumDecl, variants: Vec<EnumVariantInfo>) {
         let canonical = match self.module_path.as_deref() {
             Some(module) => format!("{module}::{}", decl.name),
             None => decl.name.clone(),
@@ -832,7 +847,7 @@ impl TypeChecker {
             name: canonical.clone(),
             public: decl.public,
             type_params: decl.type_params.clone(),
-            variants: variant_infos,
+            variants,
             declaration_span: decl.span,
         };
         if canonical != decl.name {
@@ -870,7 +885,24 @@ impl TypeChecker {
         for (tag, variant) in decl.variants.iter().enumerate() {
             variant_infos.push(EnumVariantInfo {
                 name: variant.name.clone(),
-                payload_types: variant.payload.iter().map(qualify).collect(),
+                payload_types: variant
+                    .payload
+                    .iter()
+                    .map(|ty| {
+                        // Imported metadata must preserve the same parameter
+                        // bindings as the declaring module's normalization.
+                        ty.map_names(|name| {
+                            if decl.type_params.contains(name) {
+                                return name.clone();
+                            }
+                            let Type::Named(ref qualified) = qualify(&Type::Named(name.clone()))
+                            else {
+                                unreachable!("module qualification preserves named types");
+                            };
+                            qualified.clone()
+                        })
+                    })
+                    .collect(),
                 tag: tag as i64,
                 declaration_span: variant.span,
             });
@@ -894,6 +926,8 @@ impl TypeChecker {
     }
 
     pub(super) fn register_interface(&mut self, decl: &InterfaceDecl, module_path: Option<&str>) {
+        let mut bound = decl.type_params.clone();
+        bound.push("Self".to_string());
         let registered_name = match module_path {
             Some(module) => format!("{module}::{}", decl.name),
             None => decl.name.clone(),
@@ -901,27 +935,26 @@ impl TypeChecker {
         let mut methods = HashMap::new();
         let mut method_order = Vec::new();
         for m in &decl.methods {
-            // Validate the signature types (params + return) against known types.
+            // Signature types are normalized here and VALIDATED in
+            // `check_interface`, once every declaration is registered: a
+            // method may name a type declared later in the file, and a
+            // generic interface's `T` is only known to be a parameter once
+            // the whole declaration is in view (willow-rlq9). An imported
+            // module's interface keeps its own spellings; the module's
+            // checker has already judged them.
             let return_type = if module_path.is_none() {
-                self.normalize_type(&m.return_type, m.span)
+                self.normalize_declared_type(&m.return_type, &bound, m.span)
             } else {
                 m.return_type.clone()
             };
-            let params = if module_path.is_none() {
-                self.normalize_param_types(&m.params)
+            let params: Vec<Type> = if module_path.is_none() {
+                m.params
+                    .iter()
+                    .map(|param| self.normalize_declared_type(&param.ty, &bound, param.type_span))
+                    .collect()
             } else {
                 m.params.iter().map(|p| p.ty.clone()).collect()
             };
-            // For a generic interface, method signatures may reference the
-            // interface's type parameters (e.g. `fn from(e: E) -> Self`), which
-            // are not concrete types — skip validation, like generic enums
-            // (willow-1js.1). Non-generic interfaces validate normally.
-            if decl.type_params.is_empty() {
-                self.validate_type(&return_type, m.span);
-                for (param, ty) in m.params.iter().zip(params.iter()) {
-                    self.validate_type(ty, param.span);
-                }
-            }
             if methods.contains_key(&m.name) {
                 self.push(
                     Diagnostic::new(
