@@ -1,0 +1,21 @@
+// E1707 still rejects async reference declarations in this stage.
+// Narrow future shape (no E1708):
+// async fn read(x: &i64) -> i64 { return x; }
+// let task = read(&value);
+// let result = await task;
+//
+// Escaping shapes additionally produce E1708:
+// return read(&value);
+// let tasks = [read(&value)];
+// let task = read(&value); save(task);
+// let task = read(&value); // leaving this block without await
+//
+// The runnable counterpart uses value capture until E1707 is relaxed.
+async fn read(value: i64) -> i64 {
+    return value;
+}
+async fn main() {
+    let value = 42;
+    let task = read(value);
+    println(await task);
+}

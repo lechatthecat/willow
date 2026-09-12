@@ -89,6 +89,8 @@ pub struct TypeChecker {
     /// syntax identity rather than a source coordinate, so a pass that rebuilds
     /// a node cannot silently inherit its neighbour's type (willow-njot).
     pub expr_types: HashMap<ExprId, Type>,
+    /// Resolved reference-parameter modes keyed by the argument place identity.
+    pub reference_arg_modes: HashMap<ExprId, ParamMode>,
     /// Unannotated map constructors and uses awaiting their first insertion.
     inferred_maps: HashMap<Span, (Vec<ExprId>, Option<usize>)>,
     /// What every type ANNOTATION the checker normalized became: the written
@@ -351,6 +353,7 @@ impl TypeChecker {
             enum_variant_resolutions: HashMap::new(),
             pattern_resolutions: HashMap::new(),
             expr_types: HashMap::new(),
+            reference_arg_modes: HashMap::new(),
             inferred_maps: HashMap::new(),
             normalized_types: HashMap::new(),
             static_call_classes: HashMap::new(),

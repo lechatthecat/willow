@@ -1,0 +1,14 @@
+// Cooperative waits and loops need no task stack. Calling a synchronous
+// helper enters a stable stack lazily, preserving recursion across preemption.
+fn sum(n: i64) -> i64 {
+    if n == 0 { return 0; }
+    return n + sum(n - 1);
+}
+async fn worker() -> i64 {
+    await yield();
+    defer { println("cleanup"); }
+    return sum(20);
+}
+async fn main() {
+    println(await worker());
+}

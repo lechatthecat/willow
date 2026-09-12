@@ -67,7 +67,7 @@ use super::type_helpers::{
     reference_type,
 };
 use super::{
-    CoopSuspendPoint, FRAME_SLOT_TASK_ID, FuncGen, VarStorage, array_element_type,
+    CoopSuspendPoints, FRAME_SLOT_TASK_ID, FuncGen, VarStorage, array_element_type,
     async_frame_slot_offset, channel_runtime_suffix,
 };
 
@@ -4966,7 +4966,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_coop_lir_function(
         &mut self,
         f: &LirFunction,
-        suspends: &mut Vec<CoopSuspendPoint>,
+        suspends: &mut CoopSuspendPoints,
         frame: cranelift_codegen::ir::Value,
     ) {
         self.emit_lir_function_inner(f, Some((suspends, frame)));
@@ -4975,7 +4975,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn emit_lir_function_inner(
         &mut self,
         f: &LirFunction,
-        mut coop: Option<(&mut Vec<CoopSuspendPoint>, cranelift_codegen::ir::Value)>,
+        mut coop: Option<(&mut CoopSuspendPoints, cranelift_codegen::ir::Value)>,
     ) {
         let incoming_frames =
             lir_call_frame_entries(f).expect("validated method preparation frames");
@@ -5308,7 +5308,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                                 types::I64,
                                 MemFlagsData::new(),
                                 task,
-                                async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+                                async_frame_slot_offset(
+                                    FRAME_SLOT_TASK_ID,
+                                    reference_type(self.module.target_config()).bytes(),
+                                ),
                             );
                             let raw =
                                 self.emit_value_runtime_call("willow_frame_await", &[task, id]);
@@ -5423,7 +5426,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                                 types::I64,
                                 MemFlagsData::new(),
                                 task,
-                                async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+                                async_frame_slot_offset(
+                                    FRAME_SLOT_TASK_ID,
+                                    reference_type(self.module.target_config()).bytes(),
+                                ),
                             );
                             self.emit_void_runtime_call(
                                 "willow_sched_unregister_task_waiter",
@@ -5482,7 +5488,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             types::I64,
                             MemFlagsData::new(),
                             task,
-                            async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+                            async_frame_slot_offset(
+                                FRAME_SLOT_TASK_ID,
+                                reference_type(self.module.target_config()).bytes(),
+                            ),
                         );
                         let value =
                             self.emit_task_terminal_value(task, id, result_ty, *cancel_aware);
@@ -5507,7 +5516,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         operation: &SuspendOp,
         resume: BlockId,
         blocks: &[cranelift_codegen::ir::Block],
-        suspends: &mut Vec<CoopSuspendPoint>,
+        suspends: &mut CoopSuspendPoints,
         frame: cranelift_codegen::ir::Value,
     ) {
         match operation {
@@ -5869,7 +5878,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         block: &LirBlock,
         blocks: &[cranelift_codegen::ir::Block],
         return_type: &Type,
-        mut coop: Option<(&mut Vec<CoopSuspendPoint>, cranelift_codegen::ir::Value)>,
+        mut coop: Option<(&mut CoopSuspendPoints, cranelift_codegen::ir::Value)>,
         sync_poll: Option<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value)>,
         defers: &mut LirBlockDeferCtx<'_>,
     ) -> Vec<(usize, LirDeferState)> {
@@ -5907,6 +5916,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             match inst {
                 LirInst::Compute { local, value, span } => {
+                    if task_stack_boundary(value)
+                        && let Some((suspends, frame)) = coop.as_mut()
+                    {
+                        let symbol = task_boundary_symbol(function, block.id.0, inst_index);
+                        self.emit_task_boundary(Some(value), &symbol, suspends, *frame);
+                        continue;
+                    }
                     let result = self.emit_lir_rvalue(function, value, *span);
                     if !self.terminated
                         && (function.locals[local.0 as usize].is_gc_owner()
@@ -7020,7 +7036,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 let env = self.emit_gc_alloc(GcLayoutMetadata::new(
                     GcObjectKind::Closure,
-                    (captures.len() as i64 + 1) * 8,
+                    (captures.len() as i64 + 1)
+                        * willow_abi::storage_word_bytes(
+                            reference_type(self.module.target_config()).bytes(),
+                        ) as i64,
                     0,
                     mask,
                 ));
@@ -7036,7 +7055,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let ty = capture.ty(&function.locals).expect("capture type");
                     self.emit_gc_heap_store(
                         env,
-                        (i as i32 + 1) * 8,
+                        (i as i32 + 1)
+                            * willow_abi::storage_word_bytes(
+                                reference_type(self.module.target_config()).bytes(),
+                            ) as i32,
                         value,
                         &ty,
                         GcStoreDestination::ObjectField,
@@ -7403,7 +7425,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     types::I64,
                     MemFlagsData::new(),
                     receiver,
-                    async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+                    async_frame_slot_offset(
+                        FRAME_SLOT_TASK_ID,
+                        reference_type(self.module.target_config()).bytes(),
+                    ),
                 );
                 self.emit_void_runtime_call("willow_sched_cancel", &[id]);
                 self.builder.ins().iconst(types::I8, 0)
@@ -8401,6 +8426,231 @@ fn flat_static_reference_call_supported(
             .zip(types)
             .all(|(param, arg)| ctx.supported_type(param) && ctx.same_repr(param, arg))
         && ctx.same_repr(ret, result)
+}
+
+/// User calls can run synchronous safepoints. Builtin scalar/collection
+/// operations and task creation remain on the ordinary poll stack.
+pub(super) fn task_stack_boundary(value: &crate::ir::lowered::LirRvalue) -> bool {
+    use crate::ir::lowered::LirRvalue as R;
+    let params = match value {
+        R::StaticCall { arg_types, .. }
+        | R::ConstructorCall { arg_types, .. }
+        | R::MethodCall { arg_types, .. }
+        | R::EnumMethod { arg_types, .. }
+        | R::IntrinsicCall { arg_types, .. } => arg_types.as_slice(),
+        R::BuiltinCall { params, .. } => params.as_slice(),
+        _ => &[],
+    };
+    if params
+        .iter()
+        .any(|ty| matches!(ty, Type::Fn(..) | Type::Closure(..)))
+    {
+        return true;
+    }
+    match value {
+        R::DirectCall { .. } | R::IndirectCall { .. } | R::IntoError { .. } => true,
+        R::StaticCall { class, .. } | R::ConstructorCall { class, .. } => {
+            crate::semantic::builtin_types::resolve(&Type::Named(*class)).is_none()
+        }
+        R::MethodCall { receiver_ty, .. } | R::EnumMethod { receiver_ty, .. } => {
+            crate::semantic::builtin_types::resolve(receiver_ty).is_none()
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn task_boundary_symbol(
+    function: &LirFunction,
+    block: usize,
+    instruction: usize,
+) -> String {
+    format!("{}$task_boundary.{block}.{instruction}", function.name)
+}
+
+/// A bounded cleanup can run directly on the cooperative poll stack. Calls
+/// into user code and cycles need a resumable native stack, including those
+/// nested inside another deferred region.
+pub(super) fn cleanup_needs_task_stack(function: &LirFunction) -> bool {
+    lir_sync_poll_blocks(function)
+        .iter()
+        .skip(1)
+        .any(|poll| *poll)
+        || function.blocks.iter().any(|block| {
+            lir_block_successors(block).contains(&0)
+                || block.recovery.iter().any(|target| target.0 == 0)
+        })
+        || function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instrs)
+            .any(|inst| match inst {
+                LirInst::Compute { value, .. } => task_stack_boundary(value),
+                LirInst::Defer { body, .. } => cleanup_needs_task_stack(&body.function),
+                _ => false,
+            })
+}
+
+pub(super) fn task_cleanup_symbol(poll: u32, flag: i32, recovery: bool) -> String {
+    format!("__willow_task_cleanup.{poll}.{flag}.{}", u8::from(recovery))
+}
+
+impl FuncGen<'_, '_> {
+    pub(super) fn emit_task_cleanup_callback(&mut self, region: &LirFunction, recovery: bool) {
+        self.recover_eligible_depth = usize::from(recovery);
+        let panic_exit = self.builder.create_block();
+        self.panic_return_block = Some(panic_exit);
+        self.emit_lir_cleanup_region(region);
+        if !self.terminated {
+            let ready = self.builder.ins().iconst(types::I32, 1);
+            self.builder.ins().return_(&[ready]);
+        }
+        self.builder.switch_to_block(panic_exit);
+        let depth = self.emit_value_runtime_call("willow_root_depth", &[]);
+        let baseline = self
+            .panic_function_root_depth
+            .expect("cleanup root baseline");
+        let count = self.builder.ins().isub(depth, baseline);
+        self.emit_void_runtime_call("willow_pop_roots", &[count]);
+        let panicked = self
+            .builder
+            .ins()
+            .iconst(types::I32, willow_abi::RuntimePollResult::Panicked as i64);
+        self.builder.ins().return_(&[panicked]);
+    }
+
+    pub(super) fn emit_task_boundary_callback(
+        &mut self,
+        function: &LirFunction,
+        local: LirLocalId,
+        value: &crate::ir::lowered::LirRvalue,
+        span: Span,
+    ) {
+        use crate::ir::lowered::{LirOperand, LirRvalue as R};
+        self.bind_coop_lir_locals(function);
+        self.bind_lir_locals(function);
+        let panic_exit = self.builder.create_block();
+        self.panic_return_block = Some(panic_exit);
+        if let R::MethodCall { method, .. } = value
+            && self.flat_method_frame_enabled(method)
+        {
+            self.lir_call_frames.push((method.clone(), span));
+            self.callstack_frame_depth = 1;
+        }
+        if value
+            .operands()
+            .iter()
+            .any(|arg| matches!(arg, LirOperand::Reference { .. }))
+        {
+            self.lir_reference_scopes.push(Vec::new());
+        }
+        let result = self.emit_lir_rvalue(function, value, span);
+        if !self.terminated {
+            if function.locals[local.0 as usize].is_gc_owner()
+                || !matches!(
+                    function.locals[local.0 as usize].ty,
+                    Type::Void | Type::Never
+                )
+            {
+                self.store_lir_local(function, local, result);
+            }
+            let ready = self.builder.ins().iconst(types::I32, 1);
+            self.builder.ins().return_(&[ready]);
+        }
+        self.builder.switch_to_block(panic_exit);
+        let depth = self.emit_value_runtime_call("willow_root_depth", &[]);
+        let baseline = self
+            .panic_function_root_depth
+            .expect("boundary root baseline");
+        let count = self.builder.ins().isub(depth, baseline);
+        self.emit_void_runtime_call("willow_pop_roots", &[count]);
+        let ready = self
+            .builder
+            .ins()
+            .iconst(types::I32, willow_abi::RuntimePollResult::Panicked as i64);
+        self.builder.ins().return_(&[ready]);
+    }
+
+    pub(super) fn emit_task_boundary(
+        &mut self,
+        value: Option<&crate::ir::lowered::LirRvalue>,
+        symbol: &str,
+        suspends: &mut CoopSuspendPoints,
+        frame: cranelift_codegen::ir::Value,
+    ) {
+        use crate::ir::lowered::{LirOperand, LirRvalue as R};
+        let resume = self.builder.create_block();
+        self.builder.ins().jump(resume, &[]);
+        self.builder.switch_to_block(resume);
+        let callback = self.func_ids[symbol];
+        let callback = self
+            .module
+            .declare_func_in_func(callback, self.builder.func);
+        let address = self
+            .builder
+            .ins()
+            .func_addr(reference_type(self.module.target_config()), callback);
+        // Explicitly handle suspension before panic propagation or observing
+        // the result slot. Runtime-call wrappers cannot express this split.
+        let enter = self.func_ids["willow_task_stack_enter"];
+        let enter = self.module.declare_func_in_func(enter, self.builder.func);
+        let call = self.builder.ins().call(enter, &[address, frame]);
+        let status = self.builder.inst_results(call)[0];
+        self.emit_void_runtime_call("willow_task_stack_leave", &[]);
+        let ready = self.builder.create_block();
+        let pending = self.builder.create_block();
+        let ready_status = self.builder.ins().icmp_imm_s(IntCC::Equal, status, 1);
+        let panic_status = self.builder.ins().icmp_imm_s(
+            IntCC::Equal,
+            status,
+            willow_abi::RuntimePollResult::Panicked as i64,
+        );
+        let done = self.builder.ins().bor(ready_status, panic_status);
+        self.builder.ins().brif(done, ready, &[], pending, &[]);
+        self.builder.switch_to_block(pending);
+        let state = self
+            .builder
+            .ins()
+            .iconst(types::I64, (suspends.len() + 1) as i64);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), state, frame, 0);
+        self.emit_coop_unwind_poll_roots();
+        let preempted = self
+            .builder
+            .ins()
+            .iconst(types::I32, super::COOP_POLL_PREEMPTED);
+        self.builder.ins().return_(&[preempted]);
+        self.record_coop_suspend(suspends, resume);
+        self.builder.switch_to_block(ready);
+        if let Some(R::MethodCall { method, .. }) = value
+            && self.flat_method_frame_enabled(method)
+        {
+            self.lir_call_frames
+                .pop()
+                .expect("prepared boundary method");
+            self.emit_callstack_pop();
+        }
+        if value.is_some_and(|value| {
+            value
+                .operands()
+                .iter()
+                .any(|arg| matches!(arg, LirOperand::Reference { .. }))
+        }) {
+            self.emit_flat_reference_call_end();
+        }
+        // The callback reports an unwind explicitly. Comparing TLS depth
+        // here would lose a panic raised before an earlier suspension.
+        let panicked = self.builder.create_block();
+        let normal = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(panic_status, panicked, &[], normal, &[]);
+        self.builder.switch_to_block(panicked);
+        self.emit_sync_panic_unwind();
+        self.builder.switch_to_block(normal);
+        self.terminated = false;
+        self.panic_depth_snapshot = None;
+    }
 }
 
 #[cfg(test)]

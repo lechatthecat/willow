@@ -17,12 +17,6 @@ pub(super) use willow_abi::{GcObjectKind, GcStoreDestination};
 
 use super::*;
 
-// Willow's supported object targets are currently 64-bit. The shared ABI
-// describes this from a target pointer width rather than from the compiler
-// host's `usize`, so a 32-bit target can switch this call site to its target
-// width without changing the descriptor.
-const TARGET_POINTER_BYTES: u32 = 8;
-const GC_HEADER_SIZE: i64 = willow_abi::gc_header::size(TARGET_POINTER_BYTES) as i64;
 const GC_HEADER_MARKED_OFFSET: i32 = willow_abi::gc_header::MARKED_OFFSET as i32;
 const GC_HEADER_ALLOCATED_OFFSET: i32 = willow_abi::gc_header::ALLOCATED_OFFSET as i32;
 const GC_HEADER_GENERATION_OFFSET: i32 = willow_abi::gc_header::GENERATION_OFFSET as i32;
@@ -31,10 +25,6 @@ const GC_HEADER_TYPE_ID_OFFSET: i32 = willow_abi::gc_header::TYPE_ID_OFFSET as i
 const GC_HEADER_LAYOUT_ID_OFFSET: i32 = willow_abi::gc_header::LAYOUT_ID_OFFSET as i32;
 const GC_HEADER_REF_MASK_OFFSET: i32 = willow_abi::gc_header::REF_MASK_OFFSET as i32;
 const GC_HEADER_SIZE_OFFSET: i32 = willow_abi::gc_header::SIZE_OFFSET as i32;
-const GC_HEADER_NEXT_OFFSET: i32 = willow_abi::gc_header::next_offset(TARGET_POINTER_BYTES) as i32;
-const GC_TLAB_LIMIT_OFFSET: i64 = willow_abi::tlab::LIMIT_OFFSET as i64;
-const GC_TLAB_FAST_ALLOCS_OFFSET: i64 = willow_abi::tlab::FAST_ALLOCATIONS_OFFSET as i64;
-const GC_TLAB_FAST_BYTES_OFFSET: i64 = willow_abi::tlab::FAST_BYTES_OFFSET as i64;
 const GC_TLAB_STATE_SIZE: u64 = willow_abi::tlab::STATE_SIZE as u64;
 const GC_TLAB_MAX_OBJECT_SIZE: i64 = willow_abi::tlab::MAX_OBJECT_SIZE as i64;
 
@@ -77,11 +67,12 @@ impl GcLayoutMetadata {
         runtime_type_id: i64,
         fields: &[(String, Type)],
         enum_infos: &TypeMap<EnumInfo>,
+        pointer_bytes: u32,
     ) -> Self {
         let gc_ref_mask = gc_ref_mask_for_layout(class_name, fields, enum_infos);
         let mut layout = Self::new(
             GcObjectKind::Class,
-            (fields.len() as i64 + 1) * 8,
+            (fields.len() as i64 + 1) * willow_abi::storage_word_bytes(pointer_bytes) as i64,
             runtime_type_id,
             gc_ref_mask,
         );
@@ -180,7 +171,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             );
         }
         debug_assert_eq!(GC_TLAB_STATE_SIZE, 32, "compiler/runtime TLAB ABI changed");
-        let total_size = (GC_HEADER_SIZE + layout.payload_size + 7) & !7;
+        let pointer_bytes = reference_type(self.module.target_config()).bytes();
+        let header_size = willow_abi::gc_header::size(pointer_bytes) as i64;
+        let alignment = willow_abi::storage_word_bytes(pointer_bytes) as i64;
+        let total_size = (header_size + layout.payload_size + alignment - 1) & !(alignment - 1);
         if total_size > GC_TLAB_MAX_OBJECT_SIZE {
             return self.emit_gc_alloc_slow(layout);
         }
@@ -190,7 +184,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .module
             .declare_data_in_func(self.gc_tlab_state, self.builder.func);
         let tlab = self.builder.ins().tls_value(ptr_ty, tls_global);
-        let limit_addr = self.builder.ins().iadd_imm_s(tlab, GC_TLAB_LIMIT_OFFSET);
+        let limit_addr = self
+            .builder
+            .ins()
+            .iadd_imm_s(tlab, willow_abi::tlab::limit_offset(pointer_bytes) as i64);
         let cursor = self
             .builder
             .ins()
@@ -282,23 +279,28 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             cursor,
             GC_HEADER_REF_MASK_OFFSET,
         );
-        let total_size_value = self.builder.ins().iconst(types::I64, total_size);
+        // GcHeader::size is usize; the separate allocation counters are u64.
+        let header_size_value = self.builder.ins().iconst(ptr_ty, total_size);
         self.builder.ins().store(
             MemFlagsData::trusted(),
-            total_size_value,
+            header_size_value,
             cursor,
             GC_HEADER_SIZE_OFFSET,
         );
+        let total_size_value = self.builder.ins().iconst(types::I64, total_size);
         let null = self.builder.ins().iconst(ptr_ty, 0);
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), null, cursor, GC_HEADER_NEXT_OFFSET);
+        self.builder.ins().store(
+            MemFlagsData::trusted(),
+            null,
+            cursor,
+            willow_abi::gc_header::next_offset(pointer_bytes) as i32,
+        );
 
         let one64 = self.builder.ins().iconst(types::I64, 1);
-        let fast_allocs_addr = self
-            .builder
-            .ins()
-            .iadd_imm_s(tlab, GC_TLAB_FAST_ALLOCS_OFFSET);
+        let fast_allocs_addr = self.builder.ins().iadd_imm_s(
+            tlab,
+            willow_abi::tlab::fast_allocations_offset(pointer_bytes) as i64,
+        );
         self.builder.ins().atomic_rmw(
             types::I64,
             MemFlagsData::trusted(),
@@ -306,10 +308,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             fast_allocs_addr,
             one64,
         );
-        let fast_bytes_addr = self
-            .builder
-            .ins()
-            .iadd_imm_s(tlab, GC_TLAB_FAST_BYTES_OFFSET);
+        let fast_bytes_addr = self.builder.ins().iadd_imm_s(
+            tlab,
+            willow_abi::tlab::fast_bytes_offset(pointer_bytes) as i64,
+        );
         self.builder.ins().atomic_rmw(
             types::I64,
             MemFlagsData::trusted(),
@@ -317,7 +319,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             fast_bytes_addr,
             total_size_value,
         );
-        let payload = self.builder.ins().iadd_imm_s(cursor, GC_HEADER_SIZE);
+        let payload = self.builder.ins().iadd_imm_s(cursor, header_size);
         self.builder.ins().jump(done_block, &[payload.into()]);
 
         self.builder.switch_to_block(slow_block);
@@ -422,7 +424,7 @@ mod tests {
 
     #[test]
     fn generated_header_and_tlab_layout_contract_is_stable() {
-        assert_eq!(GC_HEADER_SIZE, 40);
+        assert_eq!(willow_abi::gc_header::size(8), 40);
         assert_eq!(GC_HEADER_ALLOCATED_OFFSET, 1);
         assert_eq!(GC_HEADER_GENERATION_OFFSET, 2);
         assert_eq!(GC_HEADER_AGE_OFFSET, 3);
@@ -430,7 +432,7 @@ mod tests {
         assert_eq!(GC_HEADER_LAYOUT_ID_OFFSET, 8);
         assert_eq!(GC_HEADER_REF_MASK_OFFSET, 16);
         assert_eq!(GC_HEADER_SIZE_OFFSET, 24);
-        assert_eq!(GC_HEADER_NEXT_OFFSET, 32);
+        assert_eq!(willow_abi::gc_header::next_offset(8), 32);
         assert_eq!(GC_TLAB_STATE_SIZE, 32);
         assert_eq!(GC_TLAB_MAX_OBJECT_SIZE, 4096);
     }
@@ -441,7 +443,7 @@ mod tests {
             ("count".to_string(), Type::I64),
             ("name".to_string(), Type::String),
         ];
-        let layout = GcLayoutMetadata::class("Node", 17, &fields, &TypeMap::new());
+        let layout = GcLayoutMetadata::class("Node", 17, &fields, &TypeMap::new(), 8);
         assert_eq!(layout.kind, GcObjectKind::Class);
         assert_eq!(layout.payload_size, 24);
         assert_eq!(layout.runtime_type_id, 17);

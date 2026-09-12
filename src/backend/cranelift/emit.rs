@@ -71,7 +71,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::StackSlot {
         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
-            8,
+            reference_type(self.module.target_config()).bytes(),
             0,
         ));
         self.stack_store(val, slot);
@@ -124,9 +124,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_push_root(object);
         let box_ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
             GcObjectKind::InterfaceBox,
-            16,
+            willow_abi::dispatch_layout::interface_bytes(
+                reference_type(self.module.target_config()).bytes(),
+            ) as i64,
             0,
-            0b01,
+            willow_abi::dispatch_layout::INTERFACE_GC_REF_MASK,
         ));
 
         // word 0: concrete object pointer (GC-traced). Direct roots are
@@ -147,7 +149,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let vtable_ptr = self.builder.ins().symbol_value(ptr_ty, gv);
         self.emit_gc_heap_store_classified(
             box_ptr,
-            8,
+            willow_abi::dispatch_layout::vtable_offset(
+                reference_type(self.module.target_config()).bytes(),
+            ) as i32,
             vtable_ptr,
             false,
             GcStoreDestination::InterfaceObject,

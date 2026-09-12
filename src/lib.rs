@@ -431,7 +431,14 @@ fn run_frontend(
         let checker = check_module(&body, module, &graph.files, &helpers, artifacts, options)?;
         error_count += diagnostic_error_count(&checker.errors);
         emit_frontend_diagnostics(&checker.errors, map, &graph)?;
-        let concurrency = check_unit_concurrency(&body, &graph.files, &helpers, None);
+        let concurrency = check_unit_concurrency(
+            &body,
+            &graph.files,
+            &helpers,
+            None,
+            &checker.expr_types,
+            &checker.reference_arg_modes,
+        );
         error_count += diagnostic_error_count(&concurrency);
         emit_frontend_diagnostics(&concurrency, map, &graph)?;
     }
@@ -447,8 +454,14 @@ fn run_frontend(
         )?;
         error_count += checked.error_count;
         emit_frontend_diagnostics(&checked.checker.errors, map, &graph)?;
-        let concurrency =
-            check_unit_concurrency(&body, &graph.files, &helpers, Some(&item_imports));
+        let concurrency = check_unit_concurrency(
+            &body,
+            &graph.files,
+            &helpers,
+            Some(&item_imports),
+            &checked.checker.expr_types,
+            &checked.checker.reference_arg_modes,
+        );
         error_count += diagnostic_error_count(&concurrency);
         emit_frontend_diagnostics(&concurrency, map, &graph)?;
     }
@@ -832,6 +845,8 @@ fn check_unit_concurrency(
     modules: &[module::ResolvedModule],
     helpers: &HelperIndex,
     entry_items: Option<&[module::resolver::ItemImport]>,
+    expr_types: &std::collections::HashMap<parser::ast::ExprId, parser::ast::Type>,
+    reference_modes: &std::collections::HashMap<parser::ast::ExprId, parser::ast::ParamMode>,
 ) -> Vec<diagnostics::Diagnostic> {
     let mut analyzer = semantic::ConcurrencyAnalyzer::new();
     if let Some(items) = entry_items {
@@ -861,7 +876,13 @@ fn check_unit_concurrency(
             }
         }
     }
-    analyzer.check_program(program).errors
+    let mut errors = analyzer.check_program(program).errors;
+    errors.extend(semantic::async_borrows::check(
+        program,
+        expr_types,
+        reference_modes,
+    ));
+    errors
 }
 
 /// Render only the sources a diagnostic actually references. Successful builds
@@ -1609,7 +1630,14 @@ mod frontend_phase_tests {
     #[test]
     fn concurrency_phase_reports_entry_errors_without_rendering() {
         let program = parse_source("async fn update(x: &mut i64) {} fn main() {}");
-        let phase = check_unit_concurrency(&program, &[], &HelperIndex::new(), Some(&[]));
+        let phase = check_unit_concurrency(
+            &program,
+            &[],
+            &HelperIndex::new(),
+            Some(&[]),
+            &Default::default(),
+            &Default::default(),
+        );
         assert!(diagnostic_error_count(&phase) > 0);
         assert!(!phase.is_empty());
     }

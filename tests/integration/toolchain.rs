@@ -612,7 +612,18 @@ fn test_runtime_lib_cli_override_links_program() {
     let id = unique_test_id();
     let src_path = temp_path(format!("willow_runtime_cli_override_{id}.wi"));
     let bin_path = temp_path(format!("willow_runtime_cli_override_{id}"));
-    fs::write(&src_path, "fn main() { println(\"override\"); }").unwrap();
+    fs::write(
+        &src_path,
+        r#"fn sum(n: i64) -> i64 {
+    if n == 0 { return 0; }
+    return n + sum(n - 1);
+}
+async fn main() {
+    defer { println("override"); }
+    println(sum(10));
+}"#,
+    )
+    .unwrap();
 
     let compiler = env!("CARGO_BIN_EXE_willowc");
     let status = Command::new(compiler)
@@ -631,7 +642,8 @@ fn test_runtime_lib_cli_override_links_program() {
     let out = Command::new(&bin_path)
         .output()
         .expect("failed to run binary");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "override\n");
+    assert!(out.status.success(), "override binary failed: {out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "55\noverride\n");
 
     let _ = fs::remove_file(&src_path);
     remove_output_artifacts(&bin_path);
@@ -643,7 +655,18 @@ fn test_runtime_lib_env_override_links_program() {
     let id = unique_test_id();
     let src_path = temp_path(format!("willow_runtime_env_override_{id}.wi"));
     let bin_path = temp_path(format!("willow_runtime_env_override_{id}"));
-    fs::write(&src_path, "fn main() { println(env::args_len()); }").unwrap();
+    fs::write(
+        &src_path,
+        r#"fn sum(n: i64) -> i64 {
+    if n == 0 { return 0; }
+    return n + sum(n - 1);
+}
+async fn main() {
+    defer { println(env::args_len()); }
+    println(sum(10));
+}"#,
+    )
+    .unwrap();
 
     let compiler = env!("CARGO_BIN_EXE_willowc");
     let status = Command::new(compiler)
@@ -656,7 +679,8 @@ fn test_runtime_lib_env_override_links_program() {
     let out = Command::new(&bin_path)
         .output()
         .expect("failed to run binary");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
+    assert!(out.status.success(), "override binary failed: {out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "55\n0\n");
 
     let _ = fs::remove_file(&src_path);
     remove_output_artifacts(&bin_path);

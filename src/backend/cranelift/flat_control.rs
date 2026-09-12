@@ -36,7 +36,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             types::I64,
             cranelift_codegen::ir::MemFlagsData::new(),
             frame,
-            super::async_frame_slot_offset(super::FRAME_SLOT_TASK_ID),
+            super::async_frame_slot_offset(
+                super::FRAME_SLOT_TASK_ID,
+                reference_type(self.module.target_config()).bytes(),
+            ),
         );
         self.emit_set_spawn_site(id, span.line);
         frame

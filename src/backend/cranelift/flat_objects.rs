@@ -89,6 +89,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             type_id,
             &layout,
             self.enum_infos,
+            reference_type(self.module.target_config()).bytes(),
         ));
         self.emit_store_class_descriptor(ptr, &name);
         ptr
@@ -123,7 +124,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             ),
             MemFlagsData::new(),
             object,
-            (index as i32 + 1) * 8,
+            (index as i32 + 1)
+                * willow_abi::storage_word_bytes(
+                    reference_type(self.module.target_config()).bytes(),
+                ) as i32,
         )
     }
 
@@ -148,7 +152,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let value = self.coerce_to_target(value, &source_ty, target_ty);
         self.emit_gc_heap_store(
             object,
-            (index as i32 + 1) * 8,
+            (index as i32 + 1)
+                * willow_abi::storage_word_bytes(
+                    reference_type(self.module.target_config()).bytes(),
+                ) as i32,
             value,
             target_ty,
             GcStoreDestination::ObjectField,

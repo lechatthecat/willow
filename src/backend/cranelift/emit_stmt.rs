@@ -99,7 +99,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // recover; here `recover()` lowers to a constant `None`.
                 let eligible_before = self.recover_eligible_depth;
                 self.recover_eligible_depth = 0;
-                self.emit_deferred_action(&entry.action);
+                self.emit_deferred_action(&entry.action, entry.flag_offset);
                 self.recover_eligible_depth = eligible_before;
                 if let Some(inactive) = inactive {
                     if !self.terminated {
@@ -311,8 +311,29 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.seal_block(done_b);
     }
 
-    pub(super) fn emit_deferred_action(&mut self, action: &super::DeferredAction) {
-        self.emit_lir_cleanup_region(&action.function);
+    pub(super) fn emit_deferred_action(
+        &mut self,
+        action: &super::DeferredAction,
+        flag_offset: Option<i32>,
+    ) {
+        if let (Some(frame), Some(mut suspends), Some(flag)) = (
+            self.coop_frame,
+            self.coop_suspend_points.clone(),
+            flag_offset,
+        ) && super::lir_gen::cleanup_needs_task_stack(&action.function)
+        {
+            let cranelift_codegen::ir::UserFuncName::User(name) = &self.builder.func.name else {
+                unreachable!("generated poll has a user id")
+            };
+            let symbol = super::lir_gen::task_cleanup_symbol(
+                name.index,
+                flag,
+                self.recover_eligible_depth > 0,
+            );
+            self.emit_task_boundary(None, &symbol, &mut suspends, frame);
+        } else {
+            self.emit_lir_cleanup_region(&action.function);
+        }
     }
 
     /// Preserve the native call chain when a synchronous helper exhausts its
@@ -573,7 +594,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.panic_defer_codegen_depth = 1;
             self.recover_eligible_depth =
                 eligible_depth_before + if entry.recovery_capable { 1 } else { 0 };
-            self.emit_deferred_action(&entry.action);
+            self.emit_deferred_action(&entry.action, entry.flag_offset);
             if !self.terminated {
                 self.emit_void_runtime_call("willow_panic_leave_defer", &[]);
                 self.builder.ins().jump(next, &[]);

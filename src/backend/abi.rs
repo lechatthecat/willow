@@ -96,6 +96,9 @@ const BLOCK_PANIC_ALLOC: RuntimeEffects = RuntimeEffects::MAY_BLOCK
     .union(RuntimeEffects::MAY_ALLOCATE);
 const SUSPEND: RuntimeEffects = RuntimeEffects::MAY_SUSPEND;
 const PREEMPT: RuntimeEffects = RuntimeEffects::MAY_PREEMPT;
+const TASK_STACK: RuntimeEffects = RuntimeEffects::MAY_PREEMPT
+    .union(RuntimeEffects::MAY_PANIC)
+    .union(RuntimeEffects::MAY_ALLOCATE);
 const NO_PREEMPT: RuntimeEffects = RuntimeEffects::NO_PREEMPT_REGION;
 
 use AbiTy::{F64, I8, I32, I64, Ptr, Word};
@@ -339,6 +342,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_sched_is_cancelled" => ([I64] -> Some(I64));
     NONE; "willow_sched_set_spawn_site" => ([I64, Ptr, I64] -> None);
     NONE; "willow_sched_set_cancel_fn" => ([I64, Ptr] -> None);
+    NONE; "willow_sched_set_cancel_fn_cooperative" => ([I64, Ptr, I32] -> None);
     ALLOC; "willow_fs_temp_path" => ([Ptr] -> Some(Ptr));
     BLOCK_ALLOC; "willow_fs_read_to_string" => ([Ptr] -> Some(Ptr));
     BLOCK_ALLOC; "willow_fs_write_string" => ([Ptr, Ptr] -> Some(Ptr));
@@ -405,6 +409,9 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_preempt_begin" => ([Ptr] -> None);
     NONE; "willow_preempt_end" => ([] -> None);
     PREEMPT; "willow_preempt_check" => ([] -> Some(I32));
+    TASK_STACK; "willow_task_stack_enter" => ([Ptr, Ptr] -> Some(I32));
+    NONE; "willow_task_stack_leave" => ([] -> None);
+    NO_PREEMPT; "willow_sched_spawn_cooperative" => ([Ptr, Ptr] -> Some(I64));
     PREEMPT; "willow_sync_safepoint" => ([] -> Some(I32));
     NONE; "willow_sync_native_active" => ([] -> Some(I32));
     NONE; "willow_sync_cancelled" => ([] -> Some(I32));
@@ -836,6 +843,7 @@ mod alloc_effects_tests {
         "willow_cancellation_token_attach",
         "willow_cancellation_token_cancel",
         "willow_task_scope_new",
+        "willow_task_stack_enter",
         "willow_task_scope_child",
         "willow_task_scope_add",
         "willow_task_scope_cancel",

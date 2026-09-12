@@ -77,9 +77,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_push_root(object);
         let box_ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
             GcObjectKind::InterfaceBox,
-            16,
+            willow_abi::dispatch_layout::interface_bytes(
+                reference_type(self.module.target_config()).bytes(),
+            ) as i64,
             0,
-            0b01,
+            willow_abi::dispatch_layout::INTERFACE_GC_REF_MASK,
         ));
         self.emit_gc_heap_store_classified(
             box_ptr,
@@ -90,7 +92,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         );
         self.emit_gc_heap_store_classified(
             box_ptr,
-            8,
+            willow_abi::dispatch_layout::vtable_offset(
+                reference_type(self.module.target_config()).bytes(),
+            ) as i32,
             vtable_ptr,
             false,
             GcStoreDestination::InterfaceObject,
@@ -135,14 +139,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             reference_type(self.module.target_config()),
             MemFlagsData::new(),
             box_ptr,
-            8i32,
+            willow_abi::dispatch_layout::vtable_offset(
+                reference_type(self.module.target_config()).bytes(),
+            ) as i32,
         );
         // Interior pointer into a static data symbol, not into the GC heap, so
         // it needs no rooting and the collector never sees it as a reference.
-        let target_vtable = self
-            .builder
-            .ins()
-            .iadd_imm_s(vtable, (slot_offset * 8) as i64);
+        let target_vtable = self.builder.ins().iadd_imm_s(
+            vtable,
+            willow_abi::dispatch_layout::table_slot_offset(
+                slot_offset as u32,
+                reference_type(self.module.target_config()).bytes(),
+            ) as i64,
+        );
         self.emit_box_with_vtable(object, target_vtable)
     }
 
@@ -297,7 +306,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .builder
             .ins()
             .load(ptr_ty, MemFlagsData::new(), self_ptr, 0i32);
-        let offset = (CLASS_DESCRIPTOR_HEADER_BYTES as usize + slot * 8) as i32;
+        let offset =
+            willow_abi::dispatch_layout::class_slot_offset(slot as u32, ptr_ty.bytes()) as i32;
         self.builder
             .ins()
             .load(ptr_ty, MemFlagsData::new(), descriptor, offset)

@@ -1060,6 +1060,7 @@ impl RuntimeScheduler {
         poll: RuntimePollFn,
         frame: *mut c_void,
         cancel: Option<RuntimeCancelFn>,
+        cooperative_poll: bool,
     ) {
         debug_assert!(
             self.tasks.with(id, |_| ()).is_none(),
@@ -1067,6 +1068,7 @@ impl RuntimeScheduler {
         );
         let mut task = RuntimeTask::new(id);
         task.poll = Some(poll);
+        task.cooperative_poll = cooperative_poll;
         task.cancel = cancel;
         task.frame = frame;
         task.frame_rooted = !frame.is_null();
@@ -1125,7 +1127,7 @@ impl RuntimeScheduler {
     ) -> RuntimeTaskId {
         let id = self.reserve_task_id();
         initialize(id);
-        self.publish_reserved_task(id, poll, frame, cancel);
+        self.publish_reserved_task(id, poll, frame, cancel, false);
         id
     }
 
@@ -1656,6 +1658,22 @@ pub(crate) fn spawn_global_task_initialized(
     cancel: Option<RuntimeCancelFn>,
     initialize: impl FnOnce(RuntimeTaskId),
 ) -> u64 {
+    spawn_global_task_initialized_inner(poll, frame, cancel, initialize, false)
+}
+
+/// Spawn a generated poll whose synchronous calls enter a stack lazily.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sched_spawn_cooperative(poll: RuntimePollFn, frame: *mut c_void) -> i64 {
+    spawn_global_task_initialized_inner(poll, frame, None, |_| {}, true) as i64
+}
+
+fn spawn_global_task_initialized_inner(
+    poll: RuntimePollFn,
+    frame: *mut c_void,
+    cancel: Option<RuntimeCancelFn>,
+    initialize: impl FnOnce(RuntimeTaskId),
+    cooperative_poll: bool,
+) -> u64 {
     // Reserve under the metadata lock, then initialize entirely outside it.
     // The frame is rooted before the callback because native initialization may
     // allocate or explicitly collect. A panic leaves an id gap but the guard
@@ -1663,7 +1681,7 @@ pub(crate) fn spawn_global_task_initialized(
     let id = with_global(RuntimeScheduler::reserve_task_id);
     let mut root = PendingSpawnRoot::new(frame as *mut u8);
     initialize(id);
-    with_global(|sched| sched.publish_reserved_task(id, poll, frame, cancel));
+    with_global(|sched| sched.publish_reserved_task(id, poll, frame, cancel, cooperative_poll));
     root.publish();
     crate::observability::record(
         crate::observability::RuntimeEventKind::TaskSpawn,
@@ -2057,6 +2075,19 @@ pub extern "C" fn willow_sched_set_cancel_fn(id: u64, cancel: RuntimeCancelFn) {
     let id = id as RuntimeTaskId;
     global_task_table().with_mut(id, |task| {
         task.cancel = Some(cancel);
+    });
+}
+
+/// Attach cooperative cleanup with its compiler-proven native stack requirement.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sched_set_cancel_fn_cooperative(
+    id: u64,
+    cancel: RuntimeCancelFn,
+    needs_stack: i32,
+) {
+    global_task_table().with_mut(id, |task| {
+        task.cancel = Some(cancel);
+        task.native_cancel_cleanup = needs_stack != 0;
     });
 }
 
@@ -3202,30 +3233,39 @@ fn scheduler_run_loop(
                 all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
             ))]
             {
-                let mut stack =
-                    crate::native_stack::NativeStack::acquire_cleanup(cancel_fn, cancel_frame);
-                let flag = global_task_table()
-                    .with(id, RuntimeTask::preempt_flag_ptr)
-                    .unwrap_or(std::ptr::null());
-                crate::preempt::willow_preempt_begin(flag);
-                unsafe {
-                    crate::native_stack::NativeStack::resume(&mut *stack);
+                let direct = global_task_table()
+                    .with(id, |task| {
+                        task.cooperative_poll && !task.native_cancel_cleanup
+                    })
+                    .unwrap_or(false);
+                if direct {
+                    unsafe { cancel_fn(cancel_frame) };
+                } else {
+                    let mut stack =
+                        crate::native_stack::NativeStack::acquire_cleanup(cancel_fn, cancel_frame);
+                    let flag = global_task_table()
+                        .with(id, RuntimeTask::preempt_flag_ptr)
+                        .unwrap_or(std::ptr::null());
+                    crate::preempt::willow_preempt_begin(flag);
+                    unsafe {
+                        crate::native_stack::NativeStack::resume(&mut *stack);
+                    }
+                    crate::preempt::willow_preempt_end();
+                    if stack.is_suspended() {
+                        global_task_table().with_mut(id, |task| task.native_stack = Some(stack));
+                        finish_global_poll_boundary(id, GlobalPollBoundary::Runnable);
+                        crate::observability::record(
+                            crate::observability::RuntimeEventKind::TaskPreempt,
+                            Some(worker),
+                            id,
+                            i64::from(RUNTIME_POLL_PREEMPTED),
+                        );
+                        set_current_task(None);
+                        finish_active_poll(shared);
+                        continue;
+                    }
+                    crate::native_stack::NativeStack::recycle(stack);
                 }
-                crate::preempt::willow_preempt_end();
-                if stack.is_suspended() {
-                    global_task_table().with_mut(id, |task| task.native_stack = Some(stack));
-                    finish_global_poll_boundary(id, GlobalPollBoundary::Runnable);
-                    crate::observability::record(
-                        crate::observability::RuntimeEventKind::TaskPreempt,
-                        Some(worker),
-                        id,
-                        i64::from(RUNTIME_POLL_PREEMPTED),
-                    );
-                    set_current_task(None);
-                    finish_active_poll(shared);
-                    continue;
-                }
-                crate::native_stack::NativeStack::recycle(stack);
             }
             #[cfg(not(any(
                 all(
@@ -3317,18 +3357,31 @@ fn scheduler_run_loop(
             all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
         ))]
         let (result, native_cancelled) = {
-            let mut stack = global_task_table()
-                .with_mut(id, |task| task.native_stack.take())
-                .flatten()
-                .unwrap_or_else(|| crate::native_stack::NativeStack::acquire(poll, frame));
-            let result = unsafe { crate::native_stack::NativeStack::resume(&mut *stack) };
-            let cancelled = stack.is_cancelled();
-            if stack.is_suspended() {
-                global_task_table().with_mut(id, |task| task.native_stack = Some(stack));
+            let direct = global_task_table()
+                .with(id, |task| {
+                    task.cooperative_poll
+                        && !task
+                            .native_stack
+                            .as_ref()
+                            .is_some_and(|stack| stack.is_cleanup())
+                })
+                .unwrap_or(false);
+            if direct {
+                (unsafe { poll(frame) }, false)
             } else {
-                crate::native_stack::NativeStack::recycle(stack);
+                let mut stack = global_task_table()
+                    .with_mut(id, |task| task.native_stack.take())
+                    .flatten()
+                    .unwrap_or_else(|| crate::native_stack::NativeStack::acquire(poll, frame));
+                let result = unsafe { crate::native_stack::NativeStack::resume(&mut *stack) };
+                let cancelled = stack.is_cancelled();
+                if stack.is_suspended() {
+                    global_task_table().with_mut(id, |task| task.native_stack = Some(stack));
+                } else {
+                    crate::native_stack::NativeStack::recycle(stack);
+                }
+                (result, cancelled)
             }
-            (result, cancelled)
         };
         #[cfg(not(any(
             all(
@@ -3521,6 +3574,93 @@ fn replace_global_scheduler_for_test(worker_count: usize) {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&timers);
         *sched = RuntimeScheduler::with_components(run_queues, tasks, timers);
     });
+}
+
+/// Enter or resume a task-owned synchronous helper callback.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_task_stack_enter(callback: RuntimePollFn, frame: *mut c_void) -> i32 {
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+    ))]
+    {
+        let id = current_task_id().expect("task stack entry outside a task");
+        let mut stack = global_task_table()
+            .with_mut(id, |task| task.native_stack.take())
+            .flatten()
+            .unwrap_or_else(|| crate::native_stack::NativeStack::acquire(callback, frame));
+        let panic_depth = stack.entry_panic_depth();
+        let result = unsafe { crate::native_stack::NativeStack::resume(&mut *stack) };
+        // A recovered cleanup panic must not revoke sticky cancellation, and
+        // an already-active outer panic is not a new helper failure.
+        let new_panic = crate::panic_context::willow_panic_depth() > panic_depth;
+        let pending = stack.is_suspended() || stack.is_cancelled();
+        global_task_table().with_mut(id, |task| task.native_stack = Some(stack));
+        if pending && !(result == RUNTIME_POLL_PANICKED && new_panic) {
+            RUNTIME_POLL_PREEMPTED
+        } else {
+            result
+        }
+    }
+    #[cfg(not(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+    )))]
+    unsafe {
+        callback(frame)
+    }
+}
+
+/// Release a completed helper stack after generated result/cleanup handling.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_task_stack_leave() {
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+    ))]
+    {
+        let id = current_task_id().expect("task stack exit outside a task");
+        let stack = global_task_table()
+            .with_mut(id, |task| {
+                if task
+                    .native_stack
+                    .as_ref()
+                    .is_some_and(|stack| !stack.is_suspended())
+                {
+                    task.native_stack.take()
+                } else {
+                    None
+                }
+            })
+            .flatten();
+        if let Some(stack) = stack {
+            crate::native_stack::NativeStack::recycle(stack);
+        }
+    }
 }
 
 /// Idle-stop / drive-completion viewpoints (willow-6wd6).
@@ -4627,6 +4767,129 @@ mod tests {
         );
         let _ = (inner, main);
         with_global(|sched| sched.clear_running());
+    }
+
+    #[test]
+    fn cooperative_poll_runs_without_an_active_native_stack() {
+        unsafe extern "C" fn poll(_: *mut c_void) -> i32 {
+            assert_eq!(crate::preempt::willow_sync_native_active(), 0);
+            RUNTIME_POLL_READY
+        }
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let id = willow_sched_spawn_cooperative(poll, std::ptr::null_mut()) as u64;
+        assert!(
+            global_task_table()
+                .with(id, |task| task.cooperative_poll)
+                .unwrap()
+        );
+        willow_sched_run_until(id);
+        assert!(target_is_done(Some(id)));
+    }
+
+    #[test]
+    fn cooperative_boundary_returns_callback_result_and_releases_stack() {
+        unsafe extern "C" fn helper(_: *mut c_void) -> i32 {
+            42
+        }
+        unsafe extern "C" fn poll(_: *mut c_void) -> i32 {
+            assert_eq!(willow_task_stack_enter(helper, std::ptr::null_mut()), 42);
+            willow_task_stack_leave();
+            assert_eq!(crate::preempt::willow_sync_native_active(), 0);
+            RUNTIME_POLL_READY
+        }
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let id = willow_sched_spawn_cooperative(poll, std::ptr::null_mut()) as u64;
+        willow_sched_run_until(id);
+        assert!(target_is_done(Some(id)));
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn cooperative_boundary_resumes_helper_without_restarting_it() {
+        static ENTRIES: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn helper(_: *mut c_void) -> i32 {
+            ENTRIES.fetch_add(1, Ordering::SeqCst);
+            assert!(crate::native_stack::suspend());
+            42
+        }
+        unsafe extern "C" fn poll(_: *mut c_void) -> i32 {
+            let result = willow_task_stack_enter(helper, std::ptr::null_mut());
+            // Leave must preserve a suspended callback until the next poll.
+            willow_task_stack_leave();
+            if result == RUNTIME_POLL_PREEMPTED {
+                return result;
+            }
+            assert_eq!(result, 42);
+            assert_eq!(ENTRIES.load(Ordering::SeqCst), 1);
+            RUNTIME_POLL_READY
+        }
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        ENTRIES.store(0, Ordering::SeqCst);
+        let id = willow_sched_spawn_cooperative(poll, std::ptr::null_mut()) as u64;
+        willow_sched_run_until(id);
+        assert!(target_is_done(Some(id)));
+    }
+
+    #[test]
+    fn cooperative_cancel_bounded_cleanup_avoids_native_stack() {
+        static CALLED: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn cleanup(_: *mut c_void) {
+            assert_eq!(crate::preempt::willow_sync_native_active(), 0);
+            CALLED.fetch_add(1, Ordering::SeqCst);
+        }
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        CALLED.store(0, Ordering::SeqCst);
+        let frame = willow_async_frame_alloc(0, 0).cast();
+        let id = willow_sched_spawn_cooperative(poll_ready_now, frame) as u64;
+        willow_sched_set_cancel_fn_cooperative(id, cleanup, 0);
+        willow_sched_cancel(id);
+        willow_sched_run_until(id);
+        assert_eq!(CALLED.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn cooperative_cancel_unbounded_cleanup_retains_native_stack() {
+        static CALLED: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn cleanup(_: *mut c_void) {
+            assert_eq!(crate::preempt::willow_sync_native_active(), 1);
+            CALLED.fetch_add(1, Ordering::SeqCst);
+        }
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        CALLED.store(0, Ordering::SeqCst);
+        let frame = willow_async_frame_alloc(0, 0).cast();
+        let id = willow_sched_spawn_cooperative(poll_ready_now, frame) as u64;
+        willow_sched_set_cancel_fn_cooperative(id, cleanup, 1);
+        willow_sched_cancel(id);
+        willow_sched_run_until(id);
+        assert_eq!(CALLED.load(Ordering::SeqCst), 1);
     }
 
     /// Completes on the first poll.

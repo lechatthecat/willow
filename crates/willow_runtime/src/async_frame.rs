@@ -5,7 +5,7 @@
 // instructions using the layout below; no Rust accessor functions are needed
 // (and would require unsafe raw pointer operations).
 //
-// Layout (each slot = one pointer-sized word, 8 bytes on 64-bit):
+// Layout (each mixed scalar/reference slot is at least 8 bytes):
 //
 //   [WillowAsyncFrameHeader (3 words) | data slot 0 | data slot 1 | … ]
 //
@@ -47,16 +47,22 @@ pub const ASYNC_FRAME_HEADER_BYTES: usize =
     willow_abi::async_frame::header_bytes(std::mem::size_of::<usize>() as u32) as usize;
 
 /// Byte offset of the `state` field within the payload.
-pub const ASYNC_FRAME_STATE_OFFSET: usize =
-    willow_abi::async_frame::STATE_WORD as usize * std::mem::size_of::<usize>();
+pub const ASYNC_FRAME_STATE_OFFSET: usize = willow_abi::async_frame::header_word_offset(
+    willow_abi::async_frame::STATE_WORD,
+    std::mem::size_of::<usize>() as u32,
+) as usize;
 
 /// Byte offset of the `slot_count` field within the payload.
-pub const ASYNC_FRAME_SLOT_COUNT_OFFSET: usize =
-    willow_abi::async_frame::SLOT_COUNT_WORD as usize * std::mem::size_of::<usize>();
+pub const ASYNC_FRAME_SLOT_COUNT_OFFSET: usize = willow_abi::async_frame::header_word_offset(
+    willow_abi::async_frame::SLOT_COUNT_WORD,
+    std::mem::size_of::<usize>() as u32,
+) as usize;
 
 /// Byte offset of the `status` field within the payload (willow-ezs.1.3).
-pub const ASYNC_FRAME_STATUS_OFFSET: usize =
-    willow_abi::async_frame::STATUS_WORD as usize * std::mem::size_of::<usize>();
+pub const ASYNC_FRAME_STATUS_OFFSET: usize = willow_abi::async_frame::header_word_offset(
+    willow_abi::async_frame::STATUS_WORD,
+    std::mem::size_of::<usize>() as u32,
+) as usize;
 
 // ---------------------------------------------------------------------------
 // Frame status word (willow-ezs.1.3)
@@ -175,7 +181,8 @@ pub extern "C" fn willow_frame_is_cancelled(frame: *mut c_void) -> i64 {
 
 /// Byte offset of data slot `n` within the payload.
 pub const fn async_frame_slot_offset(n: usize) -> usize {
-    ASYNC_FRAME_HEADER_BYTES + n * std::mem::size_of::<usize>()
+    ASYNC_FRAME_HEADER_BYTES
+        + n * willow_abi::storage_word_bytes(std::mem::size_of::<usize>() as u32) as usize
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +200,7 @@ pub const fn async_frame_slot_offset(n: usize) -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_async_frame_alloc(slot_count: i64, gc_slot_mask: u64) -> *mut c_void {
     let slots = slot_count.max(0) as usize;
-    let payload_bytes = ASYNC_FRAME_HEADER_BYTES + slots * std::mem::size_of::<usize>();
+    let payload_bytes = async_frame_slot_offset(slots);
 
     // The header occupies 3 words (bits 0–2 of gc_ref_mask) and is never GC.
     // Data slot K maps to payload word (3 + K), i.e. bit (3 + K).
@@ -226,7 +233,7 @@ mod tests {
     }
 
     fn frame_payload_bytes(slots: usize) -> usize {
-        ASYNC_FRAME_HEADER_BYTES + slots * std::mem::size_of::<usize>()
+        async_frame_slot_offset(slots)
     }
 
     // -------------------------------------------------------------------------
@@ -290,7 +297,7 @@ mod tests {
     fn frame_f6_slot_one_offset() {
         assert_eq!(
             async_frame_slot_offset(1),
-            ASYNC_FRAME_HEADER_BYTES + std::mem::size_of::<usize>()
+            ASYNC_FRAME_HEADER_BYTES + std::mem::size_of::<i64>()
         );
     }
 

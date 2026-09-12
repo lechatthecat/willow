@@ -264,13 +264,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             reference_type(self.module.target_config()),
             MemFlagsData::new(),
             box_ptr,
-            8i32,
+            willow_abi::dispatch_layout::vtable_offset(
+                reference_type(self.module.target_config()).bytes(),
+            ) as i32,
         );
         let fnptr = self.builder.ins().load(
             reference_type(self.module.target_config()),
             MemFlagsData::new(),
             vtable,
-            (slot * 8) as i32,
+            willow_abi::dispatch_layout::table_slot_offset(
+                slot as u32,
+                reference_type(self.module.target_config()).bytes(),
+            ) as i32,
         );
 
         // Pin the hidden receiver even when the interface box is held only by

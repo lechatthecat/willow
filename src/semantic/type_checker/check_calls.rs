@@ -81,6 +81,8 @@ impl TypeChecker {
                 self.push_missing_reference_arg(arg);
             }
             (ParamMode::Reference { mutable, .. }, CallArgMode::Reference { .. }) => {
+                self.reference_arg_modes
+                    .insert(arg.expr.id(), param.mode.clone());
                 self.check_reference_argument(param, arg, *mutable);
             }
         }

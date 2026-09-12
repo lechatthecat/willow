@@ -1,3 +1,4 @@
+pub mod async_borrows;
 pub mod builtin_types;
 pub mod call_graph;
 pub mod concurrency;

@@ -2,6 +2,8 @@
 name = "willowc"
 version = "0.1.0"
 edition = "2024"
+# Local-only benches/ is untracked; keep cargo from auto-discovering it.
+autobenches = false
 
 [workspace]
 members = [".", "crates/willow_abi", "crates/willow_runtime", "crates/willow_continuations"]
@@ -15,10 +17,6 @@ path = "src/main.rs"
 [lib]
 name = "willow_compiler"
 path = "src/lib.rs"
-
-[[bench]]
-name = "compiler_bench"
-harness = false
 
 [dependencies]
 cc = "1.4.2"

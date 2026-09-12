@@ -9819,3 +9819,19 @@ fn assert_sync_preemption_capability(source: &str, expected: &[&str]) {
         assert_compile_error_contains(source, expected);
     }
 }
+
+#[test]
+fn async_reference_escape_reports_e1708_after_e1707() {
+    let (ok, diagnostics) = compile_with_compiler_env(
+        "async fn read(x: &i64) -> i64 { return x; } async fn main() { let x = 1; let task = read(&x); }",
+        &[],
+    );
+    assert!(!ok, "escaping async borrow unexpectedly compiled");
+    let declaration = diagnostics.find("error[E1707]").expect(&diagnostics);
+    let escape = diagnostics.find("error[E1708]").expect(&diagnostics);
+    assert!(declaration < escape, "{diagnostics}");
+    assert!(
+        diagnostics.contains("async reference borrow escapes its discharge block"),
+        "{diagnostics}"
+    );
+}

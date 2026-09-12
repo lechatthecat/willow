@@ -22,6 +22,12 @@ struct CoopPollBody<'a> {
     lir: &'a LirFunction,
     result_offset: Option<i32>,
     lir_defer_offsets: HashMap<LirDeferId, i32>,
+    cleanup: Option<(&'a LirFunction, bool)>,
+    boundary: Option<(
+        LirLocalId,
+        &'a crate::ir::lowered::LirRvalue,
+        crate::diagnostics::Span,
+    )>,
 }
 
 /// Physical frame details the generated async-main driver shares with its poll
@@ -62,12 +68,16 @@ impl Codegen {
     ) -> cranelift_codegen::ir::Value {
         if bitmap.iter().skip(1).any(|word| *word != 0) {
             let alloc = self.func_id("willow_gc_alloc_bitmap");
+            let payload_size = willow_abi::async_frame::data_slot_offset(
+                slot_count as u32,
+                reference_type(self.module.target_config()).bytes(),
+            ) as i64;
             return super::gc_codegen::emit_bitmap_alloc(
                 &mut self.module,
                 builder,
                 alloc,
                 0,
-                (slot_count + ASYNC_FRAME_HEADER_WORDS as i64) * 8,
+                payload_size,
                 bitmap,
             );
         }
@@ -97,10 +107,15 @@ impl Codegen {
         {
             offsets.insert(
                 local.id,
-                async_frame_slot_offset(first_parameter_slot + index),
+                async_frame_slot_offset(
+                    first_parameter_slot + index,
+                    reference_type(self.module.target_config()).bytes(),
+                ),
             );
         }
-        let frame_all = std::env::var("WILLOW_ASYNC_FRAME_ALL").is_ok();
+        let frame_all = std::env::var("WILLOW_ASYNC_FRAME_ALL").is_ok()
+            || lir.blocks.iter().any(|b| b.instrs.iter().any(|i| matches!(i, LirInst::Defer { .. })))
+            || lir.blocks.iter().flat_map(|b| &b.instrs).any(|inst| matches!(inst, LirInst::Compute { value, .. } if super::lir_gen::task_stack_boundary(value)));
         let selected: Vec<_> = if frame_all {
             lir.locals
                 .iter()
@@ -119,7 +134,10 @@ impl Codegen {
                 continue;
             }
             let index = reserved.len();
-            offsets.insert(local.id, async_frame_slot_offset(index));
+            offsets.insert(
+                local.id,
+                async_frame_slot_offset(index, reference_type(self.module.target_config()).bytes()),
+            );
             reserved.push(AsyncFrameSlot {
                 storage_kind: local.storage_kind,
                 source_span: local.source_span,
@@ -148,7 +166,10 @@ impl Codegen {
         let mut defer_offsets = HashMap::new();
         for (id, span) in defer_sites {
             let index = reserved.len();
-            defer_offsets.insert(id, async_frame_slot_offset(index));
+            defer_offsets.insert(
+                id,
+                async_frame_slot_offset(index, reference_type(self.module.target_config()).bytes()),
+            );
             reserved.push(AsyncFrameSlot {
                 storage_kind: crate::ir::lowered::LirStorageKind::Value,
                 source_span: Some(span),
@@ -197,7 +218,10 @@ impl Codegen {
                 name: "__result".to_string(),
                 ty: f.return_type.clone().into(),
             });
-            async_frame_slot_offset(FRAME_SLOT_RESULT)
+            async_frame_slot_offset(
+                FRAME_SLOT_RESULT,
+                reference_type(self.module.target_config()).bytes(),
+            )
         });
         let first_param_slot = slots.len();
 
@@ -222,7 +246,10 @@ impl Codegen {
             .map(|(i, p)| {
                 (
                     p.name.clone(),
-                    async_frame_slot_offset(first_param_slot + i),
+                    async_frame_slot_offset(
+                        first_param_slot + i,
+                        reference_type(self.module.target_config()).bytes(),
+                    ),
                     p.ty.clone().into(),
                 )
             })
@@ -247,6 +274,8 @@ impl Codegen {
             lir_offsets,
             &param_bindings,
             CoopPollBody {
+                boundary: None,
+                cleanup: None,
                 current_class: None,
                 lir: &lir,
                 result_offset,
@@ -320,8 +349,14 @@ impl Codegen {
         self.record_async_frame_size_warning(&f.name, f.span, &layout);
         let slot_count = layout.slot_count() as i64;
         let mask = layout.gc_slot_mask as i64;
-        let result_offset = async_frame_slot_offset(FRAME_SLOT_RESULT);
-        let task_id_offset = async_frame_slot_offset(FRAME_SLOT_TASK_ID);
+        let result_offset = async_frame_slot_offset(
+            FRAME_SLOT_RESULT,
+            reference_type(self.module.target_config()).bytes(),
+        );
+        let task_id_offset = async_frame_slot_offset(
+            FRAME_SLOT_TASK_ID,
+            reference_type(self.module.target_config()).bytes(),
+        );
         let param_bindings: Vec<(String, i32, Type)> = f
             .params
             .iter()
@@ -329,7 +364,10 @@ impl Codegen {
             .map(|(i, p)| {
                 (
                     p.name.clone(),
-                    async_frame_slot_offset(2 + i),
+                    async_frame_slot_offset(
+                        2 + i,
+                        reference_type(self.module.target_config()).bytes(),
+                    ),
                     p.ty.clone().into(),
                 )
             })
@@ -365,7 +403,8 @@ impl Codegen {
         // safe).
         for (i, p) in f.params.iter().enumerate() {
             let arg = builder.block_params(entry)[i];
-            let off = async_frame_slot_offset(2 + i);
+            let off =
+                async_frame_slot_offset(2 + i, reference_type(self.module.target_config()).bytes());
             emit_gc_heap_store_raw(
                 &mut builder,
                 is_gc_managed(
@@ -384,7 +423,7 @@ impl Codegen {
         let poll_addr = builder
             .ins()
             .func_addr(reference_type(self.module.target_config()), poll_ref);
-        let spawn_fid = self.func_id("willow_sched_spawn");
+        let spawn_fid = self.func_id("willow_sched_spawn_cooperative");
         let spawn_ref = self.module.declare_func_in_func(spawn_fid, builder.func);
         // Record the scheduler task id in slot 1 (TASK_ID) so an awaiter can
         // willow_sched_await it.
@@ -393,14 +432,34 @@ impl Codegen {
         builder
             .ins()
             .store(MemFlagsData::trusted(), task_id, frame, task_id_offset);
-        // Attach the cancellation cleanup entry (willow-vynv.3).
-        let cancel_ref = self.module.declare_func_in_func(cancel_fid, builder.func);
-        let cancel_addr = builder
-            .ins()
-            .func_addr(reference_type(self.module.target_config()), cancel_ref);
-        let set_fid = self.func_id("willow_sched_set_cancel_fn");
-        let set_ref = self.module.declare_func_in_func(set_fid, builder.func);
-        builder.ins().call(set_ref, &[task_id, cancel_addr]);
+        // No cleanup callback is needed for a task without deferred actions
+        // or lexical locks; cancellation must not allocate a native stack just
+        // to invoke an empty callback.
+        if lir
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instrs)
+            .any(|inst| {
+                matches!(
+                    inst,
+                    LirInst::Defer { .. } | LirInst::EnterDeferScope { lock: Some(_), .. }
+                )
+            })
+        {
+            // Attach the cancellation cleanup entry (willow-vynv.3).
+            let cancel_ref = self.module.declare_func_in_func(cancel_fid, builder.func);
+            let cancel_addr = builder
+                .ins()
+                .func_addr(reference_type(self.module.target_config()), cancel_ref);
+            let native_cleanup = lir.blocks.iter().flat_map(|block| &block.instrs).any(|inst|
+                matches!(inst, LirInst::Defer { body, .. } if super::lir_gen::cleanup_needs_task_stack(&body.function)));
+            let needs_stack = builder.ins().iconst(types::I32, i64::from(native_cleanup));
+            let set_fid = self.func_id("willow_sched_set_cancel_fn_cooperative");
+            let set_ref = self.module.declare_func_in_func(set_fid, builder.func);
+            builder
+                .ins()
+                .call(set_ref, &[task_id, cancel_addr, needs_stack]);
+        }
         builder.ins().return_(&[frame]);
         builder.finalize(self.module.target_config());
         self.module
@@ -422,6 +481,8 @@ impl Codegen {
             lir_offsets,
             &param_bindings,
             CoopPollBody {
+                boundary: None,
+                cleanup: None,
                 current_class: None,
                 lir: &lir,
                 result_offset: Some(result_offset),
@@ -479,7 +540,10 @@ impl Codegen {
         let self_offset = if m.is_static {
             None
         } else {
-            let offset = async_frame_slot_offset(slots.len());
+            let offset = async_frame_slot_offset(
+                slots.len(),
+                reference_type(self.module.target_config()).bytes(),
+            );
             slots.push(AsyncFrameSlot {
                 storage_kind: crate::ir::lowered::LirStorageKind::Value,
                 source_span: None,
@@ -515,8 +579,14 @@ impl Codegen {
         self.record_async_frame_size_warning(&format!("{class_name}::{}", m.name), m.span, &layout);
         let slot_count = layout.slot_count() as i64;
         let mask = layout.gc_slot_mask as i64;
-        let result_offset = async_frame_slot_offset(FRAME_SLOT_RESULT);
-        let task_id_offset = async_frame_slot_offset(FRAME_SLOT_TASK_ID);
+        let result_offset = async_frame_slot_offset(
+            FRAME_SLOT_RESULT,
+            reference_type(self.module.target_config()).bytes(),
+        );
+        let task_id_offset = async_frame_slot_offset(
+            FRAME_SLOT_TASK_ID,
+            reference_type(self.module.target_config()).bytes(),
+        );
 
         let mut param_bindings: Vec<(String, i32, Type)> = Vec::new();
         if let Some(offset) = self_offset {
@@ -529,7 +599,10 @@ impl Codegen {
         param_bindings.extend(m.params.iter().enumerate().map(|(i, p)| {
             (
                 p.name.clone(),
-                async_frame_slot_offset(first_param_slot + i),
+                async_frame_slot_offset(
+                    first_param_slot + i,
+                    reference_type(self.module.target_config()).bytes(),
+                ),
                 p.ty.clone().into(),
             )
         }));
@@ -573,7 +646,10 @@ impl Codegen {
         }
         for (i, p) in m.params.iter().enumerate() {
             let arg = builder.block_params(entry)[i + 1];
-            let off = async_frame_slot_offset(first_param_slot + i);
+            let off = async_frame_slot_offset(
+                first_param_slot + i,
+                reference_type(self.module.target_config()).bytes(),
+            );
             emit_gc_heap_store_raw(
                 &mut builder,
                 is_gc_managed(
@@ -593,21 +669,41 @@ impl Codegen {
         let poll_addr = builder
             .ins()
             .func_addr(reference_type(self.module.target_config()), poll_ref);
-        let spawn_fid = self.func_id("willow_sched_spawn");
+        let spawn_fid = self.func_id("willow_sched_spawn_cooperative");
         let spawn_ref = self.module.declare_func_in_func(spawn_fid, builder.func);
         let spawn_call = builder.ins().call(spawn_ref, &[poll_addr, frame]);
         let task_id = builder.inst_results(spawn_call)[0];
         builder
             .ins()
             .store(MemFlagsData::trusted(), task_id, frame, task_id_offset);
-        // Attach the cancellation cleanup entry (willow-vynv.3).
-        let cancel_ref = self.module.declare_func_in_func(cancel_fid, builder.func);
-        let cancel_addr = builder
-            .ins()
-            .func_addr(reference_type(self.module.target_config()), cancel_ref);
-        let set_fid = self.func_id("willow_sched_set_cancel_fn");
-        let set_ref = self.module.declare_func_in_func(set_fid, builder.func);
-        builder.ins().call(set_ref, &[task_id, cancel_addr]);
+        // No cleanup callback is needed for a task without deferred actions
+        // or lexical locks; cancellation must not allocate a native stack just
+        // to invoke an empty callback.
+        if lir
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instrs)
+            .any(|inst| {
+                matches!(
+                    inst,
+                    LirInst::Defer { .. } | LirInst::EnterDeferScope { lock: Some(_), .. }
+                )
+            })
+        {
+            // Attach the cancellation cleanup entry (willow-vynv.3).
+            let cancel_ref = self.module.declare_func_in_func(cancel_fid, builder.func);
+            let cancel_addr = builder
+                .ins()
+                .func_addr(reference_type(self.module.target_config()), cancel_ref);
+            let native_cleanup = lir.blocks.iter().flat_map(|block| &block.instrs).any(|inst|
+                matches!(inst, LirInst::Defer { body, .. } if super::lir_gen::cleanup_needs_task_stack(&body.function)));
+            let needs_stack = builder.ins().iconst(types::I32, i64::from(native_cleanup));
+            let set_fid = self.func_id("willow_sched_set_cancel_fn_cooperative");
+            let set_ref = self.module.declare_func_in_func(set_fid, builder.func);
+            builder
+                .ins()
+                .call(set_ref, &[task_id, cancel_addr, needs_stack]);
+        }
         builder.ins().return_(&[frame]);
         builder.finalize(self.module.target_config());
         self.module
@@ -639,6 +735,8 @@ impl Codegen {
             lir_offsets,
             &param_bindings,
             CoopPollBody {
+                boundary: None,
+                cleanup: None,
                 current_class: Some(class_name),
                 lir: &lir,
                 result_offset: Some(result_offset),
@@ -706,7 +804,10 @@ impl Codegen {
                 &mut builder,
                 Some(barrier_ref),
                 frame,
-                async_frame_slot_offset(frame_layout.first_param_slot),
+                async_frame_slot_offset(
+                    frame_layout.first_param_slot,
+                    reference_type(self.module.target_config()).bytes(),
+                ),
                 arr,
                 GcStoreDestination::AsyncFrameSlot,
                 MemFlagsData::trusted(),
@@ -720,7 +821,7 @@ impl Codegen {
         let poll_addr = builder
             .ins()
             .func_addr(reference_type(self.module.target_config()), poll_ref);
-        let spawn_fid = self.func_id("willow_sched_spawn");
+        let spawn_fid = self.func_id("willow_sched_spawn_cooperative");
         let spawn_ref = self.module.declare_func_in_func(spawn_fid, builder.func);
         let spawn_call = builder.ins().call(spawn_ref, &[poll_addr, frame]);
         let main_task_id = builder.inst_results(spawn_call)[0];
@@ -780,8 +881,100 @@ impl Codegen {
         param_bindings: &[(String, i32, Type)],
         body: CoopPollBody<'_>,
     ) -> Result<(Vec<AsyncDeferSite>, Vec<AsyncLockSite>)> {
-        let result_offset = body.result_offset;
+        if body.boundary.is_none() && body.cleanup.is_none() {
+            for block in &body.lir.blocks {
+                for (index, instruction) in block.instrs.iter().enumerate() {
+                    if let LirInst::Compute { local, value, span } = instruction
+                        && super::lir_gen::task_stack_boundary(value)
+                    {
+                        let symbol =
+                            super::lir_gen::task_boundary_symbol(body.lir, block.id.0, index);
+                        let mut signature = self.module.make_signature();
+                        signature
+                            .params
+                            .push(AbiParam::new(reference_type(self.module.target_config())));
+                        signature.returns.push(AbiParam::new(types::I32));
+                        let id = self.module.declare_function(
+                            &symbol,
+                            cranelift_module::Linkage::Local,
+                            &signature,
+                        )?;
+                        self.func_ids.insert(symbol.clone(), id);
+                        self.compile_coop_main_poll(
+                            &symbol,
+                            f,
+                            offsets.clone(),
+                            lir_offsets.clone(),
+                            param_bindings,
+                            CoopPollBody {
+                                current_class: body.current_class,
+                                lir: body.lir,
+                                result_offset: None,
+                                lir_defer_offsets: body.lir_defer_offsets.clone(),
+                                boundary: Some((*local, value, *span)),
+                                cleanup: None,
+                            },
+                        )?;
+                    }
+                }
+            }
+        }
         let func_id = self.func_ids[poll_symbol];
+        if body.boundary.is_none() && body.cleanup.is_none() {
+            for instruction in body.lir.blocks.iter().flat_map(|block| &block.instrs) {
+                if let LirInst::Defer {
+                    id, body: action, ..
+                } = instruction
+                    && super::lir_gen::cleanup_needs_task_stack(&action.function)
+                {
+                    let flag_offset = body.lir_defer_offsets[id];
+                    let bindings: Vec<_> = body
+                        .lir
+                        .locals
+                        .iter()
+                        .filter_map(|local| {
+                            lir_offsets
+                                .get(&local.id)
+                                .map(|offset| (local.name.clone(), *offset, local.ty.clone()))
+                        })
+                        .collect();
+                    for recovery in [false, true] {
+                        let symbol = super::lir_gen::task_cleanup_symbol(
+                            func_id.as_u32(),
+                            flag_offset,
+                            recovery,
+                        );
+                        let mut signature = self.module.make_signature();
+                        signature
+                            .params
+                            .push(AbiParam::new(reference_type(self.module.target_config())));
+                        signature.returns.push(AbiParam::new(types::I32));
+                        let id = self.module.declare_function(
+                            &symbol,
+                            cranelift_module::Linkage::Local,
+                            &signature,
+                        )?;
+                        self.func_ids.insert(symbol.clone(), id);
+                        self.compile_coop_main_poll(
+                            &symbol,
+                            f,
+                            offsets.clone(),
+                            HashMap::new(),
+                            &bindings,
+                            CoopPollBody {
+                                current_class: body.current_class,
+                                lir: body.lir,
+                                result_offset: None,
+                                lir_defer_offsets: HashMap::new(),
+                                boundary: None,
+                                cleanup: Some((&action.function, recovery)),
+                            },
+                        )?;
+                    }
+                }
+            }
+        }
+        let result_offset = body.result_offset;
         // Declare the async fn name as static bytes so the poll fn can tag its
         // task for async stack traces (debug builds only; willow-9lw).
         let tag_name = if self.build_mode == BuildMode::Debug {
@@ -834,7 +1027,7 @@ impl Codegen {
         // resume blocks need no SSA block params — we emit structured control
         // flow (if/while) directly and seal everything at the end (slice 5).
         let body_start = builder.create_block();
-        let mut suspends: Vec<CoopSuspendPoint> = Vec::new();
+        let mut suspends = CoopSuspendPoints::default();
         let defer_sites: Vec<AsyncDeferSite>;
         let lock_sites: Vec<AsyncLockSite>;
         let coop_root_slots: Vec<cranelift_codegen::ir::StackSlot>;
@@ -886,6 +1079,7 @@ impl Codegen {
                 interface_infos: &self.interface_infos,
                 vtable_ids: &self.vtable_ids,
                 coop_frame: None,
+                coop_suspend_points: None,
                 coop_result_offset: None,
                 // The frame is the poll fn's parameter (allocated + GC-rooted by
                 // the driver via willow_sched_spawn); locals are frame-backed via
@@ -917,11 +1111,19 @@ impl Codegen {
                 );
             }
             fg.builder.switch_to_block(body_start);
-            fg.coop_frame = Some(frame);
+            fg.coop_frame = (body.boundary.is_none() && body.cleanup.is_none()).then_some(frame);
+            fg.coop_suspend_points =
+                (body.boundary.is_none() && body.cleanup.is_none()).then(|| suspends.clone());
             fg.coop_result_offset = result_offset;
             // Lexical scopes, recovery edges and every return are explicit in
             // LIR; no source-body wrapper is needed around the poll graph.
-            fg.emit_coop_lir_function(body.lir, &mut suspends, frame);
+            if let Some((region, recovery)) = body.cleanup {
+                fg.emit_task_cleanup_callback(region, recovery);
+            } else if let Some((local, value, span)) = body.boundary {
+                fg.emit_task_boundary_callback(body.lir, local, value, span);
+            } else {
+                fg.emit_coop_lir_function(body.lir, &mut suspends, frame);
+            }
             defer_sites = std::mem::take(&mut fg.collected_defer_sites);
             lock_sites = std::mem::take(&mut fg.collected_lock_sites);
             coop_root_slots = std::mem::take(
@@ -947,7 +1149,7 @@ impl Codegen {
         let state = builder
             .ins()
             .load(types::I64, MemFlagsData::new(), frame, 0i32);
-        for (k, suspend) in suspends.iter().enumerate() {
+        for (k, suspend) in suspends.0.borrow().iter().enumerate() {
             let want = builder.ins().iconst(types::I64, (k + 1) as i64);
             let is_k = builder.ins().icmp(IntCC::Equal, state, want);
             let restore = builder.create_block();
@@ -1079,6 +1281,7 @@ impl Codegen {
                 interface_infos: &self.interface_infos,
                 vtable_ids: &self.vtable_ids,
                 coop_frame: None,
+                coop_suspend_points: None,
                 coop_result_offset: None,
                 async_frame: Some(frame),
                 async_frame_offsets: HashMap::new(),
@@ -1164,7 +1367,7 @@ impl Codegen {
                 fg.emit_void_runtime_call("willow_panic_enter_defer", &[]);
                 fg.panic_defer_codegen_depth = 1;
                 fg.recover_eligible_depth = usize::from(site.recovery_capable);
-                fg.emit_deferred_action(&site.action);
+                fg.emit_deferred_action(&site.action, Some(site.flag_offset));
                 if !fg.terminated {
                     fg.emit_void_runtime_call("willow_panic_leave_defer", &[]);
                     fg.builder.ins().jump(panic_next, &[]);
@@ -1248,7 +1451,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     pub(super) fn record_coop_suspend(
         &mut self,
-        suspends: &mut Vec<CoopSuspendPoint>,
+        suspends: &mut CoopSuspendPoints,
         resume: cranelift_codegen::ir::Block,
     ) {
         let roots = self
@@ -1283,7 +1486,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// Cooperative locals are frame-backed, so no SSA values cross the boundary.
     fn emit_coop_safepoint_to(
         &mut self,
-        suspends: &mut Vec<CoopSuspendPoint>,
+        suspends: &mut CoopSuspendPoints,
         frame: cranelift_codegen::ir::Value,
         resume: cranelift_codegen::ir::Block,
     ) {
@@ -1317,7 +1520,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// preempt at the same statement without executing it.
     pub(super) fn emit_coop_statement_safepoint(
         &mut self,
-        suspends: &mut Vec<CoopSuspendPoint>,
+        suspends: &mut CoopSuspendPoints,
         frame: cranelift_codegen::ir::Value,
     ) {
         let continuation = self.builder.create_block();
@@ -1330,7 +1533,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// unwind, and resume registration cannot drift apart.
     fn finish_coop_builtin_suspend(
         &mut self,
-        suspends: &mut Vec<CoopSuspendPoint>,
+        suspends: &mut CoopSuspendPoints,
         frame: cranelift_codegen::ir::Value,
     ) {
         let state = (suspends.len() + 1) as i64;
@@ -1349,7 +1552,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_coop_sleep_value(
         &mut self,
         millis: cranelift_codegen::ir::Value,
-        suspends: &mut Vec<CoopSuspendPoint>,
+        suspends: &mut CoopSuspendPoints,
         frame: cranelift_codegen::ir::Value,
     ) {
         let sleep_fid = self.func_id("willow_sched_sleep");
@@ -1362,7 +1565,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     pub(super) fn emit_coop_yield(
         &mut self,
-        suspends: &mut Vec<CoopSuspendPoint>,
+        suspends: &mut CoopSuspendPoints,
         frame: cranelift_codegen::ir::Value,
     ) {
         let yield_fid = self.func_id("willow_sched_yield");
@@ -1419,7 +1622,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         awaited: cranelift_codegen::ir::Value,
         stored_slot: Option<i32>,
         spawn_site_line: Option<usize>,
-        suspends: &mut Vec<CoopSuspendPoint>,
+        suspends: &mut CoopSuspendPoints,
         frame: cranelift_codegen::ir::Value,
     ) -> Option<cranelift_codegen::ir::Value> {
         if let Some(offset) = stored_slot {
@@ -1436,7 +1639,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             types::I64,
             MemFlagsData::new(),
             awaited,
-            async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+            async_frame_slot_offset(
+                FRAME_SLOT_TASK_ID,
+                reference_type(self.module.target_config()).bytes(),
+            ),
         );
         if let Some(line) = spawn_site_line {
             self.emit_set_spawn_site(id, line);
@@ -1495,7 +1701,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             types::I64,
             MemFlagsData::new(),
             awaited,
-            async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+            async_frame_slot_offset(
+                FRAME_SLOT_TASK_ID,
+                reference_type(self.module.target_config()).bytes(),
+            ),
         );
         // A plain `await` is not cancellation-aware: a cancelled callee is a
         // located panic, not a value. `await t.result()` opts out of that.
@@ -1528,7 +1737,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         offsets: [i32; 4],
         value_ty: &Type,
         header: crate::diagnostics::Span,
-        suspends: &mut Vec<CoopSuspendPoint>,
+        suspends: &mut CoopSuspendPoints,
         frame: cranelift_codegen::ir::Value,
     ) {
         let [handle_offset, token_offset, phase_offset, value_offset] = offsets;
@@ -1790,7 +1999,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 clif_type(reference_type(self.module.target_config()), result_ty),
                 MemFlagsData::new(),
                 task_frame,
-                async_frame_slot_offset(FRAME_SLOT_RESULT),
+                async_frame_slot_offset(
+                    FRAME_SLOT_RESULT,
+                    reference_type(self.module.target_config()).bytes(),
+                ),
             ));
         }
         Some(self.emit_task_result_value(task_frame, result_ty))
@@ -1854,7 +2066,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 clif_type(reference_type(self.module.target_config()), result_ty),
                 MemFlagsData::new(),
                 task_frame,
-                async_frame_slot_offset(FRAME_SLOT_RESULT),
+                async_frame_slot_offset(
+                    FRAME_SLOT_RESULT,
+                    reference_type(self.module.target_config()).bytes(),
+                ),
             )
         };
         let ok = self.emit_alloc_enum_variant(0, &payload_ty, raw);

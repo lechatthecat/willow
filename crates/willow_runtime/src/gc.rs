@@ -25,6 +25,11 @@ use std::thread::ThreadId;
 
 pub use willow_abi::{GcObjectKind, GcStoreDestination};
 
+// Inline and bitmap masks index mixed scalar/reference storage words.
+// Shadow root arrays and custom trace callbacks retain their native layouts.
+const GC_STORAGE_WORD_BYTES: usize =
+    willow_abi::storage_word_bytes(std::mem::size_of::<usize>() as u32) as usize;
+
 const GC_GENERATION_YOUNG: u8 = 0;
 const GC_GENERATION_OLD: u8 = 1;
 const GC_NURSERY_THRESHOLD_BYTES: usize = 256 * 1024;
@@ -177,7 +182,7 @@ pub const GC_TLAB_MAX_OBJECT_SIZE: usize = 4 * 1024;
 mod raw_heap {
     use std::ptr::NonNull;
 
-    use super::GcHeader;
+    use super::{GC_STORAGE_WORD_BYTES, GcHeader};
 
     #[derive(Clone, Copy)]
     pub(super) struct Payload(NonNull<u8>);
@@ -290,13 +295,24 @@ mod raw_heap {
 
         pub(super) fn payload_word(self, index: usize) -> Option<Payload> {
             // SAFETY: the caller bounds `index` by the payload size.
-            let child = unsafe { *self.payload().as_ptr().cast::<*mut u8>().add(index) };
+            let child = unsafe {
+                *self
+                    .payload()
+                    .as_ptr()
+                    .add(index * GC_STORAGE_WORD_BYTES)
+                    .cast::<*mut u8>()
+            };
             Payload::from_raw(child)
         }
 
         pub(super) fn payload_slot(self, index: usize) -> *mut *mut u8 {
             // SAFETY: callers bound `index` by the payload word count.
-            unsafe { self.payload().as_ptr().cast::<*mut u8>().add(index) }
+            unsafe {
+                self.payload()
+                    .as_ptr()
+                    .add(index * GC_STORAGE_WORD_BYTES)
+                    .cast::<*mut u8>()
+            }
         }
 
         pub(super) fn marked(self) -> bool {
@@ -1099,13 +1115,15 @@ impl ConcurrentCycle {
         }
         let payload = value as *mut u8;
         let mut children = Vec::new();
-        let words = metadata.payload_size / std::mem::size_of::<usize>();
+        let words = metadata.payload_size / GC_STORAGE_WORD_BYTES;
         let mut slots = 0;
         for index in 0..words.min(64) {
             if metadata.gc_ref_mask & (1u64 << index) != 0 {
                 // SAFETY: immutable epoch metadata bounds the live allocation;
                 // generated and native reference stores use atomic publication.
-                children.push(unsafe { load_gc_reference(payload.cast::<*mut u8>().add(index)) });
+                children.push(unsafe {
+                    load_gc_reference(payload.add(index * GC_STORAGE_WORD_BYTES).cast::<*mut u8>())
+                });
                 slots += 1;
             }
         }
@@ -1119,7 +1137,9 @@ impl ConcurrentCycle {
                     let index = word * 64 + bits.trailing_zeros() as usize;
                     if index < words {
                         children.push(unsafe {
-                            load_gc_reference(payload.cast::<*mut u8>().add(index))
+                            load_gc_reference(
+                                payload.add(index * GC_STORAGE_WORD_BYTES).cast::<*mut u8>(),
+                            )
                         });
                         slots += 1;
                     }
@@ -1220,7 +1240,7 @@ fn mark_worklist(mut worklist: Vec<*mut u8>) -> crate::gc_telemetry::MarkWork {
         let Some(metadata) = object.begin_trace() else {
             continue; // already visited — handles cycles
         };
-        let payload_words = metadata.payload_size / std::mem::size_of::<usize>();
+        let payload_words = metadata.payload_size / GC_STORAGE_WORD_BYTES;
         let mut scanned_slots = 0usize;
         for i in 0..payload_words.min(64) {
             if (metadata.gc_ref_mask & (1u64 << i)) != 0 {
@@ -1863,9 +1883,12 @@ pub extern "C" fn willow_gc_alloc_bitmap(
     descriptor: *const u64,
 ) -> *mut u8 {
     assert!(!descriptor.is_null());
-    assert!(payload_size >= 0 && payload_size % 8 == 0);
+    assert!(payload_size >= 0 && payload_size % GC_STORAGE_WORD_BYTES as i64 == 0);
     let count = unsafe { *descriptor } as usize;
-    assert_eq!(count, (payload_size as usize / 8).div_ceil(64));
+    assert_eq!(
+        count,
+        (payload_size as usize / GC_STORAGE_WORD_BYTES).div_ceil(64)
+    );
     let mask = if count == 0 {
         0
     } else {
@@ -2552,7 +2575,7 @@ fn append_bitmap_slots(object: HeapObject, slots: &mut Vec<*mut *mut u8>) {
     // SAFETY: only willow_gc_alloc_bitmap installs the reserved tracing type, after validating a
     // compiler-owned, process-lifetime descriptor. Moving GC copies the pointer.
     let count = unsafe { *descriptor } as usize;
-    let payload_words = metadata.payload_size / std::mem::size_of::<usize>();
+    let payload_words = metadata.payload_size / GC_STORAGE_WORD_BYTES;
     for word in 1..count {
         let mut bits = unsafe { *descriptor.add(word + 1) };
         while bits != 0 {
@@ -2571,7 +2594,7 @@ fn object_reference_slots(
     trace_registry: &HashMap<u32, TraceFn>,
 ) -> Vec<*mut *mut u8> {
     let metadata = object.trace_metadata();
-    let payload_words = metadata.payload_size / std::mem::size_of::<usize>();
+    let payload_words = metadata.payload_size / GC_STORAGE_WORD_BYTES;
     let mut slots = Vec::new();
     for index in 0..payload_words.min(64) {
         if (metadata.gc_ref_mask & (1u64 << index)) != 0 {
@@ -4627,6 +4650,47 @@ mod tests {
         let ptr = willow_alloc_typed(16, 0b10);
         let header = payload_to_header(ptr);
         assert_eq!(unsafe { (*header).gc_ref_mask }, 0b10);
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_bitmap_and_inline_slots_follow_mixed_storage_layout() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        // Inline bit 1 and extended bit 65 have a scalar word immediately
+        // before them. Both paths must locate the same storage-word stride.
+        static BITMAP: [u64; 3] = [2, 0b10, 0b10];
+        let bytes = 66 * GC_STORAGE_WORD_BYTES;
+        let parent = willow_gc_alloc_bitmap(0, bytes as i64, BITMAP.as_ptr());
+        let child = willow_alloc(8);
+        let object = HeapObject::from_raw(payload_to_header(parent)).unwrap();
+        let offsets = [
+            willow_abi::WordLayout::new(&[willow_abi::SlotKind::Word])
+                .byte_size(std::mem::size_of::<usize>() as u32) as usize,
+            65 * GC_STORAGE_WORD_BYTES,
+        ];
+        for &offset in &offsets {
+            unsafe {
+                parent
+                    .add(offset - GC_STORAGE_WORD_BYTES)
+                    .cast::<i64>()
+                    .write(i64::MAX);
+                parent.add(offset).cast::<*mut u8>().write(child);
+            }
+        }
+        let slots = object_reference_slots(object, &HashMap::new());
+        assert_eq!(slots.len(), 2);
+        for (slot, offset) in slots.iter().zip(offsets) {
+            assert_eq!(*slot as usize - parent as usize, offset);
+            assert_eq!(unsafe { **slot }, child);
+        }
+        assert_eq!(object.payload_word(1).unwrap().as_ptr(), child);
+        assert_eq!(object.payload_word(65).unwrap().as_ptr(), child);
+        let mut root = parent;
+        willow_push_root(&mut root);
+        willow_gc_collect();
+        assert_eq!(willow_gc_allocated_bytes(), obj_size(bytes) + obj_size(8));
+        willow_pop_root();
         reset_gc();
     }
 

@@ -25,6 +25,8 @@ fn scheduler_callbacks_and_frame_handles_are_native_pointers() {
     let _: fn(unsafe extern "C" fn(*mut c_void)) -> task::RuntimeCancelFn = cancel_alias;
     let _: extern "C" fn(task::RuntimePollFn, *mut c_void) -> u64 = scheduler::willow_sched_spawn;
     let _: extern "C" fn(u64, task::RuntimeCancelFn) = scheduler::willow_sched_set_cancel_fn;
+    let _: extern "C" fn(u64, task::RuntimeCancelFn, i32) =
+        scheduler::willow_sched_set_cancel_fn_cooperative;
     let _: extern "C" fn(u64) = scheduler::willow_sched_wake;
     let _: extern "C" fn() -> u64 = scheduler::willow_sched_current_task;
     let _: extern "C" fn() -> u64 = scheduler::willow_sched_active_workers;
@@ -114,4 +116,44 @@ fn lock_handles_are_pointers_and_tokens_and_payloads_remain_i64() {
     let _: extern "C" fn(*mut c_void, i64) -> i32 = async_rwlock::willow_async_rwlock_poll;
     let _: extern "C" fn(*mut c_void, i64) -> i64 = async_rwlock::willow_async_rwlock_load;
     let _: extern "C" fn(*mut c_void, i64, i64) -> i32 = async_rwlock::willow_async_rwlock_commit;
+}
+
+#[test]
+fn interface_dispatch_layout_matches_native_pointer_aggregate() {
+    #[repr(C)]
+    struct InterfaceBox {
+        object: *mut c_void,
+        vtable: *const c_void,
+    }
+    let pointer_bytes = std::mem::size_of::<*const c_void>() as u32;
+    assert_eq!(
+        willow_abi::dispatch_layout::interface_bytes(pointer_bytes) as usize,
+        std::mem::size_of::<InterfaceBox>()
+    );
+    assert_eq!(
+        willow_abi::dispatch_layout::OBJECT_OFFSET as usize,
+        std::mem::offset_of!(InterfaceBox, object)
+    );
+    assert_eq!(
+        willow_abi::dispatch_layout::vtable_offset(pointer_bytes) as usize,
+        std::mem::offset_of!(InterfaceBox, vtable)
+    );
+}
+
+#[test]
+fn lazy_task_stack_entrypoints_keep_pointer_callback_abi() {
+    let _: extern "C" fn(crate::task::RuntimePollFn, *mut c_void) -> i64 =
+        crate::scheduler::willow_sched_spawn_cooperative;
+    let _: extern "C" fn(crate::task::RuntimePollFn, *mut c_void) -> i32 =
+        crate::scheduler::willow_task_stack_enter;
+    let _: extern "C" fn() = crate::scheduler::willow_task_stack_leave;
+}
+
+#[test]
+fn tlab_storage_size_matches_target_contract() {
+    let width = std::mem::size_of::<usize>() as u32;
+    assert_eq!(
+        willow_abi::tlab::state_size(width) as usize,
+        std::mem::size_of::<crate::gc::GcTlabState>()
+    );
 }

@@ -96,7 +96,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .position(|(name, _)| name == field)
                     .expect("checked reference field");
                 let owner = self.load_lir_local(function, *object);
-                self.builder.ins().iadd_imm_s(owner, (index as i64 + 1) * 8)
+                self.builder.ins().iadd_imm_s(
+                    owner,
+                    (index as i64 + 1)
+                        * willow_abi::storage_word_bytes(
+                            reference_type(self.module.target_config()).bytes(),
+                        ) as i64,
+                )
             }
             LirPlace::ArrayElement { owner, index, .. } => {
                 let owner = self.load_lir_local(function, *owner);

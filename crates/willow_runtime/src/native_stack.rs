@@ -35,6 +35,7 @@ pub(crate) struct NativeStack {
     suspended: bool,
     cancelled: bool,
     cleanup_depth: u32,
+    entry_panic_depth: i32,
     root_depth: usize,
     parked_roots: Option<u64>,
     trace: RuntimeStackTrace,
@@ -62,12 +63,17 @@ impl NativeStack {
             stack.frame = frame;
             stack.cancelled = false;
             stack.cleanup_depth = 0;
+            stack.entry_panic_depth = crate::panic_context::willow_panic_depth();
             stack.trace = RuntimeStackTrace::default();
             stack.reference_context = Default::default();
             stack
         } else {
             Self::new(poll, frame)
         }
+    }
+
+    pub(crate) fn entry_panic_depth(&self) -> i32 {
+        self.entry_panic_depth
     }
 
     pub(crate) fn acquire_cleanup(cancel: RuntimeCancelFn, frame: *mut c_void) -> Box<Self> {
@@ -111,11 +117,16 @@ impl NativeStack {
             suspended: false,
             cancelled: false,
             cleanup_depth: 0,
+            entry_panic_depth: crate::panic_context::willow_panic_depth(),
             root_depth: 0,
             parked_roots: None,
             trace: RuntimeStackTrace::default(),
             reference_context: Default::default(),
         })
+    }
+
+    pub(crate) fn is_cleanup(&self) -> bool {
+        self.cancel_entry.is_some()
     }
 
     pub(crate) fn is_suspended(&self) -> bool {

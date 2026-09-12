@@ -1382,6 +1382,7 @@ impl Codegen {
             interface_infos: &self.interface_infos,
             vtable_ids: &self.vtable_ids,
             coop_frame: None,
+            coop_suspend_points: None,
             coop_result_offset: None,
             async_frame: None,
             async_frame_offsets: HashMap::new(),
@@ -1458,7 +1459,10 @@ impl Codegen {
                     clif_type(reference_type(fg.module.target_config()), &capture.ty),
                     MemFlagsData::trusted(),
                     env,
-                    (i as i32 + 1) * 8,
+                    (i as i32 + 1)
+                        * willow_abi::storage_word_bytes(
+                            reference_type(fg.module.target_config()).bytes(),
+                        ) as i32,
                 );
                 fg.bind_param(&capture.name, &capture.ty, &ParamMode::Value, val);
             }
@@ -1591,8 +1595,10 @@ impl Codegen {
             // static init sees a safe (null) slot (willow-qsqf §12.3). The slot
             // holds a pointer and is registered as a GC root, so it must be
             // 8-aligned — the collector dereferences the root slot.
-            data.define_zeroinit(8);
-            data.set_align(8);
+            let storage_bytes =
+                willow_abi::storage_word_bytes(reference_type(self.module.target_config()).bytes());
+            data.define_zeroinit(storage_bytes as usize);
+            data.set_align(storage_bytes as u64);
             self.module.define_data(data_id, &data)?;
             self.static_storage
                 .entry(class_key.to_string())
@@ -1771,6 +1777,7 @@ impl Codegen {
             interface_infos: &self.interface_infos,
             vtable_ids: &self.vtable_ids,
             coop_frame: None,
+            coop_suspend_points: None,
             coop_result_offset: None,
             async_frame: None,
             async_frame_offsets: HashMap::new(),
@@ -1913,7 +1920,16 @@ impl Codegen {
         let mut data = DataDescription::new();
         // Explicit zeroed bytes (not `define_zeroinit`, which is BSS and cannot
         // carry the function-address relocations written below).
-        data.define(vec![0u8; slot_count * 8].into_boxed_slice());
+        let pointer_bytes = reference_type(self.module.target_config()).bytes();
+        data.set_align(pointer_bytes as u64);
+        data.define(
+            vec![
+                0u8;
+                willow_abi::dispatch_layout::table_slot_offset(slot_count as u32, pointer_bytes)
+                    as usize
+            ]
+            .into_boxed_slice(),
+        );
         // Filled BY NAME, which is what lets one method occupy several slots
         // (a diamond's shared grandparent) without the copies disagreeing.
         for (slot, method_name) in slots.iter().enumerate() {
@@ -1945,7 +1961,10 @@ impl Codegen {
                 None => func_id,
             };
             let func_ref = self.module.declare_func_in_data(entry, &mut data);
-            data.write_function_addr((slot * 8) as u32, func_ref);
+            data.write_function_addr(
+                willow_abi::dispatch_layout::table_slot_offset(slot as u32, pointer_bytes),
+                func_ref,
+            );
         }
         self.module.define_data(data_id, &data)?;
         self.vtable_ids.insert(key, data_id);
@@ -2022,7 +2041,8 @@ impl Codegen {
         let descriptor = builder
             .ins()
             .load(ptr_ty, MemFlagsData::new(), self_ptr, 0i32);
-        let offset = (CLASS_DESCRIPTOR_HEADER_BYTES as usize + vslot * 8) as i32;
+        let offset =
+            willow_abi::dispatch_layout::class_slot_offset(vslot as u32, ptr_ty.bytes()) as i32;
         let callee = builder
             .ins()
             .load(ptr_ty, MemFlagsData::new(), descriptor, offset);
@@ -2097,7 +2117,13 @@ impl Codegen {
         // Explicit zeroed bytes (not `define_zeroinit`, which is BSS and cannot
         // carry the function-address relocations written below) — the same
         // constraint `declare_one_vtable` works under.
-        let mut bytes = vec![0u8; (slots.len() + 1) * 8];
+        let pointer_bytes = reference_type(self.module.target_config()).bytes();
+        data.set_align(willow_abi::dispatch_layout::CLASS_ID_BYTES as u64);
+        let mut bytes = vec![
+            0u8;
+            willow_abi::dispatch_layout::class_slot_offset(slots.len() as u32, pointer_bytes)
+                as usize
+        ];
         // The type_id is a plain constant, not a relocation, so it is written
         // into the bytes directly — in the TARGET's byte order, which is what
         // the generated `load` will read it back in.
@@ -2112,7 +2138,10 @@ impl Codegen {
             // the method, which is exactly what an inherited slot must hold.
             if let Some(func_id) = self.resolve_class_method_func_id(class_name, method_name) {
                 let func_ref = self.module.declare_func_in_data(func_id, &mut data);
-                data.write_function_addr(CLASS_DESCRIPTOR_HEADER_BYTES + slot as u32 * 8, func_ref);
+                data.write_function_addr(
+                    willow_abi::dispatch_layout::class_slot_offset(slot as u32, pointer_bytes),
+                    func_ref,
+                );
             }
         }
         self.module.define_data(data_id, &data)?;
@@ -2244,6 +2273,7 @@ impl Codegen {
             interface_infos: &self.interface_infos,
             vtable_ids: &self.vtable_ids,
             coop_frame: None,
+            coop_suspend_points: None,
             coop_result_offset: None,
             async_frame: None,
             async_frame_offsets: HashMap::new(),

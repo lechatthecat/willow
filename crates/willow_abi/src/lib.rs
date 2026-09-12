@@ -1,6 +1,6 @@
 //! Target-independent contracts shared by the Willow compiler and runtime.
 //!
-//! Layouts are expressed in pointer-sized words, fixed-width discriminants,
+//! Layouts are expressed in mixed storage words, pointer slots, fixed-width discriminants,
 //! and semantic slot kinds. A consumer supplies its target pointer width only
 //! when converting a descriptor to byte offsets or allocation sizes. This
 //! keeps cross-compilation independent of the host Rust process layout.
@@ -11,6 +11,14 @@
 pub const GC_BITMAP_TYPE_ID: u32 = 0xB17B_17B1;
 
 pub const GC_REF_MASK_BITS: usize = u64::BITS as usize;
+
+/// Stride of a mixed i64/f64/reference storage slot. Narrow pointers do not
+/// shrink scalar payloads or header fields. Pointer-only dispatch structures
+/// use their own packed pointer layout instead. This policy alone does not
+/// establish native 32-bit runtime support.
+pub const fn storage_word_bytes(pointer_bytes: u32) -> u32 {
+    if pointer_bytes < 8 { 8 } else { pointer_bytes }
+}
 
 /// Target-independent representation class for one C-ABI parameter/return.
 ///
@@ -237,13 +245,49 @@ pub mod gc_header {
     }
 }
 
+/// Pointer-only interface boxes and dispatch tables. Scalar class identifiers
+/// keep their fixed i64 representation even when table entries are narrower.
+pub mod dispatch_layout {
+    pub const OBJECT_OFFSET: u32 = 0;
+    pub const CLASS_ID_BYTES: u32 = 8;
+    pub const INTERFACE_GC_REF_MASK: u64 = 0b01;
+
+    pub const fn vtable_offset(pointer_bytes: u32) -> u32 {
+        pointer_bytes
+    }
+
+    pub const fn interface_bytes(pointer_bytes: u32) -> u32 {
+        2 * pointer_bytes
+    }
+
+    pub const fn table_slot_offset(slot: u32, pointer_bytes: u32) -> u32 {
+        slot * pointer_bytes
+    }
+
+    pub const fn class_slot_offset(slot: u32, pointer_bytes: u32) -> u32 {
+        CLASS_ID_BYTES + table_slot_offset(slot, pointer_bytes)
+    }
+}
+
 /// Generated-code-facing thread-local allocation-buffer state ABI.
 pub mod tlab {
+    pub const fn limit_offset(pointer_bytes: u32) -> u32 {
+        pointer_bytes
+    }
+    pub const fn fast_allocations_offset(pointer_bytes: u32) -> u32 {
+        (2 * pointer_bytes + 7) & !7
+    }
+    pub const fn fast_bytes_offset(pointer_bytes: u32) -> u32 {
+        fast_allocations_offset(pointer_bytes) + 8
+    }
+    pub const fn state_size(pointer_bytes: u32) -> u32 {
+        fast_bytes_offset(pointer_bytes) + 8
+    }
     pub const CURSOR_OFFSET: u32 = 0;
-    pub const LIMIT_OFFSET: u32 = 8;
-    pub const FAST_ALLOCATIONS_OFFSET: u32 = 16;
-    pub const FAST_BYTES_OFFSET: u32 = 24;
-    pub const STATE_SIZE: u32 = 32;
+    pub const LIMIT_OFFSET: u32 = limit_offset(8);
+    pub const FAST_ALLOCATIONS_OFFSET: u32 = fast_allocations_offset(8);
+    pub const FAST_BYTES_OFFSET: u32 = fast_bytes_offset(8);
+    pub const STATE_SIZE: u32 = state_size(8);
     pub const MAX_OBJECT_SIZE: u32 = 4 * 1024;
 }
 
@@ -255,15 +299,19 @@ pub mod async_frame {
     pub const STATUS_WORD: u32 = 2;
 
     pub const fn header_bytes(pointer_bytes: u32) -> u32 {
-        HEADER_WORDS * pointer_bytes
+        header_word_offset(HEADER_WORDS, pointer_bytes)
+    }
+
+    pub const fn header_word_offset(word: u32, pointer_bytes: u32) -> u32 {
+        word * super::storage_word_bytes(pointer_bytes)
     }
 
     pub const fn data_slot_offset(slot: u32, pointer_bytes: u32) -> u32 {
-        (HEADER_WORDS + slot) * pointer_bytes
+        header_bytes(pointer_bytes) + slot * super::storage_word_bytes(pointer_bytes)
     }
 }
 
-/// Representation of one target word in a runtime-owned aggregate.
+/// Representation of one mixed storage word in a runtime-owned aggregate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SlotKind {
     /// Scalar, tag, task id, or other non-reference Willow word.
@@ -290,7 +338,7 @@ impl<'a> WordLayout<'a> {
     }
 
     pub const fn byte_size(self, pointer_bytes: u32) -> u32 {
-        self.word_count() * pointer_bytes
+        self.word_count() * storage_word_bytes(pointer_bytes)
     }
 
     pub const fn gc_ref_mask(self, first_payload_word: u32) -> u64 {
@@ -334,11 +382,11 @@ impl<'a> EnumVariantLayout<'a> {
     }
 
     pub const fn payload_byte_offset(self, pointer_bytes: u32) -> u32 {
-        self.payload_word_offset() * pointer_bytes
+        self.payload_word_offset() * storage_word_bytes(pointer_bytes)
     }
 
     pub const fn payload_bytes(self, pointer_bytes: u32) -> u32 {
-        (Self::TAG_WORDS + self.payload.word_count()) * pointer_bytes
+        self.payload_byte_offset(pointer_bytes) + self.payload.byte_size(pointer_bytes)
     }
 
     pub const fn gc_ref_mask(self) -> u64 {
@@ -388,6 +436,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dispatch_layout_preserves_scalar_ids_and_scales_pointer_slots() {
+        // Twenty-two width/shape cases: box size, vtable offset and nine
+        // dispatch slots on each of the 32-bit and 64-bit layout models.
+        for pointer_bytes in [4, 8] {
+            assert_eq!(
+                dispatch_layout::interface_bytes(pointer_bytes),
+                2 * pointer_bytes
+            );
+            assert_eq!(dispatch_layout::vtable_offset(pointer_bytes), pointer_bytes);
+            for slot in 0..9 {
+                assert_eq!(
+                    dispatch_layout::table_slot_offset(slot, pointer_bytes),
+                    slot * pointer_bytes
+                );
+                assert_eq!(
+                    dispatch_layout::class_slot_offset(slot, pointer_bytes),
+                    8 + slot * pointer_bytes
+                );
+            }
+        }
+        assert_eq!(dispatch_layout::OBJECT_OFFSET, 0);
+        assert_eq!(dispatch_layout::INTERFACE_GC_REF_MASK, 1);
+    }
+
+    #[test]
     fn enum_layout_is_instantiated_from_payload_reference_shape() {
         const SCALAR: EnumVariantLayout<'_> = EnumVariantLayout::new(0, &[SlotKind::Word]);
         const STRING: EnumVariantLayout<'_> = EnumVariantLayout::new(0, &[SlotKind::GcRef]);
@@ -408,12 +481,48 @@ mod tests {
     }
 
     #[test]
-    fn target_pointer_width_is_supplied_by_the_consumer() {
+    fn narrow_pointers_do_not_shrink_mixed_frame_slots() {
         const LAYOUT: NativeFrameLayout<'_> =
             NativeFrameLayout::new(&[SlotKind::Word, SlotKind::GcRef]);
-        assert_eq!(LAYOUT.payload_bytes(4), 20);
+        assert_eq!(LAYOUT.payload_bytes(4), 40);
         assert_eq!(LAYOUT.payload_bytes(8), 40);
         assert_eq!(LAYOUT.gc_ref_mask(), 1 << 4);
+    }
+
+    #[test]
+    fn mixed_scalar_and_pointer_fields_never_overlap_at_either_width() {
+        const SLOTS: &[SlotKind] = &[SlotKind::Word, SlotKind::GcRef, SlotKind::NativePtr];
+        let frame = NativeFrameLayout::new(SLOTS);
+        let variant = EnumVariantLayout::new(1, SLOTS);
+        for pointer_bytes in [4, 8] {
+            let mut bytes = vec![0u8; frame.payload_bytes(pointer_bytes) as usize];
+            let offsets = [
+                async_frame::header_word_offset(async_frame::STATE_WORD, pointer_bytes),
+                async_frame::header_word_offset(async_frame::SLOT_COUNT_WORD, pointer_bytes),
+                async_frame::header_word_offset(async_frame::STATUS_WORD, pointer_bytes),
+                frame.slot_offset(0, pointer_bytes),
+                frame.slot_offset(1, pointer_bytes),
+                frame.slot_offset(2, pointer_bytes),
+            ];
+            // Model full-width state/count/status and f64 bits, followed by
+            // native-width references. Distinct byte markers reveal overlap.
+            let widths = [8, 8, 8, 8, pointer_bytes, pointer_bytes];
+            for (index, (&offset, &width)) in offsets.iter().zip(&widths).enumerate() {
+                bytes[offset as usize..(offset + width) as usize].fill(index as u8 + 1);
+            }
+            for (index, (&offset, &width)) in offsets.iter().zip(&widths).enumerate() {
+                assert!(
+                    bytes[offset as usize..(offset + width) as usize]
+                        .iter()
+                        .all(|&byte| byte == index as u8 + 1)
+                );
+            }
+            assert_eq!(variant.payload_byte_offset(pointer_bytes), 8);
+            assert_eq!(variant.payload_bytes(pointer_bytes), 32);
+            assert_eq!(WordLayout::new(SLOTS).byte_size(pointer_bytes), 24);
+            assert_eq!(variant.gc_ref_mask(), 0b0100);
+            assert_eq!(frame.gc_ref_mask(), 0b010000);
+        }
     }
 
     #[test]

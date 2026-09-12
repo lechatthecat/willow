@@ -95,11 +95,6 @@ struct UnitResolutionContext {
     modules: module_index::ModuleResolutionContext,
 }
 
-/// Bytes before the first virtual method slot in a class descriptor: the
-/// `type_id` at offset 0 (willow-fm7t). Slot `k` therefore lives at
-/// `CLASS_DESCRIPTOR_HEADER_BYTES + k * 8`.
-pub(super) const CLASS_DESCRIPTOR_HEADER_BYTES: u32 = 8;
-
 /// What one unit's bare enum aliases displaced, so the tables can be put back
 /// the way the next unit needs them (willow-nm0g).
 #[derive(Default)]
@@ -390,8 +385,17 @@ impl Codegen {
         let mut tlab_data = DataDescription::new();
         // Explicit zeroed bytes (not `define_zeroinit`, which lowers to BSS/TLS
         // and emits an `UninitializedTls` section the object writer rejects).
-        tlab_data.define(vec![0u8; 32].into_boxed_slice());
-        tlab_data.set_align(8);
+        tlab_data.define(
+            vec![
+                0u8;
+                willow_abi::tlab::state_size(reference_type(module.target_config()).bytes())
+                    as usize
+            ]
+            .into_boxed_slice(),
+        );
+        tlab_data.set_align(willow_abi::storage_word_bytes(
+            reference_type(module.target_config()).bytes(),
+        ) as u64);
         module.define_data(gc_tlab_state, &tlab_data)?;
         let type_scope = TypeScope::default();
         let mut class_layouts = TypeMap::with_scope(type_scope.clone());
@@ -460,7 +464,10 @@ impl Codegen {
         span: crate::diagnostics::Span,
         layout: &AsyncFrameLayout,
     ) {
-        let size_bytes = (ASYNC_FRAME_HEADER_WORDS + layout.slot_count()) * 8;
+        let size_bytes = willow_abi::async_frame::data_slot_offset(
+            layout.slot_count() as u32,
+            reference_type(self.module.target_config()).bytes(),
+        ) as usize;
         if size_bytes >= ASYNC_FRAME_LARGE_WARNING_BYTES {
             self.async_frame_size_warnings.push(AsyncFrameSizeWarning {
                 source_file: self.source_file.clone(),
@@ -1516,6 +1523,7 @@ struct FuncGen<'a, 'b> {
     /// match arm, willow-zvkv) stores the result and returns the Ready status
     /// instead of a future pointer.
     coop_frame: Option<cranelift_codegen::ir::Value>,
+    coop_suspend_points: Option<CoopSuspendPoints>,
     /// Byte offset of the poll frame's `__result` slot, when it has one.
     coop_result_offset: Option<i32>,
     /// Base pointer of this function's heap async frame, if one was allocated
@@ -1566,6 +1574,18 @@ struct CoopShadowRoots {
     all: Vec<cranelift_codegen::ir::StackSlot>,
 }
 
+#[derive(Clone, Default)]
+struct CoopSuspendPoints(std::rc::Rc<std::cell::RefCell<Vec<CoopSuspendPoint>>>);
+
+impl CoopSuspendPoints {
+    fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+    fn push(&self, point: CoopSuspendPoint) {
+        self.0.borrow_mut().push(point);
+    }
+}
+
 struct CoopSuspendPoint {
     resume: cranelift_codegen::ir::Block,
     roots: Vec<cranelift_codegen::ir::StackSlot>,
@@ -1605,9 +1625,6 @@ enum VarStorage {
 /// Async-frame layout constants — must match `crates/willow_runtime/src/async_frame.rs`
 /// (`willow_async_frame_alloc` lays out
 /// `[state(word0) | slot_count(word1) | status(word2) | data slot 0..]`).
-const ASYNC_FRAME_HEADER_BYTES: i32 =
-    willow_abi::async_frame::header_bytes(std::mem::size_of::<usize>() as u32) as i32;
-
 /// Byte offset of data slot `n` from the async frame base.
 /// Async-task frame slot indices used with [`async_frame_slot_offset`].
 /// Every async/task frame begins with these fixed slots after its header:
@@ -1622,8 +1639,8 @@ const FRAME_SLOT_TASK_ID: usize = 1;
 const WILLOW_FRAME_STATUS_TERMINAL_MASK: i64 = willow_abi::frame_status::TERMINAL_MASK;
 const WILLOW_FRAME_STATUS_CANCELLED: i64 = willow_abi::FrameTerminalStatus::Cancelled as i64;
 
-fn async_frame_slot_offset(n: usize) -> i32 {
-    ASYNC_FRAME_HEADER_BYTES + (n as i32) * 8
+fn async_frame_slot_offset(n: usize, pointer_bytes: u32) -> i32 {
+    willow_abi::async_frame::data_slot_offset(n as u32, pointer_bytes) as i32
 }
 
 impl<'a, 'b> FuncGen<'a, 'b> {
@@ -1678,7 +1695,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // GC can find and trace them during any allocation in the body.
                 let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
-                    8,
+                    reference_type(self.module.target_config()).bytes(),
                     0,
                 ));
                 self.stack_store(val, slot);
@@ -2931,7 +2948,7 @@ mod tests {
         let mut fields: Vec<(String, Type)> =
             (0..64).map(|i| (format!("n{i}"), Type::I64)).collect();
         fields.push(("late".into(), Type::String));
-        let layout = gc_codegen::GcLayoutMetadata::class("Wide", 1, &fields, &TypeMap::new());
+        let layout = gc_codegen::GcLayoutMetadata::class("Wide", 1, &fields, &TypeMap::new(), 8);
         assert_eq!(layout.gc_ref_mask, 0);
         assert_eq!(layout.bitmap, [0, 2]);
     }

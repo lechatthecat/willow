@@ -881,6 +881,8 @@ fn test_runnable_example_files_compile_and_run() {
              odd sample\nrising batch\n?\nno reading\n6\n7\n5\n6\n9\n",
         ),
         ("example/lambda_context.wi", "20\n12\n12\nyes\n"),
+        ("example/async_reference_escape_rejected.wi", "42\n"),
+        ("example/lazy_task_stack.wi", "cleanup\n210\n"),
         (
             "example/reference_width.wi",
             "reference\n4294967297\n4294967298\nreference!\n",

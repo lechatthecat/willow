@@ -160,9 +160,13 @@ pub struct RuntimeTask {
     pub(crate) state: AtomicTaskState,
     /// Cooperative resume entry, or `None` for a bookkeeping-only placeholder.
     pub poll: Option<RuntimePollFn>,
+    /// Generated polls manage their own lazy synchronous stack boundaries.
+    pub(crate) cooperative_poll: bool,
     /// Cancellation cleanup entry running the frame's pending defers, or
     /// `None` when the async fn has no defer sites (willow-vynv.3).
     pub cancel: Option<RuntimeCancelFn>,
+    /// Cancellation may call synchronous helpers requiring a native stack.
+    pub(crate) native_cancel_cleanup: bool,
     /// Heap async frame passed to `poll`. Kept alive via a GC runtime root while
     /// the task is pending; `null` for placeholders.
     pub frame: *mut c_void,
@@ -217,7 +221,9 @@ impl Clone for RuntimeTask {
             id: self.id,
             state: self.state.clone(),
             poll: self.poll,
+            cooperative_poll: self.cooperative_poll,
             cancel: self.cancel,
+            native_cancel_cleanup: self.native_cancel_cleanup,
             frame: self.frame,
             frame_rooted: self.frame_rooted,
             wake_deadline: self.wake_deadline,
@@ -249,7 +255,9 @@ impl RuntimeTask {
             id,
             state: AtomicTaskState::new(),
             poll: None,
+            cooperative_poll: false,
             cancel: None,
+            native_cancel_cleanup: true,
             frame: std::ptr::null_mut(),
             frame_rooted: false,
             wake_deadline: None,
