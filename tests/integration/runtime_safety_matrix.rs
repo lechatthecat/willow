@@ -294,22 +294,24 @@ async fn main() {
 fn rsm_12_cancel_inside_selected_arm_runs_pending_defer() {
     assert_async_output(
         r#"
-async fn selected() {
+async fn selected(ready: Channel<i64>) {
     let channel = Channel<i64>::with_capacity(1);
     channel.send(1);
     select {
         let value = channel.recv() => {
             defer println("selected-cleanup");
             println(value);
+            ready.send(1);
             await sleep(10000);
         }
     }
 }
 async fn main() {
-    let task = selected();
-    await sleep(20);
+    let ready = Channel<i64>::with_capacity(1);
+    let task = selected(ready);
+    ready.recv();
     task.cancel();
-    await sleep(30);
+    await task.result();
     println(task.is_cancelled());
 }
 "#,
@@ -322,7 +324,7 @@ async fn main() {
 fn rsm_13_completed_select_arm_defer_is_not_rerun_on_cancel() {
     assert_async_output(
         r#"
-async fn selected() {
+async fn selected(ready: Channel<i64>) {
     let channel = Channel<i64>::with_capacity(1);
     channel.send(1);
     select {
@@ -331,13 +333,15 @@ async fn selected() {
             println(value);
         }
     }
+    ready.send(1);
     await sleep(10000);
 }
 async fn main() {
-    let task = selected();
-    await sleep(20);
+    let ready = Channel<i64>::with_capacity(1);
+    let task = selected(ready);
+    ready.recv();
     task.cancel();
-    await sleep(30);
+    await task.result();
     println(task.is_cancelled());
 }
 "#,
@@ -412,19 +416,21 @@ async fn main() {
 fn rsm_17_cancel_inside_while_runs_active_iteration_defer() {
     assert_async_output(
         r#"
-async fn waiting() {
+async fn waiting(ready: Channel<i64>) {
     let mut i = 0;
     while i < 2 {
         defer println("while-cleanup");
+        ready.send(1);
         await sleep(10000);
         i = i + 1;
     }
 }
 async fn main() {
-    let task = waiting();
-    await sleep(20);
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    ready.recv();
     task.cancel();
-    await sleep(30);
+    await task.result();
     println(task.is_cancelled());
 }
 "#,
@@ -460,19 +466,21 @@ async fn main() {
 fn rsm_19_cancel_before_while_defer_registration_runs_nothing() {
     assert_async_output(
         r#"
-async fn waiting() {
+async fn waiting(ready: Channel<i64>) {
     let mut active = true;
     while active {
+        ready.send(1);
         await sleep(10000);
         defer println("not-registered");
         active = false;
     }
 }
 async fn main() {
-    let task = waiting();
-    await sleep(20);
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    ready.recv();
     task.cancel();
-    await sleep(30);
+    await task.result();
     println(task.is_cancelled());
 }
 "#,
@@ -1136,21 +1144,23 @@ async fn main() {
 fn rsm_56_cancel_inside_timeout_arm_runs_pending_defer() {
     assert_async_output(
         r#"
-async fn waiting() {
+async fn waiting(ready: Channel<i64>) {
     let channel = Channel<i64>::new();
     select {
         let value = channel.recv() => { println(value); }
         sleep(1) => {
             defer println("timeout-cleanup");
+            ready.send(1);
             await sleep(10000);
         }
     }
 }
 async fn main() {
-    let task = waiting();
-    await sleep(20);
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    ready.recv();
     task.cancel();
-    await sleep(30);
+    await task.result();
     println(task.is_cancelled());
 }
 "#,
@@ -1163,21 +1173,23 @@ async fn main() {
 fn rsm_57_cancel_inside_default_arm_runs_pending_defer() {
     assert_async_output(
         r#"
-async fn waiting() {
+async fn waiting(ready: Channel<i64>) {
     let channel = Channel<i64>::new();
     select {
         let value = channel.recv() => { println(value); }
         default => {
             defer println("default-cleanup");
+            ready.send(1);
             await sleep(10000);
         }
     }
 }
 async fn main() {
-    let task = waiting();
-    await sleep(20);
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    ready.recv();
     task.cancel();
-    await sleep(30);
+    await task.result();
     println(task.is_cancelled());
 }
 "#,
@@ -1361,19 +1373,20 @@ async fn main() {
 fn rsm_66_cancel_second_while_iteration_does_not_rerun_first() {
     assert_async_output(
         r#"
-async fn waiting() {
+async fn waiting(ready: Channel<i64>) {
     let mut i = 0;
     while i < 3 {
         defer println(i);
-        if i == 1 { await sleep(10000); }
+        if i == 1 { ready.send(1); await sleep(10000); }
         i = i + 1;
     }
 }
 async fn main() {
-    let task = waiting();
-    await sleep(20);
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    ready.recv();
     task.cancel();
-    await sleep(30);
+    await task.result();
     println(task.is_cancelled());
 }
 "#,
@@ -1386,21 +1399,23 @@ async fn main() {
 fn rsm_67_cancel_nested_while_unwinds_inner_then_outer() {
     assert_async_output(
         r#"
-async fn waiting() {
+async fn waiting(ready: Channel<i64>) {
     let mut outer = 0;
     while outer < 1 {
         defer println("outer");
         while true {
             defer println("inner");
+            ready.send(1);
             await sleep(10000);
         }
     }
 }
 async fn main() {
-    let task = waiting();
-    await sleep(20);
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    ready.recv();
     task.cancel();
-    await sleep(30);
+    await task.result();
     println(task.is_cancelled());
 }
 "#,
@@ -1417,20 +1432,22 @@ class CleanupLabel {
     pub text: String;
     pub fn show(self) { println(self.text); }
 }
-async fn waiting() {
+async fn waiting(ready: Channel<i64>) {
     let mut active = true;
     while active {
         let label = new CleanupLabel("class" + "-cleanup");
         defer label.show();
+        ready.send(1);
         await sleep(10000);
         active = false;
     }
 }
 async fn main() {
-    let task = waiting();
-    await sleep(20);
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    ready.recv();
     task.cancel();
-    await sleep(30);
+    await task.result();
     println(task.is_cancelled());
 }
 "#,
@@ -1727,21 +1744,23 @@ async fn main() {
 fn rsm_87_select_cancel_cleanup_survives_workers_and_scheduler_stress() {
     assert_async_output(
         r#"
-async fn waiting() {
+async fn waiting(ready: Channel<i64>) {
     let channel = Channel<i64>::with_capacity(1);
     channel.send(1);
     select {
         let value = channel.recv() => {
             defer println(value);
+            ready.send(1);
             await sleep(10000);
         }
     }
 }
 async fn main() {
-    let task = waiting();
-    await sleep(20);
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    ready.recv();
     task.cancel();
-    await sleep(30);
+    await task.result();
     println(task.is_cancelled());
 }
 "#,
@@ -1754,20 +1773,22 @@ async fn main() {
 fn rsm_88_while_cancel_cleanup_survives_full_gc_stress() {
     assert_async_output(
         r#"
-async fn waiting() {
+async fn waiting(ready: Channel<i64>) {
     let mut active = true;
     while active {
         let value = "while" + "-gc";
         defer println(value);
+        ready.send(1);
         await sleep(10000);
         active = false;
     }
 }
 async fn main() {
-    let task = waiting();
-    await sleep(20);
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    ready.recv();
     task.cancel();
-    await sleep(30);
+    await task.result();
     println(task.is_cancelled());
 }
 "#,
