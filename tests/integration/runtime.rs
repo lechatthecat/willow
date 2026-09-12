@@ -5358,7 +5358,7 @@ fn main() {
 }
 
 #[test]
-fn downcast_04b_debug_build_embeds_nil_guard_contexts() {
+fn downcast_04b_debug_binary_preserves_matching_and_fallback() {
     let id = unique_test_id();
     let src_path = temp_path(format!("willow_downcast_guard_{}.wi", id));
     let bin_path = temp_path(format!("willow_downcast_guard_{}", id));
@@ -5372,7 +5372,7 @@ fn kind(a: Animal) -> String {
         _ => "other",
     };
 }
-fn main() { println(kind(new Cat())); }
+fn main() { println(kind(new Cat())); println(kind(new Dog())); }
 "#;
     std::fs::write(&src_path, source).unwrap();
 
@@ -5383,15 +5383,19 @@ fn main() { println(kind(new Cat())); }
         .expect("failed to compile");
     assert!(output.status.success(), "should compile");
 
-    let binary = std::fs::read(&bin_path).expect("binary should exist");
-    let content = String::from_utf8_lossy(&binary);
+    // Unreferenced builtin strings are not a diagnostic contract: native
+    // linkers may remove them. Verify the emitted downcast paths execute.
+    // Interface guard calls/contexts are pinned by emit_interface's object test.
+    let execution = std::process::Command::new(&bin_path)
+        .output()
+        .expect("failed to run debug downcast binary");
 
     let _ = std::fs::remove_file(&src_path);
     let _ = std::fs::remove_file(&bin_path);
     let _ = std::fs::remove_file(format!("{bin_path}.wsmap"));
 
-    assert!(content.contains("interface downcast box"));
-    assert!(content.contains("interface downcast object"));
+    assert!(execution.status.success());
+    assert_eq!(execution.stdout, b"other\ndog\n");
 }
 
 #[test]

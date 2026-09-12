@@ -693,19 +693,21 @@ fn rsm_35_multiple_gc_operands_survive_nested_cancel_cleanup() {
     assert_async_output(
         r#"
 fn cleanup(first: String, second: String) { println(first + second); }
-async fn waiting() {
+async fn waiting(ready: Channel<i64>) {
     if true {
         let first = "left" + "-";
         let second = "right" + "!";
         defer cleanup(first, second);
+        ready.send(1);
         await sleep(10000);
     }
 }
 async fn main() {
-    let task = waiting();
-    await sleep(20);
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    ready.recv();
     task.cancel();
-    await sleep(30);
+    await task.result();
     println(task.is_cancelled());
 }
 "#,
