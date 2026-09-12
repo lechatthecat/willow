@@ -2,6 +2,11 @@ name: Performance validation
 
 on:
   workflow_dispatch:
+    inputs:
+      targets:
+        description: Native runner labels as a JSON array
+        required: false
+        default: '["ubuntu-24.04", "ubuntu-24.04-arm", "macos-15", "macos-15-intel", "windows-2025"]'
   push:
     branches: [codex/bd-performance-batch]
     paths:
@@ -22,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025]
+        os: ${{ fromJSON(inputs.targets || '["ubuntu-24.04", "ubuntu-24.04-arm", "macos-15", "macos-15-intel", "windows-2025"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4

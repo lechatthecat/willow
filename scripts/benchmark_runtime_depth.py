@@ -131,10 +131,14 @@ def main():
             for label in samples:
                 binary = root / (f"{name}-{label}" + (".exe" if os.name == "nt" else ""))
                 compiler = getattr(args, f"{label}_compiler") or args.compiler
-                subprocess.run([
+                compilation = subprocess.run([
                     str(compiler.resolve()), "build", str(entry), "--release",
                     "--runtime-lib", str(getattr(args, label).resolve()), "-o", str(binary)
-                ], check=True, capture_output=True)
+                ], capture_output=True)
+                if compilation.returncode:
+                    raise RuntimeError(f"{name}/{label} compile failed:\n"
+                                       + compilation.stdout.decode(errors="replace")
+                                       + compilation.stderr.decode(errors="replace"))
                 binaries[label] = binary
                 output = subprocess.check_output([str(binary)], timeout=60)
                 if expected is None:
