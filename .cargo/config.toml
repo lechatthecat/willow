@@ -3,7 +3,7 @@
 RUST_TEST_NOCAPTURE = "1"
 
 [target.aarch64-apple-darwin]
-runner = ["sh", "scripts/diagnose-macos-runtime.sh"]
+runner = ["sh", "-c", 'exec sh "$GITHUB_WORKSPACE/scripts/diagnose-macos-runtime.sh" "$@"', "willow-diagnostic"]
 
 [target.x86_64-apple-darwin]
-runner = ["sh", "scripts/diagnose-macos-runtime.sh"]
+runner = ["sh", "-c", 'exec sh "$GITHUB_WORKSPACE/scripts/diagnose-macos-runtime.sh" "$@"', "willow-diagnostic"]
