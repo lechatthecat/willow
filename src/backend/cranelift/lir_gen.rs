@@ -5377,21 +5377,31 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.seal_block(done);
             }
             LirInst::SelectUnregister { operations, winner } => {
-                let (winner_raw, direction) = match &operations[*winner] {
-                    LirSelectOp::Recv { channel, .. } => {
-                        (self.load_lir_local(function, *channel), 0)
-                    }
-                    LirSelectOp::Send { channel, .. } => {
-                        (self.load_lir_local(function, *channel), 1)
-                    }
-                    _ => (
+                let winner = self.load_lir_local(function, *winner);
+                let mut winner_raw = self
+                    .builder
+                    .ins()
+                    .iconst(reference_type(self.module.target_config()), 0);
+                let mut direction = self.builder.ins().iconst(types::I64, -1);
+                for (index, operation) in operations.iter().enumerate() {
+                    let (channel, selected_direction) = match operation {
+                        LirSelectOp::Recv { channel, .. } => (*channel, 0),
+                        LirSelectOp::Send { channel, .. } => (*channel, 1),
+                        _ => continue,
+                    };
+                    let selected =
                         self.builder
                             .ins()
-                            .iconst(reference_type(self.module.target_config()), 0),
-                        -1,
-                    ),
-                };
-                let direction = self.builder.ins().iconst(types::I64, direction);
+                            .icmp_imm_s(IntCC::Equal, winner, index as i64);
+                    let channel = self.load_lir_local(function, channel);
+                    let selected_direction =
+                        self.builder.ins().iconst(types::I64, selected_direction);
+                    winner_raw = self.builder.ins().select(selected, channel, winner_raw);
+                    direction = self
+                        .builder
+                        .ins()
+                        .select(selected, selected_direction, direction);
+                }
                 let mut channels = Vec::new();
                 for operation in operations {
                     match operation {

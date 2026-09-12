@@ -224,7 +224,7 @@ pub enum LirInst {
     },
     SelectUnregister {
         operations: Vec<LirSelectOp>,
-        winner: usize,
+        winner: LirLocalId,
     },
     SelectCommit {
         operation: LirSelectOp,

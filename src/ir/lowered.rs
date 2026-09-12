@@ -579,7 +579,7 @@ pub(crate) enum SourceInst {
     },
     SelectUnregister {
         operations: Vec<LirSelectOp>,
-        winner: usize,
+        winner: LirLocalId,
     },
     SelectCommit {
         operation: LirSelectOp,
@@ -3567,11 +3567,11 @@ impl Builder {
         });
 
         self.switch_to(idle);
-        if let Some(default) = operations
+        let default = operations
             .iter()
-            .position(|operation| matches!(operation, LirSelectOp::Default))
-        {
-            self.terminate(SourceTerminator::Jump(case_blocks[default]));
+            .position(|operation| matches!(operation, LirSelectOp::Default));
+        if default.is_some() {
+            self.terminate(SourceTerminator::Jump(dispatch));
         } else if self.is_async {
             self.terminate(SourceTerminator::Suspend {
                 operation: SuspendOp::SelectWait {
@@ -3598,15 +3598,26 @@ impl Builder {
         }
 
         self.switch_to(dispatch);
+        // All winners share one alias-aware cleanup graph. `chosen == -1`
+        // denotes default, which retains no channel ownership.
+        self.push(SourceInst::SelectUnregister {
+            operations: operations.clone(),
+            winner: chosen,
+        });
         let selectable: Vec<_> = operations
             .iter()
             .enumerate()
             .filter(|(_, operation)| !matches!(operation, LirSelectOp::Default))
             .map(|(index, _)| index)
             .collect();
+        if selectable.is_empty() {
+            self.terminate(SourceTerminator::Jump(
+                default.map_or(done, |index| case_blocks[index]),
+            ));
+        }
         for (position, index) in selectable.iter().enumerate() {
             let fallback = if position + 1 == selectable.len() {
-                probe
+                default.map_or(probe, |index| case_blocks[index])
             } else {
                 self.new_block()
             };
@@ -3634,10 +3645,6 @@ impl Builder {
 
         for (index, case) in cases.iter().enumerate() {
             self.switch_to(case_blocks[index]);
-            self.push(SourceInst::SelectUnregister {
-                operations: operations.clone(),
-                winner: index,
-            });
             let success_name = self.synthetic_name("select_success");
             let success = self.declare_local(success_name, Type::Bool, None, true, false);
             self.push(SourceInst::SelectCommit {
@@ -5622,6 +5629,46 @@ mod tests {
                 .keys()
                 .all(|id| f.locals.get(id.0 as usize).is_some())
         );
+    }
+
+    #[test]
+    fn select_cleanup_graph_is_shared_across_all_winners() {
+        for asynchronous in [false, true] {
+            for count in [1, 10, 40] {
+                let prefix = if asynchronous { "async " } else { "" };
+                let mut source = format!("{prefix}fn f(ch: Channel<i64>) {{ select {{");
+                for _ in 0..count {
+                    source.push_str("let value = ch.recv() => { print(value); }");
+                }
+                source.push_str("default => { print(0); } } }");
+                let p = lir(&source);
+                let f = func(&p, "f");
+                let cleanups = f
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.instrs)
+                    .filter_map(|inst| match inst {
+                        SourceInst::SelectUnregister { operations, winner } => {
+                            Some((operations, winner))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                // One quadratic alias-check graph, not one per winning arm.
+                assert_eq!(cleanups.len(), 1, "{count} arms, async={asynchronous}");
+                assert_eq!(cleanups[0].0.len(), count + 1);
+                let picks = f
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.instrs)
+                    .filter_map(|inst| match inst {
+                        SourceInst::SelectPick { chosen, .. } => Some(chosen),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(picks, vec![cleanups[0].1]);
+            }
+        }
     }
 
     #[test]
