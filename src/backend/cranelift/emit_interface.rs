@@ -600,25 +600,32 @@ fn main() {}
 
     fn nil_check_relocations_in_symbol(bytes: &[u8], symbol_name: &str) -> usize {
         let file = object::File::parse(bytes).expect("fixture object should parse");
+        let matches_name = |name: &str, expected: &str| {
+            name == expected
+                || (file.format() == object::BinaryFormat::MachO
+                    && name.strip_prefix('_') == Some(expected))
+        };
         let probe = file
             .symbols()
-            .find(|symbol| symbol.name().ok() == Some(symbol_name))
+            .find(|symbol| symbol.name().is_ok_and(|name| matches_name(name, symbol_name)))
             .unwrap_or_else(|| panic!("{symbol_name} symbol should exist"));
         let section = file
             .section_by_index(probe.section_index().expect("probe should have a section"))
             .expect("probe section should exist");
-        let start = probe.address();
-        // COFF function symbols commonly report a size of zero. In that case,
+        // Relocation offsets are section-relative, including in Mach-O where
+        // the section and its function symbols can have nonzero addresses.
+        let start = probe.address() - section.address();
+        // COFF and Mach-O function symbols commonly report a size of zero. In that case,
         // use the next symbol in the same section as the function boundary.
         let end = if probe.size() != 0 {
             start + probe.size()
         } else {
             file.symbols()
                 .filter(|symbol| symbol.section_index() == probe.section_index())
-                .map(|symbol| symbol.address())
+                .map(|symbol| symbol.address() - section.address())
                 .filter(|address| *address > start)
                 .min()
-                .unwrap_or(section.address() + section.size())
+                .unwrap_or(section.size())
         };
         section
             .relocations()
@@ -632,7 +639,7 @@ fn main() {}
                 file.symbol_by_index(index)
                     .ok()
                     .and_then(|symbol| symbol.name().ok())
-                    == Some("willow_nil_deref")
+                    .is_some_and(|name| matches_name(name, "willow_nil_deref"))
             })
             .count()
     }
