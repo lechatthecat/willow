@@ -49,11 +49,12 @@ impl AsRef<std::ffi::OsStr> for RuntimeStaticlib {
 
 pub(super) fn build_runtime_staticlib(release: bool) -> RuntimeStaticlib {
     use willow_compiler::toolchain::Toolchain;
-    let options = if release {
+    let mut options = if release {
         willow_compiler::CompilerOptions::release()
     } else {
         willow_compiler::CompilerOptions::debug()
     };
+    options.target.cargo_target_dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
     let toolchain = willow_compiler::toolchain::HostToolchain::new(&options.target);
     let path = toolchain
         .resolve_runtime_library()
