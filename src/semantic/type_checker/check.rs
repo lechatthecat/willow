@@ -707,6 +707,16 @@ impl TypeChecker {
         for stmt in &block.stmts {
             self.check_stmt(stmt);
         }
+        for stmt in &block.stmts {
+            if let Stmt::Let(binding) = stmt
+                && self.inferred_maps.remove(&binding.span).is_some()
+            {
+                self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                    "cannot infer map key and value types")
+                    .with_label(Label::primary(binding.span, "map needs type information"))
+                    .with_help("add a Map<K, V> annotation or insert a key and value before using its contents"));
+            }
+        }
         self.symbols.pop_scope();
         self.lexical_block_depth -= 1;
     }
@@ -929,6 +939,19 @@ impl TypeChecker {
                     }
                     inferred
                 };
+                if annotation.is_none()
+                    && builtin_types::binary_args(&ty, B::Map)
+                        .is_some_and(|(key, value)| *key == Type::Void && *value == Type::Void)
+                {
+                    self.inferred_maps.insert(
+                        s.span,
+                        (
+                            vec![s.init.id()],
+                            self.current_async_context
+                                .then_some(self.async_local_types.len()),
+                        ),
+                    );
+                }
                 // Record the resolved type of locals inside async fns so the
                 // backend can frame-back unannotated live-across-await locals
                 // (willow-lpn.5c).
@@ -1596,6 +1619,9 @@ impl TypeChecker {
                 }
                 // Local variable?
                 if let Some(info) = self.symbols.lookup_var(name) {
+                    if let Some((uses, _)) = self.inferred_maps.get_mut(&info.declaration_span) {
+                        uses.push(expr.id());
+                    }
                     return info.ty.clone();
                 }
                 // Named function used as a value: `apply(10, double)` where `double: fn(...)`

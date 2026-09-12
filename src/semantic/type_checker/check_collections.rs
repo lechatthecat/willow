@@ -309,6 +309,47 @@ impl TypeChecker {
         let key_ty = key_ty.clone();
         let val_ty = val_ty.clone();
 
+        if key_ty == Type::Void
+            && val_ty == Type::Void
+            && m.method == "insert"
+            && m.args.len() == 2
+            && let Expr::Var(name, _, _) = &m.object
+            && let Some(info) = self.symbols.lookup_var(name).cloned()
+            && self.inferred_maps.contains_key(&info.declaration_span)
+        {
+            let key = self.check_expr(&m.args[0].expr);
+            let value = self.check_expr(&m.args[1].expr);
+            if key != Type::Void && value != Type::Void {
+                let ty = B::Map.apply(vec![key, value]);
+                let (uses, async_slot) = self.inferred_maps.remove(&info.declaration_span).unwrap();
+                for id in uses {
+                    self.expr_types.insert(id, ty.clone());
+                }
+                if let Some(slot) = async_slot {
+                    self.async_local_types[slot] = ty.clone();
+                }
+                self.symbols.lookup_var_mut(name).unwrap().ty = ty;
+            }
+            return Some(Type::Void);
+        }
+
+        if (key_ty == Type::Void || val_ty == Type::Void)
+            && matches!(
+                m.method.as_str(),
+                "get" | "contains" | "freeze" | "toString"
+            )
+        {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    "cannot use map contents before key and value types are known",
+                )
+                .with_label(Label::primary(m.span, "map needs type information"))
+                .with_help("insert a key and value first, or add a Map<K, V> annotation"),
+            );
+        }
+
         let check_key = async |checker: &mut Self, arg: &CallArg| {
             let k = checker.check_expr(&arg.expr);
             if key_ty != Type::Void && !checker.types_compatible(&key_ty, &k) {

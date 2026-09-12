@@ -127,3 +127,10 @@ the lambda passed here must not capture an enclosing local. A lambda that does
 capture is a `closure` value instead; see `lir_closures.wi`. Cancelling the returned Task cancels all chunk Tasks and exposes no
 partial result. A mapper panic follows the normal Task policy and aborts the
 process. See `parallel_map.wi`.
+
+## Map type inference
+
+`map_inference.wi` shows an unannotated local map whose first `insert(key, value)`
+determines its key and value types. Later insertions must match those types.
+Use an explicit `Map<K, V>` annotation for an empty map or when reading its
+contents before an insertion provides type information.

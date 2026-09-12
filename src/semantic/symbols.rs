@@ -274,6 +274,13 @@ impl SymbolTable {
         None
     }
 
+    pub fn lookup_var_mut(&mut self, name: &str) -> Option<&mut VarInfo> {
+        self.scopes
+            .iter_mut()
+            .rev()
+            .find_map(|scope| scope.get_mut(name))
+    }
+
     pub fn define_func(&mut self, name: String, info: FuncInfo) {
         self.functions
             .insert(FunctionId::free_from_source_name(&name), info);

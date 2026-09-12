@@ -19228,3 +19228,105 @@ fn main() {
         "<xy>\n40\n",
     );
 }
+
+#[test]
+fn map_inference_from_insert() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std::collections::Map;
+fn main() {
+    let m = Map::new();
+    println(m.len());
+    m.insert("k", 3);
+    println(m.get("k").unwrap());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "0\n3\n");
+}
+
+#[test]
+fn map_inference_preserves_types_and_shadowing() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std::collections::Map;
+fn main() {
+    let m = Map::new();
+    if true {
+        let m = Map::new();
+        m.insert(7, "inner");
+        println(m.get(7).unwrap());
+    }
+    m.insert("outer", 42);
+    println(m.get("outer").unwrap());
+    let n = Map::new();
+    n.insert(1, "value");
+    println(n.get(1).unwrap());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "inner\n42\nvalue\n");
+}
+
+#[test]
+fn map_inference_rejects_conflicting_insertions() {
+    for insertion in ["m.insert(1, 2);", "m.insert(\"b\", \"bad\");"] {
+        let source = format!(
+            r#"import std::collections::Map;
+fn main() {{ let m = Map::new(); m.insert("a", 1); {insertion} }}"#
+        );
+        assert_compile_error_contains(&source, &["error[E0201]", "map"]);
+    }
+}
+
+#[test]
+fn map_inference_requires_evidence_for_empty_map() {
+    assert_compile_error_contains(
+        "import std::collections::Map; fn main() { let m = Map::new(); println(m.len()); }",
+        &["error[E0201]", "cannot infer map key and value types"],
+    );
+}
+
+#[test]
+fn map_inference_works_in_async_body() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std::collections::Map;
+async fn number() -> i64 { return 3; }
+async fn main() {
+    let m = Map::new();
+    m.insert("k", await number());
+    println(m.get("k").unwrap());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn map_inference_reports_early_content_use() {
+    assert_compile_error_contains(
+        r#"import std::collections::Map;
+fn main() { let m = Map::new(); m.get("k"); m.insert("k", 3); }"#,
+        &["error[E0201]", "before key and value types are known"],
+    );
+}
+
+#[test]
+fn map_inference_insertion_in_nested_scope() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std::collections::Map;
+fn main() {
+    let m = Map::new();
+    if true { m.insert("k", 3); }
+    println(m.get("k").unwrap());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "3\n");
+}

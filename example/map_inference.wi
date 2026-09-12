@@ -1,0 +1,9 @@
+import std::collections::Map;
+
+fn main() {
+    let scores = Map::new();
+    scores.insert("Ada", 42);
+    scores.insert("Grace", 43);
+    println(scores.get("Ada").unwrap());
+    println(scores.len());
+}

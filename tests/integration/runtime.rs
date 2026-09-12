@@ -889,6 +889,7 @@ fn test_runnable_example_files_compile_and_run() {
             "example/constructor_reference_args.wi",
             "42\n22\n6\n20\nhi!/hi!\n31\n6\n",
         ),
+        ("example/map_inference.wi", "42\n2\n"),
         ("example/maps.wi", "2\n31\n25\n-1\ntrue\nfalse\ntwo\n"),
         ("example/module_alias_demo/main.wi", "5\n16\n"),
         (
