@@ -344,6 +344,10 @@ impl Codegen {
     pub fn new(opts: &CompilerOptions) -> Result<Self> {
         let isa_builder = cranelift_native::builder().map_err(|e| anyhow::anyhow!("{}", e))?;
         let mut flag_builder = settings::builder();
+        // Apple Silicon requires position-independent executable text.
+        if cfg!(target_vendor = "apple") {
+            flag_builder.set("is_pic", "true")?;
+        }
         match opts.target.build_mode {
             BuildMode::Debug => flag_builder.set("opt_level", "none")?,
             BuildMode::Release => flag_builder.set("opt_level", "speed")?,
