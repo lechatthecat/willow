@@ -27,7 +27,7 @@ pub(crate) fn protect_current_thread() {
 }
 
 /// Change the signal handler's guard range while entering a task-owned stack.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn replace_guard(lower: usize, upper: usize) -> (usize, usize) {
     protect_current_thread();
     PROTECTION.with(|slot| slot.borrow().as_ref().unwrap().replace_guard(lower, upper))
@@ -214,16 +214,14 @@ mod platform {
                 return;
             }
             if action.sa_sigaction == libc::SIG_DFL || consumed {
-                // Default memory faults are fatal. Restore that disposition
-                // and let the original instruction repeat. Synthetic signals
-                // need explicit redelivery because they have no instruction.
+                // Restore the fatal disposition and redeliver explicitly.
+                // Darwin can report SEGV_ACCERR even for raise(SIGSEGV), so
+                // si_code cannot tell us whether an instruction will repeat.
                 let mut default: libc::sigaction = unsafe { std::mem::zeroed() };
                 default.sa_sigaction = libc::SIG_DFL;
                 unsafe { libc::sigemptyset(&mut default.sa_mask) };
                 unsafe { libc::sigaction(signal, &default, ptr::null_mut()) };
-                if unsafe { (*info).si_code } <= 0 {
-                    unsafe { libc::raise(signal) };
-                }
+                unsafe { libc::raise(signal) };
                 return;
             }
 
@@ -367,7 +365,6 @@ mod platform {
     }
 
     impl Protection {
-        #[cfg(target_os = "linux")]
         pub(super) fn replace_guard(&self, lower: usize, upper: usize) -> (usize, usize) {
             let slot = unsafe { &*self.slot };
             let previous = (
@@ -575,7 +572,7 @@ mod platform {
             }
             use std::os::unix::process::ExitStatusExt;
             let output = subprocess(TEST);
-            assert_eq!(output.status.signal(), Some(libc::SIGSEGV));
+            assert_eq!(output.status.signal(), Some(libc::SIGSEGV), "{output:?}");
             assert!(
                 !output
                     .stderr

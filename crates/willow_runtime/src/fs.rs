@@ -518,12 +518,25 @@ mod tests {
 
     #[test]
     fn blocked_syscall_does_not_hold_a_scheduler_worker() {
+        use crate::async_frame::async_frame_slot_offset;
         use crate::scheduler::{
             reset_global_scheduler_for_test, willow_sched_run_until, willow_sched_task_state,
         };
 
-        unsafe extern "C" fn ready_immediately(_frame: *mut c_void) -> i32 {
-            crate::task::RUNTIME_POLL_READY
+        unsafe extern "C" fn ready_after_blocked(frame: *mut c_void) -> i32 {
+            let blocked_id = unsafe {
+                *(frame
+                    .cast::<u8>()
+                    .add(async_frame_slot_offset(0))
+                    .cast::<u64>())
+            };
+            if willow_sched_task_state(blocked_id) == 7 {
+                crate::task::RUNTIME_POLL_READY
+            } else {
+                // Task publication is Ready; it becomes BlockedSyscall only
+                // after its first poll. Do not assume worker dispatch order.
+                crate::task::RUNTIME_POLL_YIELD
+            }
         }
 
         let _guard = runtime_test_guard();
@@ -547,8 +560,14 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("blocking pool job did not start");
 
-        let quick_id =
-            crate::scheduler::willow_sched_spawn(ready_immediately, std::ptr::null_mut());
+        let quick_frame = crate::async_frame::willow_async_frame_alloc(1, 0);
+        unsafe {
+            *quick_frame
+                .cast::<u8>()
+                .add(async_frame_slot_offset(0))
+                .cast::<u64>() = blocked_id;
+        }
+        let quick_id = crate::scheduler::willow_sched_spawn(ready_after_blocked, quick_frame);
         assert_eq!(
             willow_sched_run_until(quick_id),
             1,

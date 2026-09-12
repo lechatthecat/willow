@@ -1,28 +1,34 @@
 # 0001 — Task-owned synchronous stacks
 
-- **Status:** implemented on GNU Linux x86_64 and aarch64; other targets retain E0810.
+- **Status:** implemented on GNU/Linux x86_64 and aarch64, macOS x86_64 and aarch64, and Windows x86_64 MSVC. Other targets retain E0810.
 - **Runtime:** `crates/willow_runtime/src/native_stack.rs`, `scheduler.rs`, `preempt.rs`.
 - **Compiler capability:** `ConcurrencyAnalyzer::with_sync_stack_preemption` and `TypeChecker::with_sync_stack_preemption`.
 - **Tests:** `tests/integration/native_sync_stack.rs` and runtime native-stack tests.
 
 ## Mechanism and supported targets
 
-The runtime uses libc `getcontext`, `makecontext`, and `swapcontext`, rather than
-Cranelift's experimental `stack_switch` instruction or hand-written assembly.
+The runtime uses `corosensei` 0.3.4 for non-moving, guarded coroutine stacks
+and ABI-preserving context switches on all enabled targets. This replaces the
+GNU libc `ucontext` backend so Linux exercises the same runtime integration as
+macOS and Windows. Cranelift's experimental `stack_switch` is not required.
+
 The build gate is exactly:
 
 ```rust
-all(target_os = "linux", target_env = "gnu",
-    any(target_arch = "x86_64", target_arch = "aarch64"))
+any(
+    all(target_os = "linux", target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+)
 ```
 
-GNU libc exposes the required context APIs on these targets. The host x86_64
-path is exercised by the runtime and integration tests; aarch64 is enabled by
-the same ABI-preserving libc mechanism and still needs a dedicated CI runner.
-Musl Linux, macOS, Windows, and other architectures have no enabled native-stack
-backend. Their compiler retains E0810 for task calls into synchronous looping
-or recursive helpers. No unsupported target silently receives a no-op version
-of this safety check.
+The compiler, scheduler, safepoints, and integration tests use this same gate.
+All four native CI targets accept task calls into synchronous looping and
+recursive helpers and run the same preemption and cancellation tests. GNU/Linux
+aarch64 is enabled but still needs a dedicated native CI runner. Musl Linux and
+targets outside the gate retain E0810; their safety check is not a no-op.
 
 The existing `stack_switch_capability` tests continue to probe the pinned
 Cranelift implementation. They describe that alternative's limitations, not the
@@ -31,10 +37,14 @@ this implementation.
 
 ## Stack ownership and scheduler affinity
 
-A poll executes on an 8 MiB writable `mmap` reservation with inaccessible guard
-pages at both ends. Physical pages are demand-paged by the kernel. The mapping
-and libc contexts stay at stable addresses until the native activation finishes;
-references into synchronous frames never relocate.
+A poll executes on a stack with 8 MiB usable capacity and a lower guard.
+On Unix, `corosensei::stack::DefaultStack` uses `mmap` and `mprotect`.
+On Windows it uses `VirtualAlloc`, reserves stack-growth guard pages and the
+current thread's overflow guarantee, and saves/restores the TEB stack bounds,
+deallocation stack, and guaranteed bytes during context switches. Runtime
+thread protection is installed before allocation so task stacks inherit the
+64 KiB overflow guarantee. Stack storage stays at a stable address until the
+native activation finishes; references into synchronous frames never relocate.
 
 An initial poll obtains a cached native stack from its worker, creating one if
 none is available. A completed poll returns the stack to that worker's cache.
@@ -86,17 +96,21 @@ task through `PanicContext`. Cancellation state and cleanup nesting live in the
 native stack, not worker TLS. Each resumed quantum gets a fresh scheduling
 budget; no-preempt regions cannot suspend through this hook.
 
-No Rust reference to `NativeStack` spans `swapcontext`: scheduler and trampoline
-code use stable raw pointers at this boundary. Context objects are initialized
-after allocation because libc may keep pointers to interior register storage.
-Rust unwinding is not used to implement language cancellation or panic;
-`extern "C"` entry points do not permit a Rust unwind across the context boundary.
+No Rust reference to the whole `NativeStack` spans a context switch:
+scheduler and trampoline code use stable raw pointers, and resumption borrows
+only the coroutine field. Rust unwinding is not used to implement language
+cancellation or panic; `extern "C"` entry points do not permit a Rust unwind.
+Dropping a stack requires all generated calls to have returned and all parked
+roots to have been removed. Only the idle trampoline is discarded at teardown;
+no generated cleanup is bypassed.
 
-The existing alternate signal stack and native stack-overflow handler switch
-the active guard range with the context and restore the worker's range on return.
-Cranelift's enabled stack probes therefore encounter the task guard before an
-adjacent mapping. Overflow remains fatal and uses the existing native-stack
-overflow diagnostic; it is not a recoverable language panic.
+On Linux and macOS the alternate signal stack and overflow handler switch the
+active guard range with the context and restore the worker's range on return.
+On Windows the backend maintains native TEB bounds and growth guards, and the
+vectored exception handler diagnoses stack exhaustion. Cranelift's stack
+probes encounter the task guard before exhausting the reservation. Overflow
+remains fatal and uses the existing native-stack-overflow diagnostic; it is
+not a recoverable language panic.
 
 ## Cancellation and cleanup
 
@@ -133,7 +147,8 @@ collection, trace isolation, persistent OS-thread affinity across separate
 drives, fairness with more busy helpers than workers, cancellation cleanup
 ordering, runtime callback cleanup, and panic/recover during cancellation.
 
-Cross-platform context implementations and platform CI remain required before
-lifting E0810 on the other targets. They must satisfy the same non-moving stack,
-root registration, OS affinity, and cleanup contracts; Windows additionally
-requires correct stack-bound/TIB and guard-page handling.
+Additional runtime tests check fatal overflow on a task stack, floating-point
+locals across repeated suspension and cache reuse, and Windows TEB stack-bound
+restoration. These tests and the native helper integration suite run on Linux,
+macOS Apple Silicon, macOS Intel, and Windows MSVC in CI. Cross-compilation
+checks compilation only; native CI results provide platform execution evidence.

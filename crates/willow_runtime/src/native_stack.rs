@@ -5,16 +5,18 @@
 //! scheduler lock, or GC registry lock crosses a context switch. Generated code
 //! is pinned to its scheduler worker while native frames remain suspended.
 
+#[cfg(unix)]
+use corosensei::stack::Stack;
+use corosensei::{Coroutine, CoroutineResult, Yielder};
 use std::cell::Cell;
 use std::ffi::c_void;
-use std::mem::MaybeUninit;
 
 use crate::stack_trace::RuntimeStackTrace;
 use crate::task::{RUNTIME_POLL_PREEMPTED, RuntimeCancelFn, RuntimePollFn};
 
 thread_local! {
     static CURRENT: Cell<*mut NativeStack> = const { Cell::new(std::ptr::null_mut()) };
-    // ucontext may retain pointers into its own allocation across cache moves.
+    // NativeStack and the coroutine stack retain stable addresses across cache moves.
     #[allow(clippy::vec_box)]
     static IDLE_STACKS: std::cell::RefCell<Vec<Box<NativeStack>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -22,10 +24,10 @@ thread_local! {
 pub(crate) struct NativeStack {
     pub(crate) worker: usize,
     owner_thread: std::thread::ThreadId,
-    context: libc::ucontext_t,
-    scheduler: libc::ucontext_t,
-    mapping: *mut c_void,
-    mapping_len: usize,
+    coroutine: Coroutine<(), (), ()>,
+    yielder: *const Yielder<(), ()>,
+    #[cfg(unix)]
+    guard: (usize, usize),
     poll: RuntimePollFn,
     cancel_entry: Option<RuntimeCancelFn>,
     frame: *mut c_void,
@@ -48,8 +50,8 @@ impl std::fmt::Debug for NativeStack {
 }
 
 // SAFETY: the scheduler transfers exclusive ownership only while this stack is
-// suspended and dispatches it only to its owning worker. The mapping and both
-// contexts retain stable addresses inside Box.
+// suspended and dispatches it only to its owning worker. The task allocation and
+// coroutine stack retain stable addresses; user frames never migrate.
 unsafe impl Send for NativeStack {}
 
 impl NativeStack {
@@ -85,59 +87,35 @@ impl NativeStack {
     }
 
     pub(crate) fn new(poll: RuntimePollFn, frame: *mut c_void) -> Box<Self> {
-        unsafe {
-            let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
-            let usable = 8 * 1024 * 1024;
-            let len = usable + 2 * page;
-            let mapping = libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            );
-            assert_ne!(
-                mapping,
-                libc::MAP_FAILED,
-                "cannot allocate task native stack"
-            );
-            let bottom = mapping.cast::<u8>().add(page).cast::<c_void>();
-            if libc::mprotect(bottom, usable, libc::PROT_READ | libc::PROT_WRITE) != 0 {
-                libc::munmap(mapping, len);
-                panic!("cannot protect task native stack");
-            }
-            let mut context = MaybeUninit::<libc::ucontext_t>::zeroed();
-            assert_eq!(libc::getcontext(context.as_mut_ptr()), 0);
-            let mut stack = Box::new(Self {
-                worker: crate::scheduler::current_worker(),
-                owner_thread: std::thread::current().id(),
-                context: context.assume_init(),
-                scheduler: MaybeUninit::zeroed().assume_init(),
-                mapping,
-                mapping_len: len,
-                poll,
-                cancel_entry: None,
-                frame,
-                result: 0,
-                suspended: false,
-                cancelled: false,
-                cleanup_depth: 0,
-                root_depth: 0,
-                parked_roots: None,
-                trace: RuntimeStackTrace::default(),
-                reference_context: Default::default(),
-            });
-            // getcontext may store interior pointers (e.g. x86 FP state), so
-            // initialize again after moving the context to its stable allocation.
-            assert_eq!(libc::getcontext(&mut stack.context), 0);
-            stack.context.uc_stack.ss_sp = bottom;
-            stack.context.uc_stack.ss_size = usable;
-            stack.context.uc_stack.ss_flags = 0;
-            stack.context.uc_link = std::ptr::null_mut();
-            libc::makecontext(&mut stack.context, trampoline, 0);
-            stack
-        }
+        // Windows stacks inherit the current thread's overflow guarantee.
+        crate::stack_overflow::protect_current_thread();
+        let storage = corosensei::stack::DefaultStack::new(8 * 1024 * 1024)
+            .expect("cannot allocate task native stack");
+        #[cfg(unix)]
+        let guard = {
+            let lower = storage.limit().get();
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+            (lower, lower + page)
+        };
+        Box::new(Self {
+            worker: crate::scheduler::current_worker(),
+            owner_thread: std::thread::current().id(),
+            coroutine: Coroutine::with_stack(storage, |yielder, ()| trampoline(yielder)),
+            yielder: std::ptr::null(),
+            #[cfg(unix)]
+            guard,
+            poll,
+            cancel_entry: None,
+            frame,
+            result: 0,
+            suspended: false,
+            cancelled: false,
+            cleanup_depth: 0,
+            root_depth: 0,
+            parked_roots: None,
+            trace: RuntimeStackTrace::default(),
+            reference_context: Default::default(),
+        })
     }
 
     pub(crate) fn is_suspended(&self) -> bool {
@@ -148,7 +126,7 @@ impl NativeStack {
     }
 
     /// The lifecycle grants exclusive stack ownership, but no Rust reference
-    /// spans swapcontext: generated code and safepoint hooks access CURRENT via
+    /// spans the context switch: generated code and safepoint hooks access CURRENT via
     /// raw pointers while the scheduler's Rust activation is suspended.
     pub(crate) unsafe fn resume(stack: *mut Self) -> i32 {
         unsafe {
@@ -170,16 +148,14 @@ impl NativeStack {
                     crate::gc::resume_parked_roots(token);
                 }
             }
-            let guard = crate::stack_overflow::replace_guard(
-                (*stack).mapping as usize,
-                (*stack).context.uc_stack.ss_sp as usize,
-            );
-            let switched = libc::swapcontext(
-                std::ptr::addr_of_mut!((*stack).scheduler),
-                std::ptr::addr_of!((*stack).context),
-            );
+            #[cfg(unix)]
+            let guard = crate::stack_overflow::replace_guard((*stack).guard.0, (*stack).guard.1);
+            // Borrow only the coroutine field: user code accesses the other
+            // fields through CURRENT while this activation is suspended.
+            let switched = (*std::ptr::addr_of_mut!((*stack).coroutine)).resume(());
+            #[cfg(unix)]
             crate::stack_overflow::replace_guard(guard.0, guard.1);
-            assert_eq!(switched, 0, "task context resume failed");
+            assert!(matches!(switched, CoroutineResult::Yield(())));
             (*stack).trace = crate::stack_trace::replace_current(outer_trace);
             (*stack).reference_context = crate::reference_debug::replace_current(outer_reference);
             CURRENT.with(|slot| slot.set(previous));
@@ -193,16 +169,21 @@ impl Drop for NativeStack {
         // A live synchronous frame must first run generated cancellation cleanup.
         assert!(!self.suspended, "dropping a suspended task native stack");
         assert!(self.parked_roots.is_none());
-        unsafe {
-            libc::munmap(self.mapping, self.mapping_len);
-        }
+        // Only the idle trampoline remains; no generated frames or roots are
+        // live. Finish it without unwinding through runtime TLS during teardown.
+        // SAFETY: the trampoline holds only raw pointers and trivial values at
+        // its idle yield, and all user calls have returned (asserted above).
+        unsafe { self.coroutine.force_reset() };
     }
 }
 
-extern "C" fn trampoline() {
+fn trampoline(yielder: &Yielder<(), ()>) {
     loop {
         let stack = CURRENT.with(Cell::get);
         assert!(!stack.is_null());
+        unsafe {
+            (*stack).yielder = yielder;
+        }
         // Do not keep an exclusive reference across the user poll: safepoints
         // access this same allocation through CURRENT while the poll is active.
         let (poll, cancel, frame) =
@@ -223,13 +204,7 @@ extern "C" fn trampoline() {
         unsafe {
             (*stack).result = result;
             (*stack).suspended = false;
-            assert_eq!(
-                libc::swapcontext(
-                    std::ptr::addr_of_mut!((*stack).context),
-                    std::ptr::addr_of!((*stack).scheduler)
-                ),
-                0
-            );
+            yielder.suspend(());
         }
     }
 }
@@ -245,13 +220,7 @@ pub(crate) fn suspend() -> bool {
         (*stack).parked_roots = Some(crate::gc::park_current_roots((*stack).root_depth));
         (*stack).result = RUNTIME_POLL_PREEMPTED;
         (*stack).suspended = true;
-        assert_eq!(
-            libc::swapcontext(
-                std::ptr::addr_of_mut!((*stack).context),
-                std::ptr::addr_of!((*stack).scheduler)
-            ),
-            0
-        );
+        (*(*stack).yielder).suspend(());
     }
     true
 }
@@ -302,6 +271,125 @@ mod tests {
     use super::*;
     use crate::preempt::{PreemptConfig, begin_quantum, willow_preempt_end, willow_sync_safepoint};
     use crate::task::RUNTIME_POLL_READY;
+
+    #[test]
+    fn native_stack_overflow_reports_the_runtime_diagnostic() {
+        const CHILD: &str = "WILLOW_TASK_STACK_OVERFLOW_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            #[inline(never)]
+            fn recurse(depth: usize) -> usize {
+                let padding = [1u8; 8192];
+                std::hint::black_box(&padding);
+                if std::hint::black_box(depth) == 0 {
+                    return 0;
+                }
+                recurse(depth - 1).wrapping_add(std::hint::black_box(padding[0]) as usize)
+            }
+            unsafe extern "C" fn overflow(_: *mut c_void) -> i32 {
+                std::hint::black_box(recurse(1_000_000));
+                RUNTIME_POLL_READY
+            }
+            let mut stack = NativeStack::new(overflow, std::ptr::null_mut());
+            unsafe { NativeStack::resume(&mut *stack) };
+            panic!("task stack exhaustion was not fatal");
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native_stack::tests::native_stack_overflow_reports_the_runtime_diagnostic",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(101), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("Willow runtime error: native stack overflow"),
+            "{output:?}"
+        );
+    }
+
+    #[test]
+    fn recycled_stack_preserves_float_locals_and_uses_the_new_frame() {
+        let _guard = crate::gc::runtime_test_guard();
+        unsafe extern "C" fn poll(frame: *mut c_void) -> i32 {
+            let initial = unsafe { *frame.cast::<f64>() };
+            let locals = std::array::from_fn::<_, 32, _>(|i| initial + i as f64 * 0.25);
+            for _ in 0..20 {
+                std::hint::black_box(&locals);
+                assert!(suspend());
+                for (i, value) in locals.iter().enumerate() {
+                    assert_eq!(*value, initial + i as f64 * 0.25);
+                }
+            }
+            unsafe { *frame.cast::<f64>() = locals.iter().sum() };
+            RUNTIME_POLL_READY
+        }
+        let mut address = None;
+        for initial in [1.25, 7.5, -4.0] {
+            let mut output = initial;
+            let mut stack = NativeStack::acquire(poll, (&mut output as *mut f64).cast());
+            let current = std::ptr::from_ref(&*stack);
+            assert_eq!(*address.get_or_insert(current), current);
+            for _ in 0..20 {
+                assert_eq!(
+                    unsafe { NativeStack::resume(&mut *stack) },
+                    RUNTIME_POLL_PREEMPTED
+                );
+            }
+            assert_eq!(
+                unsafe { NativeStack::resume(&mut *stack) },
+                RUNTIME_POLL_READY
+            );
+            assert_eq!(
+                output,
+                (0..32).map(|i| initial + i as f64 * 0.25).sum::<f64>()
+            );
+            NativeStack::recycle(stack);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_switch_updates_and_restores_thread_stack_bounds() {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentThreadStackLimits(low: *mut usize, high: *mut usize);
+        }
+        fn bounds() -> (usize, usize) {
+            let (mut low, mut high) = (0, 0);
+            unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+            let marker = 0u8;
+            let address = std::ptr::from_ref(&marker) as usize;
+            assert!(low <= address && address < high);
+            (low, high)
+        }
+        unsafe extern "C" fn poll(frame: *mut c_void) -> i32 {
+            let task_bounds = bounds();
+            unsafe { *frame.cast::<(usize, usize)>() = task_bounds };
+            assert!(suspend());
+            // StackLimit may grow as pages are committed; StackBase is fixed.
+            assert_eq!(bounds().1, task_bounds.1);
+            RUNTIME_POLL_READY
+        }
+        let _guard = crate::gc::runtime_test_guard();
+        let parent = bounds();
+        let mut task_bounds = (0usize, 0usize);
+        let mut stack = NativeStack::new(poll, std::ptr::from_mut(&mut task_bounds).cast());
+        assert_eq!(
+            unsafe { NativeStack::resume(&mut *stack) },
+            RUNTIME_POLL_PREEMPTED
+        );
+        assert_ne!(task_bounds.1, parent.1);
+        assert_eq!(bounds().1, parent.1);
+        assert_eq!(
+            unsafe { NativeStack::resume(&mut *stack) },
+            RUNTIME_POLL_READY
+        );
+        assert_eq!(bounds().1, parent.1);
+    }
 
     fn quantum() {
         begin_quantum(

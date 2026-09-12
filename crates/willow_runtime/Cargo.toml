@@ -13,3 +13,6 @@ libc = "0.2"
 ryu = "1"
 socket2 = "0.6.5"
 willow_abi = { path = "../willow_abi" }
+
+[target.'cfg(any(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "windows", target_arch = "x86_64", target_env = "msvc")))'.dependencies]
+corosensei = "0.3.4"

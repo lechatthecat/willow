@@ -12,9 +12,9 @@ The production-configuration unit test checks all three settings.
 
 Inline probes touch the active stack and need no probe libcall with a
 thread-stack limit assumption. They therefore compose with the task-owned
-non-moving GNU/Linux stacks in [decision 0001](0001-task-stack-switch-capability.md).
-Those stacks retain guard pages and register the active guard range with the
-fatal overflow handler. Probes do not replace guard pages or make overflow
+non-moving Linux/macOS/Windows stacks in [decision 0001](0001-task-stack-switch-capability.md).
+Those stacks retain guard pages; Unix registers the active guard range and
+Windows maintains native stack bounds for the fatal overflow handler. Probes do not replace guard pages or make overflow
 recoverable. Four-KiB spacing also touches every page on systems with larger
 pages, at the cost of additional touches.
 
@@ -47,6 +47,6 @@ terminate with the native-stack-overflow diagnostic.
 The 20 call/frame perspectives pass locally on Linux x86_64. The production
 flag test and overflow suite have no platform skip and are included in the
 Linux/macOS/Windows CI workflow from decision 0003. Native synchronous task
-stack tests separately cover Linux stack switching and cancellation.
+stack tests separately cover stack switching and cancellation on all four CI targets.
 macOS and Windows execution results remain pending those remote CI runs;
 this decision does not claim a local Linux run verifies their exception paths.

@@ -306,18 +306,32 @@ pub extern "C" fn willow_preempt_check() -> i32 {
 /// Invocation-constant activity bit for generated synchronous safepoint guards.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sync_native_active() -> i32 {
-    #[cfg(all(
-        target_os = "linux",
-        target_env = "gnu",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     ))]
     {
         i32::from(crate::native_stack::is_active())
     }
-    #[cfg(not(all(
-        target_os = "linux",
-        target_env = "gnu",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+    #[cfg(not(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     )))]
     0
 }
@@ -326,10 +340,17 @@ pub extern "C" fn willow_sync_native_active() -> i32 {
 /// through compiler-generated cleanup edges; yielding preserves the call chain.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sync_safepoint() -> i32 {
-    #[cfg(all(
-        target_os = "linux",
-        target_env = "gnu",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     ))]
     {
         if crate::native_stack::cancelled() != 0 {
@@ -341,10 +362,17 @@ pub extern "C" fn willow_sync_safepoint() -> i32 {
         }
         crate::native_stack::cancelled()
     }
-    #[cfg(not(all(
-        target_os = "linux",
-        target_env = "gnu",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+    #[cfg(not(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     )))]
     {
         crate::gc::willow_gc_safepoint();
@@ -354,18 +382,32 @@ pub extern "C" fn willow_sync_safepoint() -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sync_cancelled() -> i32 {
-    #[cfg(all(
-        target_os = "linux",
-        target_env = "gnu",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     ))]
     {
         crate::native_stack::cancelled()
     }
-    #[cfg(not(all(
-        target_os = "linux",
-        target_env = "gnu",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+    #[cfg(not(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     )))]
     {
         0
@@ -374,20 +416,34 @@ pub extern "C" fn willow_sync_cancelled() -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sync_cleanup_enter() {
-    #[cfg(all(
-        target_os = "linux",
-        target_env = "gnu",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     ))]
     crate::native_stack::cleanup_enter();
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sync_cleanup_leave() {
-    #[cfg(all(
-        target_os = "linux",
-        target_env = "gnu",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     ))]
     crate::native_stack::cleanup_leave();
 }

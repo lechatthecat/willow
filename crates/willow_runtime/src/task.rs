@@ -124,10 +124,17 @@ pub(crate) struct TaskDebugInfo {
 
 #[derive(Debug)]
 pub struct RuntimeTask {
-    #[cfg(all(
-        target_os = "linux",
-        target_env = "gnu",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     ))]
     pub(crate) native_stack: Option<Box<crate::native_stack::NativeStack>>,
     pub id: RuntimeTaskId,
@@ -178,10 +185,17 @@ unsafe impl Send for RuntimeTask {}
 impl Clone for RuntimeTask {
     fn clone(&self) -> Self {
         Self {
-            #[cfg(all(
-                target_os = "linux",
-                target_env = "gnu",
-                any(target_arch = "x86_64", target_arch = "aarch64")
+            #[cfg(any(
+                all(
+                    target_os = "linux",
+                    target_env = "gnu",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(
+                    target_os = "macos",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
             ))]
             native_stack: None,
             id: self.id,
@@ -203,10 +217,17 @@ impl Clone for RuntimeTask {
 impl RuntimeTask {
     pub fn new(id: RuntimeTaskId) -> Self {
         Self {
-            #[cfg(all(
-                target_os = "linux",
-                target_env = "gnu",
-                any(target_arch = "x86_64", target_arch = "aarch64")
+            #[cfg(any(
+                all(
+                    target_os = "linux",
+                    target_env = "gnu",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(
+                    target_os = "macos",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
             ))]
             native_stack: None,
             id,

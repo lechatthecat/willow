@@ -132,10 +132,8 @@ impl Toolchain for HostToolchain {
         {
             let mut command = Command::new("cc");
             command.arg(object).arg(runtime).arg("-o").arg(output);
-            // GNU linkers use `-no-pie`; Apple ld spells this `-no_pie`.
-            if cfg!(any(target_os = "macos", target_os = "ios")) {
-                command.arg("-Wl,-no_pie");
-            } else {
+            // Apple targets emit PIC and use the platform default PIE link.
+            if !cfg!(target_vendor = "apple") {
                 command.arg("-no-pie");
             }
             command.arg("-lm").arg("-lpthread");
