@@ -165,19 +165,6 @@ mod platform {
             .clone()
     }
 
-    fn synchronous_fault(code: libc::c_int) -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            // Darwin's SI_USER/SI_QUEUE/... start at 0x10001, unlike Linux's
-            // nonpositive synthetic codes (XNU bsd/sys/signal.h).
-            (1..0x10000).contains(&code)
-        }
-        #[cfg(target_os = "linux")]
-        {
-            code > 0
-        }
-    }
-
     unsafe extern "C" fn signal_handler(
         signal: libc::c_int,
         info: *mut libc::siginfo_t,
@@ -186,8 +173,7 @@ mod platform {
         // All allocations and publication happen during setup. The handler
         // uses only native pointer-sized atomics and POSIX signal-safe calls.
         let address = unsafe { (*info).si_addr() as usize };
-        let synchronous = synchronous_fault(unsafe { (*info).si_code });
-        if synchronous && address != 0 {
+        if unsafe { (*info).si_code } > 0 && address != 0 {
             let key = thread_key();
             let mut node = SLOTS.load(Ordering::Acquire);
             while !node.is_null() {
@@ -228,16 +214,14 @@ mod platform {
                 return;
             }
             if action.sa_sigaction == libc::SIG_DFL || consumed {
-                // Default memory faults are fatal. Restore that disposition
-                // and let the original instruction repeat. Synthetic signals
-                // need explicit redelivery because they have no instruction.
+                // Restore the fatal disposition and redeliver explicitly.
+                // Darwin can report SEGV_ACCERR even for raise(SIGSEGV), so
+                // si_code cannot tell us whether an instruction will repeat.
                 let mut default: libc::sigaction = unsafe { std::mem::zeroed() };
                 default.sa_sigaction = libc::SIG_DFL;
                 unsafe { libc::sigemptyset(&mut default.sa_mask) };
                 unsafe { libc::sigaction(signal, &default, ptr::null_mut()) };
-                if !synchronous {
-                    unsafe { libc::raise(signal) };
-                }
+                unsafe { libc::raise(signal) };
                 return;
             }
 
