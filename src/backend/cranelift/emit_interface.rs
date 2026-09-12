@@ -607,7 +607,11 @@ fn main() {}
         };
         let probe = file
             .symbols()
-            .find(|symbol| symbol.name().is_ok_and(|name| matches_name(name, symbol_name)))
+            .find(|symbol| {
+                symbol
+                    .name()
+                    .is_ok_and(|name| matches_name(name, symbol_name))
+            })
             .unwrap_or_else(|| panic!("{symbol_name} symbol should exist"));
         let section = file
             .section_by_index(probe.section_index().expect("probe should have a section"))
