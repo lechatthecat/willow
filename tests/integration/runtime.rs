@@ -1469,6 +1469,21 @@ fn test_runnable_example_files_compile_and_run() {
                 matches!(&lines[1..], ["1", "2"] | ["2", "1"]),
                 "{path} channel results mismatch: {out}"
             );
+        } else if path == "example/coop_select.wi" {
+            // Independent producers can become runnable together; select is
+            // allowed to consume either ready channel first.
+            assert!(
+                matches!(out.as_str(), "100\n200\n300\n" | "200\n100\n300\n"),
+                "{path} channel values or final sum mismatch: {out}"
+            );
+        } else if path == "example/async_sleep_ordering.wi" {
+            // Deadline promotion does not order execution on parallel workers.
+            let lines = out.lines().collect::<Vec<_>>();
+            assert_eq!(lines.len(), 6, "{path} output mismatch: {out}");
+            assert_eq!(&lines[3..], &["6", "true", "210"], "{path}: {out}");
+            let mut workers = lines[..3].to_vec();
+            workers.sort_unstable();
+            assert_eq!(workers, ["1", "2", "3"], "{path}: {out}");
         } else if path == "example/async_yield.wi" {
             let lines = out.lines().collect::<Vec<_>>();
             assert_eq!(lines.len(), 5, "{path} output mismatch: {out}");

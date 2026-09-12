@@ -5,6 +5,7 @@
 // is woken by a later send/close on any of them. Here the consumer selects over
 // two channels fed by two independent producers running on the cooperative
 // scheduler, so it blocks on whichever channel becomes ready first.
+// The two values may print in either order; their awaited sum prints last.
 
 async fn fast(ch: Channel<i64>) -> i64 {
     await sleep(1);

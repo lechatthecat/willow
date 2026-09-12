@@ -8,14 +8,10 @@
 // concurrent computation in Willow.  Awaiting requires an async context, so
 // `main` is declared `async`.
 
-// The work a task performs must stay preemptible.  A *synchronous* helper that
-// can run unbounded work — a loop, or recursion such as `fib(n - 1) + fib(n - 2)`
-// — would hold a scheduler worker until it finished, so calling one from a task
-// is rejected with E0810.  See `example/task_recursion_rejected.wi`.
-//
-// Computing the value inside the `async fn` avoids that: every loop backedge in
-// an async fn carries a safepoint, so the task yields to the scheduler as it
-// goes.
+// Both async loops and synchronous helpers can be preempted on the supported
+// Linux, macOS, and Windows targets. Synchronous helpers use task-owned native
+// stacks, preserving their call chain while another task runs. This example
+// keeps the computation directly in the async body to show loop safepoints.
 async fn fib_task(n: i64) -> i64 {
     let mut previous = 0;
     let mut current = 1;

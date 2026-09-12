@@ -7,8 +7,8 @@
 // independent operations that no longer serialize on one global lock — but the
 // behaviour they implement is unchanged, which is what this program shows.
 //
-// The output is fixed: the three workers resume in deadline order (30ms, 60ms,
-// 90ms) even though they were started in the opposite order.
+// Timers are promoted in deadline order (30ms, 60ms, 90ms), but parallel
+// workers may print their IDs in any order. The awaited sum prints afterwards.
 
 import std::collections::Array;
 
