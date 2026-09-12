@@ -77,8 +77,14 @@ fn is_idle(state: &ParallelRunState) -> bool {
     parallel_run_is_idle_locked(state)
 }
 
+// Every scheduler frame reserves the ABI header, even when the fixture uses
+// only the state word. Completion publishes status in the third header word.
+type CounterFrame = [i64; crate::async_frame::ASYNC_FRAME_HEADER_WORDS as usize];
+
 fn counter_frame() -> *mut c_void {
-    Box::into_raw(Box::new(0i64)) as *mut c_void
+    Box::into_raw(Box::new(
+        [0; crate::async_frame::ASYNC_FRAME_HEADER_WORDS as usize],
+    )) as *mut c_void
 }
 
 /// One node of an await chain: the id it awaits (0 for the tail), a turn
@@ -87,6 +93,7 @@ fn counter_frame() -> *mut c_void {
 /// its child and is woken by it is polled twice.
 #[repr(C)]
 struct ChainFrame {
+    header: CounterFrame,
     child: u64,
     turns: i64,
     polls: i64,
@@ -94,6 +101,7 @@ struct ChainFrame {
 
 fn chain_frame(child: u64) -> *mut c_void {
     Box::into_raw(Box::new(ChainFrame {
+        header: [0; crate::async_frame::ASYNC_FRAME_HEADER_WORDS as usize],
         child,
         turns: 0,
         polls: 0,
@@ -450,7 +458,7 @@ fn idle_14_run_until_returns_only_once_its_target_is_terminal() {
         -1,
         "the drive may not return while its target is still runnable"
     );
-    drop(unsafe { Box::from_raw(frame as *mut i64) });
+    drop(unsafe { Box::from_raw(frame as *mut CounterFrame) });
 }
 
 #[test]
@@ -489,7 +497,7 @@ fn idle_17_run_until_reports_every_completion_it_drove() {
         completed <= others.len() as i64 + 1,
         "a re-drive must not double-count completions, got {completed}"
     );
-    drop(unsafe { Box::from_raw(frame as *mut i64) });
+    drop(unsafe { Box::from_raw(frame as *mut CounterFrame) });
 }
 
 #[test]
@@ -507,7 +515,7 @@ fn idle_18_a_drive_strands_no_runnable_task_behind_its_own_stop() {
     );
     assert!(!scheduler_has_wake_source());
     for frame in frames {
-        drop(unsafe { Box::from_raw(frame as *mut i64) });
+        drop(unsafe { Box::from_raw(frame as *mut CounterFrame) });
     }
 }
 
@@ -525,7 +533,7 @@ fn idle_19_more_tasks_than_workers_all_complete_in_one_drive() {
         assert_eq!(willow_sched_task_state(id), -1);
     }
     for frame in frames {
-        drop(unsafe { Box::from_raw(frame as *mut i64) });
+        drop(unsafe { Box::from_raw(frame as *mut CounterFrame) });
     }
 }
 
