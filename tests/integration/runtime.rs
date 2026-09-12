@@ -882,6 +882,10 @@ fn test_runnable_example_files_compile_and_run() {
         ),
         ("example/lambda_context.wi", "20\n12\n12\nyes\n"),
         (
+            "example/reference_width.wi",
+            "reference\n4294967297\n4294967298\nreference!\n",
+        ),
+        (
             "example/match_binding_gc_roots.wi",
             "99\n10\n55\n9\n[note] kept!\n300\n7\n",
         ),

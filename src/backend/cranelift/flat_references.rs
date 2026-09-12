@@ -71,7 +71,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .expect("checked local place");
                 match storage {
                     VarStorage::Stack { slot, .. } => {
-                        let ptr = self.module.target_config().pointer_type();
+                        let ptr = reference_type(self.module.target_config());
                         self.builder.ins().stack_addr(ptr, slot, 0)
                     }
                     VarStorage::ReferencePtr { var, .. } => self.builder.use_var(var),

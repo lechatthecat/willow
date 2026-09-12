@@ -178,10 +178,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let frame = self
             .async_frame
             .expect("lock cleanup requires its compiler-generated async frame");
-        let handle = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), frame, handle_offset);
+        let handle = self.builder.ins().load(
+            reference_type(self.module.target_config()),
+            MemFlagsData::new(),
+            frame,
+            handle_offset,
+        );
         let held_b = self.builder.create_block();
         let done_b = self.builder.create_block();
         self.builder.ins().brif(handle, held_b, &[], done_b, &[]);
@@ -220,7 +222,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(commit_b);
         self.builder.seal_block(commit_b);
         let value = self.builder.ins().load(
-            clif_type(value_ty),
+            clif_type(reference_type(self.module.target_config()), value_ty),
             MemFlagsData::new(),
             frame,
             value_offset,
@@ -281,14 +283,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .into(),
             vec![value_ty.clone()],
         );
+        let null_handle = self
+            .builder
+            .ins()
+            .iconst(reference_type(self.module.target_config()), 0);
         self.emit_gc_heap_store(
             frame,
             handle_offset,
-            zero64,
+            null_handle,
             &handle_ty,
             GcStoreDestination::AsyncFrameSlot,
         );
-        let zero_value = match clif_type(value_ty) {
+        let zero_value = match clif_type(reference_type(self.module.target_config()), value_ty) {
             types::F64 => self.builder.ins().f64const(0.0),
             ty => self.builder.ins().iconst(ty, 0),
         };
@@ -916,7 +922,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if *return_ty == Type::Void || force_void {
             self.builder.ins().return_(&[]);
         } else {
-            let zero = match clif_type(return_ty) {
+            let zero = match clif_type(reference_type(self.module.target_config()), return_ty) {
                 types::F64 => self.builder.ins().f64const(0.0),
                 ty => self.builder.ins().iconst(ty, 0),
             };

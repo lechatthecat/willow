@@ -64,6 +64,7 @@ use super::option_repr::{OptionRepr, option_repr};
 use super::symbols::{class_method_symbol_name, class_name_for_object_type, module_item_symbol};
 use super::type_helpers::{
     builtin_call_runtime_name, clif_type, gc_stat_builtin_runtime_name, is_gc_managed,
+    reference_type,
 };
 use super::{
     CoopSuspendPoint, FRAME_SLOT_TASK_ID, FuncGen, VarStorage, array_element_type,
@@ -324,7 +325,7 @@ fn assignable_repr(target: &Type, value: &Type) -> bool {
         (Type::Generic(..), Type::Generic(..)) => target == value,
         (Type::Generic(..), _) | (_, Type::Generic(..)) => false,
         _ => {
-            clif_type(target) == clif_type(value)
+            clif_type(types::I64, target) == clif_type(types::I64, value)
                 && gc_managed_supported(target) == gc_managed_supported(value)
         }
     }
@@ -5227,7 +5228,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .cloned()
             .unwrap_or_else(|| panic!("LIR local `{name}` has no storage"));
         if function.locals[local.0 as usize].is_gc_owner() {
-            let ptr_ty = self.module.target_config().pointer_type();
+            let ptr_ty = reference_type(self.module.target_config());
             return match storage {
                 VarStorage::Stack { slot, .. } => self.stack_load(ptr_ty, slot),
                 VarStorage::Frame { offset, .. } => self.builder.ins().load(
@@ -5380,7 +5381,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     LirSelectOp::Send { channel, .. } => {
                         (self.load_lir_local(function, *channel), 1)
                     }
-                    _ => (self.builder.ins().iconst(types::I64, 0), -1),
+                    _ => (
+                        self.builder
+                            .ins()
+                            .iconst(reference_type(self.module.target_config()), 0),
+                        -1,
+                    ),
                 };
                 let direction = self.builder.ins().iconst(types::I64, direction);
                 let mut channels = Vec::new();
@@ -5689,7 +5695,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ty: &Type,
         null: &mut Option<cranelift_codegen::ir::Value>,
     ) {
-        let ptr_ty = self.module.target_config().pointer_type();
+        let ptr_ty = reference_type(self.module.target_config());
         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
             8,
@@ -5753,7 +5759,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if roots.is_empty() {
             return;
         }
-        let ptr_ty = self.module.target_config().pointer_type();
+        let ptr_ty = reference_type(self.module.target_config());
         let zero = self.builder.ins().iconst(ptr_ty, 0);
         let frame_base = self.async_frame;
         for root in roots {
@@ -5829,7 +5835,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // Give an address-taken local its definitive slot at function
                 // entry so no `&` use inserts path-local promotion, and so the
                 // one slot is the same one whichever block writes it first.
-                let clif = clif_type(&local.ty);
+                let clif = clif_type(reference_type(self.module.target_config()), &local.ty);
                 let zero = if clif == types::F64 {
                     self.builder.ins().f64const(0.0)
                 } else {
@@ -5843,7 +5849,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // write — a `match` whose arms all diverge, a merge reached from a
             // branch that never assigned — still has a reaching definition,
             // including a match merge whose other arm diverges.
-            let clif = clif_type(&local.ty);
+            let clif = clif_type(reference_type(self.module.target_config()), &local.ty);
             let var = self.builder.declare_var(clif);
             let zero = match clif {
                 types::F64 => self.builder.ins().f64const(0.0),
@@ -6505,10 +6511,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 } else {
                     // Unreachable fall-through in a value function (the checker
                     // guarantees returns); satisfy the signature with a zero.
-                    let zero = match clif_type(return_type) {
-                        types::F64 => self.builder.ins().f64const(0.0),
-                        ty => self.builder.ins().iconst(ty, 0),
-                    };
+                    let zero =
+                        match clif_type(reference_type(self.module.target_config()), return_type) {
+                            types::F64 => self.builder.ins().f64const(0.0),
+                            ty => self.builder.ins().iconst(ty, 0),
+                        };
                     self.builder.ins().return_(&[zero]);
                 }
             }
@@ -6575,10 +6582,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         "compiler invariant violated: checked downcast pattern class `{class_name}` has no type id"
                     )
                 });
-                let obj = self
-                    .builder
-                    .ins()
-                    .load(types::I64, MemFlagsData::new(), scrutinee, 0i32);
+                let obj = self.builder.ins().load(
+                    reference_type(self.module.target_config()),
+                    MemFlagsData::new(),
+                    scrutinee,
+                    0i32,
+                );
                 let actual = self.emit_load_runtime_type_id(obj);
                 let expected = self.builder.ins().iconst(types::I64, type_id);
                 self.builder.ins().icmp(IntCC::Equal, actual, expected)
@@ -6617,7 +6626,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 for (i, ((name, _), payload_ty)) in
                     bindings.iter().zip(payload_types.iter()).enumerate()
                 {
-                    let clif_ty = clif_type(payload_ty);
+                    let clif_ty =
+                        clif_type(reference_type(self.module.target_config()), payload_ty);
                     // In the niche the scrutinee IS the payload — there is no
                     // heap object to load word 1 from.
                     let raw = if niche && i == 0 {
@@ -6649,10 +6659,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 binding_ty,
                 ..
             } => {
-                let obj = self
-                    .builder
-                    .ins()
-                    .load(types::I64, MemFlagsData::new(), scrutinee, 0i32);
+                let obj = self.builder.ins().load(
+                    reference_type(self.module.target_config()),
+                    MemFlagsData::new(),
+                    scrutinee,
+                    0i32,
+                );
                 vec![(binding.clone(), binding_ty.clone(), obj)]
             }
             crate::ir::lowered::LirPattern::Wildcard
@@ -6984,7 +6996,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
                 self.builder
                     .ins()
-                    .func_addr(super::type_helpers::FN_ADDR_TYPE, fref)
+                    .func_addr(reference_type(self.module.target_config()), fref)
             }
             LirRvalue::Closure { id, captures, ty } => {
                 let name = self.lambda_names[id];
@@ -6993,7 +7005,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let code = self
                     .builder
                     .ins()
-                    .func_addr(super::type_helpers::FN_ADDR_TYPE, fref);
+                    .func_addr(reference_type(self.module.target_config()), fref);
                 if !matches!(ty, Type::Closure(..)) {
                     return code;
                 }
@@ -7105,7 +7117,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 let code = if closure {
                     self.builder.ins().load(
-                        super::type_helpers::FN_ADDR_TYPE,
+                        reference_type(self.module.target_config()),
                         MemFlagsData::trusted(),
                         target,
                         0,
@@ -7127,13 +7139,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 let mut signature = self.module.make_signature();
                 if closure {
-                    signature.params.push(AbiParam::new(types::I64));
+                    signature
+                        .params
+                        .push(AbiParam::new(reference_type(self.module.target_config())));
                 }
-                signature
-                    .params
-                    .extend(params.iter().map(|ty| AbiParam::new(clif_type(ty))));
+                signature.params.extend(params.iter().map(|ty| {
+                    AbiParam::new(clif_type(reference_type(self.module.target_config()), ty))
+                }));
                 if *result != Type::Void {
-                    signature.returns.push(AbiParam::new(clif_type(result)));
+                    signature.returns.push(AbiParam::new(clif_type(
+                        reference_type(self.module.target_config()),
+                        result,
+                    )));
                 }
                 let signature = self.builder.import_signature(signature);
                 let pushed = self.emit_callstack_push(&name.to_string(), span);
@@ -7792,7 +7809,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let is_ref = is_gc_managed(&protected, self.enum_infos);
             if is_ref {
                 let slot = self.emit_push_root(initial);
-                initial = self.stack_load(self.module.target_config().pointer_type(), slot);
+                initial = self.stack_load(reference_type(self.module.target_config()), slot);
             }
             let word = self.coerce_to_i64(initial, &protected);
             let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
@@ -7849,7 +7866,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .inst_results(call)
                 .first()
                 .copied()
-                .unwrap_or_else(|| self.builder.ins().iconst(clif_type(ret_ty), 0));
+                .unwrap_or_else(|| {
+                    self.builder.ins().iconst(
+                        clif_type(reference_type(self.module.target_config()), ret_ty),
+                        0,
+                    )
+                });
             if pushed {
                 self.emit_callstack_pop();
             }
@@ -7865,7 +7887,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         let mangled = class_method_symbol_name(self.known_modules, class, method);
         let fid = self.func_ids[&mangled];
-        let dummy_self = self.builder.ins().iconst(types::I64, 0);
+        let dummy_self = self
+            .builder
+            .ins()
+            .iconst(reference_type(self.module.target_config()), 0);
         let has_reference_args = self.func_param_modes.get(&mangled).is_some_and(|modes| {
             modes
                 .iter()
@@ -7883,7 +7908,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .inst_results(call)
             .first()
             .copied()
-            .unwrap_or_else(|| self.builder.ins().iconst(clif_type(ret_ty), 0));
+            .unwrap_or_else(|| {
+                self.builder.ins().iconst(
+                    clif_type(reference_type(self.module.target_config()), ret_ty),
+                    0,
+                )
+            });
         if pushed {
             self.emit_callstack_pop();
         }
@@ -7910,7 +7940,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return if tag == 0 {
                 args[0]
             } else {
-                self.builder.ins().iconst(types::I64, 0)
+                self.builder
+                    .ins()
+                    .iconst(reference_type(self.module.target_config()), 0)
             };
         }
         if !self.enum_is_gc_object_type(enum_name) {
@@ -7929,7 +7961,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             })
             .collect::<Vec<_>>();
         let layout = willow_abi::EnumVariantLayout::new(tag as u32, &kinds);
-        let bytes = self.module.target_config().pointer_type().bytes();
+        let bytes = reference_type(self.module.target_config()).bytes();
         let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
             GcObjectKind::Enum,
             i64::from(layout.payload_bytes(bytes)),
@@ -8068,7 +8100,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let tag = self.enum_variant_tag(class, variant);
         if option_repr(enum_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
-            return self.builder.ins().iconst(types::I64, 0);
+            return self
+                .builder
+                .ins()
+                .iconst(reference_type(self.module.target_config()), 0);
         }
         if !self.enum_is_gc_object_type(class) {
             return self.builder.ins().iconst(types::I64, tag);
@@ -8086,7 +8121,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             })
             .collect::<Vec<_>>();
         let layout = willow_abi::EnumVariantLayout::new(tag as u32, &kinds);
-        let bytes = self.module.target_config().pointer_type().bytes();
+        let bytes = reference_type(self.module.target_config()).bytes();
         let object = self.emit_gc_alloc(GcLayoutMetadata::new(
             GcObjectKind::Enum,
             i64::from(layout.payload_bytes(bytes)),
@@ -8143,7 +8178,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .collect::<Vec<_>>();
             let tag = self.enum_variant_tag(class, variant);
             let layout = willow_abi::EnumVariantLayout::new(tag as u32, &kinds);
-            let bytes = self.module.target_config().pointer_type().bytes();
+            let bytes = reference_type(self.module.target_config()).bytes();
             let word = self.coerce_to_i64(value, target);
             self.emit_gc_heap_store(
                 object,

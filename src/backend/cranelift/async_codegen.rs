@@ -176,7 +176,9 @@ impl Codegen {
         // Declare the poll fn `fn(frame: i64) -> i32`.
         let poll_symbol = poll_symbol(USER_MAIN_SYMBOL);
         let mut poll_sig = self.module.make_signature();
-        poll_sig.params.push(AbiParam::new(types::I64));
+        poll_sig
+            .params
+            .push(AbiParam::new(reference_type(self.module.target_config())));
         poll_sig.returns.push(AbiParam::new(types::I32));
         let poll_fid = self
             .module
@@ -267,7 +269,9 @@ impl Codegen {
     ) -> Result<()> {
         let poll_symbol = coop_poll_symbol(name);
         let mut poll_sig = self.module.make_signature();
-        poll_sig.params.push(AbiParam::new(types::I64));
+        poll_sig
+            .params
+            .push(AbiParam::new(reference_type(self.module.target_config())));
         poll_sig.returns.push(AbiParam::new(types::I32));
         let poll_fid = self
             .module
@@ -277,7 +281,9 @@ impl Codegen {
         // fn (it needs the defer sites collected while emitting the body).
         let cancel_symbol = coop_cancel_symbol(name);
         let mut cancel_sig = self.module.make_signature();
-        cancel_sig.params.push(AbiParam::new(types::I64));
+        cancel_sig
+            .params
+            .push(AbiParam::new(reference_type(self.module.target_config())));
         let cancel_fid =
             self.module
                 .declare_function(&cancel_symbol, Linkage::Local, &cancel_sig)?;
@@ -335,9 +341,13 @@ impl Codegen {
         let mut ctx = self.module.make_context();
         let mut sig = self.module.make_signature();
         for p in &f.params {
-            sig.params.push(AbiParam::new(clif_type(&p.ty)));
+            sig.params.push(AbiParam::new(clif_type(
+                reference_type(self.module.target_config()),
+                &p.ty,
+            )));
         }
-        sig.returns.push(AbiParam::new(types::I64));
+        sig.returns
+            .push(AbiParam::new(reference_type(self.module.target_config())));
         ctx.func.signature = sig;
         ctx.func.name = UserFuncName::user(0, ctor_fid.as_u32());
         let mut fn_ctx = FunctionBuilderContext::new();
@@ -373,7 +383,7 @@ impl Codegen {
         let poll_ref = self.module.declare_func_in_func(poll_fid, builder.func);
         let poll_addr = builder
             .ins()
-            .func_addr(super::type_helpers::FN_ADDR_TYPE, poll_ref);
+            .func_addr(reference_type(self.module.target_config()), poll_ref);
         let spawn_fid = self.func_id("willow_sched_spawn");
         let spawn_ref = self.module.declare_func_in_func(spawn_fid, builder.func);
         // Record the scheduler task id in slot 1 (TASK_ID) so an awaiter can
@@ -387,7 +397,7 @@ impl Codegen {
         let cancel_ref = self.module.declare_func_in_func(cancel_fid, builder.func);
         let cancel_addr = builder
             .ins()
-            .func_addr(super::type_helpers::FN_ADDR_TYPE, cancel_ref);
+            .func_addr(reference_type(self.module.target_config()), cancel_ref);
         let set_fid = self.func_id("willow_sched_set_cancel_fn");
         let set_ref = self.module.declare_func_in_func(set_fid, builder.func);
         builder.ins().call(set_ref, &[task_id, cancel_addr]);
@@ -434,7 +444,9 @@ impl Codegen {
     ) -> Result<()> {
         let poll_symbol = coop_poll_symbol(mangled);
         let mut poll_sig = self.module.make_signature();
-        poll_sig.params.push(AbiParam::new(types::I64));
+        poll_sig
+            .params
+            .push(AbiParam::new(reference_type(self.module.target_config())));
         poll_sig.returns.push(AbiParam::new(types::I32));
         let poll_fid = self
             .module
@@ -443,7 +455,9 @@ impl Codegen {
         // Cancellation cleanup entry (willow-vynv.3).
         let cancel_symbol = coop_cancel_symbol(mangled);
         let mut cancel_sig = self.module.make_signature();
-        cancel_sig.params.push(AbiParam::new(types::I64));
+        cancel_sig
+            .params
+            .push(AbiParam::new(reference_type(self.module.target_config())));
         let cancel_fid =
             self.module
                 .declare_function(&cancel_symbol, Linkage::Local, &cancel_sig)?;
@@ -523,12 +537,14 @@ impl Codegen {
         let ctor_fid = self.func_ids[mangled];
         let mut ctx = self.module.make_context();
         let mut sig = self.module.make_signature();
-        let ptr_ty = self.module.target_config().pointer_type();
-        sig.params.push(AbiParam::new(types::I64)); // self/dummy method ABI slot
+        let ptr_ty = reference_type(self.module.target_config());
+        sig.params
+            .push(AbiParam::new(reference_type(self.module.target_config()))); // self/dummy method ABI slot
         for p in &m.params {
             sig.params.push(AbiParam::new(param_abi_type(p, ptr_ty)));
         }
-        sig.returns.push(AbiParam::new(types::I64));
+        sig.returns
+            .push(AbiParam::new(reference_type(self.module.target_config())));
         ctx.func.signature = sig;
         ctx.func.name = UserFuncName::user(0, ctor_fid.as_u32());
         let mut fn_ctx = FunctionBuilderContext::new();
@@ -576,7 +592,7 @@ impl Codegen {
         let poll_ref = self.module.declare_func_in_func(poll_fid, builder.func);
         let poll_addr = builder
             .ins()
-            .func_addr(super::type_helpers::FN_ADDR_TYPE, poll_ref);
+            .func_addr(reference_type(self.module.target_config()), poll_ref);
         let spawn_fid = self.func_id("willow_sched_spawn");
         let spawn_ref = self.module.declare_func_in_func(spawn_fid, builder.func);
         let spawn_call = builder.ins().call(spawn_ref, &[poll_addr, frame]);
@@ -588,7 +604,7 @@ impl Codegen {
         let cancel_ref = self.module.declare_func_in_func(cancel_fid, builder.func);
         let cancel_addr = builder
             .ins()
-            .func_addr(super::type_helpers::FN_ADDR_TYPE, cancel_ref);
+            .func_addr(reference_type(self.module.target_config()), cancel_ref);
         let set_fid = self.func_id("willow_sched_set_cancel_fn");
         let set_ref = self.module.declare_func_in_func(set_fid, builder.func);
         builder.ins().call(set_ref, &[task_id, cancel_addr]);
@@ -671,8 +687,10 @@ impl Codegen {
                 8,
                 0,
             ));
-            builder.ins().stack_store(types::I64, frame, slot, 0);
-            let ptr_ty = self.module.target_config().pointer_type();
+            builder
+                .ins()
+                .stack_store(reference_type(self.module.target_config()), frame, slot, 0);
+            let ptr_ty = reference_type(self.module.target_config());
             let addr = builder.ins().stack_addr(ptr_ty, slot, 0);
             let push_fid = self.func_id("willow_push_root");
             let push_ref = self.module.declare_func_in_func(push_fid, builder.func);
@@ -701,7 +719,7 @@ impl Codegen {
         let poll_ref = self.module.declare_func_in_func(poll_fid, builder.func);
         let poll_addr = builder
             .ins()
-            .func_addr(super::type_helpers::FN_ADDR_TYPE, poll_ref);
+            .func_addr(reference_type(self.module.target_config()), poll_ref);
         let spawn_fid = self.func_id("willow_sched_spawn");
         let spawn_ref = self.module.declare_func_in_func(spawn_fid, builder.func);
         let spawn_call = builder.ins().call(spawn_ref, &[poll_addr, frame]);
@@ -717,10 +735,12 @@ impl Codegen {
         builder.ins().call(run_ref, &[main_task_id]);
 
         if let Some((result_offset, err_ty)) = frame_layout.main_result {
-            let result =
-                builder
-                    .ins()
-                    .load(types::I64, MemFlagsData::trusted(), frame, result_offset);
+            let result = builder.ins().load(
+                reference_type(self.module.target_config()),
+                MemFlagsData::trusted(),
+                frame,
+                result_offset,
+            );
             let pop_fid = self.func_id("willow_pop_roots");
             let pop_ref = self.module.declare_func_in_func(pop_fid, builder.func);
             let one = builder.ins().iconst(types::I32, 1);
@@ -771,7 +791,8 @@ impl Codegen {
             None
         };
         let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
+        sig.params
+            .push(AbiParam::new(reference_type(self.module.target_config())));
         sig.returns.push(AbiParam::new(types::I32));
         let mut ctx = self.module.make_context();
         ctx.func.signature = sig;
@@ -782,7 +803,7 @@ impl Codegen {
         builder.append_block_params_for_function_params(entry);
         builder.switch_to_block(entry);
         let frame = builder.block_params(entry)[0];
-        let ptr_ty = self.module.target_config().pointer_type();
+        let ptr_ty = reference_type(self.module.target_config());
         // Tag the running task with this async fn's name on every poll entry (so
         // resumes re-tag too), before dispatch (willow-9lw).
         if let Some(name) = &tag_name
@@ -919,7 +940,7 @@ impl Codegen {
         // before registering any of them so a collection cannot interpret stale
         // stack bytes as object pointers. A later assignment updates the rooted
         // slot normally.
-        let null = builder.ins().iconst(types::I64, 0);
+        let null = builder.ins().iconst(ptr_ty, 0);
         for slot in &coop_root_slots {
             builder.ins().stack_store(ptr_ty, null, *slot, 0);
         }
@@ -935,7 +956,7 @@ impl Codegen {
             builder.switch_to_block(restore);
             let push_id = self.func_id("willow_push_root");
             let push_ref = self.module.declare_func_in_func(push_id, builder.func);
-            let ptr_ty = self.module.target_config().pointer_type();
+            let ptr_ty = reference_type(self.module.target_config());
             for slot in &suspend.roots {
                 let addr = builder.ins().stack_addr(ptr_ty, *slot, 0);
                 builder.ins().call(push_ref, &[addr]);
@@ -999,7 +1020,8 @@ impl Codegen {
         lock_sites: &[AsyncLockSite],
     ) -> Result<()> {
         let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
+        sig.params
+            .push(AbiParam::new(reference_type(self.module.target_config())));
         let mut ctx = self.module.make_context();
         ctx.func.signature = sig;
         ctx.func.name = UserFuncName::user(0, cancel_fid.as_u32());
@@ -1449,9 +1471,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.record_coop_suspend(suspends, resume_b);
         self.builder.switch_to_block(resume_b);
         stored_slot.map(|offset| {
-            self.builder
-                .ins()
-                .load(types::I64, MemFlagsData::new(), frame, offset)
+            self.builder.ins().load(
+                reference_type(self.module.target_config()),
+                MemFlagsData::new(),
+                frame,
+                offset,
+            )
         })
     }
 
@@ -1538,10 +1563,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         // --- acquire ---------------------------------------------------
         self.builder.switch_to_block(acquire_b);
-        let handle = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), frame, handle_offset);
+        let handle = self.builder.ins().load(
+            reference_type(self.module.target_config()),
+            MemFlagsData::new(),
+            frame,
+            handle_offset,
+        );
         let token_ptr = self.builder.ins().iadd_imm_s(frame, token_offset as i64);
         let status = if mode == LockMode::Mutex {
             self.emit_value_runtime_call(acquire_fn, &[handle, token_ptr])
@@ -1636,10 +1663,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         // --- resumed poll ------------------------------------------------
         self.builder.switch_to_block(poll_b);
-        let handle = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), frame, handle_offset);
+        let handle = self.builder.ins().load(
+            reference_type(self.module.target_config()),
+            MemFlagsData::new(),
+            frame,
+            handle_offset,
+        );
         let token = self
             .builder
             .ins()
@@ -1707,10 +1736,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // --- owned --------------------------------------------------------
         self.builder.switch_to_block(owned_b);
         self.terminated = false;
-        let handle = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), frame, handle_offset);
+        let handle = self.builder.ins().load(
+            reference_type(self.module.target_config()),
+            MemFlagsData::new(),
+            frame,
+            handle_offset,
+        );
         let token = self
             .builder
             .ins()
@@ -1756,7 +1787,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 return None;
             }
             return Some(self.builder.ins().load(
-                clif_type(result_ty),
+                clif_type(reference_type(self.module.target_config()), result_ty),
                 MemFlagsData::new(),
                 task_frame,
                 async_frame_slot_offset(FRAME_SLOT_RESULT),
@@ -1791,7 +1822,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let cancelled_b = self.builder.create_block();
         let ok_b = self.builder.create_block();
         let merge_b = self.builder.create_block();
-        self.builder.append_block_param(merge_b, types::I64);
+        self.builder
+            .append_block_param(merge_b, reference_type(self.module.target_config()));
         self.builder
             .ins()
             .brif(is_cancelled, cancelled_b, &[], ok_b, &[]);
@@ -1819,7 +1851,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.ins().iconst(types::I64, 0)
         } else {
             self.builder.ins().load(
-                clif_type(result_ty),
+                clif_type(reference_type(self.module.target_config()), result_ty),
                 MemFlagsData::new(),
                 task_frame,
                 async_frame_slot_offset(FRAME_SLOT_RESULT),

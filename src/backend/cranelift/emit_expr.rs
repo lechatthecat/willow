@@ -10,7 +10,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let gv = self
                 .module
                 .declare_data_in_func(*data_id, self.builder.func);
-            let ptr_ty = self.module.target_config().pointer_type();
+            let ptr_ty = reference_type(self.module.target_config());
             let bytes_ptr = self.builder.ins().symbol_value(ptr_ty, gv);
             // Call willow_string_literal to get (or create) a permanent WillowString.
             let len_val = self.builder.ins().iconst(types::I64, value.len() as i64);
@@ -19,7 +19,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let call = self.builder.ins().call(fref, &[bytes_ptr, len_val]);
             return self.builder.inst_results(call)[0];
         }
-        self.builder.ins().iconst(types::I64, 0)
+        self.builder
+            .ins()
+            .iconst(reference_type(self.module.target_config()), 0)
     }
 
     /// Emit the unwind for a `panic(...)` whose message is already in hand,
@@ -40,7 +42,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         span: crate::diagnostics::Span,
     ) -> cranelift_codegen::ir::Value {
         if self.coop_frame.is_some() {
-            let result = self.builder.ins().iconst(types::I64, 0);
+            let result = self
+                .builder
+                .ins()
+                .iconst(reference_type(self.module.target_config()), 0);
             self.emit_language_panic(msg, Some(span));
             return result;
         }
@@ -56,7 +61,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // Produce the expression's unreachable placeholder before the
             // unwind emits a terminator. A recovery jumps to a lexical
             // scope continuation and never consumes this value.
-            let result = self.builder.ins().iconst(types::I64, 0);
+            let result = self
+                .builder
+                .ins()
+                .iconst(reference_type(self.module.target_config()), 0);
             self.emit_runtime_call_with_cleanup(
                 "willow_panic_raise",
                 &[msg, file_ptr, line, col],
@@ -94,7 +102,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let none_block = self.builder.create_block();
         let some_block = self.builder.create_block();
         let merge = self.builder.create_block();
-        let result = self.builder.declare_var(types::I64);
+        let result = self
+            .builder
+            .declare_var(reference_type(self.module.target_config()));
         self.builder
             .ins()
             .brif(is_none, none_block, &[], some_block, &[]);
@@ -152,7 +162,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> Option<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value)> {
         let data_id = *self.string_literals.get(value)?;
         let gv = self.module.declare_data_in_func(data_id, self.builder.func);
-        let ptr_ty = self.module.target_config().pointer_type();
+        let ptr_ty = reference_type(self.module.target_config());
         let bytes_ptr = self.builder.ins().symbol_value(ptr_ty, gv);
         let len = self.builder.ins().iconst(types::I64, value.len() as i64);
         Some((bytes_ptr, len))

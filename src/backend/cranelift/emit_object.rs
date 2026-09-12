@@ -20,7 +20,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 panic!("compiler invariant violated: checked class `{class}` has no descriptor")
             });
         let gv = self.module.declare_data_in_func(data_id, self.builder.func);
-        let ptr_ty = self.module.target_config().pointer_type();
+        let ptr_ty = reference_type(self.module.target_config());
         self.builder.ins().symbol_value(ptr_ty, gv)
     }
 
@@ -47,7 +47,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         ptr: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
-        let ptr_ty = self.module.target_config().pointer_type();
+        let ptr_ty = reference_type(self.module.target_config());
         let descriptor = self
             .builder
             .ins()

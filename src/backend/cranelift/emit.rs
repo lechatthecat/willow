@@ -80,7 +80,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     pub(super) fn emit_push_root_slot(&mut self, slot: cranelift_codegen::ir::StackSlot) {
-        let ptr_ty = self.module.target_config().pointer_type();
+        let ptr_ty = reference_type(self.module.target_config());
         let addr = self.builder.ins().stack_addr(ptr_ty, slot, 0);
         let push_id = self.func_id("willow_push_root");
         let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
@@ -143,7 +143,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let gv = self
             .module
             .declare_data_in_func(vtable_id, self.builder.func);
-        let ptr_ty = self.module.target_config().pointer_type();
+        let ptr_ty = reference_type(self.module.target_config());
         let vtable_ptr = self.builder.ins().symbol_value(ptr_ty, gv);
         self.emit_gc_heap_store_classified(
             box_ptr,

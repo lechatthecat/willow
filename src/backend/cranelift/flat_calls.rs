@@ -24,10 +24,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_callstack_push(method, span);
         }
         if interface {
-            let object = self
-                .builder
-                .ins()
-                .load(types::I64, MemFlagsData::new(), receiver, 0);
+            let object = self.builder.ins().load(
+                reference_type(self.module.target_config()),
+                MemFlagsData::new(),
+                receiver,
+                0,
+            );
             self.emit_interface_dispatch_nil_check(object, span, method);
         }
         receiver
@@ -133,17 +135,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .cloned()
                     .unwrap_or(Type::Void);
                 let mut sig = self.module.make_signature();
-                sig.params.push(AbiParam::new(types::I64));
-                let ptr_ty = self.module.target_config().pointer_type();
+                sig.params
+                    .push(AbiParam::new(reference_type(self.module.target_config())));
+                let ptr_ty = reference_type(self.module.target_config());
                 for (idx, pt) in params.iter().flat_map(|p| p.iter()).enumerate() {
                     let abi = match modes.as_ref().and_then(|all| all.get(idx)) {
                         Some(ParamMode::Reference { .. }) => ptr_ty,
-                        _ => clif_type(pt),
+                        _ => clif_type(reference_type(self.module.target_config()), pt),
                     };
                     sig.params.push(AbiParam::new(abi));
                 }
                 if ret_type != Type::Void {
-                    sig.returns.push(AbiParam::new(clif_type(&ret_type)));
+                    sig.returns.push(AbiParam::new(clif_type(
+                        reference_type(self.module.target_config()),
+                        &ret_type,
+                    )));
                 }
                 let sig_ref = self.builder.import_signature(sig);
                 self.builder.ins().call_indirect(sig_ref, fnptr, &call_args)
@@ -154,7 +160,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .inst_results(call)
             .first()
             .copied()
-            .unwrap_or_else(|| self.builder.ins().iconst(clif_type(ret_ty), 0));
+            .unwrap_or_else(|| {
+                self.builder.ins().iconst(
+                    clif_type(reference_type(self.module.target_config()), ret_ty),
+                    0,
+                )
+            });
         if has_reference_args {
             self.emit_flat_reference_call_end();
         }
@@ -239,22 +250,28 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             self.emit_callstack_push(method, span)
         };
-        let obj = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), box_ptr, 0i32);
+        let obj = self.builder.ins().load(
+            reference_type(self.module.target_config()),
+            MemFlagsData::new(),
+            box_ptr,
+            0i32,
+        );
 
         if !receiver_prepared {
             self.emit_interface_dispatch_nil_check(obj, span, method);
         }
-        let vtable = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), box_ptr, 8i32);
-        let fnptr =
-            self.builder
-                .ins()
-                .load(types::I64, MemFlagsData::new(), vtable, (slot * 8) as i32);
+        let vtable = self.builder.ins().load(
+            reference_type(self.module.target_config()),
+            MemFlagsData::new(),
+            box_ptr,
+            8i32,
+        );
+        let fnptr = self.builder.ins().load(
+            reference_type(self.module.target_config()),
+            MemFlagsData::new(),
+            vtable,
+            (slot * 8) as i32,
+        );
 
         // Pin the hidden receiver even when the interface box is held only by
         // an async frame's interior slot.
@@ -268,17 +285,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let arg_vals = args.to_vec();
 
         let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        let ptr_ty = self.module.target_config().pointer_type();
+        sig.params
+            .push(AbiParam::new(reference_type(self.module.target_config())));
+        let ptr_ty = reference_type(self.module.target_config());
         for (idx, pt) in param_types.iter().enumerate() {
             let abi = match param_modes.get(idx) {
                 Some(ParamMode::Reference { .. }) => ptr_ty,
-                _ => clif_type(pt),
+                _ => clif_type(reference_type(self.module.target_config()), pt),
             };
             sig.params.push(AbiParam::new(abi));
         }
         if ret_type != Type::Void {
-            sig.returns.push(AbiParam::new(clif_type(&ret_type)));
+            sig.returns.push(AbiParam::new(clif_type(
+                reference_type(self.module.target_config()),
+                &ret_type,
+            )));
         }
         let sig_ref = self.builder.import_signature(sig);
 

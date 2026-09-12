@@ -126,7 +126,7 @@ pub(super) fn emit_bitmap_alloc(
     let global = module.declare_data_in_func(data_id, builder.func);
     let pointer = builder
         .ins()
-        .symbol_value(module.target_config().pointer_type(), global);
+        .symbol_value(reference_type(module.target_config()), global);
     let type_id = builder.ins().iconst(types::I64, type_id);
     let size = builder.ins().iconst(types::I64, payload_size);
     let alloc = module.declare_func_in_func(alloc_id, builder.func);
@@ -185,7 +185,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return self.emit_gc_alloc_slow(layout);
         }
 
-        let ptr_ty = self.module.target_config().pointer_type();
+        let ptr_ty = reference_type(self.module.target_config());
         let tls_global = self
             .module
             .declare_data_in_func(self.gc_tlab_state, self.builder.func);
@@ -194,11 +194,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let cursor = self
             .builder
             .ins()
-            .atomic_load(types::I64, MemFlagsData::trusted(), tlab);
+            .atomic_load(ptr_ty, MemFlagsData::trusted(), tlab);
         let limit = self
             .builder
             .ins()
-            .atomic_load(types::I64, MemFlagsData::trusted(), limit_addr);
+            .atomic_load(ptr_ty, MemFlagsData::trusted(), limit_addr);
         let new_cursor = self.builder.ins().iadd_imm_s(cursor, total_size);
         let nonempty = self.builder.ins().icmp_imm_s(IntCC::NotEqual, cursor, 0);
         let no_overflow =
@@ -289,13 +289,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             cursor,
             GC_HEADER_SIZE_OFFSET,
         );
-        let zero64 = self.builder.ins().iconst(types::I64, 0);
-        self.builder.ins().store(
-            MemFlagsData::trusted(),
-            zero64,
-            cursor,
-            GC_HEADER_NEXT_OFFSET,
-        );
+        let null = self.builder.ins().iconst(ptr_ty, 0);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), null, cursor, GC_HEADER_NEXT_OFFSET);
 
         let one64 = self.builder.ins().iconst(types::I64, 1);
         let fast_allocs_addr = self
@@ -334,7 +331,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     fn emit_gc_alloc_slow(&mut self, layout: GcLayoutMetadata) -> Value {
-        let ptr_ty = self.module.target_config().pointer_type();
+        let ptr_ty = reference_type(self.module.target_config());
         let tls_global = self
             .module
             .declare_data_in_func(self.gc_tlab_state, self.builder.func);

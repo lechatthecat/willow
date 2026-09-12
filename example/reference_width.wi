@@ -1,0 +1,29 @@
+// willow-d9lm.2: reference values and genuine 64-bit scalar values coexist.
+// Expected output: reference, 4294967297, 4294967298, reference!
+import std::collections::Array;
+
+interface Label {
+    fn text(self) -> String;
+}
+
+class Item implements Label {
+    pub value: String;
+    pub fn text(self) -> String {
+        return self.value;
+    }
+}
+
+fn apply(value: i64, callback: fn(i64) -> i64) -> i64 {
+    return callback(value);
+}
+
+fn main() {
+    let label: Label = new Item("reference");
+    println(label.text());
+    let values: Array<i64> = [4294967297];
+    println(values[0]);
+    println(apply(values[0], |value| value + 1));
+    let suffix = "!";
+    let decorate = |text: String| text + suffix;
+    println(decorate(label.text()));
+}

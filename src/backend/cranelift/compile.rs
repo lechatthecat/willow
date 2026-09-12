@@ -971,12 +971,19 @@ impl Codegen {
         let env_param = closure_env_param(lambda_type.as_ref(), l.span);
         let mut sig = self.module.make_signature();
         if env_param.is_some() {
-            sig.params.push(AbiParam::new(types::I64));
+            sig.params
+                .push(AbiParam::new(reference_type(self.module.target_config())));
         }
         for ty in &param_types {
-            sig.params.push(AbiParam::new(clif_type(ty)));
+            sig.params.push(AbiParam::new(clif_type(
+                reference_type(self.module.target_config()),
+                ty,
+            )));
         }
-        sig.returns.push(AbiParam::new(clif_type(&ast_ret)));
+        sig.returns.push(AbiParam::new(clif_type(
+            reference_type(self.module.target_config()),
+            &ast_ret,
+        )));
         let id = self.module.declare_function(name, Linkage::Local, &sig)?;
         self.func_ids.insert(name, id);
         self.func_return_types.insert(name, ast_ret.clone());
@@ -1095,7 +1102,7 @@ impl Codegen {
         // The runtime ABI surface is declared from a single source of truth in
         // `crate::backend::abi`. Adding or changing a runtime symbol means
         // editing `RUNTIME_SYMBOLS`, not this loop.
-        let ptr_ty = self.module.target_config().pointer_type();
+        let ptr_ty = reference_type(self.module.target_config());
         for symbol in abi::RUNTIME_SYMBOLS {
             let mut sig = self.module.make_signature();
             symbol.fill_signature(&mut sig, ptr_ty);
@@ -1168,7 +1175,7 @@ impl Codegen {
         export: bool,
     ) -> Result<()> {
         let mut sig = self.module.make_signature();
-        let ptr_ty = self.module.target_config().pointer_type();
+        let ptr_ty = reference_type(self.module.target_config());
         // `willow_user_main` is parameterless even when `fn main(args:
         // Array<String>)` is declared (see compile_function_named).
         if symbol_name != USER_MAIN_SYMBOL {
@@ -1183,8 +1190,10 @@ impl Codegen {
         // sync with compile_function_named.
         let force_void_main = symbol_name == USER_MAIN_SYMBOL && main_result_err_type(f).is_some();
         if call_return_type != Type::Void && !force_void_main {
-            sig.returns
-                .push(AbiParam::new(clif_type(&call_return_type)));
+            sig.returns.push(AbiParam::new(clif_type(
+                reference_type(self.module.target_config()),
+                &call_return_type,
+            )));
         }
         let linkage = if export {
             Linkage::Export
@@ -1234,7 +1243,7 @@ impl Codegen {
         let is_main = user_function_symbol(name) == USER_MAIN_SYMBOL;
 
         let mut sig = self.module.make_signature();
-        let ptr_ty = self.module.target_config().pointer_type();
+        let ptr_ty = reference_type(self.module.target_config());
         if !is_main {
             for param in &f.params {
                 sig.params
@@ -1305,8 +1314,10 @@ impl Codegen {
         // mains (incl. async, whose body returns a Future) keep their signature.
         let force_void_main = main_result_err_ty.is_some();
         if call_return_type != Type::Void && !force_void_main {
-            sig.returns
-                .push(AbiParam::new(clif_type(&call_return_type)));
+            sig.returns.push(AbiParam::new(clif_type(
+                reference_type(self.module.target_config()),
+                &call_return_type,
+            )));
         }
 
         let mut ctx = self.module.make_context();
@@ -1444,7 +1455,7 @@ impl Codegen {
             let env = fg.load_var(&env);
             for (i, capture) in lir_fn.captures.iter().enumerate() {
                 let val = fg.builder.ins().load(
-                    clif_type(&capture.ty),
+                    clif_type(reference_type(fg.module.target_config()), &capture.ty),
                     MemFlagsData::trusted(),
                     env,
                     (i as i32 + 1) * 8,
@@ -1469,10 +1480,11 @@ impl Codegen {
                 // return (e.g. a statement-position match, willow-zvkv); this
                 // fall-through is then unreachable but must still satisfy the
                 // signature.
-                let zero = match clif_type(&call_return_type) {
-                    types::F64 => fg.builder.ins().f64const(0.0),
-                    ty => fg.builder.ins().iconst(ty, 0),
-                };
+                let zero =
+                    match clif_type(reference_type(fg.module.target_config()), &call_return_type) {
+                        types::F64 => fg.builder.ins().f64const(0.0),
+                        ty => fg.builder.ins().iconst(ty, 0),
+                    };
                 fg.builder.ins().return_(&[zero]);
             } else {
                 fg.builder.ins().return_(&[]);
@@ -1509,15 +1521,18 @@ impl Codegen {
             );
             self.claim_symbol(&mangled, format!("method `{}::{}`", c.name, m.name), m.span)?;
             let mut sig = self.module.make_signature();
-            let ptr_ty = self.module.target_config().pointer_type();
-            sig.params.push(AbiParam::new(types::I64)); // self pointer
+            let ptr_ty = reference_type(self.module.target_config());
+            sig.params
+                .push(AbiParam::new(reference_type(self.module.target_config()))); // self pointer
             for p in &m.params {
                 sig.params.push(AbiParam::new(param_abi_type(p, ptr_ty)));
             }
             let call_return_type = method_call_return_type(m);
             if call_return_type != Type::Void {
-                sig.returns
-                    .push(AbiParam::new(clif_type(&call_return_type)));
+                sig.returns.push(AbiParam::new(clif_type(
+                    reference_type(self.module.target_config()),
+                    &call_return_type,
+                )));
             }
             let id = self
                 .module
@@ -1774,7 +1789,7 @@ impl Codegen {
             address_taken: HashSet::new(),
         };
 
-        let ptr_ty = fg.module.target_config().pointer_type();
+        let ptr_ty = reference_type(fg.module.target_config());
         for callee in calls {
             let callee_ref = fg.module.declare_func_in_func(*callee, fg.builder.func);
             fg.builder.ins().call(callee_ref, &[]);
@@ -2000,7 +2015,7 @@ impl Codegen {
         builder.seal_block(entry);
 
         let params: Vec<cranelift_codegen::ir::Value> = builder.block_params(entry).to_vec();
-        let ptr_ty = self.module.target_config().pointer_type();
+        let ptr_ty = reference_type(self.module.target_config());
         // Parameter 0 is the receiver for every instance method, which is what
         // a vtable slot is only ever reached through.
         let self_ptr = params[0];
@@ -2155,15 +2170,18 @@ impl Codegen {
         let func_id = self.func_ids[&mangled];
 
         let mut sig = self.module.make_signature();
-        let ptr_ty = self.module.target_config().pointer_type();
-        sig.params.push(AbiParam::new(types::I64)); // self pointer
+        let ptr_ty = reference_type(self.module.target_config());
+        sig.params
+            .push(AbiParam::new(reference_type(self.module.target_config()))); // self pointer
         for p in &m.params {
             sig.params.push(AbiParam::new(param_abi_type(p, ptr_ty)));
         }
         let call_return_type = method_call_return_type(m);
         if call_return_type != Type::Void {
-            sig.returns
-                .push(AbiParam::new(clif_type(&call_return_type)));
+            sig.returns.push(AbiParam::new(clif_type(
+                reference_type(self.module.target_config()),
+                &call_return_type,
+            )));
         }
 
         let mut ctx = self.module.make_context();
@@ -2270,7 +2288,7 @@ impl Codegen {
             ));
             fg.stack_store(self_val, self_slot);
             {
-                let ptr_ty = fg.module.target_config().pointer_type();
+                let ptr_ty = reference_type(fg.module.target_config());
                 let addr = fg.builder.ins().stack_addr(ptr_ty, self_slot, 0);
                 let push_id = fg.func_id("willow_push_root");
                 let push_ref = fg.module.declare_func_in_func(push_id, fg.builder.func);
@@ -2310,10 +2328,11 @@ impl Codegen {
                 // Unreachable fall-through after a body that ends with an
                 // all-returning statement match (willow-zvkv): satisfy the
                 // signature with a typed zero.
-                let zero = match clif_type(&call_return_type) {
-                    types::F64 => fg.builder.ins().f64const(0.0),
-                    ty => fg.builder.ins().iconst(ty, 0),
-                };
+                let zero =
+                    match clif_type(reference_type(fg.module.target_config()), &call_return_type) {
+                        types::F64 => fg.builder.ins().f64const(0.0),
+                        ty => fg.builder.ins().iconst(ty, 0),
+                    };
                 fg.builder.ins().return_(&[zero]);
             } else {
                 fg.builder.ins().return_(&[]);

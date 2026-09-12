@@ -370,13 +370,10 @@ impl Codegen {
         flag_builder.set("probestack_size_log2", "12")?;
         let flags = settings::Flags::new(flag_builder);
         let isa = isa_builder.finish(flags)?;
-        // Willow's ABI is 64-bit throughout: every reference — GC handle,
-        // string, array, class object, async frame, function address — is a
-        // fixed 64-bit word on both sides of the runtime boundary
-        // (`type_helpers::FN_ADDR_TYPE`, `backend::abi`). On a 32-bit host that
-        // is silently wrong, and `func_addr` would fail deep inside Cranelift
-        // with no mention of the real cause. Say it here instead. Lifting the
-        // restriction is `willow-d9lm`, not a matter of relaxing this check.
+        // Reference lowering follows the target pointer width, but shared payload
+        // storage and runtime layouts still assume 64 bits. Keep this
+        // guard until willow-d9lm's runtime/layout migrations and native-target
+        // execution gate are complete; the lowering seam alone is insufficient.
         if isa.pointer_bits() != 64 {
             anyhow::bail!(
                 "unsupported target `{}`: willow requires a 64-bit target, but this one has \
@@ -1637,7 +1634,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ty: cranelift_codegen::ir::Type,
         slot: cranelift_codegen::ir::StackSlot,
     ) -> cranelift_codegen::ir::Value {
-        let ptr_ty = self.module.target_config().pointer_type();
+        let ptr_ty = reference_type(self.module.target_config());
         self.builder.ins().stack_load(ptr_ty, ty, slot, 0)
     }
 
@@ -1646,7 +1643,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         value: cranelift_codegen::ir::Value,
         slot: cranelift_codegen::ir::StackSlot,
     ) {
-        let ptr_ty = self.module.target_config().pointer_type();
+        let ptr_ty = reference_type(self.module.target_config());
         self.builder.ins().stack_store(ptr_ty, value, slot, 0);
     }
 
@@ -1685,7 +1682,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     0,
                 ));
                 self.stack_store(val, slot);
-                let ptr_ty = self.module.target_config().pointer_type();
+                let ptr_ty = reference_type(self.module.target_config());
                 let addr = self.builder.ins().stack_addr(ptr_ty, slot, 0);
                 let push_id = self.func_id("willow_push_root");
                 let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
@@ -1707,13 +1704,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.vars.insert(name.to_string(), storage);
             }
             ParamMode::Value => {
-                let var = self.builder.declare_var(clif_type(ty));
+                let var = self.builder.declare_var(clif_type(
+                    type_helpers::reference_type(self.module.target_config()),
+                    ty,
+                ));
                 self.builder.def_var(var, val);
                 self.vars
                     .insert(name.to_string(), VarStorage::Value { var });
             }
             ParamMode::Reference { .. } => {
-                let ptr_ty = self.module.target_config().pointer_type();
+                let ptr_ty = reference_type(self.module.target_config());
                 let var = self.builder.declare_var(ptr_ty);
                 self.builder.def_var(var, val);
                 self.vars.insert(
@@ -1770,20 +1770,38 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn load_var(&mut self, storage: &VarStorage) -> cranelift_codegen::ir::Value {
         match storage {
             VarStorage::Value { var, .. } => self.builder.use_var(*var),
-            VarStorage::Stack { slot, ty } => self.stack_load(clif_type(ty), *slot),
+            VarStorage::Stack { slot, ty } => self.stack_load(
+                clif_type(
+                    type_helpers::reference_type(self.module.target_config()),
+                    ty,
+                ),
+                *slot,
+            ),
             VarStorage::ReferencePtr { var, ty } => {
                 let ptr = self.builder.use_var(*var);
-                self.builder
-                    .ins()
-                    .load(clif_type(ty), MemFlagsData::new(), ptr, 0)
+                self.builder.ins().load(
+                    clif_type(
+                        type_helpers::reference_type(self.module.target_config()),
+                        ty,
+                    ),
+                    MemFlagsData::new(),
+                    ptr,
+                    0,
+                )
             }
             VarStorage::Frame { offset, ty } => {
                 let base = self
                     .async_frame
                     .expect("frame-backed var requires an allocated async frame");
-                self.builder
-                    .ins()
-                    .load(clif_type(ty), MemFlagsData::new(), base, *offset)
+                self.builder.ins().load(
+                    clif_type(
+                        type_helpers::reference_type(self.module.target_config()),
+                        ty,
+                    ),
+                    MemFlagsData::new(),
+                    base,
+                    *offset,
+                )
             }
         }
     }
@@ -2142,7 +2160,7 @@ fn param_abi_type(
 ) -> cranelift_codegen::ir::Type {
     match &param.mode {
         ParamMode::Reference { .. } => pointer_type,
-        ParamMode::Value => clif_type(&param.ty),
+        ParamMode::Value => clif_type(pointer_type, &param.ty),
     }
 }
 
@@ -2835,7 +2853,7 @@ mod tests {
         );
         assert_eq!(
             isa.pointer_type(),
-            type_helpers::FN_ADDR_TYPE,
+            type_helpers::reference_type(isa.frontend_config()),
             "a function address must be exactly as wide as a pointer on an accepted target"
         );
     }
@@ -2883,14 +2901,17 @@ mod tests {
     #[test]
     fn unit_async_codegen_07_future_uses_runtime_pointer_abi() {
         assert_eq!(
-            clif_type(&Type::Generic("Future".to_string().into(), vec![Type::I64])),
+            clif_type(
+                types::I64,
+                &Type::Generic("Future".to_string().into(), vec![Type::I64])
+            ),
             types::I64
         );
         assert_eq!(
-            clif_type(&Type::Generic(
-                "Future".to_string().into(),
-                vec![Type::Void]
-            )),
+            clif_type(
+                types::I64,
+                &Type::Generic("Future".to_string().into(), vec![Type::Void])
+            ),
             types::I64
         );
     }

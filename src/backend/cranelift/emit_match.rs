@@ -24,11 +24,16 @@ pub(super) fn emit_main_result_exit_raw(
     builder.switch_to_block(err_block);
     builder.seal_block(err_block);
     let msg = if err_is_string {
+        builder.ins().load(
+            reference_type(module.target_config()),
+            MemFlagsData::new(),
+            result_ptr,
+            8i32,
+        )
+    } else {
         builder
             .ins()
-            .load(types::I64, MemFlagsData::new(), result_ptr, 8i32)
-    } else {
-        builder.ins().iconst(types::I64, 0)
+            .iconst(reference_type(module.target_config()), 0)
     };
     let fail_ref = module.declare_func_in_func(fail_id, builder.func);
     builder.ins().call(fail_ref, &[msg]);
@@ -78,8 +83,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Multiple candidates: switch on the payload's runtime type_id, read
         // through its class descriptor (willow-fm7t).
         let type_id = self.emit_load_runtime_type_id(e1_payload);
-        let result_var = self.builder.declare_var(types::I64);
-        let zero = self.builder.ins().iconst(types::I64, 0);
+        let result_var = self
+            .builder
+            .declare_var(reference_type(self.module.target_config()));
+        let zero = self
+            .builder
+            .ins()
+            .iconst(reference_type(self.module.target_config()), 0);
         self.builder.def_var(result_var, zero);
         let merge = self.builder.create_block();
         let n = dispatch.len();

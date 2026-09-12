@@ -8,60 +8,36 @@ use super::type_index::TypeMap;
 use cranelift_codegen::ir::types;
 
 use super::EnumInfo;
-use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
+use crate::semantic::builtin_types;
+#[cfg(test)]
+use crate::semantic::builtin_types::BuiltinTypeId as B;
 use crate::semantic::ids::SemanticType as Type;
 
-/// The Cranelift type of a Willow FUNCTION VALUE — the one place the backend
-/// decides how wide a function address is.
-///
-/// It is a fixed 64-bit word, NOT `target_config().pointer_type()`, and the
-/// difference is deliberate. Every reference in Willow's ABI crosses the
-/// runtime boundary as a 64-bit word — GC handles, strings, arrays, class
-/// objects, async frames and function addresses alike — which is what lets
-/// `crates/willow_runtime` declare them as plain `i64` without a per-target
-/// signature (see the `willow_parallel_map_i64` note in `backend::abi`).
-/// [`super::Codegen::new`] rejects any target whose pointer is not 64 bits, so
-/// on every target the compiler accepts this constant and `pointer_type()`
-/// agree. Widening Willow to a 32-bit target is an ABI-wide change, not a
-/// matter of editing this line; it is tracked as `willow-d9lm`.
-pub(crate) const FN_ADDR_TYPE: cranelift_codegen::ir::Type = types::I64;
+/// Reference and function-address width comes from the selected target.
+/// The 64-bit target guard remains until the runtime and layouts are migrated
+/// together (willow-d9lm.4 / willow-d9lm.5).
+pub(crate) fn reference_type(
+    config: cranelift_codegen::isa::TargetFrontendConfig,
+) -> cranelift_codegen::ir::Type {
+    config.pointer_type()
+}
 
 pub(crate) fn clif_type<N: builtin_types::TypeName>(
+    reference_type: cranelift_codegen::ir::Type,
     ty: &crate::parser::ast::Type<N>,
 ) -> cranelift_codegen::ir::Type {
     match ty {
         crate::parser::ast::Type::I64 => types::I64,
         crate::parser::ast::Type::F64 => types::F64,
-        crate::parser::ast::Type::Bool => types::I8,
-        crate::parser::ast::Type::String => types::I64,
-        crate::parser::ast::Type::Never => types::I64, // bottom type — treated as I64 for codegen purposes
-        crate::parser::ast::Type::Array(_) => types::I64,
-        // Task<T>/JoinHandle<T> are pointers to async task frames.
-        // `TaskResult<T>` is the SAME pointer viewed cancellation-awarely
-        // (willow-qrj9): `result()` is an identity adapter, so it must never
-        // gain a distinct representation.
-        crate::parser::ast::Type::Generic(_, _)
-            if builtin_types::resolve(ty).is_some_and(|resolved| {
-                matches!(resolved.id, B::Task | B::JoinHandle | B::TaskResult)
-            }) =>
-        {
-            types::I64
-        }
-        // Future<T> is an opaque runtime future pointer.
-        crate::parser::ast::Type::Generic(_, _)
-            if builtin_types::unary_arg(ty, B::Future).is_some() =>
-        {
-            types::I64
-        }
-        crate::parser::ast::Type::Generic(_, _) => types::I64,
-        // A function address, a fixed 64-bit word — see [`FN_ADDR_TYPE`].
-        crate::parser::ast::Type::Fn(_, _) => FN_ADDR_TYPE,
-        // A closure VALUE is the environment object, so it is a GC pointer and
-        // not a code address; the code pointer lives in its word 0
-        // (willow-0g8j.2.12).
-        crate::parser::ast::Type::Closure(_, _) => types::I64,
-        crate::parser::ast::Type::Named(_) => types::I64,
-        crate::parser::ast::Type::Void => types::I8,
+        crate::parser::ast::Type::Bool | crate::parser::ast::Type::Void => types::I8,
+        // Never uses the reference representation for unreachable values.
+        crate::parser::ast::Type::String
+        | crate::parser::ast::Type::Never
+        | crate::parser::ast::Type::Array(_)
+        | crate::parser::ast::Type::Generic(_, _)
+        | crate::parser::ast::Type::Fn(_, _)
+        | crate::parser::ast::Type::Closure(_, _)
+        | crate::parser::ast::Type::Named(_) => reference_type,
     }
 }
 
@@ -180,54 +156,33 @@ pub(crate) use crate::semantic::intrinsics::{
 mod tests {
     use super::*;
 
-    /// Every Willow reference — GC handle, string, array, class object,
-    /// generic instance and function address — is the SAME 64-bit word. The
-    /// runtime declares all of them as `i64`, so a type that disagreed here
-    /// would cross the boundary truncated or widened (willow-0g8j ABI audit).
     #[test]
-    fn every_reference_type_is_one_64_bit_word() {
-        let reference_types = [
+    fn reference_types_follow_target_width_and_scalars_keep_their_widths() {
+        let references = [
             Type::String,
+            Type::Never,
             Type::Array(Box::new(Type::I64)),
             Type::Named("Point".to_string().into()),
             Type::Generic("Option".to_string().into(), vec![Type::I64]),
+            Type::Generic("Task".to_string().into(), vec![Type::I64]),
+            Type::Generic("JoinHandle".to_string().into(), vec![Type::I64]),
+            Type::Generic("TaskResult".to_string().into(), vec![Type::I64]),
+            Type::Generic("Future".to_string().into(), vec![Type::Void]),
             Type::Fn(vec![Type::I64], Box::new(Type::I64)),
+            Type::Closure(vec![Type::String], Box::new(Type::Bool)),
         ];
-        for ty in reference_types {
-            assert_eq!(
-                clif_type(&ty).bits(),
-                64,
-                "reference type {ty:?} must be a 64-bit word"
-            );
+        for pointer in [types::I32, types::I64] {
+            for ty in &references {
+                assert_eq!(clif_type(pointer, ty), pointer, "{ty:?}");
+            }
+            for (ty, expected) in [
+                (Type::I64, types::I64),
+                (Type::F64, types::F64),
+                (Type::Bool, types::I8),
+                (Type::Void, types::I8),
+            ] {
+                assert_eq!(clif_type(pointer, &ty), expected);
+            }
         }
-    }
-
-    /// The function-address width has exactly one definition. A call through a
-    /// function value loads the address with `clif_type`, and the address
-    /// itself is produced by `func_addr(FN_ADDR_TYPE, ..)`; if those two ever
-    /// disagreed, Cranelift would reject the `call_indirect` — or worse,
-    /// accept a truncated address.
-    #[test]
-    fn a_function_value_has_the_function_address_type() {
-        let f = Type::Fn(vec![Type::String], Box::new(Type::Bool));
-        assert_eq!(clif_type(&f), FN_ADDR_TYPE);
-        assert_eq!(FN_ADDR_TYPE.bits(), 64);
-        // A function type's own shape must not change its representation: an
-        // address is an address whatever it points at.
-        assert_eq!(
-            clif_type(&Type::Fn(vec![], Box::new(Type::Void))),
-            clif_type(&f)
-        );
-    }
-
-    /// The scalars are the types that are NOT one word, and they are the
-    /// reason the check above cannot simply be "everything is 64 bits".
-    #[test]
-    fn scalars_keep_their_own_widths() {
-        assert_eq!(clif_type(&Type::I64).bits(), 64);
-        assert_eq!(clif_type(&Type::F64).bits(), 64);
-        assert!(clif_type(&Type::F64).is_float());
-        assert_eq!(clif_type(&Type::Bool).bits(), 8);
-        assert_eq!(clif_type(&Type::Void).bits(), 8);
     }
 }

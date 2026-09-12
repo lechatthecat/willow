@@ -117,7 +117,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .position(|(name, _)| name == field)
             .expect("checked field");
         self.builder.ins().load(
-            clif_type(&layout[index].1),
+            clif_type(
+                reference_type(self.module.target_config()),
+                &layout[index].1,
+            ),
             MemFlagsData::new(),
             object,
             (index as i32 + 1) * 8,
@@ -160,14 +163,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let info = self
             .lookup_static_storage(&class, field)
             .expect("checked static property");
-        let ptr_ty = self.module.target_config().pointer_type();
+        let ptr_ty = reference_type(self.module.target_config());
         let global = self
             .module
             .declare_data_in_func(info.data_id, self.builder.func);
         let address = self.builder.ins().symbol_value(ptr_ty, global);
-        self.builder
-            .ins()
-            .load(clif_type(&info.ty), MemFlagsData::new(), address, 0)
+        self.builder.ins().load(
+            clif_type(reference_type(self.module.target_config()), &info.ty),
+            MemFlagsData::new(),
+            address,
+            0,
+        )
     }
 
     pub(super) fn emit_flat_static_store(
@@ -184,7 +190,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let source_ty = Self::flat_operand_type(function, value);
         let value = self.emit_lir_operand(function, value);
         let value = self.coerce_to_target(value, &source_ty, &info.ty);
-        let ptr_ty = self.module.target_config().pointer_type();
+        let ptr_ty = reference_type(self.module.target_config());
         let global = self
             .module
             .declare_data_in_func(info.data_id, self.builder.func);

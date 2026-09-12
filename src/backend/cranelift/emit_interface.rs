@@ -1,4 +1,4 @@
-use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC, types};
+use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC};
 use cranelift_module::Module;
 
 use super::*;
@@ -35,7 +35,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         span: crate::diagnostics::Span,
         context: &str,
     ) {
-        let zero = self.builder.ins().iconst(types::I64, 0);
+        let zero = self
+            .builder
+            .ins()
+            .iconst(reference_type(self.module.target_config()), 0);
         let is_nil = self.builder.ins().icmp(IntCC::Equal, ptr, zero);
 
         let nil_block = self.builder.create_block();
@@ -122,14 +125,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         box_ptr: cranelift_codegen::ir::Value,
         slot_offset: usize,
     ) -> cranelift_codegen::ir::Value {
-        let object = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), box_ptr, 0i32);
-        let vtable = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), box_ptr, 8i32);
+        let object = self.builder.ins().load(
+            reference_type(self.module.target_config()),
+            MemFlagsData::new(),
+            box_ptr,
+            0i32,
+        );
+        let vtable = self.builder.ins().load(
+            reference_type(self.module.target_config()),
+            MemFlagsData::new(),
+            box_ptr,
+            8i32,
+        );
         // Interior pointer into a static data symbol, not into the GC heap, so
         // it needs no rooting and the collector never sees it as a reference.
         let target_vtable = self
@@ -285,7 +292,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self_ptr: cranelift_codegen::ir::Value,
         slot: usize,
     ) -> cranelift_codegen::ir::Value {
-        let ptr_ty = self.module.target_config().pointer_type();
+        let ptr_ty = reference_type(self.module.target_config());
         let descriptor = self
             .builder
             .ins()

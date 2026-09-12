@@ -12,6 +12,8 @@
 // of pi; the lint is a false positive there.
 #![allow(clippy::approx_constant)]
 
+#[cfg(test)]
+mod abi_signature_tests;
 pub mod args;
 pub mod array;
 pub mod async_frame;

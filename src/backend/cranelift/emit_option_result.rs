@@ -68,7 +68,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         inner_ty: &Type,
         default_val: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
-        let result_var = self.builder.declare_var(clif_type(inner_ty));
+        let result_var = self.builder.declare_var(clif_type(
+            reference_type(self.module.target_config()),
+            inner_ty,
+        ));
         let is_some = self.emit_option_is_some(ptr, inner_ty);
         let some_block = self.builder.create_block();
         let none_block = self.builder.create_block();
@@ -122,7 +125,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
         self.terminated = false;
-        let clif_ty = clif_type(payload_ty);
+        let clif_ty = clif_type(reference_type(self.module.target_config()), payload_ty);
         let raw = self
             .builder
             .ins()
@@ -146,7 +149,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         success_tag: i64,
         default_val: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
-        let clif_ty = clif_type(payload_ty);
+        let clif_ty = clif_type(reference_type(self.module.target_config()), payload_ty);
         let result_var = self.builder.declare_var(clif_ty);
         let tag = self
             .builder
@@ -201,11 +204,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Type::Fn(param_types, ret_type) = f_ty {
             let mut sig = self.module.make_signature();
             for pt in param_types {
-                sig.params.push(AbiParam::new(clif_type(pt)));
+                sig.params.push(AbiParam::new(clif_type(
+                    reference_type(self.module.target_config()),
+                    pt,
+                )));
             }
             let has_return = **ret_type != Type::Void;
             if has_return {
-                sig.returns.push(AbiParam::new(clif_type(ret_type)));
+                sig.returns.push(AbiParam::new(clif_type(
+                    reference_type(self.module.target_config()),
+                    ret_type,
+                )));
             }
             let sig_ref = self.builder.import_signature(sig);
             let panic_depth = self.emit_pre_willow_call_panic_depth();
@@ -235,7 +244,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let ptr_type = self.module.target_config().pointer_type();
+        let ptr_type = reference_type(self.module.target_config());
         let result_var = self.builder.declare_var(ptr_type);
         let is_some = self.emit_option_is_some(ptr, inner_ty);
 
@@ -273,7 +282,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let ptr_type = self.module.target_config().pointer_type();
+        let ptr_type = reference_type(self.module.target_config());
         let result_var = self.builder.declare_var(ptr_type);
         let is_some = self.emit_option_is_some(ptr, inner_ty);
         let output_inner = match f_ty {
@@ -314,7 +323,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let ptr_type = self.module.target_config().pointer_type();
+        let ptr_type = reference_type(self.module.target_config());
         let result_var = self.builder.declare_var(ptr_type);
         let is_some = self.emit_option_is_some(ptr, inner_ty);
 
@@ -351,7 +360,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let ptr_type = self.module.target_config().pointer_type();
+        let ptr_type = reference_type(self.module.target_config());
         let result_var = self.builder.declare_var(ptr_type);
         let tag = self
             .builder
@@ -404,7 +413,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let ptr_type = self.module.target_config().pointer_type();
+        let ptr_type = reference_type(self.module.target_config());
         let result_var = self.builder.declare_var(ptr_type);
         let tag = self
             .builder
@@ -455,7 +464,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let ptr_type = self.module.target_config().pointer_type();
+        let ptr_type = reference_type(self.module.target_config());
         let result_var = self.builder.declare_var(ptr_type);
         let tag = self
             .builder
@@ -500,7 +509,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let ptr_type = self.module.target_config().pointer_type();
+        let ptr_type = reference_type(self.module.target_config());
         let result_var = self.builder.declare_var(ptr_type);
         let tag = self
             .builder
@@ -551,7 +560,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             willow_abi::SlotKind::Word
         }];
         let layout = willow_abi::EnumVariantLayout::new(tag as u32, &slots);
-        let pointer_bytes = self.module.target_config().pointer_type().bytes();
+        let pointer_bytes = reference_type(self.module.target_config()).bytes();
         // Root the payload across the enum allocation: a GC-managed payload is a
         // live pointer that must survive the collection the GC allocator may
         // trigger before we store it into the new enum. Only reference payloads
@@ -607,7 +616,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             willow_abi::SlotKind::Word
         }];
         let layout = willow_abi::EnumVariantLayout::new(tag as u32, &slots);
-        let pointer_bytes = self.module.target_config().pointer_type().bytes();
+        let pointer_bytes = reference_type(self.module.target_config()).bytes();
         // See `emit_alloc_enum_variant`: root a GC-managed payload across the
         // allocation so a collection cannot free it before it is stored.
         if payload_is_gc {
@@ -658,7 +667,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let option_ty = Type::Generic("Option".to_string().into(), vec![payload_ty.clone()]);
         if option_repr(&option_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
-            self.builder.ins().iconst(types::I64, 0)
+            self.builder
+                .ins()
+                .iconst(reference_type(self.module.target_config()), 0)
         } else {
             self.emit_alloc_boxed_none()
         }
