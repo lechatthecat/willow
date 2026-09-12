@@ -93,13 +93,13 @@ impl Checker<'_> {
         let references: Vec<_> = args
             .iter()
             .filter_map(|arg| match arg.mode {
-                CallArgMode::Reference { ampersand_span } => Some((
-                    ampersand_span,
-                    self.modes.get(&arg.expr.id()).and_then(|mode| match mode {
-                        ParamMode::Reference { mutable, .. } => Some(*mutable),
-                        _ => None,
-                    }),
-                )),
+                CallArgMode::Reference { ampersand_span } => {
+                    let ParamMode::Reference { mutable, .. } = self.modes.get(&arg.expr.id())?
+                    else {
+                        return None;
+                    };
+                    Some((ampersand_span, Some(*mutable)))
+                }
                 CallArgMode::Value => None,
             })
             .collect();
@@ -325,6 +325,57 @@ mod tests {
         assert!(type_errors.is_empty(), "{type_errors:?}");
         assert_eq!(borrows.len(), 1, "{borrows:?}");
         assert_eq!(borrows[0].code, ErrorCode::E1708);
+    }
+
+    #[test]
+    fn synchronous_reference_calls_return_independent_tasks() {
+        for (declaration, call) in [
+            (
+                "fn make(x: &i64) -> Task<i64> { return other(); }",
+                "make(&x)",
+            ),
+            (
+                "class Factory { pub fn make(self, x: &i64) -> Task<i64> { return other(); } }",
+                "new Factory().make(&x)",
+            ),
+            (
+                "class Factory { pub static fn make(x: &i64) -> Task<i64> { return other(); } }",
+                "Factory::make(&x)",
+            ),
+        ] {
+            let source = format!(
+                "async fn other() -> i64 {{ return 42; }} {declaration} \
+                 fn consume(task: Task<i64>) {{}} \
+                 fn main() {{ let x = 1; let task = {call}; consume(task); }}"
+            );
+            let (borrows, type_errors) = analyze_source(&source);
+            assert!(type_errors.is_empty(), "{source}: {type_errors:?}");
+            assert!(borrows.is_empty(), "{source}: {borrows:?}");
+        }
+    }
+
+    #[test]
+    fn asynchronous_reference_call_variants_still_reject_escape() {
+        for (declaration, call) in [
+            ("async fn make(x: &i64) -> i64 { return x; }", "make(&x)"),
+            (
+                "class Factory { pub async fn make(self, x: &i64) -> i64 { return x; } }",
+                "new Factory().make(&x)",
+            ),
+            (
+                "class Factory { pub static async fn make(x: &i64) -> i64 { return x; } }",
+                "Factory::make(&x)",
+            ),
+        ] {
+            let source = format!(
+                "{declaration} fn consume(task: Task<i64>) {{}} \
+                 fn main() {{ let x = 1; let task = {call}; consume(task); }}"
+            );
+            let (borrows, type_errors) = analyze_source(&source);
+            assert!(type_errors.is_empty(), "{source}: {type_errors:?}");
+            assert_eq!(borrows.len(), 1, "{source}: {borrows:?}");
+            assert_eq!(borrows[0].code, ErrorCode::E1708);
+        }
     }
 
     #[test]

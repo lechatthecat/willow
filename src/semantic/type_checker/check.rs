@@ -1763,6 +1763,7 @@ impl TypeChecker {
                         );
                     }
                     self.check_call_args_against_param_infos(&info.param_infos, &c.args);
+                    self.record_async_reference_args(&info.param_infos, &c.args, info.is_async);
                     // Calling an async fn captures its arguments into a Task that
                     // may cross a worker boundary — enforce Send/Sync (dgwo.4).
                     if info.is_async {

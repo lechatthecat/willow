@@ -45,6 +45,17 @@ pub(crate) fn snapshot_current() -> RuntimeStackTrace {
     CALL_STACK.with(|slot| slot.borrow().clone())
 }
 
+/// The generated task constructor is called inside a debug call frame.
+/// Copy its location before publishing the task to other workers.
+pub(crate) fn current_call_site() -> Option<(String, u32)> {
+    CALL_STACK.with(|slot| {
+        slot.borrow()
+            .frames()
+            .last()
+            .map(|frame| (frame.file.clone(), frame.line as u32))
+    })
+}
+
 /// Read `len` raw UTF-8 bytes at `ptr` into an owned (Rust-heap) String. Used
 /// for call-frame names/paths so the call stack never allocates on the Willow
 /// GC heap (which would pollute `gc_allocated_bytes`).
@@ -119,6 +130,23 @@ pub fn print_current_call_stack() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_call_site_tracks_innermost_frame_and_empty_stack() {
+        let previous = replace_current(Default::default());
+        assert_eq!(current_call_site(), None);
+        willow_callstack_push(b"outer".as_ptr(), 5, b"outer.wi".as_ptr(), 8, 12, 1);
+        willow_callstack_push(b"inner".as_ptr(), 5, b"inner.wi".as_ptr(), 8, 34, 1);
+        let inner = current_call_site();
+        willow_callstack_pop();
+        let outer = current_call_site();
+        willow_callstack_pop();
+        let empty = current_call_site();
+        replace_current(previous);
+        assert_eq!(inner, Some(("inner.wi".to_owned(), 34)));
+        assert_eq!(outer, Some(("outer.wi".to_owned(), 12)));
+        assert_eq!(empty, None);
+    }
 
     #[test]
     fn stack_trace_records_source_frames() {

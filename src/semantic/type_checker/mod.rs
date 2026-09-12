@@ -89,7 +89,7 @@ pub struct TypeChecker {
     /// syntax identity rather than a source coordinate, so a pass that rebuilds
     /// a node cannot silently inherit its neighbour's type (willow-njot).
     pub expr_types: HashMap<ExprId, Type>,
-    /// Resolved reference-parameter modes keyed by the argument place identity.
+    /// Reference-parameter modes of resolved async calls, keyed by argument identity.
     pub reference_arg_modes: HashMap<ExprId, ParamMode>,
     /// Unannotated map constructors and uses awaiting their first insertion.
     inferred_maps: HashMap<Span, (Vec<ExprId>, Option<usize>)>,

@@ -9835,3 +9835,43 @@ fn async_reference_escape_reports_e1708_after_e1707() {
         "{diagnostics}"
     );
 }
+
+#[test]
+fn imported_synchronous_reference_call_returns_independent_task() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "factory.wi",
+                "async fn other() -> i64 { return 42; } pub fn make(x: &i64) -> Task<i64> { return other(); }",
+            ),
+            (
+                "main.wi",
+                "import factory; fn consume(task: Task<i64>) -> Task<i64> { return task; } async fn main() { let x = 1; let task = factory::make(&x); println(await consume(task)); }",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn imported_asynchronous_reference_call_still_rejects_escape() {
+    let project = TestProject::new(
+        "imported_async_reference_escape",
+        &[
+            (
+                "factory.wi",
+                "pub async fn make(x: &i64) -> i64 { return x; }",
+            ),
+            (
+                "main.wi",
+                "import factory; fn consume(task: Task<i64>) {} fn main() { let x = 1; let task = factory::make(&x); consume(task); }",
+            ),
+        ],
+    );
+    let output = project.compile("main.wi");
+    assert!(!output.status.success());
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostics.contains("error[E1708]"), "{diagnostics}");
+}

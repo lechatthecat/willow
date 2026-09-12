@@ -8481,23 +8481,28 @@ pub(super) fn task_boundary_symbol(
 /// into user code and cycles need a resumable native stack, including those
 /// nested inside another deferred region.
 pub(super) fn cleanup_needs_task_stack(function: &LirFunction) -> bool {
-    lir_sync_poll_blocks(function)
-        .iter()
-        .skip(1)
-        .any(|poll| *poll)
-        || function.blocks.iter().any(|block| {
-            lir_block_successors(block).contains(&0)
-                || block.recovery.iter().any(|target| target.0 == 0)
-        })
-        || function
-            .blocks
+    let mut pending = vec![function];
+    while let Some(region) = pending.pop() {
+        if lir_sync_poll_blocks(region)
             .iter()
-            .flat_map(|block| &block.instrs)
-            .any(|inst| match inst {
-                LirInst::Compute { value, .. } => task_stack_boundary(value),
-                LirInst::Defer { body, .. } => cleanup_needs_task_stack(&body.function),
-                _ => false,
+            .skip(1)
+            .any(|poll| *poll)
+            || region.blocks.iter().any(|block| {
+                lir_block_successors(block).contains(&0)
+                    || block.recovery.iter().any(|target| target.0 == 0)
             })
+        {
+            return true;
+        }
+        for instruction in region.blocks.iter().flat_map(|block| &block.instrs) {
+            match instruction {
+                LirInst::Compute { value, .. } if task_stack_boundary(value) => return true,
+                LirInst::Defer { body, .. } => pending.push(&body.function),
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 pub(super) fn task_cleanup_symbol(poll: u32, flag: i32, recovery: bool) -> String {
@@ -8669,6 +8674,65 @@ mod tests {
     use crate::backend::cranelift::symbols::{backend_symbol_component, class_member_symbol};
     use crate::lexer::Lexer;
     use crate::parser::Parser;
+
+    #[test]
+    fn cleanup_stack_classifier_handles_deep_defer_trees_on_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                use crate::ir::lowered::{LirDeferBody, LirDeferId};
+
+                fn region(instructions: Vec<LirInst>) -> LirFunction {
+                    LirFunction {
+                        name: "cleanup".to_string().into(),
+                        is_async: false,
+                        params: Vec::new(),
+                        return_type: Type::Void,
+                        blocks: vec![LirBlock {
+                            id: BlockId(0),
+                            instrs: instructions,
+                            terminator: Terminator::CleanupReturn,
+                            recovery: Vec::new(),
+                        }],
+                        locals: Vec::new(),
+                        async_frame: Default::default(),
+                        captures: Vec::new(),
+                    }
+                }
+
+                // Build the ownership tree directly: source lowering would
+                // obscure this classifier's stack usage with unrelated work.
+                const DEPTH: usize = 10_000;
+                let mut tree = region(Vec::new());
+                for _ in 0..DEPTH {
+                    tree = region(vec![LirInst::Defer {
+                        id: LirDeferId(0),
+                        body: LirDeferBody {
+                            function: Box::new(tree),
+                            captures: Vec::new(),
+                            recovery_capable: false,
+                        },
+                        span: Span::dummy(),
+                    }]);
+                }
+                assert!(!cleanup_needs_task_stack(&tree));
+
+                // A cycle only at the deepest leaf must still be discovered.
+                let mut leaf = &mut tree;
+                for _ in 0..DEPTH {
+                    let LirInst::Defer { body, .. } = &mut leaf.blocks[0].instrs[0] else {
+                        unreachable!()
+                    };
+                    leaf = &mut body.function;
+                }
+                leaf.blocks[0].terminator = Terminator::Jump(BlockId(0));
+                assert!(cleanup_needs_task_stack(&tree));
+                // LirFunction's iterative Drop also runs on this small stack.
+            })
+            .expect("spawn classifier test thread")
+            .join()
+            .expect("classifier test thread");
+    }
 
     /// The registration tables [`LirTypeCtx`] borrows, derived from a parsed
     /// single-file program the same way `compile_program` derives them: class

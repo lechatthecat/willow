@@ -1401,6 +1401,7 @@ impl TypeChecker {
                     );
                 }
                 self.check_call_args_against_param_infos(&mi.param_infos, args);
+                self.record_async_reference_args(&mi.param_infos, args, mi.is_async);
                 method_call_return_type(&mi)
             }
         }
@@ -2023,6 +2024,7 @@ impl TypeChecker {
                         );
                     }
                     self.check_call_args_against_param_infos(&fi.param_infos, args);
+                    self.record_async_reference_args(&fi.param_infos, args, fi.is_async);
                     // A module-qualified call to an async fn yields `Task<T>`,
                     // just like a local async call — without this the call site
                     // types as the bare `T` and `await` rejects it
@@ -2150,6 +2152,7 @@ impl TypeChecker {
                     );
                 }
                 self.check_call_args_against_param_infos(&mi.param_infos, args);
+                self.record_async_reference_args(&mi.param_infos, args, mi.is_async);
                 method_call_return_type(&mi)
             }
         }

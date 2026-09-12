@@ -56,6 +56,28 @@ impl TypeChecker {
         self.check_call_args_against_param_infos(&param_infos, args);
     }
 
+    /// Only async callees retain reference arguments after this call returns.
+    /// A synchronous function may return an independent Task without borrowing
+    /// its caller's storage for the lifetime of that Task.
+    pub(super) fn record_async_reference_args(
+        &mut self,
+        params: &[ParamInfo],
+        args: &[CallArg],
+        is_async: bool,
+    ) {
+        if !is_async {
+            return;
+        }
+        for (param, arg) in params.iter().zip(args) {
+            if matches!(param.mode, ParamMode::Reference { .. })
+                && matches!(arg.mode, CallArgMode::Reference { .. })
+            {
+                self.reference_arg_modes
+                    .insert(arg.expr.id(), param.mode.clone());
+            }
+        }
+    }
+
     pub(super) fn check_call_args_against_param_infos(
         &mut self,
         params: &[ParamInfo],
@@ -81,8 +103,6 @@ impl TypeChecker {
                 self.push_missing_reference_arg(arg);
             }
             (ParamMode::Reference { mutable, .. }, CallArgMode::Reference { .. }) => {
-                self.reference_arg_modes
-                    .insert(arg.expr.id(), param.mode.clone());
                 self.check_reference_argument(param, arg, *mutable);
             }
         }

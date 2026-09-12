@@ -1069,6 +1069,12 @@ impl RuntimeScheduler {
         let mut task = RuntimeTask::new(id);
         task.poll = Some(poll);
         task.cooperative_poll = cooperative_poll;
+        // Generated constructors run inside the caller's debug call frame.
+        // The later explicit setter can race the first poll on another worker,
+        // so install the location before the task table or queue can expose it.
+        if cooperative_poll && let Some((file, line)) = crate::stack_trace::current_call_site() {
+            task.set_spawn_site(file, line);
+        }
         task.cancel = cancel;
         task.frame = frame;
         task.frame_rooted = !frame.is_null();
@@ -2861,6 +2867,12 @@ fn claim_global_ready_for_worker(
             }
             Claim::FinalizeCancelled => {
                 with_global(|sched| sched.finalize_cancelled(id));
+                crate::observability::record(
+                    crate::observability::RuntimeEventKind::TaskCancelled,
+                    Some(worker),
+                    id,
+                    0,
+                );
                 set_current_task(None);
             }
             Claim::Drop => {}
@@ -4890,6 +4902,50 @@ mod tests {
         willow_sched_cancel(id);
         willow_sched_run_until(id);
         assert_eq!(CALLED.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cooperative_spawn_publishes_call_site_before_first_poll() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let previous = crate::stack_trace::replace_current(Default::default());
+        crate::stack_trace::willow_callstack_push(
+            b"child".as_ptr(),
+            5,
+            b"spawn.wi".as_ptr(),
+            8,
+            42,
+            3,
+        );
+        let frame = willow_async_frame_alloc(0, 0).cast();
+        let id = willow_sched_spawn_cooperative(poll_ready_now, frame) as u64;
+        crate::stack_trace::replace_current(previous);
+        // Inspect the published record before the caller can invoke the
+        // post-constructor setter: another worker can already claim it here.
+        let site = global_task_table().with(id, |task| {
+            task.spawn_site()
+                .map(|(file, line)| (file.to_owned(), line))
+        });
+        willow_sched_run_until(id);
+        assert_eq!(site, Some(Some(("spawn.wi".to_owned(), 42))));
+    }
+
+    #[test]
+    fn cooperative_cancel_without_cleanup_reports_terminal_cancellation_once() {
+        use crate::observability::{WillowRuntimeMetricsV1, willow_runtime_metrics_snapshot_v1};
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let mut before = WillowRuntimeMetricsV1::default();
+        willow_runtime_metrics_snapshot_v1(&mut before);
+        let frame = willow_async_frame_alloc(0, 0).cast();
+        let id = willow_sched_spawn_cooperative(poll_ready_now, frame) as u64;
+        willow_sched_cancel(id);
+        willow_sched_run_until(id);
+        willow_sched_run();
+        let mut after = WillowRuntimeMetricsV1::default();
+        willow_runtime_metrics_snapshot_v1(&mut after);
+        assert_eq!(after.task_cancellations - before.task_cancellations, 1);
+        assert_eq!(after.task_polls - before.task_polls, 0);
     }
 
     /// Completes on the first poll.
