@@ -32,7 +32,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
-          ref: 1e5f30c5e03e6756793c14bd901f13e5dbbb142d
+          ref: ba2b7ab4b5eb84ddf2d9d9f0dcadf0334f9e6a28
           path: baseline
       - name: Install toolchain
         run: rustup toolchain install 1.95.0 --profile minimal --component llvm-tools

@@ -34,3 +34,7 @@ AGENTS.md
 
 # Local-only internal docs (reference private bd issues / requirements)
 /docs
+
+# Publish only the standalone compiler benchmark harness.
+/benches/*
+!/benches/compiler_bench.rs
