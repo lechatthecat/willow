@@ -24,3 +24,7 @@ tests, and the runnable-example audit for commit `51265ab` on 2026-09-12 in
 [GitHub Actions run 34683897875](https://github.com/lechatthecat/willow/actions/runs/34683897875).
 These are native execution results for the named targets; other target triples
 are not covered by this run.
+
+For day-to-day changes, follow the
+[platform compatibility guide](../platform_compatibility.md), including its
+pre-merge checklist and the platform-specific regressions to avoid.
