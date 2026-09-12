@@ -417,6 +417,14 @@ pub(super) fn compile_and_collect_relocation_targets_all(
     source: &str,
     env: &[(&str, &str)],
 ) -> Vec<String> {
+    compile_and_collect_relocation_targets_mode(source, env, false)
+}
+
+pub(super) fn compile_and_collect_relocation_targets_mode(
+    source: &str,
+    env: &[(&str, &str)],
+    release: bool,
+) -> Vec<String> {
     use object::read::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
 
     let id = unique_test_id();
@@ -436,6 +444,9 @@ pub(super) fn compile_and_collect_relocation_targets_all(
     command
         .args(["build", &src_path, "-o", &bin_path])
         .env("WILLOW_KEEP_OBJECT", "1");
+    if release {
+        command.arg("--release");
+    }
     for (key, value) in env {
         command.env(key, value);
     }

@@ -1387,7 +1387,7 @@ impl Codegen {
             source_file: &self.source_file,
             address_taken: super::lir_address_taken_locals(&lir_fn),
         };
-        if panic_return_block.is_some() {
+        if panic_return_block.is_some() && super::root_effect::may_push_gc_roots(&lir_fn) {
             fg.panic_function_root_depth =
                 Some(fg.emit_value_runtime_call("willow_root_depth", &[]));
         }
@@ -2239,7 +2239,10 @@ impl Codegen {
             source_file: &self.source_file,
             address_taken: super::lir_address_taken_locals(&lir_fn),
         };
-        if panic_return_block.is_some() {
+        // Instance methods always bind a rooted `self`, even for scalar bodies.
+        if panic_return_block.is_some()
+            && (!m.is_static || super::root_effect::may_push_gc_roots(&lir_fn))
+        {
             fg.panic_function_root_depth =
                 Some(fg.emit_value_runtime_call("willow_root_depth", &[]));
         }

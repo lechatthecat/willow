@@ -2,8 +2,8 @@
 
 use super::support::{
     TestProject, compile_and_collect_relocation_targets,
-    compile_and_collect_relocation_targets_all, compile_and_run_release, compile_and_run_with_env,
-    compile_with_compiler_env,
+    compile_and_collect_relocation_targets_all, compile_and_collect_relocation_targets_mode,
+    compile_and_run_release, compile_and_run_with_env, compile_with_compiler_env,
 };
 
 const PURE_RECURSION: &str = r#"
@@ -85,7 +85,116 @@ fn pe_04_analysis_off_restores_conservative_depth_checks() {
     let targets =
         compile_and_collect_relocation_targets(PURE_RECURSION, &[("WILLOW_PANIC_EFFECTS", "0")]);
     assert!(has_target(&targets, "willow_panic_depth"), "{targets:?}");
-    assert!(has_target(&targets, "willow_root_depth"), "{targets:?}");
+    // Disabling panic effects must not disable the independent zero-root proof.
+    assert!(!has_target(&targets, "willow_root_depth"), "{targets:?}");
+}
+
+#[test]
+fn pe_zero_root_panicking_chain_omits_root_unwind_calls() {
+    let source = r#"
+fn divide(n: i64) -> i64 { return 42 / n; }
+fn recurse(n: i64) -> i64 {
+    if n <= 1 { return divide(n); }
+    return recurse(n - 1);
+}
+class Math { pub static fn calculate(n: i64) -> i64 { return recurse(n); } }
+fn main() { println(Math::calculate(2)); }
+"#;
+    for release in [false, true] {
+        for env in [&[][..], &[("WILLOW_PANIC_EFFECTS", "0")][..]] {
+            let targets = compile_and_collect_relocation_targets_mode(source, env, release);
+            assert!(has_target(&targets, "willow_panic_depth"), "{targets:?}");
+            for name in ["willow_root_depth", "willow_pop_roots", "willow_push_root"] {
+                assert!(
+                    !has_target(&targets, name),
+                    "unexpected {name}: {targets:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn pe_zero_root_proof_keeps_reference_and_unknown_cleanup() {
+    // Each fixture has an empty main: the helper alone must retain the entry
+    // snapshot and abnormal-return pop, even with panic effects disabled.
+    let fixtures = [
+        "fn control(n: i64) -> i64 { let s = \"root\"; return 1 / n; }",
+        "class Box {} fn control(n: i64) -> i64 { let b = new Box(); return 1 / n; }",
+        "import std::collections::Array; fn control(n: i64) -> i64 { let a: Array<i64> = [1]; return 1 / n; }",
+        "import std::collections::Map; fn control(n: i64) -> i64 { let m: Map<i64, i64> = Map::new(); return 1 / n; }",
+        "fn control(n: i64) -> i64 { let c = Channel<i64>::new(); return 1 / n; }",
+        "interface Value { fn get(self) -> i64; } fn control(v: Value) -> i64 { return v.get(); }",
+        "fn control(f: fn(i64) -> i64) -> i64 { return f(0); }",
+        "fn control(n: &i64) -> i64 { return 1 / n; }",
+        "fn make() -> String { return \"root\"; } fn control() { make(); }",
+        "fn control(n: i64) -> i64 { defer { let s = \"root\"; println(s); } return 1 / n; }",
+        "fn control(n: i64) -> i64 { match n { 0 => { let s = \"root\"; println(s); }, _ => {} } return 1 / n; }",
+        "fn control(n: i64) -> i64 { let mut i = 0; while i < n { let s = \"root\"; println(s); i = i + 1; } return 1 / n; }",
+        "class Control { pub fn divide(self, n: i64) -> i64 { return 1 / n; } }",
+        "fn control() { panic(\"explicit\"); }",
+    ];
+    for fixture in fixtures {
+        let source = format!("{fixture}\nfn main() {{}}");
+        for release in [false, true] {
+            let targets = compile_and_collect_relocation_targets_mode(
+                &source,
+                &[("WILLOW_PANIC_EFFECTS", "0")],
+                release,
+            );
+            for name in ["willow_root_depth", "willow_pop_roots"] {
+                assert!(
+                    has_target(&targets, name),
+                    "missing {name} for {fixture}: {targets:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn pe_zero_root_panic_returns_preserve_typed_abi_and_recovery() {
+    let source = r#"
+fn fail() { panic("explicit"); }
+fn integer(n: i64) -> i64 { return 1 / n; }
+fn floating() -> f64 { fail(); return 2.5; }
+fn boolean() -> bool { fail(); return true; }
+fn empty() { fail(); }
+class Math { pub static fn divide(n: i64) -> i64 { return integer(n); } }
+fn exercise(which: i64) {
+    defer match recover() {
+        Some(info) => println("recovered"),
+        None => println("missed")
+    }
+    if which == 0 { println(integer(0)); }
+    if which == 1 { println(floating()); }
+    if which == 2 { println(boolean()); }
+    if which == 3 { empty(); }
+    if which == 4 { println(Math::divide(0)); }
+    println("unreachable");
+}
+fn main() {
+    let mut i = 0;
+    while i < 5 { exercise(i); i = i + 1; }
+    println("after");
+}
+"#;
+    let expected = "recovered\n".repeat(5) + "after\n";
+    for env in [
+        &[][..],
+        &[("WILLOW_PANIC_EFFECTS", "0")][..],
+        &[
+            ("WILLOW_GC_STRESS", "alloc"),
+            ("WILLOW_GC_VERIFY_BARRIER", "1"),
+        ][..],
+    ] {
+        let (out, ok) = compile_and_run_with_env(source, env);
+        assert!(ok, "{out}");
+        assert_eq!(out, expected);
+    }
+    let (out, ok) = compile_and_run_release(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, expected);
 }
 
 #[test]

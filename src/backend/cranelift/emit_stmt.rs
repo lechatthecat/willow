@@ -863,14 +863,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let Some(block) = self.panic_return_block else {
             return;
         };
-        let entry_depth = self
-            .panic_function_root_depth
-            .expect("panic return requires an entry root-depth snapshot");
         self.builder.switch_to_block(block);
         self.builder.seal_block(block);
-        let current_depth = self.emit_value_runtime_call("willow_root_depth", &[]);
-        let roots_to_pop = self.builder.ins().isub(current_depth, entry_depth);
-        self.emit_void_runtime_call("willow_pop_roots", &[roots_to_pop]);
+        if let Some(entry_depth) = self.panic_function_root_depth {
+            let current_depth = self.emit_value_runtime_call("willow_root_depth", &[]);
+            let roots_to_pop = self.builder.ins().isub(current_depth, entry_depth);
+            self.emit_void_runtime_call("willow_pop_roots", &[roots_to_pop]);
+        }
         if *return_ty == Type::Void || force_void {
             self.builder.ins().return_(&[]);
         } else {

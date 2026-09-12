@@ -20,7 +20,7 @@ import std::collections::Array;
 // is a programming fault. The runtime raises it; the recovered PanicInfo still
 // points at the statement below.
 fn lookup(values: Array<i64>, index: i64) -> i64 {
-    return values[index];
+    return values[slot_index(index, 1)];
 }
 
 // `report` is an ordinary helper called FROM a deferred block. Its own defer
@@ -97,4 +97,10 @@ fn main() {
     select {
         let value = channel.recv() => { println("  received " + value.toString()); }
     }
+}
+
+// A panic-capable helper with only immediate values: division can raise a
+// runtime panic, but this function needs no GC root-depth unwind bookkeeping.
+fn slot_index(index: i64, stride: i64) -> i64 {
+    return index / stride;
 }

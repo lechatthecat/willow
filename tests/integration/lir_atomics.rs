@@ -29,6 +29,39 @@ const PLAIN: [(&str, &str); 0] = [];
 const BUDGET: [(&str, &str); 1] = [("WILLOW_TASK_BUDGET", "1")];
 const STRESS: [(&str, &str); 1] = [("WILLOW_GC_STRESS", "alloc")];
 
+#[test]
+fn lir_atomics_24_temporary_receivers_survive_allocating_operands() {
+    // willow-p8ud: the former AST emitter left a temporary receiver unrooted
+    // while evaluating its operand. Exercise both call-result and constructor
+    // receivers, including void-returning stores, with collection at allocation.
+    assert_atomics(
+        r#"
+import std::collections::Array;
+fn fresh(start: i64) -> AtomicI64 { return AtomicI64::new(start); }
+fn fresh_bool(start: bool) -> AtomicBool { return AtomicBool::new(start); }
+fn churn(n: i64) -> i64 {
+    let junk: Array<String> = ["aa", "bb", "cc"];
+    return junk.len() + n;
+}
+fn churn_bool() -> bool { return churn(1) == 4; }
+fn main() {
+    let mut i = 0;
+    while i < 40 {
+        println(fresh(7).add(churn(1)));
+        println(AtomicI64::new(8).sub(churn(1)));
+        println(fresh(9).swap(churn(1)));
+        AtomicI64::new(10).store(churn(1));
+        println(fresh_bool(false).swap(churn_bool()));
+        AtomicBool::new(false).store(churn_bool());
+        i = i + 1;
+    }
+}
+"#,
+        &"7\n8\n9\nfalse\n".repeat(40),
+        &["fresh", "fresh_bool", "churn", "churn_bool", "main"],
+    );
+}
+
 /// `expected` must come out of all three configurations, and `functions` must
 /// each be named in the walker's selection log — otherwise a body could go
 /// unlowered while the program still printed the right answer.

@@ -44,6 +44,7 @@ mod gc_codegen;
 mod lir_gen;
 mod option_repr;
 mod panic_effect;
+mod root_effect;
 mod std_collection;
 mod symbols;
 mod type_helpers;
@@ -1441,7 +1442,8 @@ struct FuncGen<'a, 'b> {
     /// Callees return an ABI-safe neutral value while panic state remains
     /// active; callers branch before observing that value (willow-s9ej.4).
     panic_return_block: Option<cranelift_codegen::ir::Block>,
-    /// Shadow-root depth inherited from the caller at function entry.
+    /// Shadow-root depth inherited from the caller at function entry. Omitted
+    /// for synchronous bodies proven unable to push roots (root_effect).
     panic_function_root_depth: Option<cranelift_codegen::ir::Value>,
     emitting_sync_cancel_cleanup: bool,
     lir_cleanup_exit: Option<(cranelift_codegen::ir::Block, usize, bool)>,
