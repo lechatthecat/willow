@@ -1995,8 +1995,7 @@ mod tests {
         crate::gc::reset_internal_for_test();
         crate::scheduler::reset_global_scheduler_for_test();
         // A select with a recv case AND a send case on the same channel parks
-        // the task on both queues; close must not wake it twice (the second
-        // `remove_channel_wait` would drop a reference it still needs).
+        // the task on both queues; close must retain ownership on other channels.
         let task = crate::scheduler::with_global_for_test(|sched| {
             let id = sched.spawn_placeholder();
             sched.park(id);
@@ -2014,15 +2013,47 @@ mod tests {
             state.send_waiters.register(task);
         }
         register_existing_test_ownership(task, raw);
-        register_existing_test_ownership(task, other);
+        let other_owner = {
+            let mut state = unsafe { channel_from_raw(other) }
+                .unwrap()
+                .state
+                .lock()
+                .unwrap();
+            assert!(register_wait(
+                other,
+                &mut state.waiters,
+                task,
+                ChannelRole::RecvWait
+            ));
+            token(
+                other,
+                ChannelRole::RecvWait,
+                state.waiters.ticket(task).unwrap(),
+            )
+        };
+        let before = crate::scheduler::with_global_for_test(|sched| {
+            sched
+                .with_task_mut(task, |task| task.wait_channels().to_vec())
+                .unwrap()
+        });
+        assert_eq!(
+            before.len(),
+            3,
+            "both closed-channel roles and the other channel must be registered"
+        );
+        assert!(
+            before.contains(&other_owner),
+            "other ownership must exist before close"
+        );
 
         willow_channel_close(raw);
 
         assert_eq!(
             crate::scheduler::take_channel_waits(task),
-            expected_test_ownership(task, other),
+            vec![other_owner],
             "close must drop only the closed channel's reverse reference"
         );
+        assert_eq!(expected_test_ownership(task, other), vec![other_owner]);
     }
     #[test]
     fn receive_select_retains_winner_and_compensates_losing_claim() {
