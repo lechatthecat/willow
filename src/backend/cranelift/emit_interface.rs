@@ -637,6 +637,18 @@ fn main() {}
                 if *offset < start || *offset >= end {
                     return false;
                 }
+                // AArch64 Mach-O PIC loads use a PAGE21/PAGEOFF12 pair
+                // for one helper address. Count the page relocation once.
+                if file.architecture() == object::Architecture::Aarch64
+                    && matches!(
+                        relocation.flags(),
+                        object::RelocationFlags::MachO { r_type, .. }
+                            if r_type == object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
+                                || r_type == object::macho::ARM64_RELOC_PAGEOFF12
+                    )
+                {
+                    return false;
+                }
                 let RelocationTarget::Symbol(index) = relocation.target() else {
                     return false;
                 };
