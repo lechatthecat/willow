@@ -48,5 +48,7 @@ The 20 call/frame perspectives pass locally on Linux x86_64. The production
 flag test and overflow suite have no platform skip and are included in the
 Linux/macOS/Windows CI workflow from decision 0003. Native synchronous task
 stack tests separately cover stack switching and cancellation on all four CI targets.
-macOS and Windows execution results remain pending those remote CI runs;
-this decision does not claim a local Linux run verifies their exception paths.
+All four native targets passed the workspace tests and runnable-example audit
+for commit `51265ab` on 2026-09-12 in
+[GitHub Actions run 34683897875](https://github.com/lechatthecat/willow/actions/runs/34683897875),
+including their native-stack-overflow tests.
