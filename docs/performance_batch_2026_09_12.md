@@ -287,9 +287,9 @@ https://github.com/lechatthecat/willow/actions/runs/34690503325 .
 | willow-s9ej | Completed panic epic after all children closed | Closed |
 | willow-8hq4.5 | Reused panic snapshots only across proven stable regions | Closed |
 | willow-8hq4.8 | Added exact channel ownership and linear wake accounting | Closed |
-| willow-8hq4.2 | Cached successful runtime freshness proofs conservatively | Content-digest native gate pending |
+| willow-8hq4.2 | Cached successful runtime freshness proofs conservatively | Closed |
 | willow-8hq4.4 | Reduced panic/root depth access cost with native evidence | Closed |
-| willow-8hq4.1 | Dead stripping with metadata retention and native link measurements | Final full-suite gate pending |
+| willow-8hq4.1 | Dead stripping with metadata retention and native link measurements | Closed |
 
 The additional runtime FuncRef colocation implementation belongs to
 `willow-8hq4.6`; it remains open for explicit range proof and is not counted
@@ -300,3 +300,23 @@ described above. The cache ticket was reopened rather than treating the
 failure as flaky. The corrected digest implementation at `3c50d9a` has fresh
 native performance/toolchain gates in run 34690931372 and full CI in
 run 34690932635. Formatting and strict workspace Clippy passed locally.
+
+Final native performance validation at `3c50d9a` passed on all five targets:
+https://github.com/lechatthecat/willow/actions/runs/34690931372 . This includes
+the archive-content regression, runtime/toolchain/ABI gates, panic stress,
+benchmarks, and accessor disassembly. The final cache ticket was closed again
+after those gates passed.
+
+Full workspace plus runnable-example evidence with the product changes:
+Linux and Windows passed in run 34688891554; Apple Silicon passed in
+run 34690503325 after the cancellation fixture corrections (4,468 integration
+tests plus the separate example audit). Intel Mac remains in progress.
+The fresh all-platform full run 34690932635 includes the final archive digest.
+
+All ten tickets in the accounting table are closed. Dead-strip acceptance is
+supported by completed full workspace/example gates on Linux, Windows, and
+Apple Silicon, plus final focused native correctness on all five targets.
+The dead-strip implementation has not changed since `476c65c`. The additional
+Intel Mac full run and all-platform digest-era full rerun are still running
+at handoff; this report does not claim those runs are green. Their latest
+status is available at the linked Actions runs.
