@@ -14,12 +14,11 @@ pub const GC_REF_MASK_BITS: usize = u64::BITS as usize;
 
 /// Target-independent representation class for one C-ABI parameter/return.
 ///
-/// `Word` is deliberately distinct from both `I64` and `Ptr`: it is a
-/// Willow one-word value whose bits may hold a GC handle, a tagged value, or a
-/// scalar payload.  It remains a 64-bit Willow word even when a consumer is
-/// inspecting another target's native pointer width.  `Ptr` is reserved
-/// for addresses dereferenced by the runtime (including function pointers and
-/// out-parameters).
+/// `Word` is a generic 64-bit Willow payload that may contain scalar bits or
+/// an encoded reference (for example an array element or map key). `Ptr`
+/// represents reference-only handles, object and frame addresses, function
+/// pointers, and out-parameters, and follows the target's native pointer width.
+/// Fixed-width counters, sizes, and task identifiers use `I64`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AbiTy {
     Word,
