@@ -115,11 +115,12 @@ def main():
     parser.add_argument("--before", required=True, type=pathlib.Path)
     parser.add_argument("--after", required=True, type=pathlib.Path)
     parser.add_argument("--output", required=True, type=pathlib.Path)
+    parser.add_argument("--baseline-note", default="Unmodified baseline runtime archive")
     parser.add_argument("--iterations", type=int, default=9)
     args = parser.parse_args()
     if args.iterations < 1:
         parser.error("iterations must be positive")
-    results = {"platform": platform.platform(), "machine": platform.machine(), "cases": []}
+    results = {"platform": platform.platform(), "machine": platform.machine(), "baseline_note": args.baseline_note, "cases": []}
     with tempfile.TemporaryDirectory(prefix="willow-depth-bench-") as directory:
         root = pathlib.Path(directory)
         for name, source in cases():

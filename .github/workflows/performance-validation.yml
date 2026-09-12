@@ -39,6 +39,7 @@ jobs:
       - name: Build compiler and runtime pair
         shell: bash
         run: |
+          python3 scripts/prepare_benchmark_baseline.py baseline
           cargo +1.95.0 build --locked --bin willowc
           cargo +1.95.0 build --locked --release -p willow_runtime
           cargo +1.95.0 build --locked --release --manifest-path baseline/Cargo.toml -p willow_runtime --target-dir baseline/target
@@ -54,8 +55,13 @@ jobs:
         run: |
           mkdir -p evidence
           archive=libwillow_runtime.a
-          if [ "$RUNNER_OS" = Windows ]; then archive=willow_runtime.lib; fi
-          python3 scripts/benchmark_runtime_depth.py --before "baseline/target/release/$archive" --after "target/release/$archive" --iterations 9 --output evidence/runtime_depth.json
+          baseline_note="Unmodified baseline runtime archive"
+          if [ "$RUNNER_OS" = Windows ]; then
+            archive=willow_runtime.lib
+            baseline_note="Baseline adds an unused aborting select-cleanup ABI export required by MSVC; no benchmark executes it"
+          fi
+          python3 scripts/benchmark_native_link.py --output evidence/link.json
+          python3 scripts/benchmark_runtime_depth.py --before "baseline/target/release/$archive" --after "target/release/$archive" --iterations 9 --baseline-note "$baseline_note" --output evidence/runtime_depth.json
           python3 scripts/native_runtime_disassembly.py baseline/target/release/$archive target/release/$archive evidence
       - uses: actions/upload-artifact@v4
         if: always()
