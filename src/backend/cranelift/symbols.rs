@@ -332,7 +332,7 @@ pub(crate) fn class_name_for_object_type(
     ty: &crate::semantic::ids::SemanticType,
 ) -> Option<crate::semantic::ids::TypeId> {
     match ty {
-        Type::Named(name) => Some(name.clone()),
+        Type::Named(name) => Some(*name),
         _ => None,
     }
 }

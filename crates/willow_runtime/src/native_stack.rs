@@ -14,6 +14,8 @@ use crate::task::{RUNTIME_POLL_PREEMPTED, RuntimeCancelFn, RuntimePollFn};
 
 thread_local! {
     static CURRENT: Cell<*mut NativeStack> = const { Cell::new(std::ptr::null_mut()) };
+    // ucontext may retain pointers into its own allocation across cache moves.
+    #[allow(clippy::vec_box)]
     static IDLE_STACKS: std::cell::RefCell<Vec<Box<NativeStack>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 

@@ -1,0 +1,1 @@
+pub enum Wrap<T> { Val(T), Empty }

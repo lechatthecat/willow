@@ -83,7 +83,7 @@ pub(super) fn slots<S: IfaceShapes + ?Sized, Q: super::type_index::TypeLookup + 
         match task {
             Work::Enter(iface) => {
                 let canonical = shapes.canonical(&iface);
-                if !visiting.insert(canonical.clone()) {
+                if !visiting.insert(canonical) {
                     results.push(Vec::new());
                     continue;
                 }
@@ -141,14 +141,14 @@ pub(super) fn super_offset<
                 if canonical == target {
                     return Some(offset);
                 }
-                if !visiting.insert(canonical.clone()) {
+                if !visiting.insert(canonical) {
                     continue;
                 }
                 work.push(Work::Exit(canonical));
                 let mut next = offset;
                 let mut children = Vec::new();
                 for sup in shapes.supers(&source) {
-                    children.push(Work::Enter(sup.clone(), next));
+                    children.push(Work::Enter(sup, next));
                     next += slots(shapes, &sup).len();
                 }
                 work.extend(children.into_iter().rev());
@@ -161,8 +161,8 @@ pub(super) fn super_offset<
 impl IfaceShapes for super::type_index::TypeMap<super::InterfaceInfo> {
     fn canonical(&self, iface: &super::TypeId) -> super::TypeId {
         self.get_id(iface)
-            .map(|info| info.name.clone())
-            .unwrap_or_else(|| iface.clone())
+            .map(|info| info.name)
+            .unwrap_or_else(|| *iface)
     }
     fn supers(&self, iface: &super::TypeId) -> Vec<super::TypeId> {
         self.get_id(iface)
@@ -196,7 +196,7 @@ mod tests {
 
     impl IfaceShapes for Table {
         fn canonical(&self, iface: &super::super::TypeId) -> super::super::TypeId {
-            iface.clone()
+            *iface
         }
         fn supers(&self, iface: &super::super::TypeId) -> Vec<super::super::TypeId> {
             self.0

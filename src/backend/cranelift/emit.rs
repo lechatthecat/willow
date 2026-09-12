@@ -28,7 +28,7 @@ pub(super) fn resolve_vtable_id(
 ) -> Option<DataId> {
     let canonical_iface = interface_infos
         .get(interface_name)
-        .map(|i| i.name.clone())
+        .map(|i| i.name)
         .unwrap_or_else(|| interface_name.to_string().into());
     vtable_ids
         .get(&(TypeId::from_source_name(class_name), canonical_iface))

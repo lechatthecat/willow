@@ -655,7 +655,7 @@ impl Codegen {
             };
             // The name travels with the key: the walker reads it back to find a
             // method's enclosing class.
-            f.name = key.clone();
+            f.name = key;
             self.lir_functions.insert(key, f);
         }
         for l in lir.lambdas {
@@ -666,10 +666,10 @@ impl Codegen {
             // whichever unit does declare it.
             match self.lambda_names.get(&l.id) {
                 Some(name) => {
-                    let name = name.clone();
+                    let name = *name;
                     let mut f = l.function;
-                    f.name = name.clone();
-                    self.lir_functions.insert(f.name.clone(), f);
+                    f.name = name;
+                    self.lir_functions.insert(f.name, f);
                 }
                 None => {
                     self.lir_lambdas.insert(l.id, l.function);
@@ -690,7 +690,8 @@ impl Codegen {
         self.rebind_item_import_functions(&unit.item_imports);
         self.source_file = unit.source_file.clone();
         let program = &unit.program;
-        let result = self.with_unit_resolution(self.resolution_context(), |this| {
+
+        self.with_unit_resolution(self.resolution_context(), |this| {
             // Bind the types this unit imported by single-item import under the
             // local names it spells them by (willow-0g8j.3), then the module's own
             // enums/interfaces under their unqualified names so the module body
@@ -745,8 +746,7 @@ impl Codegen {
                 this.compile_unit_static_init(unit)?;
                 Ok(())
             })()
-        });
-        result
+        })
     }
 
     /// Declare and compile the entry program in one call. A multi-unit driver
@@ -862,7 +862,7 @@ impl Codegen {
                 // compiled by the walker like any other function.
                 if let Some(mut lf) = this.lir_lambdas.remove(&lambda.id) {
                     lf.name = this.func_ids.scope().lookup_id(name);
-                    this.lir_functions.insert(lf.name.clone(), lf);
+                    this.lir_functions.insert(lf.name, lf);
                 }
             }
 
@@ -1607,9 +1607,7 @@ impl Codegen {
                 TypeId::from_source_name(class_key),
                 format!("$static_init.{}", field.name),
             );
-            self.func_ids
-                .scope()
-                .declare(&initializer_name, identity.clone());
+            self.func_ids.scope().declare(&initializer_name, identity);
             self.func_ids.scope().declare(&symbol, identity);
             self.declare_function_symbol(&initializer_name, &symbol, &initializer, false)?;
             self.unit_static_inits
@@ -1872,7 +1870,7 @@ impl Codegen {
         iface: &InterfaceInfo,
         span: crate::diagnostics::Span,
     ) -> Result<()> {
-        let key = (TypeId::from_source_name(class_name), iface.name.clone());
+        let key = (TypeId::from_source_name(class_name), iface.name);
         if self.vtable_ids.contains_key(&key) {
             return Ok(());
         }

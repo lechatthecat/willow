@@ -1004,18 +1004,20 @@ async fn main() {
 fn panic_recover_47_cancellation_only_defer_observes_none() {
     let (out, ok) = compile_and_run(
         r#"
-async fn waiting() {
+async fn waiting(ready: Channel<i64>) {
     defer match recover() {
         Some(_) => println("wrong"),
         None => println("cancel-none")
     }
+    ready.send(1);
     await sleep(10000);
 }
 async fn main() {
-    let task = waiting();
-    await sleep(1);
+    let ready = Channel<i64>::new();
+    let task = waiting(ready);
+    ready.recv();
     task.cancel();
-    await sleep(1);
+    let _ = await task.result();
     println(task.is_cancelled());
 }
 "#,

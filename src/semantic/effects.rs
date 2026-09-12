@@ -826,7 +826,7 @@ mod tests {
         let collect = |facts: &EffectFacts<&'static str>| {
             facts
                 .iter()
-                .map(|(id, summary)| (id.clone(), summary.clone()))
+                .map(|(id, summary)| (*id, summary.clone()))
                 .collect::<Vec<_>>()
         };
         assert_eq!(collect(&forward), collect(&reverse));

@@ -237,7 +237,7 @@ impl TypeChecker {
                     let owner = TypeId::local(class.name.as_str());
                     for method in &class.methods {
                         self.lock_effect_callables.insert(
-                            FunctionId::method(owner.clone(), method.name.as_str()),
+                            FunctionId::method(owner, method.name.as_str()),
                             method.is_async,
                         );
                     }
@@ -262,7 +262,7 @@ impl TypeChecker {
                 interface
                     .method_order
                     .iter()
-                    .map(move |method| FunctionId::method(owner.clone(), method.as_str()))
+                    .map(move |method| FunctionId::method(owner, method.as_str()))
             })
             .collect::<Vec<_>>();
         for callable in interface_callables {
@@ -456,13 +456,13 @@ impl TypeChecker {
         let Some(callee_is_async) = self.lock_effect_callables.get(&callee).copied() else {
             return;
         };
-        let Some(caller) = self.current_effect_callable.clone() else {
+        let Some(caller) = self.current_effect_callable else {
             return;
         };
         self.lock_effect_edges
             .entry(caller)
             .or_default()
-            .insert(callee.clone());
+            .insert(callee);
         if callee_is_async {
             return;
         }
@@ -483,7 +483,7 @@ impl TypeChecker {
     ) {
         // A lambda has no named call-graph node, but a lock inside its own
         // body still needs direct-site diagnostics.
-        if let Some(caller) = self.current_effect_callable.clone() {
+        if let Some(caller) = self.current_effect_callable {
             self.lock_direct_effects
                 .entry(caller)
                 .or_insert(LockEffectCause {
@@ -569,7 +569,7 @@ impl TypeChecker {
         let mut graph = CallGraph::default();
         for (caller, callees) in &self.lock_effect_edges {
             graph.merge(
-                caller.clone(),
+                *caller,
                 CallSites {
                     targets: callees.iter().cloned().collect(),
                     has_unknown: false,
@@ -586,18 +586,16 @@ impl TypeChecker {
         // to express: the effect is real, it just belongs to the Task.
         for (callable, is_async) in &self.lock_effect_callables {
             if *is_async {
-                problem = problem.transmit(
-                    callable.clone(),
-                    RuntimeEffects::ALL.difference(LOCK_EFFECT_WAIT),
-                );
+                problem =
+                    problem.transmit(*callable, RuntimeEffects::ALL.difference(LOCK_EFFECT_WAIT));
             }
         }
         for (owner, cause) in &self.lock_direct_effects {
             problem = problem.seed(
-                owner.clone(),
+                *owner,
                 cause.kind.effects(),
                 Some(LockEffectWitness {
-                    owner: owner.clone(),
+                    owner: *owner,
                     cause: *cause,
                 }),
             );

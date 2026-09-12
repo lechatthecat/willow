@@ -663,6 +663,218 @@ pub(crate) fn inline_scalar_leaves(functions: &mut [super::lowered::SourceFuncti
     }
 }
 
+/// Eliminate one nonescaping scalar aggregate in a pure single-block body.
+/// No call, allocation, fault, or GC observation may cross the replacement.
+/// Stored operands must remain stable: replacing a store with a later read of
+/// a mutable variable would otherwise observe the wrong version of its value.
+pub(crate) fn scalar_replace_objects(
+    blocks: &mut [SourceBlock],
+    locals: &[super::lowered::LirLocal],
+) {
+    use super::lowered::async_liveness::{instruction_use_def, terminator_uses};
+    use super::lowered::{LirLocalId, LirOperand as O, LirRvalue as V};
+    use std::collections::HashSet;
+    let [block] = blocks else {
+        return;
+    };
+    if !block.recovery.is_empty() {
+        return;
+    }
+    let scalar = |ty: &Type| matches!(ty, Type::I64 | Type::F64 | Type::Bool);
+    let atom = |expr: &HirExpr| {
+        scalar(&expr.ty)
+            && matches!(
+                expr.kind,
+                HirExprKind::Int(_)
+                    | HirExprKind::Float(_)
+                    | HirExprKind::Bool(_)
+                    | HirExprKind::Var(_)
+            )
+    };
+    if !matches!(&block.terminator, SourceTerminator::Return(None))
+        && !matches!(&block.terminator, SourceTerminator::Return(Some(value)) if atom(value))
+    {
+        return;
+    }
+    let names: HashMap<_, _> = locals
+        .iter()
+        .map(|local| (local.name.as_str(), local.id))
+        .collect();
+    let mut last_def = HashMap::new();
+    let mut counts = HashMap::<LirLocalId, usize>::new();
+    let mut uses = HashSet::new();
+    let mut defs = HashSet::new();
+    let mut candidate = None;
+    for (index, inst) in block.instrs.iter().enumerate() {
+        uses.clear();
+        defs.clear();
+        instruction_use_def(inst, &names, &mut uses, &mut defs);
+        for &id in &defs {
+            last_def.insert(id, index);
+            *counts.entry(id).or_default() += 1;
+        }
+        if let SourceInst::Compute {
+            local,
+            value: V::ObjectAlloc { class },
+            ..
+        } = inst
+            && candidate.replace((*local, *class, index)).is_some()
+        {
+            return;
+        }
+    }
+    let Some((object, class, allocated_at)) = candidate else {
+        return;
+    };
+    if counts.get(&object) != Some(&1) {
+        return;
+    }
+    let mut aliases = HashSet::from([object]);
+    let mut fields = HashMap::<String, O>::new();
+    let mut remove = HashSet::from([allocated_at]);
+    let mut replacements = HashMap::new();
+    let mut discard_defs = HashSet::new();
+    for (index, inst) in block.instrs.iter().enumerate() {
+        if index == allocated_at {
+            continue;
+        }
+        let alias_source = match inst {
+            SourceInst::Compute {
+                local,
+                value: V::Use(O::Local(source)),
+                ..
+            } if aliases.contains(source) => Some((*local, *source)),
+            SourceInst::Let {
+                name,
+                value:
+                    HirExpr {
+                        kind: HirExprKind::Var(source),
+                        ..
+                    },
+                ..
+            } => names
+                .get(source.as_str())
+                .filter(|source| aliases.contains(source))
+                .and_then(|source| names.get(name.as_str()).map(|target| (*target, *source))),
+            _ => None,
+        };
+        if let Some((target, _)) = alias_source {
+            if index < allocated_at {
+                return;
+            }
+            if counts.get(&target) != Some(&1) {
+                return;
+            }
+            aliases.insert(target);
+            remove.insert(index);
+            continue;
+        }
+        match inst {
+            SourceInst::Compute {
+                local,
+                value:
+                    V::FieldStore {
+                        object: O::Local(owner),
+                        object_ty,
+                        field,
+                        value,
+                    },
+                ..
+            } if aliases.contains(owner) => {
+                if !matches!(object_ty, Type::Named(name) if *name == class)
+                    || !value.ty(locals).is_some_and(|ty| scalar(&ty))
+                {
+                    return;
+                }
+                if let O::Local(source) = value
+                    && (aliases.contains(source)
+                        || last_def.get(source).is_some_and(|defined| *defined > index))
+                {
+                    return;
+                }
+                fields.insert(field.clone(), value.clone());
+                discard_defs.insert(*local);
+                remove.insert(index);
+                continue;
+            }
+            SourceInst::Compute {
+                value:
+                    V::FieldLoad {
+                        object: O::Local(owner),
+                        object_ty,
+                        field,
+                        result,
+                    },
+                ..
+            } if aliases.contains(owner) => {
+                let Some(value) = fields.get(field) else {
+                    return;
+                };
+                if !matches!(object_ty, Type::Named(name) if *name == class)
+                    || !scalar(result)
+                    || value.ty(locals).as_ref() != Some(result)
+                {
+                    return;
+                }
+                replacements.insert(index, value.clone());
+                continue;
+            }
+            SourceInst::Compute { value, .. } => match value {
+                V::Use(operand) if operand.ty(locals).is_some_and(|ty| scalar(&ty)) => {}
+                V::Unary { ty, .. } if scalar(ty) => {}
+                V::Binary { op, operand_ty, .. }
+                    if scalar(operand_ty)
+                        && !matches!(op, BinOp::Div | BinOp::Rem | BinOp::Pow) => {}
+                _ => return,
+            },
+            SourceInst::Let { value, .. }
+            | SourceInst::Assign { value, .. }
+            | SourceInst::Expr(value)
+                if atom(value) => {}
+            SourceInst::ClearScopeRoots { .. } => continue,
+            _ => return,
+        }
+        uses.clear();
+        defs.clear();
+        instruction_use_def(inst, &names, &mut uses, &mut defs);
+        if !uses.is_disjoint(&aliases) || !defs.is_disjoint(&aliases) {
+            return;
+        }
+    }
+    // Removed store instructions produce only unused void temporaries. Any
+    // unusual consumer of that result makes this candidate ineligible.
+    for (index, inst) in block.instrs.iter().enumerate() {
+        if remove.contains(&index) || matches!(inst, SourceInst::ClearScopeRoots { .. }) {
+            continue;
+        }
+        uses.clear();
+        defs.clear();
+        instruction_use_def(inst, &names, &mut uses, &mut defs);
+        if !uses.is_disjoint(&discard_defs) {
+            return;
+        }
+    }
+    uses.clear();
+    terminator_uses(&block.terminator, &names, &mut uses, &HashSet::new());
+    if !uses.is_disjoint(&aliases) || !uses.is_disjoint(&discard_defs) {
+        return;
+    }
+    let mut index = 0;
+    block.instrs.retain_mut(|inst| {
+        let at = index;
+        index += 1;
+        if remove.contains(&at) {
+            return false;
+        }
+        if let Some(operand) = replacements.remove(&at)
+            && let SourceInst::Compute { value, .. } = inst
+        {
+            *value = V::Use(operand);
+        }
+        true
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1260,218 +1472,4 @@ fn calling(n: i64) -> i64 { let mut i = 0; while i < n { i = effect(i); } return
             .join()
             .unwrap();
     }
-}
-
-/// Eliminate one nonescaping scalar aggregate in a pure single-block body.
-/// No call, allocation, fault, or GC observation may cross the replacement.
-/// Stored operands must remain stable: replacing a store with a later read of
-/// a mutable variable would otherwise observe the wrong version of its value.
-pub(crate) fn scalar_replace_objects(
-    blocks: &mut [SourceBlock],
-    locals: &[super::lowered::LirLocal],
-) {
-    use super::lowered::async_liveness::{instruction_use_def, terminator_uses};
-    use super::lowered::{LirLocalId, LirOperand as O, LirRvalue as V};
-    use std::collections::HashSet;
-    let [block] = blocks else {
-        return;
-    };
-    if !block.recovery.is_empty() {
-        return;
-    }
-    let scalar = |ty: &Type| matches!(ty, Type::I64 | Type::F64 | Type::Bool);
-    let atom = |expr: &HirExpr| {
-        scalar(&expr.ty)
-            && matches!(
-                expr.kind,
-                HirExprKind::Int(_)
-                    | HirExprKind::Float(_)
-                    | HirExprKind::Bool(_)
-                    | HirExprKind::Var(_)
-            )
-    };
-    if !matches!(&block.terminator, SourceTerminator::Return(None))
-        && !matches!(&block.terminator, SourceTerminator::Return(Some(value)) if atom(value))
-    {
-        return;
-    }
-    let names: HashMap<_, _> = locals
-        .iter()
-        .map(|local| (local.name.as_str(), local.id))
-        .collect();
-    let mut last_def = HashMap::new();
-    let mut counts = HashMap::<LirLocalId, usize>::new();
-    let mut uses = HashSet::new();
-    let mut defs = HashSet::new();
-    let mut candidate = None;
-    for (index, inst) in block.instrs.iter().enumerate() {
-        uses.clear();
-        defs.clear();
-        instruction_use_def(inst, &names, &mut uses, &mut defs);
-        for &id in &defs {
-            last_def.insert(id, index);
-            *counts.entry(id).or_default() += 1;
-        }
-        if let SourceInst::Compute {
-            local,
-            value: V::ObjectAlloc { class },
-            ..
-        } = inst
-        {
-            if candidate.replace((*local, *class, index)).is_some() {
-                return;
-            }
-        }
-    }
-    let Some((object, class, allocated_at)) = candidate else {
-        return;
-    };
-    if counts.get(&object) != Some(&1) {
-        return;
-    }
-    let mut aliases = HashSet::from([object]);
-    let mut fields = HashMap::<String, O>::new();
-    let mut remove = HashSet::from([allocated_at]);
-    let mut replacements = HashMap::new();
-    let mut discard_defs = HashSet::new();
-    for (index, inst) in block.instrs.iter().enumerate() {
-        if index == allocated_at {
-            continue;
-        }
-        let alias_source = match inst {
-            SourceInst::Compute {
-                local,
-                value: V::Use(O::Local(source)),
-                ..
-            } if aliases.contains(source) => Some((*local, *source)),
-            SourceInst::Let {
-                name,
-                value:
-                    HirExpr {
-                        kind: HirExprKind::Var(source),
-                        ..
-                    },
-                ..
-            } => names
-                .get(source.as_str())
-                .filter(|source| aliases.contains(source))
-                .and_then(|source| names.get(name.as_str()).map(|target| (*target, *source))),
-            _ => None,
-        };
-        if let Some((target, _)) = alias_source {
-            if index < allocated_at {
-                return;
-            }
-            if counts.get(&target) != Some(&1) {
-                return;
-            }
-            aliases.insert(target);
-            remove.insert(index);
-            continue;
-        }
-        match inst {
-            SourceInst::Compute {
-                local,
-                value:
-                    V::FieldStore {
-                        object: O::Local(owner),
-                        object_ty,
-                        field,
-                        value,
-                    },
-                ..
-            } if aliases.contains(owner) => {
-                if !matches!(object_ty, Type::Named(name) if *name == class)
-                    || !value.ty(locals).is_some_and(|ty| scalar(&ty))
-                {
-                    return;
-                }
-                if let O::Local(source) = value {
-                    if aliases.contains(source)
-                        || last_def.get(source).is_some_and(|defined| *defined > index)
-                    {
-                        return;
-                    }
-                }
-                fields.insert(field.clone(), value.clone());
-                discard_defs.insert(*local);
-                remove.insert(index);
-                continue;
-            }
-            SourceInst::Compute {
-                value:
-                    V::FieldLoad {
-                        object: O::Local(owner),
-                        object_ty,
-                        field,
-                        result,
-                    },
-                ..
-            } if aliases.contains(owner) => {
-                let Some(value) = fields.get(field) else {
-                    return;
-                };
-                if !matches!(object_ty, Type::Named(name) if *name == class)
-                    || !scalar(result)
-                    || value.ty(locals).as_ref() != Some(result)
-                {
-                    return;
-                }
-                replacements.insert(index, value.clone());
-                continue;
-            }
-            SourceInst::Compute { value, .. } => match value {
-                V::Use(operand) if operand.ty(locals).is_some_and(|ty| scalar(&ty)) => {}
-                V::Unary { ty, .. } if scalar(ty) => {}
-                V::Binary { op, operand_ty, .. }
-                    if scalar(operand_ty)
-                        && !matches!(op, BinOp::Div | BinOp::Rem | BinOp::Pow) => {}
-                _ => return,
-            },
-            SourceInst::Let { value, .. }
-            | SourceInst::Assign { value, .. }
-            | SourceInst::Expr(value)
-                if atom(value) => {}
-            SourceInst::ClearScopeRoots { .. } => continue,
-            _ => return,
-        }
-        uses.clear();
-        defs.clear();
-        instruction_use_def(inst, &names, &mut uses, &mut defs);
-        if !uses.is_disjoint(&aliases) || !defs.is_disjoint(&aliases) {
-            return;
-        }
-    }
-    // Removed store instructions produce only unused void temporaries. Any
-    // unusual consumer of that result makes this candidate ineligible.
-    for (index, inst) in block.instrs.iter().enumerate() {
-        if remove.contains(&index) || matches!(inst, SourceInst::ClearScopeRoots { .. }) {
-            continue;
-        }
-        uses.clear();
-        defs.clear();
-        instruction_use_def(inst, &names, &mut uses, &mut defs);
-        if !uses.is_disjoint(&discard_defs) {
-            return;
-        }
-    }
-    uses.clear();
-    terminator_uses(&block.terminator, &names, &mut uses, &HashSet::new());
-    if !uses.is_disjoint(&aliases) || !uses.is_disjoint(&discard_defs) {
-        return;
-    }
-    let mut index = 0;
-    block.instrs.retain_mut(|inst| {
-        let at = index;
-        index += 1;
-        if remove.contains(&at) {
-            return false;
-        }
-        if let Some(operand) = replacements.remove(&at) {
-            if let SourceInst::Compute { value, .. } = inst {
-                *value = V::Use(operand);
-            }
-        }
-        true
-    });
 }

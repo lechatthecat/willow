@@ -236,7 +236,7 @@ impl CallGraph {
                 Item::Class(class) => {
                     let owner = TypeId::local(class.name.as_str());
                     for method in &class.methods {
-                        let id = FunctionId::method(owner.clone(), method.name.as_str());
+                        let id = FunctionId::method(owner, method.name.as_str());
                         let sites = collect_call_sites(
                             &method.params,
                             &method.body,
@@ -247,7 +247,7 @@ impl CallGraph {
                         graph.merge(id, sites);
                     }
                     for constructor in &class.constructors {
-                        let id = FunctionId::method(owner.clone(), "init");
+                        let id = FunctionId::method(owner, "init");
                         let sites = collect_call_sites(
                             &constructor.params,
                             &constructor.body,
@@ -285,7 +285,7 @@ impl CallGraph {
                     sites.targets.remove(&target);
                     sites.has_unknown = true;
                 }
-                graph.merge(id.clone(), sites);
+                graph.merge(*id, sites);
             }
         }
         graph
@@ -850,14 +850,14 @@ mod tests {
         let mut graph = CallGraph::default();
         let id = FunctionId::method(TypeId::local("Cell"), "init");
         graph.merge(
-            id.clone(),
+            id,
             CallSites {
                 targets: [FunctionId::free("first")].into_iter().collect(),
                 has_unknown: false,
             },
         );
         graph.merge(
-            id.clone(),
+            id,
             CallSites {
                 targets: [FunctionId::free("second")].into_iter().collect(),
                 has_unknown: true,

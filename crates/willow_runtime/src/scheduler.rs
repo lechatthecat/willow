@@ -2690,11 +2690,10 @@ fn claim_global_ready_for_worker(
                 task.native_stack.as_ref().map(|stack| stack.worker)
             })
             .flatten()
+            && owner != worker
         {
-            if owner != worker {
-                queues.push_local(owner, id);
-                return None;
-            }
+            queues.push_local(owner, id);
+            return None;
         }
         let claim_guard = shared.map(|state| {
             state

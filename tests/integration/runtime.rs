@@ -789,6 +789,8 @@ fn test_runnable_example_files_compile_and_run() {
             "example/enum_match.wi",
             "north\nwest\n78.53975\n12\n0.0\nzero\nnonzero\nyes\nno\n",
         ),
+        ("example/generic_enum_empty/main.wi", "1\n2\n"),
+        ("example/unqualified_enum_pair.wi", "42\n"),
         ("example/unqualified_enum_variant.wi", "42\n1007\n-1\n"),
         (
             "example/interface_box_dynamic_dispatch.wi",

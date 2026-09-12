@@ -215,10 +215,6 @@ fn range_i64(ty: &Type) -> bool {
     matches!(ty, Type::Generic(name, args) if name == &TypeId::local("Range") && args.as_slice() == [Type::I64])
 }
 
-/// One entry of a builtin namespace: the runtime symbol a call lowers to, its
-/// parameter types, its result type, and whether the runtime's word has to be
-/// narrowed to a `bool` (willow-0g8j.2.10, willow-0g8j.2.13).
-
 /// The builtin namespace call `class::method` names, or `None` if it is not one.
 ///
 /// `env`, `fs` and `net` are NAMESPACES, not classes: they have no layout, no
@@ -543,7 +539,7 @@ fn resolve_class_key<Q: super::type_index::TypeLookup + ?Sized>(
 ) -> Option<TypeId> {
     let name = &name.type_id();
     if class_layouts.contains_key(name) {
-        return Some(name.clone());
+        return Some(*name);
     }
     // One runtime class is one `type_id`, so two spellings that carry the same
     // id are one answer; a class with no id at all is never merged by name.
@@ -560,7 +556,7 @@ fn resolve_class_key<Q: super::type_index::TypeLookup + ?Sized>(
             if visible_only && !visible_modules.contains(module) {
                 continue;
             }
-            let qualified = name.clone().in_namespace(module);
+            let qualified = (*name).in_namespace(module);
             if !class_layouts.contains_key(&qualified) {
                 continue;
             }
@@ -670,7 +666,7 @@ impl LirTypeCtx<'_> {
             })
             .collect();
         Some((
-            name.clone(),
+            *name,
             LirEnumDef {
                 identity: def.identity,
                 type_params: Vec::new(),
@@ -1092,7 +1088,7 @@ impl LirTypeCtx<'_> {
         if !is_qualified_form(a, b) && !is_qualified_form(b, a) {
             return false;
         }
-        if !open.insert((a.clone(), b.clone())) {
+        if !open.insert((*a, *b)) {
             return true;
         }
         da.type_params == db.type_params
@@ -1178,10 +1174,10 @@ impl LirTypeCtx<'_> {
         // `p.m()` on a module class the entry file never item-imported
         // (E0350), and an item import puts the short name in the tables
         // (willow-0g8j.2.19).
-        let mut search = Some(class.clone());
+        let mut search = Some(*class);
         let mut seen = HashSet::new();
         while let Some(name) = search {
-            if !seen.insert(name.clone()) {
+            if !seen.insert(name) {
                 break;
             }
             let mangled = class_method_symbol_name(self.known_modules, &name.to_string(), method);
@@ -1677,14 +1673,14 @@ fn lir_sync_defer_stacks_agree(f: &LirFunction) -> bool {
 /// line to go and fix.
 pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Option<String> {
     if f.blocks.iter().enumerate().any(|(index, block)| {
-        block.id.0 as usize != index
+        block.id.0 != index
             || lir_block_successors(block)
                 .iter()
                 .any(|target| *target >= f.blocks.len())
             || block
                 .recovery
                 .iter()
-                .any(|target| target.0 as usize >= f.blocks.len())
+                .any(|target| target.0 >= f.blocks.len())
     }) {
         return Some("the LIR graph has an invalid block identity or target".into());
     }
@@ -1806,17 +1802,18 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                             },
                         ..
                     } = operand
-                    {
-                        if !array_captures
+                        && !array_captures
                             .get(owner)
                             .is_some_and(|(captured, checked_index)| {
                                 ctx.same_repr(captured, element)
                                     && *checked_index
                                         == crate::ir::lowered::LirOperand::Local(*index)
                             })
-                        {
-                            return Some("array reference disagrees with its captured buffer or checked index".into());
-                        }
+                    {
+                        return Some(
+                            "array reference disagrees with its captured buffer or checked index"
+                                .into(),
+                        );
                     }
                 }
             }
@@ -1835,13 +1832,13 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
     // initializers have been split into preceding Compute instructions.
     for block in &f.blocks {
         for instruction in &block.instrs {
-            if let LirInst::Let { name, ty, .. } = instruction {
-                if !ctx.supported_type(ty) {
-                    return Some(format!(
-                        "`let {name}` binds type `{}`, outside the walker's subset",
-                        type_name(ty)
-                    ));
-                }
+            if let LirInst::Let { name, ty, .. } = instruction
+                && !ctx.supported_type(ty)
+            {
+                return Some(format!(
+                    "`let {name}` binds type `{}`, outside the walker's subset",
+                    type_name(ty)
+                ));
             }
         }
     }
@@ -1892,25 +1889,24 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                         }
                     }
                     match value {
-                        crate::ir::lowered::LirRvalue::FunctionRef { function, ty } => {
-                            if !ctx.fn_value_of(function).is_some_and(|known| known == *ty) {
-                                return Some(format!(
-                                    "the function value `{function}` at line {} has an incompatible signature",
-                                    span.line
-                                ));
-                            }
+                        crate::ir::lowered::LirRvalue::FunctionRef { function, ty }
+                            if !ctx.fn_value_of(function).is_some_and(|known| known == *ty) =>
+                        {
+                            return Some(format!(
+                                "the function value `{function}` at line {} has an incompatible signature",
+                                span.line
+                            ));
                         }
-                        crate::ir::lowered::LirRvalue::Closure { id, captures, ty } => {
-                            if captures.len() > super::OBJECT_FIELD_MASK_CAPACITY
+                        crate::ir::lowered::LirRvalue::Closure { id, captures, ty }
+                            if (captures.len() > super::OBJECT_FIELD_MASK_CAPACITY
                                 || !(ctx.lambda_symbol)(*id)
                                     .and_then(|symbol| ctx.fn_value_of(&symbol))
-                                    .is_some_and(|known| known == *ty)
-                            {
-                                return Some(format!(
-                                    "a lambda at line {} has an unsupported environment or signature",
-                                    span.line
-                                ));
-                            }
+                                    .is_some_and(|known| known == *ty)) =>
+                        {
+                            return Some(format!(
+                                "a lambda at line {} has an unsupported environment or signature",
+                                span.line
+                            ));
                         }
                         _ => {}
                     }
@@ -1922,19 +1918,18 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                         method,
                         ..
                     } = value
-                    {
-                        if !flat_intrinsic_supported(
+                        && !flat_intrinsic_supported(
                             *intrinsic,
                             receiver_ty,
                             arg_types,
                             result,
                             ctx,
-                        ) {
-                            return Some(format!(
-                                "the `{method}` method at line {} uses an unsupported type",
-                                span.line
-                            ));
-                        }
+                        )
+                    {
+                        return Some(format!(
+                            "the `{method}` method at line {} uses an unsupported type",
+                            span.line
+                        ));
                     }
                     if !flat_rvalue_supported(value, &f.locals, ctx)
                         || !value.is_well_typed(&f.locals, *local)
@@ -2278,79 +2273,6 @@ fn lir_hoistable_around(node: &HirExpr, target: &HirExpr, seen: &mut bool) -> bo
     true
 }
 
-/// The single value-position `await` this statement value can be split around
-/// (willow-0g8j.2.11), with its classified site.
-///
-/// A Cranelift value computed before a park does not survive the poll fn's
-/// return, so the suspension has to run FIRST and the rest of the expression
-/// after the resume. `println(await twice(21))` becomes "await, park, resume,
-/// then print what came back".
-///
-/// That reorder is exactly the one the former AST suspension normalizer performs on the AST
-/// before lowering, which is why the two agree: the liveness pass runs on the
-/// normalized AST, so any local this path re-reads after the resume was already
-/// planned a frame slot. Anything ahead of the await that is NOT re-evaluable
-/// is where that pass spends a temp slot instead (`let t = await twice(21);
-/// println(t);`), so the statement this one sees is already split.
-///
-/// A root await is not returned here: `emit_lir_block` splits that one itself.
-#[cfg(test)]
-fn lir_hoisted_await<'e>(
-    value: &'e HirExpr,
-    cooperative_leaves: &std::collections::HashSet<FunctionId>,
-) -> Option<(&'e HirExpr, LirAwaitSite<'e>)> {
-    if lir_await_site(value, cooperative_leaves).is_some() {
-        return None;
-    }
-    // Exactly one suspension in the whole value: two would need two parks, and
-    // this pass only reorders around one. Being the only one also proves the
-    // await's own operands do not suspend.
-    let mut found = Vec::new();
-    lir_collect_suspensions(value, &mut found);
-    let [target] = found.as_slice() else {
-        return None;
-    };
-    let target = *target;
-    // `await sleep(..)` / `await yield()` produce nothing to feed back into the
-    // enclosing expression, so they only ever appear as a statement root.
-    if target.ty == Type::Void {
-        return None;
-    }
-    let site = lir_await_site(target, cooperative_leaves)?;
-    let mut seen = false;
-    lir_hoistable_around(value, target, &mut seen).then_some((target, site))
-}
-
-/// True for the `Result::Ok()` a `Result<void, E>` main returns on success.
-/// The object carries a tag and no payload, and the only thing that ever reads
-/// it is the exit that
-/// asks whether the tag is `Err`, so the answer is known without building it
-/// (willow-0g8j.2.14).
-#[cfg(test)]
-fn hir_is_zero_arg_result_ok(value: &HirExpr) -> bool {
-    matches!(
-        &value.kind,
-        HirExprKind::StaticCall { class, method, args }
-            if class == &TypeId::local("Result") && method == "Ok" && args.is_empty()
-    )
-}
-
-/// The await a plain value position - a `return` operand, a `Branch`
-/// condition - is split around: the root await when the expression IS one,
-/// otherwise the single value-position await inside it. Either way the resume
-/// leaves the result in a Cranelift value the rest of the position then reads.
-#[cfg(test)]
-fn lir_value_position_await<'e>(
-    value: &'e HirExpr,
-    cooperative_leaves: &std::collections::HashSet<FunctionId>,
-) -> Option<(&'e HirExpr, LirAwaitSite<'e>)> {
-    if let Some(site) = lir_await_site(value, cooperative_leaves) {
-        return (value.ty != Type::Void && !site.operands().iter().any(lir_expr_suspends))
-            .then_some((value, site));
-    }
-    lir_hoisted_await(value, cooperative_leaves)
-}
-
 /// An `await` the cooperative LIR path can split into a suspension
 /// (willow-0g8j.2.11). Classified once, by the function both eligibility and
 /// emission call, so an admitted await is always an emittable one.
@@ -2361,28 +2283,11 @@ enum LirAwaitSite<'a> {
     /// `await yield()`: an unconditional reschedule.
     Yield,
     /// `await f(..)` where `f` is a cooperative leaf. The callee's constructor
-    /// runs here and hands back the frame this task waits on; `span` is the
-    /// await's own span, which is the key its callee-frame slot is reserved
-    /// under.
+    /// runs here and hands back the frame this task waits on.
     LeafCall {
         callee: &'a FunctionId,
         args: &'a [HirExpr],
-        span: Span,
     },
-}
-
-#[cfg(test)]
-impl<'a> LirAwaitSite<'a> {
-    /// The sub-expressions evaluated at the await site, before the split. They
-    /// are ordinary straight-line LIR, so they may not themselves suspend.
-    #[cfg(test)]
-    fn operands(&self) -> &[HirExpr] {
-        match self {
-            LirAwaitSite::Sleep(millis) => std::slice::from_ref(*millis),
-            LirAwaitSite::Yield => &[],
-            LirAwaitSite::LeafCall { args, .. } => args,
-        }
-    }
 }
 
 /// The await forms this splitter takes — the ones that are still ordinary
@@ -2408,11 +2313,7 @@ fn lir_await_site<'e>(
     if !cooperative_leaves.contains(&callee.clone()) {
         return None;
     }
-    Some(LirAwaitSite::LeafCall {
-        callee,
-        args,
-        span: expr.span,
-    })
+    Some(LirAwaitSite::LeafCall { callee, args })
 }
 
 /// Recognise the two scheduler builtins whose await result is `void`. Keeping
@@ -2437,108 +2338,6 @@ fn lir_builtin_await(expr: &HirExpr) -> Option<LirAwaitSite<'_>> {
         ("yield", []) => Some(LirAwaitSite::Yield),
         _ => None,
     }
-}
-
-/// The message for a value whose type the walker will not convert into the slot
-/// it is being written to. Shared so every store site words it the same way.
-#[cfg(test)]
-fn store_reason(what: &str, from: &Type, to: &Type, span: Span) -> String {
-    format!(
-        "{what} at line {} puts a `{}` into a `{}` slot, a conversion the walker does not emit",
-        span.line,
-        type_name(from),
-        type_name(to)
-    )
-}
-
-/// `None` when `e` is in the subset, otherwise a reason naming the SMALLEST
-/// sub-expression that is not. `supported_expr` is the oracle for the decision;
-/// this only walks down to find where it first goes wrong, so the two can never
-/// disagree about whether the expression is eligible.
-/// Why `super.init(args)` in `f` is outside the walker's subset, or `None`.
-///
-/// The enclosing class comes from the lowered function's own name, which
-/// `lower_program` builds as `Class::init` -- the same string
-/// `compile_class_method_inner` looks the body up under. That is what lets this
-/// resolve the base class the emitter will resolve at emission time from
-/// `FuncGen::current_class`.
-#[cfg(test)]
-fn super_init_rejection<'e>(
-    f: &'e LirFunction,
-    args: &'e [HirExpr],
-    ctx: &LirTypeCtx<'_>,
-    names: &HashMap<&'e str, Cow<'e, Type>>,
-) -> Option<String> {
-    // The last separator divides class from method: a module class carries its
-    // own `module::` qualification (willow-0g8j.16).
-    let class = match f.name.owner_type() {
-        Some(class) => class,
-        // Not a method at all: the emitter's `current_class` would be `None`
-        // and it would evaluate the arguments and store nothing.
-        None => return Some("it calls `super.init(...)` outside a class body".to_string()),
-    };
-    let Some(base) = ctx.class_base.get(&class) else {
-        return Some(format!(
-            "it calls `super.init(...)`, but class `{class}` has no base class"
-        ));
-    };
-    for arg in args {
-        if let Some(reason) = expr_rejection(arg, ctx, names) {
-            return Some(reason);
-        }
-    }
-    let mangled = class_method_symbol_name(ctx.known_modules, &base.to_string(), "init");
-    if (ctx.known_fn)(&mangled) {
-        // An explicit base constructor is an ordinary `init` method call with
-        // the receiver already in hand, so it is vetted like one.
-        if !ctx.callable(&mangled, args, true) {
-            return Some(format!(
-                "the base constructor `{base}::init` called by `super.init(...)` takes arguments \
-                 outside the walker's subset"
-            ));
-        }
-        return None;
-    }
-    // No declared base constructor: the emitter stores the arguments straight
-    // into the base's memberwise field slots, so those slots must line up with
-    // the arguments one for one.
-    let Some(layout) = ctx.class_layouts.get(base) else {
-        return Some(format!(
-            "`super.init(...)` targets base class `{base}`, whose layout the walker cannot resolve"
-        ));
-    };
-    if layout.len() != args.len() {
-        return Some(format!(
-            "`super.init(...)` passes {} argument(s) to the memberwise constructor of base class \
-             `{base}`, which has {} field(s)",
-            args.len(),
-            layout.len()
-        ));
-    }
-    for ((field, field_ty), arg) in layout.iter().zip(args) {
-        if matches!(arg.kind, HirExprKind::ReferenceArg { .. }) {
-            return Some(format!(
-                "`super.init(...)` passes a reference argument to memberwise field \
-                 `{base}::{field}`"
-            ));
-        }
-        if !ctx.supported_type(field_ty) {
-            return Some(format!(
-                "`super.init(...)` stores memberwise field `{base}::{field}` of type `{}`, outside \
-                 the walker's subset",
-                type_name(field_ty)
-            ));
-        }
-        if !ctx.storable(field_ty, &arg.ty) {
-            return Some(store_reason(
-                &format!("`super.init(...)`'s store to `{base}::{field}`"),
-                &arg.ty,
-                field_ty,
-                arg.span,
-            ));
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -4861,41 +4660,6 @@ fn supported_expr_node<'n>(
     }
 }
 
-/// Whether this call passes at least one `&place` into a reference parameter —
-/// the condition under which the debug reference-call context must be cleared
-/// once the call returns.
-#[cfg(test)]
-fn lir_has_reference_args(modes: Option<&[ParamMode]>, args: &[HirExpr]) -> bool {
-    args.iter().enumerate().any(|(idx, arg)| {
-        matches!(
-            (modes.and_then(|modes| modes.get(idx)), &arg.kind),
-            (
-                Some(ParamMode::Reference { .. }),
-                HirExprKind::ReferenceArg { .. }
-            )
-        )
-    })
-}
-
-/// How the debug reference-call report names the place behind a `&place`
-/// argument, read off the LOWERED place instead of the AST one.
-///
-/// Every string these produce must be byte-identical to what
-/// `reference_place_kind` and `reference_place_name` in the parent module
-/// produce for the same source: the literals the hook passes are declared
-/// once, from the AST, by `collect_reference_debug_strings_in_program`, so a
-/// string only this path can invent is undeclared and would reach the runtime
-/// as a null pointer (willow-0g8j.2.17).
-#[cfg(test)]
-fn lir_reference_place_kind(place: &HirExpr) -> &'static str {
-    match &place.kind {
-        HirExprKind::Var(_) => "local",
-        HirExprKind::FieldAccess { .. } => "field",
-        HirExprKind::Index { .. } => "array_element",
-        _ => "expression",
-    }
-}
-
 /// The source-shaped name of a reference place. See [`lir_reference_place_kind`]
 /// for why this must agree with the AST spelling exactly.
 #[cfg(test)]
@@ -5063,47 +4827,6 @@ fn lir_back_edges(f: &LirFunction) -> std::collections::HashSet<(usize, usize)> 
         }
     }
     edges
-}
-
-/// Does evaluating this expression reach a user or runtime call?
-///
-/// The preemption contract: a safepoint is only worth emitting where control
-/// can actually reach a call, so the cooperative LIR emitter asks this before
-/// planting one. Structural and exhaustive, so a new expression form has to
-/// answer the question rather than silently inherit `false`.
-#[cfg(test)]
-fn hir_expression_executes_call(expr: &HirExpr) -> bool {
-    match &expr.kind {
-        HirExprKind::Call { .. }
-        | HirExprKind::MethodCall { .. }
-        | HirExprKind::StaticCall { .. }
-        | HirExprKind::New { .. }
-        | HirExprKind::ObjectLiteral { .. }
-        | HirExprKind::Print { .. }
-        | HirExprKind::Array { .. }
-        | HirExprKind::Index { .. }
-        | HirExprKind::Select { .. } => true,
-        HirExprKind::Lambda { .. }
-        | HirExprKind::Int(_)
-        | HirExprKind::Float(_)
-        | HirExprKind::Bool(_)
-        | HirExprKind::Str(_)
-        | HirExprKind::Var(_)
-        | HirExprKind::FnRef(_)
-        | HirExprKind::StaticField { .. } => false,
-        HirExprKind::Binary { .. }
-        | HirExprKind::Unary { .. }
-        | HirExprKind::Ternary { .. }
-        | HirExprKind::FieldAccess { .. }
-        | HirExprKind::ReferenceArg { .. }
-        | HirExprKind::Range { .. }
-        | HirExprKind::Await { .. }
-        | HirExprKind::TryPropagate { .. }
-        | HirExprKind::Match { .. } => expr
-            .children()
-            .into_iter()
-            .any(hir_expression_executes_call),
-    }
 }
 
 #[cfg(test)]
@@ -6022,6 +5745,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
+    // Keep explicit emission operands aligned with the LIR/runtime ABI.
+    #[allow(clippy::too_many_arguments)]
     fn emit_lir_block(
         &mut self,
         function: &LirFunction,
@@ -7152,7 +6877,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .func_addr(super::type_helpers::FN_ADDR_TYPE, fref)
             }
             LirRvalue::Closure { id, captures, ty } => {
-                let name = self.lambda_names[id].clone();
+                let name = self.lambda_names[id];
                 let fid = *self.func_ids.get_id(&name).expect("registered lambda");
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
                 let code = self
@@ -7432,6 +7157,1107 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 }
 
+/// Representation checks for resolved flat builtin methods. Receiver/result
+/// identity and arity are checked against the semantic intrinsic table first.
+fn flat_intrinsic_supported(
+    intrinsic: Intrinsic,
+    receiver: &Type,
+    args: &[Type],
+    result: &Type,
+    ctx: &LirTypeCtx<'_>,
+) -> bool {
+    use Intrinsic::*;
+    if !ctx.supported_type(receiver)
+        || !ctx.supported_type(result)
+        || !args.iter().all(|ty| ctx.supported_type(ty))
+    {
+        return false;
+    }
+    match intrinsic {
+        ArrayPush | ChannelSend => {
+            let element = match receiver {
+                Type::Array(element) => &**element,
+                _ => match builtin_types::unary_arg(receiver, B::Channel) {
+                    Some(element) => element,
+                    None => return false,
+                },
+            };
+            args.len() == 1 && ctx.storable(element, &args[0])
+        }
+        ArrayToString => {
+            matches!(receiver, Type::Array(element) if collection_elem_kind(element).is_some())
+        }
+        MapContains | FrozenMapContains | MapGet | FrozenMapGet | MapInsert | MapToString => {
+            let Some((_, types)) = lir_collection(receiver) else {
+                return false;
+            };
+            if types.len() != 2 {
+                return false;
+            }
+            match intrinsic {
+                MapToString => types.iter().all(|ty| collection_elem_kind(ty).is_some()),
+                MapInsert => {
+                    args.len() == 2
+                        && ctx.same_repr(&types[0], &args[0])
+                        && ctx.storable(&types[1], &args[1])
+                }
+                _ => args.len() == 1 && ctx.same_repr(&types[0], &args[0]),
+            }
+        }
+        AtomicLoad | AtomicStore | AtomicSwap | AtomicAdd | AtomicSub => {
+            atomic_cell(receiver).is_some_and(|cell| args.iter().all(|arg| *arg == cell.word()))
+        }
+        CellGet | CellSet | RwCellRead | RwCellWrite => blocking_cell(receiver)
+            .is_some_and(|(_, elem)| args.iter().all(|arg| ctx.same_repr(elem, arg))),
+        _ => true,
+    }
+}
+
+impl<'a, 'b> FuncGen<'a, 'b> {
+    /// Operands are already evaluated, typed, and rooted by LIR. This emitter
+    /// performs one resolved operation; it never walks executable syntax.
+    // Keep explicit emission operands aligned with the LIR/runtime ABI.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_flat_intrinsic(
+        &mut self,
+        intrinsic: Intrinsic,
+        receiver: cranelift_codegen::ir::Value,
+        receiver_ty: &Type,
+        args: &[cranelift_codegen::ir::Value],
+        arg_types: &[Type],
+        result: &Type,
+        span: Span,
+    ) -> cranelift_codegen::ir::Value {
+        // Frame-backed references can otherwise move during a coercion or a
+        // blocking runtime call. Direct roots pin every loaded SSA operand.
+        let roots_before = self.gc_root_count;
+        if is_gc_managed(receiver_ty, self.enum_infos) {
+            self.emit_push_root(receiver);
+        }
+        for (&value, ty) in args.iter().zip(arg_types) {
+            if is_gc_managed(ty, self.enum_infos) {
+                self.emit_push_root(value);
+            }
+        }
+        let value = self.emit_flat_intrinsic_inner(
+            intrinsic,
+            receiver,
+            receiver_ty,
+            args,
+            arg_types,
+            result,
+            span,
+        );
+        self.emit_pop_roots_n(self.gc_root_count - roots_before);
+        self.gc_root_count = roots_before;
+        value
+    }
+
+    // Keep explicit emission operands aligned with the LIR/runtime ABI.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_flat_intrinsic_inner(
+        &mut self,
+        intrinsic: Intrinsic,
+        receiver: cranelift_codegen::ir::Value,
+        receiver_ty: &Type,
+        args: &[cranelift_codegen::ir::Value],
+        arg_types: &[Type],
+        _result: &Type,
+        _span: Span,
+    ) -> cranelift_codegen::ir::Value {
+        use Intrinsic::*;
+        match intrinsic {
+            StringToString | TaskResult => receiver,
+            I64ToString => self.emit_value_runtime_call("willow_i64_to_string", &[receiver]),
+            F64ToString => self.emit_value_runtime_call("willow_f64_to_string", &[receiver]),
+            BoolToString => self.emit_value_runtime_call("willow_bool_to_string", &[receiver]),
+            TaskCancel => {
+                let id = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    receiver,
+                    async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+                );
+                self.emit_void_runtime_call("willow_sched_cancel", &[id]);
+                self.builder.ins().iconst(types::I8, 0)
+            }
+            TaskIsCancelled => {
+                let raw = self.emit_value_runtime_call("willow_frame_is_cancelled", &[receiver]);
+                self.builder.ins().ireduce(types::I8, raw)
+            }
+            TokenIsCancelled | ScopeIsCancelled | TokenCancel | ScopeCancel | TokenChild
+            | ScopeChild | TokenAttach | ScopeAdd | ScopeFinish => {
+                let handle =
+                    cancellation_handle(receiver_ty).expect("validated cancellation intrinsic");
+                let suffix = match intrinsic {
+                    TokenIsCancelled | ScopeIsCancelled => "is_cancelled",
+                    TokenCancel | ScopeCancel => "cancel",
+                    TokenChild | ScopeChild => "child",
+                    TokenAttach => "attach",
+                    ScopeAdd => "add",
+                    ScopeFinish => "finish",
+                    _ => unreachable!(),
+                };
+                let mut values = vec![receiver];
+                values.extend_from_slice(args);
+                let symbol = format!("{}_{suffix}", handle.prefix());
+                let value = self.emit_runtime_call_with_cleanup(&symbol, &values, |_| {});
+                match intrinsic {
+                    TokenIsCancelled | ScopeIsCancelled => {
+                        self.builder.ins().ireduce(types::I8, value.unwrap())
+                    }
+                    _ => value.unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0)),
+                }
+            }
+            AtomicLoad | AtomicStore | AtomicSwap | AtomicAdd | AtomicSub => {
+                let cell = atomic_cell(receiver_ty).expect("validated atomic intrinsic");
+                let operation = match intrinsic {
+                    AtomicLoad => "load",
+                    AtomicStore => "store",
+                    AtomicSwap => "swap",
+                    AtomicAdd => "add",
+                    AtomicSub => "sub",
+                    _ => unreachable!(),
+                };
+                let mut values = vec![receiver];
+                values.extend_from_slice(args);
+                self.emit_runtime_call_with_cleanup(
+                    &format!("willow_atomic_{}_{operation}", cell.suffix()),
+                    &values,
+                    |_| {},
+                )
+                .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
+            }
+            CellGet | CellSet | RwCellRead | RwCellWrite => {
+                let (kind, element) = blocking_cell(receiver_ty).expect("validated cell intrinsic");
+                let operation = match intrinsic {
+                    CellGet => "get",
+                    CellSet => "set",
+                    RwCellRead => "read",
+                    RwCellWrite => "write",
+                    _ => unreachable!(),
+                };
+                let mut values = vec![receiver];
+                if let Some(&value) = args.first() {
+                    values.push(self.coerce_to_i64(value, element));
+                }
+                match self.emit_runtime_call_with_cleanup(
+                    &format!("{}_{operation}", kind.prefix()),
+                    &values,
+                    |_| {},
+                ) {
+                    Some(value) => self.coerce_i64_to(value, element),
+                    None => self.builder.ins().iconst(types::I8, 0),
+                }
+            }
+            ChannelSend | ChannelRecv | ChannelClose => {
+                let element = builtin_types::unary_arg(receiver_ty, B::Channel)
+                    .expect("validated channel intrinsic");
+                let operation = match intrinsic {
+                    ChannelSend => "send",
+                    ChannelRecv => "recv",
+                    ChannelClose => "close",
+                    _ => unreachable!(),
+                };
+                let symbol = if intrinsic == ChannelClose {
+                    "willow_channel_close".to_string()
+                } else {
+                    format!(
+                        "willow_channel_{operation}_{}",
+                        channel_runtime_suffix(element)
+                    )
+                };
+                let mut values = vec![receiver];
+                if let Some(&value) = args.first() {
+                    let value = self.coerce_to_target(value, &arg_types[0], element);
+                    if is_gc_managed(element, self.enum_infos) {
+                        self.emit_push_root(value);
+                    }
+                    values.push(value);
+                }
+                self.emit_runtime_call_with_cleanup(&symbol, &values, |_| {})
+                    .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
+            }
+            ArrayLen | FrozenArrayLen => {
+                self.emit_value_runtime_call("willow_array_len", &[receiver])
+            }
+            ArrayPush => {
+                let element = array_element_type(receiver_ty);
+                let value = self.coerce_to_target(args[0], &arg_types[0], &element);
+                if is_gc_managed(&element, self.enum_infos) {
+                    self.emit_push_root(value);
+                }
+                let word = self.coerce_to_i64(value, &element);
+                self.emit_void_runtime_call("willow_array_push", &[receiver, word]);
+                self.builder.ins().iconst(types::I8, 0)
+            }
+            ArrayPop => {
+                let word = self.emit_value_runtime_call("willow_array_pop", &[receiver]);
+                self.coerce_i64_to(word, &array_element_type(receiver_ty))
+            }
+            ArrayToString => {
+                let kind = collection_elem_kind(&array_element_type(receiver_ty))
+                    .expect("validated array rendering kind");
+                let kind = self.builder.ins().iconst(types::I64, kind);
+                self.emit_value_runtime_call("willow_array_to_string", &[receiver, kind])
+            }
+            ArrayFreeze => self.emit_value_runtime_call("willow_array_copy", &[receiver]),
+            MapLen | FrozenMapLen => self.emit_value_runtime_call("willow_map_len", &[receiver]),
+            MapToString => self.emit_value_runtime_call("willow_map_to_string", &[receiver]),
+            MapFreeze => self.emit_value_runtime_call("willow_map_copy", &[receiver]),
+            MapContains | FrozenMapContains | MapGet | FrozenMapGet | MapInsert => {
+                let (_, parameters) = lir_collection(receiver_ty).expect("validated map intrinsic");
+                let (key_ty, value_ty) = (&parameters[0], &parameters[1]);
+                let key = self.coerce_to_i64(args[0], key_ty);
+                let key_ref = self.map_is_ref_flag(key_ty);
+                match intrinsic {
+                    MapContains | FrozenMapContains => {
+                        let value = self.emit_value_runtime_call(
+                            "willow_map_contains",
+                            &[receiver, key, key_ref],
+                        );
+                        self.builder.ins().ireduce(types::I8, value)
+                    }
+                    MapGet | FrozenMapGet => {
+                        let option = Type::Generic("Option".into(), vec![value_ty.clone()]);
+                        let niche = self.builder.ins().iconst(
+                            types::I64,
+                            i64::from(
+                                option_repr(&option, self.enum_infos)
+                                    == Some(OptionRepr::NullableGcPointer),
+                            ),
+                        );
+                        self.emit_value_runtime_call(
+                            "willow_map_get",
+                            &[receiver, key, key_ref, niche],
+                        )
+                    }
+                    MapInsert => {
+                        let value = self.coerce_to_target(args[1], &arg_types[1], value_ty);
+                        if is_gc_managed(value_ty, self.enum_infos) {
+                            self.emit_push_root(value);
+                        }
+                        let word = self.coerce_to_i64(value, value_ty);
+                        let value_ref = self.map_is_ref_flag(value_ty);
+                        self.emit_void_runtime_call(
+                            "willow_map_insert",
+                            &[receiver, key, key_ref, word, value_ref],
+                        );
+                        self.builder.ins().iconst(types::I8, 0)
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
+impl<'a, 'b> FuncGen<'a, 'b> {
+    /// Resolved enum combinators consume already-evaluated, typed operands.
+    fn emit_flat_enum_method(
+        &mut self,
+        receiver: cranelift_codegen::ir::Value,
+        receiver_ty: &Type,
+        method: &str,
+        args: &[cranelift_codegen::ir::Value],
+        arg_types: &[Type],
+        span: Span,
+    ) -> cranelift_codegen::ir::Value {
+        const OK_TAG: i64 = 0;
+        const ERR_TAG: i64 = 1;
+        let resolved = builtin_types::resolve(receiver_ty)
+            .expect("Option/Result receiver vetted by eligibility");
+        let id = resolved.id;
+        let payload = |i: usize| resolved.args.get(i).cloned().unwrap_or(Type::Void);
+        let (ok_ty, err_ty) = (payload(0), payload(1));
+        let recv = receiver;
+        let roots_before = self.gc_root_count;
+        for (&value, ty) in args.iter().zip(arg_types) {
+            if is_gc_managed(ty, self.enum_infos) {
+                self.emit_push_root(value);
+            }
+        }
+        // Every branch below either allocates a panic message or evaluates an
+        // argument that may allocate, and the receiver is otherwise live only
+        // in an SSA register — so it is rooted for the whole method.
+        self.emit_push_root(recv);
+        let value = match (id, method) {
+            (B::Option, "is_some") => self.emit_option_is_some(recv, &ok_ty),
+            (B::Option, "is_none") => {
+                let some = self.emit_option_is_some(recv, &ok_ty);
+                let zero = self.builder.ins().iconst(types::I8, 0);
+                self.builder.ins().icmp(IntCC::Equal, some, zero)
+            }
+            (B::Option, "unwrap") => {
+                let msg = self.emit_string_literal("called `Option::unwrap()` on a `None` value");
+                self.emit_option_unwrap(recv, &ok_ty, msg, Some(span))
+            }
+            (B::Option, "expect") => {
+                let msg = args[0];
+                self.emit_option_unwrap(recv, &ok_ty, msg, Some(span))
+            }
+            (B::Option, "unwrap_or") => {
+                let default_val = args[0];
+                self.emit_option_unwrap_or(recv, &ok_ty, default_val)
+            }
+            (B::Result, "is_ok") | (B::Result, "is_err") => {
+                let tag = self.emit_load_enum_tag(recv);
+                let want = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, if method == "is_ok" { OK_TAG } else { ERR_TAG });
+                self.builder.ins().icmp(IntCC::Equal, tag, want)
+            }
+            (B::Result, "unwrap") => {
+                let msg = self.emit_string_literal("called `Result::unwrap()` on an `Err` value");
+                self.emit_enum_unwrap(recv, &ok_ty, OK_TAG, msg, Some(span))
+            }
+            (B::Result, "unwrap_err") => {
+                let msg =
+                    self.emit_string_literal("called `Result::unwrap_err()` on an `Ok` value");
+                self.emit_enum_unwrap(recv, &err_ty, ERR_TAG, msg, Some(span))
+            }
+            (B::Result, "expect") => {
+                let msg = args[0];
+                self.emit_enum_unwrap(recv, &ok_ty, OK_TAG, msg, Some(span))
+            }
+            (B::Result, "unwrap_or") => {
+                let default_val = args[0];
+                self.emit_enum_unwrap_or(recv, &ok_ty, OK_TAG, default_val)
+            }
+            // The callable-taking combinators (willow-0g8j.2.2). The receiver
+            // is already rooted above, which is what makes calling an arbitrary
+            // function — and allocating the new enum around its result — safe
+            // here. Shared helpers enforce tag layout, the pointer niche,
+            // and the indirect-call ABI.
+            (B::Option, "map") => {
+                let (f_val, f_ty) = (args[0], arg_types[0].clone());
+                let produced = fn_return_type(&f_ty);
+                self.emit_option_map(recv, &ok_ty, &produced, f_val, &f_ty)
+            }
+            (B::Option, "and_then") => {
+                let (f_val, f_ty) = (args[0], arg_types[0].clone());
+                self.emit_option_and_then(recv, &ok_ty, f_val, &f_ty)
+            }
+            (B::Option, "or_else") => {
+                let (f_val, f_ty) = (args[0], arg_types[0].clone());
+                self.emit_option_or_else(recv, &ok_ty, f_val, &f_ty)
+            }
+            (B::Result, "map") => {
+                let (f_val, f_ty) = (args[0], arg_types[0].clone());
+                let produced = fn_return_type(&f_ty);
+                self.emit_result_map(recv, &ok_ty, &err_ty, &produced, f_val, &f_ty)
+            }
+            (B::Result, "map_err") => {
+                let (f_val, f_ty) = (args[0], arg_types[0].clone());
+                let produced = fn_return_type(&f_ty);
+                self.emit_result_map_err(recv, &ok_ty, &err_ty, &produced, f_val, &f_ty)
+            }
+            (B::Result, "and_then") => {
+                let (f_val, f_ty) = (args[0], arg_types[0].clone());
+                self.emit_result_and_then(recv, &ok_ty, f_val, &f_ty)
+            }
+            (B::Result, "or_else") => {
+                let (f_val, f_ty) = (args[0], arg_types[0].clone());
+                self.emit_result_or_else(recv, &err_ty, f_val, &f_ty)
+            }
+            _ => unreachable!("unsupported `{method}` on an Option/Result passed eligibility"),
+        };
+        self.emit_pop_roots_n(self.gc_root_count - roots_before);
+        self.gc_root_count = roots_before;
+        value
+    }
+}
+
+impl<'a, 'b> FuncGen<'a, 'b> {
+    fn emit_flat_format_scalar(
+        &mut self,
+        value: cranelift_codegen::ir::Value,
+        ty: &Type,
+        format: Option<crate::interpolate::F64Format>,
+    ) -> cranelift_codegen::ir::Value {
+        if let Some(format) = format {
+            assert_eq!(*ty, Type::F64, "validated f64 format operand");
+            return self.emit_value_runtime_call(format.runtime_symbol(), &[value]);
+        }
+        match ty {
+            Type::String => value,
+            Type::I64 => self.emit_value_runtime_call("willow_i64_to_string", &[value]),
+            Type::F64 => self.emit_value_runtime_call("willow_f64_to_string", &[value]),
+            Type::Bool => self.emit_value_runtime_call("willow_bool_to_string", &[value]),
+            _ => unreachable!("validated display format operand"),
+        }
+    }
+
+    fn emit_flat_builtin_call(
+        &mut self,
+        callee: &crate::semantic::ids::FunctionId,
+        args: &[cranelift_codegen::ir::Value],
+    ) -> cranelift_codegen::ir::Value {
+        let runtime = builtin_call_runtime_name(callee.unqualified_name())
+            .expect("resolved builtin function");
+        self.emit_runtime_call_with_cleanup(runtime, args, |_| {})
+            .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
+    }
+}
+
+impl<'a, 'b> FuncGen<'a, 'b> {
+    fn emit_lir_static_call_values(
+        &mut self,
+        class: &str,
+        method: &str,
+        args: &[cranelift_codegen::ir::Value],
+        arg_types: &[Type],
+        ret_ty: &Type,
+        span: Span,
+    ) -> cranelift_codegen::ir::Value {
+        self.emit_lir_static_call_values_inner(class, method, args, arg_types, ret_ty, span)
+    }
+    fn emit_lir_static_call_values_inner(
+        &mut self,
+        class: &str,
+        method: &str,
+        args: &[cranelift_codegen::ir::Value],
+        _arg_types: &[Type],
+        ret_ty: &Type,
+        span: crate::diagnostics::Span,
+    ) -> cranelift_codegen::ir::Value {
+        let resolved_class = self.static_call_class_name(class);
+        let class = resolved_class.as_str();
+        if class == "Map" && method == "new" {
+            let (key, value) = builtin_types::binary_args(ret_ty, B::Map)
+                .expect("map constructor must carry checked type arguments");
+            return self.emit_map_new(key, value);
+        }
+        if class == "Channel"
+            && let Type::Generic(_, type_args) = ret_ty
+            && let Some(element_ty) = type_args.first()
+        {
+            let is_ref = self.builder.ins().iconst(
+                types::I64,
+                i64::from(is_gc_managed(element_ty, self.enum_infos)),
+            );
+            if method == "new" {
+                return self.emit_value_runtime_call("willow_channel_new", &[is_ref]);
+            }
+            if method == "with_capacity" {
+                let capacity = args[0];
+                return self
+                    .emit_value_runtime_call("willow_channel_new_bounded", &[is_ref, capacity]);
+            }
+        }
+        if let Some(handle) = cancellation_handle(ret_ty)
+            && method == "new"
+            && class == handle.class_name()
+        {
+            let runtime = format!("{}_new", handle.prefix());
+            return self.emit_value_runtime_call(&runtime, &[]);
+        }
+        if let Some(cell) = atomic_cell(ret_ty)
+            && method == "new"
+            && class == cell.class_name()
+        {
+            let initial = args[0];
+            let runtime = format!("willow_atomic_{}_new", cell.suffix());
+            return self.emit_value_runtime_call(&runtime, &[initial]);
+        }
+        if let Some((kind, elem)) = blocking_cell(ret_ty)
+            && method == "new"
+            && class == kind.class_name()
+        {
+            let elem = elem.clone();
+            let initial = args[0];
+            let word = self.coerce_to_i64(initial, &elem);
+            let is_ref = is_gc_managed(&elem, self.enum_infos);
+            let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
+            let runtime = format!("{}_new", kind.prefix());
+            return self.emit_value_runtime_call(&runtime, &[word, flag]);
+        }
+        if let Some((prefix, protected)) = scheduler_lock(ret_ty)
+            && method == "new"
+            && matches!(class, "Mutex" | "RwLock")
+        {
+            let protected = protected.clone();
+            let mut initial = args[0];
+            let is_ref = is_gc_managed(&protected, self.enum_infos);
+            if is_ref {
+                let slot = self.emit_push_root(initial);
+                initial = self.stack_load(self.module.target_config().pointer_type(), slot);
+            }
+            let word = self.coerce_to_i64(initial, &protected);
+            let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
+            let runtime = format!("{prefix}_new");
+            let handle = self.emit_value_runtime_call(&runtime, &[word, flag]);
+            if is_ref {
+                self.emit_pop_roots_n(1);
+                self.gc_root_count -= 1;
+            }
+            return handle;
+        }
+        if self.enum_infos.contains_key(class) {
+            return self.emit_lir_enum_construction_values(class, method, args, ret_ty);
+        }
+        if let Some(entry) = namespace_builtin_call(
+            self.known_modules,
+            self.builtin_module_aliases,
+            class,
+            method,
+        ) {
+            let (arg_vals, arg_roots) = (args.to_vec(), 0usize);
+            let result = self
+                .emit_runtime_call_with_cleanup(entry.runtime, &arg_vals, |this| {
+                    if arg_roots > 0 {
+                        this.emit_pop_roots_n(arg_roots);
+                        this.gc_root_count -= arg_roots;
+                    }
+                })
+                .expect("every builtin namespace entry returns a value");
+            return if entry.narrow_to_bool {
+                self.builder.ins().ireduce(types::I8, result)
+            } else {
+                result
+            };
+        }
+        if let Some(module_prefix) = self.known_modules.linker_prefix(class).cloned() {
+            let mangled = module_item_symbol(&module_prefix, method);
+            let has_reference_args = self.func_param_modes.get(&mangled).is_some_and(|modes| {
+                modes
+                    .iter()
+                    .any(|mode| matches!(mode, ParamMode::Reference { .. }))
+            });
+            let user_callee = format!("{class}::{method}");
+            let (arg_vals, arg_roots) = (args.to_vec(), 0usize);
+            let fid = *self.func_ids.get(mangled.as_str()).unwrap_or_else(|| {
+                panic!("eligible LIR module call `{class}::{method}` has no declared function")
+            });
+            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+            let pushed = self.emit_callstack_push(&user_callee, span);
+            let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
+            let call = self.builder.ins().call(fref, &arg_vals);
+            let result = self
+                .builder
+                .inst_results(call)
+                .first()
+                .copied()
+                .unwrap_or_else(|| self.builder.ins().iconst(clif_type(ret_ty), 0));
+            if pushed {
+                self.emit_callstack_pop();
+            }
+            if has_reference_args {
+                self.emit_flat_reference_call_end();
+            }
+            if arg_roots > 0 {
+                self.emit_pop_roots_n(arg_roots);
+                self.gc_root_count -= arg_roots;
+            }
+            self.emit_post_willow_call_panic_check(panic_depth);
+            return result;
+        }
+        let mangled = class_method_symbol_name(self.known_modules, class, method);
+        let fid = self.func_ids[&mangled];
+        let dummy_self = self.builder.ins().iconst(types::I64, 0);
+        let has_reference_args = self.func_param_modes.get(&mangled).is_some_and(|modes| {
+            modes
+                .iter()
+                .any(|mode| matches!(mode, ParamMode::Reference { .. }))
+        });
+        let (arg_vals, arg_roots) = (args.to_vec(), 0usize);
+        let fref = self.module.declare_func_in_func(fid, self.builder.func);
+        let mut call_args = vec![dummy_self];
+        call_args.extend(arg_vals);
+        let pushed = self.emit_callstack_push(method, span);
+        let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
+        let call = self.builder.ins().call(fref, &call_args);
+        let result = self
+            .builder
+            .inst_results(call)
+            .first()
+            .copied()
+            .unwrap_or_else(|| self.builder.ins().iconst(clif_type(ret_ty), 0));
+        if pushed {
+            self.emit_callstack_pop();
+        }
+        if has_reference_args {
+            self.emit_flat_reference_call_end();
+        }
+        if arg_roots > 0 {
+            self.emit_pop_roots_n(arg_roots);
+            self.gc_root_count -= arg_roots;
+        }
+        self.emit_post_willow_call_panic_check(panic_depth);
+        result
+    }
+
+    fn emit_lir_enum_construction_values(
+        &mut self,
+        enum_name: &str,
+        variant: &str,
+        args: &[cranelift_codegen::ir::Value],
+        enum_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let tag = self.enum_variant_tag(enum_name, variant);
+        if option_repr(enum_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
+            return if tag == 0 {
+                args[0]
+            } else {
+                self.builder.ins().iconst(types::I64, 0)
+            };
+        }
+        if !self.enum_is_gc_object_type(enum_name) {
+            return self.builder.ins().iconst(types::I64, tag);
+        }
+        let mut payloads = self.resolve_variant_payload_types(enum_name, variant, enum_ty);
+        normalize_void_payloads(&mut payloads);
+        let kinds = payloads
+            .iter()
+            .map(|ty| {
+                if is_gc_managed(ty, self.enum_infos) {
+                    willow_abi::SlotKind::GcRef
+                } else {
+                    willow_abi::SlotKind::Word
+                }
+            })
+            .collect::<Vec<_>>();
+        let layout = willow_abi::EnumVariantLayout::new(tag as u32, &kinds);
+        let bytes = self.module.target_config().pointer_type().bytes();
+        let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
+            GcObjectKind::Enum,
+            i64::from(layout.payload_bytes(bytes)),
+            0,
+            layout.gc_ref_mask(),
+        ));
+        let tag_value = self.builder.ins().iconst(types::I64, tag);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), tag_value, ptr, 0i32);
+        for (index, (&value, ty)) in args.iter().zip(&payloads).enumerate() {
+            let word = self.coerce_to_i64(value, ty);
+            self.emit_gc_heap_store(
+                ptr,
+                layout.payload_byte_offset(bytes) as i32 + index as i32 * bytes as i32,
+                word,
+                ty,
+                GcStoreDestination::EnumPayload,
+            );
+        }
+        ptr
+    }
+}
+
+fn flat_static_call_supported(
+    class: &str,
+    method: &str,
+    args: &[Type],
+    result: &Type,
+    ctx: &LirTypeCtx<'_>,
+) -> bool {
+    let class = ctx.resolved_class(class);
+    if !ctx.supported_type(result) || args.iter().any(|ty| !ctx.supported_type(ty)) {
+        return false;
+    }
+    if class == "Map" && method == "new" && args.is_empty() {
+        return matches!(lir_collection(result), Some((LirCollection::Map, _)));
+    }
+    if class == "Channel" && builtin_types::unary_arg(result, B::Channel).is_some() {
+        return (method == "new" && args.is_empty())
+            || (method == "with_capacity" && args == [Type::I64]);
+    }
+    if let Some(cell) = atomic_cell(result)
+        && class == cell.class_name()
+        && method == "new"
+    {
+        return args == [cell.word()];
+    }
+    if let Some((kind, elem)) = blocking_cell(result)
+        && class == kind.class_name()
+        && method == "new"
+    {
+        return args.len() == 1 && ctx.same_repr(elem, &args[0]);
+    }
+    if let Some((_, elem)) = scheduler_lock(result)
+        && matches!(class, "Mutex" | "RwLock")
+        && method == "new"
+    {
+        return args.len() == 1 && ctx.same_repr(elem, &args[0]);
+    }
+    if let Some(handle) = cancellation_handle(result)
+        && class == handle.class_name()
+        && method == "new"
+    {
+        return args.is_empty();
+    }
+    if let Some(entry) =
+        namespace_builtin_call(ctx.known_modules, ctx.builtin_module_aliases, class, method)
+    {
+        return entry.params == args && ctx.repr_compatible(result, &entry.ret);
+    }
+    if ctx.is_enum(class) {
+        let Some((name, definition)) = ctx.enum_instance(result) else {
+            return false;
+        };
+        let Some(variant) = definition.variant(method) else {
+            return false;
+        };
+        return name == TypeId::from_source_name(class)
+            && variant.payloads.len() == args.len()
+            && variant
+                .payloads
+                .iter()
+                .zip(args)
+                .all(|(slot, arg)| ctx.same_repr(slot, arg));
+    }
+    let (symbol, skip_self) = if let Some(prefix) = ctx.known_modules.linker_prefix(class) {
+        (module_item_symbol(prefix, method), false)
+    } else {
+        if !ctx.supported_class(class) {
+            return false;
+        }
+        (
+            class_method_symbol_name(ctx.known_modules, class, method),
+            true,
+        )
+    };
+    if !(ctx.known_fn)(&symbol) {
+        return false;
+    }
+    if ctx
+        .func_param_modes
+        .get(&symbol)
+        .is_some_and(|modes| modes.iter().any(|mode| !matches!(mode, ParamMode::Value)))
+    {
+        return false;
+    }
+    let Some(Type::Fn(params, ret)) = ctx.fn_types.get(&symbol) else {
+        return false;
+    };
+    let params = if skip_self {
+        let Some((_, params)) = params.split_first() else {
+            return false;
+        };
+        params
+    } else {
+        params.as_slice()
+    };
+    params.len() == args.len()
+        && params
+            .iter()
+            .zip(args)
+            .all(|(param, arg)| ctx.same_repr(param, arg))
+        && ctx.same_repr(ret, result)
+}
+
+impl<'a, 'b> FuncGen<'a, 'b> {
+    /// Allocate and initialise the tag before evaluating any source payload.
+    /// Nullable Option representations reserve no object: the payload store
+    /// below replaces this null placeholder with the actual pointer.
+    fn emit_flat_enum_alloc(
+        &mut self,
+        class: &str,
+        variant: &str,
+        enum_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let tag = self.enum_variant_tag(class, variant);
+        if option_repr(enum_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
+            return self.builder.ins().iconst(types::I64, 0);
+        }
+        if !self.enum_is_gc_object_type(class) {
+            return self.builder.ins().iconst(types::I64, tag);
+        }
+        let mut payloads = self.resolve_variant_payload_types(class, variant, enum_ty);
+        normalize_void_payloads(&mut payloads);
+        let kinds = payloads
+            .iter()
+            .map(|ty| {
+                if is_gc_managed(ty, self.enum_infos) {
+                    willow_abi::SlotKind::GcRef
+                } else {
+                    willow_abi::SlotKind::Word
+                }
+            })
+            .collect::<Vec<_>>();
+        let layout = willow_abi::EnumVariantLayout::new(tag as u32, &kinds);
+        let bytes = self.module.target_config().pointer_type().bytes();
+        let object = self.emit_gc_alloc(GcLayoutMetadata::new(
+            GcObjectKind::Enum,
+            i64::from(layout.payload_bytes(bytes)),
+            0,
+            layout.gc_ref_mask(),
+        ));
+        let tag_value = self.builder.ins().iconst(types::I64, tag);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), tag_value, object, 0i32);
+        object
+    }
+
+    /// A payload store is its own LIR operation so coercion occurs before the
+    /// next payload is evaluated. The returned representation is written back
+    /// to the enum local (necessary for nullable Option::Some).
+    // Keep explicit emission operands aligned with the LIR/runtime ABI.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_flat_enum_payload_store(
+        &mut self,
+        object: cranelift_codegen::ir::Value,
+        class: &str,
+        variant: &str,
+        index: usize,
+        value: cranelift_codegen::ir::Value,
+        source_ty: &Type,
+        enum_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let before = self.gc_root_count;
+        if is_gc_managed(enum_ty, self.enum_infos) {
+            self.emit_push_root(object);
+        }
+        if is_gc_managed(source_ty, self.enum_infos) {
+            self.emit_push_root(value);
+        }
+        let mut payloads = self.resolve_variant_payload_types(class, variant, enum_ty);
+        normalize_void_payloads(&mut payloads);
+        let target = &payloads[index];
+        let value = self.coerce_to_target(value, source_ty, target);
+        let result = if option_repr(enum_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer)
+        {
+            assert_eq!(index, 0);
+            value
+        } else {
+            let kinds = payloads
+                .iter()
+                .map(|ty| {
+                    if is_gc_managed(ty, self.enum_infos) {
+                        willow_abi::SlotKind::GcRef
+                    } else {
+                        willow_abi::SlotKind::Word
+                    }
+                })
+                .collect::<Vec<_>>();
+            let tag = self.enum_variant_tag(class, variant);
+            let layout = willow_abi::EnumVariantLayout::new(tag as u32, &kinds);
+            let bytes = self.module.target_config().pointer_type().bytes();
+            let word = self.coerce_to_i64(value, target);
+            self.emit_gc_heap_store(
+                object,
+                layout.payload_byte_offset(bytes) as i32 + index as i32 * bytes as i32,
+                word,
+                target,
+                GcStoreDestination::EnumPayload,
+            );
+            object
+        };
+        self.emit_pop_roots_n(self.gc_root_count - before);
+        self.gc_root_count = before;
+        result
+    }
+}
+
+/// Validate metadata that operand type equality alone cannot establish.
+fn flat_rvalue_supported(
+    value: &crate::ir::lowered::LirRvalue,
+    locals: &[crate::ir::lowered::LirLocal],
+    ctx: &LirTypeCtx<'_>,
+) -> bool {
+    use crate::ir::lowered::LirRvalue as V;
+    let ty = |operand: &crate::ir::lowered::LirOperand| operand.ty(locals);
+    let field_type = |object: &Type, field: &str| -> Option<Type> {
+        if range_i64(object) {
+            return matches!(field, "start" | "end").then_some(Type::I64);
+        }
+        ctx.class_layout_of(object)?
+            .iter()
+            .find(|(name, _)| name == field)
+            .map(|(_, ty)| ty.clone())
+    };
+    if value.operands().iter().any(|operand| matches!(operand, crate::ir::lowered::LirOperand::Reference { place, .. } if !flat_reference_place_supported(place, locals, ctx))) { return false; }
+    match value {
+        V::ReferenceDebug { argument, .. } => matches!(argument, crate::ir::lowered::LirOperand::Reference { place, .. } if flat_reference_place_supported(place, locals, ctx)),
+        V::StartTask { callee, params, output, .. } => ctx.cooperative_leaves.contains(&ctx.fn_types.scope().resolve(callee))
+            && (ctx.known_fn)(&callee.to_string())
+            && ctx.supported_type(output) && params.iter().all(|ty| ctx.supported_type(ty))
+            && ctx.fn_types.get_id(callee).is_some_and(|signature| matches!(signature, Type::Fn(declared, result) if declared.len() == params.len() && declared.iter().zip(params).all(|(expected, actual)| ctx.same_repr(expected, actual)) && builtin_types::unary_arg(result, B::Task).is_some_and(|payload| ctx.same_repr(payload, output))))
+            && ctx.func_param_modes.get_id(callee).is_none_or(|modes| modes.iter().all(|mode| matches!(mode, ParamMode::Value))),
+        V::AwaitFuture { result, .. } => ctx.supported_type(result),
+        V::SelectIdleWait { .. } => true,
+        V::PrepareMethod { receiver_ty, method, .. } => flat_method_signature(receiver_ty, method, ctx).is_some(),
+        V::MethodCall { receiver_ty, method, args, arg_types, result, .. } => flat_argument_modes_match(args, &flat_method_modes(receiver_ty, method, ctx)) && flat_method_signature(receiver_ty, method, ctx).is_some_and(|(params, ret)| params.len() == arg_types.len() && params.iter().zip(arg_types).all(|(param, arg)| ctx.same_repr(param, arg)) && ctx.same_repr(&ret, result)),
+        V::IndirectCall { callee, params, result, .. } => ty(callee).is_some_and(|callee| ctx.supported_type(&callee)) && params.iter().all(|param| ctx.supported_type(param)) && ctx.supported_type(result),
+        V::RebindResultError { source, target, .. } => ctx.supported_enum_type(source) && ctx.supported_enum_type(target)
+            && builtin_types::binary_args(source, B::Result).zip(builtin_types::binary_args(target, B::Result)).is_some_and(|((_, source), (_, target))| ctx.same_repr(source, target)),
+        V::IntoError { source, target, .. } => {
+            let Type::Named(class) = source else { return false; };
+            ctx.supported_class(class) && ctx.supported_type(target) && ctx.resolve_class_method(class, "into").is_some_and(|symbol|
+                ctx.fn_types.get(&symbol).is_some_and(|signature| matches!(signature, Type::Fn(params, result) if params.len() == 1 && ctx.same_repr(result, target))))
+        }
+        V::Coerce { source, target, .. } => ctx.supported_type(source) && ctx.supported_type(target) && ctx.storable(target, source),
+        V::CaptureArrayOwner { array, index } => ty(array).is_some_and(|array| matches!(array, Type::Array(_)) && ctx.supported_type(&array)) && ty(index) == Some(Type::I64),
+        V::ArrayAlloc { length, element } => *length <= i64::MAX as usize && ctx.supported_type(&Type::Array(Box::new(element.clone()))),
+        V::ArrayStore { array, value, element, .. } => ty(array).is_some_and(|array| ctx.supported_type(&array) && matches!(&array, Type::Array(inner) if ctx.same_repr(inner, element))) && ctx.supported_type(element) && ty(value).is_some_and(|value| ctx.storable(element, &value)),
+        V::Index { array, element, .. } => ctx.supported_type(element) && ty(array).is_some_and(|array| ctx.supported_type(&array) && (matches!(&array, Type::Array(_)) || matches!(lir_collection(&array), Some((LirCollection::FrozenArray, _)))) && ctx.same_repr(&array_element_type(&array), element)),
+        V::ObjectAlloc { class } => ctx.supported_class(class) && ctx.class_layouts.get(class).is_some() && ctx.class_type_ids.get(class).is_some(),
+        V::FieldLoad { object_ty, field, result, .. } => ctx.supported_type(object_ty) && ctx.supported_type(result) && field_type(object_ty, field).is_some_and(|field| ctx.same_repr(&field, result)),
+        V::FieldStore { object_ty, field, value, .. } => ctx.class_layout_of(object_ty).is_some() && field_type(object_ty, field).is_some_and(|field| ty(value).is_some_and(|value| ctx.supported_type(&value) && ctx.storable(&field, &value))),
+        V::StaticField { class, field, result } => (ctx.static_field)(ctx.resolved_class(&class.to_string()), field).is_some_and(|field| ctx.supported_type(&field) && ctx.same_repr(&field, result)),
+        V::StaticStore { class, field, value } => (ctx.static_field)(ctx.resolved_class(&class.to_string()), field).is_some_and(|field| ctx.supported_type(&field) && ty(value).is_some_and(|value| ctx.supported_type(&value) && ctx.storable(&field, &value))),
+        V::ConstructorCall { class, object, args, arg_types } => {
+            if !ctx.supported_class(class) || !ty(object).is_some_and(|ty| matches!(&ty, Type::Named(name) if name == class)) || args.len() != arg_types.len() { return false; }
+            let symbol = class_method_symbol_name(ctx.known_modules, &class.to_string(), "init");
+            if !(ctx.known_fn)(&symbol) || !flat_argument_modes_match(args, ctx.func_param_modes.get(&symbol).map(Vec::as_slice).unwrap_or(&[])) { return false; }
+            let Some(Type::Fn(params, result)) = ctx.fn_types.get(&symbol) else { return false; };
+            let Some((_, params)) = params.split_first() else { return false; };
+            **result == Type::Void && params.len() == arg_types.len() && params.iter().zip(arg_types).all(|(param, arg)| ctx.supported_type(param) && ctx.same_repr(param, arg))
+        }
+        V::StaticCall { class, method, args, arg_types, result } => {
+            if args.iter().any(|arg| matches!(arg, crate::ir::lowered::LirOperand::Reference { .. })) { flat_static_reference_call_supported(&class.to_string(), method, args, arg_types, result, ctx) }
+            else { flat_static_call_supported(&class.to_string(), method, arg_types, result, ctx) }
+        },
+        V::EnumAlloc { class, variant, enum_ty } => ctx.supported_enum_type(enum_ty) && ctx.enum_instance(enum_ty).is_some_and(|(name, definition)| name == *class && definition.variant(variant).is_some()),
+        V::EnumPayloadStore { class, variant, index, source, enum_ty, .. } => ctx.supported_enum_type(enum_ty) && ctx.supported_type(source) && ctx.enum_instance(enum_ty).is_some_and(|(name, definition)| name == *class && definition.variant(variant).and_then(|variant| variant.payloads.get(*index)).is_some_and(|slot| ctx.storable(slot, source))),
+        V::Range { start, end } => ty(start) == Some(Type::I64) && ty(end) == Some(Type::I64),
+        V::EnumMethod { receiver_ty, method, arg_types, result, .. } => ctx.supported_enum_type(receiver_ty) && ctx.supported_type(result) && arg_types.iter().all(|ty| ctx.supported_type(ty)) && option_result_method(receiver_ty, method, arg_types).is_some_and(|ret| ctx.same_repr(&ret, result)),
+        V::BuiltinCall { callee, params, result, .. } => {
+            let void_future = *result == Type::Void || builtin_types::unary_arg(result, B::Future) == Some(&Type::Void);
+            if callee.is_free_named("sleep") { return params == &[Type::I64] && void_future; }
+            if callee.is_free_named("yield") { return params.is_empty() && void_future; }
+            if !params.is_empty() { return false; }
+            if callee.is_free_named("gc_collect") || callee.is_free_named("gc_minor_collect") { *result == Type::Void }
+            else { callee.is_free_named(callee.unqualified_name()) && gc_stat_builtin_runtime_name(callee.unqualified_name()).is_some() && *result == Type::I64 }
+        }
+        V::FormatScalar { ty, format, .. } => matches!(ty, Type::I64 | Type::F64 | Type::Bool | Type::String) && (format.is_none() || *ty == Type::F64),
+        V::Panic { message } => ty(message) == Some(Type::String),
+        V::Binary { op, operand_ty, .. } if matches!(operand_ty, Type::Named(_) | Type::Generic(..)) => matches!(op, BinOp::Eq | BinOp::Ne) && ctx.tag_immediate_enum(operand_ty),
+        V::Recover => true,
+        _ => true,
+    }
+}
+
+/// The by-value dispatch ABI, including inherited methods and interface Self.
+fn flat_method_signature(
+    receiver: &Type,
+    method: &str,
+    ctx: &LirTypeCtx<'_>,
+) -> Option<(Vec<Type>, Type)> {
+    if !ctx.supported_type(receiver) {
+        return None;
+    }
+    let name = match receiver {
+        Type::Named(name) | Type::Generic(name, _) => name,
+        _ => return None,
+    };
+    let (params, ret) = if (ctx.is_interface)(name) {
+        let sig = (ctx.iface_method)(receiver, method)?;
+        let ret = if matches!(&sig.ret, Type::Named(name) if *name == TypeId::local("Self")) {
+            receiver.clone()
+        } else {
+            sig.ret
+        };
+        (sig.params, ret)
+    } else {
+        if !ctx.supported_class(name) {
+            return None;
+        }
+        let symbol = ctx.resolve_class_method(name, method)?;
+        let Type::Fn(params, ret) = ctx.fn_types.get(&symbol)? else {
+            return None;
+        };
+        let (_, params) = params.split_first()?;
+        (params.to_vec(), (**ret).clone())
+    };
+    (ctx.supported_type(&ret) && params.iter().all(|param| ctx.supported_type(param)))
+        .then_some((params, ret))
+}
+
+fn flat_argument_modes_match(args: &[crate::ir::lowered::LirOperand], modes: &[ParamMode]) -> bool {
+    args.iter().enumerate().all(|(index, arg)| {
+        matches!(arg, crate::ir::lowered::LirOperand::Reference { .. })
+            == matches!(modes.get(index), Some(ParamMode::Reference { .. }))
+    })
+}
+fn flat_method_modes(receiver: &Type, method: &str, ctx: &LirTypeCtx<'_>) -> Vec<ParamMode> {
+    let name = match receiver {
+        Type::Named(name) | Type::Generic(name, _) => name,
+        _ => return vec![],
+    };
+    if (ctx.is_interface)(name) {
+        return (ctx.iface_method)(receiver, method)
+            .map(|sig| sig.modes)
+            .unwrap_or_default();
+    }
+    ctx.resolve_class_method(name, method)
+        .and_then(|symbol| ctx.func_param_modes.get(&symbol).cloned())
+        .unwrap_or_default()
+}
+fn flat_reference_place_supported(
+    place: &crate::ir::lowered::LirPlace,
+    locals: &[crate::ir::lowered::LirLocal],
+    ctx: &LirTypeCtx<'_>,
+) -> bool {
+    use crate::ir::lowered::LirPlace;
+    let Some(ty) = place.ty(locals) else {
+        return false;
+    };
+    if !ctx.supported_type(&ty) || matches!(ty, Type::Void | Type::Never) {
+        return false;
+    }
+    match place {
+        LirPlace::Local(_) | LirPlace::ArrayElement { .. } => true,
+        LirPlace::Field {
+            object_ty, field, ..
+        } => ctx.class_layout_of(object_ty).is_some_and(|layout| {
+            layout
+                .iter()
+                .any(|(name, field_ty)| name == field && ctx.same_repr(field_ty, &ty))
+        }),
+    }
+}
+fn flat_static_reference_call_supported(
+    class: &str,
+    method: &str,
+    args: &[crate::ir::lowered::LirOperand],
+    types: &[Type],
+    result: &Type,
+    ctx: &LirTypeCtx<'_>,
+) -> bool {
+    let class = ctx.resolved_class(class);
+    let (symbol, skip_self) = if let Some(prefix) = ctx.known_modules.linker_prefix(class) {
+        (module_item_symbol(prefix, method), false)
+    } else {
+        if !ctx.supported_class(class) {
+            return false;
+        }
+        (
+            class_method_symbol_name(ctx.known_modules, class, method),
+            true,
+        )
+    };
+    if !(ctx.known_fn)(&symbol)
+        || !flat_argument_modes_match(
+            args,
+            ctx.func_param_modes
+                .get(&symbol)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        )
+    {
+        return false;
+    }
+    let Some(Type::Fn(params, ret)) = ctx.fn_types.get(&symbol) else {
+        return false;
+    };
+    let params = if skip_self {
+        let Some((_, tail)) = params.split_first() else {
+            return false;
+        };
+        tail
+    } else {
+        params.as_slice()
+    };
+    params.len() == types.len()
+        && params
+            .iter()
+            .zip(types)
+            .all(|(param, arg)| ctx.supported_type(param) && ctx.same_repr(param, arg))
+        && ctx.same_repr(ret, result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7505,7 +8331,7 @@ mod tests {
 
     impl crate::backend::cranelift::vtable_layout::IfaceShapes for TestTables {
         fn canonical(&self, iface: &TypeId) -> TypeId {
-            iface.clone()
+            *iface
         }
 
         fn supers(&self, iface: &TypeId) -> Vec<TypeId> {
@@ -7720,13 +8546,13 @@ mod tests {
             // its own fields, which is not what the walker is handed.
             let own = t.class_layouts.clone();
             for (class_name, _) in own.iter() {
-                let mut chain = vec![class_name.clone()];
-                let mut seen = HashSet::from([class_name.clone()]);
+                let mut chain = vec![*class_name];
+                let mut seen = HashSet::from([*class_name]);
                 while let Some(base) = t.class_base.get(chain.last().expect("non-empty")) {
-                    if !seen.insert(base.clone()) {
+                    if !seen.insert(*base) {
                         break;
                     }
-                    chain.push(base.clone());
+                    chain.push(*base);
                 }
                 let mut fields: Vec<(String, Type)> = Vec::new();
                 for ancestor in chain.iter().rev() {
@@ -7739,7 +8565,7 @@ mod tests {
                         }
                     }
                 }
-                t.class_layouts.insert(class_name.clone(), fields);
+                t.class_layouts.insert(*class_name, fields);
             }
             t
         }
@@ -7753,7 +8579,7 @@ mod tests {
                 class_base: &self.class_base,
                 class_type_ids: &self.class_type_ids,
                 is_interface: &|n| self.interfaces.contains(&n.to_string()),
-                iface_identity: &|n| self.interfaces.contains(&n.to_string()).then(|| n.clone()),
+                iface_identity: &|n| self.interfaces.contains(&n.to_string()).then_some(*n),
                 can_box: &|class, iface| {
                     self.vtables
                         .contains(&(class.to_string(), iface.to_string()))
@@ -14563,1099 +15389,4 @@ fn f() {
         );
         assert!(!hoistable_in_main(&no));
     }
-}
-
-/// Representation checks for resolved flat builtin methods. Receiver/result
-/// identity and arity are checked against the semantic intrinsic table first.
-fn flat_intrinsic_supported(
-    intrinsic: Intrinsic,
-    receiver: &Type,
-    args: &[Type],
-    result: &Type,
-    ctx: &LirTypeCtx<'_>,
-) -> bool {
-    use Intrinsic::*;
-    if !ctx.supported_type(receiver)
-        || !ctx.supported_type(result)
-        || !args.iter().all(|ty| ctx.supported_type(ty))
-    {
-        return false;
-    }
-    match intrinsic {
-        ArrayPush | ChannelSend => {
-            let element = match receiver {
-                Type::Array(element) => &**element,
-                _ => match builtin_types::unary_arg(receiver, B::Channel) {
-                    Some(element) => element,
-                    None => return false,
-                },
-            };
-            args.len() == 1 && ctx.storable(element, &args[0])
-        }
-        ArrayToString => {
-            matches!(receiver, Type::Array(element) if collection_elem_kind(element).is_some())
-        }
-        MapContains | FrozenMapContains | MapGet | FrozenMapGet | MapInsert | MapToString => {
-            let Some((_, types)) = lir_collection(receiver) else {
-                return false;
-            };
-            if types.len() != 2 {
-                return false;
-            }
-            match intrinsic {
-                MapToString => types.iter().all(|ty| collection_elem_kind(ty).is_some()),
-                MapInsert => {
-                    args.len() == 2
-                        && ctx.same_repr(&types[0], &args[0])
-                        && ctx.storable(&types[1], &args[1])
-                }
-                _ => args.len() == 1 && ctx.same_repr(&types[0], &args[0]),
-            }
-        }
-        AtomicLoad | AtomicStore | AtomicSwap | AtomicAdd | AtomicSub => {
-            atomic_cell(receiver).is_some_and(|cell| args.iter().all(|arg| *arg == cell.word()))
-        }
-        CellGet | CellSet | RwCellRead | RwCellWrite => blocking_cell(receiver)
-            .is_some_and(|(_, elem)| args.iter().all(|arg| ctx.same_repr(elem, arg))),
-        _ => true,
-    }
-}
-
-impl<'a, 'b> FuncGen<'a, 'b> {
-    /// Operands are already evaluated, typed, and rooted by LIR. This emitter
-    /// performs one resolved operation; it never walks executable syntax.
-    fn emit_flat_intrinsic(
-        &mut self,
-        intrinsic: Intrinsic,
-        receiver: cranelift_codegen::ir::Value,
-        receiver_ty: &Type,
-        args: &[cranelift_codegen::ir::Value],
-        arg_types: &[Type],
-        result: &Type,
-        span: Span,
-    ) -> cranelift_codegen::ir::Value {
-        // Frame-backed references can otherwise move during a coercion or a
-        // blocking runtime call. Direct roots pin every loaded SSA operand.
-        let roots_before = self.gc_root_count;
-        if is_gc_managed(receiver_ty, self.enum_infos) {
-            self.emit_push_root(receiver);
-        }
-        for (&value, ty) in args.iter().zip(arg_types) {
-            if is_gc_managed(ty, self.enum_infos) {
-                self.emit_push_root(value);
-            }
-        }
-        let value = self.emit_flat_intrinsic_inner(
-            intrinsic,
-            receiver,
-            receiver_ty,
-            args,
-            arg_types,
-            result,
-            span,
-        );
-        self.emit_pop_roots_n(self.gc_root_count - roots_before);
-        self.gc_root_count = roots_before;
-        value
-    }
-
-    fn emit_flat_intrinsic_inner(
-        &mut self,
-        intrinsic: Intrinsic,
-        receiver: cranelift_codegen::ir::Value,
-        receiver_ty: &Type,
-        args: &[cranelift_codegen::ir::Value],
-        arg_types: &[Type],
-        _result: &Type,
-        _span: Span,
-    ) -> cranelift_codegen::ir::Value {
-        use Intrinsic::*;
-        match intrinsic {
-            StringToString | TaskResult => receiver,
-            I64ToString => self.emit_value_runtime_call("willow_i64_to_string", &[receiver]),
-            F64ToString => self.emit_value_runtime_call("willow_f64_to_string", &[receiver]),
-            BoolToString => self.emit_value_runtime_call("willow_bool_to_string", &[receiver]),
-            TaskCancel => {
-                let id = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::new(),
-                    receiver,
-                    async_frame_slot_offset(FRAME_SLOT_TASK_ID),
-                );
-                self.emit_void_runtime_call("willow_sched_cancel", &[id]);
-                self.builder.ins().iconst(types::I8, 0)
-            }
-            TaskIsCancelled => {
-                let raw = self.emit_value_runtime_call("willow_frame_is_cancelled", &[receiver]);
-                self.builder.ins().ireduce(types::I8, raw)
-            }
-            TokenIsCancelled | ScopeIsCancelled | TokenCancel | ScopeCancel | TokenChild
-            | ScopeChild | TokenAttach | ScopeAdd | ScopeFinish => {
-                let handle =
-                    cancellation_handle(receiver_ty).expect("validated cancellation intrinsic");
-                let suffix = match intrinsic {
-                    TokenIsCancelled | ScopeIsCancelled => "is_cancelled",
-                    TokenCancel | ScopeCancel => "cancel",
-                    TokenChild | ScopeChild => "child",
-                    TokenAttach => "attach",
-                    ScopeAdd => "add",
-                    ScopeFinish => "finish",
-                    _ => unreachable!(),
-                };
-                let mut values = vec![receiver];
-                values.extend_from_slice(args);
-                let symbol = format!("{}_{suffix}", handle.prefix());
-                let value = self.emit_runtime_call_with_cleanup(&symbol, &values, |_| {});
-                match intrinsic {
-                    TokenIsCancelled | ScopeIsCancelled => {
-                        self.builder.ins().ireduce(types::I8, value.unwrap())
-                    }
-                    _ => value.unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0)),
-                }
-            }
-            AtomicLoad | AtomicStore | AtomicSwap | AtomicAdd | AtomicSub => {
-                let cell = atomic_cell(receiver_ty).expect("validated atomic intrinsic");
-                let operation = match intrinsic {
-                    AtomicLoad => "load",
-                    AtomicStore => "store",
-                    AtomicSwap => "swap",
-                    AtomicAdd => "add",
-                    AtomicSub => "sub",
-                    _ => unreachable!(),
-                };
-                let mut values = vec![receiver];
-                values.extend_from_slice(args);
-                self.emit_runtime_call_with_cleanup(
-                    &format!("willow_atomic_{}_{operation}", cell.suffix()),
-                    &values,
-                    |_| {},
-                )
-                .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
-            }
-            CellGet | CellSet | RwCellRead | RwCellWrite => {
-                let (kind, element) = blocking_cell(receiver_ty).expect("validated cell intrinsic");
-                let operation = match intrinsic {
-                    CellGet => "get",
-                    CellSet => "set",
-                    RwCellRead => "read",
-                    RwCellWrite => "write",
-                    _ => unreachable!(),
-                };
-                let mut values = vec![receiver];
-                if let Some(&value) = args.first() {
-                    values.push(self.coerce_to_i64(value, element));
-                }
-                match self.emit_runtime_call_with_cleanup(
-                    &format!("{}_{operation}", kind.prefix()),
-                    &values,
-                    |_| {},
-                ) {
-                    Some(value) => self.coerce_i64_to(value, element),
-                    None => self.builder.ins().iconst(types::I8, 0),
-                }
-            }
-            ChannelSend | ChannelRecv | ChannelClose => {
-                let element = builtin_types::unary_arg(receiver_ty, B::Channel)
-                    .expect("validated channel intrinsic");
-                let operation = match intrinsic {
-                    ChannelSend => "send",
-                    ChannelRecv => "recv",
-                    ChannelClose => "close",
-                    _ => unreachable!(),
-                };
-                let symbol = if intrinsic == ChannelClose {
-                    "willow_channel_close".to_string()
-                } else {
-                    format!(
-                        "willow_channel_{operation}_{}",
-                        channel_runtime_suffix(element)
-                    )
-                };
-                let mut values = vec![receiver];
-                if let Some(&value) = args.first() {
-                    let value = self.coerce_to_target(value, &arg_types[0], element);
-                    if is_gc_managed(element, self.enum_infos) {
-                        self.emit_push_root(value);
-                    }
-                    values.push(value);
-                }
-                self.emit_runtime_call_with_cleanup(&symbol, &values, |_| {})
-                    .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
-            }
-            ArrayLen | FrozenArrayLen => {
-                self.emit_value_runtime_call("willow_array_len", &[receiver])
-            }
-            ArrayPush => {
-                let element = array_element_type(receiver_ty);
-                let value = self.coerce_to_target(args[0], &arg_types[0], &element);
-                if is_gc_managed(&element, self.enum_infos) {
-                    self.emit_push_root(value);
-                }
-                let word = self.coerce_to_i64(value, &element);
-                self.emit_void_runtime_call("willow_array_push", &[receiver, word]);
-                self.builder.ins().iconst(types::I8, 0)
-            }
-            ArrayPop => {
-                let word = self.emit_value_runtime_call("willow_array_pop", &[receiver]);
-                self.coerce_i64_to(word, &array_element_type(receiver_ty))
-            }
-            ArrayToString => {
-                let kind = collection_elem_kind(&array_element_type(receiver_ty))
-                    .expect("validated array rendering kind");
-                let kind = self.builder.ins().iconst(types::I64, kind);
-                self.emit_value_runtime_call("willow_array_to_string", &[receiver, kind])
-            }
-            ArrayFreeze => self.emit_value_runtime_call("willow_array_copy", &[receiver]),
-            MapLen | FrozenMapLen => self.emit_value_runtime_call("willow_map_len", &[receiver]),
-            MapToString => self.emit_value_runtime_call("willow_map_to_string", &[receiver]),
-            MapFreeze => self.emit_value_runtime_call("willow_map_copy", &[receiver]),
-            MapContains | FrozenMapContains | MapGet | FrozenMapGet | MapInsert => {
-                let (_, parameters) = lir_collection(receiver_ty).expect("validated map intrinsic");
-                let (key_ty, value_ty) = (&parameters[0], &parameters[1]);
-                let key = self.coerce_to_i64(args[0], key_ty);
-                let key_ref = self.map_is_ref_flag(key_ty);
-                match intrinsic {
-                    MapContains | FrozenMapContains => {
-                        let value = self.emit_value_runtime_call(
-                            "willow_map_contains",
-                            &[receiver, key, key_ref],
-                        );
-                        self.builder.ins().ireduce(types::I8, value)
-                    }
-                    MapGet | FrozenMapGet => {
-                        let option = Type::Generic("Option".into(), vec![value_ty.clone()]);
-                        let niche = self.builder.ins().iconst(
-                            types::I64,
-                            i64::from(
-                                option_repr(&option, self.enum_infos)
-                                    == Some(OptionRepr::NullableGcPointer),
-                            ),
-                        );
-                        self.emit_value_runtime_call(
-                            "willow_map_get",
-                            &[receiver, key, key_ref, niche],
-                        )
-                    }
-                    MapInsert => {
-                        let value = self.coerce_to_target(args[1], &arg_types[1], value_ty);
-                        if is_gc_managed(value_ty, self.enum_infos) {
-                            self.emit_push_root(value);
-                        }
-                        let word = self.coerce_to_i64(value, value_ty);
-                        let value_ref = self.map_is_ref_flag(value_ty);
-                        self.emit_void_runtime_call(
-                            "willow_map_insert",
-                            &[receiver, key, key_ref, word, value_ref],
-                        );
-                        self.builder.ins().iconst(types::I8, 0)
-                    }
-                    _ => unreachable!(),
-                }
-            }
-        }
-    }
-}
-
-impl<'a, 'b> FuncGen<'a, 'b> {
-    /// Resolved enum combinators consume already-evaluated, typed operands.
-    fn emit_flat_enum_method(
-        &mut self,
-        receiver: cranelift_codegen::ir::Value,
-        receiver_ty: &Type,
-        method: &str,
-        args: &[cranelift_codegen::ir::Value],
-        arg_types: &[Type],
-        span: Span,
-    ) -> cranelift_codegen::ir::Value {
-        const OK_TAG: i64 = 0;
-        const ERR_TAG: i64 = 1;
-        let resolved = builtin_types::resolve(receiver_ty)
-            .expect("Option/Result receiver vetted by eligibility");
-        let id = resolved.id;
-        let payload = |i: usize| resolved.args.get(i).cloned().unwrap_or(Type::Void);
-        let (ok_ty, err_ty) = (payload(0), payload(1));
-        let recv = receiver;
-        let roots_before = self.gc_root_count;
-        for (&value, ty) in args.iter().zip(arg_types) {
-            if is_gc_managed(ty, self.enum_infos) {
-                self.emit_push_root(value);
-            }
-        }
-        // Every branch below either allocates a panic message or evaluates an
-        // argument that may allocate, and the receiver is otherwise live only
-        // in an SSA register — so it is rooted for the whole method.
-        self.emit_push_root(recv);
-        let value = match (id, method) {
-            (B::Option, "is_some") => self.emit_option_is_some(recv, &ok_ty),
-            (B::Option, "is_none") => {
-                let some = self.emit_option_is_some(recv, &ok_ty);
-                let zero = self.builder.ins().iconst(types::I8, 0);
-                self.builder.ins().icmp(IntCC::Equal, some, zero)
-            }
-            (B::Option, "unwrap") => {
-                let msg = self.emit_string_literal("called `Option::unwrap()` on a `None` value");
-                self.emit_option_unwrap(recv, &ok_ty, msg, Some(span))
-            }
-            (B::Option, "expect") => {
-                let msg = args[0];
-                self.emit_option_unwrap(recv, &ok_ty, msg, Some(span))
-            }
-            (B::Option, "unwrap_or") => {
-                let default_val = args[0];
-                self.emit_option_unwrap_or(recv, &ok_ty, default_val)
-            }
-            (B::Result, "is_ok") | (B::Result, "is_err") => {
-                let tag = self.emit_load_enum_tag(recv);
-                let want = self
-                    .builder
-                    .ins()
-                    .iconst(types::I64, if method == "is_ok" { OK_TAG } else { ERR_TAG });
-                self.builder.ins().icmp(IntCC::Equal, tag, want)
-            }
-            (B::Result, "unwrap") => {
-                let msg = self.emit_string_literal("called `Result::unwrap()` on an `Err` value");
-                self.emit_enum_unwrap(recv, &ok_ty, OK_TAG, msg, Some(span))
-            }
-            (B::Result, "unwrap_err") => {
-                let msg =
-                    self.emit_string_literal("called `Result::unwrap_err()` on an `Ok` value");
-                self.emit_enum_unwrap(recv, &err_ty, ERR_TAG, msg, Some(span))
-            }
-            (B::Result, "expect") => {
-                let msg = args[0];
-                self.emit_enum_unwrap(recv, &ok_ty, OK_TAG, msg, Some(span))
-            }
-            (B::Result, "unwrap_or") => {
-                let default_val = args[0];
-                self.emit_enum_unwrap_or(recv, &ok_ty, OK_TAG, default_val)
-            }
-            // The callable-taking combinators (willow-0g8j.2.2). The receiver
-            // is already rooted above, which is what makes calling an arbitrary
-            // function — and allocating the new enum around its result — safe
-            // here. Shared helpers enforce tag layout, the pointer niche,
-            // and the indirect-call ABI.
-            (B::Option, "map") => {
-                let (f_val, f_ty) = (args[0], arg_types[0].clone());
-                let produced = fn_return_type(&f_ty);
-                self.emit_option_map(recv, &ok_ty, &produced, f_val, &f_ty)
-            }
-            (B::Option, "and_then") => {
-                let (f_val, f_ty) = (args[0], arg_types[0].clone());
-                self.emit_option_and_then(recv, &ok_ty, f_val, &f_ty)
-            }
-            (B::Option, "or_else") => {
-                let (f_val, f_ty) = (args[0], arg_types[0].clone());
-                self.emit_option_or_else(recv, &ok_ty, f_val, &f_ty)
-            }
-            (B::Result, "map") => {
-                let (f_val, f_ty) = (args[0], arg_types[0].clone());
-                let produced = fn_return_type(&f_ty);
-                self.emit_result_map(recv, &ok_ty, &err_ty, &produced, f_val, &f_ty)
-            }
-            (B::Result, "map_err") => {
-                let (f_val, f_ty) = (args[0], arg_types[0].clone());
-                let produced = fn_return_type(&f_ty);
-                self.emit_result_map_err(recv, &ok_ty, &err_ty, &produced, f_val, &f_ty)
-            }
-            (B::Result, "and_then") => {
-                let (f_val, f_ty) = (args[0], arg_types[0].clone());
-                self.emit_result_and_then(recv, &ok_ty, f_val, &f_ty)
-            }
-            (B::Result, "or_else") => {
-                let (f_val, f_ty) = (args[0], arg_types[0].clone());
-                self.emit_result_or_else(recv, &err_ty, f_val, &f_ty)
-            }
-            _ => unreachable!("unsupported `{method}` on an Option/Result passed eligibility"),
-        };
-        self.emit_pop_roots_n(self.gc_root_count - roots_before);
-        self.gc_root_count = roots_before;
-        value
-    }
-}
-
-impl<'a, 'b> FuncGen<'a, 'b> {
-    fn emit_flat_format_scalar(
-        &mut self,
-        value: cranelift_codegen::ir::Value,
-        ty: &Type,
-        format: Option<crate::interpolate::F64Format>,
-    ) -> cranelift_codegen::ir::Value {
-        if let Some(format) = format {
-            assert_eq!(*ty, Type::F64, "validated f64 format operand");
-            return self.emit_value_runtime_call(format.runtime_symbol(), &[value]);
-        }
-        match ty {
-            Type::String => value,
-            Type::I64 => self.emit_value_runtime_call("willow_i64_to_string", &[value]),
-            Type::F64 => self.emit_value_runtime_call("willow_f64_to_string", &[value]),
-            Type::Bool => self.emit_value_runtime_call("willow_bool_to_string", &[value]),
-            _ => unreachable!("validated display format operand"),
-        }
-    }
-
-    fn emit_flat_builtin_call(
-        &mut self,
-        callee: &crate::semantic::ids::FunctionId,
-        args: &[cranelift_codegen::ir::Value],
-    ) -> cranelift_codegen::ir::Value {
-        let runtime = builtin_call_runtime_name(callee.unqualified_name())
-            .expect("resolved builtin function");
-        self.emit_runtime_call_with_cleanup(runtime, args, |_| {})
-            .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
-    }
-}
-
-impl<'a, 'b> FuncGen<'a, 'b> {
-    fn emit_lir_static_call_values(
-        &mut self,
-        class: &str,
-        method: &str,
-        args: &[cranelift_codegen::ir::Value],
-        arg_types: &[Type],
-        ret_ty: &Type,
-        span: Span,
-    ) -> cranelift_codegen::ir::Value {
-        self.emit_lir_static_call_values_inner(class, method, args, arg_types, ret_ty, span)
-    }
-    fn emit_lir_static_call_values_inner(
-        &mut self,
-        class: &str,
-        method: &str,
-        args: &[cranelift_codegen::ir::Value],
-        _arg_types: &[Type],
-        ret_ty: &Type,
-        span: crate::diagnostics::Span,
-    ) -> cranelift_codegen::ir::Value {
-        let resolved_class = self.static_call_class_name(class);
-        let class = resolved_class.as_str();
-        if class == "Map" && method == "new" {
-            let (key, value) = builtin_types::binary_args(ret_ty, B::Map)
-                .expect("map constructor must carry checked type arguments");
-            return self.emit_map_new(key, value);
-        }
-        if class == "Channel"
-            && let Type::Generic(_, type_args) = ret_ty
-            && let Some(element_ty) = type_args.first()
-        {
-            let is_ref = self.builder.ins().iconst(
-                types::I64,
-                i64::from(is_gc_managed(element_ty, self.enum_infos)),
-            );
-            if method == "new" {
-                return self.emit_value_runtime_call("willow_channel_new", &[is_ref]);
-            }
-            if method == "with_capacity" {
-                let capacity = args[0];
-                return self
-                    .emit_value_runtime_call("willow_channel_new_bounded", &[is_ref, capacity]);
-            }
-        }
-        if let Some(handle) = cancellation_handle(ret_ty)
-            && method == "new"
-            && class == handle.class_name()
-        {
-            let runtime = format!("{}_new", handle.prefix());
-            return self.emit_value_runtime_call(&runtime, &[]);
-        }
-        if let Some(cell) = atomic_cell(ret_ty)
-            && method == "new"
-            && class == cell.class_name()
-        {
-            let initial = args[0];
-            let runtime = format!("willow_atomic_{}_new", cell.suffix());
-            return self.emit_value_runtime_call(&runtime, &[initial]);
-        }
-        if let Some((kind, elem)) = blocking_cell(ret_ty)
-            && method == "new"
-            && class == kind.class_name()
-        {
-            let elem = elem.clone();
-            let initial = args[0];
-            let word = self.coerce_to_i64(initial, &elem);
-            let is_ref = is_gc_managed(&elem, self.enum_infos);
-            let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
-            let runtime = format!("{}_new", kind.prefix());
-            return self.emit_value_runtime_call(&runtime, &[word, flag]);
-        }
-        if let Some((prefix, protected)) = scheduler_lock(ret_ty)
-            && method == "new"
-            && matches!(class, "Mutex" | "RwLock")
-        {
-            let protected = protected.clone();
-            let mut initial = args[0];
-            let is_ref = is_gc_managed(&protected, self.enum_infos);
-            if is_ref {
-                let slot = self.emit_push_root(initial);
-                initial = self.stack_load(self.module.target_config().pointer_type(), slot);
-            }
-            let word = self.coerce_to_i64(initial, &protected);
-            let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
-            let runtime = format!("{prefix}_new");
-            let handle = self.emit_value_runtime_call(&runtime, &[word, flag]);
-            if is_ref {
-                self.emit_pop_roots_n(1);
-                self.gc_root_count -= 1;
-            }
-            return handle;
-        }
-        if self.enum_infos.contains_key(class) {
-            return self.emit_lir_enum_construction_values(class, method, args, ret_ty);
-        }
-        if let Some(entry) = namespace_builtin_call(
-            self.known_modules,
-            self.builtin_module_aliases,
-            class,
-            method,
-        ) {
-            let (arg_vals, arg_roots) = (args.to_vec(), 0usize);
-            let result = self
-                .emit_runtime_call_with_cleanup(entry.runtime, &arg_vals, |this| {
-                    if arg_roots > 0 {
-                        this.emit_pop_roots_n(arg_roots);
-                        this.gc_root_count -= arg_roots;
-                    }
-                })
-                .expect("every builtin namespace entry returns a value");
-            return if entry.narrow_to_bool {
-                self.builder.ins().ireduce(types::I8, result)
-            } else {
-                result
-            };
-        }
-        if let Some(module_prefix) = self.known_modules.linker_prefix(class).cloned() {
-            let mangled = module_item_symbol(&module_prefix, method);
-            let has_reference_args = self.func_param_modes.get(&mangled).is_some_and(|modes| {
-                modes
-                    .iter()
-                    .any(|mode| matches!(mode, ParamMode::Reference { .. }))
-            });
-            let user_callee = format!("{class}::{method}");
-            let (arg_vals, arg_roots) = (args.to_vec(), 0usize);
-            let fid = *self.func_ids.get(mangled.as_str()).unwrap_or_else(|| {
-                panic!("eligible LIR module call `{class}::{method}` has no declared function")
-            });
-            let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            let pushed = self.emit_callstack_push(&user_callee, span);
-            let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
-            let call = self.builder.ins().call(fref, &arg_vals);
-            let result = self
-                .builder
-                .inst_results(call)
-                .first()
-                .copied()
-                .unwrap_or_else(|| self.builder.ins().iconst(clif_type(ret_ty), 0));
-            if pushed {
-                self.emit_callstack_pop();
-            }
-            if has_reference_args {
-                self.emit_flat_reference_call_end();
-            }
-            if arg_roots > 0 {
-                self.emit_pop_roots_n(arg_roots);
-                self.gc_root_count -= arg_roots;
-            }
-            self.emit_post_willow_call_panic_check(panic_depth);
-            return result;
-        }
-        let mangled = class_method_symbol_name(self.known_modules, class, method);
-        let fid = self.func_ids[&mangled];
-        let dummy_self = self.builder.ins().iconst(types::I64, 0);
-        let has_reference_args = self.func_param_modes.get(&mangled).is_some_and(|modes| {
-            modes
-                .iter()
-                .any(|mode| matches!(mode, ParamMode::Reference { .. }))
-        });
-        let (arg_vals, arg_roots) = (args.to_vec(), 0usize);
-        let fref = self.module.declare_func_in_func(fid, self.builder.func);
-        let mut call_args = vec![dummy_self];
-        call_args.extend(arg_vals);
-        let pushed = self.emit_callstack_push(method, span);
-        let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
-        let call = self.builder.ins().call(fref, &call_args);
-        let result = self
-            .builder
-            .inst_results(call)
-            .first()
-            .copied()
-            .unwrap_or_else(|| self.builder.ins().iconst(clif_type(ret_ty), 0));
-        if pushed {
-            self.emit_callstack_pop();
-        }
-        if has_reference_args {
-            self.emit_flat_reference_call_end();
-        }
-        if arg_roots > 0 {
-            self.emit_pop_roots_n(arg_roots);
-            self.gc_root_count -= arg_roots;
-        }
-        self.emit_post_willow_call_panic_check(panic_depth);
-        result
-    }
-
-    fn emit_lir_enum_construction_values(
-        &mut self,
-        enum_name: &str,
-        variant: &str,
-        args: &[cranelift_codegen::ir::Value],
-        enum_ty: &Type,
-    ) -> cranelift_codegen::ir::Value {
-        let tag = self.enum_variant_tag(enum_name, variant);
-        if option_repr(enum_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
-            return if tag == 0 {
-                args[0]
-            } else {
-                self.builder.ins().iconst(types::I64, 0)
-            };
-        }
-        if !self.enum_is_gc_object_type(enum_name) {
-            return self.builder.ins().iconst(types::I64, tag);
-        }
-        let mut payloads = self.resolve_variant_payload_types(enum_name, variant, enum_ty);
-        normalize_void_payloads(&mut payloads);
-        let kinds = payloads
-            .iter()
-            .map(|ty| {
-                if is_gc_managed(ty, self.enum_infos) {
-                    willow_abi::SlotKind::GcRef
-                } else {
-                    willow_abi::SlotKind::Word
-                }
-            })
-            .collect::<Vec<_>>();
-        let layout = willow_abi::EnumVariantLayout::new(tag as u32, &kinds);
-        let bytes = self.module.target_config().pointer_type().bytes();
-        let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
-            GcObjectKind::Enum,
-            i64::from(layout.payload_bytes(bytes)),
-            0,
-            layout.gc_ref_mask(),
-        ));
-        let tag_value = self.builder.ins().iconst(types::I64, tag);
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), tag_value, ptr, 0i32);
-        for (index, (&value, ty)) in args.iter().zip(&payloads).enumerate() {
-            let word = self.coerce_to_i64(value, ty);
-            self.emit_gc_heap_store(
-                ptr,
-                layout.payload_byte_offset(bytes) as i32 + index as i32 * bytes as i32,
-                word,
-                ty,
-                GcStoreDestination::EnumPayload,
-            );
-        }
-        ptr
-    }
-}
-
-fn flat_static_call_supported(
-    class: &str,
-    method: &str,
-    args: &[Type],
-    result: &Type,
-    ctx: &LirTypeCtx<'_>,
-) -> bool {
-    let class = ctx.resolved_class(class);
-    if !ctx.supported_type(result) || args.iter().any(|ty| !ctx.supported_type(ty)) {
-        return false;
-    }
-    if class == "Map" && method == "new" && args.is_empty() {
-        return matches!(lir_collection(result), Some((LirCollection::Map, _)));
-    }
-    if class == "Channel" && builtin_types::unary_arg(result, B::Channel).is_some() {
-        return (method == "new" && args.is_empty())
-            || (method == "with_capacity" && args == [Type::I64]);
-    }
-    if let Some(cell) = atomic_cell(result)
-        && class == cell.class_name()
-        && method == "new"
-    {
-        return args == [cell.word()];
-    }
-    if let Some((kind, elem)) = blocking_cell(result)
-        && class == kind.class_name()
-        && method == "new"
-    {
-        return args.len() == 1 && ctx.same_repr(elem, &args[0]);
-    }
-    if let Some((_, elem)) = scheduler_lock(result)
-        && matches!(class, "Mutex" | "RwLock")
-        && method == "new"
-    {
-        return args.len() == 1 && ctx.same_repr(elem, &args[0]);
-    }
-    if let Some(handle) = cancellation_handle(result)
-        && class == handle.class_name()
-        && method == "new"
-    {
-        return args.is_empty();
-    }
-    if let Some(entry) =
-        namespace_builtin_call(ctx.known_modules, ctx.builtin_module_aliases, class, method)
-    {
-        return entry.params == args && ctx.repr_compatible(result, &entry.ret);
-    }
-    if ctx.is_enum(class) {
-        let Some((name, definition)) = ctx.enum_instance(result) else {
-            return false;
-        };
-        let Some(variant) = definition.variant(method) else {
-            return false;
-        };
-        return name == TypeId::from_source_name(class)
-            && variant.payloads.len() == args.len()
-            && variant
-                .payloads
-                .iter()
-                .zip(args)
-                .all(|(slot, arg)| ctx.same_repr(slot, arg));
-    }
-    let (symbol, skip_self) = if let Some(prefix) = ctx.known_modules.linker_prefix(class) {
-        (module_item_symbol(prefix, method), false)
-    } else {
-        if !ctx.supported_class(class) {
-            return false;
-        }
-        (
-            class_method_symbol_name(ctx.known_modules, class, method),
-            true,
-        )
-    };
-    if !(ctx.known_fn)(&symbol) {
-        return false;
-    }
-    if ctx
-        .func_param_modes
-        .get(&symbol)
-        .is_some_and(|modes| modes.iter().any(|mode| !matches!(mode, ParamMode::Value)))
-    {
-        return false;
-    }
-    let Some(Type::Fn(params, ret)) = ctx.fn_types.get(&symbol) else {
-        return false;
-    };
-    let params = if skip_self {
-        let Some((_, params)) = params.split_first() else {
-            return false;
-        };
-        params
-    } else {
-        params.as_slice()
-    };
-    params.len() == args.len()
-        && params
-            .iter()
-            .zip(args)
-            .all(|(param, arg)| ctx.same_repr(param, arg))
-        && ctx.same_repr(ret, result)
-}
-
-impl<'a, 'b> FuncGen<'a, 'b> {
-    /// Allocate and initialise the tag before evaluating any source payload.
-    /// Nullable Option representations reserve no object: the payload store
-    /// below replaces this null placeholder with the actual pointer.
-    fn emit_flat_enum_alloc(
-        &mut self,
-        class: &str,
-        variant: &str,
-        enum_ty: &Type,
-    ) -> cranelift_codegen::ir::Value {
-        let tag = self.enum_variant_tag(class, variant);
-        if option_repr(enum_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
-            return self.builder.ins().iconst(types::I64, 0);
-        }
-        if !self.enum_is_gc_object_type(class) {
-            return self.builder.ins().iconst(types::I64, tag);
-        }
-        let mut payloads = self.resolve_variant_payload_types(class, variant, enum_ty);
-        normalize_void_payloads(&mut payloads);
-        let kinds = payloads
-            .iter()
-            .map(|ty| {
-                if is_gc_managed(ty, self.enum_infos) {
-                    willow_abi::SlotKind::GcRef
-                } else {
-                    willow_abi::SlotKind::Word
-                }
-            })
-            .collect::<Vec<_>>();
-        let layout = willow_abi::EnumVariantLayout::new(tag as u32, &kinds);
-        let bytes = self.module.target_config().pointer_type().bytes();
-        let object = self.emit_gc_alloc(GcLayoutMetadata::new(
-            GcObjectKind::Enum,
-            i64::from(layout.payload_bytes(bytes)),
-            0,
-            layout.gc_ref_mask(),
-        ));
-        let tag_value = self.builder.ins().iconst(types::I64, tag);
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), tag_value, object, 0i32);
-        object
-    }
-
-    /// A payload store is its own LIR operation so coercion occurs before the
-    /// next payload is evaluated. The returned representation is written back
-    /// to the enum local (necessary for nullable Option::Some).
-    fn emit_flat_enum_payload_store(
-        &mut self,
-        object: cranelift_codegen::ir::Value,
-        class: &str,
-        variant: &str,
-        index: usize,
-        value: cranelift_codegen::ir::Value,
-        source_ty: &Type,
-        enum_ty: &Type,
-    ) -> cranelift_codegen::ir::Value {
-        let before = self.gc_root_count;
-        if is_gc_managed(enum_ty, self.enum_infos) {
-            self.emit_push_root(object);
-        }
-        if is_gc_managed(source_ty, self.enum_infos) {
-            self.emit_push_root(value);
-        }
-        let mut payloads = self.resolve_variant_payload_types(class, variant, enum_ty);
-        normalize_void_payloads(&mut payloads);
-        let target = &payloads[index];
-        let value = self.coerce_to_target(value, source_ty, target);
-        let result = if option_repr(enum_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer)
-        {
-            assert_eq!(index, 0);
-            value
-        } else {
-            let kinds = payloads
-                .iter()
-                .map(|ty| {
-                    if is_gc_managed(ty, self.enum_infos) {
-                        willow_abi::SlotKind::GcRef
-                    } else {
-                        willow_abi::SlotKind::Word
-                    }
-                })
-                .collect::<Vec<_>>();
-            let tag = self.enum_variant_tag(class, variant);
-            let layout = willow_abi::EnumVariantLayout::new(tag as u32, &kinds);
-            let bytes = self.module.target_config().pointer_type().bytes();
-            let word = self.coerce_to_i64(value, target);
-            self.emit_gc_heap_store(
-                object,
-                layout.payload_byte_offset(bytes) as i32 + index as i32 * bytes as i32,
-                word,
-                target,
-                GcStoreDestination::EnumPayload,
-            );
-            object
-        };
-        self.emit_pop_roots_n(self.gc_root_count - before);
-        self.gc_root_count = before;
-        result
-    }
-}
-
-/// Validate metadata that operand type equality alone cannot establish.
-fn flat_rvalue_supported(
-    value: &crate::ir::lowered::LirRvalue,
-    locals: &[crate::ir::lowered::LirLocal],
-    ctx: &LirTypeCtx<'_>,
-) -> bool {
-    use crate::ir::lowered::LirRvalue as V;
-    let ty = |operand: &crate::ir::lowered::LirOperand| operand.ty(locals);
-    let field_type = |object: &Type, field: &str| -> Option<Type> {
-        if range_i64(object) {
-            return matches!(field, "start" | "end").then_some(Type::I64);
-        }
-        ctx.class_layout_of(object)?
-            .iter()
-            .find(|(name, _)| name == field)
-            .map(|(_, ty)| ty.clone())
-    };
-    if value.operands().iter().any(|operand| matches!(operand, crate::ir::lowered::LirOperand::Reference { place, .. } if !flat_reference_place_supported(place, locals, ctx))) { return false; }
-    match value {
-        V::ReferenceDebug { argument, .. } => matches!(argument, crate::ir::lowered::LirOperand::Reference { place, .. } if flat_reference_place_supported(place, locals, ctx)),
-        V::StartTask { callee, params, output, .. } => ctx.cooperative_leaves.contains(&ctx.fn_types.scope().resolve(callee))
-            && (ctx.known_fn)(&callee.to_string())
-            && ctx.supported_type(output) && params.iter().all(|ty| ctx.supported_type(ty))
-            && ctx.fn_types.get_id(callee).is_some_and(|signature| matches!(signature, Type::Fn(declared, result) if declared.len() == params.len() && declared.iter().zip(params).all(|(expected, actual)| ctx.same_repr(expected, actual)) && builtin_types::unary_arg(result, B::Task).is_some_and(|payload| ctx.same_repr(payload, output))))
-            && ctx.func_param_modes.get_id(callee).is_none_or(|modes| modes.iter().all(|mode| matches!(mode, ParamMode::Value))),
-        V::AwaitFuture { result, .. } => ctx.supported_type(result),
-        V::SelectIdleWait { .. } => true,
-        V::PrepareMethod { receiver_ty, method, .. } => flat_method_signature(receiver_ty, method, ctx).is_some(),
-        V::MethodCall { receiver_ty, method, args, arg_types, result, .. } => flat_argument_modes_match(args, &flat_method_modes(receiver_ty, method, ctx)) && flat_method_signature(receiver_ty, method, ctx).is_some_and(|(params, ret)| params.len() == arg_types.len() && params.iter().zip(arg_types).all(|(param, arg)| ctx.same_repr(param, arg)) && ctx.same_repr(&ret, result)),
-        V::IndirectCall { callee, params, result, .. } => ty(callee).is_some_and(|callee| ctx.supported_type(&callee)) && params.iter().all(|param| ctx.supported_type(param)) && ctx.supported_type(result),
-        V::RebindResultError { source, target, .. } => ctx.supported_enum_type(source) && ctx.supported_enum_type(target)
-            && builtin_types::binary_args(source, B::Result).zip(builtin_types::binary_args(target, B::Result)).is_some_and(|((_, source), (_, target))| ctx.same_repr(source, target)),
-        V::IntoError { source, target, .. } => {
-            let Type::Named(class) = source else { return false; };
-            ctx.supported_class(class) && ctx.supported_type(target) && ctx.resolve_class_method(class, "into").is_some_and(|symbol|
-                ctx.fn_types.get(&symbol).is_some_and(|signature| matches!(signature, Type::Fn(params, result) if params.len() == 1 && ctx.same_repr(result, target))))
-        }
-        V::Coerce { source, target, .. } => ctx.supported_type(source) && ctx.supported_type(target) && ctx.storable(target, source),
-        V::CaptureArrayOwner { array, index } => ty(array).is_some_and(|array| matches!(array, Type::Array(_)) && ctx.supported_type(&array)) && ty(index) == Some(Type::I64),
-        V::ArrayAlloc { length, element } => *length <= i64::MAX as usize && ctx.supported_type(&Type::Array(Box::new(element.clone()))),
-        V::ArrayStore { array, value, element, .. } => ty(array).is_some_and(|array| ctx.supported_type(&array) && matches!(&array, Type::Array(inner) if ctx.same_repr(inner, element))) && ctx.supported_type(element) && ty(value).is_some_and(|value| ctx.storable(element, &value)),
-        V::Index { array, element, .. } => ctx.supported_type(element) && ty(array).is_some_and(|array| ctx.supported_type(&array) && (matches!(&array, Type::Array(_)) || matches!(lir_collection(&array), Some((LirCollection::FrozenArray, _)))) && ctx.same_repr(&array_element_type(&array), element)),
-        V::ObjectAlloc { class } => ctx.supported_class(class) && ctx.class_layouts.get(class).is_some() && ctx.class_type_ids.get(class).is_some(),
-        V::FieldLoad { object_ty, field, result, .. } => ctx.supported_type(object_ty) && ctx.supported_type(result) && field_type(object_ty, field).is_some_and(|field| ctx.same_repr(&field, result)),
-        V::FieldStore { object_ty, field, value, .. } => ctx.class_layout_of(object_ty).is_some() && field_type(object_ty, field).is_some_and(|field| ty(value).is_some_and(|value| ctx.supported_type(&value) && ctx.storable(&field, &value))),
-        V::StaticField { class, field, result } => (ctx.static_field)(ctx.resolved_class(&class.to_string()), field).is_some_and(|field| ctx.supported_type(&field) && ctx.same_repr(&field, result)),
-        V::StaticStore { class, field, value } => (ctx.static_field)(ctx.resolved_class(&class.to_string()), field).is_some_and(|field| ctx.supported_type(&field) && ty(value).is_some_and(|value| ctx.supported_type(&value) && ctx.storable(&field, &value))),
-        V::ConstructorCall { class, object, args, arg_types } => {
-            if !ctx.supported_class(class) || !ty(object).is_some_and(|ty| matches!(&ty, Type::Named(name) if name == class)) || args.len() != arg_types.len() { return false; }
-            let symbol = class_method_symbol_name(ctx.known_modules, &class.to_string(), "init");
-            if !(ctx.known_fn)(&symbol) || !flat_argument_modes_match(args, ctx.func_param_modes.get(&symbol).map(Vec::as_slice).unwrap_or(&[])) { return false; }
-            let Some(Type::Fn(params, result)) = ctx.fn_types.get(&symbol) else { return false; };
-            let Some((_, params)) = params.split_first() else { return false; };
-            **result == Type::Void && params.len() == arg_types.len() && params.iter().zip(arg_types).all(|(param, arg)| ctx.supported_type(param) && ctx.same_repr(param, arg))
-        }
-        V::StaticCall { class, method, args, arg_types, result } => {
-            if args.iter().any(|arg| matches!(arg, crate::ir::lowered::LirOperand::Reference { .. })) { flat_static_reference_call_supported(&class.to_string(), method, args, arg_types, result, ctx) }
-            else { flat_static_call_supported(&class.to_string(), method, arg_types, result, ctx) }
-        },
-        V::EnumAlloc { class, variant, enum_ty } => ctx.supported_enum_type(enum_ty) && ctx.enum_instance(enum_ty).is_some_and(|(name, definition)| name == *class && definition.variant(variant).is_some()),
-        V::EnumPayloadStore { class, variant, index, source, enum_ty, .. } => ctx.supported_enum_type(enum_ty) && ctx.supported_type(source) && ctx.enum_instance(enum_ty).is_some_and(|(name, definition)| name == *class && definition.variant(variant).and_then(|variant| variant.payloads.get(*index)).is_some_and(|slot| ctx.storable(slot, source))),
-        V::Range { start, end } => ty(start) == Some(Type::I64) && ty(end) == Some(Type::I64),
-        V::EnumMethod { receiver_ty, method, arg_types, result, .. } => ctx.supported_enum_type(receiver_ty) && ctx.supported_type(result) && arg_types.iter().all(|ty| ctx.supported_type(ty)) && option_result_method(receiver_ty, method, arg_types).is_some_and(|ret| ctx.same_repr(&ret, result)),
-        V::BuiltinCall { callee, params, result, .. } => {
-            let void_future = *result == Type::Void || builtin_types::unary_arg(result, B::Future) == Some(&Type::Void);
-            if callee.is_free_named("sleep") { return params == &[Type::I64] && void_future; }
-            if callee.is_free_named("yield") { return params.is_empty() && void_future; }
-            if !params.is_empty() { return false; }
-            if callee.is_free_named("gc_collect") || callee.is_free_named("gc_minor_collect") { *result == Type::Void }
-            else { callee.is_free_named(callee.unqualified_name()) && gc_stat_builtin_runtime_name(callee.unqualified_name()).is_some() && *result == Type::I64 }
-        }
-        V::FormatScalar { ty, format, .. } => matches!(ty, Type::I64 | Type::F64 | Type::Bool | Type::String) && (format.is_none() || *ty == Type::F64),
-        V::Panic { message } => ty(message) == Some(Type::String),
-        V::Binary { op, operand_ty, .. } if matches!(operand_ty, Type::Named(_) | Type::Generic(..)) => matches!(op, BinOp::Eq | BinOp::Ne) && ctx.tag_immediate_enum(operand_ty),
-        V::Recover => true,
-        _ => true,
-    }
-}
-
-/// The by-value dispatch ABI, including inherited methods and interface Self.
-fn flat_method_signature(
-    receiver: &Type,
-    method: &str,
-    ctx: &LirTypeCtx<'_>,
-) -> Option<(Vec<Type>, Type)> {
-    if !ctx.supported_type(receiver) {
-        return None;
-    }
-    let name = match receiver {
-        Type::Named(name) | Type::Generic(name, _) => name,
-        _ => return None,
-    };
-    let (params, ret) = if (ctx.is_interface)(name) {
-        let sig = (ctx.iface_method)(receiver, method)?;
-        let ret = if matches!(&sig.ret, Type::Named(name) if *name == TypeId::local("Self")) {
-            receiver.clone()
-        } else {
-            sig.ret
-        };
-        (sig.params, ret)
-    } else {
-        if !ctx.supported_class(name) {
-            return None;
-        }
-        let symbol = ctx.resolve_class_method(name, method)?;
-        let Type::Fn(params, ret) = ctx.fn_types.get(&symbol)? else {
-            return None;
-        };
-        let (_, params) = params.split_first()?;
-        (params.to_vec(), (**ret).clone())
-    };
-    (ctx.supported_type(&ret) && params.iter().all(|param| ctx.supported_type(param)))
-        .then_some((params, ret))
-}
-
-fn flat_argument_modes_match(args: &[crate::ir::lowered::LirOperand], modes: &[ParamMode]) -> bool {
-    args.iter().enumerate().all(|(index, arg)| {
-        matches!(arg, crate::ir::lowered::LirOperand::Reference { .. })
-            == matches!(modes.get(index), Some(ParamMode::Reference { .. }))
-    })
-}
-fn flat_method_modes(receiver: &Type, method: &str, ctx: &LirTypeCtx<'_>) -> Vec<ParamMode> {
-    let name = match receiver {
-        Type::Named(name) | Type::Generic(name, _) => name,
-        _ => return vec![],
-    };
-    if (ctx.is_interface)(name) {
-        return (ctx.iface_method)(receiver, method)
-            .map(|sig| sig.modes)
-            .unwrap_or_default();
-    }
-    ctx.resolve_class_method(name, method)
-        .and_then(|symbol| ctx.func_param_modes.get(&symbol).cloned())
-        .unwrap_or_default()
-}
-fn flat_reference_place_supported(
-    place: &crate::ir::lowered::LirPlace,
-    locals: &[crate::ir::lowered::LirLocal],
-    ctx: &LirTypeCtx<'_>,
-) -> bool {
-    use crate::ir::lowered::LirPlace;
-    let Some(ty) = place.ty(locals) else {
-        return false;
-    };
-    if !ctx.supported_type(&ty) || matches!(ty, Type::Void | Type::Never) {
-        return false;
-    }
-    match place {
-        LirPlace::Local(_) | LirPlace::ArrayElement { .. } => true,
-        LirPlace::Field {
-            object_ty, field, ..
-        } => ctx.class_layout_of(object_ty).is_some_and(|layout| {
-            layout
-                .iter()
-                .any(|(name, field_ty)| name == field && ctx.same_repr(field_ty, &ty))
-        }),
-    }
-}
-fn flat_static_reference_call_supported(
-    class: &str,
-    method: &str,
-    args: &[crate::ir::lowered::LirOperand],
-    types: &[Type],
-    result: &Type,
-    ctx: &LirTypeCtx<'_>,
-) -> bool {
-    let class = ctx.resolved_class(class);
-    let (symbol, skip_self) = if let Some(prefix) = ctx.known_modules.linker_prefix(class) {
-        (module_item_symbol(prefix, method), false)
-    } else {
-        if !ctx.supported_class(class) {
-            return false;
-        }
-        (
-            class_method_symbol_name(ctx.known_modules, class, method),
-            true,
-        )
-    };
-    if !(ctx.known_fn)(&symbol)
-        || !flat_argument_modes_match(
-            args,
-            ctx.func_param_modes
-                .get(&symbol)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-        )
-    {
-        return false;
-    }
-    let Some(Type::Fn(params, ret)) = ctx.fn_types.get(&symbol) else {
-        return false;
-    };
-    let params = if skip_self {
-        let Some((_, tail)) = params.split_first() else {
-            return false;
-        };
-        tail
-    } else {
-        params.as_slice()
-    };
-    params.len() == types.len()
-        && params
-            .iter()
-            .zip(types)
-            .all(|(param, arg)| ctx.supported_type(param) && ctx.same_repr(param, arg))
-        && ctx.same_repr(ret, result)
 }

@@ -1,0 +1,9 @@
+import m;
+
+fn empty() -> m::Wrap<i64> { return m::Wrap::Empty; }
+
+fn main() {
+    let value: m::Wrap<i64> = m::Wrap::Empty;
+    println(match value { m::Wrap::Empty => 1, m::Wrap::Val(n) => n });
+    println(match empty() { m::Wrap::Empty => 2, m::Wrap::Val(n) => n });
+}

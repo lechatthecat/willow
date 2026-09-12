@@ -1247,6 +1247,31 @@ impl TypeChecker {
         span: Span,
         var: &str,
     ) -> Option<Diagnostic> {
+        // A user enum's fieldless constructor supplies no evidence for its
+        // parameters. Diagnose the unresolved binding before it reaches LIR.
+        if let Expr::StaticCall(call) = init
+            && call.args.is_empty()
+            && call.type_args.is_empty()
+            && let Type::Generic(name, args) = ty
+            && name != "Option"
+            && name != "Result"
+            && args.contains(&Type::Void)
+            && let Some(info) = self.symbols.lookup_enum(name)
+            && info
+                .variants
+                .iter()
+                .any(|variant| variant.name == call.method && variant.payload_types.is_empty())
+        {
+            return Some(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0202,
+                    format!("cannot infer type arguments for `{name}::{}`", call.method),
+                )
+                .with_label(Label::primary(span, "type annotation required"))
+                .with_help(format!("add a concrete type annotation to `{var}`")),
+            );
+        }
         // Only a bare `Option::`/`Result::` variant constructor triggers this.
         let is_variant_ctor = matches!(
             init,

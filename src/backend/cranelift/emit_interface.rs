@@ -206,7 +206,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .filter(|&(_, &id)| {
                 id != receiver_id && is_self_or_descendant(&base_ids, id, receiver_id)
             })
-            .map(|(cls, &id)| (id, cls.clone()))
+            .map(|(cls, &id)| (id, *cls))
             .collect();
         descendants.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         for (_, cls) in descendants {

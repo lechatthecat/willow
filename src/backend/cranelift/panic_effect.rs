@@ -75,7 +75,7 @@ pub(super) fn analyze_program(
                     method_keys.insert((class.name.clone(), method.name.clone()), key.clone());
                     candidates.push(Candidate {
                         key,
-                        id: FunctionId::method(owner.clone(), method.name.as_str()),
+                        id: FunctionId::method(owner, method.name.as_str()),
                         body: &method.body,
                     });
                 }
@@ -84,7 +84,7 @@ pub(super) fn analyze_program(
                     method_keys.insert((class.name.clone(), "init".to_string()), key.clone());
                     candidates.push(Candidate {
                         key,
-                        id: FunctionId::method(owner.clone(), "init"),
+                        id: FunctionId::method(owner, "init"),
                         body: &constructor.body,
                     });
                 }
@@ -101,7 +101,7 @@ pub(super) fn analyze_program(
     for (name, lambda) in lambdas {
         if let LambdaBody::Block(body) = &lambda.body {
             let id = FunctionId::free(name.as_str());
-            lambda_ids.push((id.clone(), lambda));
+            lambda_ids.push((id, lambda));
             candidates.push(Candidate {
                 key: name.clone(),
                 id,
@@ -134,9 +134,9 @@ pub(super) fn analyze_program(
     for candidate in &candidates {
         let mut hazards = HazardVisitor { panics: false };
         hazards.visit_block(candidate.body);
-        problem = problem.body(candidate.id.clone());
+        problem = problem.body(candidate.id);
         if hazards.panics {
-            problem = problem.seed(candidate.id.clone(), PANIC, None);
+            problem = problem.seed(candidate.id, PANIC, None);
         }
     }
 
@@ -149,7 +149,7 @@ pub(super) fn analyze_program(
             if own_bodies.contains(target) {
                 continue;
             }
-            problem = problem.seed(target.clone(), external_effects(target, &context), None);
+            problem = problem.seed(*target, external_effects(target, &context), None);
         }
     }
 

@@ -7644,3 +7644,36 @@ fn main() {}
         &["cannot assign to `self`"],
     );
 }
+
+#[test]
+fn unqualified_multiple_payload_bindings() {
+    let (out, ok) = compile_and_run(
+        r#"
+enum PairValue { Pair(i64, i64), Empty }
+fn main() {
+    let value = PairValue::Pair(12, 30);
+    println(match value { Pair(a, b) => a + b, Empty => 0 });
+    println(match value { PairValue::Pair(a, b) => a + b, PairValue::Empty => 0 });
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n42\n");
+}
+
+#[test]
+fn unqualified_multiple_payload_wrong_arity() {
+    let stderr = compile_error_stderr(
+        r#"
+enum PairValue { Pair(i64, i64) }
+fn main() {
+    let value = PairValue::Pair(1, 2);
+    println(match value { Pair(a, b, c) => a });
+}
+"#,
+    );
+    assert!(
+        stderr.contains("error[") && stderr.contains("binding"),
+        "{stderr}"
+    );
+}

@@ -405,6 +405,13 @@ impl TypeChecker {
         self.imported_names.insert(spelling.to_string(), None);
     }
 
+    /// Hide another unit's access name without rebuilding its type identities.
+    pub fn hide_module_spelling(&mut self, name: &str) {
+        self.symbols.hide_module_spelling(name);
+        self.imported_names.remove(name);
+        self.signature_only_modules.insert(name.to_string());
+    }
+
     /// `name` is what THIS unit calls the module -- an alias, or the last
     /// segment of its path -- and is the spelling its items are registered
     /// under. `canonical` is the module's one identity in the build, which is

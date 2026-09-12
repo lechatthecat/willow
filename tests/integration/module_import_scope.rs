@@ -721,3 +721,64 @@ fn the_module_import_scope_example_is_fully_lowered() {
     assert!(ok, "every body in the example must compile from LIR: {out}");
     assert_eq!(out, "7\nsale:3\n9\n100\n");
 }
+
+// willow-3d9k: a graph dependency does not grant the entry a source name.
+#[test]
+fn entry_cannot_use_another_units_module_spelling() {
+    for (import, spelling) in [("import sales;", "sales"), ("import sales as biz;", "biz")] {
+        let ledger =
+            format!("{import} pub fn total() -> i64 {{ return {spelling}::amount(2).value; }}");
+        let entry = format!("import ledger; fn main() {{ println({spelling}::amount(2).value); }}");
+        let stderr = compile_temp_project_error_stderr(
+            &[
+                ("sales.wi", SALES),
+                ("ledger.wi", &ledger),
+                ("main.wi", &entry),
+            ],
+            "main.wi",
+        );
+        assert!(
+            stderr.contains("error[") && stderr.contains("main.wi"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("internal compiler error"), "{stderr}");
+        let entry = format!(
+            "import ledger; fn main() {{ let hidden: {spelling}::Amount = new {spelling}::Amount(2, \"hidden\"); }}"
+        );
+        let stderr = compile_temp_project_error_stderr(
+            &[
+                ("sales.wi", SALES),
+                ("ledger.wi", &ledger),
+                ("main.wi", &entry),
+            ],
+            "main.wi",
+        );
+        assert!(
+            stderr.contains("error[E0350]") && stderr.contains("not imported"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn entry_visibility_preserves_cross_unit_interface_aliases() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "catalog.wi",
+                "pub interface Priced { fn price(self) -> i64; }",
+            ),
+            (
+                "pricing.wi",
+                "import catalog as cat; pub fn charge(p: cat::Priced) -> i64 { return p.price(); }",
+            ),
+            (
+                "main.wi",
+                "import pricing; import catalog as shop; class Flat implements shop::Priced { pub fn price(self) -> i64 { return 5; } } fn main() { println(pricing::charge(new Flat())); }",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "5\n");
+}

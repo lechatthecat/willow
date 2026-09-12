@@ -112,7 +112,7 @@ fn shallow_expr(source: &HirExpr) -> HirExpr {
         HirExprKind::Bool(value) => HirExprKind::Bool(*value),
         HirExprKind::Str(value) => HirExprKind::Str(value.clone()),
         HirExprKind::Var(value) => HirExprKind::Var(value.clone()),
-        HirExprKind::FnRef(value) => HirExprKind::FnRef(value.clone()),
+        HirExprKind::FnRef(value) => HirExprKind::FnRef(*value),
         HirExprKind::Binary { op, lhs: _, rhs: _ } => HirExprKind::Binary {
             op: op.clone(),
             lhs: Box::new(empty_expr()),
@@ -123,7 +123,7 @@ fn shallow_expr(source: &HirExpr) -> HirExpr {
             operand: Box::new(empty_expr()),
         },
         HirExprKind::Call { callee, args } => HirExprKind::Call {
-            callee: callee.clone(),
+            callee: *callee,
             args: expr_slots(args.len()),
         },
         HirExprKind::Print { value: _, newline } => HirExprKind::Print {
@@ -147,7 +147,7 @@ fn shallow_expr(source: &HirExpr) -> HirExpr {
             else_expr: Box::new(empty_expr()),
         },
         HirExprKind::New { class, args } => HirExprKind::New {
-            class: class.clone(),
+            class: *class,
             args: expr_slots(args.len()),
         },
         HirExprKind::FieldAccess { object: _, field } => HirExprKind::FieldAccess {
@@ -164,14 +164,14 @@ fn shallow_expr(source: &HirExpr) -> HirExpr {
             args: expr_slots(args.len()),
         },
         HirExprKind::ObjectLiteral { class, fields } => HirExprKind::ObjectLiteral {
-            class: class.clone(),
+            class: *class,
             fields: fields
                 .iter()
                 .map(|(name, _)| (name.clone(), empty_expr()))
                 .collect(),
         },
         HirExprKind::StaticField { class, field } => HirExprKind::StaticField {
-            class: class.clone(),
+            class: *class,
             field: field.clone(),
         },
         HirExprKind::StaticCall {
@@ -179,7 +179,7 @@ fn shallow_expr(source: &HirExpr) -> HirExpr {
             method,
             args,
         } => HirExprKind::StaticCall {
-            class: class.clone(),
+            class: *class,
             method: method.clone(),
             args: expr_slots(args.len()),
         },
@@ -371,7 +371,7 @@ fn shallow_stmt(source: &HirStmt) -> HirStmt {
             value: _,
             span,
         } => HirStmt::StaticFieldAssign {
-            class: class.clone(),
+            class: *class,
             field: field.clone(),
             value: empty_expr(),
             span: *span,

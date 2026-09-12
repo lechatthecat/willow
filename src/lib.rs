@@ -543,48 +543,24 @@ fn typecheck_phase(
     for item in item_imports {
         checker.register_item_import(&item.local, &item.canonical_module, &item.item, item.span);
     }
-    // Seed non-preemptible methods of imported classes so a cross-module
-    // typed-receiver call (`w.heavy()` where `w: m::Work`) in a task context is
-    // flagged E0810 (willow-0a6k.2). Keyed by the receiver class name the
-    // checker resolves: `module::Class::method` for a whole-module import,
-    // `Local::method` for a direct class import. The reason travels with the
-    // module name so the diagnostic can distinguish a loop from recursion.
-    let mut module_method_owners: std::collections::HashMap<
-        semantic::ids::FunctionId,
-        (String, semantic::concurrency::NonpreemptibleReason),
-    > = std::collections::HashMap::new();
-    for m in modules {
-        let helpers = helpers_index
-            .get(&m.canonical_path)
-            .cloned()
-            .unwrap_or_default();
-        let methods: Vec<(
-            &semantic::ids::FunctionId,
-            semantic::concurrency::NonpreemptibleReason,
-        )> = helpers
-            .iter()
-            .filter(|(id, _)| id.owner().is_some())
-            .map(|(id, helper)| (id, helper.reason))
-            .collect();
-        for (key, reason) in &methods {
-            // Whole-module access: `name::Class::method`.
-            module_method_owners.insert(
-                (*key).clone().in_namespace(m.name.as_str()),
-                (m.name.clone(), *reason),
-            );
-        }
-        // Direct class imports re-key `Class::method` under the local name.
-        for item in item_imports {
-            if item.canonical_module == m.canonical_path {
-                for (key, reason) in &methods {
-                    if let Some(imported) = key.remap_imported_item(&item.item, &item.local) {
-                        module_method_owners.insert(imported, (m.name.clone(), *reason));
-                    }
-                }
+    // Preserve build-wide type identities, but expose only this file's names.
+    let visible: std::collections::HashSet<String> = modules
+        .iter()
+        .flat_map(|module| entry_module_spellings(program, item_imports, module))
+        .collect();
+    for module in modules {
+        for spelling in [&module.name, &module.canonical_path] {
+            if !visible.contains(spelling) {
+                checker.hide_module_spelling(spelling);
             }
         }
     }
-    checker.set_nonpreemptible_module_methods(module_method_owners);
+
+    checker.set_nonpreemptible_module_methods(imported_nonpreemptible_method_owners(
+        program,
+        modules,
+        helpers_index,
+    ));
     checker.check_program(program);
     let error_count = diagnostic_error_count(&checker.errors);
     Ok(TypecheckPhase {
@@ -655,10 +631,8 @@ fn entry_module_spellings(
 
 /// Bring the modules `program` itself imports into `checker`'s scope.
 ///
-/// The entry file registers every module in the graph, including ones it
-/// reaches only transitively. A module gets no such latitude: it sees exactly
-/// what its own `import` lines name, under the name it gave them, because that
-/// is what the backend will resolve when it compiles this body.
+/// Each source unit sees exactly what its own `import` lines name, under the
+/// name it gave them, matching the backend when it compiles that body.
 ///
 /// What an imported module's public signature NAMES is another matter: `mid`
 /// may export `Crate extends Parcel` with `Parcel` declared in `base`, and a
@@ -837,9 +811,16 @@ fn imported_nonpreemptible_method_owners(
                 };
                 remapped
             } else {
-                key.clone().in_namespace(access)
+                (*key).in_namespace(access)
             };
             out.insert(visible_key, (dependency.name.clone(), helper.reason));
+            if direct_item.is_none() {
+                // Entry aliases can retain the graph's registered class identity.
+                out.insert(
+                    (*key).in_namespace(&dependency.name),
+                    (dependency.name.clone(), helper.reason),
+                );
+            }
         }
     }
     out
@@ -1581,6 +1562,48 @@ mod frontend_phase_tests {
         .unwrap();
         assert_eq!(phase.error_count, 0);
         assert!(phase.checker.errors.is_empty());
+    }
+
+    #[test]
+    fn imported_nonpreemptible_methods_follow_each_units_aliases() {
+        let source = "pub class Work { pub fn heavy(self) { while true {} } }";
+        let program = parse_source(source);
+        let helpers = HelperIndex::from([(
+            "worker".to_string(),
+            semantic::concurrency::compute_nonpreemptible_helpers(&program),
+        )]);
+        let modules = [module::ResolvedModule {
+            id: module::ModuleId(0),
+            name: "another_units_alias".into(),
+            canonical_path: "worker".into(),
+            path: "worker.wi".into(),
+            source: source.into(),
+            program,
+        }];
+        for (import, class) in [
+            ("import worker;", "worker::Work"),
+            ("import worker as jobs;", "jobs::Work"),
+            ("import worker::Work as Job;", "Job"),
+        ] {
+            let body = parse_source(&format!(
+                "{import} pub async fn run() {{ let w: {class} = new {class}(); w.heavy(); }}"
+            ));
+            let mut checker = semantic::TypeChecker::new().with_sync_stack_preemption(false);
+            register_prelude(&mut checker).unwrap();
+            register_module_imports(&mut checker, &body, &modules);
+            checker.set_nonpreemptible_module_methods(imported_nonpreemptible_method_owners(
+                &body, &modules, &helpers,
+            ));
+            checker.check_module_program(&body);
+            assert!(
+                checker
+                    .errors
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == diagnostics::ErrorCode::E0810),
+                "{class}: {:?}",
+                checker.errors
+            );
+        }
     }
 
     #[test]

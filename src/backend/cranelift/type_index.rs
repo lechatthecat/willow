@@ -15,18 +15,18 @@ pub struct TypeScope(Rc<HashMap<TypeId, TypeBinding>>);
 impl TypeScope {
     pub fn resolve(&self, id: &TypeId) -> TypeId {
         let bindings = &self.0;
-        let mut current = id.clone();
+        let mut current = *id;
         // At most one visit per binding before reaching a terminal or a cycle.
         // Cyclic aliases have no declaration identity: preserve the original
         // spelling, allowing normal missing-type handling instead of looping.
         for _ in 0..=bindings.len() {
             match bindings.get(&current) {
-                Some(TypeBinding::Alias(next)) => current = next.clone(),
-                Some(TypeBinding::Canonical(target)) => return target.clone(),
+                Some(TypeBinding::Alias(next)) => current = *next,
+                Some(TypeBinding::Canonical(target)) => return *target,
                 None => return current,
             }
         }
-        id.clone()
+        *id
     }
     pub fn bind(&mut self, alias: &str, target: &str) -> Option<TypeBinding> {
         Rc::make_mut(&mut self.0).insert(
@@ -69,7 +69,7 @@ impl TypeKey for TypeId {
     }
     fn declare(&self, scope: &mut TypeScope) -> TypeId {
         scope.restore(&self.to_string(), None);
-        self.clone()
+        *self
     }
 }
 impl TypeKey for (TypeId, TypeId) {
@@ -152,7 +152,7 @@ impl TypeLookup for String {
 }
 impl TypeLookup for TypeId {
     fn type_id(&self) -> TypeId {
-        self.clone()
+        *self
     }
 }
 
@@ -484,7 +484,7 @@ mod tests {
         assert_eq!(map.get("pal::Color"), collected.get("pal::Color"));
         assert_eq!(map.values().copied().collect::<Vec<_>>(), vec![7]);
         assert_eq!(
-            map.iter().map(|(k, v)| (k.clone(), *v)).collect::<Vec<_>>(),
+            map.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>(),
             vec![(TypeId::from_source_name("pal::Color"), 7)]
         );
     }

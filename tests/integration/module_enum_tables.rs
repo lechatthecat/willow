@@ -1185,3 +1185,49 @@ fn main() {
     assert!(ok, "item-imported enum build failed: {out}");
     assert_eq!(out, "high\nlow\n");
 }
+
+#[test]
+fn module_generic_fieldless_variant_uses_contextual_type() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            ("m.wi", "pub enum Wrap<T> { Val(T), Empty }"),
+            (
+                "main.wi",
+                r#"
+import m;
+fn empty() -> m::Wrap<i64> { return m::Wrap::Empty; }
+fn main() {
+    let a: m::Wrap<i64> = m::Wrap::Empty;
+    let b = empty();
+    let c = m::Wrap::Val(3);
+    println(match a { m::Wrap::Empty => 1, m::Wrap::Val(v) => v });
+    println(match b { m::Wrap::Empty => 2, m::Wrap::Val(v) => v });
+    println(match c { m::Wrap::Empty => 0, m::Wrap::Val(v) => v });
+}
+"#,
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n2\n3\n");
+}
+
+#[test]
+fn module_generic_fieldless_variant_without_context_reports_diagnostic() {
+    let stderr = compile_temp_project_error_stderr(
+        &[
+            ("m.wi", "pub enum Wrap<T> { Val(T), Empty }"),
+            (
+                "main.wi",
+                "import m; fn main() { let value = m::Wrap::Empty; }",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(
+        stderr.contains("error[") && stderr.contains("annotation"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("internal compiler error"), "{stderr}");
+}

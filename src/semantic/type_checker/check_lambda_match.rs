@@ -580,7 +580,9 @@ impl TypeChecker {
                 bindings,
                 span,
                 ..
-            } if written != enum_name && self.canonical_type_name(written) == info.name => {
+            } if (written.is_empty() && bare)
+                || (written != enum_name && self.canonical_type_name(written) == info.name) =>
+            {
                 Some(Pattern::EnumVariantTuple {
                     enum_name: enum_name.clone(),
                     variant: variant.clone(),

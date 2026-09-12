@@ -56,6 +56,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         roots
     }
+    // Explicit receiver, ABI operands, and call-frame state are independent.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn emit_flat_class_method(
         &mut self,
         receiver: Value,
@@ -177,6 +179,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ///
     /// Root the concrete object directly across dispatch so a moving minor
     /// collection cannot invalidate the hidden receiver SSA value.
+    // Explicit receiver, ABI operands, and call-frame state are independent.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn emit_flat_interface_call(
         &mut self,
         receiver: Value,
@@ -188,7 +192,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         frame_prepared: bool,
     ) -> cranelift_codegen::ir::Value {
         let iface_name = match receiver_ty {
-            Type::Named(name) | Type::Generic(name, _) => name.clone(),
+            Type::Named(name) | Type::Generic(name, _) => *name,
             _ => unreachable!("interface receiver type vetted by LIR eligibility"),
         };
         let info = self

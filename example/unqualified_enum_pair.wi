@@ -1,0 +1,6 @@
+enum PairValue { Pair(i64, i64), Empty }
+
+fn main() {
+    let value = PairValue::Pair(12, 30);
+    println(match value { Pair(a, b) => a + b, Empty => 0 });
+}

@@ -335,7 +335,7 @@ impl LirRvalue {
             Self::Coerce { value, source, target } => ty(value).as_ref() == Some(source) && destination.ty == *target,
             Self::ArrayAlloc { element, .. } => destination.ty == Type::Array(Box::new(element.clone())),
             Self::ArrayStore { array, index, value, element } => ty(array) == Some(Type::Array(Box::new(element.clone()))) && ty(index) == Some(Type::I64) && ty(value).is_some() && destination.ty == Type::Void,
-            Self::Index { array, index, element } => ty(index) == Some(Type::I64) && destination.ty == *element && ty(array).is_some_and(|array| match &array { Type::Array(inner) => **inner == *element, Type::Generic(name, args) => *name == TypeId::local("FrozenArray") && args == &[element.clone()], _ => false }),
+            Self::Index { array, index, element } => ty(index) == Some(Type::I64) && destination.ty == *element && ty(array).is_some_and(|array| match &array { Type::Array(inner) => **inner == *element, Type::Generic(name, args) => *name == TypeId::local("FrozenArray") && args == std::slice::from_ref(element), _ => false }),
             Self::ObjectAlloc { class } => destination.ty == Type::Named(*class),
             Self::FieldLoad { object, object_ty, result, .. } => ty(object).as_ref() == Some(object_ty) && destination.ty == *result,
             Self::FieldStore { object, object_ty, value, .. } => ty(object).as_ref() == Some(object_ty) && ty(value).is_some() && destination.ty == Type::Void,

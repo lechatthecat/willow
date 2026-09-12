@@ -311,6 +311,11 @@ impl SymbolTable {
             .filter_map(|(name, id)| self.modules.get(id).map(|info| (name.as_str(), info)))
     }
 
+    /// Remove a source spelling while retaining the shared module/type metadata.
+    pub fn hide_module_spelling(&mut self, name: &str) {
+        self.module_names.remove(name);
+    }
+
     pub fn lookup_module(&self, name: &str) -> Option<&ModuleInfo> {
         self.modules.get(self.module_names.get(name)?)
     }

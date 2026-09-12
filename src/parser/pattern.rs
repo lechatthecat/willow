@@ -80,20 +80,38 @@ impl Parser {
                         })
                     }
                 } else if matches!(self.peek_kind(), TokenKind::LParen) {
-                    // `Dog(d)` — interface->concrete downcast pattern (willow-1js.4).
-                    // (Enum variants are always `::`-qualified, so an unqualified
-                    // name with `(` is unambiguously a class downcast.)
-                    self.advance(); // consume (
-                    let binding = self.expect_ident()?; // `_` lexes as an identifier
+                    // One binding remains ambiguous with a class downcast;
+                    // zero or multiple bindings can only be an enum pattern.
+                    self.advance();
+                    let mut bindings = Vec::new();
+                    if !matches!(self.peek_kind(), TokenKind::RParen) {
+                        loop {
+                            bindings.push(self.expect_ident()?);
+                            if !self.eat(TokenKind::Comma)
+                                || matches!(self.peek_kind(), TokenKind::RParen)
+                            {
+                                break;
+                            }
+                        }
+                    }
                     self.expect(TokenKind::RParen)?;
-                    let end = self.current_span();
-                    let merged = span.to(end);
-                    Ok(Pattern::ClassDowncast {
-                        class_name: name,
-                        binding,
-                        span: merged,
-                        id: PatternId::fresh(),
-                    })
+                    let merged = span.to(self.current_span());
+                    if bindings.len() == 1 {
+                        Ok(Pattern::ClassDowncast {
+                            class_name: name,
+                            binding: bindings.pop().unwrap(),
+                            span: merged,
+                            id: PatternId::fresh(),
+                        })
+                    } else {
+                        Ok(Pattern::EnumVariantTuple {
+                            enum_name: String::new(),
+                            variant: name,
+                            bindings,
+                            span: merged,
+                            id: PatternId::fresh(),
+                        })
+                    }
                 } else {
                     Ok(Pattern::Binding {
                         name,

@@ -223,7 +223,7 @@ impl TypeChecker {
         // `Option<i64>` instead of independently inferring `Option<Void>`.
         if let Expr::StaticCall(call) = expr
             && let Some((enum_name, payloads, result)) =
-                self.expected_variant(&call.method, expected)
+                self.expected_qualified_variant(&call.method, expected)
             && self.static_variant_matches_expected_enum(call, &enum_name, expected)
         {
             return self.construct_static_variant_call(call, &enum_name, &payloads, result);
@@ -316,10 +316,28 @@ impl TypeChecker {
         name: &str,
         expected: &Type,
     ) -> Option<(String, Vec<Type>, Type)> {
+        let nameable = match expected {
+            Type::Named(name) | Type::Generic(name, _) => self
+                .symbols
+                .lookup_enum(name)
+                .is_some_and(|info| self.enum_nameable_bare(&info.name)),
+            _ => false,
+        };
+        if !nameable {
+            return None;
+        }
+        self.expected_qualified_variant(name, expected)
+    }
+
+    fn expected_qualified_variant(
+        &self,
+        name: &str,
+        expected: &Type,
+    ) -> Option<(String, Vec<Type>, Type)> {
         match expected {
             Type::Named(enum_name) => {
                 let info = self.symbols.lookup_enum(enum_name)?;
-                if !info.type_params.is_empty() || !self.enum_nameable_bare(&info.name) {
+                if !info.type_params.is_empty() {
                     return None;
                 }
                 let variant = info.variants.iter().find(|v| v.name == name)?;
@@ -331,7 +349,7 @@ impl TypeChecker {
             }
             Type::Generic(enum_name, type_args) => {
                 let info = self.symbols.lookup_enum(enum_name)?;
-                if info.type_params.is_empty() || !self.enum_nameable_bare(&info.name) {
+                if info.type_params.is_empty() {
                     return None;
                 }
                 let instantiated = info.instantiate(type_args);

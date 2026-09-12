@@ -160,7 +160,7 @@ impl ConcurrencyAnalyzer {
     ) -> Self {
         for (name, helper) in index {
             self.nonpreemptible_sync_helpers.insert(
-                name.clone().in_namespace(module_name),
+                (*name).in_namespace(module_name),
                 SyncHelperRef {
                     span: helper.span,
                     reason: helper.reason,
@@ -289,7 +289,7 @@ impl ConcurrencyAnalyzer {
                         && let Some(class_name) = &self.current_class
                     {
                         self.check_task_sync_helper_call(
-                            &FunctionId::method(class_name.clone(), method.method.as_str()),
+                            &FunctionId::method(*class_name, method.method.as_str()),
                             method.span,
                         );
                     }
@@ -304,9 +304,7 @@ impl ConcurrencyAnalyzer {
                 AstEvent::Expr(Expr::StaticCall(static_call)) => {
                     let callee = if static_call.class == "Self" {
                         FunctionId::method(
-                            self.current_class
-                                .clone()
-                                .unwrap_or_else(|| TypeId::local("Self")),
+                            self.current_class.unwrap_or_else(|| TypeId::local("Self")),
                             static_call.method.as_str(),
                         )
                     } else {
@@ -486,7 +484,7 @@ pub(crate) fn compute_nonpreemptible_helpers(
     let mut graph = CallGraph::default();
     for helper in &helpers {
         graph.merge(
-            helper.id.clone(),
+            helper.id,
             CallSites {
                 targets: helper
                     .calls
@@ -509,19 +507,11 @@ pub(crate) fn compute_nonpreemptible_helpers(
         .unknown_callee(RuntimeEffects::NONE)
         .missing_body(RuntimeEffects::NONE);
     for helper in &helpers {
-        problem = problem.body(helper.id.clone());
+        problem = problem.body(helper.id);
         if helper.contains_loop {
-            problem = problem.seed(
-                helper.id.clone(),
-                NO_PREEMPT,
-                Some(NonpreemptibleReason::Loop),
-            );
+            problem = problem.seed(helper.id, NO_PREEMPT, Some(NonpreemptibleReason::Loop));
         } else if cycles.contains(&helper.id) {
-            problem = problem.seed(
-                helper.id.clone(),
-                NO_PREEMPT,
-                Some(NonpreemptibleReason::Recursion),
-            );
+            problem = problem.seed(helper.id, NO_PREEMPT, Some(NonpreemptibleReason::Recursion));
         }
     }
 

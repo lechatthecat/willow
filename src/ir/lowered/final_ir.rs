@@ -52,6 +52,8 @@ impl Drop for LirFunction {
 }
 impl Clone for LirFunction {
     fn clone(&self) -> Self {
+        // Inline work items avoid another allocation for each cleanup frame.
+        #[allow(clippy::large_enum_variant)]
         enum Work<'a> {
             Enter(usize, &'a LirFunction),
             Finish(usize, LirFunction, Vec<(usize, usize, usize)>),
@@ -68,7 +70,7 @@ impl Clone for LirFunction {
                         else {
                             unreachable!()
                         };
-                        body.function = Box::new(finished.remove(&child).expect("cloned cleanup"));
+                        *body.function = finished.remove(&child).expect("cloned cleanup");
                     }
                     finished.insert(id, function);
                 }
@@ -169,6 +171,8 @@ pub enum LirPattern {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+// Keep the hot instruction stream contiguous; boxing changes every emitter.
+#[allow(clippy::large_enum_variant)]
 pub enum LirInst {
     Compute {
         local: LirLocalId,
@@ -399,8 +403,7 @@ fn finish_function(source: super::SourceFunction) -> LirFunction {
                     else {
                         unreachable!()
                     };
-                    body.function =
-                        Box::new(finished.remove(&child).expect("finished cleanup region"));
+                    *body.function = finished.remove(&child).expect("finished cleanup region");
                 }
                 finished.insert(id, function);
             }

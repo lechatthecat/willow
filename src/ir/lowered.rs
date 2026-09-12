@@ -995,8 +995,8 @@ fn lower_function(
     // checker has already guaranteed value-returning paths return).
     let (blocks, locals) = b.finish();
     let name = match class {
-        Some(class) => FunctionId::method(class.clone(), f.name.name()),
-        None => f.name.clone(),
+        Some(class) => FunctionId::method(*class, f.name.name()),
+        None => f.name,
     };
     let function = SourceFunction {
         name,
@@ -1556,7 +1556,7 @@ impl Builder {
         let mut out = expr.clone();
         out.kind = match &expr.kind {
             HirExprKind::Call { callee, args } => HirExprKind::Call {
-                callee: callee.clone(),
+                callee: *callee,
                 args: args
                     .iter()
                     .enumerate()
@@ -2091,7 +2091,7 @@ impl Builder {
     /// operands retain their address identity; only their receiver/index values
     /// are materialized, never the referenced slot's contents.
     fn lower_nested_cfg(&mut self, value: &HirExpr) -> Option<HirExpr> {
-        if !expression_needs_cfg(value) && !(self.is_async && suspends_anywhere(value)) {
+        if !(expression_needs_cfg(value) || self.is_async && suspends_anywhere(value)) {
             return None;
         }
         enum Work<'a> {
@@ -2294,8 +2294,7 @@ impl Builder {
                                 let ty = self.locals[source.0 as usize].ty.clone();
                                 if let Type::Fn(params, result) | Type::Closure(params, result) =
                                     &ty
-                                {
-                                    if !args.iter().any(|arg| {
+                                    && !args.iter().any(|arg| {
                                         matches!(arg.kind, HirExprKind::ReferenceArg { .. })
                                     }) && arguments_compatible(&self.resolution, params, args)
                                     {
@@ -2318,7 +2317,6 @@ impl Builder {
                                         );
                                         continue;
                                     }
-                                }
                             }
                             HirExprKind::MethodCall {
                                 object,
@@ -2520,9 +2518,9 @@ impl Builder {
                     } else if matches!(
                         expr.kind,
                         HirExprKind::Lambda { .. } | HirExprKind::Select { .. }
-                    ) || (!control_flow.contains(&std::ptr::from_ref(expr))
-                        && !matches!(expr.kind, HirExprKind::ReferenceArg { .. })
-                        && !(place
+                    ) || !(control_flow.contains(&std::ptr::from_ref(expr))
+                        || matches!(expr.kind, HirExprKind::ReferenceArg { .. })
+                        || (place
                             && matches!(
                                 expr.kind,
                                 HirExprKind::Index { .. } | HirExprKind::FieldAccess { .. }
@@ -4046,7 +4044,7 @@ impl Builder {
                     .try_into()
                     .unwrap_or_else(|_| unreachable!("one operand in, one operand out"));
                 self.push(SourceInst::StaticFieldAssign {
-                    class: class.clone(),
+                    class: *class,
                     field: field.clone(),
                     value,
                 });

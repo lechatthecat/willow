@@ -361,6 +361,7 @@ impl Codegen {
         // corrupt an adjacent mapping before the runtime can diagnose overflow.
         flag_builder.set("enable_probestack", "true")?;
         flag_builder.set("probestack_strategy", "inline")?;
+        flag_builder.set("probestack_size_log2", "12")?;
         let flags = settings::Flags::new(flag_builder);
         let isa = isa_builder.finish(flags)?;
         // Willow's ABI is 64-bit throughout: every reference — GC handle,
@@ -592,9 +593,9 @@ impl Codegen {
 
     /// Register enum info so the backend can lower enum variant construction.
     pub fn register_enum_info(&mut self, name: String, info: EnumInfo) {
-        let identity = info.name.clone();
+        let identity = info.name;
         self.restore_type_alias(&identity.to_string(), None);
-        self.enum_infos.insert(identity.clone(), info);
+        self.enum_infos.insert(identity, info);
         if TypeId::from_source_name(&name) != identity {
             self.bind_canonical_type_alias(&name, &identity.to_string());
         }
@@ -622,7 +623,7 @@ impl Codegen {
         for (name, info) in aliases {
             // The unit checker supplies identity; metadata remains build-wide.
             if self.enum_infos.get_canonical(&info.name).is_none() {
-                self.enum_infos.insert(info.name.clone(), info.clone());
+                self.enum_infos.insert(info.name, info.clone());
             }
             self.bind_canonical_type_alias(name, &info.name.to_string());
         }
@@ -635,9 +636,9 @@ impl Codegen {
 
     /// Register interface metadata for vtable generation and method dispatch.
     pub fn register_interface_info(&mut self, name: String, info: InterfaceInfo) {
-        let identity = info.name.clone();
+        let identity = info.name;
         self.restore_type_alias(&identity.to_string(), None);
-        self.interface_infos.insert(identity.clone(), info);
+        self.interface_infos.insert(identity, info);
         if TypeId::from_source_name(&name) != identity {
             self.bind_canonical_type_alias(&name, &identity.to_string());
         }
@@ -656,16 +657,12 @@ impl Codegen {
     }
 
     pub fn register_lir_functions(&mut self, lir: crate::ir::lowered::LirProgram) {
-        self.lir_functions = lir
-            .functions
-            .into_iter()
-            .map(|f| (f.name.clone(), f))
-            .collect();
+        self.lir_functions = lir.functions.into_iter().map(|f| (f.name, f)).collect();
         for lambda in lir.lambdas {
             if let Some(name) = self.lambda_names.get(&lambda.id) {
                 let mut function = lambda.function;
-                function.name = name.clone();
-                self.lir_functions.insert(function.name.clone(), function);
+                function.name = *name;
+                self.lir_functions.insert(function.name, function);
             } else {
                 self.lir_lambdas.insert(lambda.id, lambda.function);
             }
@@ -705,7 +702,7 @@ impl Codegen {
             let id = name.type_id();
             self.enum_infos
                 .get_id(&id)
-                .map(|info| info.name.clone())
+                .map(|info| info.name)
                 .unwrap_or(id)
         })
     }
@@ -734,7 +731,7 @@ impl Codegen {
 
     fn canonical_declared_id(&self, id: &TypeId) -> TypeId {
         if let Some(info) = self.enum_infos.get_id(id) {
-            return info.name.clone();
+            return info.name;
         }
         let resolved = self.type_scope.resolve(id);
         if self.class_layouts.get_canonical_id(&resolved).is_some()
@@ -742,7 +739,7 @@ impl Codegen {
         {
             resolved
         } else {
-            id.clone()
+            *id
         }
     }
 
@@ -1111,7 +1108,7 @@ impl Codegen {
                 .type_scope
                 .resolve(&TypeId::from_source_name(&base_name));
             self.class_dependents
-                .entry(base.clone())
+                .entry(base)
                 .or_default()
                 .insert(TypeId::from_source_name(&c.name));
             self.class_base.insert(c.name.clone(), base);
@@ -1129,11 +1126,11 @@ impl Codegen {
         let mut pending = vec![TypeId::from_source_name(name)];
         let mut seen = HashSet::new();
         while let Some(name) = pending.pop() {
-            if !seen.insert(name.clone()) {
+            if !seen.insert(name) {
                 continue;
             }
-            self.dirty_class_layouts.insert(name.clone());
-            self.dirty_class_vslots.insert(name.clone());
+            self.dirty_class_layouts.insert(name);
+            self.dirty_class_vslots.insert(name);
             if let Some(children) = self.class_dependents.get(&name) {
                 pending.extend(children.iter().cloned());
             }
@@ -1201,8 +1198,8 @@ impl Codegen {
     /// the backend is driven directly -- stops at the repeat rather than
     /// looping forever.
     fn ancestor_chain(&self, class_name: &TypeId) -> Vec<TypeId> {
-        let mut chain = vec![class_name.clone()];
-        let mut seen = HashSet::from([class_name.clone()]);
+        let mut chain = vec![*class_name];
+        let mut seen = HashSet::from([*class_name]);
         // `class_base` records canonical names (`register_class_layout`
         // canonicalizes as it stores), so the walk reads them as identities
         // rather than through the aliases of whichever unit is compiling.
@@ -1210,10 +1207,10 @@ impl Codegen {
             .class_base
             .get_canonical_id(chain.last().expect("non-empty"))
         {
-            if !seen.insert(base.clone()) {
+            if !seen.insert(*base) {
                 break;
             }
-            chain.push(base.clone());
+            chain.push(*base);
         }
         chain
     }
@@ -1268,7 +1265,7 @@ impl Codegen {
         let mut search = Some(TypeId::from_source_name(class_name));
         let mut seen = HashSet::new();
         while let Some(name) = search {
-            if !seen.insert(name.clone()) {
+            if !seen.insert(name) {
                 break;
             }
             let mangled =
@@ -1920,7 +1917,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if name == TypeId::from_source_name(ancestor) {
                 return true;
             }
-            if !seen.insert(name.clone()) {
+            if !seen.insert(name) {
                 break;
             }
             current = self.class_base.get_id(&name).cloned();
@@ -1933,7 +1930,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let mut current = Some(TypeId::from_source_name(cls));
         let mut seen = HashSet::new();
         while let Some(name) = current {
-            if !seen.insert(name.clone()) {
+            if !seen.insert(name) {
                 break;
             }
             let mangled = class_method_symbol_name(self.known_modules, &name.to_string(), method);
@@ -2017,7 +2014,7 @@ fn lookup_static_storage_in(
     let mut current = Some(TypeId::from_source_name(class));
     let mut seen = std::collections::HashSet::new();
     while let Some(name) = current {
-        if !seen.insert(name.clone()) {
+        if !seen.insert(name) {
             break;
         }
         if let Some(info) = static_storage
@@ -2508,6 +2505,18 @@ mod symbol_namespace_tests {
 mod tests {
 
     #[test]
+    fn production_stack_probes_use_inline_four_kib_pages() {
+        let codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+        let flags = codegen.module.isa().flags();
+        assert!(flags.enable_probestack());
+        assert_eq!(
+            flags.probestack_strategy(),
+            settings::ProbestackStrategy::Inline
+        );
+        assert_eq!(flags.probestack_size_log2(), 12);
+    }
+
+    #[test]
     fn closure_type_canonicalization_perspectives() {
         use super::*;
 
@@ -2724,7 +2733,7 @@ mod tests {
                 let function = FunctionId::free_from_source_name("local");
                 let original = FunctionId::free_from_source_name("original");
                 if binding_shape != 0 {
-                    codegen.bind_function_alias(function.clone(), original.clone());
+                    codegen.bind_function_alias(function, original);
                     codegen.bind_type_alias("Local", "Original");
                     codegen
                         .known_modules

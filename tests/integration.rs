@@ -19,8 +19,6 @@ mod typecheck;
 mod channel_element_inference;
 #[path = "integration/class_dispatch_filter.rs"]
 mod class_dispatch_filter;
-#[path = "integration/method_receiver_roots.rs"]
-mod method_receiver_roots;
 #[path = "integration/class_layout_order.rs"]
 mod class_layout_order;
 #[path = "integration/class_vtable_dispatch.rs"]
@@ -81,6 +79,8 @@ mod lir_stage5_cutover;
 mod lir_static_initializers;
 #[path = "integration/lir_static_property_bodies.rs"]
 mod lir_static_property_bodies;
+#[path = "integration/method_receiver_roots.rs"]
+mod method_receiver_roots;
 
 #[path = "integration/module_lir_bodies.rs"]
 mod module_lir_bodies;

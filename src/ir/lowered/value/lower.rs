@@ -43,16 +43,16 @@ fn static_call(
     result: &Type,
     callables: &Callables,
 ) -> bool {
-    if let Some(namespace) = callables.resolution.namespaces.get(class) {
-        if let Some(signature) = crate::semantic::intrinsics::namespace_builtin(namespace, method) {
-            return signature.ret == *result
-                && signature.params.len() == args.len()
-                && signature
-                    .params
-                    .iter()
-                    .zip(args)
-                    .all(|(ty, arg)| argument_coercible(ty, arg, &callables.resolution));
-        }
+    if let Some(namespace) = callables.resolution.namespaces.get(class)
+        && let Some(signature) = crate::semantic::intrinsics::namespace_builtin(namespace, method)
+    {
+        return signature.ret == *result
+            && signature.params.len() == args.len()
+            && signature
+                .params
+                .iter()
+                .zip(args)
+                .all(|(ty, arg)| argument_coercible(ty, arg, &callables.resolution));
     }
     if let Some(signature) = super::super::static_signature(&callables.resolution, class, method) {
         return signature.is_static
@@ -281,12 +281,11 @@ fn argument_types(
                 .map(|signature| signature.params)
         }
         HirExprKind::StaticCall { class, method, .. } => {
-            if let Some(namespace) = callables.resolution.namespaces.get(class) {
-                if let Some(signature) =
+            if let Some(namespace) = callables.resolution.namespaces.get(class)
+                && let Some(signature) =
                     crate::semantic::intrinsics::namespace_builtin(namespace, method)
-                {
-                    return Some(signature.params);
-                }
+            {
+                return Some(signature.params);
             }
             if let Some(signature) =
                 super::super::static_signature(&callables.resolution, class, method)
@@ -298,10 +297,9 @@ fn argument_types(
                     class.name(),
                     "Mutex" | "RwLock" | "BlockingCell" | "BlockingRwCell"
                 )
+                && let Type::Generic(_, params) = &node.ty
             {
-                if let Type::Generic(_, params) = &node.ty {
-                    return Some(params.clone());
-                }
+                return Some(params.clone());
             }
             None
         }
@@ -446,13 +444,14 @@ fn lower(
     fn arguments<'a>(args: &'a [HirExpr], targets: Option<&[Type]>) -> Vec<Work<'a>> {
         let mut work = Vec::new();
         for (index, child) in args.iter().enumerate().rev() {
-            if let Some(target) = targets.and_then(|types| types.get(index)) {
-                if *target != child.ty && !matches!(child.kind, HirExprKind::ReferenceArg { .. }) {
-                    work.push(Work::Coerce {
-                        child,
-                        target: target.clone(),
-                    });
-                }
+            if let Some(target) = targets.and_then(|types| types.get(index))
+                && *target != child.ty
+                && !matches!(child.kind, HirExprKind::ReferenceArg { .. })
+            {
+                work.push(Work::Coerce {
+                    child,
+                    target: target.clone(),
+                });
             }
             work.push(Work::Enter(child));
         }
@@ -747,8 +746,7 @@ fn lower(
                 if let Some((callee, args)) = reference_call {
                     let has_refs = args
                         .iter()
-                        .enumerate()
-                        .any(|(_, arg)| matches!(arg.kind, HirExprKind::ReferenceArg { .. }));
+                        .any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. }));
                     for (index, arg) in args.iter().enumerate() {
                         if matches!(arg.kind, HirExprKind::ReferenceArg { .. }) {
                             reference_sites.insert(std::ptr::from_ref(arg), (callee, index));
@@ -1188,7 +1186,7 @@ fn lower(
             )),
             HirExprKind::FnRef(function) => LirOperand::Local(emit(
                 LirRvalue::FunctionRef {
-                    function: function.clone(),
+                    function: *function,
                     ty: node.ty.clone(),
                 },
                 node.ty.clone(),

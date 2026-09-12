@@ -475,7 +475,7 @@ impl<V> FunctionMap<V> {
     /// Register a declaration; an own declaration shadows a same-named import.
     pub fn insert(&mut self, name: impl AsRef<str>, value: V) -> Option<V> {
         let id = self.scope.declaration_id(name.as_ref());
-        self.scope.restore(id.clone(), None);
+        self.scope.restore(id, None);
         self.values.insert(id, value)
     }
 
@@ -615,10 +615,7 @@ mod function_scope_tests {
         effects.insert("module.target", true);
         signatures.insert("local", "i64");
         let alias = FunctionId::free_from_source_name("local");
-        let old = scope.bind(
-            alias.clone(),
-            FunctionId::free_from_source_name("module.target"),
-        );
+        let old = scope.bind(alias, FunctionId::free_from_source_name("module.target"));
         signatures.set_scope(scope.clone());
         effects.set_scope(scope.clone());
         assert_eq!(signatures.get("local"), Some(&"String"));
@@ -689,7 +686,7 @@ mod backend_identity_tests {
                 let mut effects = FunctionMap::with_scope(scope.clone());
                 // A deliberately unrelated linker spelling cannot recover
                 // namespace/owner/name by parsing or component splitting.
-                scope.declare("arbitrary.$linker.label", id.clone());
+                scope.declare("arbitrary.$linker.label", id);
                 signatures.insert("arbitrary.$linker.label", 42);
                 effects.insert("arbitrary.$linker.label", true);
                 assert_eq!(signatures.ids().next(), Some(&id));
@@ -697,12 +694,12 @@ mod backend_identity_tests {
                 assert_eq!(effects.get_id(&id), Some(&true));
                 assert_eq!(scope.lookup_id("arbitrary.$linker.label"), id);
                 let alias = FunctionId::free("local_alias");
-                let previous = scope.bind(alias.clone(), id.clone());
+                let previous = scope.bind(alias, id);
                 signatures.set_scope(scope.clone());
                 effects.set_scope(scope.clone());
                 assert_eq!(signatures.get_id(&alias), Some(&42));
                 assert_eq!(effects.get_id(&alias), Some(&true));
-                scope.restore(alias.clone(), previous);
+                scope.restore(alias, previous);
                 signatures.set_scope(scope.clone());
                 effects.set_scope(scope.clone());
                 assert_eq!(signatures.get_id(&alias), None);
