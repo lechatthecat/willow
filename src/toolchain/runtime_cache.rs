@@ -7,6 +7,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::UNIX_EPOCH;
@@ -38,7 +39,45 @@ impl FileStamp {
 struct BuildStamp {
     version: u32,
     inputs: u64,
-    archive: FileStamp,
+    archive: ArchiveStamp,
+}
+
+const BUILD_STAMP_VERSION: u32 = 2;
+
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
+struct ArchiveStamp {
+    metadata: FileStamp,
+    digest: u64,
+}
+
+impl ArchiveStamp {
+    fn read(path: &Path) -> Result<Self> {
+        let metadata = FileStamp::read(path)?;
+        anyhow::ensure!(metadata.len > 0, "empty runtime archive");
+        let mut file = fs::File::open(path)?;
+        let mut hash = DefaultHasher::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut bytes = 0_u64;
+        loop {
+            let count = match file.read(&mut buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if count == 0 {
+                break;
+            }
+            hash.write(&buffer[..count]);
+            bytes += count as u64;
+        }
+        anyhow::ensure!(
+            bytes == metadata.len && FileStamp::read(path)? == metadata,
+            "archive changed while reading"
+        );
+        Ok(Self {
+            metadata,
+            digest: hash.finish(),
+        })
+    }
 }
 
 fn hash_file(path: &Path, hash: &mut DefaultHasher) -> Result<()> {
@@ -314,16 +353,13 @@ pub(super) fn build_if_stale(
     let stamp_path = archive.with_extension("willow-fresh.json");
     let before = inputs().ok();
     if !force
-        && let (Some(inputs), Ok(archive_stamp), Ok(contents)) =
-            (before, FileStamp::read(archive), fs::read(&stamp_path))
-        && archive_stamp.len > 0
-        && fs::File::open(archive).is_ok()
-        && serde_json::from_slice::<BuildStamp>(&contents).ok()
-            == Some(BuildStamp {
-                version: 1,
-                inputs,
-                archive: archive_stamp,
-            })
+        && let Some(inputs) = before
+        && let Ok(contents) = fs::read(&stamp_path)
+        && let Ok(stamp) = serde_json::from_slice::<BuildStamp>(&contents)
+        && stamp.version == BUILD_STAMP_VERSION
+        && stamp.inputs == inputs
+        // Avoid streaming an archive when the cheaper input proof is stale.
+        && ArchiveStamp::read(archive).ok() == Some(stamp.archive)
     {
         return Ok(());
     }
@@ -336,11 +372,10 @@ pub(super) fn build_if_stale(
     build()?;
     if let Some(before) = before
         && inputs().ok() == Some(before)
-        && let Ok(archive) = FileStamp::read(archive)
-        && archive.len > 0
+        && let Ok(archive) = ArchiveStamp::read(archive)
     {
         let stamp = BuildStamp {
-            version: 1,
+            version: BUILD_STAMP_VERSION,
             inputs: before,
             archive,
         };
@@ -425,6 +460,33 @@ mod tests {
             .unwrap();
         fixture.build(&count, false).unwrap();
         assert_eq!(count.get(), 2);
+    }
+
+    #[test]
+    fn equal_mtime_and_size_cannot_hide_changed_archive_content() {
+        let fixture = Fixture::new();
+        let count = Cell::new(0);
+        fixture.build(&count, false).unwrap();
+        let archive = fixture.archive();
+        let before = FileStamp::read(&archive).unwrap();
+        let modified = fs::metadata(&archive).unwrap().modified().unwrap();
+        fs::write(&archive, "partial").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&archive)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(FileStamp::read(&archive).unwrap(), before);
+        fixture.build(&count, false).unwrap();
+        assert_eq!(
+            count.get(),
+            2,
+            "replaced bytes must invalidate the archive proof"
+        );
+        assert_eq!(fs::read(&archive).unwrap(), b"archive");
+        fixture.build(&count, false).unwrap();
+        assert_eq!(count.get(), 2, "rebuilt archive should be fresh");
     }
 
     #[test]
