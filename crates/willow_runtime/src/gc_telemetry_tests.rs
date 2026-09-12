@@ -7,9 +7,6 @@ fn assert_consistent(s: &WillowGcStatsV1) {
     assert_eq!(s.version, 1);
     assert!(s.phase <= 2);
     assert!(s.last_cycle.epoch <= s.epoch);
-    if s.phase == 0 && s.last_cycle.epoch != 0 {
-        assert_eq!(s.epoch, s.last_cycle.epoch);
-    }
     assert_eq!(s.pauses.count, s.minor_cycles + s.major_cycles);
     assert_eq!(s.pauses.buckets.iter().sum::<u64>(), s.pauses.count);
     assert_eq!(s.minor_pauses.count, s.minor_cycles);
@@ -489,4 +486,44 @@ fn trace_file_flushes_complete_pairs_and_open_failure_preserves_gc() {
 #[test]
 fn trace_file_write_failure_preserves_collection() {
     run_trace_child(std::path::Path::new("/dev/full"), 1);
+}
+
+#[test]
+fn aborted_cycles_restore_idle_without_publishing_partial_work() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    willow_gc_collect();
+    let completed = snapshot();
+    let mut epoch = completed.epoch;
+    for kind in [CycleKind::Minor, CycleKind::Major] {
+        let result = std::panic::catch_unwind(|| {
+            let _cycle = Cycle::begin(kind);
+            assert_eq!(snapshot().phase, kind as u32);
+            panic!("injected collection failure");
+        });
+        assert!(result.is_err());
+        let aborted = snapshot();
+        assert_eq!(aborted.phase, 0);
+        assert_eq!(aborted.epoch, epoch + 1);
+        epoch = aborted.epoch;
+        assert_eq!(aborted.last_cycle.epoch, completed.last_cycle.epoch);
+        assert_eq!(
+            aborted.last_major_cycle.epoch,
+            completed.last_major_cycle.epoch
+        );
+        assert_eq!(aborted.major_cycles, completed.major_cycles);
+        assert_eq!(aborted.minor_cycles, completed.minor_cycles);
+        assert_eq!(aborted.pauses, completed.pauses);
+        assert_eq!(aborted.marked_bytes, completed.marked_bytes);
+        assert_eq!(aborted.scanned_bytes, completed.scanned_bytes);
+        assert_eq!(aborted.mark_ns, completed.mark_ns);
+        assert_consistent(&aborted);
+    }
+    willow_gc_collect();
+    let recovered = snapshot();
+    assert_eq!(recovered.phase, 0);
+    assert_eq!(recovered.epoch, epoch + 1);
+    assert_eq!(recovered.major_cycles, completed.major_cycles + 1);
+    assert_eq!(recovered.last_cycle.epoch, recovered.epoch);
+    assert_consistent(&recovered);
 }

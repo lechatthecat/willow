@@ -221,7 +221,20 @@ pub(crate) struct Cycle {
     kind: CycleKind,
     epoch: u64,
     start_ns: u64,
+    completed: bool,
 }
+
+impl Drop for Cycle {
+    fn drop(&mut self) {
+        if !self.completed {
+            // An aborted collection has no completed work to publish. Keep its
+            // epoch consumed while allowing the next elected collector to start.
+            let mut telemetry = TELEMETRY.lock().unwrap_or_else(|p| p.into_inner());
+            telemetry.stats.phase = 0;
+        }
+    }
+}
+
 impl Cycle {
     /// Called only by the elected collector, before requesting safepoints.
     pub(crate) fn begin(kind: CycleKind) -> Self {
@@ -235,6 +248,7 @@ impl Cycle {
             kind,
             epoch: stats.epoch,
             start_ns,
+            completed: false,
         }
     }
     /// Called after resuming mutators; returns the trace record for publication
@@ -255,7 +269,7 @@ impl Cycle {
         self.finish_metrics(before, after, work, Some(pause_ns), Some(reclaimed))
     }
     fn finish_metrics(
-        self,
+        mut self,
         before: u64,
         after: u64,
         work: MarkWork,
@@ -282,6 +296,7 @@ impl Cycle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .complete(cycle);
+        self.completed = true;
         cycle
     }
 }

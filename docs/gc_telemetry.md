@@ -41,7 +41,7 @@ allocation or safepoint effect. The legacy V1 symbol retains its return conventi
 | `pauses`, `minor_pauses`, `major_pauses` | Count, cumulative nanoseconds, maximum, and 65 logarithmic buckets. Bucket 0 is zero; bucket b > 0 is `[2^(b-1), 2^b)` ns. |
 | `last_cycle` | Complete most recent cycle: identity, kind, timestamps, latency, work, occupied bytes before/after and actual swept bytes. Concurrent allocations can offset reclamation in the before/after difference. |
 | `last_major_cycle` | Most recent whole-heap liveness measurement. A minor cycle leaves this record intact. |
-| `phase`, `epoch` | Coherent cycle state: phase 0 = idle, 1 = minor STW, 2 = major cycle (including concurrent traversal). Epoch advances for elected collections; skipped collection requests do not create cycles. |
+| `phase`, `epoch` | Coherent cycle state: phase 0 = idle, 1 = minor STW, 2 = major cycle (including concurrent traversal). Epoch advances for elected collections; skipped collection requests do not create cycles. An unwinding collection restores idle without publishing partial work: its epoch remains consumed and completed counters, histograms and last-cycle summaries stay unchanged. |
 | `reset_generation` | Advances on runtime reset. Cumulative counters reset together. `GcRates::between` rejects windows across resets. |
 | `process_resident_bytes`, `resident_valid` | Best-effort process RSS, including memory outside the GC. Only the C snapshot samples the OS. |
 | `trace_errors` | Process-lifetime failed trace opens/writes/flushes. A failed sink is disabled after one failure. |
