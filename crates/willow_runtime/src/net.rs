@@ -162,6 +162,11 @@ pub extern "C" fn willow_net_shutdown(stream: *mut u8) -> *mut u8 {
     };
     match stream.shutdown(Shutdown::Both) {
         Ok(()) => crate::fs::alloc_ok(0, false),
+        // Darwin can report ENOTCONN after the peer has already closed or a
+        // previous shutdown completed. The requested closed state is reached.
+        Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {
+            crate::fs::alloc_ok(0, false)
+        }
         Err(error) => crate::fs::alloc_io_err(&format!("net::shutdown: {error}")),
     }
 }

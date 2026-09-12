@@ -18,12 +18,14 @@ pub trait Toolchain {
 /// Toolchain for the host Rust target.
 pub struct HostToolchain {
     target: TargetOptions,
+    runtime_lock: std::cell::RefCell<Option<std::fs::File>>,
 }
 
 impl HostToolchain {
     pub fn new(target: &TargetOptions) -> Self {
         Self {
             target: target.clone(),
+            runtime_lock: std::cell::RefCell::new(None),
         }
     }
 
@@ -89,6 +91,21 @@ impl Toolchain for HostToolchain {
             return validate_runtime_library(path);
         }
         let path = self.default_runtime_library_path();
+        // Cargo may replace the un-hashed staticlib alias even for a fresh
+        // build. Hold a process-shared lock through linking so another Willow
+        // compiler cannot remove that alias while the linker is opening it.
+        if self.runtime_lock.borrow().is_none() {
+            let directory = path.parent().expect("runtime profile directory");
+            std::fs::create_dir_all(directory)?;
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(directory.join(".willow-runtime.lock"))?;
+            lock.lock().context("failed to lock the runtime library")?;
+            *self.runtime_lock.borrow_mut() = Some(lock);
+        }
         self.build_default_runtime_library()?;
         validate_runtime_library(path)
     }

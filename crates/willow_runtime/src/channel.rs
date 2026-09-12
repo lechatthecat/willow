@@ -367,7 +367,12 @@ fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue) {
     // task can progress and the buffer is still full/open, abort with a
     // clear runtime panic instead of deadlocking (willow-o038).
     loop {
-        let completed = crate::scheduler::willow_sched_run();
+        // Re-probe this channel even if unrelated tasks remain runnable.
+        // An unbounded nested drive can wait for a task that is itself waiting
+        // for this send/recv to return, despite the channel already being ready.
+        let completed = crate::scheduler::willow_sched_run_until_deadline(
+            crate::scheduler::willow_monotonic_millis().saturating_add(1),
+        );
         if channel_try_send_value(raw, value) != 0 {
             // The failed attempts registered this task as a send waiter (a
             // no-op outside a task). Drop that registration: nobody will
@@ -515,7 +520,12 @@ fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
                 return WillowChannelValue::default();
             }
         }
-        let completed = crate::scheduler::willow_sched_run();
+        // Re-probe this channel even if unrelated tasks remain runnable.
+        // An unbounded nested drive can wait for a task that is itself waiting
+        // for this send/recv to return, despite the channel already being ready.
+        let completed = crate::scheduler::willow_sched_run_until_deadline(
+            crate::scheduler::willow_monotonic_millis().saturating_add(1),
+        );
         if completed == 0 {
             let mut state = channel.state.lock().expect("channel mutex poisoned");
             if let Some(value) = state.values.pop_front() {

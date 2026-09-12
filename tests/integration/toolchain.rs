@@ -414,61 +414,44 @@ fn test_backend_runtime_symbol_table_lists_expected_symbols() {
 /// Shared by the debug and release coverage tests so the exported
 /// surface cannot silently diverge between build profiles.
 fn assert_staticlib_exports_backend_symbols(runtime_lib: &Path) {
-    let output = staticlib_symbols_output(runtime_lib);
-    let nm_symbols = String::from_utf8_lossy(&output.stdout);
-
-    let backend_symbols = backend_runtime_symbols();
-    let mut missing = Vec::new();
-    for symbol in &backend_symbols {
-        // Match on word boundaries so `willow_alloc` does not satisfy
-        // `willow_alloc_typed`. nm output lists one symbol token per line.
-        let found = nm_symbols.lines().any(|line| {
-            line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .any(|tok| tok == symbol)
-        });
-        if !found {
-            missing.push(symbol.clone());
+    use object::{Object, ObjectSymbol};
+    let bytes = fs::read(runtime_lib).expect("runtime staticlib should be readable");
+    let archive = object::read::archive::ArchiveFile::parse(bytes.as_slice())
+        .expect("runtime staticlib should be an archive");
+    let mut symbols = std::collections::HashSet::new();
+    for member in archive.members() {
+        let member = member.expect("archive member should parse");
+        let data = member
+            .data(bytes.as_slice())
+            .expect("archive member should be readable");
+        // Rust archives can also contain LLVM bitcode. The callable ABI must
+        // be defined in native object members, independent of the host nm's
+        // LLVM version or platform-specific output format.
+        let Ok(object) = object::File::parse(data) else {
+            continue;
+        };
+        for symbol in object
+            .symbols()
+            .filter(|s| s.is_definition() && s.is_global())
+        {
+            if let Ok(name) = symbol.name() {
+                let name = if object.format() == object::BinaryFormat::MachO {
+                    name.strip_prefix('_').unwrap_or(name)
+                } else {
+                    name
+                };
+                symbols.insert(name.to_owned());
+            }
         }
     }
+    let missing: Vec<_> = backend_runtime_symbols()
+        .into_iter()
+        .filter(|name| !symbols.contains(name))
+        .collect();
     assert!(
         missing.is_empty(),
-        "runtime staticlib {runtime_lib:?} is missing symbols imported by the backend: {missing:?}"
+        "runtime staticlib {runtime_lib:?} is missing backend symbols: {missing:?}"
     );
-}
-
-#[cfg(not(all(windows, target_env = "msvc")))]
-fn staticlib_symbols_output(runtime_lib: &Path) -> std::process::Output {
-    let output = Command::new("nm")
-        .arg(runtime_lib)
-        .output()
-        .expect("failed to inspect runtime staticlib with nm");
-    assert!(output.status.success(), "nm failed for {runtime_lib:?}");
-    output
-}
-
-#[cfg(all(windows, target_env = "msvc"))]
-fn staticlib_symbols_output(runtime_lib: &Path) -> std::process::Output {
-    let target = if cfg!(target_arch = "x86_64") {
-        "x86_64-pc-windows-msvc"
-    } else if cfg!(target_arch = "aarch64") {
-        "aarch64-pc-windows-msvc"
-    } else if cfg!(target_arch = "x86") {
-        "i686-pc-windows-msvc"
-    } else {
-        panic!("unsupported Windows MSVC target architecture");
-    };
-    let mut cmd = cc::windows_registry::find_tool(target, "dumpbin.exe")
-        .expect("failed to find MSVC dumpbin.exe")
-        .to_command();
-    cmd.arg("/SYMBOLS").arg(runtime_lib);
-    let output = cmd
-        .output()
-        .expect("failed to inspect runtime staticlib with dumpbin");
-    assert!(
-        output.status.success(),
-        "dumpbin failed for {runtime_lib:?}"
-    );
-    output
 }
 
 #[test]

@@ -17271,6 +17271,22 @@ fn net_10_wrong_handle_type_is_rejected() {
 }
 
 #[test]
+fn net_12_repeated_shutdown_is_successful() {
+    let source = NET_ECHO_SOURCE
+        .replace(
+            "net::shutdown(client)?;",
+            "net::shutdown(client)?; net::shutdown(client)?;",
+        )
+        .replace(
+            "net::shutdown(server)?;",
+            "net::shutdown(server)?; net::shutdown(server)?;",
+        );
+    let (out, ok) = compile_and_run(&source);
+    assert!(ok, "{out}");
+    assert_eq!(out, "ping\n");
+}
+
+#[test]
 fn net_11_utf8_payload_roundtrips() {
     let source = NET_ECHO_SOURCE.replace("\"ping\"", "\"日本語🌱\"");
     let (out, ok) = compile_and_run_with_env(&source, &[("WILLOW_WORKERS", "5")]);

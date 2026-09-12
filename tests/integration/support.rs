@@ -29,29 +29,39 @@ pub(super) fn contains_path_fragment(haystack: &str, slash_fragment: &str) -> bo
     haystack.contains(slash_fragment) || haystack.contains(&slash_fragment.replace('/', "\\"))
 }
 
-pub(super) fn target_dir() -> std::path::PathBuf {
-    std::env::var_os("CARGO_TARGET_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("target"))
+pub(super) struct RuntimeStaticlib {
+    path: PathBuf,
+    _toolchain: willow_compiler::toolchain::HostToolchain,
 }
 
-pub(super) fn build_runtime_staticlib(release: bool) -> std::path::PathBuf {
-    let mut args = vec!["build", "-p", "willow_runtime"];
-    if release {
-        args.push("--release");
+impl std::ops::Deref for RuntimeStaticlib {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
     }
-    let status = Command::new("cargo")
-        .args(args)
-        .status()
-        .expect("failed to build willow_runtime");
-    assert!(status.success(), "willow_runtime build failed");
-    target_dir()
-        .join(if release { "release" } else { "debug" })
-        .join(if cfg!(target_env = "msvc") {
-            "willow_runtime.lib"
-        } else {
-            "libwillow_runtime.a"
-        })
+}
+
+impl AsRef<std::ffi::OsStr> for RuntimeStaticlib {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.path.as_os_str()
+    }
+}
+
+pub(super) fn build_runtime_staticlib(release: bool) -> RuntimeStaticlib {
+    use willow_compiler::toolchain::Toolchain;
+    let options = if release {
+        willow_compiler::CompilerOptions::release()
+    } else {
+        willow_compiler::CompilerOptions::debug()
+    };
+    let toolchain = willow_compiler::toolchain::HostToolchain::new(&options.target);
+    let path = toolchain
+        .resolve_runtime_library()
+        .expect("runtime build failed");
+    RuntimeStaticlib {
+        path,
+        _toolchain: toolchain,
+    }
 }
 
 pub(super) fn collect_wi_files(root: &str) -> Vec<String> {
@@ -347,15 +357,19 @@ pub(super) fn compile_and_run_with_env(source: &str, env: &[(&str, &str)]) -> (S
     for (key, value) in env {
         compiler_cmd.env(key, value);
     }
-    let status = compiler_cmd
-        .stderr(Stdio::null())
-        .status()
-        .expect("failed to run compiler");
+    let compiled = compiler_cmd.output().expect("failed to run compiler");
 
-    if !status.success() {
+    if !compiled.status.success() {
         let _ = fs::remove_file(&src_path);
         remove_output_artifacts(&bin_path);
-        return (String::new(), false);
+        return (
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&compiled.stdout),
+                String::from_utf8_lossy(&compiled.stderr)
+            ),
+            false,
+        );
     }
 
     let mut cmd = Command::new(&bin_path);
@@ -466,6 +480,17 @@ pub(super) fn compile_and_collect_relocation_targets_mode(
     let mut names = Vec::new();
     for section in object.sections() {
         for (_offset, relocation) in section.relocations() {
+            // AArch64 Mach-O PIC address loads have two relocation records.
+            if object.architecture() == object::Architecture::Aarch64
+                && matches!(
+                    relocation.flags(),
+                    object::RelocationFlags::MachO { r_type, .. }
+                        if r_type == object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
+                            || r_type == object::macho::ARM64_RELOC_PAGEOFF12
+                )
+            {
+                continue;
+            }
             let RelocationTarget::Symbol(index) = relocation.target() else {
                 continue;
             };
