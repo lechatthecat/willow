@@ -559,11 +559,11 @@ fn test_link_discards_unused_function_sections() {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
-fn test_runtime_calls_use_direct_relative_relocations() {
+fn test_runtime_calls_preserve_native_import_relocations() {
     use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
     let id = unique_test_id();
-    let source = temp_path(format!("willow_direct_runtime_{id}.wi"));
-    let binary = temp_path(format!("willow_direct_runtime_{id}"));
+    let source = temp_path(format!("willow_import_runtime_{id}.wi"));
+    let binary = temp_path(format!("willow_import_runtime_{id}"));
     fs::write(&source, "fn main() { println(42); }").unwrap();
     for mode in ["--debug", "--release"] {
         let output = Command::new(env!("CARGO_BIN_EXE_willowc"))
@@ -584,10 +584,13 @@ fn test_runtime_calls_use_direct_relative_relocations() {
                 if let RelocationTarget::Symbol(index) = relocation.target()
                     && file.symbol_by_index(index).unwrap().name().unwrap() == "willow_println_i64"
                 {
+                    assert!(file.symbol_by_index(index).unwrap().is_undefined());
+                    // Non-PIC x86_64 imports use the standard ObjectModule far
+                    // call policy, without promising a nearby definition.
                     assert_eq!(
                         relocation.flags(),
                         object::RelocationFlags::Elf {
-                            r_type: object::elf::R_X86_64_PLT32,
+                            r_type: object::elf::R_X86_64_64,
                         }
                     );
                     calls += 1;
@@ -596,7 +599,7 @@ fn test_runtime_calls_use_direct_relative_relocations() {
         }
         assert!(
             calls > 0,
-            "expected a direct call to the print runtime helper"
+            "expected an imported print runtime helper reference"
         );
         let output = Command::new(&binary).output().unwrap();
         assert!(output.status.success());

@@ -6,7 +6,7 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
-use cranelift_object::ObjectBuilder;
+use cranelift_object::{ObjectBuilder, ObjectModule};
 use std::collections::{HashMap, HashSet};
 
 use crate::backend::abi;
@@ -45,8 +45,6 @@ mod lir_gen;
 mod option_repr;
 mod panic_effect;
 mod root_effect;
-mod runtime_module;
-use runtime_module::RuntimeObjectModule as ObjectModule;
 mod std_collection;
 mod symbols;
 mod type_helpers;
