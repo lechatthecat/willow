@@ -82,7 +82,7 @@ fn is_idle(state: &ParallelRunState) -> bool {
 type CounterFrame = [i64; crate::async_frame::ASYNC_FRAME_HEADER_WORDS as usize];
 
 fn counter_frame() -> *mut c_void {
-    Box::into_raw(Box::new(
+    Box::into_raw(Box::<CounterFrame>::new(
         [0; crate::async_frame::ASYNC_FRAME_HEADER_WORDS as usize],
     )) as *mut c_void
 }

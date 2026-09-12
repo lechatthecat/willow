@@ -1,9 +1,0 @@
-[env]
-# Preserve diagnostics when a native runtime test aborts before libtest reports it.
-RUST_TEST_NOCAPTURE = "1"
-
-[target.aarch64-apple-darwin]
-runner = ["sh", "-c", 'exec sh "$GITHUB_WORKSPACE/scripts/diagnose-macos-runtime.sh" "$@"', "willow-diagnostic"]
-
-[target.x86_64-apple-darwin]
-runner = ["sh", "-c", 'exec sh "$GITHUB_WORKSPACE/scripts/diagnose-macos-runtime.sh" "$@"', "willow-diagnostic"]
