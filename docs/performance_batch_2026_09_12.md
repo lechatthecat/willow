@@ -1,8 +1,8 @@
 # Runtime and toolchain performance batch — 2026-09-12
 
 Base revision: `1e5f30c5e03e6756793c14bd901f13e5dbbb142d`.
-Measurements below are Linux x86_64 observations, not native Apple/Windows
-acceptance. Raw samples are in `benches/performance_2026_09_12/`. Some sampling
+The initial measurements are Linux x86_64 observations; the final section
+records native Linux, Apple, and Windows evidence. Raw samples are in `benches/performance_2026_09_12/`. Some sampling
 overlapped compiler verification; small timing differences are not evidence of
 improvement. No pure-function speedup is attributed to the runtime changes.
 
@@ -16,9 +16,17 @@ Linking the same object for `example/class.wi` seven times per configuration:
 | Debug | 300.05 ms | 191.17 ms | 18,008,800 B | 14,297,584 B |
 | Release | 115.50 ms | 65.05 ms | 6,275,304 B | 4,395,088 B |
 
-All four binaries printed `42` and exited successfully. These size measurements
-precede the metadata-retention correction described below; the release fixture
-does not emit metadata, while final debug binaries retain their metadata blob.
+All four binaries printed `42` and exited successfully. These initial size
+measurements precede metadata retention. A final seven-sample repeat using the
+same object/archive per profile retains the debug metadata symbol on both sides:
+
+| Runtime archive | Link before | Link after | Binary before | Binary after |
+| --- | ---: | ---: | ---: | ---: |
+| Debug | 274.30 ms | 182.36 ms | 18,136,472 B | 14,401,496 B |
+| Release | 102.62 ms | 61.66 ms | 6,292,256 B | 4,395,488 B |
+
+Every final binary printed `42`. Raw samples are in `dead_strip_final.json`;
+workspace tests ran concurrently, so timings remain host observations.
 
 Flags use GNU `--gc-sections`, Apple `-dead_strip`, and MSVC `/OPT:REF /OPT:ICF`.
 Unknown linker families retain their existing behavior. The Linux regression
@@ -28,8 +36,8 @@ sections disappear, including when symbol stripping is enabled.
 The full integration run found that metadata accessed by symbol, rather than by
 generated code, was removed. When debug information is emitted, the linker now
 explicitly roots `willow_runtime_metadata_v1` (with Apple's symbol prefix).
-Both embedded-metadata regressions pass after this correction. Native Apple and
-Windows linker/execution gates remain required.
+Both embedded-metadata regressions pass after this correction. Native Apple and Windows linker/execution gates passed; the final native
+measurements and suite status are recorded below.
 
 ## willow-8hq4.2: runtime freshness proof
 
@@ -57,8 +65,14 @@ Cargo invocation on the next compile. Nine-sample observations:
 | `WILLOW_FORCE_RUNTIME_BUILD=1` debug compile | 269.877 ms |
 
 The forced path includes the new fingerprint work, so it is not represented as
-a historical pre-change compiler baseline. Further platform measurements and
-the complete CLI input-invalidation matrix remain acceptance work.
+a historical pre-change compiler baseline. A subsequent final-tree CLI matrix passed all 37 Cargo-invocation assertions:
+fresh skips, repeated force, overrides even with force, independent profiles,
+missing/wrong-kind archives, source/manifest/lock touches, and added/removed
+nested sources. Every successful binary printed `42`. Nine-sample medians were
+230.33 ms warm, 287.54 ms forced, and 31.39 ms for the isolated no-op Cargo
+probe, recorded in `runtime_cache_cli.json`. Tests for unreadable/uncertain state,
+coarse timestamps, and failed publication cover the conservative failure paths.
+Native platform validation is recorded below.
 
 ## willow-8hq4.4: panic and root depth
 
@@ -90,7 +104,8 @@ The primary chain improves materially; the controls do not. Linux disassembly
 removes the panic accessor's `lock inc`/`lock cmpxchg`/Arc-release sequence.
 The root accessor reduces to TLS address/load, overflow check, and return on
 the normal path, without Vec initialization/destruction or RefCell machinery.
-Native platform measurements and worker-migration timing remain outstanding.
+Native platform accessor measurements and the four-task context-switch
+workload are recorded below.
 
 Reproduce with `scripts/benchmark_runtime_depth.py --before BEFORE_ARCHIVE
 --after AFTER_ARCHIVE --output RESULTS.json`.
@@ -110,8 +125,8 @@ Request fixture binaries decreased by 4,096 bytes (4,609,888 to 4,605,792);
 other fixture file sizes were unchanged due to section alignment.
 
 The benchmark supports `--before-compiler` and `--after-compiler` for this
-comparison. Native macOS/Windows/Linux-AArch64 and large-displacement gates
-remain required before closing the ticket.
+comparison. Native execution passed on macOS, Windows, and Linux AArch64. Explicit
+large-displacement/range proof remains required before closing the ticket.
 
 ## willow-8hq4.5 and willow-s9ej.13: stable snapshots and nested recovery
 
@@ -137,8 +152,10 @@ panic during the resumed action is covered too.
 
 Nine-sample stable-region timings were 97.543 ms before and 95.654 ms after;
 the generic chain was 52.146 vs 52.666 ms. These small differences are not a
-claimed material speedup. Read elimination is the deterministic improvement.
-Raw results: `runtime_snapshots.json`.
+claimed material speedup. Read elimination is the deterministic improvement. The fixture's whole-object
+panic-depth call relocations were 10 → 10 in debug and 10 → 8 in release;
+`snapshot_read_counts.json` records these exact counts. Raw timing results:
+`runtime_snapshots.json`.
 
 ## Native panic portability evidence (willow-s9ej.9)
 
@@ -165,5 +182,104 @@ Sixty channel unit tests and 103 existing select integration tests passed.
 Three new integration fixtures passed in normal, budget-one, and scheduler-GC
 stress configurations. Shared 10k/100k gates assert exactly N wake attempts;
 the combined test completed in under one second locally including setup and
-consumption. Exact per-size timings and footprint/ping-pong measurements are
-recorded separately when collected.
+consumption. Measured send-loop times (debug runtime) were 33.800 ms for 10k sends and
+406.253 ms for 100k sends, with exactly 10k/100k wake attempts.
+
+Three-sample release medians for 10k idle tasks/private ping-pong rounds:
+
+| Workers | Idle RSS before → after | Ping-pong before → after |
+| --- | ---: | ---: |
+| 1 | 760.2 → 840.9 bytes/task | 36.655 → 39.053 ms |
+| 5 | 762.3 → 839.7 bytes/task | 36.987 → 38.709 ms |
+
+The baseline runtime predates the depth changes, so these measurements cover
+combined runtime edits. Exact ownership increases parked-task storage and does
+not close the private-channel ping-pong gap; that remains outside this ticket.
+Raw samples: `channel_scaling.json` and `channel_runtime.json`.
+
+## Native measurements and final validation
+
+Native runtime, toolchain, ABI export/link, and 30-perspective panic stress
+checks passed on all five targets. Unix depth evidence is from
+https://github.com/lechatthecat/willow/actions/runs/34688891604 ; Unix link
+measurements are from
+https://github.com/lechatthecat/willow/actions/runs/34689471861 . The corrected
+Windows harness and both measurements passed in
+https://github.com/lechatthecat/willow/actions/runs/34689717977 .
+
+The Windows old archive needed an otherwise-unused new ABI export because
+MSVC resolves all declared externals, including those without relocations.
+Only the isolated baseline checkout receives that export; it aborts if called,
+and all benchmark cases execute successfully. No baseline depth implementation
+was changed. The first Windows harness attempts are retained in CI history;
+the successful run above supplies the actual evidence.
+
+Nine-sample panic-capable chain medians and full-accessor static instruction
+counts (including cold/error paths):
+
+| Native runner | Chain before → after | Panic accessor instructions | Root accessor instructions |
+| --- | ---: | ---: | ---: |
+| ubuntu-24.04 | 152.251 → 101.690 ms | 104 → 42 | 39 → 14 |
+| ubuntu-24.04-arm | 284.824 → 141.891 ms | 114 → 53 | 52 → 19 |
+| macos-15 | 169.252 → 104.481 ms | 103 → 47 | 51 → 18 |
+| macos-15-intel | 715.276 → 466.433 ms | 104 → 49 | 44 → 15 |
+| windows-2025 | 113.214 → 73.165 ms | 108 → 50 | 50 → 21 |
+
+The worker-context benchmark ran four eager tasks with repeated panic/recovery
+and yields; output stayed 10 on each target. Controls and request/GC workloads
+are in each raw JSON file. Small control or worker differences are not claimed
+as wins. Both accessor disassemblies are checked in beside the samples.
+
+Seven-sample native linker measurements, same object/archive per profile:
+
+| Native runner | Profile | Link before → after | Bytes before → after |
+| --- | --- | ---: | ---: |
+| ubuntu-24.04 | debug | 340.185 → 267.509 ms | 18,062,040 → 14,311,192 |
+| ubuntu-24.04 | release | 141.129 → 104.640 ms | 6,292,104 → 4,384,400 |
+| ubuntu-24.04-arm | debug | 318.553 → 256.229 ms | 18,576,840 → 14,555,432 |
+| ubuntu-24.04-arm | release | 127.605 → 89.847 ms | 6,537,048 → 4,500,616 |
+| macos-15 | debug | 66.007 → 57.885 ms | 5,780,024 → 1,109,784 |
+| macos-15 | release | 53.031 → 48.894 ms | 2,558,824 → 555,592 |
+| macos-15-intel | debug | 135.368 → 113.292 ms | 5,431,784 → 1,042,800 |
+| macos-15-intel | release | 105.449 → 95.496 ms | 2,489,792 → 538,520 |
+| windows-2025 | debug | 121.422 → 120.379 ms | 350,720 → 350,720 |
+| windows-2025 | release | 63.588 → 63.162 ms | 197,120 → 197,120 |
+
+Windows already eliminated these sections with its original linker defaults;
+the explicit flags produced the same sizes and no meaningful timing gain.
+The Windows comparison uses `link.exe` directly, so it excludes the constant
+`cl.exe` driver startup cost. All linked executables printed 42. The POSIX
+comparisons use the same `cc` driver as the compiler.
+
+The complete local workspace run passed 7,442 tests (26 ignored), and strict
+Clippy and formatting pass. Native Linux's initial full CI run passed too.
+Apple Silicon's initial full run exposed two test assumptions: requiring
+unused predeclared strings to survive linking, and cancelling after a fixed
+20-ms delay before a worker necessarily registered its defer. The tests now
+execute matched/fallback downcasts and synchronize readiness/completion.
+Both corrections passed on Apple Silicon in run 34689632347, which exposed
+the same fixed-delay cancellation race in fixture 88. All eleven remaining
+fixtures using this pattern now signal at their intended phase and await task
+completion. The full runtime safety matrix passed 109 tests; fixtures 35 and
+88 each passed ten repeated GC-stress runs. Final native CI at revision
+`055fceb` is tracked by
+https://github.com/lechatthecat/willow/actions/runs/34690503325 .
+
+## Ticket accounting
+
+| Ticket | Work completed | Status |
+| --- | --- | --- |
+| willow-u7n | Audited original optimization roadmap against implemented acceptance | Closed |
+| willow-aff | Audited Option/Result acceptance, preserving the recorded nullable-removal descope | Closed |
+| willow-s9ej.9 | Verified historical native panic stress evidence at the base revision | Closed |
+| willow-s9ej.13 | Fixed nested recovery restoring enclosing defer depth | Closed |
+| willow-s9ej | Completed panic epic after all children closed | Closed |
+| willow-8hq4.5 | Reused panic snapshots only across proven stable regions | Closed |
+| willow-8hq4.8 | Added exact channel ownership and linear wake accounting | Closed |
+| willow-8hq4.2 | Cached successful runtime freshness proofs conservatively | Closed |
+| willow-8hq4.4 | Reduced panic/root depth access cost with native evidence | Closed |
+| willow-8hq4.1 | Dead stripping with metadata retention and native link measurements | Final full-suite gate pending |
+
+The additional runtime FuncRef colocation implementation belongs to
+`willow-8hq4.6`; it remains open for explicit range proof and is not counted
+among these ten. GC, async, and generics implementation gaps remain open.

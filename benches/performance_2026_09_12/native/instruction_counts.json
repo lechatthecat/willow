@@ -1,0 +1,67 @@
+[
+  {
+    "platform": "windows-2025",
+    "accessor_instruction_counts": {
+      "before": {
+        "willow_root_depth": 50,
+        "willow_panic_depth": 108
+      },
+      "after": {
+        "willow_root_depth": 21,
+        "willow_panic_depth": 50
+      }
+    }
+  },
+  {
+    "platform": "macos-15-intel",
+    "accessor_instruction_counts": {
+      "before": {
+        "willow_root_depth": 44,
+        "willow_panic_depth": 104
+      },
+      "after": {
+        "willow_root_depth": 15,
+        "willow_panic_depth": 49
+      }
+    }
+  },
+  {
+    "platform": "ubuntu-24.04",
+    "accessor_instruction_counts": {
+      "before": {
+        "willow_root_depth": 39,
+        "willow_panic_depth": 104
+      },
+      "after": {
+        "willow_root_depth": 14,
+        "willow_panic_depth": 42
+      }
+    }
+  },
+  {
+    "platform": "macos-15",
+    "accessor_instruction_counts": {
+      "before": {
+        "willow_root_depth": 51,
+        "willow_panic_depth": 103
+      },
+      "after": {
+        "willow_root_depth": 18,
+        "willow_panic_depth": 47
+      }
+    }
+  },
+  {
+    "platform": "ubuntu-24.04-arm",
+    "accessor_instruction_counts": {
+      "before": {
+        "willow_root_depth": 52,
+        "willow_panic_depth": 114
+      },
+      "after": {
+        "willow_root_depth": 19,
+        "willow_panic_depth": 53
+      }
+    }
+  }
+]

@@ -1,0 +1,249 @@
+{
+  "platform": "Windows",
+  "architecture": "AMD64",
+  "compiler": "D:\\a\\willow\\willow\\target\\debug\\willowc.exe",
+  "linker": "C:\\Program Files\\Microsoft Visual Studio\\18\\Enterprise\\VC\\Tools\\MSVC\\14.51.36231\\bin\\Hostx64\\x64\\link.exe",
+  "iterations": 7,
+  "method": "Same object/archive per profile; before/after order alternates each iteration; link wall time excludes executable validation; every result must print 42.",
+  "profiles": [
+    {
+      "profile": "debug",
+      "runtime": "D:\\a\\willow\\willow\\target\\debug\\willow_runtime.lib",
+      "before_flags": [],
+      "after_flags": [
+        "/OPT:REF",
+        "/OPT:ICF",
+        "/INCLUDE:willow_runtime_metadata_v1"
+      ],
+      "samples": [
+        {
+          "iteration": 0,
+          "mode": "before",
+          "elapsed_ms": 132.3749,
+          "bytes": 350720,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 0,
+          "mode": "after",
+          "elapsed_ms": 138.1234,
+          "bytes": 350720,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 1,
+          "mode": "after",
+          "elapsed_ms": 156.6238,
+          "bytes": 350720,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 1,
+          "mode": "before",
+          "elapsed_ms": 125.5624,
+          "bytes": 350720,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 2,
+          "mode": "before",
+          "elapsed_ms": 121.422,
+          "bytes": 350720,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 2,
+          "mode": "after",
+          "elapsed_ms": 205.3478,
+          "bytes": 350720,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 3,
+          "mode": "after",
+          "elapsed_ms": 120.3794,
+          "bytes": 350720,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 3,
+          "mode": "before",
+          "elapsed_ms": 118.3074,
+          "bytes": 350720,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 4,
+          "mode": "before",
+          "elapsed_ms": 153.4977,
+          "bytes": 350720,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 4,
+          "mode": "after",
+          "elapsed_ms": 119.9124,
+          "bytes": 350720,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 5,
+          "mode": "after",
+          "elapsed_ms": 115.9465,
+          "bytes": 350720,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 5,
+          "mode": "before",
+          "elapsed_ms": 120.9855,
+          "bytes": 350720,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 6,
+          "mode": "before",
+          "elapsed_ms": 120.9032,
+          "bytes": 350720,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 6,
+          "mode": "after",
+          "elapsed_ms": 117.6077,
+          "bytes": 350720,
+          "stdout": "42\n"
+        }
+      ],
+      "medians": {
+        "before": {
+          "elapsed_ms": 121.422,
+          "bytes": 350720
+        },
+        "after": {
+          "elapsed_ms": 120.3794,
+          "bytes": 350720
+        }
+      }
+    },
+    {
+      "profile": "release",
+      "runtime": "D:\\a\\willow\\willow\\target\\release\\willow_runtime.lib",
+      "before_flags": [],
+      "after_flags": [
+        "/OPT:REF",
+        "/OPT:ICF"
+      ],
+      "samples": [
+        {
+          "iteration": 0,
+          "mode": "before",
+          "elapsed_ms": 64.272,
+          "bytes": 197120,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 0,
+          "mode": "after",
+          "elapsed_ms": 64.7753,
+          "bytes": 197120,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 1,
+          "mode": "after",
+          "elapsed_ms": 61.5989,
+          "bytes": 197120,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 1,
+          "mode": "before",
+          "elapsed_ms": 61.264,
+          "bytes": 197120,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 2,
+          "mode": "before",
+          "elapsed_ms": 63.9084,
+          "bytes": 197120,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 2,
+          "mode": "after",
+          "elapsed_ms": 61.7579,
+          "bytes": 197120,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 3,
+          "mode": "after",
+          "elapsed_ms": 61.9418,
+          "bytes": 197120,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 3,
+          "mode": "before",
+          "elapsed_ms": 62.1989,
+          "bytes": 197120,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 4,
+          "mode": "before",
+          "elapsed_ms": 60.9042,
+          "bytes": 197120,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 4,
+          "mode": "after",
+          "elapsed_ms": 65.7802,
+          "bytes": 197120,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 5,
+          "mode": "after",
+          "elapsed_ms": 63.1618,
+          "bytes": 197120,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 5,
+          "mode": "before",
+          "elapsed_ms": 63.588,
+          "bytes": 197120,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 6,
+          "mode": "before",
+          "elapsed_ms": 64.2228,
+          "bytes": 197120,
+          "stdout": "42\n"
+        },
+        {
+          "iteration": 6,
+          "mode": "after",
+          "elapsed_ms": 69.8023,
+          "bytes": 197120,
+          "stdout": "42\n"
+        }
+      ],
+      "medians": {
+        "before": {
+          "elapsed_ms": 63.588,
+          "bytes": 197120
+        },
+        "after": {
+          "elapsed_ms": 63.1618,
+          "bytes": 197120
+        }
+      }
+    }
+  ]
+}
