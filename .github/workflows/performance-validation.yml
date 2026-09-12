@@ -60,9 +60,9 @@ jobs:
             archive=willow_runtime.lib
             baseline_note="Baseline adds an unused aborting select-cleanup ABI export required by MSVC; no benchmark executes it"
           fi
-          python3 scripts/benchmark_native_link.py --output evidence/link.json
           python3 scripts/benchmark_runtime_depth.py --before "baseline/target/release/$archive" --after "target/release/$archive" --iterations 9 --baseline-note "$baseline_note" --output evidence/runtime_depth.json
           python3 scripts/native_runtime_disassembly.py baseline/target/release/$archive target/release/$archive evidence
+          python3 scripts/benchmark_native_link.py --output evidence/link.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:

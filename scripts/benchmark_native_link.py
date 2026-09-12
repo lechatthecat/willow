@@ -31,16 +31,23 @@ def windows_linker():
     installation = checked([vswhere, "-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"]).stdout.strip()
     if not installation:
         raise RuntimeError("vswhere found no Visual Studio C++ toolchain")
-    arch = {"AMD64": "amd64", "x86_64": "amd64", "ARM64": "arm64", "aarch64": "arm64", "x86": "x86"}.get(platform.machine())
+    arch = {"AMD64": "x64", "x86_64": "x64", "ARM64": "arm64", "aarch64": "arm64", "x86": "x86"}.get(platform.machine())
     if not arch:
         raise RuntimeError(f"unsupported Windows architecture: {platform.machine()}")
     devcmd = Path(installation) / "Common7/Tools/VsDevCmd.bat"
-    # Environment output is parsed privately and never written to artifacts/logs.
-    command = f'call "{devcmd}" -no_logo -arch={arch} >nul && set'
-    gathered = subprocess.run(["cmd.exe", "/s", "/c", command], cwd=ROOT, text=True, capture_output=True)
-    if gathered.returncode:
-        raise RuntimeError("VsDevCmd.bat failed to initialize the linker environment")
-    for line in gathered.stdout.splitlines():
+    # A batch file avoids cmd.exe's distinct /c quoting rules. Keep setup
+    # diagnostics separate from the environment so failures never dump secrets.
+    marker = "WILLOW_LINK_ENVIRONMENT_START"
+    with tempfile.TemporaryDirectory(prefix="willow-msvc-env-") as directory:
+        batch = Path(directory) / "setup.cmd"
+        batch.write_text(f'@echo off\ncall "{devcmd}" -no_logo -arch={arch}\n'
+                         f'if errorlevel 1 exit /b 1\necho {marker}\nset\n')
+        gathered = subprocess.run(["cmd.exe", "/d", "/c", str(batch)], cwd=ROOT,
+                                  text=True, capture_output=True)
+    diagnostics, separator, values = gathered.stdout.partition(marker)
+    if gathered.returncode or not separator:
+        raise RuntimeError("VsDevCmd.bat failed:\n" + diagnostics + gathered.stderr)
+    for line in values.splitlines():
         key, separator, value = line.partition("=")
         if separator and key:
             env[key.upper()] = value
