@@ -31,3 +31,6 @@ AGENTS.md
 *.log
 *.trace
 *.ndjson
+
+# Local-only internal docs (reference private bd issues / requirements)
+/docs
