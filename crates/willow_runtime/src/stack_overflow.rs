@@ -27,7 +27,7 @@ pub(crate) fn protect_current_thread() {
 }
 
 /// Change the signal handler's guard range while entering a task-owned stack.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn replace_guard(lower: usize, upper: usize) -> (usize, usize) {
     protect_current_thread();
     PROTECTION.with(|slot| slot.borrow().as_ref().unwrap().replace_guard(lower, upper))
@@ -367,7 +367,6 @@ mod platform {
     }
 
     impl Protection {
-        #[cfg(target_os = "linux")]
         pub(super) fn replace_guard(&self, lower: usize, upper: usize) -> (usize, usize) {
             let slot = unsafe { &*self.slot };
             let previous = (

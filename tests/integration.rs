@@ -193,10 +193,17 @@ mod lir_constant_folding;
 #[path = "integration/type_argument_arity.rs"]
 mod type_argument_arity;
 
-#[cfg(all(
-    target_os = "linux",
-    target_env = "gnu",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(any(
+    all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
 ))]
 #[path = "integration/native_sync_stack.rs"]
 mod native_sync_stack;

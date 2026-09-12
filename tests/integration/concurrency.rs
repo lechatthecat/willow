@@ -2455,10 +2455,17 @@ fn main() {
     assert_eq!(out, "3\n");
 }
 
-#[cfg(not(all(
-    target_os = "linux",
-    target_env = "gnu",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
 )))]
 #[test]
 fn test_self_looping_method_reports_single_e0810() {
@@ -2557,10 +2564,17 @@ async fn main() {
 // through a typed receiver in a task context, is flagged with a module note
 // (willow-0a6k.2). The receiver-class key differs by import style.
 
-#[cfg(not(all(
-    target_os = "linux",
-    target_env = "gnu",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
 )))]
 #[test]
 fn test_cross_module_typed_receiver_item_import_reports_e0810() {
@@ -2600,10 +2614,17 @@ fn main() {
     }
 }
 
-#[cfg(not(all(
-    target_os = "linux",
-    target_env = "gnu",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
 )))]
 #[test]
 fn test_cross_module_typed_receiver_whole_module_import_reports_e0810() {
@@ -2674,10 +2695,17 @@ async fn main() {
 // the absence of false positives for loop-free module helpers.
 // ---------------------------------------------------------------------------
 
-#[cfg(not(all(
-    target_os = "linux",
-    target_env = "gnu",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
 )))]
 #[test]
 fn test_module_async_fn_calling_looping_helper_reports_e0810() {
@@ -2720,10 +2748,17 @@ fn main() {
     }
 }
 
-#[cfg(not(all(
-    target_os = "linux",
-    target_env = "gnu",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
 )))]
 #[test]
 fn test_module_transitive_looping_helper_reports_e0810() {
@@ -2792,10 +2827,17 @@ fn main() {
     assert_eq!(out, "1\n");
 }
 
-#[cfg(not(all(
-    target_os = "linux",
-    target_env = "gnu",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
 )))]
 #[test]
 fn test_entry_async_calling_module_looping_helper_reports_e0810() {
@@ -2835,10 +2877,17 @@ async fn main() {
     }
 }
 
-#[cfg(not(all(
-    target_os = "linux",
-    target_env = "gnu",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
 )))]
 #[test]
 fn test_entry_async_calling_module_transitive_helper_reports_e0810() {
@@ -2903,10 +2952,17 @@ async fn main() {
     assert_eq!(out, "42\n");
 }
 
-#[cfg(not(all(
-    target_os = "linux",
-    target_env = "gnu",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
 )))]
 #[test]
 fn test_item_imported_looping_helper_from_async_reports_e0810() {
@@ -2971,10 +3027,17 @@ async fn main() {
     assert_eq!(out, "42\n");
 }
 
-#[cfg(not(all(
-    target_os = "linux",
-    target_env = "gnu",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
 )))]
 #[test]
 fn test_module_to_module_looping_call_from_async_reports_e0810() {
@@ -5077,10 +5140,17 @@ fn psp_04_fn_value_cannot_enter_task() {
     assert!(stderr.contains("E2402"), "{stderr}");
 }
 
-#[cfg(not(all(
-    target_os = "linux",
-    target_env = "gnu",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
 )))]
 #[test]
 fn psp_05_sync_helper_loop_rejected() {
@@ -5136,10 +5206,17 @@ fn psp_07_call_boundary_safepoints() {
     assert_eq!(out, "7\n");
 }
 
-#[cfg(not(all(
-    target_os = "linux",
-    target_env = "gnu",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
 )))]
 #[test]
 fn psp_07b_recursive_sync_helper_rejected() {
@@ -8633,10 +8710,17 @@ async fn main() {
 /// helper cannot run in task context — and that is the point: the two analyses
 /// now share one fixpoint and must still reach *different* conclusions about
 /// the same cycle.
-#[cfg(not(all(
-    target_os = "linux",
-    target_env = "gnu",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
 )))]
 #[test]
 fn lock_lower_47_a_pure_recursive_cycle_is_still_provably_wait_free() {
@@ -9696,10 +9780,21 @@ async fn main() {
 
 // The same source remains rejected on runtimes without native task stacks.
 fn assert_sync_preemption_capability(source: &str, expected: &[&str]) {
-    if cfg!(all(
-        target_os = "linux",
-        target_env = "gnu",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+    if cfg!(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "windows",
+            target_env = "msvc",
+            target_arch = "x86_64"
+        )
     )) {
         let source = if source.contains("fn main(") {
             source.to_owned()

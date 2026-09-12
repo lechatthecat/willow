@@ -14,10 +14,10 @@ it gets the same gates as Apple Silicon (`macos-15`). This choice is explicit
 rather than depending on whichever architecture `macos-latest` selects.
 Runner labels were checked against [GitHub's runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 
-CI coverage does not enable synchronous task-stack preemption on macOS or
-Windows. Those platforms retain the capability gate/E0810 described in
-[decision 0001](0001-task-stack-switch-capability.md). Their tests must assert
-that behavior until native stack implementations pass the required contracts.
+All four targets enable synchronous task-stack preemption through the portable
+backend described in [decision 0001](0001-task-stack-switch-capability.md).
+The native-stack runtime and integration suites run on each target, including
+cancellation, GC roots, worker affinity, and stack-overflow diagnostics.
 
 The workflow is locally reviewable; remote macOS/Windows results require a
 GitHub Actions run after publishing the change. A local Linux pass must not

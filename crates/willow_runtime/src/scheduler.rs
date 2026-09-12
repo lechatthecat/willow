@@ -820,10 +820,17 @@ impl RuntimeScheduler {
     ) -> Option<(RuntimeCancelFn, *mut c_void)> {
         self.tasks
             .with_mut(id, |task| {
-                #[cfg(all(
-                    target_os = "linux",
-                    target_env = "gnu",
-                    any(target_arch = "x86_64", target_arch = "aarch64")
+                #[cfg(any(
+                    all(
+                        target_os = "linux",
+                        target_env = "gnu",
+                        any(target_arch = "x86_64", target_arch = "aarch64")
+                    ),
+                    all(
+                        target_os = "macos",
+                        any(target_arch = "x86_64", target_arch = "aarch64")
+                    ),
+                    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
                 ))]
                 if task
                     .native_stack
@@ -1569,10 +1576,17 @@ fn finish_global_poll_boundary(id: RuntimeTaskId, boundary: GlobalPollBoundary) 
 fn take_global_cancel_work(id: RuntimeTaskId) -> Option<(RuntimeCancelFn, *mut c_void)> {
     global_task_table()
         .with_mut(id, |task| {
-            #[cfg(all(
-                target_os = "linux",
-                target_env = "gnu",
-                any(target_arch = "x86_64", target_arch = "aarch64")
+            #[cfg(any(
+                all(
+                    target_os = "linux",
+                    target_env = "gnu",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(
+                    target_os = "macos",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
             ))]
             if task
                 .native_stack
@@ -2518,10 +2532,17 @@ fn willow_sched_run_parallel(
         }
     };
     let workers = workers.max(1);
-    #[cfg(all(
-        target_os = "linux",
-        target_env = "gnu",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     ))]
     let workers = {
         let mut workers = workers;
@@ -2629,10 +2650,17 @@ fn record_completed_task(completed: &mut i64, shared: Option<&ParallelRunState>)
 }
 
 fn task_requires_cancel_poll(task: &RuntimeTask) -> bool {
-    #[cfg(all(
-        target_os = "linux",
-        target_env = "gnu",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     ))]
     if task
         .native_stack
@@ -2684,10 +2712,17 @@ fn claim_global_ready_for_worker(
         // a requeue (willow-atth).
         let _in_flight = ClaimInFlight::enter();
         let id = queues.pop_for_worker(worker)?;
-        #[cfg(all(
-            target_os = "linux",
-            target_env = "gnu",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+        #[cfg(any(
+            all(
+                target_os = "linux",
+                target_env = "gnu",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            all(
+                target_os = "macos",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
         ))]
         if let Some(owner) = tasks
             .with(id, |task| {
@@ -3102,10 +3137,17 @@ fn scheduler_run_loop(
         // (willow-vynv.3). The frame stays rooted until finalization.
         let cancel_work = take_global_cancel_work(id);
         if let Some((cancel_fn, cancel_frame)) = cancel_work {
-            #[cfg(all(
-                target_os = "linux",
-                target_env = "gnu",
-                any(target_arch = "x86_64", target_arch = "aarch64")
+            #[cfg(any(
+                all(
+                    target_os = "linux",
+                    target_env = "gnu",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(
+                    target_os = "macos",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
             ))]
             {
                 let mut stack =
@@ -3133,10 +3175,17 @@ fn scheduler_run_loop(
                 }
                 crate::native_stack::NativeStack::recycle(stack);
             }
-            #[cfg(not(all(
-                target_os = "linux",
-                target_env = "gnu",
-                any(target_arch = "x86_64", target_arch = "aarch64")
+            #[cfg(not(any(
+                all(
+                    target_os = "linux",
+                    target_env = "gnu",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(
+                    target_os = "macos",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
             )))]
             unsafe {
                 cancel_fn(cancel_frame)
@@ -3203,10 +3252,17 @@ fn scheduler_run_loop(
             0,
         );
         crate::preempt::willow_preempt_begin(preempt_flag);
-        #[cfg(all(
-            target_os = "linux",
-            target_env = "gnu",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+        #[cfg(any(
+            all(
+                target_os = "linux",
+                target_env = "gnu",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            all(
+                target_os = "macos",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
         ))]
         let (result, native_cancelled) = {
             let mut stack = global_task_table()
@@ -3222,10 +3278,17 @@ fn scheduler_run_loop(
             }
             (result, cancelled)
         };
-        #[cfg(not(all(
-            target_os = "linux",
-            target_env = "gnu",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+        #[cfg(not(any(
+            all(
+                target_os = "linux",
+                target_env = "gnu",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            all(
+                target_os = "macos",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
         )))]
         let (result, native_cancelled) = (unsafe { poll(frame) }, false);
         crate::preempt::willow_preempt_end();

@@ -115,7 +115,7 @@ pub struct ConcurrencyAnalyzer {
     nonpreemptible_sync_helpers: HashMap<FunctionId, SyncHelperRef>,
 }
 
-// The preemption default is true on supported Linux targets, so deriving
+// The preemption default is true on supported native-stack targets, so deriving
 // Default would change behavior even though this looks derivable elsewhere.
 #[allow(clippy::derivable_impls)]
 impl Default for ConcurrencyAnalyzer {
@@ -124,10 +124,21 @@ impl Default for ConcurrencyAnalyzer {
             errors: Vec::new(),
             report: ConcurrencyReport::default(),
             current_async_context: false,
-            sync_stack_preemption: cfg!(all(
-                target_os = "linux",
-                target_env = "gnu",
-                any(target_arch = "x86_64", target_arch = "aarch64")
+            sync_stack_preemption: cfg!(any(
+                all(
+                    target_os = "linux",
+                    target_env = "gnu",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(
+                    target_os = "macos",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(
+                    target_os = "windows",
+                    target_env = "msvc",
+                    target_arch = "x86_64"
+                )
             )),
             current_class: None,
             nonpreemptible_sync_helpers: HashMap::new(),
