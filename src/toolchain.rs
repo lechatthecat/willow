@@ -7,8 +7,6 @@ use anyhow::{Context, Result};
 
 use crate::{BuildMode, TargetOptions};
 
-mod runtime_cache;
-
 /// Platform boundary used by the compiler after native object generation.
 pub trait Toolchain {
     fn write_object(&self, output: &str, bytes: &[u8]) -> Result<PathBuf>;
@@ -117,12 +115,7 @@ impl Toolchain for HostToolchain {
             lock.lock().context("failed to lock the runtime library")?;
             *self.runtime_lock.borrow_mut() = Some(lock);
         }
-        runtime_cache::build_if_stale(
-            &path,
-            std::env::var_os("WILLOW_FORCE_RUNTIME_BUILD").is_some_and(|value| value == "1"),
-            || runtime_cache::fingerprint(Path::new(env!("CARGO_MANIFEST_DIR")), &path),
-            || self.build_default_runtime_library(),
-        )?;
+        self.build_default_runtime_library()?;
         validate_runtime_library(path)
     }
 
