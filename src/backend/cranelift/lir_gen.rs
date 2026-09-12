@@ -6921,6 +6921,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let (prepared, _) = self.lir_call_frames.pop().expect("prepared method frame");
                     assert_eq!(prepared, *method);
                 }
+                // PrepareMethod snapshots the receiver before evaluating arguments.
+                // A GC stack local is a direct root until after this instruction,
+                // including when the original binding is reassigned by the call.
+                // Heap-frame fields and borrowed storage do not pin an SSA alias.
+                let receiver_rooted = match receiver {
+                    crate::ir::lowered::LirOperand::Local(id) => matches!(
+                        self.vars.get(&function.locals[id.0 as usize].name),
+                        Some(VarStorage::Stack { ty, .. })
+                            if is_gc_managed(ty, self.enum_infos)
+                    ),
+                    _ => false,
+                };
                 let receiver = self.emit_lir_operand(function, receiver);
                 let (args, roots) = self.emit_flat_call_operands(function, args);
                 let result = if matches!(receiver_ty, Type::Named(name) | Type::Generic(name, _) if self.interface_infos.contains_key(name))
@@ -6942,7 +6954,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         &args,
                         result,
                         span,
-                        true,
+                        receiver_rooted,
                         true,
                     )
                 };

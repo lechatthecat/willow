@@ -64,10 +64,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         args: &[Value],
         ret_ty: &Type,
         span: crate::diagnostics::Span,
-        receiver_prepared: bool,
+        receiver_rooted: bool,
         frame_prepared: bool,
     ) -> cranelift_codegen::ir::Value {
-        let _ = receiver_prepared; // Class receivers have no nil-dispatch check.
         let class = class_name_for_object_type(receiver_ty)
             .expect("class receiver type vetted by LIR eligibility");
         let self_ptr = receiver;
@@ -85,7 +84,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         };
         // Frame-backed receivers need a direct root to pin their loaded SSA
         // alias while the user method runs.
-        self.emit_push_root(self_ptr);
+        let receiver_roots = usize::from(!receiver_rooted);
+        if !receiver_rooted {
+            self.emit_push_root(self_ptr);
+        }
         // An indirect call cannot be cleared by one implementation's summary:
         // any reachable target's panic is this call site's panic.
         let panic_depth = match virtual_slot {
@@ -157,8 +159,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if pushed {
             self.emit_callstack_pop();
         }
-        self.emit_pop_roots_n(arg_roots + 1);
-        self.gc_root_count -= arg_roots + 1;
+        self.emit_pop_roots_n(arg_roots + receiver_roots);
+        self.gc_root_count -= arg_roots + receiver_roots;
         self.emit_post_willow_call_panic_check(panic_depth);
         result
     }

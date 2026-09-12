@@ -823,6 +823,10 @@ fn test_runnable_example_files_compile_and_run() {
             "true\nfalse\n7\n1000\nwillow\n",
         ),
         ("example/match_color.wi", "green\n"),
+        (
+            "example/method_receiver_roots.wi",
+            "original!\nreplacement!\n",
+        ),
         ("example/functions.wi", "25\ntrue\n"),
         ("example/hello.wi", "50"),
         ("example/hello_world.wi", "Hello, world!\n"),

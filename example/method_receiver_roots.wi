@@ -1,0 +1,19 @@
+// A method keeps its original receiver when an argument replaces the binding.
+// Expected output: original!, replacement!
+class Item {
+    pub value: String;
+    pub fn read(self, ignored: i64) -> String {
+        gc_collect();
+        return self.value + "!";
+    }
+}
+fn replace(slot: &mut Item) -> i64 {
+    slot = new Item("replacement");
+    gc_collect();
+    return 0;
+}
+fn main() {
+    let mut item = new Item("original");
+    println(item.read(replace(&item)));
+    println(item.read(0));
+}
