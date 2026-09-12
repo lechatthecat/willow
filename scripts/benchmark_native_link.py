@@ -84,7 +84,9 @@ def main():
             obj = Path(str(executable) + (".obj" if windows else ".o"))
             if windows:
                 base = [str(obj), str(runtime), f"/OUT:{executable}", "/NOLOGO", "/SUBSYSTEM:CONSOLE", "legacy_stdio_definitions.lib", "kernel32.lib", "ntdll.lib", "userenv.lib", "ws2_32.lib", "dbghelp.lib", "psapi.lib", "/defaultlib:msvcrt"]
-                before = ["/OPT:NOREF", "/OPT:NOICF"]
+                # Match the original driver flags. MSVC may already enable
+                # elimination by default; do not manufacture a before/after win.
+                before = []
                 after = ["/OPT:REF", "/OPT:ICF"] + (["/INCLUDE:willow_runtime_metadata_v1"] if profile == "debug" else [])
             else:
                 base = [str(obj), str(runtime), "-o", str(executable), "-lm", "-lpthread"]
