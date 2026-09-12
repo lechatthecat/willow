@@ -1,7 +1,6 @@
 //! Runtime leaf operations used by the explicit LIR control-flow graph.
 use super::*;
 use cranelift_codegen::ir::{InstBuilder, Value, types};
-use cranelift_module::Module;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_flat_start_task(

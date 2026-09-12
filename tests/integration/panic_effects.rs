@@ -14,6 +14,198 @@ fn fib(n: i64) -> i64 {
 fn main() { println(fib(10)); }
 "#;
 
+const SNAPSHOT_CHAIN: &str = r#"
+fn step(n: i64) -> i64 { if n < 0 { panic("negative"); } return n + 1; }
+fn chain(n: i64) -> i64 {
+    let a = step(n);
+    let b = step(a);
+    let c = step(b);
+    return c;
+}
+fn main() { println(chain(0)); }
+"#;
+
+#[test]
+fn panic_snapshots_reduce_three_surviving_straight_line_reads() {
+    for release in [false, true] {
+        let optimized = compile_and_collect_relocation_targets_mode(SNAPSHOT_CHAIN, &[], release);
+        let baseline = compile_and_collect_relocation_targets_mode(
+            SNAPSHOT_CHAIN,
+            &[("WILLOW_PANIC_SNAPSHOT_REUSE", "0")],
+            release,
+        );
+        let count = |names: &[String]| {
+            names
+                .iter()
+                .filter(|name| name.as_str() == "willow_panic_depth")
+                .count()
+        };
+        assert!(count(&optimized) > 0, "may-panic calls must retain checks");
+        let expected_reduction = if release { 2 } else { 0 };
+        assert!(
+            count(&baseline) >= count(&optimized) + expected_reduction,
+            "expected stable-region read reduction, release={release}: baseline={}, optimized={}",
+            count(&baseline),
+            count(&optimized)
+        );
+    }
+}
+
+#[test]
+fn panic_snapshots_do_not_add_reads_to_pure_calls() {
+    for release in [false, true] {
+        let targets = compile_and_collect_relocation_targets_mode(PURE_RECURSION, &[], release);
+        assert!(!has_target(&targets, "willow_panic_depth"));
+    }
+}
+
+#[test]
+fn panic_snapshots_recover_then_raise_again_and_panic_in_second_call() {
+    let source = r#"
+fn step(n: i64) -> i64 { if n < 0 { panic("negative"); } return n + 1; }
+fn active_helper() {
+    defer match recover() {
+        Some(_) => {
+            println(step(1));
+            if true {
+                defer match recover() { Some(info) => println(info.message), None => {} }
+                println(step(2));
+                println(step(-1));
+                println(999);
+            }
+            println(step(3));
+        },
+        None => {}
+    }
+    panic("outer");
+}
+fn main() { active_helper(); println(42); }
+"#;
+    for reuse in ["0", "1"] {
+        let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_PANIC_SNAPSHOT_REUSE", reuse)]);
+        assert!(ok, "{out}");
+        assert_eq!(out, "2\n3\nnegative\n4\n42\n");
+    }
+    let (out, ok) = compile_and_run_release(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, "2\n3\nnegative\n4\n42\n");
+}
+
+#[test]
+fn panic_snapshots_preserve_control_flow_and_active_panic_entry() {
+    let fixtures = [
+        (
+            r#"
+fn step(n: i64) -> i64 { if n < 0 { panic("negative"); } return n + 1; }
+fn choose(flag: bool) -> i64 {
+    let mut value = 0;
+    if flag { value = step(1); } else { value = step(2); value = step(value); }
+    return step(value);
+}
+fn main() { println(choose(true)); println(choose(false)); }
+"#,
+            "3\n5\n",
+        ),
+        (
+            r#"
+fn step(n: i64) -> i64 { if n == 2 { panic("iteration"); } return n + 1; }
+fn main() {
+    let mut i = 0;
+    while i < 4 {
+        if true {
+            defer match recover() { Some(info) => println(info.message), None => {} }
+            println(step(i));
+        }
+        i = i + 1;
+    }
+    println(42);
+}
+"#,
+            "1\n2\niteration\n4\n42\n",
+        ),
+        (
+            r#"
+fn step(n: i64) -> i64 { if n < 0 { panic("negative"); } return n + 1; }
+fn chain(n: i64) -> i64 { let a = step(n); let b = step(a); return step(b); }
+fn action() {
+    defer {
+        println(chain(0));
+        match recover() { Some(info) => println(info.message), None => {} }
+        println(chain(1));
+    }
+    panic("outer");
+}
+fn main() { action(); println(42); }
+"#,
+            "3\nouter\n4\n42\n",
+        ),
+        (
+            r#"
+class Math {
+    pub value: i64;
+    pub init(self, value: i64) { if value < 0 { panic("negative"); } self.value = value; }
+    pub fn step(self) -> i64 { if self.value < 0 { panic("negative"); } return self.value + 1; }
+    pub static fn next(n: i64) -> i64 { if n < 0 { panic("negative"); } return n + 1; }
+}
+fn early(n: i64) -> i64 {
+    if n == 0 { return Math::next(n); }
+    let a = Math::next(n); let b = Math::next(a); return Math::next(b);
+}
+fn main() { let item = new Math(1); println(item.step()); println(early(0)); println(early(1)); }
+"#,
+            "2\n1\n4\n",
+        ),
+    ];
+    for (source, expected) in fixtures {
+        for reuse in ["0", "1"] {
+            let (out, ok) = compile_and_run_with_env(
+                source,
+                &[
+                    ("WILLOW_PANIC_SNAPSHOT_REUSE", reuse),
+                    ("WILLOW_GC_STRESS", "alloc"),
+                ],
+            );
+            assert!(ok, "{out}");
+            assert_eq!(out, expected);
+        }
+        let (out, ok) = compile_and_run_release(source);
+        assert!(ok, "{out}");
+        assert_eq!(out, expected);
+    }
+}
+
+#[test]
+fn nested_recovery_can_panic_again_inside_the_inner_deferred_action() {
+    let source = r#"
+fn action() {
+    defer match recover() {
+        Some(_) => {
+            if true {
+                defer match recover() { Some(info) => println(info.message), None => {} }
+                defer { panic("inner defer"); }
+                panic("inner body");
+            }
+            println("resumed");
+        },
+        None => {}
+    }
+    panic("outer");
+}
+fn main() {
+    if true {
+        defer match recover() { Some(info) => println(info.message), None => {} }
+        action();
+    }
+    println(42);
+}
+"#;
+    for reuse in ["0", "1"] {
+        let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_PANIC_SNAPSHOT_REUSE", reuse)]);
+        assert!(ok, "{out}");
+        assert_eq!(out, "inner defer\ninner body\n42\n");
+    }
+}
+
 const SELF_DISPATCH_PANIC: &str = r#"
 open class Base {
     pub open fn hook(self) -> i64 { return 1; }

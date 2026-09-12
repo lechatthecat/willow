@@ -798,6 +798,10 @@ static RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
 std::thread_local! {
     static ROOT_STACK: std::cell::RefCell<Vec<*mut *mut u8>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    // Only this mutator changes its shadow stack. Keep the hot depth query
+    // independent of the Vec's destructor-bearing TLS and RefCell borrow.
+    // Stack parking/resumption must publish the transferred depth as well.
+    static ROOT_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1683,7 +1687,11 @@ pub extern "C" fn willow_gc_init() {
 pub extern "C" fn willow_push_root(slot: *mut *mut u8) {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     claim_root_stack_owner();
-    ROOT_STACK.with(|rs| rs.borrow_mut().push(slot));
+    ROOT_STACK.with(|rs| {
+        let mut stack = rs.borrow_mut();
+        stack.push(slot);
+        ROOT_DEPTH.set(stack.len());
+    });
 }
 
 /// Unregister the most recently pushed root slot.
@@ -1691,7 +1699,9 @@ pub extern "C" fn willow_push_root(slot: *mut *mut u8) {
 pub extern "C" fn willow_pop_root() {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     ROOT_STACK.with(|rs| {
-        rs.borrow_mut().pop();
+        let mut stack = rs.borrow_mut();
+        stack.pop();
+        ROOT_DEPTH.set(stack.len());
     });
     release_root_stack_owner_if_empty();
 }
@@ -1705,6 +1715,7 @@ pub extern "C" fn willow_pop_roots(count: i32) {
         let remove = (count as usize).min(stack.len());
         let new_len = stack.len() - remove;
         stack.truncate(new_len);
+        ROOT_DEPTH.set(stack.len());
     });
     release_root_stack_owner_if_empty();
 }
@@ -1715,17 +1726,15 @@ pub extern "C" fn willow_pop_roots(count: i32) {
 /// path-dependent (willow-s9ej.3).
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_root_depth() -> i32 {
-    ROOT_STACK.with(|rs| {
-        i32::try_from(rs.borrow().len()).unwrap_or_else(|_| {
-            eprintln!("runtime fatal: generated-code root depth overflow");
-            std::process::abort();
-        })
+    i32::try_from(ROOT_DEPTH.get()).unwrap_or_else(|_| {
+        eprintln!("runtime fatal: generated-code root depth overflow");
+        std::process::abort();
     })
 }
 
 /// Number of shadow roots on the running native stack.
 pub(crate) fn gc_thread_root_depth() -> usize {
-    ROOT_STACK.with(|roots| roots.borrow().len())
+    ROOT_DEPTH.get()
 }
 
 /// Transfer a native task stack's roots to the collector before suspending it.
@@ -1745,6 +1754,7 @@ pub(crate) unsafe fn park_current_roots(depth: usize) -> u64 {
             roots[depth..].iter().map(|slot| *slot as usize).collect(),
         );
         roots.truncate(depth);
+        ROOT_DEPTH.set(roots.len());
     });
     release_root_stack_owner_if_empty();
     token
@@ -1762,9 +1772,9 @@ pub(crate) unsafe fn resume_parked_roots(token: u64) {
         claim_root_stack_owner();
     }
     ROOT_STACK.with(|roots| {
-        roots
-            .borrow_mut()
-            .extend(slots.into_iter().map(|slot| slot as *mut *mut u8))
+        let mut roots = roots.borrow_mut();
+        roots.extend(slots.into_iter().map(|slot| slot as *mut *mut u8));
+        ROOT_DEPTH.set(roots.len());
     });
 }
 
@@ -3683,6 +3693,7 @@ fn reset_internal() {
         .registry_generation
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     ROOT_STACK.with(|rs| rs.borrow_mut().clear());
+    ROOT_DEPTH.set(0);
     // Clear the string literal interning cache: cached pointers are into the
     // heap that was just freed above and must not be returned again.
     crate::string::clear_string_literal_cache();
@@ -5112,6 +5123,80 @@ mod tests {
         willow_pop_roots(1);
         ROOT_STACK.with(|rs| assert_eq!(rs.borrow().len(), 0));
         reset_gc();
+    }
+
+    #[test]
+    fn test_gc_root_depth_mirror_tracks_mutations_and_stack_transfers() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let check = |expected: usize| {
+            ROOT_STACK.with(|stack| assert_eq!(stack.borrow().len(), expected));
+            assert_eq!(gc_thread_root_depth(), expected);
+            assert_eq!(willow_root_depth(), expected as i32);
+        };
+        check(0);
+        let mut slots = [std::ptr::null_mut(); 3];
+        for (index, slot) in slots.iter_mut().enumerate() {
+            willow_push_root(slot);
+            check(index + 1);
+        }
+        // A new worker's view must not inherit this worker's three roots.
+        std::thread::spawn(|| {
+            assert_eq!(willow_root_depth(), 0);
+            assert_eq!(gc_thread_root_depth(), 0);
+        })
+        .join()
+        .unwrap();
+        check(3);
+        willow_pop_roots(0);
+        check(3);
+        // Slots stay alive and no collection/safepoint occurs while detached.
+        let token = unsafe { park_current_roots(1) };
+        check(1);
+        unsafe { resume_parked_roots(token) };
+        check(3);
+        let token = unsafe { park_current_roots(0) };
+        check(0);
+        unsafe { resume_parked_roots(token) };
+        check(3);
+        willow_pop_root();
+        check(2);
+        willow_pop_roots(1);
+        check(1);
+        willow_pop_roots(100);
+        check(0);
+        willow_pop_root();
+        check(0);
+        willow_push_root(&mut slots[0]);
+        willow_pop_roots(-1); // Preserve the existing clamp behavior.
+        check(0);
+        willow_push_root(&mut slots[0]);
+        reset_gc();
+        check(0);
+    }
+
+    #[test]
+    fn test_gc_root_depth_mirror_overflow_is_fatal() {
+        const CHILD: &str = "WILLOW_ROOT_DEPTH_OVERFLOW_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            ROOT_DEPTH.set(i32::MAX as usize + 1);
+            willow_root_depth();
+            panic!("root depth overflow unexpectedly returned");
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "gc::tests::test_gc_root_depth_mirror_overflow_is_fatal",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("runtime fatal: generated-code root depth overflow")
+        );
     }
 
     /// pop_roots(0) はスタックを変えない

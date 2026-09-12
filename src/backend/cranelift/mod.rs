@@ -6,7 +6,7 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
-use cranelift_object::{ObjectBuilder, ObjectModule};
+use cranelift_object::ObjectBuilder;
 use std::collections::{HashMap, HashSet};
 
 use crate::backend::abi;
@@ -45,6 +45,8 @@ mod lir_gen;
 mod option_repr;
 mod panic_effect;
 mod root_effect;
+mod runtime_module;
+use runtime_module::RuntimeObjectModule as ObjectModule;
 mod std_collection;
 mod symbols;
 mod type_helpers;
@@ -1446,6 +1448,9 @@ struct FuncGen<'a, 'b> {
     /// Shadow-root depth inherited from the caller at function entry. Omitted
     /// for synchronous bodies proven unable to push roots (root_effect).
     panic_function_root_depth: Option<cranelift_codegen::ir::Value>,
+    /// Observed post-call depth at entry to a fresh continuation block. Reuse
+    /// is restricted to this block before any intervening call instruction.
+    panic_depth_snapshot: Option<(cranelift_codegen::ir::Block, cranelift_codegen::ir::Value)>,
     emitting_sync_cancel_cleanup: bool,
     lir_cleanup_exit: Option<(cranelift_codegen::ir::Block, usize, bool)>,
     /// Debug call-chain frames installed by this generated function and not

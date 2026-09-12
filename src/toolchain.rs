@@ -7,6 +7,8 @@ use anyhow::{Context, Result};
 
 use crate::{BuildMode, TargetOptions};
 
+mod runtime_cache;
+
 /// Platform boundary used by the compiler after native object generation.
 pub trait Toolchain {
     fn write_object(&self, output: &str, bytes: &[u8]) -> Result<PathBuf>;
@@ -66,7 +68,16 @@ impl HostToolchain {
         let mut command = Command::new("cargo");
         command.args(args).current_dir(&manifest_dir);
         if let Some(target_dir) = &self.target.cargo_target_dir {
-            command.env("CARGO_TARGET_DIR", target_dir);
+            // Cargo runs from the compiler workspace, while relative output
+            // paths belong to the invoking process. Preserve that location.
+            command.env(
+                "CARGO_TARGET_DIR",
+                if target_dir.is_absolute() {
+                    target_dir.clone()
+                } else {
+                    std::env::current_dir()?.join(target_dir)
+                },
+            );
         }
         let status = command
             .status()
@@ -106,7 +117,12 @@ impl Toolchain for HostToolchain {
             lock.lock().context("failed to lock the runtime library")?;
             *self.runtime_lock.borrow_mut() = Some(lock);
         }
-        self.build_default_runtime_library()?;
+        runtime_cache::build_if_stale(
+            &path,
+            std::env::var_os("WILLOW_FORCE_RUNTIME_BUILD").is_some_and(|value| value == "1"),
+            || runtime_cache::fingerprint(Path::new(env!("CARGO_MANIFEST_DIR")), &path),
+            || self.build_default_runtime_library(),
+        )?;
         validate_runtime_library(path)
     }
 
@@ -130,6 +146,7 @@ impl Toolchain for HostToolchain {
                 .arg(object)
                 .arg(runtime)
                 .arg("/link")
+                .args(dead_strip_args("windows", "msvc"))
                 .arg(format!("/OUT:{output}"))
                 .arg("/SUBSYSTEM:CONSOLE")
                 .arg("legacy_stdio_definitions.lib")
@@ -140,6 +157,9 @@ impl Toolchain for HostToolchain {
                 .arg("dbghelp.lib")
                 .arg("psapi.lib")
                 .arg("/defaultlib:msvcrt");
+            if self.target.emit_debug_info {
+                command.args(retain_debug_metadata_args("windows", "msvc"));
+            }
             command
                 .status()
                 .with_context(|| "failed to run MSVC compiler driver")
@@ -149,6 +169,10 @@ impl Toolchain for HostToolchain {
         {
             let mut command = Command::new("cc");
             command.arg(object).arg(runtime).arg("-o").arg(output);
+            command.args(dead_strip_args(std::env::consts::OS, ""));
+            if self.target.emit_debug_info {
+                command.args(retain_debug_metadata_args(std::env::consts::OS, ""));
+            }
             // Apple targets emit PIC and use the platform default PIE link.
             if !cfg!(target_vendor = "apple") {
                 command.arg("-no-pie");
@@ -182,6 +206,27 @@ impl Toolchain for HostToolchain {
     }
 }
 
+/// Keep unsupported linker families unchanged rather than assuming GNU flags.
+fn dead_strip_args(os: &str, environment: &str) -> &'static [&'static str] {
+    match (os, environment) {
+        ("windows", "msvc") => &["/OPT:REF", "/OPT:ICF"],
+        ("macos" | "ios", _) => &["-Wl,-dead_strip"],
+        ("linux", _) => &["-Wl,--gc-sections"],
+        _ => &[],
+    }
+}
+
+/// Debuggers discover this exported blob by symbol; generated code never
+/// references it. Make it a link root whenever codegen emits the metadata.
+fn retain_debug_metadata_args(os: &str, environment: &str) -> &'static [&'static str] {
+    match (os, environment) {
+        ("windows", "msvc") => &["/INCLUDE:willow_runtime_metadata_v1"],
+        ("macos" | "ios", _) => &["-Wl,-u,_willow_runtime_metadata_v1"],
+        ("linux", _) => &["-Wl,--undefined=willow_runtime_metadata_v1"],
+        _ => &[],
+    }
+}
+
 fn validate_runtime_library(path: impl Into<PathBuf>) -> Result<PathBuf> {
     let path = path.into();
     if path.is_file() {
@@ -198,6 +243,32 @@ fn source_map_path(output: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dead_strip_flags_match_native_linker_family() {
+        assert_eq!(dead_strip_args("linux", "gnu"), &["-Wl,--gc-sections"]);
+        assert_eq!(dead_strip_args("linux", "musl"), &["-Wl,--gc-sections"]);
+        assert_eq!(dead_strip_args("macos", ""), &["-Wl,-dead_strip"]);
+        assert_eq!(dead_strip_args("ios", ""), &["-Wl,-dead_strip"]);
+        assert_eq!(
+            dead_strip_args("windows", "msvc"),
+            &["/OPT:REF", "/OPT:ICF"]
+        );
+        assert!(dead_strip_args("windows", "gnu").is_empty());
+        assert!(dead_strip_args("unknown", "").is_empty());
+        assert_eq!(
+            retain_debug_metadata_args("linux", "gnu"),
+            &["-Wl,--undefined=willow_runtime_metadata_v1"]
+        );
+        assert_eq!(
+            retain_debug_metadata_args("macos", ""),
+            &["-Wl,-u,_willow_runtime_metadata_v1"]
+        );
+        assert_eq!(
+            retain_debug_metadata_args("windows", "msvc"),
+            &["/INCLUDE:willow_runtime_metadata_v1"]
+        );
+    }
 
     #[test]
     fn object_extension_matches_host_abi() {

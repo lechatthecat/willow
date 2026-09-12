@@ -1,0 +1,30 @@
+[
+  {
+    "profile": "debug",
+    "dead_strip": false,
+    "median_ms": 300.05,
+    "bytes": 18008800,
+    "stdout": "42"
+  },
+  {
+    "profile": "debug",
+    "dead_strip": true,
+    "median_ms": 191.17,
+    "bytes": 14297584,
+    "stdout": "42"
+  },
+  {
+    "profile": "release",
+    "dead_strip": false,
+    "median_ms": 115.5,
+    "bytes": 6275304,
+    "stdout": "42"
+  },
+  {
+    "profile": "release",
+    "dead_strip": true,
+    "median_ms": 65.05,
+    "bytes": 4395088,
+    "stdout": "42"
+  }
+]

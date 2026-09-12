@@ -1,5 +1,4 @@
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC, types};
-use cranelift_module::Module;
 
 use super::*;
 
@@ -486,6 +485,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(scope.cleanup);
         self.terminated = false;
+        // Every incoming unwind removed this function's active panic-defer
+        // suffix. Enclosing deferred actions are suspended, not installed,
+        // until a recovered edge resumes them.
+        self.panic_defer_codegen_depth = 0;
         if let Some(depth) = scope.coop_root_depth_at_entry {
             self.gc_root_count = depth;
             self.coop_shadow_roots
@@ -544,7 +547,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
 
             self.emit_void_runtime_call("willow_panic_enter_defer", &[]);
-            self.panic_defer_codegen_depth = codegen_depth_before + 1;
+            self.panic_defer_codegen_depth = 1;
             self.recover_eligible_depth =
                 eligible_depth_before + if entry.recovery_capable { 1 } else { 0 };
             self.emit_deferred_action(&entry.action);
@@ -558,7 +561,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.switch_to_block(next);
             self.builder.seal_block(next);
             self.terminated = false;
-            self.panic_defer_codegen_depth = codegen_depth_before;
+            self.panic_defer_codegen_depth = 0;
             self.recover_eligible_depth = eligible_depth_before;
             self.vars = vars_before.clone();
         }
@@ -606,6 +609,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             self.lir_reference_scopes = scope.reference_scopes_at_entry.clone();
             self.emit_replay_reference_scopes();
+            for _ in 0..codegen_depth_before {
+                self.emit_void_runtime_call("willow_panic_enter_defer", &[]);
+            }
             self.builder.ins().jump(scope.resume, &[]);
             // The propagation edge still has no prepared frames.
             self.callstack_frame_depth = 0;
@@ -758,8 +764,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_pre_willow_call_panic_depth(
         &mut self,
     ) -> Option<cranelift_codegen::ir::Value> {
+        let reusable = self.panic_depth_snapshot.and_then(|(block, depth)| {
+            (self.builder.current_block() == Some(block)
+                && std::env::var_os("WILLOW_PANIC_SNAPSHOT_REUSE").is_none_or(|value| value != "0")
+                && self
+                    .builder
+                    .func
+                    .layout
+                    .block_insts(block)
+                    .all(|inst| !self.builder.func.dfg.insts[inst].opcode().is_call()))
+            .then_some(depth)
+        });
+        // Publishing diagnostic location cannot mutate panic depth. Query the
+        // proof before emitting this marker so debug metadata is not itself
+        // an artificial invalidation at this call's snapshot point.
         self.emit_fault_site();
-        Some(self.emit_value_runtime_call("willow_panic_depth", &[]))
+        Some(reusable.unwrap_or_else(|| self.emit_value_runtime_call("willow_panic_depth", &[])))
     }
 
     /// Debug builds: publish the statement being executed before a runtime call
@@ -820,6 +840,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(normal);
         self.builder.seal_block(normal);
         self.terminated = false;
+        // Cache the OBSERVED depth, never the entry/expected depth: a callee
+        // may recover an existing panic and lower the depth. The observation
+        // dominates this new, empty continuation block. Any intervening call
+        // (including recover, indirect calls, or context switches) invalidates
+        // reuse, as does moving to another control-flow block.
+        self.panic_depth_snapshot = Some((normal, depth_after));
     }
 
     /// Raise a user-visible language fault whose message is already a Willow

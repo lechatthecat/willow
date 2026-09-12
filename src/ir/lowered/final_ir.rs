@@ -224,6 +224,7 @@ pub enum LirInst {
     },
     SelectUnregister {
         operations: Vec<LirSelectOp>,
+        winner: usize,
     },
     SelectCommit {
         operation: LirSelectOp,
@@ -488,8 +489,8 @@ fn finish_function(source: super::SourceFunction) -> LirFunction {
                             I::SelectPick { ready, chosen } => {
                                 LirInst::SelectPick { ready, chosen }
                             }
-                            I::SelectUnregister { operations } => {
-                                LirInst::SelectUnregister { operations }
+                            I::SelectUnregister { operations, winner } => {
+                                LirInst::SelectUnregister { operations, winner }
                             }
                             I::SelectCommit { operation, success } => {
                                 LirInst::SelectCommit { operation, success }

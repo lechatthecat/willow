@@ -7,6 +7,7 @@
 //! synchronous `main` installs a standalone context in `runtime_start`.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::gc::{
@@ -54,6 +55,9 @@ struct PanicState {
 pub struct PanicContext {
     owner: u64,
     state: Mutex<PanicState>,
+    // Contexts can be shared across workers. Publish depth under the state lock;
+    // readers need neither that lock nor a worker-local mirror.
+    active_depth: AtomicUsize,
 }
 
 impl PanicContext {
@@ -61,6 +65,7 @@ impl PanicContext {
         Self {
             owner,
             state: Mutex::new(PanicState::default()),
+            active_depth: AtomicUsize::new(0),
         }
     }
 
@@ -75,21 +80,24 @@ impl PanicContext {
     }
 
     fn active(&self) -> bool {
-        !self.lock().active.is_empty()
+        self.depth() != 0
     }
 
     fn depth(&self) -> usize {
-        self.lock().active.len()
+        self.active_depth.load(Ordering::Acquire)
     }
 
     fn push(&self, info: *mut u8) {
-        self.lock().active.push(PanicRecord {
+        let mut state = self.lock();
+        state.active.push(PanicRecord {
             info: info as usize,
             call_stack: crate::stack_trace::current_call_stack_text(),
             reference_call: crate::reference_debug::current_reference_call()
                 .as_ref()
                 .map(crate::reference_debug::reference_call_context_text),
         });
+        self.active_depth
+            .store(state.active.len(), Ordering::Release);
     }
 
     fn enter_defer(&self) {
@@ -116,6 +124,8 @@ impl PanicContext {
         let Some(record) = state.active.pop() else {
             return std::ptr::null_mut();
         };
+        self.active_depth
+            .store(state.active.len(), Ordering::Release);
         state.returned_roots.push(record.info);
         record.info as *mut u8
     }
@@ -332,7 +342,11 @@ pub extern "C" fn willow_panic_raise(message: *const u8, file: *const u8, line: 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_panic_active() -> i32 {
-    current_context().is_some_and(|context| context.active()) as i32
+    CURRENT_CONTEXT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|context| context.active()) as i32
+    })
 }
 
 /// Number of active language-panic records in the current execution context.
@@ -340,7 +354,11 @@ pub extern "C" fn willow_panic_active() -> i32 {
 /// does not make a harmless helper look like it raised a nested panic.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_panic_depth() -> i32 {
-    current_context().map_or(0, |context| context.depth().try_into().unwrap_or(i32::MAX))
+    CURRENT_CONTEXT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map_or(0, |context| context.depth().try_into().unwrap_or(i32::MAX))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -487,6 +505,75 @@ mod tests {
         let info = willow_panic_recover();
         willow_panic_leave_defer();
         info
+    }
+
+    #[test]
+    fn depth_matches_nested_recovery_and_context_swaps() {
+        let _heap = runtime_test_guard();
+        willow_gc_init();
+        let _restore = ContextTestGuard::install(240);
+        let first = current_context().unwrap();
+        let second = Arc::new(PanicContext::new(241));
+        let check = |expected| {
+            assert_eq!(willow_panic_depth(), expected);
+            assert_eq!(willow_panic_active(), i32::from(expected != 0));
+            assert_eq!(current_snapshot().unwrap().active, expected as usize);
+        };
+        check(0);
+        raise("outer", "", 0, 0);
+        check(1);
+        raise("inner", "", 0, 0);
+        check(2);
+        replace_current_context(Some(Arc::clone(&second)));
+        check(0);
+        raise("other", "", 0, 0);
+        check(1);
+        replace_current_context(Some(Arc::clone(&first)));
+        check(2);
+        willow_panic_release_recovered(recover_one());
+        check(1);
+        willow_panic_release_recovered(recover_one());
+        check(0);
+        replace_current_context(Some(second));
+        check(1);
+        willow_panic_release_recovered(recover_one());
+        check(0);
+        replace_current_context(None);
+        assert_eq!(willow_panic_depth(), 0);
+        assert_eq!(willow_panic_active(), 0);
+    }
+
+    #[test]
+    fn shared_context_depth_tracks_another_threads_mutations() {
+        let _heap = runtime_test_guard();
+        willow_gc_init();
+        let _restore = ContextTestGuard::install(242);
+        let context = current_context().unwrap();
+        raise("shared", "", 0, 0);
+        let worker_context = Arc::clone(&context);
+        std::thread::spawn(move || {
+            assert_eq!(willow_panic_depth(), 0, "fresh worker has no context");
+            replace_current_context(Some(Arc::clone(&worker_context)));
+            assert_eq!(willow_panic_depth(), 1);
+            willow_panic_release_recovered(recover_one());
+            assert_eq!(willow_panic_depth(), 0);
+            replace_current_context(None);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(willow_panic_depth(), 0);
+        assert_eq!(context.depth(), context.snapshot().active);
+    }
+
+    #[test]
+    fn depth_abi_saturates_at_i32_max() {
+        let _restore = ContextTestGuard::install(243);
+        let context = current_context().unwrap();
+        // Exercise saturation without allocating billions of panic records.
+        context.active_depth.store(usize::MAX, Ordering::Release);
+        assert_eq!(willow_panic_depth(), i32::MAX);
+        assert_eq!(willow_panic_active(), 1);
+        context.active_depth.store(0, Ordering::Release);
     }
 
     #[test]

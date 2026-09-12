@@ -87,7 +87,7 @@ pub(crate) fn analyze(blocks: &[SourceBlock], locals: &[LirLocal]) -> LirAsyncFr
                 SourceInst::SelectPick { chosen, .. } => {
                     pinned.insert(*chosen);
                 }
-                SourceInst::SelectUnregister { operations } => {
+                SourceInst::SelectUnregister { operations, .. } => {
                     for operation in operations {
                         collect_select_locals(operation, &mut pinned);
                     }
@@ -315,7 +315,7 @@ pub(crate) fn instruction_use_def(
             }
             defs.insert(*chosen);
         }
-        SourceInst::SelectUnregister { operations } => {
+        SourceInst::SelectUnregister { operations, .. } => {
             for operation in operations {
                 select_uses(operation, uses, defs);
             }

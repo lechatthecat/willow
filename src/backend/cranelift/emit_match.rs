@@ -1,5 +1,4 @@
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC, types};
-use cranelift_module::Module;
 
 use super::*;
 

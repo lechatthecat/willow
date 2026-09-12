@@ -9,6 +9,121 @@ use super::support::{compile_and_run_with_env, compile_with_compiler_env};
 /// No extra compiler environment: the ordinary build.
 const PLAIN: [(&str, &str); 0] = [];
 
+fn assert_channel_claim_configs(source: &str, expected: &str) {
+    for env in [
+        &[][..],
+        &[("WILLOW_TASK_BUDGET", "1")][..],
+        &[("WILLOW_GC_STRESS", "scheduler")][..],
+    ] {
+        let (out, ok) = compile_and_run_with_env(source, env);
+        assert!(ok, "channel ownership under {env:?}: {out}");
+        assert_eq!(out, expected, "channel ownership under {env:?}");
+    }
+}
+
+#[test]
+fn async_channel_claim_aliases_preserve_recv_and_send_winners() {
+    assert_channel_claim_configs(
+        r#"
+async fn main() {
+    let ch = Channel<String>::with_capacity(1);
+    let alias = ch;
+    ch.send("first" + "!");
+    select {
+        let value = ch.recv() => { println(value); }
+        let value = alias.recv() => { println(value); }
+        alias.send("wrong") => { println("wrong send"); }
+        sleep(5000) => { println("timeout"); }
+        default => { println("wrong default"); }
+    }
+    select {
+        let value = ch.recv() => { println("wrong recv"); }
+        alias.send("second" + "!") => { println("sent"); }
+        let value = alias.recv() => { println("wrong alias"); }
+        default => { println("wrong default"); }
+    }
+    gc_collect();
+    println(ch.recv());
+    select {
+        let value = ch.recv() => { println("wrong empty"); }
+        let value = alias.recv() => { println("wrong empty alias"); }
+        default => { println("empty"); }
+    }
+}
+"#,
+        "first!\nsent\nsecond!\nempty\n",
+    );
+}
+
+#[test]
+fn async_channel_claim_losing_channels_release_values_for_other_receivers() {
+    assert_channel_claim_configs(
+        r#"
+async fn receive(ch: Channel<i64>) -> i64 { return ch.recv(); }
+async fn complete() -> i64 { return 7; }
+async fn main() {
+    let a = Channel<i64>::new();
+    let b = Channel<i64>::new();
+    let done = complete();
+    await done;
+    let mut total = 0;
+    let mut i = 0;
+    while i < 12 {
+        a.send(10);
+        b.send(20);
+        let mut selected = 0;
+        select {
+            let value = a.recv() => { total = total + value; selected = 1; }
+            let value = b.recv() => { total = total + value; selected = 2; }
+            let value = await done => { selected = 3; }
+            sleep(5000) => { println("timeout"); }
+        }
+        if selected != 1 { let task = receive(a); total = total + await task; }
+        if selected != 2 { let task = receive(b); total = total + await task; }
+        i = i + 1;
+    }
+    println(total);
+}
+"#,
+        "360\n",
+    );
+}
+
+#[test]
+fn async_channel_claim_shared_receivers_keep_reference_payloads_across_wakes() {
+    assert_channel_claim_configs(
+        r#"
+async fn receive(ch: Channel<String>) -> i64 {
+    let mut count = 0;
+    let mut i = 0;
+    while i < 8 {
+        let value = ch.recv();
+        gc_collect();
+        if value == "payload!" { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+async fn produce(ch: Channel<String>) {
+    let mut i = 0;
+    while i < 24 { ch.send("payload" + "!"); i = i + 1; }
+}
+async fn main() {
+    let ch = Channel<String>::with_capacity(1);
+    let a = receive(ch);
+    let b = receive(ch);
+    let c = receive(ch);
+    await sleep(2);
+    let producer = produce(ch);
+    let total = await a + await b + await c;
+    await producer;
+    println(total);
+}
+"#,
+        "24\n",
+    );
+}
+
 fn assert_lir(source: &str, expected: &str) {
     let (out, ok) = compile_and_run_with_env(source, &PLAIN);
     if !ok {

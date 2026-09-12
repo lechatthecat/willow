@@ -579,6 +579,7 @@ pub(crate) enum SourceInst {
     },
     SelectUnregister {
         operations: Vec<LirSelectOp>,
+        winner: usize,
     },
     SelectCommit {
         operation: LirSelectOp,
@@ -3633,6 +3634,7 @@ impl Builder {
             self.switch_to(case_blocks[index]);
             self.push(SourceInst::SelectUnregister {
                 operations: operations.clone(),
+                winner: index,
             });
             let success_name = self.synthetic_name("select_success");
             let success = self.declare_local(success_name, Type::Bool, None, true, false);

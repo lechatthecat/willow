@@ -504,6 +504,108 @@ fn test_build_uses_rust_runtime_without_generated_c_artifacts() {
     remove_output_artifacts(&bin_path);
 }
 
+/// Check actual elimination, not just the spelling of the linker flags. The
+/// used and unused functions live in the same input object so archive-member
+/// selection alone cannot make this test pass.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_link_discards_unused_function_sections() {
+    use willow_compiler::toolchain::{HostToolchain, Toolchain};
+
+    let id = unique_test_id();
+    let source = temp_path(format!("willow_dead_strip_{id}.c"));
+    let object = temp_path(format!("willow_dead_strip_{id}.o"));
+    let binary = temp_path(format!("willow_dead_strip_{id}"));
+    fs::write(
+        &source,
+        "int willow_unused_link_probe(void) { return 7; }\nint main(void) { return 0; }\n",
+    )
+    .unwrap();
+    assert!(
+        Command::new("cc")
+            .args(["-ffunction-sections", "-c", &source, "-o", &object])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let runtime = build_runtime_staticlib(false);
+    for strip_symbols in [false, true] {
+        let mut options = willow_compiler::CompilerOptions::debug();
+        options.target.emit_debug_info = false; // This fixture is C, not Willow.
+        options.target.strip_symbols = strip_symbols;
+        assert!(
+            HostToolchain::new(&options.target)
+                .link(Path::new(&object), &runtime, &binary)
+                .unwrap()
+                .success()
+        );
+        assert!(Command::new(&binary).status().unwrap().success());
+        if !strip_symbols {
+            use object::{Object, ObjectSymbol};
+            let bytes = fs::read(&binary).unwrap();
+            let file = object::File::parse(bytes.as_slice()).unwrap();
+            assert!(file.symbols().any(|symbol| symbol.name() == Ok("main")));
+            assert!(
+                !file
+                    .symbols()
+                    .any(|symbol| { symbol.name() == Ok("willow_unused_link_probe") })
+            );
+        }
+    }
+    let _ = fs::remove_file(source);
+    let _ = fs::remove_file(object);
+    remove_output_artifacts(&binary);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn test_runtime_calls_use_direct_relative_relocations() {
+    use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
+    let id = unique_test_id();
+    let source = temp_path(format!("willow_direct_runtime_{id}.wi"));
+    let binary = temp_path(format!("willow_direct_runtime_{id}"));
+    fs::write(&source, "fn main() { println(42); }").unwrap();
+    for mode in ["--debug", "--release"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_willowc"))
+            .args(["build", &source, "-o", &binary, mode])
+            .env("WILLOW_KEEP_OBJECT", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = fs::read(format!("{binary}.o")).unwrap();
+        let file = object::File::parse(bytes.as_slice()).unwrap();
+        let mut calls = 0;
+        for section in file.sections() {
+            for (_, relocation) in section.relocations() {
+                if let RelocationTarget::Symbol(index) = relocation.target()
+                    && file.symbol_by_index(index).unwrap().name().unwrap() == "willow_println_i64"
+                {
+                    assert_eq!(
+                        relocation.flags(),
+                        object::RelocationFlags::Elf {
+                            r_type: object::elf::R_X86_64_PLT32,
+                        }
+                    );
+                    calls += 1;
+                }
+            }
+        }
+        assert!(
+            calls > 0,
+            "expected a direct call to the print runtime helper"
+        );
+        let output = Command::new(&binary).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"42\n");
+    }
+    let _ = fs::remove_file(source);
+    remove_output_artifacts(&binary);
+}
+
 #[test]
 fn test_runtime_lib_cli_override_links_program() {
     let runtime_lib = build_runtime_staticlib(false);

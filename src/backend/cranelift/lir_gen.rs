@@ -5291,15 +5291,44 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.switch_to_block(done);
                 self.builder.seal_block(done);
             }
-            LirInst::SelectUnregister { operations } => {
+            LirInst::SelectUnregister { operations, winner } => {
+                let (winner_raw, direction) = match &operations[*winner] {
+                    LirSelectOp::Recv { channel, .. } => {
+                        (self.load_lir_local(function, *channel), 0)
+                    }
+                    LirSelectOp::Send { channel, .. } => {
+                        (self.load_lir_local(function, *channel), 1)
+                    }
+                    _ => (self.builder.ins().iconst(types::I64, 0), -1),
+                };
+                let direction = self.builder.ins().iconst(types::I64, direction);
+                let mut channels = Vec::new();
                 for operation in operations {
                     match operation {
                         LirSelectOp::Recv { channel, .. } | LirSelectOp::Send { channel, .. } => {
                             let channel = self.load_lir_local(function, *channel);
+                            // Source expressions can alias at runtime. Cleanup
+                            // must run once per raw, retaining the winning
+                            // direction even when it occurs in a later arm.
+                            let cleanup = self.builder.create_block();
+                            let done = self.builder.create_block();
+                            let mut unique = self.builder.ins().iconst(types::I8, 1);
+                            for previous in &channels {
+                                let distinct =
+                                    self.builder.ins().icmp(IntCC::NotEqual, channel, *previous);
+                                unique = self.builder.ins().band(unique, distinct);
+                            }
+                            self.builder.ins().brif(unique, cleanup, &[], done, &[]);
+                            self.builder.switch_to_block(cleanup);
+                            self.builder.seal_block(cleanup);
                             self.emit_void_runtime_call(
-                                "willow_channel_unregister_waiter",
-                                &[channel],
+                                "willow_channel_select_cleanup",
+                                &[channel, winner_raw, direction],
                             );
+                            self.builder.ins().jump(done, &[]);
+                            self.builder.switch_to_block(done);
+                            self.builder.seal_block(done);
+                            channels.push(channel);
                         }
                         LirSelectOp::Join { task, .. } => {
                             let task = self.load_lir_local(function, *task);

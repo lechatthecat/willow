@@ -54,33 +54,63 @@ impl<T: Copy + Eq + Hash> WaitQueue<T> {
     /// Register `value`. Returns false when it was already registered, so the
     /// caller can skip the reverse-reference bookkeeping that pairs with it.
     pub fn register(&mut self, value: T) -> bool {
-        if self.members.contains_key(&value) {
+        if self.ticket(value).is_some() {
             return false;
         }
+        self.register_ticket(value);
+        true
+    }
+
+    /// Return the existing registration ticket, or create a fresh FIFO entry.
+    pub fn register_ticket(&mut self, value: T) -> Option<u64> {
+        if let Some(ticket) = self.ticket(value) {
+            return Some(ticket);
+        }
         let ticket = self.next_ticket;
-        self.next_ticket = self.next_ticket.wrapping_add(1);
+        self.next_ticket = self
+            .next_ticket
+            .checked_add(1)
+            .expect("wait queue registration ticket exhausted");
         self.members.insert(value, ticket);
         self.order.push_back(WaitEntry { value, ticket });
-        true
+        Some(ticket)
+    }
+
+    /// Return the current registration generation without changing FIFO order.
+    pub fn ticket(&self, value: T) -> Option<u64> {
+        self.members.get(&value).copied()
     }
 
     /// Deregister `value` (select unregister, wake, cancellation purge).
     /// Returns whether it was registered.
     pub fn remove(&mut self, value: T) -> bool {
-        let removed = self.members.remove(&value).is_some();
-        if removed {
-            self.compact_if_sparse();
-        }
-        removed
+        let Some(ticket) = self.ticket(value) else {
+            return false;
+        };
+        self.remove_ticket(value, ticket)
     }
 
-    /// Take the oldest live waiter. Tombstones and superseded registrations are
-    /// skipped, so a stale head cannot swallow a wake.
+    /// Remove only the matching registration; stale cleanup preserves a newer one.
+    pub fn remove_ticket(&mut self, value: T, ticket: u64) -> bool {
+        if self.ticket(value) != Some(ticket) {
+            return false;
+        }
+        self.members.remove(&value);
+        self.compact_if_sparse();
+        true
+    }
+
+    /// Take the oldest live waiter, discarding its registration ticket.
     pub fn pop_front(&mut self) -> Option<T> {
+        self.pop_front_ticket().map(|(value, _)| value)
+    }
+
+    /// Take the oldest live waiter and its exact registration generation.
+    pub fn pop_front_ticket(&mut self) -> Option<(T, u64)> {
         while let Some(entry) = self.order.pop_front() {
             if self.members.get(&entry.value) == Some(&entry.ticket) {
                 self.members.remove(&entry.value);
-                return Some(entry.value);
+                return Some((entry.value, entry.ticket));
             }
         }
         None
@@ -400,5 +430,36 @@ mod tests {
         assert!(queue.is_empty());
         assert_eq!(queue.first_live(), None);
         assert!(queue.queued_entries() <= 16);
+    }
+    #[test]
+    fn ticket_cleanup_preserves_new_generation_and_fifo() {
+        let mut queue = WaitQueue::default();
+        let old = queue.register_ticket(1).unwrap();
+        let peer = queue.register_ticket(2).unwrap();
+        assert_eq!(queue.register_ticket(1), Some(old));
+        assert!(!queue.register(1));
+        assert!(queue.remove_ticket(1, old));
+        let new = queue.register_ticket(1).unwrap();
+        assert_ne!(old, new);
+        assert!(!queue.remove_ticket(1, old));
+        assert_eq!(queue.ticket(1), Some(new));
+        assert_eq!(queue.pop_front_ticket(), Some((2, peer)));
+        assert_eq!(queue.pop_front_ticket(), Some((1, new)));
+        assert_eq!(queue.ticket(1), None);
+        assert_eq!(queue.pop_front_ticket(), None);
+    }
+
+    #[test]
+    fn ticket_exhaustion_does_not_publish_a_colliding_entry() {
+        let mut queue = WaitQueue {
+            next_ticket: u64::MAX,
+            ..WaitQueue::default()
+        };
+        let exhausted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            queue.register_ticket(1);
+        }));
+        assert!(exhausted.is_err());
+        assert!(queue.is_empty());
+        assert_eq!(queue.ticket(1), None);
     }
 }

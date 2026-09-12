@@ -10,6 +10,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub type RuntimeTaskId = u64;
 
+/// Exact channel-side ownership mirrored in a task's cancellation links.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum ChannelRole {
+    RecvWait,
+    RecvClaim,
+    SendWait,
+    SendHandoff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct ChannelOwnershipToken {
+    pub channel: usize,
+    pub role: ChannelRole,
+    pub generation: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeTaskState {
     Ready,
@@ -85,7 +101,7 @@ pub(crate) struct TaskWaitLinks {
     /// references so cancellation deregisters in O(registered) instead of
     /// scanning every channel (willow-p4er). Addresses stay live while the
     /// task does (the handles sit in its rooted frame).
-    wait_channels: Vec<usize>,
+    wait_channels: Vec<ChannelOwnershipToken>,
     /// The lock this task is queued on, or holds a reserved handoff for
     /// (willow-38w.1.2). At most one: a critical section may not nest and may
     /// not suspend, so a task waits on one lock at a time. Cancellation takes
@@ -360,26 +376,61 @@ impl RuntimeTask {
         self.wait.as_ref().map_or(0, |wait| wait.awaiting.len())
     }
 
-    /// Record a channel this task parked on. Returns whether the reverse
-    /// reference is new.
-    pub fn add_wait_channel(&mut self, address: usize) -> bool {
-        let channels = &mut self.wait_mut().wait_channels;
-        if channels.contains(&address) {
-            return false;
+    /// Install exact ownership; repeated publication of the same token succeeds.
+    pub(crate) fn install_channel_ownership(&mut self, token: ChannelOwnershipToken) -> bool {
+        if let Some(existing) = self
+            .wait_channels()
+            .iter()
+            .find(|existing| existing.channel == token.channel && existing.role == token.role)
+        {
+            return *existing == token;
         }
-        channels.push(address);
+        self.wait_mut().wait_channels.push(token);
         true
     }
 
-    pub fn remove_wait_channel(&mut self, address: usize) {
-        if let Some(wait) = self.wait.as_mut() {
-            wait.wait_channels.retain(|&channel| channel != address);
+    /// Replace only the ownership generation observed by the channel caller.
+    pub(crate) fn transition_channel_ownership(
+        &mut self,
+        old: ChannelOwnershipToken,
+        new: ChannelOwnershipToken,
+    ) -> bool {
+        let Some(wait) = self.wait.as_mut() else {
+            return false;
+        };
+        let Some(index) = wait.wait_channels.iter().position(|token| *token == old) else {
+            return false;
+        };
+        if wait.wait_channels.iter().enumerate().any(|(other, token)| {
+            other != index && token.channel == new.channel && token.role == new.role
+        }) {
+            return false;
         }
-        self.release_wait_if_vacant();
+        wait.wait_channels[index] = new;
+        true
     }
 
-    /// Take every channel reverse reference, leaving none behind.
-    pub fn take_wait_channels(&mut self) -> Vec<usize> {
+    pub(crate) fn clear_channel_ownership(&mut self, token: ChannelOwnershipToken) -> bool {
+        let removed = if let Some(wait) = self.wait.as_mut() {
+            if let Some(index) = wait
+                .wait_channels
+                .iter()
+                .position(|existing| *existing == token)
+            {
+                wait.wait_channels.remove(index);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        self.release_wait_if_vacant();
+        removed
+    }
+
+    /// Take exact reverse references for cancellation outside the task shard.
+    pub(crate) fn take_wait_channels(&mut self) -> Vec<ChannelOwnershipToken> {
         let channels = match self.wait.as_mut() {
             Some(wait) => std::mem::take(&mut wait.wait_channels),
             None => Vec::new(),
@@ -388,7 +439,7 @@ impl RuntimeTask {
         channels
     }
 
-    pub fn wait_channels(&self) -> &[usize] {
+    pub(crate) fn wait_channels(&self) -> &[ChannelOwnershipToken] {
         match self.wait.as_ref() {
             Some(wait) => &wait.wait_channels,
             None => &[],
@@ -602,6 +653,14 @@ mod tests {
 /// ```
 #[cfg(test)]
 mod footprint {
+    fn channel_token(channel: usize) -> super::ChannelOwnershipToken {
+        super::ChannelOwnershipToken {
+            channel,
+            role: super::ChannelRole::RecvWait,
+            generation: 1,
+        }
+    }
+
     use super::*;
 
     /// Inline size budget for one scheduler task slot. Before willow-ezs.3 the
@@ -657,10 +716,10 @@ mod footprint {
     #[test]
     fn f07_channel_waits_allocate_and_release() {
         let mut task = RuntimeTask::new(1);
-        assert!(task.add_wait_channel(0x1000));
+        assert!(task.install_channel_ownership(channel_token(0x1000)));
         assert!(task.owns_wait_links());
-        assert_eq!(task.wait_channels(), &[0x1000]);
-        task.remove_wait_channel(0x1000);
+        assert_eq!(task.wait_channels(), &[channel_token(0x1000)]);
+        task.clear_channel_ownership(channel_token(0x1000));
         assert!(!task.owns_wait_links());
         assert!(task.wait_channels().is_empty());
     }
@@ -670,13 +729,13 @@ mod footprint {
         let mut task = RuntimeTask::new(1);
         task.register_waiter(2);
         task.add_awaiting(3);
-        task.add_wait_channel(0x2000);
+        task.install_channel_ownership(channel_token(0x2000));
 
         task.remove_waiter(2);
         assert!(task.owns_wait_links());
         task.remove_awaiting(3);
         assert!(task.owns_wait_links());
-        task.remove_wait_channel(0x2000);
+        task.clear_channel_ownership(channel_token(0x2000));
         assert!(!task.owns_wait_links(), "F8: released only after the last");
     }
 
@@ -788,17 +847,56 @@ mod footprint {
         assert_eq!(awaiting, vec![4], "F18");
         assert!(!task.owns_wait_links());
 
-        task.add_wait_channel(0x30);
-        assert_eq!(task.take_wait_channels(), vec![0x30], "F19");
+        task.install_channel_ownership(channel_token(0x30));
+        assert_eq!(task.take_wait_channels(), vec![channel_token(0x30)], "F19");
         assert!(!task.owns_wait_links());
     }
 
     #[test]
     fn f20_duplicate_channel_registration_is_deduplicated() {
         let mut task = RuntimeTask::new(1);
-        assert!(task.add_wait_channel(0x40));
-        assert!(!task.add_wait_channel(0x40), "F20: already registered");
-        assert_eq!(task.wait_channels(), &[0x40]);
+        assert!(task.install_channel_ownership(channel_token(0x40)));
+        assert!(
+            task.install_channel_ownership(channel_token(0x40)),
+            "F20: idempotent publication"
+        );
+        assert_eq!(task.wait_channels(), &[channel_token(0x40)]);
+    }
+
+    #[test]
+    fn channel_ownership_rejects_stale_generations_and_preserves_other_roles() {
+        let mut task = RuntimeTask::new(1);
+        let wait = channel_token(0x40);
+        let newer = ChannelOwnershipToken {
+            generation: 2,
+            ..wait
+        };
+        let claim = ChannelOwnershipToken {
+            role: ChannelRole::RecvClaim,
+            ..wait
+        };
+        let send = ChannelOwnershipToken {
+            role: ChannelRole::SendWait,
+            ..wait
+        };
+        let handoff = ChannelOwnershipToken {
+            role: ChannelRole::SendHandoff,
+            ..wait
+        };
+        assert!(task.install_channel_ownership(wait));
+        assert!(!task.install_channel_ownership(newer));
+        assert!(task.install_channel_ownership(send));
+        assert!(!task.transition_channel_ownership(newer, claim));
+        assert!(!task.clear_channel_ownership(newer));
+        assert!(task.transition_channel_ownership(wait, claim));
+        assert!(!task.clear_channel_ownership(wait));
+        assert!(task.wait_channels().contains(&send));
+        assert!(task.transition_channel_ownership(send, handoff));
+        assert!(!task.transition_channel_ownership(claim, handoff));
+        assert!(task.clear_channel_ownership(claim));
+        assert!(task.owns_wait_links());
+        assert!(task.clear_channel_ownership(handoff));
+        assert!(!task.owns_wait_links());
     }
 
     #[test]
@@ -806,13 +904,13 @@ mod footprint {
         let mut task = RuntimeTask::new(1);
         task.register_waiter(5);
         task.add_awaiting(6);
-        task.add_wait_channel(0x50);
+        task.install_channel_ownership(channel_token(0x50));
         task.set_name("origin".to_string());
 
         let mut cloned = task.clone();
         assert_eq!(cloned.live_waiters(), vec![5]);
         assert!(cloned.is_awaiting(6));
-        assert_eq!(cloned.wait_channels(), &[0x50]);
+        assert_eq!(cloned.wait_channels(), &[channel_token(0x50)]);
         assert_eq!(cloned.name(), Some("origin"));
 
         cloned.remove_waiter(5);
@@ -829,10 +927,10 @@ mod footprint {
         for waiter in 0..10_000u64 {
             task.register_waiter(waiter);
             task.add_awaiting(waiter);
-            task.add_wait_channel(waiter as usize);
+            task.install_channel_ownership(channel_token(waiter as usize));
             task.remove_waiter(waiter);
             task.remove_awaiting(waiter);
-            task.remove_wait_channel(waiter as usize);
+            task.clear_channel_ownership(channel_token(waiter as usize));
             assert!(
                 !task.owns_wait_links(),
                 "F22: cycle {waiter} retained a wait allocation"

@@ -1,0 +1,17 @@
+{
+  "method": "debug runtime unit test; parked placeholders, queued sends, exact receiver wake attempt counter; elapsed excludes setup and consumption",
+  "command": "cargo test -p willow_runtime shared_channel_ten_and_hundred_thousand_sends_have_linear_wakes -- --nocapture",
+  "samples": [
+    {
+      "count": 10000,
+      "wake_attempts": 10000,
+      "send_elapsed_ms": 33.800453
+    },
+    {
+      "count": 100000,
+      "wake_attempts": 100000,
+      "send_elapsed_ms": 406.253203
+    }
+  ],
+  "gate_seconds": 180
+}

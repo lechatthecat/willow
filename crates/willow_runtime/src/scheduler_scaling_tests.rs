@@ -365,7 +365,11 @@ fn scaling_05_active_task_footprint_by_workload() {
         for index in 0..tasks {
             let id = scheduler.spawn_parked_placeholder();
             scheduler.with_task_mut(id, |task| {
-                task.add_wait_channel(0x1000 + index);
+                task.install_channel_ownership(crate::task::ChannelOwnershipToken {
+                    channel: 0x1000 + index,
+                    role: crate::task::ChannelRole::RecvWait,
+                    generation: 1,
+                });
             });
         }
         report(
@@ -472,7 +476,11 @@ fn scaling_07_measured_heap_per_active_task() {
                 for index in 0..tasks {
                     let id = scheduler.spawn_parked_placeholder();
                     scheduler.with_task_mut(id, |task| {
-                        task.add_wait_channel(0x1000 + index);
+                        task.install_channel_ownership(crate::task::ChannelOwnershipToken {
+                            channel: 0x1000 + index,
+                            role: crate::task::ChannelRole::RecvWait,
+                            generation: 1,
+                        });
                     });
                 }
                 scheduler

@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 
 use crate::lock_wait::{LockId, LockWaitLink, RegistrationToken};
 use crate::task::{
-    RUNTIME_POLL_BLOCKED_SYSCALL, RUNTIME_POLL_PANICKED, RUNTIME_POLL_PENDING,
-    RUNTIME_POLL_PREEMPTED, RUNTIME_POLL_READY, RUNTIME_POLL_YIELD, RuntimeCancelFn, RuntimePollFn,
-    RuntimeTask, RuntimeTaskId, RuntimeTaskState,
+    ChannelOwnershipToken, RUNTIME_POLL_BLOCKED_SYSCALL, RUNTIME_POLL_PANICKED,
+    RUNTIME_POLL_PENDING, RUNTIME_POLL_PREEMPTED, RUNTIME_POLL_READY, RUNTIME_POLL_YIELD,
+    RuntimeCancelFn, RuntimePollFn, RuntimeTask, RuntimeTaskId, RuntimeTaskState,
 };
 use crate::task_state::{BoundaryOutcome, CancelOutcome, ClaimOutcome, TaskLifecycle, WakeOutcome};
 use crate::timer_queue::{TimerQueue, TimerWake};
@@ -20,7 +20,7 @@ use crate::timer_queue::{TimerQueue, TimerWake};
 #[derive(Debug)]
 struct TerminalCleanup {
     task_id: RuntimeTaskId,
-    channel_waits: Vec<usize>,
+    channel_waits: Vec<ChannelOwnershipToken>,
     lock_wait: Option<LockWaitLink>,
 }
 
@@ -1733,6 +1733,25 @@ pub(crate) fn try_wake_parked_task(id: u64) -> bool {
     transitioned
 }
 
+/// A channel reservation already published under its mutex remains valid for
+/// a live task that is queued or polling: it may have observed readiness before
+/// this wake. Only terminal owners may lose it; exact cleanup handles races.
+pub(crate) fn wake_channel_owner(id: u64) -> bool {
+    crate::gc::stress_collect("scheduler");
+    let outcome = wake_global_task_outcome(id);
+    if outcome == WakeOutcome::Enqueue {
+        crate::observability::record(
+            crate::observability::RuntimeEventKind::TaskWake,
+            current_task_id().map(|_| current_worker()),
+            id,
+            0,
+        );
+    }
+    notify_idle_waiters();
+    crate::gc::stress_collect("scheduler");
+    outcome != WakeOutcome::Terminal
+}
+
 /// The id of the currently-running task (0 if none). Used by blocking runtime
 /// primitives (e.g. cooperative channel `recv`) to register the running task as
 /// a waiter before it suspends (willow-dsw).
@@ -1783,28 +1802,50 @@ pub extern "C" fn willow_sched_set_spawn_site(id: u64, file: *const u8, line: i6
     });
 }
 
-/// Record that `task_id` registered as a waiter on the channel at `addr`
-/// (deduplicated; willow-p4er reverse reference for O(registered)
-/// cancellation cleanup).
-pub(crate) fn record_channel_wait(task_id: u64, addr: usize) {
-    global_task_table().with_mut(task_id as RuntimeTaskId, |task| {
-        task.add_wait_channel(addr);
-    });
-}
-
-/// Remove one channel reverse reference after normal unregister/wake. Without
-/// this, cancellation cost grows with every distinct channel the task has ever
-/// waited on and can retain stale, already-swept channel addresses.
-pub(crate) fn remove_channel_wait(task_id: u64, addr: usize) {
-    global_task_table().with_mut(task_id as RuntimeTaskId, |task| {
-        task.remove_wait_channel(addr);
-    });
-}
-
-/// Take (and clear) the channels `task_id` registered on (willow-p4er).
-pub(crate) fn take_channel_waits(task_id: u64) -> Vec<usize> {
+/// Publish channel ownership under its task shard, without a safepoint.
+pub(crate) fn install_channel_ownership(task_id: u64, token: ChannelOwnershipToken) -> bool {
     global_task_table()
-        .with_mut(task_id as RuntimeTaskId, RuntimeTask::take_wait_channels)
+        .with_mut(task_id, |task| {
+            let state = task.state.load();
+            if state.lifecycle().is_terminal()
+                || state.lifecycle() == TaskLifecycle::Cancelling
+                || state.cancel_requested()
+            {
+                return false;
+            }
+            task.install_channel_ownership(token)
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn transition_channel_ownership(
+    task_id: u64,
+    old: ChannelOwnershipToken,
+    new: ChannelOwnershipToken,
+) -> bool {
+    global_task_table()
+        .with_mut(task_id, |task| {
+            let state = task.state.load();
+            if state.lifecycle().is_terminal()
+                || state.lifecycle() == TaskLifecycle::Cancelling
+                || state.cancel_requested()
+            {
+                return false;
+            }
+            task.transition_channel_ownership(old, new)
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn clear_channel_ownership(task_id: u64, token: ChannelOwnershipToken) -> bool {
+    global_task_table()
+        .with_mut(task_id, |task| task.clear_channel_ownership(token))
+        .unwrap_or(false)
+}
+
+pub(crate) fn take_channel_waits(task_id: u64) -> Vec<ChannelOwnershipToken> {
+    global_task_table()
+        .with_mut(task_id, RuntimeTask::take_wait_channels)
         .unwrap_or_default()
 }
 
@@ -2485,7 +2526,7 @@ fn drain_terminal_cleanups() {
     let cleanups = with_global(|sched| sched.take_pending_terminal_cleanups());
     for cleanup in cleanups {
         crate::netpoll::purge_task(cleanup.task_id);
-        crate::channel::purge_task_from_addresses(cleanup.task_id, cleanup.channel_waits);
+        crate::channel::purge_task_from_tokens(cleanup.task_id, cleanup.channel_waits);
         // A task that dies while queued on (or holding a reservation for) a
         // scheduler-aware lock must not strand it: phase-driven cleanup removes
         // a `Waiting` entry, and re-hands ownership that was already reserved
@@ -3496,6 +3537,14 @@ mod scaling_measurements;
 
 #[cfg(test)]
 mod tests {
+    fn channel_token(channel: usize) -> crate::task::ChannelOwnershipToken {
+        crate::task::ChannelOwnershipToken {
+            channel,
+            role: crate::task::ChannelRole::RecvWait,
+            generation: 1,
+        }
+    }
+
     use super::*;
     use crate::async_frame::{async_frame_slot_offset, willow_async_frame_alloc};
     use crate::gc::{
@@ -7082,8 +7131,8 @@ mod tests {
         let mut scheduler = RuntimeScheduler::with_worker_count(DEFAULT_WORKERS);
         let id = scheduler.spawn_placeholder();
         scheduler.with_task_mut(id, |task| {
-            task.add_wait_channel(0x1234);
-            task.add_wait_channel(0x5678);
+            task.install_channel_ownership(channel_token(0x1234));
+            task.install_channel_ownership(channel_token(0x5678));
         });
 
         scheduler.complete(id);
@@ -7092,7 +7141,10 @@ mod tests {
         let cleanups = scheduler.take_pending_terminal_cleanups();
         assert_eq!(cleanups.len(), 1);
         assert_eq!(cleanups[0].task_id, id);
-        assert_eq!(cleanups[0].channel_waits, vec![0x1234, 0x5678]);
+        assert_eq!(
+            cleanups[0].channel_waits,
+            vec![channel_token(0x1234), channel_token(0x5678)]
+        );
         assert!(cleanups[0].lock_wait.is_none());
     }
 
