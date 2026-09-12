@@ -588,7 +588,7 @@ mod platform {
             }
             use std::os::unix::process::ExitStatusExt;
             let output = subprocess(TEST);
-            assert_eq!(output.status.signal(), Some(libc::SIGSEGV));
+            assert_eq!(output.status.signal(), Some(libc::SIGSEGV), "{output:?}");
             assert!(
                 !output
                     .stderr
