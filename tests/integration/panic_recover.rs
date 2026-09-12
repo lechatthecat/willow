@@ -1152,20 +1152,24 @@ async fn main() { await work(); println("completed"); }
 
 #[test]
 fn panic_recover_54_consumed_async_defer_is_not_rerun_by_later_cancel() {
+    // Synchronize after recovery and join cancellation: elapsed time does not
+    // guarantee either event on a busy worker pool.
     let (out, ok) = compile_and_run(
         r#"
-async fn work() {
+async fn work(ready: Channel<i64>) {
     if true {
         defer match recover() { Some(_) => println("once"), None => println("wrong") }
         panic("handled");
     }
+    ready.send(1);
     await sleep(10000);
 }
 async fn main() {
-    let task = work();
-    await sleep(1);
+    let ready = Channel<i64>::new();
+    let task = work(ready);
+    ready.recv();
     task.cancel();
-    await sleep(1);
+    let _ = await task.result();
     println(task.is_cancelled());
 }
 "#,
