@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 use willow_compiler::{CompilerOptions, compile, emit_hir_text, emit_lir_text, project};
 
 #[derive(Debug)]
@@ -262,7 +262,7 @@ impl RunCommand {
             .args(&self.program_args)
             .status()
             .with_context(|| format!("failed to run {output}"))?;
-        std::process::exit(status.code().unwrap_or(0));
+        std::process::exit(child_exit_code(status));
     }
 }
 
@@ -305,8 +305,21 @@ impl DebugCommand {
         let status = Command::new(&output)
             .status()
             .with_context(|| format!("failed to run {output}"))?;
-        std::process::exit(status.code().unwrap_or(0));
+        std::process::exit(child_exit_code(status));
     }
+}
+
+fn child_exit_code(status: ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        if let Some(signal) = status.signal() {
+            // Preserve signal failure using the shell exit-code convention.
+            return 128 + signal;
+        }
+    }
+    status.code().unwrap_or(0)
 }
 
 pub(super) fn run(args: Vec<String>) -> Result<()> {
@@ -338,6 +351,28 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_exit_code_preserves_normal_exits() {
+        use std::os::unix::process::ExitStatusExt;
+
+        for code in [0, 1, 42, 255] {
+            assert_eq!(child_exit_code(ExitStatus::from_raw(code << 8)), code);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_exit_code_reports_signal_deaths() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // SIGABRT, SIGKILL, SIGSEGV, SIGTERM, and a core-dumping SIGSEGV.
+        for raw in [6, 9, 11, 15, 11 | 0x80] {
+            let status = ExitStatus::from_raw(raw);
+            assert_eq!(child_exit_code(status), 128 + (raw & 0x7f));
+        }
     }
 
     #[test]
