@@ -27,6 +27,8 @@ mod class_vtable_dispatch;
 mod codegen;
 #[path = "integration/codegen_invariants.rs"]
 mod codegen_invariants;
+#[path = "integration/codegen_scaling.rs"]
+mod codegen_scaling;
 #[path = "integration/defer_panic_termination.rs"]
 mod defer_panic_termination;
 #[path = "integration/enum_identity_aliases.rs"]

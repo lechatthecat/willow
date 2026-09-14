@@ -211,8 +211,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .get(&iface_name)
             .cloned()
             .expect("interface info vetted by LIR eligibility");
-        // The embedded-region layout the vtables are emitted from, so the slot
-        // indexed here is the slot the data object holds (willow-1fc6).
+        // The composed layout the vtables are emitted from, so the slot indexed
+        // here is the slot the data object holds (willow-1fc6).
         let slot = super::vtable_layout::slot_of(self.interface_infos, &info.name, method)
             .expect("interface method slot vetted by LIR eligibility");
         let sig_info = info.methods[method].clone();

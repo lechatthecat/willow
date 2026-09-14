@@ -21,6 +21,12 @@ pub fn check(
     types: &HashMap<ExprId, Type>,
     modes: &HashMap<ExprId, ParamMode>,
 ) -> Vec<Diagnostic> {
+    if !modes
+        .values()
+        .any(|mode| matches!(mode, ParamMode::Reference { .. }))
+    {
+        return Vec::new();
+    }
     let mut blocks = Vec::new();
     let mut initializers = Vec::new();
     for item in &program.items {
@@ -51,24 +57,16 @@ pub fn check(
         reported: HashSet::new(),
     };
     for (initializer, boundary) in initializers {
-        let mut walk = AstWalk::new(AstEvent::Expr(initializer));
-        while let Some(event) = walk.next() {
-            match event {
-                AstEvent::Block(block) => {
-                    blocks.push(block);
-                    walk.skip_children();
-                }
-                AstEvent::Expr(expr) => {
-                    if let Some(task) = checker.borrowed_call(expr, boundary) {
-                        checker.escape(&task, initializer.span());
-                    }
-                }
-                _ => {}
-            }
-        }
+        // Field initializers report escapes at the whole initializer, as
+        // before the single-walk rewrite; bodies report at the call itself.
+        checker.walk(
+            AstEvent::Expr(initializer),
+            boundary,
+            Some(initializer.span()),
+        );
     }
-    while let Some(block) = blocks.pop() {
-        checker.block(block, &mut blocks);
+    for block in blocks {
+        checker.walk(AstEvent::Block(block), block.span, None);
     }
     checker.errors
 }
@@ -135,138 +133,225 @@ impl Checker<'_> {
         self.errors.push(diagnostic);
     }
 
-    /// Inspect uses and exits before descending into independently checked blocks.
-    /// Bind events distinguish captures from shadowed locals; callable and loop
-    /// boundaries distinguish exits that can bypass this block's later await.
-    fn check_pending_uses(
-        &mut self,
-        stmt: &Stmt,
-        pending: &HashMap<&str, BorrowedTask>,
-        allowed_var: Option<ExprId>,
-    ) {
-        let mut scopes: Vec<HashSet<&str>> = vec![HashSet::new()];
-        let mut callable_depth = 0;
-        let mut loop_depth = 0;
-        for event in AstWalk::new(AstEvent::Stmt(stmt)) {
-            let mut exit = None;
-            let mut used = None;
+    /// One source-order walk handles both local discharge and ancestor uses.
+    /// Names resolve through binding stacks; exits drain indexed active tasks,
+    /// so already-reported tasks never multiply work at later exits.
+    fn walk<'a>(&mut self, root: AstEvent<'a>, boundary: Span, escape_label: Option<Span>) {
+        let mut state = WalkState::default();
+        let mut next_block = None;
+        let mut statements = Vec::new();
+        let mut callable = 0usize;
+        let mut loops = 0usize;
+        for event in AstWalk::new(root) {
+            count_event();
             match event {
-                AstEvent::EnterScope => scopes.push(HashSet::new()),
+                AstEvent::Block(block) => next_block = Some(block.span),
+                AstEvent::EnterScope => {
+                    state.scopes.push(Vec::new());
+                    if let Some(span) = next_block.take() {
+                        state.blocks.push(BlockState {
+                            span,
+                            scope: state.scopes.len(),
+                            pending: HashMap::new(),
+                        });
+                    }
+                }
                 AstEvent::ExitScope => {
-                    scopes.pop();
-                }
-                AstEvent::Bind(name) => {
-                    scopes.last_mut().expect("binding scope").insert(name);
-                }
-                AstEvent::Expr(Expr::Lambda(_)) => callable_depth += 1,
-                AstEvent::ExitExpr(Expr::Lambda(_)) => callable_depth -= 1,
-                AstEvent::Stmt(Stmt::While(_) | Stmt::For(_)) => loop_depth += 1,
-                AstEvent::ExitStmt(Stmt::While(_) | Stmt::For(_)) => loop_depth -= 1,
-                AstEvent::Expr(Expr::Var(name, span, id)) if Some(*id) != allowed_var => {
-                    used = Some((name.as_str(), *span));
-                }
-                AstEvent::Stmt(Stmt::Assign(assign)) => {
-                    used = Some((assign.name.as_str(), assign.span));
-                }
-                AstEvent::Stmt(Stmt::Return(ret)) if callable_depth == 0 => {
-                    exit = Some(ret.span);
-                }
-                AstEvent::Expr(Expr::TryPropagate(_, span, _)) if callable_depth == 0 => {
-                    exit = Some(*span);
-                }
-                AstEvent::Stmt(Stmt::Break(span) | Stmt::Continue(span))
-                    if callable_depth == 0 && loop_depth == 0 =>
-                {
-                    exit = Some(*span);
-                }
-                _ => {}
-            }
-            if let Some((name, span)) = used
-                && !scopes.iter().rev().any(|scope| scope.contains(name))
-                && let Some(task) = pending.get(name)
-            {
-                self.escape(task, span);
-            }
-            if let Some(span) = exit {
-                for task in pending.values() {
-                    self.escape(task, span);
-                }
-            }
-        }
-    }
-
-    fn block<'a>(&mut self, block: &'a Block, blocks: &mut Vec<&'a Block>) {
-        let mut pending: HashMap<&str, BorrowedTask> = HashMap::new();
-        for stmt in &block.stmts {
-            let root = match stmt {
-                Stmt::Let(s) => Some(&s.init),
-                Stmt::Expr(s) => Some(&s.expr),
-                Stmt::Return(s) => s.value.as_ref(),
-                _ => None,
-            };
-            let mut allowed_call = None;
-            let mut allowed_var = None;
-            let mut new_binding = None;
-            if let Stmt::Let(binding) = stmt {
-                if let Some(old) = pending.remove(binding.name.as_str()) {
-                    self.escape(&old, binding.span);
-                }
-                if let Some(task) = self.borrowed_call(&binding.init, block.span) {
-                    allowed_call = Some(task.call);
-                    new_binding = Some((binding.name.as_str(), task));
-                }
-            }
-            if let Some(Expr::Await(wait)) = root {
-                let operand = match &wait.expr {
-                    Expr::MethodCall(c)
-                        if c.method == "result"
-                            && c.args.is_empty()
-                            && self.types.get(&c.object.id()).is_some_and(|t| {
-                                builtin_types::unary_arg(t, BuiltinTypeId::Task).is_some()
-                            }) =>
+                    if state
+                        .blocks
+                        .last()
+                        .is_some_and(|block| block.scope == state.scopes.len())
                     {
-                        &c.object
-                    }
-                    operand => operand,
-                };
-                if let Some(task) = self.borrowed_call(operand, block.span) {
-                    allowed_call = Some(task.call);
-                } else if let Expr::Var(name, _, id) = operand
-                    && pending.remove(name.as_str()).is_some()
-                {
-                    allowed_var = Some(*id);
-                }
-            }
-            self.check_pending_uses(stmt, &pending, allowed_var);
-            let mut walk = AstWalk::new(AstEvent::Stmt(stmt));
-            while let Some(event) = walk.next() {
-                match event {
-                    AstEvent::Block(child) => {
-                        // Each nested block proves discharge of its own tasks.
-                        // Outer task uses and exits were checked with lexical
-                        // binding information before this traversal.
-                        blocks.push(child);
-                        walk.skip_children();
-                    }
-                    AstEvent::Expr(expr) => {
-                        if Some(expr.id()) != allowed_call
-                            && let Some(task) = self.borrowed_call(expr, block.span)
-                        {
-                            self.escape(&task, expr.span());
+                        let block = state.blocks.pop().unwrap();
+                        for call in block.pending.into_values() {
+                            state.escape(self, call, block.span);
                         }
                     }
-                    _ => {}
+                    for name in state.scopes.pop().unwrap().into_iter().rev() {
+                        let bindings = state.names.get_mut(name).unwrap();
+                        bindings.pop();
+                        if bindings.is_empty() {
+                            state.names.remove(name);
+                        }
+                    }
                 }
+                AstEvent::Bind(name) => {
+                    state.names.entry(name).or_default().push(None);
+                    state.scopes.last_mut().unwrap().push(name);
+                }
+                AstEvent::Stmt(stmt) => {
+                    let mut statement = StatementState {
+                        allowed_call: None,
+                        new_binding: None,
+                    };
+                    let block_span = state.blocks.last().map_or(boundary, |b| b.span);
+                    if let Stmt::Let(binding) = stmt {
+                        let old = state
+                            .blocks
+                            .last_mut()
+                            .and_then(|b| b.pending.remove(binding.name.as_str()));
+                        if let Some(call) = old {
+                            state.escape(self, call, binding.span);
+                        }
+                        if let Some(task) = self.borrowed_call(&binding.init, block_span) {
+                            statement.allowed_call = Some(task.call);
+                            statement.new_binding = Some((binding.name.as_str(), task));
+                        }
+                    }
+                    let root = match stmt {
+                        Stmt::Let(s) => Some(&s.init),
+                        Stmt::Expr(s) => Some(&s.expr),
+                        Stmt::Return(s) => s.value.as_ref(),
+                        _ => None,
+                    };
+                    if let Some(Expr::Await(wait)) = root {
+                        let operand = match &wait.expr {
+                            Expr::MethodCall(c)
+                                if c.method == "result"
+                                    && c.args.is_empty()
+                                    && self.types.get(&c.object.id()).is_some_and(|t| {
+                                        builtin_types::unary_arg(t, BuiltinTypeId::Task).is_some()
+                                    }) =>
+                            {
+                                &c.object
+                            }
+                            operand => operand,
+                        };
+                        if let Some(task) = self.borrowed_call(operand, block_span) {
+                            statement.allowed_call = Some(task.call);
+                        } else if let Expr::Var(name, _, _) = operand {
+                            let call = state
+                                .blocks
+                                .last_mut()
+                                .and_then(|b| b.pending.remove(name.as_str()));
+                            if let Some(call) = call {
+                                state.remove(call);
+                            }
+                        }
+                    }
+                    statements.push(statement);
+                    match stmt {
+                        Stmt::While(_) | Stmt::For(_) => loops += 1,
+                        Stmt::Assign(assign) => state.use_name(self, &assign.name, assign.span),
+                        Stmt::Return(ret) => state.exit(self, callable, None, ret.span),
+                        Stmt::Break(span) | Stmt::Continue(span) => {
+                            state.exit(self, callable, Some(loops), *span)
+                        }
+                        _ => {}
+                    }
+                }
+                AstEvent::ExitStmt(stmt) => {
+                    if matches!(stmt, Stmt::While(_) | Stmt::For(_)) {
+                        loops -= 1;
+                    }
+                    if let Some((name, task)) = statements.pop().unwrap().new_binding {
+                        let call = task.call;
+                        state.blocks.last_mut().unwrap().pending.insert(name, call);
+                        *state.names.get_mut(name).unwrap().last_mut().unwrap() = Some(call);
+                        state.by_callable.entry(callable).or_default().insert(call);
+                        state
+                            .by_loop
+                            .entry((callable, loops))
+                            .or_default()
+                            .insert(call);
+                        state.active.insert(call, (task, callable, loops));
+                    }
+                }
+                AstEvent::Expr(expr) => {
+                    match expr {
+                        Expr::Lambda(_) => callable += 1,
+                        Expr::Var(name, span, _) => state.use_name(self, name, *span),
+                        Expr::TryPropagate(_, span, _) => state.exit(self, callable, None, *span),
+                        _ => {}
+                    }
+                    let span = state.blocks.last().map_or(boundary, |b| b.span);
+                    if Some(expr.id()) != statements.last().and_then(|s| s.allowed_call)
+                        && let Some(task) = self.borrowed_call(expr, span)
+                    {
+                        self.escape(&task, escape_label.unwrap_or_else(|| expr.span()));
+                    }
+                }
+                AstEvent::ExitExpr(Expr::Lambda(_)) => callable -= 1,
+                _ => {}
             }
-            if let Some((name, task)) = new_binding {
-                pending.insert(name, task);
-            }
-        }
-        for task in pending.values() {
-            self.escape(task, block.span);
         }
     }
 }
+
+struct BlockState<'a> {
+    span: Span,
+    scope: usize,
+    pending: HashMap<&'a str, ExprId>,
+}
+struct StatementState<'a> {
+    allowed_call: Option<ExprId>,
+    new_binding: Option<(&'a str, BorrowedTask)>,
+}
+#[derive(Default)]
+struct WalkState<'a> {
+    scopes: Vec<Vec<&'a str>>,
+    names: HashMap<&'a str, Vec<Option<ExprId>>>,
+    blocks: Vec<BlockState<'a>>,
+    active: HashMap<ExprId, (BorrowedTask, usize, usize)>,
+    by_callable: HashMap<usize, HashSet<ExprId>>,
+    by_loop: HashMap<(usize, usize), HashSet<ExprId>>,
+}
+impl WalkState<'_> {
+    fn remove(&mut self, call: ExprId) -> Option<BorrowedTask> {
+        let (task, callable, loops) = self.active.remove(&call)?;
+        remove_active_index(&mut self.by_callable, callable, call);
+        remove_active_index(&mut self.by_loop, (callable, loops), call);
+        Some(task)
+    }
+    fn escape(&mut self, checker: &mut Checker<'_>, call: ExprId, span: Span) {
+        if let Some(task) = self.remove(call) {
+            checker.escape(&task, span);
+        }
+    }
+    fn use_name(&mut self, checker: &mut Checker<'_>, name: &str, span: Span) {
+        if let Some(Some(call)) = self.names.get(name).and_then(|names| names.last()) {
+            self.escape(checker, *call, span);
+        }
+    }
+    fn exit(
+        &mut self,
+        checker: &mut Checker<'_>,
+        callable: usize,
+        loops: Option<usize>,
+        span: Span,
+    ) {
+        let calls = match loops {
+            Some(loops) => self.by_loop.remove(&(callable, loops)),
+            None => self.by_callable.remove(&callable),
+        };
+        for call in calls.into_iter().flatten() {
+            self.escape(checker, call, span);
+        }
+    }
+}
+
+fn remove_active_index<K: std::hash::Hash + Eq>(
+    index: &mut HashMap<K, HashSet<ExprId>>,
+    key: K,
+    call: ExprId,
+) {
+    if let Some(calls) = index.get_mut(&key) {
+        calls.remove(&call);
+        if calls.is_empty() {
+            index.remove(&key);
+        } else if calls.len() <= calls.capacity() / 4 {
+            calls.shrink_to_fit();
+        }
+    }
+}
+
+#[inline]
+fn count_event() {
+    #[cfg(test)]
+    AST_EVENTS.with(|count| count.set(count.get() + 1));
+}
+#[cfg(test)]
+thread_local! { static AST_EVENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 #[cfg(test)]
 mod tests {
@@ -288,6 +373,65 @@ mod tests {
         checker.check_module_program(&program);
         let borrows = check(&program, &checker.expr_types, &checker.reference_arg_modes);
         (borrows, checker.errors)
+    }
+
+    #[test]
+    fn nested_walk_visits_each_event_once_in_mixed_programs() {
+        for depth in [32, 64, 128] {
+            for pending in [false, true] {
+                let nested = format!(
+                    "{}println(1);{}",
+                    "if true {".repeat(depth),
+                    "}".repeat(depth)
+                );
+                let body = if pending {
+                    format!("let x = 1; let task = borrow(&x); {nested} await task;")
+                } else {
+                    nested
+                };
+                let source = format!(
+                    "async fn borrow(x: &i64) -> i64 {{ return x; }} async fn other() {{ let x = 1; await borrow(&x); }} async fn main() {{ {body} }}"
+                );
+                let (program, errors) =
+                    Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+                assert!(errors.is_empty());
+                let mut checker = TypeChecker::new();
+                checker.check_module_program(&program);
+                assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+                let expected: usize = program
+                    .items
+                    .iter()
+                    .filter_map(|item| match item {
+                        Item::Function(f) => Some(AstWalk::new(AstEvent::Block(&f.body)).count()),
+                        _ => None,
+                    })
+                    .sum();
+                AST_EVENTS.with(|count| count.set(0));
+                assert!(
+                    check(&program, &checker.expr_types, &checker.reference_arg_modes).is_empty()
+                );
+                let actual = AST_EVENTS.with(|count| count.get());
+                assert_eq!(actual, expected, "depth={depth}, pending={pending}");
+                println!("depth={depth} pending={pending} events={actual}");
+                AST_EVENTS.with(|count| count.set(0));
+                assert!(check(&program, &HashMap::new(), &HashMap::new()).is_empty());
+                assert_eq!(AST_EVENTS.with(|count| count.get()), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn nested_pending_tasks_and_repeated_exits_report_once_each() {
+        let (borrows, errors) = analyze(
+            "let outer = borrow(&x); if true { let inner = borrow(&x); if true { return; } await inner; } if true { return; } await outer;",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(borrows.len(), 2, "{borrows:?}");
+        let (borrows, errors) = analyze(
+            "let task = borrow(&x); let f = || { let inner = borrow(&x); return; }; await task;",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(borrows.len(), 1, "{borrows:?}");
     }
 
     #[test]

@@ -17,7 +17,9 @@ use crate::gc::{
     GcObjectKind, GcStoreDestination, willow_alloc_with_layout, willow_gc_write_barrier,
 };
 use crate::string::willow_string_as_str;
+use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, MutexGuard};
 
 /// `type_id` for maps. Distinct from the array type id and well above the
@@ -30,7 +32,7 @@ const MAP_TYPE_ID: u32 = 0xA22A_0002;
 /// `Word` holds it verbatim: an `i64`, a `bool` as 0/1, or the BITS of an `f64`
 /// (which is why `Map<f64, V>` matches keys bit-for-bit, and so distinguishes
 /// `0.0` from `-0.0`).
-#[derive(PartialEq, Eq, Hash, Clone)]
+#[derive(PartialEq, Eq, Clone)]
 enum MapKey {
     Word(i64),
     Str(String),
@@ -49,16 +51,67 @@ struct MapData {
     entries: HashMap<MapKey, i64>,
 }
 
-/// Build an owned key from a raw key word.
+/// The owned and borrowed keys share exactly the same hash/equality encoding.
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+enum KeyRef<'a> {
+    Word(i64),
+    Str(&'a str),
+}
+
+trait KeyView {
+    fn key_ref(&self) -> KeyRef<'_>;
+}
+
+impl KeyView for MapKey {
+    fn key_ref(&self) -> KeyRef<'_> {
+        match self {
+            Self::Word(word) => KeyRef::Word(*word),
+            Self::Str(text) => KeyRef::Str(text),
+        }
+    }
+}
+
+impl KeyView for KeyRef<'_> {
+    fn key_ref(&self) -> KeyRef<'_> {
+        *self
+    }
+}
+
+impl Hash for MapKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key_ref().hash(state);
+    }
+}
+
+impl Hash for dyn KeyView + '_ {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key_ref().hash(state);
+    }
+}
+
+impl PartialEq for dyn KeyView + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.key_ref() == other.key_ref()
+    }
+}
+impl Eq for dyn KeyView + '_ {}
+
+impl<'a> Borrow<dyn KeyView + 'a> for MapKey {
+    fn borrow(&self) -> &(dyn KeyView + 'a) {
+        self
+    }
+}
+
+/// Borrow a key only during the lookup; no Willow pointer is retained in the map.
 ///
 /// # Safety
-/// When `key_is_ref` is nonzero, `word` must be a valid WillowString pointer.
-unsafe fn key_from_word(word: i64, key_is_ref: i64) -> MapKey {
+/// When `key_is_ref` is nonzero, `word` must be a valid WillowString pointer
+/// for the returned borrow's lifetime. Do not allocate in the GC while borrowed.
+unsafe fn key_from_word<'a>(word: i64, key_is_ref: i64) -> KeyRef<'a> {
     if key_is_ref != 0 {
-        let s = unsafe { willow_string_as_str(word as *const u8) };
-        MapKey::Str(s.to_string())
+        KeyRef::Str(unsafe { willow_string_as_str(word as *const u8) })
     } else {
-        MapKey::Word(word)
+        KeyRef::Word(word)
     }
 }
 
@@ -152,6 +205,10 @@ pub extern "C" fn willow_map_insert(
     debug_assert_eq!(data.layout.value_is_ref, val_is_ref != 0);
     debug_assert_eq!(data.layout.key_kind == 3, key_is_ref != 0);
     let key = unsafe { key_from_word(key_word, key_is_ref) };
+    let owned_key = match key {
+        KeyRef::Word(word) => MapKey::Word(word),
+        KeyRef::Str(text) => MapKey::Str(text.to_owned()),
+    };
     if data.layout.value_is_ref {
         willow_gc_write_barrier(
             map,
@@ -159,7 +216,7 @@ pub extern "C" fn willow_map_insert(
             GcStoreDestination::MapValue as i64,
         );
     }
-    data.entries.insert(key, val_word);
+    data.entries.insert(owned_key, val_word);
 }
 
 /// Look up `key`, returning a Willow `Option<V>` (`Some(value)` or `None`).
@@ -183,7 +240,7 @@ pub extern "C" fn willow_map_get(
     }
     let data = unsafe { map_data(map) };
     let key = unsafe { key_from_word(key_word, key_is_ref) };
-    let value = data.entries.get(&key).copied();
+    let value = data.entries.get(&key as &dyn KeyView).copied();
     let is_ref = data.layout.value_is_ref;
     drop(data);
     match value {
@@ -247,7 +304,7 @@ pub extern "C" fn willow_map_contains(map: *mut u8, key_word: i64, key_is_ref: i
     }
     let data = unsafe { map_data(map) };
     let key = unsafe { key_from_word(key_word, key_is_ref) };
-    i64::from(data.entries.contains_key(&key))
+    i64::from(data.entries.contains_key(&key as &dyn KeyView))
 }
 
 // Willow `Option` layout (must match the compiler's enum lowering):
@@ -428,5 +485,164 @@ mod tests {
             (layout.key_kind, layout.value_kind, layout.value_is_ref),
             (1, 2, false)
         );
+    }
+    #[test]
+    fn borrowed_string_keys_survive_copy_update_and_collection() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let mut map = willow_map_new(3, 0, 0);
+        willow_push_root(&mut map);
+        for (i, text) in ["", "日本語🦀", "ordinary"].into_iter().enumerate() {
+            let key = willow_string_from_str(text);
+            willow_map_insert(map, key as i64, 1, i as i64, 0);
+        }
+        let mut copy = willow_map_copy(map);
+        willow_push_root(&mut copy);
+        // No source key is rooted: map keys own their bytes independently.
+        willow_gc_collect();
+        for (i, text) in ["", "日本語🦀", "ordinary"].into_iter().enumerate() {
+            let mut key = willow_string_from_str(text);
+            willow_push_root(&mut key);
+            assert_eq!(willow_map_contains(map, key as i64, 1), 1);
+            assert_eq!(
+                opt_payload(willow_map_get(copy, key as i64, 1, 0)),
+                i as i64
+            );
+            willow_map_insert(map, key as i64, 1, 99, 0);
+            assert_eq!(
+                opt_payload(willow_map_get(copy, key as i64, 1, 0)),
+                i as i64
+            );
+            assert_eq!(opt_payload(willow_map_get(map, key as i64, 1, 0)), 99);
+            willow_pop_roots(1);
+        }
+        assert_eq!(willow_map_len(map), 3);
+        willow_pop_roots(2);
+    }
+
+    #[test]
+    fn borrowed_word_keys_preserve_all_bits() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let map = willow_map_new(1, 0, 0);
+        let words = [
+            0,
+            i64::MIN,
+            0x7ff8_0000_0000_0001,
+            0x7ff8_0000_0000_0002,
+            -1,
+        ];
+        for (i, word) in words.into_iter().enumerate() {
+            willow_map_insert(map, word, 0, i as i64, 0);
+        }
+        for (i, word) in words.into_iter().enumerate() {
+            assert_eq!(willow_map_contains(map, word, 0), 1);
+            assert_eq!(opt_payload(willow_map_get(map, word, 0, 0)), i as i64);
+        }
+        assert_eq!(willow_map_contains(map, 1, 0), 0);
+        assert_eq!(willow_map_len(map), words.len() as i64);
+    }
+
+    /// willow-ssl7.7: a read-only lookup must not copy the key. Counted per
+    /// thread through the test binary's counting global allocator, after all
+    /// setup allocations, so the numbers are this loop's own Rust allocation
+    /// traffic and nothing else's.
+    #[test]
+    fn read_only_lookups_never_copy_the_key() {
+        use crate::scheduler::scaling_measurements::counting_allocator as counter;
+        const CALLS: usize = 1_000;
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let mut map = willow_map_new(3, 0, 0);
+        willow_push_root(&mut map);
+        let mut get_bytes_by_len: Vec<(usize, usize)> = Vec::new();
+        for len in [8usize, 64, 1024] {
+            let mut hit = willow_string_from_str(&"k".repeat(len));
+            willow_push_root(&mut hit);
+            willow_map_insert(map, hit as i64, 1, len as i64, 0);
+            let mut miss = willow_string_from_str(&"m".repeat(len));
+            willow_push_root(&mut miss);
+
+            // `contains` returns a scalar, so the whole call is the lookup:
+            // hits and misses alike must allocate nothing at any key length.
+            let allocs = counter::thread_allocations();
+            let bytes = counter::thread_bytes();
+            for _ in 0..CALLS {
+                assert_eq!(willow_map_contains(map, hit as i64, 1), 1);
+                assert_eq!(willow_map_contains(map, miss as i64, 1), 0);
+            }
+            assert_eq!(
+                (
+                    counter::thread_allocations() - allocs,
+                    counter::thread_bytes() - bytes
+                ),
+                (0, 0),
+                "contains allocated at key length {len}"
+            );
+
+            // The same for `get`'s key lookup with its required `Option`
+            // output excluded: borrow the key, probe the table, drop it.
+            let data = unsafe { map_data(map) };
+            let allocs = counter::thread_allocations();
+            let bytes = counter::thread_bytes();
+            for _ in 0..CALLS {
+                let key = unsafe { key_from_word(hit as i64, 1) };
+                assert_eq!(
+                    data.entries.get(&key as &dyn KeyView).copied(),
+                    Some(len as i64)
+                );
+                let key = unsafe { key_from_word(miss as i64, 1) };
+                assert_eq!(data.entries.get(&key as &dyn KeyView).copied(), None);
+            }
+            assert_eq!(
+                (
+                    counter::thread_allocations() - allocs,
+                    counter::thread_bytes() - bytes
+                ),
+                (0, 0),
+                "get key lookup allocated at key length {len}"
+            );
+            drop(data);
+
+            // The public `get` still allocates its `Option` in the GC heap,
+            // which in turn asks Rust for space. That stays under one Rust
+            // allocation per call, so no per-call owned key hides in it.
+            let allocs = counter::thread_allocations();
+            let bytes = counter::thread_bytes();
+            for _ in 0..CALLS {
+                assert_eq!(
+                    opt_payload(willow_map_get(map, hit as i64, 1, 0)),
+                    len as i64
+                );
+                assert_eq!(opt_tag(willow_map_get(map, miss as i64, 1, 0)), 1);
+            }
+            let get_allocs = counter::thread_allocations() - allocs;
+            let get_bytes = counter::thread_bytes() - bytes;
+            assert!(
+                get_allocs < 2 * CALLS,
+                "get allocated {get_allocs} times for {} calls at key length {len}",
+                2 * CALLS
+            );
+            get_bytes_by_len.push((len, get_bytes));
+            willow_pop_roots(2);
+        }
+        // Copying each looked-up key would put `calls * len` bytes through the
+        // allocator; the GC's own bookkeeping grows with the live heap instead,
+        // so the totals stay far below that and the growth between the
+        // shortest and longest key does too.
+        let (long_len, long_bytes) = *get_bytes_by_len.last().expect("one length");
+        assert!(
+            long_bytes < 2 * CALLS * long_len,
+            "{long_bytes} bytes for {} lookups of a {long_len}-byte key",
+            2 * CALLS
+        );
+        let (short_len, short_bytes) = get_bytes_by_len[0];
+        // Compare without subtracting: GC bookkeeping can make the short run
+        // allocate slightly more than the long one.
+        assert!(
+            long_bytes < short_bytes + CALLS * (long_len - short_len),
+            "get bytes went {short_bytes} -> {long_bytes} from key length {short_len} to {long_len}"
+        );
+        willow_pop_roots(1);
     }
 }

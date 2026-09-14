@@ -4,6 +4,17 @@ use crate::semantic::symbols::*;
 
 use super::*;
 
+#[derive(Default)]
+struct ReferencePlaceUses {
+    mutable: Vec<Span>,
+    other: Vec<Span>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ALIAS_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 #[willow_continuations::checker]
 impl TypeChecker {
     pub(super) fn check_call_argument_count(
@@ -754,8 +765,8 @@ impl TypeChecker {
     }
 
     pub(super) fn check_mut_reference_aliases(&mut self, params: &[ParamInfo], args: &[CallArg]) {
-        let mut seen_mut_refs: Vec<(String, Span)> = Vec::new();
-        let mut seen_other_uses: Vec<(String, Span)> = Vec::new();
+        let mut places: std::collections::HashMap<String, ReferencePlaceUses> =
+            std::collections::HashMap::new();
 
         for (param, arg) in params.iter().zip(args) {
             let Some(name) = reference_place_key(&arg.expr) else {
@@ -768,41 +779,55 @@ impl TypeChecker {
                     CallArgMode::Reference { .. }
                 )
             );
-
-            if is_mut_reference {
-                for (previous_name, previous_span) in &seen_mut_refs {
-                    if previous_name == &name {
-                        self.push_mut_reference_alias_diagnostic(
-                            &name,
-                            arg.span,
-                            *previous_span,
-                            "same mutable place passed here",
-                        );
-                    }
+            // The entry owns the place key; only matching prior spans are visited.
+            let mut occupied = match places.entry(name) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry,
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert_entry(ReferencePlaceUses::default())
                 }
-                for (previous_name, previous_span) in &seen_other_uses {
-                    if previous_name == &name {
-                        self.push_mut_reference_alias_diagnostic(
-                            &name,
-                            arg.span,
-                            *previous_span,
-                            "same place used by another argument",
-                        );
-                    }
-                }
-                seen_mut_refs.push((name, arg.span));
+            };
+            let name = occupied.key();
+            let entry = occupied.get();
+            #[cfg(test)]
+            ALIAS_WORK.with(|work| {
+                let (lookups, pairs) = work.get();
+                work.set((lookups + 1, pairs));
+            });
+            let mutable_label = if is_mut_reference {
+                "same mutable place passed here"
             } else {
-                for (previous_name, previous_span) in &seen_mut_refs {
-                    if previous_name == &name {
-                        self.push_mut_reference_alias_diagnostic(
-                            &name,
-                            arg.span,
-                            *previous_span,
-                            "mutable reference passed here",
-                        );
-                    }
-                }
-                seen_other_uses.push((name, arg.span));
+                "mutable reference passed here"
+            };
+            // Keep the original diagnostic order: mutable uses before other uses.
+            let conflicts = entry
+                .mutable
+                .iter()
+                .map(|span| (span, mutable_label))
+                .chain(
+                    entry
+                        .other
+                        .iter()
+                        .take(if is_mut_reference {
+                            entry.other.len()
+                        } else {
+                            0
+                        })
+                        .map(|span| (span, "same place used by another argument")),
+                );
+            for (previous_span, label) in conflicts {
+                #[cfg(test)]
+                ALIAS_WORK.with(|work| {
+                    let (lookups, pairs) = work.get();
+                    work.set((lookups, pairs + 1));
+                });
+                // Reuse the argument's key without another place-tree traversal.
+                self.push_mut_reference_alias_diagnostic(name, arg.span, *previous_span, label);
+            }
+            let entry = occupied.get_mut();
+            if is_mut_reference {
+                entry.mutable.push(arg.span);
+            } else {
+                entry.other.push(arg.span);
             }
         }
     }
@@ -1255,5 +1280,139 @@ mod printable_tests {
              class Dog implements Animal { pub fn speak(self) -> i64 { return 1; } } \
              fn main() { let a: Animal = new Dog(); println(a); }",
         );
+    }
+}
+
+#[cfg(test)]
+mod reference_alias_index_tests {
+    use super::*;
+
+    fn run(keys: &[usize], modes: &[u8], shape: u8) -> (Vec<Diagnostic>, (usize, usize)) {
+        let mut params = Vec::new();
+        let mut args = Vec::new();
+        for (i, (&key, &mode)) in keys.iter().zip(modes).enumerate() {
+            let span = Span::new(i, i + 1, 1, i + 1);
+            let mut expr = Expr::Var(format!("x{key}"), span, ExprId::fresh());
+            if shape >= 1 {
+                expr = Expr::FieldAccess(Box::new(expr), "field".into(), span, ExprId::fresh());
+            }
+            if shape >= 2 {
+                expr = Expr::Index(
+                    Box::new(expr),
+                    Box::new(Expr::Integer(0, span, ExprId::fresh())),
+                    span,
+                    ExprId::fresh(),
+                );
+            }
+            params.push(ParamInfo {
+                ty: Type::I64,
+                mode: if mode == 0 {
+                    ParamMode::Value
+                } else {
+                    ParamMode::Reference {
+                        mutable: mode == 2,
+                        ampersand_span: span,
+                        mut_span: None,
+                    }
+                },
+                span,
+                type_span: span,
+            });
+            args.push(CallArg {
+                expr,
+                mode: if mode == 0 {
+                    CallArgMode::Value
+                } else {
+                    CallArgMode::Reference {
+                        ampersand_span: span,
+                    }
+                },
+                span,
+            });
+        }
+        let mut checker = TypeChecker::new();
+        ALIAS_WORK.with(|work| work.set((0, 0)));
+        checker.check_mut_reference_aliases(&params, &args);
+        (checker.errors, ALIAS_WORK.with(|work| work.get()))
+    }
+
+    #[test]
+    fn distinct_places_visit_no_prior_candidates() {
+        for n in [128, 256, 512, 1024] {
+            let (errors, work) = run(&(0..n).collect::<Vec<_>>(), &vec![2; n], 2);
+            assert!(errors.is_empty());
+            assert_eq!(work, (n, 0));
+            println!(
+                "distinct n={n} indexed_lookups={} candidate_visits={}",
+                work.0, work.1
+            );
+        }
+    }
+
+    #[test]
+    fn same_place_reports_every_required_pair() {
+        for n in [16, 32, 64] {
+            let (errors, work) = run(&vec![0; n], &vec![2; n], 0);
+            let pairs = n * (n - 1) / 2;
+            assert_eq!(work, (n, pairs));
+            assert_eq!(errors.len(), pairs);
+            println!(
+                "repeated n={n} indexed_lookups={} candidate_visits={}",
+                work.0, work.1
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_modes_keep_all_diagnostic_spans_and_order() {
+        // Exhaust all value/shared/mutable mode combinations, including both orders
+        // and multiple prior conflicts. Keep one unrelated place in the sequence.
+        let keys = [0, 0, 1, 0, 0];
+        for shape in 0..3 {
+            for encoded in 0..243 {
+                let mut remaining = encoded;
+                let modes: Vec<_> = (0..5)
+                    .map(|_| {
+                        let mode = remaining % 3;
+                        remaining /= 3;
+                        mode as u8
+                    })
+                    .collect();
+                let (errors, _) = run(&keys, &modes, shape);
+                let mut expected = Vec::new();
+                for i in 0..keys.len() {
+                    for prior_mutable in [true, false] {
+                        for j in 0..i {
+                            if keys[i] != keys[j]
+                                || (modes[j] == 2) != prior_mutable
+                                || (modes[i] != 2 && !prior_mutable)
+                            {
+                                continue;
+                            }
+                            let label = if modes[i] != 2 {
+                                "mutable reference passed here"
+                            } else if prior_mutable {
+                                "same mutable place passed here"
+                            } else {
+                                "same place used by another argument"
+                            };
+                            expected.push((i, j, label));
+                        }
+                    }
+                }
+                let actual: Vec<_> = errors
+                    .iter()
+                    .map(|error| {
+                        assert_eq!(error.code, ErrorCode::E1706);
+                        (
+                            error.labels[0].span.start,
+                            error.labels[1].span.start,
+                            error.labels[1].message.as_str(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(actual, expected, "shape={shape} modes={modes:?}");
+            }
+        }
     }
 }

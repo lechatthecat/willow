@@ -56,65 +56,42 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         e1_payload: cranelift_codegen::ir::Value,
         e1_name: &str,
     ) -> cranelift_codegen::ir::Value {
-        // Candidate runtime types: e1_name and its subclasses that resolve `into`.
-        let mut dispatch: Vec<(i64, FuncId)> = self
-            .class_type_ids
-            .iter()
-            .filter(|(cls, _)| self.class_is_a(&cls.to_string(), e1_name))
-            .filter_map(|(cls, &id)| {
-                self.resolve_method_func_id(&cls.to_string(), "into")
-                    .map(|fid| (id, fid))
-            })
-            .collect();
-        dispatch.sort_by_key(|(id, _)| *id);
-
-        // Zero or one candidate: a plain direct call (no subclass override).
-        if dispatch.len() <= 1 {
-            let fid = dispatch
-                .first()
-                .map(|(_, f)| *f)
-                .or_else(|| self.resolve_method_func_id(e1_name, "into"))
-                .expect("Into impl must exist (verified by the type checker)");
-            let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            let call = self.builder.ins().call(fref, &[e1_payload]);
-            return self.builder.inst_results(call)[0];
-        }
-
-        // Multiple candidates: switch on the payload's runtime type_id, read
-        // through its class descriptor (willow-fm7t).
-        let type_id = self.emit_load_runtime_type_id(e1_payload);
-        let result_var = self
-            .builder
-            .declare_var(reference_type(self.module.target_config()));
-        let zero = self
-            .builder
-            .ins()
-            .iconst(reference_type(self.module.target_config()), 0);
-        self.builder.def_var(result_var, zero);
-        let merge = self.builder.create_block();
-        let n = dispatch.len();
-        for (i, (tid, fid)) in dispatch.into_iter().enumerate() {
-            let tid_c = self.builder.ins().iconst(types::I64, tid);
-            let is_match = self.builder.ins().icmp(IntCC::Equal, type_id, tid_c);
-            let arm = self.builder.create_block();
-            let next = self.builder.create_block();
-            self.builder.ins().brif(is_match, arm, &[], next, &[]);
-            self.builder.switch_to_block(arm);
-            self.builder.seal_block(arm);
-            let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            let call = self.builder.ins().call(fref, &[e1_payload]);
-            let r = self.builder.inst_results(call)[0];
-            self.builder.def_var(result_var, r);
-            self.builder.ins().jump(merge, &[]);
-            self.builder.switch_to_block(next);
-            self.builder.seal_block(next);
-            if i + 1 == n {
-                self.builder.ins().jump(merge, &[]);
+        // Reuse ordinary virtual dispatch: inherited implementations collapse
+        // to one target; real overrides use the class descriptor's shared slot.
+        let plan = self.plan_virtual_call(e1_name, "into");
+        let fid = self.func_ids[&plan.mangled];
+        let call = if let Some(slot) = plan.virtual_slot {
+            let fnptr = self.emit_vtable_slot_load(e1_payload, slot);
+            // Every `into` in the hierarchy shares one signature (an
+            // `override` may not change it), so the resolved target's return
+            // type describes them all: `Into<f64>` returns a scalar, not a
+            // pointer.
+            let pointer = reference_type(self.module.target_config());
+            let ret_type = self
+                .func_return_types
+                .get(&plan.mangled)
+                .cloned()
+                .unwrap_or(Type::Void);
+            let mut signature = self.module.make_signature();
+            signature
+                .params
+                .push(cranelift_codegen::ir::AbiParam::new(pointer));
+            if ret_type != Type::Void {
+                signature
+                    .returns
+                    .push(cranelift_codegen::ir::AbiParam::new(clif_type(
+                        pointer, &ret_type,
+                    )));
             }
-        }
-        self.builder.switch_to_block(merge);
-        self.builder.seal_block(merge);
-        self.builder.use_var(result_var)
+            let signature = self.builder.import_signature(signature);
+            self.builder
+                .ins()
+                .call_indirect(signature, fnptr, &[e1_payload])
+        } else {
+            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+            self.builder.ins().call(fref, &[e1_payload])
+        };
+        self.builder.inst_results(call)[0]
     }
 
     /// Leave a `Result<void, E>` main by inspecting the `Result` value: `Err`

@@ -64,64 +64,203 @@ impl DesugarPass {
 type IfaceIndex =
     std::collections::HashMap<String, (Vec<String>, Vec<parser::ast::InterfaceMethodDecl>)>;
 
-/// Full composed method list for interface `name`, with the interface that
-/// originally contributed each effective method. Supers are visited in order,
-/// transitively, then own methods; an own/later method of the same name replaces
-/// an inherited one in place. `visiting` guards against extends-cycles.
-fn iface_compose_methods_with_origin(
-    name: &str,
-    snap: &IfaceIndex,
-    visiting: &mut std::collections::HashSet<String>,
-) -> Vec<(parser::ast::InterfaceMethodDecl, String)> {
-    enum Step<'a> {
-        Enter(&'a str),
-        Leave(&'a str),
-    }
-    let mut work = vec![Step::Enter(name)];
-    let mut out: Vec<(parser::ast::InterfaceMethodDecl, String)> = Vec::new();
-    let mut positions = std::collections::HashMap::new();
-    while let Some(step) = work.pop() {
-        match step {
-            Step::Enter(name) => {
-                if !visiting.insert(name.to_string()) {
-                    continue;
-                }
-                work.push(Step::Leave(name));
-                if let Some((supers, _)) = snap.get(name) {
-                    work.extend(supers.iter().rev().map(|sup| Step::Enter(sup)));
-                }
-            }
-            Step::Leave(name) => {
-                if let Some((_, own)) = snap.get(name) {
-                    for method in own {
-                        let value = (method.clone(), name.to_string());
-                        if let Some(&position) = positions.get(&method.name) {
-                            out[position] = value;
-                        } else {
-                            positions.insert(method.name.clone(), out.len());
-                            out.push(value);
-                        }
-                    }
-                }
-                visiting.remove(name);
-            }
-        }
-    }
-    out
+/// Snapshot-scoped summaries. References avoid cloning default bodies while
+/// merging; materialization happens only at the AST ownership boundary.
+#[derive(Default)]
+struct IfaceComposition<'a> {
+    completed:
+        std::collections::HashMap<&'a str, Vec<(&'a parser::ast::InterfaceMethodDecl, &'a str)>>,
+    invalid: std::collections::HashSet<&'a str>,
+    related_supers: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    #[cfg(test)]
+    relationship_expansions: usize,
+    #[cfg(test)]
+    expanded: usize,
+    #[cfg(test)]
+    merged: usize,
 }
 
-/// Full composed method list for interface `name`: supers (in order,
-/// transitively) then own; an own/later method of the same name overrides an
-/// inherited one in place. `visiting` guards against extends-cycles.
-fn iface_compose_methods(
-    name: &str,
-    snap: &IfaceIndex,
-    visiting: &mut std::collections::HashSet<String>,
-) -> Vec<parser::ast::InterfaceMethodDecl> {
-    iface_compose_methods_with_origin(name, snap, visiting)
-        .into_iter()
-        .map(|(m, _)| m)
-        .collect()
+impl<'a> IfaceComposition<'a> {
+    fn new(snap: &'a IfaceIndex) -> Self {
+        // Remove leaves toward their dependents. The remaining vertices are
+        // precisely cycles and interfaces reaching a cycle. Invalid declarations
+        // retain only own methods; the checker still diagnoses their unchanged
+        // extends clauses. This avoids enumerating paths before E0423.
+        let mut remaining = std::collections::HashMap::new();
+        let mut dependents: std::collections::HashMap<&str, Vec<&str>> =
+            std::collections::HashMap::new();
+        let mut ready = Vec::new();
+        for (name, (supers, _)) in snap {
+            let mut count = 0;
+            for sup in supers {
+                if snap.contains_key(sup) {
+                    count += 1;
+                    dependents.entry(sup).or_default().push(name);
+                }
+            }
+            remaining.insert(name.as_str(), count);
+            if count == 0 {
+                ready.push(name.as_str());
+            }
+        }
+        while let Some(name) = ready.pop() {
+            if let Some(children) = dependents.get(name) {
+                for child in children {
+                    let count = remaining.get_mut(child).unwrap();
+                    *count -= 1;
+                    if *count == 0 {
+                        ready.push(child);
+                    }
+                }
+            }
+        }
+        let invalid: std::collections::HashSet<_> = remaining
+            .into_iter()
+            .filter_map(|(name, count)| (count != 0).then_some(name))
+            .collect();
+        let mut result = Self {
+            invalid,
+            ..Self::default()
+        };
+        for &name in &result.invalid {
+            let mut methods = Vec::new();
+            let mut positions = std::collections::HashMap::new();
+            for method in &snap[name].1 {
+                if let Some(&position) = positions.get(&method.name) {
+                    methods[position] = (method, name);
+                } else {
+                    positions.insert(&method.name, methods.len());
+                    methods.push((method, name));
+                }
+            }
+            result.completed.insert(name, methods);
+        }
+        result
+    }
+
+    fn related(&mut self, name: &str, other: &str, snap: &IfaceIndex) -> bool {
+        if name == other {
+            return true;
+        }
+        for root in [name, other] {
+            if !self.related_supers.contains_key(root) {
+                let mut supers = Vec::new();
+                let visits = iface_all_supers(
+                    root,
+                    snap,
+                    &mut std::collections::HashSet::new(),
+                    &mut supers,
+                );
+                #[cfg(test)]
+                {
+                    self.relationship_expansions += visits;
+                }
+                #[cfg(not(test))]
+                let _ = visits;
+                self.related_supers
+                    .insert(root.to_string(), supers.into_iter().collect());
+            }
+        }
+        self.related_supers[name].contains(other) || self.related_supers[other].contains(name)
+    }
+
+    fn compose(
+        &mut self,
+        name: &'a str,
+        snap: &'a IfaceIndex,
+    ) -> Vec<(&'a parser::ast::InterfaceMethodDecl, &'a str)> {
+        struct Frame<'a> {
+            name: &'a str,
+            next_super: usize,
+            methods: Vec<(&'a parser::ast::InterfaceMethodDecl, &'a str)>,
+            positions: std::collections::HashMap<&'a str, usize>,
+        }
+        impl<'a> Frame<'a> {
+            fn new(name: &'a str) -> Self {
+                Self {
+                    name,
+                    next_super: 0,
+                    methods: Vec::new(),
+                    positions: std::collections::HashMap::new(),
+                }
+            }
+            fn merge(&mut self, method: &'a parser::ast::InterfaceMethodDecl, origin: &'a str) {
+                if let Some(&position) = self.positions.get(method.name.as_str()) {
+                    self.methods[position] = (method, origin);
+                } else {
+                    self.positions.insert(&method.name, self.methods.len());
+                    self.methods.push((method, origin));
+                }
+            }
+        }
+        if let Some(summary) = self.completed.get(name) {
+            return summary.clone();
+        }
+        let mut active = std::collections::HashSet::from([name]);
+        let mut stack = vec![Frame::new(name)];
+        while let Some(frame) = stack.last_mut() {
+            if let Some(sup) = snap
+                .get(frame.name)
+                .and_then(|(supers, _)| supers.get(frame.next_super))
+            {
+                frame.next_super += 1;
+                if active.contains(sup.as_str()) {
+                    unreachable!("cycle prepass excludes invalid roots");
+                } else if let Some(summary) = self.completed.get(sup.as_str()) {
+                    for &(method, origin) in summary {
+                        frame.merge(method, origin);
+                        #[cfg(test)]
+                        {
+                            self.merged += 1;
+                        }
+                    }
+                } else {
+                    active.insert(sup.as_str());
+                    stack.push(Frame::new(sup));
+                }
+                continue;
+            }
+            let mut frame = stack.pop().unwrap();
+            #[cfg(test)]
+            {
+                self.expanded += 1;
+            }
+            if let Some((_, own)) = snap.get(frame.name) {
+                for method in own {
+                    frame.merge(method, frame.name);
+                    #[cfg(test)]
+                    {
+                        self.merged += 1;
+                    }
+                }
+            }
+            active.remove(frame.name);
+            self.completed.insert(frame.name, frame.methods.clone());
+            if let Some(parent) = stack.last_mut() {
+                for (method, origin) in frame.methods {
+                    parent.merge(method, origin);
+                    #[cfg(test)]
+                    {
+                        self.merged += 1;
+                    }
+                }
+            } else {
+                return frame.methods;
+            }
+        }
+        unreachable!()
+    }
+
+    fn methods(
+        &mut self,
+        name: &'a str,
+        snap: &'a IfaceIndex,
+    ) -> Vec<parser::ast::InterfaceMethodDecl> {
+        self.compose(name, snap)
+            .into_iter()
+            .map(|(method, _)| method.clone())
+            .collect()
+    }
 }
 
 /// Transitive super-interface names of `name` (in discovery order).
@@ -130,7 +269,7 @@ fn iface_all_supers(
     snap: &IfaceIndex,
     visiting: &mut std::collections::HashSet<String>,
     out: &mut Vec<String>,
-) {
+) -> usize {
     enum Step<'a> {
         Enter(&'a str),
         Super(&'a str),
@@ -138,6 +277,8 @@ fn iface_all_supers(
     }
     let mut work = vec![Step::Enter(name)];
     let mut seen: std::collections::HashSet<String> = out.iter().cloned().collect();
+    let mut completed = std::collections::HashSet::new();
+    let mut expanded = 0;
     while let Some(step) = work.pop() {
         match step {
             Step::Super(name) => {
@@ -147,9 +288,10 @@ fn iface_all_supers(
                 work.push(Step::Enter(name));
             }
             Step::Enter(name) => {
-                if !visiting.insert(name.to_string()) {
+                if completed.contains(name) || !visiting.insert(name.to_string()) {
                     continue;
                 }
+                expanded += 1;
                 work.push(Step::Leave(name));
                 if let Some((supers, _)) = snap.get(name) {
                     work.extend(supers.iter().rev().map(|sup| Step::Super(sup)));
@@ -157,73 +299,48 @@ fn iface_all_supers(
             }
             Step::Leave(name) => {
                 visiting.remove(name);
+                completed.insert(name);
             }
         }
     }
+    expanded
 }
 
-fn iface_names_related(name: &str, other: &str, snap: &IfaceIndex) -> bool {
-    if name == other {
-        return true;
-    }
-    let mut name_supers = Vec::new();
-    iface_all_supers(
-        name,
-        snap,
-        &mut std::collections::HashSet::new(),
-        &mut name_supers,
-    );
-    if name_supers.iter().any(|s| s == other) {
-        return true;
-    }
-    let mut other_supers = Vec::new();
-    iface_all_supers(
-        other,
-        snap,
-        &mut std::collections::HashSet::new(),
-        &mut other_supers,
-    );
-    other_supers.iter().any(|s| s == name)
-}
-
-fn iface_inherited_default_conflicts(
+fn iface_inherited_default_conflicts<'a>(
     iface_name: &str,
     iface_span: diagnostics::Span,
-    extends: &[String],
+    extends: &'a [String],
     own_methods: &[parser::ast::InterfaceMethodDecl],
-    snap: &IfaceIndex,
+    snap: &'a IfaceIndex,
+    composition: &mut IfaceComposition<'a>,
 ) -> Vec<diagnostics::Diagnostic> {
     use diagnostics::{Diagnostic, ErrorCode, Label, Severity};
     use std::collections::{HashMap, HashSet};
 
-    #[derive(Clone)]
     struct DefaultProvider {
         origin: String,
-        span: diagnostics::Span,
     }
 
-    if extends.len() < 2 {
+    if extends.len() < 2 || composition.invalid.contains(iface_name) {
         return Vec::new();
     }
 
     let own_method_names: HashSet<&str> = own_methods.iter().map(|m| m.name.as_str()).collect();
     let mut inherited_defaults: HashMap<String, Vec<DefaultProvider>> = HashMap::new();
+    let mut provider_keys = HashSet::new();
 
     for sup in extends {
-        for (method, origin) in iface_compose_methods_with_origin(sup, snap, &mut HashSet::new()) {
+        for (method, origin) in composition.compose(sup, snap) {
             if method.default_body.is_none() || own_method_names.contains(method.name.as_str()) {
                 continue;
             }
             let providers = inherited_defaults.entry(method.name.clone()).or_default();
-            if providers
-                .iter()
-                .any(|p| p.origin == origin && p.span == method.span)
-            {
+            // A snapshot has one effective declaration per (origin, method).
+            if !provider_keys.insert((method.name.as_str(), origin)) {
                 continue;
             }
             providers.push(DefaultProvider {
-                origin,
-                span: method.span,
+                origin: origin.to_string(),
             });
         }
     }
@@ -232,7 +349,7 @@ fn iface_inherited_default_conflicts(
     for (method_name, providers) in inherited_defaults {
         'method: for (idx, left) in providers.iter().enumerate() {
             for right in providers.iter().skip(idx + 1) {
-                if iface_names_related(&left.origin, &right.origin, snap) {
+                if composition.related(&left.origin, &right.origin, snap) {
                     continue;
                 }
                 diags.push(
@@ -359,11 +476,17 @@ fn resolve_interface_inheritance(
         }
     }
 
+    let mut composition = IfaceComposition::new(&snapshot);
     let mut diags = Vec::new();
     for it in &program.items {
         if let Item::Interface(i) = it {
             diags.extend(iface_inherited_default_conflicts(
-                &i.name, i.span, &i.extends, &i.methods, &snapshot,
+                &i.name,
+                i.span,
+                &i.extends,
+                &i.methods,
+                &snapshot,
+                &mut composition,
             ));
         }
     }
@@ -451,7 +574,7 @@ fn resolve_interface_inheritance(
             _ => None,
         })
         .map(|n| {
-            let methods = iface_compose_methods(&n, &snapshot, &mut HashSet::new());
+            let methods = composition.methods(snapshot.get_key_value(&n).unwrap().0, &snapshot);
             (n, methods)
         })
         .collect();
@@ -548,13 +671,16 @@ fn build_module_default_methods(
     iface_index: &IfaceIndex,
 ) -> DefaultMethodIndex {
     use parser::ast::Item;
-    use std::collections::HashSet;
+    let mut composition = IfaceComposition::new(iface_index);
     let mut out = DefaultMethodIndex::new();
     for m in modules {
         for it in &m.program.items {
             if let Item::Interface(i) = it {
                 let qualified = format!("{}::{}", m.name, i.name);
-                let composed = iface_compose_methods(&qualified, iface_index, &mut HashSet::new());
+                let composed = composition.methods(
+                    iface_index.get_key_value(&qualified).unwrap().0,
+                    iface_index,
+                );
                 let with_body: Vec<_> = composed
                     .into_iter()
                     .filter(|mm| mm.default_body.is_some())
@@ -922,6 +1048,229 @@ mod tests {
     use crate::parser::Parser;
     use crate::parser::ast::{Item, Type};
 
+    fn index_from_source(source: &str) -> IfaceIndex {
+        parse(source)
+            .items
+            .into_iter()
+            .filter_map(|item| match item {
+                Item::Interface(i) => Some((i.name, (i.extends, i.methods))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn repeated_diamonds_have_linear_summary_work() {
+        for depth in [8, 16, 32, 64, 128] {
+            let mut source = String::from("interface I0 { fn ping(self) -> i64; }\n");
+            for i in 1..=depth {
+                source += &format!(
+                    "interface A{i} extends I{} {{}}\ninterface B{i} extends I{} {{}}\ninterface I{i} extends A{i}, B{i} {{}}\n",
+                    i - 1,
+                    i - 1
+                );
+            }
+            let index = index_from_source(&source);
+            let mut composition = IfaceComposition::new(&index);
+            // All roots plus repeated equivalent calls share the same summaries.
+            for _ in 0..3 {
+                for name in index.keys() {
+                    let methods = composition.compose(name, &index);
+                    assert_eq!(methods.len(), 1);
+                    assert_eq!(methods[0].1, "I0");
+                }
+            }
+            assert_eq!(composition.expanded, 3 * depth + 1);
+            assert_eq!(composition.merged, 4 * depth + 1);
+            let mut supers = Vec::new();
+            let expanded = iface_all_supers(
+                &format!("I{depth}"),
+                &index,
+                &mut std::collections::HashSet::new(),
+                &mut supers,
+            );
+            assert_eq!(expanded, 3 * depth + 1);
+            assert_eq!(supers.len(), 3 * depth);
+            println!(
+                "depth={depth} expanded={} merged={} ancestors={expanded}",
+                composition.expanded, composition.merged
+            );
+            let mut program = parse(&source);
+            assert!(
+                DesugarPass::run(&mut program, &mut [])
+                    .diagnostics
+                    .is_empty()
+            );
+            assert_eq!(
+                program
+                    .items
+                    .iter()
+                    .filter_map(|item| match item {
+                        Item::Interface(i) => Some(i.methods.len()),
+                        _ => None,
+                    })
+                    .sum::<usize>(),
+                3 * depth + 1
+            );
+        }
+    }
+
+    #[test]
+    fn cyclic_graph_recovery_and_relationship_queries_are_bounded() {
+        for size in [8, 16, 32, 64] {
+            let mut index = IfaceIndex::new();
+            for i in 0..size {
+                index.insert(
+                    format!("I{i}"),
+                    ((0..size).map(|j| format!("I{j}")).collect(), vec![]),
+                );
+            }
+            index.insert("Valid".into(), (vec![], vec![]));
+            let mut composition = IfaceComposition::new(&index);
+            assert_eq!(composition.invalid.len(), size);
+            for name in index.keys() {
+                assert!(composition.compose(name, &index).is_empty());
+            }
+            assert_eq!(
+                composition.expanded, 1,
+                "invalid roots never enter composition"
+            );
+
+            let mut chain = IfaceIndex::new();
+            for i in 0..size {
+                chain.insert(
+                    format!("I{i}"),
+                    (
+                        if i == 0 {
+                            vec![]
+                        } else {
+                            vec![format!("I{}", i - 1)]
+                        },
+                        vec![],
+                    ),
+                );
+            }
+            let mut composition = IfaceComposition::new(&chain);
+            for _ in 0..3 {
+                for i in 0..size {
+                    for j in 0..size {
+                        assert!(composition.related(&format!("I{i}"), &format!("I{j}"), &chain));
+                    }
+                }
+            }
+            assert_eq!(composition.relationship_expansions, size * (size + 1) / 2);
+        }
+    }
+
+    #[test]
+    fn growing_summaries_and_fanout_are_bounded_by_summary_inputs() {
+        for size in [8, 16, 32, 64] {
+            let mut source = String::new();
+            for i in 0..size {
+                let extends = if i == 0 {
+                    String::new()
+                } else {
+                    format!(" extends I{}", i - 1)
+                };
+                source += &format!("interface I{i}{extends} {{ fn m{i}(self) -> i64; }}\n");
+            }
+            for i in 0..size {
+                source += &format!("interface F{i} extends I{} {{}}\n", size - 1);
+            }
+            let index = index_from_source(&source);
+            let mut composition = IfaceComposition::new(&index);
+            for name in index.keys() {
+                composition.compose(name, &index);
+            }
+            assert_eq!(composition.expanded, 2 * size);
+            assert_eq!(composition.merged, size * (size + 1) / 2 + size * size);
+        }
+    }
+
+    #[test]
+    fn summaries_preserve_order_origins_and_cycle_context() {
+        // Reference the original path traversal, including cycles. Exhaust all
+        // directed graphs on three vertices and query every root twice.
+        fn reference<'a>(
+            name: &'a str,
+            index: &'a IfaceIndex,
+            active: &mut std::collections::HashSet<&'a str>,
+            out: &mut Vec<(&'a parser::ast::InterfaceMethodDecl, &'a str)>,
+        ) {
+            if !active.insert(name) {
+                return;
+            }
+            if let Some((supers, own)) = index.get(name) {
+                for sup in supers {
+                    reference(sup, index, active, out);
+                }
+                for method in own {
+                    if let Some(position) = out.iter().position(|(m, _)| m.name == method.name) {
+                        out[position] = (method, name);
+                    } else {
+                        out.push((method, name));
+                    }
+                }
+            }
+            active.remove(name);
+        }
+        for edges in 0..512 {
+            let mut index = index_from_source(
+                "interface A { fn same(self) -> i64 { return 1; } fn a(self) -> i64; } interface B { fn same(self) -> i64; fn b(self) -> i64; } interface C { fn c(self) -> i64; }",
+            );
+            let names = ["A", "B", "C"];
+            for (i, name) in names.iter().enumerate() {
+                index.get_mut(*name).unwrap().0 = names
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| edges & (1 << (3 * i + j)) != 0)
+                    .map(|(_, name)| name.to_string())
+                    .collect();
+            }
+            let mut composition = IfaceComposition::new(&index);
+            for _ in 0..2 {
+                for name in names {
+                    let mut expected = Vec::new();
+                    reference(
+                        name,
+                        &index,
+                        &mut std::collections::HashSet::new(),
+                        &mut expected,
+                    );
+                    let actual = composition.compose(name, &index);
+                    if composition.invalid.contains(name) {
+                        assert!(actual.iter().all(|(_, origin)| *origin == name));
+                        continue;
+                    }
+                    let signature = |items: Vec<(&parser::ast::InterfaceMethodDecl, &str)>| {
+                        items
+                            .into_iter()
+                            .map(|(m, origin)| {
+                                (m.name.clone(), origin.to_string(), m.default_body.is_some())
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(
+                        signature(actual),
+                        signature(expected),
+                        "edges={edges} root={name}"
+                    );
+                }
+            }
+        }
+        let index = index_from_source(
+            "interface A {} interface B extends A {} interface C extends A {} interface D extends B, C {}",
+        );
+        let mut supers = Vec::new();
+        iface_all_supers(
+            "D",
+            &index,
+            &mut std::collections::HashSet::new(),
+            &mut supers,
+        );
+        assert_eq!(supers, ["B", "A", "C"]);
+    }
+
     #[test]
     fn deep_interface_composition_and_type_substitution_use_explicit_worklists() {
         std::thread::Builder::new()
@@ -948,11 +1297,7 @@ mod tests {
                     };
                     index.insert(format!("I{depth}"), (supers, methods));
                 }
-                let methods = iface_compose_methods_with_origin(
-                    "I0",
-                    &index,
-                    &mut std::collections::HashSet::new(),
-                );
+                let methods = IfaceComposition::new(&index).compose("I0", &index);
                 assert_eq!(methods.len(), 1);
                 assert_eq!(methods[0].1, "I7999");
                 let mut supers = Vec::new();

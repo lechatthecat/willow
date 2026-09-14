@@ -274,8 +274,8 @@ macro_rules! lir_type_ctx {
             },
             // The same layout `declare_one_vtable` emits from, so the
             // offset eligibility vets is the offset the widening adds.
-            iface_widen_offset: &|target, source| {
-                super::vtable_layout::super_offset(&$me.interface_infos, source, target)
+            iface_widen_path: &|target, source| {
+                super::vtable_layout::super_path(&$me.interface_infos, source, target)
             },
             fn_types: &$me.fn_types,
             func_param_modes: &$me.func_param_modes,
@@ -1896,27 +1896,59 @@ impl Codegen {
         iface: &InterfaceInfo,
         span: crate::diagnostics::Span,
     ) -> Result<()> {
-        let key = (TypeId::from_source_name(class_name), iface.name);
-        if self.vtable_ids.contains_key(&key) {
-            return Ok(());
+        let mut pending = vec![iface.name];
+        let mut definitions = Vec::new();
+        // Declare every reachable symbol before writing references. Explicit
+        // worklists keep deep inheritance independent of the compiler stack.
+        while let Some(name) = pending.pop() {
+            let canonical = self
+                .interface_infos
+                .get(&name)
+                .map(|info| info.name)
+                .unwrap_or(name);
+            let key = (TypeId::from_source_name(class_name), canonical);
+            if self.vtable_ids.contains_key(&key) {
+                continue;
+            }
+            let info = self
+                .interface_infos
+                .get(&canonical)
+                .cloned()
+                .unwrap_or_else(|| iface.clone());
+            let symbol = vtable_symbol(class_name, &info.name.to_string());
+            self.claim_symbol(
+                &symbol,
+                format!("interface implementation `{class_name}: {}`", info.name),
+                span,
+            )?;
+            let id = self
+                .module
+                .declare_data(&symbol, Linkage::Local, false, false)?;
+            self.vtable_ids.insert(key, id);
+            for sup in &info.extends {
+                if let Some(super_info) = self.interface_infos.get(sup) {
+                    pending.push(super_info.name);
+                }
+            }
+            definitions.push(info);
         }
-        // The EMBEDDED-region layout, not the composed `method_order`: a
-        // super-interface's table must stay contiguous inside this one so a
-        // widening can reach it by pointer arithmetic (willow-1fc6).
+        for info in definitions {
+            self.define_one_vtable(class_name, &info, span)?;
+        }
+        Ok(())
+    }
+
+    fn define_one_vtable(
+        &mut self,
+        class_name: &str,
+        iface: &InterfaceInfo,
+        span: crate::diagnostics::Span,
+    ) -> Result<()> {
+        let key = (TypeId::from_source_name(class_name), iface.name);
+        let data_id = self.vtable_ids[&key];
         let slots = super::vtable_layout::slots(&self.interface_infos, &iface.name);
-        let slot_count = slots.len().max(1);
-        let symbol = vtable_symbol(class_name, &iface.name.to_string());
-        // A vtable is data, not a function, but it shares the one linker
-        // namespace with every other symbol the backend hands out, so it is
-        // claimed like the rest (willow-uqzx, catalog item 8).
-        self.claim_symbol(
-            &symbol,
-            format!("interface implementation `{class_name}: {}`", iface.name),
-            span,
-        )?;
-        let data_id = self
-            .module
-            .declare_data(&symbol, Linkage::Local, false, false)?;
+        let method_words = slots.len().max(1);
+        let slot_count = method_words + iface.extends.len();
         let mut data = DataDescription::new();
         // Explicit zeroed bytes (not `define_zeroinit`, which is BSS and cannot
         // carry the function-address relocations written below).
@@ -1966,8 +1998,25 @@ impl Codegen {
                 func_ref,
             );
         }
+        for (index, sup) in iface.extends.iter().enumerate() {
+            let canonical = self
+                .interface_infos
+                .get(sup)
+                .map(|info| info.name)
+                .unwrap_or(*sup);
+            if let Some(&target) = self.vtable_ids.get(&(key.0, canonical)) {
+                let reference = self.module.declare_data_in_data(target, &mut data);
+                data.write_data_addr(
+                    willow_abi::dispatch_layout::table_slot_offset(
+                        (method_words + index) as u32,
+                        pointer_bytes,
+                    ),
+                    reference,
+                    0,
+                );
+            }
+        }
         self.module.define_data(data_id, &data)?;
-        self.vtable_ids.insert(key, data_id);
         Ok(())
     }
 

@@ -300,6 +300,7 @@ struct Frontend {
     program: parser::ast::Program,
     module_graph: module::ModuleGraph,
     helpers: HelperIndex,
+    dependencies: ModuleDependencies,
 }
 
 /// A single compilation request. Owns the shared context (paths, options,
@@ -417,6 +418,7 @@ fn run_frontend(
     let desugar = desugar_phase(&mut program, &mut graph.files);
     emit_frontend_diagnostics(&desugar.diagnostics, map, &graph)?;
     let artifacts = graph.artifacts.as_ref().expect("spooled import graph");
+    let dependencies = ModuleDependencies::new(&graph.files);
     let mut helpers = HelperIndex::new();
     for module in &graph.files {
         let body = artifacts.hydrate(&module.program)?;
@@ -428,7 +430,15 @@ fn run_frontend(
     let mut error_count = parse.error_count + imports.error_count + desugar.error_count;
     for module in &graph.files {
         let body = artifacts.hydrate(&module.program)?;
-        let checker = check_module(&body, module, &graph.files, &helpers, artifacts, options)?;
+        let checker = check_module(
+            &body,
+            module,
+            &graph.files,
+            &dependencies,
+            &helpers,
+            artifacts,
+            options,
+        )?;
         error_count += diagnostic_error_count(&checker.errors);
         emit_frontend_diagnostics(&checker.errors, map, &graph)?;
         let concurrency = check_unit_concurrency(
@@ -475,6 +485,7 @@ fn run_frontend(
         program,
         module_graph: graph,
         helpers,
+        dependencies,
     })
 }
 
@@ -586,6 +597,7 @@ fn check_module(
     body: &parser::ast::Program,
     module: &module::ResolvedModule,
     modules: &[module::ResolvedModule],
+    dependencies: &ModuleDependencies,
     helpers: &HelperIndex,
     artifacts: &UnitArtifacts,
     options: &CompilerOptions,
@@ -593,7 +605,7 @@ fn check_module(
     let mut checker = semantic::TypeChecker::new();
     checker.set_enforce_send_sync(options.enforce_send_sync);
     register_prelude(&mut checker)?;
-    register_module_imports(&mut checker, body, modules);
+    register_module_imports(&mut checker, body, modules, dependencies);
     checker.set_module_path(&module.canonical_path);
     checker.set_nonpreemptible_module_methods(imported_nonpreemptible_method_owners(
         body, modules, helpers,
@@ -658,22 +670,27 @@ fn register_module_imports(
     checker: &mut semantic::TypeChecker,
     program: &parser::ast::Program,
     modules: &[module::ResolvedModule],
+    dependencies: &ModuleDependencies,
 ) {
     // `(canonical path, access spelling)` for each module this program imports.
     // A module can appear twice under two spellings -- `import base as b;` next
     // to `import base::Parcel;` -- and then it is registered under both, since
     // the item lookup resolves against the canonical one.
-    let mut imported: Vec<(&str, &str)> = Vec::new();
+    let mut imported: std::collections::HashMap<usize, Vec<&str>> =
+        std::collections::HashMap::new();
+    let mut spellings_seen = std::collections::HashSet::new();
     let mut item_imports: Vec<(&str, &str, &str, diagnostics::Span)> = Vec::new();
     for import in &program.imports {
         let path = import.path.as_str();
         // Whole module: `import worker;`, `import a::b as c;`.
-        if let Some(dep) = modules.iter().find(|d| d.canonical_path == path) {
+        if let Some(&id) = dependencies.by_path.get(path) {
             let access = import
                 .alias
                 .as_deref()
                 .unwrap_or_else(|| path.rsplit("::").next().unwrap_or(path));
-            push_unique(&mut imported, (dep.canonical_path.as_str(), access));
+            if spellings_seen.insert((id, access)) {
+                imported.entry(id).or_default().push(access);
+            }
             continue;
         }
         // Single item: `import math::add;`, `import math::add as plus;`. The
@@ -683,36 +700,30 @@ fn register_module_imports(
         let Some((module_path, item)) = path.rsplit_once("::") else {
             continue;
         };
-        let Some(dep) = modules.iter().find(|d| d.canonical_path == module_path) else {
+        let Some(&id) = dependencies.by_path.get(module_path) else {
             continue;
         };
-        push_unique(&mut imported, (dep.canonical_path.as_str(), module_path));
+        if spellings_seen.insert((id, module_path)) {
+            imported.entry(id).or_default().push(module_path);
+        }
         let local = import.alias.as_deref().unwrap_or(item);
         item_imports.push((local, module_path, item, import.span));
     }
 
-    let needed = dependency_closure(imported.iter().map(|(path, _)| *path), modules);
-    for dep in modules {
+    let needed = dependencies.closure(imported.keys().copied());
+    for (id, dep) in modules.iter().enumerate() {
         let canonical = dep.canonical_path.as_str();
-        if !needed.contains(canonical) {
+        if !needed[id] {
             continue;
         }
         let dep_path = dep.path.to_string_lossy();
-        let mut spellings = imported
-            .iter()
-            .filter(|(path, _)| *path == canonical)
-            .peekable();
-        if spellings.peek().is_none() {
+        let Some(spellings) = imported.get(&id) else {
             checker.register_module_type_signatures(canonical, &dep_path, &dep.program);
             continue;
-        }
-        // The first spelling registers the module; the rest are bound to
-        // those same registrations, so one class this unit can write two names
-        // for stays one type (willow-uvlp).
-        let mut spellings = spellings.map(|(_, access)| *access);
-        let Some(registered) = spellings.next() else {
-            continue;
         };
+        // Keep source spelling order and bind aliases to the first registration.
+        let mut spellings = spellings.iter().copied();
+        let registered = spellings.next().expect("import has a spelling");
         checker.register_module_with_id(
             dep.id,
             registered,
@@ -730,38 +741,77 @@ fn register_module_imports(
     }
 }
 
-fn push_unique<'a>(out: &mut Vec<(&'a str, &'a str)>, entry: (&'a str, &'a str)) {
-    if !out.contains(&entry) {
-        out.push(entry);
-    }
+/// Compilation-owned graph metadata; contains no hydrated bodies or checkers.
+struct ModuleDependencies {
+    by_path: std::collections::HashMap<String, usize>,
+    edges: Vec<Vec<usize>>,
 }
 
-/// The canonical paths of `roots` plus everything they import, transitively.
-fn dependency_closure<'a>(
-    roots: impl Iterator<Item = &'a str>,
-    modules: &'a [module::ResolvedModule],
-) -> std::collections::HashSet<&'a str> {
-    let mut closure: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut pending: Vec<&str> = roots.collect();
-    while let Some(path) = pending.pop() {
-        if !closure.insert(path) {
-            continue;
-        }
-        let Some(dep) = modules.iter().find(|d| d.canonical_path == path) else {
-            continue;
-        };
-        for import in &dep.program.imports {
-            let sub = import.path.as_str();
-            if let Some(found) = modules.iter().find(|d| d.canonical_path == sub) {
-                pending.push(found.canonical_path.as_str());
-            } else if let Some((module_path, _)) = sub.rsplit_once("::")
-                && let Some(found) = modules.iter().find(|d| d.canonical_path == module_path)
-            {
-                pending.push(found.canonical_path.as_str());
+#[cfg(test)]
+thread_local! {
+    static DEPENDENCY_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+impl ModuleDependencies {
+    fn new(modules: &[module::ResolvedModule]) -> Self {
+        let by_path: std::collections::HashMap<_, _> = modules
+            .iter()
+            .enumerate()
+            .map(|(id, module)| (module.canonical_path.clone(), id))
+            .collect();
+        let edges = modules
+            .iter()
+            .map(|module| {
+                let mut seen = std::collections::HashSet::new();
+                module
+                    .program
+                    .imports
+                    .iter()
+                    .filter_map(|import| {
+                        #[cfg(test)]
+                        DEPENDENCY_WORK.with(|work| {
+                            let (lookups, visits) = work.get();
+                            work.set((lookups + 1, visits));
+                        });
+                        let id = by_path.get(&import.path).copied().or_else(|| {
+                            let (path, _) = import.path.rsplit_once("::")?;
+                            #[cfg(test)]
+                            DEPENDENCY_WORK.with(|work| {
+                                let (lookups, visits) = work.get();
+                                work.set((lookups + 1, visits));
+                            });
+                            by_path.get(path).copied()
+                        })?;
+                        seen.insert(id).then_some(id)
+                    })
+                    .collect()
+            })
+            .collect();
+        Self { by_path, edges }
+    }
+
+    fn closure(&self, roots: impl Iterator<Item = usize>) -> Vec<bool> {
+        let mut seen = vec![false; self.edges.len()];
+        let mut pending = Vec::new();
+        for id in roots {
+            if !std::mem::replace(&mut seen[id], true) {
+                pending.push(id);
             }
         }
+        while let Some(id) = pending.pop() {
+            for &dependency in &self.edges[id] {
+                #[cfg(test)]
+                DEPENDENCY_WORK.with(|work| {
+                    let (lookups, visits) = work.get();
+                    work.set((lookups, visits + 1));
+                });
+                if !std::mem::replace(&mut seen[dependency], true) {
+                    pending.push(dependency);
+                }
+            }
+        }
+        seen
     }
-    closure
 }
 
 /// Index non-preemptible methods visible through one module's own imports.
@@ -1025,6 +1075,7 @@ fn run_backend(
         program,
         mut module_graph,
         helpers,
+        dependencies,
     } = frontend;
     let module_init_plan = ir::module_init::ModuleInitPlan::from_graph(&module_graph);
     let mut artifacts = module_graph.artifacts.take().expect("spooled frontend");
@@ -1095,7 +1146,15 @@ fn run_backend(
     let mut declared_modules = Vec::with_capacity(modules.len());
     for module in &modules {
         let body = artifacts.hydrate(&module.program)?;
-        let checker = check_module(&body, module, &modules, &helpers, &artifacts, opts)?;
+        let checker = check_module(
+            &body,
+            module,
+            &modules,
+            &dependencies,
+            &helpers,
+            &artifacts,
+            opts,
+        )?;
         for info in checker.symbols.enums.values() {
             codegen.register_enum_info(info.name.clone(), info.to_semantic());
         }
@@ -1153,7 +1212,15 @@ fn run_backend(
         let _lir = artifacts.live(UnitKind::Lir);
         let aliases = {
             let body = artifacts.hydrate(&module.program)?;
-            let checker = check_module(&body, module, &modules, &helpers, &artifacts, opts)?;
+            let checker = check_module(
+                &body,
+                module,
+                &modules,
+                &dependencies,
+                &helpers,
+                &artifacts,
+                opts,
+            )?;
             let aliases = unit_enum_aliases(&checker);
             drop(body);
             // ANF declarations may hoist a lambda before an await and create
@@ -1535,6 +1602,108 @@ mod frontend_phase_tests {
     }
 
     #[test]
+    fn module_dependency_index_work_is_numeric_and_output_sensitive() {
+        for size in [8usize, 16, 32, 64] {
+            for shape in ["chain", "fanout", "diamond"] {
+                let n = if shape == "diamond" {
+                    2 * size + 1
+                } else {
+                    size
+                };
+                let modules: Vec<_> = (0..n)
+                    .map(|id| {
+                        let dependencies = if id == 0 {
+                            vec![]
+                        } else if shape == "chain" {
+                            vec![id - 1]
+                        } else if shape == "fanout" || id <= 2 {
+                            vec![0]
+                        } else {
+                            let layer = (id - 1) / 2;
+                            vec![2 * layer - 1, 2 * layer]
+                        };
+                        let source = dependencies
+                            .iter()
+                            .map(|dep| format!("import m{dep};"))
+                            .collect::<String>();
+                        module::ResolvedModule {
+                            id: module::ModuleId(id as u32),
+                            name: format!("m{id}"),
+                            canonical_path: format!("m{id}"),
+                            path: format!("m{id}.wi").into(),
+                            source: String::new(),
+                            program: parse_source(&source),
+                        }
+                    })
+                    .collect();
+                DEPENDENCY_WORK.with(|work| work.set((0, 0)));
+                let index = ModuleDependencies::new(&modules);
+                let expected_edges = if shape == "diamond" {
+                    4 * size - 2
+                } else {
+                    n - 1
+                };
+                assert_eq!(DEPENDENCY_WORK.with(|work| work.get()), (expected_edges, 0));
+                for _ in 0..3 {
+                    for root in 0..n {
+                        let closure = index.closure(std::iter::once(root));
+                        assert!(closure[root]);
+                        assert!(closure[0]);
+                        assert!(
+                            closure
+                                .iter()
+                                .enumerate()
+                                .all(|(id, present)| !present || id <= root)
+                        );
+                    }
+                }
+                let expected_visits = match shape {
+                    "chain" => n * (n - 1) / 2,
+                    "fanout" => n - 1,
+                    _ => 4 * size * (size - 1) + 2,
+                };
+                let work = DEPENDENCY_WORK.with(|work| work.get());
+                assert_eq!(work, (expected_edges, 3 * expected_visits));
+                println!(
+                    "shape={shape} modules={n} passes=3 build_path_lookups={} closure_path_lookups=0 edge_visits={}",
+                    work.0, work.1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn module_dependency_index_resolves_alias_and_item_edges_once() {
+        let sources = [
+            "pub class Base {}",
+            "import m0 as b; import m0::Base as B;",
+            "import m1;",
+        ];
+        let modules: Vec<_> = sources
+            .iter()
+            .enumerate()
+            .map(|(id, source)| module::ResolvedModule {
+                id: module::ModuleId(id as u32),
+                name: format!("m{id}"),
+                canonical_path: format!("m{id}"),
+                path: format!("m{id}.wi").into(),
+                source: String::new(),
+                program: parse_source(source),
+            })
+            .collect();
+        let index = ModuleDependencies::new(&modules);
+        assert_eq!(index.edges, [vec![], vec![0], vec![1]]);
+        assert_eq!(index.closure(std::iter::once(2)), vec![true, true, true]);
+        let body = parse_source(
+            "import m0 as b; import m0::Base as B; pub fn f(x: b::Base) -> B { return x; }",
+        );
+        let mut checker = semantic::TypeChecker::new();
+        register_module_imports(&mut checker, &body, &modules, &index);
+        checker.check_module_program(&body);
+        assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+    }
+
+    #[test]
     fn lex_phase_separates_success_from_diagnostics() {
         assert!(lex_phase("fn main() {}").is_ok());
         assert!(lex_phase("fn main() { @ }").is_err());
@@ -1611,7 +1780,12 @@ mod frontend_phase_tests {
             ));
             let mut checker = semantic::TypeChecker::new().with_sync_stack_preemption(false);
             register_prelude(&mut checker).unwrap();
-            register_module_imports(&mut checker, &body, &modules);
+            register_module_imports(
+                &mut checker,
+                &body,
+                &modules,
+                &ModuleDependencies::new(&modules),
+            );
             checker.set_nonpreemptible_module_methods(imported_nonpreemptible_method_owners(
                 &body, &modules, &helpers,
             ));

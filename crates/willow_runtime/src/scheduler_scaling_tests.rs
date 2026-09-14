@@ -89,13 +89,33 @@ const TASK_COUNTS: [usize; 4] = [1_000, 2_500, 5_000, 10_000];
 /// a request up to, so it is a lower bound on RSS and it is deterministic
 /// across platforms — which is what makes before/after numbers comparable at
 /// all. It is compiled only into this crate's test binary.
+///
+/// Besides the process-wide totals it keeps per-thread counters, which is what
+/// a single-threaded allocation *assertion* needs: the process totals move
+/// under every other test thread in the same binary, the thread-local ones see
+/// only the calling thread's own work (willow-ssl7.7).
 #[cfg(test)]
-mod counting_allocator {
+pub(crate) mod counting_allocator {
     use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
     static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
+    // Const-initialized and `Drop`-free, so reading them registers no TLS
+    // destructor and allocates nothing: the allocator can touch them without
+    // re-entering itself. `try_with` keeps a post-teardown access from
+    // panicking inside `alloc`.
+    thread_local! {
+        static THREAD_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+        static THREAD_BYTES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn record_thread(bytes: usize) {
+        let _ = THREAD_ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+        let _ = THREAD_BYTES.try_with(|total| total.set(total.get() + bytes));
+    }
 
     pub struct Counting;
 
@@ -108,6 +128,7 @@ mod counting_allocator {
             if !ptr.is_null() {
                 LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
                 ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+                record_thread(layout.size());
             }
             ptr
         }
@@ -122,6 +143,7 @@ mod counting_allocator {
             if !ptr.is_null() {
                 LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
                 ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+                record_thread(layout.size());
             }
             ptr
         }
@@ -132,6 +154,7 @@ mod counting_allocator {
                 LIVE_BYTES.fetch_add(new_size, Ordering::Relaxed);
                 LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
                 ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+                record_thread(new_size);
             }
             new_ptr
         }
@@ -148,6 +171,16 @@ mod counting_allocator {
     /// Allocation calls since process start.
     pub fn allocations() -> usize {
         ALLOCATIONS.load(Ordering::Relaxed)
+    }
+
+    /// Allocation calls made by the calling thread.
+    pub(crate) fn thread_allocations() -> usize {
+        THREAD_ALLOCATIONS.with(Cell::get)
+    }
+
+    /// Bytes the calling thread has requested from the allocator.
+    pub(crate) fn thread_bytes() -> usize {
+        THREAD_BYTES.with(Cell::get)
     }
 }
 

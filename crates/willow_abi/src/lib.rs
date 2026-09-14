@@ -247,6 +247,10 @@ pub mod gc_header {
 
 /// Pointer-only interface boxes and dispatch tables. Scalar class identifiers
 /// keep their fixed i64 representation even when table entries are narrower.
+/// Interface tables contain composed method pointers (at least one word),
+/// followed by direct-super table pointers in declaration order. Supertables
+/// are shared static symbols; widening follows these pointers. The interface
+/// box and its GC mask remain two words with only the object traced.
 pub mod dispatch_layout {
     pub const OBJECT_OFFSET: u32 = 0;
     pub const CLASS_ID_BYTES: u32 = 8;

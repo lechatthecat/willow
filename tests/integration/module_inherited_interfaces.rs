@@ -43,6 +43,7 @@
 //!  22 two modules each contribute a base class and an interface
 //!  23 control: an entry class implementing the module interface directly
 //!  24 the runnable example program
+//!  25 an imported sub-interface widens to its imported super
 
 use super::support::compile_temp_project_and_run;
 
@@ -328,8 +329,8 @@ fn main() {
 }
 
 /// A module whose interface inherits another: `Measured extends Named`, so a
-/// `Parcel` is usable as either and the sub-interface's vtable embeds the
-/// super's region.
+/// `Parcel` is usable as either and `Measured`'s vtable carries a pointer to
+/// the one shared `Named` table (willow-ssl7.5).
 const LIB_SUPER: &str = r#"
 module lib;
 
@@ -1039,4 +1040,61 @@ fn mi_24_the_runnable_example_program() {
     );
     assert!(ok, "expected the example to compile:\n{output}");
     assert_eq!(output, "30\n100\n40\nparcel\nentry\n7\n21\n120\n");
+}
+
+#[test]
+fn mi_25_an_imported_sub_interface_widens_to_its_imported_super() {
+    // willow-ssl7.5: widening reads the super's table out of the sub-interface's
+    // own table. Both interfaces live in the module, so the table the entry
+    // file's widening lands on has to be the same one the module's own
+    // `lib::name` dispatches through, in the entry file and across the boundary.
+    assert_output(
+        &[
+            ("lib.wi", LIB_SUPER),
+            (
+                "app.wi",
+                r#"
+import lib;
+import lib::Parcel;
+import lib::Measured;
+import lib::Named;
+
+class EntryParcel extends Parcel {
+    pub override fn tag(self) -> String {
+        return "entry";
+    }
+}
+
+fn tag_of(n: Named) -> String {
+    return n.tag();
+}
+
+fn main() {
+    let m: Measured = new Parcel(4);
+    let n: Named = m;
+    println(n.tag());
+    println(tag_of(m));
+    println(lib::name(m));
+    println(lib::describe(m));
+    // Widening an already-widened value, and one whose class overrides the
+    // super's method, so the pointer walk cannot be short-circuited.
+    let sub: Measured = new EntryParcel(5);
+    let wide: Named = sub;
+    let again: Named = wide;
+    println(again.tag());
+    println(lib::name(sub));
+    println(lib::describe(sub));
+}
+"#,
+            ),
+        ],
+        "parcel
+parcel
+parcel
+40
+entry
+entry
+50
+",
+    );
 }

@@ -120,6 +120,27 @@ struct LirDeferState {
     flags: HashMap<Span, cranelift_codegen::ir::StackSlot>,
 }
 
+/// A normal flush can share code only with the same lexical registrations,
+/// panic destinations and root/protocol depth. Return values remain in their
+/// already-bound LIR locals; a block parameter selects the continuation.
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct NormalCleanupKey {
+    entries: Vec<Vec<usize>>,
+    depth: usize,
+    roots: usize,
+    panic_targets: Vec<cranelift_codegen::ir::Block>,
+    panic_depth: usize,
+    recover_depth: usize,
+    call_depth: usize,
+    native_active: bool,
+}
+struct NormalCleanup {
+    entry: cranelift_codegen::ir::Block,
+    end: Option<cranelift_codegen::ir::Block>,
+    selector: cranelift_codegen::ir::Value,
+    continuations: Vec<cranelift_codegen::ir::Block>,
+}
+
 /// Scopes a synchronous function opened, so the ones no `LeaveDeferScope` ever
 /// closes still get their panic cleanup emitted once at the end of the body.
 #[derive(Default)]
@@ -138,6 +159,8 @@ struct LirDeferLedger {
     /// outer one, so sealing at the point a scope is finished would seal a
     /// block a later child still has to name (willow-0g8j.2.15).
     cleanups: Vec<cranelift_codegen::ir::Block>,
+    normal: HashMap<NormalCleanupKey, NormalCleanup>,
+    sites: HashMap<crate::ir::lowered::LirDeferId, (usize, usize, usize)>,
 }
 
 /// Mutable synchronous-defer context shared while one LIR block is emitted.
@@ -430,12 +453,13 @@ pub(super) struct LirTypeCtx<'x> {
     /// — there is no slot to index, so a walker that admitted such a call would
     /// silently miscompile (willow-0g8j.6).
     pub iface_method: &'x dyn Fn(&Type, &str) -> Option<IfaceMethodSig>,
-    /// The slot offset at which interface `target`'s vtable is embedded in
-    /// interface `source`'s, or `None` when `target` is not a super-interface.
-    /// Offset zero is representation-compatible; a non-zero offset makes
-    /// [`FuncGen::coerce_to_target`] allocate a box whose vtable pointer is
-    /// advanced to the embedded target region (willow-1fc6).
-    pub iface_widen_offset: &'x dyn Fn(&TypeId, &TypeId) -> Option<usize>,
+    /// The super-pointer slots to load, in order, to reach interface `target`'s
+    /// vtable from interface `source`'s, or `None` when `target` is not a
+    /// super-interface. An empty path is the interface itself and is
+    /// representation-compatible; otherwise [`FuncGen::coerce_to_target`]
+    /// follows the path and allocates a box holding the target's own shared
+    /// table pointer (willow-1fc6, willow-ssl7.5).
+    pub iface_widen_path: &'x dyn Fn(&TypeId, &TypeId) -> Option<Vec<usize>>,
     /// The declared type of the static property `(class, field)`, resolved
     /// through the class hierarchy exactly as
     /// [`FuncGen::emit_static_field_read`] resolves the storage it loads from —
@@ -827,7 +851,7 @@ impl LirTypeCtx<'_> {
     /// bare [`assignable_repr`] everywhere else.
     fn storable(&self, target: &Type, value: &Type) -> bool {
         self.repr_compatible(target, value)
-            || self.iface_widen_offset(target, value).is_some()
+            || self.iface_widen_path(target, value).is_some()
             || self.boxable(target, value)
             // A fresh empty map fits any admitted map slot: it is one
             // representation with nothing recorded in it yet (see
@@ -1141,20 +1165,22 @@ impl LirTypeCtx<'_> {
     fn repr_compatible(&self, target: &Type, value: &Type) -> bool {
         self.same_repr(target, value)
             || self.class_widening(target, value)
-            || self.iface_widen_offset(target, value) == Some(0)
+            || self
+                .iface_widen_path(target, value)
+                .is_some_and(|path| path.is_empty())
     }
 
     /// The vtable-slot adjustment required to widen `value` to `target`.
     /// Identity is handled by [`assignable_repr`], so this answers only a
     /// strict interface-to-super-interface conversion.
-    fn iface_widen_offset(&self, target: &Type, value: &Type) -> Option<usize> {
+    fn iface_widen_path(&self, target: &Type, value: &Type) -> Option<Vec<usize>> {
         let (Type::Named(target_iface), Type::Named(value_iface)) = (target, value) else {
             return None;
         };
         (target_iface != value_iface
             && (self.is_interface)(target_iface)
             && (self.is_interface)(value_iface))
-        .then(|| (self.iface_widen_offset)(target_iface, value_iface))
+        .then(|| (self.iface_widen_path)(target_iface, value_iface))
         .flatten()
     }
 
@@ -1630,6 +1656,7 @@ fn lir_flushed_scope_count(
     sites: &[crate::ir::lowered::LirDeferId],
     open_sites: &[Vec<crate::ir::lowered::LirDeferId>],
 ) -> usize {
+    let sites: HashSet<_> = sites.iter().copied().collect();
     open_sites
         .iter()
         .rev()
@@ -5018,6 +5045,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         let mut lir_defer_scopes = Vec::new();
         let mut ledger = LirDeferLedger::default();
+        if coop.is_some() {
+            for (block_index, block) in f.blocks.iter().enumerate() {
+                for (instruction_index, inst) in block.instrs.iter().enumerate() {
+                    if let LirInst::Defer { id, .. } = inst {
+                        let entry_id = self.defer_counter;
+                        self.defer_counter += 1;
+                        ledger
+                            .sites
+                            .insert(*id, (block_index, instruction_index, entry_id));
+                    }
+                }
+            }
+        }
         // Synchronous defer state per LIR block, filled in along the edges as
         // the predecessors are emitted. Async functions rebuild every scope
         // from the LIR at each exit, so they do not need it.
@@ -5193,6 +5233,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             while let Some(frame) = lir_defer_scopes.pop() {
                 self.finish_lir_async_panic_scope(frame);
             }
+        }
+        for cleanup in ledger.normal.into_values() {
+            if let Some(end) = cleanup.end {
+                self.builder.switch_to_block(end);
+                let mut switch = cranelift_frontend::Switch::new();
+                for (index, &continuation) in cleanup.continuations.iter().enumerate() {
+                    switch.set_entry(index as u128, continuation);
+                }
+                switch.emit(self.builder, cleanup.selector, cleanup.continuations[0]);
+                for continuation in cleanup.continuations {
+                    self.builder.seal_block(continuation);
+                }
+            }
+            self.builder.seal_block(cleanup.entry);
         }
         // The enclosing function compiler may append shared panic-return CFG
         // after the LIR body. It seals all blocks once that ABI edge exists
@@ -6129,7 +6183,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 LirInst::LeaveDeferScope { sites } => {
                     if coop.is_some() {
-                        self.emit_lir_defer_sites(function, sites);
+                        self.emit_lir_defer_sites(function, sites, defers.ledger);
                     } else if let Some(frame) = defers.scopes.pop() {
                         defers.ledger.closed.insert(frame.id);
                         self.finish_lir_defer_scope(frame, &mut defers.ledger.cleanups);
@@ -6139,7 +6193,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 LirInst::FlushDefers { sites } => {
                     if coop.is_some() {
-                        self.emit_lir_defer_sites(function, sites);
+                        self.emit_lir_defer_sites(function, sites, defers.ledger);
                     } else {
                         self.emit_lir_sync_flush(sites, defers.scopes, defers.ledger);
                     }
@@ -6368,7 +6422,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return;
         }
         let depth = open[open.len() - flushed].scope.defer_depth;
-        self.emit_flush_defers_from(depth);
+        self.emit_lir_shared_normal_cleanup(depth, ledger);
         // The path taken here has left those scopes; only the paths that reach
         // their `LeaveDeferScope` still hold them. Record what the scope looked
         // like from here so the end-of-body sweep can emit the panic cleanup of
@@ -6388,6 +6442,90 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
+    fn emit_lir_shared_normal_cleanup(&mut self, depth: usize, ledger: &mut LirDeferLedger) {
+        // Active reference/call preparations carry per-site diagnostic values.
+        // Their cleanup remains local rather than merging distinct protocols.
+        if !self.lir_call_frames.is_empty() || !self.lir_reference_scopes.is_empty() {
+            self.emit_flush_defers_from(depth);
+            return;
+        }
+        // A poll-shaped body (poll fn, cancellation cleanup, task-stack
+        // boundary callback) is re-entered at its suspend points by the state
+        // dispatch, which jumps straight into the middle of a flush that
+        // crosses a task-stack boundary. The selector's defining block then no
+        // longer dominates the switch at the end of the shared region, so the
+        // sharing is only sound while every edge into the flush comes from the
+        // flush's own entry (willow-xgfk).
+        if self.async_frame.is_some() {
+            self.emit_flush_defers_from(depth);
+            return;
+        }
+        let key = NormalCleanupKey {
+            entries: self
+                .defer_stack
+                .iter()
+                .map(|frame| frame.iter().map(|entry| entry.id).collect())
+                .collect(),
+            depth,
+            roots: self.gc_root_count,
+            panic_targets: self
+                .panic_scopes
+                .iter()
+                .map(|scope| scope.cleanup)
+                .collect(),
+            panic_depth: self.panic_defer_codegen_depth,
+            recover_depth: self.recover_eligible_depth,
+            call_depth: self.callstack_frame_depth,
+            native_active: self.sync_native_active.is_some(),
+        };
+        let (entry, index) = if let Some(cleanup) = ledger.normal.get(&key) {
+            (cleanup.entry, cleanup.continuations.len())
+        } else {
+            let entry = self.builder.create_block();
+            self.builder.append_block_param(entry, types::I32);
+            if let Some(active) = self.sync_native_active {
+                self.builder
+                    .append_block_param(entry, self.builder.func.dfg.value_type(active));
+            }
+            (entry, 0)
+        };
+        let selector = self.builder.ins().iconst(types::I32, index as i64);
+        let mut args = vec![selector.into()];
+        if let Some(active) = self.sync_native_active {
+            args.push(active.into());
+        }
+        self.builder.ins().jump(entry, &args);
+        if !ledger.normal.contains_key(&key) {
+            self.builder.switch_to_block(entry);
+            let selector = self.builder.block_params(entry)[0];
+            let before_active = self.sync_native_active;
+            if before_active.is_some() {
+                self.sync_native_active = Some(self.builder.block_params(entry)[1]);
+            }
+            self.emit_flush_defers_from(depth);
+            self.sync_native_active = before_active;
+            let end = (!self.terminated).then(|| self.builder.current_block().unwrap());
+            ledger.normal.insert(
+                key.clone(),
+                NormalCleanup {
+                    entry,
+                    end,
+                    selector,
+                    continuations: Vec::new(),
+                },
+            );
+        }
+        let cleanup = ledger.normal.get_mut(&key).unwrap();
+        if cleanup.end.is_some() {
+            let continuation = self.builder.create_block();
+            cleanup.continuations.push(continuation);
+            self.builder.switch_to_block(continuation);
+            self.terminated = false;
+        } else {
+            self.terminated = true;
+        }
+    }
+
     /// Emit exactly the LIR defer sites named by a CFG exit. Runtime flags
     /// decide which registrations on that source path are active, so this is
     /// independent of Rust code-generation order between basic blocks.
@@ -6395,21 +6533,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         function: &LirFunction,
         sites: &[crate::ir::lowered::LirDeferId],
+        ledger: &mut LirDeferLedger,
     ) {
         if sites.is_empty() || self.coop_frame.is_none() {
             return;
         }
         let mut entries = Vec::with_capacity(sites.len());
         for site_id in sites {
-            let body = function
-                .blocks
-                .iter()
-                .flat_map(|block| &block.instrs)
-                .find_map(|inst| match inst {
-                    LirInst::Defer { id, body, .. } if id == site_id => Some(body),
-                    _ => None,
-                })
+            let &(block, instruction, id) = ledger
+                .sites
+                .get(site_id)
                 .expect("LIR defer exit references an unknown site");
+            let LirInst::Defer { body, .. } = &function.blocks[block].instrs[instruction] else {
+                unreachable!()
+            };
             let action = body.clone();
             let bindings = self
                 .vars
@@ -6419,8 +6556,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     _ => None,
                 })
                 .collect();
-            let id = self.defer_counter;
-            self.defer_counter += 1;
             entries.push(super::DeferEntry {
                 id,
                 action,
@@ -6433,7 +6568,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         let depth = self.defer_stack.len();
         self.defer_stack.push(entries);
-        self.emit_flush_defers_from(depth);
+        self.emit_lir_shared_normal_cleanup(depth, ledger);
         self.defer_stack.pop();
     }
 
@@ -8440,6 +8575,27 @@ fn flat_static_reference_call_supported(
 
 /// User calls can run synchronous safepoints. Builtin scalar/collection
 /// operations and task creation remain on the ordinary poll stack.
+/// Frame slots consumed by one callback, including reference owners/indices.
+/// Boundary functions use `frame_all`, so these are existing parent slots.
+pub(super) fn task_boundary_locals(
+    function: &LirFunction,
+    result: LirLocalId,
+    value: &crate::ir::lowered::LirRvalue,
+) -> Vec<LirLocalId> {
+    let mut seen = HashSet::new();
+    value
+        .operands()
+        .into_iter()
+        .flat_map(|operand| operand.locals())
+        .chain(std::iter::once(result))
+        .filter(|id| {
+            let local = &function.locals[id.0 as usize];
+            (local.is_gc_owner() || !matches!(local.ty, Type::Void | Type::Never))
+                && seen.insert(*id)
+        })
+        .collect()
+}
+
 pub(super) fn task_stack_boundary(value: &crate::ir::lowered::LirRvalue) -> bool {
     use crate::ir::lowered::LirRvalue as R;
     let params = match value {
@@ -8541,8 +8697,19 @@ impl FuncGen<'_, '_> {
         span: Span,
     ) {
         use crate::ir::lowered::{LirOperand, LirRvalue as R};
-        self.bind_coop_lir_locals(function);
-        self.bind_lir_locals(function);
+        for id in task_boundary_locals(function, local, value) {
+            let binding = &function.locals[id.0 as usize];
+            let offset = self.lir_frame_offsets[&id];
+            self.vars.insert(
+                binding.name.clone(),
+                VarStorage::Frame {
+                    offset,
+                    ty: binding.ty.clone(),
+                },
+            );
+            #[cfg(test)]
+            super::async_codegen::count_callback_binding();
+        }
         let panic_exit = self.builder.create_block();
         self.panic_return_block = Some(panic_exit);
         if let R::MethodCall { method, .. } = value
@@ -9099,8 +9266,8 @@ mod tests {
                     }
                     None
                 },
-                iface_widen_offset: &|target, source| {
-                    crate::backend::cranelift::vtable_layout::super_offset(self, source, target)
+                iface_widen_path: &|target, source| {
+                    crate::backend::cranelift::vtable_layout::super_path(self, source, target)
                 },
                 fn_types: &self.fn_types,
                 func_param_modes: &self.param_modes,

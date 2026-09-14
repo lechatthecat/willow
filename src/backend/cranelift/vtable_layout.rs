@@ -1,58 +1,10 @@
-//! Interface vtable LAYOUT: which method occupies which slot, and where a
-//! super-interface's table sits inside a sub-interface's.
-//!
-//! A Willow interface value is a two-word box, `[object | vtable]`, and a call
-//! through it indexes the vtable by a slot number computed from the receiver's
-//! STATIC interface. Widening such a value to a super-interface therefore has
-//! to produce a box whose vtable answers the SUPER's slot numbering — and the
-//! concrete class is not known at the widening site, so the target table can
-//! only come from the source table.
-//!
-//! The layout below makes that possible. An interface's slots are the slots of
-//! each direct super, **verbatim and in order**, followed by the methods the
-//! interface itself adds:
-//!
-//! ```text
-//! interface A { fn a(); }          A: [a]
-//! interface B { fn b(); }          B: [b]
-//! interface C extends A, B { fn c(); }
-//!                                  C: [a | b | c]
-//!                                      ^   ^
-//!                                      |   B's table, embedded at slot 1
-//!                                      A's table, embedded at slot 0
-//! ```
-//!
-//! So every super-interface's table is a contiguous run inside the sub's, and
-//! widening is `vtable + offset * 8` — the C++ multiple-inheritance trick.
-//! [`super_offset`] computes that offset; it is `0` for the single-`extends`
-//! chain, where the super's table is a plain prefix and the box can be reused
-//! unchanged.
-//!
-//! Two properties make the "verbatim copy" honest:
-//!
-//! * A slot is filled by NAME (`resolve_class_method_func_id`), so a method
-//!   that appears in two regions — a diamond's shared grandparent, or an own
-//!   declaration that re-states an inherited one — gets the same address in
-//!   every slot that names it. Duplicate slots can never disagree.
-//! * [`slot_of`] resolves a method to its FIRST slot, and a super's region is
-//!   built by this same function, so the index a call site computes from the
-//!   super equals the index inside the embedded region.
-//!
-//! This is deliberately not the interface's `method_order`, which desugaring
-//! composes with cross-super deduplication: that list is the SEMANTIC view (what
-//! a class must implement), and deduplicating across supers is exactly what
-//! destroys the embedded-region property (willow-1fc6).
-//!
-//! # Cost
-//!
-//! Repeating a shared super is the point, so a table grows with the number of
-//! PATHS to each ancestor, not the number of ancestors: nesting diamonds
-//! doubles the slot count per level. Neither [`slots`] nor [`super_offset`]
-//! memoises either, so a query re-walks the whole super graph. Both are
-//! compile-time and static-data costs only — dispatch stays one indexed load —
-//! and inheritance graphs deep enough to notice do not occur in practice. If
-//! one ever does, cache `slots` per interface; the results are pure functions
-//! of the interface table.
+//! Interface boxes remain `[object | vtable]`. Each vtable stores composed
+//! method pointers once, followed by pointers to its direct-super tables.
+//! Widening follows a statically resolved sequence of supertable pointer loads.
+//! Shared ancestors are shared data symbols, so diamonds use O(methods + edges)
+//! table words per class rather than one copy per inheritance path. This trades
+//! O(path length) loads at widening sites for bounded static data; method
+//! dispatch remains one indexed function-pointer load.
 
 use std::collections::HashSet;
 
@@ -72,39 +24,7 @@ pub(super) fn slots<S: IfaceShapes + ?Sized, Q: super::type_index::TypeLookup + 
     shapes: &S,
     iface: &Q,
 ) -> Vec<String> {
-    enum Work {
-        Enter(super::TypeId),
-        Exit(super::TypeId, usize),
-    }
-    let mut work = vec![Work::Enter(iface.type_id())];
-    let mut visiting = HashSet::new();
-    let mut results: Vec<Vec<String>> = Vec::new();
-    while let Some(task) = work.pop() {
-        match task {
-            Work::Enter(iface) => {
-                let canonical = shapes.canonical(&iface);
-                if !visiting.insert(canonical) {
-                    results.push(Vec::new());
-                    continue;
-                }
-                let supers = shapes.supers(&iface);
-                work.push(Work::Exit(iface, supers.len()));
-                work.extend(supers.into_iter().rev().map(Work::Enter));
-            }
-            Work::Exit(iface, count) => {
-                let children = results.split_off(results.len() - count);
-                let mut out: Vec<String> = children.into_iter().flatten().collect();
-                for method in shapes.methods(&iface) {
-                    if !out.contains(&method) {
-                        out.push(method);
-                    }
-                }
-                visiting.remove(&shapes.canonical(&iface));
-                results.push(out);
-            }
-        }
-    }
-    results.pop().unwrap_or_default()
+    shapes.methods(&iface.type_id())
 }
 
 pub(super) fn slot_of<S: IfaceShapes + ?Sized, Q: super::type_index::TypeLookup + ?Sized>(
@@ -115,7 +35,8 @@ pub(super) fn slot_of<S: IfaceShapes + ?Sized, Q: super::type_index::TypeLookup 
     slots(shapes, iface).iter().position(|name| name == method)
 }
 
-pub(super) fn super_offset<
+/// Slot indices of direct-super pointers to load. Empty means identity.
+pub(super) fn super_path<
     S: IfaceShapes + ?Sized,
     Q: super::type_index::TypeLookup + ?Sized,
     R: super::type_index::TypeLookup + ?Sized,
@@ -123,36 +44,36 @@ pub(super) fn super_offset<
     shapes: &S,
     source: &Q,
     target: &R,
-) -> Option<usize> {
-    enum Work {
-        Enter(super::TypeId, usize),
-        Exit(super::TypeId),
-    }
+) -> Option<Vec<usize>> {
     let target = shapes.canonical(&target.type_id());
-    let mut work = vec![Work::Enter(source.type_id(), 0)];
-    let mut visiting = HashSet::new();
-    while let Some(task) = work.pop() {
-        match task {
-            Work::Exit(id) => {
-                visiting.remove(&id);
+    let source = shapes.canonical(&source.type_id());
+    if source == target {
+        return Some(Vec::new());
+    }
+    // Parent links avoid cloning an ever-growing path at each graph edge.
+    let mut parents = std::collections::HashMap::new();
+    let mut seen = HashSet::from([source]);
+    let mut work = vec![source];
+    while let Some(current) = work.pop() {
+        let base = shapes.methods(&current).len().max(1);
+        for (index, sup) in shapes.supers(&current).into_iter().enumerate() {
+            let sup = shapes.canonical(&sup);
+            if !seen.insert(sup) {
+                continue;
             }
-            Work::Enter(source, offset) => {
-                let canonical = shapes.canonical(&source);
-                if canonical == target {
-                    return Some(offset);
+            parents.insert(sup, (current, base + index));
+            if sup == target {
+                let mut path = Vec::new();
+                let mut node = target;
+                while node != source {
+                    let (parent, slot) = parents[&node];
+                    path.push(slot);
+                    node = parent;
                 }
-                if !visiting.insert(canonical) {
-                    continue;
-                }
-                work.push(Work::Exit(canonical));
-                let mut next = offset;
-                let mut children = Vec::new();
-                for sup in shapes.supers(&source) {
-                    children.push(Work::Enter(sup, next));
-                    next += slots(shapes, &sup).len();
-                }
-                work.extend(children.into_iter().rev());
+                path.reverse();
+                return Some(path);
             }
+            work.push(sup);
         }
     }
     None
@@ -181,165 +102,284 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    // Layout perspectives (willow-ssl7.5). 1 leaf interface exposes only its
+    // own method slots, 2 `slot_of` finds a declared method and rejects an
+    // undeclared one, 3 an unknown interface has no slots and no supers,
+    // 4 a chain hop lands at `methods.max(1) + super index`, 5 a widening path
+    // is the sequence of those hops, 6 two direct supers get distinct adjacent
+    // pointer slots, 7 three supers extend that run, 8 a diamond reaches its
+    // shared ancestor through one recorded path, 9 that path is bounded by the
+    // graph depth rather than the number of paths, 10 narrowing is not a
+    // widening, 11 identity widening is the empty path, 12 a methodless
+    // interface still reserves one word before its super pointers, 13 an
+    // `extends` cycle terminates, 14 a self-extending interface terminates,
+    // 15 an unknown super name is skipped rather than fatal, 16 a disconnected
+    // interface is unreachable, 17 aliases are canonicalized on the source,
+    // 18 on the target and 19 on each super edge, 20 a ten-deep chain widens
+    // with one slot per hop, 21 a deep diamond keeps total table words linear
+    // in interfaces and edges, 22 a method redeclared by a super keeps one
+    // slot, and 23 declaration order of methods is the slot order.
+
     /// `name -> (supers, composed methods)`, i.e. what desugaring leaves behind.
-    struct Table(HashMap<&'static str, (Vec<&'static str>, Vec<&'static str>)>);
+    struct Table {
+        rows: HashMap<&'static str, (Vec<&'static str>, Vec<&'static str>)>,
+        aliases: HashMap<&'static str, &'static str>,
+    }
 
     impl Table {
         fn new(rows: &[(&'static str, &[&'static str], &[&'static str])]) -> Self {
-            Table(
-                rows.iter()
+            Table {
+                rows: rows
+                    .iter()
                     .map(|(n, s, m)| (*n, (s.to_vec(), m.to_vec())))
                     .collect(),
-            )
+                aliases: HashMap::new(),
+            }
+        }
+
+        fn alias(mut self, alias: &'static str, target: &'static str) -> Self {
+            self.aliases.insert(alias, target);
+            self
+        }
+
+        /// Table words one vtable occupies: composed methods (at least one
+        /// reserved word) plus one pointer per direct super.
+        fn words(&self, iface: &'static str) -> usize {
+            let (supers, methods) = &self.rows[iface];
+            methods.len().max(1) + supers.len()
         }
     }
 
     impl IfaceShapes for Table {
         fn canonical(&self, iface: &super::super::TypeId) -> super::super::TypeId {
-            *iface
+            self.aliases
+                .get(iface.name())
+                .map(super::super::TypeId::local)
+                .unwrap_or(*iface)
         }
         fn supers(&self, iface: &super::super::TypeId) -> Vec<super::super::TypeId> {
-            self.0
-                .get(iface.name())
+            self.rows
+                .get(self.canonical(iface).name())
                 .map(|(s, _)| s.iter().map(super::super::TypeId::local).collect())
                 .unwrap_or_default()
         }
         fn methods(&self, iface: &super::super::TypeId) -> Vec<String> {
-            self.0
-                .get(iface.name())
+            self.rows
+                .get(self.canonical(iface).name())
                 .map(|(_, m)| m.iter().map(|n| n.to_string()).collect())
                 .unwrap_or_default()
         }
     }
 
-    // A plain interface lays its own methods out in declaration order.
-    #[test]
-    fn unit_vtable_01_own_methods_keep_declaration_order() {
-        let t = Table::new(&[("A", &[], &["a", "z"])]);
-        assert_eq!(slots(&t, "A"), vec!["a".to_string(), "z".to_string()]);
-        assert_eq!(slot_of(&t, "A", "z"), Some(1));
-        assert_eq!(slot_of(&t, "A", "nope"), None);
-    }
-
-    // A single-`extends` chain leaves the super's table as a prefix: the
-    // widened box needs no adjustment at all.
-    #[test]
-    fn unit_vtable_02_single_chain_is_a_prefix() {
-        let t = Table::new(&[("A", &[], &["a"]), ("B", &["A"], &["a", "b"])]);
-        assert_eq!(slots(&t, "B"), vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(super_offset(&t, "B", "A"), Some(0));
-    }
-
-    // THE bug: a SECOND super's table is embedded after the first's, so the
-    // widened box must advance the vtable pointer past it (willow-1fc6).
-    #[test]
-    fn unit_vtable_03_second_super_is_embedded_after_the_first() {
-        let t = Table::new(&[
-            ("A", &[], &["a"]),
-            ("B", &[], &["b"]),
-            ("C", &["A", "B"], &["a", "b", "c"]),
-        ]);
-        assert_eq!(
-            slots(&t, "C"),
-            vec!["a".to_string(), "b".to_string(), "c".to_string()]
-        );
-        assert_eq!(super_offset(&t, "C", "A"), Some(0));
-        assert_eq!(super_offset(&t, "C", "B"), Some(1));
-        // The embedded region really is `B`'s own table.
-        assert_eq!(slots(&t, "C")[1..2], slots(&t, "B")[..]);
-    }
-
-    // A diamond repeats the shared grandparent's slots in BOTH regions rather
-    // than deduplicating them, which is what keeps each region contiguous.
-    #[test]
-    fn unit_vtable_04_diamond_repeats_the_shared_super() {
-        let t = Table::new(&[
+    fn diamond() -> Table {
+        Table::new(&[
             ("X", &[], &["x"]),
             ("A", &["X"], &["x", "a"]),
             ("B", &["X"], &["x", "b"]),
             ("C", &["A", "B"], &["x", "a", "b", "c"]),
-        ]);
-        assert_eq!(slots(&t, "C"), ["x", "a", "x", "b", "c"]);
-        assert_eq!(super_offset(&t, "C", "A"), Some(0));
-        assert_eq!(super_offset(&t, "C", "B"), Some(2));
-        assert_eq!(super_offset(&t, "C", "X"), Some(0));
-        assert_eq!(slots(&t, "C")[2..4], slots(&t, "B")[..]);
-        // A method in two regions resolves to the first, which is the slot the
-        // un-widened receiver indexes.
-        assert_eq!(slot_of(&t, "C", "x"), Some(0));
+        ])
     }
 
-    // Widening runs one way: a super has no slot for the sub's own methods.
     #[test]
-    fn unit_vtable_05_narrowing_has_no_offset() {
-        let t = Table::new(&[("A", &[], &["a"]), ("B", &["A"], &["a", "b"])]);
-        assert_eq!(super_offset(&t, "A", "B"), None);
-        assert_eq!(super_offset(&t, "A", "A"), Some(0));
+    fn methods_and_shared_super_paths_have_one_layout() {
+        let t = diamond();
+        assert_eq!(slots(&t, "C"), ["x", "a", "b", "c"]);
+        assert_eq!(slot_of(&t, "C", "b"), Some(2));
+        assert_eq!(slot_of(&t, "C", "missing"), None);
+        assert_eq!(super_path(&t, "C", "A"), Some(vec![4]));
+        assert_eq!(super_path(&t, "C", "B"), Some(vec![5]));
+        assert_eq!(super_path(&t, "C", "X"), Some(vec![5, 2]));
+        assert_eq!(super_path(&t, "A", "X"), Some(vec![2]));
+        assert_eq!(super_path(&t, "C", "C"), Some(vec![]));
+        assert_eq!(super_path(&t, "A", "C"), None);
     }
 
-    // An `extends` cycle is a diagnosed program, but layout still has to
-    // terminate: codegen runs on whatever the checker handed it.
     #[test]
-    fn unit_vtable_06_extends_cycle_terminates() {
-        let t = Table::new(&[("A", &["B"], &["a"]), ("B", &["A"], &["b"])]);
-        assert_eq!(slots(&t, "A"), ["b", "a"]);
-        assert_eq!(super_offset(&t, "A", "B"), Some(0));
+    fn leaf_and_unknown_interfaces_expose_their_own_slots_only() {
+        let t = Table::new(&[("L", &[], &["one", "two"])]);
+        assert_eq!(slots(&t, "L"), ["one", "two"]);
+        assert_eq!(slot_of(&t, "L", "one"), Some(0));
+        assert_eq!(slot_of(&t, "L", "two"), Some(1));
+        assert_eq!(slot_of(&t, "L", "three"), None);
+        assert!(slots(&t, "Absent").is_empty());
+        assert_eq!(super_path(&t, "Absent", "L"), None);
+        assert_eq!(super_path(&t, "L", "Absent"), None);
     }
 
-    // An unknown super (an interface from a module the backend never saw)
-    // contributes no slots, so the sub's own methods still get stable indices.
     #[test]
-    fn unit_vtable_07_unknown_super_contributes_nothing() {
-        let t = Table::new(&[("C", &["Gone"], &["c"])]);
-        assert_eq!(slots(&t, "C"), ["c"]);
-        assert_eq!(super_offset(&t, "C", "Gone"), Some(0));
-        assert_eq!(super_offset(&t, "C", "Other"), None);
-    }
-
-    // An own method that re-states an inherited one does not get a second
-    // slot: it is the same name, and slots are filled by name.
-    #[test]
-    fn unit_vtable_08_own_redeclaration_reuses_the_inherited_slot() {
-        let t = Table::new(&[("A", &[], &["m"]), ("B", &["A"], &["m", "b"])]);
-        assert_eq!(slots(&t, "B"), ["m", "b"]);
-        assert_eq!(slot_of(&t, "B", "m"), Some(0));
-        assert_eq!(super_offset(&t, "B", "A"), Some(0));
-    }
-
-    // Three supers: each region starts where the previous one ended.
-    #[test]
-    fn unit_vtable_09_three_supers_are_laid_out_end_to_end() {
+    fn chain_hops_follow_the_method_count_of_each_interface() {
         let t = Table::new(&[
-            ("A", &[], &["a1", "a2"]),
-            ("B", &[], &["b"]),
-            ("C", &[], &["c1", "c2", "c3"]),
-            (
-                "D",
-                &["A", "B", "C"],
-                &["a1", "a2", "b", "c1", "c2", "c3", "d"],
-            ),
+            ("Base", &[], &["b"]),
+            ("Mid", &["Base"], &["b", "m1", "m2"]),
+            ("Top", &["Mid"], &["b", "m1", "m2", "t"]),
         ]);
-        assert_eq!(slots(&t, "D").len(), 7);
-        assert_eq!(super_offset(&t, "D", "A"), Some(0));
-        assert_eq!(super_offset(&t, "D", "B"), Some(2));
-        assert_eq!(super_offset(&t, "D", "C"), Some(3));
-        assert_eq!(slot_of(&t, "D", "d"), Some(6));
+        // Base pointer slot of `Top` is 4 (four methods), of `Mid` is 3.
+        assert_eq!(super_path(&t, "Top", "Mid"), Some(vec![4]));
+        assert_eq!(super_path(&t, "Mid", "Base"), Some(vec![3]));
+        assert_eq!(super_path(&t, "Top", "Base"), Some(vec![4, 3]));
+        // Widening is directional.
+        assert_eq!(super_path(&t, "Base", "Top"), None);
+        assert_eq!(super_path(&t, "Base", "Mid"), None);
     }
 
-    // A transitive super is found through the sub-super's own offset, so the
-    // two hops add up.
     #[test]
-    fn unit_vtable_10_transitive_super_offsets_compose() {
+    fn multiple_direct_supers_get_adjacent_pointer_slots() {
         let t = Table::new(&[
             ("P", &[], &["p"]),
             ("Q", &[], &["q"]),
-            ("R", &["P", "Q"], &["p", "q", "r"]),
-            ("S", &[], &["s"]),
-            ("T", &["S", "R"], &["s", "p", "q", "r", "t"]),
+            ("R", &[], &["r"]),
+            ("S", &["P", "Q", "R"], &["p", "q", "r"]),
         ]);
-        assert_eq!(slots(&t, "T"), ["s", "p", "q", "r", "t"]);
-        assert_eq!(super_offset(&t, "T", "R"), Some(1));
-        assert_eq!(super_offset(&t, "T", "Q"), Some(2));
-        assert_eq!(slots(&t, "T")[2..3], slots(&t, "Q")[..]);
+        assert_eq!(super_path(&t, "S", "P"), Some(vec![3]));
+        assert_eq!(super_path(&t, "S", "Q"), Some(vec![4]));
+        assert_eq!(super_path(&t, "S", "R"), Some(vec![5]));
+        assert_eq!(t.words("S"), 6);
+    }
+
+    #[test]
+    fn methodless_interfaces_reserve_one_word_before_super_pointers() {
+        let t = Table::new(&[("E", &[], &[]), ("F", &["E"], &[])]);
+        assert!(slots(&t, "F").is_empty());
+        assert_eq!(super_path(&t, "F", "E"), Some(vec![1]));
+        assert_eq!(t.words("E"), 1);
+        assert_eq!(t.words("F"), 2);
+    }
+
+    #[test]
+    fn cyclic_and_empty_layouts_are_bounded() {
+        let t = Table::new(&[("A", &["B"], &[]), ("B", &["A"], &["b"])]);
+        assert!(slots(&t, "A").is_empty());
+        assert_eq!(super_path(&t, "A", "B"), Some(vec![1]));
+        assert_eq!(super_path(&t, "A", "Missing"), None);
+    }
+
+    #[test]
+    fn self_extending_and_unknown_supers_terminate() {
+        let t = Table::new(&[
+            ("Loop", &["Loop"], &["l"]),
+            ("Ghosted", &["NotDeclared"], &["g"]),
+        ]);
+        assert_eq!(super_path(&t, "Loop", "Loop"), Some(vec![]));
+        assert_eq!(super_path(&t, "Ghosted", "Loop"), None);
+        // The unknown super is still a slot, so a later declaration of it
+        // cannot move the ones already laid out.
+        assert_eq!(super_path(&t, "Ghosted", "NotDeclared"), Some(vec![1]));
+    }
+
+    #[test]
+    fn disconnected_interfaces_are_not_reachable() {
+        let t = Table::new(&[
+            ("Left", &[], &["l"]),
+            ("Right", &[], &["r"]),
+            ("LeftChild", &["Left"], &["l", "c"]),
+        ]);
+        assert_eq!(super_path(&t, "LeftChild", "Right"), None);
+        assert_eq!(super_path(&t, "Left", "Right"), None);
+        assert_eq!(super_path(&t, "LeftChild", "Left"), Some(vec![2]));
+    }
+
+    #[test]
+    fn aliases_are_canonicalized_on_source_target_and_edges() {
+        let t = diamond().alias("CAlias", "C").alias("XAlias", "X");
+        assert_eq!(super_path(&t, "CAlias", "X"), super_path(&t, "C", "X"));
+        assert_eq!(super_path(&t, "C", "XAlias"), super_path(&t, "C", "X"));
+        assert_eq!(super_path(&t, "CAlias", "XAlias"), Some(vec![5, 2]));
+        assert_eq!(super_path(&t, "CAlias", "CAlias"), Some(vec![]));
+        assert_eq!(slots(&t, "CAlias"), ["x", "a", "b", "c"]);
+        let aliased_edge = Table::new(&[("Sub", &["SuperAlias"], &["s"]), ("Super", &[], &["s"])])
+            .alias("SuperAlias", "Super");
+        assert_eq!(super_path(&aliased_edge, "Sub", "Super"), Some(vec![1]));
+    }
+
+    #[test]
+    fn deep_chain_widens_with_one_slot_per_hop() {
+        let names: Vec<String> = (0..10).map(|i| format!("I{i}")).collect();
+        let leaked: Vec<&'static str> = names
+            .iter()
+            .map(|n| &*Box::leak(n.clone().into_boxed_str()))
+            .collect();
+        let mut rows: Vec<(&'static str, Vec<&'static str>, Vec<&'static str>)> = Vec::new();
+        for (i, name) in leaked.iter().enumerate() {
+            let supers = if i == 0 {
+                Vec::new()
+            } else {
+                vec![leaked[i - 1]]
+            };
+            rows.push((*name, supers, vec!["m"]));
+        }
+        let table = Table::new(
+            &rows
+                .iter()
+                .map(|(n, s, m)| (*n, s.as_slice(), m.as_slice()))
+                .collect::<Vec<_>>(),
+        );
+        let path = super_path(&table, leaked[9], leaked[0]).expect("chain widening");
+        assert_eq!(path, vec![1; 9]);
+        assert_eq!(
+            super_path(&table, leaked[9], leaked[5]),
+            Some(vec![1, 1, 1, 1])
+        );
+        // Each vtable stores its method plus one super pointer regardless of
+        // how deep the chain is.
+        assert!(leaked.iter().skip(1).all(|name| table.words(name) == 2));
+    }
+
+    #[test]
+    fn deep_diamonds_keep_table_words_linear() {
+        // Level i has `Ai`/`Bi`, both extending both of level i-1: the number
+        // of distinct inheritance PATHS to level 0 doubles per level, so a
+        // verbatim-embedding layout would too.
+        const LEVELS: usize = 8;
+        let mut names: Vec<&'static str> = Vec::new();
+        let mut rows: Vec<(&'static str, Vec<&'static str>, Vec<&'static str>)> = Vec::new();
+        for level in 0..LEVELS {
+            let a: &'static str = Box::leak(format!("A{level}").into_boxed_str());
+            let b: &'static str = Box::leak(format!("B{level}").into_boxed_str());
+            let supers = if level == 0 {
+                Vec::new()
+            } else {
+                vec![names[names.len() - 2], names[names.len() - 1]]
+            };
+            rows.push((a, supers.clone(), vec!["m"]));
+            rows.push((b, supers, vec!["m"]));
+            names.push(a);
+            names.push(b);
+        }
+        let table = Table::new(
+            &rows
+                .iter()
+                .map(|(n, s, m)| (*n, s.as_slice(), m.as_slice()))
+                .collect::<Vec<_>>(),
+        );
+        // Two root tables of one method word each, then two tables per level
+        // holding that method word plus one pointer per direct super.
+        let total: usize = names.iter().map(|name| table.words(name)).sum();
+        assert_eq!(total, 2 + (LEVELS - 1) * 2 * (1 + 2));
+        assert!(total <= 4 * names.len());
+        // Widening from the deepest table to either root is one pointer load
+        // per level, not one per inheritance path.
+        let deepest = names[names.len() - 1];
+        let path = super_path(&table, deepest, "A0").expect("diamond widening");
+        assert_eq!(path.len(), LEVELS - 1, "{path:?}");
+        assert_eq!(
+            super_path(&table, deepest, "B0").map(|p| p.len()),
+            Some(LEVELS - 1)
+        );
+    }
+
+    #[test]
+    fn composed_method_order_is_the_slot_order() {
+        // Composition already de-duplicated the redeclared `x`; the layout
+        // keeps one slot for it and dispatch resolves to the first position.
+        let t = Table::new(&[
+            ("Sup", &[], &["x", "y"]),
+            ("Sub", &["Sup"], &["x", "y", "z"]),
+        ]);
+        assert_eq!(slots(&t, "Sub"), ["x", "y", "z"]);
+        assert_eq!(slot_of(&t, "Sub", "x"), Some(0));
+        assert_eq!(slot_of(&t, "Sup", "x"), Some(0));
+        assert_eq!(slot_of(&t, "Sub", "z"), Some(2));
+        assert_eq!(slot_of(&t, "Sup", "z"), None);
+        assert_eq!(super_path(&t, "Sub", "Sup"), Some(vec![3]));
     }
 }

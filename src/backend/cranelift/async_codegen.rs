@@ -11,9 +11,25 @@ use cranelift_module::Module;
 
 use super::*;
 
+#[cfg(test)]
+std::thread_local! {
+    static CALLBACK_WORK: std::cell::Cell<(usize, usize, usize, usize)> = const {
+        std::cell::Cell::new((0, 0, 0, 0))
+    };
+}
+
+#[cfg(test)]
+pub(super) fn count_callback_binding() {
+    CALLBACK_WORK.with(|work| {
+        let (visits, callbacks, copies, bindings) = work.get();
+        work.set((visits, callbacks, copies, bindings + 1));
+    });
+}
+
 /// C-ABI status codes returned by the scheduler-aware lock entry points. Both
 /// compiler and runtime derive them from `willow_abi`.
 const MUTEX_STATUS_ACQUIRED: i64 = willow_abi::LockAcquireStatus::Acquired as i64;
+
 const MUTEX_STATUS_PENDING: i64 = willow_abi::LockAcquireStatus::Pending as i64;
 
 /// Body-specific inputs to the shared cooperative poll-function builder.
@@ -884,6 +900,11 @@ impl Codegen {
         if body.boundary.is_none() && body.cleanup.is_none() {
             for block in &body.lir.blocks {
                 for (index, instruction) in block.instrs.iter().enumerate() {
+                    #[cfg(test)]
+                    CALLBACK_WORK.with(|work| {
+                        let (visits, callbacks, copies, bindings) = work.get();
+                        work.set((visits + 1, callbacks, copies, bindings));
+                    });
                     if let LirInst::Compute { local, value, span } = instruction
                         && super::lir_gen::task_stack_boundary(value)
                     {
@@ -900,17 +921,34 @@ impl Codegen {
                             &signature,
                         )?;
                         self.func_ids.insert(symbol.clone(), id);
+                        // Keep the parent's frame layout as the source of truth;
+                        // a callback only needs its operands and result slots.
+                        let callback_offsets: HashMap<_, _> =
+                            super::lir_gen::task_boundary_locals(body.lir, *local, value)
+                                .into_iter()
+                                .map(|local| (local, lir_offsets[&local]))
+                                .collect();
+                        #[cfg(test)]
+                        CALLBACK_WORK.with(|work| {
+                            let (visits, callbacks, copies, bindings) = work.get();
+                            work.set((
+                                visits,
+                                callbacks + 1,
+                                copies + callback_offsets.len(),
+                                bindings,
+                            ));
+                        });
                         self.compile_coop_main_poll(
                             &symbol,
                             f,
-                            offsets.clone(),
-                            lir_offsets.clone(),
-                            param_bindings,
+                            HashMap::new(),
+                            callback_offsets,
+                            &[],
                             CoopPollBody {
                                 current_class: body.current_class,
                                 lir: body.lir,
                                 result_offset: None,
-                                lir_defer_offsets: body.lir_defer_offsets.clone(),
+                                lir_defer_offsets: HashMap::new(),
                                 boundary: Some((*local, value, *span)),
                                 cleanup: None,
                             },
@@ -1097,7 +1135,14 @@ impl Codegen {
                 coop_shadow_roots: Some(CoopShadowRoots::default()),
                 build_mode: self.build_mode,
                 source_file: &self.source_file,
-                address_taken: super::lir_address_taken_locals(body.lir),
+                // Boundary operands already occupy address-stable parent frame
+                // slots. No parent-wide address analysis or local seeding is
+                // needed when emitting just this one call.
+                address_taken: if body.boundary.is_some() {
+                    HashSet::new()
+                } else {
+                    super::lir_address_taken_locals(body.lir)
+                },
             };
             // Bind params from their frame slots (cooperative leaf, slice 4b):
             // the constructor stored the args there before spawning.
@@ -2149,5 +2194,158 @@ mod async_mutex_abi_tests {
     #[test]
     fn invalid_status_phase_constants_are_distinct() {
         assert_ne!(MUTEX_STATUS_PHASE_ACQUIRE, MUTEX_STATUS_PHASE_POLL);
+    }
+}
+
+#[cfg(test)]
+mod task_boundary_callback_tests {
+    use super::*;
+
+    /// `fn work` must not be an inlinable scalar leaf, or the optimizer folds
+    /// the call away and no task-stack boundary exists to compile (willow-ssl7.3).
+    const WORK: &str = "fn work(x: i64) -> i64 { println(x); return x + 1; }";
+
+    /// Compile `source` and return the callback preparation work the emitter
+    /// recorded: parent instructions visited while discovering boundaries,
+    /// callbacks emitted, parent frame-offset entries copied into a callback,
+    /// and locals bound inside callback bodies.
+    fn callback_work(source: &str) -> (usize, usize, usize, usize) {
+        let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
+        let (program, errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(errors.is_empty(), "{errors:?}");
+        let mut checker = crate::semantic::TypeChecker::new();
+        crate::register_prelude(&mut checker).unwrap();
+        checker.check_program(&program);
+        assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+        let tables = crate::ir::lower::CheckerTables::from_checker(&checker);
+        let (hir, diagnostics) = crate::ir::lower::lower_program_with(&program, &tables);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let mut codegen = Codegen::new(&crate::CompilerOptions::debug()).unwrap();
+        codegen.register_lir_functions(crate::ir::lowered::lower_program(&hir));
+        CALLBACK_WORK.with(|work| work.set((0, 0, 0, 0)));
+        codegen
+            .compile_program(&program, "callback-scaling.wi")
+            .unwrap();
+        CALLBACK_WORK.with(|work| work.get())
+    }
+
+    fn async_main(locals: usize, calls: &str) -> String {
+        let mut source = String::from(WORK);
+        source.push_str(" async fn main() { let input = 1;");
+        for index in 0..locals {
+            source.push_str(&format!("let live{index} = {index};"));
+        }
+        source.push_str(calls);
+        for index in 0..locals {
+            source.push_str(&format!("println(live{index});"));
+        }
+        source.push('}');
+        source
+    }
+
+    /// Perspective 1: one callback per task-stack boundary. The count is the
+    /// emitted-callback baseline every other perspective is measured against.
+    #[test]
+    fn one_callback_per_boundary_call() {
+        for callbacks in [1, 4, 16] {
+            let calls = "println(work(input));".repeat(callbacks);
+            let (_, count, _, _) = callback_work(&async_main(0, &calls));
+            assert_eq!(count, callbacks);
+        }
+    }
+
+    /// Perspective 2: THE defect. A callback copied the parent's whole offset
+    /// map and rebound every parent local, so preparation grew with the
+    /// parent's local count. Copies and bindings now depend only on the
+    /// boundary's own operands, with the parent's live locals held constant
+    /// only in count, not in how much work each callback does.
+    #[test]
+    fn preparation_is_independent_of_parent_locals() {
+        for locals in [8, 64, 256] {
+            for callbacks in [4, 16] {
+                let calls = "println(work(input));".repeat(callbacks);
+                let (_, count, copies, bindings) = callback_work(&async_main(locals, &calls));
+                assert_eq!(count, callbacks);
+                assert_eq!(copies, 2 * callbacks, "locals={locals}");
+                assert_eq!(bindings, copies, "locals={locals}");
+                println!(
+                    "locals={locals} callbacks={callbacks} copies={copies} bindings={bindings}"
+                );
+            }
+        }
+    }
+
+    /// Perspective 3: the parent LIR is walked once per compiled body, not once
+    /// per callback: visits stay proportional to the parent's instruction count
+    /// rather than to (instructions * callbacks).
+    #[test]
+    fn parent_lir_is_walked_once_not_once_per_callback() {
+        let mut previous = 0;
+        for callbacks in [4, 16, 64] {
+            let calls = "println(work(input));".repeat(callbacks);
+            let (visits, count, _, _) = callback_work(&async_main(8, &calls));
+            assert_eq!(count, callbacks);
+            assert!(visits <= 8 * (8 + callbacks + 1), "{visits}");
+            assert!(visits > previous, "{visits} <= {previous}");
+            previous = visits;
+            println!("callbacks={callbacks} parent_visits={visits}");
+        }
+    }
+
+    /// Perspective 4: copies track the boundary's arity. Three arguments plus
+    /// the result slot bind four locals, independent of everything else.
+    #[test]
+    fn copies_track_boundary_operand_count() {
+        let source = "fn three(a: i64, b: i64, c: i64) -> i64 { println(a); return a + b + c; } \
+             async fn main() { let x = 1; let y = 2; let z = 3; println(three(x, y, z)); }";
+        let (_, count, copies, bindings) = callback_work(source);
+        assert_eq!(count, 1);
+        assert_eq!(copies, 4);
+        assert_eq!(bindings, 4);
+    }
+
+    /// Perspective 5: a void result is not a frame slot, so a no-argument void
+    /// boundary still compiles a callback while binding nothing. The callback
+    /// body must not need parent bindings to be emittable.
+    #[test]
+    fn void_boundary_binds_no_locals() {
+        let source = "fn side() { println(7); } async fn main() { side(); }";
+        let (_, count, copies, bindings) = callback_work(source);
+        assert_eq!(count, 1);
+        assert_eq!(copies, 0);
+        assert_eq!(bindings, 0);
+    }
+
+    /// Perspective 6: GC-owning operands keep their parent frame slots — the
+    /// callback binds the owner slots themselves, so the collector still sees
+    /// exactly one owner per value.
+    #[test]
+    fn gc_owner_operands_keep_parent_slots() {
+        let source = "fn tag(s: String) -> String { println(s); return s; } \
+             async fn main() { let name = \"a\"; println(tag(name)); }";
+        let (_, count, copies, bindings) = callback_work(source);
+        assert_eq!(count, 1);
+        assert_eq!(copies, 2);
+        assert_eq!(bindings, 2);
+    }
+
+    /// Perspective 7: a user method call is a boundary too, and its receiver is
+    /// one of the operands the callback binds.
+    #[test]
+    fn method_call_boundaries_bind_receiver_and_result() {
+        let source = "class C { pub v: i64; pub fn get(self) -> i64 { println(self.v); return self.v; } } \
+             async fn main() { let c = new C(1); println(c.get()); }";
+        let (_, count, copies, bindings) = callback_work(source);
+        assert_eq!(count, 1);
+        assert_eq!(copies, 2);
+        assert_eq!(bindings, 2);
+    }
+
+    /// Perspective 8: bodies with no user calls need no callbacks at all, so the
+    /// guarded preparation never runs for them.
+    #[test]
+    fn builtin_only_bodies_emit_no_callbacks() {
+        let (_, count, copies, bindings) = callback_work("async fn main() { println(1); }");
+        assert_eq!((count, copies, bindings), (0, 0, 0));
     }
 }

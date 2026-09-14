@@ -1,0 +1,46 @@
+// Interface widening in a diamond (willow-ssl7.5).
+//
+// `Panel` inherits both `Framed` and `Titled`, and both of those inherit
+// `Widget`, so there are two distinct inheritance PATHS from `Panel` to
+// `Widget`. An interface box is `[object | vtable]`; each vtable stores its
+// composed method pointers once, followed by a pointer to each direct-super
+// table. Widening therefore loads one supertable pointer per level instead of
+// embedding a copy of every super's table in every descendant, which would
+// grow with the number of paths rather than the number of interfaces.
+//
+// Every method answers a distinct value, so a call that landed in the wrong
+// slot could not print the expected one.
+
+interface Widget { fn id(self) -> i64; }
+interface Framed extends Widget { fn frame(self) -> i64; }
+interface Titled extends Widget { fn title(self) -> String; }
+interface Panel extends Framed, Titled { fn panel(self) -> i64; }
+
+class Card implements Panel {
+    pub tag: i64;
+
+    pub fn id(self) -> i64 { return self.tag; }
+    pub fn frame(self) -> i64 { return self.tag * 10; }
+    pub fn title(self) -> String { return "card"; }
+    pub fn panel(self) -> i64 { return self.tag * 100; }
+}
+
+fn widget_id(w: Widget) -> i64 { return w.id(); }
+fn framed_frame(f: Framed) -> i64 { return f.frame(); }
+fn titled_title(t: Titled) -> String { return t.title(); }
+
+fn main() {
+    let p: Panel = new Card(7);
+    println(p.panel());
+    // Widened through the first branch, two levels up.
+    println(widget_id(p));
+    println(framed_frame(p));
+    println(titled_title(p));
+    // An already-widened box widens again from its own vtable.
+    let f: Framed = p;
+    println(widget_id(f));
+    // The second branch reaches the same shared root table.
+    let t: Titled = p;
+    println(widget_id(t));
+    println(t.title());
+}

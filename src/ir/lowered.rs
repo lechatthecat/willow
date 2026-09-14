@@ -658,6 +658,11 @@ pub(crate) enum SourceTerminator {
     CleanupReturn,
 }
 
+#[cfg(test)]
+thread_local! {
+    static FINAL_ASYNC_ANALYSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Lower every function (free functions and class methods, flattened as
 /// `Class::method`) of a typed-HIR program to basic blocks.
 pub(crate) fn lower_source_program(program: &HirProgram) -> SourceProgram {
@@ -686,7 +691,13 @@ pub(crate) fn lower_source_program(program: &HirProgram) -> SourceProgram {
         super::optimize::inline_scalar_recursion(function);
         super::optimize::unroll_scalar_loops(function);
         lifetime::clear_dead_temporaries(function);
-        function.async_frame = async_liveness::analyze(&function.blocks, &function.locals);
+        function.async_frame = if function.is_async {
+            #[cfg(test)]
+            FINAL_ASYNC_ANALYSES.with(|count| count.set(count.get() + 1));
+            async_liveness::analyze(&function.blocks, &function.locals)
+        } else {
+            LirAsyncFrameLayout::default()
+        };
         function.visit_expr_roots_mut(|expr| {
             expr.visit_mut_preorder(true, |node| {
                 if let HirExprKind::Lambda { body, .. } = &mut node.kind {
@@ -4871,6 +4882,51 @@ fn format_terminator(t: &SourceTerminator) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sync_bodies_skip_final_async_analysis() {
+        for n in [1, 8, 64] {
+            let source = (0..n).map(|i| format!(
+                "fn f{i}(x: i64) {{ defer {{ print(x); }} let callback = |y: i64| -> i64 {{ defer {{ print(y); }} print(x); return y; }}; callback(x); }}"
+            )).collect::<String>();
+            FINAL_ASYNC_ANALYSES.with(|count| count.set(0));
+            let program = lir(&source);
+            assert_eq!(program.functions.len(), n);
+            assert_eq!(program.lambdas.len(), n);
+            for function in program
+                .functions
+                .iter()
+                .chain(program.lambdas.iter().map(|lambda| &lambda.function))
+            {
+                assert!(!function.is_async);
+                assert_eq!(function.async_frame, LirAsyncFrameLayout::default());
+            }
+            assert_eq!(FINAL_ASYNC_ANALYSES.with(|count| count.get()), 0);
+            println!("sync functions={n} lambdas={n} final_async_analyses=0 frame_slots=0");
+        }
+    }
+
+    #[test]
+    fn async_layout_matches_final_transformed_graph() {
+        FINAL_ASYNC_ANALYSES.with(|count| count.set(0));
+        let program = lir(
+            "async fn f(s: String) { defer { print(s); } let first = 1; await yield(); print(first); let second = 2; await yield(); print(second); print(s); }",
+        );
+        let function = func(&program, "f");
+        assert_eq!(FINAL_ASYNC_ANALYSES.with(|count| count.get()), 1);
+        assert!(function.is_async);
+        assert!(!function.async_frame.slots.is_empty());
+        assert_eq!(
+            function.async_frame,
+            async_liveness::analyze(&function.blocks, &function.locals)
+        );
+        let captured = function
+            .locals
+            .iter()
+            .find(|local| local.name == "s")
+            .unwrap();
+        assert!(function.async_frame.slot(captured.id).is_some());
+    }
+
     #[test]
     fn defer_identity_survives_twenty_shared_span_shapes() {
         for count in 1..=20 {

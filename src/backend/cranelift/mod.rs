@@ -1876,19 +1876,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         {
             return value;
         }
-        // Interface → SUPER-interface. The concrete class is not known here, so
-        // the target vtable can only come from the source's: the layout embeds
-        // each super's table as a contiguous run, and widening advances the
-        // vtable pointer to that run (see `vtable_layout`). Offset 0 — the
-        // single-`extends` chain, where the super's table is a plain prefix —
-        // needs no new box at all. A target that is not a super leaves the value
-        // alone; the checker has already rejected that program (willow-1fc6).
+        // Shared supertables preserve the target's method numbering. Only
+        // static table pointers are followed; the object stays unchanged.
         if let Type::Named(vn) | Type::Generic(vn, _) = value_ty
             && self.interface_infos.contains_key(vn)
         {
-            return match vtable_layout::super_offset(self.interface_infos, vn, iface_name) {
-                Some(0) | None => value,
-                Some(offset) => self.emit_interface_rewiden(value, offset),
+            return match vtable_layout::super_path(self.interface_infos, vn, iface_name) {
+                Some(path) if !path.is_empty() => self.emit_interface_rewiden(value, &path),
+                _ => value,
             };
         }
         if let Type::Named(class_name) = value_ty
@@ -1951,39 +1946,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Type::Bool => self.builder.ins().uextend(types::I64, val),
             _ => val,
         }
-    }
-
-    /// True when `cls` is `ancestor` or transitively extends it.
-    fn class_is_a(&self, cls: &str, ancestor: &str) -> bool {
-        let mut current = Some(TypeId::from_source_name(cls));
-        let mut seen = HashSet::new();
-        while let Some(name) = current {
-            if name == TypeId::from_source_name(ancestor) {
-                return true;
-            }
-            if !seen.insert(name) {
-                break;
-            }
-            current = self.class_base.get_id(&name).cloned();
-        }
-        false
-    }
-
-    /// FuncId of `cls`'s (or the nearest ancestor's) `method`, or `None`.
-    fn resolve_method_func_id(&self, cls: &str, method: &str) -> Option<FuncId> {
-        let mut current = Some(TypeId::from_source_name(cls));
-        let mut seen = HashSet::new();
-        while let Some(name) = current {
-            if !seen.insert(name) {
-                break;
-            }
-            let mangled = class_method_symbol_name(self.known_modules, &name.to_string(), method);
-            if let Some(&fid) = self.func_ids.get(&mangled) {
-                return Some(fid);
-            }
-            current = self.class_base.get_id(&name).cloned();
-        }
-        None
     }
 
     /// Resolve the concrete payload types for an enum variant.

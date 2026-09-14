@@ -104,30 +104,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         box_ptr
     }
 
-    /// Widen an interface box to a SUPER-interface whose vtable is embedded
-    /// `slot_offset` slots into the source's (willow-1fc6).
-    ///
-    /// The object word is carried over unchanged — widening never changes which
-    /// object a value denotes — and the vtable pointer is advanced to the
-    /// embedded region, which is a byte-identical copy of the target
-    /// interface's own vtable for that class. See [`super::vtable_layout`] for
-    /// why the region is there and why the copy cannot drift.
-    ///
-    /// Only called with a non-zero offset: an offset of 0 means the source box
-    /// already answers the target's slot numbering, so there is nothing to do.
-    ///
-    /// Deliberately no [`Self::emit_interface_dispatch_nil_check`]. A widening
-    /// cannot produce a nil box that its input did not already carry, and the
-    /// only thing that dereferences a box is dispatch, which checks it before
-    /// the first load — in `emit_lir_interface_call`, since that is where a
-    /// span for the diagnostic exists.
-    /// Guarding here would only move an identical panic earlier, at the cost of
-    /// a branch on every coercion and of threading a span through
-    /// `coerce_to_target`.
+    /// Widen by loading a path of shared static supertable pointers, then
+    /// rebox the unchanged object. Static table pointers need no GC roots.
     pub(super) fn emit_interface_rewiden(
         &mut self,
         box_ptr: cranelift_codegen::ir::Value,
-        slot_offset: usize,
+        path: &[usize],
     ) -> cranelift_codegen::ir::Value {
         let object = self.builder.ins().load(
             reference_type(self.module.target_config()),
@@ -143,15 +125,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 reference_type(self.module.target_config()).bytes(),
             ) as i32,
         );
-        // Interior pointer into a static data symbol, not into the GC heap, so
-        // it needs no rooting and the collector never sees it as a reference.
-        let target_vtable = self.builder.ins().iadd_imm_s(
-            vtable,
-            willow_abi::dispatch_layout::table_slot_offset(
-                slot_offset as u32,
-                reference_type(self.module.target_config()).bytes(),
-            ) as i64,
-        );
+        let mut target_vtable = vtable;
+        for &slot in path {
+            target_vtable = self.builder.ins().load(
+                reference_type(self.module.target_config()),
+                MemFlagsData::new(),
+                target_vtable,
+                willow_abi::dispatch_layout::table_slot_offset(
+                    slot as u32,
+                    reference_type(self.module.target_config()).bytes(),
+                ) as i32,
+            );
+        }
         self.emit_box_with_vtable(object, target_vtable)
     }
 

@@ -10,28 +10,29 @@
 //! box reused as a `B` box dispatches `b()` through the slot holding `a()`.
 //! Wrong method, and usually a wrong ABI on top of it.
 //!
-//! An interface's vtable now embeds each super's table verbatim, in order, so
-//! every super occupies a contiguous run, and widening advances the vtable
-//! pointer to that run. Offset zero — a single-`extends` chain, or the first of
-//! several supers — still reuses the box untouched; anything else allocates a
-//! rebox. The tests below drive the widening from every position that stores a
-//! value, and from every shape of `extends` graph the offset arithmetic has to
-//! survive.
+//! An interface's vtable now holds its composed method pointers followed by
+//! one POINTER per direct super, each aimed at that super's own table — one
+//! shared static symbol per interface rather than a copy embedded per child
+//! (willow-ssl7.5). Widening therefore loads the target's table through those
+//! pointers, one load per `extends` hop, and reboxes with it; only widening an
+//! interface to itself keeps the box untouched. The tests below drive the
+//! widening from every position that stores a value, and from every shape of
+//! `extends` graph the pointer walk has to survive.
 //!
 //! 24 perspectives:
 //!   1 dispatch on the child itself      13 an instance-method argument
-//!   2 the FIRST super is offset zero    14 the third super accumulates two
-//!   3 a function argument                  preceding tables
-//!   4 a return value                    15 a String-returning method through
-//!   5 a local initialiser                  a preceding i64 super
-//!   6 an assignment                     16 a String PARAMETER likewise
-//!   7 an array literal element          17 a diamond's shared root
-//!   8 `Array::push`                     18 the diamond's second branch
-//!   9 an indexed array store            19 a transitive offset composes
-//!  10 a constructor's field             20 a default method through a second
-//!  11 a field assignment                   super
-//!  12 a static-method argument          21 widening an already-widened value
-//!                                       22 narrowing is still rejected
+//!   2 the FIRST super is a pointer      14 the third super is the third
+//!     slot like any other                  pointer slot
+//!   3 a function argument               15 a String-returning method through
+//!   4 a return value                       a preceding i64 super
+//!   5 a local initialiser               16 a String PARAMETER likewise
+//!   6 an assignment                     17 a diamond's shared root
+//!   7 an array literal element          18 the diamond's second branch
+//!   8 `Array::push`                     19 a transitive walk composes
+//!   9 an indexed array store            20 a default method through a second
+//!  10 a constructor's field                super
+//!  11 a field assignment                21 widening an already-widened value
+//!  12 a static-method argument          22 narrowing is still rejected
 //!                                       23 the example runs
 //!                                       24 the example under GC stress, and
 //!                                          fully claimed by the LIR walker
@@ -97,10 +98,11 @@ fn super_coercion_01_child_dispatch_uses_child_slots() {
     );
 }
 
-// 2. The FIRST super's table is a plain prefix, so that widening reuses the
-// box exactly as before. This is the case the old code got right.
+// 2. The FIRST super. The old layout got this one right by accident, because
+// its table was a prefix of the child's; now it is reached by the same pointer
+// load as any other super, so the method numbering it sees is its own.
 #[test]
-fn super_coercion_02_first_super_is_offset_zero() {
+fn super_coercion_02_first_super_is_a_pointer_slot() {
     assert_both(
         &program(
             "fn use_alpha(a: Alpha) -> i64 { return a.alpha2(); } \
@@ -246,11 +248,11 @@ fn super_coercion_13_instance_method_argument() {
     );
 }
 
-// 14. The THIRD super starts after both preceding tables, so the offset is a
-// sum and not just "not zero" — `Gamma` is at slot 4, past Alpha's two and
-// Beta's two.
+// 14. The THIRD super, so the slot is past two other super pointers rather
+// than just "not the first" — `Gamma`'s pointer follows `All`'s own method
+// slots and the `Alpha`/`Beta` pointers.
 #[test]
-fn super_coercion_14_third_super_accumulates_two_tables() {
+fn super_coercion_14_third_super_is_the_third_pointer_slot() {
     assert_both(
         &program(
             "fn use_gamma(g: Gamma) -> i64 { return g.gamma(); } \
@@ -332,7 +334,7 @@ fn super_coercion_17_diamond_shared_root() {
 }
 
 // 18. Widening the diamond to its SECOND branch: both the branch's own method
-// and the root method it inherited must answer from the embedded region.
+// and the root method it inherited must answer from that branch's own table.
 #[test]
 fn super_coercion_18_diamond_second_branch() {
     assert_both(
@@ -366,10 +368,11 @@ class Impl implements Join {{
     )
 }
 
-// 19. Two levels of `extends`: the offset of a grandparent is the offset of
-// the parent plus the parent's own offset for it.
+// 19. Two levels of `extends`: reaching a grandparent loads the parent's table
+// pointer and then the grandparent's out of that table, so the walk composes
+// one load per hop instead of summing embedded offsets.
 #[test]
-fn super_coercion_19_transitive_offsets_compose() {
+fn super_coercion_19_transitive_walks_compose() {
     assert_both(
         r#"
 interface A { fn a(self) -> i64; }
@@ -434,7 +437,7 @@ fn main() {
 }
 
 // 21. Widening a value that was itself already widened: the second conversion
-// starts from the embedded region, not from the original table.
+// starts from the table the first one landed on, not from the original.
 #[test]
 fn super_coercion_21_widening_an_already_widened_value() {
     assert_both(

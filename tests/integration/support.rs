@@ -438,6 +438,27 @@ pub(super) fn compile_and_collect_relocation_targets_mode(
     env: &[(&str, &str)],
     release: bool,
 ) -> Vec<String> {
+    let mut names: Vec<String> = compile_and_collect_relocations_by_section(source, env, release)
+        .into_iter()
+        .map(|(_section, name)| name)
+        .collect();
+    names.sort();
+    names
+}
+
+/// Every relocation as `(section role, target symbol)`, where the role is
+/// `"text"` for an executable section and `"data"` for everything else.
+///
+/// An instruction that calls or addresses a symbol lives in a text section; a
+/// vtable or class-descriptor slot that holds the same symbol's address is a
+/// data relocation. Counting them apart is the difference between "this many
+/// call sites were emitted" and "this many tables mention the function"
+/// (willow-76bf).
+pub(super) fn compile_and_collect_relocations_by_section(
+    source: &str,
+    env: &[(&str, &str)],
+    release: bool,
+) -> Vec<(String, String)> {
     use object::read::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
 
     let id = unique_test_id();
@@ -476,8 +497,13 @@ pub(super) fn compile_and_collect_relocation_targets_mode(
     let object = object::File::parse(&*bytes)
         .unwrap_or_else(|err| panic!("intermediate object {obj_path} unparseable: {err}"));
 
-    let mut names = Vec::new();
+    let mut names: Vec<(String, String)> = Vec::new();
     for section in object.sections() {
+        let role = if section.kind() == object::SectionKind::Text {
+            "text"
+        } else {
+            "data"
+        };
         for (_offset, relocation) in section.relocations() {
             // AArch64 Mach-O PIC address loads have two relocation records.
             if object.architecture() == object::Architecture::Aarch64
@@ -497,7 +523,7 @@ pub(super) fn compile_and_collect_relocation_targets_mode(
                 continue;
             };
             if let Ok(name) = symbol.name() {
-                names.push(name.trim_start_matches('_').to_string());
+                names.push((role.to_string(), name.trim_start_matches('_').to_string()));
             }
         }
     }

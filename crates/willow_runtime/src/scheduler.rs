@@ -3685,7 +3685,7 @@ mod idle_stop_tests;
 /// them and how to read the table.
 #[cfg(test)]
 #[path = "scheduler_scaling_tests.rs"]
-mod scaling_measurements;
+pub(crate) mod scaling_measurements;
 
 #[cfg(test)]
 mod tests {

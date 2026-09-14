@@ -527,6 +527,7 @@ struct TlabStateRecord {
     observed_fast_allocated_bytes: u64,
 }
 
+#[cfg(test)]
 impl RegionMarkBitmap {
     fn unmark(&mut self, offset: usize) {
         let granule = offset / GC_REGION_MARK_GRANULE;
@@ -640,11 +641,13 @@ impl OldRegion {
             .then_some(object)
     }
 
+    #[cfg(test)]
     fn record_marked_object(&mut self, object: HeapObject) {
         let offset = object.as_ptr() as usize - self.start();
         self.mark_bitmap.mark(offset);
     }
 
+    #[cfg(test)]
     fn release_object(&mut self, object: HeapObject) {
         let offset = object.as_ptr() as usize - self.start();
         let Some(span_size) = self.allocations.remove(&offset) else {
@@ -662,6 +665,7 @@ impl OldRegion {
         self.coalesce_free_spans();
     }
 
+    #[cfg(test)]
     fn coalesce_free_spans(&mut self) {
         self.free_spans.sort_unstable_by_key(|span| span.offset);
         let mut merged: Vec<RegionFreeSpan> = Vec::with_capacity(self.free_spans.len());
@@ -2138,20 +2142,6 @@ pub extern "C" fn willow_gc_write_barrier(owner: *mut u8, value: *mut u8, destin
     }
 }
 
-fn forget_remembered_owner(state: &mut GcState, owner_payload: usize) {
-    if !state.remembered_set.remove(&owner_payload) {
-        return;
-    }
-    let card = owner_payload / GC_CARD_SIZE;
-    if !state
-        .remembered_set
-        .iter()
-        .any(|owner| owner / GC_CARD_SIZE == card)
-    {
-        state.dirty_cards.remove(&card);
-    }
-}
-
 fn allocate_object(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8 {
     assist_concurrent_mark();
     if payload_size < 0 {
@@ -3298,6 +3288,11 @@ fn collect_internal() {
     crate::gc_telemetry::emit_cycle(event);
 }
 
+#[cfg(test)]
+static SWEEP_REGION_VISITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static SWEEP_OBJECT_VISITS: AtomicUsize = AtomicUsize::new(0);
+
 /// Sweep the region-backed old-object index and nursery/pinned regions without
 /// moving survivors. Dead old spans return to their owning region's free list;
 /// completely empty regions are released. Returns total logical bytes freed.
@@ -3307,58 +3302,67 @@ fn sweep() -> usize {
 
     let mut state = runtime().heap.lock().unwrap();
     state.major_collections = state.major_collections.saturating_add(1);
-    for region in &mut state.old_regions {
-        region.mark_bitmap.clear();
-    }
-    let mut previous: Option<HeapObject> = None;
-    let mut current = HeapObject::from_raw(state.heap_head);
-    while let Some(object) = current {
-        let next = object.next();
-        let size = object.size();
-
-        if object.marked() {
-            // Survivor: retain the stable address and rebuild region-local
-            // liveness/mark metadata for future partial-region selection.
-            let region = state
-                .old_regions
-                .iter_mut()
-                .find(|region| region.contains(object.as_ptr() as usize))
-                .expect("linked old object belongs to an old region");
-            region.record_marked_object(object);
-            object.clear_mark();
-            previous = Some(object);
-            current = next;
-        } else {
-            // Unreachable: unlink and free.
-            if let Some(previous) = previous {
-                previous.set_next(next);
-            } else {
-                state.heap_head = next.map(HeapObject::as_ptr).unwrap_or(std::ptr::null_mut());
-            }
-            // Run a finalizer (if any) before releasing the payload so the
-            // object can free non-GC resources it owns (e.g. a boxed Map).
-            if let Some(drop_fn) = lookup_drop(object.type_id()) {
-                // SAFETY: drop_fn is the registered finalizer for this type_id;
-                // it releases the payload's owned resources and does not touch GC state.
-                unsafe { drop_fn(object.payload().as_ptr()) };
-            }
-            let payload = object.payload().as_ptr() as usize;
-            forget_remembered_owner(&mut state, payload);
-            if object.generation() == GC_GENERATION_YOUNG {
-                state.young_allocated_bytes = state.young_allocated_bytes.saturating_sub(size);
-            }
-            object.reclaim_in_place();
-            let region = state
-                .old_regions
-                .iter_mut()
-                .find(|region| region.contains(object.as_ptr() as usize))
-                .expect("linked old object belongs to an old region");
-            region.release_object(object);
-            freed_bytes += size;
-            freed_count += 1;
-            state.allocated_bytes = state.allocated_bytes.saturating_sub(size);
-            state.total_frees = state.total_frees.saturating_add(1);
-            current = next;
+    // Allocation metadata already orders object spans by address. Walk each
+    // region once, rebuild the live-object index, and derive maximal free gaps
+    // between survivors. This also trims the bump tail without sorting holes.
+    {
+        let GcState {
+            old_regions,
+            heap_head,
+            remembered_set,
+            young_allocated_bytes,
+            allocated_bytes,
+            total_frees,
+            ..
+        } = &mut *state;
+        *heap_head = std::ptr::null_mut();
+        for region in old_regions {
+            #[cfg(test)]
+            SWEEP_REGION_VISITS.fetch_add(1, Ordering::Relaxed);
+            region.mark_bitmap.clear();
+            region.free_spans.clear();
+            let mut live_end = 0;
+            let base = region.base;
+            region.allocations.retain(|&offset, span_size| {
+                #[cfg(test)]
+                SWEEP_OBJECT_VISITS.fetch_add(1, Ordering::Relaxed);
+                // SAFETY: allocation metadata owns a valid header at offset.
+                let object = HeapObject::from_raw(unsafe { base.add(offset) }.cast())
+                    .expect("region allocation has a non-null header");
+                let size = object.size();
+                if object.marked() {
+                    if offset > live_end {
+                        region.free_spans.push(RegionFreeSpan {
+                            offset: live_end,
+                            size: offset - live_end,
+                        });
+                    }
+                    live_end = offset + *span_size;
+                    region.mark_bitmap.mark(offset);
+                    object.clear_mark();
+                    object.set_next(HeapObject::from_raw(*heap_head));
+                    *heap_head = object.as_ptr();
+                    true
+                } else {
+                    if let Some(drop_fn) = lookup_drop(object.type_id()) {
+                        // SAFETY: registered finalizers release owned resources
+                        // without touching GC state, before storage is reclaimed.
+                        unsafe { drop_fn(object.payload().as_ptr()) };
+                    }
+                    remembered_set.remove(&(object.payload().as_ptr() as usize));
+                    if object.generation() == GC_GENERATION_YOUNG {
+                        *young_allocated_bytes = young_allocated_bytes.saturating_sub(size);
+                    }
+                    object.reclaim_in_place();
+                    region.live_bytes = region.live_bytes.saturating_sub(size);
+                    freed_bytes += size;
+                    freed_count += 1;
+                    *allocated_bytes = allocated_bytes.saturating_sub(size);
+                    *total_frees = total_frees.saturating_add(1);
+                    false
+                }
+            });
+            region.used = live_end;
         }
     }
 
@@ -3418,7 +3422,7 @@ fn sweep() -> usize {
                     .saturating_add(size);
             } else {
                 let payload = object.payload().as_ptr() as usize;
-                forget_remembered_owner(&mut state, payload);
+                state.remembered_set.remove(&payload);
                 if let Some(drop_fn) = lookup_drop(object.type_id()) {
                     // SAFETY: same finalizer contract as old-region objects.
                     unsafe { drop_fn(object.payload().as_ptr()) };
@@ -3451,6 +3455,18 @@ fn sweep() -> usize {
             };
             chunk_index += 1;
         }
+    }
+
+    // Removing owners one at a time must not scan the remaining owner set.
+    // Rebuild cards once after both region and TLAB reclamation.
+    {
+        let GcState {
+            remembered_set,
+            dirty_cards,
+            ..
+        } = &mut *state;
+        dirty_cards.clear();
+        dirty_cards.extend(remembered_set.iter().map(|owner| owner / GC_CARD_SIZE));
     }
 
     if std::env::var("WILLOW_GC_VERIFY_REGIONS").is_ok()
@@ -4754,6 +4770,131 @@ mod tests {
                 .expect_err("missing barrier entry must be rejected")
                 .contains("without a remembered-set entry")
         );
+        reset_gc();
+    }
+
+    // Exercise the production sweep directly to isolate sweep work from mark
+    // discovery and allocation costs. All fixture pointers remain GC-owned.
+    #[test]
+    fn test_gc_sweep_scaling_and_fragmentation() {
+        let _guard = gc_test_guard();
+        for large in [false, true] {
+            for n in [32, 64, 128, 256] {
+                reset_gc();
+                set_threshold(usize::MAX);
+                let payload_size = if large { GC_LARGE_OBJECT_THRESHOLD } else { 8 };
+                let objects: Vec<_> = (0..2 * n)
+                    .map(|_| willow_alloc_object(61, payload_size as i64))
+                    .collect();
+                for (index, &payload) in objects.iter().enumerate() {
+                    unsafe {
+                        *payload = (index % 251) as u8;
+                        (*payload_to_header(payload)).marked = index % 2 == 1;
+                    }
+                }
+                SWEEP_REGION_VISITS.store(0, Ordering::Relaxed);
+                SWEEP_OBJECT_VISITS.store(0, Ordering::Relaxed);
+                let start = std::time::Instant::now();
+                assert_eq!(sweep(), n * (GC_HEADER_SIZE + payload_size));
+                let elapsed = start.elapsed();
+                assert_eq!(
+                    SWEEP_REGION_VISITS.load(Ordering::Relaxed),
+                    if large { 2 * n } else { 1 }
+                );
+                assert_eq!(SWEEP_OBJECT_VISITS.load(Ordering::Relaxed), 2 * n);
+                let state = runtime().heap.lock().unwrap();
+                verify_old_region_metadata(&state).unwrap();
+                assert_eq!(state.allocated_bytes, n * (GC_HEADER_SIZE + payload_size));
+                assert_eq!(state.old_regions.len(), if large { n } else { 1 });
+                if !large {
+                    assert_eq!(state.old_regions[0].free_spans.len(), n);
+                }
+                for (index, &payload) in objects.iter().enumerate().filter(|(i, _)| i % 2 == 1) {
+                    assert_eq!(unsafe { *payload }, (index % 251) as u8);
+                }
+                drop(state);
+                // The visit counts above are the proof; this line is the
+                // separate pause measurement, and it carries the build
+                // configuration it was taken in because the two are not
+                // comparable across profiles (willow-ssl7.1, willow-tqzq).
+                eprintln!(
+                    "sweep profile={} large={large} dead={n} regions={} objects={} elapsed_ns={}",
+                    if cfg!(debug_assertions) {
+                        "debug"
+                    } else {
+                        "release"
+                    },
+                    SWEEP_REGION_VISITS.load(Ordering::Relaxed),
+                    SWEEP_OBJECT_VISITS.load(Ordering::Relaxed),
+                    elapsed.as_nanos()
+                );
+                // Cleared marks make the next sweep reclaim every survivor.
+                assert_eq!(sweep(), n * (GC_HEADER_SIZE + payload_size));
+                assert_eq!(willow_gc_old_region_count(), 0);
+                assert_eq!(willow_gc_allocated_bytes(), 0);
+            }
+        }
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_sweep_adjacent_gaps_tail_finalizers_and_cards() {
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        unsafe fn count_drop(_: *mut u8) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+        let _guard = gc_test_guard();
+        reset_gc();
+        set_threshold(usize::MAX);
+        DROPS.store(0, Ordering::Relaxed);
+        willow_register_drop(9876, count_drop);
+        let objects: Vec<_> = (0..8).map(|_| willow_alloc_object(9876, 8)).collect();
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            for &payload in &objects {
+                state.remembered_set.insert(payload as usize);
+                state.dirty_cards.insert(payload as usize / GC_CARD_SIZE);
+            }
+        }
+        for index in [0, 3, 5] {
+            unsafe {
+                (*payload_to_header(objects[index])).marked = true;
+            }
+        }
+        sweep();
+        assert_eq!(DROPS.load(Ordering::Relaxed), 5);
+        {
+            let state = runtime().heap.lock().unwrap();
+            verify_old_region_metadata(&state).unwrap();
+            let region = &state.old_regions[0];
+            let span = GC_HEADER_SIZE + 8;
+            assert_eq!(region.used, 6 * span);
+            assert_eq!(region.free_spans.len(), 2);
+            assert_eq!(region.free_spans[0].offset, span);
+            assert_eq!(region.free_spans[0].size, 2 * span);
+            assert_eq!(region.free_spans[1].offset, 4 * span);
+            assert_eq!(region.free_spans[1].size, span);
+            let expected: HashSet<_> = [0, 3, 5].map(|i| objects[i] as usize).into();
+            assert_eq!(state.remembered_set, expected);
+            assert_eq!(
+                state.dirty_cards,
+                expected.iter().map(|p| p / GC_CARD_SIZE).collect()
+            );
+        }
+        assert_eq!(
+            willow_alloc_object(61, (GC_HEADER_SIZE + 16) as i64),
+            objects[1]
+        );
+        sweep();
+        assert_eq!(DROPS.load(Ordering::Relaxed), 8);
+        sweep();
+        assert_eq!(DROPS.load(Ordering::Relaxed), 8);
+        let state = runtime().heap.lock().unwrap();
+        assert!(state.old_regions.is_empty());
+        assert!(state.remembered_set.is_empty());
+        assert!(state.dirty_cards.is_empty());
+        assert_eq!(state.allocated_bytes, 0);
+        drop(state);
         reset_gc();
     }
 

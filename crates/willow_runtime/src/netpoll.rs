@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -25,7 +25,7 @@ fn valid_native_handle(handle: RawFd) -> bool {
     handle != -1
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IoInterest {
     Readable,
     Writable,
@@ -102,9 +102,30 @@ const PLATFORM_POLL_SUPPORTED: bool = true;
 )))]
 const PLATFORM_POLL_SUPPORTED: bool = false;
 
+type RegistrationKey = (RawFd, RuntimeTaskId, IoInterest);
+
+/// Where a live registration sits: its `registrations` index (kept dense
+/// with `swap_remove`) and the monotonic sequence assigned when it was
+/// registered, which keeps per-token wake order first-registered-first.
+#[derive(Debug, Clone, Copy)]
+struct RegistrationSlot {
+    position: usize,
+    sequence: u64,
+}
+
 #[derive(Debug)]
 pub struct RuntimeNetPoll {
     registrations: Vec<IoRegistration>,
+    slots: HashMap<RegistrationKey, RegistrationSlot>,
+    next_sequence: u64,
+    /// Waiters per token in registration order, so readiness wakes tasks
+    /// sharing one descriptor FIFO instead of in hash order.
+    by_token: HashMap<usize, BTreeMap<u64, RegistrationKey>>,
+    by_task: HashMap<RuntimeTaskId, HashSet<RegistrationKey>>,
+    by_fd: HashMap<RawFd, HashSet<RegistrationKey>>,
+    interest_counts: HashMap<RawFd, [usize; 2]>,
+    #[cfg(test)]
+    ready_visits: std::cell::Cell<usize>,
     ready_tokens: VecDeque<usize>,
     #[cfg(target_os = "linux")]
     epoll_fd: Option<i32>,
@@ -118,6 +139,22 @@ pub struct RuntimeNetPoll {
     wake_sender: Option<std::net::UdpSocket>,
 }
 
+fn remove_index_key<K: std::hash::Hash + Eq>(
+    index: &mut HashMap<K, HashSet<RegistrationKey>>,
+    bucket: K,
+    key: RegistrationKey,
+) {
+    if let Some(keys) = index.get_mut(&bucket) {
+        keys.remove(&key);
+        if keys.len() <= keys.capacity() / 4 {
+            keys.shrink_to_fit();
+        }
+        if keys.is_empty() {
+            index.remove(&bucket);
+        }
+    }
+}
+
 impl Default for RuntimeNetPoll {
     fn default() -> Self {
         Self::new()
@@ -128,6 +165,14 @@ impl RuntimeNetPoll {
     pub fn new() -> Self {
         Self {
             registrations: Vec::new(),
+            slots: HashMap::new(),
+            next_sequence: 0,
+            by_token: HashMap::new(),
+            by_task: HashMap::new(),
+            by_fd: HashMap::new(),
+            interest_counts: HashMap::new(),
+            #[cfg(test)]
+            ready_visits: std::cell::Cell::new(0),
             ready_tokens: VecDeque::new(),
             #[cfg(target_os = "linux")]
             epoll_fd: None,
@@ -147,19 +192,89 @@ impl RuntimeNetPoll {
     }
 
     pub fn register(&mut self, registration: IoRegistration) {
-        if !self.registrations.iter().any(|existing| {
-            existing.fd == registration.fd
-                && existing.task_id == registration.task_id
-                && existing.interest == registration.interest
-        }) {
-            self.registrations.push(registration);
+        let key = (registration.fd, registration.task_id, registration.interest);
+        if self.slots.contains_key(&key) {
+            return;
+        }
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        self.slots.insert(
+            key,
+            RegistrationSlot {
+                position: self.registrations.len(),
+                sequence,
+            },
+        );
+        self.by_token
+            .entry(registration.token)
+            .or_default()
+            .insert(sequence, key);
+        self.by_task
+            .entry(registration.task_id)
+            .or_default()
+            .insert(key);
+        self.by_fd.entry(registration.fd).or_default().insert(key);
+        let counts = self.interest_counts.entry(registration.fd).or_default();
+        counts[0] += usize::from(registration.interest.overlaps(IoInterest::Readable));
+        counts[1] += usize::from(registration.interest.overlaps(IoInterest::Writable));
+        self.registrations.push(registration);
+    }
+
+    fn remove_registration(&mut self, key: RegistrationKey) {
+        let Some(slot) = self.slots.remove(&key) else {
+            return;
+        };
+        let removed = self.registrations.swap_remove(slot.position);
+        if let Some(moved) = self.registrations.get(slot.position) {
+            self.slots
+                .get_mut(&(moved.fd, moved.task_id, moved.interest))
+                .expect("moved registration is indexed")
+                .position = slot.position;
+        }
+        if let Some(waiters) = self.by_token.get_mut(&removed.token) {
+            waiters.remove(&slot.sequence);
+            if waiters.is_empty() {
+                self.by_token.remove(&removed.token);
+            }
+        }
+        remove_index_key(&mut self.by_task, removed.task_id, key);
+        remove_index_key(&mut self.by_fd, removed.fd, key);
+        let counts = self.interest_counts.get_mut(&removed.fd).unwrap();
+        counts[0] -= usize::from(removed.interest.overlaps(IoInterest::Readable));
+        counts[1] -= usize::from(removed.interest.overlaps(IoInterest::Writable));
+        if *counts == [0, 0] {
+            self.interest_counts.remove(&removed.fd);
+            // HashMap iteration visits capacity, so keep Windows snapshots
+            // proportional to live descriptors after cancellation churn.
+            if self.interest_counts.len() <= self.interest_counts.capacity() / 4 {
+                self.interest_counts.shrink_to_fit();
+            }
         }
     }
 
+    fn remove_task_fd(&mut self, fd: RawFd, task_id: RuntimeTaskId) {
+        for interest in [
+            IoInterest::Readable,
+            IoInterest::Writable,
+            IoInterest::ReadWrite,
+        ] {
+            self.remove_registration((fd, task_id, interest));
+        }
+    }
+
+    fn merged_interest(&self, fd: RawFd) -> Option<IoInterest> {
+        self.interest_counts
+            .get(&fd)
+            .map(|counts| match (counts[0] > 0, counts[1] > 0) {
+                (true, true) => IoInterest::ReadWrite,
+                (true, false) => IoInterest::Readable,
+                (false, true) => IoInterest::Writable,
+                (false, false) => unreachable!("empty interest entry"),
+            })
+    }
+
     pub fn reregister(&mut self, registration: IoRegistration) {
-        self.registrations.retain(|existing| {
-            !(existing.fd == registration.fd && existing.task_id == registration.task_id)
-        });
+        self.remove_task_fd(registration.fd, registration.task_id);
         self.register(registration);
     }
 
@@ -176,8 +291,7 @@ impl RuntimeNetPoll {
             // The platform poller rejected the fd: roll back the registration we
             // just added so a failed `epoll_ctl` does not leave a phantom waiter
             // that keeps `has_waiters()` true forever and misleads the scheduler.
-            self.registrations
-                .retain(|r| !(r.fd == fd && r.task_id == task_id && r.interest == interest));
+            self.remove_registration((fd, task_id, interest));
             let _ = self.sync_platform_fd(fd);
         }
         rc
@@ -198,16 +312,17 @@ impl RuntimeNetPoll {
         if rc != 0 {
             // Drop the registration on sync failure so no phantom waiter remains
             // (the prior registration for this fd/task was already replaced).
-            self.registrations
-                .retain(|r| !(r.fd == fd && r.task_id == task_id && r.interest == interest));
+            self.remove_registration((fd, task_id, interest));
             let _ = self.sync_platform_fd(fd);
         }
         rc
     }
 
     pub fn deregister_fd(&mut self, fd: RawFd) -> i32 {
-        self.registrations
-            .retain(|registration| registration.fd != fd);
+        let keys: Vec<_> = self.by_fd.get(&fd).into_iter().flatten().copied().collect();
+        for key in keys {
+            self.remove_registration(key);
+        }
         self.sync_platform_fd(fd)
     }
 
@@ -215,11 +330,11 @@ impl RuntimeNetPoll {
     /// have independent read and write waiters on the same native handle, so a
     /// completed operation must not deregister the other tasks.
     pub fn deregister_task_fd(&mut self, fd: RawFd, task_id: RuntimeTaskId) -> i32 {
-        self.registrations
-            .retain(|registration| !(registration.fd == fd && registration.task_id == task_id));
+        self.remove_task_fd(fd, task_id);
         self.sync_platform_fd(fd)
     }
 
+    /// Current waiters, in unspecified order.
     pub fn registrations(&self) -> &[IoRegistration] {
         &self.registrations
     }
@@ -232,13 +347,17 @@ impl RuntimeNetPoll {
     /// cancelled task must not linger as an I/O waiter, and its fds must not
     /// keep firing wakeups for a task that will never poll again.
     pub fn purge_task(&mut self, task_id: RuntimeTaskId) {
-        let affected: HashSet<RawFd> = self
-            .registrations
-            .iter()
-            .filter(|r| r.task_id == task_id)
-            .map(|r| r.fd)
+        let keys: Vec<_> = self
+            .by_task
+            .get(&task_id)
+            .into_iter()
+            .flatten()
+            .copied()
             .collect();
-        self.registrations.retain(|r| r.task_id != task_id);
+        let affected: HashSet<_> = keys.iter().map(|key| key.0).collect();
+        for key in keys {
+            self.remove_registration(key);
+        }
         // Rebuild the kernel interest from the registrations that survived.
         // This is required even when another task still shares the fd: the
         // cancelled task may have been the only READABLE (or WRITABLE)
@@ -261,10 +380,17 @@ impl RuntimeNetPoll {
     ) -> Vec<RuntimeTaskId> {
         let mut seen = HashSet::new();
         let mut tasks = Vec::new();
-        for registration in &self.registrations {
-            if registration.token != token {
-                continue;
-            }
+        // Registration order is the wake order: a task that waited longer on
+        // a shared token is woken before one that registered after it.
+        for key in self
+            .by_token
+            .get(&token)
+            .into_iter()
+            .flat_map(BTreeMap::values)
+        {
+            #[cfg(test)]
+            self.ready_visits.set(self.ready_visits.get() + 1);
+            let registration = &self.registrations[self.slots[key].position];
             if let Some(ready) = ready_interest
                 && !registration.interest.overlaps(ready)
             {
@@ -310,6 +436,11 @@ impl RuntimeNetPoll {
     #[cfg(test)]
     pub fn reset_for_test(&mut self) {
         self.registrations.clear();
+        self.slots.clear();
+        self.by_token.clear();
+        self.by_task.clear();
+        self.by_fd.clear();
+        self.interest_counts.clear();
         self.ready_tokens.clear();
         self.close_platform();
     }
@@ -380,17 +511,7 @@ impl RuntimeNetPoll {
         let Some(epoll_fd) = self.epoll_fd else {
             return 0;
         };
-        let interest = self
-            .registrations
-            .iter()
-            .filter(|registration| registration.fd == fd)
-            .fold(None, |acc, registration| {
-                match (acc, registration.interest) {
-                    (None, interest) => Some(interest),
-                    (Some(existing), interest) if existing == interest => Some(existing),
-                    (Some(_), _) => Some(IoInterest::ReadWrite),
-                }
-            });
+        let interest = self.merged_interest(fd);
         let Some(interest) = interest else {
             let mut event = libc::epoll_event { events: 0, u64: 0 };
             unsafe {
@@ -501,7 +622,7 @@ impl RuntimeNetPoll {
         let Some(kqueue_fd) = self.kqueue_fd else {
             return 0;
         };
-        let interest = merged_interest(&self.registrations, fd);
+        let interest = self.merged_interest(fd);
         let mut failed = false;
         for (filter, wanted) in [
             (
@@ -634,7 +755,7 @@ impl RuntimeNetPoll {
     }
 
     fn sync_platform_fd(&mut self, fd: RawFd) -> i32 {
-        if merged_interest(&self.registrations, fd).is_none() {
+        if self.merged_interest(fd).is_none() {
             return 0;
         }
         let mut probe = [WsaPollFd {
@@ -690,19 +811,6 @@ impl RuntimeNetPoll {
     fn drain_platform_waker(&self) {}
 
     fn close_platform(&mut self) {}
-}
-
-fn merged_interest(registrations: &[IoRegistration], fd: RawFd) -> Option<IoInterest> {
-    registrations
-        .iter()
-        .filter(|registration| registration.fd == fd)
-        .fold(None, |acc, registration| {
-            match (acc, registration.interest) {
-                (None, interest) => Some(interest),
-                (Some(existing), interest) if existing == interest => Some(existing),
-                (Some(_), _) => Some(IoInterest::ReadWrite),
-            }
-        })
 }
 
 static GLOBAL_NETPOLL: LazyLock<Mutex<RuntimeNetPoll>> =
@@ -830,7 +938,10 @@ fn wait_ready_tasks(timeout: Option<Duration>) -> Vec<RuntimeTaskId> {
                 None
             } else {
                 Some((
-                    poll.registrations.clone(),
+                    poll.interest_counts
+                        .keys()
+                        .map(|&fd| (fd, poll.merged_interest(fd).unwrap()))
+                        .collect::<Vec<_>>(),
                     poll.wake_receiver.as_ref()?.as_raw_socket() as usize,
                 ))
             }
@@ -915,20 +1026,10 @@ fn wait_apple_events(kqueue_fd: i32, timeout: Option<Duration>) -> Vec<ReadyEven
 
 #[cfg(target_os = "windows")]
 fn wait_windows_events(
-    registrations: &[IoRegistration],
+    unique: &[(RawFd, IoInterest)],
     wake_socket: usize,
     timeout: Option<Duration>,
 ) -> Vec<ReadyEvent> {
-    let mut unique = Vec::<(RawFd, IoInterest)>::new();
-    for registration in registrations {
-        if let Some((_, interest)) = unique.iter_mut().find(|(fd, _)| *fd == registration.fd) {
-            if *interest != registration.interest {
-                *interest = IoInterest::ReadWrite;
-            }
-        } else {
-            unique.push((registration.fd, registration.interest));
-        }
-    }
     let mut sockets = Vec::with_capacity(unique.len() + 1);
     sockets.push(WsaPollFd {
         fd: wake_socket,
@@ -1123,6 +1224,189 @@ mod tests {
 
     static NETPOLL_TEST_LAST_REGISTER: AtomicI32 = AtomicI32::new(0);
 
+    fn assert_indexes(poll: &RuntimeNetPoll) {
+        assert_eq!(poll.slots.len(), poll.registrations.len());
+        assert_eq!(
+            poll.by_token.values().map(BTreeMap::len).sum::<usize>(),
+            poll.registrations.len()
+        );
+        assert_eq!(
+            poll.by_task.values().map(HashSet::len).sum::<usize>(),
+            poll.registrations.len()
+        );
+        assert_eq!(
+            poll.by_fd.values().map(HashSet::len).sum::<usize>(),
+            poll.registrations.len()
+        );
+        for (position, registration) in poll.registrations.iter().enumerate() {
+            let key = (registration.fd, registration.task_id, registration.interest);
+            let slot = poll.slots[&key];
+            assert_eq!(slot.position, position);
+            assert!(slot.sequence < poll.next_sequence);
+            assert_eq!(poll.by_token[&registration.token][&slot.sequence], key);
+            assert!(poll.by_task[&registration.task_id].contains(&key));
+            assert!(poll.by_fd[&registration.fd].contains(&key));
+        }
+        for (&fd, counts) in &poll.interest_counts {
+            let mut expected = [0, 0];
+            for registration in poll.registrations.iter().filter(|r| r.fd == fd) {
+                expected[0] += usize::from(registration.interest.overlaps(IoInterest::Readable));
+                expected[1] += usize::from(registration.interest.overlaps(IoInterest::Writable));
+            }
+            assert_eq!(*counts, expected);
+        }
+    }
+
+    #[test]
+    fn netpoll_index_scaling_and_mutations() {
+        for n in [64, 128, 256, 512] {
+            let mut poll = RuntimeNetPoll::new();
+            for fd in 0..n {
+                poll.register(IoRegistration::new(
+                    fd,
+                    fd as RuntimeTaskId + 1,
+                    IoInterest::Readable,
+                ));
+            }
+            // These are exactly the candidate buckets consumed by readiness;
+            // unrelated registrations contribute no candidate visits.
+            assert_eq!(poll.ready_tasks(0), vec![1]);
+            assert_eq!(poll.ready_visits.replace(0), 1);
+            let mut visits = 0;
+            for token in 0..n as usize {
+                visits += poll.by_token[&token].len();
+                assert_eq!(poll.ready_tasks(token), vec![token as RuntimeTaskId + 1]);
+            }
+            assert_eq!(visits, n as usize);
+            assert_eq!(poll.ready_visits.get(), n as usize);
+            for task in 1..=n as RuntimeTaskId {
+                assert_eq!(poll.by_task[&task].len(), 1);
+                poll.purge_task(task);
+            }
+            assert_indexes(&poll);
+            assert!(poll.slots.is_empty());
+            assert!(poll.by_fd.is_empty());
+            assert!(poll.by_token.is_empty());
+            assert!(poll.by_task.is_empty());
+            assert!(poll.interest_counts.is_empty());
+        }
+    }
+
+    #[test]
+    fn netpoll_shared_bucket_shrinks_after_cancellation() {
+        let mut poll = RuntimeNetPoll::new();
+        for task in 1..=512 {
+            poll.register(IoRegistration::new(8, task, IoInterest::Readable));
+        }
+        for task in 1..512 {
+            poll.purge_task(task);
+        }
+        assert_eq!(poll.ready_tasks(8), vec![512]);
+        assert_eq!(poll.ready_visits.get(), 1);
+        assert_eq!(poll.by_token[&8].len(), 1);
+        assert!(poll.by_fd[&8].capacity() <= 4);
+        assert_indexes(&poll);
+    }
+
+    #[test]
+    fn netpoll_wakes_shared_token_waiters_in_registration_order() {
+        let mut poll = RuntimeNetPoll::new();
+        for task in [5, 3, 9, 1] {
+            poll.register(IoRegistration::new(8, task, IoInterest::Readable));
+        }
+        // Tasks sharing a token wake first-registered-first, not in hash order.
+        assert_eq!(poll.ready_tasks(8), vec![5, 3, 9, 1]);
+        assert_eq!(poll.ready_visits.replace(0), 4);
+        poll.purge_task(3);
+        assert_eq!(poll.ready_tasks(8), vec![5, 9, 1]);
+        // Re-registering moves a waiter to the back of the line.
+        poll.register(IoRegistration::new(8, 3, IoInterest::Readable));
+        poll.reregister(IoRegistration::new(8, 5, IoInterest::Writable));
+        assert_eq!(poll.ready_tasks(8), vec![9, 1, 3, 5]);
+        assert_eq!(
+            poll.ready_tasks_for(8, Some(IoInterest::Readable)),
+            vec![9, 1, 3]
+        );
+        assert_eq!(
+            poll.tasks_for_ready_events(vec![
+                ReadyEvent {
+                    token: 8,
+                    interest: Some(IoInterest::Writable),
+                },
+                ReadyEvent {
+                    token: 8,
+                    interest: None,
+                },
+            ]),
+            vec![5, 9, 1, 3]
+        );
+        // A second poller running the same sequence sees the same order.
+        let mut twin = RuntimeNetPoll::new();
+        for task in [5, 3, 9, 1] {
+            twin.register(IoRegistration::new(8, task, IoInterest::Readable));
+        }
+        twin.purge_task(3);
+        twin.register(IoRegistration::new(8, 3, IoInterest::Readable));
+        twin.reregister(IoRegistration::new(8, 5, IoInterest::Writable));
+        assert_eq!(twin.ready_tasks(8), poll.ready_tasks(8));
+        assert_indexes(&poll);
+        assert_indexes(&twin);
+    }
+
+    #[test]
+    fn netpoll_indexes_preserve_filtering_dedup_and_reuse() {
+        let mut poll = RuntimeNetPoll::new();
+        for interest in [
+            IoInterest::Readable,
+            IoInterest::Writable,
+            IoInterest::ReadWrite,
+        ] {
+            poll.register(IoRegistration {
+                fd: 8,
+                token: 100,
+                task_id: 1,
+                interest,
+            });
+        }
+        poll.register(IoRegistration {
+            fd: 9,
+            token: 100,
+            task_id: 2,
+            interest: IoInterest::Writable,
+        });
+        assert_eq!(
+            poll.ready_tasks_for(100, Some(IoInterest::Readable)),
+            vec![1]
+        );
+        assert_eq!(
+            poll.ready_tasks_for(100, Some(IoInterest::Writable)),
+            vec![1, 2]
+        );
+        assert_indexes(&poll);
+        poll.reregister(IoRegistration::new(8, 1, IoInterest::Readable));
+        assert_eq!(poll.ready_tasks(100), vec![2]);
+        assert_eq!(poll.merged_interest(8), Some(IoInterest::Readable));
+        assert_indexes(&poll);
+        poll.deregister_fd(8);
+        poll.register(IoRegistration::new(8, 3, IoInterest::Writable));
+        assert_eq!(poll.ready_tasks(8), vec![3]);
+        assert_indexes(&poll);
+        poll.purge_task(2);
+        assert!(poll.ready_tasks(100).is_empty());
+        assert_indexes(&poll);
+        let events = vec![
+            ReadyEvent {
+                token: 8,
+                interest: None
+            };
+            3
+        ];
+        assert_eq!(poll.tasks_for_ready_events(events), vec![3]);
+        poll.reset_for_test();
+        assert_indexes(&poll);
+        assert!(poll.interest_counts.is_empty());
+    }
+
     #[test]
     fn netpoll_maps_tokens_to_tasks() {
         let mut poll = RuntimeNetPoll::default();
@@ -1159,6 +1443,13 @@ mod tests {
             !poll.has_waiters(),
             "a failed registration must be rolled back, not left as a phantom waiter"
         );
+        assert_indexes(&poll);
+        assert_eq!(
+            poll.reregister_fd(file.as_raw_fd().into(), 9, IoInterest::Writable),
+            -1
+        );
+        assert_indexes(&poll);
+        assert!(!poll.has_waiters());
         poll.reset_for_test();
     }
 

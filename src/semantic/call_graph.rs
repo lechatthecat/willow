@@ -30,7 +30,9 @@
 //! land there, so an analysis that reads the graph cannot mistake "no edge" for
 //! "no effect".
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+
+use std::sync::Mutex;
 
 use crate::parser::ast::*;
 use crate::parser::iter::{AstEvent, AstWalk};
@@ -42,7 +44,7 @@ use crate::semantic::ids::{FunctionId, TypeId};
 /// has no symbol tables) or from the checker's symbol tables. Both feed the one
 /// [`ClassHierarchy::dispatch_targets`] below, so the two consumers cannot drift
 /// apart in how they resolve a virtual call.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct ClassHierarchy {
     /// class -> its base class, if any. Every known class has an entry, so the
     /// key set is the set of concrete dispatch candidates.
@@ -50,6 +52,31 @@ pub struct ClassHierarchy {
     /// (class, method) pairs the class declares a body for. Static methods are
     /// excluded: they are not dispatch targets.
     declared: BTreeSet<(String, String)>,
+    dispatch: Mutex<Option<DispatchAnalysis>>,
+}
+
+// Bound memoized queries independently of call-site count. Each result has at
+// most one entry per declaration; FIFO eviction only affects recomputation.
+const DISPATCH_CACHE_ENTRIES: usize = 256;
+
+#[derive(Debug, Default)]
+struct DispatchAnalysis {
+    children: HashMap<String, Vec<String>>,
+    owners: HashMap<String, HashSet<String>>,
+    results: HashMap<(String, String), Vec<FunctionId>>,
+    order: VecDeque<(String, String)>,
+    #[cfg(test)]
+    visits: usize,
+}
+
+impl Clone for ClassHierarchy {
+    fn clone(&self) -> Self {
+        Self {
+            bases: self.bases.clone(),
+            declared: self.declared.clone(),
+            dispatch: Mutex::default(),
+        }
+    }
 }
 
 impl ClassHierarchy {
@@ -82,6 +109,7 @@ impl ClassHierarchy {
     /// first base, so a caller merging several sources cannot silently sever a
     /// hierarchy by re-registering a class it only saw as a base name.
     pub fn add_class(&mut self, class: &str, base: Option<&str>) {
+        *self.dispatch.get_mut().expect("dispatch cache lock") = None;
         let entry = self.bases.entry(class.to_string()).or_default();
         if entry.is_none() {
             *entry = base.map(str::to_owned);
@@ -90,6 +118,7 @@ impl ClassHierarchy {
 
     /// Register a non-static method body declared directly by `class`.
     pub fn add_method(&mut self, class: &str, method: &str) {
+        *self.dispatch.get_mut().expect("dispatch cache lock") = None;
         self.declared
             .insert((class.to_string(), method.to_string()));
     }
@@ -157,24 +186,84 @@ impl ClassHierarchy {
     /// An empty result means "no body in this unit", which callers must treat as
     /// unknown rather than as safe.
     pub fn dispatch_targets(&self, declared_class: &str, method: &str) -> Vec<FunctionId> {
+        let mut cached = self.dispatch.lock().expect("dispatch cache lock");
+        let analysis = cached.get_or_insert_with(|| {
+            let mut analysis = DispatchAnalysis::default();
+            for (class, base) in &self.bases {
+                if let Some(base) = base {
+                    analysis
+                        .children
+                        .entry(base.clone())
+                        .or_default()
+                        .push(class.clone());
+                }
+            }
+            for (class, method) in &self.declared {
+                analysis
+                    .owners
+                    .entry(method.clone())
+                    .or_default()
+                    .insert(class.clone());
+            }
+            analysis
+        });
+        let key = (declared_class.to_owned(), method.to_owned());
+        if let Some(targets) = analysis.results.get(&key) {
+            return targets.clone();
+        }
+        let Some(owners) = analysis.owners.get(method) else {
+            return Vec::new();
+        };
         let mut targets = BTreeSet::new();
-        for concrete in self.bases.keys() {
-            if !self.is_same_or_subclass(concrete, declared_class) {
+        // A virtual union needs the inherited body at its static root, plus
+        // every override below that root. Inheriting descendants cannot add
+        // another target, so never resolve an ancestor chain for each one.
+        let mut current = Some(declared_class);
+        let mut ancestors = HashSet::new();
+        while let Some(class) = current {
+            if !ancestors.insert(class) {
+                break;
+            }
+            #[cfg(test)]
+            {
+                analysis.visits += 1;
+            }
+            if owners.contains(class) {
+                if self.is_known_class(class) {
+                    targets.insert(FunctionId::method(TypeId::from_source_name(class), method));
+                }
+                break;
+            }
+            current = self.base_of(class);
+        }
+        let mut pending = vec![declared_class];
+        let mut seen = HashSet::new();
+        while let Some(class) = pending.pop() {
+            if !seen.insert(class) {
                 continue;
             }
-            if let Some(declaring) = self.declaring_class(concrete, method) {
-                // `from_source_name` rather than `local`: a hierarchy built from
-                // the checker's symbol tables carries module-qualified class
-                // names, and the namespace must land in the ID, not the owner.
-                // An AST-built hierarchy has no qualified names, so the two
-                // agree there.
-                targets.insert(FunctionId::method(
-                    TypeId::from_source_name(declaring),
-                    method,
-                ));
+            #[cfg(test)]
+            {
+                analysis.visits += 1;
+            }
+            if self.is_known_class(class) && owners.contains(class) {
+                targets.insert(FunctionId::method(TypeId::from_source_name(class), method));
+            }
+            if let Some(children) = analysis.children.get(class) {
+                pending.extend(children.iter().map(String::as_str));
             }
         }
-        targets.into_iter().collect()
+        let targets: Vec<_> = targets.into_iter().collect();
+        if analysis.results.len() == DISPATCH_CACHE_ENTRIES {
+            let oldest = analysis
+                .order
+                .pop_front()
+                .expect("cached query has an order entry");
+            analysis.results.remove(&oldest);
+        }
+        analysis.order.push_back(key.clone());
+        analysis.results.insert(key, targets.clone());
+        targets
     }
 
     /// Class names in a stable order. Used by consumers that need to enumerate
@@ -638,6 +727,118 @@ mod tests {
             .get(&FunctionId::free(name))
             .expect("node")
             .has_unknown
+    }
+
+    #[test]
+    fn dispatch_reuses_chain_wide_and_unrelated_queries() {
+        for n in [32, 64, 128, 256] {
+            for wide in [false, true] {
+                let mut hierarchy = ClassHierarchy::default();
+                hierarchy.add_class("C0", None);
+                hierarchy.add_method("C0", "m");
+                for i in 1..n {
+                    let parent = if wide {
+                        "C0".to_owned()
+                    } else {
+                        format!("C{}", i - 1)
+                    };
+                    hierarchy.add_class(&format!("C{i}"), Some(&parent));
+                    hierarchy.add_class(&format!("Unrelated{i}"), None);
+                    hierarchy.add_method(&format!("Unrelated{i}"), "m");
+                }
+                let expected = vec![FunctionId::method(TypeId::local("C0"), "m")];
+                for _ in 0..n {
+                    assert_eq!(hierarchy.dispatch_targets("C0", "m"), expected);
+                }
+                let cache = hierarchy.dispatch.lock().unwrap();
+                let analysis = cache.as_ref().unwrap();
+                assert_eq!(analysis.visits, n + 1);
+                eprintln!(
+                    "dispatch n={n} wide={wide} queries={n} visits={}",
+                    analysis.visits
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_matches_concrete_union_on_malformed_hierarchies() {
+        let mut seed = 7u64;
+        for _ in 0..100 {
+            let mut hierarchy = ClassHierarchy::default();
+            for i in 0..12 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let parent = format!("C{}", (seed >> 32) % 15);
+                hierarchy.add_class(&format!("C{i}"), Some(&parent));
+                if seed & 3 == 0 {
+                    hierarchy.add_method(&format!("C{i}"), "m");
+                }
+            }
+            hierarchy.add_method("C14", "m"); // absent declaration owner
+            for i in 0..16 {
+                let class = format!("C{i}");
+                let expected: BTreeSet<_> = hierarchy
+                    .classes()
+                    .filter(|concrete| hierarchy.is_same_or_subclass(concrete, &class))
+                    .filter_map(|concrete| hierarchy.declaring_class(concrete, "m"))
+                    .map(|owner| FunctionId::method(TypeId::from_source_name(owner), "m"))
+                    .collect();
+                assert_eq!(
+                    hierarchy.dispatch_targets(&class, "m"),
+                    expected.into_iter().collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_cache_invalidates_and_bounds_queries() {
+        let mut hierarchy = ClassHierarchy::default();
+        hierarchy.add_class("pkg::Base", None);
+        hierarchy.add_method("pkg::Base", "m");
+        let base = FunctionId::method(TypeId::from_source_name("pkg::Base"), "m");
+        assert_eq!(hierarchy.dispatch_targets("pkg::Base", "m"), vec![base]);
+        hierarchy.add_class("pkg::Child", Some("pkg::Base"));
+        hierarchy.add_method("pkg::Child", "m");
+        let child = FunctionId::method(TypeId::from_source_name("pkg::Child"), "m");
+        let expected: Vec<_> = BTreeSet::from([base, child]).into_iter().collect();
+        assert_eq!(hierarchy.dispatch_targets("pkg::Base", "m"), expected);
+        let mut clone = hierarchy.clone();
+        clone.add_class("Other", Some("pkg::Base"));
+        clone.add_method("Other", "m");
+        assert_eq!(clone.dispatch_targets("pkg::Base", "m").len(), 3);
+        assert_eq!(hierarchy.dispatch_targets("pkg::Base", "m"), expected);
+        for i in 0..2 * DISPATCH_CACHE_ENTRIES {
+            assert!(
+                hierarchy
+                    .dispatch_targets(&format!("Missing{i}"), "m")
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            hierarchy
+                .dispatch
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .results
+                .len(),
+            DISPATCH_CACHE_ENTRIES
+        );
+        assert_eq!(hierarchy.dispatch_targets("pkg::Base", "m"), expected);
+        hierarchy.add_class("A", Some("B"));
+        hierarchy.add_class("B", Some("A"));
+        hierarchy.add_class("Leaf", Some("A"));
+        hierarchy.add_method("B", "m");
+        hierarchy.add_method("Leaf", "m");
+        for class in ["A", "B"] {
+            let targets = hierarchy.dispatch_targets(class, "m");
+            assert_eq!(targets.len(), 2);
+            assert!(targets.contains(&FunctionId::method(TypeId::local("B"), "m")));
+            assert!(targets.contains(&FunctionId::method(TypeId::local("Leaf"), "m")));
+        }
+        assert!(hierarchy.dispatch_targets("A", "missing").is_empty());
     }
 
     #[test]
