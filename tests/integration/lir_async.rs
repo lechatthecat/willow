@@ -2087,22 +2087,27 @@ async fn main() {
 fn async_lir_85_cancelling_a_task_with_an_open_recovery_scope_runs_its_defer_once() {
     // Cancellation walks the frame's registered defer sites. A scope that was
     // never left must still be cleaned up, and exactly once.
+    //
+    // `main` cancels only after `slow` reports from inside the scope: a timer
+    // margin instead would leave the order to the scheduler (willow-ssl7.13).
     assert_recovery(
         r#"
-async fn slow() -> i64 {
+async fn slow(entered: Channel<i64>) -> i64 {
     if true {
         defer match recover() {
             Some(info) => println("d: " + info.message),
             None => println("d: cancelled path")
         }
-        await sleep(200);
+        entered.send(1);
+        await sleep(10000);
         println("never");
     }
     return 1;
 }
 async fn main() {
-    let t = slow();
-    await sleep(1);
+    let entered = Channel<i64>::new();
+    let t = slow(entered);
+    entered.recv();
     t.cancel();
     match await t.result() {
         Ok(v) => println(v),
@@ -2117,9 +2122,14 @@ async fn main() {
 
 #[test]
 fn async_lir_86_a_defer_consumed_by_the_recovery_is_not_rerun_by_a_later_cancel() {
+    // `run` reports on `recovered` once the scope has been left through its
+    // recovery, and `main` cancels only then. Ordering the two by timer
+    // deadlines instead (`sleep(1)` against `sleep(5)`) let a late resume on a
+    // loaded worker pool deliver the cancellation while the scope was still
+    // open, which printed `d: clean` on macos-15 (willow-ssl7.13).
     assert_recovery(
         r#"
-async fn run() -> i64 {
+async fn run(recovered: Channel<i64>, hold: Channel<i64>) -> i64 {
     if true {
         defer match recover() {
             Some(info) => println("d: " + info.message),
@@ -2128,12 +2138,14 @@ async fn run() -> i64 {
         await sleep(1);
         panic("stop");
     }
-    await sleep(50);
-    return 7;
+    recovered.send(1);
+    return hold.recv();
 }
 async fn main() {
-    let t = run();
-    await sleep(5);
+    let recovered = Channel<i64>::new();
+    let hold = Channel<i64>::new();
+    let t = run(recovered, hold);
+    recovered.recv();
     t.cancel();
     match await t.result() {
         Ok(v) => println(v),
