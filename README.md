@@ -271,10 +271,6 @@ Current limitations include:
 
 The project intentionally focuses on making the compiler and runtime architecture solid before treating the language surface as stable.
 
-## Feedback
-
-Willow is a personal language project, and feedback from compiler/runtime developers or people experimenting with new languages is welcome. Bug reports, implementation discussion, and small reproducible examples are especially useful.
-
 ## License
 
 Willow is available under the [MIT License](LICENSE).
