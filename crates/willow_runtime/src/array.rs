@@ -551,12 +551,14 @@ mod tests {
         willow_gc_init();
         let mut arr = willow_array_new(0, 0); // scalar (non-reference) array
         willow_push_root(&mut arr as *mut *mut u8);
-        // SAFETY: guarded because process environment is global to the test binary.
-        unsafe { std::env::set_var("WILLOW_GC_STRESS", "alloc") };
+        // Guarded because the stress override is global to the test binary.
+        let collections = crate::gc::willow_gc_major_collections();
+        crate::gc::set_gc_stress_for_test(Some("alloc"));
         for i in 0..12 {
             willow_array_push(arr, i * 7); // crosses several growth points
         }
-        unsafe { std::env::remove_var("WILLOW_GC_STRESS") };
+        crate::gc::set_gc_stress_for_test(None);
+        assert!(crate::gc::willow_gc_major_collections() > collections);
         assert_eq!(willow_array_len(arr), 12);
         assert_eq!(willow_array_get(arr, 0), 0);
         assert_eq!(willow_array_get(arr, 11), 77);

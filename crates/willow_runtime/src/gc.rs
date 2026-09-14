@@ -2295,16 +2295,46 @@ pub extern "C" fn willow_gc_minor_collect() {
 /// - `all`       — enable all of the above.
 ///
 /// Example: `WILLOW_GC_STRESS=alloc cargo test`, or `WILLOW_GC_STRESS=all`.
+///
+/// The variable is read once: every slow-path allocation asks for it several
+/// times, and `std::env::var` costs a `getenv` scan plus, on Windows, a heap
+/// allocation for the key on each call (willow-ssl7.12).
 pub(crate) fn gc_stress_enabled(kind: &str) -> bool {
-    std::env::var("WILLOW_GC_STRESS")
-        .ok()
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .any(|mode| mode == "all" || mode == kind)
-        })
-        .unwrap_or(false)
+    static MODES: LazyLock<Vec<String>> = LazyLock::new(|| {
+        parse_gc_stress_modes(&std::env::var("WILLOW_GC_STRESS").unwrap_or_default())
+    });
+    #[cfg(test)]
+    if let Some(modes) = &*gc_stress_override()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    {
+        return modes.iter().any(|mode| mode == "all" || mode == kind);
+    }
+    MODES.iter().any(|mode| mode == "all" || mode == kind)
+}
+
+fn parse_gc_stress_modes(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Process-wide stress-mode override for tests that cannot restart the process
+/// with a different `WILLOW_GC_STRESS`. `None` restores the environment value.
+#[cfg(test)]
+fn gc_stress_override() -> &'static Mutex<Option<Vec<String>>> {
+    static OVERRIDE: Mutex<Option<Vec<String>>> = Mutex::new(None);
+    &OVERRIDE
+}
+
+#[cfg(test)]
+pub(crate) fn set_gc_stress_for_test(modes: Option<&str>) {
+    *gc_stress_override()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = modes.map(parse_gc_stress_modes);
 }
 
 pub(crate) fn stress_collect(kind: &str) {
@@ -3801,6 +3831,65 @@ mod tests {
 
     fn gc_test_guard() -> std::sync::MutexGuard<'static, ()> {
         runtime_test_guard()
+    }
+
+    // willow-ssl7.12: stress-mode checks sit on the allocation slow path, so
+    // they must not read the environment (a Windows `getenv` allocates) per
+    // call. The environment is parsed once; tests switch modes through the
+    // override without touching the process environment.
+    #[test]
+    fn gc_stress_mode_checks_are_allocation_free_after_first_use() {
+        use crate::scheduler::scaling_measurements::counting_allocator as counter;
+        let _guard = gc_test_guard();
+        set_gc_stress_for_test(None);
+        let _ = gc_stress_enabled("alloc");
+        let allocations = counter::thread_allocations();
+        let bytes = counter::thread_bytes();
+        for kind in ["alloc", "minor", "await", "scheduler"] {
+            for _ in 0..1_000 {
+                std::hint::black_box(gc_stress_enabled(kind));
+            }
+        }
+        assert_eq!(
+            (
+                counter::thread_allocations() - allocations,
+                counter::thread_bytes() - bytes
+            ),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn gc_stress_modes_parse_lists_and_override_replaces_the_environment() {
+        let _guard = gc_test_guard();
+        assert!(parse_gc_stress_modes("").is_empty());
+        assert_eq!(
+            parse_gc_stress_modes(" alloc , minor,,await"),
+            ["alloc", "minor", "await"]
+        );
+        set_gc_stress_for_test(Some("minor, scheduler"));
+        assert!(gc_stress_enabled("minor"));
+        assert!(gc_stress_enabled("scheduler"));
+        assert!(!gc_stress_enabled("alloc"));
+        assert!(!gc_stress_enabled("await"));
+        set_gc_stress_for_test(Some("all"));
+        assert!(
+            ["alloc", "minor", "await", "scheduler"]
+                .into_iter()
+                .all(gc_stress_enabled)
+        );
+        set_gc_stress_for_test(Some(""));
+        assert!(!gc_stress_enabled("alloc"));
+        set_gc_stress_for_test(None);
+        let from_environment = std::env::var("WILLOW_GC_STRESS")
+            .map(|value| parse_gc_stress_modes(&value))
+            .unwrap_or_default();
+        assert_eq!(
+            gc_stress_enabled("alloc"),
+            from_environment
+                .iter()
+                .any(|mode| mode == "all" || mode == "alloc")
+        );
     }
 
     #[test]
