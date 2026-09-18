@@ -20,6 +20,9 @@ pub const fn storage_word_bytes(pointer_bytes: u32) -> u32 {
     if pointer_bytes < 8 { 8 } else { pointer_bytes }
 }
 
+pub mod runtime_symbols;
+pub use runtime_symbols::{RUNTIME_SYMBOLS, RuntimeSymbol, runtime_symbol};
+
 /// Target-independent representation class for one C-ABI parameter/return.
 ///
 /// `Word` is a generic 64-bit Willow payload that may contain scalar bits or

@@ -1100,12 +1100,12 @@ impl Codegen {
         }
 
         // The runtime ABI surface is declared from a single source of truth in
-        // `crate::backend::abi`. Adding or changing a runtime symbol means
-        // editing `RUNTIME_SYMBOLS`, not this loop.
+        // `willow_abi::runtime_symbols`. Adding or changing a runtime symbol
+        // means editing `RUNTIME_SYMBOLS`, not this loop.
         let ptr_ty = reference_type(self.module.target_config());
         for symbol in abi::RUNTIME_SYMBOLS {
             let mut sig = self.module.make_signature();
-            symbol.fill_signature(&mut sig, ptr_ty);
+            abi::fill_signature(symbol, &mut sig, ptr_ty);
             let id = self
                 .module
                 .declare_function(symbol.name, Linkage::Import, &sig)?;

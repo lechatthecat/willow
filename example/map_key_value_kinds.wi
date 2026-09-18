@@ -1,0 +1,46 @@
+// map_key_value_kinds.wi — every key/value reference combination of Map<K, V>.
+//
+// `Map::insert` crosses the runtime ABI as
+// `(map, key_word, key_is_ref, val_word, val_is_ref)`: each payload word is
+// followed by its own is-reference flag. The four combinations below exercise
+// both flags in both states, and a collection between insert and lookup shows
+// that reference values are traced through the map (willow-9tls.7).
+
+import std::collections::Map;
+
+class Point {
+    pub x: i64;
+    pub y: i64;
+    pub fn sum(self) -> i64 { return self.x + self.y; }
+}
+
+fn main() {
+    // scalar key, scalar value: neither flag set.
+    let mut squares: Map<i64, i64> = Map::new();
+    squares.insert(3, 9);
+    squares.insert(4, 16);
+    println(match squares.get(4) { Some(v) => v, None => -1 }); // 16
+
+    // reference key, scalar value: only the key flag set.
+    let mut ages: Map<String, i64> = Map::new();
+    ages.insert("Ada", 36);
+    ages.insert("Ada", 37); // same content, same key
+    println(ages.len()); // 1
+    println(match ages.get("Ada") { Some(v) => v, None => -1 }); // 37
+
+    // scalar key, reference value: only the value flag set.
+    let mut names: Map<i64, String> = Map::new();
+    names.insert(1, "one");
+    names.insert(2, "two");
+    gc_collect();
+    println(match names.get(2) { Some(s) => s, None => "?" }); // two
+
+    // reference key, reference value: both flags set.
+    let mut points: Map<String, Point> = Map::new();
+    points.insert("origin", new Point(0, 0));
+    points.insert("far", new Point(40, 2));
+    gc_collect();
+    println(match points.get("far") { Some(p) => p.sum(), None => -1 }); // 42
+    println(points.contains("origin")); // true
+    println(points.contains("nowhere")); // false
+}
