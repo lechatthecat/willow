@@ -247,12 +247,7 @@ fn memory_limit_also_bounds_generated_tlab_reservations() {
     let _guard = runtime_test_guard();
     reset_internal_for_test();
     runtime().heap.lock().unwrap().memory_limit_bytes = Some(GC_TLAB_CHUNK_SIZE);
-    let mut tls = GcTlabState {
-        cursor: AtomicUsize::new(0),
-        limit: AtomicUsize::new(0),
-        fast_allocations: AtomicU64::new(0),
-        fast_allocated_bytes: AtomicU64::new(0),
-    };
+    let mut tls = tlab_state_for_test();
     let mut root = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
     assert!(!root.is_null());
     willow_push_root(&mut root);
@@ -270,12 +265,7 @@ fn memory_limit_also_bounds_generated_tlab_reservations() {
 fn minor_collection_pins_children_when_region_budget_prevents_copying() {
     let _guard = runtime_test_guard();
     reset_internal_for_test();
-    let mut tls = GcTlabState {
-        cursor: AtomicUsize::new(0),
-        limit: AtomicUsize::new(0),
-        fast_allocations: AtomicU64::new(0),
-        fast_allocated_bytes: AtomicU64::new(0),
-    };
+    let mut tls = tlab_state_for_test();
     let mut parent = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 1);
     willow_push_root(&mut parent);
     let child = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
@@ -302,12 +292,7 @@ fn budget_exhaustion_reports_error_before_callers_can_dereference_null() {
         if path == "old" {
             willow_alloc(8);
         } else {
-            let mut tls = GcTlabState {
-                cursor: AtomicUsize::new(0),
-                limit: AtomicUsize::new(0),
-                fast_allocations: AtomicU64::new(0),
-                fast_allocated_bytes: AtomicU64::new(0),
-            };
+            let mut tls = tlab_state_for_test();
             willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
         }
         panic!("budget exhaustion returned to an unchecked allocation caller");
@@ -349,12 +334,7 @@ fn reservation_pressure_collects_garbage_before_rejecting_an_allocation() {
 fn captured_array_owner_survives_resize_and_moving_collection() {
     let _guard = runtime_test_guard();
     reset_internal_for_test();
-    let mut tls = GcTlabState {
-        cursor: AtomicUsize::new(0),
-        limit: AtomicUsize::new(0),
-        fast_allocations: AtomicU64::new(0),
-        fast_allocated_bytes: AtomicU64::new(0),
-    };
+    let mut tls = tlab_state_for_test();
     let mut array = crate::array::willow_array_new(1, 0);
     willow_push_root(&mut array);
     crate::array::willow_array_set(array, 0, 17);

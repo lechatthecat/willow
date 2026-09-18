@@ -259,16 +259,16 @@ pub extern "C" fn willow_map_copy(map: *mut u8) -> *mut u8 {
     if map.is_null() {
         return willow_map_new(0, 0, 0);
     }
-    // Snapshot the source entries into owned Rust data first; the value words are
-    // kept alive by the still-rooted source map across the `willow_map_new`
-    // allocation below.
-    let (layout, entries): (MapLayout, Vec<(MapKey, i64)>) = {
-        let src = unsafe { map_data(map) };
-        (
-            src.layout,
-            src.entries.iter().map(|(k, &v)| (k.clone(), v)).collect(),
-        )
-    };
+    let layout = unsafe { map_data(map) }.layout;
+    // Allocate the destination BEFORE reading any value word out of the source
+    // (willow-9tls.8). `willow_map_new` can collect, and a moving minor
+    // collection evacuates young values reachable only through the rooted
+    // source map, rewriting the source's slots through `trace_map`. A native
+    // snapshot taken before that allocation would still hold the pre-move
+    // addresses and put dangling pointers into the copy. Once the destination
+    // exists, nothing below GC-allocates or polls a safepoint (the key clones
+    // are Rust-heap allocations), so the words read from the source are the
+    // current ones.
     let copy = willow_map_new(
         layout.key_kind,
         layout.value_kind,
@@ -277,12 +277,14 @@ pub extern "C" fn willow_map_copy(map: *mut u8) -> *mut u8 {
     if copy.is_null() {
         return std::ptr::null_mut();
     }
+    let src = unsafe { map_data(map) };
     let mut dst = unsafe { map_data(copy) };
-    for (k, v) in entries {
+    dst.entries.reserve(src.entries.len());
+    for (k, &v) in &src.entries {
         if layout.value_is_ref {
             willow_gc_write_barrier(copy, v as *mut u8, GcStoreDestination::MapValue as i64);
         }
-        dst.entries.insert(k, v);
+        dst.entries.insert(k.clone(), v);
     }
     copy
 }
@@ -541,6 +543,164 @@ mod tests {
         }
         assert_eq!(willow_map_contains(map, 1, 0), 0);
         assert_eq!(willow_map_len(map), words.len() as i64);
+    }
+
+    /// willow-9tls.8: `freeze()` copies the value words a moving collection
+    /// leaves in the source, not the ones it read before that collection.
+    ///
+    /// The scenario is a worker that freezes a map while another thread stops
+    /// the world for a minor collection. The rooted source map is pinned, but
+    /// its young values are reachable only through its slots, so they are
+    /// COPIED to the old generation and the source's slots are rewritten. A
+    /// native snapshot of those slots taken before `willow_map_copy`'s own
+    /// allocation would carry the pre-move addresses into the copy.
+    ///
+    /// Deterministic ordering: this thread registers as a mutator, so the
+    /// collector cannot proceed until it parks; `alloc` stress makes the
+    /// destination allocation reach `collect_internal`, whose first act under a
+    /// pending stop is to park at the safepoint. The collection therefore runs
+    /// exactly between the copy's allocation and its return.
+    #[test]
+    fn copy_stores_values_as_relocated_by_a_collection_inside_its_allocation() {
+        use std::time::{Duration, Instant};
+        const VALUES: i64 = 8;
+
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        crate::gc::willow_gc_register_mutator();
+        // Environment stress must not promote the values before the copy: the
+        // point is that they are still young when the collection runs.
+        crate::gc::set_gc_stress_for_test(Some(""));
+        let mut tls = crate::gc::tlab_state_for_test();
+        let mut map = willow_map_new(0, 4, 1);
+        willow_push_root(&mut map);
+        let mut young = Vec::new();
+        for i in 0..VALUES {
+            let value = crate::gc::willow_gc_alloc_slow(&mut tls, 42, 0, 8, 0);
+            assert!(!value.is_null());
+            unsafe { *(value as *mut i64) = 1000 + i };
+            willow_map_insert(map, i, 0, value as i64, 1);
+            young.push(value);
+        }
+        let moved_before = crate::gc::willow_gc_moved_objects();
+
+        let collector = std::thread::spawn(|| crate::gc::willow_gc_minor_collect());
+        // Wait for the COORDINATION flag, not the lock-free gate: the gate is
+        // published first, and a safepoint reached between the two returns
+        // without parking, which would leave the collector waiting forever.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !crate::gc::stop_pending_for_test() {
+            assert!(
+                Instant::now() < deadline,
+                "the collector never requested a stop"
+            );
+            std::thread::yield_now();
+        }
+        crate::gc::set_gc_stress_for_test(Some("alloc"));
+        let mut copy = willow_map_copy(map);
+        crate::gc::set_gc_stress_for_test(None);
+        collector.join().unwrap();
+        willow_push_root(&mut copy);
+
+        assert_eq!(
+            crate::gc::willow_gc_moved_objects() - moved_before,
+            VALUES,
+            "every value was evacuated while the copy was in progress"
+        );
+        for i in 0..VALUES {
+            let source = willow_map_get(map, i, 0, 1);
+            let copied = willow_map_get(copy, i, 0, 1);
+            assert_ne!(source, young[i as usize], "value {i} moved");
+            assert_eq!(copied, source, "copy holds the relocated value {i}");
+            assert_eq!(unsafe { *(copied as *const i64) }, 1000 + i);
+        }
+        assert_eq!(willow_map_len(copy), VALUES);
+        willow_pop_roots(2);
+        crate::gc::willow_gc_unregister_mutator();
+    }
+
+    /// The copy's own slots take the write barrier: a young value copied into
+    /// the old destination puts the DESTINATION in the remembered set (the
+    /// source already is), so a later minor collection rewrites the copy as
+    /// well as the source. The copy is a direct root here, which would get it
+    /// traced anyway; the remembered-set count is what shows the barrier ran.
+    #[test]
+    fn copy_of_young_values_is_updated_by_the_next_minor_collection() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        crate::gc::set_gc_stress_for_test(Some(""));
+        let mut tls = crate::gc::tlab_state_for_test();
+        let mut map = willow_map_new(0, 4, 1);
+        willow_push_root(&mut map);
+        let young = crate::gc::willow_gc_alloc_slow(&mut tls, 42, 0, 8, 0);
+        unsafe { *(young as *mut i64) = 77 };
+        willow_map_insert(map, 1, 0, young as i64, 1);
+        let remembered = crate::gc::willow_gc_remembered_set_size();
+        let mut copy = willow_map_copy(map);
+        willow_push_root(&mut copy);
+        crate::gc::set_gc_stress_for_test(None);
+        assert_eq!(willow_map_get(copy, 1, 0, 1), young);
+        assert_eq!(
+            crate::gc::willow_gc_remembered_set_size(),
+            remembered + 1,
+            "the copy joined the remembered set"
+        );
+
+        crate::gc::willow_gc_minor_collect();
+
+        let moved = willow_map_get(map, 1, 0, 1);
+        assert_ne!(moved, young, "the young value was evacuated");
+        assert_eq!(willow_map_get(copy, 1, 0, 1), moved);
+        assert_eq!(unsafe { *(moved as *const i64) }, 77);
+        // The copy is independent: dropping the source keeps the value alive
+        // through the copy alone.
+        willow_pop_roots(2);
+        willow_push_root(&mut copy);
+        crate::gc::willow_gc_collect();
+        assert_eq!(
+            unsafe { *(willow_map_get(copy, 1, 0, 1) as *const i64) },
+            77
+        );
+        willow_pop_roots(1);
+        // `tls` lives on this stack and is registered with the heap; drop the
+        // registration before it goes out of scope.
+        willow_gc_init();
+    }
+
+    /// A full collection inside the copy's allocation (non-moving) keeps every
+    /// value: the only thing keeping them alive at that moment is the rooted
+    /// source map.
+    #[test]
+    fn copy_keeps_string_values_across_a_full_collection_in_its_allocation() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let mut map = willow_map_new(3, 3, 1);
+        willow_push_root(&mut map);
+        for (key, value) in [("a", "alpha"), ("b", "beta"), ("c", "gamma")] {
+            let mut key = willow_string_from_str(key);
+            willow_push_root(&mut key);
+            let value = willow_string_from_str(value);
+            willow_map_insert(map, key as i64, 1, value as i64, 1);
+            willow_pop_roots(1);
+        }
+        let majors = crate::gc::willow_gc_major_collections();
+        crate::gc::set_gc_stress_for_test(Some("alloc"));
+        let mut copy = willow_map_copy(map);
+        crate::gc::set_gc_stress_for_test(None);
+        willow_push_root(&mut copy);
+        assert!(crate::gc::willow_gc_major_collections() > majors);
+        willow_pop_roots(2);
+        willow_push_root(&mut copy);
+        crate::gc::willow_gc_collect();
+        for (key, value) in [("a", "alpha"), ("b", "beta"), ("c", "gamma")] {
+            let mut key = willow_string_from_str(key);
+            willow_push_root(&mut key);
+            let got = willow_map_get(copy, key as i64, 1, 1);
+            assert_eq!(unsafe { willow_string_as_str(got) }, value);
+            willow_pop_roots(1);
+        }
+        assert_eq!(willow_map_len(copy), 3);
+        willow_pop_roots(1);
     }
 
     /// willow-ssl7.7: a read-only lookup must not copy the key. Counted per

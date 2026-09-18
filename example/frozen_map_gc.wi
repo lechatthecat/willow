@@ -1,0 +1,123 @@
+// frozen_map_gc.wi — `freeze()` and a collection that moves the values
+// (willow-9tls.8).
+//
+// A `Map<K, V>` whose values are GC objects keeps them alive through its own
+// trace hook. Class instances made by compiled code start in the nursery, and
+// a minor collection MOVES a young value that is reachable only through the
+// map's slots: the map is a root and stays put, the value is copied to the
+// old generation, and the map's slot is rewritten.
+//
+// `freeze()` allocates the frozen copy, and any allocation can run a
+// collection — on this thread when the heap says so, or by parking at a
+// safepoint while a pool worker stops the world. The runtime used to read the
+// value words out of the source BEFORE that allocation and then insert the
+// pre-move addresses into the copy, so a frozen map made at the wrong moment
+// pointed at reclaimed nursery memory. It now allocates the copy first and
+// reads the source afterwards, so the copy holds whatever the collection left
+// in the source.
+//
+// Every read below goes through the FROZEN copy after further collections; a
+// stale word would print a wrong number or abort on an invalid pointer. Run
+// under `WILLOW_GC_STRESS=minor` to move the values on every nursery refill,
+// or `WILLOW_WORKERS=4` to let the mappers stop the world under each other.
+
+import std::collections::Array;
+import std::collections::Map;
+import std::parallel;
+
+class Node {
+    pub v: i64;
+}
+
+fn node_value(nodes: FrozenMap<i64, Node>, key: i64) -> i64 {
+    return match nodes.get(key) {
+        Option::Some(n) => n.v,
+        Option::None => -1,
+    };
+}
+
+fn text_value(names: FrozenMap<i64, String>, key: i64) -> String {
+    return match names.get(key) {
+        Option::Some(s) => s,
+        Option::None => "?",
+    };
+}
+
+// Freeze a map of young class values, then collect again so a stale word in
+// the copy would name reclaimed memory rather than the old bytes.
+fn frozen_sum(count: i64) -> i64 {
+    let mut nodes: Map<i64, Node> = Map::new();
+    let mut i = 0;
+    while i < count {
+        nodes.insert(i, new Node(i * 10));
+        i = i + 1;
+    }
+    let frozen = nodes.freeze();
+    gc_minor_collect();
+    nodes.insert(count, new Node(-1000)); // the copy is independent
+    let mut sum = 0;
+    let mut k = 0;
+    while k < count {
+        sum = sum + node_value(frozen, k);
+        k = k + 1;
+    }
+    return sum + node_value(frozen, count); // -1 for the missing key
+}
+
+// One mapper freezes a map of young values while the others collect: with
+// WILLOW_WORKERS=4 they run on separate threads, so a collection can stop
+// this worker inside `freeze()`. Every mapper returns its own frozen sum.
+fn freeze_under_collections(seed: i64) -> i64 {
+    if seed % 3 == 0 {
+        gc_minor_collect();
+    }
+    let mut nodes: Map<i64, Node> = Map::new();
+    let mut i = 0;
+    while i < 16 {
+        nodes.insert(i, new Node(seed + i));
+        i = i + 1;
+    }
+    let frozen = nodes.freeze();
+    if seed % 2 == 0 {
+        gc_minor_collect();
+    }
+    let mut sum = 0;
+    let mut k = 0;
+    while k < 16 {
+        sum = sum + node_value(frozen, k);
+        k = k + 1;
+    }
+    return sum;
+}
+
+async fn pool_total() -> i64 {
+    let seeds: Array<i64> = [1, 2, 3, 4, 5, 6, 7, 8];
+    let sums = await parallel::map(seeds.freeze(), freeze_under_collections);
+    let mut total = 0;
+    let mut i = 0;
+    while i < sums.len() {
+        total = total + sums[i];
+        i = i + 1;
+    }
+    return total;
+}
+
+async fn main() {
+    // 0 + 10 + ... + 90 = 450, plus -1 for the key inserted after the freeze.
+    println(frozen_sum(10));
+
+    // String values: keys are copied by content, values are references.
+    let mut names: Map<i64, String> = Map::new();
+    names.insert(1, "one");
+    names.insert(2, "two" + "!");
+    let texts = names.freeze();
+    gc_minor_collect();
+    gc_collect();
+    println(text_value(texts, 2));
+    println(text_value(texts, 3));
+
+    // Each seed s contributes 16*s + (0 + ... + 15) = 16*s + 120;
+    // seeds 1..8 sum to 36, so the total is 16*36 + 8*120 = 1536.
+    println(await pool_total());
+    println(texts.len());
+}

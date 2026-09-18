@@ -3787,6 +3787,37 @@ pub fn reset_internal_for_test() {
     reset_internal();
 }
 
+/// A fresh, empty generated-TLS block for tests in sibling modules that need a
+/// YOUNG object: `willow_gc_alloc_slow` is the only runtime entry that allocates
+/// into the nursery, every `willow_alloc_*` helper goes straight to the old
+/// generation. Container tests use it to give a container young children that a
+/// minor collection will move.
+#[cfg(test)]
+pub(crate) fn tlab_state_for_test() -> GcTlabState {
+    GcTlabState {
+        cursor: AtomicUsize::new(0),
+        limit: AtomicUsize::new(0),
+        fast_allocations: AtomicU64::new(0),
+        fast_allocated_bytes: AtomicU64::new(0),
+    }
+}
+
+/// Whether a collector has requested a stop that `willow_gc_safepoint` would
+/// park on. The lock-free gate (`willow_gc_stop_flag`) is published FIRST and
+/// the coordination flag second, so a test that must enter a runtime call
+/// after the stop is pending has to watch the coordination flag: a thread that
+/// polls between the two publications returns from the safepoint without
+/// parking, and a collector waiting for it never resumes. The collector holds
+/// the coordination lock only while it checks who has parked, then waits on
+/// the condvar, so this lock is uncontended while the stop is pending.
+#[cfg(test)]
+pub(crate) fn stop_pending_for_test() -> bool {
+    let (lock, _) = &runtime().coord;
+    lock.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .stop_requested
+}
+
 /// How many objects the collector has freed since the last heap reset. Exposed
 /// for tests in sibling modules that register their own root sources and need
 /// to show a collection actually reclaimed something — without it, "my object
@@ -4364,12 +4395,7 @@ mod tests {
     }
 
     fn new_tlab_state() -> GcTlabState {
-        GcTlabState {
-            cursor: AtomicUsize::new(0),
-            limit: AtomicUsize::new(0),
-            fast_allocations: AtomicU64::new(0),
-            fast_allocated_bytes: AtomicU64::new(0),
-        }
+        tlab_state_for_test()
     }
 
     #[test]

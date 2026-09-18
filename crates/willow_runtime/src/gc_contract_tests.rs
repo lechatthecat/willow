@@ -60,12 +60,7 @@ fn drops_of(payload: *mut u8) -> usize {
 }
 
 fn new_tlab_state() -> GcTlabState {
-    GcTlabState {
-        cursor: AtomicUsize::new(0),
-        limit: AtomicUsize::new(0),
-        fast_allocations: AtomicU64::new(0),
-        fast_allocated_bytes: AtomicU64::new(0),
-    }
+    tlab_state_for_test()
 }
 
 /// Offset of `payload`'s header within its old region, plus whether that region

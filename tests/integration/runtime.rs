@@ -769,6 +769,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/for_loops.wi", "6\n1\n2\n3\n5050\n9\n"),
         ("example/frozen_array.wi", "5\n4\n10\n"),
         ("example/frozen_map.wi", "3\n2\ntrue\n150\n"),
+        ("example/frozen_map_gc.wi", "449\ntwo!\n?\n1536\n2\n"),
         (
             "example/parallel_map.wi",
             "[25, 1, 16, 4, 9]\n[10, 2, 8, 4, 6]\n",
