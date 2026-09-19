@@ -821,9 +821,8 @@ fn main() {
 
 // ── Example files ───────────────────────────────────────────────────────────
 
-#[test]
-fn test_runnable_example_files_compile_and_run() {
-    let cases = [
+fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
+    &[
         (
             "example/run_queue_metrics.wi",
             "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n",
@@ -874,6 +873,11 @@ fn test_runnable_example_files_compile_and_run() {
         (
             "example/codegen_invariants.wi",
             "2\ntrue\n2\n-1\nhello Alice\n11\n12\nBob\n12\nBob scored 12\n14\n8\n21\n-1\n12\n7\n",
+        ),
+        ("example/constructor_flow.wi", "zero\n0\none\n1\nmany\n2\n"),
+        (
+            "example/map_float_keys.wi",
+            "true\n1\n20\n20\n{0.0: 20}\ntrue\nfalse\nNaN cannot be used as a Map key\n1\n",
         ),
         ("example/constructor_visibility.wi", "pub\n42\n7\n"),
         ("example/constructors.wi", "John\n20\n7\n"),
@@ -1572,9 +1576,12 @@ fn test_runnable_example_files_compile_and_run() {
                 "false\nscope complete\n30\ntrue\nscope task cancelled\n",
             ),
         ),
-    ];
+    ]
+}
 
-    let mut expected_paths = cases
+#[test]
+fn test_runnable_example_catalog_is_complete() {
+    let mut expected_paths = runnable_example_cases()
         .iter()
         .map(|(path, _)| path.to_string())
         .collect::<Vec<_>>();
@@ -1584,8 +1591,18 @@ fn test_runnable_example_files_compile_and_run() {
         actual_paths, expected_paths,
         "every runnable non-future example entrypoint should have an output assertion"
     );
+}
 
-    for (path, expected) in cases {
+#[test]
+fn test_constructor_flow_example() {
+    let (out, ok) = compile_file_and_run("example/constructor_flow.wi");
+    assert!(ok, "constructor flow example failed to compile or run");
+    assert_eq!(out, "zero\n0\none\n1\nmany\n2\n");
+}
+
+#[test]
+fn test_runnable_example_files_compile_and_run() {
+    for &(path, expected) in runnable_example_cases() {
         let (out, ok) = compile_file_and_run(path);
         assert!(ok, "{path} failed to compile or run");
         if path == "example/concurrent_counts.wi" {

@@ -15317,18 +15317,12 @@ fn f() {
         assert!(eligible_checked(src, "f", &["f"]));
     }
 
-    // d14. THE position rule. In an operand position the panic's terminator
-    // would strand the call that consumes its value, so the whole function
-    // fails validation — the reason names the type, not the callee, because the
-    // problem is the `!` and not `panic` itself.
+    // d14. Diverging operands terminate evaluation before the consuming call.
+    // Lowering emits the panic without fabricating a value for println.
     #[test]
-    fn d14_operand_position_panic_is_refused() {
+    fn d14_operand_position_panic_is_eligible() {
         let src = "fn f() -> i64 { println(panic(\"no\")); return 1; }";
-        let reason = rejected(src, "f", &["f"]);
-        assert!(
-            reason.contains("`panic`") && reason.contains("has type `!`"),
-            "{reason}"
-        );
+        assert!(eligible_checked(src, "f", &["f"]));
     }
 
     // d15. a local binding named `panic` is an ordinary indirect call through
