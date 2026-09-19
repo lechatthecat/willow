@@ -76,6 +76,8 @@ error_codes! {
     E0423, // cyclic interface inheritance (`extends` cycle)
     E0424, // reserved: previously "multiple interface inheritance unsupported"
     E0425, // ambiguous default method from two implemented interfaces
+    // Type checker; sits next to E0423 so both `extends` cycles read together.
+    E0426, // cyclic class inheritance (`extends` cycle)
     // Class/visibility E050x
     E0501,
     E0502,

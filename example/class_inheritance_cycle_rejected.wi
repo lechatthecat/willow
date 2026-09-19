@@ -1,0 +1,58 @@
+// class_inheritance_cycle_rejected.wi -- a class may not, directly or through
+// its bases, extend itself.
+//
+// Every `extends` chain has to end at a class with no base. A chain that comes
+// back to where it started is rejected with E0426, once per cycle, with every
+// member labelled and the whole ring spelled out in a note:
+//
+//   open class A extends B { pub x: i64; }
+//   open class B extends A { pub y: i64; }
+//
+//   error[E0426]: cyclic class inheritance involving `A`
+//    --> ring.wi:1:6
+//     |
+//   1 | open class A extends B { pub x: i64; }
+//     |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ class cannot transitively extend itself
+//   2 | open class B extends A { pub y: i64; }
+//     |      --------------------------------- `B` is part of the cycle
+//     |
+//   note: inheritance cycle: A extends B extends A
+//   help: remove one `extends` so the chain ends at a class with no base
+//
+// The same applies to a class that names itself (`class A extends A`) and to a
+// longer ring (`A extends B`, `B extends C`, `C extends A`). A class that only
+// extends INTO a ring is not reported on its own: cutting the ring is the one
+// fix, and the checks that need a finished base chain (constructor arity,
+// base `init` rules, interface conformance) run again once it is cut. Before
+// this rule existed the ring above either compiled silently (no fields) or
+// crashed the compiler in codegen (with fields).
+//
+// The runnable program below is the shape the ring was probably reaching for:
+// a chain that ends at a root, with each class adding its own field.
+
+open class Root {
+    pub x: i64;
+
+    pub fn sum(self) -> i64 {
+        return self.x;
+    }
+}
+
+open class Mid extends Root {
+    pub y: i64;
+}
+
+class Leaf extends Mid {
+    pub z: i64;
+
+    pub fn describe(self) -> String {
+        return "Leaf: " + self.x.toString() + " " + self.y.toString() + " " + self.z.toString();
+    }
+}
+
+fn main() {
+    // The memberwise constructor takes the fields root-first: x, y, z.
+    let leaf = new Leaf(1, 2, 3);
+    println(leaf.describe());
+    println("sum: " + (leaf.sum() + leaf.y + leaf.z).toString());
+}

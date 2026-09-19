@@ -7,6 +7,8 @@ mod check_decls;
 mod check_lambda_match;
 pub use check_lambda_match::LambdaCapture;
 mod check_ops;
+#[cfg(test)]
+mod class_cycle_tests;
 mod diagnostics;
 mod resolve;
 mod returns;
@@ -140,6 +142,11 @@ pub struct TypeChecker {
     /// Set while checking an `init(...)` constructor body — `return <value>` is
     /// rejected (willow-scq2 §8 → E0841).
     in_constructor: bool,
+    /// Canonical names of every class already labelled by an E0426 class
+    /// `extends` cycle diagnostic. Each member of a cycle discovers the same
+    /// cycle from its own declaration; the first one in declaration order
+    /// reports it and the rest stay silent (willow-jlky).
+    reported_class_cycles: HashSet<String>,
     /// Names introduced by imports (module access names and item-import locals),
     /// used to reject local declarations that collide with an import. The span
     /// is the item-import's location, or `None` for module access names.
@@ -383,6 +390,7 @@ impl TypeChecker {
             in_static_method: false,
             in_static_initializer: false,
             in_constructor: false,
+            reported_class_cycles: HashSet::new(),
             imported_names: HashMap::new(),
             module_access_names: HashMap::new(),
             signature_only_modules: HashSet::new(),
@@ -1473,6 +1481,28 @@ impl TypeChecker {
             current = Some(base.clone());
         }
         false
+    }
+
+    /// The `extends` cycle on `class_name`'s base chain, as canonical names in
+    /// chain order starting at the first class the walk met twice, or `None`
+    /// when the chain ends at a class with no (registered) base. A class that
+    /// merely extends INTO a cycle gets that cycle back too; the caller tells
+    /// the two apart by membership (willow-jlky).
+    ///
+    /// Identity is the registered `ClassInfo::name`, as in `class_extends`, so
+    /// a chain that comes back through an imported alias still closes.
+    fn class_extends_cycle(&self, class_name: &str) -> Option<Vec<String>> {
+        let mut chain: Vec<String> = Vec::new();
+        let mut current = Some(class_name.to_string());
+        while let Some(name) = current {
+            let class = self.symbols.lookup_class(&name)?;
+            if let Some(start) = chain.iter().position(|seen| *seen == class.name) {
+                return Some(chain.split_off(start));
+            }
+            chain.push(class.name.clone());
+            current = class.base_class.clone();
+        }
+        None
     }
 
     fn type_mismatch_error_code(&self, expected: &Type, actual: &Type) -> ErrorCode {

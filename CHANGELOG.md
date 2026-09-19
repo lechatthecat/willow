@@ -30,3 +30,24 @@ Notable user-facing changes to the Willow compiler, runtime, and toolchain.
   **This rejection is temporary.** It is lifted once task-aware
   synchronous-stack preemption ships, at which point recursive SCCs preempt
   instead of erroring. See `example/task_recursion_rejected.wi`.
+
+### Fixed
+
+- **Class `extends` cycles are now rejected with E0426.** A ring such as
+  `open class A extends B {}` / `open class B extends A {}` used to compile
+  silently when the classes had no fields, and to abort with an internal
+  compiler error (E0800, "constructor `A` was not lowered to operands") when
+  they did. The checker now walks each class's base chain and reports a chain
+  that returns to its start once per cycle, labelling every member:
+
+  ```text
+  error[E0426]: cyclic class inheritance involving `A`
+  note: inheritance cycle: A extends B extends A
+  help: remove one `extends` so the chain ends at a class with no base
+  ```
+
+  A class that merely extends into a ring is not reported on its own, and
+  `new` of any class whose chain reaches a ring skips the constructor arity
+  check: cutting the ring is the one fix, and the checks that depend on a
+  finished base chain run again once it is cut. Interface `extends` cycles
+  keep E0423. See `example/class_inheritance_cycle_rejected.wi`.
