@@ -458,8 +458,9 @@ mod destination_abi_tests {
     /// Perspective 5: `destination_kind` reaches `willow_gc_write_barrier` as a
     /// bare integer, so the compiler's enum and the runtime's must agree
     /// discriminant for discriminant. The lock-cell destinations were added on
-    /// both sides in willow-38w.1.4/.1.5; the rest are pinned so a renumbering
-    /// shows up here rather than as a mis-classified barrier at runtime.
+    /// both sides in willow-38w.1.4/.1.5 and the blocking-cell ones in
+    /// willow-9tls.5; the rest are pinned so a renumbering shows up here
+    /// rather than as a mis-classified barrier at runtime.
     #[test]
     fn store_destinations_are_the_shared_runtime_type() {
         let values: &[willow_abi::GcStoreDestination] = &[
@@ -471,8 +472,10 @@ mod destination_abi_tests {
             GcStoreDestination::GlobalStatic,
             GcStoreDestination::AsyncMutexCell,
             GcStoreDestination::AsyncRwLockCell,
+            GcStoreDestination::BlockingCell,
+            GcStoreDestination::BlockingRwCell,
         ];
-        assert_eq!(values.len(), 8);
+        assert_eq!(values.len(), 10);
     }
 
     /// Perspective 6: the mutex cell is NOT a global static. The runtime's
@@ -484,6 +487,8 @@ mod destination_abi_tests {
         for destination in [
             GcStoreDestination::AsyncMutexCell,
             GcStoreDestination::AsyncRwLockCell,
+            GcStoreDestination::BlockingCell,
+            GcStoreDestination::BlockingRwCell,
         ] {
             assert_ne!(destination as i64, GcStoreDestination::GlobalStatic as i64);
         }

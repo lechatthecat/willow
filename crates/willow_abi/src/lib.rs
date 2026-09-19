@@ -203,6 +203,10 @@ pub enum GcStoreDestination {
     ContainerInternal = 9,
     AsyncMutexCell = 10,
     AsyncRwLockCell = 11,
+    /// The protected word of a `BlockingCell<T>` (willow-9tls.5).
+    BlockingCell = 12,
+    /// The protected word of a `BlockingRwCell<T>` (willow-9tls.5).
+    BlockingRwCell = 13,
 }
 
 /// Derive the opaque layout fingerprint used by generated and native objects.
@@ -539,6 +543,8 @@ mod tests {
         assert_eq!(GcObjectKind::Closure as u64, 13);
         assert_eq!(GcStoreDestination::ObjectField as i64, 1);
         assert_eq!(GcStoreDestination::AsyncRwLockCell as i64, 11);
+        assert_eq!(GcStoreDestination::BlockingCell as i64, 12);
+        assert_eq!(GcStoreDestination::BlockingRwCell as i64, 13);
         assert_eq!(RuntimePollResult::Pending as i32, 0);
         assert_eq!(RuntimePollResult::BlockedSyscall as i32, 5);
         assert_eq!(FrameTerminalStatus::Cancelled as i64, 2);

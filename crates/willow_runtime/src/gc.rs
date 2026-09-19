@@ -3067,7 +3067,6 @@ impl<'a> MinorCollector<'a> {
 
 fn minor_collect_with_roots(mut roots: Vec<*mut u8>) -> (u64, u64, crate::gc_telemetry::MarkWork) {
     roots.extend(runtime_roots_snapshot());
-    roots.extend(crate::lock::lock_gc_roots());
     let trace_registry = type_registry().lock().unwrap().clone();
     let drop_registry = drop_registry().lock().unwrap().clone();
     let mut state = runtime().heap.lock().unwrap();
@@ -3191,7 +3190,6 @@ fn collect_internal() {
         drop(state);
         let mut roots = all_registered_stack_roots(coord);
         roots.extend(runtime_roots_snapshot());
-        roots.extend(crate::lock::lock_gc_roots());
         for &root in &roots {
             checked_payload_to_header(root, "GC root graph");
         }
@@ -3227,7 +3225,6 @@ fn collect_internal() {
             drop(state);
             let mut roots = all_registered_stack_roots(coord);
             roots.extend(runtime_roots_snapshot());
-            roots.extend(crate::lock::lock_gc_roots());
             for &root in &roots {
                 checked_payload_to_header(root, "GC remark root");
                 marking.enqueue(root);

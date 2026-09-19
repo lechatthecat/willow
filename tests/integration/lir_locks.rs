@@ -721,12 +721,12 @@ fn main() {
     );
 }
 
-/// A blocking cell is a leaked raw runtime pointer rather than a GC object, so
-/// the walker must NOT root its receiver — handing the collector one would let
-/// it trace a pointer it does not own. Allocating around every access is what
-/// makes a wrong decision here visible.
+/// A blocking cell is a GC object (willow-9tls.5), so the walker roots and
+/// traces its receiver like any reference: the cell reached through a class
+/// field must survive the collections that the allocations around every
+/// access trigger, or `get()` reads reclaimed memory.
 #[test]
-fn lir_locks_22_blocking_cell_receiver_is_not_traced() {
+fn lir_locks_22_blocking_cell_receiver_is_traced_through_a_field() {
     assert_locks(
         r#"
 class Holder {

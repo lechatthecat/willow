@@ -107,17 +107,19 @@ pub(crate) fn channel_element_type(ty: &Type) -> Option<Type> {
 /// areas) WITHOUT a `willow_alloc_object` GcHeader: the collector must never
 /// root or trace them as heap objects (it would read a bogus header at
 /// `payload_to_header` and crash — see willow-lpn.9). Any GC references they
-/// hold are kept alive by a runtime registry instead (channel buffers, lock
-/// cells — willow-dsw/dgwo.3). All other generics (`Task`/`JoinHandle` async
-/// frames, `Range`, `Map`, user generics) are real GC heap objects.
+/// hold are kept alive by the runtime instead. All other generics
+/// (`Task`/`JoinHandle` async frames, `Range`, `Map`, user generics) are real
+/// GC heap objects.
 pub(crate) fn is_opaque_runtime_pointer_type(name: &str) -> bool {
     // Channel left this list when channels became GC-MANAGED objects
     // (willow-p4er): their handles must be traced from frames/fields like
-    // any reference, or the collector reclaims a live channel. The rest are
-    // Mutex/RwLock left this list in willow-38w.1.6 when their public handles
-    // became traced GC objects with finalizers. The remaining cells are leaked
-    // raw runtime pointers by design.
-    matches!(name, "Future" | "BlockingCell" | "BlockingRwCell")
+    // any reference, or the collector reclaims a live channel. Mutex/RwLock
+    // left in willow-38w.1.6 when their public handles became traced GC
+    // objects with finalizers, and BlockingCell/BlockingRwCell followed in
+    // willow-9tls.5 (the runtime traces the protected word through a
+    // registered hook and sweeps dead cells). Only `Future` remains a raw
+    // runtime pointer.
+    matches!(name, "Future")
 }
 
 pub(crate) fn is_gc_managed(ty: &Type, enum_infos: &TypeMap<EnumInfo>) -> bool {
@@ -131,9 +133,10 @@ pub(crate) fn is_gc_managed(ty: &Type, enum_infos: &TypeMap<EnumInfo>) -> bool {
         // Array<T> is a GC-managed heap object (handle + buffer); locals,
         // parameters, and class fields of array type must be rooted/traced.
         Type::Array(_) => true,
-        // Opaque runtime-pointer generics (Future/Blocking* compatibility cells) are NOT
-        // GC heap objects (see `is_opaque_runtime_pointer_type`); every other
-        // generic — Task/JoinHandle async frames, Range, Map, user generics — is.
+        // Opaque runtime-pointer generics (`Future`) are NOT GC heap objects
+        // (see `is_opaque_runtime_pointer_type`); every other generic —
+        // Task/JoinHandle async frames, Range, Map, blocking cells, user
+        // generics — is.
         Type::Generic(name, _) => !is_opaque_runtime_pointer_type(name.name()),
         // String is now a GC-managed WillowString heap object (payload: len + bytes).
         // It is allocated through the central GC path and has a valid GcHeader.

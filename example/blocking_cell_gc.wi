@@ -1,0 +1,60 @@
+// blocking_cell_gc.wi — BlockingCell<T> and BlockingRwCell<T> are GC objects
+// (willow-9tls.5).
+//
+// A blocking cell used to be a raw runtime pointer that lived until the
+// process exited, and every cell holding a reference was also recorded in a
+// global registry the collector scanned as a root on each collection. A loop
+// that creates cells therefore grew native memory and root-scan time for the
+// program's lifetime, and nothing a cell referenced could ever be reclaimed.
+//
+// Cells are now ordinary GC objects. A live cell keeps its value alive through
+// its own trace hook, and a cell nothing references is swept together with
+// anything only it held. The value can be a young class instance that a minor
+// collection moves: the cell's slot is rewritten like any field, so `get()`
+// afterwards returns the moved object.
+//
+// The last line compares the heap after churning 2000 cells and collecting
+// against the heap before: equal means no cell and no held value leaked. Run
+// under `WILLOW_GC_STRESS=minor` to move the values on every nursery refill.
+
+class Node {
+    pub v: i64;
+}
+
+// Create `count` cells that nothing keeps; each holds a fresh Node or String.
+fn churn(count: i64) -> i64 {
+    let mut i = 0;
+    let mut sum = 0;
+    while i < count {
+        let node = BlockingCell::new(new Node(i));
+        let text = BlockingRwCell::new("v" + i.toString());
+        sum = sum + node.get().v;
+        text.write(text.read() + "!");
+        i = i + 1;
+    }
+    return sum;
+}
+
+// A live cell keeps a young value alive across the collections that move it,
+// whether the value arrived through `new` or a later `set`.
+fn survive() -> i64 {
+    let cell = BlockingCell::new(new Node(5));
+    gc_minor_collect();
+    cell.set(new Node(cell.get().v + 1));
+    gc_minor_collect();
+    gc_collect();
+    return cell.get().v;
+}
+
+fn main() {
+    // Warm up so the interned string literals exist before the baseline.
+    churn(1);
+    gc_collect();
+    let baseline = gc_allocated_bytes();
+
+    println(churn(2000));   // 0 + 1 + ... + 1999 = 1999000
+    println(survive());     // 6
+
+    gc_collect();
+    println(gc_allocated_bytes() == baseline);   // true: nothing leaked
+}
