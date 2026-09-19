@@ -235,11 +235,66 @@ fn average_task_bytes(scheduler: &RuntimeScheduler) -> usize {
     if scheduler.task_count() == 0 {
         return inline;
     }
-    let metadata: usize = scheduler
-        .tasks()
-        .map(|task| task_metadata_bytes(&task))
-        .sum();
+    let mut metadata = 0;
+    scheduler.for_each_task(|task| metadata += task_metadata_bytes(task));
     inline + metadata / scheduler.task_count()
+}
+
+/// Ownership-safe inspection must not copy relationship/debug payloads, even
+/// when reads repeat or the task table retains spare capacity after removals.
+#[test]
+fn task_inspection_does_not_allocate_or_duplicate_payloads() {
+    const READS: usize = 16;
+    println!("tasks,relationships_per_task,live_tasks,single_reads,visits,allocations");
+    for tasks in [1, 32, 256] {
+        for relationships in [0, 32, 256] {
+            let mut scheduler = RuntimeScheduler::with_worker_count(1);
+            let ids: Vec<_> = (0..tasks)
+                .map(|_| scheduler.spawn_parked_placeholder())
+                .collect();
+            // Remove half before attaching diagnostic payloads: leave a sparse
+            // table without registering relationships for tasks being removed.
+            for &id in ids.iter().skip(1).step_by(2) {
+                scheduler.complete(id);
+            }
+            for &id in ids.iter().step_by(2) {
+                scheduler
+                    .with_task_mut(id, |task| {
+                        task.set_name("inspection-worker".repeat(16));
+                        for waiter in 0..relationships as u64 {
+                            task.register_waiter(10_000 + waiter);
+                            task.add_awaiting(20_000 + waiter);
+                        }
+                    })
+                    .unwrap();
+            }
+            let live = scheduler.task_count();
+            let mut single_reads = 0;
+            let mut visits = 0;
+            let before = counting_allocator::thread_allocations();
+            for _ in 0..READS {
+                scheduler
+                    .with_task(ids[0], |task| {
+                        assert_eq!(task.waiter_count(), relationships);
+                        assert_eq!(task.awaiting_count(), relationships);
+                        single_reads += 1;
+                    })
+                    .unwrap();
+                scheduler.for_each_task(|task| {
+                    assert_eq!(task.waiter_count(), relationships);
+                    assert_eq!(task.awaiting_count(), relationships);
+                    assert_eq!(task.name().unwrap().len(), "inspection-worker".len() * 16);
+                    visits += 1;
+                });
+            }
+            let allocations = counting_allocator::thread_allocations() - before;
+            assert_eq!(allocations, 0);
+            assert_eq!(single_reads, READS);
+            assert_eq!(visits, live * READS);
+            assert!(scheduler.with_task(u64::MAX, |_| unreachable!()).is_none());
+            println!("{tasks},{relationships},{live},{single_reads},{visits},{allocations}");
+        }
+    }
 }
 
 /// Fan-in registration: every task awaits the same task (willow-ezs.2).
@@ -263,7 +318,12 @@ fn scaling_01_fan_in_registration() {
         }
         let elapsed = start.elapsed();
 
-        assert_eq!(scheduler.task(awaitee).unwrap().waiter_count(), tasks);
+        assert_eq!(
+            scheduler
+                .with_task(awaitee, |task| task.waiter_count())
+                .unwrap(),
+            tasks
+        );
         report("fan_in_registration", tasks, elapsed, 0);
     }
 }
@@ -288,7 +348,7 @@ fn scaling_02_fan_in_completion() {
         scheduler.complete(awaitee);
         let elapsed = start.elapsed();
 
-        assert!(scheduler.task(awaitee).is_none());
+        assert!(scheduler.with_task(awaitee, |_| ()).is_none());
         report("fan_in_completion", tasks, elapsed, 0);
     }
 }
@@ -316,9 +376,12 @@ fn scaling_03_losing_select_arm_churn() {
         }
         let elapsed = start.elapsed();
 
-        let awaitee_task = scheduler.task(awaitee).unwrap();
-        assert_eq!(awaitee_task.waiter_count(), 1);
-        assert!(awaitee_task.queued_waiter_entries() <= 16);
+        scheduler
+            .with_task(awaitee, |awaitee_task| {
+                assert_eq!(awaitee_task.waiter_count(), 1);
+                assert!(awaitee_task.queued_waiter_entries() <= 16);
+            })
+            .unwrap();
         report("select_arm_churn", tasks, elapsed, 0);
     }
 }
@@ -349,7 +412,12 @@ fn scaling_04_waiter_teardown() {
         }
         let elapsed = start.elapsed();
 
-        assert_eq!(scheduler.task(awaitee).unwrap().waiter_count(), 0);
+        assert_eq!(
+            scheduler
+                .with_task(awaitee, |task| task.waiter_count())
+                .unwrap(),
+            0
+        );
         report("waiter_teardown", tasks, elapsed, 0);
     }
 }

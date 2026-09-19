@@ -84,17 +84,27 @@ unsafe fn trace_channel(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     if !channel.is_ref {
         return;
     }
-    if let Ok(mut state) = channel.state.lock() {
-        for value in &mut state.values {
-            slots.push(std::ptr::addr_of_mut!(value.ptr_value).cast::<*mut u8>());
-        }
+    // Queue operations preserve VecDeque's initialized-element invariant even
+    // when another channel operation unwinds. Recover only for GC: bookkeeping
+    // may be incomplete, but every remaining queued reference must stay alive.
+    let mut state = channel
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for value in &mut state.values {
+        slots.push(std::ptr::addr_of_mut!(value.ptr_value).cast::<*mut u8>());
     }
 }
 
 unsafe fn snapshot_channel(payload: *mut u8, children: &mut Vec<*mut u8>) {
     let channel = unsafe { &*(payload as *const WillowAbiChannel) };
     if channel.is_ref {
-        let state = channel.state.lock().unwrap();
+        // As in STW tracing, poison must never suppress queued roots. Copy
+        // directly into the caller's buffer; traversal/marking happens unlocked.
+        let state = channel
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         children.extend(
             state
                 .values
@@ -1167,6 +1177,94 @@ mod tests {
             CHANNEL_REGISTRATION_COUNT.load(std::sync::atomic::Ordering::SeqCst),
             registrations + 1,
             "the first channel after a GC reset must reinstall both hooks once"
+        );
+    }
+
+    fn poison_channel(channel: &WillowAbiChannel) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = channel.state.lock().unwrap();
+            panic!("intentional channel poison");
+        }));
+        assert!(result.is_err());
+        assert!(channel.state.is_poisoned());
+    }
+
+    #[test]
+    fn poisoned_channel_gc_hooks_visit_each_queued_reference() {
+        for count in [0, 1, 16, 256, 4096] {
+            let mut channel = WillowAbiChannel::new(true);
+            let mut values = vec![0u8; count];
+            let expected: Vec<_> = values.iter_mut().map(|v| v as *mut u8).collect();
+            {
+                let mut state = channel.state.lock().unwrap();
+                for &ptr in &expected {
+                    state.values.push_back(WillowChannelValue {
+                        ptr_value: ptr.cast(),
+                    });
+                }
+                // Exercise a wrapped VecDeque without changing its length.
+                for _ in 0..count / 2 {
+                    let value = state.values.pop_front().unwrap();
+                    state.values.push_back(value);
+                }
+            }
+            let mut expected = expected;
+            expected.rotate_left(count / 2);
+            poison_channel(&channel);
+            let payload = (&mut channel as *mut WillowAbiChannel).cast();
+            let mut slots = Vec::new();
+            unsafe { trace_channel(payload, &mut slots) };
+            assert_eq!(slots.len(), count);
+            assert_eq!(
+                slots
+                    .iter()
+                    .map(|&slot| unsafe { *slot })
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            let mut children = vec![std::ptr::null_mut()];
+            unsafe { snapshot_channel(payload, &mut children) };
+            assert_eq!(&children[1..], expected);
+            assert!(
+                channel
+                    .state
+                    .try_lock()
+                    .is_err_and(|e| matches!(e, std::sync::TryLockError::Poisoned(_)))
+            );
+            channel.is_ref = false;
+            let payload = (&mut channel as *mut WillowAbiChannel).cast();
+            slots.clear();
+            children.clear();
+            unsafe {
+                trace_channel(payload, &mut slots);
+                snapshot_channel(payload, &mut children);
+            }
+            assert!(slots.is_empty());
+            assert!(children.is_empty());
+        }
+    }
+
+    #[test]
+    fn poisoned_channel_keeps_queued_child_alive_during_collection() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        let mut root = willow_channel_new(1).cast::<u8>();
+        crate::gc::willow_push_root(&mut root);
+        let child = willow_channel_new(0);
+        willow_channel_send_value(root.cast(), WillowChannelValue { ptr_value: child });
+        poison_channel(unsafe { &*root.cast::<WillowAbiChannel>() });
+        let before = CHANNEL_DROP_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        crate::gc::willow_gc_collect();
+        assert_eq!(
+            CHANNEL_DROP_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "rooted poisoned channel and its queued child must both survive"
+        );
+        crate::gc::willow_pop_roots(1);
+        crate::gc::willow_gc_collect();
+        assert_eq!(
+            CHANNEL_DROP_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            before + 2
         );
     }
 

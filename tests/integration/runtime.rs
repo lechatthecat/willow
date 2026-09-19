@@ -708,6 +708,10 @@ fn main() {
 fn test_runnable_example_files_compile_and_run() {
     let cases = [
         (
+            "example/run_queue_metrics.wi",
+            "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+        ),
+        (
             "example/arithmetic.wi",
             "27\n15\n126\n3\n3\n54\n3\ntrue\n1024\n1\n",
         ),
@@ -6100,4 +6104,42 @@ async fn main() {
     );
     assert!(ok, "{out}");
     assert_eq!(out, "15\n");
+}
+
+#[test]
+fn iface_same_named_modules_keep_distinct_vtables() {
+    let one = r#"
+module one;
+pub interface View { fn value(self) -> i64; }
+pub class First implements View {
+    pub fn value(self) -> i64 { return 11; }
+}
+pub fn read(v: View) -> i64 { return v.value(); }
+"#;
+    let two = r#"
+module two;
+pub interface View { fn value(self) -> i64; }
+pub class Second implements View {
+    pub fn value(self) -> i64 { return 22; }
+}
+pub fn read(v: View) -> i64 { return v.value(); }
+"#;
+    let main = r#"
+import one;
+import two;
+fn main() {
+    let first: one::View = new one::First();
+    let second: two::View = new two::Second();
+    println(first.value());
+    println(second.value());
+    println(one::read(new one::First()));
+    println(two::read(new two::Second()));
+}
+"#;
+    let (out, ok) = compile_temp_project_and_run(
+        &[("one.wi", one), ("two.wi", two), ("main.wi", main)],
+        "main.wi",
+    );
+    assert!(ok, "same-named interface dispatch failed: {out}");
+    assert_eq!(out, "11\n22\n11\n22\n");
 }

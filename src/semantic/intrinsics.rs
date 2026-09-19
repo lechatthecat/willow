@@ -1590,18 +1590,20 @@ fn f() {
     }
 }
 
-/// The zero-argument GC statistic builtins: `() -> i64` reads of a runtime
+/// The zero-argument runtime statistic builtins: `() -> i64` reads of a runtime
 /// counter. Their ABI entries are all `NONE; ([] -> Some(I64))`, so LIR
 /// emission needs only the runtime call (willow-0g8j.3.1).
 ///
 /// Derived from `builtin_call_runtime_name` rather than repeating its list:
 /// `gc_collect` / `gc_minor_collect` are the void pair beside these, and
 /// `sleep` / `yield` are futures, not reads.
-pub(crate) fn gc_stat_builtin_runtime_name(callee: &str) -> Option<&'static str> {
+pub(crate) fn runtime_stat_builtin_runtime_name(callee: &str) -> Option<&'static str> {
     if callee == "gc_collect" || callee == "gc_minor_collect" {
         return None;
     }
-    callee.strip_prefix("gc_")?;
+    callee
+        .strip_prefix("gc_")
+        .or_else(|| callee.strip_prefix("sched_"))?;
     builtin_call_runtime_name(callee)
 }
 
@@ -1609,6 +1611,15 @@ pub(crate) fn builtin_call_runtime_name(callee: &str) -> Option<&'static str> {
     match callee {
         "gc_collect" => Some("willow_gc_collect"),
         "gc_minor_collect" => Some("willow_gc_minor_collect"),
+        "sched_local_pop_hits" => Some("willow_sched_local_pop_hits"),
+        "sched_global_pop_hits" => Some("willow_sched_global_pop_hits"),
+        "sched_global_pop_attempts" => Some("willow_sched_global_pop_attempts"),
+        "sched_steal_attempts" => Some("willow_sched_steal_attempts"),
+        "sched_steal_successes" => Some("willow_sched_steal_successes"),
+        "sched_steal_failures" => Some("willow_sched_steal_failures"),
+        "sched_victim_locks" => Some("willow_sched_victim_locks"),
+        "sched_global_pushes" => Some("willow_sched_global_pushes"),
+        "sched_local_pushes" => Some("willow_sched_local_pushes"),
         "gc_allocated_bytes" => Some("willow_gc_allocated_bytes"),
         "gc_tlab_fast_allocations" => Some("willow_gc_tlab_fast_allocations"),
         "gc_tlab_slow_allocations" => Some("willow_gc_tlab_slow_allocations"),

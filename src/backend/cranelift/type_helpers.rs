@@ -152,7 +152,7 @@ pub(crate) fn is_gc_managed(ty: &Type, enum_infos: &TypeMap<EnumInfo>) -> bool {
 
 // Runtime identity belongs to semantic lowering; backend consumers share it.
 pub(crate) use crate::semantic::intrinsics::{
-    builtin_call_runtime_name, gc_stat_builtin_runtime_name,
+    builtin_call_runtime_name, runtime_stat_builtin_runtime_name,
 };
 
 #[cfg(test)]

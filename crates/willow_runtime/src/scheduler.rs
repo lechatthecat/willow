@@ -199,6 +199,8 @@ struct RunQueues {
     /// every worker repeatedly requeues CPU-bound work to itself.
     prefer_global: Vec<AtomicBool>,
     global: Mutex<VecDeque<RuntimeTaskId>>,
+    metrics: crate::observability::RunQueueMetrics,
+    worker_metrics: Vec<crate::observability::RunQueueMetrics>,
 }
 
 impl RunQueues {
@@ -210,6 +212,10 @@ impl RunQueues {
                 .collect(),
             prefer_global: (0..worker_count).map(|_| AtomicBool::new(false)).collect(),
             global: Mutex::new(VecDeque::new()),
+            metrics: crate::observability::RunQueueMetrics::default(),
+            worker_metrics: (0..worker_count)
+                .map(|_| crate::observability::RunQueueMetrics::default())
+                .collect(),
         }
     }
 
@@ -226,12 +232,19 @@ impl RunQueues {
     }
 
     fn push_global(&self, id: RuntimeTaskId) {
-        Self::lock(&self.global).push_back(id);
+        let mut queue = Self::lock(&self.global);
+        queue.push_back(id);
+        self.metrics.global_pushes.fetch_add(1, Ordering::Relaxed);
     }
 
     fn push_local(&self, worker: usize, id: RuntimeTaskId) {
         match self.locals.get(worker) {
-            Some(queue) => Self::lock(queue).push_back(id),
+            Some(queue) => {
+                Self::lock(queue).push_back(id);
+                self.worker_metrics[worker]
+                    .local_pushes
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             None => self.push_global(id),
         }
     }
@@ -239,49 +252,82 @@ impl RunQueues {
     #[cfg(test)]
     fn push_local_front(&self, worker: usize, id: RuntimeTaskId) {
         match self.locals.get(worker) {
-            Some(queue) => Self::lock(queue).push_front(id),
-            None => Self::lock(&self.global).push_front(id),
+            Some(queue) => {
+                Self::lock(queue).push_front(id);
+                self.worker_metrics[worker]
+                    .local_pushes
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            None => {
+                Self::lock(&self.global).push_front(id);
+                self.metrics.global_pushes.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
     #[cfg(test)]
     fn force_push_global(&self, id: RuntimeTaskId) {
-        Self::lock(&self.global).push_back(id);
+        self.push_global(id);
+    }
+
+    fn pop_global(&self, metrics: &crate::observability::RunQueueMetrics) -> Option<RuntimeTaskId> {
+        metrics.global_pop_attempts.fetch_add(1, Ordering::Relaxed);
+        let id = Self::lock(&self.global).pop_front();
+        if id.is_some() {
+            metrics.global_pop_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        id
     }
 
     fn pop_for_worker(&self, worker: usize) -> Option<RuntimeTaskId> {
+        let metrics = self.worker_metrics.get(worker).unwrap_or(&self.metrics);
         let prefer_global = self
             .prefer_global
             .get(worker)
             .map(|preference| preference.fetch_xor(true, Ordering::Relaxed))
             .unwrap_or(true);
         if prefer_global {
-            if let Some(id) = Self::lock(&self.global).pop_front() {
+            if let Some(id) = self.pop_global(metrics) {
                 return Some(id);
             }
             if let Some(queue) = self.locals.get(worker)
                 && let Some(id) = Self::lock(queue).pop_front()
             {
+                metrics.local_pop_hits.fetch_add(1, Ordering::Relaxed);
                 return Some(id);
             }
         } else {
             if let Some(queue) = self.locals.get(worker)
                 && let Some(id) = Self::lock(queue).pop_front()
             {
+                metrics.local_pop_hits.fetch_add(1, Ordering::Relaxed);
                 return Some(id);
             }
-            if let Some(id) = Self::lock(&self.global).pop_front() {
+            if let Some(id) = self.pop_global(metrics) {
                 return Some(id);
             }
         }
+        // One attempt is one steal scan, including the empty single-worker scan.
+        metrics.steal_attempts.fetch_add(1, Ordering::Relaxed);
         let count = self.locals.len();
         for offset in 1..count {
             let victim = (worker + offset) % count;
+            metrics.victim_locks.fetch_add(1, Ordering::Relaxed);
             if let Some(id) = Self::lock(&self.locals[victim]).pop_back() {
+                metrics.steal_successes.fetch_add(1, Ordering::Relaxed);
                 return Some(id);
             }
         }
+        metrics.steal_failures.fetch_add(1, Ordering::Relaxed);
         None
+    }
+
+    fn metrics_snapshot(&self) -> crate::observability::RunQueueMetricsSnapshot {
+        let mut snapshot = self.metrics.snapshot();
+        for metrics in &self.worker_metrics {
+            snapshot.add(metrics.snapshot());
+        }
+        snapshot
     }
 
     fn remove(&self, id: RuntimeTaskId) -> bool {
@@ -445,12 +491,12 @@ impl ShardedTaskTable {
             .sum()
     }
 
-    fn snapshots(&self) -> Vec<RuntimeTask> {
-        self.shards
-            .iter()
-            .enumerate()
-            .flat_map(|(index, _)| self.lock_shard(index).values().cloned().collect::<Vec<_>>())
-            .collect()
+    fn for_each(&self, mut read: impl FnMut(&RuntimeTask)) {
+        for index in 0..self.shards.len() {
+            for task in self.lock_shard(index).values() {
+                read(task);
+            }
+        }
     }
 
     fn drain(&self) -> Vec<RuntimeTask> {
@@ -866,13 +912,11 @@ impl RuntimeScheduler {
     /// the task table it summarizes.
     #[cfg(test)]
     fn blocked_syscall_invariant_holds(&self) -> bool {
-        self.blocked_syscall_count()
-            == self
-                .tasks
-                .snapshots()
-                .into_iter()
-                .filter(|task| task.runtime_state() == Some(RuntimeTaskState::BlockedSyscall))
-                .count()
+        let mut blocked = 0;
+        self.for_each_task(|task| {
+            blocked += usize::from(task.runtime_state() == Some(RuntimeTaskState::BlockedSyscall));
+        });
+        self.blocked_syscall_count() == blocked
     }
 
     /// The single terminal transition for Completed/Cancelled/Panicked
@@ -1025,10 +1069,11 @@ impl RuntimeScheduler {
         if seen.values().any(|count| *count > 1) {
             return false;
         }
-        self.tasks
-            .snapshots()
-            .into_iter()
-            .all(|task| task.state.load().is_queued() == seen.contains_key(&task.id))
+        let mut matches = true;
+        self.for_each_task(|task| {
+            matches &= task.state.load().is_queued() == seen.contains_key(&task.id);
+        });
+        matches
     }
 
     /// Total runnable tasks across all queues.
@@ -1260,8 +1305,15 @@ impl RuntimeScheduler {
         self.claim_ready_for_worker(0)
     }
 
-    pub fn task(&self, id: RuntimeTaskId) -> Option<RuntimeTask> {
-        self.tasks.with(id, Clone::clone)
+    /// Inspect a borrowed task under its shard lock, returning only the data
+    /// the caller needs. The callback must not re-enter the scheduler or task
+    /// table: doing so can deadlock on this lock.
+    pub fn with_task<R>(
+        &self,
+        id: RuntimeTaskId,
+        read: impl FnOnce(&RuntimeTask) -> R,
+    ) -> Option<R> {
+        self.tasks.with(id, read)
     }
 
     pub fn with_task_mut<R>(
@@ -1272,8 +1324,11 @@ impl RuntimeScheduler {
         self.tasks.with_mut(id, mutate)
     }
 
-    pub fn tasks(&self) -> impl Iterator<Item = RuntimeTask> {
-        self.tasks.snapshots().into_iter()
+    /// Inspect each task once, holding one shard lock at a time. This is not
+    /// an atomic snapshot of the table. Callbacks must not re-enter the
+    /// scheduler or task table, and task references cannot escape the callback.
+    pub fn for_each_task(&self, read: impl FnMut(&RuntimeTask)) {
+        self.tasks.for_each(read);
     }
 
     pub fn task_count(&self) -> usize {
@@ -1403,6 +1458,29 @@ static GLOBAL_RUN_QUEUES: LazyLock<RwLock<Arc<RunQueues>>> = LazyLock::new(|| {
 
 static GLOBAL_TASK_TABLE: LazyLock<RwLock<Arc<ShardedTaskTable>>> =
     LazyLock::new(|| RwLock::new(Arc::new(ShardedTaskTable::new())));
+
+pub(crate) fn run_queue_global_pushes() -> u64 {
+    global_run_queues()
+        .metrics
+        .global_pushes
+        .load(Ordering::Relaxed)
+}
+
+pub(crate) fn read_run_queue_metric(
+    read: impl Fn(&crate::observability::RunQueueMetrics) -> u64,
+) -> u64 {
+    let queues = global_run_queues();
+    queues
+        .worker_metrics
+        .iter()
+        .fold(read(&queues.metrics), |sum, metrics| {
+            sum.wrapping_add(read(metrics))
+        })
+}
+
+pub(crate) fn run_queue_metrics_snapshot() -> crate::observability::RunQueueMetricsSnapshot {
+    global_run_queues().metrics_snapshot()
+}
 
 fn global_run_queues() -> Arc<RunQueues> {
     GLOBAL_RUN_QUEUES
@@ -2160,17 +2238,23 @@ pub fn async_chain_text() -> String {
         let mut seen = std::collections::HashSet::new();
         // Walk current task -> its awaiter -> ... via the reverse `waiters` link.
         while seen.insert(id) {
-            let Some(task) = sched.task(id) else { break };
-            let name = task.name().unwrap_or("<async task>");
-            let site = match task.spawn_site() {
-                Some((file, line)) => format!(" [task {id}, spawned at {file}:{line}]"),
-                None => format!(" [task {id}]"),
+            let Some((line, awaiter)) = sched.with_task(id, |task| {
+                let name = task.name().unwrap_or("<async task>");
+                let site = match task.spawn_site() {
+                    Some((file, line)) => format!(" [task {id}, spawned at {file}:{line}]"),
+                    None => format!(" [task {id}]"),
+                };
+                // Only inspect the first live waiter; do not copy the task's
+                // other relationships while rendering its diagnostic line.
+                (
+                    format!("  {}: async {}{}", lines.len(), name, site),
+                    task.first_live_waiter(),
+                )
+            }) else {
+                break;
             };
-            lines.push(format!("  {}: async {}{}", lines.len(), name, site));
-            // The first waiter is the awaiter that suspended on this task.
-            // `first_live` scans tombstones, which is fine here: this runs once
-            // while rendering a panic trace, never on a scheduling hot path.
-            match task.first_live_waiter() {
+            lines.push(line);
+            match awaiter {
                 Some(awaiter) => id = awaiter,
                 None => break,
             }
@@ -3691,6 +3775,10 @@ mod idle_stop_tests;
 pub(crate) mod scaling_measurements;
 
 #[cfg(test)]
+#[path = "scheduler_run_queue_metrics_tests.rs"]
+mod run_queue_metrics_tests;
+
+#[cfg(test)]
 mod tests {
     fn channel_token(channel: usize) -> crate::task::ChannelOwnershipToken {
         crate::task::ChannelOwnershipToken {
@@ -4047,7 +4135,10 @@ mod tests {
         assert_eq!(s.claim_ready_for_worker(0), Some(id));
         s.wake(id); // arrives while Running
         assert!(!s.is_queued(id), "a Running task must not be queued");
-        assert!(s.task(id).unwrap().state.load().wake_requested());
+        assert!(
+            s.with_task(id, |task| task.state.load().wake_requested())
+                .unwrap()
+        );
         assert!(s.queue_invariant_holds());
         s.clear_running();
     }
@@ -4782,6 +4873,50 @@ mod tests {
         );
         let _ = (inner, main);
         with_global(|sched| sched.clear_running());
+    }
+
+    #[test]
+    fn async_chain_inspection_handles_depth_fanout_tombstones_and_cycles() {
+        let _guard = runtime_test_guard();
+        for depth in [1, 32, 256] {
+            for fanout in [0, 32, 256] {
+                reset_global_scheduler_for_test();
+                with_global(|sched| {
+                    let chain: Vec<_> = (0..depth)
+                        .map(|_| sched.spawn_parked_placeholder())
+                        .collect();
+                    let extras: Vec<_> = (0..fanout)
+                        .map(|_| sched.spawn_parked_placeholder())
+                        .collect();
+                    let removed = sched.spawn_parked_placeholder();
+                    for (index, &id) in chain.iter().enumerate() {
+                        sched.register_waiter(id, removed);
+                        if depth > 1 {
+                            sched.register_waiter(id, chain[(index + 1) % depth]);
+                        }
+                        for &extra in &extras {
+                            sched.register_waiter(id, extra);
+                        }
+                        sched.unregister_waiter(id, removed);
+                        sched.with_task_mut(id, |task| {
+                            task.set_name(format!("chain_{index}"));
+                            task.set_spawn_site("inspection.wi".to_string(), index as u32 + 1);
+                        });
+                    }
+                    sched.set_running(chain[0]);
+                });
+                let text = async_chain_text();
+                // At depth one, the first extra is the only following awaiter.
+                let expected = depth + usize::from(depth == 1 && fanout > 0);
+                assert_eq!(text.lines().count(), expected + 1);
+                for (index, line) in text.lines().skip(1).take(depth).enumerate() {
+                    assert!(line.contains(&format!("async chain_{index} [")));
+                    assert!(line.ends_with(&format!("inspection.wi:{}]", index + 1)));
+                }
+                with_global(|sched| sched.clear_running());
+            }
+        }
+        reset_global_scheduler_for_test();
     }
 
     #[test]
@@ -5535,7 +5670,9 @@ mod tests {
         scheduler.set_running_wake_after_millis(millis);
         scheduler.clear_running();
         scheduler.park(id);
-        scheduler.task(id).unwrap().wake_deadline.unwrap()
+        scheduler
+            .with_task(id, |task| task.wake_deadline.unwrap())
+            .unwrap()
     }
 
     #[test]
@@ -5716,7 +5853,7 @@ mod tests {
             "no running task means there is nobody to wake"
         );
         assert_eq!(s.timers.earliest_hint_nanos(), TimerQueue::empty_hint());
-        assert_eq!(s.task(id).unwrap().wake_deadline, None);
+        assert_eq!(s.with_task(id, |task| task.wake_deadline).unwrap(), None);
     }
 
     #[test]
@@ -5841,7 +5978,7 @@ mod tests {
             "a Ready task that is not queued is invisible to every worker"
         );
         assert_eq!(s.ready_total(), 1);
-        assert_eq!(s.task(id).unwrap().wake_deadline, None);
+        assert_eq!(s.with_task(id, |task| task.wake_deadline).unwrap(), None);
     }
 
     #[test]
@@ -6541,8 +6678,14 @@ mod tests {
         let awaitee = s.spawn_parked_placeholder();
         let waiter = s.spawn_parked_placeholder();
         s.register_waiter(awaitee, waiter);
-        assert_eq!(s.task(awaitee).unwrap().live_waiters(), vec![waiter]);
-        assert!(s.task(waiter).unwrap().is_awaiting(awaitee));
+        assert_eq!(
+            s.with_task(awaitee, |task| task.live_waiters()).unwrap(),
+            vec![waiter]
+        );
+        assert!(
+            s.with_task(waiter, |task| task.is_awaiting(awaitee))
+                .unwrap()
+        );
     }
 
     #[test]
@@ -6569,9 +6712,12 @@ mod tests {
             start.wait();
         });
         for id in [1, 2] {
-            let task = tasks.with(id, Clone::clone).unwrap();
-            assert_eq!(task.waiter_count(), 0);
-            assert_eq!(task.awaiting_count(), 0);
+            tasks
+                .with(id, |task| {
+                    assert_eq!(task.waiter_count(), 0);
+                    assert_eq!(task.awaiting_count(), 0);
+                })
+                .unwrap();
         }
     }
 
@@ -6605,8 +6751,11 @@ mod tests {
         let waiter = s.spawn_parked_placeholder();
         s.register_waiter(awaitee, waiter);
         s.register_waiter(awaitee, waiter);
-        assert_eq!(s.task(awaitee).unwrap().waiter_count(), 1);
-        assert_eq!(s.task(waiter).unwrap().awaiting_count(), 1);
+        assert_eq!(s.with_task(awaitee, |task| task.waiter_count()).unwrap(), 1);
+        assert_eq!(
+            s.with_task(waiter, |task| task.awaiting_count()).unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -6616,8 +6765,11 @@ mod tests {
         let waiter = s.spawn_parked_placeholder();
         s.register_waiter(awaitee, waiter);
         s.unregister_waiter(awaitee, waiter);
-        assert!(s.task(awaitee).unwrap().live_waiters().is_empty());
-        assert!(s.task(waiter).unwrap().awaiting_count() == 0);
+        assert!(
+            s.with_task(awaitee, |task| task.live_waiters().is_empty())
+                .unwrap()
+        );
+        assert!(s.with_task(waiter, |task| task.awaiting_count()).unwrap() == 0);
     }
 
     #[test]
@@ -6630,10 +6782,14 @@ mod tests {
         s.register_waiter(awaitee, waiter);
         s.finalize_cancelled(waiter);
         assert!(
-            s.task(awaitee).unwrap().live_waiters().is_empty(),
+            s.with_task(awaitee, |task| task.live_waiters().is_empty())
+                .unwrap(),
             "cancellation must deregister the task-completion waiter"
         );
-        assert!(s.task(waiter).is_none(), "cancelled waiter must be reaped");
+        assert!(
+            s.with_task(waiter, |_| ()).is_none(),
+            "cancelled waiter must be reaped"
+        );
     }
 
     #[test]
@@ -6644,7 +6800,7 @@ mod tests {
         s.register_waiter(awaitee, waiter);
         s.complete(awaitee);
         assert!(
-            s.task(waiter).unwrap().awaiting_count() == 0,
+            s.with_task(waiter, |task| task.awaiting_count()).unwrap() == 0,
             "a completed awaitee leaves no reverse reference behind"
         );
         assert_eq!(s.task_state(waiter), Some(RuntimeTaskState::Ready));
@@ -6658,10 +6814,19 @@ mod tests {
         let waiter = s.spawn_parked_placeholder();
         s.register_waiter(a, waiter);
         s.register_waiter(b, waiter);
-        assert_eq!(s.task(waiter).unwrap().awaiting_count(), 2);
+        assert_eq!(
+            s.with_task(waiter, |task| task.awaiting_count()).unwrap(),
+            2
+        );
         s.finalize_cancelled(waiter);
-        assert!(s.task(a).unwrap().live_waiters().is_empty());
-        assert!(s.task(b).unwrap().live_waiters().is_empty());
+        assert!(
+            s.with_task(a, |task| task.live_waiters().is_empty())
+                .unwrap()
+        );
+        assert!(
+            s.with_task(b, |task| task.live_waiters().is_empty())
+                .unwrap()
+        );
     }
 
     #[test]
@@ -6670,7 +6835,7 @@ mod tests {
         let waiter = s.spawn_parked_placeholder();
         s.register_waiter(9_999, waiter);
         assert!(
-            s.task(waiter).unwrap().awaiting_count() == 0,
+            s.with_task(waiter, |task| task.awaiting_count()).unwrap() == 0,
             "no reverse reference for a registration that did not happen"
         );
     }
@@ -6714,16 +6879,26 @@ mod tests {
         for &waiter in &waiters {
             s.register_waiter(awaitee, waiter);
         }
-        assert_eq!(s.task(awaitee).unwrap().live_waiters(), waiters);
+        assert_eq!(
+            s.with_task(awaitee, |task| task.live_waiters()).unwrap(),
+            waiters
+        );
 
         for &waiter in &waiters {
             s.register_waiter(awaitee, waiter);
         }
-        assert_eq!(s.task(awaitee).unwrap().waiter_count(), FAN_IN);
-        assert_eq!(s.task(awaitee).unwrap().queued_waiter_entries(), FAN_IN);
+        assert_eq!(
+            s.with_task(awaitee, |task| task.waiter_count()).unwrap(),
+            FAN_IN
+        );
+        assert_eq!(
+            s.with_task(awaitee, |task| task.queued_waiter_entries())
+                .unwrap(),
+            FAN_IN
+        );
         for &waiter in &waiters {
             assert_eq!(
-                s.task(waiter).unwrap().awaiting_count(),
+                s.with_task(waiter, |task| task.awaiting_count()).unwrap(),
                 1,
                 "a duplicate registration must not add a second reverse reference"
             );
@@ -6744,10 +6919,13 @@ mod tests {
         s.unregister_waiter(awaitee, first);
         s.register_waiter(awaitee, first);
         assert_eq!(
-            s.task(awaitee).unwrap().live_waiters(),
+            s.with_task(awaitee, |task| task.live_waiters()).unwrap(),
             vec![second, third, first]
         );
-        assert!(s.task(first).unwrap().is_awaiting(awaitee));
+        assert!(
+            s.with_task(first, |task| task.is_awaiting(awaitee))
+                .unwrap()
+        );
     }
 
     /// FI5, FI6.
@@ -6775,11 +6953,14 @@ mod tests {
         );
         for &waiter in &waiters {
             assert!(
-                s.task(waiter).unwrap().awaiting_count() == 0,
+                s.with_task(waiter, |task| task.awaiting_count()).unwrap() == 0,
                 "the reverse reference must be cleared for every waiter"
             );
         }
-        assert!(s.task(awaitee).is_none(), "the awaitee is reaped");
+        assert!(
+            s.with_task(awaitee, |_| ()).is_none(),
+            "the awaitee is reaped"
+        );
     }
 
     /// FI7, FI8.
@@ -6797,7 +6978,10 @@ mod tests {
                 s.finalize_cancelled(waiter);
             }
         }
-        assert_eq!(s.task(awaitee).unwrap().waiter_count(), FAN_IN / 2);
+        assert_eq!(
+            s.with_task(awaitee, |task| task.waiter_count()).unwrap(),
+            FAN_IN / 2
+        );
 
         s.complete(awaitee);
         let mut woken = 0;
@@ -6808,7 +6992,10 @@ mod tests {
         assert_eq!(woken, FAN_IN / 2);
         for (index, &waiter) in waiters.iter().enumerate() {
             if index % 2 == 0 {
-                assert!(s.task(waiter).is_none(), "cancelled waiters are reaped");
+                assert!(
+                    s.with_task(waiter, |_| ()).is_none(),
+                    "cancelled waiters are reaped"
+                );
             }
         }
     }
@@ -6828,16 +7015,18 @@ mod tests {
             s.unregister_waiter(awaitee, churner);
         }
 
-        let awaitee_task = s.task(awaitee).unwrap();
-        assert_eq!(awaitee_task.waiter_count(), 1);
-        assert_eq!(awaitee_task.live_waiters(), vec![resident]);
+        s.with_task(awaitee, |awaitee_task| {
+            assert_eq!(awaitee_task.waiter_count(), 1);
+            assert_eq!(awaitee_task.live_waiters(), vec![resident]);
+            assert!(
+                awaitee_task.queued_waiter_entries() <= 16,
+                "tombstones from losing arms must be compacted, saw {}",
+                awaitee_task.queued_waiter_entries()
+            );
+        })
+        .unwrap();
         assert!(
-            awaitee_task.queued_waiter_entries() <= 16,
-            "tombstones from losing arms must be compacted, saw {}",
-            awaitee_task.queued_waiter_entries()
-        );
-        assert!(
-            s.task(churner).unwrap().awaiting_count() == 0,
+            s.with_task(churner, |task| task.awaiting_count()).unwrap() == 0,
             "a losing arm must leave no reverse reference"
         );
     }
@@ -6852,12 +7041,16 @@ mod tests {
         for &awaitee in &awaitees {
             s.register_waiter(awaitee, waiter);
         }
-        assert_eq!(s.task(waiter).unwrap().awaiting_count(), awaitees.len());
+        assert_eq!(
+            s.with_task(waiter, |task| task.awaiting_count()).unwrap(),
+            awaitees.len()
+        );
 
         s.finalize_cancelled(waiter);
         for &awaitee in &awaitees {
             assert!(
-                s.task(awaitee).unwrap().live_waiters().is_empty(),
+                s.with_task(awaitee, |task| task.live_waiters().is_empty())
+                    .unwrap(),
                 "cancellation must deregister from every awaitee"
             );
         }
@@ -6892,7 +7085,10 @@ mod tests {
 
         // Never registered: unregistering must not disturb the live relation.
         s.unregister_waiter(awaitee, 4_242);
-        assert_eq!(s.task(awaitee).unwrap().live_waiters(), vec![live]);
+        assert_eq!(
+            s.with_task(awaitee, |task| task.live_waiters()).unwrap(),
+            vec![live]
+        );
 
         // Registered then reaped behind the awaitee's back.
         let reaped = s.spawn_parked_placeholder();
@@ -7096,7 +7292,7 @@ mod tests {
     fn fst_07_null_frame_task_completes_safely() {
         let mut s = RuntimeScheduler::with_worker_count(1);
         let id = s.spawn_placeholder();
-        assert!(s.task(id).unwrap().frame.is_null());
+        assert!(s.with_task(id, |task| task.frame.is_null()).unwrap());
         s.complete(id);
         assert_eq!(s.task_state(id), None);
     }
@@ -7214,7 +7410,10 @@ mod tests {
         });
         assert_eq!(done, 0, "a pending frame must fall through to registration");
         with_global_for_test(|s| {
-            assert_eq!(s.task(awaitee).unwrap().live_waiters(), vec![waiter]);
+            assert_eq!(
+                s.with_task(awaitee, |task| task.live_waiters()).unwrap(),
+                vec![waiter]
+            );
         });
         // Completing the awaitee both wakes the waiter and publishes the status.
         with_global_for_test(|s| s.complete(awaitee));
@@ -7237,7 +7436,12 @@ mod tests {
         let done =
             with_current_task_for_test(waiter, || willow_frame_await(std::ptr::null_mut(), id));
         assert_eq!(done, 0);
-        with_global_for_test(|s| assert_eq!(s.task(id).unwrap().live_waiters(), vec![waiter]));
+        with_global_for_test(|s| {
+            assert_eq!(
+                s.with_task(id, |task| task.live_waiters()).unwrap(),
+                vec![waiter]
+            )
+        });
         reset_global_scheduler_for_test();
     }
 

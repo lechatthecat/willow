@@ -52,6 +52,7 @@ pub(super) fn analyze_program(
     known: &FunctionMap<bool>,
     known_modules: &ModuleSymbols,
     lambdas: &[(String, LambdaExpr)],
+    expr_types: &HashMap<ExprId, Type<crate::semantic::ids::TypeId>>,
 ) -> HashMap<String, bool> {
     let mut free_keys = HashMap::new();
     let mut method_keys = HashMap::new();
@@ -132,7 +133,10 @@ pub(super) fn analyze_program(
     let own_bodies: HashSet<&FunctionId> =
         candidates.iter().map(|candidate| &candidate.id).collect();
     for candidate in &candidates {
-        let mut hazards = HazardVisitor { panics: false };
+        let mut hazards = HazardVisitor {
+            panics: false,
+            expr_types,
+        };
         hazards.visit_block(candidate.body);
         problem = problem.body(candidate.id);
         if hazards.panics {
@@ -185,6 +189,7 @@ impl Codegen {
             &self.function_may_panic,
             &self.known_modules,
             lambdas,
+            &self.expr_types,
         );
         let mut ordered = effects.into_iter().collect::<Vec<_>>();
         ordered.sort_by(|left, right| left.0.cmp(&right.0));
@@ -337,17 +342,18 @@ fn external_effects(target: &FunctionId, context: &AnalysisContext<'_>) -> Runti
 ///
 /// Direct hazards accumulate independently of traversal order. The explicit
 /// worklist keeps this read-only analysis independent of expression depth.
-struct HazardVisitor {
+struct HazardVisitor<'a> {
     panics: bool,
+    expr_types: &'a HashMap<ExprId, Type<crate::semantic::ids::TypeId>>,
 }
 
-impl HazardVisitor {
+impl HazardVisitor<'_> {
     fn mark_direct(&mut self) {
         self.panics = true;
     }
 }
 
-impl HazardVisitor {
+impl HazardVisitor<'_> {
     fn visit_block(&mut self, block: &Block) {
         let mut walk = AstWalk::new(AstEvent::Block(block));
         while let Some(event) = walk.next() {
@@ -389,7 +395,11 @@ impl HazardVisitor {
     fn visit_expr(&mut self, expression: &Expr) {
         match expression {
             Expr::Binary(expr) => {
-                if matches!(expr.op, BinOp::Div | BinOp::Rem | BinOp::Pow) {
+                // Reuse checked expression types; unknown additions remain
+                // conservative for direct backend users without artifacts.
+                let concat = expr.op == BinOp::Add
+                    && !matches!(self.expr_types.get(&expr.id), Some(Type::I64 | Type::F64));
+                if concat || matches!(expr.op, BinOp::Div | BinOp::Rem | BinOp::Pow) {
                     self.mark_direct();
                 }
             }
@@ -461,7 +471,10 @@ mod tests {
                     .body
                     .stmts
                     .push(Stmt::Expr(crate::parser::ast::ExprStmt { expr, span }));
-                let mut hazards = HazardVisitor { panics: false };
+                let mut hazards = HazardVisitor {
+                    panics: false,
+                    expr_types: &HashMap::new(),
+                };
                 hazards.visit_block(&function.body);
                 assert!(hazards.panics);
                 drop(program);
@@ -486,6 +499,7 @@ mod tests {
             &FunctionMap::default(),
             &ModuleSymbols::default(),
             &[],
+            &HashMap::new(),
         )
     }
 
@@ -497,6 +511,16 @@ mod tests {
         );
         assert_eq!(effects.get("even"), Some(&false));
         assert_eq!(effects.get("odd"), Some(&false));
+    }
+
+    #[test]
+    fn concatenation_fault_propagates_to_callers() {
+        let effects = analyze(
+            "fn concat(a: String, b: String) -> String { return a + b; } \
+             fn caller() -> String { return concat(\"a\", \"b\"); }",
+        );
+        assert_eq!(effects.get("concat"), Some(&true));
+        assert_eq!(effects.get("caller"), Some(&true));
     }
 
     #[test]
@@ -528,7 +552,7 @@ mod tests {
     #[test]
     fn self_method_edges_participate_in_fixpoint() {
         let effects = analyze(
-            "class Work { pub fn safe(self, n: i64) -> i64 { return n + 1; }\n\
+            "class Work { pub fn safe(self, n: i64) -> i64 { return n - 1; }\n\
              pub fn unsafe(self) { self.safe(1); panic(\"x\"); }\n\
              pub fn reaches(self) { self.unsafe(); } }",
         );

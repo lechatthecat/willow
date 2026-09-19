@@ -197,7 +197,7 @@ pub struct InterfaceInfo<N = String> {
     pub methods: HashMap<String, InterfaceMethodInfo<N>>,
     /// Method names in declaration order — the deterministic vtable slot order
     /// used by interface dispatch codegen (willow-xds).
-    pub method_order: Vec<String>,
+    pub method_order: super::method_slots::MethodSlots,
     /// Generic type parameter names in declaration order (`interface Foo<T>`),
     /// empty for non-generic interfaces (willow-1js.1).
     #[allow(dead_code)]

@@ -18,6 +18,8 @@ pub(super) trait IfaceShapes {
     fn canonical(&self, iface: &super::TypeId) -> super::TypeId;
     fn supers(&self, iface: &super::TypeId) -> Vec<super::TypeId>;
     fn methods(&self, iface: &super::TypeId) -> Vec<String>;
+    fn method_slot(&self, iface: &super::TypeId, method: &str) -> Option<usize>;
+    fn method_count(&self, iface: &super::TypeId) -> usize;
 }
 
 pub(super) fn slots<S: IfaceShapes + ?Sized, Q: super::type_index::TypeLookup + ?Sized>(
@@ -32,7 +34,7 @@ pub(super) fn slot_of<S: IfaceShapes + ?Sized, Q: super::type_index::TypeLookup 
     iface: &Q,
     method: &str,
 ) -> Option<usize> {
-    slots(shapes, iface).iter().position(|name| name == method)
+    shapes.method_slot(&iface.type_id(), method)
 }
 
 /// Slot indices of direct-super pointers to load. Empty means identity.
@@ -55,7 +57,7 @@ pub(super) fn super_path<
     let mut seen = HashSet::from([source]);
     let mut work = vec![source];
     while let Some(current) = work.pop() {
-        let base = shapes.methods(&current).len().max(1);
+        let base = shapes.method_count(&current).max(1);
         for (index, sup) in shapes.supers(&current).into_iter().enumerate() {
             let sup = shapes.canonical(&sup);
             if !seen.insert(sup) {
@@ -90,9 +92,15 @@ impl IfaceShapes for super::type_index::TypeMap<super::InterfaceInfo> {
             .map(|info| info.extends.clone())
             .unwrap_or_default()
     }
+    fn method_slot(&self, iface: &super::TypeId, method: &str) -> Option<usize> {
+        self.get_id(iface)?.method_order.slot_of(method)
+    }
+    fn method_count(&self, iface: &super::TypeId) -> usize {
+        self.get_id(iface).map_or(0, |info| info.method_order.len())
+    }
     fn methods(&self, iface: &super::TypeId) -> Vec<String> {
         self.get_id(iface)
-            .map(|info| info.method_order.clone())
+            .map(|info| info.method_order.as_slice().to_vec())
             .unwrap_or_default()
     }
 }
@@ -163,12 +171,47 @@ mod tests {
                 .map(|(s, _)| s.iter().map(super::super::TypeId::local).collect())
                 .unwrap_or_default()
         }
+        fn method_slot(&self, iface: &super::super::TypeId, method: &str) -> Option<usize> {
+            self.methods(iface).iter().position(|name| name == method)
+        }
+        fn method_count(&self, iface: &super::super::TypeId) -> usize {
+            self.methods(iface).len()
+        }
         fn methods(&self, iface: &super::super::TypeId) -> Vec<String> {
             self.rows
                 .get(self.canonical(iface).name())
                 .map(|(_, m)| m.iter().map(|n| n.to_string()).collect())
                 .unwrap_or_default()
         }
+    }
+
+    #[test]
+    fn lookup_and_widening_do_not_materialize_method_lists() {
+        struct Indexed;
+        impl IfaceShapes for Indexed {
+            fn canonical(&self, iface: &super::super::TypeId) -> super::super::TypeId {
+                *iface
+            }
+            fn supers(&self, iface: &super::super::TypeId) -> Vec<super::super::TypeId> {
+                if iface.name() == "Child" {
+                    vec![super::super::TypeId::local("Base")]
+                } else {
+                    Vec::new()
+                }
+            }
+            fn methods(&self, _: &super::super::TypeId) -> Vec<String> {
+                panic!("dispatch lookup must not copy or scan the method list")
+            }
+            fn method_slot(&self, _: &super::super::TypeId, method: &str) -> Option<usize> {
+                (method == "last").then_some(4095)
+            }
+            fn method_count(&self, _: &super::super::TypeId) -> usize {
+                4096
+            }
+        }
+        assert_eq!(slot_of(&Indexed, "Child", "last"), Some(4095));
+        assert_eq!(slot_of(&Indexed, "Child", "absent"), None);
+        assert_eq!(super_path(&Indexed, "Child", "Base"), Some(vec![4096]));
     }
 
     fn diamond() -> Table {

@@ -6,7 +6,7 @@ use crate::wait_queue::WaitQueue;
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 pub type RuntimeTaskId = u64;
 
@@ -81,7 +81,7 @@ pub const RUNTIME_POLL_BLOCKED_SYSCALL: i32 = willow_abi::RuntimePollResult::Blo
 /// instead of costing 160 inline bytes in every scheduler slot. The box is
 /// released again as soon as the last relationship goes away, so a workload
 /// that parks and resumes 10,000 tasks returns to its ready-task footprint.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct TaskWaitLinks {
     /// Tasks parked awaiting THIS task's completion; woken in registration
     /// order when it completes (dependency wake for `await <task>`,
@@ -138,6 +138,8 @@ pub(crate) struct TaskDebugInfo {
     spawn_site: Option<(String, u32)>,
 }
 
+/// A scheduler-owned task. Inspect it by borrowing; copying the record would
+/// duplicate its frame-root and wait-registration ownership.
 #[derive(Debug)]
 pub struct RuntimeTask {
     #[cfg(any(
@@ -201,40 +203,6 @@ pub struct RuntimeTask {
 // is kept alive by a runtime root while the task is pending/running; generated
 // code may move a task between workers only after the Send/Sync checks.
 unsafe impl Send for RuntimeTask {}
-
-impl Clone for RuntimeTask {
-    fn clone(&self) -> Self {
-        Self {
-            #[cfg(any(
-                all(
-                    target_os = "linux",
-                    target_env = "gnu",
-                    any(target_arch = "x86_64", target_arch = "aarch64")
-                ),
-                all(
-                    target_os = "macos",
-                    any(target_arch = "x86_64", target_arch = "aarch64")
-                ),
-                all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
-            ))]
-            native_stack: None,
-            id: self.id,
-            state: self.state.clone(),
-            poll: self.poll,
-            cooperative_poll: self.cooperative_poll,
-            cancel: self.cancel,
-            native_cancel_cleanup: self.native_cancel_cleanup,
-            frame: self.frame,
-            frame_rooted: self.frame_rooted,
-            wake_deadline: self.wake_deadline,
-            yield_requested: self.yield_requested,
-            wait: self.wait.clone(),
-            debug: self.debug.clone(),
-            preempt_flag: Box::new(AtomicBool::new(self.preempt_flag.load(Ordering::Acquire))),
-            panic_context: Arc::clone(&self.panic_context),
-        }
-    }
-}
 
 impl RuntimeTask {
     pub fn new(id: RuntimeTaskId) -> Self {
@@ -599,6 +567,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn task_cannot_be_cloned() {
+        // Type inference is ambiguous if RuntimeTask ever implements Clone.
+        trait AmbiguousIfClone<A> {
+            fn check() {}
+        }
+        impl<T> AmbiguousIfClone<()> for T {}
+        struct ImplementsClone;
+        impl<T: Clone> AmbiguousIfClone<ImplementsClone> for T {}
+        let _ = <RuntimeTask as AmbiguousIfClone<_>>::check;
+    }
+
+    #[test]
     fn task_state_transitions_are_explicit() {
         let task = RuntimeTask::new(7);
         assert!(task.state.claim_queue_slot());
@@ -614,10 +594,10 @@ mod tests {
     }
 
     #[test]
-    fn cloned_task_owns_an_independent_preempt_flag() {
+    fn distinct_tasks_own_independent_preempt_flags() {
         let task = RuntimeTask::new(1);
-        let cloned = task.clone();
-        assert_ne!(task.preempt_flag_ptr(), cloned.preempt_flag_ptr());
+        let other = RuntimeTask::new(2);
+        assert_ne!(task.preempt_flag_ptr(), other.preempt_flag_ptr());
 
         crate::preempt::willow_preempt_request(task.preempt_flag_ptr());
         assert_eq!(
@@ -625,7 +605,7 @@ mod tests {
             1
         );
         assert_eq!(
-            crate::preempt::willow_preempt_requested(cloned.preempt_flag_ptr()),
+            crate::preempt::willow_preempt_requested(other.preempt_flag_ptr()),
             0
         );
     }
@@ -656,7 +636,6 @@ mod tests {
 /// F18 taking awaitees drains and releases in one step
 /// F19 taking channel waits drains and releases in one step
 /// F20 duplicate channel registration is deduplicated
-/// F21 clone copies relationships and debug data without sharing them
 /// F22 10,000 park/resume cycles return to the ready-task footprint
 /// ```
 #[cfg(test)]
@@ -905,28 +884,6 @@ mod footprint {
         assert!(task.owns_wait_links());
         assert!(task.clear_channel_ownership(handoff));
         assert!(!task.owns_wait_links());
-    }
-
-    #[test]
-    fn f21_clone_copies_relationships_without_sharing_them() {
-        let mut task = RuntimeTask::new(1);
-        task.register_waiter(5);
-        task.add_awaiting(6);
-        task.install_channel_ownership(channel_token(0x50));
-        task.set_name("origin".to_string());
-
-        let mut cloned = task.clone();
-        assert_eq!(cloned.live_waiters(), vec![5]);
-        assert!(cloned.is_awaiting(6));
-        assert_eq!(cloned.wait_channels(), &[channel_token(0x50)]);
-        assert_eq!(cloned.name(), Some("origin"));
-
-        cloned.remove_waiter(5);
-        assert_eq!(
-            task.live_waiters(),
-            vec![5],
-            "F21: the clone owns its own relationships"
-        );
     }
 
     #[test]

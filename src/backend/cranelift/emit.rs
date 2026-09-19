@@ -19,7 +19,7 @@ use super::*;
 /// A free function rather than a `FuncGen` method so LIR eligibility can ask
 /// the same question before emission (willow-j260): the walker may only admit
 /// a class → interface coercion that [`FuncGen::emit_interface_box`] can
-/// actually build, and the two must agree on every aliasing fallback below.
+/// actually build, and the two must use the same scoped type identities.
 pub(super) fn resolve_vtable_id(
     vtable_ids: &VtableMap<DataId>,
     interface_infos: &TypeMap<InterfaceInfo>,
@@ -39,24 +39,6 @@ pub(super) fn resolve_vtable_id(
             ))
         })
         .copied()
-        .or_else(|| {
-            // The box site may name a module-local generic interface by its
-            // bare name (`Box`) while its vtable is keyed by the qualified
-            // name (`mod::Box`). Fall back to the class's unique vtable whose
-            // interface short name (last `::` segment) matches (willow-1js.5).
-            let short = interface_name.rsplit("::").next().unwrap_or(interface_name);
-            let mut found: Option<DataId> = None;
-            for (key, id) in vtable_ids.iter() {
-                let (cls, iface) = (&key.0, &key.1);
-                if cls == &TypeId::from_source_name(class_name) && iface.name() == short {
-                    if found.is_some() {
-                        return None; // ambiguous: more than one match
-                    }
-                    found = Some(*id);
-                }
-            }
-            found
-        })
 }
 
 impl<'a, 'b> FuncGen<'a, 'b> {
@@ -160,5 +142,43 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_pop_roots_n(1);
         self.gc_root_count -= 1;
         box_ptr
+    }
+}
+
+#[cfg(test)]
+mod vtable_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn missing_qualified_interface_never_matches_another_modules_short_name() {
+        let class = TypeId::from_source_name("Concrete");
+        for count in [1, 16, 256, 4096] {
+            let mut tables = VtableMap::from([(
+                (class, TypeId::from_source_name("one::View")),
+                DataId::from_u32(0),
+            )]);
+            for index in 1..count {
+                tables.insert(
+                    (
+                        class,
+                        TypeId::from_source_name(&format!("other{index}::View")),
+                    ),
+                    DataId::from_u32(index as u32),
+                );
+            }
+            let interfaces = TypeMap::new();
+            assert_eq!(
+                resolve_vtable_id(&tables, &interfaces, "Concrete", "one::View"),
+                Some(DataId::from_u32(0))
+            );
+            assert_eq!(
+                resolve_vtable_id(&tables, &interfaces, "Concrete", "two::View"),
+                None
+            );
+            assert_eq!(
+                resolve_vtable_id(&tables, &interfaces, "Concrete", "View"),
+                None
+            );
+        }
     }
 }

@@ -97,9 +97,11 @@ fn alloc_buffer(cap: i64, is_ref: bool) -> *mut u8 {
     } else {
         willow_alloc_with_layout(GcObjectKind::ArrayBuffer, 0, payload, 0)
     };
-    if !buf.is_null() {
-        unsafe { *(buf as *mut i64) = cap };
+    if buf.is_null() {
+        raise_with("array buffer allocation failed");
+        return buf;
     }
+    unsafe { *(buf as *mut i64) = cap };
     buf
 }
 
@@ -194,6 +196,9 @@ pub extern "C" fn willow_array_copy(arr: *mut u8) -> *mut u8 {
     let len = willow_array_len(arr);
     let is_ref = unsafe { handle_word(arr, H_IS_REF) };
     let mut copy = willow_array_new(len, is_ref);
+    if copy.is_null() {
+        return copy;
+    }
     willow_push_root(&mut copy as *mut *mut u8);
     let mut i = 0;
     while i < len {
@@ -287,6 +292,10 @@ pub extern "C" fn willow_array_push(arr: *mut u8, value: i64) {
             willow_push_root(&mut val as *mut *mut u8);
         }
         let new_buf = alloc_buffer(new_cap, is_ref);
+        if new_buf.is_null() {
+            willow_pop_roots(1 + i32::from(root_val));
+            return;
+        }
         unsafe {
             let old_buf = handle_buffer(arr);
             for i in 0..len {
@@ -563,5 +572,57 @@ mod tests {
         assert_eq!(willow_array_get(arr, 0), 0);
         assert_eq!(willow_array_get(arr, 11), 77);
         willow_pop_roots(1);
+    }
+
+    // Synthetic handle lengths force checked overflow without huge allocations.
+    // The real buffer retains its valid capacity for GC tracing throughout.
+    #[test]
+    fn array_allocation_overflow_preserves_state_and_roots() {
+        use crate::panic_context::*;
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let previous = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(902))));
+        for (is_ref, nonnull_value) in [(false, false), (true, false), (true, true)] {
+            let mut arr = willow_array_new(1, i64::from(is_ref));
+            willow_push_root(&mut arr);
+            let value = if nonnull_value {
+                willow_string_from_str("rooted") as i64
+            } else {
+                0
+            };
+            let buffer = unsafe { handle_buffer(arr) };
+            unsafe {
+                set_handle_word(arr, H_LEN, i64::MAX);
+                set_handle_word(arr, H_CAP, i64::MAX);
+            }
+            let depth = crate::gc::willow_root_depth();
+            willow_array_push(arr, value);
+            assert_eq!(crate::gc::willow_root_depth(), depth);
+            assert_eq!(willow_panic_depth(), 1);
+            assert_eq!(unsafe { handle_buffer(arr) }, buffer);
+            assert_eq!(unsafe { handle_word(arr, H_LEN) }, i64::MAX);
+            assert_eq!(unsafe { handle_word(arr, H_CAP) }, i64::MAX);
+            willow_panic_enter_defer();
+            let info = willow_panic_recover();
+            willow_panic_leave_defer();
+            assert!(unsafe { panic_info_message(info) }.starts_with("array capacity too large:"));
+            willow_panic_release_recovered(info);
+
+            assert!(willow_array_copy(arr).is_null());
+            assert_eq!(crate::gc::willow_root_depth(), depth);
+            assert_eq!(willow_panic_depth(), 1);
+            willow_panic_enter_defer();
+            let info = willow_panic_recover();
+            willow_panic_leave_defer();
+            assert!(unsafe { panic_info_message(info) }.starts_with("array capacity too large:"));
+            willow_panic_release_recovered(info);
+            unsafe {
+                set_handle_word(arr, H_LEN, 1);
+                set_handle_word(arr, H_CAP, 1);
+            }
+            assert_eq!(willow_array_get(arr, 0), 0);
+            willow_pop_roots(1);
+        }
+        replace_current_context(previous);
     }
 }

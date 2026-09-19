@@ -3,7 +3,21 @@ use std::sync::Mutex;
 
 use crate::array::{willow_array_new, willow_array_set};
 use crate::gc::{willow_pop_roots, willow_push_root};
+#[cfg(not(test))]
 use crate::string::willow_string_from_str;
+
+// Exercise the actual allocation boundary without a timing-dependent deadlock test.
+#[cfg(test)]
+fn willow_string_from_str(text: &str) -> *mut u8 {
+    assert!(
+        std::thread::spawn(|| ARGS.try_lock().is_ok())
+            .join()
+            .unwrap(),
+        "ARGS must be unlocked before a managed allocation"
+    );
+    crate::gc::willow_gc_collect();
+    crate::string::willow_string_from_str(text)
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 struct RuntimeArgs {
@@ -43,16 +57,21 @@ pub extern "C" fn willow_runtime_args_len() -> i64 {
 /// a GC-managed WillowString for an in-range user argument, or zero for None.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_runtime_arg(index: i64) -> *mut u8 {
-    let args = ARGS.lock().expect("runtime args mutex poisoned");
-    if index < 0 || index >= args.user_argc as i64 || args.user_argv == 0 {
-        return std::ptr::null_mut();
-    }
-    let user_argv = args.user_argv as *mut *mut c_char;
-    let cptr = unsafe { *user_argv.add(index as usize) };
-    if cptr.is_null() {
-        return std::ptr::null_mut();
-    }
-    let s = unsafe { std::ffi::CStr::from_ptr(cptr) }.to_string_lossy();
+    let s = {
+        let args = ARGS.lock().expect("runtime args mutex poisoned");
+        if index < 0 || index >= args.user_argc as i64 || args.user_argv == 0 {
+            return std::ptr::null_mut();
+        }
+        let user_argv = args.user_argv as *mut *mut c_char;
+        let cptr = unsafe { *user_argv.add(index as usize) };
+        if cptr.is_null() {
+            return std::ptr::null_mut();
+        }
+        // Own the text and release ARGS before allocation can stop other mutators.
+        unsafe { std::ffi::CStr::from_ptr(cptr) }
+            .to_string_lossy()
+            .into_owned()
+    };
     willow_string_from_str(&s)
 }
 
@@ -95,16 +114,21 @@ pub extern "C" fn willow_runtime_args_array() -> *mut u8 {
 /// Returns a GC-managed WillowString for the program name (argv[0]).
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_runtime_program_name() -> *mut u8 {
-    let args = ARGS.lock().expect("runtime args mutex poisoned");
-    if args.argc <= 0 || args.argv == 0 {
-        return willow_string_from_str("");
-    }
-    let argv = args.argv as *mut *mut c_char;
-    let program = unsafe { *argv };
-    if program.is_null() {
-        return willow_string_from_str("");
-    }
-    let s = unsafe { std::ffi::CStr::from_ptr(program) }.to_string_lossy();
+    let s = {
+        let args = ARGS.lock().expect("runtime args mutex poisoned");
+        let program = if args.argc <= 0 || args.argv == 0 {
+            std::ptr::null_mut()
+        } else {
+            unsafe { *(args.argv as *mut *mut c_char) }
+        };
+        if program.is_null() {
+            String::new()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(program) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
     willow_string_from_str(&s)
 }
 
@@ -192,5 +216,41 @@ mod tests {
         let mut argv = vec![program.as_ptr() as *mut c_char];
         willow_runtime_store_args(1, argv.as_mut_ptr());
         assert_eq!(ws_text(willow_runtime_program_name()), "prog");
+    }
+
+    #[test]
+    fn args_unit_08_null_entries_and_null_argv() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        reset_for_tests();
+        willow_runtime_store_args(2, std::ptr::null_mut());
+        assert_eq!(ws_text(willow_runtime_program_name()), "");
+        assert!(willow_runtime_arg(0).is_null());
+        let mut argv = [std::ptr::null_mut(); 2];
+        willow_runtime_store_args(2, argv.as_mut_ptr());
+        assert_eq!(ws_text(willow_runtime_program_name()), "");
+        assert!(willow_runtime_arg(0).is_null());
+        reset_for_tests();
+    }
+
+    #[test]
+    fn args_unit_09_snapshots_preserve_lossy_and_increasing_length_text() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        reset_for_tests();
+        for len in [0, 1, 64, 4096] {
+            let mut bytes = vec![b'x'; len];
+            bytes.push(0xff);
+            let text = CString::new(bytes).unwrap();
+            let expected = text.to_string_lossy();
+            let mut argv = [text.as_ptr() as *mut c_char; 2];
+            willow_runtime_store_args(2, argv.as_mut_ptr());
+            assert_eq!(ws_text(willow_runtime_program_name()), expected);
+            assert_eq!(ws_text(willow_runtime_arg(0)), expected);
+            let array = willow_runtime_args_array();
+            let value = crate::array::willow_array_get(array, 0) as *mut u8;
+            assert_eq!(ws_text(value), expected);
+            reset_for_tests();
+        }
     }
 }

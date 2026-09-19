@@ -196,6 +196,10 @@ mod tests {
 
         assert!(effects("willow_alloc").contains(RuntimeEffects::MAY_ALLOCATE));
         assert!(
+            effects("willow_string_concat")
+                .contains(RuntimeEffects::MAY_ALLOCATE.union(RuntimeEffects::MAY_PANIC))
+        );
+        assert!(
             effects("willow_fs_read_to_string")
                 .contains(RuntimeEffects::MAY_BLOCK.union(RuntimeEffects::MAY_ALLOCATE))
         );

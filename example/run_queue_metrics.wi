@@ -1,0 +1,30 @@
+// Run-queue metrics are cumulative, relaxed reads. Compare deltas rather than
+// assuming a fixed schedule or a transaction across several getters.
+async fn measured_worker(done: Channel<i64>) {
+    await yield();
+    done.send(1);
+}
+
+async fn main() {
+    let before = sched_global_pushes();
+    let done = Channel<i64>::new();
+    let mut i = 0;
+    while i < 16 {
+        measured_worker(done);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 16 {
+        done.recv();
+        i = i + 1;
+    }
+    println(sched_global_pushes() > before);
+    println(sched_local_pushes() > 0);
+    println(sched_local_pop_hits() >= 0);
+    println(sched_global_pop_hits() >= 0);
+    println(sched_global_pop_attempts() >= 0);
+    println(sched_steal_attempts() >= 0);
+    println(sched_steal_successes() >= 0);
+    println(sched_steal_failures() >= 0);
+    println(sched_victim_locks() >= 0);
+}

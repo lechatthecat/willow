@@ -230,7 +230,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let vslot = self
             .class_vslots
             .get(class_name)
-            .and_then(|slots| slots.iter().position(|n| n == method_name));
+            .and_then(|slots| slots.slot_of(method_name));
 
         // The candidate set answers two compile-time questions only: can any
         // reachable target panic, and is there exactly one target (so the

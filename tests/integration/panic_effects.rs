@@ -939,3 +939,19 @@ fn main() {
         "{stderr}"
     );
 }
+
+#[test]
+fn string_concat_keeps_panic_checks_and_balanced_roots() {
+    let source = r#"
+fn concat(a: String, b: String) -> String { return a + b; }
+fn main() { println(concat("hello", " world")); }
+"#;
+    for release in [false, true] {
+        let targets = compile_and_collect_relocation_targets_mode(source, &[], release);
+        assert!(has_target(&targets, "willow_string_concat"));
+        assert!(has_target(&targets, "willow_panic_depth"));
+    }
+    let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_GC_STRESS", "alloc")]);
+    assert!(ok, "{out}");
+    assert_eq!(out, "hello world\n");
+}

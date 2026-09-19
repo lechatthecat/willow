@@ -177,6 +177,15 @@ impl TypeChecker {
             },
         );
         for name in [
+            "sched_local_pop_hits",
+            "sched_global_pop_hits",
+            "sched_global_pop_attempts",
+            "sched_steal_attempts",
+            "sched_steal_successes",
+            "sched_steal_failures",
+            "sched_victim_locks",
+            "sched_global_pushes",
+            "sched_local_pushes",
             "gc_allocated_bytes",
             "gc_tlab_fast_allocations",
             "gc_tlab_slow_allocations",
@@ -1011,7 +1020,7 @@ impl TypeChecker {
                 name: registered_name,
                 public: decl.public,
                 methods,
-                method_order,
+                method_order: method_order.into(),
                 type_params: decl.type_params.clone(),
                 extends: decl
                     .extends

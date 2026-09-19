@@ -175,7 +175,7 @@ pub struct Codegen {
     /// appending a new one. A method that is neither `open` nor `override` gets
     /// no slot: it can neither be overridden nor override anything, so a direct
     /// call to it is always right.
-    class_vslots: TypeMap<Vec<String>>,
+    class_vslots: TypeMap<crate::semantic::method_slots::MethodSlots>,
     /// Maps each class name to its descriptor data symbol — word 0 of every
     /// object of that class (willow-fm7t). Offset 0 of the descriptor is the
     /// class's `type_id`; the virtual method slots follow it in
@@ -1243,7 +1243,7 @@ impl Codegen {
             // Root-most ancestor first, so each level appends onto the order it
             // inherits.
             let chain = self.ancestor_chain(&class_name);
-            let mut slots: Vec<String> = Vec::new();
+            let mut slots = crate::semantic::method_slots::MethodSlots::default();
             for ancestor in chain.iter().rev() {
                 // An identity, not a spelling, for the same reason
                 // `finalize_class_layouts` reads one.
@@ -1251,9 +1251,7 @@ impl Codegen {
                     continue;
                 };
                 for method in own {
-                    if !slots.contains(method) {
-                        slots.push(method.clone());
-                    }
+                    slots.insert(method);
                 }
             }
             self.class_vslots.insert_canonical_id(class_name, slots);
@@ -1511,7 +1509,7 @@ struct FuncGen<'a, 'b> {
     /// of every object of that class (willow-fm7t).
     class_descriptor_ids: &'a TypeMap<DataId>,
     /// Per-class virtual method slot order, indexed by slot (willow-fm7t).
-    class_vslots: &'a TypeMap<Vec<String>>,
+    class_vslots: &'a TypeMap<crate::semantic::method_slots::MethodSlots>,
     /// Interface metadata for method dispatch + boxing.
     interface_infos: &'a TypeMap<InterfaceInfo>,
     /// Static `(class, interface)` vtable data objects for class→interface boxing.

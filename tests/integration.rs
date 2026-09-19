@@ -87,6 +87,8 @@ mod lir_static_initializers;
 mod lir_static_property_bodies;
 #[path = "integration/method_receiver_roots.rs"]
 mod method_receiver_roots;
+#[path = "integration/run_queue_metrics.rs"]
+mod run_queue_metrics;
 
 #[path = "integration/module_lir_bodies.rs"]
 mod module_lir_bodies;

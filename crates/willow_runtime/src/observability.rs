@@ -119,6 +119,74 @@ pub struct WillowRuntimeMetricsV1 {
     pub blocking_queue_full: u64,
 }
 
+// Run-queue telemetry is separate from WillowRuntimeMetricsV1 so its C layout
+// stays unchanged. Counters belong to the queue instance and reset with it.
+macro_rules! run_queue_metrics {
+    ($($field:ident $(=> $getter:ident)?),+ $(,)?) => {
+        // Pad worker banks to reduce false sharing on the hot path.
+        #[repr(align(64))]
+        #[derive(Debug, Default)]
+        pub(crate) struct RunQueueMetrics {
+            $(pub(crate) $field: AtomicU64,)+
+        }
+
+        /// Cumulative queue events. Reads are relaxed and are not a transaction:
+        /// concurrent snapshots may span adjacent events. No queue locks or
+        /// profiler callbacks are involved in recording or loading the counters.
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+        pub struct RunQueueMetricsSnapshot {
+            $(pub $field: u64,)+
+        }
+
+        impl RunQueueMetricsSnapshot {
+            pub(crate) fn add(&mut self, other: Self) {
+                $(self.$field = self.$field.wrapping_add(other.$field);)+
+            }
+        }
+
+        impl RunQueueMetrics {
+            pub(crate) fn snapshot(&self) -> RunQueueMetricsSnapshot {
+                RunQueueMetricsSnapshot {
+                    $($field: self.$field.load(Ordering::Relaxed),)+
+                }
+            }
+        }
+
+        $($(
+            #[unsafe(no_mangle)]
+            pub extern "C" fn $getter() -> i64 {
+                crate::scheduler::read_run_queue_metric(|metrics| {
+                    metrics.$field.load(Ordering::Relaxed)
+                }) as i64
+            }
+        )?)+
+    };
+}
+
+run_queue_metrics! {
+    local_pop_hits => willow_sched_local_pop_hits,
+    global_pop_hits => willow_sched_global_pop_hits,
+    global_pop_attempts => willow_sched_global_pop_attempts,
+    steal_attempts => willow_sched_steal_attempts,
+    steal_successes => willow_sched_steal_successes,
+    steal_failures => willow_sched_steal_failures,
+    victim_locks => willow_sched_victim_locks,
+    global_pushes, // Shared-only counter: the getter below needs no worker scan.
+    local_pushes => willow_sched_local_pushes,
+}
+
+/// Global publishes use only the shared bank, so this read stays O(1).
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sched_global_pushes() -> i64 {
+    crate::scheduler::run_queue_global_pushes() as i64
+}
+
+/// Read the active scheduler's run-queue counters without scanning its queues.
+/// Aggregation is O(worker count); recording an event is O(1).
+pub fn run_queue_metrics_snapshot() -> RunQueueMetricsSnapshot {
+    crate::scheduler::run_queue_metrics_snapshot()
+}
+
 type RuntimeEventHookV1 = unsafe extern "C" fn(*const WillowRuntimeEventV1, *mut c_void);
 
 struct HookRegistration {

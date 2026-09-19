@@ -1985,7 +1985,7 @@ impl Codegen {
             let vslot = self
                 .class_vslots
                 .get(class_name)
-                .and_then(|slots| slots.iter().position(|n| n == method_name));
+                .and_then(|slots| slots.slot_of(method_name));
             let entry = match vslot {
                 Some(vslot) => {
                     self.declare_vtable_thunk(class_name, method_name, vslot, func_id, span)?
@@ -2153,7 +2153,7 @@ impl Codegen {
         let slots = self
             .class_vslots
             .get(class_name)
-            .cloned()
+            .map(|slots| slots.as_slice().to_vec())
             .unwrap_or_default();
         let symbol = class_descriptor_symbol(class_name);
         // Shares the one linker namespace with every other symbol the backend

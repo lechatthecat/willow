@@ -63,8 +63,8 @@ use super::gc_codegen::{GcLayoutMetadata, GcObjectKind, GcStoreDestination};
 use super::option_repr::{OptionRepr, option_repr};
 use super::symbols::{class_method_symbol_name, class_name_for_object_type, module_item_symbol};
 use super::type_helpers::{
-    builtin_call_runtime_name, clif_type, gc_stat_builtin_runtime_name, is_gc_managed,
-    reference_type,
+    builtin_call_runtime_name, clif_type, is_gc_managed, reference_type,
+    runtime_stat_builtin_runtime_name,
 };
 use super::{
     CoopSuspendPoints, FRAME_SLOT_TASK_ID, FuncGen, VarStorage, array_element_type,
@@ -4146,7 +4146,7 @@ fn supported_expr_node<'n>(
             // statistic counters. Same shape — a zero-argument runtime call
             // with no AST-only metadata — but they return the counter
             // (willow-0g8j.3.1).
-            if gc_stat_builtin_runtime_name(callee.unqualified_name()).is_some() {
+            if runtime_stat_builtin_runtime_name(callee.unqualified_name()).is_some() {
                 return args.is_empty() && e.ty == Type::I64;
             }
             if callee.is_free_named("recover") {
@@ -7353,9 +7353,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     };
                     self.emit_push_root(lhs);
                     self.emit_push_root(rhs);
-                    let raw = self.emit_value_runtime_call(name, &[lhs, rhs]);
-                    self.emit_pop_roots_n(2);
-                    self.gc_root_count -= 2;
+                    let raw = self
+                        .emit_runtime_call_with_cleanup(name, &[lhs, rhs], |this| {
+                            this.emit_pop_roots_n(2);
+                            this.gc_root_count -= 2;
+                        })
+                        .expect("string runtime operation returns a value");
                     return match op {
                         BinOp::Add => raw,
                         BinOp::Eq => self.builder.ins().ireduce(types::I8, raw),
@@ -8437,7 +8440,7 @@ fn flat_rvalue_supported(
             if callee.is_free_named("yield") { return params.is_empty() && void_future; }
             if !params.is_empty() { return false; }
             if callee.is_free_named("gc_collect") || callee.is_free_named("gc_minor_collect") { *result == Type::Void }
-            else { callee.is_free_named(callee.unqualified_name()) && gc_stat_builtin_runtime_name(callee.unqualified_name()).is_some() && *result == Type::I64 }
+            else { callee.is_free_named(callee.unqualified_name()) && runtime_stat_builtin_runtime_name(callee.unqualified_name()).is_some() && *result == Type::I64 }
         }
         V::FormatScalar { ty, format, .. } => matches!(ty, Type::I64 | Type::F64 | Type::Bool | Type::String) && (format.is_none() || *ty == Type::F64),
         V::Panic { message } => ty(message) == Some(Type::String),
@@ -8985,6 +8988,12 @@ mod tests {
                 .unwrap_or_default()
         }
 
+        fn method_slot(&self, iface: &TypeId, method: &str) -> Option<usize> {
+            self.methods(iface).iter().position(|name| name == method)
+        }
+        fn method_count(&self, iface: &TypeId) -> usize {
+            self.methods(iface).len()
+        }
         fn methods(&self, iface: &TypeId) -> Vec<String> {
             self.iface_methods
                 .get(&iface.to_string())

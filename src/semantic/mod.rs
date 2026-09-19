@@ -5,6 +5,7 @@ pub mod concurrency;
 pub mod effects;
 pub mod ids;
 pub mod intrinsics;
+pub mod method_slots;
 pub mod symbols;
 pub mod type_checker;
 

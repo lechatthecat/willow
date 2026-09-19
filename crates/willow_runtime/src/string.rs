@@ -19,6 +19,12 @@ use crate::gc::{GcObjectKind, willow_alloc_with_layout, willow_gc_add_runtime_ro
 // Core allocation helpers
 // ---------------------------------------------------------------------------
 
+/// Include the length word and NUL without overflowing either size domain.
+fn string_payload_size(len: usize) -> Option<i64> {
+    let size = len.checked_add(9)?;
+    i64::try_from(size).ok()
+}
+
 /// Allocate a new WillowString from a raw byte slice.
 /// Returns a pointer to the payload (the `len` field at offset 0).
 #[unsafe(no_mangle)]
@@ -30,15 +36,10 @@ pub extern "C" fn willow_string_alloc(bytes: *const u8, len: i64) -> *mut u8 {
     if len_usize > 0 && bytes.is_null() {
         return std::ptr::null_mut();
     }
-    // Checked arithmetic: payload = 8 (len field) + len_usize + 1 (NUL)
-    let Some(payload_size_usize) = 8usize.checked_add(len_usize).and_then(|n| n.checked_add(1))
-    else {
+    let Some(payload_size) = string_payload_size(len_usize) else {
         return std::ptr::null_mut();
     };
-    if payload_size_usize > i64::MAX as usize {
-        return std::ptr::null_mut();
-    }
-    let ptr = willow_alloc_with_layout(GcObjectKind::String, 0, payload_size_usize as i64, 0);
+    let ptr = willow_alloc_with_layout(GcObjectKind::String, 0, payload_size, 0);
     if ptr.is_null() {
         return ptr;
     }
@@ -151,8 +152,13 @@ pub extern "C" fn willow_string_eq(lhs: *const u8, rhs: *const u8) -> i64 {
 pub extern "C" fn willow_string_concat(lhs: *const u8, rhs: *const u8) -> *mut u8 {
     let (lhs_bytes, lhs_len) = unsafe { ws_as_bytes(lhs) };
     let (rhs_bytes, rhs_len) = unsafe { ws_as_bytes(rhs) };
-    let total_len = lhs_len + rhs_len;
-    let payload_size = 8_i64 + total_len as i64 + 1;
+    let Some((total_len, payload_size)) = lhs_len
+        .checked_add(rhs_len)
+        .and_then(|len| string_payload_size(len).map(|size| (len, size)))
+    else {
+        crate::panic_context::raise_language_message("string concatenation size overflow");
+        return std::ptr::null_mut();
+    };
     let ptr = willow_alloc_with_layout(GcObjectKind::String, 0, payload_size, 0);
     if ptr.is_null() {
         return ptr;
@@ -202,6 +208,56 @@ pub unsafe fn willow_string_as_str<'a>(s: *const u8) -> &'a str {
 mod tests {
     use super::*;
     use crate::gc::{runtime_test_guard, willow_gc_init};
+
+    #[test]
+    fn string_payload_size_boundaries() {
+        assert_eq!(string_payload_size(0), Some(9));
+        assert_eq!(string_payload_size(i64::MAX as usize - 9), Some(i64::MAX));
+        assert_eq!(string_payload_size(i64::MAX as usize - 8), None);
+        assert_eq!(string_payload_size(usize::MAX), None);
+    }
+
+    #[test]
+    fn concat_increasing_sizes_preserves_bytes_and_terminator() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        for (left_len, right_len) in [(0, 0), (1, 1), (16, 256), (4096, 1)] {
+            let left = "a".repeat(left_len);
+            let right = "b".repeat(right_len);
+            let mut lhs = willow_string_from_str(&left);
+            crate::gc::willow_push_root(&mut lhs);
+            let mut rhs = willow_string_from_str(&right);
+            crate::gc::willow_push_root(&mut rhs);
+            let result = willow_string_concat(lhs, rhs);
+            assert_eq!(unsafe { willow_string_as_str(result) }, left + &right);
+            assert_eq!(unsafe { *result.add(8 + left_len + right_len) }, 0);
+            crate::gc::willow_pop_roots(2);
+        }
+    }
+
+    #[test]
+    fn concat_overflow_raises_before_reading_content() {
+        use crate::panic_context::*;
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let previous = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(944))));
+        // Only the length words exist: every case must fail before copying bytes.
+        for (left, right) in [(i64::MAX, 1_i64), (i64::MAX - 8, 0), (-1, 1)] {
+            let result =
+                willow_string_concat((&left as *const i64).cast(), (&right as *const i64).cast());
+            assert!(result.is_null());
+            assert_eq!(willow_panic_depth(), 1);
+            willow_panic_enter_defer();
+            let info = willow_panic_recover();
+            willow_panic_leave_defer();
+            assert_eq!(
+                unsafe { panic_info_message(info) },
+                "string concatenation size overflow"
+            );
+            willow_panic_release_recovered(info);
+        }
+        replace_current_context(previous);
+    }
 
     unsafe fn ws_to_string(ptr: *const u8) -> String {
         unsafe { willow_string_as_str(ptr) }.to_string()
