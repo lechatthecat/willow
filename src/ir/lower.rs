@@ -1633,9 +1633,13 @@ fn lower_ternary_expr(t: &TernaryExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Di
     let condition = lower_expr(&t.condition, ctx)?;
     let then_expr = lower_expr(&t.then_expr, ctx)?;
     let else_expr = lower_expr(&t.else_expr, ctx)?;
-    // Both arms share a type (the checker enforces it); use the `then`
-    // arm's resolved type as the ternary's type.
-    let ty = then_expr.ty.clone();
+    // A diverging arm contributes no value to the result. If both diverge,
+    // the result remains Never.
+    let ty = if then_expr.ty == Type::Never {
+        else_expr.ty.clone()
+    } else {
+        then_expr.ty.clone()
+    };
     Ok(HirExpr {
         kind: HirExprKind::Ternary {
             condition: Box::new(condition),

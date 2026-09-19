@@ -938,12 +938,12 @@ fn contention_05_timer_register_and_drain() {
                                     .unwrap_or(false)
                             },
                             |woken| {
-                                let outcome = tasks.with_mut(woken, |task| {
+                                let outcome = tasks.with_mut(woken.task_id, |task| {
                                     task.wake_deadline = None;
                                     task.state.wake()
                                 });
                                 if outcome == Some(WakeOutcome::Enqueue) {
-                                    queues.push_local(worker, woken);
+                                    queues.push_local(worker, woken.task_id);
                                 }
                             },
                         );

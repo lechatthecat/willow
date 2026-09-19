@@ -856,6 +856,56 @@ struct GcCoord {
     parked: HashSet<ThreadId>,
 }
 
+/// Reference-counted roots owned by runtime structures. Collection takes a
+/// distinct-object snapshot; repeated owners retain one entry until the last
+/// owner releases it. Keep registry locking behind this boundary.
+#[derive(Default)]
+struct RuntimeRootSet {
+    roots: Mutex<HashMap<usize, usize>>,
+}
+
+impl RuntimeRootSet {
+    fn add(&self, object: *mut u8) {
+        if object.is_null() {
+            return;
+        }
+        let mut roots = self.roots.lock().unwrap();
+        *roots.entry(object as usize).or_insert(0) += 1;
+    }
+
+    fn remove(&self, object: *mut u8) {
+        if object.is_null() {
+            return;
+        }
+        let root = object as usize;
+        let mut roots = self.roots.lock().unwrap();
+        if let Some(count) = roots.get_mut(&root) {
+            if *count > 1 {
+                *count -= 1;
+            } else {
+                roots.remove(&root);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> Vec<*mut u8> {
+        self.roots
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|&root| root as *mut u8)
+            .collect()
+    }
+
+    fn len(&self) -> usize {
+        self.roots.lock().unwrap().len()
+    }
+
+    fn clear(&self) {
+        self.roots.lock().unwrap().clear();
+    }
+}
+
 /// Process-wide GC services. Keeping the heap, roots, registries, and STW
 /// coordinator behind one explicit owner makes lock ordering visible and keeps
 /// runtime entry points from reaching into unrelated globals.
@@ -866,7 +916,7 @@ struct GcRuntime {
     collect_lock: Mutex<()>,
     root_stack_owner: Mutex<Option<ThreadId>>,
     skipped_foreign_owner_collections: std::sync::atomic::AtomicU64,
-    runtime_roots: Mutex<HashMap<usize, usize>>,
+    runtime_roots: RuntimeRootSet,
     parked_stack_roots: Mutex<HashMap<u64, Vec<usize>>>,
     next_parked_stack: AtomicU64,
     coord: (Mutex<GcCoord>, Condvar),
@@ -888,7 +938,7 @@ impl Default for GcRuntime {
             collect_lock: Mutex::new(()),
             root_stack_owner: Mutex::new(None),
             skipped_foreign_owner_collections: std::sync::atomic::AtomicU64::new(0),
-            runtime_roots: Mutex::new(HashMap::new()),
+            runtime_roots: RuntimeRootSet::default(),
             parked_stack_roots: Mutex::new(HashMap::new()),
             next_parked_stack: AtomicU64::new(1),
             coord: (Mutex::new(GcCoord::default()), Condvar::new()),
@@ -1831,9 +1881,7 @@ pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
     if let Some(cycle) = runtime().heap.lock().unwrap().concurrent_cycle.as_ref() {
         cycle.enqueue(object);
     }
-    let mut roots = runtime().runtime_roots.lock().unwrap();
-    let root = object as usize;
-    *roots.entry(root).or_insert(0) += 1;
+    runtime().runtime_roots.add(object);
 }
 
 /// Remove a persistent runtime root when the owning runtime structure no
@@ -1845,15 +1893,7 @@ pub extern "C" fn willow_gc_remove_runtime_root(object: *mut u8) {
     }
 
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
-    let root = object as usize;
-    let mut roots = runtime().runtime_roots.lock().unwrap();
-    if let Some(count) = roots.get_mut(&root) {
-        if *count > 1 {
-            *count -= 1;
-        } else {
-            roots.remove(&root);
-        }
-    }
+    runtime().runtime_roots.remove(object);
 }
 
 /// Allocate a GC-managed object of `payload_size` bytes with the given
@@ -3364,18 +3404,11 @@ fn foreign_root_stack_owner_active() -> bool {
 /// prove that panic/recover releases every root it took, instead of only
 /// checking that the program printed the right text (willow-s9ej.7).
 pub fn runtime_root_count() -> usize {
-    runtime().runtime_roots.lock().unwrap().len()
+    runtime().runtime_roots.len()
 }
 
 fn runtime_roots_snapshot() -> Vec<*mut u8> {
-    let mut roots: Vec<_> = runtime()
-        .runtime_roots
-        .lock()
-        .unwrap()
-        .keys()
-        .map(|&root| root as *mut u8)
-        .filter(|root| !root.is_null())
-        .collect();
+    let mut roots = runtime().runtime_roots.snapshot();
     let parked = runtime().parked_stack_roots.lock().unwrap();
     for slots in parked.values() {
         for &slot in slots {
@@ -3446,7 +3479,7 @@ fn reset_internal() {
     state.old_region_reuses = 0;
     state.old_regions_released = 0;
     state.major_collections = 0;
-    runtime().runtime_roots.lock().unwrap().clear();
+    runtime().runtime_roots.clear();
     runtime().parked_stack_roots.lock().unwrap().clear();
     *runtime().root_stack_owner.lock().unwrap() = None;
     {
@@ -3632,7 +3665,7 @@ mod tests {
         let heap = runtime.heap.lock().unwrap();
         assert!(heap.heap_head.is_null());
         assert_eq!(heap.allocated_bytes, 0);
-        assert!(runtime.runtime_roots.lock().unwrap().is_empty());
+        assert_eq!(runtime.runtime_roots.len(), 0);
         assert!(runtime.trace_registry.lock().unwrap().is_empty());
         assert!(runtime.drop_registry.lock().unwrap().is_empty());
     }
@@ -5041,34 +5074,61 @@ mod tests {
     }
 
     #[test]
+    fn runtime_root_set_distinct_snapshots_and_balanced_owners() {
+        for distinct in [16, 64, 256] {
+            let roots = RuntimeRootSet::default();
+            let mut objects = vec![0u8; distinct];
+            let pointers: Vec<_> = objects.iter_mut().map(|object| object as *mut u8).collect();
+            roots.add(std::ptr::null_mut());
+            roots.remove(std::ptr::null_mut());
+            assert_eq!(roots.len(), 0);
+            for &pointer in &pointers {
+                for _ in 0..4 {
+                    roots.add(pointer);
+                }
+            }
+            assert_eq!(roots.len(), distinct);
+            let mut snapshot = roots.snapshot();
+            snapshot.sort_unstable();
+            assert_eq!(snapshot, pointers);
+            for remaining_owners in (0..4).rev() {
+                for &pointer in &pointers {
+                    roots.remove(pointer);
+                }
+                assert_eq!(
+                    roots.len(),
+                    if remaining_owners == 0 { 0 } else { distinct }
+                );
+            }
+            assert!(roots.snapshot().is_empty());
+            // Removing an absent root must remain a no-op.
+            roots.remove(pointers[0]);
+            roots.add(pointers[0]);
+            roots.clear();
+            assert_eq!(roots.len(), 0);
+            assert!(roots.snapshot().is_empty());
+        }
+    }
+
+    #[test]
     fn test_gc_runtime_root_ignores_null_and_ref_counts_retentions() {
         let _guard = gc_test_guard();
         reset_gc();
         let ptr = willow_alloc_object(2, 32);
-        let root = ptr as usize;
 
         willow_gc_add_runtime_root(std::ptr::null_mut());
         willow_gc_add_runtime_root(ptr);
         willow_gc_add_runtime_root(ptr);
-        assert_eq!(runtime().runtime_roots.lock().unwrap().len(), 1);
-        assert_eq!(
-            runtime().runtime_roots.lock().unwrap().get(&root).copied(),
-            Some(2)
-        );
+        assert_eq!(runtime().runtime_roots.len(), 1);
+        assert_eq!(runtime().runtime_roots.snapshot(), vec![ptr]);
 
         willow_gc_remove_runtime_root(std::ptr::null_mut());
-        assert_eq!(runtime().runtime_roots.lock().unwrap().len(), 1);
-        assert_eq!(
-            runtime().runtime_roots.lock().unwrap().get(&root).copied(),
-            Some(2)
-        );
+        assert_eq!(runtime().runtime_roots.len(), 1);
+        assert_eq!(runtime().runtime_roots.snapshot(), vec![ptr]);
 
         willow_gc_remove_runtime_root(ptr);
-        assert_eq!(runtime().runtime_roots.lock().unwrap().len(), 1);
-        assert_eq!(
-            runtime().runtime_roots.lock().unwrap().get(&root).copied(),
-            Some(1)
-        );
+        assert_eq!(runtime().runtime_roots.len(), 1);
+        assert_eq!(runtime().runtime_roots.snapshot(), vec![ptr]);
         willow_gc_collect();
         assert_eq!(
             willow_gc_allocated_bytes(),
@@ -5077,7 +5137,7 @@ mod tests {
         );
 
         willow_gc_remove_runtime_root(ptr);
-        assert_eq!(runtime().runtime_roots.lock().unwrap().len(), 0);
+        assert_eq!(runtime().runtime_roots.len(), 0);
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
         reset_gc();

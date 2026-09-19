@@ -230,9 +230,22 @@ impl RunQueues {
     }
 
     fn push_global(&self, id: RuntimeTaskId) {
+        self.push_global_batch(std::slice::from_ref(&id));
+    }
+
+    /// Publish already-granted queue tokens in slice order under one lock.
+    /// Callers must own each token, granted by the task-state machine (e.g.
+    /// `wake` or `claim_queue_slot`) or retained when returning an unclaimed id.
+    /// This storage layer neither validates task lifecycle nor deduplicates ids.
+    fn push_global_batch(&self, ids: &[RuntimeTaskId]) {
+        if ids.is_empty() {
+            return;
+        }
         let mut queue = Self::lock(&self.global);
-        queue.push_back(id);
-        self.metrics.global_pushes.fetch_add(1, Ordering::Relaxed);
+        queue.extend(ids.iter().copied());
+        self.metrics
+            .global_pushes
+            .fetch_add(ids.len() as u64, Ordering::Relaxed);
     }
 
     fn push_local(&self, worker: usize, id: RuntimeTaskId) {
@@ -598,8 +611,24 @@ fn wake_task_outcome_in(
     run_queues: &RunQueues,
     id: RuntimeTaskId,
 ) -> WakeOutcome {
+    wake_task_matching_in(tasks, run_queues, id, None).unwrap_or(WakeOutcome::Terminal)
+}
+
+/// Match timer identity and publish its wake under the same task shard lock.
+/// A popped timer must not wake a newly re-armed sleep or a finished task.
+fn wake_task_matching_in(
+    tasks: &ShardedTaskTable,
+    run_queues: &RunQueues,
+    id: RuntimeTaskId,
+    deadline: Option<Instant>,
+) -> Option<WakeOutcome> {
     tasks
         .with_mut(id, |task| {
+            if let Some(deadline) = deadline
+                && !timer_matches_task(task, deadline)
+            {
+                return None;
+            }
             let before = task.state.lifecycle();
             let outcome = task.state.wake();
             if !matches!(outcome, WakeOutcome::Terminal) {
@@ -609,9 +638,9 @@ fn wake_task_outcome_in(
                 run_queues.push_global(id);
             }
             tasks.reconcile_blocked_transition(before, task.state.lifecycle());
-            outcome
+            Some(outcome)
         })
-        .unwrap_or(WakeOutcome::Terminal)
+        .flatten()
 }
 
 /// Boolean compatibility wrapper for call sites that only care whether this
@@ -633,13 +662,15 @@ fn wake_task_in(tasks: &ShardedTaskTable, run_queues: &RunQueues, id: RuntimeTas
 /// stale — the same answer it gets once the record is gone (willow-0a6k.7).
 fn timer_entry_is_current(tasks: &ShardedTaskTable, wake: TimerWake) -> bool {
     tasks
-        .with(wake.task_id, |task| {
-            matches!(
-                task.state.lifecycle(),
-                TaskLifecycle::Parked | TaskLifecycle::BlockedSyscall | TaskLifecycle::Running
-            ) && task.wake_deadline == Some(wake.deadline)
-        })
+        .with(wake.task_id, |task| timer_matches_task(task, wake.deadline))
         .unwrap_or(false)
+}
+
+fn timer_matches_task(task: &RuntimeTask, deadline: Instant) -> bool {
+    matches!(
+        task.state.lifecycle(),
+        TaskLifecycle::Parked | TaskLifecycle::BlockedSyscall | TaskLifecycle::Running
+    ) && task.wake_deadline == Some(deadline)
 }
 
 /// Record `millis` as the running task's wake-deadline and register the timer.
@@ -1258,19 +1289,16 @@ impl RuntimeScheduler {
 
     /// Move every due timer directly from the timer heap to the ready queue.
     ///
-    /// This transition must happen under ONE lock — now the timer heap's own
-    /// lock rather than the scheduler metadata mutex (willow-9ha4). If a worker
-    /// removed the last timer and released the lock before waking its task,
-    /// another worker could observe neither a timer nor runnable work and
-    /// incorrectly return from `run_until` while the target was still parked.
+    /// TimerQueue keeps popped batches visible to idle detection until every
+    /// wake finishes, allowing callbacks to run outside the timer heap lock.
     fn wake_due_timers(&self, now: Instant) -> usize {
         let tasks = &*self.tasks;
         let run_queues = &*self.run_queues;
         self.timers.wake_due(
             now,
             |wake| timer_entry_is_current(tasks, wake),
-            |id| {
-                wake_task_in(tasks, run_queues, id);
+            |entry| {
+                wake_task_matching_in(tasks, run_queues, entry.task_id, Some(entry.deadline));
             },
         )
     }
@@ -1607,8 +1635,8 @@ fn wake_global_due_timers(now: Instant) -> usize {
     let woken = timers.wake_due(
         now,
         |wake| timer_entry_is_current(&tasks, wake),
-        |id| {
-            wake_task_in(&tasks, &run_queues, id);
+        |entry| {
+            wake_task_matching_in(&tasks, &run_queues, entry.task_id, Some(entry.deadline));
         },
     );
     if woken > 0 {
@@ -5286,7 +5314,9 @@ mod tests {
         reset_global_scheduler_for_test();
 
         // Frame with one GC-reference data slot (mask bit 0).
-        let frame = willow_async_frame_alloc(1, 0b1) as *mut u8;
+        let mut frame = willow_async_frame_alloc(1, 0b1) as *mut u8;
+        // Protect setup until spawn transfers ownership to the scheduler root.
+        crate::gc::willow_push_root(&mut frame as *mut *mut u8);
         // A heap object reachable ONLY through the frame's GC slot.
         let obj = willow_alloc_typed(16, 0);
         let slot0 = unsafe { frame.add(async_frame_slot_offset(0)).cast::<*mut u8>() };
@@ -5300,6 +5330,7 @@ mod tests {
         // Spawning roots the frame; the first poll parks the task (Pending). The
         // poll counter uses the state word, leaving the data slot untouched.
         let id = willow_sched_spawn(poll_ready_on_second, frame as *mut c_void);
+        crate::gc::willow_pop_root();
         assert_eq!(willow_sched_run(), 0);
         assert_eq!(willow_sched_task_state(id), 2); // Parked
 
@@ -5886,6 +5917,43 @@ mod tests {
     }
 
     #[test]
+    fn t9ha4_timer_wake_rechecks_identity_under_task_lock() {
+        let mut scheduler = RuntimeScheduler::with_worker_count(1);
+        let id = scheduler.spawn_placeholder();
+        let old = park_with_sleep(&mut scheduler, id, 0);
+        assert!(timer_entry_is_current(
+            &scheduler.tasks,
+            TimerWake {
+                task_id: id,
+                deadline: old
+            }
+        ));
+        assert!(scheduler.wake(id));
+        let new = park_with_sleep(&mut scheduler, id, 60_000);
+        // Model a re-arm after the heap's liveness check, before its callback.
+        assert_eq!(
+            wake_task_matching_in(&scheduler.tasks, &scheduler.run_queues, id, Some(old)),
+            None
+        );
+        assert_eq!(
+            scheduler.with_task(id, |task| task.wake_deadline),
+            Some(Some(new))
+        );
+        assert_eq!(
+            scheduler.with_task(id, |task| task.state.lifecycle()),
+            Some(TaskLifecycle::Parked)
+        );
+        assert_eq!(
+            wake_task_matching_in(&scheduler.tasks, &scheduler.run_queues, id, Some(new)),
+            Some(WakeOutcome::Enqueue)
+        );
+        assert_eq!(
+            wake_task_matching_in(&scheduler.tasks, &scheduler.run_queues, id, Some(new)),
+            None
+        );
+    }
+
+    #[test]
     fn t9ha4_07_re_armed_sleep_supersedes_the_earlier_entry() {
         let mut s = RuntimeScheduler::with_worker_count(1);
         let id = s.spawn_placeholder();
@@ -6202,10 +6270,8 @@ mod tests {
 
     #[test]
     fn t9ha4_19_promotion_never_exposes_a_window_with_neither_timer_nor_ready_entry() {
-        // The invariant that forces the wake to happen UNDER the heap lock: if
-        // the entry were popped and the lock released before the task was made
-        // Ready, another worker could see no timer and no runnable work and
-        // wrongly conclude that the scheduler is idle.
+        // Popped batches must remain visible to idle detection until the task
+        // is Ready, even though wake callbacks run outside the heap lock.
         let _guard = runtime_test_guard();
         reset_global_scheduler_for_test();
         let id = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);

@@ -306,17 +306,11 @@ fn is_fresh_empty_map(e: &HirExpr) -> bool {
 
 /// Whether `ty` can be a map key the walker emits.
 ///
-/// The runtime's key is `Int(i64) | Str(String)` and it picks between them from
-/// the is-ref flag the backend passes. `String` is the only REFERENCE key it can
-/// read — anything else GC-managed would be handed to it as a `WillowString`
-/// pointer and read as one. Every scalar is fine: `coerce_to_i64` widens a
-/// `bool` and bitcasts an `f64`, so each arrives as the one word `Int` holds
-/// verbatim, and `map_to_string` is told the key's kind so it renders back into
-/// the right one.
-///
-/// `f64` keys therefore match bit-for-bit: `0.0` and `-0.0` are distinct keys,
-/// and a `NaN` key matches only a `NaN` with the same payload. That is the
-/// runtime representation, not an additional eligibility restriction.
+/// Scalar keys arrive as words: `coerce_to_i64` widens bool and bitcasts f64.
+/// The runtime uses the map's declared key kind to interpret each word. String
+/// keys are copied and compared by content; other GC-managed types are rejected.
+/// For f64, runtime validation rejects NaN and canonicalizes -0.0 to +0.0;
+/// other finite and infinite values retain their IEEE 754 bits.
 fn map_key_supported(ty: &Type) -> bool {
     matches!(ty, Type::String) || scalar(ty)
 }
@@ -1510,6 +1504,7 @@ fn lir_call_frame_entries(f: &LirFunction) -> Option<Vec<Vec<(String, Span)>>> {
     while let Some(index) = work.pop() {
         let mut stack = entries.get(index)?.clone()?;
         let mut edges = Vec::new();
+        let mut diverged = false;
         for instruction in &f.blocks[index].instrs {
             match instruction {
                 LirInst::Compute {
@@ -1529,6 +1524,16 @@ fn lir_call_frame_entries(f: &LirFunction) -> Option<Vec<Vec<(String, Span)>>> {
                         return None;
                     }
                 }
+                // Panic unwinds preparations at runtime and recovery restores
+                // the state captured on scope entry. The syntactic terminator
+                // is unreachable; forwarding its state invents a normal edge.
+                LirInst::Compute {
+                    value: LirRvalue::Panic { .. },
+                    ..
+                } => {
+                    diverged = true;
+                    break;
+                }
                 LirInst::EnterDeferScope {
                     resume: Some(resume),
                     ..
@@ -1536,11 +1541,13 @@ fn lir_call_frame_entries(f: &LirFunction) -> Option<Vec<Vec<(String, Span)>>> {
                 _ => {}
             }
         }
-        edges.extend(
-            lir_block_successors(&f.blocks[index])
-                .into_iter()
-                .map(|target| (target, stack.clone())),
-        );
+        if !diverged {
+            edges.extend(
+                lir_block_successors(&f.blocks[index])
+                    .into_iter()
+                    .map(|target| (target, stack.clone())),
+            );
+        }
         for (target, state) in edges {
             match entries.get_mut(target)? {
                 Some(existing) if *existing != state => return None,
@@ -1580,6 +1587,7 @@ fn lir_reference_scope_entries(
     while let Some(index) = work.pop() {
         let mut scopes = entries.get(index)?.clone()?;
         let mut edges = Vec::new();
+        let mut diverged = false;
         for instruction in &f.blocks[index].instrs {
             match instruction {
                 LirInst::Compute {
@@ -1612,6 +1620,16 @@ fn lir_reference_scope_entries(
                 {
                     scopes.pop()?;
                 }
+                // Panic unwinds preparations at runtime and recovery restores
+                // the state captured on scope entry. The syntactic terminator
+                // is unreachable; forwarding its state invents a normal edge.
+                LirInst::Compute {
+                    value: V::Panic { .. },
+                    ..
+                } => {
+                    diverged = true;
+                    break;
+                }
                 LirInst::EnterDeferScope {
                     resume: Some(resume),
                     ..
@@ -1619,11 +1637,13 @@ fn lir_reference_scope_entries(
                 _ => {}
             }
         }
-        edges.extend(
-            lir_block_successors(&f.blocks[index])
-                .into_iter()
-                .map(|target| (target, scopes.clone())),
-        );
+        if !diverged {
+            edges.extend(
+                lir_block_successors(&f.blocks[index])
+                    .into_iter()
+                    .map(|target| (target, scopes.clone())),
+            );
+        }
         for (target, state) in edges {
             match entries.get_mut(target)? {
                 Some(existing) if *existing != state => return None,
@@ -9357,6 +9377,49 @@ mod tests {
         let lir = crate::ir::lowered::lower_program(&hir);
         let tables = TestTables::build(&program, fns, &lir.lambdas);
         (lir, tables)
+    }
+
+    #[test]
+    fn divergent_preparations_scale_with_nesting() {
+        use crate::ir::lowered::LirRvalue as V;
+        for depth in [8, 32, 128] {
+            let expression = format!(
+                "{}panic(\"stop\"){}",
+                "c.take(&x, ".repeat(depth),
+                ")".repeat(depth),
+            );
+            let source = format!(
+                r#"class C {{ pub fn take(self, x: &i64, y: i64) -> i64 {{ return y; }} }}
+                fn main() {{ let c = new C(); let x = 42;
+                    if true {{ defer match recover() {{ Some(_) => {{}}, None => {{}} }};
+                        {expression};
+                    }}
+                    c.take(&x, 1);
+                }}"#,
+            );
+            let (program, _) = checked_lowering(&source, &["main"]);
+            let function = program
+                .functions
+                .iter()
+                .find(|f| f.name.is_free_named("main"))
+                .unwrap();
+            assert!(lir_call_frame_entries(function).is_some());
+            assert!(lir_reference_scope_entries(function).is_some());
+            let mut counts = [0; 4];
+            for instruction in function.blocks.iter().flat_map(|b| &b.instrs) {
+                if let LirInst::Compute { value, .. } = instruction {
+                    match value {
+                        V::PrepareMethod { .. } => counts[0] += 1,
+                        V::BeginReferenceCall => counts[1] += 1,
+                        V::Panic { .. } => counts[2] += 1,
+                        V::MethodCall { .. } => counts[3] += 1,
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(counts, [depth + 1, depth + 1, 1, 1]);
+            println!("divergent preparations: depth={depth}, counts={counts:?}");
+        }
     }
 
     #[test]

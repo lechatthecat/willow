@@ -348,7 +348,9 @@ mod tests {
         reset();
 
         // Allocate the "local variable" the frame will keep alive.
-        let local_obj = willow_alloc_object(1, 16);
+        let mut local_obj = willow_alloc_object(1, 16);
+        // Keep the setup object alive across frame allocation, including stress GC.
+        willow_push_root(&mut local_obj as *mut *mut u8);
         assert!(!local_obj.is_null());
 
         // Allocate frame with 1 GC-pointer slot (gc_slot_mask bit 0 = slot 0).
@@ -362,6 +364,8 @@ mod tests {
                 .cast::<*mut u8>()
         };
         unsafe { slot0_ptr.write(local_obj) };
+        // From here on, only the frame may keep the object alive.
+        willow_pop_root();
 
         // Root only the frame.
         let mut frame_root: *mut u8 = frame_raw;
@@ -393,7 +397,9 @@ mod tests {
         let _guard = runtime_test_guard();
         reset();
 
-        let obj = willow_alloc_object(1, 8);
+        let mut obj = willow_alloc_object(1, 8);
+        // Keep the setup object alive across frame allocation, including stress GC.
+        willow_push_root(&mut obj as *mut *mut u8);
         let frame_raw = willow_async_frame_alloc(1, 0b1) as *mut u8;
 
         let slot0_ptr = unsafe {
@@ -402,9 +408,18 @@ mod tests {
                 .cast::<*mut u8>()
         };
         unsafe { slot0_ptr.write(obj) };
+        // From here on, only the frame may keep the object alive.
+        willow_pop_root();
 
         let mut frame_root: *mut u8 = frame_raw;
         willow_push_root(&mut frame_root as *mut *mut u8);
+
+        willow_gc_collect();
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            (header_size_for_test() + frame_payload_bytes(1) + header_size_for_test() + 8) as i64,
+            "object must survive before its frame slot is cleared"
+        );
 
         // Clear the slot → set to null.
         unsafe { slot0_ptr.write(std::ptr::null_mut()) };
@@ -452,7 +467,9 @@ mod tests {
         let _guard = runtime_test_guard();
         reset();
 
-        let obj = willow_alloc_object(1, 8);
+        let mut obj = willow_alloc_object(1, 8);
+        // Keep the setup object alive across frame allocation, including stress GC.
+        willow_push_root(&mut obj as *mut *mut u8);
         let frame_raw = willow_async_frame_alloc(1, 0b1) as *mut u8;
         let slot0 = unsafe {
             (frame_raw as *mut u8)
@@ -460,6 +477,8 @@ mod tests {
                 .cast::<*mut u8>()
         };
         unsafe { slot0.write(obj) };
+        // From here on, only the frame may keep the object alive.
+        willow_pop_root();
 
         let mut root: *mut u8 = frame_raw;
         willow_push_root(&mut root as *mut *mut u8);
@@ -484,10 +503,14 @@ mod tests {
         let _guard = runtime_test_guard();
         reset();
 
-        let s = crate::string::willow_string_from_str("hello");
+        let mut s = crate::string::willow_string_from_str("hello");
+        // Keep the setup object alive across frame allocation, including stress GC.
+        willow_push_root(&mut s as *mut *mut u8);
         let frame_raw = willow_async_frame_alloc(1, 0b1) as *mut u8;
         let slot0 = unsafe { frame_raw.add(async_frame_slot_offset(0)).cast::<*mut u8>() };
         unsafe { slot0.write(s) };
+        // From here on, only the frame may keep the object alive.
+        willow_pop_root();
 
         let baseline = willow_gc_allocated_bytes();
         let mut root: *mut u8 = frame_raw;
@@ -517,13 +540,17 @@ mod tests {
         let _guard = runtime_test_guard();
         reset();
 
-        let s = crate::string::willow_string_from_str("world");
+        let mut s = crate::string::willow_string_from_str("world");
+        // Keep the setup object alive across frame allocation, including stress GC.
+        willow_push_root(&mut s as *mut *mut u8);
         // slot 0 = scalar (mask bit 0 clear), slot 1 = ref (mask bit 1 set).
         let frame_raw = willow_async_frame_alloc(2, 0b10) as *mut u8;
         let slot0 = unsafe { frame_raw.add(async_frame_slot_offset(0)).cast::<i64>() };
         let slot1 = unsafe { frame_raw.add(async_frame_slot_offset(1)).cast::<*mut u8>() };
         unsafe { slot0.write(42) }; // a bare integer, NOT a pointer
         unsafe { slot1.write(s) };
+        // From here on, only the frame may keep the object alive.
+        willow_pop_root();
 
         let baseline = willow_gc_allocated_bytes();
         let mut root: *mut u8 = frame_raw;
@@ -561,10 +588,14 @@ mod tests {
         reset();
 
         // A reference-element array (handle + buffer are GC objects).
-        let arr = crate::array::willow_array_new(2, 1);
+        let mut arr = crate::array::willow_array_new(2, 1);
+        // Keep the setup object alive across frame allocation, including stress GC.
+        willow_push_root(&mut arr as *mut *mut u8);
         let frame_raw = willow_async_frame_alloc(1, 0b1) as *mut u8;
         let slot0 = unsafe { frame_raw.add(async_frame_slot_offset(0)).cast::<*mut u8>() };
         unsafe { slot0.write(arr) };
+        // From here on, only the frame may keep the object alive.
+        willow_pop_root();
 
         let baseline = willow_gc_allocated_bytes();
         let mut root: *mut u8 = frame_raw;

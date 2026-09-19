@@ -139,21 +139,34 @@ struct Record {
 struct FlatSyntax {
     nodes: Vec<Record>,
 }
+// The established wire order groups expression edges before statement edges,
+// even when fields interleave them (select cases and match arms).
+fn child_counts(node: NodeMut<'_>) -> (usize, usize) {
+    let (mut expressions, mut statements) = (0, 0);
+    node.for_each_child(|child| match child {
+        NodeMut::Expr(_) => expressions += 1,
+        NodeMut::Stmt(_) => statements += 1,
+    });
+    (expressions, statements)
+}
+
 impl FlatSyntax {
     fn new(root: NodeOwned) -> Self {
         let mut pending = std::collections::VecDeque::from([root]);
         let mut nodes = Vec::new();
         while let Some(mut node) = pending.pop_front() {
-            let children = node
-                .as_mut()
-                .children()
-                .into_iter()
-                .map(|child| {
-                    let id = nodes.len() + pending.len() + 1;
-                    pending.push_back(child.take());
-                    id
-                })
-                .collect();
+            let (expressions, statements) = child_counts(node.as_mut());
+            let mut children = vec![0; expressions + statements];
+            let (mut expr_index, mut stmt_index) = (0, expressions);
+            node.as_mut().for_each_child(|child| {
+                let index = match &child {
+                    NodeMut::Expr(_) => &mut expr_index,
+                    NodeMut::Stmt(_) => &mut stmt_index,
+                };
+                children[*index] = nodes.len() + pending.len() + 1;
+                *index += 1;
+                pending.push_back(child.take());
+            });
             nodes.push(Record {
                 shell: node.into(),
                 children,
@@ -173,21 +186,36 @@ impl FlatSyntax {
             },
         ) in self.nodes.into_iter().enumerate().rev()
         {
-            let slots = shell.as_mut().children();
-            if slots.len() != children.len() {
+            let (expressions, statements) = child_counts(shell.as_mut());
+            if expressions + statements != children.len() {
                 return Err("syntax child count mismatch".into());
             }
-            for (slot, child) in slots.into_iter().zip(children) {
-                if child <= index || child >= count {
-                    return Err("invalid syntax child index".into());
+            let (mut expr_index, mut stmt_index) = (0, expressions);
+            let mut result = Ok(());
+            shell.as_mut().for_each_child(|slot| {
+                if result.is_err() {
+                    return;
                 }
-                let child = completed[child].take().ok_or("reused syntax child index")?;
-                match (slot, child) {
-                    (NodeMut::Expr(slot), Shell::Expr(expr)) => *slot = expr,
-                    (NodeMut::Stmt(slot), Shell::Stmt(stmt)) => *slot = *stmt,
-                    _ => return Err("syntax child kind mismatch".into()),
-                }
-            }
+                result = (|| {
+                    let slot_index = match &slot {
+                        NodeMut::Expr(_) => &mut expr_index,
+                        NodeMut::Stmt(_) => &mut stmt_index,
+                    };
+                    let child = children[*slot_index];
+                    *slot_index += 1;
+                    if child <= index || child >= count {
+                        return Err("invalid syntax child index");
+                    }
+                    let child = completed[child].take().ok_or("reused syntax child index")?;
+                    match (slot, child) {
+                        (NodeMut::Expr(slot), Shell::Expr(expr)) => *slot = expr,
+                        (NodeMut::Stmt(slot), Shell::Stmt(stmt)) => *slot = *stmt,
+                        _ => return Err("syntax child kind mismatch"),
+                    }
+                    Ok(())
+                })();
+            });
+            result?;
             completed[index] = Some(shell);
         }
         if completed.iter().skip(1).any(Option::is_some) {
@@ -270,13 +298,109 @@ mod tests {
                 let mut work = vec![super::super::ownership::NodeRef::Stmt(&restored)];
                 while let Some(node) = work.pop() {
                     count += 1;
-                    work.extend(node.children());
+                    node.for_each_child(|child| work.push(child));
                 }
                 assert_eq!(count, 16_002);
             })
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn flat_wire_preserves_legacy_mixed_child_order() {
+        let span = Span::dummy();
+        let leaf = |value| Expr::Integer(value, span, ExprId::fresh());
+        let block = || Block {
+            stmts: vec![Stmt::Break(span)],
+            span,
+        };
+        let roots = [
+            Expr::Match(Box::new(MatchExpr {
+                id: ExprId::fresh(),
+                scrutinee: Box::new(leaf(0)),
+                arms: vec![
+                    MatchArm {
+                        pattern: Pattern::Wildcard(span, PatternId::fresh()),
+                        body: MatchBody::Block(block()),
+                        span,
+                    },
+                    MatchArm {
+                        pattern: Pattern::Wildcard(span, PatternId::fresh()),
+                        body: MatchBody::Expr(Box::new(leaf(0))),
+                        span,
+                    },
+                ],
+                span,
+            })),
+            Expr::Select(SelectExpr {
+                id: ExprId::fresh(),
+                cases: vec![
+                    SelectCase {
+                        kind: SelectCaseKind::Timeout { millis: leaf(0) },
+                        body: block(),
+                        span,
+                    },
+                    SelectCase {
+                        kind: SelectCaseKind::Join {
+                            binding: "t".into(),
+                            task: leaf(0),
+                        },
+                        body: Block {
+                            stmts: vec![],
+                            span,
+                        },
+                        span,
+                    },
+                ],
+                span,
+            }),
+        ];
+        for root in roots {
+            // Old writers emit both expression records before the statement
+            // record even though the statement appears between them in fields.
+            let legacy = FlatSyntax {
+                nodes: vec![
+                    Record {
+                        shell: Shell::Expr(root),
+                        children: vec![1, 2, 3],
+                    },
+                    Record {
+                        shell: Shell::Expr(leaf(11)),
+                        children: vec![],
+                    },
+                    Record {
+                        shell: Shell::Expr(leaf(22)),
+                        children: vec![],
+                    },
+                    Record {
+                        shell: Shell::Stmt(Box::new(Stmt::Continue(span))),
+                        children: vec![],
+                    },
+                ],
+            };
+            let wire = serde_json::to_vec(&legacy).unwrap();
+            let restored: Expr = serde_json::from_slice(&wire).unwrap();
+            let mut fields = Vec::new();
+            super::super::ownership::NodeRef::Expr(&restored).for_each_child(|child| {
+                fields.push(match child {
+                    super::super::ownership::NodeRef::Expr(Expr::Integer(value, ..)) => *value,
+                    super::super::ownership::NodeRef::Stmt(Stmt::Continue(_)) => -1,
+                    _ => panic!("wrong restored child"),
+                });
+            });
+            assert_eq!(fields, [11, -1, 22]);
+            let new_wire = serde_json::to_vec(&restored).unwrap();
+            let roundtrip: Expr = serde_json::from_slice(&new_wire).unwrap();
+            assert_eq!(serde_json::to_vec(&roundtrip).unwrap(), new_wire);
+            // New record indices may differ, but old readers still see the
+            // expression/expression/statement grouping in each edge list.
+            let flat: FlatSyntax = serde_json::from_slice(&new_wire).unwrap();
+            let edges = &flat.nodes[0].children;
+            assert!(matches!(flat.nodes[edges[0]].shell, Shell::Expr(_)));
+            assert!(matches!(flat.nodes[edges[1]].shell, Shell::Expr(_)));
+            assert!(matches!(flat.nodes[edges[2]].shell, Shell::Stmt(_)));
+        }
     }
 
     #[test]

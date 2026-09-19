@@ -11,6 +11,8 @@ mod check_ops;
 mod class_cycle_tests;
 mod constructor_flow;
 mod diagnostics;
+#[cfg(test)]
+mod never_tests;
 mod resolve;
 mod returns;
 mod send_sync;
@@ -1356,7 +1358,9 @@ impl TypeChecker {
     }
 
     fn types_compatible(&self, expected: &Type, actual: &Type) -> bool {
-        expected == actual
+        // A diverging expression produces no value and can flow into any
+        // expected type. This is directional: concrete values cannot become Never.
+        *actual == Type::Never || expected == actual
             // A Void-placeholder generic (e.g. Option<Void> from None) matches any
             // concrete instantiation of the same generic enum.
             || matches!((expected, actual),

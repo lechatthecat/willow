@@ -20,8 +20,9 @@
 //! removed the last timer, released the lock, and only then woke the task,
 //! another worker could observe neither a pending timer nor runnable work and
 //! wrongly return from `run_until` while the target task was still parked.
-//! [`TimerQueue::wake_due`] therefore holds the heap lock across the `wake`
-//! callback; that is deliberate and not an oversight.
+//! [`TimerQueue::wake_due`] publishes an in-flight batch under the heap lock,
+//! then releases it before callbacks. Until every batch finishes,
+//! [`TimerQueue::next_deadline`] reports a conservative already-due deadline.
 //!
 //! # Lock order
 //!
@@ -29,8 +30,9 @@
 //! TimerQueue::heap  ->  task shard
 //! ```
 //!
-//! The `live` and `wake` callbacks run under the heap lock and take task
-//! shards, so nothing may take the heap lock while holding a task shard.
+//! The `live` callback runs under the heap lock and takes task shards, so
+//! nothing may take the heap lock while holding a task shard. Wake callbacks
+//! run outside the heap lock.
 //! [`TimerQueue::push`] is the one call that runs on the task side; it must be
 //! made after the shard guard is released.
 //!
@@ -82,10 +84,50 @@ pub(crate) struct TimerWake {
 /// A min-heap of wake-deadlines plus a lock-free "earliest deadline" hint.
 #[derive(Debug)]
 pub(crate) struct TimerQueue {
-    heap: Mutex<BinaryHeap<Reverse<TimerWake>>>,
+    heap: Mutex<TimerState>,
     /// Nanoseconds-since-epoch of the earliest entry, or [`NO_DEADLINE`].
     /// Written only while `heap` is held; read without any lock.
     earliest_nanos: AtomicU64,
+}
+
+/// Scan only after enough new registrations to pay for a linear rebuild.
+#[derive(Debug)]
+struct TimerState {
+    entries: BinaryHeap<Reverse<TimerWake>>,
+    pushes_since_scan: usize,
+    promotions_in_flight: usize,
+    promotion_hint: Option<TimerWake>,
+}
+
+impl TimerState {
+    fn compact(&mut self, live: &impl Fn(TimerWake) -> bool) {
+        // Base the budget on the current heap, so a formerly large queue
+        // does not retain a large scan interval after most timers drain.
+        if self.pushes_since_scan < 64 || self.pushes_since_scan < self.entries.len().div_ceil(2) {
+            return;
+        }
+        self.entries.retain(|entry| live(entry.0));
+        self.pushes_since_scan = 0;
+    }
+}
+
+/// Keep idle detection armed through callbacks, including nested promotions.
+/// On unwind, return unprocessed entries rather than silently losing timers.
+struct Promotion<'a> {
+    queue: &'a TimerQueue,
+    remaining: std::vec::IntoIter<TimerWake>,
+}
+
+impl Drop for Promotion<'_> {
+    fn drop(&mut self) {
+        let mut state = self.queue.lock();
+        state.entries.extend(self.remaining.by_ref().map(Reverse));
+        state.promotions_in_flight -= 1;
+        if state.promotions_in_flight == 0 {
+            state.promotion_hint = None;
+        }
+        self.queue.publish_hint(&state.entries);
+    }
 }
 
 impl Default for TimerQueue {
@@ -97,12 +139,17 @@ impl Default for TimerQueue {
 impl TimerQueue {
     pub(crate) fn new() -> Self {
         Self {
-            heap: Mutex::new(BinaryHeap::new()),
+            heap: Mutex::new(TimerState {
+                entries: BinaryHeap::new(),
+                pushes_since_scan: 0,
+                promotions_in_flight: 0,
+                promotion_hint: None,
+            }),
             earliest_nanos: AtomicU64::new(NO_DEADLINE),
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, BinaryHeap<Reverse<TimerWake>>> {
+    fn lock(&self) -> MutexGuard<'_, TimerState> {
         self.heap
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -126,8 +173,9 @@ impl TimerQueue {
     /// re-arming a sleep stays O(log n) instead of O(n).
     pub(crate) fn push(&self, task_id: RuntimeTaskId, deadline: Instant) {
         let mut heap = self.lock();
-        heap.push(Reverse(TimerWake { deadline, task_id }));
-        self.publish_hint(&heap);
+        heap.entries.push(Reverse(TimerWake { deadline, task_id }));
+        heap.pushes_since_scan = heap.pushes_since_scan.saturating_add(1);
+        self.publish_hint(&heap.entries);
     }
 
     /// Lock-free hint: is it worth taking the lock to look for a due timer at
@@ -138,7 +186,8 @@ impl TimerQueue {
     }
 
     /// Drop leading entries that no longer describe a live wake, then report
-    /// the earliest remaining one.
+    /// the earliest remaining one, or a conservative due deadline while a
+    /// popped batch is still waking. The task id is not a wake instruction.
     ///
     /// `live` answers "does this task still expect this exact deadline?" — a
     /// task that was woken, re-armed, or finished leaves stale entries behind.
@@ -147,32 +196,56 @@ impl TimerQueue {
         live: impl Fn(TimerWake) -> bool,
     ) -> Option<(RuntimeTaskId, Instant)> {
         let mut heap = self.lock();
-        let next = Self::prune_locked(&mut heap, &live).map(|wake| (wake.task_id, wake.deadline));
-        self.publish_hint(&heap);
-        next
+        heap.compact(&live);
+        let next = Self::prune_locked(&mut heap.entries, &live);
+        self.publish_hint(&heap.entries);
+        // The representative may already be woken; it is a keep-alive hint,
+        // not a task to wake again. All callers use only presence/deadline.
+        next.into_iter()
+            .chain(heap.promotion_hint)
+            .min()
+            .map(|wake| (wake.task_id, wake.deadline))
     }
 
-    /// Pop every timer due at `now` and wake its task, all under one heap lock
-    /// (see the atomicity invariant in the module docs). Returns how many
-    /// timers were promoted.
+    /// Pop a due batch under the heap lock, then wake outside it. In-flight
+    /// batches remain visible to idle detection. Returns timers promoted.
     pub(crate) fn wake_due(
         &self,
         now: Instant,
         live: impl Fn(TimerWake) -> bool,
-        mut wake: impl FnMut(RuntimeTaskId),
+        mut wake: impl FnMut(TimerWake),
     ) -> usize {
         let mut heap = self.lock();
-        let mut woken = 0;
-        while let Some(wake_entry) = Self::prune_locked(&mut heap, &live) {
-            if wake_entry.deadline > now {
+        heap.compact(&live);
+        let mut due = Vec::new();
+        while let Some(entry) = Self::prune_locked(&mut heap.entries, &live) {
+            if entry.deadline > now {
                 break;
             }
-            heap.pop();
-            wake(wake_entry.task_id);
-            woken += 1;
+            heap.entries.pop();
+            due.push(entry);
         }
-        self.publish_hint(&heap);
-        woken
+        self.publish_hint(&heap.entries);
+        let Some(first) = due.first().copied() else {
+            return 0;
+        };
+        heap.promotions_in_flight += 1;
+        heap.promotion_hint = Some(heap.promotion_hint.map_or(first, |old| old.min(first)));
+        drop(heap);
+        let mut count = 0;
+        let mut promotion = Promotion {
+            queue: self,
+            remaining: due.into_iter(),
+        };
+        for entry in promotion.remaining.by_ref() {
+            // Earlier callbacks (or another worker) may finish/re-arm a task.
+            // In particular, duplicate registrations must not wake it twice.
+            if live(entry) {
+                wake(entry);
+                count += 1;
+            }
+        }
+        count
     }
 
     /// Discard leading stale entries and return the first live one, leaving it
@@ -192,14 +265,15 @@ impl TimerQueue {
 
     /// Entries currently held, including not-yet-pruned stale ones.
     pub(crate) fn len(&self) -> usize {
-        self.lock().len()
+        self.lock().entries.len()
     }
 
     /// Drop every entry (test reset).
     pub(crate) fn clear(&self) {
         let mut heap = self.lock();
-        heap.clear();
-        self.publish_hint(&heap);
+        heap.entries.clear();
+        heap.pushes_since_scan = 0;
+        self.publish_hint(&heap.entries);
     }
 
     /// The raw hint value, for tests that assert the fast path is armed.
@@ -240,7 +314,7 @@ mod tests {
 
     fn collect_woken(queue: &TimerQueue, now: Instant) -> Vec<RuntimeTaskId> {
         let mut order = Vec::new();
-        queue.wake_due(now, all_live, |id| order.push(id));
+        queue.wake_due(now, all_live, |entry| order.push(entry.task_id));
         order
     }
 
@@ -368,7 +442,7 @@ mod tests {
         queue.wake_due(
             well_past(base),
             |wake| wake.task_id != 1,
-            |id| order.push(id),
+            |entry| order.push(entry.task_id),
         );
         assert_eq!(order, vec![2]);
     }
@@ -426,19 +500,21 @@ mod tests {
         assert!(!queue.maybe_due(observed));
     }
 
-    // tq_15: the wake callback runs while the heap lock is held, which is what
-    // makes "pop + wake" atomic against an idleness observer.
+    // tq_15: callbacks release the lock but remain visible to idle detection.
     #[test]
-    fn tq_15_wake_callback_runs_under_the_heap_lock() {
+    fn tq_15_wake_callback_releases_lock_and_keeps_idle_detection_armed() {
         let queue = TimerQueue::new();
         let base = Instant::now();
         queue.push(1, base);
         queue.wake_due(well_past(base), all_live, |_| {
             assert!(
-                queue.heap.try_lock().is_err(),
-                "the heap must still be locked while a timer is being woken"
+                queue.heap.try_lock().is_ok(),
+                "wake callbacks must not hold the heap lock"
             );
+            assert_eq!(queue.next_deadline(|_| false), Some((1, base)));
+            assert_eq!(queue.len(), 0);
         });
+        assert_eq!(queue.next_deadline(all_live), None);
     }
 
     // tq_16: `clear` empties the heap and the hint together (test reset path).
@@ -602,5 +678,148 @@ mod tests {
             Vec::<RuntimeTaskId>::new()
         );
         assert_eq!(queue.len(), 1);
+    }
+    #[test]
+    fn compaction_bounds_buried_stale_timers_and_linear_scan_work() {
+        use std::cell::Cell;
+        for registrations in [256, 1024, 4096] {
+            let queue = TimerQueue::new();
+            let now = Instant::now();
+            queue.push(0, now);
+            let inspections = Cell::new(0usize);
+            let live = |entry: TimerWake| {
+                inspections.set(inspections.get() + 1);
+                entry.task_id == 0
+            };
+            for id in 1..=registrations {
+                queue.push(id, now + Duration::from_secs(id));
+                assert_eq!(queue.next_deadline(live), Some((0, now)));
+                assert!(queue.len() <= 64, "stale entries buried behind a live head");
+            }
+            assert!(inspections.get() <= 3 * registrations as usize);
+            eprintln!(
+                "stale registrations={registrations} inspections={} retained={}",
+                inspections.get(),
+                queue.len()
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_live_fanout_does_not_rescan_on_idle_queries() {
+        use std::cell::Cell;
+        for registrations in [256, 1024, 4096] {
+            let queue = TimerQueue::new();
+            let now = Instant::now();
+            let inspections = Cell::new(0usize);
+            let live = |_: TimerWake| {
+                inspections.set(inspections.get() + 1);
+                true
+            };
+            for id in 1..=registrations {
+                queue.push(id, now + Duration::from_secs(id));
+                queue.next_deadline(live);
+            }
+            assert!(inspections.get() <= 3 * registrations as usize);
+            let before = inspections.get();
+            for _ in 0..registrations {
+                queue.next_deadline(live);
+            }
+            assert_eq!(inspections.get() - before, registrations as usize);
+            assert_eq!(queue.len(), registrations as usize);
+            eprintln!(
+                "live registrations={registrations} build_inspections={before} idle_inspections={}",
+                inspections.get() - before
+            );
+        }
+    }
+
+    #[test]
+    fn nested_promotions_and_pushes_preserve_pending_work() {
+        let queue = TimerQueue::new();
+        let now = Instant::now();
+        queue.push(1, now);
+        queue.wake_due(now, all_live, |id| {
+            assert_eq!(id.task_id, 1);
+            queue.push(2, now);
+            assert_eq!(
+                queue.wake_due(now, all_live, |id| {
+                    assert_eq!(id.task_id, 2);
+                    assert!(queue.next_deadline(all_live).is_some());
+                }),
+                1
+            );
+            assert!(queue.next_deadline(all_live).is_some());
+        });
+        assert_eq!(queue.next_deadline(all_live), None);
+    }
+
+    #[test]
+    fn unwinding_callback_restores_unprocessed_timers() {
+        let queue = TimerQueue::new();
+        let now = Instant::now();
+        for id in 1..=3 {
+            queue.push(id, now);
+        }
+        let result = std::panic::catch_unwind(|| {
+            queue.wake_due(now, all_live, |_| panic!("wake failed"));
+        });
+        assert!(result.is_err());
+        assert_eq!(queue.lock().promotions_in_flight, 0);
+        assert_eq!(collect_woken(&queue, now), vec![2, 3]);
+        assert_eq!(queue.next_deadline(all_live), None);
+    }
+
+    #[test]
+    fn concurrent_batches_keep_idle_detection_armed_until_both_finish() {
+        let queue = TimerQueue::new();
+        let now = Instant::now();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        queue.push(1, now);
+        std::thread::scope(|scope| {
+            let queue = &queue;
+            scope.spawn(move || {
+                queue.wake_due(now, all_live, |_| {
+                    entered_tx.send(()).unwrap();
+                    finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                });
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            queue.push(2, now);
+            assert_eq!(collect_woken(queue, now), vec![2]);
+            assert!(queue.next_deadline(|_| false).is_some());
+            finish_tx.send(()).unwrap();
+        });
+        assert_eq!(queue.next_deadline(all_live), None);
+    }
+    #[test]
+    fn batch_revalidates_entries_after_earlier_callbacks() {
+        use std::cell::Cell;
+        let queue = TimerQueue::new();
+        let now = Instant::now();
+        queue.push(1, now);
+        queue.push(1, now);
+        queue.push(2, now);
+        let current = Cell::new(true);
+        let count = queue.wake_due(now, |_| current.get(), |_| current.set(false));
+        assert_eq!(count, 1, "later entries became stale during the first wake");
+        assert_eq!(queue.next_deadline(all_live), None);
+    }
+    #[test]
+    fn compaction_budget_tracks_a_heap_that_has_drained() {
+        let queue = TimerQueue::new();
+        let now = Instant::now();
+        for id in 1..=4096 {
+            queue.push(id, now);
+        }
+        queue.next_deadline(all_live);
+        assert_eq!(collect_woken(&queue, now).len(), 4096);
+        queue.push(0, now);
+        for id in 1..=256 {
+            queue.push(id, now + Duration::from_secs(id));
+            queue.next_deadline(|entry| entry.task_id == 0);
+            assert!(queue.len() <= 64);
+        }
     }
 }

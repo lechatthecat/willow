@@ -29,9 +29,9 @@ const MAP_TYPE_ID: u32 = 0xA22A_0002;
 /// A key copied out of the Willow heap so the map owns it independently of the
 /// GC. String keys compare by content (not pointer identity), which is what
 /// `Map<String, V>` lookups require. Every other admitted key is one word, so
-/// `Word` holds it verbatim: an `i64`, a `bool` as 0/1, or the BITS of an `f64`
-/// (which is why `Map<f64, V>` matches keys bit-for-bit, and so distinguishes
-/// `0.0` from `-0.0`).
+/// `Word` holds an `i64`, a `bool` as 0/1, or canonical `f64` bits. Floating
+/// keys reject NaN and normalize both signed zeros to +0.0, so admitted keys
+/// have the same equality as the language's numerical `==`.
 #[derive(PartialEq, Eq, Clone)]
 enum MapKey {
     Word(i64),
@@ -105,14 +105,30 @@ impl<'a> Borrow<dyn KeyView + 'a> for MapKey {
 /// Borrow a key only during the lookup; no Willow pointer is retained in the map.
 ///
 /// # Safety
-/// When `key_is_ref` is nonzero, `word` must be a valid WillowString pointer
+/// When `key_kind` is 3, `word` must be a valid WillowString pointer
 /// for the returned borrow's lifetime. Do not allocate in the GC while borrowed.
-unsafe fn key_from_word<'a>(word: i64, key_is_ref: i64) -> KeyRef<'a> {
-    if key_is_ref != 0 {
-        KeyRef::Str(unsafe { willow_string_as_str(word as *const u8) })
-    } else {
-        KeyRef::Word(word)
+/// Returns None for NaN; callers must release the map lock before raising.
+unsafe fn key_from_word<'a>(word: i64, key_kind: i64) -> Option<KeyRef<'a>> {
+    match key_kind {
+        3 => Some(KeyRef::Str(unsafe {
+            willow_string_as_str(word as *const u8)
+        })),
+        1 => {
+            // Classify bits without floating-point arithmetic, preserving
+            // subnormals and rejecting both quiet and signaling NaNs.
+            let magnitude = (word as u64) & 0x7fff_ffff_ffff_ffff;
+            if magnitude > 0x7ff0_0000_0000_0000 {
+                None
+            } else {
+                Some(KeyRef::Word(if magnitude == 0 { 0 } else { word }))
+            }
+        }
+        _ => Some(KeyRef::Word(word)),
     }
+}
+
+fn raise_nan_key() {
+    crate::panic_context::raise_language_message("NaN cannot be used as a Map key");
 }
 
 /// Lock the inline `MapData` at a map payload pointer.
@@ -207,7 +223,11 @@ pub extern "C" fn willow_map_insert(
     let mut data = unsafe { map_data(map) };
     debug_assert_eq!(data.layout.value_is_ref, val_is_ref != 0);
     debug_assert_eq!(data.layout.key_kind == 3, key_is_ref != 0);
-    let key = unsafe { key_from_word(key_word, key_is_ref) };
+    let Some(key) = (unsafe { key_from_word(key_word, data.layout.key_kind) }) else {
+        drop(data);
+        raise_nan_key();
+        return;
+    };
     let owned_key = match key {
         KeyRef::Word(word) => MapKey::Word(word),
         KeyRef::Str(text) => MapKey::Str(text.to_owned()),
@@ -242,7 +262,12 @@ pub extern "C" fn willow_map_get(
         };
     }
     let data = unsafe { map_data(map) };
-    let key = unsafe { key_from_word(key_word, key_is_ref) };
+    debug_assert_eq!(data.layout.key_kind == 3, key_is_ref != 0);
+    let Some(key) = (unsafe { key_from_word(key_word, data.layout.key_kind) }) else {
+        drop(data);
+        raise_nan_key();
+        return std::ptr::null_mut();
+    };
     let value = data.entries.get(&key as &dyn KeyView).copied();
     let is_ref = data.layout.value_is_ref;
     drop(data);
@@ -308,7 +333,12 @@ pub extern "C" fn willow_map_contains(map: *mut u8, key_word: i64, key_is_ref: i
         return 0;
     }
     let data = unsafe { map_data(map) };
-    let key = unsafe { key_from_word(key_word, key_is_ref) };
+    debug_assert_eq!(data.layout.key_kind == 3, key_is_ref != 0);
+    let Some(key) = (unsafe { key_from_word(key_word, data.layout.key_kind) }) else {
+        drop(data);
+        raise_nan_key();
+        return 0;
+    };
     i64::from(data.entries.contains_key(&key as &dyn KeyView))
 }
 
@@ -331,8 +361,8 @@ fn alloc_none() -> *mut u8 {
     crate::gc::willow_alloc_enum_variant(0, willow_abi::EnumVariantLayout::new(1, &[]), &[])
 }
 
-/// Debug display of a whole map: `{a: 1, b: 2}` — entries sorted by key for
-/// deterministic output (HashMap iteration order is not stable). Kinds follow
+/// Debug display of a whole map: `{a: 1, b: 2}` — entries sorted by rendered key
+/// for deterministic output (HashMap iteration order is not stable). Kinds follow
 /// `willow_array_to_string` (0=i64, 1=f64, 2=bool, 3=String); string KEYS are
 /// printed bare (they are identifiers-like), string VALUES are quoted
 /// (willow-vwn6). `key_kind` is what tells a word key apart from the `f64` and
@@ -361,7 +391,7 @@ pub extern "C" fn willow_map_to_string(map: *mut u8) -> *mut u8 {
             })
             .collect()
     };
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut out = String::from("{");
     for (i, (key, word)) in entries.iter().enumerate() {
         if i > 0 {
@@ -570,7 +600,7 @@ mod tests {
     fn borrowed_word_keys_preserve_all_bits() {
         let _guard = runtime_test_guard();
         willow_gc_init();
-        let map = willow_map_new(1, 0, 0);
+        let map = willow_map_new(0, 0, 0);
         let words = [
             0,
             i64::MIN,
@@ -587,6 +617,117 @@ mod tests {
         }
         assert_eq!(willow_map_contains(map, 1, 0), 0);
         assert_eq!(willow_map_len(map), words.len() as i64);
+    }
+
+    #[test]
+    fn float_keys_normalize_zero_preserve_numbers_and_copy() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let mut map = willow_map_new(1, 0, 0);
+        willow_push_root(&mut map);
+        for zeros in [[0.0_f64, -0.0], [-0.0_f64, 0.0]] {
+            for (index, key) in zeros.into_iter().enumerate() {
+                willow_map_insert(map, key.to_bits() as i64, 0, index as i64 + 10, 0);
+            }
+            assert_eq!(willow_map_len(map), 1);
+            for key in zeros {
+                assert_eq!(willow_map_contains(map, key.to_bits() as i64, 0), 1);
+                assert_eq!(
+                    opt_payload(willow_map_get(map, key.to_bits() as i64, 0, 0)),
+                    11
+                );
+            }
+        }
+        let values = [
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            -f64::from_bits(1),
+            1.5,
+            -1.5,
+        ];
+        for (index, value) in values.into_iter().enumerate() {
+            willow_map_insert(map, value.to_bits() as i64, 0, index as i64, 0);
+        }
+        let mut copy = willow_map_copy(map);
+        willow_push_root(&mut copy);
+        assert_eq!(willow_map_len(copy), 9);
+        for (index, value) in values.into_iter().enumerate() {
+            assert_eq!(
+                opt_payload(willow_map_get(copy, value.to_bits() as i64, 0, 0)),
+                index as i64
+            );
+        }
+        assert_eq!(opt_payload(willow_map_get(copy, i64::MIN, 0, 0)), 11);
+        assert!(!unsafe { willow_string_as_str(willow_map_to_string(copy)) }.contains("-0.0:"));
+        willow_pop_roots(2);
+    }
+
+    #[test]
+    fn float_keys_reject_all_nan_forms_without_mutating_or_holding_lock() {
+        use crate::panic_context::*;
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let previous = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(903))));
+        let mut map = willow_map_new(1, 0, 0);
+        willow_push_root(&mut map);
+        willow_map_insert(map, 0, 0, 42, 0);
+        for bits in [
+            0x7ff0_0000_0000_0001u64,
+            0x7ff8_0000_0000_0000,
+            0x7fff_ffff_ffff_ffff,
+        ] {
+            for sign in [0, 1u64 << 63] {
+                for operation in 0..4 {
+                    let word = (bits | sign) as i64;
+                    match operation {
+                        0 => willow_map_insert(map, word, 0, 99, 0),
+                        1 => assert_eq!(willow_map_contains(map, word, 0), 0),
+                        _ => assert!(willow_map_get(map, word, 0, operation - 2).is_null()),
+                    }
+                    assert_eq!(willow_panic_depth(), 1);
+                    willow_panic_enter_defer();
+                    let info = willow_panic_recover();
+                    willow_panic_leave_defer();
+                    assert_eq!(
+                        unsafe { panic_info_message(info) },
+                        "NaN cannot be used as a Map key"
+                    );
+                    willow_panic_release_recovered(info);
+                    assert_eq!(willow_map_len(map), 1);
+                    assert_eq!(opt_payload(willow_map_get(map, 0, 0, 0)), 42);
+                }
+            }
+        }
+        willow_pop_roots(1);
+        replace_current_context(previous);
+    }
+
+    #[test]
+    fn float_key_normalization_scales_without_allocations() {
+        use crate::scheduler::scaling_measurements::counting_allocator as counter;
+        for count in [16usize, 128, 1024, 8192] {
+            let allocations = counter::thread_allocations();
+            for index in 0..count {
+                let word = (index as f64).to_bits() as i64;
+                assert!(
+                    matches!(unsafe { key_from_word(word, 1) }, Some(KeyRef::Word(got)) if got == word)
+                );
+                // Integer keys that happen to encode NaN or -0.0 remain integers.
+                assert!(matches!(
+                    unsafe { key_from_word(i64::MIN, 0) },
+                    Some(KeyRef::Word(i64::MIN))
+                ));
+                assert!(matches!(
+                    unsafe { key_from_word(f64::NAN.to_bits() as i64, 0) },
+                    Some(KeyRef::Word(_))
+                ));
+            }
+            assert_eq!(counter::thread_allocations(), allocations);
+            eprintln!("normalization calls={}, allocations=0", 3 * count);
+        }
     }
 
     /// willow-9tls.8: `freeze()` copies the value words a moving collection
@@ -790,12 +931,12 @@ mod tests {
             let allocs = counter::thread_allocations();
             let bytes = counter::thread_bytes();
             for _ in 0..CALLS {
-                let key = unsafe { key_from_word(hit as i64, 1) };
+                let key = unsafe { key_from_word(hit as i64, 3) }.unwrap();
                 assert_eq!(
                     data.entries.get(&key as &dyn KeyView).copied(),
                     Some(len as i64)
                 );
-                let key = unsafe { key_from_word(miss as i64, 1) };
+                let key = unsafe { key_from_word(miss as i64, 3) }.unwrap();
                 assert_eq!(data.entries.get(&key as &dyn KeyView).copied(), None);
             }
             assert_eq!(

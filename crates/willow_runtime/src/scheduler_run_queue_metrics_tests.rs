@@ -249,3 +249,114 @@ fn public_snapshot_and_scalar_getters_read_active_queue() {
     );
     assert_eq!(willow_sched_victim_locks(), snapshot.victim_locks as i64);
 }
+
+#[test]
+fn global_batch_preserves_fifo_and_counts_ids_at_increasing_sizes() {
+    for size in [1, 16, 256, 4096, 100_000] {
+        let queues = RunQueues::new(1);
+        let ids = (1..=size).collect::<Vec<RuntimeTaskId>>();
+        queues.push_global(0);
+        queues.push_global_batch(&ids);
+        queues.push_global(size + 1);
+        for expected in 0..=size + 1 {
+            assert_eq!(queues.pop_for_worker(0), Some(expected));
+        }
+        assert_eq!(queues.pop_for_worker(0), None);
+        let metrics = queues.metrics_snapshot();
+        assert_eq!(metrics.global_pushes, size + 2);
+        assert_eq!(metrics.global_pop_hits, size + 2);
+        println!(
+            "batch_size={size} pushes={} pops={}",
+            metrics.global_pushes, metrics.global_pop_hits
+        );
+    }
+}
+
+#[test]
+fn empty_global_batch_returns_while_global_mutex_is_held() {
+    let queues = RunQueues::new(1);
+    let guard = RunQueues::lock(&queues.global);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            queues.push_global_batch(&[]);
+            tx.send(()).unwrap();
+        });
+        let completed = rx.recv_timeout(Duration::from_secs(5));
+        // Release before asserting so a regression cannot strand the scoped thread.
+        drop(guard);
+        assert!(
+            completed.is_ok(),
+            "empty batch attempted to acquire the mutex"
+        );
+    });
+    assert_eq!(queues.len(), 0);
+    assert_eq!(
+        queues.metrics_snapshot(),
+        RunQueueMetricsSnapshot::default()
+    );
+}
+
+#[test]
+fn global_batch_tokens_are_popped_exactly_once_by_concurrent_workers() {
+    use crate::task_state::AtomicTaskState;
+    for size in [1, 16, 256, 4096] {
+        let queues = RunQueues::new(8);
+        let states = (0..size)
+            .map(|_| AtomicTaskState::new())
+            .collect::<Vec<_>>();
+        let ids = states
+            .iter()
+            .enumerate()
+            .filter_map(|(id, state)| state.claim_queue_slot().then_some(id as RuntimeTaskId))
+            .collect::<Vec<_>>();
+        queues.push_global_batch(&ids);
+        // Repeated wakes cannot grant additional tokens for these queued tasks.
+        for state in &states {
+            assert_ne!(state.wake(), WakeOutcome::Enqueue);
+            assert!(!state.claim_queue_slot());
+        }
+        let seen = (0..size).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let queues = &queues;
+                let seen = &seen;
+                let states = &states;
+                scope.spawn(move || {
+                    while let Some(id) = queues.pop_for_worker(worker) {
+                        assert_eq!(seen[id as usize].fetch_add(1, Ordering::Relaxed), 0);
+                        assert_eq!(states[id as usize].claim_for_poll(), ClaimOutcome::Poll);
+                    }
+                });
+            }
+        });
+        assert!(seen.iter().all(|count| count.load(Ordering::Relaxed) == 1));
+        assert_eq!(queues.len(), 0);
+        assert_eq!(queues.metrics_snapshot().global_pop_hits, size as u64);
+    }
+}
+
+#[test]
+fn global_batch_single_id_caller_rejects_terminal_and_reaped_tasks() {
+    let mut scheduler = RuntimeScheduler::with_worker_count(1);
+    let id = scheduler.spawn_placeholder();
+    scheduler.prepare_placeholder_terminal_owner(id);
+    assert!(
+        scheduler
+            .tasks
+            .with(id, |task| task.state.finish_terminal())
+            .unwrap()
+    );
+    let before = scheduler.run_queues.metrics_snapshot();
+    assert_eq!(
+        wake_task_outcome_in(&scheduler.tasks, &scheduler.run_queues, id),
+        WakeOutcome::Terminal
+    );
+    assert_eq!(scheduler.run_queues.metrics_snapshot(), before);
+    scheduler.tasks.remove(id);
+    assert_eq!(
+        wake_task_outcome_in(&scheduler.tasks, &scheduler.run_queues, id),
+        WakeOutcome::Terminal
+    );
+    assert_eq!(scheduler.run_queues.metrics_snapshot(), before);
+}

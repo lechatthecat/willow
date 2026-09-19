@@ -190,10 +190,10 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     ALLOC; "willow_map_copy" => ([Ptr] -> Some(Ptr));
     // (map, key_word, key_is_ref, val_word, val_is_ref): each generic payload
     // word is followed by its own is-reference flag (willow-9tls.7).
-    NONE; "willow_map_insert" => ([Ptr, Word, I64, Word, I64] -> None);
-    ALLOC; "willow_map_get" => ([Ptr, Word, I64, I64] -> Some(Ptr));
+    PANIC_ALLOC; "willow_map_insert" => ([Ptr, Word, I64, Word, I64] -> None);
+    PANIC_ALLOC; "willow_map_get" => ([Ptr, Word, I64, I64] -> Some(Ptr));
     NONE; "willow_map_len" => ([Ptr] -> Some(I64));
-    NONE; "willow_map_contains" => ([Ptr, Word, I64] -> Some(I64));
+    PANIC_ALLOC; "willow_map_contains" => ([Ptr, Word, I64] -> Some(I64));
     // --- timer ---
     NONE; "willow_runtime_sleep" => ([I64] -> Some(Ptr));
     NONE; "willow_runtime_yield" => ([] -> Some(Ptr));

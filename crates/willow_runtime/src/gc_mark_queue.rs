@@ -251,7 +251,7 @@ impl MarkWork {
     }
 }
 
-/// Why [`MarkWorkQueue::inject`] refused an item.
+/// Why [`MarkWorkQueue::inject`] or [`MarkWorker::push`] refused an item.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RejectReason {
     /// Tagged with an epoch that is not the running one. The item was
@@ -261,6 +261,8 @@ pub enum RejectReason {
     Idle,
     /// The item carries no work (an empty batch).
     Empty,
+    /// The consumer has retired; its operations no longer change the queue.
+    Retired,
 }
 
 // ── safepoint discipline ────────────────────────────────────────────────────
@@ -874,6 +876,9 @@ impl MarkWorker {
     /// lock the item is inserted beneath, so an epoch transition cannot land
     /// between the check and the insertion.
     pub fn push(&mut self, item: MarkWorkItem) -> Result<(), RejectReason> {
+        if self.retired {
+            return Err(RejectReason::Retired);
+        }
         if item.is_empty() {
             return Err(RejectReason::Empty);
         }
@@ -972,6 +977,9 @@ impl MarkWorker {
     /// `None` does **not** mean marking is finished: a peer may still publish.
     /// Only the termination protocol decides that.
     pub fn next_work(&mut self) -> Option<MarkWork> {
+        if self.retired {
+            return None;
+        }
         self.complete_held();
         if self.is_stale() {
             self.deactivate();
@@ -1029,6 +1037,9 @@ impl MarkWorker {
     /// unchanged — it counted the item in both places. An item this consumer
     /// was never handed is a new insertion and is counted as one.
     pub fn relinquish(&mut self, work: MarkWork) {
+        if self.retired {
+            return;
+        }
         let was_held = self.in_hand.take().is_some();
         let refused = {
             let mut injector = QueueGuard::new(&self.queue.injector);
@@ -1060,6 +1071,10 @@ impl MarkWorker {
 
     /// Release the slot and publish everything left in it.
     ///
+    /// Retirement is permanent: `slot()` becomes `None`, pushes return
+    /// [`RejectReason::Retired`], and publication, consumption, relinquishment,
+    /// and repeated retirement are inert. Relinquish held work before retiring.
+    ///
     /// Called automatically on drop. A worker that exits with local work must
     /// not take that work with it — the items are published to the injector so
     /// a surviving consumer finds them.
@@ -1079,7 +1094,7 @@ impl MarkWorker {
             self.complete_held();
         }
         self.deactivate();
-        let moved = match self.slot {
+        let moved = match self.slot.take() {
             Some(index) => {
                 let moved = self.queue.flush_slot(index);
                 // Publish all local work before allowing a new owner in.

@@ -6,20 +6,23 @@
 //!
 //! ```text
 //!   handle payload:  [ len(i64), cap(i64), is_ref(i64), buffer ]   (gc_ref_mask = 0b1000)
-//!   buffer payload:  [ cap(i64), elem0, elem1, ... elem_{cap-1} ]
+//!   buffer payload:  [ len(atomic i64), elem0, elem1, ... elem_{cap-1} ]
 //! ```
 //!
 //! Each element occupies one 64-bit word. Scalars are stored directly (`bool`
 //! zero-extended, `f64` bit-cast); reference elements store the GC pointer.
 //! The handle traces `buffer` through `gc_ref_mask`; a reference buffer uses a
-//! dedicated `type_id` + trace function that scans its `cap` slots (unused
-//! slots are null and skipped). Logical length (`len`) ≤ capacity (`cap`).
+//! dedicated `type_id` + trace function that scans only its logical length.
+//! Capacity is kept in the handle; new spare slots are zeroed and pop clears
+//! removed slots. Generated calls root any independently borrowed reference slots.
 //!
 //! Index access is bounds-checked against `len`; out-of-range aborts.
 //!
 //! NOTE: `willow_array_element_addr` returns a pointer **into the current
 //! buffer**. A `push` that grows the array reallocates the buffer, so any
 //! element address taken before such a `push` is invalidated.
+
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::gc::{
     GcObjectKind, GcStoreDestination, willow_alloc_with_layout, willow_gc_write_barrier,
@@ -40,29 +43,35 @@ const H_BUF: usize = 3;
 const HANDLE_WORDS: i64 = 4;
 const HANDLE_MASK: u64 = 0b1000; // only word 3 (the buffer pointer) is a GC ref
 
-/// Trace a reference buffer: scan its `cap` element slots (word 0 is the
-/// capacity); unused slots are null and skipped.
+/// Read the published live prefix; the buffer remains independently traceable
+/// when a captured element reference keeps it alive after handle growth.
+unsafe fn buffer_len(buffer: *mut u8) -> i64 {
+    unsafe { AtomicI64::from_ptr(buffer.cast()).load(Ordering::Acquire) }
+}
+
+/// Publish length after initializing newly live slots or clearing popped slots.
+/// The concurrent marker may observe an older prefix; insertion barriers retain
+/// every newly stored reference even when its slot is outside that snapshot.
+unsafe fn set_buffer_len(buffer: *mut u8, len: i64) {
+    unsafe { AtomicI64::from_ptr(buffer.cast()).store(len, Ordering::Release) };
+}
+
+/// Trace only the live element slots (word 0 is the published length).
 ///
 /// # Safety
 /// `payload` must point at a buffer allocated by [`alloc_buffer`].
 unsafe fn trace_array_ref(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
-    let cap = unsafe { *(payload as *const i64) };
-    if cap <= 0 {
-        return;
-    }
-    let words = payload as *mut *mut u8;
-    for i in 0..cap as usize {
-        slots.push(unsafe { words.add(1 + i) });
+    let len = unsafe { buffer_len(payload) };
+    for index in 0..len {
+        slots.push(unsafe { buf_slot(payload, index).cast() });
     }
 }
 
-/// The buffer capacity is immutable; elements use atomic GC publication.
+/// Both length and reference slots use atomic publication for concurrent GC.
 unsafe fn snapshot_array_ref(payload: *mut u8, children: &mut Vec<*mut u8>) {
-    let cap = unsafe { *(payload as *const i64) };
-    for index in 0..cap.max(0) as usize {
-        children.push(unsafe {
-            crate::gc::load_gc_reference(payload.cast::<*mut u8>().add(index + 1))
-        });
+    let len = unsafe { buffer_len(payload) };
+    for index in 0..len {
+        children.push(unsafe { crate::gc::load_gc_reference(buf_slot(payload, index).cast()) });
     }
 }
 
@@ -81,7 +90,7 @@ fn ensure_trace_registered() {
     ARRAY_REGISTRATION.ensure(ARRAY_GC_TYPES);
 }
 
-/// Allocate a zero-initialized buffer of `cap` element slots (`[cap, e0..]`).
+/// Allocate an empty, zero-initialized buffer of `cap` slots (`[len=0, e0..]`).
 fn alloc_buffer(cap: i64, is_ref: bool) -> *mut u8 {
     // length word + one word per element, with overflow checked end-to-end.
     let payload = match cap.checked_add(1).and_then(|words| words.checked_mul(WORD)) {
@@ -101,7 +110,7 @@ fn alloc_buffer(cap: i64, is_ref: bool) -> *mut u8 {
         raise_with("array buffer allocation failed");
         return buf;
     }
-    unsafe { *(buf as *mut i64) = cap };
+    unsafe { set_buffer_len(buf, 0) };
     buf
 }
 
@@ -172,6 +181,7 @@ pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
         return std::ptr::null_mut();
     }
     unsafe {
+        set_buffer_len(buffer, len);
         set_handle_word(handle, H_LEN, len);
         set_handle_word(handle, H_CAP, len);
         set_handle_word(handle, H_IS_REF, elem_is_ref);
@@ -301,6 +311,7 @@ pub extern "C" fn willow_array_push(arr: *mut u8, value: i64) {
             for i in 0..len {
                 store_buffer_slot(new_buf, i, *buf_slot(old_buf, i), is_ref);
             }
+            set_buffer_len(new_buf, len);
             willow_gc_write_barrier(arr, new_buf, GcStoreDestination::ContainerInternal as i64);
             set_handle_word(arr, H_BUF, new_buf as i64);
             set_handle_word(arr, H_CAP, new_cap);
@@ -313,6 +324,7 @@ pub extern "C" fn willow_array_push(arr: *mut u8, value: i64) {
     unsafe {
         let buffer = handle_buffer(arr);
         store_buffer_slot(buffer, len, value, is_ref);
+        set_buffer_len(buffer, len + 1);
         set_handle_word(arr, H_LEN, len + 1);
     }
 }
@@ -337,6 +349,7 @@ pub extern "C" fn willow_array_pop(arr: *mut u8) -> i64 {
         let value = *slot;
         let is_ref = handle_word(arr, H_IS_REF) != 0;
         store_buffer_slot(buffer, last, 0, is_ref); // allow the GC to reclaim it
+        set_buffer_len(buffer, last);
         set_handle_word(arr, H_LEN, last);
         value
     }
@@ -551,6 +564,125 @@ mod tests {
         willow_pop_roots(1);
     }
 
+    // Deterministic slot counts isolate tracing cost from allocation and GC timing.
+    #[test]
+    fn array_trace_work_tracks_length_after_pop_and_regrowth() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        for capacity in [16, 256, 4096] {
+            let mut arr = willow_array_new(capacity, 1);
+            willow_push_root(&mut arr);
+            let value = willow_string_from_str("retained");
+            for index in 0..capacity {
+                willow_array_set(arr, index, value as i64);
+            }
+            for _ in 3..capacity {
+                assert_eq!(willow_array_pop(arr), value as i64);
+            }
+            let buffer = unsafe { handle_buffer(arr) };
+            for length in [3, 0, 1, 8, 16] {
+                while willow_array_len(arr) > length {
+                    willow_array_pop(arr);
+                }
+                while willow_array_len(arr) < length {
+                    willow_array_push(arr, value as i64);
+                }
+                let mut slots = Vec::new();
+                let mut children = Vec::new();
+                unsafe {
+                    trace_array_ref(buffer, &mut slots);
+                    snapshot_array_ref(buffer, &mut children);
+                }
+                assert_eq!(slots.len(), length as usize, "capacity={capacity}");
+                assert_eq!(children, vec![value; length as usize]);
+                println!(
+                    "capacity={capacity} length={length} trace_slots={} snapshot_children={}",
+                    slots.len(),
+                    children.len()
+                );
+                for (index, slot) in slots.into_iter().enumerate() {
+                    assert_eq!(slot, unsafe { buf_slot(buffer, index as i64).cast() });
+                }
+            }
+            willow_gc_collect();
+            assert_eq!(
+                unsafe { willow_string_as_str(willow_array_get(arr, 0) as *mut u8) },
+                "retained"
+            );
+            willow_pop_roots(1);
+        }
+    }
+
+    #[test]
+    fn array_trace_preserves_captured_reference_buffer_after_growth() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let mut arr = willow_array_new(1, 1);
+        willow_push_root(&mut arr);
+        let value = willow_string_from_str("captured");
+        willow_array_set(arr, 0, value as i64);
+        let mut captured = willow_array_reference_owner(arr, 0);
+        willow_push_root(&mut captured);
+        willow_array_push(arr, value as i64);
+        assert_ne!(captured, unsafe { handle_buffer(arr) });
+        willow_array_pop(arr);
+        willow_array_pop(arr);
+        willow_gc_collect();
+        let mut children = Vec::new();
+        unsafe { snapshot_array_ref(captured, &mut children) };
+        assert_eq!(children.len(), 1);
+        assert_eq!(unsafe { willow_string_as_str(children[0]) }, "captured");
+        children.clear();
+        unsafe { snapshot_array_ref(handle_buffer(arr), &mut children) };
+        assert!(children.is_empty());
+        willow_pop_roots(2);
+    }
+
+    #[test]
+    fn array_snapshot_length_publication_during_push_pop() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let mut arr = willow_array_new(256, 1);
+        willow_push_root(&mut arr);
+        let mut value = willow_string_from_str("published");
+        willow_push_root(&mut value);
+        for _ in 0..256 {
+            willow_array_pop(arr);
+        }
+        let buffer = unsafe { handle_buffer(arr) } as usize;
+        let expected = value as usize;
+        let start = std::sync::Barrier::new(2);
+        // No allocations/collections while the reader borrows this buffer.
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                start.wait();
+                let mut children = Vec::new();
+                for _ in 0..4096 {
+                    children.clear();
+                    unsafe { snapshot_array_ref(buffer as *mut u8, &mut children) };
+                    assert!(children.len() <= 256);
+                    assert!(
+                        children
+                            .iter()
+                            .all(|child| child.is_null() || *child as usize == expected)
+                    );
+                }
+            });
+            start.wait();
+            for _ in 0..16 {
+                for _ in 0..256 {
+                    willow_array_push(arr, value as i64);
+                }
+                for _ in 0..256 {
+                    willow_array_pop(arr);
+                }
+            }
+            reader.join().unwrap();
+        });
+        assert_eq!(unsafe { buffer_len(buffer as *mut u8) }, 0);
+        willow_pop_roots(2);
+    }
+
     // Regression: pushing scalars while a collection runs during buffer growth
     // must not root the scalar word as an object pointer (previously SIGSEGV'd
     // under GC stress). Stress mode forces a collection on every allocation.
@@ -575,7 +707,7 @@ mod tests {
     }
 
     // Synthetic handle lengths force checked overflow without huge allocations.
-    // The real buffer retains its valid capacity for GC tracing throughout.
+    // The real buffer retains its valid logical length for GC tracing throughout.
     #[test]
     fn array_allocation_overflow_preserves_state_and_roots() {
         use crate::panic_context::*;

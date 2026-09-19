@@ -42,6 +42,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let mut values = Vec::with_capacity(args.len());
         for argument in args {
             let value = self.emit_lir_operand(function, argument);
+            // A callee can pop this element through another handle alias, then
+            // assign through the still-valid reference. The buffer trace only
+            // covers its live prefix, so root this borrowed slot for the call.
+            // Its owner was pinned above, keeping the slot address stable.
+            if let LirOperand::Reference {
+                place: LirPlace::ArrayElement { element, .. },
+                ..
+            } = argument
+                && is_gc_managed(element, self.enum_infos)
+            {
+                let push_id = self.func_id("willow_push_root");
+                let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
+                self.builder.ins().call(push_ref, &[value]);
+                self.gc_root_count += 1;
+            }
             if !matches!(argument, LirOperand::Reference { .. })
                 && is_gc_managed(
                     &argument

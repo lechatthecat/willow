@@ -833,3 +833,28 @@ async fn main() {
     assert!(ok, "{out}");
     assert_eq!(out, "17\n");
 }
+
+#[test]
+fn reference_to_popped_array_slot_keeps_reassigned_object_alive() {
+    let source = r#"
+import std::collections::Array;
+class Point { pub n: i64; }
+fn replace(p: &mut Point) { p = new Point(42); }
+fn use_slot(p: &mut Point, a: Array<Point>) {
+    a.pop();
+    replace(&p);
+    gc_collect();
+    let other = new Point(99);
+    println(p.n);
+    println(other.n);
+}
+fn main() {
+    let a: Array<Point> = [new Point(17)];
+    use_slot(&a[0], a);
+    println(a.len());
+}
+"#;
+    let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_GC_STRESS", "all")]);
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n99\n0\n");
+}

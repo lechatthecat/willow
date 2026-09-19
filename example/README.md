@@ -134,3 +134,11 @@ process. See `parallel_map.wi`.
 determines its key and value types. Later insertions must match those types.
 Use an explicit `Map<K, V>` annotation for an empty map or when reading its
 contents before an insertion provides type information.
+
+`map_float_keys.wi` demonstrates `Map<f64, V>` key equality: both signed
+zeros use the single canonical `+0.0` key. All other non-NaN numbers, including
+infinities, retain their bits. NaN keys raise the recoverable runtime panic
+`NaN cannot be used as a Map key` in `insert`, `get`, and `contains`.
+`FrozenMap` uses the same rules. Ordinary floating-point arithmetic and `==`
+keep IEEE semantics, and NaN remains valid as a map value. Map `toString()`
+sorts entries by rendered key text for deterministic output.

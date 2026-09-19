@@ -26,6 +26,20 @@ fn new_tlab_state() -> GcTlabState {
     }
 }
 
+// These retention fixtures need real nursery chunks: allocation stress routes
+// the slow allocation directly to old regions and leaves no TLAB to fill.
+// Keep stress enabled for the process; skip only these incompatible fixtures.
+fn skip_pinned_tlab_fixture(test_name: &str) -> bool {
+    if gc_stress_enabled("alloc") {
+        eprintln!(
+            "SKIP {test_name}: WILLOW_GC_STRESS=alloc (including all) bypasses TLABs; \
+             rerun without alloc/all to exercise pinned-retention assertions"
+        );
+        return true;
+    }
+    false
+}
+
 fn tlab_fast_alloc(
     tls: &GcTlabState,
     layout_id: u64,
@@ -410,6 +424,9 @@ fn stress_region_08_five_mutators_allocate_and_collect_concurrently() {
 #[ignore = "explicit GC stress suite"]
 fn stress_region_09_sparse_pinned_waves_quantify_retained_capacity() {
     let _guard = stress_guard();
+    if skip_pinned_tlab_fixture("stress_region_09") {
+        return;
+    }
     reset_gc();
     const WAVES: usize = 8;
     const CHUNKS_PER_WAVE: usize = 64;
@@ -500,6 +517,9 @@ fn stress_region_09_sparse_pinned_waves_quantify_retained_capacity() {
 #[ignore = "explicit GC stress suite"]
 fn stress_region_10_bounded_runtime_root_lifetimes_bound_pinned_retention() {
     let _guard = stress_guard();
+    if skip_pinned_tlab_fixture("stress_region_10") {
+        return;
+    }
     reset_gc();
     const WAVES: usize = 32;
     const LIVE_WINDOW: usize = 4;

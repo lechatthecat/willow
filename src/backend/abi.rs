@@ -420,8 +420,10 @@ mod alloc_effects_tests {
         "willow_array_element_addr",
         "willow_array_reference_owner",
         "willow_map_new",
+        "willow_map_contains",
         "willow_map_copy",
         "willow_map_get",
+        "willow_map_insert",
         "willow_atomic_i64_new",
         "willow_atomic_bool_new",
         "willow_async_mutex_new",
@@ -621,12 +623,21 @@ mod alloc_effects_tests {
     }
 
     #[test]
+    fn map_key_operations_include_nan_fault_effects() {
+        for name in ["willow_map_insert", "willow_map_get", "willow_map_contains"] {
+            assert!(
+                effects(name)
+                    .contains(RuntimeEffects::MAY_PANIC.union(RuntimeEffects::MAY_ALLOCATE))
+            );
+        }
+    }
+
+    #[test]
     fn a13_pure_readers_and_stores_stay_none() {
         for name in [
             "willow_print_i64",
             "willow_println_string",
             "willow_map_len",
-            "willow_map_contains",
             "willow_gc_write_barrier",
             "willow_push_root",
             "willow_pop_roots",

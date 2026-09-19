@@ -1,0 +1,28 @@
+// Floating-point keys follow numeric equality; NaN is not a valid key.
+import std::collections::Map;
+
+fn reject_nan(keys: Map<f64, i64>, nan: f64) {
+    defer match recover() {
+        Some(info) => println(info.message),
+        None => {}
+    }
+    keys.insert(nan, 30);
+    println("unreachable");
+}
+
+fn main() {
+    let keys: Map<f64, i64> = Map::new();
+    keys.insert(0.0, 10);
+    keys.insert(-0.0, 20);
+    println(0.0 == -0.0); // true
+    println(keys.len()); // 1
+    println(keys.get(0.0).unwrap()); // 20
+    println(keys.get(-0.0).unwrap()); // 20
+    println(keys.toString()); // {0.0: 20}
+    println(keys.freeze().contains(-0.0)); // true
+
+    let nan = 0.0 / 0.0; // ordinary f64 arithmetic still permits NaN
+    println(nan == nan); // false
+    reject_nan(keys, nan); // NaN cannot be used as a Map key
+    println(keys.len()); // 1: a rejected insert leaves the map unchanged
+}

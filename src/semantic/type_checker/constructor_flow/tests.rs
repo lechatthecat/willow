@@ -13,9 +13,6 @@ fn check(body: &str, expected_missing: &[&str]) {
         if body.contains("defer println(match") && error.code == ErrorCode::E0905 {
             continue;
         }
-        if body == "self.x = panic(\"bad\");" && error.code == ErrorCode::E0201 {
-            continue;
-        }
         assert_eq!(error.code, ErrorCode::E0842, "{body}: {errors:?}");
         for name in ["x", "y"] {
             if error.message.contains(&format!("field `{name}`")) {

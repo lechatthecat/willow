@@ -315,7 +315,7 @@ fn argument_coercible(
     if matches!(arg.kind, HirExprKind::ReferenceArg { .. }) {
         *target == arg.ty
     } else {
-        resolution.can_coerce(&arg.ty, target)
+        arg.ty == Type::Never || resolution.can_coerce(&arg.ty, target)
     }
 }
 
@@ -341,7 +341,7 @@ fn scalar(
         HirExprKind::Unary { .. } => matches!(node.ty, Type::I64 | Type::F64 | Type::Bool),
         HirExprKind::Var(name) => names.contains_key(name),
         HirExprKind::Lambda { captures, .. } => captures.iter().all(|capture| names.contains_key(&capture.source)),
-        HirExprKind::Print { value, .. } => matches!(value.ty, Type::I64 | Type::F64 | Type::Bool | Type::String),
+        HirExprKind::Print { value, .. } => matches!(value.ty, Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never),
         HirExprKind::MethodCall { object, method, args } => crate::semantic::intrinsics::resolve(&object.ty, method, args.len()).is_some_and(|resolved|
             !(is_async && resolved.intrinsic.is_suspension_point()) && resolved.return_type(|i| args.get(i).map(|arg| arg.ty.clone())) == node.ty) || enum_method(&object.ty, method) || instance_method(&object.ty, method, args, callables),
         HirExprKind::Call { callee, args } => if let Some(local) = names.get(callee.unqualified_name()) {
@@ -662,8 +662,11 @@ fn lower(
                     locals,
                     names,
                 );
-                values.insert(std::ptr::from_ref(node), LirOperand::Local(result));
-                continue;
+                // No enclosing operand, coercion, store, or later argument can
+                // execute after this raise. Preserve only the evaluated prefix.
+                expr.kind = HirExprKind::Var(locals[result.0 as usize].name.clone());
+                expr.ty = Type::Never;
+                return;
             }
             Work::FormatLiteral { node, text } => {
                 let piece = LirOperand::Local(emit(
@@ -720,6 +723,13 @@ fn lower(
             }
             Work::Finish(node) => node,
             Work::Enter(node) => {
+                // A CFG expression with only divergent branches leaves a
+                // Never local in its unreachable merge block, not a value.
+                if node.ty == Type::Never && matches!(node.kind, HirExprKind::Var(_)) {
+                    expr.kind = node.kind.clone();
+                    expr.ty = Type::Never;
+                    return;
+                }
                 let targets = argument_types(node, names, locals, callables);
                 let reference_call = match &node.kind {
                     HirExprKind::Call { callee, args } => Some((*callee, args)),
@@ -1550,7 +1560,7 @@ fn operand(
         HirExprKind::Bool(value) => LirOperand::Bool(*value),
         _ => unreachable!("validated expression became a flat operand"),
     };
-    if snapshot && matches!(value, LirOperand::Local(_)) {
+    if snapshot && expr.ty != Type::Never && matches!(value, LirOperand::Local(_)) {
         LirOperand::Local(emit(
             LirRvalue::Use(value),
             expr.ty.clone(),
@@ -1599,7 +1609,13 @@ fn lower_store(
         } => {
             let object_ty = object.ty.clone();
             let receiver = operand(object, emitted, locals, names, callables, is_async, true);
+            if object.ty == Type::Never {
+                return true;
+            }
             let stored = operand(value, emitted, locals, names, callables, is_async, false);
+            if value.ty == Type::Never {
+                return true;
+            }
             (
                 LirRvalue::FieldStore {
                     object: receiver,
@@ -1620,8 +1636,17 @@ fn lower_store(
             };
             let element = (**element).clone();
             let receiver = operand(array, emitted, locals, names, callables, is_async, true);
+            if array.ty == Type::Never {
+                return true;
+            }
             let index_value = operand(index, emitted, locals, names, callables, is_async, true);
+            if index.ty == Type::Never {
+                return true;
+            }
             let stored = operand(value, emitted, locals, names, callables, is_async, false);
+            if value.ty == Type::Never {
+                return true;
+            }
             (
                 LirRvalue::ArrayStore {
                     array: receiver,
@@ -1638,6 +1663,9 @@ fn lower_store(
             value,
         } => {
             let stored = operand(value, emitted, locals, names, callables, is_async, false);
+            if value.ty == Type::Never {
+                return true;
+            }
             (
                 LirRvalue::StaticStore {
                     class: *class,
@@ -1689,9 +1717,25 @@ fn lower_blocks_with(
                 }
                 _ => {}
             }
+            // Keep lexical scope markers even after a raise: backend cleanup
+            // construction consumes them on exceptional paths as well.
             if !matches!(
                 &inst,
-                SourceInst::Expr(HirExpr {
+                SourceInst::Let {
+                    value: HirExpr {
+                        ty: Type::Never,
+                        kind: HirExprKind::Var(_),
+                        ..
+                    },
+                    ..
+                } | SourceInst::Assign {
+                    value: HirExpr {
+                        ty: Type::Never,
+                        kind: HirExprKind::Var(_),
+                        ..
+                    },
+                    ..
+                } | SourceInst::Expr(HirExpr {
                     ty: Type::Never,
                     kind: HirExprKind::Var(_),
                     ..
@@ -1702,7 +1746,10 @@ fn lower_blocks_with(
         }
         match &mut block.terminator {
             SourceTerminator::Branch { cond, .. } | SourceTerminator::Return(Some(cond)) => {
-                lower(cond, &mut emitted, locals, &mut names, callables, is_async)
+                lower(cond, &mut emitted, locals, &mut names, callables, is_async);
+                if cond.ty == Type::Never {
+                    block.terminator = SourceTerminator::Return(None);
+                }
             }
             _ => {}
         }
@@ -1725,6 +1772,60 @@ mod tests {
         let (hir, errors) = crate::ir::lower::lower_program_with(&ast, &tables);
         assert!(errors.is_empty(), "{errors:?}");
         super::super::super::lower_source_program(&hir)
+    }
+
+    #[test]
+    fn never_lowering_counts_scale_with_branch_count() {
+        for count in [8, 32, 128] {
+            let mut source = String::from("fn f(flag: bool) { ");
+            for index in 0..count {
+                source.push_str(&format!(
+                    "let x{index}: f64 = flag ? panic(\"stop\") : 2.5;"
+                ));
+            }
+            source.push('}');
+            let program = program(&source);
+            let function = program
+                .functions
+                .iter()
+                .find(|f| f.name.is_free_named("f"))
+                .unwrap();
+            let instructions: Vec<_> = function.blocks.iter().flat_map(|b| &b.instrs).collect();
+            let raises = instructions
+                .iter()
+                .filter(|inst| {
+                    matches!(
+                        inst,
+                        SourceInst::Compute {
+                            value: LirRvalue::Panic { .. },
+                            ..
+                        }
+                    )
+                })
+                .count();
+            assert_eq!(raises, count);
+            assert!(!instructions.iter().any(|inst| matches!(
+                inst,
+                SourceInst::Assign {
+                    value: HirExpr {
+                        ty: Type::Never,
+                        kind: HirExprKind::Var(_),
+                        ..
+                    },
+                    ..
+                }
+            )));
+            let metrics = (
+                function.blocks.len(),
+                instructions.len(),
+                function.locals.len(),
+            );
+            println!(
+                "never scaling: branches={count}, blocks={}, instructions={}, locals={}",
+                metrics.0, metrics.1, metrics.2
+            );
+            assert_eq!(metrics, (3 * count + 1, 5 * count + 1, 5 * count + 1));
+        }
     }
 
     #[test]

@@ -220,3 +220,6 @@ mod native_sync_stack;
 
 #[path = "integration/constructor_flow.rs"]
 mod constructor_flow;
+
+#[path = "integration/never_values.rs"]
+mod never_values;

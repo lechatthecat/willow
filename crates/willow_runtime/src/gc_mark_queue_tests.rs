@@ -1641,3 +1641,65 @@ fn mark_queue_slot_pool_concurrent_claims_have_exclusive_owners() {
     assert_eq!(snapshot.registered_assists, 0);
     assert_eq!(snapshot.counter_underflows, 0);
 }
+
+#[test]
+fn mark_queue_retired_handles_leave_replacement_owners_untouched() {
+    for slots in [1, 8, 64, 512] {
+        for assist in [false, true] {
+            let (queue, _) = started_queue(slots);
+            let mut retired = if assist {
+                queue.register_assist()
+            } else {
+                queue.register_worker().unwrap()
+            };
+            let slot = retired.slot();
+            retired.push(object(1)).unwrap();
+            retired.push(object(2)).unwrap();
+            let held = retired.next_work().unwrap();
+            assert_eq!(retired.retire(), 1);
+            assert_eq!(retired.slot(), None);
+            let mut replacement = queue.register_worker().unwrap();
+            assert_eq!(replacement.slot(), slot);
+            replacement.push(object(3)).unwrap();
+            replacement.push(object(4)).unwrap();
+            let before = queue.snapshot();
+            for _ in 0..slots {
+                assert_eq!(retired.push(object(5)), Err(RejectReason::Retired));
+                assert_eq!(retired.publish_local(usize::MAX), 0);
+                assert!(retired.next_work().is_none());
+                retired.relinquish(held.clone());
+                assert_eq!(retired.retire(), 0);
+            }
+            assert_eq!(queue.snapshot(), before);
+            drop(retired);
+            assert_eq!(queue.snapshot(), before);
+            assert_eq!(drain(&mut replacement), vec![4, 3, 1]);
+            drop(replacement);
+            let after = queue.snapshot();
+            assert!(after.is_drained());
+            assert_eq!(after.abandoned, 1);
+            assert_eq!(after.counter_underflows, 0);
+            assert_eq!(QueueGuard::new(&queue.free_slots).len(), slots);
+        }
+    }
+}
+
+#[test]
+fn mark_queue_retired_slotless_assist_is_inert() {
+    let (queue, epoch) = started_queue(0);
+    let mut assist = queue.register_assist();
+    assert_eq!(assist.slot(), None);
+    assist.retire();
+    queue.inject(MarkWork::new(epoch, object(1))).unwrap();
+    let before = queue.snapshot();
+    assert_eq!(assist.push(object(2)), Err(RejectReason::Retired));
+    assert_eq!(assist.publish_local(usize::MAX), 0);
+    assert!(assist.next_work().is_none());
+    assist.relinquish(MarkWork::new(epoch, object(3)));
+    assert_eq!(assist.retire(), 0);
+    drop(assist);
+    assert_eq!(queue.snapshot(), before);
+    let mut replacement = queue.register_assist();
+    assert_eq!(drain(&mut replacement), vec![1]);
+    assert_eq!(queue.snapshot().counter_underflows, 0);
+}
