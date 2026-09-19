@@ -31,6 +31,9 @@ pub enum RuntimeEventKind {
     NetpollWake = 13,
     ChannelWait = 14,
     BlockingDetach = 15,
+    /// A Task had to wait for a blocking-pool queue slot; `value` is the
+    /// number of slot waiters after it registered (willow-9tls.6).
+    BlockingQueueFull = 16,
 }
 
 impl RuntimeEventKind {
@@ -51,6 +54,7 @@ impl RuntimeEventKind {
             Self::NetpollWake => "netpoll_wake",
             Self::ChannelWait => "channel_wait",
             Self::BlockingDetach => "blocking_detach",
+            Self::BlockingQueueFull => "blocking_queue_full",
         }
     }
 
@@ -68,6 +72,7 @@ impl RuntimeEventKind {
                 | Self::TaskCancelled
                 | Self::TaskPanicked
                 | Self::BlockingDetach
+                | Self::BlockingQueueFull
         )
     }
 }
@@ -109,6 +114,9 @@ pub struct WillowRuntimeMetricsV1 {
     pub netpoll_wakes: u64,
     pub channel_waits: u64,
     pub blocking_detaches: u64,
+    /// Tasks that found the bounded blocking-pool queue full and parked as
+    /// slot waiters (one per Task, not per re-poll).
+    pub blocking_queue_full: u64,
 }
 
 type RuntimeEventHookV1 = unsafe extern "C" fn(*const WillowRuntimeEventV1, *mut c_void);
@@ -149,6 +157,7 @@ static NETPOLL_WAITS: AtomicU64 = AtomicU64::new(0);
 static NETPOLL_WAKES: AtomicU64 = AtomicU64::new(0);
 static CHANNEL_WAITS: AtomicU64 = AtomicU64::new(0);
 static BLOCKING_DETACHES: AtomicU64 = AtomicU64::new(0);
+static BLOCKING_QUEUE_FULL: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static BUILT_EVENTS: AtomicU64 = AtomicU64::new(0);
 
@@ -169,6 +178,7 @@ fn counter(kind: RuntimeEventKind) -> &'static AtomicU64 {
         RuntimeEventKind::NetpollWake => &NETPOLL_WAKES,
         RuntimeEventKind::ChannelWait => &CHANNEL_WAITS,
         RuntimeEventKind::BlockingDetach => &BLOCKING_DETACHES,
+        RuntimeEventKind::BlockingQueueFull => &BLOCKING_QUEUE_FULL,
     }
 }
 
@@ -321,6 +331,7 @@ pub extern "C" fn willow_runtime_metrics_snapshot_v1(out: *mut WillowRuntimeMetr
         netpoll_wakes: NETPOLL_WAKES.load(Ordering::Relaxed),
         channel_waits: CHANNEL_WAITS.load(Ordering::Relaxed),
         blocking_detaches: BLOCKING_DETACHES.load(Ordering::Relaxed),
+        blocking_queue_full: BLOCKING_QUEUE_FULL.load(Ordering::Relaxed),
     };
     0
 }

@@ -17062,6 +17062,61 @@ async fn main() {
     assert_eq!(out, "false\nfalse\n");
 }
 
+#[test]
+fn fs_29_async_burst_over_blocking_queue_capacity_all_complete() {
+    // Overload policy (willow-9tls.6): a bounded pool (1 thread, 2 queued
+    // jobs) receives 40 `*_async` reads of a 128 KiB file at once, so the
+    // queue is full long before the burst is spawned. None fails or is
+    // dropped: over-capacity Tasks wait for a slot and every one completes
+    // with its real result, and a cancelled waiter is simply cancelled.
+    // Admission order is covered by the runtime unit tests; this asserts
+    // only results. (Traced with WILLOW_SCHED_TRACE=1 this run records
+    // dozens of `blocking_queue_full` events; a 1-byte `exists_async` burst
+    // never filled the queue because each job finished before the next
+    // spawn.)
+    let (out, ok) = compile_and_run_with_env(
+        r#"
+import std::fs;
+import std::collections::Array;
+
+async fn main() {
+    let path = fs::temp_path("willow_t29_big");
+    let mut payload = "x";
+    let mut d = 0;
+    while d < 17 { payload = payload + payload; d = d + 1; }
+    fs::write_string(path, payload);
+    let tasks: Array<Task<Result<String, IoError>>> = [];
+    let mut i = 0;
+    while i < 40 { tasks.push(fs::read_to_string_async(path)); i = i + 1; }
+    let token = CancellationToken::new();
+    let doomed = token.attach(fs::read_to_string_async(path));
+    token.cancel();
+    let mut mismatches = 0;
+    let mut k = 0;
+    while k < tasks.len() {
+        match await tasks[k] {
+            Ok(text) => { if text != payload { mismatches = mismatches + 1; } }
+            Err(e) => { mismatches = mismatches + 1; }
+        }
+        k = k + 1;
+    }
+    println(mismatches);
+    match await doomed.result() { Ok(v) => println("completed"), Err(Cancelled) => println("cancelled"), }
+    fs::remove_file(path);
+}
+"#,
+        &[
+            ("WILLOW_BLOCKING_THREADS", "1"),
+            ("WILLOW_BLOCKING_QUEUE", "2"),
+        ],
+    );
+    assert!(ok, "{out}");
+    assert!(
+        out == "0\ncancelled\n" || out == "0\ncompleted\n",
+        "every burst Task must complete with its own result: {out}"
+    );
+}
+
 // ── std::net v1 (willow-2s3.1) ───────────────────────────────────────
 // Numeric-address bind is synchronous; connect/accept/read/write return Tasks
 // whose poll functions park on the platform netpoll backend.

@@ -353,6 +353,10 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     PANIC_ALLOC; "willow_parallel_map_i64" => ([Ptr, Ptr] -> Some(Ptr));
     NONE; "willow_blocking_active_jobs" => ([] -> Some(I64));
     NONE; "willow_blocking_completed_jobs" => ([] -> Some(I64));
+    // Bounded blocking-pool queue gauges (willow-9tls.6).
+    NONE; "willow_blocking_queued_jobs" => ([] -> Some(I64));
+    NONE; "willow_blocking_slot_waiters" => ([] -> Some(I64));
+    NONE; "willow_blocking_queue_capacity" => ([] -> Some(I64));
     NONE; "willow_sched_current_task" => ([] -> Some(I64));
     // Tag the running task with its async fn name for async stack traces
     // (willow-9lw): (name_ptr, name_len).

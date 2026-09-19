@@ -3527,6 +3527,9 @@ pub fn with_current_task_for_test<R>(id: u64, f: impl FnOnce() -> R) -> R {
 
 #[cfg(test)]
 pub fn reset_global_scheduler_for_test() {
+    // Drained tasks never run their cancel path, so drop their blocking-pool
+    // slot reservations too (task ids restart and would alias them).
+    crate::blocking::reset_slot_waiters_for_test();
     let frames = with_global(|sched| {
         let mut frames = std::mem::take(&mut sched.pending_frame_unroots);
         frames.extend(sched.tasks.drain().into_iter().filter_map(|mut task| {

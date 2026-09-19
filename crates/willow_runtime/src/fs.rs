@@ -141,6 +141,11 @@ enum BlockingFsResult {
 struct BlockingFsState {
     task_id: AtomicU64,
     result: Mutex<Option<BlockingFsResult>>,
+    /// The pool job while the bounded queue had no room for it: the Task owns
+    /// it and re-submits on each poll until admitted (willow-9tls.6). The job
+    /// captures an `Arc` of this state, so whoever drops the state without
+    /// running the job must `take()` it first or the cycle leaks.
+    pending: Mutex<Option<crate::blocking::BlockingWork>>,
 }
 
 impl BlockingFsState {
@@ -148,7 +153,22 @@ impl BlockingFsState {
         Self {
             task_id: AtomicU64::new(0),
             result: Mutex::new(None),
+            pending: Mutex::new(None),
         }
+    }
+
+    fn take_pending(&self) -> Option<crate::blocking::BlockingWork> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    fn keep_pending(&self, work: crate::blocking::BlockingWork) {
+        *self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(work);
     }
 
     fn finish(&self, result: BlockingFsResult) {
@@ -204,6 +224,16 @@ unsafe extern "C" fn poll_blocking_fs(frame: *mut c_void) -> i32 {
     let Some(state) = (unsafe { blocking_state(frame) }) else {
         return crate::task::RUNTIME_POLL_READY;
     };
+    if let Some(work) = state.take_pending() {
+        // Queue was full at spawn: this Task is (or becomes) a slot
+        // waiter. Either way it parks BlockedSyscall — the pool owes it a
+        // wake, for a freed slot now or for completion once admitted.
+        let task_id = state.task_id.load(Ordering::Acquire);
+        if let Err(work) = crate::blocking::try_submit_or_wait(task_id, work) {
+            state.keep_pending(work);
+        }
+        return crate::task::RUNTIME_POLL_BLOCKED_SYSCALL;
+    }
     let result = state
         .result
         .lock()
@@ -244,7 +274,14 @@ unsafe extern "C" fn cancel_blocking_fs(frame: *mut c_void) {
     unsafe {
         let raw = fs_frame(frame).take_native::<Arc<BlockingFsState>>(FS_TASK_JOB_SLOT);
         if !raw.is_null() {
-            drop(Box::from_raw(raw));
+            let state = Box::from_raw(raw);
+            // Work the pool never admitted is dropped unrun (it may still be
+            // registered as a slot waiter). Admitted work runs to completion
+            // on its own Arc; its completion wake is stale and ignored.
+            if state.take_pending().is_some() {
+                crate::blocking::forget_waiter(state.task_id.load(Ordering::Acquire));
+            }
+            drop(state);
         }
     }
 }
@@ -276,12 +313,14 @@ fn spawn_blocking_fs_after_publication(
     // cancel callback owns and may already have freed the boxed frame copy.
     let state_box = Box::into_raw(Box::new(Arc::clone(&state)));
     unsafe { fs_frame(frame) }.store_native(FS_TASK_JOB_SLOT, state_box);
-    if !crate::blocking::submit(move || {
+    if let Err(job) = crate::blocking::try_submit(Box::new(move || {
         let result = work();
         state_for_work.finish(result);
-    }) {
-        unsafe { cancel_blocking_fs(frame) };
-        return std::ptr::null_mut();
+    })) {
+        // Bounded queue is full (willow-9tls.6): the Task keeps the job and
+        // registers as a slot waiter on its first poll, once it has an id.
+        // Nothing is refused, so the caller still gets a real Task.
+        state.keep_pending(job);
     }
     let task_id = crate::scheduler::spawn_global_task_initialized(
         poll_blocking_fs,
@@ -406,7 +445,10 @@ mod tests {
         let dir = std::path::PathBuf::from(unsafe { willow_string_as_str(unique) });
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("t.txt");
-        let path = willow_string_from_str(file.to_str().unwrap());
+        // Every Ok/Err result allocates, and an allocation may collect
+        // (WILLOW_GC_STRESS=alloc); root the path for as long as it is reused.
+        let mut path = willow_string_from_str(file.to_str().unwrap());
+        willow_push_root(&mut path as *mut *mut u8);
 
         let contents = willow_string_from_str("hello");
         let w = willow_fs_write_string(path, contents);
@@ -425,6 +467,7 @@ mod tests {
 
         let missing = willow_fs_read_to_string(path);
         assert_eq!(read_tag(missing), 1, "read of removed file must be Err");
+        willow_pop_roots(1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -514,6 +557,128 @@ mod tests {
             },
         );
         assert!(observed);
+    }
+
+    /// Overload policy (willow-9tls.6): with every pool thread stalled and the
+    /// bounded queue full, `*_async` calls still return real Tasks. Those Tasks
+    /// keep their job, park as slot waiters (observable as BlockedSyscall,
+    /// `willow_blocking_slot_waiters`, and the `blocking_queue_full` metric),
+    /// nothing is refused or dropped, a cancelled waiter's job never runs, and
+    /// once the pool drains every surviving Task completes with its result.
+    #[test]
+    fn queue_full_parks_fs_tasks_as_slot_waiters_instead_of_failing() {
+        use crate::async_frame::async_frame_slot_offset;
+        use crate::blocking::test_support::{
+            pool_threads, queue_full_metric, stall_pool_threads, wait_until,
+        };
+        use crate::blocking::{
+            willow_blocking_completed_jobs, willow_blocking_queue_capacity,
+            willow_blocking_queued_jobs, willow_blocking_slot_waiters,
+        };
+        use crate::scheduler::{
+            reset_global_scheduler_for_test, willow_monotonic_millis, willow_sched_cancel,
+            willow_sched_run_until, willow_sched_run_until_deadline, willow_sched_task_state,
+        };
+
+        fn task_id_of(frame: *mut c_void) -> u64 {
+            unsafe {
+                *(frame as *const u8)
+                    .add(async_frame_slot_offset(FS_TASK_ID_SLOT))
+                    .cast::<u64>()
+            }
+        }
+
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let threads = pool_threads();
+        let completed_before = willow_blocking_completed_jobs();
+        let metric_before = queue_full_metric();
+
+        // Stall every pool thread, then fill the queue with fillers.
+        let mut stalled = stall_pool_threads();
+        let capacity = willow_blocking_queue_capacity() as usize;
+        for _ in 0..capacity {
+            crate::blocking::try_submit(Box::new(|| {}))
+                .ok()
+                .expect("filler fits");
+        }
+        assert_eq!(willow_blocking_queued_jobs() as usize, capacity);
+
+        // Over capacity: every call still yields a Task, no null, no error.
+        let unique = willow_fs_temp_path(willow_string_from_str("willow_fs_queue_full"));
+        let path = unsafe { willow_string_as_str(unique) }.to_string();
+        std::fs::write(&path, "x").unwrap();
+        const OVERFLOW: usize = 5;
+        // Spawning may collect (GC stress) and `unique` is unrooted, so hand
+        // each call its own fresh path string.
+        let mut frames: Vec<*mut c_void> = (0..OVERFLOW)
+            .map(|_| willow_fs_exists_async(willow_string_from_str(&path)))
+            .collect();
+        assert!(frames.iter().all(|frame| !frame.is_null()));
+        // A completed Task unroots its frame; an awaiter would hold the Task
+        // handle as a root, so root the frames here until their results are
+        // read (the Vec never reallocates, so the slots stay put).
+        for frame in frames.iter_mut() {
+            willow_push_root((frame as *mut *mut c_void).cast::<*mut u8>());
+        }
+        let ids: Vec<u64> = frames.iter().map(|frame| task_id_of(*frame)).collect();
+        assert_eq!(
+            willow_blocking_queued_jobs() as usize,
+            capacity,
+            "queue did not grow"
+        );
+
+        // Their first poll registers them as waiters; they park BlockedSyscall.
+        willow_sched_run_until_deadline(willow_monotonic_millis() + 200);
+        for id in &ids {
+            assert_eq!(
+                willow_sched_task_state(*id),
+                7,
+                "task {id} must park BlockedSyscall"
+            );
+        }
+        assert_eq!(willow_blocking_slot_waiters() as usize, OVERFLOW);
+        assert_eq!(queue_full_metric(), metric_before + OVERFLOW as u64);
+        assert_eq!(willow_blocking_queued_jobs() as usize, capacity);
+
+        // Cancel the oldest waiter: its job is dropped unrun and it leaves
+        // the list without stranding the next waiter.
+        willow_sched_cancel(ids[0]);
+        willow_sched_run_until_deadline(willow_monotonic_millis() + 200);
+        assert_eq!(
+            willow_sched_task_state(ids[0]),
+            -1,
+            "cancelled waiter is terminal"
+        );
+        assert_eq!(willow_blocking_slot_waiters() as usize, OVERFLOW - 1);
+
+        // Drain: every survivor completes with the real result.
+        stalled.release_all();
+        for (index, id) in ids.iter().enumerate().skip(1) {
+            // Several waiters may complete inside one drive, so the count
+            // is not per target; the terminal state is.
+            willow_sched_run_until(*id);
+            assert_eq!(willow_sched_task_state(*id), -1, "task {index} completes");
+            let exists = unsafe {
+                *(frames[index] as *const u8)
+                    .add(async_frame_slot_offset(FS_TASK_RESULT_SLOT))
+                    .cast::<i64>()
+            };
+            assert_eq!(exists, 1, "task {index} must observe the file");
+        }
+        willow_pop_roots(OVERFLOW as i32);
+        assert_eq!(willow_blocking_slot_waiters(), 0);
+        wait_until("queue to drain", || willow_blocking_queued_jobs() == 0);
+        wait_until("jobs to finish", || {
+            willow_blocking_completed_jobs() - completed_before
+                >= (threads + capacity + OVERFLOW - 1) as i64
+        });
+        assert_eq!(
+            willow_blocking_completed_jobs() - completed_before,
+            (threads + capacity + OVERFLOW - 1) as i64,
+            "the cancelled waiter's job must never have run"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
