@@ -239,6 +239,37 @@ fn main() {
     assert_eq!(out, "42\ntrue\n");
 }
 
+// Nursery/TLAB counters describe different paths under allocation stress:
+// alloc collects on allocation and uses old regions, bypassing the nursery.
+// Compile each fixture once and check all three runtime modes explicitly so
+// ambient WILLOW_GC_STRESS never removes normal-mode movement coverage.
+fn assert_gc_allocation_modes(source: &str, nursery_expected: &str, alloc_expected: &str) {
+    let project = TestProject::new("gc_allocation_modes", &[("main.wi", source)]);
+    let compiled = project.compile("main.wi");
+    assert!(
+        compiled.status.success(),
+        "GC fixture compilation failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    for (mode, expected) in [
+        ("", nursery_expected),
+        ("minor", nursery_expected),
+        ("alloc", alloc_expected),
+    ] {
+        let output = project.run_with_env(&[("WILLOW_GC_STRESS", mode)]);
+        assert!(
+            output.status.success(),
+            "GC fixture failed in mode {mode:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected,
+            "GC fixture output in mode {mode:?}"
+        );
+    }
+}
+
 #[test]
 fn gc_tlab_01_first_allocation_refills_then_next_allocations_use_fast_path() {
     let src = r#"
@@ -259,9 +290,11 @@ fn main() {
     println(gc_tlab_reserved_bytes() > 0);
 }
 "#;
-    let (out, ok) = compile_and_run(src);
-    assert!(ok, "TLAB metrics program failed");
-    assert_eq!(out, "6\ntrue\ntrue\ntrue\ntrue\n");
+    assert_gc_allocation_modes(
+        src,
+        "6\ntrue\ntrue\ntrue\ntrue\n",
+        "6\ntrue\nfalse\nfalse\nfalse\n",
+    );
 }
 
 #[test]
@@ -283,9 +316,7 @@ fn main() {
     println(gc_tlab_reserved_bytes());
 }
 "#;
-    let (out, ok) = compile_and_run(src);
-    assert!(ok, "TLAB collection program failed");
-    assert_eq!(out, "30\ntrue\n0\n0\n");
+    assert_gc_allocation_modes(src, "30\ntrue\n0\n0\n", "30\nfalse\n0\n0\n");
 }
 
 #[test]
@@ -306,9 +337,7 @@ fn main() {
     println(gc_tlab_fast_allocations() > 0);
 }
 "#;
-    let (out, ok) = compile_and_run(src);
-    assert!(ok, "TLAB refill program failed");
-    assert_eq!(out, "244650\ntrue\ntrue\n");
+    assert_gc_allocation_modes(src, "244650\ntrue\ntrue\n", "244650\nfalse\nfalse\n");
 }
 
 #[test]
@@ -334,9 +363,11 @@ fn main() {
     println(gc_remembered_set_size());
 }
 "#;
-    let (out, ok) = compile_and_run(src);
-    assert!(ok, "generated object-field barrier program failed");
-    assert_eq!(out, "true\ntrue\n42\ntrue\n0\n");
+    assert_gc_allocation_modes(
+        src,
+        "true\ntrue\n42\ntrue\n0\n",
+        "false\nfalse\n42\nfalse\n0\n",
+    );
 }
 
 #[test]
@@ -357,9 +388,7 @@ fn main() {
     println(gc_remembered_set_size());
 }
 "#;
-    let (out, ok) = compile_and_run(src);
-    assert!(ok, "array young-reference update program failed");
-    assert_eq!(out, "true\n77\ntrue\n0\n");
+    assert_gc_allocation_modes(src, "true\n77\ntrue\n0\n", "false\n77\nfalse\n0\n");
 }
 
 #[test]
@@ -379,9 +408,7 @@ async fn main() {
     println(await worker());
 }
 "#;
-    let (out, ok) = compile_and_run(src);
-    assert!(ok, "async-frame young-reference update program failed");
-    assert_eq!(out, "true\n88\n");
+    assert_gc_allocation_modes(src, "true\n88\n", "false\n88\n");
 }
 
 #[test]
@@ -401,9 +428,7 @@ fn main() {
     println(gc_minor_collections() > before);
 }
 "#;
-    let (out, ok) = compile_and_run(src);
-    assert!(ok, "automatic nursery collection program failed");
-    assert_eq!(out, "17997000\ntrue\n");
+    assert_gc_allocation_modes(src, "17997000\ntrue\n", "17997000\nfalse\n");
 }
 
 #[test]
@@ -457,9 +482,7 @@ fn main() {
     println(gc_moved_objects() >= moved + 1);
 }
 "#;
-    let (out, ok) = compile_and_run(src);
-    assert!(ok, "enum/interface young-reference update program failed");
-    assert_eq!(out, "17\n25\ntrue\n");
+    assert_gc_allocation_modes(src, "17\n25\ntrue\n", "17\n25\nfalse\n");
 }
 
 #[test]
@@ -564,9 +587,7 @@ fn main() {
     println(gc_pinned_region_count() > before);
 }
 "#;
-    let (out, ok) = compile_and_run(src);
-    assert!(ok, "pinned-region promotion program failed");
-    assert_eq!(out, "73\ntrue\n");
+    assert_gc_allocation_modes(src, "73\ntrue\n", "73\nfalse\n");
 }
 
 #[test]

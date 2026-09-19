@@ -622,10 +622,11 @@ fn alloc_cancelled_result() -> *mut u8 {
     )
 }
 
-unsafe fn finish_state(frame: *mut c_void) -> Option<&'static mut Arc<ScopeCore>> {
+unsafe fn finish_state(frame: *mut c_void) -> Option<Arc<ScopeCore>> {
     let raw =
         unsafe { scope_finish_frame(frame) }.load_native::<Arc<ScopeCore>>(SCOPE_FINISH_STATE_SLOT);
-    unsafe { raw.as_mut() }
+    // Own a strong reference across polling and frame-slot cleanup.
+    unsafe { raw.as_ref() }.cloned()
 }
 
 unsafe fn finish_scope_task(frame: *mut c_void, result: *mut u8) -> i32 {
@@ -718,6 +719,29 @@ mod tests {
 
     unsafe extern "C" fn pending_forever(_frame: *mut c_void) -> i32 {
         crate::task::RUNTIME_POLL_PENDING
+    }
+
+    #[test]
+    fn poll_state_remains_owned_after_frame_cleanup() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        let frame = NativeTaskFrame::<ScopeFinishFrame>::allocate().unwrap();
+        let core = Arc::new(ScopeCore::default());
+        let weak = Arc::downgrade(&core);
+        frame.store_native(SCOPE_FINISH_STATE_SLOT, Box::into_raw(Box::new(core)));
+        let state = unsafe { finish_state(frame.as_raw()) }.unwrap();
+        unsafe { cancel_scope_finish(frame.as_raw()) };
+        assert!(
+            frame
+                .load_native::<Arc<ScopeCore>>(SCOPE_FINISH_STATE_SLOT)
+                .is_null()
+        );
+        assert!(weak.upgrade().is_some());
+        drop(state);
+        assert!(weak.upgrade().is_none());
+        // Repeated cleanup must leave the cleared slot alone.
+        unsafe { cancel_scope_finish(frame.as_raw()) };
+        reset_internal_for_test();
     }
 
     #[test]

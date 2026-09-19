@@ -53,7 +53,7 @@
 use super::*;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::{Duration, Instant};
 
 fn object(addr: usize) -> MarkWorkItem {
@@ -1523,4 +1523,121 @@ fn mark_queue_41_is_drained_depends_on_exactly_one_counter() {
         !snapshot.is_drained(),
         "outstanding work is the whole point"
     );
+}
+
+#[test]
+fn mark_queue_slot_pool_exhaustion_reuse_and_scaling() {
+    for slots in [0, 1, 8, 64, 512, 4096] {
+        let (queue, _) = started_queue(slots);
+        let capacity = QueueGuard::new(&queue.free_slots).capacity();
+        let mut workers: Vec<_> = (0..slots)
+            .map(|_| queue.register_worker().expect("free slot"))
+            .collect();
+        let claimed: HashSet<_> = workers
+            .iter()
+            .map(|worker| worker.slot().unwrap())
+            .collect();
+        assert_eq!(claimed.len(), slots);
+        assert!(claimed.iter().all(|&slot| slot < slots));
+        assert!(queue.register_worker().is_none());
+        let assist = queue.register_assist();
+        assert_eq!(assist.slot(), None);
+        drop(assist);
+
+        // Fragment the occupied slots and reuse every hole while retaining
+        // all other owners. Explicit retirement followed by Drop returns once.
+        for worker in workers.iter_mut().step_by(2) {
+            worker.retire();
+            assert_eq!(worker.retire(), 0);
+        }
+        let holes = slots.div_ceil(2);
+        let replacements: Vec<_> = (0..holes).map(|_| queue.register_assist()).collect();
+        let retained = workers
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .map(|worker| worker.slot().unwrap());
+        let owners: HashSet<_> = retained
+            .chain(
+                replacements
+                    .iter()
+                    .map(|worker| worker.slot().expect("reused slot")),
+            )
+            .collect();
+        assert_eq!(owners.len(), slots);
+        assert!(queue.register_worker().is_none());
+        drop(workers);
+        drop(replacements);
+        let free = QueueGuard::new(&queue.free_slots);
+        assert_eq!(free.len(), slots);
+        assert_eq!(free.iter().copied().collect::<HashSet<_>>().len(), slots);
+        assert_eq!(
+            free.capacity(),
+            capacity,
+            "registration must not grow storage"
+        );
+        println!(
+            "slots={slots} successful_claims={} exhausted_claims=3 returns={} capacity={capacity}",
+            slots + holes,
+            slots + holes
+        );
+    }
+}
+
+#[test]
+fn mark_queue_slot_pool_keeps_stale_owners_until_retirement() {
+    let (queue, _) = started_queue(1);
+    let mut old = queue.register_worker().unwrap();
+    old.push(object(1)).unwrap();
+    queue.end_epoch();
+    queue.begin_epoch();
+    assert!(old.is_stale());
+    assert!(queue.register_worker().is_none());
+    assert_eq!(queue.register_assist().slot(), None);
+    old.retire();
+    let mut current = queue.register_worker().unwrap();
+    current.push(object(2)).unwrap();
+    drop(old); // Must not return the new owner's slot a second time.
+    assert!(queue.register_worker().is_none());
+    assert_eq!(drain(&mut current), vec![2]);
+    drop(current);
+    assert!(queue.snapshot().is_drained());
+    assert_eq!(queue.snapshot().counter_underflows, 0);
+}
+
+#[test]
+fn mark_queue_slot_pool_concurrent_claims_have_exclusive_owners() {
+    const THREADS: usize = 16;
+    const ROUNDS: usize = 128;
+    let (queue, _) = started_queue(THREADS);
+    let barrier = std::sync::Barrier::new(THREADS);
+    let owners: Vec<_> = (0..THREADS).map(|_| AtomicUsize::new(0)).collect();
+    std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let (queue, barrier, owners) = (&queue, &barrier, &owners);
+            scope.spawn(move || {
+                for round in 0..ROUNDS {
+                    let mut worker = if (thread + round) % 2 == 0 {
+                        queue.register_worker().expect("one slot per thread")
+                    } else {
+                        queue.register_assist()
+                    };
+                    let slot = worker.slot().expect("one slot per thread");
+                    assert_eq!(owners[slot].fetch_add(1, Ordering::SeqCst), 0);
+                    barrier.wait();
+                    assert!(queue.register_worker().is_none());
+                    barrier.wait();
+                    assert_eq!(owners[slot].fetch_sub(1, Ordering::SeqCst), 1);
+                    worker.retire();
+                    drop(worker);
+                    barrier.wait();
+                }
+            });
+        }
+    });
+    assert_eq!(QueueGuard::new(&queue.free_slots).len(), THREADS);
+    let snapshot = queue.snapshot();
+    assert_eq!(snapshot.registered_workers, 0);
+    assert_eq!(snapshot.registered_assists, 0);
+    assert_eq!(snapshot.counter_underflows, 0);
 }

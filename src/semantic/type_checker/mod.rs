@@ -9,6 +9,7 @@ pub use check_lambda_match::LambdaCapture;
 mod check_ops;
 #[cfg(test)]
 mod class_cycle_tests;
+mod constructor_flow;
 mod diagnostics;
 mod resolve;
 mod returns;
@@ -176,10 +177,8 @@ pub struct TypeChecker {
     imported_blocking_std_functions: HashMap<String, &'static str>,
     /// Suppress duplicate missing-import diagnostics per type name.
     missing_collection_imports_reported: HashSet<String>,
-    /// Enforce the Send/Sync async checks (E2402-E2405). Off by default for the
-    /// multi-worker target; enabled by the five-worker default or explicitly
-    /// via WILLOW_DATA_RACE_CHECK
-    /// (willow-dgwo.4/.9).
+    /// Enforce the Send/Sync async checks (E2402-E2405). Compiler entry points
+    /// always enable these; direct checker tests can isolate individual rules.
     enforce_send_sync: bool,
     /// Synchronous helpers that contain or transitively reach a loop, or that
     /// belong to or reach a recursive call cycle, keyed by `Class::method` (and

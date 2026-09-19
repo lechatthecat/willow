@@ -20,6 +20,8 @@ pub const fn storage_word_bytes(pointer_bytes: u32) -> u32 {
     if pointer_bytes < 8 { 8 } else { pointer_bytes }
 }
 
+pub mod workers;
+
 pub mod runtime_symbols;
 pub use runtime_symbols::{RUNTIME_SYMBOLS, RuntimeSymbol, runtime_symbol};
 

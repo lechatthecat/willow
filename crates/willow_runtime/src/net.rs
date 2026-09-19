@@ -190,11 +190,6 @@ enum NetOperation {
     ImmediateError(String),
 }
 
-unsafe fn operation(frame: *mut c_void) -> Option<&'static mut NetOperation> {
-    let raw = unsafe { net_frame(frame) }.load_native::<NetOperation>(NET_TASK_OPERATION_SLOT);
-    unsafe { raw.as_mut() }
-}
-
 unsafe fn task_handle(frame: *mut c_void) -> *mut u8 {
     unsafe { net_frame(frame) }.load_gc(NET_TASK_HANDLE_SLOT)
 }
@@ -264,13 +259,13 @@ unsafe fn finish_error(frame: *mut c_void, message: &str, fd: Option<i64>) -> i3
     unsafe { finish(frame, error, fd) }
 }
 
-unsafe fn poll_connect(frame: *mut c_void) -> i32 {
-    let Some(NetOperation::Connect {
+unsafe fn poll_connect(frame: *mut c_void, operation: &mut NetOperation) -> i32 {
+    let NetOperation::Connect {
         address_text,
         address,
         socket,
         started,
-    }) = (unsafe { operation(frame) })
+    } = operation
     else {
         return unsafe { finish_error(frame, "net::connect_async: invalid operation", None) };
     };
@@ -456,11 +451,16 @@ unsafe fn poll_write(frame: *mut c_void, bytes: &[u8], offset: &mut usize) -> i3
 }
 
 unsafe extern "C" fn poll_net_operation(frame: *mut c_void) -> i32 {
-    let Some(operation) = (unsafe { operation(frame) }) else {
+    let native_frame = unsafe { net_frame(frame) };
+    let raw = native_frame.take_native::<NetOperation>(NET_TASK_OPERATION_SLOT);
+    if raw.is_null() {
         return crate::task::RUNTIME_POLL_READY;
-    };
-    match operation {
-        NetOperation::Connect { .. } => unsafe { poll_connect(frame) },
+    }
+    // Poll/cancel callbacks for a task are serialized by the scheduler. Take
+    // ownership so finish() cannot free fields borrowed by the poll helpers.
+    let mut operation = unsafe { Box::from_raw(raw) };
+    let status = match operation.as_mut() {
+        NetOperation::Connect { .. } => unsafe { poll_connect(frame, &mut operation) },
         NetOperation::Accept => unsafe { poll_accept(frame) },
         NetOperation::Read { max_bytes, bytes } => unsafe { poll_read(frame, *max_bytes, bytes) },
         NetOperation::Write { bytes, offset } => unsafe { poll_write(frame, bytes, offset) },
@@ -468,7 +468,11 @@ unsafe extern "C" fn poll_net_operation(frame: *mut c_void) -> i32 {
             let message = std::mem::take(message);
             unsafe { finish_error(frame, &message, None) }
         }
+    };
+    if status == crate::task::RUNTIME_POLL_PENDING {
+        native_frame.store_native(NET_TASK_OPERATION_SLOT, Box::into_raw(operation));
     }
+    status
 }
 
 unsafe extern "C" fn cancel_net_operation(frame: *mut c_void) {

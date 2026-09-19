@@ -217,3 +217,6 @@ mod type_argument_arity;
 ))]
 #[path = "integration/native_sync_stack.rs"]
 mod native_sync_stack;
+
+#[path = "integration/constructor_flow.rs"]
+mod constructor_flow;

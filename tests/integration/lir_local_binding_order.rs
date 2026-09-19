@@ -521,10 +521,9 @@ async fn main() {
 /// copy of the local. Contention makes the sections interleave, so a binding
 /// shared through anything but per-frame storage would cross the two.
 ///
-/// Which task enters the section first is the scheduler's choice — the runtime
-/// clamps every worker override up to `DEFAULT_WORKERS`, so these two really do
-/// run in parallel — and the assertion must not encode one order. Both tasks
-/// add the same amount and separate themselves by a private `tag`, so the two
+/// Which task enters the section first is the scheduler's choice. With multiple
+/// workers they can run in parallel, so the assertion must not encode one order.
+/// Both tasks add the same amount and separate themselves by a private `tag`, so the two
 /// observations are 10 and 20 either way and the printed sum is 33 for both
 /// interleavings. A crossed binding loses a tag and changes it.
 #[test]

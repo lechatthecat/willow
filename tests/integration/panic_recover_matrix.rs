@@ -193,35 +193,8 @@ fn main() {}
     );
 }
 
-#[test]
-fn prm_regression_007_panicked_poll_is_terminalized_before_reporting() {
-    let source = fs::read_to_string("crates/willow_runtime/src/scheduler.rs")
-        .expect("scheduler source must be readable");
-    let start = source
-        .find("PollOutcome::Panicked | PollOutcome::Invalid(_) => {")
-        .expect("panicked poll branch must exist");
-    let tail = &source[start..];
-    let end = tail
-        .find("// Done polling this task")
-        .expect("panicked poll branch must precede post-poll cleanup");
-    let branch = &tail[..end];
-    assert!(
-        branch.contains("finalize_panicked(id)"),
-        "panicked poll must publish a terminal state and enqueue cleanup before abort:\n{branch}"
-    );
-    let finalize = source[start..]
-        .find("finalize_panicked(id)")
-        .expect("terminalization call")
-        + start;
-    let report = source[start..]
-        .find("finish_unhandled_with_async_chain")
-        .expect("panic report call")
-        + start;
-    assert!(
-        finalize < report,
-        "terminalization must precede unhandled-panic reporting"
-    );
-}
+// Perspective 007 is exercised behaviorally by the runtime unit test
+// panic_context::tests::panicked_poll_is_terminalized_before_reporting.
 
 fn assert_runtime_fault_has_source_location(source: &str) {
     let (out, ok) = compile_and_run(source);

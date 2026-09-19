@@ -7727,9 +7727,8 @@ fn coop_spawn_08_spawn_async_leaf_runs_to_completion() {
     // The exact interleaving of the spawner's prints with the leaf's is NOT an
     // invariant and must not be asserted (willow-0uce). `willow_sched_spawn`
     // publishes the task to the shared run queues and the runtime drives them
-    // on a worker pool of at least 5 threads — `WILLOW_WORKERS` is clamped UP
-    // to `DEFAULT_WORKERS`, so even a single-worker request gets the pool — so
-    // a peer worker may claim and poll `work` the instant it is spawned,
+    // on the configured worker pool. With multiple workers, a peer worker
+    // may claim and poll `work` the instant it is spawned,
     // concurrently with `main` running on to `println(2)`. Both `1 2 100 ...`
     // and `1 100 2 ...` are legal; a wider gap between the spawn and the next
     // statement makes `1 100 200 2 ...` legal too. Asserting one ordering was
@@ -17147,9 +17146,8 @@ async fn main() {
 
 #[test]
 fn net_01_loopback_echo_uses_async_socket_operations() {
-    // Exercise the runtime's minimum five-worker pool. Non-blocking behavior
-    // is pinned separately by readiness parking/wake and cancellation tests;
-    // WILLOW_WORKERS values below five are intentionally clamped to five.
+    // Request five workers explicitly. Non-blocking behavior is pinned
+    // separately by readiness parking/wake and cancellation tests.
     let (out, ok) = compile_and_run_with_env(NET_ECHO_SOURCE, &[("WILLOW_WORKERS", "5")]);
     assert!(ok, "{out}");
     assert_eq!(out, "ping\n");

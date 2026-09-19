@@ -265,7 +265,7 @@ Current limitations include:
 
 - the standard library is still small: prelude plus `std::collections`, `std::option`, `std::result`, `std::io`, `std::env`, and `std::fs`
 - synchronous filesystem forms block the calling worker; `*_async` forms run on a bounded blocking pool (`WILLOW_BLOCKING_THREADS`, default 4; queue `WILLOW_BLOCKING_QUEUE`, default 16 per thread); when the queue is full an `*_async` Task waits for a slot, served oldest first, rather than failing
-- runs use at least five active workers; `WILLOW_WORKERS=N` can request more, while values below five are clamped to five
+- runs default to available CPU parallelism (one worker if detection fails); `WILLOW_WORKERS=N` honors any positive count, including one; Send/Sync checks are always enforced regardless of worker count
 - syntax, runtime APIs, and compiler internals may still change
 - the compiler currently requires a Rust toolchain to build from source
 

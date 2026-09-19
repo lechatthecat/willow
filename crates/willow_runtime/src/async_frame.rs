@@ -92,26 +92,27 @@ pub const WILLOW_FRAME_STATUS_TERMINAL_MASK: i64 = willow_abi::frame_status::TER
 /// Cancellation was requested but the task has not reached the boundary yet.
 pub const WILLOW_FRAME_STATUS_CANCEL_REQUESTED: i64 = willow_abi::frame_status::CANCEL_REQUESTED;
 
-/// The status word of `frame` as an atomic, or `None` for a null frame.
+/// Pointer to the atomic status word, or null for a null frame.
 ///
 /// # Safety
-/// `frame` must be null or an async frame from [`willow_async_frame_alloc`].
-unsafe fn status_word(frame: *mut c_void) -> Option<&'static AtomicI64> {
+/// `frame` must be null or a live async frame from [`willow_async_frame_alloc`].
+/// The returned pointer must not be dereferenced after the frame is released.
+unsafe fn status_word(frame: *mut c_void) -> *const AtomicI64 {
     if frame.is_null() {
-        return None;
+        return std::ptr::null();
     }
     // The word is naturally aligned (the payload is word-aligned and the
     // offset is a multiple of 8), so the atomic view is valid.
-    Some(unsafe {
-        &*(frame as *mut u8)
+    unsafe {
+        (frame as *mut u8)
             .add(ASYNC_FRAME_STATUS_OFFSET)
             .cast::<AtomicI64>()
-    })
+    }
 }
 
 /// Read a frame's status word (0 when the frame is null).
 pub fn frame_status(frame: *mut c_void) -> i64 {
-    unsafe { status_word(frame) }.map_or(WILLOW_FRAME_STATUS_PENDING, |word| {
+    unsafe { status_word(frame).as_ref() }.map_or(WILLOW_FRAME_STATUS_PENDING, |word| {
         word.load(Ordering::Acquire)
     })
 }
@@ -133,7 +134,7 @@ pub fn frame_is_terminal(frame: *mut c_void) -> bool {
 /// Idempotent: a frame that already carries a terminal code keeps it, so a
 /// repeated or racing transition cannot rewrite a published result.
 pub fn frame_publish_terminal(frame: *mut c_void, terminal: i64) {
-    let Some(word) = (unsafe { status_word(frame) }) else {
+    let Some(word) = (unsafe { status_word(frame).as_ref() }) else {
         return;
     };
     let terminal = terminal & WILLOW_FRAME_STATUS_TERMINAL_MASK;
@@ -153,7 +154,7 @@ pub fn frame_publish_terminal(frame: *mut c_void, terminal: i64) {
 /// Set the cancel-requested bit (`Task::cancel()`), leaving any terminal code
 /// alone.
 pub fn frame_request_cancel(frame: *mut c_void) {
-    if let Some(word) = unsafe { status_word(frame) } {
+    if let Some(word) = unsafe { status_word(frame).as_ref() } {
         word.fetch_or(WILLOW_FRAME_STATUS_CANCEL_REQUESTED, Ordering::Release);
     }
 }

@@ -118,7 +118,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Upper bound on the items moved by a single steal or injector drain. Bounded
@@ -462,7 +462,6 @@ enum ConsumerKind {
 /// takes them all, ascending, which is why the order is total across slots and
 /// not merely a three-tier rule.
 struct LocalSlot {
-    in_use: AtomicBool,
     private: Mutex<Vec<MarkWork>>,
     shared: Mutex<VecDeque<MarkWork>>,
 }
@@ -470,7 +469,6 @@ struct LocalSlot {
 impl Default for LocalSlot {
     fn default() -> Self {
         Self {
-            in_use: AtomicBool::new(false),
             private: Mutex::new(Vec::new()),
             shared: Mutex::new(VecDeque::new()),
         }
@@ -493,6 +491,11 @@ pub struct MarkWorkQueue {
     last_issued: AtomicU64,
     injector: Mutex<VecDeque<MarkWork>>,
     slots: Vec<LocalSlot>,
+    /// Unclaimed slot indices. Claim/return each do one O(1) pop/push;
+    /// capacity is reserved at construction and never shrunk. This lock is
+    /// never held with a work-segment lock. Epoch changes do not release slots:
+    /// stale handles keep ownership until retirement has flushed their work.
+    free_slots: Mutex<Vec<usize>>,
     quarantine: Mutex<Vec<MarkWork>>,
     counters: Counters,
 }
@@ -512,6 +515,7 @@ impl MarkWorkQueue {
             last_issued: AtomicU64::new(MarkEpoch::IDLE.0),
             injector: Mutex::new(VecDeque::new()),
             slots: (0..slots).map(|_| LocalSlot::default()).collect(),
+            free_slots: Mutex::new((0..slots).rev().collect()),
             quarantine: Mutex::new(Vec::new()),
             counters: Counters::default(),
         })
@@ -724,11 +728,7 @@ impl MarkWorkQueue {
     }
 
     fn claim_slot(&self) -> Option<usize> {
-        self.slots.iter().position(|slot| {
-            slot.in_use
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-        })
+        QueueGuard::new(&self.free_slots).pop()
     }
 
     /// Force every private segment into the injector so all work is visible to
@@ -1082,9 +1082,8 @@ impl MarkWorker {
         let moved = match self.slot {
             Some(index) => {
                 let moved = self.queue.flush_slot(index);
-                self.queue.slots[index]
-                    .in_use
-                    .store(false, Ordering::SeqCst);
+                // Publish all local work before allowing a new owner in.
+                QueueGuard::new(&self.queue.free_slots).push(index);
                 moved
             }
             None => 0,

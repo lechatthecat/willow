@@ -92,15 +92,17 @@ impl GcLayoutMetadata {
     }
 }
 
-/// Shared allocation path for wide class objects and async frames.
-pub(super) fn emit_bitmap_alloc(
+/// Intern exact trace descriptors within the object module. A layout fingerprint
+/// is insufficient: it does not include the wide bitmap. Equal bitmaps can safely
+/// share data even when allocation size or runtime type differ.
+fn bitmap_descriptor(
     module: &mut ObjectModule,
-    builder: &mut FunctionBuilder<'_>,
-    alloc_id: FuncId,
-    type_id: i64,
-    payload_size: i64,
+    descriptors: &mut HashMap<Vec<u64>, DataId>,
     bitmap: &[u64],
-) -> Value {
+) -> DataId {
+    if let Some(&id) = descriptors.get(bitmap) {
+        return id;
+    }
     let data_id = module
         .declare_anonymous_data(false, false)
         .expect("GC bitmap data");
@@ -114,6 +116,21 @@ pub(super) fn emit_bitmap_alloc(
     module
         .define_data(data_id, &data)
         .expect("GC bitmap definition");
+    descriptors.insert(bitmap.to_vec(), data_id);
+    data_id
+}
+
+/// Shared allocation path for wide class objects and async frames.
+pub(super) fn emit_bitmap_alloc(
+    module: &mut ObjectModule,
+    descriptors: &mut HashMap<Vec<u64>, DataId>,
+    builder: &mut FunctionBuilder<'_>,
+    alloc_id: FuncId,
+    type_id: i64,
+    payload_size: i64,
+    bitmap: &[u64],
+) -> Value {
+    let data_id = bitmap_descriptor(module, descriptors, bitmap);
     let global = module.declare_data_in_func(data_id, builder.func);
     let pointer = builder
         .ins()
@@ -163,6 +180,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let alloc = self.func_id("willow_gc_alloc_bitmap");
             return emit_bitmap_alloc(
                 self.module,
+                self.gc_bitmap_descriptors,
                 self.builder,
                 alloc,
                 layout.runtime_type_id,
@@ -408,6 +426,51 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bitmap_descriptors_scale_with_unique_contents_not_sites() {
+        for words in [2, 8, 64] {
+            for sites in [1, 16, 256] {
+                let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+                let before = codegen.module.declarations().get_data_objects().count();
+                let mut bitmap = vec![0; words];
+                bitmap[words - 1] = 1;
+                let first = bitmap_descriptor(
+                    &mut codegen.module,
+                    &mut codegen.gc_bitmap_descriptors,
+                    &bitmap,
+                );
+                for _ in 1..sites {
+                    assert_eq!(
+                        bitmap_descriptor(
+                            &mut codegen.module,
+                            &mut codegen.gc_bitmap_descriptors,
+                            &bitmap,
+                        ),
+                        first,
+                    );
+                }
+                assert_eq!(
+                    codegen.module.declarations().get_data_objects().count() - before,
+                    1
+                );
+                // The low mask and bitmap length are identical; only a high
+                // reference bit differs. A layout-fingerprint key would collide.
+                bitmap[words - 1] = 2;
+                let other = bitmap_descriptor(
+                    &mut codegen.module,
+                    &mut codegen.gc_bitmap_descriptors,
+                    &bitmap,
+                );
+                assert_ne!(first, other);
+                assert_eq!(
+                    codegen.module.declarations().get_data_objects().count() - before,
+                    2
+                );
+                assert_eq!(codegen.gc_bitmap_descriptors.len(), 2);
+            }
+        }
+    }
 
     #[test]
     fn layout_id_is_stable_and_shape_sensitive() {

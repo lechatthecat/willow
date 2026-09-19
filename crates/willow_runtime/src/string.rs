@@ -25,7 +25,8 @@ fn string_payload_size(len: usize) -> Option<i64> {
     i64::try_from(size).ok()
 }
 
-/// Allocate a new WillowString from a raw byte slice.
+/// Allocate a new WillowString from a raw UTF-8 byte slice.
+/// Invalid UTF-8 is a fatal runtime invariant violation.
 /// Returns a pointer to the payload (the `len` field at offset 0).
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_string_alloc(bytes: *const u8, len: i64) -> *mut u8 {
@@ -39,6 +40,15 @@ pub extern "C" fn willow_string_alloc(bytes: *const u8, len: i64) -> *mut u8 {
     let Some(payload_size) = string_payload_size(len_usize) else {
         return std::ptr::null_mut();
     };
+    if len_usize > 0 {
+        let input = unsafe { std::slice::from_raw_parts(bytes, len_usize) };
+        require_utf8(input);
+    }
+    unsafe { alloc_validated_bytes(bytes, len_usize, payload_size) }
+}
+
+// Caller guarantees valid UTF-8 bytes and a checked payload size.
+unsafe fn alloc_validated_bytes(bytes: *const u8, len_usize: usize, payload_size: i64) -> *mut u8 {
     let ptr = willow_alloc_with_layout(GcObjectKind::String, 0, payload_size, 0);
     if ptr.is_null() {
         return ptr;
@@ -182,11 +192,20 @@ pub extern "C" fn willow_string_concat(lhs: *const u8, rhs: *const u8) -> *mut u
 
 /// Allocate a WillowString from a Rust `&str`.
 pub fn willow_string_from_str(s: &str) -> *mut u8 {
-    willow_string_alloc(s.as_bytes().as_ptr(), s.len() as i64)
+    let Some(payload_size) = string_payload_size(s.len()) else {
+        return std::ptr::null_mut();
+    };
+    // Rust strings already guarantee UTF-8: do not rescan formatted/file text.
+    unsafe { alloc_validated_bytes(s.as_ptr(), s.len(), payload_size) }
+}
+
+fn require_utf8(bytes: &[u8]) -> &str {
+    std::str::from_utf8(bytes)
+        .unwrap_or_else(|_| crate::panic_context::fatal_invariant("invalid UTF-8 in WillowString"))
 }
 
 /// Read a WillowString payload as a Rust `&str`.
-/// Returns `""` on null or invalid UTF-8.
+/// Returns `""` on null; invalid UTF-8 is a fatal runtime invariant violation.
 ///
 /// # Safety
 /// `s` must be null or a valid pointer to a WillowString allocated by this
@@ -197,7 +216,7 @@ pub unsafe fn willow_string_as_str<'a>(s: *const u8) -> &'a str {
     }
     let len = unsafe { *(s as *const i64) } as usize;
     let bytes = unsafe { std::slice::from_raw_parts(s.add(8), len) };
-    std::str::from_utf8(bytes).unwrap_or("")
+    require_utf8(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +227,78 @@ pub unsafe fn willow_string_as_str<'a>(s: *const u8) -> &'a str {
 mod tests {
     use super::*;
     use crate::gc::{runtime_test_guard, willow_gc_init};
+
+    #[test]
+    fn invalid_utf8_is_process_fatal() {
+        const CHILD: &str = "WILLOW_TEST_INVALID_STRING_UTF8";
+        if let Ok(case) = std::env::var(CHILD) {
+            let _guard = runtime_test_guard();
+            willow_gc_init();
+            match case.as_str() {
+                "alloc" => {
+                    willow_string_alloc([0xff].as_ptr(), 1);
+                }
+                "literal" => {
+                    willow_string_literal(b"\xc0\x80".as_ptr(), 2);
+                }
+                "truncated" => {
+                    willow_string_alloc(b"\xe2\x82".as_ptr(), 2);
+                }
+                "corrupt" => {
+                    let ptr = willow_string_from_str("a");
+                    unsafe {
+                        *ptr.add(8) = 0xff;
+                        willow_string_as_str(ptr);
+                    }
+                }
+                _ => panic!("unknown child case"),
+            }
+            return;
+        }
+        for case in ["alloc", "literal", "truncated", "corrupt"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "string::tests::invalid_utf8_is_process_fatal",
+                    "--nocapture",
+                ])
+                .env(CHILD, case)
+                .output()
+                .expect("run invalid UTF-8 subprocess");
+            assert!(
+                !output.status.success(),
+                "{case}: invalid UTF-8 was accepted"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("runtime fatal: invalid UTF-8 in WillowString"),
+                "{case}: {stderr}"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(output.status.signal(), Some(libc::SIGABRT));
+            }
+        }
+    }
+
+    #[test]
+    fn utf8_byte_entries_preserve_content() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        for repeats in [0, 1, 16, 256, 4096] {
+            let text = "a\0é水🦀".repeat(repeats);
+            let ptr = willow_string_alloc(text.as_ptr(), text.len() as i64);
+            assert!(!ptr.is_null());
+            assert_eq!(unsafe { willow_string_as_str(ptr) }, text);
+            assert_eq!(unsafe { *ptr.add(8 + text.len()) }, 0);
+        }
+        let text = "literal é水🦀";
+        let ptr = willow_string_literal(text.as_ptr(), text.len() as i64);
+        assert_eq!(unsafe { willow_string_as_str(ptr) }, text);
+        assert_eq!(willow_string_literal(text.as_ptr(), text.len() as i64), ptr);
+        assert_eq!(unsafe { willow_string_as_str(std::ptr::null()) }, "");
+    }
 
     #[test]
     fn string_payload_size_boundaries() {

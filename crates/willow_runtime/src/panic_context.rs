@@ -404,6 +404,8 @@ pub(crate) fn finish_unhandled_with_async_chain(async_chain: &str) -> ! {
     if records.is_empty() {
         fatal_invariant("finish-unhandled called without an active panic");
     }
+    #[cfg(test)]
+    tests::observe_unhandled_report();
     for (index, record) in records.iter().rev().enumerate() {
         let info = record.info as *mut u8;
         let message = unsafe { panic_info_message(info) };
@@ -466,6 +468,89 @@ mod tests {
         willow_gc_init, willow_gc_minor_collect,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    thread_local! {
+        static REPORT_OBSERVER: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn observe_unhandled_report() {
+        REPORT_OBSERVER.with(|observer| {
+            if let Some(observer) = observer.borrow().as_ref() {
+                observer();
+            }
+        });
+    }
+
+    #[test]
+    fn panicked_poll_is_terminalized_before_reporting() {
+        use crate::async_frame::{
+            WILLOW_FRAME_STATUS_PANICKED, frame_terminal_status, willow_async_frame_alloc,
+        };
+        use crate::scheduler::*;
+        const CHILD: &str = "WILLOW_TEST_PANIC_REPORT_CHILD";
+        const MARKER: &str = "panic-report-observed-terminal-and-clean";
+        if std::env::var_os(CHILD).is_none() {
+            for workers in ["1", "4"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "panic_context::tests::panicked_poll_is_terminalized_before_reporting",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("WILLOW_WORKERS", workers)
+                    .output()
+                    .unwrap();
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!output.status.success(), "unhandled panic must terminate");
+                assert!(stderr.contains(MARKER), "workers={workers}: {stderr}");
+                assert!(stderr.contains("runtime panic: report-order"), "{stderr}");
+            }
+            return;
+        }
+        let _heap = runtime_test_guard();
+        willow_gc_init();
+        reset_global_scheduler_for_test();
+        unsafe extern "C" fn poll(frame: *mut std::ffi::c_void) -> i32 {
+            let id = willow_sched_current_task();
+            // Keep a real I/O registration alive until the report observer;
+            // an empty cleanup queue alone would also pass if enqueue broke.
+            #[cfg(unix)]
+            let sockets = {
+                use std::os::fd::AsRawFd;
+                let sockets = std::os::unix::net::UnixStream::pair().unwrap();
+                assert_eq!(crate::netpoll::willow_netpoll_init(), 0);
+                assert_eq!(
+                    crate::netpoll::willow_netpoll_register(i64::from(sockets.0.as_raw_fd()), 1),
+                    0
+                );
+                assert!(crate::netpoll::has_waiters());
+                sockets
+            };
+            REPORT_OBSERVER.with(|observer| {
+                *observer.borrow_mut() = Some(Box::new(move || {
+                    assert_eq!(frame_terminal_status(frame), WILLOW_FRAME_STATUS_PANICKED);
+                    assert_eq!(willow_sched_task_state(id), -1);
+                    assert_eq!(willow_sched_heavy_task_count(), 0);
+                    assert_eq!(willow_sched_queue_entry_count(), 0);
+                    assert_eq!(willow_sched_pending_cleanup_count(), 0);
+                    #[cfg(unix)]
+                    {
+                        let _keep_registration_alive = &sockets;
+                        assert!(!crate::netpoll::has_waiters());
+                    }
+                    eprintln!("{MARKER}");
+                }));
+            });
+            raise("report-order", "", 0, 0);
+            crate::task::RUNTIME_POLL_PANICKED
+        }
+        let frame = willow_async_frame_alloc(0, 0);
+        let id = willow_sched_spawn_cooperative(poll, frame) as u64;
+        willow_sched_run_until(id);
+        panic!("unhandled task panic returned");
+    }
 
     struct ContextTestGuard {
         previous: Option<Arc<PanicContext>>,

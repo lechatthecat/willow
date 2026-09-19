@@ -254,3 +254,78 @@ fn bitmap_frame_10_main() {
 fn bitmap_frame_10_function() {
     check_frame(193, false);
 }
+
+#[test]
+fn repeated_wide_class_sites_emit_one_bitmap_descriptor() {
+    use super::support::{temp_path, unique_test_id};
+    use std::{fs, process::Command};
+
+    for sites in [1, 4, 16] {
+        let id = unique_test_id();
+        let src = temp_path(format!("bitmap_dedup_{id}.wi"));
+        let bin = temp_path(format!("bitmap_dedup_{id}"));
+        let obj = format!(
+            "{bin}.{}",
+            if cfg!(all(target_os = "windows", target_env = "msvc")) {
+                "obj"
+            } else {
+                "o"
+            }
+        );
+        let fields = (0..65)
+            .map(|i| format!("pub field_{i}: String;"))
+            .collect::<String>();
+        let args = vec!["\"kept\""; 65].join(",");
+        let functions = (0..sites)
+            .map(|i| format!("fn make{i}() -> Wide {{ return new Wide({args}); }}"))
+            .collect::<String>();
+        let calls = (0..sites)
+            .map(|i| format!("let v{i} = make{i}(); gc_minor_collect(); println(v{i}.field_64);"))
+            .collect::<String>();
+        fs::write(
+            &src,
+            format!("class Wide {{ {fields} }} {functions} fn main() {{ {calls} }}"),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_willowc"))
+            .args(["build", &src, "-o", &bin])
+            .env("WILLOW_KEEP_OBJECT", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = fs::read(&obj).unwrap();
+        let descriptor = [2_u64, u64::MAX - 1, 3]
+            .into_iter()
+            .flat_map(u64::to_ne_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bytes
+                .windows(descriptor.len())
+                .filter(|window| *window == descriptor)
+                .count(),
+            1,
+            "{sites} sites"
+        );
+        let output = Command::new(&bin)
+            .env("WILLOW_GC_STRESS", "minor")
+            .env("WILLOW_WORKERS", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "kept\n".repeat(sites)
+        );
+        for path in [&src, &bin, &obj] {
+            let _ = fs::remove_file(path);
+        }
+    }
+}

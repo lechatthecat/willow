@@ -268,16 +268,15 @@ impl TypeChecker {
         // `in_constructor` is set.
         self.check_block(&ctor.body);
 
-        // Every instance field must be assigned in the constructor body
-        // (willow-scq2 §8 → E0842). MVP check: a `self.field = ...` exists for
-        // each field somewhere in the body (not path-sensitive).
-        let mut assigned: HashSet<String> = HashSet::new();
-        collect_self_field_assigns(&ctor.body, &mut assigned);
-        for field in &c.fields {
-            if field.is_static {
-                continue;
-            }
-            if !assigned.contains(&field.name) {
+        // E0842: every successful exit must initialize every instance field.
+        let fields: Vec<_> = c.fields.iter().filter(|field| !field.is_static).collect();
+        let missing = super::constructor_flow::uninitialized_fields(
+            &ctor.body,
+            fields.iter().map(|field| field.name.as_str()),
+            &self.expr_types,
+        );
+        for (field, missing) in fields.iter().zip(missing) {
+            if missing {
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
@@ -287,9 +286,12 @@ impl TypeChecker {
                             field.name, c.name
                         ),
                     )
-                    .with_label(Label::primary(ctor.span, "field left uninitialized"))
+                    .with_label(Label::primary(
+                        ctor.span,
+                        "field left uninitialized on a normal exit",
+                    ))
                     .with_help(format!(
-                        "assign `self.{} = ...` in the constructor",
+                        "assign `self.{} = ...` on every path that returns from the constructor",
                         field.name
                     )),
                 );

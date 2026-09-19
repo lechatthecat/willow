@@ -522,7 +522,7 @@ fn idle_18_a_drive_strands_no_runnable_task_behind_its_own_stop() {
 #[test]
 fn idle_19_more_tasks_than_workers_all_complete_in_one_drive() {
     let _guard = fresh_scheduler();
-    let count = DEFAULT_WORKERS * 40;
+    let count = runtime_worker_config().active_workers() * 40;
     let frames: Vec<*mut c_void> = (0..count).map(|_| counter_frame()).collect();
     let ids: Vec<u64> = frames
         .iter()

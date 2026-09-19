@@ -215,9 +215,10 @@ unsafe fn fs_frame(frame: *mut c_void) -> NativeTaskFrame<FsScalarFrame> {
     unsafe { NativeTaskFrame::from_raw(frame) }
 }
 
-unsafe fn blocking_state(frame: *mut c_void) -> Option<&'static Arc<BlockingFsState>> {
+unsafe fn blocking_state(frame: *mut c_void) -> Option<Arc<BlockingFsState>> {
     let raw = unsafe { fs_frame(frame) }.load_native::<Arc<BlockingFsState>>(FS_TASK_JOB_SLOT);
-    unsafe { raw.as_ref() }
+    // The frame may release its boxed Arc when this poll completes.
+    unsafe { raw.as_ref() }.cloned()
 }
 
 unsafe extern "C" fn poll_blocking_fs(frame: *mut c_void) -> i32 {
@@ -409,10 +410,33 @@ pub extern "C" fn willow_fs_remove_file_async(path: *const u8) -> *mut c_void {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gc::runtime_test_guard;
+    use crate::gc::{reset_internal_for_test, runtime_test_guard};
 
     fn read_tag(ptr: *mut u8) -> i64 {
         unsafe { *(ptr as *const i64) }
+    }
+
+    #[test]
+    fn poll_state_remains_owned_after_frame_cleanup() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        let frame = NativeTaskFrame::<FsScalarFrame>::allocate().unwrap();
+        let core = Arc::new(BlockingFsState::new());
+        let weak = Arc::downgrade(&core);
+        frame.store_native(FS_TASK_JOB_SLOT, Box::into_raw(Box::new(core)));
+        let state = unsafe { blocking_state(frame.as_raw()) }.unwrap();
+        unsafe { cancel_blocking_fs(frame.as_raw()) };
+        assert!(
+            frame
+                .load_native::<Arc<BlockingFsState>>(FS_TASK_JOB_SLOT)
+                .is_null()
+        );
+        assert!(weak.upgrade().is_some());
+        drop(state);
+        assert!(weak.upgrade().is_none());
+        // Repeated cleanup must leave the cleared slot alone.
+        unsafe { cancel_blocking_fs(frame.as_raw()) };
+        reset_internal_for_test();
     }
 
     #[test]

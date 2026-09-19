@@ -22,9 +22,8 @@ async fn main() {
 // Async state machines + async stack traces — willow-9lw acceptance.
 // ---------------------------------------------------------------------------
 
-// WILLOW_WORKERS contract (willow-gyaa.4): runs use at least five workers;
-// WILLOW_WORKERS=N may request more. These pin result correctness for default,
-// clamped-low, and larger explicit values.
+// WILLOW_WORKERS honors any positive count; the default is available
+// parallelism. Results must agree for single and multiple workers.
 const WORKERS_CONCURRENT_SRC: &str = r#"
 async fn compute(n: i64) -> i64 {
     await sleep(1);
@@ -47,7 +46,7 @@ fn test_workers_default_runs_concurrent_program() {
 
 #[test]
 fn test_workers_env_does_not_change_result() {
-    // 1 and 4 clamp to five; 0 and garbage use the five-worker default.
+    // 1 and 4 are honored; 0 and garbage use available parallelism.
     for value in ["1", "4", "0", "not-a-number"] {
         let (out, ok) =
             compile_and_run_with_env(WORKERS_CONCURRENT_SRC, &[("WILLOW_WORKERS", value)]);
@@ -659,13 +658,12 @@ fn test_prelude_markers_do_not_break_normal_program() {
 }
 
 // ── Async-call capture checking (willow-dgwo.4) ──────────────────────────────
-// Enforced by default because Willow always runs with at least five workers, or
-// explicitly via WILLOW_DATA_RACE_CHECK.
+// Always enforced, independently of WILLOW_WORKERS or WILLOW_DATA_RACE_CHECK.
 //
 // 20 perspectives (this block + the dgwo.2 classifier unit tests in
 // type_checker/send_sync.rs cover the underlying type rules):
 //  1. non-Sync GC arg (Array) rejected under the check (E2402)
-//  2. a low worker override is clamped and still rejected
+//  2. a single-worker override still rejects unsafe captures
 //  3. E2402 help names the safe wrappers
 //  4. Map arg rejected
 //  5. Option<Array> arg rejected
@@ -701,7 +699,10 @@ fn test_dgwo4_nonsync_gc_arg_rejected_under_check() {
 #[test]
 fn test_dgwo4_low_worker_override_still_rejects_nonsync_arg() {
     let (ok, stderr) = compile_with_compiler_env(NONSYNC_ARG_SRC, &[("WILLOW_WORKERS", "1")]);
-    assert!(!ok, "WILLOW_WORKERS=1 must be clamped to five");
+    assert!(
+        !ok,
+        "single-worker scheduling must preserve Send/Sync checks"
+    );
     assert!(stderr.contains("error[E2402]"), "{stderr}");
 }
 
@@ -1286,8 +1287,7 @@ async fn main() {
 }
 
 // ── Multi-worker capstone (willow-dgwo.9) ─────────────────────────────────────
-// The five-worker minimum enables the Send/Sync checks that make task migration
-// sound. WILLOW_WORKERS values below five are clamped; invalid values use five.
+// Send/Sync checks make task migration sound regardless of worker count.
 const NONSEND_ASYNC_FRAME_SRC: &str = r#"
 fn inc(x: i64) -> i64 { return x + 1; }
 async fn run() -> i64 {
@@ -1307,19 +1307,22 @@ fn test_dgwo9_workers_env_enables_data_race_check() {
 }
 
 #[test]
-fn test_dgwo9_default_five_workers_enable_data_race_check() {
+fn test_dgwo9_default_workers_keep_data_race_check() {
     let (ok, stderr) = compile_with_compiler_env(NONSYNC_ARG_SRC, &[]);
     assert!(
         !ok,
-        "the five-worker default should enable Send/Sync checks"
+        "the default configuration must enforce Send/Sync checks"
     );
     assert!(stderr.contains("error[E2402]"), "{stderr}");
 }
 
 #[test]
-fn test_dgwo9_workers_one_is_clamped_and_keeps_checks_on() {
+fn test_dgwo9_workers_one_keeps_checks_on() {
     let (ok, stderr) = compile_with_compiler_env(NONSYNC_ARG_SRC, &[("WILLOW_WORKERS", "1")]);
-    assert!(!ok, "WILLOW_WORKERS=1 must be clamped to five");
+    assert!(
+        !ok,
+        "single-worker scheduling must preserve Send/Sync checks"
+    );
     assert!(stderr.contains("error[E2402]"), "{stderr}");
 }
 
@@ -1329,9 +1332,21 @@ fn test_dgwo9_invalid_workers_fall_back_to_default_checks() {
         compile_with_compiler_env(NONSYNC_ARG_SRC, &[("WILLOW_WORKERS", "not-a-number")]);
     assert!(
         !ok,
-        "invalid WILLOW_WORKERS should fall back to five-worker checks: {stderr}"
+        "invalid WILLOW_WORKERS must preserve Send/Sync checks: {stderr}"
     );
     assert!(stderr.contains("error[E2402]"), "{stderr}");
+}
+
+#[test]
+fn test_dgwo9_single_worker_cannot_disable_capture_or_frame_checks() {
+    for source in [NONSYNC_ARG_SRC, NONSEND_ASYNC_FRAME_SRC] {
+        let (ok, stderr) = compile_with_compiler_env(
+            source,
+            &[("WILLOW_WORKERS", "1"), ("WILLOW_DATA_RACE_CHECK", "0")],
+        );
+        assert!(!ok, "single worker must retain type safety");
+        assert!(stderr.contains("error[E2402]"), "{stderr}");
+    }
 }
 
 #[test]

@@ -1,0 +1,33 @@
+// Every successful constructor exit initializes every instance field.
+// Panic paths do not construct an object; deferred assignments do not count.
+class Label {
+    pub text: String;
+    pub code: i64;
+
+    pub init(self, code: i64) {
+        if code < 0 {
+            panic("negative label code");
+        }
+        if code == 0 {
+            self.text = "zero";
+            self.code = 0;
+            return;
+        }
+        match code {
+            1 => { self.text = "one"; },
+            _ => { self.text = "many"; }
+        };
+        while true {
+            self.code = code;
+            break;
+        }
+    }
+}
+
+fn main() {
+    for code in 0..3 {
+        let label = new Label(code);
+        println(label.text);
+        println(label.code);
+    }
+}

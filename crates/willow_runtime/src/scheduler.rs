@@ -4,6 +4,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
+use willow_abi::workers::{default_worker_count, parse_worker_count};
 
 use crate::lock_wait::{LockId, LockWaitLink, RegistrationToken};
 use crate::task::{
@@ -35,7 +36,9 @@ pub struct SchedulerMetadataSnapshot {
     pub blocked_syscalls: usize,
 }
 
-pub const DEFAULT_WORKERS: usize = 5;
+// Fixed fixture size for local multi-worker scheduler tests.
+#[cfg(test)]
+const TEST_WORKERS: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PollOutcome {
@@ -81,12 +84,7 @@ pub struct RuntimeWorkerConfig {
 
 impl RuntimeWorkerConfig {
     fn from_env_value(value: Option<&str>, default_workers: usize) -> Self {
-        let default_workers = default_workers.max(DEFAULT_WORKERS);
-        let env_workers = value
-            .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .filter(|workers| *workers > 0)
-            .map(|workers| workers.max(DEFAULT_WORKERS));
-        let requested_workers = env_workers.unwrap_or(default_workers);
+        let requested_workers = parse_worker_count(value).unwrap_or(default_workers.max(1));
 
         Self {
             requested_workers,
@@ -146,9 +144,9 @@ static TEST_SINGLE_WORKER: AtomicUsize = AtomicUsize::new(0);
 /// Test-only: make the worker config report a single worker while the guard is
 /// alive, so process-global drives dispatch to one persistent worker.
 ///
-/// `from_env_value` clamps every override up to `DEFAULT_WORKERS`, so a test
-/// cannot request a single-threaded drive through `WILLOW_WORKERS`. A test that
-/// asserts on *which* tasks one drive reaped needs one: with the pool, a second
+/// This avoids mutating the process environment for tests that need a single
+/// worker regardless of the host default. A test that asserts on *which* tasks
+/// one drive reaped needs one: with multiple workers, a second
 /// worker can claim a task that the drive itself woke — a terminal purge
 /// compensating a cancelled channel handoff, say — and complete it before the
 /// run loop observes that its target is already done, so the drive returns a
@@ -181,7 +179,7 @@ pub fn runtime_worker_config() -> RuntimeWorkerConfig {
     }
     RuntimeWorkerConfig::from_env_value(
         std::env::var("WILLOW_WORKERS").ok().as_deref(),
-        DEFAULT_WORKERS,
+        default_worker_count(),
     )
 }
 
@@ -2271,14 +2269,14 @@ pub fn async_chain_text() -> String {
     })
 }
 
-/// Requested worker count from `WILLOW_WORKERS`, or 5 by default.
+/// Requested worker count from `WILLOW_WORKERS`, or available parallelism.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_requested_workers() -> u64 {
     runtime_worker_config().requested_workers() as u64
 }
 
-/// Worker count the current runtime will actually run. Defaults to 5;
-/// `WILLOW_WORKERS=N` overrides it; values below 5 are clamped to 5.
+/// Worker count the current runtime will run. Any positive `WILLOW_WORKERS`
+/// value is honored; invalid values use available parallelism (fallback: one).
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_active_workers() -> u64 {
     runtime_worker_config().active_workers() as u64
@@ -5365,10 +5363,25 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_worker_config_defaults_to_five_active_workers() {
-        let config = RuntimeWorkerConfig::from_env_value(None, DEFAULT_WORKERS);
-        assert_eq!(config.requested_workers(), 5);
-        assert_eq!(config.active_workers(), 5);
+    fn scheduler_worker_config_uses_supplied_default() {
+        for default in [0, 1, 2, 5, 8, 64] {
+            let config = RuntimeWorkerConfig::from_env_value(None, default);
+            assert_eq!(config.requested_workers(), default.max(1));
+            assert_eq!(config.active_workers(), default.max(1));
+        }
+    }
+
+    #[test]
+    fn scheduler_worker_config_sizes_queues_to_requested_count() {
+        for workers in [1, 2, 8, 64] {
+            let config = RuntimeWorkerConfig::from_env_value(Some(&workers.to_string()), 5);
+            let scheduler = RuntimeScheduler::with_worker_count(config.active_workers());
+            assert_eq!(scheduler.worker_count(), workers);
+            assert_eq!(scheduler.run_queues.locals.len(), workers);
+            assert_eq!(scheduler.run_queues.prefer_global.len(), workers);
+            assert_eq!(scheduler.run_queues.worker_metrics.len(), workers);
+            assert_eq!(scheduler.task_count(), 0);
+        }
     }
 
     #[test]
@@ -5379,21 +5392,22 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_worker_config_clamps_small_overrides_to_five() {
+    fn scheduler_worker_config_honors_small_overrides() {
         for value in ["1", "2", "4"] {
-            let config = RuntimeWorkerConfig::from_env_value(Some(value), DEFAULT_WORKERS);
-            assert_eq!(config.requested_workers(), 5);
-            assert_eq!(config.active_workers(), 5);
+            let config = RuntimeWorkerConfig::from_env_value(Some(value), TEST_WORKERS);
+            let expected = value.parse::<usize>().unwrap();
+            assert_eq!(config.requested_workers(), expected);
+            assert_eq!(config.active_workers(), expected);
         }
     }
 
     #[test]
     fn scheduler_worker_config_rejects_zero_and_invalid_override() {
-        let zero = RuntimeWorkerConfig::from_env_value(Some("0"), DEFAULT_WORKERS);
+        let zero = RuntimeWorkerConfig::from_env_value(Some("0"), TEST_WORKERS);
         assert_eq!(zero.requested_workers(), 5);
         assert_eq!(zero.active_workers(), 5);
 
-        let invalid = RuntimeWorkerConfig::from_env_value(Some("many"), DEFAULT_WORKERS);
+        let invalid = RuntimeWorkerConfig::from_env_value(Some("many"), TEST_WORKERS);
         assert_eq!(invalid.requested_workers(), 5);
         assert_eq!(invalid.active_workers(), 5);
     }
@@ -5407,11 +5421,11 @@ mod tests {
     //
     //  1. the guard reports one active worker
     //  2. the guard reports one requested worker
-    //  3. dropping the guard restores the 5-worker default
-    //  4. the default (no guard) really is a pool, so the guard is required
+    //  3. dropping the guard restores the previous config
+    //  4. the unguarded config follows the environment and host default
     //  5. nested guards keep the single-worker view until the outermost drops
     //  6. sequential guards re-arm cleanly
-    //  7. the guard does not touch `from_env_value` parsing/clamping
+    //  7. the guard does not touch `from_env_value` parsing
     //  8. the ABI accessors agree with the guarded config
     //  9. `reset_global_scheduler_for_test` under the guard sizes run queues
     //     for exactly one worker
@@ -5449,12 +5463,7 @@ mod tests {
     #[test]
     fn single_worker_guard_is_scoped_and_nestable() {
         let _guard = runtime_test_guard();
-        // Perspective 4: without a guard the runtime picks the pool, which is
-        // exactly why the override exists.
-        assert!(
-            runtime_worker_config().active_workers() > 1,
-            "perspective 4"
-        );
+        let previous = runtime_worker_config();
 
         {
             let outer = single_worker_for_test();
@@ -5469,7 +5478,7 @@ mod tests {
         // Perspective 3: the outermost drop restores the default.
         assert_eq!(
             runtime_worker_config().active_workers(),
-            DEFAULT_WORKERS,
+            previous.active_workers(),
             "perspective 3"
         );
 
@@ -5483,14 +5492,14 @@ mod tests {
         let _guard = runtime_test_guard();
         let _single = single_worker_for_test();
         // Perspective 7: only `runtime_worker_config()` consults the override;
-        // the parser keeps clamping to DEFAULT_WORKERS.
+        // the parser still honors explicit positive counts.
         assert_eq!(
-            RuntimeWorkerConfig::from_env_value(Some("1"), DEFAULT_WORKERS).active_workers(),
-            DEFAULT_WORKERS,
+            RuntimeWorkerConfig::from_env_value(Some("1"), TEST_WORKERS).active_workers(),
+            1,
             "perspective 7"
         );
         assert_eq!(
-            RuntimeWorkerConfig::from_env_value(Some("8"), DEFAULT_WORKERS).active_workers(),
+            RuntimeWorkerConfig::from_env_value(Some("8"), TEST_WORKERS).active_workers(),
             8,
             "perspective 7"
         );
@@ -5588,6 +5597,7 @@ mod tests {
         let _guard = runtime_test_guard();
         // Perspective 17: the override is RAII, so a panicking test body cannot
         // leave every later test pinned to one worker.
+        let previous = runtime_worker_config();
         let panicked = std::panic::catch_unwind(|| {
             let _single = single_worker_for_test();
             assert_eq!(runtime_worker_config().active_workers(), 1);
@@ -5596,7 +5606,7 @@ mod tests {
         assert!(panicked.is_err());
         assert_eq!(
             runtime_worker_config().active_workers(),
-            DEFAULT_WORKERS,
+            previous.active_workers(),
             "perspective 17"
         );
     }
@@ -5616,11 +5626,11 @@ mod tests {
 
     #[test]
     fn scheduler_active_worker_abi_reports_requested_workers() {
-        let active = willow_sched_active_workers();
-        let requested = willow_sched_requested_workers();
-        assert!(active >= 1);
-        assert!(requested >= 1);
-        assert_eq!(active, requested);
+        let _guard = runtime_test_guard();
+        let expected = parse_worker_count(std::env::var("WILLOW_WORKERS").ok().as_deref())
+            .unwrap_or_else(default_worker_count) as u64;
+        assert_eq!(willow_sched_active_workers(), expected);
+        assert_eq!(willow_sched_requested_workers(), expected);
     }
 
     #[test]
@@ -7566,8 +7576,8 @@ mod tests {
     //
     // These are deterministic ownership assertions, not RSS benchmarks. Each
     // global workload uses the production scheduler entry point, whose default
-    // and minimum worker count is five. The blocked-syscall workload drives a
-    // local five-worker scheduler because real blocking jobs would make 10,000
+    // and worker count follows the runtime configuration. The blocked-syscall
+    // workload drives a local five-worker scheduler because real jobs would make 10,000
     // native syscalls the subject of the test instead of scheduler metadata.
     // ---------------------------------------------------------------------
 
@@ -7599,11 +7609,7 @@ mod tests {
     fn reset_stress_fixture() {
         reset_global_scheduler_for_test();
         reset_internal_for_test();
-        assert_eq!(DEFAULT_WORKERS, 5);
-        assert!(
-            runtime_worker_config().active_workers() >= DEFAULT_WORKERS,
-            "the scheduler must retain its minimum five-worker contract"
-        );
+        assert!(runtime_worker_config().active_workers() >= 1);
     }
 
     unsafe extern "C" fn poll_zero_sleep_then_ready(frame: *mut c_void) -> i32 {
@@ -7654,7 +7660,7 @@ mod tests {
 
     #[test]
     fn reaping_02_finish_terminal_captures_cleanup_before_task_removal() {
-        let mut scheduler = RuntimeScheduler::with_worker_count(DEFAULT_WORKERS);
+        let mut scheduler = RuntimeScheduler::with_worker_count(TEST_WORKERS);
         let id = scheduler.spawn_placeholder();
         scheduler.with_task_mut(id, |task| {
             task.install_channel_ownership(channel_token(0x1234));
@@ -7749,7 +7755,7 @@ mod tests {
 
     #[test]
     fn reaping_04_executable_task_keeps_netpoll_cleanup_even_without_channels() {
-        let mut scheduler = RuntimeScheduler::with_worker_count(DEFAULT_WORKERS);
+        let mut scheduler = RuntimeScheduler::with_worker_count(TEST_WORKERS);
         let id = scheduler.spawn_task(poll_ready_now, std::ptr::null_mut());
         assert_eq!(scheduler.claim_ready_for_worker(0), Some(id));
         scheduler.complete(id);
@@ -7859,7 +7865,7 @@ mod tests {
 
     #[test]
     fn stress_10k_blocked_syscall_tasks_reap_all_scheduler_metadata() {
-        let mut scheduler = RuntimeScheduler::with_worker_count(DEFAULT_WORKERS);
+        let mut scheduler = RuntimeScheduler::with_worker_count(TEST_WORKERS);
         let task_ids = (0..STRESS_TASKS)
             .map(|_| scheduler.spawn_placeholder())
             .collect::<Vec<_>>();

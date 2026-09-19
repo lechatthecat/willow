@@ -1,13 +1,13 @@
 //! GC-managed hash map `Map<K, V>`.
 //!
-//! The map is a thin GC object whose single payload word holds a raw pointer to
-//! a boxed [`MapData`] (a Rust `HashMap`). Two GC hooks keep it correct:
+//! The map stores a `Mutex<MapData>` directly in its non-moving GC payload.
+//! Two GC hooks keep it correct:
 //!
 //! * a trace function reports reference-typed *values* so they stay alive while
 //!   the map is reachable (keys are copied out of the Willow heap, so they need
 //!   no tracing — see [`MapKey`]);
-//! * a finalizer frees the boxed `MapData` when the map is swept, so the Rust
-//!   allocation does not leak.
+//! * a finalizer drops the inline state when the map is swept, releasing the
+//!   hash table and its owned string keys.
 //!
 //! Keys are one 64-bit word — an `i64`, the bits of an `f64`, or a `bool` — or
 //! a `String` compared by content. Values are stored as raw 64-bit words; `.get`
@@ -115,13 +115,12 @@ unsafe fn key_from_word<'a>(word: i64, key_is_ref: i64) -> KeyRef<'a> {
     }
 }
 
-/// Borrow the boxed `MapData` behind a map payload pointer.
+/// Lock the inline `MapData` at a map payload pointer.
 ///
 /// # Safety
 /// `map` must be a non-null map payload produced by [`willow_map_new`].
 unsafe fn map_data<'a>(map: *mut u8) -> MutexGuard<'a, MapData> {
-    let boxed = unsafe { *(map as *mut *mut Mutex<MapData>) };
-    unsafe { &*boxed }.lock().unwrap()
+    unsafe { &*map.cast::<Mutex<MapData>>() }.lock().unwrap()
 }
 
 /// Trace hook: report reference-typed values as GC children.
@@ -141,12 +140,9 @@ unsafe fn snapshot_map(payload: *mut u8, children: &mut Vec<*mut u8>) {
     }
 }
 
-/// Finalizer hook: free the boxed `MapData` when the map is swept.
+/// Finalizer hook: release the hash table and owned keys when the map is swept.
 unsafe fn drop_map(payload: *mut u8) {
-    let boxed = unsafe { *(payload as *mut *mut Mutex<MapData>) };
-    if !boxed.is_null() {
-        drop(unsafe { Box::from_raw(boxed) });
-    }
+    unsafe { std::ptr::drop_in_place(payload.cast::<Mutex<MapData>>()) };
 }
 
 /// Register the map trace and finalizer. Called on every `willow_map_new`
@@ -164,27 +160,34 @@ fn ensure_registered() {
     MAP_REGISTRATION.ensure(MAP_GC_TYPES);
 }
 
-/// Allocate an empty map. The payload is a single word holding the boxed
-/// `MapData` pointer; `gc_ref_mask` is 0 because that word is a Rust pointer,
-/// not a GC pointer (tracing happens through `trace_map`).
+/// Allocate an empty map with inline state. `gc_ref_mask` is zero because
+/// reference values are traced through `trace_map`, not the native state words.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_map_new(key_kind: i64, value_kind: i64, value_is_ref: i64) -> *mut u8 {
+    // Old-generation payloads never move and provide header alignment, which
+    // must also satisfy the inline mutex on every supported target.
+    const { assert!(align_of::<Mutex<MapData>>() <= align_of::<crate::gc::GcHeader>()) };
     ensure_registered();
-    let data = Box::into_raw(Box::new(Mutex::new(MapData {
-        layout: MapLayout {
-            key_kind,
-            value_kind,
-            value_is_ref: value_is_ref != 0,
-        },
-        entries: HashMap::new(),
-    })));
-    let map = willow_alloc_with_layout(GcObjectKind::Map, MAP_TYPE_ID, 8, 0);
+    let map = willow_alloc_with_layout(
+        GcObjectKind::Map,
+        MAP_TYPE_ID,
+        size_of::<Mutex<MapData>>() as i64,
+        0,
+    );
     if map.is_null() {
-        // Reclaim the box rather than leaking it.
-        drop(unsafe { Box::from_raw(data) });
         return std::ptr::null_mut();
     }
-    unsafe { *(map as *mut *mut Mutex<MapData>) = data };
+    // No GC allocation occurs between reserving the payload and initializing it.
+    unsafe {
+        map.cast::<Mutex<MapData>>().write(Mutex::new(MapData {
+            layout: MapLayout {
+                key_kind,
+                value_kind,
+                value_is_ref: value_is_ref != 0,
+            },
+            entries: HashMap::new(),
+        }));
+    }
     map
 }
 
@@ -394,6 +397,47 @@ mod tests {
         let m = willow_map_new(0, 0, 0);
         assert!(!m.is_null());
         assert_eq!(willow_map_len(m), 0);
+    }
+
+    #[test]
+    fn inline_maps_remain_stable_and_are_reclaimed_at_increasing_counts() {
+        use crate::gc::{GC_HEADER_SIZE, willow_gc_allocated_bytes};
+
+        let _guard = runtime_test_guard();
+        for count in [1, 16, 128] {
+            willow_gc_init();
+            // Reserve every root slot before registering its address.
+            let mut maps = vec![std::ptr::null_mut(); count];
+            for slot in &mut maps {
+                *slot = willow_map_new(3, 3, 1);
+                assert!(!slot.is_null());
+                assert!((*slot as usize).is_multiple_of(align_of::<Mutex<MapData>>()));
+                willow_push_root(slot);
+            }
+            let payload_bytes = size_of::<Mutex<MapData>>();
+            assert_eq!(
+                willow_gc_allocated_bytes() as usize,
+                count * (GC_HEADER_SIZE + payload_bytes)
+            );
+            let addresses = maps.clone();
+            for &map in &maps {
+                let mut key = willow_string_from_str("owned-key");
+                willow_push_root(&mut key);
+                let value = willow_string_from_str("traced-value");
+                willow_map_insert(map, key as i64, 1, value as i64, 1);
+                willow_pop_roots(1);
+            }
+            willow_gc_collect();
+            assert_eq!(maps, addresses, "inline mutexes must never move");
+            for &map in &maps {
+                let key = willow_string_from_str("owned-key");
+                let value = willow_map_get(map, key as i64, 1, 1);
+                assert_eq!(unsafe { willow_string_as_str(value) }, "traced-value");
+            }
+            willow_pop_roots(count as i32);
+            willow_gc_collect();
+            assert_eq!(willow_gc_allocated_bytes(), 0);
+        }
     }
 
     #[test]

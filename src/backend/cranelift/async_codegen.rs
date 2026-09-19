@@ -90,6 +90,7 @@ impl Codegen {
             ) as i64;
             return super::gc_codegen::emit_bitmap_alloc(
                 &mut self.module,
+                &mut self.gc_bitmap_descriptors,
                 builder,
                 alloc,
                 0,
@@ -1096,6 +1097,7 @@ impl Codegen {
                 collected_cleanup_order: 0,
                 module: &mut self.module,
                 gc_tlab_state: self.gc_tlab_state,
+                gc_bitmap_descriptors: &mut self.gc_bitmap_descriptors,
                 func_ids: &self.func_ids,
                 func_return_types: &self.func_return_types,
                 fn_types: &self.fn_types,
@@ -1305,6 +1307,7 @@ impl Codegen {
                 collected_cleanup_order: 0,
                 module: &mut self.module,
                 gc_tlab_state: self.gc_tlab_state,
+                gc_bitmap_descriptors: &mut self.gc_bitmap_descriptors,
                 func_ids: &self.func_ids,
                 func_return_types: &self.func_return_types,
                 fn_types: &self.fn_types,

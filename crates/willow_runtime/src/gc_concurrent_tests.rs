@@ -333,6 +333,8 @@ fn reservation_pressure_collects_garbage_before_rejecting_an_allocation() {
 #[test]
 fn captured_array_owner_survives_resize_and_moving_collection() {
     let _guard = runtime_test_guard();
+    // Alloc stress allocates old objects; this fixture requires evacuation.
+    let _stress = GcStressTestScope::normal();
     reset_internal_for_test();
     let mut tls = tlab_state_for_test();
     let mut array = crate::array::willow_array_new(1, 0);

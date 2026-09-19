@@ -414,9 +414,8 @@ async fn main() {
     assert_every_run(&outputs, "10\n20\n30\ndone\n");
 }
 
-/// Perspective 35. Worker-count variations must not change the result. The
-/// runtime clamps `WILLOW_WORKERS` up to its five-worker minimum, so this
-/// exercises the configured maximum as well as the clamped request.
+/// Perspective 35. Worker-count variations must not change the result.
+/// Exercise actual single-worker and multi-worker scheduling.
 #[test]
 fn sched_wake_35_worker_count_does_not_change_the_result() {
     let source = r#"

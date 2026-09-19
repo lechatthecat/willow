@@ -1,24 +1,10 @@
 //! AST analysis helpers for the type checker (extracted from `mod.rs`):
 //! control-flow "always returns" checks, sub-expression walking, and
-//! constructor self-field / super-init collection. Re-exported from `mod.rs`.
-
-use std::collections::HashSet;
+//! constructor super-init collection. Re-exported from `mod.rs`.
 
 use crate::diagnostics::Span;
 use crate::parser::ast::*;
 use crate::parser::iter::{AstEvent, AstWalk};
-
-/// Collect the names of fields assigned via `self.field = ...` anywhere in the
-/// block (willow-scq2 §8 definite-assignment, MVP non-path-sensitive).
-pub(crate) fn collect_self_field_assigns(block: &Block, out: &mut HashSet<String>) {
-    walk_constructor_statements(block, |stmt| {
-        if let Stmt::FieldAssign(assign) = stmt
-            && matches!(&assign.object, Expr::Var(name, _, _) if name == "self")
-        {
-            out.insert(assign.field.clone());
-        }
-    });
-}
 
 /// Collect the span of every `super(...)` call in the block.
 pub(crate) fn collect_super_init_spans(block: &Block, out: &mut Vec<Span>) {
@@ -252,7 +238,7 @@ fn always_returns(mut node: ReturnNode<'_>) -> bool {
 mod tests {
     //! Constructor-scan perspectives (willow-uqzx.1.1, shared structural walk).
     //!
-    //! Both scans are statement-structure only, so the perspectives are: a1
+    //! The structural walker is statement-only, so the perspectives are: a1
     //! direct assignment, a2 nested block statements (`if` / `else` / `while` /
     //! `for`), a3 a `defer` body is skipped, a4 an expression body is never
     //! entered (a lambda is a separate callable), a5 an assignment to a
@@ -260,6 +246,7 @@ mod tests {
     //! source order including one inside a branch, a7 a `super.init` in a
     //! `defer` body is skipped.
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn return_analysis_handles_fifty_thousand_branches_on_small_stack() {
@@ -320,7 +307,7 @@ mod tests {
                 collect_super_init_spans(&body, &mut spans);
                 assert_eq!(spans, [span]);
                 let mut fields = HashSet::new();
-                collect_self_field_assigns(&body, &mut fields);
+                collect_test_assignments(&body, &mut fields);
                 assert!(fields.is_empty());
                 drop(body);
             })
@@ -350,10 +337,21 @@ mod tests {
 
     fn assigned_fields(src: &str) -> Vec<String> {
         let mut out = HashSet::new();
-        collect_self_field_assigns(&class_ctor_body(src, "C"), &mut out);
+        collect_test_assignments(&class_ctor_body(src, "C"), &mut out);
         let mut names: Vec<String> = out.into_iter().collect();
         names.sort();
         names
+    }
+
+    // Exercise the structural walker independently of definite assignment.
+    fn collect_test_assignments(block: &Block, out: &mut HashSet<String>) {
+        walk_constructor_statements(block, |stmt| {
+            if let Stmt::FieldAssign(assign) = stmt
+                && matches!(&assign.object, Expr::Var(name, ..) if name == "self")
+            {
+                out.insert(assign.field.clone());
+            }
+        });
     }
 
     fn super_init_lines(src: &str) -> Vec<usize> {
