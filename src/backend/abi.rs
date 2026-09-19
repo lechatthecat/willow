@@ -424,6 +424,8 @@ mod alloc_effects_tests {
         "willow_async_mutex_recursive_panic",
         "willow_async_rwlock_new",
         "willow_async_rwlock_recursive_panic",
+        "willow_blocking_cell_new",
+        "willow_blocking_rw_cell_new",
         "willow_channel_new",
         "willow_channel_send_i64",
         "willow_channel_send_bool",
@@ -574,8 +576,6 @@ mod alloc_effects_tests {
             "willow_future_ready_bool",
             "willow_future_ready_f64",
             "willow_future_ready_ptr",
-            "willow_blocking_cell_new",
-            "willow_blocking_rw_cell_new",
             "willow_preempt_flag_new",
         ] {
             assert!(!allocates(name), "{name} allocates native, not GC, memory");
@@ -606,6 +606,8 @@ mod alloc_effects_tests {
             "willow_runtime_args_array",
             "willow_channel_new",
             "willow_async_mutex_new",
+            "willow_blocking_cell_new",
+            "willow_blocking_rw_cell_new",
             "willow_cancellation_token_new",
             "willow_task_scope_new",
             "willow_async_frame_alloc",

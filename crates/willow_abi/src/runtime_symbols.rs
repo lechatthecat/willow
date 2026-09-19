@@ -220,10 +220,12 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_atomic_bool_store" => ([Ptr, I8] -> None);
     NONE; "willow_atomic_bool_swap" => ([Ptr, I8] -> Some(I8));
     // Blocking cells hold a generic Willow word plus an is-reference flag.
-    NONE; "willow_blocking_cell_new" => ([Word, I64] -> Some(Ptr));
+    // The cells are GC-managed payloads (willow-9tls.5): `new` allocates the
+    // handle on the GC heap and roots a reference word across that allocation.
+    ALLOC; "willow_blocking_cell_new" => ([Word, I64] -> Some(Ptr));
     BLOCK; "willow_blocking_cell_get" => ([Ptr] -> Some(Word));
     BLOCK; "willow_blocking_cell_set" => ([Ptr, Word] -> None);
-    NONE; "willow_blocking_rw_cell_new" => ([Word, I64] -> Some(Ptr));
+    ALLOC; "willow_blocking_rw_cell_new" => ([Word, I64] -> Some(Ptr));
     BLOCK; "willow_blocking_rw_cell_read" => ([Ptr] -> Some(Word));
     BLOCK; "willow_blocking_rw_cell_write" => ([Ptr, Word] -> None);
     // Scheduler-aware Mutex<T> (willow-38w.1.3): acquire/poll return a status

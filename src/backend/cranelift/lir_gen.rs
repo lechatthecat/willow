@@ -187,11 +187,11 @@ fn scalar(ty: &Type) -> bool {
 /// is GC-managed only when some variant carries a payload, which this function
 /// has no way to know. Keep the `Named` arm ahead of the catch-all.
 ///
-/// The subset also holds generics that are NOT GC heap objects — the opaque
-/// runtime-pointer ones (`Future<T>`, `BlockingCell<T>`, …), which this function
-/// would answer `true` for. It never sees them either: [`assignable_repr`]
-/// compares two generics by equality and rejects a generic against anything
-/// else, so no `Type::Generic` reaches its catch-all arm at all.
+/// The subset also holds a generic that is NOT a GC heap object — the opaque
+/// runtime-pointer `Future<T>` — which this function would answer `true` for.
+/// It never sees it either: [`assignable_repr`] compares two generics by
+/// equality and rejects a generic against anything else, so no
+/// `Type::Generic` reaches its catch-all arm at all.
 fn gc_managed_supported(ty: &Type) -> bool {
     matches!(
         ty,
@@ -757,14 +757,14 @@ impl LirTypeCtx<'_> {
                 let (_, elem) = blocking_cell(ty).expect("guarded by the arm");
                 !matches!(elem, Type::Void) && self.supported_type_inner(elem, open)
             }
-            // A runtime future (willow-0g8j.3): one opaque pointer word, like
-            // the blocking cells above and, like them, NOT GC-managed
-            // (`is_opaque_runtime_pointer_type`), so the walker copies it
-            // around without ever rooting or dereferencing it. Its output type
-            // is vetted anyway, because that is what an `await` of it would
-            // produce; `Void` is admitted, since `Future<void>` is the only
-            // instantiation the language can actually produce -- from `sleep`
-            // and `yield`.
+            // A runtime future (willow-0g8j.3): one opaque pointer word that,
+            // unlike the blocking cells above (GC-managed since willow-9tls.5),
+            // is NOT GC-managed (`is_opaque_runtime_pointer_type`), so the
+            // walker copies it around without ever rooting or dereferencing
+            // it. Its output type is vetted anyway, because that is what an
+            // `await` of it would produce; `Void` is admitted, since
+            // `Future<void>` is the only instantiation the language can
+            // actually produce -- from `sleep` and `yield`.
             //
             // Awaiting a future VALUE is NOT a suspension: lowering refuses
             // to split it (`lower_root_suspend`) and the walker emits the
@@ -7962,6 +7962,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             && method == "new"
             && class == kind.class_name()
         {
+            // The runtime allocates the cell on the GC heap (willow-9tls.5) and
+            // roots a reference word itself across that allocation, so no
+            // shadow-root push is needed here, unlike the scheduler locks.
             let elem = elem.clone();
             let initial = args[0];
             let word = self.coerce_to_i64(initial, &elem);

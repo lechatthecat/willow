@@ -803,6 +803,7 @@ fn test_runnable_example_files_compile_and_run() {
         ),
         ("example/leibniz_pi.wi", "3.141592663589326\n"),
         ("example/locks.wi", "5\ndev\nprod\nfalse\ntrue\n"),
+        ("example/blocking_cell_gc.wi", "1999000\n6\ntrue\n"),
         (
             "example/lock_match_arm.wi",
             "10\n6\n6\ncredited\ndebited\n10\n100\n20\n3\n123\n\
