@@ -917,6 +917,10 @@ fn test_runnable_example_files_compile_and_run() {
             "high\nlow\n42\n10\ntrue\n7\ntrue\n",
         ),
         (
+            "example/module_base_short_name/main.wi",
+            "3\n12\n7\n5\n20\n50\n3\n12\n42\n1\n0\n",
+        ),
+        (
             "example/module_call_demo/main.wi",
             "5\n11\n12\nAlice: 12\n7\nBob=7\n=0\ntwo\n5\nrecovered: negative score\ntotal: 12\n",
         ),

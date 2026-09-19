@@ -1,0 +1,72 @@
+// module_base_short_name -- a module-qualified base keeps its module
+// (willow-ejg5).
+//
+// `class Sized extends shapes::Sized` names two different classes: the local
+// `Sized` being declared and the module's `shapes::Sized` it extends. Lowering
+// used to record the base by its last path segment, so the local class became
+// its own base: reading an inherited field through it walked a one-class loop
+// forever, and with an unrelated local `Sized` beside `class Cube extends
+// shapes::Sized`, the inherited `width` took the LOCAL class's type and code
+// generation failed with
+//
+//   error[E0800]: internal compiler error: ... the field `width` on a `Cube`
+//   ... has incompatible operands, metadata or destination
+//
+// The base now keeps its qualifier. Every member below reaches the module
+// class it was declared on, whatever the local names are.
+import shapes;
+
+// The local class that shares the module root's short name.
+open class Sized extends shapes::Sized {
+    pub depth: i64;
+
+    pub override fn area(self) -> i64 {
+        return self.width * self.depth;
+    }
+
+    pub fn footprint(self) -> i64 {
+        return self.width + self.depth;
+    }
+}
+
+// Two levels below the module root, through the local `Sized`.
+class Block extends Sized {
+    pub fn volume(self) -> i64 {
+        return self.area() * self.depth;
+    }
+}
+
+// A different local class extending the module root directly: its `width` is
+// `shapes::Sized`'s `i64`, not the local `Sized`'s field of the same name.
+class Cube extends shapes::Sized {
+    pub side: i64;
+
+    pub fn volume(self) -> i64 {
+        return self.width * self.side * self.side;
+    }
+}
+
+fn through_module_base(s: shapes::Sized) -> i64 {
+    return s.area();
+}
+
+fn main() {
+    let s = new Sized(3, 4);
+    println(s.width);
+    println(s.area());
+    println(s.footprint());
+    s.widen(2);
+    println(s.width);
+    println(through_module_base(s));
+
+    let b = new Block(2, 5);
+    println(b.volume());
+
+    let c = new Cube(3, 2);
+    println(c.width);
+    println(c.volume());
+
+    println(through_module_base(new shapes::Rect(6, 7)));
+    println(shapes::Sized::unit());
+    println(Sized::made + Block::made);
+}

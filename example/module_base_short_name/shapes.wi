@@ -1,0 +1,26 @@
+// The module side of `module_base_short_name`. `main.wi` extends `Sized`
+// under its qualified name while declaring its own class called `Sized`.
+pub open class Sized {
+    pub width: i64;
+    pub static made: i64 = 0;
+
+    pub open fn area(self) -> i64 {
+        return self.width;
+    }
+
+    pub fn widen(self, by: i64) {
+        self.width = self.width + by;
+    }
+
+    pub static fn unit() -> i64 {
+        return 1;
+    }
+}
+
+pub open class Rect extends Sized {
+    pub height: i64;
+
+    pub override fn area(self) -> i64 {
+        return self.width * self.height;
+    }
+}

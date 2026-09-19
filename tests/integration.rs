@@ -110,6 +110,8 @@ mod module_lambdas;
 
 #[path = "integration/module_alias_identity.rs"]
 mod module_alias_identity;
+#[path = "integration/module_base_short_name.rs"]
+mod module_base_short_name;
 #[path = "integration/module_class_visibility.rs"]
 mod module_class_visibility;
 #[path = "integration/module_cross_module_types.rs"]
