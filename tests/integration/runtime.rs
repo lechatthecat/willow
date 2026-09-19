@@ -732,6 +732,10 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/booleans.wi", "true\nfalse\ntrue\ntrue\n"),
         ("example/classes_objects.wi", "Alice\n33\n"),
         ("example/class_hierarchy.wi", "3\n"),
+        (
+            "example/class_inheritance_cycle_rejected.wi",
+            "Leaf: 1 2 3\nsum: 6\n",
+        ),
         ("example/class.wi", "42\n"),
         (
             "example/class_method_dispatch.wi",

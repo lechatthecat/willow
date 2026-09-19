@@ -198,8 +198,16 @@ impl TypeChecker {
 
     pub(super) fn check_class(&mut self, c: &ClassDecl) {
         self.check_class_inheritance(c);
-        self.check_constructor_inheritance_rules(c);
-        self.check_class_implements(c);
+        // A class on, or extending into, an `extends` cycle has no usable base
+        // chain, so the checks that walk it (base constructor rules, interface
+        // conformance through inherited methods) are skipped; E0426 already
+        // owns the cycle. Its fields, bodies and constructors are still
+        // checked so an editor keeps reporting the errors around the cycle
+        // (willow-jlky).
+        if self.class_extends_cycle(&c.name).is_none() {
+            self.check_constructor_inheritance_rules(c);
+            self.check_class_implements(c);
+        }
         for field in &c.fields {
             let ty = self.normalize_type(&field.ty, field.span);
             self.validate_type(&ty, field.span);
@@ -500,6 +508,18 @@ impl TypeChecker {
             }
             return Type::Void;
         };
+
+        // A class on, or extending into, an `extends` cycle has no meaningful
+        // constructor: its memberwise field list and inherited `init` both
+        // depend on a base chain that never ends. E0426 already reports the
+        // cycle, so only the arguments' own diagnostics are kept and the call
+        // still yields the class type for the code around it (willow-jlky).
+        if self.class_extends_cycle(&resolved).is_some() {
+            for arg in &n.args {
+                self.check_expr(&arg.expr);
+            }
+            return Type::Named(resolved);
+        }
 
         if resolved == "PanicInfo" {
             for arg in &n.args {
@@ -1057,6 +1077,56 @@ impl TypeChecker {
         }
     }
 
+    /// E0426 for the class `extends` cycle `cycle` found on `c`'s base chain.
+    ///
+    /// Every member of a cycle finds the same cycle from its own declaration,
+    /// so the first member checked reports it, labelling every other member,
+    /// and later members stay silent. `cycle` starts at `c` whenever `c` is a
+    /// member (the walk began there), which keeps the note in declaration
+    /// order: `A extends B extends A`.
+    fn report_class_extends_cycle(&mut self, c: &ClassDecl, cycle: &[String]) {
+        let Some(first) = cycle.first() else {
+            return;
+        };
+        let own_name = self
+            .symbols
+            .lookup_class(&c.name)
+            .map(|info| info.name.clone())
+            .unwrap_or_else(|| c.name.clone());
+        if *first != own_name
+            || cycle
+                .iter()
+                .any(|member| self.reported_class_cycles.contains(member))
+        {
+            return;
+        }
+        self.reported_class_cycles.extend(cycle.iter().cloned());
+        let mut diagnostic = Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0426,
+            format!("cyclic class inheritance involving `{}`", c.name),
+        )
+        .with_label(Label::primary(
+            c.span,
+            "class cannot transitively extend itself",
+        ));
+        for member in cycle.iter().skip(1) {
+            if let Some(info) = self.symbols.lookup_class(member) {
+                diagnostic = diagnostic.with_label(Label::secondary(
+                    info.declaration_span,
+                    format!("`{member}` is part of the cycle"),
+                ));
+            }
+        }
+        let mut path = cycle.iter().map(String::as_str).collect::<Vec<_>>();
+        path.push(first.as_str());
+        self.push(
+            diagnostic
+                .with_note(format!("inheritance cycle: {}", path.join(" extends ")))
+                .with_help("remove one `extends` so the chain ends at a class with no base"),
+        );
+    }
+
     pub(super) fn check_class_inheritance(&mut self, c: &ClassDecl) {
         let Some(base_name) = c.base_class.as_ref().map(type_path_name) else {
             for method in &c.methods {
@@ -1107,6 +1177,16 @@ impl TypeChecker {
                 return;
             }
             Some(base) => {
+                // A base chain that never reaches a root makes every hierarchy
+                // question below meaningless: a class would "override" its own
+                // methods and "hide" its own statics. The cycle is the one
+                // diagnostic such a class gets, ahead of E0701, and a class
+                // that merely extends into a cycle says nothing of its own
+                // (willow-jlky → E0426).
+                if let Some(cycle) = self.class_extends_cycle(&c.name) {
+                    self.report_class_extends_cycle(c, &cycle);
+                    return;
+                }
                 if !base.is_open {
                     self.push(
                         Diagnostic::new(

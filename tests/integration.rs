@@ -19,6 +19,8 @@ mod typecheck;
 mod channel_element_inference;
 #[path = "integration/class_dispatch_filter.rs"]
 mod class_dispatch_filter;
+#[path = "integration/class_inheritance_cycle.rs"]
+mod class_inheritance_cycle;
 #[path = "integration/class_layout_order.rs"]
 mod class_layout_order;
 #[path = "integration/class_vtable_dispatch.rs"]
