@@ -18167,22 +18167,26 @@ fn main() {
 }
 
 #[test]
-fn lir_div_09_operand_position_panic_still_falls_back() {
-    // The negative control for the position rule. In an operand position the
-    // panic's terminator would strand the call that consumes its value, so the
-    // walker must decline the function — and this mode reports that as an
-    // error instead of silently producing wrong code.
-    let source = "fn f() -> i64 { println(panic(\"no\")); return 1; }\n\
-                  fn main() { println(f()); }";
-    let (ok, stderr) = compile_with_compiler_env(source, &PLAIN);
+fn lir_div_09_operand_position_panic_terminates_evaluation() {
+    // Never operands are supported: the panic must terminate evaluation before
+    // the consuming println, the return, or the caller's continuation runs.
+    let source = r#"
+fn f() -> i64 {
+    println("before");
+    println(panic("operand panic"));
+    println("wrong continuation");
+    return 1;
+}
+fn main() { println(f()); }
+"#;
+    let (out, ok) = compile_with_env_and_run_combined(source, &PLAIN);
+    assert!(!ok, "the program must panic: {out}");
     assert!(
-        !ok,
-        "an operand-position panic must not be claimed by the walker"
+        out.starts_with("before\nruntime panic: operand panic at "),
+        "only the evaluated prefix and panic diagnostic should be printed: {out}"
     );
-    assert!(
-        stderr.contains("has type `!`"),
-        "the refusal must name the diverging type: {stderr}"
-    );
+    assert!(!out.contains("wrong continuation"), "{out}");
+    assert!(!out.lines().any(|line| line == "1"), "{out}");
 }
 
 #[test]
