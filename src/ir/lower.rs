@@ -21,14 +21,14 @@
 //! rather than silently dropping work, so later slices can extend coverage
 //! incrementally without changing behavior.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::{Diagnostic, ErrorCode, Severity, Span};
 use crate::parser::ast::{
     AwaitExpr, BinOp, BinaryExpr, Block, CallArg, CallArgMode, CallExpr, DeferBody, Expr, ExprId,
     FunctionDecl, Item, LambdaExpr, MethodCallExpr, MethodDecl, NewExpr, ObjectLiteralExpr,
     PatternId, Program, RangeExpr, SelectCaseKind, SelectExpr, StaticCallExpr, StaticFieldExpr,
-    Stmt, TernaryExpr, Type, UnaryExpr, UnaryOp,
+    Stmt, TernaryExpr, Type, TypePath, UnaryExpr, UnaryOp,
 };
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::symbols;
@@ -305,8 +305,14 @@ pub fn lower_program_with(
                 );
             }
             Item::Class(c) => {
+                // The base keeps its module qualifier: a local `Sized extends
+                // shapes::Sized` must not read as `Sized extends Sized`, which
+                // sent `Classes::resolve` around a one-class loop forever
+                // (willow-ejg5). A qualified base is not in this map (it holds
+                // only the unit's own classes), so the walk stops there and the
+                // member type comes from the checker tables instead.
                 let mut info = ClassInfo {
-                    base: c.base_class.as_ref().map(|b| b.name().to_string()),
+                    base: c.base_class.as_ref().map(Classes::base_key),
                     ..ClassInfo::default()
                 };
                 for f in &c.fields {
@@ -518,11 +524,27 @@ impl Classes {
         }
     }
 
+    /// The key a class's `extends` target has in this table: a local name as
+    /// written, a qualified path with its module kept (willow-ejg5).
+    fn base_key(base: &TypePath) -> String {
+        match base {
+            TypePath::Local(name) => name.clone(),
+            TypePath::Qualified(parts) => parts.join("::"),
+        }
+    }
+
     /// Walk the base-class chain from `class`, returning the first member type
-    /// `pick` finds. Stops if a base class is not in the program (e.g. external).
+    /// `pick` finds. Stops if a base class is not in the program (e.g. external)
+    /// or if the chain revisits a class: the checker rejects an `extends` cycle
+    /// (E0426), so lowering never sees one, but this walk must still terminate
+    /// on any table it is handed (willow-ejg5).
     fn resolve<F: Fn(&ClassInfo) -> Option<Type>>(&self, class: &str, pick: F) -> Option<Type> {
         let mut current = Some(class);
+        let mut seen = HashSet::new();
         while let Some(name) = current {
+            if !seen.insert(name) {
+                return None;
+            }
             let info = self.map.get(name)?;
             if let Some(ty) = pick(info) {
                 return Some(ty);
@@ -4326,5 +4348,93 @@ mod tests {
         );
         let (_, diags) = lower_src("enum Msg { Num(i64), } fn f() -> Msg { return Num(7); }");
         assert!(!diags.is_empty(), "unresolved construction must report");
+    }
+
+    // willow-ejg5: the unit-local class table records a module-qualified base
+    // by its full path, and `Classes::resolve` stops at a repeated class.
+
+    /// `(class, base, fields)` rows for a hand-built class table.
+    type TableRow<'a> = (&'a str, Option<&'a str>, &'a [(&'a str, Type)]);
+
+    fn table(entries: &[TableRow<'_>]) -> Classes {
+        let mut classes = Classes::default();
+        for (name, base, fields) in entries {
+            classes.map.insert(
+                (*name).to_string(),
+                ClassInfo {
+                    fields: fields
+                        .iter()
+                        .map(|(f, ty)| ((*f).to_string(), ty.clone()))
+                        .collect(),
+                    base: base.map(str::to_string),
+                    ..ClassInfo::default()
+                },
+            );
+        }
+        classes
+    }
+
+    // A qualified base is keyed as `shapes::Sized`, not `Sized`, so a
+    // same-named local class does not become its own base.
+    #[test]
+    fn ejg5_qualified_base_keeps_its_module_in_the_class_table() {
+        let tokens = Lexer::new(
+            "class Sized extends shapes::Sized { depth: i64; }\n\
+             class Block extends Sized { tag: i64; }",
+        )
+        .tokenize()
+        .expect("lexing failed");
+        let (program, errs) = Parser::new(tokens).parse();
+        assert!(errs.is_empty(), "unexpected parse errors: {errs:?}");
+        let bases: Vec<Option<String>> = program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Class(c) => Some(c.base_class.as_ref().map(Classes::base_key)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            bases,
+            vec![Some("shapes::Sized".to_string()), Some("Sized".to_string())]
+        );
+    }
+
+    // A base outside the table ends the walk with `None` (the checker tables
+    // take over), instead of looping.
+    #[test]
+    fn ejg5_resolve_stops_at_a_base_missing_from_the_table() {
+        let classes = table(&[
+            ("Sized", Some("shapes::Sized"), &[("depth", Type::I64)]),
+            ("Block", Some("Sized"), &[]),
+        ]);
+        assert_eq!(classes.field_type("Sized", "depth"), Some(Type::I64));
+        assert_eq!(classes.field_type("Block", "depth"), Some(Type::I64));
+        assert_eq!(classes.field_type("Block", "width"), None);
+        assert_eq!(classes.field_type("Sized", "width"), None);
+    }
+
+    // The shape the bug produced: a class that is its own base. The walk
+    // must return, not spin.
+    #[test]
+    fn ejg5_resolve_terminates_on_a_self_ring() {
+        let classes = table(&[("Sized", Some("Sized"), &[("depth", Type::I64)])]);
+        assert_eq!(classes.field_type("Sized", "depth"), Some(Type::I64));
+        assert_eq!(classes.field_type("Sized", "width"), None);
+        assert_eq!(classes.method_type("Sized", "area"), None);
+    }
+
+    // A two-class ring terminates too, and a member found on the ring is
+    // still returned.
+    #[test]
+    fn ejg5_resolve_terminates_on_a_two_class_ring() {
+        let classes = table(&[
+            ("A", Some("B"), &[("a", Type::I64)]),
+            ("B", Some("A"), &[("b", Type::Bool)]),
+        ]);
+        assert_eq!(classes.field_type("A", "b"), Some(Type::Bool));
+        assert_eq!(classes.field_type("B", "a"), Some(Type::I64));
+        assert_eq!(classes.field_type("A", "missing"), None);
+        assert_eq!(classes.field_type("B", "missing"), None);
     }
 }

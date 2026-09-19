@@ -51,3 +51,15 @@ Notable user-facing changes to the Willow compiler, runtime, and toolchain.
   check: cutting the ring is the one fix, and the checks that depend on a
   finished base chain run again once it is cut. Interface `extends` cycles
   keep E0423. See `example/class_inheritance_cycle_rejected.wi`.
+
+- **A local class may extend a module class of the same short name.**
+  `import shapes;` followed by `class Sized extends shapes::Sized { .. }`
+  used to send the compiler into an infinite loop the moment an inherited
+  field such as `s.width` was read: lowering recorded the base by the last
+  segment of its path, so the local `Sized` became its own base. The same
+  slip made an unrelated local `class Sized { width: String }` retype
+  `width` on a `Cube extends shapes::Sized`, which aborted codegen with
+  E0800 ("the field `width` on a `Cube` ... has incompatible operands"). The
+  base now keeps its module qualifier and the inherited-member walk stops at
+  any repeated class. `import shapes::Sized as Base;` / `class Sized extends
+  Base` was never affected. See `example/module_base_short_name/main.wi`.

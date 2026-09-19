@@ -22,6 +22,21 @@ impl std::fmt::Display for ExprId {
     }
 }
 
+/// The one identity no syntax node may receive: `ExprId::placeholder()` is the
+/// temporary that ownership traversals swap into a slot while they move the
+/// real node out, so a real node carrying it would alias the placeholder in
+/// every checker table keyed by identity. The range allocator hands out ids
+/// starting just past it.
+const PLACEHOLDER_ID: u64 = 0;
+
+/// Where the process-wide range allocator starts: just past the reserved
+/// placeholder, so the first range of the first session never yields it.
+const FIRST_RANGE_START: u64 = PLACEHOLDER_ID + 1;
+const _: () = assert!(
+    FIRST_RANGE_START > PLACEHOLDER_ID,
+    "syntax identity ranges must start past the reserved placeholder"
+);
+
 // Reserve a disjoint range per session (or direct-parser thread). The hot
 // allocation path touches only TLS. A new range also handles counter exhaustion
 // without wrapping identities that may survive in cached/prelude syntax.
@@ -33,10 +48,17 @@ struct NodeIds {
 
 impl NodeIds {
     fn fresh(&mut self) -> u64 {
+        static NEXT_RANGE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(FIRST_RANGE_START);
+        self.fresh_from(&NEXT_RANGE)
+    }
+
+    /// The allocator behind [`NodeIds::fresh`], with the range source passed
+    /// in so a test can drive a pristine one from `FIRST_RANGE_START`.
+    fn fresh_from(&mut self, next_range: &std::sync::atomic::AtomicU64) -> u64 {
         if self.next == self.end {
             const RANGE: u64 = 1 << 32;
-            static NEXT_RANGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            self.next = NEXT_RANGE
+            self.next = next_range
                 .fetch_update(
                     std::sync::atomic::Ordering::Relaxed,
                     std::sync::atomic::Ordering::Relaxed,
@@ -58,12 +80,17 @@ thread_local! {
 }
 
 fn fresh_node_id() -> u64 {
-    NODE_IDS.with(|slot| {
+    let id = NODE_IDS.with(|slot| {
         let mut ids = slot.get();
         let id = ids.fresh();
         slot.set(ids);
         id
-    })
+    });
+    debug_assert_ne!(
+        id, PLACEHOLDER_ID,
+        "fresh syntax identity collided with the reserved placeholder"
+    );
+    id
 }
 
 /// Restores the enclosing allocator even after an error or panic. The guard
@@ -90,7 +117,7 @@ impl Drop for NodeIdSession {
 
 impl ExprId {
     pub(crate) fn placeholder() -> Self {
-        Self(0)
+        Self(PLACEHOLDER_ID)
     }
     pub fn fresh() -> Self {
         Self(fresh_node_id())
@@ -1158,5 +1185,65 @@ mod node_identity_tests {
         assert_ne!(first, last);
         assert_ne!(rollover, last);
         assert_eq!(ids.fresh(), rollover + 1);
+    }
+
+    /// willow-9tls.1: the process-wide allocator used to start at 0, so the
+    /// first real node of the first session carried `ExprId::placeholder()`.
+    /// Drive a pristine allocator from the same start the static uses.
+    #[test]
+    fn pristine_allocator_never_yields_placeholder() {
+        use std::sync::atomic::AtomicU64;
+        let ranges = AtomicU64::new(FIRST_RANGE_START);
+        let mut ids = NodeIds::default();
+        let first = ids.fresh_from(&ranges);
+        assert_ne!(first, PLACEHOLDER_ID);
+        assert_eq!(first, FIRST_RANGE_START);
+        assert_ne!(ExprId(first), ExprId::placeholder());
+
+        // Ranges are contiguous and ascending, so no later range can circle
+        // back to the reserved identity either: force several rollovers and
+        // check the first id of each, plus its neighbours.
+        for _ in 0..8 {
+            ids.next = ids.end - 1;
+            let last = ids.fresh_from(&ranges);
+            let rollover = ids.fresh_from(&ranges);
+            assert_ne!(last, PLACEHOLDER_ID);
+            assert_ne!(rollover, PLACEHOLDER_ID);
+            assert!(rollover > last);
+        }
+
+        // A second, independent allocator sharing the same range source is
+        // what a parallel session looks like; it must skip the placeholder too.
+        let mut other = NodeIds::default();
+        assert_ne!(other.fresh_from(&ranges), PLACEHOLDER_ID);
+    }
+
+    /// Smoke test: `PatternId` shares the allocator, so it inherits the
+    /// reservation, and a fresh session (what every compile enters) hands
+    /// neither kind of node the placeholder. Other tests in this binary may
+    /// have drawn ids first, so only `tests/node_id_reserved.rs` observes the
+    /// process's very first allocation.
+    #[test]
+    fn fresh_session_ids_are_distinct_from_placeholder() {
+        let _session = NodeIdSession::enter();
+        for _ in 0..64 {
+            let expr = Expr::Integer(1, Span::dummy(), ExprId::fresh());
+            assert_ne!(expr.id(), ExprId::placeholder());
+            assert_ne!(expr.id().0, PLACEHOLDER_ID);
+            let pattern = Pattern::Wildcard(Span::dummy(), PatternId::fresh());
+            assert_ne!(pattern.id().0, PLACEHOLDER_ID);
+        }
+    }
+
+    /// The swap temporary that ownership traversals leave behind must stay
+    /// recognizable as the placeholder and must not be confused with any id
+    /// the allocator can produce.
+    #[test]
+    fn placeholder_expr_carries_reserved_identity() {
+        let placeholder = super::super::ownership::placeholder_expr();
+        assert_eq!(placeholder.id(), ExprId::placeholder());
+        assert_eq!(placeholder.id().0, PLACEHOLDER_ID);
+        let _session = NodeIdSession::enter();
+        assert_ne!(ExprId::fresh(), placeholder.id());
     }
 }
