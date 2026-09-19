@@ -27,7 +27,19 @@ unsafe fn as_bool(ptr: *mut c_void) -> &'static AtomicBool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_atomic_i64_new(init: i64) -> *mut c_void {
-    let ptr = willow_alloc_with_layout(GcObjectKind::AtomicCell, 0, 8, 0) as *mut c_void;
+    atomic_i64_new_with_allocator(init, willow_alloc_with_layout)
+}
+
+// Keep allocation injectable so the null-result path can be tested without
+// exhausting process memory or changing the global GC state.
+fn atomic_i64_new_with_allocator(
+    init: i64,
+    alloc: impl FnOnce(GcObjectKind, u32, i64, u64) -> *mut u8,
+) -> *mut c_void {
+    let ptr = alloc(GcObjectKind::AtomicCell, 0, 8, 0) as *mut c_void;
+    if ptr.is_null() {
+        return ptr;
+    }
     unsafe { as_i64(ptr).store(init, SeqCst) };
     ptr
 }
@@ -62,7 +74,17 @@ pub extern "C" fn willow_atomic_i64_swap(ptr: *mut c_void, value: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_atomic_bool_new(init: u8) -> *mut c_void {
-    let ptr = willow_alloc_with_layout(GcObjectKind::AtomicCell, 0, 8, 0) as *mut c_void;
+    atomic_bool_new_with_allocator(init, willow_alloc_with_layout)
+}
+
+fn atomic_bool_new_with_allocator(
+    init: u8,
+    alloc: impl FnOnce(GcObjectKind, u32, i64, u64) -> *mut u8,
+) -> *mut c_void {
+    let ptr = alloc(GcObjectKind::AtomicCell, 0, 8, 0) as *mut c_void;
+    if ptr.is_null() {
+        return ptr;
+    }
     unsafe { as_bool(ptr).store(init != 0, SeqCst) };
     ptr
 }
@@ -87,6 +109,47 @@ pub extern "C" fn willow_atomic_bool_swap(ptr: *mut c_void, value: u8) -> u8 {
 mod tests {
     use super::*;
     use crate::gc::{runtime_test_guard, willow_gc_init};
+
+    fn failed_allocation(kind: GcObjectKind, type_id: u32, size: i64, mask: u64) -> *mut u8 {
+        assert_eq!(kind, GcObjectKind::AtomicCell);
+        assert_eq!((type_id, size, mask), (0, 8, 0));
+        std::ptr::null_mut()
+    }
+
+    #[test]
+    fn i64_new_returns_null_on_allocation_failure() {
+        for init in [i64::MIN, 0, i64::MAX] {
+            assert!(atomic_i64_new_with_allocator(init, failed_allocation).is_null());
+        }
+    }
+
+    #[test]
+    fn bool_new_returns_null_on_allocation_failure() {
+        for init in [0, 1, u8::MAX] {
+            assert!(atomic_bool_new_with_allocator(init, failed_allocation).is_null());
+        }
+    }
+
+    #[test]
+    fn failed_constructors_allocate_once_per_call() {
+        let mut allocations = 0;
+        assert!(
+            atomic_i64_new_with_allocator(42, |kind, id, size, mask| {
+                allocations += 1;
+                failed_allocation(kind, id, size, mask)
+            })
+            .is_null()
+        );
+        assert_eq!(allocations, 1);
+        assert!(
+            atomic_bool_new_with_allocator(255, |kind, id, size, mask| {
+                allocations += 1;
+                failed_allocation(kind, id, size, mask)
+            })
+            .is_null()
+        );
+        assert_eq!(allocations, 2);
+    }
 
     #[test]
     fn i64_new_load_store_add_sub_swap() {
