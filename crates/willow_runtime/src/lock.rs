@@ -560,6 +560,10 @@ mod tests {
         );
         crate::gc::set_gc_stress_for_test(None);
         willow_pop_roots(1);
+        // `tls` lives on this stack and is registered with the heap; drop the
+        // registration before it goes out of scope, or the next heap reset
+        // writes into a dead thread's stack (an access violation on Windows).
+        reset_internal_for_test();
     }
 
     #[test]
@@ -582,6 +586,9 @@ mod tests {
         assert_eq!(unsafe { *relocated }, 88);
         crate::gc::set_gc_stress_for_test(None);
         willow_pop_roots(1);
+        // See `set_of_a_young_value_remembers_the_cell`: drop the stack `tls`
+        // registration before it goes out of scope.
+        reset_internal_for_test();
     }
 
     // ── Perspective 14: a scalar store never touches the barrier ──
