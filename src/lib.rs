@@ -15,6 +15,7 @@ pub mod module;
 pub mod parser;
 pub mod prelude;
 pub mod project;
+mod query_stats;
 pub mod semantic;
 pub mod stdlib_schema;
 pub mod toolchain;
@@ -333,6 +334,7 @@ impl<'a> CompilerSession<'a> {
     }
 
     pub fn run(self) -> Result<()> {
+        let _query_stats = query_stats::Session::enter();
         let _node_ids = parser::ast::NodeIdSession::enter();
         let src_path = PathBuf::from(self.src);
         let source = std::fs::read_to_string(&src_path)
@@ -423,7 +425,7 @@ fn run_frontend(
     let dependencies = ModuleDependencies::new(&graph.files);
     let mut helpers = HelperIndex::new();
     for module in &graph.files {
-        let body = artifacts.hydrate(&module.program)?;
+        let body = artifacts.hydrate(&module.program, module.id.file_id())?;
         helpers.insert(
             module.canonical_path.clone(),
             semantic::concurrency::compute_nonpreemptible_helpers(&body),
@@ -431,7 +433,7 @@ fn run_frontend(
     }
     let mut error_count = parse.error_count + imports.error_count + desugar.error_count;
     for module in &graph.files {
-        let body = artifacts.hydrate(&module.program)?;
+        let body = artifacts.hydrate(&module.program, module.id.file_id())?;
         let checker = check_module(
             &body,
             module,
@@ -455,7 +457,7 @@ fn run_frontend(
         emit_frontend_diagnostics(&concurrency, map, &graph)?;
     }
     {
-        let body = artifacts.hydrate(&program)?;
+        let body = artifacts.hydrate(&program, diagnostics::FileId::ENTRY)?;
         let checked = typecheck_phase(
             &body,
             &graph.files,
@@ -1083,13 +1085,13 @@ fn run_backend(
     let mut artifacts = module_graph.artifacts.take().expect("spooled frontend");
     let modules = module_graph.files;
     let debug_metadata = if opts.target.emit_debug_info || opts.target.emit_source_map {
-        let entry = artifacts.hydrate(&program)?;
+        let entry = artifacts.hydrate(&program, diagnostics::FileId::ENTRY)?;
         let mut text =
             diagnostics::DebugSourceMap::from_program(&map.path, map.total_lines(), &entry)
                 .to_text();
         drop(entry);
         for module in &modules {
-            let body = artifacts.hydrate(&module.program)?;
+            let body = artifacts.hydrate(&module.program, module.id.file_id())?;
             let source = artifacts.source(module.id.file_id())?;
             let source_map =
                 diagnostics::SourceMap::new(module.path.to_string_lossy().into_owned(), source);
@@ -1117,7 +1119,7 @@ fn run_backend(
     let entry_items = module::resolver::classify_unit_imports(&program, &modules).items;
     // Immutable global type declarations contain no executable syntax.
     {
-        let body = artifacts.hydrate(&program)?;
+        let body = artifacts.hydrate(&program, diagnostics::FileId::ENTRY)?;
         let checked = typecheck_phase(&body, &modules, &entry_items, &helpers, &artifacts, opts)?;
         for (name, info) in &checked.checker.symbols.enums {
             codegen.register_enum_info(name.to_string(), info.to_semantic());
@@ -1147,7 +1149,7 @@ fn run_backend(
     // is written and dropped immediately, preserving its lambda symbols/IDs.
     let mut declared_modules = Vec::with_capacity(modules.len());
     for module in &modules {
-        let body = artifacts.hydrate(&module.program)?;
+        let body = artifacts.hydrate(&module.program, module.id.file_id())?;
         let checker = check_module(
             &body,
             module,
@@ -1182,7 +1184,7 @@ fn run_backend(
         declared_modules.push(artifacts.write(&*unit)?);
     }
     let entry_artifact = {
-        let body = artifacts.hydrate(&program)?;
+        let body = artifacts.hydrate(&program, diagnostics::FileId::ENTRY)?;
         let checked = typecheck_phase(&body, &modules, &entry_items, &helpers, &artifacts, opts)?;
         codegen.set_unit_imports(backend_unit_imports(&body, &modules));
         let displaced = codegen.install_enum_aliases(&unit_enum_aliases(&checked.checker));
@@ -1213,7 +1215,7 @@ fn run_backend(
         let unit = artifacts.track(UnitKind::Declared, unit);
         let _lir = artifacts.live(UnitKind::Lir);
         let aliases = {
-            let body = artifacts.hydrate(&module.program)?;
+            let body = artifacts.hydrate(&module.program, module.id.file_id())?;
             let checker = check_module(
                 &body,
                 module,
@@ -1252,7 +1254,7 @@ fn run_backend(
     let entry_unit = artifacts.track(UnitKind::Declared, entry_unit);
     let _entry_lir = artifacts.live(UnitKind::Lir);
     let entry_aliases = {
-        let body = artifacts.hydrate(&program)?;
+        let body = artifacts.hydrate(&program, diagnostics::FileId::ENTRY)?;
         let checked = typecheck_phase(&body, &modules, &entry_items, &helpers, &artifacts, opts)?;
         let aliases = unit_enum_aliases(&checked.checker);
         drop(body);
@@ -1471,6 +1473,7 @@ pub fn compile(
 /// covers the constructs implemented so far (willow-mb5) and lists the rest as
 /// trailing comments rather than failing.
 pub fn emit_hir_text(src: &str) -> Result<String> {
+    let _query_stats = query_stats::Session::enter();
     let _node_ids = parser::ast::NodeIdSession::enter();
     let src_path = PathBuf::from(src);
     let source = std::fs::read_to_string(&src_path)
@@ -1488,7 +1491,7 @@ pub fn emit_hir_text(src: &str) -> Result<String> {
         .artifacts
         .as_ref()
         .expect("spooled frontend")
-        .hydrate(&frontend.program)?;
+        .hydrate(&frontend.program, diagnostics::FileId::ENTRY)?;
     let items =
         module::resolver::classify_unit_imports(&frontend.program, &frontend.module_graph.files)
             .items;
@@ -1516,6 +1519,7 @@ pub fn emit_hir_text(src: &str) -> Result<String> {
 /// `--emit-lir` build flag). Runs the normal front-end, lowers to typed HIR,
 /// then makes control flow explicit as blocks.
 pub fn emit_lir_text(src: &str) -> Result<String> {
+    let _query_stats = query_stats::Session::enter();
     let _node_ids = parser::ast::NodeIdSession::enter();
     let src_path = PathBuf::from(src);
     let source = std::fs::read_to_string(&src_path)
@@ -1533,7 +1537,7 @@ pub fn emit_lir_text(src: &str) -> Result<String> {
         .artifacts
         .as_ref()
         .expect("spooled frontend")
-        .hydrate(&frontend.program)?;
+        .hydrate(&frontend.program, diagnostics::FileId::ENTRY)?;
     let items =
         module::resolver::classify_unit_imports(&frontend.program, &frontend.module_graph.files)
             .items;

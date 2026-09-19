@@ -98,14 +98,17 @@ macro_rules! runtime_abi_schema {
 /// called from within the runtime and are not emitted by the backend.
 pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     // --- print ---
-    NONE; "willow_print_i64" => ([I64] -> None);
-    NONE; "willow_println_i64" => ([I64] -> None);
-    NONE; "willow_print_bool" => ([I8] -> None);
-    NONE; "willow_println_bool" => ([I8] -> None);
-    NONE; "willow_print_f64" => ([F64] -> None);
-    NONE; "willow_println_f64" => ([F64] -> None);
-    NONE; "willow_print_string" => ([Ptr] -> None);
-    NONE; "willow_println_string" => ([Ptr] -> None);
+    // Stdout locking, writing and flushing can block the current OS thread.
+    // Native formatting allocations do not enter the Willow GC, and I/O
+    // failures are fatal rather than recoverable Willow panics.
+    BLOCK; "willow_print_i64" => ([I64] -> None);
+    BLOCK; "willow_println_i64" => ([I64] -> None);
+    BLOCK; "willow_print_bool" => ([I8] -> None);
+    BLOCK; "willow_println_bool" => ([I8] -> None);
+    BLOCK; "willow_print_f64" => ([F64] -> None);
+    BLOCK; "willow_println_f64" => ([F64] -> None);
+    BLOCK; "willow_print_string" => ([Ptr] -> None);
+    BLOCK; "willow_println_string" => ([Ptr] -> None);
     // --- math / float formatting ---
     PANIC_ALLOC; "willow_pow_negative_exponent" => ([I64, Ptr, I32, I32] -> None);
     ALLOC; "willow_f64_to_string" => ([F64] -> Some(Ptr));

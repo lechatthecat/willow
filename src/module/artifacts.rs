@@ -195,7 +195,8 @@ impl UnitArtifacts {
         Ok(())
     }
 
-    pub(crate) fn hydrate(&self, summary: &Program) -> Result<LiveUnit<Program>> {
+    pub(crate) fn hydrate(&self, summary: &Program, file: FileId) -> Result<LiveUnit<Program>> {
+        crate::query_stats::hydrate(file);
         let mut program = summary.clone();
         let hydrate_block = |block: &mut Block| -> Result<()> {
             *block = self.read(
@@ -243,6 +244,7 @@ impl UnitArtifacts {
 
 impl Drop for UnitArtifacts {
     fn drop(&mut self) {
+        crate::query_stats::peaks(self.metrics.borrow().peak);
         if std::env::var_os("WILLOW_UNIT_MEMORY_LOG").is_some_and(|value| value != "0") {
             let peak = self.metrics.borrow().peak;
             eprintln!(
@@ -343,7 +345,7 @@ mod tests {
             let expected = serde_json::to_vec(&program).unwrap();
             let mut artifacts = UnitArtifacts::new().unwrap();
             artifacts.offload(&mut program).unwrap();
-            let restored = artifacts.hydrate(&program).unwrap();
+            let restored = artifacts.hydrate(&program, FileId(9)).unwrap();
             assert_eq!(serde_json::to_vec(&*restored).unwrap(), expected, "{name}");
         }
     }
@@ -379,8 +381,8 @@ mod tests {
                 artifacts.offload(&mut program).unwrap();
                 summaries.push(program);
             }
-            for summary in &summaries {
-                let restored = artifacts.hydrate(summary).unwrap();
+            for (index, summary) in summaries.iter().enumerate() {
+                let restored = artifacts.hydrate(summary, FileId(index as u32)).unwrap();
                 assert!(!restored.items.is_empty());
             }
             assert_eq!(artifacts.peaks(), [1, 0, 0, 0]);
@@ -457,7 +459,7 @@ mod tests {
             })
             .unwrap();
         assert!(class.methods[0].body.stmts.is_empty());
-        let restored = artifacts.hydrate(&entry).unwrap();
+        let restored = artifacts.hydrate(&entry, FileId::ENTRY).unwrap();
         let class = restored
             .items
             .iter()

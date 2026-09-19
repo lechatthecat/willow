@@ -2743,18 +2743,7 @@ fn willow_sched_run_parallel(
         ),
         all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     ))]
-    let workers = {
-        let mut workers = workers;
-        for shard in &global_task_table().shards {
-            let tasks = shard.lock().unwrap_or_else(|error| error.into_inner());
-            for task in tasks.values() {
-                if let Some(stack) = task.native_stack.as_ref() {
-                    workers = workers.max(stack.worker + 1);
-                }
-            }
-        }
-        workers
-    };
+    let workers = workers.max(crate::native_stack::required_workers());
     while pool.senders.len() < workers {
         let worker = pool.senders.len();
         let (sender, receiver) = std::sync::mpsc::channel::<WorkerDrive>();
@@ -3792,6 +3781,24 @@ pub extern "C" fn willow_task_stack_leave() {
 #[cfg(test)]
 #[path = "scheduler_idle_stop_tests.rs"]
 mod idle_stop_tests;
+
+#[cfg(all(
+    test,
+    any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+    )
+))]
+#[path = "scheduler_native_affinity_tests.rs"]
+mod native_affinity_tests;
 
 /// Opt-in scaling and footprint measurements, kept out of the deterministic
 /// gate (willow-ezs.2/.3). See the module's own documentation for how to run

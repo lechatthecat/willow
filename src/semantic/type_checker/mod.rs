@@ -348,6 +348,7 @@ impl TypeChecker {
     }
 
     pub fn new() -> Self {
+        crate::query_stats::add(crate::query_stats::Counter::TypeChecker, 1);
         let mut checker = Self {
             symbols: SymbolTable::default(),
             errors: Vec::new(),

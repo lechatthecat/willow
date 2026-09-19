@@ -230,7 +230,24 @@ mod tests {
             !effects("willow_channel_unregister_waiter")
                 .contains(RuntimeEffects::NO_PREEMPT_REGION)
         );
-        assert_eq!(effects("willow_print_i64"), RuntimeEffects::NONE);
+        assert_eq!(effects("willow_print_i64"), RuntimeEffects::MAY_BLOCK);
+    }
+
+    #[test]
+    fn every_stdout_export_is_blocking_without_gc_or_scheduler_effects() {
+        for name in [
+            "willow_print_i64",
+            "willow_println_i64",
+            "willow_print_bool",
+            "willow_println_bool",
+            "willow_print_f64",
+            "willow_println_f64",
+            "willow_print_string",
+            "willow_println_string",
+        ] {
+            let symbol = runtime_symbol(name).expect("stdout ABI export");
+            assert_eq!(symbol.effects(), RuntimeEffects::MAY_BLOCK, "{name}");
+        }
     }
 
     #[test]
@@ -635,8 +652,6 @@ mod alloc_effects_tests {
     #[test]
     fn a13_pure_readers_and_stores_stay_none() {
         for name in [
-            "willow_print_i64",
-            "willow_println_string",
             "willow_map_len",
             "willow_gc_write_barrier",
             "willow_push_root",

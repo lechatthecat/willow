@@ -454,6 +454,7 @@ struct HelperNode {
 pub(crate) fn compute_nonpreemptible_helpers(
     program: &Program,
 ) -> HashMap<FunctionId, NonpreemptibleHelper> {
+    crate::query_stats::add(crate::query_stats::Counter::NonpreemptibleHelpers, 1);
     let mut helpers: Vec<HelperNode> = Vec::new();
     for item in &program.items {
         match item {

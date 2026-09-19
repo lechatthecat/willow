@@ -1156,7 +1156,9 @@ impl ConcurrentCycle {
         }
     }
 
-    fn trace(&self, value: usize) {
+    fn trace(&self, value: usize, children: &mut Vec<*mut u8>) {
+        // Also discard a partial snapshot left by an unwinding native hook.
+        children.clear();
         let Some(metadata) = self.objects.get(&value) else {
             return;
         };
@@ -1172,7 +1174,6 @@ impl ConcurrentCycle {
             return;
         }
         let payload = value as *mut u8;
-        let mut children = Vec::new();
         let words = metadata.payload_size / GC_STORAGE_WORD_BYTES;
         let mut slots = 0;
         for index in 0..words.min(64) {
@@ -1210,11 +1211,11 @@ impl ConcurrentCycle {
             // SAFETY: concurrent hooks copy values under their own locks or
             // atomics, and no object is reclaimed before final remark.
             unsafe {
-                trace(payload, &mut children);
+                trace(payload, children);
             }
             slots += children.len() - before;
         }
-        for child in children {
+        for child in children.drain(..) {
             if !child.is_null() && !self.objects.contains_key(&(child as usize)) {
                 self.unindexed.lock().unwrap().insert(child as usize);
             }
@@ -1227,6 +1228,17 @@ impl ConcurrentCycle {
     }
 
     fn drain(&self, limit: usize) {
+        // Concurrent hooks may neither allocate GC memory nor reach a safepoint,
+        // so marking cannot reenter this thread's scratch-buffer borrow. Keep
+        // capacity across bounded assists; successful drains leave the buffer empty.
+        std::thread_local! {
+            static CHILDREN: std::cell::RefCell<Vec<*mut u8>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        CHILDREN.with_borrow_mut(|children| self.drain_with_scratch(limit, children));
+    }
+
+    fn drain_with_scratch(&self, limit: usize, children: &mut Vec<*mut u8>) {
         use crate::gc_mark_queue::MarkWorkItem;
         let mut worker = self.queue.register_assist();
         for _ in 0..limit {
@@ -1234,10 +1246,10 @@ impl ConcurrentCycle {
                 break;
             };
             match work.item {
-                MarkWorkItem::Object(object) => self.trace(object.addr()),
+                MarkWorkItem::Object(object) => self.trace(object.addr(), children),
                 MarkWorkItem::ObjectBatch(objects) => {
                     for object in objects {
-                        self.trace(object.addr());
+                        self.trace(object.addr(), children);
                     }
                 }
                 _ => unreachable!("major marker queues only object work"),

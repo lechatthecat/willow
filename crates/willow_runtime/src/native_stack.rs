@@ -9,7 +9,10 @@
 use corosensei::stack::Stack;
 use corosensei::{Coroutine, CoroutineResult, Yielder};
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::ffi::c_void;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::stack_trace::RuntimeStackTrace;
 use crate::task::{RUNTIME_POLL_PREEMPTED, RuntimeCancelFn, RuntimePollFn};
@@ -21,8 +24,90 @@ thread_local! {
     static IDLE_STACKS: std::cell::RefCell<Vec<Box<NativeStack>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Counts only checked-out stacks, including stacks temporarily removed from a
+/// task record while running. Idle TLS cache entries must not pin workers.
+/// Writers never hold this lock across a context switch or acquire task locks.
+#[derive(Default)]
+struct WorkerAffinities {
+    counts: Mutex<BTreeMap<usize, usize>>,
+    bound: AtomicUsize,
+    #[cfg(test)]
+    queries: AtomicUsize,
+    #[cfg(test)]
+    updates: AtomicUsize,
+}
+
+impl WorkerAffinities {
+    fn acquire(&self, worker: usize) -> WorkerAffinity<'_> {
+        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        *counts.entry(worker).or_default() += 1;
+        self.bound.fetch_max(worker + 1, Ordering::Release);
+        #[cfg(test)]
+        self.updates.fetch_add(1, Ordering::Relaxed);
+        WorkerAffinity {
+            registry: self,
+            worker,
+        }
+    }
+
+    fn required_workers(&self) -> usize {
+        #[cfg(test)]
+        self.queries.fetch_add(1, Ordering::Relaxed);
+        self.bound.load(Ordering::Acquire)
+    }
+}
+
+struct WorkerAffinity<'a> {
+    registry: &'a WorkerAffinities,
+    worker: usize,
+}
+
+impl Drop for WorkerAffinity<'_> {
+    fn drop(&mut self) {
+        let mut counts = self
+            .registry
+            .counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let count = counts
+            .get_mut(&self.worker)
+            .expect("missing native stack affinity");
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(&self.worker);
+            if self.registry.bound.load(Ordering::Relaxed) == self.worker + 1 {
+                self.registry.bound.store(
+                    counts.last_key_value().map_or(0, |(&worker, _)| worker + 1),
+                    Ordering::Release,
+                );
+            }
+        }
+        #[cfg(test)]
+        self.registry.updates.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+static WORKER_AFFINITIES: std::sync::LazyLock<WorkerAffinities> =
+    std::sync::LazyLock::new(WorkerAffinities::default);
+
+/// The outer drive owns the persistent-worker lock, so no previous drive can
+/// still create a stack when it reads this bound. Running/nested drives retain
+/// their leases; completion and cancellation release them through recycle/drop.
+pub(crate) fn required_workers() -> usize {
+    WORKER_AFFINITIES.required_workers()
+}
+
+#[cfg(test)]
+pub(crate) fn affinity_counts_for_test() -> (usize, usize) {
+    (
+        WORKER_AFFINITIES.queries.load(Ordering::Relaxed),
+        WORKER_AFFINITIES.updates.load(Ordering::Relaxed),
+    )
+}
+
 pub(crate) struct NativeStack {
     pub(crate) worker: usize,
+    affinity: Option<WorkerAffinity<'static>>,
     owner_thread: std::thread::ThreadId,
     coroutine: Coroutine<(), (), ()>,
     yielder: *const Yielder<(), ()>,
@@ -58,6 +143,7 @@ unsafe impl Send for NativeStack {}
 impl NativeStack {
     pub(crate) fn acquire(poll: RuntimePollFn, frame: *mut c_void) -> Box<Self> {
         if let Some(mut stack) = IDLE_STACKS.with(|pool| pool.borrow_mut().pop()) {
+            stack.affinity = Some(WORKER_AFFINITIES.acquire(stack.worker));
             stack.poll = poll;
             stack.cancel_entry = None;
             stack.frame = frame;
@@ -87,8 +173,9 @@ impl NativeStack {
         stack
     }
 
-    pub(crate) fn recycle(stack: Box<Self>) {
+    pub(crate) fn recycle(mut stack: Box<Self>) {
         assert!(!stack.suspended);
+        stack.affinity = None;
         IDLE_STACKS.with(|pool| pool.borrow_mut().push(stack));
     }
 
@@ -105,6 +192,7 @@ impl NativeStack {
         };
         Box::new(Self {
             worker: crate::scheduler::current_worker(),
+            affinity: Some(WORKER_AFFINITIES.acquire(crate::scheduler::current_worker())),
             owner_thread: std::thread::current().id(),
             coroutine: Coroutine::with_stack(storage, |yielder, ()| trampoline(yielder)),
             yielder: std::ptr::null(),
@@ -282,6 +370,68 @@ mod tests {
     use super::*;
     use crate::preempt::{PreemptConfig, begin_quantum, willow_preempt_end, willow_sync_safepoint};
     use crate::task::RUNTIME_POLL_READY;
+
+    #[test]
+    fn affinity_bound_counts_shared_and_sparse_workers() {
+        let registry = WorkerAffinities::default();
+        assert_eq!(registry.required_workers(), 0);
+        let low = registry.acquire(1);
+        let high = registry.acquire(1_000_000);
+        let shared = registry.acquire(1_000_000);
+        assert_eq!(registry.required_workers(), 1_000_001);
+        assert_eq!(registry.counts.lock().unwrap().len(), 2);
+        drop(high);
+        assert_eq!(registry.required_workers(), 1_000_001);
+        drop(shared);
+        assert_eq!(registry.required_workers(), 2);
+        drop(low);
+        assert_eq!(registry.required_workers(), 0);
+    }
+
+    #[test]
+    fn affinity_queries_do_not_visit_stacks_or_update_counts() {
+        println!("stacks,workers,queries,updates");
+        for count in [16, 128, 1024] {
+            for workers in [1, 8, count] {
+                let registry = WorkerAffinities::default();
+                let leases: Vec<_> = (0..count).map(|i| registry.acquire(i % workers)).collect();
+                let queries = count * 4;
+                // Holding the writer lock also proves queries cannot inspect
+                // the counts map, regardless of its size or shape.
+                let counts = registry.counts.lock().unwrap();
+                for _ in 0..queries {
+                    assert_eq!(registry.required_workers(), workers);
+                }
+                drop(counts);
+                assert_eq!(registry.queries.load(Ordering::Relaxed), queries);
+                assert_eq!(registry.updates.load(Ordering::Relaxed), count);
+                drop(leases);
+                assert_eq!(registry.updates.load(Ordering::Relaxed), count * 2);
+                assert_eq!(registry.bound.load(Ordering::Relaxed), 0);
+                println!("{count},{workers},{queries},{}", count * 2);
+            }
+        }
+    }
+
+    #[test]
+    fn affinity_lease_is_released_by_recycle_and_drop() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::scheduler::reset_global_scheduler_for_test();
+        unsafe extern "C" fn ready(_: *mut c_void) -> i32 {
+            RUNTIME_POLL_READY
+        }
+        assert_eq!(required_workers(), 0);
+        let stack = NativeStack::acquire(ready, std::ptr::null_mut());
+        assert_eq!(required_workers(), stack.worker + 1);
+        NativeStack::recycle(stack);
+        assert_eq!(required_workers(), 0);
+        let stack = NativeStack::acquire_cleanup(cleanup_noop, std::ptr::null_mut());
+        assert_eq!(required_workers(), stack.worker + 1);
+        drop(stack);
+        assert_eq!(required_workers(), 0);
+
+        unsafe extern "C" fn cleanup_noop(_: *mut c_void) {}
+    }
 
     #[test]
     fn native_stack_overflow_reports_the_runtime_diagnostic() {

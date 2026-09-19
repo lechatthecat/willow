@@ -385,3 +385,92 @@ fn captured_array_owner_survives_resize_and_moving_collection() {
     willow_pop_roots(2);
     reset_internal_for_test();
 }
+
+// Count capacity changes at the native hook boundary, independently of the
+// queue/visited-set allocations. Each case runs on a fresh marking thread.
+thread_local! {
+    static SCRATCH_COUNTS: std::cell::Cell<(usize, usize, usize)> = const {
+        std::cell::Cell::new((0, 0, 0))
+    };
+}
+
+unsafe fn snapshot_scratch_fixture(payload: *mut u8, children: &mut Vec<*mut u8>) {
+    let words = payload.cast::<usize>();
+    let count = unsafe { *words };
+    assert!(children.is_empty(), "previous object's children leaked");
+    let before = children.capacity();
+    children.extend((0..count).map(|i| unsafe { *words.add(i + 1) as *mut u8 }));
+    SCRATCH_COUNTS.with(|stats| {
+        let (objects, slots, growths) = stats.get();
+        stats.set((
+            objects + 1,
+            slots + count,
+            growths + usize::from(children.capacity() != before),
+        ));
+    });
+}
+
+#[test]
+fn concurrent_trace_reuses_scratch_across_bounded_drains() {
+    for n in [16, 64, 256] {
+        for fanout in [1, 8, 64] {
+            std::thread::spawn(move || {
+                // A chain closed into a cycle, with repeated equivalent edges.
+                let mut payloads: Vec<_> = (0..n).map(|_| vec![0usize; fanout + 1]).collect();
+                let addresses: Vec<_> = payloads
+                    .iter_mut()
+                    .map(|p| p.as_mut_ptr() as usize)
+                    .collect();
+                for (i, payload) in payloads.iter_mut().enumerate() {
+                    payload[0] = fanout;
+                    payload[1..].fill(addresses[(i + 1) % n]);
+                }
+                let queue = crate::gc_mark_queue::MarkWorkQueue::new(1);
+                queue.begin_epoch();
+                let cycle = ConcurrentCycle {
+                    collector: std::thread::current().id(),
+                    objects: addresses
+                        .iter()
+                        .map(|&address| {
+                            (
+                                address,
+                                raw_heap::TraceMetadata {
+                                    type_id: 0xFE01,
+                                    layout_id: 0,
+                                    gc_ref_mask: 0,
+                                    payload_size: (fanout + 1) * GC_STORAGE_WORD_BYTES,
+                                },
+                            )
+                        })
+                        .collect(),
+                    legacy_traces: HashSet::new(),
+                    traces: HashMap::from([(
+                        0xFE01,
+                        snapshot_scratch_fixture as ConcurrentTraceFn,
+                    )]),
+                    visited: Mutex::new(HashSet::new()),
+                    deferred: Mutex::new(Vec::new()),
+                    unindexed: Mutex::new(HashSet::new()),
+                    queue,
+                    work: Mutex::new(crate::gc_telemetry::MarkWork::default()),
+                };
+                cycle.enqueue(addresses[0] as *mut u8);
+                while !cycle.queue.snapshot().is_drained() {
+                    cycle.drain(1);
+                }
+                assert_eq!(cycle.visited.lock().unwrap().len(), n);
+                assert_eq!(
+                    cycle.work.lock().unwrap().scanned_bytes,
+                    (n * fanout * GC_STORAGE_WORD_BYTES) as u64
+                );
+                SCRATCH_COUNTS.with(|stats| assert_eq!(stats.get(), (n, n * fanout, 1)));
+                println!(
+                    "objects={n} fanout={fanout} slots={} scratch_growths=1",
+                    n * fanout
+                );
+            })
+            .join()
+            .unwrap();
+        }
+    }
+}

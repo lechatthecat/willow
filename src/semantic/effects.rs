@@ -254,6 +254,7 @@ impl<W: Clone + Ord> EffectProblem<W> {
     /// seeded id. Iteration is a worklist over reverse edges, so each edge is
     /// revisited only when its callee's summary actually grows.
     pub fn solve(self, graph: &CallGraph) -> EffectFacts<W> {
+        crate::query_stats::add(crate::query_stats::Counter::EffectSolve, 1);
         let mut universe = self.bodies.clone();
         universe.extend(graph.ids().cloned());
         universe.extend(self.seeds.keys().cloned());

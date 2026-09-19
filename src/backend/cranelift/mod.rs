@@ -1181,6 +1181,7 @@ impl Codegen {
     /// fields at two, because the base it read had not been rebuilt yet.
     fn finalize_class_layouts(&mut self) {
         let classes = std::mem::take(&mut self.dirty_class_layouts);
+        crate::query_stats::add(crate::query_stats::Counter::ClassLayout, classes.len());
         for class_name in classes {
             let chain = self.ancestor_chain(&class_name);
             let mut fields: Vec<(String, Type)> = Vec::new();
@@ -1241,6 +1242,7 @@ impl Codegen {
     /// base. Walking the chain here makes the result order-independent.
     fn finalize_class_vslots(&mut self) {
         let classes = std::mem::take(&mut self.dirty_class_vslots);
+        crate::query_stats::add(crate::query_stats::Counter::ClassVslots, classes.len());
         for class_name in classes {
             // Root-most ancestor first, so each level appends onto the order it
             // inherits.
