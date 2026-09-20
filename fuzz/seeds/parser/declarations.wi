@@ -1,0 +1,8 @@
+module sample;
+import std::collections;
+interface Named { fn name(self) -> String; }
+class Item implements Named {
+    pub name: String;
+    pub fn name(self) -> String { return self.name; }
+}
+fn main() {}

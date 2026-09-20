@@ -68,24 +68,22 @@ fn into_raw<T>(future: RuntimeFuture<T>) -> *mut c_void {
 ///
 /// `raw` must have been created for `RuntimeFuture<T>` and remain allocated for
 /// the lifetime of the returned reference.
-unsafe fn future_from_raw<'a, T: Clone>(raw: *mut c_void) -> Option<&'a RuntimeFuture<T>> {
+unsafe fn future_from_raw<'a, T: Clone>(raw: *mut c_void) -> &'a RuntimeFuture<T> {
     if raw.is_null() {
-        None
-    } else {
-        Some(unsafe { &*(raw as *mut RuntimeFuture<T>) })
+        crate::panic_context::fatal_invariant("null legacy future handle");
     }
+    unsafe { &*(raw as *mut RuntimeFuture<T>) }
 }
 
 /// # Safety
 ///
 /// In addition to naming a live `RuntimeFuture<T>`, `raw` must be exclusively
 /// accessible for the lifetime of the returned mutable reference.
-unsafe fn future_from_raw_mut<'a, T: Clone>(raw: *mut c_void) -> Option<&'a mut RuntimeFuture<T>> {
+unsafe fn future_from_raw_mut<'a, T: Clone>(raw: *mut c_void) -> &'a mut RuntimeFuture<T> {
     if raw.is_null() {
-        None
-    } else {
-        Some(unsafe { &mut *(raw as *mut RuntimeFuture<T>) })
+        crate::panic_context::fatal_invariant("null legacy future handle");
     }
+    unsafe { &mut *(raw as *mut RuntimeFuture<T>) }
 }
 
 // ---------------------------------------------------------------------------
@@ -144,12 +142,11 @@ pub fn void_future_into_raw_pub(future: WillowFutureVoid) -> *mut c_void {
 /// # Safety
 ///
 /// `raw` must name a live `WillowFutureVoid` allocated by this module.
-unsafe fn void_future_from_raw<'a>(raw: *mut c_void) -> Option<&'a WillowFutureVoid> {
+unsafe fn void_future_from_raw<'a>(raw: *mut c_void) -> &'a WillowFutureVoid {
     if raw.is_null() {
-        None
-    } else {
-        Some(unsafe { &*(raw as *mut WillowFutureVoid) })
+        crate::panic_context::fatal_invariant("null legacy future handle");
     }
+    unsafe { &*(raw as *mut WillowFutureVoid) }
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +165,7 @@ pub extern "C" fn willow_future_pending_void() -> *mut c_void {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_is_ready_void(raw: *mut c_void) -> u8 {
-    unsafe { void_future_from_raw(raw) }.map_or(1, |f| if f.is_ready() { 1 } else { 0 })
+    u8::from(unsafe { void_future_from_raw(raw) }.is_ready())
 }
 
 #[unsafe(no_mangle)]
@@ -193,25 +190,23 @@ pub extern "C" fn willow_future_ready_ptr(value: *mut c_void) -> *mut c_void {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_await_void(raw: *mut c_void) -> u8 {
-    if let Some(future) = unsafe { void_future_from_raw(raw) } {
-        future.block_until_ready();
-    }
+    unsafe { void_future_from_raw(raw) }.block_until_ready();
     0
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_is_ready_i64(raw: *mut c_void) -> u8 {
-    match unsafe { future_from_raw::<i64>(raw) }.map(|f| f.poll()) {
-        Some(Poll::Ready(_)) | None => 1,
-        Some(Poll::Pending) => 0,
+    match unsafe { future_from_raw::<i64>(raw) }.poll() {
+        Poll::Ready(_) => 1,
+        Poll::Pending => 0,
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_await_i64(raw: *mut c_void) -> i64 {
-    match unsafe { future_from_raw::<i64>(raw) }.map(RuntimeFuture::poll) {
-        Some(Poll::Ready(value)) => value,
-        Some(Poll::Pending) | None => 0,
+    match unsafe { future_from_raw::<i64>(raw) }.poll() {
+        Poll::Ready(value) => value,
+        Poll::Pending => 0,
     }
 }
 
@@ -222,23 +217,23 @@ pub extern "C" fn willow_future_pending_i64() -> *mut c_void {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_is_ready_bool(raw: *mut c_void) -> u8 {
-    match unsafe { future_from_raw::<u8>(raw) }.map(|f| f.poll()) {
-        Some(Poll::Ready(_)) | None => 1,
-        Some(Poll::Pending) => 0,
+    match unsafe { future_from_raw::<u8>(raw) }.poll() {
+        Poll::Ready(_) => 1,
+        Poll::Pending => 0,
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_await_bool(raw: *mut c_void) -> u8 {
-    match unsafe { future_from_raw::<u8>(raw) }.map(RuntimeFuture::poll) {
-        Some(Poll::Ready(value)) => {
+    match unsafe { future_from_raw::<u8>(raw) }.poll() {
+        Poll::Ready(value) => {
             if value == 0 {
                 0
             } else {
                 1
             }
         }
-        Some(Poll::Pending) | None => 0,
+        Poll::Pending => 0,
     }
 }
 
@@ -249,17 +244,17 @@ pub extern "C" fn willow_future_pending_bool() -> *mut c_void {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_is_ready_f64(raw: *mut c_void) -> u8 {
-    match unsafe { future_from_raw::<f64>(raw) }.map(|f| f.poll()) {
-        Some(Poll::Ready(_)) | None => 1,
-        Some(Poll::Pending) => 0,
+    match unsafe { future_from_raw::<f64>(raw) }.poll() {
+        Poll::Ready(_) => 1,
+        Poll::Pending => 0,
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_await_f64(raw: *mut c_void) -> f64 {
-    match unsafe { future_from_raw::<f64>(raw) }.map(RuntimeFuture::poll) {
-        Some(Poll::Ready(value)) => value,
-        Some(Poll::Pending) | None => 0.0,
+    match unsafe { future_from_raw::<f64>(raw) }.poll() {
+        Poll::Ready(value) => value,
+        Poll::Pending => 0.0,
     }
 }
 
@@ -270,17 +265,17 @@ pub extern "C" fn willow_future_pending_f64() -> *mut c_void {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_is_ready_ptr(raw: *mut c_void) -> u8 {
-    match unsafe { future_from_raw::<*mut c_void>(raw) }.map(|f| f.poll()) {
-        Some(Poll::Ready(_)) | None => 1,
-        Some(Poll::Pending) => 0,
+    match unsafe { future_from_raw::<*mut c_void>(raw) }.poll() {
+        Poll::Ready(_) => 1,
+        Poll::Pending => 0,
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_await_ptr(raw: *mut c_void) -> *mut c_void {
-    match unsafe { future_from_raw::<*mut c_void>(raw) }.map(RuntimeFuture::poll) {
-        Some(Poll::Ready(value)) => value,
-        Some(Poll::Pending) | None => std::ptr::null_mut(),
+    match unsafe { future_from_raw::<*mut c_void>(raw) }.poll() {
+        Poll::Ready(value) => value,
+        Poll::Pending => std::ptr::null_mut(),
     }
 }
 
@@ -290,16 +285,11 @@ pub extern "C" fn willow_future_pending_ptr() -> *mut c_void {
 }
 
 /// Complete a pending i64 future with a value (called by executor when async fn finishes).
-/// Returns 1 on success, 0 if future was null.
+/// Returns 1 on success. A null handle is a fatal runtime invariant violation.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_complete_i64(raw: *mut c_void, value: i64) -> u8 {
-    match unsafe { future_from_raw_mut::<i64>(raw) } {
-        Some(future) => {
-            future.complete(value);
-            1
-        }
-        None => 0,
-    }
+    unsafe { future_from_raw_mut::<i64>(raw) }.complete(value);
+    1
 }
 
 impl<T: GcTrace> GcTrace for RuntimeFuture<T> {
@@ -383,23 +373,158 @@ mod tests {
     }
 
     #[test]
-    fn future_unit_07_null_i64_await_returns_zero() {
-        assert_eq!(willow_future_await_i64(std::ptr::null_mut()), 0);
+    fn null_handles_are_process_fatal() {
+        const CHILD: &str = "WILLOW_TEST_NULL_FUTURE";
+        if let Ok(case) = std::env::var(CHILD) {
+            let raw = std::ptr::null_mut();
+            match case.as_str() {
+                "is_ready_void" => {
+                    willow_future_is_ready_void(raw);
+                }
+                "await_void" => {
+                    willow_future_await_void(raw);
+                }
+                "is_ready_i64" => {
+                    willow_future_is_ready_i64(raw);
+                }
+                "await_i64" => {
+                    willow_future_await_i64(raw);
+                }
+                "is_ready_bool" => {
+                    willow_future_is_ready_bool(raw);
+                }
+                "await_bool" => {
+                    willow_future_await_bool(raw);
+                }
+                "is_ready_f64" => {
+                    willow_future_is_ready_f64(raw);
+                }
+                "await_f64" => {
+                    willow_future_await_f64(raw);
+                }
+                "is_ready_ptr" => {
+                    willow_future_is_ready_ptr(raw);
+                }
+                "await_ptr" => {
+                    willow_future_await_ptr(raw);
+                }
+                "complete_i64" => {
+                    willow_future_complete_i64(raw, 42);
+                }
+                _ => panic!("unknown child case"),
+            }
+            return;
+        }
+        for case in [
+            "is_ready_void",
+            "await_void",
+            "is_ready_i64",
+            "await_i64",
+            "is_ready_bool",
+            "await_bool",
+            "is_ready_f64",
+            "await_f64",
+            "is_ready_ptr",
+            "await_ptr",
+            "complete_i64",
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "future::tests::null_handles_are_process_fatal",
+                    "--nocapture",
+                ])
+                .env(CHILD, case)
+                .output()
+                .expect("run null future subprocess");
+            assert!(!output.status.success(), "{case}: null handle was accepted");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("runtime fatal: null legacy future handle"),
+                "{case}: {stderr}"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(output.status.signal(), Some(libc::SIGABRT), "{case}");
+            }
+        }
     }
 
     #[test]
-    fn future_unit_08_null_bool_await_returns_false() {
-        assert_eq!(willow_future_await_bool(std::ptr::null_mut()), 0);
-    }
-
-    #[test]
-    fn future_unit_09_null_f64_await_returns_zero() {
-        assert_eq!(willow_future_await_f64(std::ptr::null_mut()), 0.0);
-    }
-
-    #[test]
-    fn future_unit_10_null_ptr_await_returns_null() {
-        assert!(willow_future_await_ptr(std::ptr::null_mut()).is_null());
+    fn valid_handles_preserve_readiness_and_completion() {
+        macro_rules! check {
+            ($ty:ty, $pending:ident, $ready:ident, $poll:ident, $await:ident, $value:expr, $zero:expr) => {{
+                let raw = $pending();
+                assert_eq!($poll(raw), 0);
+                assert_eq!($await(raw), $zero);
+                unsafe {
+                    drop(Box::from_raw(raw.cast::<RuntimeFuture<$ty>>()));
+                }
+                let raw = $ready($value);
+                assert_eq!($poll(raw), 1);
+                assert_eq!($await(raw), $value);
+                unsafe {
+                    drop(Box::from_raw(raw.cast::<RuntimeFuture<$ty>>()));
+                }
+            }};
+        }
+        check!(
+            i64,
+            willow_future_pending_i64,
+            willow_future_ready_i64,
+            willow_future_is_ready_i64,
+            willow_future_await_i64,
+            42,
+            0
+        );
+        check!(
+            u8,
+            willow_future_pending_bool,
+            willow_future_ready_bool,
+            willow_future_is_ready_bool,
+            willow_future_await_bool,
+            1,
+            0
+        );
+        check!(
+            f64,
+            willow_future_pending_f64,
+            willow_future_ready_f64,
+            willow_future_is_ready_f64,
+            willow_future_await_f64,
+            3.5,
+            0.0
+        );
+        // A null result pointer is valid; only the future handle must be non-null.
+        check!(
+            *mut c_void,
+            willow_future_pending_ptr,
+            willow_future_ready_ptr,
+            willow_future_is_ready_ptr,
+            willow_future_await_ptr,
+            std::ptr::null_mut(),
+            std::ptr::null_mut()
+        );
+        let raw = willow_future_pending_i64();
+        assert_eq!(willow_future_complete_i64(raw, 73), 1);
+        assert_eq!(willow_future_is_ready_i64(raw), 1);
+        assert_eq!(willow_future_await_i64(raw), 73);
+        unsafe {
+            drop(Box::from_raw(raw.cast::<RuntimeFuture<i64>>()));
+        }
+        for (future, expected) in [
+            (WillowFutureVoid::Ready, 1),
+            (WillowFutureVoid::Pending, 0),
+            (WillowFutureVoid::sleep_after_millis(0), 1),
+        ] {
+            let raw = void_future_into_raw(future);
+            assert_eq!(willow_future_is_ready_void(raw), expected);
+            assert_eq!(willow_future_await_void(raw), 0);
+            unsafe {
+                drop(Box::from_raw(raw.cast::<WillowFutureVoid>()));
+            }
+        }
     }
 
     #[test]

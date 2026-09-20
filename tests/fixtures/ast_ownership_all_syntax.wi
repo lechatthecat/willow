@@ -1,0 +1,56 @@
+// Parser-only coverage fixture: intentionally includes semantically unrelated forms.
+async fn main() {
+    let mut a: i64 = 7;
+    a = 8;
+    obj.field = 9;
+    super.init(10, &a);
+    C::field = 11;
+    arr[12] = 13;
+    if true { 14; } else { 15; }
+    if false { 16; }
+    while true { break; continue; }
+    defer f(17);
+    defer { 18; }
+    lock obj as mut cell { 19; }
+    for x in 20..21 { 22; }
+    return;
+    return 23;
+    1.5;
+    "text";
+    a;
+    24 + 25;
+    -26;
+    f(27, &a);
+    obj.field;
+    obj.method(28, 29);
+    C<i64>::method(30);
+    C::field;
+    new C<i64>(31);
+    C { first: 32, second: 33 };
+    await task;
+    select {
+        let value = ch.recv() => { 34; }
+        ch.send(35) => { 36; }
+        sleep(37) => { 38; }
+        let joined = await task => { 39; }
+        default => { 40; }
+    }
+    print(41);
+    println(42);
+    true ? 43 : 44;
+    45..46;
+    |x: i64| x;
+    |x: i64| { return x; };
+    match a {
+        _ => 47,
+        bound => { 48; },
+        true => 49,
+        50 => 51,
+        C::Empty => 52,
+        C::Pair(left, right) => 53,
+        Dog(dog) => 54
+    };
+    fallible?;
+    [55, 56];
+    arr[57];
+}

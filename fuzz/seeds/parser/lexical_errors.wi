@@ -1,0 +1,2 @@
+fn main() { let x = 9999999999999999999999999999999999999; }
+/* unterminated comment

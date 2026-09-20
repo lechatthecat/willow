@@ -2494,8 +2494,12 @@ mod tests {
                 purge_task_from_tokens(task, owners);
                 assert!(expected_test_ownership(task, destination).is_empty());
                 assert_eq!(expected_test_ownership(task, original), decoys);
-                let remaining = crate::scheduler::take_channel_waits(task);
-                assert_eq!(remaining, decoys);
+                let mut remaining = crate::scheduler::take_channel_waits(task);
+                // Reverse ownership is unordered; channel waiter queues own FIFO.
+                remaining.sort_unstable();
+                let mut expected = decoys;
+                expected.sort_unstable();
+                assert_eq!(remaining, expected);
                 purge_task_from_tokens(task, remaining);
                 assert!(expected_test_ownership(task, original).is_empty());
             }

@@ -1446,6 +1446,73 @@ fn retired_tlab_header_index_bounds_lookup_work_and_rejects_dead_headers() {
 }
 
 #[test]
+fn old_region_lookup_bounds_work_for_hits_misses_nursery_and_pinned_pointers() {
+    let _guard = runtime_test_guard();
+    for count in [16usize, 64, 256, 1024] {
+        reset_internal_for_test();
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            state.threshold_bytes = usize::MAX;
+            state.nursery_threshold_bytes = usize::MAX;
+        }
+        let old: Vec<_> = (0..count)
+            .map(|_| willow_alloc((GC_LARGE_OBJECT_THRESHOLD + 8) as i64))
+            .collect();
+        let mut tls = tlab_state_for_test();
+        let mut young = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
+        willow_push_root(&mut young);
+        for pinned in [false, true] {
+            if pinned {
+                willow_gc_minor_collect();
+            }
+            let state = runtime().heap.lock().unwrap();
+            assert_eq!(state.old_regions.len(), count);
+            assert_eq!(
+                payload_generation(&state, young),
+                Some(if pinned {
+                    GC_GENERATION_OLD
+                } else {
+                    GC_GENERATION_YOUNG
+                })
+            );
+            let mut single_pass_comparisons = 0;
+            for repetitions in [1, 4] {
+                address_index::take_comparisons();
+                for query in 0..count * repetitions {
+                    let address = old[query % count] as usize;
+                    assert_eq!(
+                        find_old_region_object(&state, address, false)
+                            .map(|object| object.payload().as_ptr() as usize),
+                        Some(address)
+                    );
+                    assert!(find_old_region_object(&state, address + 1, true).is_some());
+                    assert!(find_old_region_object(&state, address + 1, false).is_none());
+                    assert!(find_old_region_object(&state, young as usize, false).is_none());
+                    assert!(find_old_region_object(&state, young as usize + 1, true).is_none());
+                    assert!(find_old_region_object(&state, usize::MAX, true).is_none());
+                }
+                let queries = count * repetitions * 6;
+                let comparisons = address_index::take_comparisons();
+                assert!(comparisons > 0, "lookup must exercise the address index");
+                assert!(comparisons <= queries * 12 * (count.ilog2() as usize + 1));
+                if repetitions == 1 {
+                    single_pass_comparisons = comparisons;
+                } else {
+                    assert_eq!(comparisons, single_pass_comparisons * repetitions);
+                }
+                println!(
+                    "old-lookup regions={count} queries={queries} pinned={pinned} comparisons={comparisons}"
+                );
+            }
+        }
+        willow_pop_root();
+        willow_gc_collect();
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+    }
+    reset_internal_for_test();
+}
+
+#[test]
 fn barrier_tlab_range_index_survives_minor_swap_removal() {
     let _guard = runtime_test_guard();
     for count in [16usize, 64, 256] {

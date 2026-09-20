@@ -122,7 +122,7 @@ fn sweep_region(
             #[cfg(test)]
             SWEEP_REGION_VISITS.fetch_add(1, Ordering::Relaxed);
             region.mark_bitmap.clear();
-            region.free_spans.clear();
+            let mut free_spans = Vec::new();
             region.largest_free_span = 0;
             let mut live_end = 0;
             let base = region.base;
@@ -143,7 +143,7 @@ fn sweep_region(
                 {
                     if offset > live_end {
                         region.largest_free_span = region.largest_free_span.max(offset - live_end);
-                        region.free_spans.push(RegionFreeSpan {
+                        free_spans.push(RegionFreeSpan {
                             offset: live_end,
                             size: offset - live_end,
                         });
@@ -168,6 +168,7 @@ fn sweep_region(
                     false
                 }
             });
+            region.free_spans = FreeSpans::from(free_spans);
             region.used = live_end;
             region.sweep_pending = false;
             region.sweep_quarantined = true;

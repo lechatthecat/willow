@@ -1,0 +1,23 @@
+[package]
+name = "willow-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+willow_compiler = { package = "willowc", path = ".." }
+
+# Keep fuzz tooling and its dependencies out of ordinary workspace builds.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "parser"
+path = "fuzz_targets/parser.rs"
+test = false
+doc = false
+bench = false

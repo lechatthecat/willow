@@ -1,0 +1,5 @@
+fn main() {
+    let x = (((((((1)))))));
+    if true { while false { if false { println(x); } } }
+    let y = [1, 2, 3];
+}

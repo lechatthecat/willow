@@ -163,6 +163,10 @@ pub struct Codegen {
     class_dependents: HashMap<TypeId, HashSet<TypeId>>,
     dirty_class_layouts: HashSet<TypeId>,
     dirty_class_vslots: HashSet<TypeId>,
+    #[cfg(test)]
+    vslot_work: [usize; 3], // visited classes, copied slots, own declarations
+    #[cfg(test)]
+    layout_work: [usize; 5], // visited classes, copied fields, own fields, invalidations, edges
     /// The `open`/`override` instance methods each class declares ITSELF, in
     /// declaration order (willow-fm7t). Recorded as classes are registered;
     /// [`Codegen::finalize_class_vslots`] turns it into `class_vslots`.
@@ -434,6 +438,10 @@ impl Codegen {
             class_dependents: HashMap::new(),
             dirty_class_layouts: HashSet::new(),
             dirty_class_vslots: HashSet::new(),
+            #[cfg(test)]
+            vslot_work: [0; 3],
+            #[cfg(test)]
+            layout_work: [0; 5],
             class_own_vmethods: TypeMap::with_scope(type_scope.clone()),
             class_vslots: TypeMap::with_scope(type_scope.clone()),
             class_descriptor_ids: TypeMap::with_scope(type_scope.clone()),
@@ -1097,6 +1105,18 @@ impl Codegen {
         // for a class with no base.
         self.class_layouts.insert(c.name.clone(), own.clone());
         self.class_own_fields.insert(c.name.clone(), own);
+        // Replace both directions of the canonical edge. Removing an empty
+        // adjacency bucket prevents historical parents accumulating on reparent.
+        let class_id = TypeId::from_source_name(&c.name);
+        if let Some(old_base) = self.class_base.remove_canonical_id(&class_id)
+            && let std::collections::hash_map::Entry::Occupied(mut entry) =
+                self.class_dependents.entry(old_base)
+        {
+            entry.get_mut().remove(&class_id);
+            if entry.get().is_empty() {
+                entry.remove();
+            }
+        }
         if let Some(base_path) = &c.base_class {
             // `TypePath::name()` deliberately returns only the final segment,
             // which is right for diagnostics but not for backend identity. A
@@ -1120,7 +1140,7 @@ impl Codegen {
             self.class_dependents
                 .entry(base)
                 .or_default()
-                .insert(TypeId::from_source_name(&c.name));
+                .insert(class_id);
             self.class_base.insert(c.name.clone(), base);
         }
         // Assign a unique type_id for runtime dynamic dispatch. It lives at
@@ -1140,15 +1160,25 @@ impl Codegen {
 
     fn invalidate_class_layout(&mut self, name: &str) {
         let mut pending = vec![TypeId::from_source_name(name)];
-        let mut seen = HashSet::new();
         while let Some(name) = pending.pop() {
-            if !seen.insert(name) {
+            // An already-dirty node has propagated to its existing children.
+            // New child edges are covered by registration invalidating the child.
+            // Check both passes: either one can be finalized independently.
+            let fields_changed = self.dirty_class_layouts.insert(name);
+            let slots_changed = self.dirty_class_vslots.insert(name);
+            if !fields_changed && !slots_changed {
                 continue;
             }
-            self.dirty_class_layouts.insert(name);
-            self.dirty_class_vslots.insert(name);
+            #[cfg(test)]
+            {
+                self.layout_work[3] += 1;
+            }
             if let Some(children) = self.class_dependents.get(&name) {
-                pending.extend(children.iter().cloned());
+                #[cfg(test)]
+                {
+                    self.layout_work[4] += children.len();
+                }
+                pending.extend(children.iter().copied());
             }
         }
     }
@@ -1171,41 +1201,84 @@ impl Codegen {
         self.class_own_vmethods.insert(c.name.clone(), own);
     }
 
-    /// Turn the per-class own-field lists into each class's full field layout,
-    /// walking `class_base` from the ROOT down.
-    ///
-    /// Base fields come FIRST, so a subclass's layout extends its base's and
-    /// the offset of an inherited field is the same through a base-typed
-    /// reference as through the subclass's own. A name a class redeclares keeps
-    /// the ancestor's slot rather than adding a second one.
-    ///
-    /// Done as a separate pass rather than during registration because classes
-    /// arrive in DECLARATION order, and a subclass may be declared before its
-    /// base (willow-59gx). The previous two-pass scheme -- own fields for
-    /// everyone, then rebuild each class from its base's entry in declaration
-    /// order -- got one level right by accident and dropped the grandparent's
-    /// fields at two, because the base it read had not been rebuilt yet.
+    /// Build dirty field layouts parent first, reusing completed parent layouts.
+    /// Base fields keep their order and type, including when a child redeclares
+    /// a name. Name indexing makes work proportional to the materialized layouts
+    /// plus own declarations, rather than replaying and scanning every ancestor.
     fn finalize_class_layouts(&mut self) {
-        let classes = std::mem::take(&mut self.dirty_class_layouts);
-        crate::query_stats::add(crate::query_stats::Counter::ClassLayout, classes.len());
-        for class_name in classes {
-            let chain = self.ancestor_chain(&class_name);
-            let mut fields: Vec<(String, Type)> = Vec::new();
-            for ancestor in chain.iter().rev() {
-                // Under the ancestor's own identity: this pass re-runs for
-                // every unit in the build, and the unit it happens to run
-                // under may have bound that very name to another module's
-                // class (willow-kd1v).
-                let Some(own) = self.class_own_fields.get_canonical_id(ancestor) else {
-                    continue;
+        let mut pending = std::mem::take(&mut self.dirty_class_layouts);
+        crate::query_stats::add(crate::query_stats::Counter::ClassLayout, pending.len());
+        let starts: Vec<_> = pending.iter().copied().collect();
+        let mut path = Vec::new();
+        let mut visiting = HashSet::new();
+        for start in starts {
+            path.clear();
+            let mut current = start;
+            while pending.contains(&current) {
+                if !visiting.insert(current) {
+                    // Invalid source is rejected by the checker. Preserve the
+                    // finite, root-relative replay for standalone backend users.
+                    for name in path.drain(..) {
+                        visiting.remove(&name);
+                        let mut fields = Vec::new();
+                        let mut names = HashSet::new();
+                        for ancestor in self.ancestor_chain(&name).iter().rev() {
+                            if let Some(own) = self.class_own_fields.get_canonical_id(ancestor) {
+                                for (field, ty) in own {
+                                    if names.insert(field.as_str()) {
+                                        fields.push((field.clone(), ty.clone()));
+                                    }
+                                }
+                            }
+                        }
+                        self.class_layouts.insert_canonical_id(name, fields);
+                        pending.remove(&name);
+                    }
+                    break;
+                }
+                path.push(current);
+                #[cfg(test)]
+                {
+                    self.layout_work[0] += 1;
+                }
+                let Some(base) = self.class_base.get_canonical_id(&current) else {
+                    break;
                 };
-                for (name, ty) in own {
-                    if !fields.iter().any(|(n, _)| n == name) {
-                        fields.push((name.clone(), ty.clone()));
+                current = *base;
+            }
+            while let Some(name) = path.pop() {
+                visiting.remove(&name);
+                let parent = self
+                    .class_base
+                    .get_canonical_id(&name)
+                    // Only registered classes participated in ancestor replay.
+                    // Do not inherit a synthetic builtin-only layout.
+                    .filter(|base| self.class_own_fields.get_canonical_id(base).is_some())
+                    .and_then(|base| self.class_layouts.get_canonical_id(base));
+                let mut fields = parent.cloned().unwrap_or_default();
+                let mut names: HashSet<&str> = parent
+                    .into_iter()
+                    .flatten()
+                    .map(|(field, _)| field.as_str())
+                    .collect();
+                #[cfg(test)]
+                {
+                    self.layout_work[1] += fields.len();
+                }
+                if let Some(own) = self.class_own_fields.get_canonical_id(&name) {
+                    #[cfg(test)]
+                    {
+                        self.layout_work[2] += own.len();
+                    }
+                    for (field, ty) in own {
+                        if names.insert(field.as_str()) {
+                            fields.push((field.clone(), ty.clone()));
+                        }
                     }
                 }
+                self.class_layouts.insert_canonical_id(name, fields);
+                pending.remove(&name);
             }
-            self.class_layouts.insert_canonical_id(class_name, fields);
         }
     }
 
@@ -1232,39 +1305,73 @@ impl Codegen {
         chain
     }
 
-    /// Turn the per-class `open`/`override` lists into each class's full slot
-    /// order, walking `class_base` from the ROOT down.
-    ///
-    /// Starting from the base's order and appending only names it does not
-    /// already carry is what makes inheritance and `override` fall out for
-    /// free: an inherited method keeps the ancestor's slot index, and an
-    /// `override` is the same name at the same index, so it REPLACES the entry
-    /// rather than adding one. `declare_one_class_descriptor` then fills each
-    /// slot with `resolve_class_method_func_id`, which walks to the ancestor
-    /// for a method this class did not redeclare.
-    ///
-    /// Done as a separate pass rather than during registration because classes
-    /// arrive in DECLARATION order, and a subclass may be declared before its
-    /// base. Walking the chain here makes the result order-independent.
+    /// Build dirty slot tables parent first, reusing completed parent summaries.
+    /// Overrides retain their inherited index; new names append in declaration
+    /// order. Canonical IDs keep summaries independent of the active unit aliases.
+    /// The explicit path handles arbitrarily deep, out-of-order declarations.
     fn finalize_class_vslots(&mut self) {
-        let classes = std::mem::take(&mut self.dirty_class_vslots);
-        crate::query_stats::add(crate::query_stats::Counter::ClassVslots, classes.len());
-        for class_name in classes {
-            // Root-most ancestor first, so each level appends onto the order it
-            // inherits.
-            let chain = self.ancestor_chain(&class_name);
-            let mut slots = crate::semantic::method_slots::MethodSlots::default();
-            for ancestor in chain.iter().rev() {
-                // An identity, not a spelling, for the same reason
-                // `finalize_class_layouts` reads one.
-                let Some(own) = self.class_own_vmethods.get_canonical_id(ancestor) else {
-                    continue;
-                };
-                for method in own {
-                    slots.insert(method);
+        let mut pending = std::mem::take(&mut self.dirty_class_vslots);
+        crate::query_stats::add(crate::query_stats::Counter::ClassVslots, pending.len());
+        let starts: Vec<_> = pending.iter().copied().collect();
+        let mut path = Vec::new();
+        let mut visiting = HashSet::new();
+        for start in starts {
+            path.clear();
+            let mut current = start;
+            while pending.contains(&current) {
+                if !visiting.insert(current) {
+                    // The checker rejects cycles. Standalone backend callers
+                    // historically get a finite, root-relative ancestor replay;
+                    // preserve that fallback rather than caching a partial cycle.
+                    for name in path.drain(..) {
+                        visiting.remove(&name);
+                        let mut slots = crate::semantic::method_slots::MethodSlots::default();
+                        for ancestor in self.ancestor_chain(&name).iter().rev() {
+                            if let Some(own) = self.class_own_vmethods.get_canonical_id(ancestor) {
+                                for method in own {
+                                    slots.insert(method);
+                                }
+                            }
+                        }
+                        self.class_vslots.insert_canonical_id(name, slots);
+                        pending.remove(&name);
+                    }
+                    break;
                 }
+                path.push(current);
+                #[cfg(test)]
+                {
+                    self.vslot_work[0] += 1;
+                }
+                let Some(base) = self.class_base.get_canonical_id(&current) else {
+                    break;
+                };
+                current = *base;
             }
-            self.class_vslots.insert_canonical_id(class_name, slots);
+            while let Some(name) = path.pop() {
+                visiting.remove(&name);
+                let mut slots = self
+                    .class_base
+                    .get_canonical_id(&name)
+                    .and_then(|base| self.class_vslots.get_canonical_id(base))
+                    .cloned()
+                    .unwrap_or_default();
+                #[cfg(test)]
+                {
+                    self.vslot_work[1] += slots.len();
+                }
+                if let Some(own) = self.class_own_vmethods.get_canonical_id(&name) {
+                    #[cfg(test)]
+                    {
+                        self.vslot_work[2] += own.len();
+                    }
+                    for method in own {
+                        slots.insert(method);
+                    }
+                }
+                self.class_vslots.insert_canonical_id(name, slots);
+                pending.remove(&name);
+            }
         }
     }
 
@@ -2693,6 +2800,104 @@ mod tests {
         assert_eq!(codegen.canonical_declared_type(&unchanged), unchanged);
     }
     #[test]
+    fn vslot_summaries_scale_with_output_and_reuse_clean_parents() {
+        for size in [1, 16, 256, 1024] {
+            for shape in ["chain", "fanout", "growing"] {
+                if shape == "growing" && size > 256 {
+                    continue;
+                }
+                let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+                // Reverse registration, without layout finalization: measure
+                // only the slot pass, independently of the field-layout pass.
+                for i in (0..size).rev() {
+                    let name = format!("C{i}");
+                    let id = TypeId::from_source_name(&name);
+                    if i > 0 {
+                        let base = if shape == "fanout" { 0 } else { i - 1 };
+                        codegen
+                            .class_base
+                            .insert(name.clone(), TypeId::from_source_name(&format!("C{base}")));
+                    }
+                    let method = if shape == "growing" {
+                        format!("m{i}")
+                    } else {
+                        "m".into()
+                    };
+                    codegen.class_own_vmethods.insert(name, vec![method]);
+                    codegen.dirty_class_vslots.insert(id);
+                }
+                codegen.finalize_class_vslots();
+                let copied = if shape == "growing" {
+                    size * (size - 1) / 2
+                } else {
+                    size - 1
+                };
+                assert_eq!(codegen.vslot_work, [size, copied, size]);
+                let mut stored = 0;
+                for i in 0..size {
+                    let slots = codegen
+                        .class_vslots
+                        .get_canonical(&format!("C{i}"))
+                        .unwrap();
+                    stored += slots.len();
+                    if shape == "growing" {
+                        assert_eq!(slots.len(), i + 1);
+                        for j in 0..=i {
+                            assert_eq!(slots.slot_of(&format!("m{j}")), Some(j));
+                        }
+                    } else {
+                        assert_eq!(slots.as_slice(), ["m"]);
+                    }
+                }
+                eprintln!(
+                    "shape={shape} size={size} visited={size} copied={copied} declarations={size} stored={stored}"
+                );
+                codegen.vslot_work = [0; 3];
+                for _ in 0..8 {
+                    codegen.finalize_class_vslots();
+                }
+                assert_eq!(codegen.vslot_work, [0; 3]);
+                let leaf = format!("C{}", size - 1);
+                codegen.invalidate_class_layout(&leaf);
+                codegen.finalize_class_vslots();
+                let inherited = if shape == "growing" {
+                    size - 1
+                } else {
+                    usize::from(size > 1)
+                };
+                assert_eq!(codegen.vslot_work, [1, inherited, 1]);
+            }
+        }
+    }
+
+    #[test]
+    fn vslot_summaries_preserve_standalone_cycle_fallback() {
+        let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+        for (name, base, method) in [("A", "B", "a"), ("B", "A", "b"), ("C", "A", "c")] {
+            codegen
+                .class_base
+                .insert(name, TypeId::from_source_name(base));
+            codegen.class_own_vmethods.insert(name, vec![method.into()]);
+            codegen
+                .dirty_class_vslots
+                .insert(TypeId::from_source_name(name));
+        }
+        codegen.finalize_class_vslots();
+        assert_eq!(
+            codegen.class_vslots.get_canonical("A").unwrap().as_slice(),
+            ["b", "a"]
+        );
+        assert_eq!(
+            codegen.class_vslots.get_canonical("B").unwrap().as_slice(),
+            ["a", "b"]
+        );
+        assert_eq!(
+            codegen.class_vslots.get_canonical("C").unwrap().as_slice(),
+            ["b", "a", "c"]
+        );
+    }
+
+    #[test]
     fn incremental_layouts_track_only_changed_dependency_subtrees() {
         for length in 1..=10 {
             for reverse in [false, true] {
@@ -3373,3 +3578,9 @@ pub(super) fn lir_address_taken_locals(
     }
     names
 }
+
+#[cfg(test)]
+mod class_layout_tests;
+
+#[cfg(test)]
+mod class_reparent_tests;

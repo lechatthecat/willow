@@ -3,7 +3,7 @@ use crate::task_state::{
     AtomicTaskState, BoundaryOutcome, ClaimOutcome, TaskLifecycle, WakeOutcome,
 };
 use crate::wait_queue::WaitQueue;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -26,6 +26,30 @@ pub(crate) struct ChannelOwnershipToken {
     pub channel: usize,
     pub role: ChannelRole,
     pub generation: u64,
+}
+
+// Generation is deliberately excluded: one live generation per channel/role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), derive(Hash))]
+struct ChannelOwnershipKey(usize, ChannelRole);
+
+impl ChannelOwnershipToken {
+    fn key(self) -> ChannelOwnershipKey {
+        ChannelOwnershipKey(self.channel, self.role)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CHANNEL_OWNERSHIP_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+impl std::hash::Hash for ChannelOwnershipKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        CHANNEL_OWNERSHIP_HASHES.with(|count| count.set(count.get() + 1));
+        std::hash::Hash::hash(&(self.0, self.1), state);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,7 +127,9 @@ pub(crate) struct TaskWaitLinks {
     /// references so cancellation deregisters in O(registered) instead of
     /// scanning every channel (willow-p4er). Addresses stay live while the
     /// task does (the handles sit in its rooted frame).
+    // Cancellation groups these by channel; registration order is immaterial.
     wait_channels: Vec<ChannelOwnershipToken>,
+    channel_ownership_index: HashMap<ChannelOwnershipKey, usize>,
     /// The lock this task is queued on, or holds a reserved handoff for
     /// (willow-38w.1.2). At most one: a critical section may not nest and may
     /// not suspend, so a task waits on one lock at a time. Cancellation takes
@@ -356,15 +382,17 @@ impl RuntimeTask {
 
     /// Install exact ownership; repeated publication of the same token succeeds.
     pub(crate) fn install_channel_ownership(&mut self, token: ChannelOwnershipToken) -> bool {
-        if let Some(existing) = self
-            .wait_channels()
-            .iter()
-            .find(|existing| existing.channel == token.channel && existing.role == token.role)
-        {
-            return *existing == token;
+        let wait = self.wait_mut();
+        match wait.channel_ownership_index.entry(token.key()) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                wait.wait_channels[*entry.get()] == token
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(wait.wait_channels.len());
+                wait.wait_channels.push(token);
+                true
+            }
         }
-        self.wait_mut().wait_channels.push(token);
-        true
     }
 
     /// Replace only the ownership generation observed by the channel caller.
@@ -376,41 +404,50 @@ impl RuntimeTask {
         let Some(wait) = self.wait.as_mut() else {
             return false;
         };
-        let Some(index) = wait.wait_channels.iter().position(|token| *token == old) else {
+        let Some(&index) = wait.channel_ownership_index.get(&old.key()) else {
             return false;
         };
-        if wait.wait_channels.iter().enumerate().any(|(other, token)| {
-            other != index && token.channel == new.channel && token.role == new.role
-        }) {
+        if wait.wait_channels[index] != old {
             return false;
+        }
+        if old.key() != new.key() {
+            if wait.channel_ownership_index.contains_key(&new.key()) {
+                return false;
+            }
+            wait.channel_ownership_index.remove(&old.key());
+            wait.channel_ownership_index.insert(new.key(), index);
         }
         wait.wait_channels[index] = new;
         true
     }
 
     pub(crate) fn clear_channel_ownership(&mut self, token: ChannelOwnershipToken) -> bool {
-        let removed = if let Some(wait) = self.wait.as_mut() {
-            if let Some(index) = wait
-                .wait_channels
-                .iter()
-                .position(|existing| *existing == token)
-            {
-                wait.wait_channels.remove(index);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
+        let Some(wait) = self.wait.as_mut() else {
+            return false;
         };
+        let Some(&index) = wait.channel_ownership_index.get(&token.key()) else {
+            return false;
+        };
+        if wait.wait_channels[index] != token {
+            return false;
+        }
+        wait.channel_ownership_index.remove(&token.key());
+        wait.wait_channels.swap_remove(index);
+        if let Some(moved) = wait.wait_channels.get(index) {
+            *wait.channel_ownership_index.get_mut(&moved.key()).unwrap() = index;
+        }
         self.release_wait_if_vacant();
-        removed
+        true
     }
 
     /// Take exact reverse references for cancellation outside the task shard.
     pub(crate) fn take_wait_channels(&mut self) -> Vec<ChannelOwnershipToken> {
         let channels = match self.wait.as_mut() {
-            Some(wait) => std::mem::take(&mut wait.wait_channels),
+            Some(wait) => {
+                // Release capacity too, even if other kinds of wait links remain.
+                wait.channel_ownership_index = HashMap::new();
+                std::mem::take(&mut wait.wait_channels)
+            }
             None => Vec::new(),
         };
         self.release_wait_if_vacant();
@@ -877,6 +914,9 @@ mod footprint {
         assert!(task.install_channel_ownership(send));
         assert!(!task.transition_channel_ownership(newer, claim));
         assert!(!task.clear_channel_ownership(newer));
+        assert!(task.transition_channel_ownership(wait, newer));
+        assert!(!task.transition_channel_ownership(wait, claim));
+        assert!(task.transition_channel_ownership(newer, wait));
         assert!(task.transition_channel_ownership(wait, claim));
         assert!(!task.clear_channel_ownership(wait));
         assert!(task.wait_channels().contains(&send));
@@ -885,6 +925,79 @@ mod footprint {
         assert!(task.clear_channel_ownership(claim));
         assert!(task.owns_wait_links());
         assert!(task.clear_channel_ownership(handoff));
+        assert!(!task.owns_wait_links());
+    }
+
+    #[test]
+    fn channel_ownership_index_scales_across_roles_and_compensation() {
+        for n in [64, 256, 1024, 4096] {
+            let mut task = RuntimeTask::new(1);
+            CHANNEL_OWNERSHIP_HASHES.with(|count| count.set(0));
+            let roles = [
+                ChannelRole::RecvWait,
+                ChannelRole::RecvClaim,
+                ChannelRole::SendWait,
+                ChannelRole::SendHandoff,
+            ];
+            for channel in 1..=n {
+                for role in roles {
+                    let token = ChannelOwnershipToken {
+                        channel,
+                        role,
+                        generation: 1,
+                    };
+                    assert!(task.install_channel_ownership(token));
+                    assert!(task.install_channel_ownership(token));
+                    assert!(!task.install_channel_ownership(ChannelOwnershipToken {
+                        generation: 2,
+                        ..token
+                    }));
+                }
+            }
+            for channel in 1..=n {
+                for role in roles {
+                    let old = ChannelOwnershipToken {
+                        channel,
+                        role,
+                        generation: 1,
+                    };
+                    let new = ChannelOwnershipToken {
+                        channel: channel + n,
+                        ..old
+                    };
+                    assert!(task.transition_channel_ownership(old, new));
+                    assert!(!task.clear_channel_ownership(old));
+                    // Failed-wake compensation clears the transitioned owner.
+                    assert!(task.clear_channel_ownership(new));
+                    assert!(!task.clear_channel_ownership(new));
+                }
+            }
+            let hashes = CHANNEL_OWNERSHIP_HASHES.with(|count| count.get());
+            println!("channels={n} tokens={} hashes={hashes}", 4 * n);
+            // Includes growth rehashes and moved-slot index repair. Hash-table
+            // probes are expected O(1); this bounds actual key hashing work.
+            assert!(hashes <= 80 * n, "{hashes} hashes for {n} channels");
+            assert!(!task.owns_wait_links());
+        }
+    }
+
+    #[test]
+    fn channel_ownership_take_resets_index_with_other_links_live() {
+        let mut task = RuntimeTask::new(1);
+        task.add_awaiting(2);
+        for channel in 1..=32 {
+            assert!(task.install_channel_ownership(channel_token(channel)));
+        }
+        let taken = task.take_wait_channels();
+        assert_eq!(taken.len(), 32);
+        assert!(task.take_wait_channels().is_empty());
+        assert!(task.is_awaiting(2));
+        for token in taken {
+            assert!(!task.clear_channel_ownership(token));
+            assert!(task.install_channel_ownership(token));
+        }
+        task.take_awaiting();
+        assert_eq!(task.take_wait_channels().len(), 32);
         assert!(!task.owns_wait_links());
     }
 

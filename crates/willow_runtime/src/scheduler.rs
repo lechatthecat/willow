@@ -596,6 +596,9 @@ fn unregister_waiter_sharded(
     });
 }
 
+#[path = "scheduler_wake_batch.rs"]
+mod wake_batch;
+pub(crate) use wake_batch::{WakeBatchScratch, wake_channel_owners};
 /// Publish one wake against a task table + run queues, with no scheduler
 /// metadata mutex involved.
 ///
@@ -614,6 +617,17 @@ fn wake_task_outcome_in(
     wake_task_matching_in(tasks, run_queues, id, None).unwrap_or(WakeOutcome::Terminal)
 }
 
+/// Shared state transition for single, timer-matched, and batched wakes.
+/// Caller holds the task shard through queue publication and accounting.
+fn wake_task_state(task: &mut RuntimeTask) -> (TaskLifecycle, WakeOutcome) {
+    let before = task.state.lifecycle();
+    let outcome = task.state.wake();
+    if outcome != WakeOutcome::Terminal {
+        task.wake_deadline = None;
+    }
+    (before, outcome)
+}
+
 /// Match timer identity and publish its wake under the same task shard lock.
 /// A popped timer must not wake a newly re-armed sleep or a finished task.
 fn wake_task_matching_in(
@@ -629,11 +643,7 @@ fn wake_task_matching_in(
             {
                 return None;
             }
-            let before = task.state.lifecycle();
-            let outcome = task.state.wake();
-            if !matches!(outcome, WakeOutcome::Terminal) {
-                task.wake_deadline = None;
-            }
+            let (before, outcome) = wake_task_state(task);
             if outcome == WakeOutcome::Enqueue {
                 run_queues.push_global(id);
             }
@@ -1837,6 +1847,20 @@ impl Drop for PendingSpawnRoot {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_wake(id: u64) {
     let _ = try_wake_parked_task(id);
+}
+
+/// Wake a contiguous array of task IDs. A zero length accepts a null pointer.
+///
+/// # Safety
+/// For nonzero `len`, `ids` must reference `len` initialized, aligned u64 values
+/// readable for this call; their storage must remain valid across GC safepoints.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn willow_sched_wake_many(ids: *const u64, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let ids = unsafe { std::slice::from_raw_parts(ids, len) };
+    wake_channel_owners(ids, &mut WakeBatchScratch::default());
 }
 
 /// Wake a channel waiter and report whether it actually consumed the wake.

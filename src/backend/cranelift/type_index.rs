@@ -166,6 +166,10 @@ impl<V> TypeMap<V> {
     pub fn insert_canonical_id(&mut self, id: TypeId, value: V) -> Option<V> {
         self.values.insert(id, value)
     }
+    /// Remove a declaration's own entry without resolving or changing aliases.
+    pub fn remove_canonical_id(&mut self, id: &TypeId) -> Option<V> {
+        self.values.remove(id)
+    }
     pub fn get<Q: TypeLookup + ?Sized>(&self, key: &Q) -> Option<&V> {
         self.values.get(&self.scope.resolve(&key.type_id()))
     }

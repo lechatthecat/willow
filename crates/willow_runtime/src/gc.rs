@@ -22,6 +22,7 @@ mod assist;
 mod concurrent_bitmap;
 mod coordinator;
 mod epoch_index;
+mod free_spans;
 mod mark_closure;
 mod mark_workers;
 mod memory_control;
@@ -31,6 +32,7 @@ mod root_handshake;
 mod satb;
 mod sweep;
 
+use free_spans::FreeSpans;
 use minor::minor_collect_internal;
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
@@ -519,7 +521,7 @@ struct OldRegion {
     kind: RegionKind,
     live_bytes: usize,
     allocations: BTreeMap<usize, usize>,
-    free_spans: Vec<RegionFreeSpan>,
+    free_spans: FreeSpans,
     largest_free_span: usize,
     sweep_pending: bool,
     sweep_quarantined: bool,
@@ -582,7 +584,7 @@ impl OldRegion {
             kind,
             live_bytes: 0,
             allocations: BTreeMap::new(),
-            free_spans: Vec::new(),
+            free_spans: FreeSpans::default(),
             largest_free_span: 0,
             sweep_pending: false,
             sweep_quarantined: false,
@@ -624,33 +626,12 @@ impl OldRegion {
         }
         let total_size = GC_HEADER_SIZE.checked_add(payload_size)?;
         let span_size = total_size.checked_next_multiple_of(GC_REGION_MARK_GRANULE)?;
-        // Select the first fitting hole and summarize the remaining holes in
-        // the same pass. Region selection must not rescan the free-span vector.
-        let mut selected = None;
-        let mut largest_remaining = 0;
-        for (index, span) in self.free_spans.iter().enumerate() {
-            let remaining = if selected.is_none() && span.size >= span_size {
-                selected = Some(index);
-                span.size - span_size
-            } else {
-                span.size
-            };
-            largest_remaining = largest_remaining.max(remaining);
-        }
+        // The sweep-built index preserves address-ordered first fit without
+        // scanning holes or shifting the remaining spans after every reuse.
         let mut reused = false;
-        let offset = if let Some(index) = selected {
+        let offset = if let Some(offset) = self.free_spans.take(span_size) {
             reused = true;
-            let span = self.free_spans.remove(index);
-            if span.size > span_size {
-                self.free_spans.insert(
-                    index,
-                    RegionFreeSpan {
-                        offset: span.offset + span_size,
-                        size: span.size - span_size,
-                    },
-                );
-            }
-            span.offset
+            offset
         } else {
             let end = self.used.checked_add(span_size)?;
             if end > self.capacity {
@@ -661,7 +642,7 @@ impl OldRegion {
             offset
         };
 
-        self.largest_free_span = largest_remaining;
+        self.largest_free_span = self.free_spans.largest();
 
         // SAFETY: the chosen span is exclusively owned by this allocation.
         let raw = unsafe { self.base.add(offset) };
@@ -731,9 +712,10 @@ impl OldRegion {
 
     #[cfg(test)]
     fn coalesce_free_spans(&mut self) {
-        self.free_spans.sort_unstable_by_key(|span| span.offset);
-        let mut merged: Vec<RegionFreeSpan> = Vec::with_capacity(self.free_spans.len());
-        for span in self.free_spans.drain(..) {
+        let mut spans: Vec<_> = self.free_spans.iter().copied().collect();
+        spans.sort_unstable_by_key(|span| span.offset);
+        let mut merged: Vec<RegionFreeSpan> = Vec::with_capacity(spans.len());
+        for span in spans {
             if let Some(last) = merged.last_mut()
                 && last.offset + last.size == span.offset
             {
@@ -749,7 +731,7 @@ impl OldRegion {
             self.used = merged.pop().expect("tail span exists").offset;
         }
         self.largest_free_span = merged.iter().map(|span| span.size).max().unwrap_or(0);
-        self.free_spans = merged;
+        self.free_spans = FreeSpans::from(merged);
     }
 
     fn available_span(&self) -> usize {
@@ -3859,6 +3841,9 @@ fn verify_old_region_metadata(state: &GcState) -> Result<(), String> {
         }
     }
     for region in &state.old_regions {
+        if !region.free_spans.is_consistent() {
+            return Err("old-region free span index mismatch".into());
+        }
         if region.largest_free_span
             != region
                 .free_spans

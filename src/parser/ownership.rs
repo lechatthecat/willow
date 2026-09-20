@@ -1,19 +1,6 @@
 //! Shared heap-backed ownership traversal for syntax trees.
 use super::ast::*;
 use crate::diagnostics::Span;
-use std::cell::Cell;
-thread_local! { static SHALLOW: Cell<bool> = const { Cell::new(false) }; }
-struct ShallowGuard(bool);
-impl ShallowGuard {
-    fn enter() -> Self {
-        Self(SHALLOW.with(|s| s.replace(true)))
-    }
-}
-impl Drop for ShallowGuard {
-    fn drop(&mut self) {
-        SHALLOW.with(|s| s.set(self.0));
-    }
-}
 pub(crate) fn placeholder_expr() -> Expr {
     Expr::Integer(0, Span::dummy(), ExprId::placeholder())
 }
@@ -384,117 +371,301 @@ impl<'a> NodeMut<'a> {
         }
     }
 }
+// Shell construction is explicit: ordinary Clone always clones a complete tree.
+// Container recursion stops at Expr/Stmt slots, so its depth depends only on
+// the fixed AST schema, never on input nesting. Metadata keeps its normal Clone.
+trait CloneShell: Sized {
+    fn clone_shell(&self) -> Self;
+}
+impl CloneShell for Expr {
+    fn clone_shell(&self) -> Self {
+        placeholder_expr()
+    }
+}
+impl CloneShell for Stmt {
+    fn clone_shell(&self) -> Self {
+        Stmt::Break(Span::dummy())
+    }
+}
+impl<T: CloneShell> CloneShell for Box<T> {
+    fn clone_shell(&self) -> Self {
+        Box::new((**self).clone_shell())
+    }
+}
+impl<T: CloneShell> CloneShell for Vec<T> {
+    fn clone_shell(&self) -> Self {
+        self.iter().map(CloneShell::clone_shell).collect()
+    }
+}
+impl<T: CloneShell> CloneShell for Option<T> {
+    fn clone_shell(&self) -> Self {
+        self.as_ref().map(CloneShell::clone_shell)
+    }
+}
+// Exhaustive destructuring forces every added field to be classified as
+// metadata or syntax. No struct update syntax may hide a new recursive field.
+macro_rules! clone_shell_struct {
+    ($ty:ident { metadata: [$($meta:ident),*], syntax: [$($child:ident),*] }) => {
+        impl CloneShell for $ty {
+            fn clone_shell(&self) -> Self {
+                let Self { $($meta,)* $($child,)* } = self;
+                Self {
+                    $($meta: $meta.clone(),)*
+                    $($child: $child.clone_shell(),)*
+                }
+            }
+        }
+    };
+}
+clone_shell_struct!(CallArg {
+    metadata: [mode, span],
+    syntax: [expr]
+});
+clone_shell_struct!(Block {
+    metadata: [span],
+    syntax: [stmts]
+});
+clone_shell_struct!(BinaryExpr {
+    metadata: [id, op, span],
+    syntax: [lhs, rhs]
+});
+clone_shell_struct!(UnaryExpr {
+    metadata: [id, op, span],
+    syntax: [expr]
+});
+clone_shell_struct!(CallExpr {
+    metadata: [id, callee, span],
+    syntax: [args]
+});
+clone_shell_struct!(MethodCallExpr {
+    metadata: [id, method, span],
+    syntax: [object, args]
+});
+clone_shell_struct!(StaticCallExpr {
+    metadata: [id, class, type_args, method, span],
+    syntax: [args]
+});
+clone_shell_struct!(NewExpr {
+    metadata: [id, class_name, type_args, span],
+    syntax: [args]
+});
+clone_shell_struct!(ObjectLiteralExpr {
+    metadata: [id, class, span],
+    syntax: [fields]
+});
+clone_shell_struct!(ObjectLiteralField {
+    metadata: [name, span],
+    syntax: [value]
+});
+clone_shell_struct!(AwaitExpr {
+    metadata: [id, span],
+    syntax: [expr]
+});
+clone_shell_struct!(SelectExpr {
+    metadata: [id, span],
+    syntax: [cases]
+});
+clone_shell_struct!(SelectCase {
+    metadata: [span],
+    syntax: [kind, body]
+});
+clone_shell_struct!(TernaryExpr {
+    metadata: [id, span],
+    syntax: [condition, then_expr, else_expr]
+});
+clone_shell_struct!(RangeExpr {
+    metadata: [id, span],
+    syntax: [start, end]
+});
+clone_shell_struct!(LambdaExpr {
+    metadata: [id, params, return_type, span],
+    syntax: [body]
+});
+clone_shell_struct!(MatchExpr {
+    metadata: [id, span],
+    syntax: [scrutinee, arms]
+});
+clone_shell_struct!(MatchArm {
+    metadata: [pattern, span],
+    syntax: [body]
+});
+clone_shell_struct!(LetStmt {
+    metadata: [name, mutable, ty, span],
+    syntax: [init]
+});
+clone_shell_struct!(AssignStmt {
+    metadata: [name, span],
+    syntax: [value]
+});
+clone_shell_struct!(FieldAssignStmt {
+    metadata: [field, span],
+    syntax: [object, value]
+});
+clone_shell_struct!(SuperInitStmt {
+    metadata: [span],
+    syntax: [args]
+});
+clone_shell_struct!(StaticFieldAssignStmt {
+    metadata: [class, field, span],
+    syntax: [value]
+});
+clone_shell_struct!(IndexAssignStmt {
+    metadata: [span],
+    syntax: [array, index, value]
+});
+clone_shell_struct!(IfStmt {
+    metadata: [span],
+    syntax: [cond, then_block, else_block]
+});
+clone_shell_struct!(WhileStmt {
+    metadata: [span],
+    syntax: [cond, body]
+});
+clone_shell_struct!(DeferStmt {
+    metadata: [span],
+    syntax: [body]
+});
+clone_shell_struct!(LockStmt {
+    metadata: [mode, binding, binding_span, mutable, span],
+    syntax: [target, body]
+});
+clone_shell_struct!(ForStmt {
+    metadata: [name, name_span, span],
+    syntax: [iterable, body]
+});
+clone_shell_struct!(ReturnStmt {
+    metadata: [span],
+    syntax: [value]
+});
+clone_shell_struct!(ExprStmt {
+    metadata: [span],
+    syntax: [expr]
+});
+macro_rules! clone_shell_body {
+    ($ty:ident) => {
+        impl CloneShell for $ty {
+            fn clone_shell(&self) -> Self {
+                match self {
+                    Self::Expr(expr) => Self::Expr(expr.clone_shell()),
+                    Self::Block(block) => Self::Block(block.clone_shell()),
+                }
+            }
+        }
+    };
+}
+clone_shell_body!(LambdaBody);
+clone_shell_body!(MatchBody);
+clone_shell_body!(DeferBody);
+impl CloneShell for SelectCaseKind {
+    fn clone_shell(&self) -> Self {
+        match self {
+            Self::Recv { binding, channel } => Self::Recv {
+                binding: binding.clone(),
+                channel: channel.clone_shell(),
+            },
+            Self::Send { channel, value } => Self::Send {
+                channel: channel.clone_shell(),
+                value: value.clone_shell(),
+            },
+            Self::Timeout { millis } => Self::Timeout {
+                millis: millis.clone_shell(),
+            },
+            Self::Join { binding, task } => Self::Join {
+                binding: binding.clone(),
+                task: task.clone_shell(),
+            },
+            Self::Default => Self::Default,
+        }
+    }
+}
 impl Expr {
     fn shallow_clone(&self) -> Self {
-        let _guard = ShallowGuard::enter();
         match self {
-            Self::Binary(v) => Self::Binary(v.clone()),
-            Self::Unary(v) => Self::Unary(v.clone()),
-            Self::Call(v) => Self::Call(v.clone()),
-            Self::MethodCall(v) => Self::MethodCall(v.clone()),
-            Self::StaticCall(v) => Self::StaticCall(v.clone()),
+            Self::Binary(v) => Self::Binary(v.clone_shell()),
+            Self::Unary(v) => Self::Unary(v.clone_shell()),
+            Self::Call(v) => Self::Call(v.clone_shell()),
+            Self::MethodCall(v) => Self::MethodCall(v.clone_shell()),
+            Self::StaticCall(v) => Self::StaticCall(v.clone_shell()),
             Self::StaticField(v) => Self::StaticField(v.clone()),
-            Self::New(v) => Self::New(v.clone()),
-            Self::ObjectLiteral(v) => Self::ObjectLiteral(v.clone()),
-            Self::Await(v) => Self::Await(v.clone()),
-            Self::Select(v) => Self::Select(v.clone()),
-            Self::Ternary(v) => Self::Ternary(v.clone()),
-            Self::Range(v) => Self::Range(v.clone()),
-            Self::Lambda(v) => Self::Lambda(v.clone()),
-            Self::Match(v) => Self::Match(v.clone()),
+            Self::New(v) => Self::New(v.clone_shell()),
+            Self::ObjectLiteral(v) => Self::ObjectLiteral(v.clone_shell()),
+            Self::Await(v) => Self::Await(v.clone_shell()),
+            Self::Select(v) => Self::Select(v.clone_shell()),
+            Self::Ternary(v) => Self::Ternary(v.clone_shell()),
+            Self::Range(v) => Self::Range(v.clone_shell()),
+            Self::Lambda(v) => Self::Lambda(v.clone_shell()),
+            Self::Match(v) => Self::Match(v.clone_shell()),
             Self::Integer(v, s, id) => Self::Integer(*v, *s, *id),
             Self::Float(v, s, id) => Self::Float(*v, *s, *id),
             Self::Bool(v, s, id) => Self::Bool(*v, *s, *id),
             Self::String(v, s, id) => Self::String(v.clone(), *s, *id),
             Self::Var(v, s, id) => Self::Var(v.clone(), *s, *id),
-            Self::FieldAccess(v, n, s, id) => Self::FieldAccess(v.clone(), n.clone(), *s, *id),
-            Self::Print(v, n, s, id) => Self::Print(v.clone(), *n, *s, *id),
-            Self::TryPropagate(v, s, id) => Self::TryPropagate(v.clone(), *s, *id),
-            Self::ArrayLiteral(v, s, id) => Self::ArrayLiteral(v.clone(), *s, *id),
-            Self::Index(a, b, s, id) => Self::Index(a.clone(), b.clone(), *s, *id),
+            Self::FieldAccess(v, n, s, id) => {
+                Self::FieldAccess(v.clone_shell(), n.clone(), *s, *id)
+            }
+            Self::Print(v, n, s, id) => Self::Print(v.clone_shell(), *n, *s, *id),
+            Self::TryPropagate(v, s, id) => Self::TryPropagate(v.clone_shell(), *s, *id),
+            Self::ArrayLiteral(v, s, id) => Self::ArrayLiteral(v.clone_shell(), *s, *id),
+            Self::Index(a, b, s, id) => Self::Index(a.clone_shell(), b.clone_shell(), *s, *id),
         }
     }
 }
 impl Clone for Expr {
     fn clone(&self) -> Self {
-        if SHALLOW.with(Cell::get) {
-            return placeholder_expr();
-        }
         let mut result = self.shallow_clone();
-        let mut work = vec![(NodeRef::Expr(self), NodeMut::Expr(&mut result))];
-        let mut source_children = Vec::new();
-        while let Some((source, target)) = work.pop() {
-            source.for_each_child(|child| source_children.push(child));
-            let mut children = source_children.drain(..);
-            target.for_each_child(|target| {
-                let source = children.next().expect("syntax child count");
-                match (source, target) {
-                    (NodeRef::Expr(a), NodeMut::Expr(b)) => {
-                        *b = a.shallow_clone();
-                        work.push((NodeRef::Expr(a), NodeMut::Expr(b)));
-                    }
-                    (NodeRef::Stmt(a), NodeMut::Stmt(b)) => {
-                        *b = a.shallow_clone();
-                        work.push((NodeRef::Stmt(a), NodeMut::Stmt(b)));
-                    }
-                    _ => unreachable!("syntax child kind"),
-                }
-            });
-            assert!(children.next().is_none(), "syntax child count");
-        }
+        clone_descendants(NodeRef::Expr(self), NodeMut::Expr(&mut result));
         result
     }
 }
 impl Stmt {
     fn shallow_clone(&self) -> Self {
-        let _guard = ShallowGuard::enter();
         match self {
-            Self::Let(v) => Self::Let(v.clone()),
-            Self::Assign(v) => Self::Assign(v.clone()),
-            Self::FieldAssign(v) => Self::FieldAssign(v.clone()),
-            Self::SuperInit(v) => Self::SuperInit(v.clone()),
-            Self::StaticFieldAssign(v) => Self::StaticFieldAssign(v.clone()),
-            Self::IndexAssign(v) => Self::IndexAssign(v.clone()),
-            Self::If(v) => Self::If(v.clone()),
-            Self::While(v) => Self::While(v.clone()),
+            Self::Let(v) => Self::Let(v.clone_shell()),
+            Self::Assign(v) => Self::Assign(v.clone_shell()),
+            Self::FieldAssign(v) => Self::FieldAssign(v.clone_shell()),
+            Self::SuperInit(v) => Self::SuperInit(v.clone_shell()),
+            Self::StaticFieldAssign(v) => Self::StaticFieldAssign(v.clone_shell()),
+            Self::IndexAssign(v) => Self::IndexAssign(v.clone_shell()),
+            Self::If(v) => Self::If(v.clone_shell()),
+            Self::While(v) => Self::While(v.clone_shell()),
             Self::Break(v) => Self::Break(*v),
             Self::Continue(v) => Self::Continue(*v),
-            Self::Defer(v) => Self::Defer(v.clone()),
-            Self::Lock(v) => Self::Lock(v.clone()),
-            Self::For(v) => Self::For(v.clone()),
-            Self::Return(v) => Self::Return(v.clone()),
-            Self::Expr(v) => Self::Expr(v.clone()),
+            Self::Defer(v) => Self::Defer(v.clone_shell()),
+            Self::Lock(v) => Self::Lock(v.clone_shell()),
+            Self::For(v) => Self::For(v.clone_shell()),
+            Self::Return(v) => Self::Return(v.clone_shell()),
+            Self::Expr(v) => Self::Expr(v.clone_shell()),
         }
     }
 }
 impl Clone for Stmt {
     fn clone(&self) -> Self {
-        if SHALLOW.with(Cell::get) {
-            return Stmt::Break(Span::dummy());
-        }
         let mut result = self.shallow_clone();
-        let mut work = vec![(NodeRef::Stmt(self), NodeMut::Stmt(&mut result))];
-        let mut source_children = Vec::new();
-        while let Some((source, target)) = work.pop() {
-            source.for_each_child(|child| source_children.push(child));
-            let mut children = source_children.drain(..);
-            target.for_each_child(|target| {
-                let source = children.next().expect("syntax child count");
-                match (source, target) {
-                    (NodeRef::Expr(a), NodeMut::Expr(b)) => {
-                        *b = a.shallow_clone();
-                        work.push((NodeRef::Expr(a), NodeMut::Expr(b)));
-                    }
-                    (NodeRef::Stmt(a), NodeMut::Stmt(b)) => {
-                        *b = a.shallow_clone();
-                        work.push((NodeRef::Stmt(a), NodeMut::Stmt(b)));
-                    }
-                    _ => unreachable!("syntax child kind"),
-                }
-            });
-            assert!(children.next().is_none(), "syntax child count");
-        }
+        clone_descendants(NodeRef::Stmt(self), NodeMut::Stmt(&mut result));
         result
+    }
+}
+fn clone_descendants(source: NodeRef<'_>, target: NodeMut<'_>) {
+    let mut work = vec![(source, target)];
+    let mut source_children = Vec::new();
+    while let Some((source, target)) = work.pop() {
+        source.for_each_child(|child| source_children.push(child));
+        let mut children = source_children.drain(..);
+        target.for_each_child(|target| {
+            let source = children.next().expect("syntax child count");
+            match (source, target) {
+                (NodeRef::Expr(a), NodeMut::Expr(b)) => {
+                    *b = a.shallow_clone();
+                    work.push((NodeRef::Expr(a), NodeMut::Expr(b)));
+                }
+                (NodeRef::Stmt(a), NodeMut::Stmt(b)) => {
+                    *b = a.shallow_clone();
+                    work.push((NodeRef::Stmt(a), NodeMut::Stmt(b)));
+                }
+                _ => unreachable!("syntax child kind"),
+            }
+        });
+        assert!(children.next().is_none(), "syntax child count");
     }
 }
 impl NodeOwned {
@@ -560,6 +731,177 @@ mod tests {
         let (program, errors) = Parser::new(tokens).parse();
         assert!(errors.is_empty(), "{errors:?}");
         program
+    }
+    // Exhaustive matches make adding variants a compile-time coverage decision.
+    fn expr_kind(expr: &Expr) -> &'static str {
+        match expr {
+            Expr::Integer(..) => "Integer",
+            Expr::Float(..) => "Float",
+            Expr::Bool(..) => "Bool",
+            Expr::String(..) => "String",
+            Expr::Var(..) => "Var",
+            Expr::Binary(..) => "Binary",
+            Expr::Unary(..) => "Unary",
+            Expr::Call(..) => "Call",
+            Expr::FieldAccess(..) => "FieldAccess",
+            Expr::MethodCall(..) => "MethodCall",
+            Expr::StaticCall(..) => "StaticCall",
+            Expr::StaticField(..) => "StaticField",
+            Expr::New(..) => "New",
+            Expr::ObjectLiteral(..) => "ObjectLiteral",
+            Expr::Await(..) => "Await",
+            Expr::Select(..) => "Select",
+            Expr::Print(..) => "Print",
+            Expr::Ternary(..) => "Ternary",
+            Expr::Range(..) => "Range",
+            Expr::Lambda(..) => "Lambda",
+            Expr::Match(..) => "Match",
+            Expr::TryPropagate(..) => "TryPropagate",
+            Expr::ArrayLiteral(..) => "ArrayLiteral",
+            Expr::Index(..) => "Index",
+        }
+    }
+    fn stmt_kind(stmt: &Stmt) -> &'static str {
+        match stmt {
+            Stmt::Let(..) => "Let",
+            Stmt::Assign(..) => "Assign",
+            Stmt::FieldAssign(..) => "FieldAssign",
+            Stmt::SuperInit(..) => "SuperInit",
+            Stmt::StaticFieldAssign(..) => "StaticFieldAssign",
+            Stmt::IndexAssign(..) => "IndexAssign",
+            Stmt::If(..) => "If",
+            Stmt::While(..) => "While",
+            Stmt::Break(..) => "Break",
+            Stmt::Continue(..) => "Continue",
+            Stmt::Defer(..) => "Defer",
+            Stmt::Lock(..) => "Lock",
+            Stmt::For(..) => "For",
+            Stmt::Return(..) => "Return",
+            Stmt::Expr(..) => "Expr",
+        }
+    }
+    fn pattern_kind(pattern: &Pattern) -> &'static str {
+        match pattern {
+            Pattern::Wildcard(..) => "Wildcard",
+            Pattern::Binding { .. } => "Binding",
+            Pattern::LiteralBool(..) => "LiteralBool",
+            Pattern::LiteralInt(..) => "LiteralInt",
+            Pattern::EnumVariant { .. } => "EnumVariant",
+            Pattern::EnumVariantTuple { .. } => "EnumVariantTuple",
+            Pattern::ClassDowncast { .. } => "ClassDowncast",
+        }
+    }
+    #[test]
+    fn clone_preserves_every_syntax_variant_and_child_slot() {
+        use std::collections::BTreeSet;
+        let program = parse(include_str!(
+            "../../tests/fixtures/ast_ownership_all_syntax.wi"
+        ));
+        let cloned = program.clone();
+        // Debug derives visit fields independently of ownership and serialization;
+        // a child omitted by BOTH ownership visitors must still fail this check.
+        assert_eq!(format!("{program:?}"), format!("{cloned:?}"));
+        assert_eq!(
+            serde_json::to_string(&program).unwrap(),
+            serde_json::to_string(&cloned).unwrap()
+        );
+        let mut exprs = BTreeSet::new();
+        let mut stmts = BTreeSet::new();
+        let mut patterns = BTreeSet::new();
+        let Item::Function(function) = &program.items[0] else {
+            panic!("fixture function")
+        };
+        let mut pending: Vec<_> = function.body.stmts.iter().map(NodeRef::Stmt).collect();
+        while let Some(node) = pending.pop() {
+            match &node {
+                NodeRef::Expr(expr) => {
+                    exprs.insert(expr_kind(expr));
+                    if let Expr::Match(expr) = expr {
+                        for arm in &expr.arms {
+                            patterns.insert(pattern_kind(&arm.pattern));
+                        }
+                    }
+                }
+                NodeRef::Stmt(stmt) => {
+                    stmts.insert(stmt_kind(stmt));
+                }
+            }
+            node.for_each_child(|child| pending.push(child));
+        }
+        assert_eq!(
+            exprs,
+            BTreeSet::from([
+                "Integer",
+                "Float",
+                "Bool",
+                "String",
+                "Var",
+                "Binary",
+                "Unary",
+                "Call",
+                "FieldAccess",
+                "MethodCall",
+                "StaticCall",
+                "StaticField",
+                "New",
+                "ObjectLiteral",
+                "Await",
+                "Select",
+                "Print",
+                "Ternary",
+                "Range",
+                "Lambda",
+                "Match",
+                "TryPropagate",
+                "ArrayLiteral",
+                "Index"
+            ])
+        );
+        assert_eq!(
+            stmts,
+            BTreeSet::from([
+                "Let",
+                "Assign",
+                "FieldAssign",
+                "SuperInit",
+                "StaticFieldAssign",
+                "IndexAssign",
+                "If",
+                "While",
+                "Break",
+                "Continue",
+                "Defer",
+                "Lock",
+                "For",
+                "Return",
+                "Expr"
+            ])
+        );
+        assert_eq!(
+            patterns,
+            BTreeSet::from([
+                "Wildcard",
+                "Binding",
+                "LiteralBool",
+                "LiteralInt",
+                "EnumVariant",
+                "EnumVariantTuple",
+                "ClassDowncast"
+            ])
+        );
+
+        // Container Clone must retain full descendants outside shell construction.
+        for stmt in &function.body.stmts {
+            match stmt {
+                Stmt::Let(value) => {
+                    assert_eq!(format!("{value:?}"), format!("{:?}", value.clone()))
+                }
+                Stmt::Expr(value) => {
+                    assert_eq!(format!("{value:?}"), format!("{:?}", value.clone()))
+                }
+                _ => {}
+            }
+        }
     }
     #[test]
     fn syntax_ownership_twenty_four_perspectives() {
@@ -669,7 +1011,7 @@ mod tests {
                         root = Expr::Print(Box::new(root), false, Span::dummy(), ExprId::fresh());
                     }
                 }
-                for _ in 0..3 {
+                for repetition in 0..3 {
                     let mut immutable_edges = 0;
                     let mut pending = vec![NodeRef::Expr(&root)];
                     while let Some(node) = pending.pop() {
@@ -687,6 +1029,21 @@ mod tests {
                         });
                     }
                     assert_eq!((immutable_edges, mutable_edges), (size, size));
+                    let clone = root.clone();
+                    let mut cloned_edges = 0;
+                    let mut pending = vec![NodeRef::Expr(&clone)];
+                    while let Some(node) = pending.pop() {
+                        node.for_each_child(|child| {
+                            cloned_edges += 1;
+                            pending.push(child);
+                        });
+                    }
+                    assert_eq!(cloned_edges, size);
+                    if repetition == 2 {
+                        println!(
+                            "size={size} fanout={fanout} repeats=3 source_edges={immutable_edges} mutable_edges={mutable_edges} clone_edges={cloned_edges}"
+                        );
+                    }
                 }
             }
         }

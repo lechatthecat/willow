@@ -162,6 +162,11 @@ unsafe impl Send for ScopedTask {}
 #[derive(Default)]
 struct ScopeState {
     tasks: Vec<ScopedTask>,
+    // Keep insertion order and stable roots in tasks; index only membership.
+    #[cfg(not(test))]
+    task_ids: HashSet<u64>,
+    #[cfg(test)]
+    task_ids: HashSet<u64, tests::CountingBuildHasher>,
     children: Vec<Arc<ScopeCore>>,
     closing: bool,
     finished: bool,
@@ -221,7 +226,7 @@ impl ScopeCore {
             if self.cancelled.load(Ordering::Acquire) || state.closing || state.finished {
                 true
             } else {
-                if !state.tasks.iter().any(|existing| existing.id == id) {
+                if state.task_ids.insert(id) {
                     state.tasks.push(ScopedTask {
                         id,
                         frame: self
@@ -415,6 +420,7 @@ impl ScopeCore {
             task.frame.release();
         }
         state.tasks.clear();
+        state.task_ids = Default::default();
         state.saw_cancelled
     }
 
@@ -777,6 +783,85 @@ mod tests {
         reset_global_scheduler_for_test, willow_sched_run, willow_sched_run_until,
     };
 
+    // Count real hash operations, including table growth, using the production
+    // RandomState hasher. No instrumentation is compiled into release builds.
+    #[derive(Default)]
+    pub(super) struct CountingBuildHasher {
+        inner: std::collections::hash_map::RandomState,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl std::hash::BuildHasher for CountingBuildHasher {
+        type Hasher = std::collections::hash_map::DefaultHasher;
+
+        fn build_hasher(&self) -> Self::Hasher {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.build_hasher()
+        }
+    }
+
+    #[test]
+    fn scope_membership_scales_and_duplicates_preserve_first_frame_and_order() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        for n in [64u64, 256, 1024, 4096] {
+            let core = ScopeCore::default();
+            for id in 1..=n {
+                core.add(id, (0x1000 + id as usize * 16) as *mut u8);
+            }
+            let distinct_hashes = core
+                .state
+                .lock()
+                .unwrap()
+                .task_ids
+                .hasher()
+                .calls
+                .load(Ordering::Relaxed);
+            assert!((n as usize..=4 * n as usize).contains(&distinct_hashes));
+            // Reverse order defeats a first-element-only duplicate shortcut.
+            for _ in 0..4 {
+                for id in (1..=n).rev() {
+                    core.add(id, std::ptr::null_mut());
+                }
+            }
+            let state = core.state.lock().unwrap();
+            let total_hashes = state.task_ids.hasher().calls.load(Ordering::Relaxed);
+            assert_eq!(total_hashes - distinct_hashes, 4 * n as usize);
+            assert_eq!(state.tasks.len(), n as usize);
+            assert_eq!(state.task_ids.len(), n as usize);
+            for (i, task) in state.tasks.iter().enumerate() {
+                assert_eq!(task.id, i as u64 + 1);
+                assert_eq!(task.frame.load(), (0x1000 + (i + 1) * 16) as *mut u8);
+            }
+            drop(state);
+            assert_eq!(core.roots.slot_count(), n as usize);
+            let mut snapshot = Vec::new();
+            let mut cancelled = false;
+            core.snapshot(&mut snapshot, &mut cancelled);
+            assert!(!cancelled);
+            assert_eq!(snapshot.len(), n as usize);
+            assert!(
+                snapshot
+                    .iter()
+                    .enumerate()
+                    .all(|(i, (id, _))| *id == i as u64 + 1)
+            );
+            core.begin_finish();
+            core.add(n + 1, std::ptr::null_mut());
+            let state = core.state.lock().unwrap();
+            assert_eq!(state.task_ids.len(), n as usize);
+            assert_eq!(
+                state.task_ids.hasher().calls.load(Ordering::Relaxed),
+                total_hashes
+            );
+            eprintln!(
+                "scope_membership n={n} distinct_hashes={distinct_hashes} duplicate_hashes={}",
+                total_hashes - distinct_hashes
+            );
+        }
+        reset_internal_for_test();
+    }
+
     unsafe extern "C" fn pending_forever(_frame: *mut c_void) -> i32 {
         crate::task::RUNTIME_POLL_PENDING
     }
@@ -985,6 +1070,8 @@ mod tests {
             state.tasks.is_empty(),
             "finished task metadata must be reaped"
         );
+        assert!(state.task_ids.is_empty());
+        assert_eq!(state.task_ids.capacity(), 0);
         drop(state);
         assert_eq!(core.roots.slot_count(), 1);
         assert!(

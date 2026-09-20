@@ -53,6 +53,7 @@ fn scheduler_callbacks_and_frame_handles_are_native_pointers() {
     let _: extern "C" fn(u64, task::RuntimeCancelFn, i32) =
         scheduler::willow_sched_set_cancel_fn_cooperative;
     let _: extern "C" fn(u64) = scheduler::willow_sched_wake;
+    let _: unsafe extern "C" fn(*const u64, usize) = scheduler::willow_sched_wake_many;
     let _: extern "C" fn() -> u64 = scheduler::willow_sched_current_task;
     let _: extern "C" fn() -> u64 = scheduler::willow_sched_active_workers;
     let _: extern "C" fn(*mut c_void, u64) -> i32 = scheduler::willow_frame_await;

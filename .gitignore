@@ -3,6 +3,7 @@
 .dolt/
 *.db
 .beads-credential-key
+.agents
 
 # Added by cargo
 /target

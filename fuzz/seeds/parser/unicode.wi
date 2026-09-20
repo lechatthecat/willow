@@ -1,0 +1,2 @@
+// Unicode in comments and string literals, including multiple byte widths.
+fn main() { println("café 日本語 🦀"); }

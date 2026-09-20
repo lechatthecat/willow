@@ -75,9 +75,11 @@ struct SendPtr(*mut u8);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
 
-static LITERAL_CACHE: Mutex<Option<HashMap<usize, SendPtr>>> = Mutex::new(None);
+type LiteralCache = HashMap<(usize, i64), SendPtr>;
 
-fn lock_literal_cache() -> MutexGuard<'static, Option<HashMap<usize, SendPtr>>> {
+static LITERAL_CACHE: Mutex<Option<LiteralCache>> = Mutex::new(None);
+
+fn lock_literal_cache() -> MutexGuard<'static, Option<LiteralCache>> {
     loop {
         match LITERAL_CACHE.try_lock() {
             Ok(guard) => return guard,
@@ -109,12 +111,12 @@ pub(crate) fn clear_string_literal_cache() {
 /// `bytes` must point to static read-only data for the lifetime of the process.
 /// `len` is the byte length of the string (excluding NUL).
 ///
-/// The first call with a given `bytes` pointer allocates a WillowString and
-/// registers it as a permanent GC root.  Subsequent calls return the same
-/// pointer.
+/// The first call with a given (`bytes`, `len`) pair allocates a WillowString
+/// and registers it as a permanent GC root. Subsequent calls with that pair
+/// return the same pointer; prefixes at the same address remain distinct.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_string_literal(bytes: *const u8, len: i64) -> *mut u8 {
-    let key = bytes as usize;
+    let key = (bytes as usize, len);
     let mut guard = lock_literal_cache();
     let cache = guard.get_or_insert_with(HashMap::new);
     if let Some(p) = cache.get(&key) {
@@ -413,6 +415,78 @@ mod tests {
         let p2 = willow_string_literal(bytes.as_ptr(), 6);
         assert_eq!(p1, p2);
         assert_eq!(unsafe { ws_to_string(p1) }, "stable");
+    }
+
+    #[test]
+    fn literal_cache_distinguishes_lengths_at_the_same_address() {
+        let _guard = runtime_test_guard();
+        static TEXT: &str = "éclair";
+        for lengths in [[0, 2, 7], [7, 2, 0]] {
+            willow_gc_init();
+            let pointers = lengths.map(|len| willow_string_literal(TEXT.as_ptr(), len));
+            for (index, len) in lengths.into_iter().enumerate() {
+                let ptr = pointers[index];
+                assert_eq!(unsafe { willow_string_as_str(ptr) }, &TEXT[..len as usize]);
+                assert_eq!(unsafe { *ptr.add(8 + len as usize) }, 0);
+                for other in &pointers[..index] {
+                    assert_ne!(ptr, *other);
+                }
+            }
+            crate::gc::willow_gc_collect();
+            for (len, ptr) in lengths.into_iter().zip(pointers) {
+                assert_eq!(willow_string_literal(TEXT.as_ptr(), len), ptr);
+                assert_eq!(unsafe { willow_string_as_str(ptr) }, &TEXT[..len as usize]);
+            }
+        }
+    }
+
+    #[test]
+    fn literal_cache_invalid_length_does_not_alias_valid_literal() {
+        let _guard = runtime_test_guard();
+        for invalid_first in [true, false] {
+            willow_gc_init();
+            let bytes = b"abc";
+            if invalid_first {
+                assert!(willow_string_literal(bytes.as_ptr(), -1).is_null());
+            }
+            let ptr = willow_string_literal(bytes.as_ptr(), 3);
+            assert!(!ptr.is_null());
+            assert_eq!(unsafe { willow_string_as_str(ptr) }, "abc");
+            assert!(willow_string_literal(bytes.as_ptr(), -1).is_null());
+            assert_eq!(willow_string_literal(bytes.as_ptr(), 3), ptr);
+        }
+    }
+
+    #[test]
+    fn literal_cache_repeated_hits_do_not_allocate() {
+        let _guard = runtime_test_guard();
+        static BYTES: [u8; 264] = [b'x'; 264];
+        for count in [16, 64, 256] {
+            for repetitions in [1, 8, 32] {
+                willow_gc_init();
+                let before = crate::gc::telemetry_heap_snapshot().0.allocation_count;
+                let pointers: Vec<_> = (0..count)
+                    .map(|offset| willow_string_literal(BYTES[offset..].as_ptr(), 8))
+                    .collect();
+                let after_misses = crate::gc::telemetry_heap_snapshot().0.allocation_count;
+                assert_eq!(after_misses - before, count as u64);
+                for _ in 0..repetitions {
+                    for (offset, ptr) in pointers.iter().enumerate() {
+                        assert_eq!(willow_string_literal(BYTES[offset..].as_ptr(), 8), *ptr);
+                    }
+                }
+                assert_eq!(lock_literal_cache().as_ref().unwrap().len(), count);
+                assert_eq!(
+                    crate::gc::telemetry_heap_snapshot().0.allocation_count,
+                    after_misses
+                );
+                println!(
+                    "literals={count} hits={} allocations={} entries={count}",
+                    count * repetitions,
+                    after_misses - before
+                );
+            }
+        }
     }
 
     #[test]

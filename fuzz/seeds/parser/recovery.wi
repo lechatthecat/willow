@@ -1,0 +1,4 @@
+fn broken( { let = ; }
+class Broken { pub x: ; fn f(self) { return +; } }
+fn main() { let x = ; let y = 2; println(y); }
+module misplaced;
