@@ -2180,9 +2180,19 @@ impl GcRootHandle {
 /// obtained an address from a trace callback never observes freed Rust heap
 /// storage. Logical release nulls the slot immediately and task metadata may be
 /// reclaimed; physical slot reclamation is synchronized with owner finalization.
-#[derive(Default)]
 pub(crate) struct GcRootArena {
     cells: Mutex<Vec<Arc<GcRootCell>>>,
+}
+
+impl Default for GcRootArena {
+    fn default() -> Self {
+        let cells = Mutex::new(Vec::new());
+        // Some platforms lazily allocate native mutex storage on first use,
+        // including try_lock(). Pay that cost before publishing the arena so
+        // even its first, empty snapshot remains allocation-free.
+        drop(cells.lock().unwrap_or_else(|error| error.into_inner()));
+        Self { cells }
+    }
 }
 
 impl GcRootArena {
@@ -4512,6 +4522,26 @@ mod tests {
 
     fn gc_test_guard() -> std::sync::MutexGuard<'static, ()> {
         runtime_test_guard()
+    }
+
+    #[test]
+    fn empty_root_arena_first_snapshot_is_allocation_free() {
+        use crate::scheduler::scaling_measurements::counting_allocator as counter;
+
+        let arena = GcRootArena::default();
+        // Move the initialized arena to a collector thread before its first
+        // snapshot; do not warm up the snapshot path inside the measurement.
+        std::thread::spawn(move || {
+            let mut children = Vec::new();
+            let allocations = counter::thread_allocations();
+            let progress = arena.snapshot_slice(0, 512, usize::MAX, &mut children);
+            let allocated = counter::thread_allocations() - allocations;
+            assert_eq!(progress, Some((0, 0)));
+            assert!(children.is_empty());
+            assert_eq!(allocated, 0);
+        })
+        .join()
+        .unwrap();
     }
 
     // willow-ssl7.12: stress-mode checks sit on the allocation slow path, so
