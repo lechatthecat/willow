@@ -78,8 +78,10 @@ fn gc_objects_metadata_and_root_slots_are_pointers() {
     let _: extern "C" fn(*mut *mut u8) = gc::willow_push_root;
     let _: extern "C" fn(*mut u8) = gc::willow_gc_add_runtime_root;
     let _: extern "C" fn(*mut u8) = gc::willow_gc_remove_runtime_root;
-    let _: extern "C" fn(*mut u8, *mut u8, i64) = gc::willow_gc_write_barrier;
+    let _: extern "C" fn(*mut u8, *mut u8, *mut u8, i64) = gc::willow_gc_write_barrier;
     let _: extern "C" fn() -> i64 = gc::willow_gc_allocated_bytes;
+    let _: extern "C" fn(u64) -> u64 = gc::willow_gc_set_memory_limit;
+    assert_schema("willow_gc_set_memory_limit", &[I64], Some(I64));
 }
 
 #[test]
@@ -242,7 +244,7 @@ fn flags_ids_and_sizes_are_i64_next_to_native_pointers() {
         Some(Ptr),
     );
     assert_schema("willow_gc_alloc_bitmap", &[I64, I64, Ptr], Some(Ptr));
-    assert_schema("willow_gc_write_barrier", &[Ptr, Ptr, I64], None);
+    assert_schema("willow_gc_write_barrier", &[Ptr, Ptr, Ptr, I64], None);
     assert_schema("willow_gc_stats_snapshot", &[I64, Ptr, I64], Some(I64));
     assert_schema("willow_string_alloc", &[Ptr, I64], Some(Ptr));
     assert_schema("willow_sched_spawn", &[Ptr, Ptr], Some(I64));

@@ -45,7 +45,7 @@ fn minor_tracing_work_scales_with_graph_and_roots() {
             let drops = drop_registry().lock().unwrap().clone();
             let mut state = runtime().heap.lock().unwrap();
             retire_all_tlabs_locked(&mut state);
-            let (_, work) = MinorCollector::new(&mut state, trace, drops)
+            let (_, work) = MinorCollector::new(&mut state, trace, drops, &mut Default::default())
                 .run(vec![nodes[0]; root_count], Default::default());
             // Existing production telemetry counts objects and reference slots,
             // not elapsed time. Duplicate edges/roots must not rescan objects.

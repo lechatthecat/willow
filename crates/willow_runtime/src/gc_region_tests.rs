@@ -53,6 +53,7 @@ fn tlab_fast_alloc_for_test(
         gc_ref_mask,
     )
     .unwrap();
+    publish_tlab_start_for_test(tls, cursor as *mut u8);
     tls.cursor.store(cursor + total_size, Ordering::Release);
     tls.fast_allocations.fetch_add(1, Ordering::Relaxed);
     tls.fast_allocated_bytes
@@ -555,20 +556,22 @@ fn region_verify_08_rejects_overlapping_free_and_allocated_spans() {
 }
 
 #[test]
-fn region_verify_09_rejects_list_region_mismatch() {
+fn region_verify_09_rejects_missing_address_index() {
     let (mut state, _) = state_with_regular_object(8);
-    state.heap_head = std::ptr::null_mut();
+    state.old_addresses.clear();
     let error = verify_old_region_metadata(&state).unwrap_err();
-    assert!(error.contains("list/region map mismatch"));
+    assert!(error.contains("address index mismatch"));
 }
 
 #[test]
-fn region_verify_10_rejects_heap_list_cycle() {
-    let (state, object) = state_with_regular_object(8);
-    object.set_next(Some(object));
+fn region_verify_10_rejects_invalid_address_index_position() {
+    let (mut state, _) = state_with_regular_object(8);
+    state.old_addresses.clear();
+    state
+        .old_addresses
+        .insert(state.old_regions[0].start(), usize::MAX);
     let error = verify_old_region_metadata(&state).unwrap_err();
-    object.set_next(None);
-    assert!(error.contains("contains a cycle"));
+    assert!(error.contains("address index mismatch"));
 }
 
 #[test]
@@ -797,6 +800,7 @@ fn pinned_region_01_metrics_include_in_place_survivor() {
         limit: AtomicUsize::new(0),
         fast_allocations: AtomicU64::new(0),
         fast_allocated_bytes: AtomicU64::new(0),
+        start_bits: AtomicUsize::new(0),
     };
     let mut young = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
     willow_push_root(&mut young);
@@ -825,6 +829,7 @@ fn pinned_region_02_major_collection_releases_unrooted_chunk() {
         limit: AtomicUsize::new(0),
         fast_allocations: AtomicU64::new(0),
         fast_allocated_bytes: AtomicU64::new(0),
+        start_bits: AtomicUsize::new(0),
     };
     let mut young = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
     willow_push_root(&mut young);
@@ -845,6 +850,7 @@ fn pinned_region_03_verifier_rejects_missing_mark() {
         limit: AtomicUsize::new(0),
         fast_allocations: AtomicU64::new(0),
         fast_allocated_bytes: AtomicU64::new(0),
+        start_bits: AtomicUsize::new(0),
     };
     let mut young = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
     willow_push_root(&mut young);
@@ -873,6 +879,7 @@ fn pinned_region_04_verifier_rejects_live_byte_mismatch() {
         limit: AtomicUsize::new(0),
         fast_allocations: AtomicU64::new(0),
         fast_allocated_bytes: AtomicU64::new(0),
+        start_bits: AtomicUsize::new(0),
     };
     let mut young = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
     willow_push_root(&mut young);
@@ -901,6 +908,7 @@ fn pinned_region_05_one_survivor_retains_chunk_and_reports_sparse_liveness() {
         limit: AtomicUsize::new(0),
         fast_allocations: AtomicU64::new(0),
         fast_allocated_bytes: AtomicU64::new(0),
+        start_bits: AtomicUsize::new(0),
     };
     let mut survivor = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
     let dead_a = tlab_fast_alloc_for_test(&tls, 2, 2, 8, 0);
@@ -951,6 +959,7 @@ fn pinned_region_06_dead_holes_are_not_reused_for_new_tlab_allocations() {
         limit: AtomicUsize::new(0),
         fast_allocations: AtomicU64::new(0),
         fast_allocated_bytes: AtomicU64::new(0),
+        start_bits: AtomicUsize::new(0),
     };
     let mut survivor = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
     let dead = tlab_fast_alloc_for_test(&tls, 2, 2, 8, 0);
@@ -993,11 +1002,22 @@ fn remembered_region_01_duplicate_barrier_hits_only_once() {
         limit: AtomicUsize::new(0),
         fast_allocations: AtomicU64::new(0),
         fast_allocated_bytes: AtomicU64::new(0),
+        start_bits: AtomicUsize::new(0),
     };
     let young = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
     let owner = willow_alloc_typed(8, 0b1);
-    willow_gc_write_barrier(owner, young, GcStoreDestination::ObjectField as i64);
-    willow_gc_write_barrier(owner, young, GcStoreDestination::ObjectField as i64);
+    willow_gc_write_barrier(
+        owner,
+        std::ptr::null_mut(),
+        young,
+        GcStoreDestination::ObjectField as i64,
+    );
+    willow_gc_write_barrier(
+        owner,
+        std::ptr::null_mut(),
+        young,
+        GcStoreDestination::ObjectField as i64,
+    );
     assert_eq!(willow_gc_remembered_set_size(), 1);
     assert_eq!(willow_gc_write_barrier_hits(), 1);
     reset_gc();
@@ -1017,10 +1037,16 @@ fn remembered_region_02_two_owners_can_share_one_card() {
         limit: AtomicUsize::new(0),
         fast_allocations: AtomicU64::new(0),
         fast_allocated_bytes: AtomicU64::new(0),
+        start_bits: AtomicUsize::new(0),
     };
     let young = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
     for &owner in pair {
-        willow_gc_write_barrier(owner, young, GcStoreDestination::ObjectField as i64);
+        willow_gc_write_barrier(
+            owner,
+            std::ptr::null_mut(),
+            young,
+            GcStoreDestination::ObjectField as i64,
+        );
     }
     assert_eq!(willow_gc_remembered_set_size(), 2);
     assert_eq!(willow_gc_dirty_card_count(), 1);
@@ -1043,14 +1069,25 @@ fn remembered_region_03_sweeping_one_shared_card_owner_keeps_card_dirty() {
         limit: AtomicUsize::new(0),
         fast_allocations: AtomicU64::new(0),
         fast_allocated_bytes: AtomicU64::new(0),
+        start_bits: AtomicUsize::new(0),
     };
     let young = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
     unsafe {
         *(live_owner as *mut *mut u8) = young;
         *(dead_owner as *mut *mut u8) = young;
     }
-    willow_gc_write_barrier(live_owner, young, GcStoreDestination::ObjectField as i64);
-    willow_gc_write_barrier(dead_owner, young, GcStoreDestination::ObjectField as i64);
+    willow_gc_write_barrier(
+        live_owner,
+        std::ptr::null_mut(),
+        young,
+        GcStoreDestination::ObjectField as i64,
+    );
+    willow_gc_write_barrier(
+        dead_owner,
+        std::ptr::null_mut(),
+        young,
+        GcStoreDestination::ObjectField as i64,
+    );
     willow_push_root(&mut live_owner);
     willow_gc_collect();
     assert_eq!(willow_gc_remembered_set_size(), 1);
@@ -1071,10 +1108,16 @@ fn remembered_region_04_global_destination_is_not_remembered() {
         limit: AtomicUsize::new(0),
         fast_allocations: AtomicU64::new(0),
         fast_allocated_bytes: AtomicU64::new(0),
+        start_bits: AtomicUsize::new(0),
     };
     let young = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
     let owner = willow_alloc_typed(8, 0b1);
-    willow_gc_write_barrier(owner, young, GcStoreDestination::GlobalStatic as i64);
+    willow_gc_write_barrier(
+        owner,
+        std::ptr::null_mut(),
+        young,
+        GcStoreDestination::GlobalStatic as i64,
+    );
     assert_eq!(willow_gc_remembered_set_size(), 0);
     assert_eq!(willow_gc_dirty_card_count(), 0);
     reset_gc();
@@ -1089,13 +1132,19 @@ fn remembered_region_05_pinned_owner_tracks_new_young_child() {
         limit: AtomicUsize::new(0),
         fast_allocations: AtomicU64::new(0),
         fast_allocated_bytes: AtomicU64::new(0),
+        start_bits: AtomicUsize::new(0),
     };
     let mut owner = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0b1);
     willow_push_root(&mut owner);
     willow_gc_minor_collect();
     let child = willow_gc_alloc_slow(&mut tls, 2, 2, 8, 0);
     unsafe { *(child as *mut i64) = 77 };
-    willow_gc_write_barrier(owner, child, GcStoreDestination::ObjectField as i64);
+    willow_gc_write_barrier(
+        owner,
+        std::ptr::null_mut(),
+        child,
+        GcStoreDestination::ObjectField as i64,
+    );
     unsafe { *(owner as *mut *mut u8) = child };
     assert_eq!(willow_gc_remembered_set_size(), 1);
     willow_gc_minor_collect();
@@ -1106,4 +1155,424 @@ fn remembered_region_05_pinned_owner_tracks_new_young_child() {
     willow_pop_root();
     willow_gc_collect();
     reset_gc();
+}
+
+#[test]
+fn old_region_index_allocation_attempts_scale_linearly() {
+    for n in [4096, 8192, 16384, 32768] {
+        let mut state = GcState {
+            memory_limit_bytes: None,
+            ..GcState::default()
+        };
+        for _ in 0..n {
+            allocate_old_region_object_locked(&mut state, 11, 7, 8, 0, true).unwrap();
+        }
+        assert_eq!(
+            state
+                .old_regions
+                .iter()
+                .map(|region| region.allocation_attempts)
+                .sum::<usize>(),
+            n
+        );
+        assert!(state.old_region_candidates.len() <= 1);
+        verify_old_region_metadata(&state).unwrap();
+        eprintln!(
+            "old-region index objects={n} regions={} attempts={}",
+            state.old_regions.len(),
+            state
+                .old_regions
+                .iter()
+                .map(|region| region.allocation_attempts)
+                .sum::<usize>()
+        );
+    }
+}
+
+#[test]
+fn old_region_index_mixed_sizes_reuse_small_tails_at_memory_limit() {
+    let mut state = GcState {
+        memory_limit_bytes: Some(4 * GC_OLD_REGION_SIZE),
+        ..GcState::default()
+    };
+    let large_regular_payload = GC_LARGE_OBJECT_THRESHOLD - GC_HEADER_SIZE - span_size(8);
+    for _ in 0..8 {
+        allocate_old_region_object_locked(&mut state, 11, 7, large_regular_payload, 0, true)
+            .unwrap();
+    }
+    assert_eq!(state.old_regions.len(), 4);
+    assert!(
+        allocate_old_region_object_locked(&mut state, 11, 7, large_regular_payload, 0, true)
+            .is_none()
+    );
+    for _ in 0..8 {
+        allocate_old_region_object_locked(&mut state, 11, 7, 8, 0, true).unwrap();
+    }
+    assert!(state.old_region_candidates.is_empty());
+    assert!(allocate_old_region_object_locked(&mut state, 11, 7, 0, 0, true).is_none());
+    assert_eq!(
+        state
+            .old_regions
+            .iter()
+            .map(|region| region.allocation_attempts)
+            .sum::<usize>(),
+        16
+    );
+    verify_old_region_metadata(&state).unwrap();
+}
+
+#[test]
+fn old_region_index_sweep_rebuilds_holes_and_compacted_indices() {
+    let _guard = global_gc_guard();
+    reset_gc();
+    let payload_size = GC_OLD_REGION_SIZE / 4 - GC_HEADER_SIZE;
+    let mut objects = Vec::new();
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        for _ in 0..12 {
+            objects.push(
+                allocate_old_region_object_locked(&mut state, 11, 7, payload_size, 0, true)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(state.old_regions.len(), 3);
+        assert!(state.old_region_candidates.is_empty());
+    }
+    // Drop the first region entirely and leave an interior hole in each survivor.
+    for i in [4, 6, 7, 8, 10, 11] {
+        unsafe {
+            (*objects[i].as_ptr()).marked = true;
+        }
+    }
+    sweep();
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        assert_eq!(state.old_regions.len(), 2);
+        assert_eq!(state.old_reserved_bytes, 2 * GC_OLD_REGION_SIZE);
+        state.memory_limit_bytes = Some(state.old_reserved_bytes);
+        for i in [9, 5] {
+            let replacement =
+                allocate_old_region_object_locked(&mut state, 11, 7, payload_size, 0, true)
+                    .unwrap();
+            assert_eq!(replacement.as_ptr(), objects[i].as_ptr());
+        }
+        assert_eq!(state.old_region_reuses, 2);
+        assert_eq!(state.old_region_allocations, 14);
+        assert!(state.old_region_candidates.is_empty());
+        verify_old_region_metadata(&state).unwrap();
+    }
+    reset_gc();
+}
+
+#[test]
+fn old_region_index_large_objects_and_overflow_do_not_enter_index() {
+    let mut state = GcState {
+        memory_limit_bytes: None,
+        ..GcState::default()
+    };
+    for _ in 0..8 {
+        allocate_old_region_object_locked(&mut state, 11, 7, GC_LARGE_OBJECT_THRESHOLD, 0, true)
+            .unwrap();
+    }
+    assert_eq!(state.old_regions.len(), 8);
+    assert!(state.old_region_candidates.is_empty());
+    let reserved = state.old_reserved_bytes;
+    assert!(allocate_old_region_object_locked(&mut state, 11, 7, usize::MAX, 0, true).is_none());
+    assert_eq!(state.old_reserved_bytes, reserved);
+    verify_old_region_metadata(&state).unwrap();
+}
+
+#[test]
+fn old_region_index_fragmented_regions_remain_candidates() {
+    let _guard = global_gc_guard();
+    for n in [32, 64, 128, 256] {
+        reset_gc();
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            // Four objects fill a region; retain alternating objects.
+            for i in 0..4 * n {
+                let object = allocate_old_region_object_locked(
+                    &mut state,
+                    11,
+                    7,
+                    GC_OLD_REGION_SIZE / 4 - GC_HEADER_SIZE,
+                    0,
+                    true,
+                )
+                .unwrap();
+                if i % 2 == 0 {
+                    unsafe {
+                        (*object.as_ptr()).marked = true;
+                    }
+                }
+            }
+        }
+        sweep();
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            assert_eq!(state.old_region_candidates.len(), n);
+            state.memory_limit_bytes = Some(state.old_reserved_bytes);
+            for _ in 0..2 * n {
+                allocate_old_region_object_locked(
+                    &mut state,
+                    11,
+                    7,
+                    GC_OLD_REGION_SIZE / 4 - GC_HEADER_SIZE,
+                    0,
+                    true,
+                )
+                .unwrap();
+            }
+            assert_eq!(state.old_region_reuses, n as u64);
+            assert_eq!(
+                state
+                    .old_regions
+                    .iter()
+                    .map(|r| r.allocation_attempts)
+                    .sum::<usize>(),
+                6 * n
+            );
+            assert!(state.old_region_candidates.is_empty());
+            verify_old_region_metadata(&state).unwrap();
+            eprintln!(
+                "fragmented index regions={n} allocations={} attempts={}",
+                6 * n,
+                6 * n
+            );
+        }
+    }
+    reset_gc();
+}
+
+#[test]
+fn barrier_region_index_survives_fragmented_region_compaction() {
+    let _guard = runtime_test_guard();
+    for count in [16usize, 64, 256] {
+        reset_internal_for_test();
+        runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
+        let payload_size = GC_LARGE_OBJECT_THRESHOLD + 8;
+        let addresses: Vec<_> = (0..count)
+            .map(|_| willow_alloc(payload_size as i64))
+            .collect();
+        let mut roots: Vec<_> = addresses.iter().step_by(2).copied().collect();
+        for root in &mut roots {
+            willow_push_root(root);
+        }
+        for round in 0..2 {
+            let state = runtime().heap.lock().unwrap();
+            address_index::take_comparisons();
+            for (index, &address) in addresses.iter().enumerate() {
+                let alive = round == 0 || index % 2 == 0;
+                assert_eq!(
+                    payload_generation(&state, address),
+                    alive.then_some(GC_GENERATION_OLD)
+                );
+                assert_eq!(
+                    barrier_owner_payload(
+                        &state,
+                        (address as usize + 1) as *mut u8,
+                        GcStoreDestination::IndirectReference as i64
+                    ),
+                    alive.then_some(address as usize)
+                );
+                assert_eq!(
+                    payload_generation(&state, (address as usize + 1) as *mut u8),
+                    None
+                );
+            }
+            assert_eq!(
+                payload_generation(&state, std::ptr::dangling_mut::<u8>()),
+                None
+            );
+            assert_eq!(payload_generation(&state, usize::MAX as *mut u8), None);
+            let comparisons = address_index::take_comparisons();
+            assert!(comparisons < count * 36 * (count.ilog2() as usize + 1));
+            println!("barrier-index regions={count} round={round} comparisons={comparisons}");
+            drop(state);
+            if round == 0 {
+                willow_gc_collect();
+            }
+        }
+        willow_pop_roots(roots.len() as i32);
+        willow_gc_collect();
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn retired_tlab_header_index_bounds_lookup_work_and_rejects_dead_headers() {
+    let _guard = runtime_test_guard();
+    for count in [16usize, 64, 256] {
+        reset_internal_for_test();
+        let mut tls = tlab_state_for_test();
+        let first = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
+        let base = payload_to_header(first).cast::<u8>();
+        let size = GC_HEADER_SIZE + 8;
+        // Simulate generated fast allocation using the actual ABI header helper.
+        for index in 1..count {
+            initialize_object_at(unsafe { base.add(index * size) }, size, 0, 0, 0).unwrap();
+            publish_tlab_start_for_test(&tls, unsafe { base.add(index * size) });
+        }
+        tls.cursor
+            .store(base as usize + count * size, Ordering::Release);
+        tls.fast_allocations
+            .store((count - 1) as u64, Ordering::Release);
+        tls.fast_allocated_bytes
+            .store(((count - 1) * size) as u64, Ordering::Release);
+        let mut state = runtime().heap.lock().unwrap();
+        assert_eq!(retire_all_tlabs_locked(&mut state), count);
+        let chunk = &state.tlab_chunks[0];
+        RETIRED_LOOKUP_COMPARISONS.set(0);
+        for index in 0..count {
+            let address = unsafe { base.add(index * size + GC_HEADER_SIZE) } as usize;
+            assert!(object_in_retired_chunk(chunk, address, false).is_some());
+            assert!(object_in_retired_chunk(chunk, address + 1, true).is_some());
+            assert!(object_in_retired_chunk(chunk, address + 1, false).is_none());
+        }
+        let comparisons = RETIRED_LOOKUP_COMPARISONS.get();
+        assert!(comparisons <= count * 3 * (count.ilog2() as usize + 2));
+        println!(
+            "retired-lookup headers={count} queries={} comparisons={comparisons}",
+            count * 3
+        );
+        let dead = HeapObject::from_raw(base.cast()).unwrap();
+        dead.reclaim_in_place();
+        assert!(object_in_retired_chunk(chunk, first as usize, false).is_none());
+        assert!(object_in_retired_chunk(chunk, first as usize + 1, true).is_none());
+        drop(state);
+        reset_internal_for_test();
+    }
+}
+
+#[test]
+fn barrier_tlab_range_index_survives_minor_swap_removal() {
+    let _guard = runtime_test_guard();
+    for count in [16usize, 64, 256] {
+        reset_internal_for_test();
+        let mut tls = tlab_state_for_test();
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            state.threshold_bytes = usize::MAX;
+            state.nursery_threshold_bytes = usize::MAX;
+        }
+        let addresses: Vec<_> = (0..count)
+            .map(|_| willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0))
+            .collect();
+        let mut roots: Vec<_> = addresses.iter().step_by(2).copied().collect();
+        for root in &mut roots {
+            willow_push_root(root);
+        }
+        willow_gc_minor_collect();
+        let state = runtime().heap.lock().unwrap();
+        assert_eq!(state.tlab_chunks.len(), count / 2);
+        for (index, &address) in addresses.iter().enumerate() {
+            let alive = index % 2 == 0;
+            assert_eq!(
+                payload_generation(&state, address),
+                alive.then_some(GC_GENERATION_OLD)
+            );
+            assert_eq!(
+                barrier_owner_payload(
+                    &state,
+                    (address as usize + 1) as *mut u8,
+                    GcStoreDestination::IndirectReference as i64
+                ),
+                alive.then_some(address as usize)
+            );
+        }
+        drop(state);
+        willow_pop_roots(roots.len() as i32);
+        willow_gc_collect();
+        assert!(runtime().heap.lock().unwrap().tlab_chunks.is_empty());
+    }
+    reset_internal_for_test();
+}
+
+#[test]
+fn zero_payload_at_region_end_remains_a_valid_exact_root() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    willow_alloc((GC_OLD_REGION_SIZE / 2 - GC_HEADER_SIZE) as i64);
+    willow_alloc((GC_OLD_REGION_SIZE / 2 - 2 * GC_HEADER_SIZE) as i64);
+    let mut empty = willow_alloc(0);
+    {
+        let state = runtime().heap.lock().unwrap();
+        assert_eq!(state.old_regions.len(), 1);
+        assert_eq!(empty as usize, state.old_regions[0].end());
+        assert_eq!(payload_generation(&state, empty), Some(GC_GENERATION_OLD));
+        assert!(find_old_region_object(&state, empty as usize, false).is_some());
+        assert!(find_old_region_object(&state, empty as usize, true).is_none());
+    }
+    willow_push_root(&mut empty);
+    willow_gc_collect();
+    assert_eq!(willow_gc_allocated_bytes(), GC_HEADER_SIZE as i64);
+    willow_pop_root();
+    willow_gc_collect();
+    assert_eq!(willow_gc_allocated_bytes(), 0);
+    reset_internal_for_test();
+}
+
+#[test]
+fn pending_sweep_colors_reused_holes_before_publication() {
+    let mut region = regular_region(1024);
+    let hole = region_alloc(&mut region, 8);
+    let _tail = region_alloc(&mut region, 8);
+    region.release_object(hole);
+    region.sweep_pending = true;
+    let (replacement, reused) = region.allocate_object(7, 11, 0, 8).unwrap();
+    assert!(reused);
+    assert_eq!(replacement.as_ptr(), hole.as_ptr());
+    assert!(replacement.marked());
+    assert!(region.mark_bitmap.is_marked(0));
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn active_tlab_validation_requires_publication_not_just_an_advanced_cursor() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    let mut tls = tlab_state_for_test();
+    let first = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
+    assert!(validate_payload_pointer(first, "published slow allocation").is_ok());
+    let header = tls.cursor.load(Ordering::Acquire) as *mut u8;
+    let bytes = GC_HEADER_SIZE + 8;
+    let payload = unsafe { header.add(GC_HEADER_SIZE) };
+    // Generated code can advance the cursor before header initialization. An
+    // unpublished tail must never be parsed, even if its flag bytes are invalid.
+    unsafe {
+        std::ptr::write_bytes(header, 0xff, bytes);
+    }
+    tls.cursor.store(header as usize + bytes, Ordering::Release);
+    let address = payload as usize;
+    assert!(
+        std::thread::spawn(move || validate_payload_pointer(
+            address as *mut u8,
+            "unpublished tail"
+        )
+        .is_err())
+        .join()
+        .unwrap()
+    );
+    initialize_object_at(header, bytes, 0, 0, 0).unwrap();
+    assert!(validate_payload_pointer(payload, "initialized but unpublished").is_err());
+    publish_tlab_start_for_test(&tls, header);
+    tls.fast_allocations.store(1, Ordering::Release);
+    tls.fast_allocated_bytes
+        .store(bytes as u64, Ordering::Release);
+    assert!(
+        std::thread::spawn(
+            move || validate_payload_pointer(address as *mut u8, "published tail").is_ok()
+        )
+        .join()
+        .unwrap()
+    );
+    assert!(validate_payload_pointer(unsafe { payload.add(1) }, "interior").is_err());
+    let mut state = runtime().heap.lock().unwrap();
+    assert_eq!(retire_all_tlabs_locked(&mut state), 2);
+    assert_eq!(tls.start_bits.load(Ordering::Acquire), 0);
+    drop(state);
+    willow_gc_collect();
+    assert_eq!(willow_gc_allocated_bytes(), 0);
+    reset_internal_for_test();
 }

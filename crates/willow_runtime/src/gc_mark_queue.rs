@@ -185,6 +185,9 @@ pub enum MarkWorkItem {
     /// Trace a group of objects. Produced by SATB buffer flushes, which already
     /// hold a contiguous run, so one queue operation amortises over many objects.
     ObjectBatch(Box<[ObjectRef]>),
+    /// Resume bitmap/native tracing at an engine-defined cursor. The engine
+    /// bounds each slice and publishes its successor before completing this item.
+    ObjectSlice { object: ObjectRef, word: usize },
     /// Scan one shard of the root set.
     RootShard(RootShardId),
     /// Scan one chunk of a region, for regions too large to be a single unit.
@@ -198,7 +201,9 @@ impl MarkWorkItem {
         match self {
             MarkWorkItem::Object(_) => 1,
             MarkWorkItem::ObjectBatch(objects) => objects.len(),
-            MarkWorkItem::RootShard(_) | MarkWorkItem::RegionChunk { .. } => 0,
+            MarkWorkItem::RootShard(_)
+            | MarkWorkItem::RegionChunk { .. }
+            | MarkWorkItem::ObjectSlice { .. } => 0,
         }
     }
 
@@ -1067,6 +1072,13 @@ impl MarkWorker {
             // undo here.
             self.queue.reject(work, RejectReason::StaleEpoch);
         }
+    }
+
+    /// Report successful completion of the current item. Its children must be
+    /// published before this call. Unlike retirement with an item still in hand,
+    /// explicit completion does not count the item as abandoned.
+    pub fn complete_current(&mut self) {
+        self.complete_held();
     }
 
     /// Release the slot and publish everything left in it.

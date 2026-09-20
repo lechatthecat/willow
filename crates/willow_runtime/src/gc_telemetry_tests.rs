@@ -115,7 +115,7 @@ fn negotiated_snapshot_validates_before_writing_and_accepts_byte_buffers() {
     assert_eq!(willow_gc_stats_size(1), size as i64);
     let mut bytes = vec![0xa5u8; size + 17];
     let out = unsafe { bytes.as_mut_ptr().add(1) };
-    for version in [i64::MIN, -1, 0, 2, i64::MAX] {
+    for version in [i64::MIN, -1, 0, 3, i64::MAX] {
         assert_eq!(willow_gc_stats_size(version), -1);
         assert_eq!(willow_gc_stats_snapshot(version, out, size as i64), -1);
         assert_eq!(
@@ -167,8 +167,8 @@ fn major_cycle_reports_live_graph_null_slots_and_duplicate_roots() {
         2 * GC_HEADER_SIZE as u64 + 24
     );
     assert_eq!(after.last_cycle.scanned_bytes, 16);
-    // Major collection scans roots at the initial stop and final remark.
-    assert_eq!(after.last_cycle.root_scan_bytes, 32);
+    // Normal major collection scans roots once during the initial handshake.
+    assert_eq!(after.last_cycle.root_scan_bytes, 16);
     assert_eq!(
         after.last_cycle.heap_after_bytes,
         after.last_cycle.marked_bytes
@@ -348,6 +348,16 @@ fn concurrent_allocation_registration_collection_and_100k_snapshots() {
                 for _ in 0..12_500 {
                     let s = snapshot();
                     assert_consistent(&s);
+                    let stops = stops::snapshot_stops();
+                    assert_eq!(stops.flags, stops::STOP_COUNTERS_VALID);
+                    let requested: u64 = stops.by_reason.iter().map(|r| r.requests).sum();
+                    let completed: u64 = stops.by_reason.iter().map(|r| r.completed).sum();
+                    assert_eq!(requested, completed + u64::from(stops.active_sequence != 0));
+                    for reason in stops.by_reason {
+                        assert_eq!(reason.completed, reason.rendezvous.count);
+                        assert_eq!(reason.completed, reason.stopped.count);
+                        assert!(reason.aborted <= reason.completed);
+                    }
                     assert!(s.counters.allocation_bytes >= previous.counters.allocation_bytes);
                     assert!(s.pauses.count >= previous.pauses.count);
                     assert!(s.timestamp_ns >= previous.timestamp_ns);
@@ -438,6 +448,10 @@ fn trace_subprocess_child() {
 }
 
 fn run_trace_child(path: &std::path::Path, expected_errors: u64) {
+    run_trace_child_version(path, expected_errors, 1);
+}
+
+fn run_trace_child_version(path: &std::path::Path, expected_errors: u64, version: u32) {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -449,6 +463,7 @@ fn run_trace_child(path: &std::path::Path, expected_errors: u64) {
             expected_errors.to_string(),
         )
         .env("WILLOW_GC_TRACE", path)
+        .env("WILLOW_GC_TRACE_VERSION", version.to_string())
         .output()
         .unwrap();
     assert!(
@@ -457,6 +472,95 @@ fn run_trace_child(path: &std::path::Path, expected_errors: u64) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn v2_trace_records_major_cycles_without_inventing_global_stops() {
+    let dir = std::env::temp_dir().join(format!(
+        "willow-gc-stops-{}-{}",
+        std::process::id(),
+        timestamp_ns()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("stops.ndjson");
+    run_trace_child_version(&path, 0, 2);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let events: Vec<_> = text
+        .lines()
+        .filter(|line| line.contains("\"version\":2"))
+        .collect();
+    assert!(
+        events.is_empty(),
+        "normal old cycles must not emit global-stop events"
+    );
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.contains("\"event\":\"gc_end\""))
+            .count(),
+        2
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn v2_stop_trace_failure_disables_writer_without_changing_counts() {
+    let _guard = runtime_test_guard();
+    struct Broken;
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("stop trace unavailable"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let before = TRACE_ERRORS.load(Ordering::Relaxed);
+    let counts = stops::snapshot_stops();
+    let mut sink = TraceSink {
+        writer: Some(Box::new(Broken)),
+    };
+    sink.stops(&[stops::StopEventV2::default()]);
+    assert!(sink.writer.is_none());
+    assert_eq!(TRACE_ERRORS.load(Ordering::Relaxed), before + 1);
+    assert_eq!(stops::snapshot_stops().last_sequence, counts.last_sequence);
+    sink.cycle(GcCycleV1::default());
+    assert_eq!(TRACE_ERRORS.load(Ordering::Relaxed), before + 1);
+}
+
+#[test]
+fn stop_trace_probe() {
+    let Some(dir) = std::env::var_os("WILLOW_STOP_TRACE_PROBE_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    reset_internal_for_test();
+    fn endpoint() -> String {
+        let baseline = snapshot();
+        let s = stops::snapshot_stops();
+        format!(
+            "{{\"version\":2,\"flags\":{},\"reset_generation\":{},\"last_sequence\":{},\"active_sequence\":{},\"events_dropped\":{},\"events_pending\":{},\"requests\":{:?},\"completed\":{:?},\"aborted\":{:?},\"trace_errors\":{},\"completed_cycles\":{}}}",
+            s.flags,
+            s.reset_generation,
+            s.last_sequence,
+            s.active_sequence,
+            s.events_dropped,
+            s.events_pending,
+            s.by_reason.map(|r| r.requests),
+            s.by_reason.map(|r| r.completed),
+            s.by_reason.map(|r| r.aborted),
+            baseline.trace_errors,
+            baseline.major_cycles + baseline.minor_cycles
+        )
+    }
+    std::fs::write(dir.join("before.json"), endpoint()).unwrap();
+    for _ in 0..16 {
+        willow_alloc(8);
+    }
+    willow_gc_collect();
+    if std::env::var_os("WILLOW_STOP_TRACE_PROBE_MAJOR_ONLY").is_none() {
+        willow_gc_minor_collect();
+    }
+    std::fs::write(dir.join("after.json"), endpoint()).unwrap();
 }
 
 #[test]

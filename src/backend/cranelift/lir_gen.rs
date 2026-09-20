@@ -5858,14 +5858,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         for root in roots {
             match root {
                 Root::Slot(slot) => self.stack_store(zero, slot),
-                // Null creates no edge and needs no write barrier, but the
-                // reference slot still synchronizes with concurrent GC readers.
+                // Null removes an existing heap edge: SATB must retain its old
+                // value even though the new value creates no edge.
                 Root::Frame(offset) => {
                     if let Some(base) = frame_base {
-                        let slot = self.builder.ins().iadd_imm_s(base, i64::from(offset));
-                        self.builder
-                            .ins()
-                            .atomic_store(MemFlagsData::new(), zero, slot);
+                        self.emit_gc_heap_store_classified(
+                            base,
+                            offset,
+                            zero,
+                            true,
+                            GcStoreDestination::AsyncFrameSlot,
+                        );
                     }
                 }
             }
@@ -9178,7 +9181,10 @@ mod tests {
                         }
                         // Same rule as `register_class`: one id per class, in
                         // declaration order.
-                        let next_id = t.class_type_ids.len() as i64 + 1;
+                        let next_id = i64::from(
+                            willow_abi::runtime_type_ids::generated_type_id(t.class_type_ids.len())
+                                .expect("test class IDs fit the generated range"),
+                        );
                         t.class_type_ids.entry(c.name.clone()).or_insert(next_id);
                         // Every class method — instance, static, or a
                         // constructor lowered to `init` — carries a hidden

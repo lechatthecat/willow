@@ -56,7 +56,7 @@ use crate::task::RuntimeTaskId;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
-const ASYNC_MUTEX_TYPE_ID: u32 = 0x10C4_0001;
+use willow_abi::runtime_type_ids::ASYNC_MUTEX_TYPE_ID;
 
 /// What an acquire attempt did. The caller (the generated frame, from Stage 4)
 /// turns this into either a straight-line load or a `Pending` return.
@@ -280,6 +280,7 @@ impl AsyncMutex {
         if self.is_ref {
             crate::gc::willow_gc_write_barrier(
                 self as *const Self as *mut u8,
+                self.value.load(Ordering::Acquire) as *mut u8,
                 value as *mut u8,
                 crate::gc::GcStoreDestination::AsyncMutexCell as i64,
             );
@@ -528,6 +529,7 @@ pub extern "C" fn willow_async_mutex_new(value: i64, is_ref: i64) -> *mut c_void
     if is_ref != 0 {
         crate::gc::willow_gc_write_barrier(
             payload,
+            std::ptr::null_mut(),
             value as *mut u8,
             crate::gc::GcStoreDestination::AsyncMutexCell as i64,
         );

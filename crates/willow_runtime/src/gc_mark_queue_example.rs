@@ -174,6 +174,9 @@ fn mark_loop(worker: &mut MarkWorker, traced: &AtomicUsize, stop: &AtomicBool) {
                 traced.fetch_add(objects.len(), Ordering::SeqCst);
             }
             MarkWorkItem::RegionChunk { .. } => {}
+            MarkWorkItem::ObjectSlice { .. } => {
+                unreachable!("graph example does not publish bitmap continuations")
+            }
         }
     }
 }

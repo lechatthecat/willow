@@ -18,7 +18,7 @@ pub extern "C" fn willow_user_main() {
         unsafe {
             *next.cast::<*mut u8>() = root;
         }
-        gc::willow_gc_write_barrier(next, root, 1);
+        gc::willow_gc_write_barrier(next, std::ptr::null_mut(), root, 1);
         root = next;
     }
     gc::willow_gc_collect();

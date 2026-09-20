@@ -1081,7 +1081,7 @@ impl Codegen {
 
     // ── Class helpers ─────────────────────────────────────────────────────────
 
-    fn register_class_layout(&mut self, c: &ClassDecl) {
+    fn register_class_layout(&mut self, c: &ClassDecl) -> Result<()> {
         self.restore_type_alias(&c.name, None);
         let own: Vec<(String, Type)> = c
             .fields
@@ -1126,10 +1126,16 @@ impl Codegen {
         // Assign a unique type_id for runtime dynamic dispatch. It lives at
         // offset 0 of the class DESCRIPTOR, which word 0 of every object of the
         // class points at (willow-fm7t).
-        let next_id = self.class_type_ids.len() as i64 + 1;
-        self.class_type_ids.entry(c.name.clone()).or_insert(next_id);
+        if self.class_type_ids.get_canonical(&c.name).is_none() {
+            let id = willow_abi::runtime_type_ids::generated_type_id(self.class_type_ids.len())
+                .ok_or_else(|| anyhow::anyhow!("generated runtime type ID range exhausted"))?;
+            self.class_type_ids
+                .entry(c.name.clone())
+                .or_insert(i64::from(id));
+        }
         self.register_class_own_vmethods(c);
         self.invalidate_class_layout(&c.name);
+        Ok(())
     }
 
     fn invalidate_class_layout(&mut self, name: &str) {
@@ -2512,6 +2518,31 @@ mod symbol_namespace_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn generated_class_type_ids_preserve_identity_across_redeclaration_and_aliases() {
+        for count in [1, 16, 64, 256] {
+            let source = (0..count)
+                .map(|i| format!("class C{i} {{}}"))
+                .collect::<String>();
+            let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+            let (program, errors) = crate::parser::Parser::new(tokens).parse();
+            assert!(errors.is_empty(), "{errors:?}");
+            let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+            for (i, item) in program.items.iter().enumerate() {
+                let Item::Class(class) = item else {
+                    panic!("expected class")
+                };
+                codegen.register_class_layout(class).unwrap();
+                codegen.register_class_layout(class).unwrap();
+                let alias = format!("Alias{i}");
+                codegen.bind_canonical_type_alias(&alias, &class.name);
+                assert_eq!(codegen.class_type_ids[&class.name], i as i64 + 1);
+                assert_eq!(codegen.class_type_ids[&alias], i as i64 + 1);
+                assert_eq!(codegen.class_type_ids.len(), i + 1);
+            }
+            assert_eq!(codegen.class_type_ids.len(), count);
+        }
+    }
 
     #[test]
     fn production_stack_probes_use_inline_four_kib_pages() {
@@ -2693,7 +2724,7 @@ mod tests {
                 }
                 let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
                 for class in classes {
-                    codegen.register_class_layout(class);
+                    codegen.register_class_layout(class).unwrap();
                     codegen.finalize_class_layouts();
                     codegen.finalize_class_vslots();
                     assert!(codegen.dirty_class_layouts.is_empty());

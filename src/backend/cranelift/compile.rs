@@ -493,7 +493,7 @@ impl Codegen {
             // subclass-first too, and no declaration order may change a layout
             // (willow-59gx).
             for (_, c) in &module_classes {
-                this.register_class_layout(c);
+                this.register_class_layout(c)?;
             }
             this.finalize_class_layouts();
             for (_, c) in &module_classes {
@@ -807,7 +807,7 @@ impl Codegen {
             // registered so far (willow-59gx).
             for item in &program.items {
                 if let Item::Class(c) = item {
-                    this.register_class_layout(c);
+                    this.register_class_layout(c)?;
                 }
             }
             // Pass 2: prepend inherited fields by walking each `extends` chain

@@ -1703,3 +1703,22 @@ fn mark_queue_retired_slotless_assist_is_inert() {
     assert_eq!(drain(&mut replacement), vec![1]);
     assert_eq!(queue.snapshot().counter_underflows, 0);
 }
+
+#[test]
+fn explicit_completion_preserves_children_without_abandoned_retirement() {
+    let queue = MarkWorkQueue::new(1);
+    let epoch = queue.begin_epoch();
+    queue.inject(MarkWork::new(epoch, object(1))).unwrap();
+    let mut worker = queue.register_worker().unwrap();
+    assert_eq!(worker.next_work().unwrap().item, object(1));
+    worker.push(object(2)).unwrap();
+    worker.complete_current();
+    worker.complete_current(); // No current item: harmless, no underflow.
+    assert!(!queue.snapshot().is_drained());
+    assert_eq!(worker.next_work().unwrap().item, object(2));
+    worker.complete_current();
+    assert!(queue.snapshot().is_drained());
+    drop(worker);
+    assert_eq!(queue.snapshot().abandoned, 0);
+    assert_eq!(queue.snapshot().counter_underflows, 0);
+}

@@ -146,7 +146,12 @@ fn contract_c2_old_object_address_survives_minor_collection_and_promotion() {
         "TLAB allocations start young"
     );
 
-    willow_gc_write_barrier(parent, young, GcStoreDestination::ObjectField as i64);
+    willow_gc_write_barrier(
+        parent,
+        std::ptr::null_mut(),
+        young,
+        GcStoreDestination::ObjectField as i64,
+    );
     unsafe { *(parent as *mut *mut u8) = young };
     let mut parent_root = parent;
     willow_push_root(&mut parent_root as *mut *mut u8);
@@ -328,5 +333,110 @@ fn contract_c7_region_bitmap_tracks_object_starts_not_reachability() {
     drop(state);
 
     willow_pop_root();
+    reset_gc();
+}
+
+unsafe fn record_then_panic_drop(payload: *mut u8) {
+    DROP_LOG.lock().unwrap().push(payload as usize);
+    if unsafe { *(payload as *const u64) } == 1 {
+        panic!("injected native drop failure");
+    }
+}
+
+#[test]
+fn panicking_drop_does_not_poison_heap_or_retry_dead_storage() {
+    let _guard = global_gc_guard();
+    for shape in ["old", "large", "tlab_major", "tlab_minor"] {
+        reset_gc();
+        willow_register_drop(CONTRACT_TYPE_ID as u32, record_then_panic_drop);
+        let mut tls = new_tlab_state();
+        let mut allocate = || match shape {
+            "large" => {
+                willow_alloc_object(CONTRACT_TYPE_ID, (GC_LARGE_OBJECT_THRESHOLD + 8) as i64)
+            }
+            "tlab_major" | "tlab_minor" => {
+                willow_gc_alloc_slow(&mut tls, 0, CONTRACT_TYPE_ID, 8, 0)
+            }
+            _ => willow_alloc_object(CONTRACT_TYPE_ID, 8),
+        };
+        let dead = allocate();
+        let healthy_dead = allocate();
+        let mut survivor = allocate();
+        unsafe { *(dead as *mut u64) = 1 };
+        willow_push_root(&mut survivor);
+        let before = crate::gc_telemetry::workers::snapshot().drop_hook_panics;
+        if shape == "tlab_minor" {
+            willow_gc_minor_collect();
+        } else {
+            willow_gc_collect();
+        }
+        assert_eq!(
+            crate::gc_telemetry::workers::snapshot().drop_hook_panics,
+            before + 1,
+            "{shape}"
+        );
+        assert_eq!(drops_of(dead), 1, "{shape}");
+        assert_eq!(drops_of(healthy_dead), 1, "{shape}");
+        assert_eq!(drops_of(survivor), 0, "{shape}");
+        assert!(!runtime().heap.is_poisoned());
+        willow_gc_collect();
+        assert_eq!(drops_of(dead), 1, "{shape}: retried failed destructor");
+        assert_eq!(drops_of(healthy_dead), 1, "{shape}");
+        willow_pop_root();
+        willow_gc_collect();
+        assert_eq!(drops_of(survivor), 1, "{shape}");
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+        assert!(!willow_alloc(8).is_null());
+    }
+    reset_gc();
+}
+
+#[test]
+fn panicking_panic_payload_cannot_escape_drop_hook_isolation() {
+    struct BadPayload;
+    impl Drop for BadPayload {
+        fn drop(&mut self) {
+            panic!("panic payload destructor");
+        }
+    }
+    unsafe fn hook(_: *mut u8) {
+        std::panic::panic_any(BadPayload);
+    }
+    let _guard = global_gc_guard();
+    let before = crate::gc_telemetry::workers::snapshot().drop_hook_panics;
+    unsafe { run_drop_hook(hook, std::ptr::null_mut()) };
+    assert_eq!(
+        crate::gc_telemetry::workers::snapshot().drop_hook_panics,
+        before + 1
+    );
+}
+
+static DROP_WITHOUT_HEAP_LOCK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+unsafe fn verify_concurrent_drop_context(_: *mut u8) {
+    assert!(!runtime().stop_requested.load(Ordering::Acquire));
+    let _heap = runtime()
+        .heap
+        .try_lock()
+        .expect("old drop held the heap mutex");
+    DROP_WITHOUT_HEAP_LOCK.store(true, Ordering::Release);
+}
+
+#[test]
+fn normal_old_drop_runs_after_world_resume_without_heap_mutex() {
+    let _guard = global_gc_guard();
+    reset_gc();
+    DROP_WITHOUT_HEAP_LOCK.store(false, Ordering::Relaxed);
+    willow_register_drop(CONTRACT_TYPE_ID as u32, verify_concurrent_drop_context);
+    willow_alloc_object(CONTRACT_TYPE_ID, 8);
+    let before = crate::gc_telemetry::workers::snapshot().drop_hook_panics;
+    willow_gc_collect();
+    assert!(DROP_WITHOUT_HEAP_LOCK.load(Ordering::Acquire));
+    assert_eq!(
+        crate::gc_telemetry::workers::snapshot().drop_hook_panics,
+        before
+    );
+    assert_eq!(willow_gc_allocated_bytes(), 0);
     reset_gc();
 }

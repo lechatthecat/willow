@@ -6,9 +6,9 @@ use std::collections::{HashMap, HashSet};
 use super::{
     DropFn, GC_GENERATION_OLD, GC_GENERATION_YOUNG, GC_HEADER_SIZE, GcHeader, GcPayload, GcState,
     HeapObject, RegionKind, TraceFn, all_registered_stack_roots, allocate_old_region_object_locked,
-    drop_registry, foreign_root_stack_owner_active, multi_mutator_active, object_reference_slots,
-    retire_all_tlabs_locked, runtime, runtime_roots_snapshot, type_registry,
-    verify_old_region_metadata, verify_remembered_set, willow_gc_safepoint, with_stw,
+    drop_registry, foreign_root_stack_owner_active, object_reference_slots, retire_tlabs_with_work,
+    runtime, runtime_roots_snapshot, type_registry, verify_old_region_metadata,
+    verify_remembered_set, willow_gc_safepoint, with_stw,
 };
 
 #[cfg(test)]
@@ -17,6 +17,7 @@ mod tests;
 
 struct MinorCollector<'a> {
     work: crate::gc_telemetry::MarkWork,
+    stop_work: &'a mut crate::gc_telemetry::stops::StopWorkV2,
     state: &'a mut GcState,
     young_objects: HashMap<usize, HeapObject>,
     forwarding: HashMap<usize, *mut u8>,
@@ -31,6 +32,7 @@ impl<'a> MinorCollector<'a> {
         state: &'a mut GcState,
         trace_registry: HashMap<u32, TraceFn>,
         drop_registry: HashMap<u32, DropFn>,
+        stop_work: &'a mut crate::gc_telemetry::stops::StopWorkV2,
     ) -> Self {
         let mut young_objects = HashMap::new();
         for chunk in &state.tlab_chunks {
@@ -40,6 +42,8 @@ impl<'a> MinorCollector<'a> {
             );
             let mut offset = 0usize;
             while offset < chunk.used {
+                stop_work.metadata_objects += 1;
+                stop_work.metadata_bytes += GC_HEADER_SIZE as u64;
                 // SAFETY: retired chunks contain a stable sequential header prefix.
                 let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast())
                     .expect("TLAB header address is non-null");
@@ -59,6 +63,7 @@ impl<'a> MinorCollector<'a> {
         }
         Self {
             work: crate::gc_telemetry::MarkWork::default(),
+            stop_work,
             state,
             young_objects,
             forwarding: HashMap::new(),
@@ -190,6 +195,7 @@ impl<'a> MinorCollector<'a> {
         let started = std::time::Instant::now();
         self.work.root_scan_bytes =
             crate::gc_telemetry::MarkWork::roots(roots.len()).root_scan_bytes;
+        self.stop_work.root_values += roots.len() as u64;
         // Pin every direct root before scanning any interior edge so a duplicate
         // stack/runtime root can never observe a moved stale SSA pointer.
         for root in roots {
@@ -205,6 +211,7 @@ impl<'a> MinorCollector<'a> {
         self.work.mark_ns = crate::gc_telemetry::elapsed_ns(started);
         let mut reclaimed_bytes = 0usize;
         for (&payload, &object) in &self.young_objects {
+            self.stop_work.swept_objects += 1;
             if !object.allocated() || object.generation() != GC_GENERATION_YOUNG {
                 continue;
             }
@@ -212,7 +219,7 @@ impl<'a> MinorCollector<'a> {
             if !self.forwarding.contains_key(&payload) {
                 if let Some(drop_fn) = self.drop_registry.get(&object.type_id()).copied() {
                     // SAFETY: unreachable young objects still own their runtime payload.
-                    unsafe { drop_fn(object.payload().as_ptr()) };
+                    unsafe { super::run_drop_hook(drop_fn, object.payload().as_ptr()) };
                 }
                 self.state.total_frees = self.state.total_frees.saturating_add(1);
             }
@@ -223,6 +230,8 @@ impl<'a> MinorCollector<'a> {
             reclaimed_bytes = reclaimed_bytes.saturating_add(size);
         }
 
+        let mut chunk_identities: Vec<_> = (0..self.state.tlab_chunks.len()).collect();
+        let mut chunk_positions = vec![None; self.state.tlab_chunks.len()];
         let mut chunk_index = 0usize;
         while chunk_index < self.state.tlab_chunks.len() {
             let base = self.state.tlab_chunks[chunk_index].base;
@@ -232,6 +241,8 @@ impl<'a> MinorCollector<'a> {
             let mut live_bytes = 0usize;
             self.state.tlab_chunks[chunk_index].mark_bitmap.clear();
             while offset < used {
+                self.stop_work.metadata_objects += 1;
+                self.stop_work.metadata_bytes += GC_HEADER_SIZE as u64;
                 // SAFETY: minor collection has already validated this retired prefix.
                 let object = HeapObject::from_raw(unsafe { base.add(offset) }.cast())
                     .expect("TLAB header address is non-null");
@@ -249,6 +260,7 @@ impl<'a> MinorCollector<'a> {
             }
             if !has_allocated {
                 let chunk = self.state.tlab_chunks.swap_remove(chunk_index);
+                chunk_identities.swap_remove(chunk_index);
                 let layout =
                     Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>())
                         .expect("TLAB chunk layout remains valid");
@@ -268,11 +280,18 @@ impl<'a> MinorCollector<'a> {
                 chunk_index += 1;
             }
         }
+        for (index, &identity) in chunk_identities.iter().enumerate() {
+            chunk_positions[identity] = Some(index);
+        }
+        self.state.tlab_addresses.remap(&chunk_positions);
         (reclaimed_bytes, self.work)
     }
 }
 
-fn minor_collect_with_roots(mut roots: Vec<*mut u8>) -> (u64, u64, crate::gc_telemetry::MarkWork) {
+fn minor_collect_with_roots(
+    mut roots: Vec<*mut u8>,
+    stop_work: &mut crate::gc_telemetry::stops::StopWorkV2,
+) -> (u64, u64, crate::gc_telemetry::MarkWork) {
     roots.extend(runtime_roots_snapshot());
     let trace_registry = type_registry().lock().unwrap().clone();
     let drop_registry = drop_registry().lock().unwrap().clone();
@@ -286,8 +305,8 @@ fn minor_collect_with_roots(mut roots: Vec<*mut u8>) -> (u64, u64, crate::gc_tel
     state.dirty_cards.clear();
     state.minor_collections = state.minor_collections.saturating_add(1);
     let before = state.allocated_bytes as u64;
-    let (_, work) =
-        MinorCollector::new(&mut state, trace_registry, drop_registry).run(roots, remembered);
+    let (_, work) = MinorCollector::new(&mut state, trace_registry, drop_registry, stop_work)
+        .run(roots, remembered);
     if std::env::var("WILLOW_GC_VERIFY_REGIONS").is_ok()
         && let Err(message) = verify_old_region_metadata(&state)
     {
@@ -312,7 +331,7 @@ pub(super) fn minor_collect_internal() {
             return;
         }
     };
-    if !multi_mutator_active() && foreign_root_stack_owner_active() {
+    if foreign_root_stack_owner_active() {
         runtime()
             .skipped_foreign_owner_collections
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -323,14 +342,17 @@ pub(super) fn minor_collect_internal() {
     // Stop the world and scan every registered mutator, for the reason spelled
     // out over the major cycle's mark phase: a registration that races a
     // single-mutator scan leaves the newcomer's objects unmarked (willow-v6k0).
-    let (before, after, work) = with_stw(|coord| {
-        {
-            let mut state = runtime().heap.lock().unwrap();
-            retire_all_tlabs_locked(&mut state);
-        }
-        let roots = all_registered_stack_roots(coord);
-        minor_collect_with_roots(roots)
-    });
+    let (before, after, work) = with_stw(
+        crate::gc_telemetry::stops::StopReason::Minor,
+        |coord, stop_work| {
+            {
+                let mut state = runtime().heap.lock().unwrap();
+                retire_tlabs_with_work(&mut state, stop_work);
+            }
+            let roots = all_registered_stack_roots(coord);
+            minor_collect_with_roots(roots, stop_work)
+        },
+    );
     let event = cycle.finish(before, after, work);
     drop(_serialize);
     crate::gc_telemetry::emit_cycle(event);

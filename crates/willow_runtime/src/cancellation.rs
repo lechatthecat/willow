@@ -14,14 +14,14 @@
 
 use std::collections::HashSet;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::gc::GcObjectKind;
 use crate::native_frame::{NativeFrameSpec, NativeTaskFrame};
 
-const CANCELLATION_TOKEN_TYPE_ID: u32 = 0x4341_4E01;
-const TASK_SCOPE_TYPE_ID: u32 = 0x5343_5001;
+use willow_abi::runtime_type_ids::CANCELLATION_TOKEN_TYPE_ID;
+use willow_abi::runtime_type_ids::TASK_SCOPE_TYPE_ID;
 const TASK_ID_SLOT: usize = 1;
 const SCOPE_FINISH_RESULT_SLOT: usize = 0;
 const SCOPE_FINISH_TASK_ID_SLOT: usize = 1;
@@ -166,6 +166,8 @@ struct ScopeState {
     closing: bool,
     finished: bool,
     saw_cancelled: bool,
+    root_scan_limit: usize,
+    child_scan_limit: usize,
 }
 
 #[derive(Default)]
@@ -173,6 +175,9 @@ struct ScopeCore {
     cancelled: AtomicBool,
     state: Mutex<ScopeState>,
     roots: crate::gc::GcRootArena,
+    // Stable slot in the Arc allocation, also rewritten by stopped relocation.
+    // Parent tracing follows this edge instead of walking every descendant.
+    gc_handle: AtomicPtr<u8>,
 }
 
 impl Drop for ScopeCore {
@@ -219,7 +224,9 @@ impl ScopeCore {
                 if !state.tasks.iter().any(|existing| existing.id == id) {
                     state.tasks.push(ScopedTask {
                         id,
-                        frame: self.roots.insert(frame),
+                        frame: self
+                            .roots
+                            .insert(self.gc_handle.load(Ordering::Acquire), frame),
                     });
                 }
                 false
@@ -411,6 +418,7 @@ impl ScopeCore {
         state.saw_cancelled
     }
 
+    #[cfg(test)]
     fn trace_frames(&self, slots: &mut Vec<*mut *mut u8>) {
         let mut pending = Vec::new();
         self.append_trace_frames(slots, &mut pending);
@@ -419,6 +427,7 @@ impl ScopeCore {
         }
     }
 
+    #[cfg(test)]
     fn append_trace_frames(
         &self,
         slots: &mut Vec<*mut *mut u8>,
@@ -437,21 +446,67 @@ impl ScopeCore {
 
 unsafe fn trace_task_scope(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     let handle = unsafe { &*payload.cast::<TaskScopeHandle>() };
-    handle.core.trace_frames(slots);
+    handle.core.roots.trace_slots(slots);
+    let state = handle
+        .core
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    slots.extend(state.children.iter().map(|child| child.gc_handle.as_ptr()));
 }
 
-unsafe fn snapshot_task_scope(payload: *mut u8, children: &mut Vec<*mut u8>) {
-    let mut slots = Vec::new();
-    // ScopeCore retains root cells until finalization; logical release is an
-    // atomic null store, so slot lifetime extends beyond these traversal locks.
-    unsafe {
-        trace_task_scope(payload, &mut slots);
+unsafe fn snapshot_task_scope_slice(
+    payload: *mut u8,
+    cursor: usize,
+    limit: usize,
+    children: &mut Vec<*mut u8>,
+) -> crate::gc::TraceSliceProgress {
+    use crate::gc::TraceSliceProgress;
+    let handle = unsafe { &*payload.cast::<TaskScopeHandle>() };
+    let mut state = match handle.core.state.try_lock() {
+        Ok(state) => state,
+        Err(std::sync::TryLockError::WouldBlock) => return TraceSliceProgress::Retry,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+    };
+    // Lock order matches add(): state, then arena. Neither lock is retained
+    // while the collector publishes children or visits a descendant.
+    let mut next = cursor;
+    if cursor == 0 || cursor < state.root_scan_limit {
+        let bound = if cursor == 0 {
+            usize::MAX
+        } else {
+            state.root_scan_limit
+        };
+        let Some((end, bound)) = handle
+            .core
+            .roots
+            .snapshot_slice(cursor, limit, bound, children)
+        else {
+            return TraceSliceProgress::Retry;
+        };
+        if cursor == 0 {
+            state.root_scan_limit = bound;
+            state.child_scan_limit = state.children.len();
+        }
+        next = end;
     }
-    children.extend(
-        slots
-            .into_iter()
-            .map(|slot| unsafe { crate::gc::load_gc_reference(slot) }),
-    );
+    if next == state.root_scan_limit || cursor >= state.root_scan_limit {
+        let first = next - state.root_scan_limit;
+        let end = first
+            .saturating_add(limit - (next - cursor))
+            .min(state.child_scan_limit);
+        children.extend(
+            state.children[first..end]
+                .iter()
+                .map(|child| child.gc_handle.load(Ordering::Acquire)),
+        );
+        next = state.root_scan_limit + end;
+    }
+    if next < state.root_scan_limit + state.child_scan_limit {
+        TraceSliceProgress::Continue(next)
+    } else {
+        TraceSliceProgress::Done
+    }
 }
 
 unsafe fn drop_cancellation_token(payload: *mut u8) {
@@ -475,7 +530,7 @@ const CANCELLATION_GC_TYPES: &[crate::gc::NativeGcType] = &[
         Some(trace_task_scope),
         Some(drop_task_scope),
     )
-    .with_concurrent_trace(snapshot_task_scope),
+    .with_concurrent_slice(snapshot_task_scope_slice),
 ];
 
 fn ensure_registered() {
@@ -510,10 +565,15 @@ fn alloc_scope(core: Arc<ScopeCore>) -> *mut u8 {
     );
     if !payload.is_null() {
         unsafe {
-            payload
-                .cast::<TaskScopeHandle>()
-                .write(TaskScopeHandle { core })
+            payload.cast::<TaskScopeHandle>().write(TaskScopeHandle {
+                core: Arc::clone(&core),
+            })
         };
+        // Native wrappers are allocated old/black during an active epoch and
+        // start without frame edges. Publish only after the Arc payload is
+        // initialized; subsequent frame insertion publishes each new edge.
+        crate::gc::publish_native_reference(payload);
+        core.gc_handle.store(payload, Ordering::Release);
     }
     payload
 }
@@ -808,7 +868,69 @@ mod tests {
     }
 
     #[test]
+    fn scope_slices_are_bounded_finite_and_do_not_wait_on_busy_state() {
+        use crate::gc::TraceSliceProgress;
+        use crate::scheduler::scaling_measurements::counting_allocator as counter;
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        for roots in [0usize, 513, 4097, 65_537] {
+            let core = Arc::new(ScopeCore::default());
+            let value = 0x1000usize as *mut u8;
+            for _ in 0..roots {
+                core.roots.insert(std::ptr::null_mut(), value);
+            }
+            for _ in 0..65 {
+                core.child().gc_handle.store(value, Ordering::Release);
+            }
+            let mut handle = TaskScopeHandle {
+                core: Arc::clone(&core),
+            };
+            let payload = std::ptr::from_mut(&mut handle).cast::<u8>();
+            let mut children = Vec::with_capacity(512);
+            let guard = core.state.lock().unwrap();
+            assert!(matches!(
+                unsafe { snapshot_task_scope_slice(payload, 0, 512, &mut children) },
+                TraceSliceProgress::Retry
+            ));
+            assert!(children.is_empty());
+            drop(guard);
+            let mut cursor = 0;
+            let mut total = 0;
+            loop {
+                children.clear();
+                let allocations = counter::thread_allocations();
+                let progress =
+                    unsafe { snapshot_task_scope_slice(payload, cursor, 512, &mut children) };
+                assert_eq!(counter::thread_allocations() - allocations, 0);
+                assert!(children.len() <= 512);
+                assert!(children.iter().all(|child| *child == value));
+                total += children.len();
+                if cursor == 0 {
+                    // Neither appended arena cells nor new child scopes extend
+                    // the extent captured by the first successful slice.
+                    core.roots.insert(std::ptr::null_mut(), value);
+                    core.child().gc_handle.store(value, Ordering::Release);
+                }
+                match progress {
+                    TraceSliceProgress::Done => break,
+                    TraceSliceProgress::Continue(next) => {
+                        assert!(next > cursor);
+                        cursor = next;
+                    }
+                    TraceSliceProgress::Retry => panic!("uncontended snapshot must progress"),
+                }
+            }
+            assert_eq!(total, roots + 65);
+            println!(
+                "scope root_cells={roots} child_edges=65 scanned_slots={total} callback_allocations=0"
+            );
+        }
+    }
+
+    #[test]
     fn scope_trace_slots_survive_task_vector_growth() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
         let core = ScopeCore::default();
         let first_frame = 0x1000usize as *mut u8;
         core.add(1, first_frame);

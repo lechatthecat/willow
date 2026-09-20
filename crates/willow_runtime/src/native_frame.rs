@@ -108,6 +108,7 @@ impl<S: NativeFrameSpec> NativeTaskFrame<S> {
         self.check(slot, SlotKind::GcRef);
         willow_gc_write_barrier(
             self.raw.cast::<u8>(),
+            self.load_gc(slot),
             value,
             GcStoreDestination::AsyncFrameSlot as i64,
         );

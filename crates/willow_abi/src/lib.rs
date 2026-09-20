@@ -5,11 +5,11 @@
 //! when converting a descriptor to byte offsets or allocation sizes. This
 //! keeps cross-compilation independent of the host Rust process layout.
 
-/// Maximum number of payload words represented by the inline GC reference mask.
-/// Reserved GC tracing type: `layout_id` points to a static descriptor containing
-/// `[bitmap_word_count, bitmap_word_0, ...]`. Inline bits remain in the mask.
-pub const GC_BITMAP_TYPE_ID: u32 = 0xB17B_17B1;
+pub mod runtime_type_ids;
+// Keep the existing descriptor-type import path available to ABI consumers.
+pub use runtime_type_ids::GC_BITMAP_TYPE_ID;
 
+/// Maximum number of payload words represented by the inline GC reference mask.
 pub const GC_REF_MASK_BITS: usize = u64::BITS as usize;
 
 /// Stride of a mixed i64/f64/reference storage slot. Narrow pointers do not
@@ -293,8 +293,11 @@ pub mod tlab {
     pub const fn fast_bytes_offset(pointer_bytes: u32) -> u32 {
         fast_allocations_offset(pointer_bytes) + 8
     }
-    pub const fn state_size(pointer_bytes: u32) -> u32 {
+    pub const fn start_bits_offset(pointer_bytes: u32) -> u32 {
         fast_bytes_offset(pointer_bytes) + 8
+    }
+    pub const fn state_size(pointer_bytes: u32) -> u32 {
+        (start_bits_offset(pointer_bytes) + pointer_bytes + 7) & !7
     }
     pub const CURSOR_OFFSET: u32 = 0;
     pub const LIMIT_OFFSET: u32 = limit_offset(8);
@@ -302,6 +305,8 @@ pub mod tlab {
     pub const FAST_BYTES_OFFSET: u32 = fast_bytes_offset(8);
     pub const STATE_SIZE: u32 = state_size(8);
     pub const MAX_OBJECT_SIZE: u32 = 4 * 1024;
+    pub const CHUNK_SIZE: u32 = 32 * 1024;
+    pub const MARK_GRANULE_BYTES: u32 = 8;
 }
 
 /// Fixed async-frame header ABI.

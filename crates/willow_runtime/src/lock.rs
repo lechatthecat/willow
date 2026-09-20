@@ -41,8 +41,8 @@ struct WillowBlockingRwCell {
 
 /// GC type ids for the two cell payloads. They share the lock-handle family
 /// with the scheduler-aware locks (`0x10C4_0001` / `0x10C4_0002`).
-const BLOCKING_CELL_TYPE_ID: u32 = 0x10C4_0003;
-const BLOCKING_RW_CELL_TYPE_ID: u32 = 0x10C4_0004;
+use willow_abi::runtime_type_ids::BLOCKING_CELL_TYPE_ID;
+use willow_abi::runtime_type_ids::BLOCKING_RW_CELL_TYPE_ID;
 
 /// Stop-the-world trace: the protected word of a reference cell is the one
 /// mutable GC slot the payload owns. The slot address stays valid after the
@@ -210,6 +210,7 @@ pub extern "C" fn willow_blocking_cell_new(value: i64, is_ref: i64) -> *mut c_vo
     if is_ref {
         crate::gc::willow_gc_write_barrier(
             payload,
+            std::ptr::null_mut(),
             value as *mut u8,
             GcStoreDestination::BlockingCell as i64,
         );
@@ -226,17 +227,18 @@ pub extern "C" fn willow_blocking_cell_get(raw: *mut c_void) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_blocking_cell_set(raw: *mut c_void, value: i64) {
     let m = unsafe { &*(raw as *const WillowBlockingCell) };
+    let mut slot = m.value.lock().expect("mutex poisoned");
     if m.is_ref {
-        // The barrier is non-safepointing and never allocates, so taking the
-        // cell lock afterwards cannot deadlock against a collector; publishing
-        // the edge before the store is the concurrent-mark contract.
+        // Keep the old-value load and the store in the same critical section.
+        // The barrier only publishes work; it never traces or reaches a safepoint.
         crate::gc::willow_gc_write_barrier(
             raw as *mut u8,
+            *slot as *mut u8,
             value as *mut u8,
             GcStoreDestination::BlockingCell as i64,
         );
     }
-    *m.value.lock().expect("mutex poisoned") = value;
+    *slot = value;
 }
 
 #[unsafe(no_mangle)]
@@ -261,6 +263,7 @@ pub extern "C" fn willow_blocking_rw_cell_new(value: i64, is_ref: i64) -> *mut c
     if is_ref {
         crate::gc::willow_gc_write_barrier(
             payload,
+            std::ptr::null_mut(),
             value as *mut u8,
             GcStoreDestination::BlockingRwCell as i64,
         );
@@ -277,14 +280,16 @@ pub extern "C" fn willow_blocking_rw_cell_read(raw: *mut c_void) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_blocking_rw_cell_write(raw: *mut c_void, value: i64) {
     let r = unsafe { &*(raw as *const WillowBlockingRwCell) };
+    let mut slot = r.value.write().expect("rwlock poisoned");
     if r.is_ref {
         crate::gc::willow_gc_write_barrier(
             raw as *mut u8,
+            *slot as *mut u8,
             value as *mut u8,
             GcStoreDestination::BlockingRwCell as i64,
         );
     }
-    *r.value.write().expect("rwlock poisoned") = value;
+    *slot = value;
 }
 
 #[cfg(test)]

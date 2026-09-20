@@ -29,9 +29,7 @@ use crate::gc::{
     willow_pop_roots, willow_push_root,
 };
 
-/// `type_id` for reference-element buffers. Chosen well above the small,
-/// sequentially-assigned class type ids so it cannot collide with one.
-const ARRAY_REF_TYPE_ID: u32 = 0xA22A_0001;
+use willow_abi::runtime_type_ids::ARRAY_REF_TYPE_ID;
 
 const WORD: i64 = std::mem::size_of::<i64>() as i64;
 
@@ -75,6 +73,25 @@ unsafe fn snapshot_array_ref(payload: *mut u8, children: &mut Vec<*mut u8>) {
     }
 }
 
+unsafe fn snapshot_array_ref_slice(
+    payload: *mut u8,
+    cursor: usize,
+    limit: usize,
+    children: &mut Vec<*mut u8>,
+) -> crate::gc::TraceSliceProgress {
+    let len = unsafe { buffer_len(payload) }.max(0) as usize;
+    let end = cursor.saturating_add(limit).min(len);
+    for index in cursor..end {
+        children
+            .push(unsafe { crate::gc::load_gc_reference(buf_slot(payload, index as i64).cast()) });
+    }
+    if end < len {
+        crate::gc::TraceSliceProgress::Continue(end)
+    } else {
+        crate::gc::TraceSliceProgress::Done
+    }
+}
+
 /// Register the ref-buffer trace. Called on every reference-buffer allocation
 /// (idempotent): `willow_gc_init` clears the type registry, so a process-global
 /// `Once` would fail to re-register after the first reset (e.g. in multi-init
@@ -83,7 +100,8 @@ static ARRAY_REGISTRATION: crate::gc::NativeGcRegistration = crate::gc::NativeGc
 const ARRAY_GC_TYPES: &[crate::gc::NativeGcType] =
     &[
         crate::gc::NativeGcType::new(ARRAY_REF_TYPE_ID, Some(trace_array_ref), None)
-            .with_concurrent_trace(snapshot_array_ref),
+            .with_concurrent_trace(snapshot_array_ref)
+            .with_concurrent_slice(snapshot_array_ref_slice),
     ];
 
 fn ensure_trace_registered() {
@@ -126,6 +144,7 @@ unsafe fn store_buffer_slot(buffer: *mut u8, index: i64, value: i64, is_ref: boo
     if is_ref {
         willow_gc_write_barrier(
             buffer,
+            unsafe { crate::gc::load_gc_reference(buf_slot(buffer, index).cast()) },
             value as *mut u8,
             GcStoreDestination::ArrayElement as i64,
         );
@@ -185,7 +204,12 @@ pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
         set_handle_word(handle, H_LEN, len);
         set_handle_word(handle, H_CAP, len);
         set_handle_word(handle, H_IS_REF, elem_is_ref);
-        willow_gc_write_barrier(handle, buffer, GcStoreDestination::ContainerInternal as i64);
+        willow_gc_write_barrier(
+            handle,
+            std::ptr::null_mut(),
+            buffer,
+            GcStoreDestination::ContainerInternal as i64,
+        );
         set_handle_word(handle, H_BUF, buffer as i64);
     }
     willow_pop_roots(1);
@@ -312,7 +336,12 @@ pub extern "C" fn willow_array_push(arr: *mut u8, value: i64) {
                 store_buffer_slot(new_buf, i, *buf_slot(old_buf, i), is_ref);
             }
             set_buffer_len(new_buf, len);
-            willow_gc_write_barrier(arr, new_buf, GcStoreDestination::ContainerInternal as i64);
+            willow_gc_write_barrier(
+                arr,
+                old_buf,
+                new_buf,
+                GcStoreDestination::ContainerInternal as i64,
+            );
             set_handle_word(arr, H_BUF, new_buf as i64);
             set_handle_word(arr, H_CAP, new_cap);
         }

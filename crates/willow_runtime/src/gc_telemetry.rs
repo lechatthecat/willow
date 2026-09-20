@@ -1,4 +1,4 @@
-//! Versioned measurements for the current stop-the-world collector.
+//! Versioned measurements for the current collector and its global stops.
 //!
 //! Allocation counters reuse the collector's TLAB accounting. Collection work
 //! accumulates locally and is published once per cycle; no per-object atomic or
@@ -10,6 +10,10 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
+
+pub mod stops;
+pub mod workers;
+pub use stops::WillowGcStatsV2;
 
 pub const GC_STATS_VERSION: u32 = 1;
 pub const HISTOGRAM_BUCKETS: usize = 65;
@@ -100,7 +104,7 @@ pub struct GcCycleV1 {
     pub reserved: u32,
     pub start_ns: u64,
     pub end_ns: u64,
-    /// From collector election to world resumption, including safepoint wait.
+    /// Aggregate global stops for major; full cycle interval for minor.
     pub pause_ns: u64,
     pub mark_ns: u64,
     pub marked_bytes: u64,
@@ -117,7 +121,7 @@ pub struct WillowGcStatsV1 {
     pub version: u32,
     pub struct_size: u32,
     pub timestamp_ns: u64,
-    /// 0 = idle, 1 = minor STW cycle, 2 = major STW cycle.
+    /// 0 = idle, 1 = minor cycle, 2 = major cycle (including concurrent work).
     pub phase: u32,
     /// Whether process_resident_bytes was available. RSS is process-wide.
     pub resident_valid: u32,
@@ -184,6 +188,10 @@ pub(crate) struct MarkWork {
     pub scanned_bytes: u64,
     pub root_scan_bytes: u64,
     pub mark_ns: u64,
+    /// Internal controller sample; frozen public telemetry layouts do not grow.
+    pub cpu_ns: u64,
+    pub cpu_incomplete: bool,
+    pub descriptor_bytes: u64,
 }
 
 impl MarkWork {
@@ -210,7 +218,7 @@ static TELEMETRY: LazyLock<Mutex<GcTelemetry>> =
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 static TRACE_ERRORS: AtomicU64 = AtomicU64::new(0);
 
-fn timestamp_ns() -> u64 {
+pub(crate) fn timestamp_ns() -> u64 {
     elapsed_ns(*START)
 }
 pub(crate) fn elapsed_ns(start: Instant) -> u64 {
@@ -256,7 +264,7 @@ impl Cycle {
     pub(crate) fn finish(self, before: u64, after: u64, work: MarkWork) -> GcCycleV1 {
         self.finish_metrics(before, after, work, None, None)
     }
-    /// Concurrent cycles measure only the initial and remark stops as pauses;
+    /// Concurrent cycles measure only global stops as pauses;
     /// allocations between them mean reclaimed bytes cannot be before - after.
     pub(crate) fn finish_concurrent(
         self,
@@ -365,10 +373,10 @@ fn snapshot_with_resident() -> WillowGcStatsV1 {
 /// Required output bytes, or -1 for an unsupported version.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_stats_size(version: i64) -> i64 {
-    if version == i64::from(GC_STATS_VERSION) {
-        std::mem::size_of::<WillowGcStatsV1>() as i64
-    } else {
-        -1
+    match version {
+        1 => std::mem::size_of::<WillowGcStatsV1>() as i64,
+        2 => std::mem::size_of::<WillowGcStatsV2>() as i64,
+        _ => -1,
     }
 }
 
@@ -387,9 +395,23 @@ pub extern "C" fn willow_gc_stats_snapshot(version: i64, out: *mut u8, out_len: 
     if out.is_null() {
         return -1;
     }
-    let stats = snapshot_with_resident();
     // SAFETY: the caller supplies writable storage of at least `size` bytes.
-    unsafe { out.cast::<WillowGcStatsV1>().write_unaligned(stats) };
+    if version == 1 {
+        unsafe {
+            out.cast::<WillowGcStatsV1>()
+                .write_unaligned(snapshot_with_resident())
+        };
+    } else {
+        let stats = WillowGcStatsV2 {
+            version: 2,
+            struct_size: size as u32,
+            timestamp_ns: timestamp_ns(),
+            baseline: snapshot_with_resident(),
+            stops: stops::snapshot_stops(),
+            workers: workers::snapshot(),
+        };
+        unsafe { out.cast::<WillowGcStatsV2>().write_unaligned(stats) };
+    }
     size
 }
 
@@ -431,6 +453,39 @@ impl TraceSink {
             self.writer = None;
         }
     }
+    fn stops(&mut self, events: &[stops::StopEventV2]) {
+        if let Some(writer) = self.writer.as_mut()
+            && events
+                .iter()
+                .try_for_each(|event| write_stop(writer, event))
+                .is_err()
+        {
+            trace_error();
+            self.writer = None;
+        }
+    }
+}
+
+fn write_stop(writer: &mut dyn Write, e: &stops::StopEventV2) -> io::Result<()> {
+    writeln!(
+        writer,
+        "{{\"version\":2,\"event\":\"gc_stop_request\",\"sequence\":{},\"reset_generation\":{},\"reason\":{},\"timestamp_ns\":{}}}",
+        e.sequence, e.reset_generation, e.reason, e.requested_ns
+    )?;
+    writeln!(
+        writer,
+        "{{\"version\":2,\"event\":\"gc_stop_release\",\"sequence\":{},\"reset_generation\":{},\"reason\":{},\"timestamp_ns\":{},\"stopped_ns\":{},\"outcome\":{},\"metadata_objects\":{},\"metadata_bytes\":{},\"root_values\":{},\"swept_objects\":{}}}",
+        e.sequence,
+        e.reset_generation,
+        e.reason,
+        e.released_ns,
+        e.stopped_ns,
+        e.outcome,
+        e.work.metadata_objects,
+        e.work.metadata_bytes,
+        e.work.root_values,
+        e.work.swept_objects
+    )
 }
 fn trace_error() {
     let _ = TRACE_ERRORS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -465,9 +520,23 @@ static TRACE: LazyLock<Option<Mutex<TraceSink>>> = LazyLock::new(|| {
     sink.writer.as_ref()?;
     Some(Mutex::new(sink))
 });
+static TRACE_STOPS: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("WILLOW_GC_TRACE_VERSION").as_deref() == Ok("2"));
 pub(crate) fn emit_cycle(cycle: GcCycleV1) {
+    // Always drain: disabled tracing must neither retain an unbounded history
+    // nor report artificial event loss after 64 successful stops.
+    let events = if TRACE.is_some() && *TRACE_STOPS {
+        stops::take_events()
+    } else {
+        stops::discard_events();
+        Vec::new()
+    };
     if let Some(sink) = &*TRACE {
-        sink.lock().unwrap_or_else(|p| p.into_inner()).cycle(cycle);
+        let mut sink = sink.lock().unwrap_or_else(|p| p.into_inner());
+        if *TRACE_STOPS {
+            sink.stops(&events);
+        }
+        sink.cycle(cycle);
     }
 }
 
@@ -557,6 +626,7 @@ pub(crate) fn reset_for_test() {
     *telemetry = GcTelemetry::default();
     telemetry.stats.epoch = epoch;
     telemetry.stats.reset_generation = generation;
+    stops::reset_for_test();
 }
 
 #[cfg(test)]

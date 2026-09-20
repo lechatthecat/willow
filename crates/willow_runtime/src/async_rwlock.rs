@@ -18,7 +18,7 @@ use crate::task::RuntimeTaskId;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
-const ASYNC_RWLOCK_TYPE_ID: u32 = 0x10C4_0002;
+use willow_abi::runtime_type_ids::ASYNC_RWLOCK_TYPE_ID;
 
 pub const RWLOCK_MODE_READ: i32 = 1;
 pub const RWLOCK_MODE_WRITE: i32 = 2;
@@ -158,6 +158,7 @@ impl AsyncRwLock {
         if self.is_ref {
             crate::gc::willow_gc_write_barrier(
                 self as *const Self as *mut u8,
+                self.value.load(Ordering::Acquire) as *mut u8,
                 value as *mut u8,
                 crate::gc::GcStoreDestination::AsyncRwLockCell as i64,
             );
@@ -300,6 +301,7 @@ pub extern "C" fn willow_async_rwlock_new(value: i64, is_ref: i64) -> *mut c_voi
     if is_ref != 0 {
         crate::gc::willow_gc_write_barrier(
             payload,
+            std::ptr::null_mut(),
             value as *mut u8,
             crate::gc::GcStoreDestination::AsyncRwLockCell as i64,
         );

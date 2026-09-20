@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-pub const NO_BASE_TYPE_ID: u32 = 0;
+pub use willow_abi::runtime_type_ids::NO_TYPE_ID as NO_BASE_TYPE_ID;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

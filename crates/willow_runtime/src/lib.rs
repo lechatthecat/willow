@@ -100,6 +100,7 @@ pub extern "C" fn runtime_start(argc: i32, argv: *mut *mut c_char) {
     // user `main` runs (willow-qsqf §11).
     unsafe { __willow_static_init() };
     unsafe { willow_user_main() };
+    gc::shutdown_mark_workers();
     panic_context::replace_current_context(previous_panic_context);
 }
 

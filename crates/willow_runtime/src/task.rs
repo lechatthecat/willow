@@ -21,6 +21,8 @@ pub(crate) enum ChannelRole {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct ChannelOwnershipToken {
+    /// Stable native ChannelCore identity, never a movable GC payload address.
+    /// The task frame must retain the owning channel through terminal cleanup.
     pub channel: usize,
     pub role: ChannelRole,
     pub generation: u64,

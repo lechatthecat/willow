@@ -155,18 +155,62 @@ pub(super) fn emit_gc_heap_store_raw(
 ) {
     if let Some(barrier) = barrier {
         let destination = builder.ins().iconst(types::I64, destination as i64);
-        builder.ins().call(barrier, &[owner, value, destination]);
-        // The concurrent marker reads reference slots atomically. Publication
-        // follows the incremental-update barrier, including null replacements.
         let slot = if offset == 0 {
             owner
         } else {
             builder.ins().iadd_imm_s(owner, i64::from(offset))
         };
+        let value_type = builder.func.dfg.value_type(value);
+        let old = builder.ins().atomic_load(value_type, flags, slot);
+        builder
+            .ins()
+            .call(barrier, &[owner, old, value, destination]);
+        // Capture and publish the old reference before mutation, even when the
+        // replacement is null. Atomic accesses also protect concurrent tracing.
         builder.ins().atomic_store(flags, value, slot);
     } else {
         builder.ins().store(flags, value, owner, offset);
     }
+}
+
+/// Publish one initialized header into the TLAB's persistent start map. The
+/// atomic OR is after all header writes and before the payload escapes.
+fn emit_tlab_start_publication(
+    builder: &mut FunctionBuilder<'_>,
+    tlab: Value,
+    header: Value,
+    limit: Value,
+    pointer_bytes: u32,
+) {
+    let ptr_ty = builder.func.dfg.value_type(tlab);
+    let bitmap_slot = builder.ins().iadd_imm_s(
+        tlab,
+        willow_abi::tlab::start_bits_offset(pointer_bytes) as i64,
+    );
+    let bitmap = builder
+        .ins()
+        .atomic_load(ptr_ty, MemFlagsData::trusted(), bitmap_slot);
+    let base = builder
+        .ins()
+        .iadd_imm_s(limit, -(willow_abi::tlab::CHUNK_SIZE as i64));
+    let offset = builder.ins().isub(header, base);
+    let granule = builder.ins().ushr_imm_s(
+        offset,
+        willow_abi::tlab::MARK_GRANULE_BYTES.trailing_zeros() as i64,
+    );
+    let word_index = builder.ins().ushr_imm_s(granule, 6);
+    let word_offset = builder.ins().ishl_imm_s(word_index, 3);
+    let word = builder.ins().iadd(bitmap, word_offset);
+    let one = builder.ins().iconst(types::I64, 1);
+    // CLIF integer shifts mask the count to the value width (64 here).
+    let mask = builder.ins().ishl(one, granule);
+    builder.ins().atomic_rmw(
+        types::I64,
+        MemFlagsData::trusted(),
+        AtomicRmwOp::Or,
+        word,
+        mask,
+    );
 }
 
 impl<'a, 'b> FuncGen<'a, 'b> {
@@ -188,7 +232,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 &layout.bitmap,
             );
         }
-        debug_assert_eq!(GC_TLAB_STATE_SIZE, 32, "compiler/runtime TLAB ABI changed");
+        debug_assert_eq!(GC_TLAB_STATE_SIZE, 40, "compiler/runtime TLAB ABI changed");
         let pointer_bytes = reference_type(self.module.target_config()).bytes();
         let header_size = willow_abi::gc_header::size(pointer_bytes) as i64;
         let alignment = willow_abi::storage_word_bytes(pointer_bytes) as i64;
@@ -314,6 +358,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             willow_abi::gc_header::next_offset(pointer_bytes) as i32,
         );
 
+        emit_tlab_start_publication(self.builder, tlab, cursor, limit, pointer_bytes);
         let one64 = self.builder.ins().iconst(types::I64, 1);
         let fast_allocs_addr = self.builder.ins().iadd_imm_s(
             tlab,
@@ -428,6 +473,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn satb_codegen_loads_old_before_each_reference_store_in_linear_code() {
+        use cranelift_codegen::ir::Opcode;
+        for stores in [1, 16, 256] {
+            let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+            codegen.declare_runtime().unwrap();
+            let mut ctx = codegen.module.make_context();
+            let mut signature = codegen.module.make_signature();
+            signature
+                .params
+                .extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+            ctx.func.signature = signature;
+            let mut fn_ctx = FunctionBuilderContext::new();
+            let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_ctx);
+            let entry = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            builder.seal_block(entry);
+            let owner = builder.block_params(entry)[0];
+            let value = builder.block_params(entry)[1];
+            let barrier_id = codegen.func_id("willow_gc_write_barrier");
+            let barrier = codegen
+                .module
+                .declare_func_in_func(barrier_id, builder.func);
+            for i in 0..stores {
+                emit_gc_heap_store_raw(
+                    &mut builder,
+                    Some(barrier),
+                    owner,
+                    i * 8,
+                    value,
+                    GcStoreDestination::ObjectField,
+                    MemFlagsData::new(),
+                );
+            }
+            builder.ins().return_(&[]);
+            builder.finalize(codegen.module.target_config());
+            let effects: Vec<_> = ctx
+                .func
+                .layout
+                .block_insts(entry)
+                .map(|i| ctx.func.dfg.insts[i].opcode())
+                .filter(|op| matches!(op, Opcode::AtomicLoad | Opcode::Call | Opcode::AtomicStore))
+                .collect();
+            assert_eq!(
+                effects,
+                [Opcode::AtomicLoad, Opcode::Call, Opcode::AtomicStore].repeat(stores as usize)
+            );
+            cranelift_codegen::verify_function(&ctx.func, codegen.module.isa()).unwrap();
+            println!(
+                "reference_stores={stores} old_loads={stores} barrier_calls={stores} atomic_stores={stores}"
+            );
+        }
+    }
+
+    #[test]
     fn bitmap_descriptors_scale_with_unique_contents_not_sites() {
         for words in [2, 8, 64] {
             for sites in [1, 16, 256] {
@@ -473,6 +573,57 @@ mod tests {
     }
 
     #[test]
+    fn tlab_start_publication_codegen_has_constant_work_per_site() {
+        use cranelift_codegen::ir::Opcode;
+        for sites in [1, 16, 256] {
+            let codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+            let mut ctx = codegen.module.make_context();
+            ctx.func
+                .signature
+                .params
+                .extend([AbiParam::new(types::I64); 3]);
+            let mut fn_ctx = FunctionBuilderContext::new();
+            let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_ctx);
+            let entry = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            builder.seal_block(entry);
+            let params = builder.block_params(entry).to_vec();
+            for _ in 0..sites {
+                emit_tlab_start_publication(&mut builder, params[0], params[1], params[2], 8);
+            }
+            builder.ins().return_(&[]);
+            builder.finalize(codegen.module.target_config());
+            let instructions: Vec<_> = ctx
+                .func
+                .layout
+                .block_insts(entry)
+                .map(|inst| ctx.func.dfg.insts[inst].opcode())
+                .collect();
+            assert_eq!(
+                instructions
+                    .iter()
+                    .filter(|&&op| op == Opcode::AtomicRmw)
+                    .count(),
+                sites
+            );
+            assert_eq!(
+                instructions
+                    .iter()
+                    .filter(|&&op| op == Opcode::AtomicLoad)
+                    .count(),
+                sites
+            );
+            assert_eq!(instructions.len(), 16 * sites + 1);
+            cranelift_codegen::verify_function(&ctx.func, codegen.module.isa()).unwrap();
+            println!(
+                "tlab_sites={sites} publication_instructions={} atomic_or={sites}",
+                instructions.len() - 1
+            );
+        }
+    }
+
+    #[test]
     fn layout_id_is_stable_and_shape_sensitive() {
         let a = GcLayoutMetadata::new(GcObjectKind::Enum, 16, 0, 0b10);
         let b = GcLayoutMetadata::new(GcObjectKind::Enum, 16, 0, 0b10);
@@ -496,8 +647,11 @@ mod tests {
         assert_eq!(GC_HEADER_REF_MASK_OFFSET, 16);
         assert_eq!(GC_HEADER_SIZE_OFFSET, 24);
         assert_eq!(willow_abi::gc_header::next_offset(8), 32);
-        assert_eq!(GC_TLAB_STATE_SIZE, 32);
+        assert_eq!(GC_TLAB_STATE_SIZE, 40);
         assert_eq!(GC_TLAB_MAX_OBJECT_SIZE, 4096);
+        assert_eq!(willow_abi::tlab::start_bits_offset(8), 32);
+        assert_eq!(willow_abi::tlab::CHUNK_SIZE, 32768);
+        assert_eq!(willow_abi::tlab::MARK_GRANULE_BYTES, 8);
     }
 
     #[test]

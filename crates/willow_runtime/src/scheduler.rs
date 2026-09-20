@@ -2702,7 +2702,7 @@ struct WorkerDrive {
     target: Option<RuntimeTaskId>,
     state: Arc<ParallelRunState>,
     deadline: Option<Instant>,
-    finished: Arc<AtomicUsize>,
+    finished: Arc<ParallelCompletion>,
 }
 
 #[derive(Default)]
@@ -2752,14 +2752,14 @@ fn willow_sched_run_parallel(
             .spawn(move || {
                 while let Ok(drive) = receiver.recv() {
                     run_parallel_worker(worker, drive.target, drive.state, drive.deadline);
-                    drive.finished.fetch_add(1, Ordering::Release);
+                    drive.finished.finish();
                 }
             })
             .expect("cannot start persistent scheduler worker");
         pool.senders.push(sender);
     }
     let state = Arc::new(ParallelRunState::default());
-    let finished = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(ParallelCompletion::new(workers));
     for sender in pool.senders.iter().take(workers) {
         sender
             .send(WorkerDrive {
@@ -2770,11 +2770,49 @@ fn willow_sched_run_parallel(
             })
             .expect("scheduler worker terminated");
     }
-    while finished.load(Ordering::Acquire) < workers {
-        crate::gc::willow_gc_safepoint();
-        std::thread::yield_now();
-    }
+    finished.wait();
     state.completed.load(Ordering::Acquire)
+}
+
+/// One completion counter per drive, independent of worker count. The mutex
+/// couples the completion predicate to the wait so the final wake cannot be lost.
+struct ParallelCompletion {
+    remaining: Mutex<usize>,
+    ready: std::sync::Condvar,
+}
+
+impl ParallelCompletion {
+    fn new(workers: usize) -> Self {
+        Self {
+            remaining: Mutex::new(workers),
+            ready: std::sync::Condvar::new(),
+        }
+    }
+
+    fn finish(&self) {
+        let mut remaining = self.remaining.lock().unwrap_or_else(|e| e.into_inner());
+        *remaining -= 1;
+        if *remaining == 0 {
+            self.ready.notify_one();
+        }
+    }
+
+    fn wait(&self) {
+        loop {
+            // The driver remains a registered mutator. Never hold the completion
+            // mutex across a safepoint, and bound every wait so GC can stop it.
+            crate::gc::willow_gc_safepoint();
+            let remaining = self.remaining.lock().unwrap_or_else(|e| e.into_inner());
+            if *remaining == 0 {
+                return;
+            }
+            drop(
+                self.ready
+                    .wait_timeout(remaining, Duration::from_millis(1))
+                    .unwrap_or_else(|e| e.into_inner()),
+            );
+        }
+    }
 }
 
 fn run_parallel_worker(
@@ -4723,6 +4761,113 @@ mod tests {
         assert!(
             unique.len() >= 2,
             "expected two worker threads to poll tasks, got {threads:?}"
+        );
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn parallel_completion_retains_early_notifications() {
+        let _guard = runtime_test_guard();
+        for workers in [1, 2, 8, 32, 128] {
+            let completion = ParallelCompletion::new(workers);
+            for completed in 1..=workers {
+                completion.finish();
+                assert_eq!(*completion.remaining.lock().unwrap(), workers - completed);
+            }
+            completion.wait();
+        }
+    }
+
+    #[test]
+    fn parallel_completion_wakes_promptly() {
+        let _guard = runtime_test_guard();
+        let mut latencies = Vec::new();
+        for _ in 0..16 {
+            let completion = Arc::new(ParallelCompletion::new(1));
+            let worker_completion = Arc::clone(&completion);
+            let worker = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(10));
+                let sent = Instant::now();
+                worker_completion.finish();
+                sent
+            });
+            completion.wait();
+            let returned = Instant::now();
+            latencies.push(returned.duration_since(worker.join().unwrap()));
+        }
+        latencies.sort_unstable();
+        let median = latencies[latencies.len() / 2];
+        eprintln!("parallel completion median wake latency: {median:?}");
+        // A median tolerates occasional host scheduling delays; this is not a
+        // hard real-time guarantee on a general-purpose operating system.
+        assert!(
+            median < Duration::from_millis(1),
+            "wake latency: {median:?}"
+        );
+    }
+
+    unsafe extern "C" fn poll_collect_and_nested_drive(_frame: *mut c_void) -> i32 {
+        crate::gc::willow_gc_minor_collect();
+        crate::gc::willow_gc_collect();
+        let child = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+        willow_sched_run_until(child);
+        assert_eq!(willow_sched_task_state(child), -1);
+        RUNTIME_POLL_READY
+    }
+
+    #[test]
+    fn parallel_completion_allows_worker_gc_and_nested_drive() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        crate::gc::reset_internal_for_test();
+        replace_global_scheduler_for_test(2);
+        willow_sched_spawn(poll_collect_and_nested_drive, std::ptr::null_mut());
+        crate::gc::willow_gc_register_mutator();
+        assert_eq!(willow_sched_run_parallel(None, 2, None), 2);
+        crate::gc::willow_gc_unregister_mutator();
+        reset_internal_for_test();
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe extern "C" fn poll_one_second_of_work(_frame: *mut c_void) -> i32 {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(1) {
+            std::hint::spin_loop();
+        }
+        RUNTIME_POLL_READY
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parallel_completion_driver_cpu_below_five_percent() {
+        fn thread_cpu_seconds() -> f64 {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+            assert_eq!(
+                unsafe { libc::getrusage(libc::RUSAGE_THREAD, usage.as_mut_ptr()) },
+                0
+            );
+            let usage = unsafe { usage.assume_init() };
+            (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as f64
+                + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as f64 / 1_000_000.0
+        }
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        replace_global_scheduler_for_test(2);
+        willow_sched_spawn(poll_one_second_of_work, std::ptr::null_mut());
+        crate::gc::willow_gc_register_mutator();
+        let cpu_start = thread_cpu_seconds();
+        let start = Instant::now();
+        let completed = willow_sched_run_parallel(None, 2, None);
+        let wall = start.elapsed().as_secs_f64();
+        let cpu = thread_cpu_seconds() - cpu_start;
+        crate::gc::willow_gc_unregister_mutator();
+        assert_eq!(completed, 1);
+        eprintln!("parallel driver: cpu={cpu:.6}s wall={wall:.6}s");
+        assert!(
+            cpu < wall * 0.05,
+            "driver CPU {cpu}s exceeds 5% of wall {wall}s"
         );
         reset_internal_for_test();
     }

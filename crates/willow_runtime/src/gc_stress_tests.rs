@@ -23,6 +23,7 @@ fn new_tlab_state() -> GcTlabState {
         limit: AtomicUsize::new(0),
         fast_allocations: AtomicU64::new(0),
         fast_allocated_bytes: AtomicU64::new(0),
+        start_bits: AtomicUsize::new(0),
     }
 }
 
@@ -61,6 +62,7 @@ fn tlab_fast_alloc(
         gc_ref_mask,
     )
     .unwrap();
+    publish_tlab_start_for_test(tls, cursor as *mut u8);
     tls.cursor.store(cursor + total_size, Ordering::Release);
     tls.fast_allocations.fetch_add(1, Ordering::Relaxed);
     tls.fast_allocated_bytes
@@ -103,11 +105,11 @@ fn stress_region_01_middle_hole_churn_reuses_one_region() {
     let _guard = stress_guard();
     reset_gc();
     let mut left = willow_alloc_object(1, 8);
+    willow_push_root(&mut left);
     for _ in 0..1000 {
         let _garbage = willow_alloc_object(2, 8);
     }
     let mut right = willow_alloc_object(3, 8);
-    willow_push_root(&mut left);
     willow_push_root(&mut right);
     willow_gc_collect();
     assert_eq!(willow_gc_old_region_count(), 1);
@@ -187,9 +189,12 @@ fn stress_region_03_sparse_survivors_across_many_regions_stay_stable() {
         let object = willow_alloc_object(value as i64 + 1, 8);
         unsafe { *(object as *mut i64) = value as i64 };
         objects.push(object);
+        // Capacity is fixed before any root slot is registered.
+        willow_push_root(objects.last_mut().unwrap());
     }
     let mut roots: Vec<*mut u8> = objects.iter().step_by(ROOT_STRIDE).copied().collect();
     let original = roots.clone();
+    willow_pop_roots(OBJECTS as i32);
     for root in &mut roots {
         willow_push_root(root);
     }
@@ -225,7 +230,10 @@ fn stress_region_04_large_and_regular_cycles_release_every_region() {
         for _ in 0..3 {
             let _garbage = willow_alloc_object(2, GC_LARGE_OBJECT_THRESHOLD as i64);
         }
-        let large = willow_alloc_object(3, GC_LARGE_OBJECT_THRESHOLD as i64);
+        let mut large = willow_alloc_object(3, GC_LARGE_OBJECT_THRESHOLD as i64);
+        // The parent allocation can now trigger paced collection. Native test
+        // locals need the same explicit rooting as generated live references.
+        willow_push_root(&mut large);
         let mut parent = willow_alloc_typed(8, 0b1);
         unsafe { *(parent as *mut *mut u8) = large };
         willow_push_root(&mut parent);
@@ -236,7 +244,7 @@ fn stress_region_04_large_and_regular_cycles_release_every_region() {
         assert_eq!(unsafe { *(parent as *mut *mut u8) }, large);
         assert_global_regions_valid();
 
-        willow_pop_root();
+        willow_pop_roots(2);
         willow_gc_collect();
         assert_eq!(
             willow_gc_old_region_count(),
@@ -260,7 +268,12 @@ fn stress_region_05_minor_major_and_remembered_set_interleave() {
     for round in 0..1000i64 {
         let young = willow_gc_alloc_slow(&mut tls, 2, 2, 8, 0);
         unsafe { *(young as *mut i64) = round };
-        willow_gc_write_barrier(parent, young, GcStoreDestination::ObjectField as i64);
+        willow_gc_write_barrier(
+            parent,
+            std::ptr::null_mut(),
+            young,
+            GcStoreDestination::ObjectField as i64,
+        );
         unsafe { *(parent as *mut *mut u8) = young };
         assert_eq!(willow_gc_remembered_set_size(), 1);
 
@@ -299,15 +312,12 @@ fn stress_region_06_many_sparse_pinned_chunks_are_eventually_released() {
         let survivor = willow_gc_alloc_slow(&mut **tls, 1, index as i64 + 1, 8, 0);
         unsafe { *(survivor as *mut i64) = index as i64 };
         survivors.push(survivor);
+        willow_push_root(survivors.last_mut().unwrap());
         for object_index in 1..OBJECTS_PER_CHUNK {
             let dead = tlab_fast_alloc(tls, 2, object_index as u32, 8, 0);
             unsafe { *(dead as *mut i64) = object_index as i64 };
         }
     }
-    for survivor in &mut survivors {
-        willow_push_root(survivor);
-    }
-
     willow_gc_minor_collect();
     willow_gc_collect();
 
@@ -350,12 +360,14 @@ fn stress_region_07_deterministic_random_graph_matches_reachability_model() {
             8,
             0b1,
         ));
+        willow_push_root(objects.last_mut().unwrap());
     }
     for index in 0..OBJECTS {
         let target = (index.wrapping_mul(1103515245).wrapping_add(12345)) % OBJECTS;
         unsafe { *(objects[index] as *mut *mut u8) = objects[target] };
     }
     let mut roots: Vec<*mut u8> = objects.iter().step_by(997).copied().collect();
+    willow_pop_roots(OBJECTS as i32);
     for root in &mut roots {
         willow_push_root(root);
     }
@@ -373,10 +385,8 @@ fn stress_region_07_deterministic_random_graph_matches_reachability_model() {
 
     let state = runtime().heap.lock().unwrap();
     let mut actual = HashSet::new();
-    let mut current = HeapObject::from_raw(state.heap_head);
-    while let Some(object) = current {
+    for object in old_region_objects(&state) {
         actual.insert(object.type_id());
-        current = object.next();
     }
     assert_eq!(actual, expected);
     assert_eq!(state.allocated_bytes, expected.len() * SMALL_OBJECT_SIZE);

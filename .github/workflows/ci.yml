@@ -42,7 +42,31 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: GC stop trace parser
+        run: python scripts/gc_stop_trace_check.py --self-test
+      - name: GC stop trace completeness
+        run: python scripts/gc_stop_telemetry_repro.py --output "${{ runner.temp }}/willow-gc-stops"
+      - name: Normal old GC zero-stop trace
+        run: python scripts/gc_stop_telemetry_repro.py --major-only --output "${{ runner.temp }}/willow-gc-stops/major-only"
+      - name: Preserve GC stop evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gc-stops-${{ matrix.target }}
+          path: ${{ runner.temp }}/willow-gc-stops/
       - name: Workspace tests
         run: cargo test --locked --workspace -- --skip runtime::test_runnable_example_files_compile_and_run
+      - name: GC region and concurrency stress (Linux)
+        if: runner.os == 'Linux'
+        run: cargo test --locked -p willow_runtime gc::stress_viewpoint_tests -- --ignored --nocapture
+      - name: GC generational stress (macOS and Windows)
+        if: runner.os != 'Linux'
+        run: cargo test --locked -p willow_runtime stress_region_05 -- --ignored --nocapture
+      - name: GC graph stress (macOS and Windows)
+        if: runner.os != 'Linux'
+        run: cargo test --locked -p willow_runtime stress_region_07 -- --ignored --nocapture
+      - name: GC concurrency stress (macOS and Windows)
+        if: runner.os != 'Linux'
+        run: cargo test --locked -p willow_runtime stress_region_08 -- --ignored --nocapture
       - name: Runnable example audit
         run: cargo test --locked --test integration runtime::test_runnable_example_files_compile_and_run -- --exact --nocapture

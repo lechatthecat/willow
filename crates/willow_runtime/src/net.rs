@@ -18,7 +18,7 @@ use crate::gc::{GcObjectKind, willow_pop_roots, willow_push_root};
 use crate::native_frame::{NativeFrameSpec, NativeTaskFrame};
 use crate::string::willow_string_as_str;
 
-const NETWORK_HANDLE_TYPE_ID: u32 = 0x4E45_5401;
+use willow_abi::runtime_type_ids::NETWORK_HANDLE_TYPE_ID;
 const NET_TASK_RESULT_SLOT: usize = 0;
 const NET_TASK_ID_SLOT: usize = 1;
 const NET_TASK_HANDLE_SLOT: usize = 2;

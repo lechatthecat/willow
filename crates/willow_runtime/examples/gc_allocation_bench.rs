@@ -28,7 +28,7 @@ pub extern "C" fn willow_user_main() {
                 unsafe {
                     *value.cast::<*mut u8>() = root;
                 }
-                gc::willow_gc_write_barrier(value, root, 1);
+                gc::willow_gc_write_barrier(value, std::ptr::null_mut(), root, 1);
                 if i % 2 == 0 {
                     root = value;
                 }

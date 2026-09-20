@@ -22,9 +22,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, MutexGuard};
 
-/// `type_id` for maps. Distinct from the array type id and well above the
-/// small, sequentially-assigned class type ids.
-const MAP_TYPE_ID: u32 = 0xA22A_0002;
+use willow_abi::runtime_type_ids::MAP_TYPE_ID;
 
 /// A key copied out of the Willow heap so the map owns it independently of the
 /// GC. String keys compare by content (not pointer identity), which is what
@@ -48,7 +46,19 @@ struct MapLayout {
 struct MapData {
     /// Fixed at construction from Map<K, V>; inserts never change GC metadata.
     layout: MapLayout,
-    entries: HashMap<MapKey, i64>,
+    /// Hash buckets may move on growth; dense value indices never do. This
+    /// permits bounded GC slices without restarting/skipping a hash iterator.
+    entries: HashMap<MapKey, usize>,
+    values: Vec<i64>,
+    /// Major cycles are serialized. Appends after the first slice are covered
+    /// by insertion barriers and must not extend this epoch's finite scan.
+    scan_limit: usize,
+}
+
+impl MapData {
+    fn get(&self, key: &dyn KeyView) -> Option<i64> {
+        self.entries.get(key).map(|&index| self.values[index])
+    }
 }
 
 /// The owned and borrowed keys share exactly the same hash/equality encoding.
@@ -143,7 +153,7 @@ unsafe fn map_data<'a>(map: *mut u8) -> MutexGuard<'a, MapData> {
 unsafe fn trace_map(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     let mut data = unsafe { map_data(payload) };
     if data.layout.value_is_ref {
-        for value in data.entries.values_mut() {
+        for value in &mut data.values {
             slots.push((value as *mut i64).cast::<*mut u8>());
         }
     }
@@ -152,7 +162,38 @@ unsafe fn trace_map(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
 unsafe fn snapshot_map(payload: *mut u8, children: &mut Vec<*mut u8>) {
     let data = unsafe { map_data(payload) };
     if data.layout.value_is_ref {
-        children.extend(data.entries.values().map(|value| *value as *mut u8));
+        children.extend(data.values.iter().map(|value| *value as *mut u8));
+    }
+}
+
+unsafe fn snapshot_map_slice(
+    payload: *mut u8,
+    cursor: usize,
+    limit: usize,
+    children: &mut Vec<*mut u8>,
+) -> crate::gc::TraceSliceProgress {
+    use crate::gc::TraceSliceProgress;
+    let mut data = match unsafe { &*payload.cast::<Mutex<MapData>>() }.try_lock() {
+        Ok(data) => data,
+        Err(std::sync::TryLockError::WouldBlock) => return TraceSliceProgress::Retry,
+        Err(std::sync::TryLockError::Poisoned(_)) => panic!("map trace found poisoned storage"),
+    };
+    if !data.layout.value_is_ref {
+        return TraceSliceProgress::Done;
+    }
+    if cursor == 0 {
+        data.scan_limit = data.values.len();
+    }
+    let end = cursor.saturating_add(limit).min(data.scan_limit);
+    children.extend(
+        data.values[cursor.min(end)..end]
+            .iter()
+            .map(|&value| value as *mut u8),
+    );
+    if end < data.scan_limit {
+        TraceSliceProgress::Continue(end)
+    } else {
+        TraceSliceProgress::Done
     }
 }
 
@@ -169,7 +210,8 @@ static MAP_REGISTRATION: crate::gc::NativeGcRegistration = crate::gc::NativeGcRe
 const MAP_GC_TYPES: &[crate::gc::NativeGcType] =
     &[
         crate::gc::NativeGcType::new(MAP_TYPE_ID, Some(trace_map), Some(drop_map))
-            .with_concurrent_trace(snapshot_map),
+            .with_concurrent_trace(snapshot_map)
+            .with_concurrent_slice(snapshot_map_slice),
     ];
 
 fn ensure_registered() {
@@ -202,6 +244,8 @@ pub extern "C" fn willow_map_new(key_kind: i64, value_kind: i64, value_is_ref: i
                 value_is_ref: value_is_ref != 0,
             },
             entries: HashMap::new(),
+            values: Vec::new(),
+            scan_limit: 0,
         }));
     }
     map
@@ -232,14 +276,31 @@ pub extern "C" fn willow_map_insert(
         KeyRef::Word(word) => MapKey::Word(word),
         KeyRef::Str(text) => MapKey::Str(text.to_owned()),
     };
-    if data.layout.value_is_ref {
+    let is_ref = data.layout.value_is_ref;
+    let MapData {
+        entries, values, ..
+    } = &mut *data;
+    let entry = entries.entry(owned_key);
+    if is_ref {
+        let old = match &entry {
+            std::collections::hash_map::Entry::Occupied(slot) => values[*slot.get()],
+            std::collections::hash_map::Entry::Vacant(_) => 0,
+        };
         willow_gc_write_barrier(
             map,
+            old as *mut u8,
             val_word as *mut u8,
             GcStoreDestination::MapValue as i64,
         );
     }
-    data.entries.insert(owned_key, val_word);
+    match entry {
+        std::collections::hash_map::Entry::Occupied(slot) => values[*slot.get()] = val_word,
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            let index = values.len();
+            values.push(val_word);
+            slot.insert(index);
+        }
+    }
 }
 
 /// Look up `key`, returning a Willow `Option<V>` (`Some(value)` or `None`).
@@ -268,7 +329,7 @@ pub extern "C" fn willow_map_get(
         raise_nan_key();
         return std::ptr::null_mut();
     };
-    let value = data.entries.get(&key as &dyn KeyView).copied();
+    let value = data.get(&key);
     let is_ref = data.layout.value_is_ref;
     drop(data);
     match value {
@@ -308,11 +369,20 @@ pub extern "C" fn willow_map_copy(map: *mut u8) -> *mut u8 {
     let src = unsafe { map_data(map) };
     let mut dst = unsafe { map_data(copy) };
     dst.entries.reserve(src.entries.len());
-    for (k, &v) in &src.entries {
+    dst.values.reserve(src.values.len());
+    for &v in &src.values {
         if layout.value_is_ref {
-            willow_gc_write_barrier(copy, v as *mut u8, GcStoreDestination::MapValue as i64);
+            willow_gc_write_barrier(
+                copy,
+                std::ptr::null_mut(),
+                v as *mut u8,
+                GcStoreDestination::MapValue as i64,
+            );
         }
-        dst.entries.insert(k.clone(), v);
+        dst.values.push(v);
+    }
+    for (key, &index) in &src.entries {
+        dst.entries.insert(key.clone(), index);
     }
     copy
 }
@@ -379,15 +449,15 @@ pub extern "C" fn willow_map_to_string(map: *mut u8) -> *mut u8 {
     let mut entries: Vec<(String, i64)> = if map.is_null() {
         Vec::new()
     } else {
-        unsafe { map_data(map) }
-            .entries
+        let data = unsafe { map_data(map) };
+        data.entries
             .iter()
-            .map(|(k, &v)| {
+            .map(|(k, &index)| {
                 let key = match k {
                     MapKey::Word(n) => crate::array::element_word_to_string(*n, key_kind),
                     MapKey::Str(s) => s.clone(),
                 };
-                (key, v)
+                (key, data.values[index])
             })
             .collect()
     };
@@ -408,6 +478,31 @@ pub extern "C" fn willow_map_to_string(map: *mut u8) -> *mut u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_slice_retries_a_busy_map_without_waiting_or_partial_children() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::willow_gc_init();
+        let mut map = willow_map_new(0, 0, 1);
+        crate::gc::willow_push_root(&mut map);
+        let child = crate::gc::willow_alloc(8);
+        willow_map_insert(map, 0, 0, child as i64, 1);
+        let guard = unsafe { map_data(map) };
+        let mut children = Vec::new();
+        assert!(matches!(
+            unsafe { snapshot_map_slice(map, 0, 512, &mut children) },
+            crate::gc::TraceSliceProgress::Retry
+        ));
+        assert!(children.is_empty());
+        drop(guard);
+        assert!(matches!(
+            unsafe { snapshot_map_slice(map, 0, 512, &mut children) },
+            crate::gc::TraceSliceProgress::Done
+        ));
+        assert_eq!(children, [child]);
+        crate::gc::willow_pop_root();
+        crate::gc::willow_gc_collect();
+    }
     use crate::gc::{
         runtime_test_guard, willow_gc_collect, willow_gc_init, willow_pop_roots, willow_push_root,
     };
@@ -932,12 +1027,9 @@ mod tests {
             let bytes = counter::thread_bytes();
             for _ in 0..CALLS {
                 let key = unsafe { key_from_word(hit as i64, 3) }.unwrap();
-                assert_eq!(
-                    data.entries.get(&key as &dyn KeyView).copied(),
-                    Some(len as i64)
-                );
+                assert_eq!(data.get(&key), Some(len as i64));
                 let key = unsafe { key_from_word(miss as i64, 3) }.unwrap();
-                assert_eq!(data.entries.get(&key as &dyn KeyView).copied(), None);
+                assert_eq!(data.get(&key), None);
             }
             assert_eq!(
                 (

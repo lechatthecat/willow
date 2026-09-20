@@ -228,27 +228,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             value_offset,
         );
         let word = self.coerce_to_i64(value, value_ty);
-        // Route the publish through the central barrier hook rather than
-        // letting the runtime cell be a store the collector never sees. The
-        // owner is the GC-managed lock handle, so this also records old->young
-        // protected-value edges for the generational collector.
-        if is_gc_managed(value_ty, self.enum_infos) {
-            let barrier_id = self.func_id("willow_gc_write_barrier");
-            let barrier = self
-                .module
-                .declare_func_in_func(barrier_id, self.builder.func);
-            let destination_kind = match mode {
-                LockMode::Mutex => GcStoreDestination::AsyncMutexCell,
-                LockMode::Read | LockMode::Write => GcStoreDestination::AsyncRwLockCell,
-            };
-            let destination = self
-                .builder
-                .ins()
-                .iconst(types::I64, destination_kind as i64);
-            self.builder
-                .ins()
-                .call(barrier, &[handle, word, destination]);
-        }
+        // Runtime commit captures the protected old value under its ownership
+        // check and performs the fused SATB/generational barrier.
         let commit = match mode {
             LockMode::Mutex => "willow_async_mutex_commit",
             // The read-mode commit block has no predecessor, but Cranelift
