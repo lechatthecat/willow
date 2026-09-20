@@ -1247,18 +1247,25 @@ async fn main() { println(await worker()); }
 
 #[test]
 fn async_lir_58_defer_cancel_entry_survives_gc_stress() {
+    // Wait for defer registration and cancellation completion explicitly;
+    // timer margins can cancel before the worker starts on a loaded runner.
     let source = r#"
-async fn worker() {
+async fn worker(entered: Channel<i64>, hold: Channel<i64>) -> i64 {
     let value = "a" + "b";
     defer println(value + "!");
-    await sleep(5000);
+    entered.send(1);
+    return hold.recv();
 }
 async fn main() {
-    let task = worker();
-    await sleep(20);
+    let entered = Channel<i64>::new();
+    let hold = Channel<i64>::new();
+    let task = worker(entered, hold);
+    entered.recv();
     task.cancel();
-    await sleep(60);
-    println("done");
+    match await task.result() {
+        Ok(value) => println("unexpected completion"),
+        Err(cancelled) => println("done"),
+    }
 }
 "#;
     let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_GC_STRESS", "alloc")]);
