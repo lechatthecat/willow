@@ -1111,6 +1111,7 @@ mod tests {
 
     #[test]
     fn channel_unit_11_abi_i64_send_recv_fifo() {
+        let _guard = crate::gc::runtime_test_guard();
         let ch = willow_channel_new(0);
         willow_channel_send_i64(ch, 10);
         willow_channel_send_i64(ch, 20);
@@ -1120,6 +1121,7 @@ mod tests {
 
     #[test]
     fn channel_unit_12_abi_bool_send_recv() {
+        let _guard = crate::gc::runtime_test_guard();
         let ch = willow_channel_new(0);
         willow_channel_send_bool(ch, 1);
         assert_eq!(willow_channel_recv_bool(ch), 1);
@@ -1127,6 +1129,7 @@ mod tests {
 
     #[test]
     fn channel_unit_13_abi_f64_send_recv() {
+        let _guard = crate::gc::runtime_test_guard();
         let ch = willow_channel_new(0);
         willow_channel_send_f64(ch, 2.5);
         assert_eq!(willow_channel_recv_f64(ch), 2.5);
