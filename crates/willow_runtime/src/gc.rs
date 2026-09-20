@@ -168,7 +168,8 @@ pub struct GcHeader {
     /// later TLAB, generational, and moving collectors can select layout-aware
     /// fast paths without changing the object ABI again.
     pub layout_id: u64,
-    /// Bit mask for the first 64 pointer-sized payload slots that contain GC refs.
+    /// Inline reference mask, or a static bitmap descriptor pointer when
+    /// `type_id == GC_BITMAP_TYPE_ID`. The descriptor owns all mask words.
     pub gc_ref_mask: u64,
     /// Total allocation size in bytes (header + payload).
     pub size: usize,
@@ -229,6 +230,25 @@ mod raw_heap {
         pub(super) layout_id: u64,
         pub(super) gc_ref_mask: u64,
         pub(super) payload_size: usize,
+    }
+
+    impl TraceMetadata {
+        pub(super) fn inline_ref_mask(self) -> u64 {
+            if self.type_id == willow_abi::GC_BITMAP_TYPE_ID {
+                let descriptor = self.gc_ref_mask as *const u64;
+                // SAFETY: bitmap allocations validate immutable descriptors whose
+                // lifetime covers the object, including collection snapshots.
+                unsafe {
+                    if *descriptor == 0 {
+                        0
+                    } else {
+                        *descriptor.add(1)
+                    }
+                }
+            } else {
+                self.gc_ref_mask
+            }
+        }
     }
 
     impl Object {
@@ -1515,8 +1535,9 @@ impl ConcurrentCycle {
         let payload = value as *mut u8;
         let words = metadata.payload_size / GC_STORAGE_WORD_BYTES;
         let mut slots = 0;
+        let inline_mask = metadata.inline_ref_mask();
         for index in 0..words.min(64) {
-            if metadata.gc_ref_mask & (1u64 << index) != 0 {
+            if inline_mask & (1u64 << index) != 0 {
                 // SAFETY: immutable epoch metadata bounds the live allocation;
                 // generated and native reference stores use atomic publication.
                 children.push(unsafe {
@@ -1526,7 +1547,7 @@ impl ConcurrentCycle {
             }
         }
         if metadata.type_id == willow_abi::GC_BITMAP_TYPE_ID {
-            let descriptor = metadata.layout_id as *const u64;
+            let descriptor = metadata.gc_ref_mask as *const u64;
             // SAFETY: bitmap descriptors are validated immutable static data.
             let count = unsafe { *descriptor } as usize;
             if count.min(words.div_ceil(64)) > 1 {
@@ -1624,7 +1645,7 @@ impl ConcurrentCycle {
             .metadata(value)
             .expect("bitmap epoch retains its object");
         assert_eq!(metadata.type_id, willow_abi::GC_BITMAP_TYPE_ID);
-        let descriptor = metadata.layout_id as *const u64;
+        let descriptor = metadata.gc_ref_mask as *const u64;
         let words = metadata.payload_size / GC_STORAGE_WORD_BYTES;
         // SAFETY: allocation validates the immutable descriptor. Start and
         // end are engine-generated and bounded by both descriptor and payload.
@@ -1892,8 +1913,9 @@ fn mark_worklist(
         }
         let payload_words = metadata.payload_size / GC_STORAGE_WORD_BYTES;
         let mut scanned_slots = 0usize;
+        let inline_mask = metadata.inline_ref_mask();
         for i in 0..payload_words.min(64) {
-            if (metadata.gc_ref_mask & (1u64 << i)) != 0 {
+            if (inline_mask & (1u64 << i)) != 0 {
                 scanned_slots += 1;
                 if let Some(child) = object.payload_word(i) {
                     worklist.push(child.as_ptr());
@@ -2776,9 +2798,10 @@ pub extern "C" fn willow_alloc(payload_size: i64) -> *mut u8 {
 /// Allocate an object with scalable tracing metadata. `descriptor` points to
 /// immutable, aligned static u64 data `[count, bits...]`, alive until all such
 /// objects have been reclaimed. Payload and bitmap sizes must agree.
+/// `layout_id` is the address-independent fingerprint computed by the compiler.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_alloc_bitmap(
-    _type_id: i64,
+    layout_id: i64,
     payload_size: i64,
     descriptor: *const u64,
 ) -> *mut u8 {
@@ -2789,16 +2812,11 @@ pub extern "C" fn willow_gc_alloc_bitmap(
         count,
         (payload_size as usize / GC_STORAGE_WORD_BYTES).div_ceil(64)
     );
-    let mask = if count == 0 {
-        0
-    } else {
-        unsafe { *descriptor.add(1) }
-    };
     allocate_object(
-        descriptor as u64,
+        layout_id as u64,
         willow_abi::GC_BITMAP_TYPE_ID,
         payload_size,
-        mask,
+        descriptor as u64,
     )
 }
 
@@ -3651,7 +3669,7 @@ fn append_bitmap_slots(object: HeapObject, slots: &mut Vec<*mut *mut u8>) {
     if metadata.type_id != willow_abi::GC_BITMAP_TYPE_ID {
         return;
     }
-    let descriptor = metadata.layout_id as *const u64;
+    let descriptor = metadata.gc_ref_mask as *const u64;
     // SAFETY: only willow_gc_alloc_bitmap installs the reserved tracing type, after validating a
     // compiler-owned, process-lifetime descriptor. Moving GC copies the pointer.
     let count = unsafe { *descriptor } as usize;
@@ -3676,8 +3694,9 @@ fn object_reference_slots(
     let metadata = object.trace_metadata();
     let payload_words = metadata.payload_size / GC_STORAGE_WORD_BYTES;
     let mut slots = Vec::new();
+    let inline_mask = metadata.inline_ref_mask();
     for index in 0..payload_words.min(64) {
-        if (metadata.gc_ref_mask & (1u64 << index)) != 0 {
+        if (inline_mask & (1u64 << index)) != 0 {
             slots.push(object.payload_slot(index));
         }
     }
@@ -5562,9 +5581,20 @@ mod tests {
         // before them. Both paths must locate the same storage-word stride.
         static BITMAP: [u64; 3] = [2, 0b10, 0b10];
         let bytes = 66 * GC_STORAGE_WORD_BYTES;
-        let parent = willow_gc_alloc_bitmap(0, bytes as i64, BITMAP.as_ptr());
+        let fingerprint = willow_abi::gc_bitmap_layout_id(
+            bytes as i64,
+            17,
+            willow_abi::gc_bitmap_fingerprint(&BITMAP[1..]),
+        );
+        let parent = willow_gc_alloc_bitmap(fingerprint as i64, bytes as i64, BITMAP.as_ptr());
         let child = willow_alloc(8);
         let object = HeapObject::from_raw(payload_to_header(parent)).unwrap();
+        assert_eq!(object.trace_metadata().layout_id, fingerprint);
+        assert_eq!(object.trace_metadata().gc_ref_mask, BITMAP.as_ptr() as u64);
+        assert_eq!(
+            std::mem::size_of::<GcHeader>(),
+            willow_abi::gc_header::size(std::mem::size_of::<usize>() as u32) as usize
+        );
         let offsets = [
             willow_abi::WordLayout::new(&[willow_abi::SlotKind::Word])
                 .byte_size(std::mem::size_of::<usize>() as u32) as usize,
@@ -5593,6 +5623,58 @@ mod tests {
         assert_eq!(willow_gc_allocated_bytes(), obj_size(bytes) + obj_size(8));
         willow_pop_root();
         reset_gc();
+    }
+
+    #[test]
+    fn bitmap_fingerprints_are_independent_of_descriptor_addresses() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        for words in [0usize, 1, 2, 8, 32, 128] {
+            let mut descriptor = vec![0u64; words + 1];
+            descriptor[0] = words as u64;
+            if words > 0 {
+                descriptor[words] = 1;
+            }
+            let copy = descriptor.clone();
+            let bytes = words * 64 * GC_STORAGE_WORD_BYTES;
+            let fingerprint = willow_abi::gc_bitmap_layout_id(
+                bytes as i64,
+                17,
+                willow_abi::gc_bitmap_fingerprint(&descriptor[1..]),
+            );
+            assert_eq!(
+                fingerprint,
+                willow_abi::gc_bitmap_layout_id(
+                    bytes as i64,
+                    17,
+                    willow_abi::gc_bitmap_fingerprint(&copy[1..])
+                )
+            );
+            assert_ne!(
+                fingerprint,
+                willow_abi::gc_bitmap_layout_id(
+                    bytes as i64,
+                    18,
+                    willow_abi::gc_bitmap_fingerprint(&copy[1..])
+                )
+            );
+            for data in [&descriptor, &copy] {
+                let ptr = willow_gc_alloc_bitmap(fingerprint as i64, bytes as i64, data.as_ptr());
+                let object = HeapObject::from_raw(payload_to_header(ptr)).unwrap();
+                assert_eq!(object.trace_metadata().layout_id, fingerprint);
+                assert_eq!(object.trace_metadata().gc_ref_mask, data.as_ptr() as u64);
+                let slots = object_reference_slots(object, &HashMap::new());
+                assert_eq!(slots.len(), usize::from(words > 0));
+                if words > 0 {
+                    assert_eq!(
+                        slots[0] as usize - ptr as usize,
+                        (words - 1) * 64 * GC_STORAGE_WORD_BYTES
+                    );
+                }
+            }
+            // Reclaim objects before their borrowed descriptors leave scope.
+            reset_gc();
+        }
     }
 
     #[test]

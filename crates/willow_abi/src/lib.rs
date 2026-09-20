@@ -234,6 +234,27 @@ pub const fn gc_layout_id(
     if hash == 0 { 1 } else { hash }
 }
 
+/// Address-independent digest of every trace bitmap word. Cache alongside the
+/// interned descriptor so equivalent allocation sites do not recompute it.
+pub fn gc_bitmap_fingerprint(bitmap: &[u64]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &word in bitmap {
+        hash ^= word;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    if hash == 0 { 1 } else { hash }
+}
+
+/// Combine shape metadata with a cached bitmap digest in constant time.
+pub fn gc_bitmap_layout_id(payload_size: i64, runtime_type_id: i64, bitmap_digest: u64) -> u64 {
+    gc_layout_id(
+        GcObjectKind::Class,
+        payload_size,
+        runtime_type_id,
+        bitmap_digest,
+    )
+}
+
 /// GC header ABI. Offsets are fixed-width and independent of Rust field lookup.
 pub mod gc_header {
     pub const MARKED_OFFSET: u32 = 0;
@@ -559,5 +580,36 @@ mod tests {
         assert_eq!(LockAcquireStatus::Cancelled as i32, -3);
         assert_eq!(LockAcquireStatus::Acquired as i32, 1);
         assert_eq!(LockStatusPhase::Poll as i32, 1);
+    }
+}
+
+#[cfg(test)]
+mod bitmap_fingerprint_tests {
+    use super::{gc_bitmap_fingerprint, gc_bitmap_layout_id};
+
+    #[test]
+    fn fingerprint_covers_size_type_and_every_bitmap_word() {
+        for words in [1, 2, 8, 32, 128] {
+            let bitmap = vec![0; words];
+            let size = words as i64 * 64 * 8;
+            let id = gc_bitmap_layout_id(size, 17, gc_bitmap_fingerprint(&bitmap));
+            assert_ne!(id, 0);
+            assert_ne!(
+                id,
+                gc_bitmap_layout_id(size + 8, 17, gc_bitmap_fingerprint(&bitmap))
+            );
+            assert_ne!(
+                id,
+                gc_bitmap_layout_id(size, 18, gc_bitmap_fingerprint(&bitmap))
+            );
+            for index in 0..words {
+                let mut changed = bitmap.clone();
+                changed[index] = 1;
+                assert_ne!(
+                    id,
+                    gc_bitmap_layout_id(size, 17, gc_bitmap_fingerprint(&changed))
+                );
+            }
+        }
     }
 }

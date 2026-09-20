@@ -132,6 +132,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     ALLOC; "willow_alloc" => ([I64] -> Some(Ptr));
     ALLOC; "willow_alloc_typed" => ([I64, I64] -> Some(Ptr));
     ALLOC; "willow_gc_alloc_layout" => ([I64, I64, I64, I64] -> Some(Ptr));
+    // Arguments: stable layout fingerprint, payload bytes, immutable descriptor.
     ALLOC; "willow_gc_alloc_bitmap" => ([I64, I64, Ptr] -> Some(Ptr));
     ALLOC; "willow_gc_alloc_slow" => ([Ptr, I64, I64, I64, I64] -> Some(Ptr));
     NONE; "willow_gc_write_barrier" => ([Ptr, Ptr, Ptr, I64] -> None);

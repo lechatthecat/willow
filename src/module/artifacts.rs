@@ -16,6 +16,10 @@ use serde::{Serialize, de::DeserializeOwned};
 use crate::diagnostics::{FileId, Span};
 use crate::parser::ast::{Block, Expr, ExprId, Item, Program};
 
+#[cfg(test)]
+#[path = "artifact_property_tests.rs"]
+mod property_tests;
+
 #[derive(Clone, Copy)]
 pub(crate) enum UnitKind {
     Ast,

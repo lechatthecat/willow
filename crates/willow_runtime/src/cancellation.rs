@@ -7,9 +7,9 @@
 //!
 //! `TaskScope` strongly owns the task frames added to it (and child scopes) so
 //! their completion can be observed after scheduler reaping. `finish()` closes
-//! the scope to new children and returns a Task that parks on every unfinished
-//! child through the ordinary task-waiter mechanism. It resolves to
-//! `Ok(void)` when all children complete and `Err(Cancelled)` if any child or
+//! the scope to new children and returns a Task that visits children in order,
+//! parking on one unfinished child through the ordinary task-waiter mechanism.
+//! It resolves to `Ok(void)` when all children complete and `Err(Cancelled)` if any child or
 //! the scope was cancelled. Task panics retain Willow's process-abort policy.
 
 use std::collections::HashSet;
@@ -318,6 +318,7 @@ impl ScopeCore {
         }
     }
 
+    #[cfg(test)]
     fn snapshot(&self, tasks: &mut Vec<(u64, *mut u8)>, saw_cancelled: &mut bool) {
         let mut pending = Vec::new();
         self.append_snapshot(tasks, saw_cancelled, &mut pending);
@@ -326,6 +327,7 @@ impl ScopeCore {
         }
     }
 
+    #[cfg(test)]
     fn append_snapshot(
         &self,
         tasks: &mut Vec<(u64, *mut u8)>,
@@ -688,9 +690,112 @@ fn alloc_cancelled_result() -> *mut u8 {
     )
 }
 
-unsafe fn finish_state(frame: *mut c_void) -> Option<Arc<ScopeCore>> {
-    let raw =
-        unsafe { scope_finish_frame(frame) }.load_native::<Arc<ScopeCore>>(SCOPE_FINISH_STATE_SLOT);
+// Retain traversal positions, never loaded managed pointers, across polls.
+// Scope membership is frozen by begin_finish before this state is published.
+struct ScopeFinishCursor {
+    core: Arc<ScopeCore>,
+    next_task: usize,
+    visited_children: usize,
+}
+
+impl ScopeFinishCursor {
+    fn new(core: Arc<ScopeCore>) -> Self {
+        Self {
+            core,
+            next_task: 0,
+            visited_children: 0,
+        }
+    }
+}
+
+struct ScopeFinishState {
+    core: Arc<ScopeCore>,
+    traversal: Mutex<ScopeFinishTraversal>,
+}
+
+impl ScopeFinishState {
+    fn new(core: Arc<ScopeCore>) -> Self {
+        Self {
+            traversal: Mutex::new(ScopeFinishTraversal {
+                stack: vec![ScopeFinishCursor::new(Arc::clone(&core))],
+                #[cfg(test)]
+                counts: [1, 0, 0],
+            }),
+            core,
+        }
+    }
+}
+
+struct ScopeFinishTraversal {
+    stack: Vec<ScopeFinishCursor>,
+    // Scope visits, frame status checks, await attempts. No production overhead.
+    #[cfg(test)]
+    counts: [usize; 3],
+}
+
+impl ScopeFinishTraversal {
+    fn poll(&mut self, mut await_task: impl FnMut(u64) -> i32) -> bool {
+        while let Some(cursor) = self.stack.last_mut() {
+            let state = cursor
+                .core
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Another finish handle may already have released these roots.
+            if !state.finished {
+                if let Some(task) = state.tasks.get(cursor.next_task) {
+                    #[cfg(test)]
+                    {
+                        self.counts[1] += 1;
+                    }
+                    let status =
+                        crate::async_frame::frame_terminal_status(task.frame.load().cast());
+                    if status == crate::async_frame::WILLOW_FRAME_STATUS_PENDING {
+                        let id = task.id;
+                        drop(state);
+                        // Await can collect; do not hold a scope mutex or carry a
+                        // loaded frame pointer through this boundary. The ID-only
+                        // await uses the same race-safe waiter registration path.
+                        #[cfg(test)]
+                        {
+                            self.counts[2] += 1;
+                        }
+                        if await_task(id) == 0 {
+                            return false;
+                        }
+                    } else {
+                        drop(state);
+                    }
+                    cursor.next_task += 1;
+                    continue;
+                }
+                // Match snapshot's order: local insertion order, then children
+                // in reverse insertion order, depth first. Push only one child
+                // at a time so the cursor stack uses O(depth), even for fan-out.
+                if cursor.visited_children < state.children.len() {
+                    let child = Arc::clone(
+                        &state.children[state.children.len() - 1 - cursor.visited_children],
+                    );
+                    cursor.visited_children += 1;
+                    drop(state);
+                    self.stack.push(ScopeFinishCursor::new(child));
+                    #[cfg(test)]
+                    {
+                        self.counts[0] += 1;
+                    }
+                    continue;
+                }
+            }
+            drop(state);
+            self.stack.pop();
+        }
+        true
+    }
+}
+
+unsafe fn finish_state(frame: *mut c_void) -> Option<Arc<ScopeFinishState>> {
+    let raw = unsafe { scope_finish_frame(frame) }
+        .load_native::<Arc<ScopeFinishState>>(SCOPE_FINISH_STATE_SLOT);
     // Own a strong reference across polling and frame-slot cleanup.
     unsafe { raw.as_ref() }.cloned()
 }
@@ -699,7 +804,7 @@ unsafe fn finish_scope_task(frame: *mut c_void, result: *mut u8) -> i32 {
     unsafe {
         let frame = scope_finish_frame(frame);
         frame.store_gc(SCOPE_FINISH_RESULT_SLOT, result);
-        let raw = frame.take_native::<Arc<ScopeCore>>(SCOPE_FINISH_STATE_SLOT);
+        let raw = frame.take_native::<Arc<ScopeFinishState>>(SCOPE_FINISH_STATE_SLOT);
         if !raw.is_null() {
             drop(Box::from_raw(raw));
         }
@@ -708,32 +813,19 @@ unsafe fn finish_scope_task(frame: *mut c_void, result: *mut u8) -> i32 {
 }
 
 unsafe extern "C" fn poll_scope_finish(frame: *mut c_void) -> i32 {
-    let Some(core) = (unsafe { finish_state(frame) }) else {
+    let Some(state) = (unsafe { finish_state(frame) }) else {
         return crate::task::RUNTIME_POLL_READY;
     };
-    let mut tasks = Vec::new();
-    let mut saw_cancelled = false;
-    core.snapshot(&mut tasks, &mut saw_cancelled);
-
-    let mut pending = false;
-    for (task_id, task_frame) in tasks {
-        match crate::async_frame::frame_terminal_status(task_frame.cast()) {
-            crate::async_frame::WILLOW_FRAME_STATUS_PENDING => {
-                if crate::scheduler::willow_frame_await(task_frame.cast(), task_id) == 0 {
-                    pending = true;
-                }
-            }
-            crate::async_frame::WILLOW_FRAME_STATUS_CANCELLED => saw_cancelled = true,
-            crate::async_frame::WILLOW_FRAME_STATUS_COMPLETED
-            | crate::async_frame::WILLOW_FRAME_STATUS_PANICKED => {}
-            _ => pending = true,
-        }
-    }
-    if pending {
+    let ready = state
+        .traversal
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .poll(|id| crate::scheduler::willow_sched_await(id));
+    if !ready {
         return crate::task::RUNTIME_POLL_PENDING;
     }
 
-    saw_cancelled |= core.finish_and_release();
+    let saw_cancelled = state.core.finish_and_release();
     let result = if saw_cancelled {
         alloc_cancelled_result()
     } else {
@@ -744,7 +836,8 @@ unsafe extern "C" fn poll_scope_finish(frame: *mut c_void) -> i32 {
 
 unsafe extern "C" fn cancel_scope_finish(frame: *mut c_void) {
     unsafe {
-        let raw = scope_finish_frame(frame).take_native::<Arc<ScopeCore>>(SCOPE_FINISH_STATE_SLOT);
+        let raw =
+            scope_finish_frame(frame).take_native::<Arc<ScopeFinishState>>(SCOPE_FINISH_STATE_SLOT);
         if !raw.is_null() {
             drop(Box::from_raw(raw));
         }
@@ -763,7 +856,9 @@ pub extern "C" fn willow_task_scope_finish(scope_handle: *mut u8) -> *mut c_void
     frame.store_gc(SCOPE_FINISH_HANDLE_SLOT, scope_handle);
     frame.store_native(
         SCOPE_FINISH_STATE_SLOT,
-        Box::into_raw(Box::new(Arc::clone(&scope.core))),
+        Box::into_raw(Box::new(Arc::new(ScopeFinishState::new(Arc::clone(
+            &scope.core,
+        ))))),
     );
     let raw = frame.as_raw();
     crate::scheduler::spawn_global_task_initialized(
@@ -862,6 +957,188 @@ mod tests {
         reset_internal_for_test();
     }
 
+    #[test]
+    fn scope_finish_staggered_completion_scales_with_multiple_handles() {
+        use crate::scheduler::{with_current_task_for_test, with_global_for_test};
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        for shape in ["flat", "deep", "fanout"] {
+            for n in [64, 256, 1024] {
+                reset_global_scheduler_for_test();
+                let root = Arc::new(ScopeCore::default());
+                let mut leaf = Arc::clone(&root);
+                for _ in 0..n {
+                    let owner = match shape {
+                        "deep" => {
+                            leaf = leaf.child();
+                            Arc::clone(&leaf)
+                        }
+                        "fanout" => root.child(),
+                        _ => Arc::clone(&root),
+                    };
+                    let frame = crate::async_frame::willow_async_frame_alloc(1, 0);
+                    let id = with_global_for_test(|scheduler| {
+                        let id = scheduler.spawn_placeholder();
+                        scheduler.with_task_mut(id, |task| task.frame = frame);
+                        id
+                    });
+                    owner.add(id, frame.cast());
+                }
+                root.begin_finish();
+                let mut ordered = Vec::new();
+                let mut cancelled = false;
+                root.snapshot(&mut ordered, &mut cancelled);
+                let first = ScopeFinishState::new(Arc::clone(&root));
+                let second = ScopeFinishState::new(Arc::clone(&root));
+                let waiters = with_global_for_test(|scheduler| {
+                    [
+                        scheduler.spawn_parked_placeholder(),
+                        scheduler.spawn_parked_placeholder(),
+                    ]
+                });
+                for &(expected_id, _) in &ordered {
+                    for (finish, waiter) in [&first, &second].into_iter().zip(waiters) {
+                        let mut traversal = finish.traversal.lock().unwrap();
+                        assert!(!traversal.poll(|id| {
+                            assert_eq!(id, expected_id, "preserve snapshot task order");
+                            with_current_task_for_test(waiter, || {
+                                crate::scheduler::willow_sched_await(id)
+                            })
+                        }));
+                        assert!(traversal.stack.len() <= if shape == "deep" { n + 1 } else { 2 });
+                    }
+                    with_global_for_test(|scheduler| {
+                        assert_eq!(
+                            scheduler
+                                .with_task(expected_id, |task| task.live_waiters())
+                                .unwrap(),
+                            waiters,
+                            "exactly one real registration per handle on the current child",
+                        );
+                        scheduler.complete(expected_id);
+                    });
+                }
+                for finish in [&first, &second] {
+                    let mut traversal = finish.traversal.lock().unwrap();
+                    assert!(traversal.poll(|_| panic!("all tasks are terminal")));
+                    let scopes = if shape == "flat" { 1 } else { n + 1 };
+                    assert_eq!(traversal.counts, [scopes, 2 * n, n]);
+                    eprintln!(
+                        "scope_finish shape={shape} n={n} scopes={} status_checks={} await_attempts={}",
+                        traversal.counts[0], traversal.counts[1], traversal.counts[2]
+                    );
+                }
+                assert!(!root.finish_and_release());
+                assert!(
+                    !root.finish_and_release(),
+                    "handles retain completion outcome"
+                );
+                reset_global_scheduler_for_test();
+            }
+        }
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn scope_finish_reloads_roots_and_tolerates_another_handle_releasing_them() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        let root = Arc::new(ScopeCore::default());
+        let pending = crate::async_frame::willow_async_frame_alloc(1, 0);
+        let moved = crate::async_frame::willow_async_frame_alloc(1, 0);
+        root.add(1, pending.cast());
+        root.begin_finish();
+        let first = ScopeFinishState::new(Arc::clone(&root));
+        let second = ScopeFinishState::new(Arc::clone(&root));
+        for finish in [&first, &second] {
+            assert!(!finish.traversal.lock().unwrap().poll(|_| 0));
+        }
+        // Model collector relocation through the actual stable root slot.
+        let mut slots = Vec::new();
+        root.trace_frames(&mut slots);
+        unsafe {
+            *slots[0] = moved.cast();
+        }
+        crate::async_frame::frame_publish_terminal(
+            moved,
+            crate::async_frame::WILLOW_FRAME_STATUS_CANCELLED,
+        );
+        assert!(
+            first
+                .traversal
+                .lock()
+                .unwrap()
+                .poll(|_| panic!("must reload moved root"))
+        );
+        assert!(root.finish_and_release());
+        assert!(unsafe { *slots[0] }.is_null());
+        assert!(
+            second
+                .traversal
+                .lock()
+                .unwrap()
+                .poll(|_| panic!("roots already released"))
+        );
+        assert!(root.finish_and_release());
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn scope_finish_out_of_order_completion_and_spurious_polls_only_revisit_frontier() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        let root = Arc::new(ScopeCore::default());
+        let mut frames = Vec::new();
+        for id in 1..=64 {
+            let frame = crate::async_frame::willow_async_frame_alloc(1, 0);
+            root.add(id, frame.cast());
+            frames.push(frame);
+        }
+        root.begin_finish();
+        let finish = ScopeFinishState::new(Arc::clone(&root));
+        let mut traversal = finish.traversal.lock().unwrap();
+        for &frame in frames[1..].iter().rev() {
+            crate::async_frame::frame_publish_terminal(
+                frame,
+                crate::async_frame::WILLOW_FRAME_STATUS_COMPLETED,
+            );
+            assert!(!traversal.poll(|id| {
+                assert_eq!(id, 1);
+                0
+            }));
+        }
+        assert_eq!(traversal.counts, [1, 63, 63]);
+        crate::async_frame::frame_publish_terminal(
+            frames[0],
+            crate::async_frame::WILLOW_FRAME_STATUS_COMPLETED,
+        );
+        assert!(traversal.poll(|_| panic!("all tasks completed")));
+        assert_eq!(traversal.counts, [1, 63 + 64, 63]);
+        assert!(!root.finish_and_release());
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn scope_finish_handles_completion_during_waiter_registration() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        let root = Arc::new(ScopeCore::default());
+        let frame = crate::async_frame::willow_async_frame_alloc(1, 0);
+        root.add(1, frame.cast());
+        root.begin_finish();
+        let finish = ScopeFinishState::new(Arc::clone(&root));
+        assert!(finish.traversal.lock().unwrap().poll(|id| {
+            assert_eq!(id, 1);
+            crate::async_frame::frame_publish_terminal(
+                frame,
+                crate::async_frame::WILLOW_FRAME_STATUS_CANCELLED,
+            );
+            1
+        }));
+        assert!(root.finish_and_release());
+        reset_internal_for_test();
+    }
+
     unsafe extern "C" fn pending_forever(_frame: *mut c_void) -> i32 {
         crate::task::RUNTIME_POLL_PENDING
     }
@@ -873,12 +1150,15 @@ mod tests {
         let frame = NativeTaskFrame::<ScopeFinishFrame>::allocate().unwrap();
         let core = Arc::new(ScopeCore::default());
         let weak = Arc::downgrade(&core);
-        frame.store_native(SCOPE_FINISH_STATE_SLOT, Box::into_raw(Box::new(core)));
+        frame.store_native(
+            SCOPE_FINISH_STATE_SLOT,
+            Box::into_raw(Box::new(Arc::new(ScopeFinishState::new(core)))),
+        );
         let state = unsafe { finish_state(frame.as_raw()) }.unwrap();
         unsafe { cancel_scope_finish(frame.as_raw()) };
         assert!(
             frame
-                .load_native::<Arc<ScopeCore>>(SCOPE_FINISH_STATE_SLOT)
+                .load_native::<Arc<ScopeFinishState>>(SCOPE_FINISH_STATE_SLOT)
                 .is_null()
         );
         assert!(weak.upgrade().is_some());
@@ -1141,6 +1421,15 @@ mod tests {
         assert!(saw_cancelled);
         assert!(tasks.is_empty());
         assert!(slots.is_empty());
+        let finish = ScopeFinishState::new(Arc::clone(&scope_root));
+        assert!(
+            finish
+                .traversal
+                .lock()
+                .unwrap()
+                .poll(|_| panic!("empty scopes"))
+        );
+        assert_eq!(finish.traversal.lock().unwrap().counts, [DEPTH + 1, 0, 0]);
         assert!(scope_root.finish_and_release());
         assert!(scope_nodes.iter().all(|node| {
             let state = node

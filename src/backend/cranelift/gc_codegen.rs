@@ -93,13 +93,14 @@ impl GcLayoutMetadata {
 }
 
 /// Intern exact trace descriptors within the object module. A layout fingerprint
-/// is insufficient: it does not include the wide bitmap. Equal bitmaps can safely
-/// share data even when allocation size or runtime type differ.
+/// is insufficient as a cache key because hashes can collide. Equal bitmaps can safely
+/// share data even when allocation size or runtime type differ. Cache their
+/// content digest here; combine it with size/type once per allocation site.
 fn bitmap_descriptor(
     module: &mut ObjectModule,
-    descriptors: &mut HashMap<Vec<u64>, DataId>,
+    descriptors: &mut HashMap<Vec<u64>, (DataId, u64)>,
     bitmap: &[u64],
-) -> DataId {
+) -> (DataId, u64) {
     if let Some(&id) = descriptors.get(bitmap) {
         return id;
     }
@@ -116,29 +117,31 @@ fn bitmap_descriptor(
     module
         .define_data(data_id, &data)
         .expect("GC bitmap definition");
-    descriptors.insert(bitmap.to_vec(), data_id);
-    data_id
+    let descriptor = (data_id, willow_abi::gc_bitmap_fingerprint(bitmap));
+    descriptors.insert(bitmap.to_vec(), descriptor);
+    descriptor
 }
 
 /// Shared allocation path for wide class objects and async frames.
 pub(super) fn emit_bitmap_alloc(
     module: &mut ObjectModule,
-    descriptors: &mut HashMap<Vec<u64>, DataId>,
+    descriptors: &mut HashMap<Vec<u64>, (DataId, u64)>,
     builder: &mut FunctionBuilder<'_>,
     alloc_id: FuncId,
     type_id: i64,
     payload_size: i64,
     bitmap: &[u64],
 ) -> Value {
-    let data_id = bitmap_descriptor(module, descriptors, bitmap);
+    let (data_id, digest) = bitmap_descriptor(module, descriptors, bitmap);
     let global = module.declare_data_in_func(data_id, builder.func);
     let pointer = builder
         .ins()
         .symbol_value(reference_type(module.target_config()), global);
-    let type_id = builder.ins().iconst(types::I64, type_id);
+    let fingerprint = willow_abi::gc_bitmap_layout_id(payload_size, type_id, digest);
+    let layout_id = builder.ins().iconst(types::I64, fingerprint as i64);
     let size = builder.ins().iconst(types::I64, payload_size);
     let alloc = module.declare_func_in_func(alloc_id, builder.func);
-    let call = builder.ins().call(alloc, &[type_id, size, pointer]);
+    let call = builder.ins().call(alloc, &[layout_id, size, pointer]);
     builder.inst_results(call)[0]
 }
 
@@ -562,7 +565,8 @@ mod tests {
                     &mut codegen.gc_bitmap_descriptors,
                     &bitmap,
                 );
-                assert_ne!(first, other);
+                assert_ne!(first.0, other.0);
+                assert_ne!(first.1, other.1);
                 assert_eq!(
                     codegen.module.declarations().get_data_objects().count() - before,
                     2

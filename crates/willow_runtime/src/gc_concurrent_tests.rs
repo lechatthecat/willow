@@ -1613,8 +1613,8 @@ fn large_bitmap_continuations_bound_scan_work_without_rescanning_prefixes() {
                     root,
                     raw_heap::TraceMetadata {
                         type_id: willow_abi::GC_BITMAP_TYPE_ID,
-                        layout_id: descriptor.as_ptr() as u64,
-                        gc_ref_mask: u64::MAX,
+                        layout_id: 1234,
+                        gc_ref_mask: descriptor.as_ptr() as u64,
                         payload_size: slots * GC_STORAGE_WORD_BYTES,
                     },
                 ),

@@ -29,3 +29,19 @@ with `cargo +nightly fuzz tmin parser <artifact>`, then add a reviewed regressio
 input to `fuzz/seeds/parser/` and a focused compiler regression test when fixing
 the bug. Generated corpora, crash artifacts, coverage, and binaries are ignored.
 Use only synthetic or public source as input; do not seed with private material.
+
+## Compiler artifact properties
+
+The private `UnitArtifacts` store also has deterministic generated-property tests
+that run without cargo-fuzz or a nightly toolchain:
+
+```sh
+cargo test -p willowc --lib module::artifacts:: -- --test-threads=1
+```
+
+These exercise real disk serialization and hydration, including AST identities,
+all body-owning slots, repeated offload, multi-file isolation, source snapshots,
+and malformed records. The case number reproduces each generated source; this
+bounded suite does not perform random mutation or shrinking. The
+[test generator](../src/module/artifact_property_tests.rs) contains the synthetic
+inputs and exact record-count assertions.

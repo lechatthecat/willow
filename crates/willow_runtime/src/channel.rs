@@ -631,66 +631,152 @@ pub extern "C" fn willow_channel_select_cleanup(
     wake_send_waiters(channel);
 }
 
-/// Metadata transitions occur under Channel -> TaskShard; wake and stress
-/// collection occur after unlocking. Failed wakes undo only their generation.
-fn wake_reserved_waiters(channel: &ChannelCore, receive: bool) {
-    loop {
-        let candidate = {
-            let mut state = channel.state.lock().expect("channel mutex poisoned");
-            if receive {
-                if state.values.len() <= state.recv_claims.len() {
-                    break;
-                }
-            } else if state.closed || state_is_full(&state) {
-                break;
-            }
-            let queue = if receive {
-                &mut state.waiters
-            } else {
-                &mut state.send_waiters
-            };
-            let Some((task, wait)) = queue.pop_front_ticket() else {
-                break;
-            };
-            let generation = next_generation(&mut state);
-            let (wait_role, owned_role) = if receive {
-                (ChannelRole::RecvWait, ChannelRole::RecvClaim)
-            } else {
-                (ChannelRole::SendWait, ChannelRole::SendHandoff)
-            };
-            let old = core_token(channel, wait_role, wait);
-            let owner = core_token(channel, owned_role, generation);
-            let map = if receive {
-                &mut state.recv_claims
-            } else {
-                &mut state.send_handoffs
-            };
-            debug_assert!(!map.contains_key(&task));
-            map.insert(task, generation);
-            if crate::scheduler::transition_channel_ownership(task, old, owner) {
-                Some((task, owner))
-            } else {
-                map.remove(&task);
-                crate::scheduler::clear_channel_ownership(task, old);
-                None
-            }
+const CHANNEL_WAKE_BATCH: usize = 32;
+type WakeCandidate = (u64, ChannelOwnershipToken);
+
+/// Reserve at most one bounded batch under Channel -> TaskShard lock order.
+/// The last flag means availability or the waiter queue was exhausted.
+fn reserve_waiter_batch<const N: usize>(
+    channel: &ChannelCore,
+    receive: bool,
+    candidates: &mut [WakeCandidate; N],
+) -> (usize, bool, bool) {
+    #[cfg(test)]
+    CHANNEL_RESERVE_LOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut state = channel.state.lock().expect("channel mutex poisoned");
+    let mut count = 0;
+    for _ in 0..N {
+        if if receive {
+            state.values.len() <= state.recv_claims.len()
+        } else {
+            state.closed || state_is_full(&state)
+        } {
+            return (count, state.closed, true);
+        }
+        let queue = if receive {
+            &mut state.waiters
+        } else {
+            &mut state.send_waiters
         };
-        if let Some((task, owner)) = candidate {
-            #[cfg(test)]
-            CHANNEL_WAKE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if !crate::scheduler::wake_channel_owner(task) {
-                let mut state = channel.state.lock().expect("channel mutex poisoned");
-                remove_exact(&mut state, task, owner);
-            }
+        let Some((task, wait)) = queue.pop_front_ticket() else {
+            return (count, state.closed, true);
+        };
+        let generation = next_generation(&mut state);
+        let (wait_role, owned_role) = if receive {
+            (ChannelRole::RecvWait, ChannelRole::RecvClaim)
+        } else {
+            (ChannelRole::SendWait, ChannelRole::SendHandoff)
+        };
+        let old = core_token(channel, wait_role, wait);
+        let owner = core_token(channel, owned_role, generation);
+        let map = if receive {
+            &mut state.recv_claims
+        } else {
+            &mut state.send_handoffs
+        };
+        debug_assert!(!map.contains_key(&task));
+        map.insert(task, generation);
+        if crate::scheduler::transition_channel_ownership(task, old, owner) {
+            candidates[count] = (task, owner);
+            count += 1;
+        } else {
+            map.remove(&task);
+            crate::scheduler::clear_channel_ownership(task, old);
         }
     }
-    if receive {
-        wake_closed_empty(channel);
+    let exhausted = if receive {
+        state.values.len() <= state.recv_claims.len() || state.waiters.is_empty()
+    } else {
+        state.closed || state_is_full(&state) || state.send_waiters.is_empty()
+    };
+    (count, state.closed, exhausted)
+}
+
+/// Publish outside the channel lock, then undo only failed generations.
+/// Return whether released reservations may let another waiter make progress.
+fn publish_waiter_batch(
+    channel: &ChannelCore,
+    candidates: &[WakeCandidate],
+    scratch: &mut crate::scheduler::WakeBatchScratch,
+) -> bool {
+    #[cfg(test)]
+    CHANNEL_WAKE_ATTEMPTS.fetch_add(candidates.len(), std::sync::atomic::Ordering::Relaxed);
+    if candidates.is_empty() {
+        return false;
+    }
+    #[cfg(test)]
+    CHANNEL_WAKE_BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Keep the common ping-pong path allocation-free, without shard partitioning.
+    if let [(task, owner)] = candidates {
+        if crate::scheduler::wake_channel_owner(*task) {
+            return false;
+        }
+        let mut state = channel.state.lock().expect("channel mutex poisoned");
+        remove_exact(&mut state, *task, *owner);
+        return true;
+    }
+    let mut ids = [0; CHANNEL_WAKE_BATCH];
+    for (id, (task, _)) in ids.iter_mut().zip(candidates) {
+        *id = *task;
+    }
+    crate::scheduler::wake_channel_owners(&ids[..candidates.len()], scratch);
+    if scratch.terminal.is_empty() {
+        return false;
+    }
+    // Scheduler results are shard-ordered. Index failures rather than rescanning
+    // candidates for each terminal task; allocate only on this uncommon path.
+    let terminal: HashSet<_> = scratch.terminal.iter().copied().collect();
+    let mut state = channel.state.lock().expect("channel mutex poisoned");
+    for &(task, owner) in candidates {
+        if terminal.contains(&task) {
+            remove_exact(&mut state, task, owner);
+        }
+    }
+    true
+}
+
+fn wake_reserved_waiters(channel: &ChannelCore, receive: bool) {
+    // Most notifications release one value/slot. Avoid initializing full batch
+    // storage on this path; a remaining fanout uses bounded batches below.
+    let mut first = [(0, core_token(channel, ChannelRole::RecvClaim, 0))];
+    let (count, closed, exhausted) = reserve_waiter_batch(channel, receive, &mut first);
+    let released = publish_waiter_batch(channel, &first[..count], &mut Default::default());
+    if exhausted && !released {
+        if receive && closed {
+            wake_closed_empty(channel);
+        }
+        return;
+    }
+    wake_reserved_batches(channel, receive);
+}
+
+// Keep large scratch setup out of the frequent zero/single-waiter call frame.
+#[inline(never)]
+fn wake_reserved_batches(channel: &ChannelCore, receive: bool) {
+    let mut candidates = [(0, core_token(channel, ChannelRole::RecvClaim, 0)); CHANNEL_WAKE_BATCH];
+    let mut scratch = crate::scheduler::WakeBatchScratch::default();
+    loop {
+        let (count, closed, exhausted) = reserve_waiter_batch(channel, receive, &mut candidates);
+        let released = publish_waiter_batch(channel, &candidates[..count], &mut scratch);
+        if exhausted && !released {
+            if receive && closed {
+                wake_closed_empty(channel);
+            }
+            break;
+        }
     }
 }
 
 #[cfg(test)]
 static CHANNEL_WAKE_ATTEMPTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+static CHANNEL_WAKE_BATCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+static CHANNEL_RESERVE_LOCKS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 fn wake_recv_waiters(channel: &ChannelCore) {
@@ -726,9 +812,9 @@ fn wake_closed_empty(channel: &ChannelCore) {
             &mut wake,
         );
     }
-    for task in wake {
-        crate::scheduler::willow_sched_wake(task);
-    }
+    let wake: Vec<_> = wake.into_iter().collect();
+    // The native Vec remains valid across scheduler GC stress points.
+    unsafe { crate::scheduler::willow_sched_wake_many(wake.as_ptr(), wake.len()) };
 }
 
 fn take_value(
@@ -880,9 +966,9 @@ pub extern "C" fn willow_channel_close(raw: *mut c_void) {
             );
         }
     }
-    for task in wake {
-        crate::scheduler::willow_sched_wake(task);
-    }
+    let wake: Vec<_> = wake.into_iter().collect();
+    // The native Vec remains valid across scheduler GC stress points.
+    unsafe { crate::scheduler::willow_sched_wake_many(wake.as_ptr(), wake.len()) };
     wake_recv_waiters(channel);
 }
 
@@ -2517,3 +2603,7 @@ mod tests {
         crate::gc::reset_internal_for_test();
     }
 }
+
+#[cfg(test)]
+#[path = "channel_batch_tests.rs"]
+mod batch_tests;

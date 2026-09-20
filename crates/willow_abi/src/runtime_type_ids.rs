@@ -32,8 +32,8 @@ runtime_type_ids! {
     CANCELLATION_TOKEN_TYPE_ID = 0x4341_4E01;
     TASK_SCOPE_TYPE_ID = 0x5343_5001;
     NETWORK_HANDLE_TYPE_ID = 0x4E45_5401;
-    /// Reserved tracing type: layout_id points to a static descriptor of
-    /// [bitmap_word_count, bitmap_word_0, ...]; inline mask bits remain in use.
+    /// Reserved tracing type: gc_ref_mask points to a static descriptor of
+    /// [bitmap_word_count, bitmap_word_0, ...]; layout_id remains a fingerprint.
     GC_BITMAP_TYPE_ID = 0xB17B_17B1;
 }
 
