@@ -840,7 +840,7 @@ fn dedicated_marker_pool_reuses_threads_and_quiesces_before_reclamation() {
                 1,
             ));
             cycle.enqueue(addresses[0] as *mut u8);
-            // No collector assistance: every callback must run on an OS marker.
+            // No collector assistance during the bounded pool job.
             let before = crate::gc_telemetry::workers::snapshot();
             pool.run(&cycle, 0);
             let after = crate::gc_telemetry::workers::snapshot();
@@ -853,17 +853,15 @@ fn dedicated_marker_pool_reuses_threads_and_quiesces_before_reclamation() {
             );
             assert!(after.wall_ns >= before.wall_ns);
             assert!(!cycle.worker_failed.load(Ordering::Acquire));
-            assert_eq!(cycle.objects.marked_count(), objects);
             let snapshot = cycle.queue.snapshot();
-            assert!(snapshot.is_drained());
             assert_eq!(snapshot.registered_workers, 0);
             assert_eq!(snapshot.registered_assists, 0);
-            assert_eq!(snapshot.injected, objects as u64);
             assert_eq!(snapshot.abandoned, 0);
             assert_eq!(cycle.active_drains.load(Ordering::Acquire), 0);
             assert_eq!(registered_mutator_count(), 0);
             let ids = MARKER_THREAD_IDS.lock().unwrap();
-            assert_eq!(ids.len(), objects);
+            let worker_traces = ids.len();
+            assert!(worker_traces > 0 && worker_traces <= objects);
             assert!(ids.iter().all(|&id| id != std::thread::current().id()));
             all_threads.extend(ids.iter().copied());
             assert!(
@@ -871,9 +869,29 @@ fn dedicated_marker_pool_reuses_threads_and_quiesces_before_reclamation() {
                 "pool recreated threads between epochs"
             );
             drop(ids);
+            // Pool jobs have a shared finite budget; unused parts of claims
+            // are not refunded. A chain handed between workers can exhaust
+            // that budget before it is fully traced. As in collector closure,
+            // drain the retained work only after every pool reader has left.
+            cycle.drain(usize::MAX);
+            assert_eq!(cycle.objects.marked_count(), objects);
+            let snapshot = cycle.queue.snapshot();
+            assert!(snapshot.is_drained());
+            assert_eq!(snapshot.injected, objects as u64);
+            assert_eq!(snapshot.registered_workers, 0);
+            assert_eq!(snapshot.registered_assists, 0);
+            assert_eq!(cycle.active_drains.load(Ordering::Acquire), 0);
+            let ids = MARKER_THREAD_IDS.lock().unwrap();
+            assert_eq!(ids.len(), objects);
+            assert!(
+                ids[worker_traces..]
+                    .iter()
+                    .all(|&id| id == std::thread::current().id())
+            );
+            drop(ids);
             assert_eq!(cycle.queue.end_epoch(), 0);
             println!(
-                "marker workers={workers} objects={objects} trace_jobs={objects} readers_after=0"
+                "marker workers={workers} objects={objects} worker_traces={worker_traces} trace_jobs={objects} readers_after=0"
             );
             // No references remain in any worker when storage is reclaimed.
             reset_internal_for_test();
