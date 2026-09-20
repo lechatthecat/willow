@@ -154,6 +154,50 @@ fn assert_satb_mutation_retains(old: *mut u8, mutation: impl FnOnce()) {
 }
 
 #[test]
+fn old_only_barriers_still_publish_during_marking_and_closure() {
+    let _guard = runtime_test_guard();
+    for phase in [1, 2] {
+        for deletion in [false, true] {
+            for runtime_root in [false, true] {
+                reset_internal_for_test();
+                let object = willow_alloc(8);
+                assert!(!runtime().tlab_ever_allocated.load(Ordering::Acquire));
+                if runtime_root && deletion {
+                    willow_gc_add_runtime_root(object);
+                }
+                assert_satb_mutation_retains(object, || {
+                    GC_MARK_PHASE.store(phase, Ordering::Release);
+                    if runtime_root {
+                        if deletion {
+                            willow_gc_remove_runtime_root(object);
+                        } else {
+                            willow_gc_add_runtime_root(object);
+                        }
+                        return;
+                    }
+                    let (old, value) = if deletion {
+                        (object, std::ptr::null_mut())
+                    } else {
+                        (std::ptr::null_mut(), object)
+                    };
+                    willow_gc_write_barrier(
+                        std::ptr::null_mut(),
+                        old,
+                        value,
+                        GcStoreDestination::GlobalStatic as i64,
+                    );
+                });
+                assert_eq!(
+                    telemetry_heap_snapshot().0.barrier_calls,
+                    u64::from(!runtime_root)
+                );
+            }
+        }
+    }
+    reset_internal_for_test();
+}
+
+#[test]
 fn satb_native_container_overwrites_and_removals_publish_old_references() {
     let _guard = runtime_test_guard();
     for capacity in [1, 256] {

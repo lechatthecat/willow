@@ -456,7 +456,6 @@ struct GcState {
     /// each dirty card attributable to one old/pinned region without changing
     /// the Stage-4 barrier ABI.
     dirty_cards: HashSet<usize>,
-    write_barrier_calls: u64,
     write_barrier_hits: u64,
     minor_collections: u64,
     promoted_objects: u64,
@@ -941,7 +940,6 @@ impl Default for GcState {
             tlab_reserved_bytes: 0,
             remembered_set: HashSet::new(),
             dirty_cards: HashSet::new(),
-            write_barrier_calls: 0,
             write_barrier_hits: 0,
             minor_collections: 0,
             promoted_objects: 0,
@@ -1057,6 +1055,11 @@ impl RuntimeRootSet {
 /// runtime entry points from reaching into unrelated globals.
 struct GcRuntime {
     heap: Mutex<GcState>,
+    write_barrier_calls: AtomicU64,
+    /// Conservative nursery-presence gate: set before the first TLAB can
+    /// publish an object, and cleared only by the quiescent runtime reset.
+    /// Keeping it set after collection avoids racing a concurrent refill.
+    tlab_ever_allocated: std::sync::atomic::AtomicBool,
     /// Always acquired before `heap`; marking temporarily releases the heap
     /// lock while registered trace callbacks run.
     collect_lock: Mutex<()>,
@@ -1083,6 +1086,8 @@ impl Default for GcRuntime {
     fn default() -> Self {
         Self {
             heap: Mutex::new(GcState::default()),
+            write_barrier_calls: AtomicU64::new(0),
+            tlab_ever_allocated: std::sync::atomic::AtomicBool::new(false),
             collect_lock: Mutex::new(()),
             root_stack_owner: Mutex::new(None),
             skipped_foreign_owner_collections: std::sync::atomic::AtomicU64::new(0),
@@ -2470,6 +2475,7 @@ fn allocate_tlab_chunk(state: &mut GcState, owner_state: usize) -> Option<*mut u
     if base.is_null() {
         return None;
     }
+    runtime().tlab_ever_allocated.store(true, Ordering::Release);
     state
         .tlab_addresses
         .insert(base as usize, state.tlab_chunks.len());
@@ -2718,7 +2724,12 @@ pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
     }
 
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
-    if let Some(cycle) = runtime().heap.lock().unwrap().concurrent_cycle.as_ref() {
+    // Registry publication cannot safepoint before the insertion finishes.
+    // The activation handshake crosses it before taking runtime roots, just
+    // as it crosses the corresponding phase-gated SATB deletion below.
+    if GC_MARK_PHASE.load(Ordering::Acquire) != 0
+        && let Some(cycle) = runtime().heap.lock().unwrap().concurrent_cycle.as_ref()
+    {
         cycle.enqueue(object);
     }
     runtime().runtime_roots.add(object);
@@ -2989,6 +3000,12 @@ fn payload_generation(state: &GcState, payload: *mut u8) -> Option<u8> {
     if let Some(object) = find_old_region_object(state, address, false) {
         return Some(object.generation());
     }
+    tlab_payload_generation(state, address)
+}
+
+// Old-region objects cannot be young. Callers testing only for a young edge
+// must not search the old-region and per-region allocation indexes first.
+fn tlab_payload_generation(state: &GcState, address: usize) -> Option<u8> {
     if let Some(chunk) = find_tlab_chunk(state, address) {
         // Active generated chunks are exclusively young. Their header prefix
         // is still advancing, so do not inspect unpublished headers here.
@@ -3101,7 +3118,22 @@ pub extern "C" fn willow_gc_write_barrier(
     destination_kind: i64,
 ) {
     let marking_active = GC_MARK_PHASE.load(Ordering::Acquire) != 0;
-    if value.is_null() && old_value.is_null() {
+    // A null store creates no generational edge; its deletion is relevant
+    // only during SATB marking. Like null/null, an inactive deletion is a
+    // no-op and is excluded from the processed-barrier telemetry counter.
+    if value.is_null() && (old_value.is_null() || !marking_active) {
+        return;
+    }
+    let _ =
+        runtime()
+            .write_barrier_calls
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |calls| {
+                Some(calls.saturating_add(1))
+            });
+    // With no nursery ever published there are no old-to-young edges.
+    // The activation handshake crosses pre-activation barrier/store pairs
+    // before root snapshots; active epochs still take the full SATB path.
+    if !marking_active && !runtime().tlab_ever_allocated.load(Ordering::Acquire) {
         return;
     }
     let mut state = runtime().heap.lock().unwrap();
@@ -3111,8 +3143,7 @@ pub extern "C" fn willow_gc_write_barrier(
     if let Some(cycle) = &state.concurrent_cycle {
         cycle.enqueue(value);
     }
-    state.write_barrier_calls = state.write_barrier_calls.saturating_add(1);
-    if payload_generation(&state, value) != Some(GC_GENERATION_YOUNG) {
+    if tlab_payload_generation(&state, value as usize) != Some(GC_GENERATION_YOUNG) {
         return;
     }
     if let Some(owner_payload) = barrier_owner_payload(&state, owner, destination_kind) {
@@ -3407,7 +3438,7 @@ pub(crate) fn telemetry_heap_snapshot() -> (
             promoted_objects: state.promoted_objects,
             promoted_bytes: state.promoted_bytes,
             moved_objects: state.moved_objects,
-            barrier_calls: state.write_barrier_calls,
+            barrier_calls: runtime().write_barrier_calls.load(Ordering::Relaxed),
             barrier_hits: state.write_barrier_hits,
         },
         GcHeapV1 {
@@ -4364,7 +4395,10 @@ fn reset_internal() {
     state.tlab_reserved_bytes = 0;
     state.remembered_set.clear();
     state.dirty_cards.clear();
-    state.write_barrier_calls = 0;
+    runtime().write_barrier_calls.store(0, Ordering::Relaxed);
+    runtime()
+        .tlab_ever_allocated
+        .store(false, Ordering::Release);
     state.write_barrier_hits = 0;
     state.minor_collections = 0;
     state.promoted_objects = 0;

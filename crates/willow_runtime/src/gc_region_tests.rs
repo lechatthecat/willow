@@ -1446,6 +1446,185 @@ fn retired_tlab_header_index_bounds_lookup_work_and_rejects_dead_headers() {
 }
 
 #[test]
+fn barrier_without_nursery_needs_no_heap_lock_and_keeps_counters() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    let value = willow_alloc(8) as usize;
+    let state = runtime().heap.lock().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        for _ in 0..1024 {
+            willow_gc_add_runtime_root(value as *mut u8);
+            willow_gc_write_barrier(
+                value as *mut u8,
+                std::ptr::null_mut(),
+                value as *mut u8,
+                GcStoreDestination::AsyncFrameSlot as i64,
+            );
+            willow_gc_remove_runtime_root(value as *mut u8);
+        }
+        tx.send(()).unwrap();
+    });
+    let completed = rx.recv_timeout(std::time::Duration::from_secs(2));
+    // Release before asserting/joining so a regression reports a failure,
+    // rather than leaving the worker permanently blocked behind this test.
+    drop(state);
+    worker.join().unwrap();
+    assert!(
+        completed.is_ok(),
+        "inactive old-only barrier took the heap lock"
+    );
+    assert_eq!(telemetry_heap_snapshot().0.barrier_calls, 1024);
+    assert_eq!(runtime().runtime_roots.len(), 0);
+    willow_gc_write_barrier(
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        0,
+    );
+    willow_gc_write_barrier(
+        std::ptr::null_mut(),
+        value as *mut u8,
+        std::ptr::null_mut(),
+        0,
+    );
+    assert_eq!(telemetry_heap_snapshot().0.barrier_calls, 1024);
+    runtime()
+        .write_barrier_calls
+        .store(u64::MAX, Ordering::Relaxed);
+    willow_gc_write_barrier(
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        value as *mut u8,
+        0,
+    );
+    assert_eq!(telemetry_heap_snapshot().0.barrier_calls, u64::MAX);
+    reset_internal_for_test();
+    assert_eq!(runtime().write_barrier_calls.load(Ordering::Relaxed), 0);
+    assert!(!runtime().tlab_ever_allocated.load(Ordering::Acquire));
+}
+
+#[test]
+fn barrier_young_test_skips_old_indexes_and_preserves_tlab_classification() {
+    let _guard = runtime_test_guard();
+    for regions in [4usize, 16, 64, 256] {
+        reset_internal_for_test();
+        let old: Vec<_> = {
+            let mut state = runtime().heap.lock().unwrap();
+            state.threshold_bytes = usize::MAX;
+            state.nursery_threshold_bytes = usize::MAX;
+            (0..regions)
+                .map(|_| {
+                    allocate_old_region_object_locked(
+                        &mut state,
+                        0,
+                        0,
+                        GC_LARGE_OBJECT_THRESHOLD + 8,
+                        0,
+                        true,
+                    )
+                    .unwrap()
+                    .payload()
+                    .as_ptr()
+                })
+                .collect()
+        };
+        for repetitions in [1usize, 4] {
+            address_index::take_comparisons();
+            {
+                let state = runtime().heap.lock().unwrap();
+                for _ in 0..repetitions {
+                    for &value in &old {
+                        for _ in 0..2 {
+                            assert_eq!(payload_generation(&state, value), Some(GC_GENERATION_OLD));
+                        }
+                    }
+                }
+            }
+            let previous_comparisons = address_index::take_comparisons();
+            assert!(previous_comparisons > 0);
+            for _ in 0..repetitions {
+                for &value in &old {
+                    // Two non-null reference stores per idle_worker spawn/first poll.
+                    for _ in 0..2 {
+                        willow_gc_write_barrier(
+                            old[0],
+                            std::ptr::null_mut(),
+                            value,
+                            GcStoreDestination::AsyncFrameSlot as i64,
+                        );
+                    }
+                }
+            }
+            let comparisons = address_index::take_comparisons();
+            assert_eq!(
+                comparisons, 0,
+                "old-only barriers must not search old indexes"
+            );
+            println!(
+                "young-barrier regions={regions} stores={} previous_index_comparisons={previous_comparisons} index_comparisons={comparisons}",
+                regions * repetitions * 2
+            );
+        }
+        let mut tls = tlab_state_for_test();
+        let mut young = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
+        willow_push_root(&mut young);
+        assert!(runtime().tlab_ever_allocated.load(Ordering::Acquire));
+        address_index::take_comparisons();
+        for &value in &old {
+            willow_gc_write_barrier(
+                old[0],
+                std::ptr::null_mut(),
+                value,
+                GcStoreDestination::AsyncFrameSlot as i64,
+            );
+        }
+        let comparisons = address_index::take_comparisons();
+        assert!(
+            comparisons <= regions,
+            "only the single TLAB index may be searched"
+        );
+        println!(
+            "young-barrier-with-tlab regions={regions} stores={regions} index_comparisons={comparisons}"
+        );
+        for phase in 0..3 {
+            if phase == 1 {
+                retire_all_tlabs_locked(&mut runtime().heap.lock().unwrap());
+            } else if phase == 2 {
+                willow_gc_minor_collect();
+            }
+            let state = runtime().heap.lock().unwrap();
+            for address in [
+                0,
+                1,
+                usize::MAX,
+                young as usize,
+                young as usize + 1,
+                young as usize - GC_HEADER_SIZE,
+                old[0] as usize,
+                old[0] as usize + 1,
+            ] {
+                assert_eq!(
+                    tlab_payload_generation(&state, address) == Some(GC_GENERATION_YOUNG),
+                    payload_generation(&state, address as *mut u8) == Some(GC_GENERATION_YOUNG),
+                    "regions={regions} phase={phase} address={address}"
+                );
+            }
+            assert_eq!(
+                tlab_payload_generation(&state, young as usize),
+                Some(if phase == 2 {
+                    GC_GENERATION_OLD
+                } else {
+                    GC_GENERATION_YOUNG
+                })
+            );
+        }
+        willow_pop_root();
+        reset_internal_for_test();
+    }
+}
+
+#[test]
 fn old_region_lookup_bounds_work_for_hits_misses_nursery_and_pinned_pointers() {
     let _guard = runtime_test_guard();
     for count in [16usize, 64, 256, 1024] {

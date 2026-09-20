@@ -63,6 +63,8 @@ pub struct GcCountersV1 {
     pub promoted_objects: u64,
     pub promoted_bytes: u64,
     pub moved_objects: u64,
+    /// Processed barriers; excludes null/null stores and null deletions when
+    /// SATB marking is inactive, both of which require no barrier work.
     pub barrier_calls: u64,
     pub barrier_hits: u64,
 }
