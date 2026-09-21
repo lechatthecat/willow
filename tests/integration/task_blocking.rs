@@ -90,3 +90,48 @@ async fn main() {{ let w = writer(); let p = progress(); await p; await w; }}
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn task_print_completion_does_not_complete_the_next_await() {
+    let source = r#"
+async fn value(n: i64) -> i64 { await sleep(1); return n; }
+async fn main() {
+    let mut i = 1;
+    while i <= 256 {
+        let task = value(i);
+        println(i);
+        println(await task);
+        i = i + 1;
+    }
+}
+"#;
+    let expected: String = (1..=256).map(|i| format!("{i}\n{i}\n")).collect();
+    for workers in ["1", "5"] {
+        let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+            source,
+            &[("WILLOW_WORKERS", workers), ("WILLOW_BLOCKING_QUEUE", "1")],
+            Duration::from_secs(30),
+        );
+        assert!(!timed_out, "workers={workers}: {out}");
+        assert!(ok, "workers={workers}: {out}");
+        assert_eq!(out, expected, "workers={workers}");
+    }
+}
+
+#[test]
+fn task_await_rechecks_share_one_call_site_per_suspension() {
+    for awaits in [1, 8, 64] {
+        let source = format!(
+            "async fn value() -> i64 {{ return 42; }} \
+             async fn main() {{ let task = value(); {} }}",
+            "println(await task);".repeat(awaits)
+        );
+        let targets = compile_and_collect_relocation_targets_all(&source, &[]);
+        let calls = targets
+            .iter()
+            .filter(|name| *name == "willow_frame_await")
+            .count();
+        assert_eq!(calls, awaits);
+        println!("awaits={awaits} terminal_check_call_sites={calls}");
+    }
+}

@@ -3784,6 +3784,50 @@ fn fst_12_await_of_a_pending_frame_registers_a_waiter() {
 }
 
 #[test]
+fn frame_await_repolling_does_not_duplicate_wait_relationships() {
+    let _guard = crate::gc::runtime_test_guard();
+    for waiters in [1, 16, 64] {
+        for polls in [1, 16, 256] {
+            reset_global_scheduler_for_test();
+            let mut frame = status_frame();
+            let (awaitee, ids) = with_global_for_test(|s| {
+                let awaitee = s.spawn_placeholder();
+                s.with_task_mut(awaitee, |task| task.frame = frame_ptr(&mut frame));
+                let ids: Vec<_> = (0..waiters).map(|_| s.spawn_parked_placeholder()).collect();
+                (awaitee, ids)
+            });
+            for _ in 0..polls {
+                for &id in &ids {
+                    let ready = with_current_task_for_test(id, || {
+                        willow_frame_await(frame_ptr(&mut frame), awaitee)
+                    });
+                    assert_eq!(ready, 0);
+                }
+            }
+            with_global_for_test(|s| {
+                assert_eq!(
+                    s.with_task(awaitee, |task| task.live_waiters()).unwrap(),
+                    ids
+                );
+                for &id in &ids {
+                    assert_eq!(s.with_task(id, |task| task.awaiting_count()), Some(1));
+                }
+                s.complete(awaitee);
+                for &id in &ids {
+                    assert_eq!(s.with_task(id, |task| task.awaiting_count()), Some(0));
+                }
+            });
+            assert_eq!(willow_frame_await(frame_ptr(&mut frame), awaitee), 1);
+            println!(
+                "waiters={waiters} polls={polls} checks={} relationships={waiters}",
+                waiters * polls
+            );
+        }
+    }
+    reset_global_scheduler_for_test();
+}
+
+#[test]
 fn fst_13_null_frame_await_falls_back_to_the_id_path() {
     let _guard = crate::gc::runtime_test_guard();
     reset_global_scheduler_for_test();

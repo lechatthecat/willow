@@ -1702,37 +1702,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .call(fref, &[task_id, file_ptr, line_val]);
     }
 
-    /// The suspension core shared by every frame-backed await: `await
-    /// <cooperative-leaf-call>`, `await <task>`, and their LIR counterparts
-    /// (willow-0g8j.2.11).
-    ///
-    /// `awaited` is the callee/task frame, already evaluated. When `stored_slot`
-    /// is `Some`, the frame is stashed there and RELOADED in the resume block —
-    /// the native stack is gone after a park, and re-evaluating the awaited
-    /// expression could call a function twice or select a different task
-    /// (willow-0a6k.6). The reloaded frame is what this returns; `None` means
-    /// the caller owns the reload, which is only correct for `await <var>`,
-    /// where the local is itself frame-backed.
-    ///
-    /// On return the builder is positioned in the resume block, reached both
-    /// from the scheduler dispatch on wake and from the already-terminal branch.
+    /// Poll a task's terminal status on every wake. Notifications can belong
+    /// to an earlier operation (for example an offloaded stdout write), so a
+    /// wake alone never permits reading the result. Reload the already-evaluated
+    /// task from its frame slot on every poll, including after moving GC.
     pub(super) fn emit_coop_frame_await(
         &mut self,
-        awaited: cranelift_codegen::ir::Value,
-        stored_slot: Option<i32>,
-        spawn_site_line: Option<usize>,
+        awaited_slot: i32,
         suspends: &mut CoopSuspendPoints,
         frame: cranelift_codegen::ir::Value,
-    ) -> Option<cranelift_codegen::ir::Value> {
-        if let Some(offset) = stored_slot {
-            self.emit_gc_heap_store_classified(
-                frame,
-                offset,
-                awaited,
-                true,
-                GcStoreDestination::AsyncFrameSlot,
-            );
-        }
+    ) {
+        let check = self.builder.create_block();
+        self.builder.ins().jump(check, &[]);
+        self.builder.switch_to_block(check);
+        let awaited = self.builder.ins().load(
+            reference_type(self.module.target_config()),
+            MemFlagsData::new(),
+            frame,
+            awaited_slot,
+        );
         // id = awaited[TASK_ID] (slot 1).
         let id = self.builder.ins().load(
             types::I64,
@@ -1743,9 +1731,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 reference_type(self.module.target_config()).bytes(),
             ),
         );
-        if let Some(line) = spawn_site_line {
-            self.emit_set_spawn_site(id, line);
-        }
         // done = willow_frame_await(awaited, id): 1 = already terminal,
         // 0 = registered as a waiter. The frame's own header answers "already
         // terminal?" without a scheduler lookup (willow-ezs.1.3); the id is
@@ -1763,7 +1748,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder
             .ins()
             .brif(is_done, resume_b, &[], suspend_b, &[]);
-        // suspend: record resume state (1-based index of resume_b), return Pending.
+        // Suspend back to the status check, not the result-reading continuation.
         self.builder.switch_to_block(suspend_b);
         let state = (suspends.len() + 1) as i64;
         let st = self.builder.ins().iconst(types::I64, state);
@@ -1773,16 +1758,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_coop_unwind_poll_roots();
         let pending = self.builder.ins().iconst(types::I32, 0);
         self.builder.ins().return_(&[pending]);
-        self.record_coop_suspend(suspends, resume_b);
+        self.record_coop_suspend(suspends, check);
         self.builder.switch_to_block(resume_b);
-        stored_slot.map(|offset| {
-            self.builder.ins().load(
-                reference_type(self.module.target_config()),
-                MemFlagsData::new(),
-                frame,
-                offset,
-            )
-        })
     }
 
     /// Read a completed callee frame's RESULT slot. A CANCELLED callee has no

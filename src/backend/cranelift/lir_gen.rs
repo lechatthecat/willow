@@ -5632,8 +5632,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 result_ty,
                 cancel_aware,
             } => {
-                let task_frame = self.load_lir_local(function, *task);
-                self.emit_coop_frame_await(task_frame, None, None, suspends, frame);
+                self.emit_coop_frame_await(self.lir_frame_offsets[task], suspends, frame);
                 let task_frame = self.load_lir_local(function, *task);
                 if let Some(result) = result {
                     let value = self
