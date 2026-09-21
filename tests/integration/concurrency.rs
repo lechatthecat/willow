@@ -3841,11 +3841,30 @@ fn cancel_15_long_sleeper_finishes_fast() {
 
 #[test]
 fn cancel_16_gc_stress() {
-    let (out, ok) = compile_and_run_gc_stress(
-        "async fn t() -> String { await sleep(20); return \"kept\"; }\nasync fn main() { let h = t(); h.cancel(); await sleep(40); println(h.is_cancelled()); }",
-    );
-    assert!(ok, "{out}");
-    assert_eq!(out, "true\n");
+    // GC stress can delay the caller beyond the timer. An unsent channel
+    // prevents normal completion before cancellation, regardless of scheduling.
+    for delay in [0, 80] {
+        let source = format!(
+            r#"
+async fn t(gate: Channel<i64>) -> String {{
+    await sleep(20);
+    gate.recv();
+    return "kept";
+}}
+async fn main() {{
+    let gate = Channel<i64>::new();
+    let h = t(gate);
+    await sleep({delay});
+    h.cancel();
+    await sleep(40);
+    println(h.is_cancelled());
+}}
+"#
+        );
+        let (out, ok) = compile_and_run_gc_stress(&source);
+        assert!(ok, "delay={delay}: {out}");
+        assert_eq!(out, "true\n", "delay={delay}");
+    }
 }
 
 #[test]
