@@ -7548,6 +7548,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         result: &Type,
         span: Span,
     ) -> cranelift_codegen::ir::Value {
+        // Length has no allocating/coercing successful path. Its only runtime
+        // fallback receives null, so no transient receiver root is needed.
+        if matches!(intrinsic, Intrinsic::ArrayLen | Intrinsic::FrozenArrayLen) {
+            return self.emit_array_access(receiver, None, None);
+        }
         // Frame-backed references can otherwise move during a coercion or a
         // blocking runtime call. Direct roots pin every loaded SSA operand.
         let roots_before = self.gc_root_count;
@@ -7701,9 +7706,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_runtime_call_with_cleanup(&symbol, &values, |_| {})
                     .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
             }
-            ArrayLen | FrozenArrayLen => {
-                self.emit_value_runtime_call("willow_array_len", &[receiver])
-            }
+            ArrayLen | FrozenArrayLen => self.emit_array_access(receiver, None, None),
             ArrayPush => {
                 let element = array_element_type(receiver_ty);
                 let value = self.coerce_to_target(args[0], &arg_types[0], &element);

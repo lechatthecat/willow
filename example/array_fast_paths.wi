@@ -1,0 +1,26 @@
+// Scalar access stays valid across growth, collection, and reference calls.
+import std::collections::Array;
+
+fn update(xs: &mut Array<i64>) {
+    gc_minor_collect();
+    xs[0] = 42;
+}
+
+fn main() {
+    let mut xs: Array<i64> = [];
+    let mut i = 0;
+    while i < 100 { xs.push(i); i = i + 1; }
+    update(&xs);
+    println(xs[0]);
+    let flags = [false];
+    flags[0] = true;
+    println(flags[0]);
+    let floats = [0.0];
+    floats[0] = -1.25;
+    println(floats[0] == -1.25);
+    let frozen = xs.freeze();
+    xs[0] = 7;
+    gc_collect();
+    println(frozen[0]);
+    println(xs[0]);
+}

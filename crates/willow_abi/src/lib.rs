@@ -20,6 +20,23 @@ pub const fn storage_word_bytes(pointer_bytes: u32) -> u32 {
     if pointer_bytes < 8 { 8 } else { pointer_bytes }
 }
 
+/// Array payloads use fixed 64-bit slots, including on narrow-pointer targets.
+/// Buffer word zero publishes the logical length, not the allocation capacity.
+pub mod array_layout {
+    pub const WORD_BYTES: i32 = 8;
+    pub const H_LEN: usize = 0;
+    pub const H_CAP: usize = 1;
+    pub const H_IS_REF: usize = 2;
+    pub const H_BUF: usize = 3;
+    pub const HANDLE_WORDS: i64 = 4;
+    pub const HANDLE_MASK: u64 = 1 << H_BUF;
+    pub const BUFFER_HEADER_WORDS: usize = 1;
+
+    pub const fn handle_offset(word: usize) -> i32 {
+        word as i32 * WORD_BYTES
+    }
+}
+
 pub mod workers;
 
 pub mod runtime_symbols;

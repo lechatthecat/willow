@@ -31,15 +31,10 @@ use crate::gc::{
 
 use willow_abi::runtime_type_ids::ARRAY_REF_TYPE_ID;
 
-const WORD: i64 = std::mem::size_of::<i64>() as i64;
-
-// Handle word offsets.
-const H_LEN: usize = 0;
-const H_CAP: usize = 1;
-const H_IS_REF: usize = 2;
-const H_BUF: usize = 3;
-const HANDLE_WORDS: i64 = 4;
-const HANDLE_MASK: u64 = 0b1000; // only word 3 (the buffer pointer) is a GC ref
+use willow_abi::array_layout::{
+    BUFFER_HEADER_WORDS, H_BUF, H_CAP, H_IS_REF, H_LEN, HANDLE_MASK, HANDLE_WORDS, WORD_BYTES,
+};
+const WORD: i64 = WORD_BYTES as i64;
 
 /// Read the published live prefix; the buffer remains independently traceable
 /// when a captured element reference keeps it alive after handle growth.
@@ -111,7 +106,10 @@ fn ensure_trace_registered() {
 /// Allocate an empty, zero-initialized buffer of `cap` slots (`[len=0, e0..]`).
 fn alloc_buffer(cap: i64, is_ref: bool) -> *mut u8 {
     // length word + one word per element, with overflow checked end-to-end.
-    let payload = match cap.checked_add(1).and_then(|words| words.checked_mul(WORD)) {
+    let payload = match cap
+        .checked_add(BUFFER_HEADER_WORDS as i64)
+        .and_then(|words| words.checked_mul(WORD))
+    {
         Some(p) => p,
         None => {
             raise_with(&format!("array capacity too large: {cap}"));
@@ -137,7 +135,7 @@ fn alloc_buffer(cap: i64, is_ref: bool) -> *mut u8 {
 /// # Safety
 /// `buffer` must be a buffer with at least `index + 1` slots.
 unsafe fn buf_slot(buffer: *mut u8, index: i64) -> *mut i64 {
-    unsafe { (buffer as *mut i64).add(1 + index as usize) }
+    unsafe { (buffer as *mut i64).add(BUFFER_HEADER_WORDS + index as usize) }
 }
 
 unsafe fn store_buffer_slot(buffer: *mut u8, index: i64, value: i64, is_ref: bool) {
@@ -454,6 +452,25 @@ mod tests {
         runtime_test_guard, willow_gc_collect, willow_gc_init, willow_pop_roots, willow_push_root,
     };
     use crate::string::{willow_string_as_str, willow_string_from_str};
+
+    #[test]
+    fn array_shared_layout_matches_allocated_payload() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let array = willow_array_new(3, 0);
+        willow_array_push(array, 42);
+        unsafe {
+            assert_eq!(WORD_BYTES as usize, std::mem::size_of::<i64>());
+            assert_eq!(handle_word(array, H_LEN), 4);
+            assert!(handle_word(array, H_CAP) > 4);
+            assert_eq!(handle_word(array, H_IS_REF), 0);
+            let buffer = handle_buffer(array);
+            assert_eq!(buffer_len(buffer), 4);
+            assert_eq!(buf_slot(buffer, 0).byte_offset_from(buffer), 8);
+            assert_eq!(*buf_slot(buffer, 3), 42);
+            assert_eq!(HANDLE_MASK, 1 << H_BUF);
+        }
+    }
 
     #[test]
     fn array_unit_01_new_sets_length() {

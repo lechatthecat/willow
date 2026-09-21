@@ -42,6 +42,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         value: &LirOperand,
         element_ty: &Type,
     ) -> Value {
+        // Primitive coercions and operand loads cannot allocate or suspend.
+        // Load the owner from its current storage and never retain a raw buffer
+        // across a call, safepoint, or suspension on the successful path.
+        if matches!(element_ty, Type::I64 | Type::F64 | Type::Bool) {
+            let array = self.emit_lir_operand(function, array);
+            let index = self.emit_lir_operand(function, index);
+            let value = self.emit_lir_operand(function, value);
+            let word = self.coerce_to_i64(value, element_ty);
+            return self.emit_array_access(array, Some(index), Some(word));
+        }
         let array = self.emit_lir_operand(function, array);
         // A frame-backed local is only an interior edge of the rooted frame.
         // Pin its loaded SSA value across allocating interface coercions.
@@ -66,10 +76,97 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> Value {
         let array = self.emit_lir_operand(function, array);
         let index = self.emit_lir_operand(function, index);
-        let value = self
-            .emit_runtime_call_with_cleanup("willow_array_get", &[array, index], |_| {})
-            .expect("array getter returns a value");
+        let value = self.emit_array_access(array, Some(index), None);
         self.coerce_i64_to(value, element_ty)
+    }
+
+    /// Inline nonallocating access; retain ABI panic propagation on cold failures.
+    /// A missing index requests len; a supplied word requests a scalar store.
+    pub(super) fn emit_array_access(
+        &mut self,
+        array: Value,
+        index: Option<Value>,
+        word: Option<Value>,
+    ) -> Value {
+        use willow_abi::array_layout as layout;
+        let inspect = self.builder.create_block();
+        let slow = self.builder.create_block();
+        self.builder.set_cold_block(slow);
+        let done = self.builder.create_block();
+        self.builder.append_block_param(done, types::I64);
+        let null = self.builder.ins().icmp_imm_s(IntCC::Equal, array, 0);
+        self.builder.ins().brif(null, slow, &[], inspect, &[]);
+        self.builder.switch_to_block(inspect);
+        self.builder.seal_block(inspect);
+        let len = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            array,
+            layout::handle_offset(layout::H_LEN),
+        );
+        let result = if let Some(index) = index {
+            let access = self.builder.create_block();
+            // Unsigned comparison rejects negative indexes; an explicit length
+            // guard also prevents malformed negative lengths from passing.
+            let in_bounds = self.builder.ins().icmp(IntCC::UnsignedLessThan, index, len);
+            let nonnegative =
+                self.builder
+                    .ins()
+                    .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, len, 0);
+            let valid = self.builder.ins().band(in_bounds, nonnegative);
+            self.builder.ins().brif(valid, access, &[], slow, &[]);
+            self.builder.switch_to_block(access);
+            self.builder.seal_block(access);
+            let ptr_ty = reference_type(self.module.target_config());
+            let buffer = self.builder.ins().load(
+                ptr_ty,
+                MemFlagsData::new(),
+                array,
+                layout::handle_offset(layout::H_BUF),
+            );
+            let offset = self
+                .builder
+                .ins()
+                .imul_imm_s(index, i64::from(layout::WORD_BYTES));
+            let offset = if ptr_ty == types::I64 {
+                offset
+            } else {
+                self.builder.ins().ireduce(ptr_ty, offset)
+            };
+            let slot = self.builder.ins().iadd(buffer, offset);
+            let header = layout::BUFFER_HEADER_WORDS as i32 * layout::WORD_BYTES;
+            if let Some(word) = word {
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::new(), word, slot, header);
+                self.builder.ins().iconst(types::I64, 0)
+            } else {
+                self.builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), slot, header)
+            }
+        } else {
+            len
+        };
+        self.builder.ins().jump(done, &[result.into()]);
+
+        self.builder.switch_to_block(slow);
+        self.builder.seal_block(slow);
+        let result = match (index, word) {
+            (Some(index), Some(word)) => {
+                self.emit_void_runtime_call("willow_array_set", &[array, index, word]);
+                self.builder.ins().iconst(types::I64, 0)
+            }
+            (Some(index), None) => {
+                self.emit_value_runtime_call("willow_array_get", &[array, index])
+            }
+            (None, None) => self.emit_value_runtime_call("willow_array_len", &[array]),
+            (None, Some(_)) => unreachable!("array store requires an index"),
+        };
+        self.builder.ins().jump(done, &[result.into()]);
+        self.builder.switch_to_block(done);
+        self.builder.seal_block(done);
+        self.builder.block_params(done)[0]
     }
 
     pub(super) fn emit_flat_object_alloc(&mut self, class: &TypeId) -> Value {
