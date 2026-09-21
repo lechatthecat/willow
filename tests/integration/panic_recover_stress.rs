@@ -687,7 +687,12 @@ async fn main() {
 }
 "#;
     let out = run_stress(source, &[("WILLOW_WORKERS", "4")]);
-    assert_eq!(out, "5\ncleaned\ntrue\n");
+    // Cancellation cleanup and the peer's result run on independent workers.
+    // Both must occur exactly once, before the final cancellation status.
+    assert!(
+        out == "5\ncleaned\ntrue\n" || out == "cleaned\n5\ntrue\n",
+        "unexpected cancellation/recovery output: {out:?}"
+    );
 }
 
 /// Perspective 23.

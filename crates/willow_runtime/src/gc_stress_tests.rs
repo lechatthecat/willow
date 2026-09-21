@@ -279,9 +279,25 @@ fn stress_region_05_minor_major_and_remembered_set_interleave() {
 
         willow_gc_minor_collect();
 
+        let survivor = unsafe { *(parent as *mut *mut u8) };
+        assert_ne!(survivor, young);
+        assert_eq!(unsafe { *(survivor as *mut i64) }, round);
+        assert_eq!(
+            unsafe { (*payload_to_header(survivor)).generation },
+            GC_GENERATION_YOUNG
+        );
+        assert_eq!(willow_gc_remembered_set_size(), 1);
+
+        // No intervening store: the remembered owner must retain the survivor
+        // until the second minor collection tenures it.
+        willow_gc_minor_collect();
         let promoted = unsafe { *(parent as *mut *mut u8) };
-        assert_ne!(promoted, young);
+        assert_ne!(promoted, survivor);
         assert_eq!(unsafe { *(promoted as *mut i64) }, round);
+        assert_eq!(
+            unsafe { (*payload_to_header(promoted)).generation },
+            GC_GENERATION_OLD
+        );
         assert_eq!(willow_gc_remembered_set_size(), 0);
         if round % 10 == 0 {
             willow_gc_collect();
@@ -440,8 +456,9 @@ fn stress_region_09_sparse_pinned_waves_quantify_retained_capacity() {
     reset_gc();
     const WAVES: usize = 8;
     const CHUNKS_PER_WAVE: usize = 64;
-    const SURVIVOR_PAYLOAD_SIZE: usize = 24;
-    const SURVIVOR_SIZE: usize = GC_HEADER_SIZE + SURVIVOR_PAYLOAD_SIZE;
+    // Keep the fixture at 64 bytes regardless of the runtime header size.
+    const SURVIVOR_SIZE: usize = 64;
+    const SURVIVOR_PAYLOAD_SIZE: usize = SURVIVOR_SIZE - GC_HEADER_SIZE;
     const OBJECTS_PER_CHUNK: usize = GC_TLAB_CHUNK_SIZE / SURVIVOR_SIZE;
     const TOTAL_CHUNKS: usize = WAVES * CHUNKS_PER_WAVE;
     const EXPECTED_RESERVED: usize = TOTAL_CHUNKS * GC_TLAB_CHUNK_SIZE;
@@ -455,7 +472,13 @@ fn stress_region_09_sparse_pinned_waves_quantify_retained_capacity() {
     for wave in 1..=WAVES {
         for chunk_index in 0..CHUNKS_PER_WAVE {
             let mut tls = Box::new(new_tlab_state());
-            let survivor = willow_gc_alloc_slow(&mut *tls, 1, chunk_index as i64 + 1, 24, 0);
+            let survivor = willow_gc_alloc_slow(
+                &mut *tls,
+                1,
+                chunk_index as i64 + 1,
+                SURVIVOR_PAYLOAD_SIZE as i64,
+                0,
+            );
             unsafe { *(survivor as *mut i64) = (wave * CHUNKS_PER_WAVE + chunk_index) as i64 };
             survivors.push(survivor);
             willow_push_root(
@@ -465,7 +488,7 @@ fn stress_region_09_sparse_pinned_waves_quantify_retained_capacity() {
             );
 
             for object_index in 1..OBJECTS_PER_CHUNK {
-                let dead = tlab_fast_alloc(&tls, 2, object_index as u32, 24, 0);
+                let dead = tlab_fast_alloc(&tls, 2, object_index as u32, SURVIVOR_PAYLOAD_SIZE, 0);
                 unsafe { *(dead as *mut i64) = object_index as i64 };
             }
             states.push(tls);
@@ -535,8 +558,9 @@ fn stress_region_10_bounded_runtime_root_lifetimes_bound_pinned_retention() {
     const LIVE_WINDOW: usize = 4;
     const CHUNKS_PER_WAVE: usize = 16;
     const OBJECTS_PER_CHUNK: usize = 64;
-    const SURVIVOR_PAYLOAD_SIZE: usize = 24;
-    const SURVIVOR_SIZE: usize = GC_HEADER_SIZE + SURVIVOR_PAYLOAD_SIZE;
+    // Keep the fixture at 64 bytes regardless of the runtime header size.
+    const SURVIVOR_SIZE: usize = 64;
+    const SURVIVOR_PAYLOAD_SIZE: usize = SURVIVOR_SIZE - GC_HEADER_SIZE;
     const WAVE_RESERVED: usize = CHUNKS_PER_WAVE * GC_TLAB_CHUNK_SIZE;
     const WAVE_LIVE: usize = CHUNKS_PER_WAVE * SURVIVOR_SIZE;
     const WAVE_FRAGMENTATION: usize = CHUNKS_PER_WAVE * (OBJECTS_PER_CHUNK - 1) * SURVIVOR_SIZE;
@@ -550,12 +574,18 @@ fn stress_region_10_bounded_runtime_root_lifetimes_bound_pinned_retention() {
         let mut batch = Vec::with_capacity(CHUNKS_PER_WAVE);
         for chunk_index in 0..CHUNKS_PER_WAVE {
             let mut tls = Box::new(new_tlab_state());
-            let survivor = willow_gc_alloc_slow(&mut *tls, 1, chunk_index as i64 + 1, 24, 0);
+            let survivor = willow_gc_alloc_slow(
+                &mut *tls,
+                1,
+                chunk_index as i64 + 1,
+                SURVIVOR_PAYLOAD_SIZE as i64,
+                0,
+            );
             unsafe { *(survivor as *mut i64) = (wave * CHUNKS_PER_WAVE + chunk_index) as i64 };
             willow_gc_add_runtime_root(survivor);
             batch.push(survivor);
             for object_index in 1..OBJECTS_PER_CHUNK {
-                let dead = tlab_fast_alloc(&tls, 2, object_index as u32, 24, 0);
+                let dead = tlab_fast_alloc(&tls, 2, object_index as u32, SURVIVOR_PAYLOAD_SIZE, 0);
                 unsafe { *(dead as *mut i64) = object_index as i64 };
             }
             states.push(tls);
