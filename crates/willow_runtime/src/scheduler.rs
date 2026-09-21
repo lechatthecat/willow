@@ -3035,6 +3035,15 @@ fn claim_global_ready_for_worker(
         // a requeue (willow-atth).
         let _in_flight = ClaimInFlight::enter();
         let id = queues.pop_for_worker(worker)?;
+        // Even a foreign-affinity reroute must resolve under the idle
+        // snapshot gate. Otherwise the snapshot can read an empty queue,
+        // then miss the claim after it requeues and clears its marker.
+        let claim_guard = shared.map(|state| {
+            state
+                .claim_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
         #[cfg(any(
             all(
                 target_os = "linux",
@@ -3057,12 +3066,6 @@ fn claim_global_ready_for_worker(
             queues.push_local(owner, id);
             return None;
         }
-        let claim_guard = shared.map(|state| {
-            state
-                .claim_gate
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-        });
         if shared.is_some_and(|state| state.stop.load(Ordering::Acquire)) {
             drop(claim_guard);
             // The queue token is still set because no claim occurred.

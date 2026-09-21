@@ -202,3 +202,52 @@ fn native_affinity_queries_scale_with_drives_not_resident_tasks() {
     }
     reset_global_scheduler_for_test();
 }
+
+#[test]
+fn affinity_reroute_keeps_claim_visible_until_idle_snapshot_finishes() {
+    let _guard = crate::gc::runtime_test_guard();
+    reset_global_scheduler_for_test();
+    replace_global_scheduler_for_test(2);
+    let task = willow_sched_spawn(deep_affinity_poll, std::ptr::null_mut());
+    // An unstarted stack provides real affinity without leaving a suspended
+    // callback to unwind when the fixture is torn down.
+    let stack = crate::native_stack::NativeStack::acquire(deep_affinity_poll, std::ptr::null_mut());
+    let owner = stack.worker;
+    global_task_table().with_mut(task, |record| record.native_stack = Some(stack));
+    let state = Arc::new(ParallelRunState::default());
+    let gate = state.claim_gate.lock().unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let claim_state = Arc::clone(&state);
+    let claimer = std::thread::spawn(move || {
+        let no_work = claim_global_ready_for_worker(owner + 1, Some(&claim_state)).is_none();
+        done_tx.send(no_work).unwrap();
+    });
+    // Before the fix the foreign worker rerouted the task and dropped its
+    // in-flight marker while this gate (the idle snapshot) was still held.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut escaped = None;
+    while !claims_in_flight() && Instant::now() < deadline {
+        if let Ok(result) = done_rx.try_recv() {
+            escaped = Some(result);
+            break;
+        }
+        std::thread::yield_now();
+    }
+    let escaped = escaped.or_else(|| done_rx.recv_timeout(Duration::from_millis(100)).ok());
+    let visible = claims_in_flight();
+    drop(gate);
+    let no_work = escaped.unwrap_or_else(|| done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    claimer.join().unwrap();
+    let queued = global_run_queues().contains(task);
+    reset_global_scheduler_for_test();
+    assert!(no_work, "a foreign worker must not claim an affined task");
+    assert!(queued, "reroute must preserve the queue entry");
+    assert!(
+        escaped.is_none(),
+        "affinity reroute escaped the idle snapshot gate"
+    );
+    assert!(
+        visible,
+        "the popped task must remain visible as an in-flight claim"
+    );
+}
