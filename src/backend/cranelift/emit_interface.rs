@@ -3,6 +3,12 @@ use cranelift_module::Module;
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    // Candidate queries and defining-class visits, isolated per compiler thread.
+    static DISPATCH_WORK: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+
 /// How one class-method call site must be emitted (willow-fm7t).
 ///
 /// Produced by [`FuncGen::plan_virtual_call`] for LIR emission. The plan fixes
@@ -168,6 +174,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// spellings of one class mangle to two symbols that share a function, and
     /// counting both would report a monomorphic call as polymorphic.
     fn virtual_dispatch_candidates(&self, class_name: &str, method_name: &str) -> Vec<String> {
+        #[cfg(test)]
+        DISPATCH_WORK.with(|work| {
+            let [queries, visits] = work.get();
+            work.set([queries + 1, visits]);
+        });
         let mut out: Vec<String> = Vec::new();
         let mut seen_targets: HashSet<FuncId> = HashSet::new();
         let push = |out: &mut Vec<String>, seen: &mut HashSet<FuncId>, cls: String| {
@@ -235,7 +246,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // The candidate set answers two compile-time questions only: can any
         // reachable target panic, and is there exactly one target (so the
         // indirect call can be devirtualized).
-        let candidates = self.virtual_dispatch_candidates(class_name, method_name);
+        let candidates = if vslot.is_none() && self.class_type_ids.contains_key(class_name) {
+            // Checked non-virtual methods cannot be overridden. Resolve only
+            // the inherited implementation; descendants cannot add targets.
+            // Unregistered names retain the cross-module interface fallback.
+            self.resolve_defining_class(class_name, method_name)
+                .into_iter()
+                .collect()
+        } else {
+            self.virtual_dispatch_candidates(class_name, method_name)
+        };
         let Some(static_class) = candidates.first().cloned() else {
             panic!(
                 "compiler invariant violated: checked class method `{class_name}::{method_name}` has no dispatch target"
@@ -305,6 +325,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let mut search = Some(class_name.to_string());
         let mut seen = HashSet::new();
         while let Some(name) = search {
+            #[cfg(test)]
+            DISPATCH_WORK.with(|work| {
+                let [queries, visits] = work.get();
+                work.set([queries, visits + 1]);
+            });
             if !seen.insert(name.clone()) {
                 break;
             }
@@ -560,7 +585,11 @@ fn main() {}
     /// zero object word, without preserving a safe-language path that creates
     /// that invalid state (willow-glaj.8).
     fn compile_interface_probe() -> Vec<u8> {
-        let tokens = crate::lexer::Lexer::new(INVALID_BOX_FIXTURE_SOURCE)
+        compile_dispatch_fixture(INVALID_BOX_FIXTURE_SOURCE)
+    }
+
+    fn compile_dispatch_fixture(source: &str) -> Vec<u8> {
+        let tokens = crate::lexer::Lexer::new(source)
             .tokenize()
             .expect("fixture should lex");
         let (program, parse_errors) = crate::parser::Parser::new(tokens).parse();
@@ -598,6 +627,59 @@ fn main() {}
             .compile_program(&program, "interface_invalid_box_fixture.wi")
             .expect("fixture should compile");
         codegen.finish().expect("fixture object should finish")
+    }
+
+    #[test]
+    fn fixed_dispatch_skips_candidate_queries_at_increasing_sizes() {
+        for shape in ["chain", "fanout"] {
+            for classes in [1, 8, 32] {
+                for calls in [1, 4, 16] {
+                    let mut source =
+                        String::from("open class C0 { pub fn fixed(self) -> i64 { return 7; } }\n");
+                    for i in 1..=classes {
+                        let parent = if shape == "chain" { i - 1 } else { 0 };
+                        source.push_str(&format!("open class C{i} extends C{parent} {{}}\n"));
+                    }
+                    source.push_str(&format!("fn probe(value: C{classes}) -> i64 {{\n"));
+                    for _ in 1..calls {
+                        source.push_str("value.fixed();\n");
+                    }
+                    source.push_str("return value.fixed(); }\n");
+                    source.push_str("fn root_probe(value: C0) -> i64 {\n");
+                    for _ in 1..calls {
+                        source.push_str("value.fixed();\n");
+                    }
+                    source.push_str("return value.fixed(); } fn main() {}\n");
+                    DISPATCH_WORK.with(|work| work.set([0; 2]));
+                    compile_dispatch_fixture(&source);
+                    let work = DISPATCH_WORK.with(|work| work.get());
+                    let depth = if shape == "chain" { classes + 1 } else { 2 };
+                    assert_eq!(
+                        work,
+                        [0, calls * (depth + 1)],
+                        "{shape}, classes={classes}, calls={calls}"
+                    );
+                    eprintln!(
+                        "fixed-dispatch shape={shape} classes={classes} calls={calls} candidate_queries={} defining_visits={}",
+                        work[0], work[1]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn virtual_dispatch_still_queries_candidates() {
+        DISPATCH_WORK.with(|work| work.set([0; 2]));
+        compile_dispatch_fixture(
+            r#"
+            open class Base { pub open fn value(self) -> i64 { return 1; } }
+            class Derived extends Base { pub override fn value(self) -> i64 { return 2; } }
+            fn probe(value: Base) -> i64 { return value.value(); }
+            fn main() {}
+        "#,
+        );
+        assert_eq!(DISPATCH_WORK.with(|work| work.get()[0]), 1);
     }
 
     fn nil_check_relocations_in_symbol(bytes: &[u8], symbol_name: &str) -> usize {

@@ -305,8 +305,16 @@ fn minor_collect_with_roots(
     state.dirty_cards.clear();
     state.minor_collections = state.minor_collections.saturating_add(1);
     let before = state.allocated_bytes as u64;
+    let young_before = state.young_allocated_bytes;
+    let promoted_before = state.promoted_bytes;
     let (_, work) = MinorCollector::new(&mut state, trace_registry, drop_registry, stop_work)
         .run(roots, remembered);
+    state.nursery_threshold_bytes = state.nursery_policy.next(
+        state.nursery_threshold_bytes,
+        young_before,
+        state.promoted_bytes.saturating_sub(promoted_before),
+        state.memory_limit_bytes,
+    );
     if std::env::var("WILLOW_GC_VERIFY_REGIONS").is_ok()
         && let Err(message) = verify_old_region_metadata(&state)
     {

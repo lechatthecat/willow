@@ -251,6 +251,36 @@ mod tests {
     }
 
     #[test]
+    fn legacy_future_await_distinguishes_blocking_timer_from_scalar_reads() {
+        let symbol = runtime_symbol("willow_future_await_void").expect("void future await ABI");
+        assert_eq!(symbol.effects(), RuntimeEffects::MAY_BLOCK);
+        assert_eq!(symbol.params, &[AbiTy::Ptr]);
+        assert_eq!(symbol.ret, Some(AbiTy::I8));
+
+        // Creating a timer only stores its deadline. Native Box allocation
+        // does not collect the Willow heap, and scalar awaits only read state.
+        for name in [
+            "willow_runtime_sleep",
+            "willow_runtime_yield",
+            "willow_future_ready_void",
+            "willow_future_ready_i64",
+            "willow_future_ready_bool",
+            "willow_future_ready_f64",
+            "willow_future_ready_ptr",
+            "willow_future_await_i64",
+            "willow_future_await_bool",
+            "willow_future_await_f64",
+            "willow_future_await_ptr",
+        ] {
+            assert_eq!(
+                runtime_symbol(name).expect("legacy future ABI").effects(),
+                RuntimeEffects::NONE,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn no_preempt_runtime_policy_avoids_double_bracketing_runtime_owned_guards() {
         let effects = |name| runtime_symbol(name).expect("known ABI symbol").effects();
         assert!(

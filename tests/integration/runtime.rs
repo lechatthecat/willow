@@ -831,6 +831,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/arithmetic.wi",
             "27\n15\n126\n3\n3\n54\n3\ntrue\n1024\n1\n",
         ),
+        ("example/array_fast_paths.wi", "42\ntrue\ntrue\n42\n7\n"),
         ("example/array_growth.wi", "5\n55\n25\n16\n3\n"),
         ("example/arrays.wi", "4\n10\n40\n100\n99\n2\nbob\ntrue\n"),
         ("example/async_sleep.wi", "42\n"),
@@ -1591,6 +1592,17 @@ fn test_runnable_example_catalog_is_complete() {
         actual_paths, expected_paths,
         "every runnable non-future example entrypoint should have an output assertion"
     );
+}
+
+#[test]
+fn test_array_fast_paths_example() {
+    let (path, expected) = runnable_example_cases()
+        .iter()
+        .find(|(path, _)| *path == "example/array_fast_paths.wi")
+        .expect("array fast paths example must be cataloged");
+    let (out, ok) = compile_file_and_run(path);
+    assert!(ok, "{path} failed to compile or run");
+    assert_eq!(out, *expected);
 }
 
 #[test]

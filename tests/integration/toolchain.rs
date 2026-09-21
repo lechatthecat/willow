@@ -1152,3 +1152,91 @@ fn main() {
         ],
     );
 }
+
+// Check object alignment as well as final addresses: a coincidentally aligned
+// link must not hide a missing alignment requirement on the input section.
+#[test]
+fn test_generated_functions_have_cache_line_alignment() {
+    use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
+
+    let id = unique_test_id();
+    let source = temp_path(format!("willow_function_alignment_{id}.wi"));
+    let binary = temp_path(format!("willow_function_alignment_{id}"));
+    fs::write(
+        &source,
+        r#"fn power(x: f64, y: f64) -> f64 { return x ** y; }
+fn fib(n: i64) -> i64 {
+    if n < 2 { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+async fn main() {
+    defer { println(7); }
+    println(fib(10));
+    println(power(2.0, 3.0));
+}"#,
+    )
+    .unwrap();
+    for mode in ["--debug", "--release"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_willowc"))
+            .args(["build", &source, "-o", &binary, mode])
+            .env("WILLOW_KEEP_OBJECT", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = fs::read(format!("{binary}.o")).unwrap();
+        let file = object::File::parse(bytes.as_slice()).unwrap();
+        let mut names = std::collections::HashSet::new();
+        for symbol in file
+            .symbols()
+            .filter(|s| s.kind() == SymbolKind::Text && s.is_definition())
+        {
+            let name = symbol.name().unwrap();
+            let section = file
+                .section_by_index(symbol.section_index().unwrap())
+                .unwrap();
+            assert!(
+                section.align() >= 64,
+                "{mode}: {name}: section alignment {}",
+                section.align()
+            );
+            assert_eq!(symbol.address() % 64, 0, "{mode}: {name}");
+            names.insert(name.to_owned());
+        }
+        assert!(
+            names.iter().any(|name| name.contains("pow_f64")),
+            "missing math helper: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name.contains("poll")),
+            "missing async poll: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name.contains("fib")),
+            "missing recursive function: {names:?}"
+        );
+        let linked_bytes = fs::read(&binary).unwrap();
+        let linked = object::File::parse(linked_bytes.as_slice()).unwrap();
+        for symbol in linked
+            .symbols()
+            .filter(|s| s.kind() == SymbolKind::Text && s.is_definition())
+        {
+            if symbol.name().is_ok_and(|name| names.contains(name)) {
+                assert_eq!(
+                    symbol.address() % 64,
+                    0,
+                    "{mode}: linked {}",
+                    symbol.name().unwrap()
+                );
+            }
+        }
+        let output = Command::new(&binary).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"55\n8\n7\n");
+    }
+    let _ = fs::remove_file(source);
+    remove_output_artifacts(&binary);
+}

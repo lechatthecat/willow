@@ -1,0 +1,6 @@
+fn wrong(x: i64) -> bool { return x; }
+fn main() {
+    let value: i64 = false;
+    let missing = unknown(1);
+    wrong(true);
+}

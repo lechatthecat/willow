@@ -384,6 +384,29 @@ fn main() {
     );
 }
 
+/// A fixed inherited target still contributes its panic effect to the caller.
+#[test]
+fn fixed_inherited_call_preserves_panic_recovery() {
+    assert_project_output(
+        r#"
+open class FixedBase {
+    pub fn fail(self) { panic("fixed"); }
+}
+class FixedChild extends FixedBase {}
+fn invoke(value: FixedChild) {
+    defer match recover() {
+        Some(info) => println("recovered:" + info.message),
+        None => println("missing panic")
+    }
+    value.fail();
+    println("unreachable");
+}
+fn main() { invoke(new FixedChild()); println("done"); }
+"#,
+        "recovered:fixed\ndone\n",
+    );
+}
+
 /// Perspective 13. One call site inside a loop, three runtime classes.
 #[test]
 fn vtable_13_an_array_of_base_elements_dispatches_per_element() {

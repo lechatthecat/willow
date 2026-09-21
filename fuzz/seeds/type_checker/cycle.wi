@@ -1,0 +1,3 @@
+open class First extends Second {}
+open class Second extends First {}
+fn main() { let value = new First(); }

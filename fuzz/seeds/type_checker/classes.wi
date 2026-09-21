@@ -1,0 +1,5 @@
+interface Value { fn value(self) -> i64; }
+class Item implements Value {
+    pub fn value(self) -> i64 { return 7; }
+}
+fn main() { let item = new Item(); let value: i64 = item.value(); }

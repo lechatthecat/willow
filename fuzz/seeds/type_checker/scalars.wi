@@ -1,0 +1,5 @@
+fn twice(x: i64) -> i64 { return x + x; }
+fn main() {
+    let value: i64 = twice(21);
+    if value == 42 { let ok: bool = true; }
+}

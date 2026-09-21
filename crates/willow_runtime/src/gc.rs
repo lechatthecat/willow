@@ -27,13 +27,16 @@ mod mark_closure;
 mod mark_workers;
 mod memory_control;
 mod minor;
+mod nursery;
 mod pacer;
 mod root_handshake;
+mod runtime_roots;
 mod satb;
 mod sweep;
 
 use free_spans::FreeSpans;
 use minor::minor_collect_internal;
+use runtime_roots::RuntimeRootSet;
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
@@ -50,7 +53,6 @@ const GC_STORAGE_WORD_BYTES: usize =
 
 const GC_GENERATION_YOUNG: u8 = 0;
 const GC_GENERATION_OLD: u8 = 1;
-const GC_NURSERY_THRESHOLD_BYTES: usize = 256 * 1024;
 const GC_CARD_SIZE: usize = 512;
 const GC_OLD_REGION_SIZE: usize = 256 * 1024;
 const GC_LARGE_OBJECT_THRESHOLD: usize = GC_OLD_REGION_SIZE / 2;
@@ -455,6 +457,7 @@ struct GcState {
     young_allocated_bytes: usize,
     /// Trigger a minor collection at the next TLAB refill after this threshold.
     nursery_threshold_bytes: usize,
+    nursery_policy: nursery::Policy,
     /// Total objects allocated lifetime.
     total_allocs: u64,
     total_allocated_bytes: u64,
@@ -926,6 +929,8 @@ fn memory_inputs(state: &GcState) -> memory_control::Inputs {
 
 impl Default for GcState {
     fn default() -> Self {
+        let memory_limit_bytes = gc_memory_limit_from_env();
+        let nursery_policy = nursery::Policy::from_env();
         Self {
             concurrent_cycle: None,
             sweeping: None,
@@ -940,14 +945,15 @@ impl Default for GcState {
             tlab_owners: HashMap::new(),
             allocated_bytes: 0,
             threshold_bytes: 1024 * 1024,
-            memory_limit_bytes: gc_memory_limit_from_env(),
+            memory_limit_bytes,
             soft_memory: memory_control::Controller::from_env(),
             last_major_live_bytes: 0,
             last_major_mark_work: 0,
             pacer: pacer::Sampler::default(),
             pacer_trigger: 1024 * 1024,
             young_allocated_bytes: 0,
-            nursery_threshold_bytes: GC_NURSERY_THRESHOLD_BYTES,
+            nursery_threshold_bytes: nursery_policy.initial(memory_limit_bytes),
+            nursery_policy,
             total_allocs: 0,
             total_allocated_bytes: 0,
             released_bytes: 0,
@@ -1018,56 +1024,6 @@ struct GcCoord {
     /// Mutators currently parked at a safepoint.
     parked: HashSet<ThreadId>,
     handshake: Option<root_handshake::Handshake>,
-}
-
-/// Reference-counted roots owned by runtime structures. Collection takes a
-/// distinct-object snapshot; repeated owners retain one entry until the last
-/// owner releases it. Keep registry locking behind this boundary.
-#[derive(Default)]
-struct RuntimeRootSet {
-    roots: Mutex<HashMap<usize, usize>>,
-}
-
-impl RuntimeRootSet {
-    fn add(&self, object: *mut u8) {
-        if object.is_null() {
-            return;
-        }
-        let mut roots = self.roots.lock().unwrap();
-        *roots.entry(object as usize).or_insert(0) += 1;
-    }
-
-    fn remove(&self, object: *mut u8) {
-        if object.is_null() {
-            return;
-        }
-        let root = object as usize;
-        let mut roots = self.roots.lock().unwrap();
-        if let Some(count) = roots.get_mut(&root) {
-            if *count > 1 {
-                *count -= 1;
-            } else {
-                roots.remove(&root);
-            }
-        }
-    }
-
-    fn snapshot(&self) -> Vec<*mut u8> {
-        self.roots
-            .lock()
-            .unwrap()
-            .keys()
-            .map(|&root| root as *mut u8)
-            .collect()
-    }
-
-    fn len(&self) -> usize {
-        self.roots.lock().unwrap().len()
-    }
-
-    fn clear(&self) {
-        self.roots.lock().unwrap().clear();
-    }
 }
 
 /// Process-wide GC services. Keeping the heap, roots, registries, and STW
@@ -4400,7 +4356,8 @@ fn reset_internal() {
     state.pacer_trigger = 1024 * 1024;
     assist::reset();
     state.young_allocated_bytes = 0;
-    state.nursery_threshold_bytes = GC_NURSERY_THRESHOLD_BYTES;
+    state.nursery_policy = nursery::Policy::from_env();
+    state.nursery_threshold_bytes = state.nursery_policy.initial(state.memory_limit_bytes);
     state.total_allocs = 0;
     state.total_allocated_bytes = 0;
     state.released_bytes = 0;

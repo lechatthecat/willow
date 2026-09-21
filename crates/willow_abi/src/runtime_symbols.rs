@@ -215,7 +215,9 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_future_ready_bool" => ([I8] -> Some(Ptr));
     NONE; "willow_future_ready_f64" => ([F64] -> Some(Ptr));
     NONE; "willow_future_ready_ptr" => ([Ptr] -> Some(Ptr));
-    NONE; "willow_future_await_void" => ([Ptr] -> Some(I8));
+    // A stored sleep future waits with thread::sleep here. This blocks the
+    // calling OS thread; it neither suspends a task nor reaches the Willow GC.
+    BLOCK; "willow_future_await_void" => ([Ptr] -> Some(I8));
     NONE; "willow_future_await_i64" => ([Ptr] -> Some(I64));
     NONE; "willow_future_await_bool" => ([Ptr] -> Some(I8));
     NONE; "willow_future_await_f64" => ([Ptr] -> Some(F64));

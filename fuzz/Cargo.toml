@@ -21,3 +21,10 @@ path = "fuzz_targets/parser.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "type_checker"
+path = "fuzz_targets/type_checker.rs"
+test = false
+doc = false
+bench = false

@@ -344,6 +344,11 @@ impl Codegen {
     pub fn new(opts: &CompilerOptions) -> Result<Self> {
         let isa_builder = cranelift_native::builder().map_err(|e| anyhow::anyhow!("{}", e))?;
         let mut flag_builder = settings::builder();
+        // Keep function cache-line placement stable across runtime-only link
+        // changes, including async entry points and internal math helpers.
+        // The shared ISA setting reaches every ObjectModule definition and
+        // preserves any larger alignment required by the target or constants.
+        flag_builder.set("log2_min_function_alignment", "6")?;
         // Apple Silicon requires position-independent executable text.
         if cfg!(target_vendor = "apple") {
             flag_builder.set("is_pic", "true")?;
