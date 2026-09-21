@@ -576,7 +576,7 @@ fn test_runtime_calls_preserve_native_import_relocations() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let bytes = fs::read(format!("{binary}.o")).unwrap();
+        let bytes = fs::read(object_path(&binary)).unwrap();
         let file = object::File::parse(bytes.as_slice()).unwrap();
         let mut calls = 0;
         for section in file.sections() {
@@ -606,6 +606,7 @@ fn test_runtime_calls_preserve_native_import_relocations() {
         assert_eq!(output.stdout, b"42\n");
     }
     let _ = fs::remove_file(source);
+    let _ = fs::remove_file(object_path(&binary));
     remove_output_artifacts(&binary);
 }
 
@@ -1187,7 +1188,7 @@ async fn main() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let bytes = fs::read(format!("{binary}.o")).unwrap();
+        let bytes = fs::read(object_path(&binary)).unwrap();
         let file = object::File::parse(bytes.as_slice()).unwrap();
         let mut names = std::collections::HashSet::new();
         for symbol in file
@@ -1238,5 +1239,6 @@ async fn main() {
         assert_eq!(output.stdout, b"55\n8\n7\n");
     }
     let _ = fs::remove_file(source);
+    let _ = fs::remove_file(object_path(&binary));
     remove_output_artifacts(&binary);
 }

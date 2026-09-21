@@ -3,7 +3,22 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Mutex, MutexGuard};
 
 const SHARD_COUNT: usize = 32;
-type Roots = HashMap<usize, usize>;
+#[derive(Default)]
+struct Roots {
+    // The map is only an index; snapshots never enumerate retained buckets.
+    indices: HashMap<usize, usize>,
+    entries: Vec<(usize, usize)>, // (address, owner count)
+}
+
+impl Roots {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn addresses(&self) -> impl Iterator<Item = usize> + '_ {
+        self.entries.iter().map(|&(address, _)| address)
+    }
+}
 
 /// Reference-counted roots owned by runtime structures. Each object belongs to
 /// one shard, so unrelated lifecycle operations need not share a registry lock.
@@ -28,7 +43,13 @@ impl RuntimeRootSet {
         }
         let root = object as usize;
         let mut roots = self.shards[Self::shard_index(root)].lock().unwrap();
-        *roots.entry(root).or_insert(0) += 1;
+        if let Some(&index) = roots.indices.get(&root) {
+            roots.entries[index].1 += 1;
+        } else {
+            let index = roots.entries.len();
+            roots.entries.push((root, 1));
+            roots.indices.insert(root, index);
+        }
     }
 
     pub(super) fn remove(&self, object: *mut u8) {
@@ -37,11 +58,15 @@ impl RuntimeRootSet {
         }
         let root = object as usize;
         let mut roots = self.shards[Self::shard_index(root)].lock().unwrap();
-        if let Some(count) = roots.get_mut(&root) {
-            if *count > 1 {
-                *count -= 1;
+        if let Some(&index) = roots.indices.get(&root) {
+            if roots.entries[index].1 > 1 {
+                roots.entries[index].1 -= 1;
             } else {
-                roots.remove(&root);
+                roots.indices.remove(&root);
+                roots.entries.swap_remove(index);
+                if let Some(&(moved, _)) = roots.entries.get(index) {
+                    *roots.indices.get_mut(&moved).unwrap() = index;
+                }
             }
         }
     }
@@ -57,7 +82,7 @@ impl RuntimeRootSet {
         let shards = self.lock_all();
         let mut roots = Vec::with_capacity(shards.iter().map(|shard| shard.len()).sum());
         for shard in &shards {
-            roots.extend(shard.keys().map(|&root| root as *mut u8));
+            roots.extend(shard.addresses().map(|root| root as *mut u8));
         }
         roots
     }
@@ -68,7 +93,7 @@ impl RuntimeRootSet {
 
     pub(super) fn clear(&self) {
         for shard in &mut self.lock_all() {
-            shard.clear();
+            **shard = Roots::default();
         }
     }
 }
@@ -96,15 +121,12 @@ mod tests {
         roots.add(pointer);
         roots.remove(pointer);
         assert_eq!(
-            roots.shards[target]
-                .lock()
-                .unwrap()
-                .get(&(pointer as usize)),
-            Some(&1)
+            roots.shards[target].lock().unwrap().entries,
+            vec![(pointer as usize, 1)]
         );
         roots.remove(pointer);
         roots.remove(pointer);
-        assert!(roots.shards[target].lock().unwrap().is_empty());
+        assert!(roots.shards[target].lock().unwrap().entries.is_empty());
         roots.add(std::ptr::null_mut());
         roots.remove(std::ptr::null_mut());
     }
@@ -137,7 +159,10 @@ mod tests {
                     }
                 }
                 let guards = roots.lock_all();
-                let occupied = guards.iter().filter(|shard| !shard.is_empty()).count();
+                let occupied = guards
+                    .iter()
+                    .filter(|shard| !shard.entries.is_empty())
+                    .count();
                 assert!(
                     occupied > SHARD_COUNT / 2,
                     "aligned roots collapsed onto too few locks"
@@ -145,7 +170,7 @@ mod tests {
                 assert_eq!(
                     guards
                         .iter()
-                        .flat_map(|shard| shard.values())
+                        .flat_map(|shard| shard.entries.iter().map(|&(_, count)| count))
                         .sum::<usize>(),
                     distinct * 4
                 );
@@ -179,6 +204,68 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_scans_only_live_entries_after_repeated_churn() {
+        for peak in [64, 256, 1024, 4096] {
+            let roots = RuntimeRootSet::default();
+            for cycle in 0..3 {
+                for index in 1..=peak {
+                    roots.add((index * 4096) as *mut u8);
+                    roots.add((index * 4096) as *mut u8);
+                }
+                // Alternate removal order to exercise both swap and tail removal.
+                for offset in 1..=peak {
+                    let index = if cycle % 2 == 0 {
+                        offset
+                    } else {
+                        peak + 1 - offset
+                    };
+                    roots.remove((index * 4096) as *mut u8);
+                    if index % 16 != 0 {
+                        roots.remove((index * 4096) as *mut u8);
+                    }
+                }
+                let guards = roots.lock_all();
+                let mut scanned = 0;
+                let capacity: usize = guards.iter().map(|s| s.indices.capacity()).sum();
+                for shard in &guards {
+                    assert_eq!(shard.indices.len(), shard.entries.len());
+                    // Count the exact dense iterator used by snapshot, including
+                    // validating every moved entry's reverse index and owner count.
+                    for address in shard.addresses().inspect(|_| scanned += 1) {
+                        let index = shard.indices[&address];
+                        assert_eq!(shard.entries[index], (address, 1));
+                        assert_eq!(address % (16 * 4096), 0);
+                    }
+                }
+                assert_eq!(scanned, peak / 16);
+                assert!(capacity > scanned);
+                drop(guards);
+                let mut snapshot: Vec<_> =
+                    roots.snapshot().into_iter().map(|p| p as usize).collect();
+                snapshot.sort_unstable();
+                assert_eq!(
+                    snapshot,
+                    (1..=peak / 16).map(|i| i * 16 * 4096).collect::<Vec<_>>()
+                );
+                eprintln!(
+                    "peak={peak} cycle={cycle} retained_buckets={capacity} scanned={scanned}"
+                );
+                for index in (16..=peak).step_by(16) {
+                    roots.remove((index * 4096) as *mut u8);
+                }
+                assert!(roots.snapshot().is_empty());
+            }
+            roots.clear();
+            assert!(
+                roots
+                    .lock_all()
+                    .iter()
+                    .all(|s| s.entries.capacity() == 0 && s.indices.capacity() == 0)
+            );
+        }
+    }
+
+    #[test]
     fn concurrent_duplicate_owners_and_snapshots() {
         const WORKERS: usize = 8;
         const DISTINCT: usize = 256;
@@ -204,8 +291,8 @@ mod tests {
                 roots
                     .lock_all()
                     .iter()
-                    .flat_map(|shard| shard.values())
-                    .all(|&count| count == WORKERS)
+                    .flat_map(|shard| shard.entries.iter().map(|&(_, count)| count))
+                    .all(|count| count == WORKERS)
             );
             barrier.wait();
             for _ in 0..32 {

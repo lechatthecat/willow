@@ -9,6 +9,62 @@ thread_local! {
     static DISPATCH_WORK: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
 }
 
+/// Function-local memoization: all metadata borrowed by `FuncGen` is immutable
+/// for this cache's lifetime. Keep source spellings as keys/results so scoped
+/// aliases retain the exact symbol lookup semantics of the uncached walk.
+#[derive(Default)]
+pub(super) struct DefiningClassCache {
+    methods: HashMap<String, HashMap<String, Option<std::rc::Rc<str>>>>,
+}
+
+impl DefiningClassCache {
+    fn resolve(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        mut visit: impl FnMut(&str) -> (bool, Option<String>),
+    ) -> Option<String> {
+        // Borrowed lookups keep cache hits allocation-free apart from returning
+        // the owned result expected by call planning.
+        if let Some(result) = self
+            .methods
+            .get(method_name)
+            .and_then(|m| m.get(class_name))
+        {
+            return result.as_deref().map(str::to_owned);
+        }
+        let classes = self.methods.entry(method_name.to_owned()).or_default();
+        let mut path = Vec::new();
+        let mut search = Some(class_name.to_owned());
+        let result = loop {
+            let Some(name) = search else { break None };
+            if let Some(result) = classes.get(&name) {
+                break result.clone();
+            }
+            #[cfg(test)]
+            DISPATCH_WORK.with(|work| {
+                let [queries, visits] = work.get();
+                work.set([queries, visits + 1]);
+            });
+            // A provisional miss also terminates malformed inheritance cycles.
+            // No recursion/reentrant lookup occurs while visiting metadata.
+            classes.insert(name.clone(), None);
+            let (defines, parent) = visit(&name);
+            path.push(name.clone());
+            if defines {
+                break Some(std::rc::Rc::<str>::from(name));
+            }
+            search = parent;
+        };
+        // Cache every suffix, not just the requested leaf: querying all nodes
+        // in a deep chain then visits each class once per method per function.
+        for name in path {
+            *classes.get_mut(&name).expect("visited class") = result.clone();
+        }
+        result.as_deref().map(str::to_owned)
+    }
+}
+
 /// How one class-method call site must be emitted (willow-fm7t).
 ///
 /// Produced by [`FuncGen::plan_virtual_call`] for LIR emission. The plan fixes
@@ -322,24 +378,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// defines `method_name`, so a subclass that INHERITS a method resolves to
     /// the implementation it actually inherits (willow-ftk).
     fn resolve_defining_class(&self, class_name: &str, method_name: &str) -> Option<String> {
-        let mut search = Some(class_name.to_string());
-        let mut seen = HashSet::new();
-        while let Some(name) = search {
-            #[cfg(test)]
-            DISPATCH_WORK.with(|work| {
-                let [queries, visits] = work.get();
-                work.set([queries, visits + 1]);
-            });
-            if !seen.insert(name.clone()) {
-                break;
-            }
-            let mangled = class_method_symbol_name(self.known_modules, &name, method_name);
-            if self.func_ids.contains_key(&mangled) {
-                return Some(name);
-            }
-            search = self.class_base.get(&name).map(ToString::to_string);
-        }
-        None
+        self.defining_class_cache
+            .borrow_mut()
+            .resolve(class_name, method_name, |name| {
+                let mangled = class_method_symbol_name(self.known_modules, name, method_name);
+                let defines = self.func_ids.contains_key(&mangled);
+                let parent = if defines {
+                    None
+                } else {
+                    self.class_base.get(name).map(ToString::to_string)
+                };
+                (defines, parent)
+            })
     }
 }
 
@@ -656,7 +706,7 @@ fn main() {}
                     let depth = if shape == "chain" { classes + 1 } else { 2 };
                     assert_eq!(
                         work,
-                        [0, calls * (depth + 1)],
+                        [0, depth + 1],
                         "{shape}, classes={classes}, calls={calls}"
                     );
                     eprintln!(
@@ -664,6 +714,89 @@ fn main() {}
                         work[0], work[1]
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn defining_cache_visits_each_class_once_per_method() {
+        for shape in ["chain", "fanout"] {
+            for classes in [1, 32, 256] {
+                for methods in [1, 4] {
+                    for repeats in [1, 4, 16] {
+                        let mut cache = DefiningClassCache::default();
+                        let mut visits = 0;
+                        for _ in 0..repeats {
+                            for method in 0..methods {
+                                // Odd methods miss: negative suffixes must also
+                                // be reused. Query leaves before their ancestors.
+                                let expected = (method % 2 == 0).then(|| "C0".to_owned());
+                                for class in (0..=classes).rev() {
+                                    let result = cache.resolve(
+                                        &format!("C{class}"),
+                                        &format!("m{method}"),
+                                        |name| {
+                                            visits += 1;
+                                            let i: usize = name[1..].parse().unwrap();
+                                            let parent = (i > 0).then(|| {
+                                                let base = if shape == "chain" { i - 1 } else { 0 };
+                                                format!("C{base}")
+                                            });
+                                            (i == 0 && method % 2 == 0, parent)
+                                        },
+                                    );
+                                    assert_eq!(result, expected);
+                                }
+                            }
+                        }
+                        assert_eq!(visits, (classes + 1) * methods);
+                        assert_eq!(
+                            cache.methods.values().map(HashMap::len).sum::<usize>(),
+                            visits
+                        );
+                        eprintln!(
+                            "defining-cache shape={shape} classes={classes} methods={methods} repeats={repeats} visits={visits} entries={visits}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn defining_cache_preserves_overrides_spellings_and_cycle_misses() {
+        let bases = HashMap::from([
+            ("Leaf", "Override"),
+            ("Override", "Base"),
+            ("Alias", "pkg::Base"),
+            ("CycleA", "CycleB"),
+            ("CycleB", "CycleA"),
+        ]);
+        let mut cache = DefiningClassCache::default();
+        for _ in 0..3 {
+            for (class, method, expected) in [
+                ("Leaf", "value", Some("Override")),
+                ("Override", "value", Some("Override")),
+                ("Base", "value", Some("Base")),
+                ("Alias", "value", Some("pkg::Base")),
+                ("Leaf", "missing", None),
+                ("CycleA", "missing", None),
+                ("CycleB", "missing", None),
+                ("CycleA", "value", Some("CycleB")),
+                ("CycleB", "value", Some("CycleB")),
+            ] {
+                assert_eq!(
+                    cache
+                        .resolve(class, method, |name| {
+                            (
+                                method == "value"
+                                    && matches!(name, "Override" | "Base" | "pkg::Base" | "CycleB"),
+                                bases.get(name).map(|base| (*base).to_owned()),
+                            )
+                        })
+                        .as_deref(),
+                    expected
+                );
             }
         }
     }

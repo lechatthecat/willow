@@ -20,6 +20,15 @@ pub(super) fn temp_path(path: impl AsRef<Path>) -> String {
         .into_owned()
 }
 
+/// Mirrors the host toolchain's intermediate-object naming convention.
+pub(super) fn object_path(bin_path: &str) -> String {
+    if cfg!(all(target_os = "windows", target_env = "msvc")) {
+        format!("{bin_path}.obj")
+    } else {
+        format!("{bin_path}.o")
+    }
+}
+
 pub(super) fn remove_output_artifacts(bin_path: &str) {
     let _ = fs::remove_file(bin_path);
     let _ = fs::remove_file(format!("{bin_path}.wsmap"));
@@ -464,12 +473,7 @@ pub(super) fn compile_and_collect_relocations_by_section(
     let id = unique_test_id();
     let src_path = temp_path(format!("willow_obj_test_{}.wi", id));
     let bin_path = temp_path(format!("willow_obj_test_{}", id));
-    // Mirrors HostToolchain::object_path.
-    let obj_path = if cfg!(all(target_os = "windows", target_env = "msvc")) {
-        format!("{bin_path}.obj")
-    } else {
-        format!("{bin_path}.o")
-    };
+    let obj_path = object_path(&bin_path);
 
     fs::write(&src_path, source).unwrap();
 

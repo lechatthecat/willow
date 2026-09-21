@@ -1633,6 +1633,8 @@ struct FuncGen<'a, 'b> {
     class_descriptor_ids: &'a TypeMap<DataId>,
     /// Per-class virtual method slot order, indexed by slot (willow-fm7t).
     class_vslots: &'a TypeMap<crate::semantic::method_slots::MethodSlots>,
+    /// Valid only for this function's immutable, scoped class/function tables.
+    defining_class_cache: std::cell::RefCell<emit_interface::DefiningClassCache>,
     /// Interface metadata for method dispatch + boxing.
     interface_infos: &'a TypeMap<InterfaceInfo>,
     /// Static `(class, interface)` vtable data objects for class→interface boxing.
