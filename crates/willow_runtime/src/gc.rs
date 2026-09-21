@@ -4464,6 +4464,19 @@ fn reset_internal() {
             tls.fast_allocated_bytes.store(0, Ordering::Release);
         }
     }
+    // Reset owns every remaining payload, including rooted objects. Finalize
+    // native owners before clearing their registries or freeing region storage.
+    // Drain the index so OldRegion::drop does not revisit reclaimed headers.
+    for region in &mut state.old_regions {
+        for (offset, _) in std::mem::take(&mut region.allocations) {
+            let object = HeapObject::from_raw(unsafe { region.base.add(offset) }.cast()).unwrap();
+            if let Some(drop_fn) = lookup_drop(object.type_id()) {
+                // SAFETY: reset is quiescent and this indexed payload is live.
+                unsafe { run_drop_hook(drop_fn, object.payload().as_ptr()) };
+            }
+            object.reclaim_in_place();
+        }
+    }
     state.old_regions.clear();
     state.old_addresses.clear();
     state.tlab_addresses.clear();
@@ -4474,6 +4487,13 @@ fn reset_internal() {
         while offset < chunk.used {
             let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast()).unwrap();
             offset += object.size();
+            // Moved or previously swept objects no longer own their payloads.
+            if object.allocated()
+                && let Some(drop_fn) = lookup_drop(object.type_id())
+            {
+                // SAFETY: reset owns the remaining initialized payload.
+                unsafe { run_drop_hook(drop_fn, object.payload().as_ptr()) };
+            }
             object.reclaim_in_place();
         }
         let layout = Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>())
@@ -4636,6 +4656,9 @@ pub fn runtime_test_guard() -> std::sync::MutexGuard<'static, ()> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod reset_tests;
 
 #[cfg(test)]
 #[path = "gc_region_tests.rs"]

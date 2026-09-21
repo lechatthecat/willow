@@ -18,7 +18,8 @@ rustc +"$toolchain" --version
 for test_filter in \
     gc::tests::test_gc_minor_collection \
     gc::tests::test_gc_runtime_root \
-    channel::tests::cancellation_tokens_follow_native_core_when_gc_wrappers_move
+    gc::reset_tests:: \
+    channel::tests::
 do
     cargo +"$toolchain" test --locked -Zbuild-std \
         --target "$target" -p willow_runtime --lib "$test_filter" \

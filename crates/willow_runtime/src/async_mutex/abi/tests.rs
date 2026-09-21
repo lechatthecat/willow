@@ -967,6 +967,8 @@ fn c_abi_reports_loss_without_a_handle_or_a_running_task() {
         // A rejected acquire leaves the value untouched.
         let owner_token = acquire_now(unsafe { mutex_from_raw(raw) }.expect("mutex"), task);
         assert_eq!(willow_async_mutex_load(raw, owner_token as i64), 5);
+        // Leave a reclaimable GC handle for the next fixture's heap reset.
+        assert_eq!(willow_async_mutex_release(raw, owner_token as i64), 1);
     });
     assert_eq!(token, -1, "no token is published on a lost acquire");
 }

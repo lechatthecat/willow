@@ -1,7 +1,7 @@
 //! Native `f64 ** f64` lowering (willow-n5yv.4-.10).
 //!
-//! The generated numerical kernel is a Cranelift translation of the binary64
-//! `pow` algorithm shipped by rust-lang/libm 0.2.16, which in turn preserves
+//! The general-exponent numerical kernel is a Cranelift translation of the
+//! binary64 `pow` algorithm shipped by rust-lang/libm 0.2.16, which preserves
 //! the FreeBSD fdlibm `e_pow.c` algorithm and its original notice:
 //!
 //! Copyright (C) 2004 by Sun Microsystems, Inc. All rights reserved.
@@ -13,6 +13,16 @@
 //! Constants are constructed from the exact binary64 bits below. V1 always
 //! emits the specified non-FMA sequence, even on FMA-capable targets, so target
 //! feature detection cannot silently change rounding.
+//!
+//! This is not fdlibm's integral-exponent algorithm: after special cases,
+//! integral exponents with |y| <= 2^53 use canonical binary exponentiation,
+//! followed by a reciprocal for negative y. Literal unrolling preserves that
+//! multiplication order. There is no uniform small-ULP accuracy guarantee for
+//! this path: squaring amplifies earlier rounding errors, and intermediate
+//! overflow/underflow can lose range before the reciprocal. The sampled maximum
+//! in willow-zeow's grid/near-one corpus is 27,174,730,217 ULP, not a global
+//! error bound; separate range probes lose subnormal results entirely. See
+//! docs/f64_power_contract.md and its reproducible numerical audit.
 
 use anyhow::Result;
 use cranelift_codegen::ir::immediates::Ieee64;

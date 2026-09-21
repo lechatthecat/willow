@@ -1,3 +1,11 @@
+//! Legacy futures are native, nonmoving allocations, separate from task frames.
+//! Constructors transfer one owned handle to the caller. Poll, await and complete
+//! borrow that handle; await does not consume it, so repeated awaits remain valid.
+//! The owner must call the matching `willow_future_release_*` exactly once after
+//! all uses and aliases have ended. Handles are not safe for concurrent access.
+//! Pointer results are borrowed payloads: releasing their future does not free
+//! the pointee. Compiler-generated lifetime cleanup is not yet implemented.
+
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
@@ -63,6 +71,36 @@ fn ready_future<T: Clone>(value: T) -> RuntimeFuture<T> {
 fn into_raw<T>(future: RuntimeFuture<T>) -> *mut c_void {
     Box::into_raw(Box::new(future)) as *mut c_void
 }
+
+/// `raw` must be the uniquely owned, live Box allocation of exactly `T`.
+unsafe fn release_raw<T>(raw: *mut c_void) {
+    if raw.is_null() {
+        crate::panic_context::fatal_invariant("null legacy future handle");
+    }
+    unsafe { drop(Box::from_raw(raw.cast::<T>())) };
+}
+
+macro_rules! release_abi {
+    ($name:ident, $ty:ty) => {
+        /// Release an owned legacy future and its native storage.
+        ///
+        /// # Safety
+        /// The handle must come from the matching typed constructor, remain
+        /// live, and have no remaining borrowers or concurrent users. This
+        /// consumes it; using or releasing it again is invalid. A null handle
+        /// is a fatal invariant violation. Pointer payloads are not freed.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $name(raw: *mut c_void) {
+            unsafe { release_raw::<$ty>(raw) };
+        }
+    };
+}
+
+release_abi!(willow_future_release_void, WillowFutureVoid);
+release_abi!(willow_future_release_i64, RuntimeFuture<i64>);
+release_abi!(willow_future_release_bool, RuntimeFuture<u8>);
+release_abi!(willow_future_release_f64, RuntimeFuture<f64>);
+release_abi!(willow_future_release_ptr, RuntimeFuture<*mut c_void>);
 
 /// # Safety
 ///
@@ -335,27 +373,89 @@ mod tests {
     }
 
     #[test]
+    fn release_destroys_owned_state_once_at_increasing_sizes() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        #[derive(Clone)]
+        struct DropCount(Rc<Cell<usize>>);
+        impl Drop for DropCount {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        for handles in [1, 16, 256] {
+            for roots in [0, 16, 256] {
+                let drops = Rc::new(Cell::new(0));
+                let mut owned = Vec::new();
+                for _ in 0..handles {
+                    let mut future = ready_future(DropCount(drops.clone()));
+                    for root in 1..=roots {
+                        future.roots_mut().push(root);
+                    }
+                    owned.push(into_raw(future));
+                }
+                assert_eq!(drops.get(), 0);
+                for raw in owned {
+                    unsafe { release_raw::<RuntimeFuture<DropCount>>(raw) };
+                }
+                assert_eq!(drops.get(), handles);
+                assert_eq!(Rc::strong_count(&drops), 1);
+                println!(
+                    "handles={handles} roots_per_handle={roots} drops={}",
+                    drops.get()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn release_ptr_preserves_borrowed_payload() {
+        let mut payload = Box::new(73_i64);
+        let ptr = (&mut *payload as *mut i64).cast();
+        let raw = willow_future_ready_ptr(ptr);
+        assert_eq!(willow_future_await_ptr(raw), ptr);
+        assert_eq!(willow_future_await_ptr(raw), ptr);
+        unsafe { willow_future_release_ptr(raw) };
+        assert_eq!(*payload, 73);
+        *payload = 91;
+        assert_eq!(*payload, 91);
+    }
+
+    #[test]
+    fn release_sleep_does_not_await_its_deadline() {
+        let raw = void_future_into_raw(WillowFutureVoid::sleep_after_millis(3_600_000));
+        assert_eq!(willow_future_is_ready_void(raw), 0);
+        unsafe { willow_future_release_void(raw) };
+    }
+
+    #[test]
     fn future_unit_01_ready_i64_abi_awaits_value() {
         let raw = willow_future_ready_i64(42);
         assert_eq!(willow_future_await_i64(raw), 42);
+        unsafe { willow_future_release_i64(raw) };
     }
 
     #[test]
     fn future_unit_02_ready_bool_abi_canonicalizes_true() {
         let raw = willow_future_ready_bool(7);
         assert_eq!(willow_future_await_bool(raw), 1);
+        unsafe { willow_future_release_bool(raw) };
     }
 
     #[test]
     fn future_unit_03_ready_bool_abi_preserves_false() {
         let raw = willow_future_ready_bool(0);
         assert_eq!(willow_future_await_bool(raw), 0);
+        unsafe { willow_future_release_bool(raw) };
     }
 
     #[test]
     fn future_unit_04_ready_f64_abi_awaits_value() {
         let raw = willow_future_ready_f64(3.5);
         assert_eq!(willow_future_await_f64(raw), 3.5);
+        unsafe { willow_future_release_f64(raw) };
     }
 
     #[test]
@@ -364,12 +464,14 @@ mod tests {
         let ptr = (&mut value as *mut i64).cast::<c_void>();
         let raw = willow_future_ready_ptr(ptr);
         assert_eq!(willow_future_await_ptr(raw), ptr);
+        unsafe { willow_future_release_ptr(raw) };
     }
 
     #[test]
     fn future_unit_06_ready_void_abi_awaits_unit() {
         let raw = willow_future_ready_void();
         assert_eq!(willow_future_await_void(raw), 0);
+        unsafe { willow_future_release_void(raw) };
     }
 
     #[test]
@@ -408,6 +510,11 @@ mod tests {
                 "await_ptr" => {
                     willow_future_await_ptr(raw);
                 }
+                "release_void" => unsafe { willow_future_release_void(raw) },
+                "release_i64" => unsafe { willow_future_release_i64(raw) },
+                "release_bool" => unsafe { willow_future_release_bool(raw) },
+                "release_f64" => unsafe { willow_future_release_f64(raw) },
+                "release_ptr" => unsafe { willow_future_release_ptr(raw) },
                 "complete_i64" => {
                     willow_future_complete_i64(raw, 42);
                 }
@@ -426,6 +533,11 @@ mod tests {
             "await_f64",
             "is_ready_ptr",
             "await_ptr",
+            "release_void",
+            "release_i64",
+            "release_bool",
+            "release_f64",
+            "release_ptr",
             "complete_i64",
         ] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -454,23 +566,24 @@ mod tests {
     #[test]
     fn valid_handles_preserve_readiness_and_completion() {
         macro_rules! check {
-            ($ty:ty, $pending:ident, $ready:ident, $poll:ident, $await:ident, $value:expr, $zero:expr) => {{
+            ($release:ident, $pending:ident, $ready:ident, $poll:ident, $await:ident, $value:expr, $zero:expr) => {{
                 let raw = $pending();
                 assert_eq!($poll(raw), 0);
                 assert_eq!($await(raw), $zero);
                 unsafe {
-                    drop(Box::from_raw(raw.cast::<RuntimeFuture<$ty>>()));
+                    $release(raw);
                 }
                 let raw = $ready($value);
                 assert_eq!($poll(raw), 1);
                 assert_eq!($await(raw), $value);
+                assert_eq!($await(raw), $value);
                 unsafe {
-                    drop(Box::from_raw(raw.cast::<RuntimeFuture<$ty>>()));
+                    $release(raw);
                 }
             }};
         }
         check!(
-            i64,
+            willow_future_release_i64,
             willow_future_pending_i64,
             willow_future_ready_i64,
             willow_future_is_ready_i64,
@@ -479,7 +592,7 @@ mod tests {
             0
         );
         check!(
-            u8,
+            willow_future_release_bool,
             willow_future_pending_bool,
             willow_future_ready_bool,
             willow_future_is_ready_bool,
@@ -488,7 +601,7 @@ mod tests {
             0
         );
         check!(
-            f64,
+            willow_future_release_f64,
             willow_future_pending_f64,
             willow_future_ready_f64,
             willow_future_is_ready_f64,
@@ -498,7 +611,7 @@ mod tests {
         );
         // A null result pointer is valid; only the future handle must be non-null.
         check!(
-            *mut c_void,
+            willow_future_release_ptr,
             willow_future_pending_ptr,
             willow_future_ready_ptr,
             willow_future_is_ready_ptr,
@@ -511,7 +624,7 @@ mod tests {
         assert_eq!(willow_future_is_ready_i64(raw), 1);
         assert_eq!(willow_future_await_i64(raw), 73);
         unsafe {
-            drop(Box::from_raw(raw.cast::<RuntimeFuture<i64>>()));
+            willow_future_release_i64(raw);
         }
         for (future, expected) in [
             (WillowFutureVoid::Ready, 1),
@@ -522,7 +635,7 @@ mod tests {
             assert_eq!(willow_future_is_ready_void(raw), expected);
             assert_eq!(willow_future_await_void(raw), 0);
             unsafe {
-                drop(Box::from_raw(raw.cast::<WillowFutureVoid>()));
+                willow_future_release_void(raw);
             }
         }
     }
@@ -531,6 +644,7 @@ mod tests {
     fn future_unit_11_pending_i64_await_returns_zero_for_mvp() {
         let raw = into_raw(RuntimeFuture::<i64>::pending());
         assert_eq!(willow_future_await_i64(raw), 0);
+        unsafe { willow_future_release_i64(raw) };
     }
 
     #[test]
@@ -539,5 +653,6 @@ mod tests {
         future.cancel();
         let raw = into_raw(future);
         assert_eq!(willow_future_await_i64(raw), 0);
+        unsafe { willow_future_release_i64(raw) };
     }
 }

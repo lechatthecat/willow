@@ -270,6 +270,23 @@ fn flags_ids_and_sizes_are_i64_next_to_native_pointers() {
 }
 
 #[test]
+fn legacy_future_release_schema() {
+    let _: unsafe extern "C" fn(*mut c_void) = future::willow_future_release_void;
+    let _: unsafe extern "C" fn(*mut c_void) = future::willow_future_release_i64;
+    let _: unsafe extern "C" fn(*mut c_void) = future::willow_future_release_bool;
+    let _: unsafe extern "C" fn(*mut c_void) = future::willow_future_release_f64;
+    let _: unsafe extern "C" fn(*mut c_void) = future::willow_future_release_ptr;
+    for suffix in ["void", "i64", "bool", "f64", "ptr"] {
+        let name = format!("willow_future_release_{suffix}");
+        assert_schema(&name, &[Ptr], None);
+        assert_eq!(
+            runtime_symbol(&name).unwrap().effects(),
+            willow_abi::RuntimeEffects::NONE
+        );
+    }
+}
+
+#[test]
 fn future_pointer_and_scalar_payloads_have_distinct_signatures() {
     let _: extern "C" fn(*mut c_void) -> *mut c_void = future::willow_future_ready_ptr;
     let _: extern "C" fn(*mut c_void) -> *mut c_void = future::willow_future_await_ptr;

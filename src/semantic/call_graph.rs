@@ -422,17 +422,12 @@ fn collect_call_sites(
         hierarchy,
         free_functions,
         current_class,
-        // The parameter scope. `walk_block` opens the body's own scope on top of
-        // it, and `exit_scope` refuses to pop this one, so parameters stay
-        // visible for the whole body without being confusable with a local.
-        scopes: vec![
-            params
-                .iter()
-                .map(|param| (param.name.clone(), Some(param.ty.clone())))
-                .collect(),
-        ],
+        bindings: LexicalBindings::default(),
         sites: CallSites::default(),
     };
+    for param in params {
+        collector.bindings.bind(&param.name, Some(param.ty.clone()));
+    }
     collector.walk(body);
     collector.sites
 }
@@ -441,21 +436,64 @@ struct CallSiteCollector<'a> {
     hierarchy: &'a ClassHierarchy,
     free_functions: &'a HashSet<&'a str>,
     current_class: Option<&'a str>,
-    /// Names visible at the current point, innermost scope last. A binding maps
-    /// to the class-bearing type it is known to hold, or `None` when the type is
-    /// not one this unit can name.
-    ///
-    /// This is the walker's real lexical scope stack (willow-uqzx.1.3). It used
-    /// to be one flat set collected in a pre-pass, so a name bound *anywhere* in
-    /// a body — a `match` arm binding, a lambda parameter — made every
-    /// same-named call site in that body look like a call through a function
-    /// value. That direction was safe but blunt; the scope stack answers the
-    /// question the call site actually asks. The same stack carries the receiver
-    /// types, which the flat map got outright wrong: an inner binding used to
-    /// leak its class to a same-named outer receiver after the inner scope had
-    /// already closed.
-    scopes: Vec<HashMap<String, Option<Type>>>,
+    bindings: LexicalBindings,
     sites: CallSites,
+}
+
+/// One visible-name index with an undo log: lookup never scans scope depth.
+/// Each scope/name pair is restored once; same-scope rebinding reuses its slot.
+#[derive(Default)]
+struct LexicalBindings {
+    visible: HashMap<String, ScopedBinding>,
+    undo: Vec<(String, Option<ScopedBinding>)>,
+    scopes: Vec<usize>,
+    #[cfg(test)]
+    probes: std::cell::Cell<usize>,
+}
+
+struct ScopedBinding {
+    depth: usize,
+    ty: Option<Type>,
+}
+
+impl LexicalBindings {
+    fn lookup(&self, name: &str) -> Option<&Option<Type>> {
+        #[cfg(test)]
+        self.probes.set(self.probes.get() + 1);
+        self.visible.get(name).map(|binding| &binding.ty)
+    }
+
+    fn bind(&mut self, name: &str, ty: Option<Type>) {
+        let depth = self.scopes.len();
+        if let Some(binding) = self.visible.get_mut(name)
+            && binding.depth == depth
+        {
+            binding.ty = ty;
+            return;
+        }
+        let previous = self
+            .visible
+            .insert(name.to_owned(), ScopedBinding { depth, ty });
+        self.undo.push((name.to_owned(), previous));
+    }
+
+    fn enter_scope(&mut self) {
+        self.scopes.push(self.undo.len());
+    }
+
+    fn exit_scope(&mut self) {
+        let Some(start) = self.scopes.pop() else {
+            return;
+        };
+        while self.undo.len() > start {
+            let (name, previous) = self.undo.pop().expect("binding in scope");
+            if let Some(ty) = previous {
+                self.visible.insert(name, ty);
+            } else {
+                self.visible.remove(&name);
+            }
+        }
+    }
 }
 
 impl CallSiteCollector<'_> {
@@ -469,7 +507,7 @@ impl CallSiteCollector<'_> {
 
     /// The innermost binding of `name`, or `None` when the name is not a local.
     fn lookup(&self, name: &str) -> Option<&Option<Type>> {
-        self.scopes.iter().rev().find_map(|scope| scope.get(name))
+        self.bindings.lookup(name)
     }
 
     /// The class a receiver expression is known to hold. Only the forms the
@@ -512,20 +550,16 @@ impl CallSiteCollector<'_> {
     }
 
     fn enter_scope(&mut self) {
-        self.scopes.push(HashMap::new());
+        self.bindings.enter_scope();
     }
 
     /// The parameter scope is not the walker's to close.
     fn exit_scope(&mut self) {
-        if self.scopes.len() > 1 {
-            self.scopes.pop();
-        }
+        self.bindings.exit_scope();
     }
 
     fn bind(&mut self, name: &str) {
-        if let Some(scope) = self.scopes.last_mut() {
-            scope.insert(name.to_string(), None);
-        }
+        self.bindings.bind(name, None);
     }
 
     fn visit_stmt(&mut self, statement: &Stmt) {
@@ -537,12 +571,9 @@ impl CallSiteCollector<'_> {
                     Expr::New(new) => Some(Type::Named(new.class_name.clone())),
                     Expr::ObjectLiteral(object) => Some(Type::Named(object.class.clone())),
                     _ => None,
-                }) && let Some(slot) = self
-                    .scopes
-                    .last_mut()
-                    .and_then(|scope| scope.get_mut(&stmt.name))
+                }) && let Some(slot) = self.bindings.visible.get_mut(&stmt.name)
                 {
-                    *slot = Some(ty);
+                    slot.ty = Some(ty);
                 }
             }
             // Resolving the base constructor needs the hierarchy plus the
@@ -645,6 +676,44 @@ mod tests {
     //! receiver's class does not leak to a same-named outer receiver, 33 a
     //! parameter stays local inside a nested block.
     use super::*;
+
+    #[test]
+    fn lexical_index_probes_are_independent_of_scope_depth() {
+        for n in [16, 64, 256, 1024] {
+            let mut bindings = LexicalBindings::default();
+            bindings.bind("receiver", Some(Type::Named("Outer".into())));
+            for i in 0..n {
+                bindings.enter_scope();
+                bindings.bind(&format!("local{i}"), None);
+                bindings.bind("receiver", Some(Type::Named(format!("Inner{i}"))));
+                // Same-scope rebinding must restore the enclosing scope too.
+                bindings.bind("receiver", None);
+                assert_eq!(bindings.lookup("receiver"), Some(&None));
+                assert_eq!(bindings.lookup("local0"), Some(&None));
+                assert_eq!(bindings.lookup("missing"), None);
+                assert_eq!(bindings.undo.len(), 1 + 2 * (i + 1));
+            }
+            for i in (0..n).rev() {
+                bindings.exit_scope();
+                assert_eq!(bindings.lookup(&format!("local{i}")), None);
+                if i > 0 {
+                    assert_eq!(bindings.lookup("receiver"), Some(&None));
+                }
+            }
+            assert_eq!(
+                bindings.lookup("receiver"),
+                Some(&Some(Type::Named("Outer".into())))
+            );
+            assert_eq!(bindings.probes.get(), 5 * n);
+            assert_eq!(bindings.visible.len(), 1);
+            assert_eq!(bindings.undo.len(), 1);
+            eprintln!(
+                "lexical-index n={n} bindings={} probes={} restored=1",
+                3 * n + 1,
+                bindings.probes.get()
+            );
+        }
+    }
 
     #[test]
     fn deep_call_site_scan_uses_a_one_megabyte_stack() {

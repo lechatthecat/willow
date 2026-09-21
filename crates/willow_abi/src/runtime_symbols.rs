@@ -229,6 +229,12 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_future_await_bool" => ([Ptr] -> Some(I8));
     NONE; "willow_future_await_f64" => ([Ptr] -> Some(F64));
     NONE; "willow_future_await_ptr" => ([Ptr] -> Some(Ptr));
+    // Release native Box storage, never the borrowed pointer payload or GC heap.
+    NONE; "willow_future_release_void" => ([Ptr] -> None);
+    NONE; "willow_future_release_i64" => ([Ptr] -> None);
+    NONE; "willow_future_release_bool" => ([Ptr] -> None);
+    NONE; "willow_future_release_f64" => ([Ptr] -> None);
+    NONE; "willow_future_release_ptr" => ([Ptr] -> None);
     // --- channels ---
     // Atomic primitives (willow-dgwo.3). Handles are native pointers;
     // AtomicBool values use the dedicated I8 representation.

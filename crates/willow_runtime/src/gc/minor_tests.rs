@@ -246,32 +246,77 @@ fn major_collection_traces_and_reclaims_survivor_storage() {
 }
 
 #[test]
-fn audit_existing_minor_metadata_walk_includes_pinned_chunks() {
+fn minor_metadata_skips_pinned_chunks_across_repeated_collections() {
+    use crate::gc::{RegionKind, willow_alloc_typed};
     let _guard = runtime_test_guard();
     for n in [32usize, 128, 512] {
-        reset_internal();
-        let mut tls = tlab_state_for_test();
-        let roots = (0..n)
-            .map(|_| willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0))
-            .collect();
-        collect(roots);
-        let mut state = runtime().heap.lock().unwrap();
-        let mut stop = crate::gc_telemetry::stops::StopWorkV2::default();
-        let (_, work) = MinorCollector::new(
-            &mut state,
-            Default::default(),
-            Default::default(),
-            &mut stop,
-        )
-        .run(vec![], Default::default());
-        assert_eq!(stop.metadata_objects, (2 * n) as u64);
-        assert_eq!(work.marked_bytes, 0);
-        eprintln!(
-            "pinned-metadata n={n} young=0 roots=0 metadata={}",
-            stop.metadata_objects
-        );
-        drop(state);
-        reset_internal();
+        for young in [0usize, 4] {
+            reset_internal();
+            let mut tls = tlab_state_for_test();
+            let roots = (0..n)
+                .map(|_| willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0))
+                .collect();
+            collect(roots);
+            // An old owner keeps a fixed young population alive through copying
+            // and tenuring. Pinned chunks themselves are deliberately unrooted:
+            // only a major collection may reclaim them.
+            let owner = willow_alloc_typed((young * size_of::<usize>()) as i64, (1 << young) - 1);
+            for cycle in 0..6 {
+                if cycle % 2 == 0 {
+                    for slot in 0..young {
+                        // Interleave dead source chunks to exercise swap removal
+                        // and address-index remapping around retained chunks.
+                        assert!(!willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0).is_null());
+                        let child = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
+                        unsafe { *owner.cast::<*mut u8>().add(slot) = child };
+                    }
+                }
+                let mut state = runtime().heap.lock().unwrap();
+                retire_all_tlabs_locked(&mut state);
+                let remembered = std::mem::take(&mut state.remembered_set);
+                state.dirty_cards.clear();
+                let mut stop = crate::gc_telemetry::stops::StopWorkV2::default();
+                let roots = if young == 0 { vec![] } else { vec![owner] };
+                let (_, work) = MinorCollector::new(
+                    &mut state,
+                    Default::default(),
+                    Default::default(),
+                    &mut stop,
+                )
+                .run(roots, remembered);
+                let expected = if cycle % 2 == 0 { 5 * young } else { 2 * young };
+                assert_eq!(stop.metadata_objects, expected as u64);
+                if young == 0 {
+                    assert_eq!(work.marked_bytes, 0);
+                }
+                assert_eq!(
+                    state
+                        .tlab_chunks
+                        .iter()
+                        .filter(|c| c.kind == RegionKind::Pinned)
+                        .count(),
+                    n
+                );
+                for (index, chunk) in state.tlab_chunks.iter().enumerate() {
+                    assert_eq!(state.tlab_addresses.exact(chunk.base as usize), Some(index));
+                }
+                assert_eq!(
+                    state.survivor_stats.survivor_space_live,
+                    if cycle % 2 == 0 {
+                        (young * (GC_HEADER_SIZE + 8)) as u64
+                    } else {
+                        0
+                    }
+                );
+                verify_old_region_metadata(&state).unwrap();
+                eprintln!(
+                    "pinned-metadata n={n} young={young} cycle={cycle} chunks={} metadata={}",
+                    state.tlab_chunks.len(),
+                    stop.metadata_objects
+                );
+            }
+            reset_internal();
+        }
     }
 }
 

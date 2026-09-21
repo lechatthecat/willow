@@ -181,11 +181,59 @@ mod tests {
                     });
                 }
                 registered(&waiters, workers);
-                assert_eq!(waiters.notify(false), 1);
-                assert_eq!(waiters.notify(true), workers - 1);
+                // Publication changes the generation before taking the list lock.
+                // Independently woken waiters can unregister before either call
+                // selects them, so only synthetic registrations have exact counts.
+                let selected = waiters.notify(false);
+                assert!(selected <= 1);
+                assert!(waiters.notify(true) <= workers - selected);
             });
             assert_eq!(waiters.registered.load(Ordering::SeqCst), 0);
             assert_eq!(waiters.notify(false), 0);
+            assert!(waiters.list.lock().unwrap().head.is_none());
+        }
+    }
+
+    #[test]
+    fn independently_woken_waiters_can_leave_before_shutdown() {
+        let waiters = IdleWaiters::default();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        assert!(waiters.wait(waiters.generation(), Duration::from_secs(5)));
+                    })
+                })
+                .collect();
+            registered(&waiters, 2);
+            assert!(waiters.notify(false) <= 1);
+            // Force an independent wake instead of relying on a spurious OS wake.
+            for handle in &handles {
+                handle.thread().unpark();
+            }
+            for handle in handles {
+                handle.join().unwrap();
+            }
+            assert_eq!(waiters.notify(true), 0);
+        });
+        assert_eq!(waiters.registered.load(Ordering::SeqCst), 0);
+        let list = waiters.list.lock().unwrap();
+        assert!(list.head.is_none());
+        assert_eq!(list.free.len(), 2);
+    }
+
+    #[test]
+    fn notification_selects_exact_counts_without_concurrent_removal() {
+        for workers in [1, 2, 8, 32] {
+            let waiters = IdleWaiters::default();
+            // Synthetic registrations cannot unregister between notifications.
+            for _ in 0..workers {
+                waiters.list.lock().unwrap().insert();
+            }
+            waiters.registered.store(workers, Ordering::SeqCst);
+            assert_eq!(waiters.notify(false), 1);
+            assert_eq!(waiters.notify(true), workers - 1);
+            assert_eq!(waiters.registered.load(Ordering::SeqCst), 0);
             assert!(waiters.list.lock().unwrap().head.is_none());
         }
     }
@@ -200,7 +248,7 @@ mod tests {
             registered(&waiters, 1);
             assert_eq!(waiters.publish(false, false), 0);
             assert!(waiters.list.lock().unwrap().head.is_some());
-            assert_eq!(waiters.notify(false), 1);
+            assert!(waiters.notify(false) <= 1);
         });
     }
 
@@ -286,7 +334,7 @@ mod tests {
                 });
                 registered(waiters, 1);
                 let start = Instant::now();
-                assert_eq!(waiters.notify(false), 1);
+                assert!(waiters.notify(false) <= 1);
                 samples.push(rx.recv_timeout(Duration::from_secs(5)).unwrap() - start);
             });
         }

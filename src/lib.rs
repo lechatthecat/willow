@@ -428,16 +428,30 @@ fn run_frontend_with_emitter(
     artifacts.offload(&mut program)?;
     let resolution = module::resolver::resolve_imports_spooled(&program, root, artifacts);
     let mut graph = resolution.graph;
-    emit_frontend_diagnostics(&resolution.diagnostics, map, &graph, emitter)?;
+    let mut diagnostic_modules = DiagnosticModuleIndex::new(&graph);
+    emit_frontend_diagnostics(
+        &resolution.diagnostics,
+        map,
+        &graph,
+        &diagnostic_modules,
+        emitter,
+    )?;
     let imports = PhaseDiagnostics::new(resolution.diagnostics);
     let item_imports = if imports.error_count == 0 {
         resolution.item_imports
     } else {
         graph.files.clear();
+        diagnostic_modules.positions.clear();
         vec![]
     };
     let desugar = desugar_phase(&mut program, &mut graph.files);
-    emit_frontend_diagnostics(&desugar.diagnostics, map, &graph, emitter)?;
+    emit_frontend_diagnostics(
+        &desugar.diagnostics,
+        map,
+        &graph,
+        &diagnostic_modules,
+        emitter,
+    )?;
     let artifacts = graph.artifacts.as_ref().expect("spooled import graph");
     let dependencies = ModuleDependencies::new(&graph.files);
     let mut helpers = HelperIndex::new();
@@ -461,7 +475,7 @@ fn run_frontend_with_emitter(
             options,
         )?;
         error_count += diagnostic_error_count(&checker.errors);
-        emit_frontend_diagnostics(&checker.errors, map, &graph, emitter)?;
+        emit_frontend_diagnostics(&checker.errors, map, &graph, &diagnostic_modules, emitter)?;
         let concurrency = check_unit_concurrency(
             &body,
             &graph.files,
@@ -471,7 +485,7 @@ fn run_frontend_with_emitter(
             &checker.reference_arg_modes,
         );
         error_count += diagnostic_error_count(&concurrency);
-        emit_frontend_diagnostics(&concurrency, map, &graph, emitter)?;
+        emit_frontend_diagnostics(&concurrency, map, &graph, &diagnostic_modules, emitter)?;
     }
     {
         let body = artifacts.hydrate(&program, diagnostics::FileId::ENTRY)?;
@@ -484,7 +498,13 @@ fn run_frontend_with_emitter(
             options,
         )?;
         error_count += checked.error_count;
-        emit_frontend_diagnostics(&checked.checker.errors, map, &graph, emitter)?;
+        emit_frontend_diagnostics(
+            &checked.checker.errors,
+            map,
+            &graph,
+            &diagnostic_modules,
+            emitter,
+        )?;
         let concurrency = check_unit_concurrency(
             &body,
             &graph.files,
@@ -494,11 +514,11 @@ fn run_frontend_with_emitter(
             &checked.checker.reference_arg_modes,
         );
         error_count += diagnostic_error_count(&concurrency);
-        emit_frontend_diagnostics(&concurrency, map, &graph, emitter)?;
+        emit_frontend_diagnostics(&concurrency, map, &graph, &diagnostic_modules, emitter)?;
     }
     let entry = validate_entry_point(&program);
     error_count += diagnostic_error_count(&entry);
-    emit_frontend_diagnostics(&entry, map, &graph, emitter)?;
+    emit_frontend_diagnostics(&entry, map, &graph, &diagnostic_modules, emitter)?;
     if error_count > 0 {
         anyhow::bail!("aborting due to {} error(s)", error_count);
     }
@@ -965,6 +985,66 @@ mod diagnostic_emission_tests {
     };
 
     #[test]
+    fn module_index_probes_scale_with_references_across_batches() {
+        struct Inspect;
+        impl DiagnosticEmitter for Inspect {
+            fn emit(
+                &mut self,
+                diagnostic: &Diagnostic,
+                sources: &dyn SourceLookup,
+            ) -> std::io::Result<()> {
+                let id = diagnostic.fix_suggestions[0].span.file_id;
+                assert_eq!(sources.get(id).unwrap().source, "é");
+                assert!(sources.get(FileId::ENTRY).is_some());
+                Ok(())
+            }
+        }
+        for n in [16, 64, 256, 1024] {
+            let mut graph = module::ModuleGraph::default();
+            for i in 0..n {
+                graph.files.push(module::ResolvedModule {
+                    id: module::ModuleId(i + 1),
+                    name: format!("m{i}"),
+                    canonical_path: format!("m{i}"),
+                    path: format!("m{i}.wi").into(),
+                    source: "é".into(),
+                    program: parser::ast::Program {
+                        module: None,
+                        imports: vec![],
+                        items: vec![],
+                    },
+                });
+            }
+            let index = DiagnosticModuleIndex::new(&graph);
+            let entry = SourceMap::new("main.wi", "fn main() {}");
+            for module in &graph.files {
+                let diagnostic = Diagnostic::new(Severity::Warning, ErrorCode::W2002, "fix")
+                    .with_fix(FixSuggestion::new(
+                        diagnostics::Span::in_file(module.id.file_id(), 0, 2, 1, 1),
+                        "e",
+                        "replace",
+                    ));
+                // Duplicate references within a batch still load only one source.
+                emit_frontend_diagnostics(
+                    &[diagnostic.clone(), diagnostic],
+                    &entry,
+                    &graph,
+                    &index,
+                    &mut Inspect,
+                )
+                .unwrap();
+            }
+            assert_eq!(index.positions.len(), n as usize);
+            assert_eq!(index.probes.get(), n as usize);
+            assert_eq!(index.lookup(FileId::ENTRY), None);
+            eprintln!(
+                "module-index modules={n} batches={n} references={} probes={n}",
+                2 * n
+            );
+        }
+    }
+
+    #[test]
     fn batches_borrow_entry_and_share_sources_referenced_only_by_fixes() {
         struct Inspect<'a> {
             entry: &'a SourceMap,
@@ -1022,7 +1102,14 @@ mod diagnostic_emission_tests {
                 imported: None,
                 emissions: 0,
             };
-            emit_frontend_diagnostics(&vec![diagnostic; n], &entry, &graph, &mut inspect).unwrap();
+            emit_frontend_diagnostics(
+                &vec![diagnostic; n],
+                &entry,
+                &graph,
+                &DiagnosticModuleIndex::new(&graph),
+                &mut inspect,
+            )
+            .unwrap();
             assert_eq!(inspect.emissions, n);
             eprintln!(
                 "batch-count n={n} emissions={} imported_maps=1 entry_borrowed=true",
@@ -1032,12 +1119,42 @@ mod diagnostic_emission_tests {
     }
 }
 
+/// Request-local positions stay valid while desugaring/checking module bodies.
+/// Clearing the graph on import failure also clears this index.
+struct DiagnosticModuleIndex {
+    positions: std::collections::HashMap<diagnostics::FileId, usize>,
+    #[cfg(test)]
+    probes: std::cell::Cell<usize>,
+}
+
+impl DiagnosticModuleIndex {
+    fn new(graph: &module::ModuleGraph) -> Self {
+        Self {
+            positions: graph
+                .files
+                .iter()
+                .enumerate()
+                .map(|(position, module)| (module.id.file_id(), position))
+                .collect(),
+            #[cfg(test)]
+            probes: std::cell::Cell::new(0),
+        }
+    }
+
+    fn lookup(&self, id: diagnostics::FileId) -> Option<usize> {
+        #[cfg(test)]
+        self.probes.set(self.probes.get() + 1);
+        self.positions.get(&id).copied()
+    }
+}
+
 /// Render only the sources a diagnostic actually references. Successful builds
 /// never materialize a build-wide collection of source strings/source maps.
 fn emit_frontend_diagnostics(
     diagnostics: &[diagnostics::Diagnostic],
     entry: &diagnostics::SourceMap,
     graph: &module::ModuleGraph,
+    modules: &DiagnosticModuleIndex,
     emitter: &mut dyn diagnostics::DiagnosticEmitter,
 ) -> Result<()> {
     if diagnostics.is_empty() {
@@ -1061,8 +1178,9 @@ fn emit_frontend_diagnostics(
         })
         .collect();
     let mut imports = diagnostics::SourceMaps::default();
-    for module in &graph.files {
-        if ids.contains(&module.id.file_id()) {
+    for id in ids {
+        if let Some(position) = modules.lookup(id) {
+            let module = &graph.files[position];
             let source = if module.source.is_empty() {
                 graph
                     .artifacts

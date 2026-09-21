@@ -81,6 +81,7 @@ impl GcTrace for RuntimeSleepFuture {
 /// Returns a WillowFutureVoid that becomes ready after `ms` milliseconds.
 /// Non-blocking: does not sleep the calling thread.
 /// Use willow_future_is_ready_void to poll, willow_future_await_void to block.
+/// The caller owns the handle and must release it with willow_future_release_void.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_runtime_sleep(ms: i64) -> *mut std::ffi::c_void {
     future::void_future_into_raw_pub(future::WillowFutureVoid::sleep_after_millis(ms))
@@ -88,6 +89,7 @@ pub extern "C" fn willow_runtime_sleep(ms: i64) -> *mut std::ffi::c_void {
 
 /// Returns a ready void future for non-cooperative `yield()` expressions. The
 /// scheduler-aware yield path is `await yield()`, lowered to `willow_sched_yield`.
+/// The caller owns the handle and must release it with willow_future_release_void.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_runtime_yield() -> *mut std::ffi::c_void {
     future::void_future_into_raw_pub(future::WillowFutureVoid::ready())
@@ -97,6 +99,12 @@ pub extern "C" fn willow_runtime_yield() -> *mut std::ffi::c_void {
 mod tests {
     use super::*;
 
+    fn await_and_release(raw: *mut std::ffi::c_void) -> u8 {
+        let result = future::willow_future_await_void(raw);
+        unsafe { future::willow_future_release_void(raw) };
+        result
+    }
+
     #[test]
     fn zero_timer_is_ready_immediately() {
         assert!(RuntimeTimer::after_millis(0).is_ready());
@@ -104,15 +112,12 @@ mod tests {
 
     #[test]
     fn timer_unit_01_negative_sleep_returns_ready_without_panic() {
-        assert_eq!(
-            future::willow_future_await_void(willow_runtime_sleep(-1)),
-            0
-        );
+        assert_eq!(await_and_release(willow_runtime_sleep(-1)), 0);
     }
 
     #[test]
     fn timer_unit_02_zero_sleep_returns_ready_without_panic() {
-        assert_eq!(future::willow_future_await_void(willow_runtime_sleep(0)), 0);
+        assert_eq!(await_and_release(willow_runtime_sleep(0)), 0);
     }
 
     #[test]
@@ -177,12 +182,12 @@ mod tests {
 
     #[test]
     fn timer_unit_12_runtime_sleep_uses_executor_path() {
-        assert_eq!(future::willow_future_await_void(willow_runtime_sleep(0)), 0);
-        assert_eq!(future::willow_future_await_void(willow_runtime_sleep(1)), 0);
+        assert_eq!(await_and_release(willow_runtime_sleep(0)), 0);
+        assert_eq!(await_and_release(willow_runtime_sleep(1)), 0);
     }
 
     #[test]
     fn timer_unit_13_runtime_yield_returns_ready_void_future() {
-        assert_eq!(future::willow_future_await_void(willow_runtime_yield()), 0);
+        assert_eq!(await_and_release(willow_runtime_yield()), 0);
     }
 }

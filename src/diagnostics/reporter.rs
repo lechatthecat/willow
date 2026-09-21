@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, Write};
 
 use super::FileId;
@@ -14,7 +15,9 @@ pub fn emit(diag: &Diagnostic, map: &SourceMap) {
 
 fn emit_single(diag: &Diagnostic, map: &SourceMap, writer: &mut dyn Write) -> io::Result<()> {
     emit_header(diag, writer)?;
-    render_file_labels(diag, map, &diag.labels, writer)?;
+    if let Some(labels) = group_labels(&diag.labels).get(&map.file_id) {
+        render_file_labels(map, labels, writer)?;
+    }
     render_footer(
         diag,
         |file_id| (file_id == map.file_id).then_some(map),
@@ -36,18 +39,14 @@ pub fn emit_with(
 ) -> io::Result<()> {
     emit_header(diag, writer)?;
 
-    let mut file_ids: Vec<FileId> = diag
-        .labels
-        .iter()
-        .filter(|label| label.span.line > 0)
-        .map(|label| label.span.file_id)
-        .collect();
-    file_ids.sort_unstable();
-    file_ids.dedup();
-
-    for file_id in file_ids {
-        if let Some(map) = maps.get(file_id) {
-            render_file_labels(diag, map, &diag.labels, writer)?;
+    let mut files: Vec<_> = group_labels(&diag.labels).into_iter().collect();
+    files.sort_unstable_by_key(|(file_id, _)| *file_id);
+    for (file_id, labels) in files {
+        // Legacy multi-file output omits files with only line-zero labels.
+        if !labels.lines.is_empty()
+            && let Some(map) = maps.get(file_id)
+        {
+            render_file_labels(map, &labels, writer)?;
         }
     }
     render_footer(diag, |file_id| maps.get(file_id), writer)
@@ -64,25 +63,44 @@ fn emit_header(diag: &Diagnostic, writer: &mut dyn Write) -> io::Result<()> {
     Ok(())
 }
 
+struct FileLabels<'a> {
+    location: &'a Label,
+    lines: HashMap<usize, Vec<&'a Label>>,
+}
+
+fn group_labels(labels: &[Label]) -> HashMap<FileId, FileLabels<'_>> {
+    let mut files = HashMap::<FileId, FileLabels<'_>>::new();
+    for label in labels {
+        #[cfg(test)]
+        LABEL_PROBES.with(|count| count.set(count.get() + 1));
+        let file = files
+            .entry(label.span.file_id)
+            .or_insert_with(|| FileLabels {
+                location: label,
+                lines: HashMap::new(),
+            });
+        // First primary wins, including line-zero labels used for the location.
+        if file.location.kind != LabelKind::Primary && label.kind == LabelKind::Primary {
+            file.location = label;
+        }
+        if label.span.line > 0 {
+            file.lines.entry(label.span.line).or_default().push(label);
+        }
+    }
+    files
+}
+
+#[cfg(test)]
+thread_local! {
+    static LABEL_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn render_file_labels(
-    diag: &Diagnostic,
     map: &SourceMap,
-    labels: &[Label],
+    labels: &FileLabels<'_>,
     writer: &mut dyn Write,
 ) -> io::Result<()> {
-    let labels: Vec<&Label> = labels
-        .iter()
-        .filter(|label| label.span.file_id == map.file_id)
-        .collect();
-    if labels.is_empty() {
-        return Ok(());
-    }
-
-    let location = labels
-        .iter()
-        .find(|label| label.kind == LabelKind::Primary)
-        .copied()
-        .unwrap_or(labels[0]);
+    let location = labels.location;
     let marker = if location.kind == LabelKind::Primary {
         "-->"
     } else {
@@ -94,21 +112,15 @@ fn render_file_labels(
         map.path, location.span.line, location.span.col
     )?;
 
-    let mut lines: Vec<usize> = labels
-        .iter()
-        .filter(|label| label.span.line > 0)
-        .map(|label| label.span.line)
-        .collect();
-    lines.sort_unstable();
-    lines.dedup();
-    if lines.is_empty() {
+    let mut lines: Vec<_> = labels.lines.iter().collect();
+    lines.sort_unstable_by_key(|(line, _)| **line);
+    let Some((last_line, _)) = lines.last() else {
         return Ok(());
-    }
-
-    let margin = digits(*lines.last().unwrap());
+    };
+    let margin = digits(**last_line);
     writeln!(writer, "{} |", " ".repeat(margin))?;
     let mut previous = None;
-    for line in lines {
+    for (&line, line_labels) in lines {
         if previous.is_some_and(|previous| line > previous + 1) {
             writeln!(writer, "...")?;
         }
@@ -121,10 +133,9 @@ fn render_file_labels(
             width = margin
         )?;
 
-        for label in &labels {
-            if label.span.line != line {
-                continue;
-            }
+        for label in line_labels {
+            #[cfg(test)]
+            LABEL_PROBES.with(|count| count.set(count.get() + 1));
             let col = label.span.col.saturating_sub(1);
             let len = label.span.end.saturating_sub(label.span.start).max(1);
             let character = if label.kind == LabelKind::Primary {
@@ -143,9 +154,6 @@ fn render_file_labels(
     }
     writeln!(writer, "{} |", " ".repeat(margin))?;
 
-    // Keep this parameter in the signature so callers cannot accidentally
-    // render labels without the diagnostic that owns them.
-    let _ = diag;
     Ok(())
 }
 
@@ -319,6 +327,70 @@ mod tests {
             assert_eq!(output.remaining, 0);
             assert_eq!(output.failures, 0);
             eprintln!("renderer-count n={n} bytes={}", n * expected.len());
+        }
+    }
+
+    #[test]
+    fn label_grouping_preserves_order_and_zero_line_locations() {
+        let mut maps = SourceMaps::new(SourceMap::new("entry.wi", "a\nb\nc"));
+        maps.insert(SourceMap::with_file_id(FileId(1), "other.wi", "z"));
+        let diagnostic = Diagnostic::new(Severity::Error, ErrorCode::E0001, "order")
+            .with_label(Label::secondary(
+                Span::in_file(FileId(1), 0, 1, 0, 2),
+                "hidden",
+            ))
+            .with_label(Label::secondary(Span::new(4, 5, 3, 1), "third"))
+            .with_label(Label::primary(Span::new(0, 0, 0, 2), "location"))
+            .with_label(Label::secondary(Span::new(0, 1, 1, 1), "first"))
+            .with_label(Label::primary(Span::new(0, 1, 1, 1), "second"))
+            .with_label(Label::primary(
+                Span::in_file(FileId(99), 0, 1, 1, 1),
+                "missing",
+            ));
+        let mut output = Vec::new();
+        emit_with(&diagnostic, &maps, &mut output).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            concat!(
+                "error[E0001]: order\n --> entry.wi:0:2\n",
+                "  |\n1 | a\n  | - first\n  | ^ second\n...\n",
+                "3 | c\n  | - third\n  |\n",
+            )
+        );
+        let mut single = Vec::new();
+        emit_single(&diagnostic, maps.get(FileId(1)).unwrap(), &mut single).unwrap();
+        assert_eq!(
+            String::from_utf8(single).unwrap(),
+            "error[E0001]: order\n ::: other.wi:0:2\n"
+        );
+    }
+
+    #[test]
+    fn label_probes_scale_linearly() {
+        for shape in ["files", "lines", "same-line"] {
+            for n in [16, 64, 256, 1024] {
+                let mut maps = SourceMaps::new(SourceMap::new("entry.wi", "x\n".repeat(n)));
+                let mut diagnostic = Diagnostic::new(Severity::Error, ErrorCode::E0001, "scale");
+                for i in (0..n).rev() {
+                    let file = if shape == "files" {
+                        FileId(i as u32)
+                    } else {
+                        FileId::ENTRY
+                    };
+                    if shape == "files" {
+                        maps.insert(SourceMap::with_file_id(file, "file.wi", "x"));
+                    }
+                    let line = if shape == "lines" { i + 1 } else { 1 };
+                    diagnostic
+                        .labels
+                        .push(Label::primary(Span::in_file(file, 0, 1, line, 1), ""));
+                }
+                LABEL_PROBES.with(|count| count.set(0));
+                emit_with(&diagnostic, &maps, &mut io::sink()).unwrap();
+                let probes = LABEL_PROBES.with(|count| count.get());
+                assert_eq!(probes, 2 * n);
+                eprintln!("label-probes shape={shape} n={n} probes={probes}");
+            }
         }
     }
 

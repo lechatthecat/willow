@@ -19403,3 +19403,57 @@ fn main() {
     assert!(ok);
     assert_eq!(out, "3\n");
 }
+
+// willow-ssl7.36: empty literal arguments must retain their parameter type.
+#[test]
+fn contextual_empty_array_arguments() {
+    let source = r#"
+import std::collections::Array;
+fn work(xs: Array<i64>, n: i64) -> i64 { return xs.len() + n; }
+fn strings(xs: Array<String>) -> i64 { return xs.len(); }
+fn make() -> Array<i64> { return []; }
+fn main() {
+    println(work([], 4096));
+    let xs: Array<i64> = [];
+    println(work(xs, 7));
+    println(strings([]));
+    println(work(true ? [] : [], 8));
+    println(work(make(), 9));
+}
+"#;
+    for run in [compile_and_run, compile_and_run_release] {
+        let (out, ok) = run(source);
+        assert!(ok, "contextual empty arrays must compile and run: {out}");
+        assert_eq!(out, "4096\n7\n0\n8\n9\n");
+    }
+}
+
+#[test]
+fn contextual_empty_array_rejects_non_array_parameter() {
+    assert_compile_error_contains(
+        "fn work(x: i64) {} fn main() { work([]); }",
+        &["error[E0201]"],
+    );
+}
+
+#[test]
+fn contextual_empty_array_allocation_sites_scale_linearly() {
+    for sites in [1, 8, 32, 128] {
+        let mut source = String::from(
+            "import std::collections::Array; \
+             fn work(xs: Array<i64>) -> i64 { return xs.len(); } \
+             fn batch(flag: bool) {",
+        );
+        for _ in 0..sites {
+            source.push_str("println(work(flag ? [] : []));");
+        }
+        source.push_str("} fn main() { batch(true); }");
+        let names = compile_and_collect_relocation_targets_all(&source, &[]);
+        let allocations = names
+            .iter()
+            .filter(|name| *name == "willow_array_new")
+            .count();
+        assert_eq!(allocations, sites * 2);
+        println!("sites={sites} literal_allocations={allocations}");
+    }
+}

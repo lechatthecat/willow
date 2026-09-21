@@ -43,6 +43,11 @@ impl<'a> MinorCollector<'a> {
                 chunk.owner_state.is_none(),
                 "minor collection requires retired TLABs"
             );
+            // Pinned chunks contain only old allocations and cannot be refilled.
+            // Major sweep maintains their metadata; minors only trace their edges.
+            if chunk.kind == RegionKind::Pinned {
+                continue;
+            }
             let mut offset = 0usize;
             while offset < chunk.used {
                 stop_work.metadata_objects += 1;
@@ -341,6 +346,12 @@ impl<'a> MinorCollector<'a> {
         let mut chunk_positions = vec![None; self.state.tlab_chunks.len()];
         let mut chunk_index = 0usize;
         while chunk_index < self.state.tlab_chunks.len() {
+            // No allocation in an already-pinned chunk changes during a minor.
+            // Keep its bitmap/live bytes and its identity for address remapping.
+            if self.state.tlab_chunks[chunk_index].kind == RegionKind::Pinned {
+                chunk_index += 1;
+                continue;
+            }
             let base = self.state.tlab_chunks[chunk_index].base;
             let used = self.state.tlab_chunks[chunk_index].used;
             let mut offset = 0usize;

@@ -7,6 +7,8 @@ use super::*;
 thread_local! {
     // Candidate queries and defining-class visits, isolated per compiler thread.
     static DISPATCH_WORK: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
+    // Reverse edges built and visited, independent of class-name aliases.
+    static DESCENDANT_WORK: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
 }
 
 /// Function-local memoization: all metadata borrowed by `FuncGen` is immutable
@@ -269,12 +271,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         };
 
         let base_ids = self.class_base_ids();
+        let reachable = descendant_ids(&base_ids, receiver_id);
         let mut descendants: Vec<(i64, TypeId)> = self
             .class_type_ids
             .iter()
-            .filter(|&(_, &id)| {
-                id != receiver_id && is_self_or_descendant(&base_ids, id, receiver_id)
-            })
+            .filter(|&(_, &id)| id != receiver_id && reachable.contains(&id))
             .map(|(cls, &id)| (id, *cls))
             .collect();
         descendants.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -458,6 +459,39 @@ pub(super) fn is_self_or_descendant(
     false
 }
 
+/// Collect the receiver subtree once instead of walking every class's ancestry.
+/// Reverse edges cost O(E) to build; the iterative walk costs O(Vr + Er) for
+/// reachable vertices/edges. IDs preserve alias identity, and insertion before
+/// enqueueing ensures even malformed cycles visit each vertex at most once.
+fn descendant_ids(base_of: &HashMap<i64, i64>, ancestor_id: i64) -> HashSet<i64> {
+    let mut children: HashMap<i64, Vec<i64>> = HashMap::new();
+    for (&child, &base) in base_of {
+        children.entry(base).or_default().push(child);
+        #[cfg(test)]
+        DESCENDANT_WORK.with(|work| {
+            let [built, visited] = work.get();
+            work.set([built + 1, visited]);
+        });
+    }
+    let mut reachable = HashSet::from([ancestor_id]);
+    let mut pending = vec![ancestor_id];
+    while let Some(parent) = pending.pop() {
+        if let Some(children) = children.get(&parent) {
+            for &child in children {
+                #[cfg(test)]
+                DESCENDANT_WORK.with(|work| {
+                    let [built, visited] = work.get();
+                    work.set([built, visited + 1]);
+                });
+                if reachable.insert(child) {
+                    pending.push(child);
+                }
+            }
+        }
+    }
+    reachable
+}
+
 #[cfg(test)]
 mod tests {
     use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
@@ -478,6 +512,88 @@ mod tests {
 
     fn hierarchy() -> HashMap<i64, i64> {
         HashMap::from([(MIDDLE, BASE), (LEAF, MIDDLE)])
+    }
+
+    #[test]
+    fn descendant_walk_matches_ancestry_for_all_small_graphs() {
+        // Each node either has no parent or points to any node, covering
+        // disconnected trees, self edges, and cycles with incoming branches.
+        for encoding in 0..5usize.pow(4) {
+            let mut digits = encoding;
+            let mut bases = HashMap::new();
+            for child in 0..4i64 {
+                let parent = digits % 5;
+                digits /= 5;
+                if parent < 4 {
+                    bases.insert(child, parent as i64);
+                }
+            }
+            for receiver in 0..=4 {
+                let reachable = descendant_ids(&bases, receiver);
+                for candidate in 0..=4 {
+                    assert_eq!(
+                        reachable.contains(&candidate),
+                        is_self_or_descendant(&bases, candidate, receiver),
+                        "graph={bases:?} receiver={receiver} candidate={candidate}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn descendant_walk_has_linear_edge_counts() {
+        for shape in ["chain", "fanout"] {
+            for edges in [1, 32, 256, 16384] {
+                let bases: HashMap<i64, i64> = (1..=edges)
+                    .map(|child| (child, if shape == "chain" { child - 1 } else { 0 }))
+                    .collect();
+                for receiver in [0, edges, edges + 1] {
+                    DESCENDANT_WORK.with(|work| work.set([0; 2]));
+                    let reachable = descendant_ids(&bases, receiver);
+                    let visited = if receiver == 0 { edges as usize } else { 0 };
+                    let work = DESCENDANT_WORK.with(|work| work.get());
+                    assert_eq!(work, [edges as usize, visited]);
+                    assert_eq!(reachable.len(), visited + 1);
+                    eprintln!(
+                        "descendant-walk shape={shape} edges={edges} receiver={receiver} built={} visited={}",
+                        work[0], work[1]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn virtual_descendant_work_scales_with_edges_and_calls() {
+        for shape in ["chain", "fanout"] {
+            for edges in [1, 8, 32] {
+                for calls in [1, 4, 16] {
+                    let mut source = String::from(
+                        "open class C0 { pub open fn value(self) -> i64 { return 0; } }\n",
+                    );
+                    for child in 1..=edges {
+                        let parent = if shape == "chain" { child - 1 } else { 0 };
+                        source.push_str(&format!(
+                            "open class C{child} extends C{parent} {{ pub open override fn value(self) -> i64 {{ return {child}; }} }}\n"
+                        ));
+                    }
+                    source.push_str("fn probe(value: C0) -> i64 {\n");
+                    for _ in 1..calls {
+                        source.push_str("value.value();\n");
+                    }
+                    source.push_str("return value.value(); } fn main() {}\n");
+                    DESCENDANT_WORK.with(|work| work.set([0; 2]));
+                    compile_dispatch_fixture(&source);
+                    let work = DESCENDANT_WORK.with(|work| work.get());
+                    assert_eq!(work, [edges * calls; 2], "{shape}, {edges}, {calls}");
+                    eprintln!(
+                        "virtual-descendants shape={shape} edges={edges} calls={calls} built={} visited={}",
+                        work[0], work[1]
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -595,6 +711,10 @@ mod tests {
             type_ids["Dog"],
             type_ids["Animal"]
         ));
+        assert_eq!(
+            descendant_ids(&base_ids, type_ids["Animal"]),
+            HashSet::from([1, 2])
+        );
     }
 
     /// An edge naming a class with no runtime id contributes nothing instead of

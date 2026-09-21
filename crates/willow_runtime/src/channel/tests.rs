@@ -272,6 +272,45 @@ fn gc_sweep_drops_channel_owned_queue_buffers() {
 }
 
 #[test]
+fn gc_reset_drops_channel_native_owners_at_increasing_sizes() {
+    let _guard = crate::gc::runtime_test_guard();
+    crate::scheduler::reset_global_scheduler_for_test();
+    crate::gc::reset_internal_for_test();
+    for count in [1usize, 32, 256] {
+        for queued in [1usize, 64] {
+            let before = CHANNEL_DROP_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+            for _ in 0..count {
+                let raw = willow_channel_new(0);
+                let channel = unsafe { channel_from_raw(raw) }.unwrap();
+                let mut state = channel.state.lock().unwrap();
+                for value in 0..queued {
+                    state.values.push_back(WillowChannelValue {
+                        i64_value: value as i64,
+                    });
+                    state.waiters.register(value as u64 + 1);
+                }
+            }
+            crate::gc::reset_internal_for_test();
+            let dropped = CHANNEL_DROP_COUNT.load(std::sync::atomic::Ordering::SeqCst) - before;
+            assert_eq!(
+                dropped, count,
+                "reset must destroy every native channel owner"
+            );
+            assert_eq!(crate::gc::willow_gc_allocated_bytes(), 0);
+            crate::gc::reset_internal_for_test();
+            assert_eq!(
+                CHANNEL_DROP_COUNT.load(std::sync::atomic::Ordering::SeqCst) - before,
+                count,
+                "a repeated reset must not drop owners twice"
+            );
+            eprintln!(
+                "reset channels={count} queued={queued} native_drops={dropped} live_owners=0"
+            );
+        }
+    }
+}
+
+#[test]
 fn channel_gc_hooks_register_once_per_registry_generation() {
     let _guard = crate::gc::runtime_test_guard();
     crate::gc::reset_internal_for_test();
