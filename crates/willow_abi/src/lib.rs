@@ -272,23 +272,27 @@ pub fn gc_bitmap_layout_id(payload_size: i64, runtime_type_id: i64, bitmap_diges
     )
 }
 
+/// Immutable allocation shape shared by objects. All words have a fixed ABI.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GcLayoutDescriptor {
+    pub type_id: u64,
+    pub layout_id: u64,
+    pub gc_ref_mask: u64,
+    pub size: u64,
+}
+
 /// GC header ABI. Offsets are fixed-width and independent of Rust field lookup.
 pub mod gc_header {
     pub const MARKED_OFFSET: u32 = 0;
     pub const ALLOCATED_OFFSET: u32 = 1;
     pub const GENERATION_OFFSET: u32 = 2;
     pub const AGE_OFFSET: u32 = 3;
-    pub const TYPE_ID_OFFSET: u32 = 4;
-    pub const LAYOUT_ID_OFFSET: u32 = 8;
-    pub const REF_MASK_OFFSET: u32 = 16;
-    pub const SIZE_OFFSET: u32 = 24;
-
-    pub const fn next_offset(pointer_bytes: u32) -> u32 {
-        SIZE_OFFSET + pointer_bytes
-    }
+    pub const OWNED_OFFSET: u32 = 4;
+    pub const DESCRIPTOR_OFFSET: u32 = 8;
 
     pub const fn size(pointer_bytes: u32) -> u32 {
-        SIZE_OFFSET + 2 * pointer_bytes
+        DESCRIPTOR_OFFSET + pointer_bytes
     }
 }
 

@@ -165,19 +165,11 @@ pub struct GcHeader {
     pub generation: u8,
     /// Number of copying minor collections survived while young.
     pub age: u8,
-    /// Runtime type identifier (0 = unknown/opaque for now).
-    pub type_id: u32,
-    /// Opaque compiler/runtime layout identifier. Stage 2 records it now so
-    /// later TLAB, generational, and moving collectors can select layout-aware
-    /// fast paths without changing the object ABI again.
-    pub layout_id: u64,
-    /// Inline reference mask, or a static bitmap descriptor pointer when
-    /// `type_id == GC_BITMAP_TYPE_ID`. The descriptor owns all mask words.
-    pub gc_ref_mask: u64,
-    /// Total allocation size in bytes (header + payload).
-    pub size: usize,
-    /// Reserved ABI word, always null. Allocation enumeration uses region metadata.
-    pub next: *mut GcHeader,
+    /// Runtime-interned descriptors are reference counted; generated ones are static.
+    pub descriptor_owned: bool,
+    /// Live: immutable descriptor address. Reclaimed: original allocation size,
+    /// so retained TLAB holes remain walkable without retaining dead metadata.
+    pub descriptor: usize,
 }
 
 /// Generated-code-facing TLS allocation state.
@@ -202,6 +194,9 @@ pub const GC_HEADER_SIZE: usize = std::mem::size_of::<GcHeader>();
 pub const GC_TLAB_CHUNK_SIZE: usize = willow_abi::tlab::CHUNK_SIZE as usize;
 const _: () = assert!(GC_TLAB_CHUNK_SIZE <= u16::MAX as usize + 1);
 pub const GC_TLAB_MAX_OBJECT_SIZE: usize = 4 * 1024;
+
+#[path = "gc/layouts.rs"]
+mod layouts;
 
 /// Raw allocation and pointer arithmetic boundary for the collector. The rest
 /// of the GC works with `Object`/`Payload`/`RootSlot` and cannot directly
@@ -283,11 +278,13 @@ mod raw_heap {
                 header.allocated = true;
                 header.generation = generation;
                 header.age = 0;
-                header.type_id = type_id;
-                header.layout_id = layout_id;
-                header.gc_ref_mask = gc_ref_mask;
-                header.size = size;
-                header.next = std::ptr::null_mut();
+                header.descriptor = super::layouts::acquire(willow_abi::GcLayoutDescriptor {
+                    type_id: u64::from(type_id),
+                    layout_id,
+                    gc_ref_mask,
+                    size: size as u64,
+                });
+                header.descriptor_owned = true;
             }
             Some(Self(header))
         }
@@ -318,17 +315,14 @@ mod raw_heap {
         }
 
         pub(super) fn trace_metadata(self) -> TraceMetadata {
-            // SAFETY: immutable allocation fields stay valid for live objects.
-            // Read individual places, without borrowing the whole header while
-            // a sweeper can clear its distinct transient mark byte.
-            unsafe {
-                let header = self.as_ptr();
-                TraceMetadata {
-                    type_id: (*header).type_id,
-                    layout_id: (*header).layout_id,
-                    gc_ref_mask: (*header).gc_ref_mask,
-                    payload_size: (*header).size - std::mem::size_of::<GcHeader>(),
-                }
+            // Immutable descriptor fields remain valid for live objects. Sweep
+            // may clear the distinct mark byte, so do not borrow the header.
+            let descriptor = self.descriptor();
+            TraceMetadata {
+                type_id: descriptor.type_id as u32,
+                layout_id: descriptor.layout_id,
+                gc_ref_mask: descriptor.gc_ref_mask,
+                payload_size: descriptor.size as usize - std::mem::size_of::<GcHeader>(),
             }
         }
 
@@ -368,8 +362,17 @@ mod raw_heap {
             // SAFETY: the closed mark epoch proved this payload unreachable;
             // its readers have quiesced and the heap mutex owns its metadata.
             unsafe {
-                (*self.as_ptr()).allocated = false;
-                (*self.as_ptr()).marked = false;
+                let size = self.size();
+                let header = &mut *self.as_ptr();
+                if header.allocated {
+                    if header.descriptor_owned {
+                        super::layouts::release(header.descriptor);
+                    }
+                    header.descriptor = size;
+                    header.descriptor_owned = false;
+                    header.allocated = false;
+                }
+                header.marked = false;
             }
         }
 
@@ -380,12 +383,24 @@ mod raw_heap {
 
         pub(super) fn size(self) -> usize {
             // SAFETY: `Object` refers to a live heap allocation.
-            unsafe { (*self.as_ptr()).size }
+            unsafe {
+                if (*self.as_ptr()).allocated {
+                    self.descriptor().size as usize
+                } else {
+                    (*self.as_ptr()).descriptor
+                }
+            }
+        }
+
+        fn descriptor(self) -> willow_abi::GcLayoutDescriptor {
+            // SAFETY: live headers own a registry reference or point to static
+            // generated data; collection excludes readers before reclamation.
+            unsafe { *((*self.as_ptr()).descriptor as *const willow_abi::GcLayoutDescriptor) }
         }
 
         pub(super) fn type_id(self) -> u32 {
             // SAFETY: `Object` refers to a live heap allocation.
-            unsafe { (*self.as_ptr()).type_id }
+            self.descriptor().type_id as u32
         }
 
         pub(super) fn generation(self) -> u8 {
@@ -732,6 +747,7 @@ impl OldRegion {
             );
         };
         self.live_bytes = self.live_bytes.saturating_sub(object.size());
+        object.reclaim_in_place();
         self.mark_bitmap.unmark(offset);
         self.free_spans.push(RegionFreeSpan {
             offset,
@@ -795,6 +811,12 @@ unsafe fn allocate_region_storage(layout: Layout) -> *mut u8 {
 
 impl Drop for OldRegion {
     fn drop(&mut self) {
+        for &offset in self.allocations.keys() {
+            // SAFETY: the region still owns each indexed header.
+            HeapObject::from_raw(unsafe { self.base.add(offset) }.cast())
+                .unwrap()
+                .reclaim_in_place();
+        }
         let layout = Layout::from_size_align(self.capacity, std::mem::align_of::<GcHeader>())
             .expect("old-region allocation layout remains valid");
         // SAFETY: each region owns one block and `Drop` runs exactly once.
@@ -4420,15 +4442,27 @@ fn reset_internal() {
     state.concurrent_cycle = None;
     state.sweeping = None;
     state.satb = satb::SatbBuffers::default();
-    for record in state.tlab_states.values() {
-        // SAFETY: reset is serialized against mutator activity in production
-        // and tests hold the runtime test guard.
-        let tls = unsafe { tlab_state_at(record.address) };
-        tls.cursor.store(0, Ordering::Release);
-        tls.limit.store(0, Ordering::Release);
-        tls.start_bits.store(0, Ordering::Release);
-        tls.fast_allocations.store(0, Ordering::Release);
-        tls.fast_allocated_bytes.store(0, Ordering::Release);
+    {
+        let GcState {
+            tlab_states,
+            tlab_chunks,
+            tlab_addresses,
+            ..
+        } = &mut *state;
+        for record in tlab_states.values() {
+            // SAFETY: reset excludes mutators and collectors. Capture the live
+            // prefix without constructing retirement indexes that reset discards.
+            let tls = unsafe { tlab_state_at(record.address) };
+            let cursor = tls.cursor.swap(0, Ordering::AcqRel);
+            if let Some(base) = record.current_chunk {
+                let chunk = &mut tlab_chunks[tlab_addresses.exact(base).expect("active TLAB")];
+                chunk.used = cursor.clamp(base, base + chunk.capacity) - base;
+            }
+            tls.limit.store(0, Ordering::Release);
+            tls.start_bits.store(0, Ordering::Release);
+            tls.fast_allocations.store(0, Ordering::Release);
+            tls.fast_allocated_bytes.store(0, Ordering::Release);
+        }
     }
     state.old_regions.clear();
     state.old_addresses.clear();
@@ -4436,6 +4470,12 @@ fn reset_internal() {
     state.old_region_candidates.clear();
     state.old_reserved_bytes = 0;
     for chunk in state.tlab_chunks.drain(..) {
+        let mut offset = 0;
+        while offset < chunk.used {
+            let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast()).unwrap();
+            offset += object.size();
+            object.reclaim_in_place();
+        }
         let layout = Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>())
             .expect("TLAB chunk layout remains valid");
         // SAFETY: reset owns and releases each registered chunk exactly once.
@@ -5396,17 +5436,102 @@ mod tests {
     }
 
     #[test]
+    fn compact_header_descriptors_follow_sweep_copy_and_reset() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let key = willow_abi::GcLayoutDescriptor {
+            type_id: 0,
+            layout_id: 0x9713_2026,
+            gc_ref_mask: 0,
+            size: (GC_HEADER_SIZE + 8) as u64,
+        };
+        let mut tls = new_tlab_state();
+        for _ in 0..2 {
+            willow_gc_alloc_layout(key.layout_id, 0, 8, 0);
+        }
+        assert_eq!(layouts::references(key), 2);
+        willow_gc_collect();
+        assert_eq!(layouts::references(key), 0);
+        let mut young = willow_gc_alloc_slow(&mut tls, key.layout_id, 0, 8, 0);
+        let mut parent = willow_alloc_typed(8, 1);
+        willow_push_root(&mut parent);
+        willow_gc_write_barrier(
+            parent,
+            std::ptr::null_mut(),
+            young,
+            GcStoreDestination::ObjectField as i64,
+        );
+        unsafe {
+            *parent.cast::<*mut u8>() = young;
+        }
+        for _ in 0..2 {
+            willow_gc_minor_collect();
+            let moved = unsafe { *parent.cast::<*mut u8>() };
+            assert_ne!(young, moved);
+            young = moved;
+            assert_eq!(layouts::references(key), 1);
+        }
+        willow_pop_root();
+        reset_gc();
+        assert_eq!(layouts::references(key), 0);
+        // Reset must retire the active TLAB prefix before releasing descriptors.
+        willow_gc_alloc_slow(&mut tls, key.layout_id, 0, 8, 0);
+        assert_eq!(layouts::references(key), 1);
+        reset_gc();
+        assert_eq!(layouts::references(key), 0);
+    }
+
+    #[test]
+    fn compact_static_header_reclamation_keeps_hole_size() {
+        static DESCRIPTOR: willow_abi::GcLayoutDescriptor = willow_abi::GcLayoutDescriptor {
+            type_id: 23,
+            layout_id: 42,
+            gc_ref_mask: 0,
+            size: 24,
+        };
+        let mut header = GcHeader {
+            marked: false,
+            allocated: true,
+            generation: GC_GENERATION_YOUNG,
+            age: 0,
+            descriptor_owned: false,
+            descriptor: &DESCRIPTOR as *const _ as usize,
+        };
+        let object = HeapObject::from_raw(&mut header).unwrap();
+        assert_eq!(object.type_id(), 23);
+        object.reclaim_in_place();
+        assert!(!object.allocated());
+        assert_eq!(object.size(), 24);
+        object.reclaim_in_place();
+        assert_eq!(object.size(), 24);
+    }
+
+    #[test]
     fn test_gc_generated_header_and_tlab_abi_layout() {
-        assert_eq!(GC_HEADER_SIZE, 40);
+        assert_eq!(GC_HEADER_SIZE, 16);
+        assert_eq!(std::mem::size_of::<willow_abi::GcLayoutDescriptor>(), 32);
+        assert_eq!(
+            std::mem::offset_of!(willow_abi::GcLayoutDescriptor, type_id),
+            0
+        );
+        assert_eq!(
+            std::mem::offset_of!(willow_abi::GcLayoutDescriptor, layout_id),
+            8
+        );
+        assert_eq!(
+            std::mem::offset_of!(willow_abi::GcLayoutDescriptor, gc_ref_mask),
+            16
+        );
+        assert_eq!(
+            std::mem::offset_of!(willow_abi::GcLayoutDescriptor, size),
+            24
+        );
         assert_eq!(std::mem::offset_of!(GcHeader, marked), 0);
         assert_eq!(std::mem::offset_of!(GcHeader, allocated), 1);
         assert_eq!(std::mem::offset_of!(GcHeader, generation), 2);
         assert_eq!(std::mem::offset_of!(GcHeader, age), 3);
-        assert_eq!(std::mem::offset_of!(GcHeader, type_id), 4);
-        assert_eq!(std::mem::offset_of!(GcHeader, layout_id), 8);
-        assert_eq!(std::mem::offset_of!(GcHeader, gc_ref_mask), 16);
-        assert_eq!(std::mem::offset_of!(GcHeader, size), 24);
-        assert_eq!(std::mem::offset_of!(GcHeader, next), 32);
+        assert_eq!(std::mem::offset_of!(GcHeader, descriptor_owned), 4);
+        assert_eq!(std::mem::offset_of!(GcHeader, descriptor), 8);
         assert_eq!(GC_TLAB_STATE_SIZE, 40);
         assert_eq!(std::mem::offset_of!(GcTlabState, cursor), 0);
         assert_eq!(std::mem::offset_of!(GcTlabState, limit), 8);
@@ -5703,9 +5828,27 @@ mod tests {
         reset_gc();
         let ptr = willow_alloc(16);
         let header = payload_to_header(ptr);
-        assert_eq!(unsafe { (*header).type_id }, 0);
-        assert_eq!(unsafe { (*header).layout_id }, 0);
-        assert_eq!(unsafe { (*header).gc_ref_mask }, 0);
+        assert_eq!(
+            HeapObject::from_raw(header)
+                .unwrap()
+                .trace_metadata()
+                .type_id,
+            0
+        );
+        assert_eq!(
+            HeapObject::from_raw(header)
+                .unwrap()
+                .trace_metadata()
+                .layout_id,
+            0
+        );
+        assert_eq!(
+            HeapObject::from_raw(header)
+                .unwrap()
+                .trace_metadata()
+                .gc_ref_mask,
+            0
+        );
         reset_gc();
     }
 
@@ -5715,7 +5858,13 @@ mod tests {
         reset_gc();
         let ptr = willow_alloc_typed(16, 0b10);
         let header = payload_to_header(ptr);
-        assert_eq!(unsafe { (*header).gc_ref_mask }, 0b10);
+        assert_eq!(
+            HeapObject::from_raw(header)
+                .unwrap()
+                .trace_metadata()
+                .gc_ref_mask,
+            0b10
+        );
         reset_gc();
     }
 
@@ -5835,10 +5984,31 @@ mod tests {
         let ptr = willow_gc_alloc_layout(0xCAFE, 42, 24, 0b101);
         assert!(!ptr.is_null());
         let header = payload_to_header(ptr);
-        assert_eq!(unsafe { (*header).layout_id }, 0xCAFE);
-        assert_eq!(unsafe { (*header).type_id }, 42);
-        assert_eq!(unsafe { (*header).gc_ref_mask }, 0b101);
-        assert_eq!(unsafe { (*header).size }, header_size() + 24);
+        assert_eq!(
+            HeapObject::from_raw(header)
+                .unwrap()
+                .trace_metadata()
+                .layout_id,
+            0xCAFE
+        );
+        assert_eq!(
+            HeapObject::from_raw(header)
+                .unwrap()
+                .trace_metadata()
+                .type_id,
+            42
+        );
+        assert_eq!(
+            HeapObject::from_raw(header)
+                .unwrap()
+                .trace_metadata()
+                .gc_ref_mask,
+            0b101
+        );
+        assert_eq!(
+            HeapObject::from_raw(header).unwrap().size(),
+            header_size() + 24
+        );
         reset_gc();
     }
 
@@ -6132,8 +6302,9 @@ mod tests {
     fn test_gc_regular_old_allocation_rolls_over_to_multiple_regions() {
         let _guard = gc_test_guard();
         reset_gc();
-        let mut roots = Vec::with_capacity(6000);
-        for value in 0..6000i64 {
+        let count = GC_OLD_REGION_SIZE / (GC_HEADER_SIZE + 8) + 10;
+        let mut roots = Vec::with_capacity(count);
+        for value in 0..count as i64 {
             let object = willow_alloc_object(70, 8);
             unsafe { *(object as *mut i64) = value };
             roots.push(object);
@@ -6146,14 +6317,14 @@ mod tests {
             "regular allocations must roll over at the region bound"
         );
         let first = roots[0];
-        let last = roots[5999];
+        let last = roots[count - 1];
 
         willow_gc_collect();
 
         assert_eq!(roots[0], first);
-        assert_eq!(roots[5999], last);
+        assert_eq!(roots[count - 1], last);
         assert_eq!(unsafe { *(roots[0] as *mut i64) }, 0);
-        assert_eq!(unsafe { *(roots[5999] as *mut i64) }, 5999);
+        assert_eq!(unsafe { *(roots[count - 1] as *mut i64) }, count as i64 - 1);
         willow_pop_roots(roots.len() as i32);
         willow_gc_collect();
         assert_eq!(willow_gc_old_region_count(), 0);
@@ -6789,11 +6960,24 @@ mod tests {
         let p2 = willow_alloc_object(2, 8);
         let p3 = willow_alloc_object(99, 8);
         assert!(!p1.is_null() && !p2.is_null() && !p3.is_null());
-        unsafe {
-            assert_eq!((*payload_to_header(p1)).type_id, 1);
-            assert_eq!((*payload_to_header(p2)).type_id, 2);
-            assert_eq!((*payload_to_header(p3)).type_id, 99);
-        }
+        assert_eq!(
+            HeapObject::from_raw(payload_to_header(p1))
+                .unwrap()
+                .type_id(),
+            1
+        );
+        assert_eq!(
+            HeapObject::from_raw(payload_to_header(p2))
+                .unwrap()
+                .type_id(),
+            2
+        );
+        assert_eq!(
+            HeapObject::from_raw(payload_to_header(p3))
+                .unwrap()
+                .type_id(),
+            99
+        );
         reset_gc();
     }
 
@@ -6813,7 +6997,13 @@ mod tests {
         let _guard = gc_test_guard();
         reset_gc();
         let ptr = willow_alloc_object(42, 8);
-        assert_eq!(unsafe { (*payload_to_header(ptr)).type_id }, 42);
+        assert_eq!(
+            HeapObject::from_raw(payload_to_header(ptr))
+                .unwrap()
+                .trace_metadata()
+                .type_id,
+            42
+        );
         reset_gc();
     }
 
@@ -6825,19 +7015,22 @@ mod tests {
         let payload: i64 = 24;
         let ptr = willow_alloc_object(1, payload);
         let expected = header_size() + payload as usize;
-        assert_eq!(unsafe { (*payload_to_header(ptr)).size }, expected);
+        assert_eq!(
+            HeapObject::from_raw(payload_to_header(ptr)).unwrap().size(),
+            expected
+        );
         reset_gc();
     }
 
-    // The retired linkage word remains zero until the compact-header ABI lands.
+    // Region membership is authoritative; no linkage word exists.
     #[test]
     fn test_gc_region_allocations_do_not_publish_heap_links() {
         let _guard = gc_test_guard();
         reset_gc();
         let first = willow_alloc_object(1, 8);
         let second = willow_alloc_object(2, 8);
-        assert!(unsafe { (*payload_to_header(first)).next }.is_null());
-        assert!(unsafe { (*payload_to_header(second)).next }.is_null());
+        assert_ne!(first, second);
+        assert_eq!(GC_HEADER_SIZE, 16);
         reset_gc();
     }
 
@@ -7018,7 +7211,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![payload_to_header(ptr_b)]
         );
-        assert!(unsafe { (*payload_to_header(ptr_b)).next }.is_null());
         willow_pop_root();
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
@@ -7058,7 +7250,6 @@ mod tests {
         let mut slot: *mut u8 = ptr;
         willow_push_root(&mut slot as *mut *mut u8);
         willow_gc_collect();
-        assert!(unsafe { (*payload_to_header(ptr)).next }.is_null());
         willow_pop_root();
         willow_gc_collect();
         reset_gc();
@@ -7432,7 +7623,10 @@ mod tests {
         reset_gc();
         let ptr = willow_alloc_object(7, 16);
         let hdr = payload_to_header(ptr);
-        assert_eq!(unsafe { (*hdr).type_id }, 7);
+        assert_eq!(
+            HeapObject::from_raw(hdr).unwrap().trace_metadata().type_id,
+            7
+        );
         let expected_payload = unsafe { (hdr as *mut u8).add(header_size()) };
         assert_eq!(
             ptr, expected_payload,
@@ -7451,8 +7645,14 @@ mod tests {
         let h1 = payload_to_header(p1);
         let h2 = payload_to_header(p2);
         assert_ne!(h1, h2, "two allocations must have distinct headers");
-        assert_eq!(unsafe { (*h1).type_id }, 1);
-        assert_eq!(unsafe { (*h2).type_id }, 2);
+        assert_eq!(
+            HeapObject::from_raw(h1).unwrap().trace_metadata().type_id,
+            1
+        );
+        assert_eq!(
+            HeapObject::from_raw(h2).unwrap().trace_metadata().type_id,
+            2
+        );
         reset_gc();
     }
 

@@ -424,7 +424,7 @@ class Box {
 fn main() {
     let refill_before = gc_tlab_refills();
     let mut sum = 0;
-    for i in 0..700 {
+    for i in 0..1400 {
         let b = new Box(i);
         sum = sum + b.value;
     }
@@ -433,7 +433,7 @@ fn main() {
     println(gc_tlab_fast_allocations() > 0);
 }
 "#;
-    assert_gc_allocation_modes(src, "244650\ntrue\ntrue\n", "244650\nfalse\nfalse\n");
+    assert_gc_allocation_modes(src, "979300\ntrue\ntrue\n", "979300\nfalse\nfalse\n");
 }
 
 #[test]
@@ -517,7 +517,7 @@ class Box {
 fn main() {
     let before = gc_minor_collections();
     let mut sum = 0;
-    for i in 0..6000 {
+    for i in 0..12000 {
         let b = new Box(i);
         sum = sum + b.value;
     }
@@ -525,7 +525,7 @@ fn main() {
     println(gc_minor_collections() > before);
 }
 "#;
-    assert_gc_allocation_modes(src, "17997000\ntrue\n", "17997000\nfalse\n");
+    assert_gc_allocation_modes(src, "71994000\ntrue\n", "71994000\nfalse\n");
 }
 
 #[test]

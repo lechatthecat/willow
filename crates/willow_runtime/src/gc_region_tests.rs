@@ -524,6 +524,8 @@ fn region_verify_05_rejects_misaligned_allocation_offset() {
     state.old_regions[0].allocations.insert(1, span);
     let error = verify_old_region_metadata(&state).unwrap_err();
     assert!(error.contains("invalid allocation span"));
+    state.old_regions[0].allocations.remove(&1);
+    state.old_regions[0].allocations.insert(0, span);
 }
 
 #[test]
@@ -588,9 +590,10 @@ fn region_verify_12_requires_one_allocation_in_large_region() {
     let _object =
         allocate_old_region_object_locked(&mut state, 11, 7, GC_LARGE_OBJECT_THRESHOLD, 0, true)
             .unwrap();
-    state.old_regions[0].allocations.clear();
+    let allocations = std::mem::take(&mut state.old_regions[0].allocations);
     let error = verify_old_region_metadata(&state).unwrap_err();
     assert!(error.contains("owns 0 allocations instead of one"));
+    state.old_regions[0].allocations = allocations;
 }
 
 #[test]
@@ -689,8 +692,9 @@ fn large_region_03_reserved_bytes_include_regular_and_large_regions() {
 fn major_region_01_releases_only_completely_dead_regions() {
     let _guard = global_gc_guard();
     reset_gc();
-    let mut objects = Vec::with_capacity(6000);
-    for value in 0..6000i64 {
+    let count = GC_OLD_REGION_SIZE / (GC_HEADER_SIZE + 8) + 10;
+    let mut objects = Vec::with_capacity(count);
+    for value in 0..count as i64 {
         let object = willow_alloc_object(1, 8);
         unsafe { *(object as *mut i64) = value };
         objects.push(object);
@@ -702,7 +706,7 @@ fn major_region_01_releases_only_completely_dead_regions() {
     let before = willow_gc_old_region_count();
     willow_gc_collect();
     assert_eq!(survivor, survivor_address);
-    assert_eq!(unsafe { *(survivor as *mut i64) }, 5999);
+    assert_eq!(unsafe { *(survivor as *mut i64) }, count as i64 - 1);
     assert!(willow_gc_old_region_count() < before);
     assert_eq!(willow_gc_old_region_count(), 1);
     willow_pop_root();
@@ -1177,7 +1181,17 @@ fn old_region_index_allocation_attempts_scale_linearly() {
                 .sum::<usize>(),
             n
         );
-        assert!(state.old_region_candidates.len() <= 1);
+        // A short tail can still fit a zero-payload compact header, even
+        // when it cannot fit the next 8-byte payload.
+        assert!(state.old_region_candidates.len() <= state.old_regions.len());
+        assert!(
+            state
+                .old_region_candidates
+                .iter()
+                .filter(|(bytes, _)| *bytes >= GC_HEADER_SIZE + 8)
+                .count()
+                <= 1
+        );
         verify_old_region_metadata(&state).unwrap();
         eprintln!(
             "old-region index objects={n} regions={} attempts={}",

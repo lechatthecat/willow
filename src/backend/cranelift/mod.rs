@@ -230,6 +230,7 @@ pub struct Codegen {
     /// the inlined GC bump-allocation fast path.
     gc_tlab_state: DataId,
     gc_bitmap_descriptors: HashMap<Vec<u64>, (DataId, u64)>,
+    gc_layout_descriptors: HashMap<willow_abi::GcLayoutDescriptor, DataId>,
     async_frame_size_warnings: Vec<AsyncFrameSizeWarning>,
     /// Which source item owns each linker symbol the backend has handed out
     /// (willow-uqzx, catalog item 8). Symbol names are built by flattening `::`
@@ -467,6 +468,7 @@ impl Codegen {
             unit_static_inits: HashMap::new(),
             gc_tlab_state,
             gc_bitmap_descriptors: HashMap::new(),
+            gc_layout_descriptors: HashMap::new(),
             async_frame_size_warnings: Vec::new(),
             symbol_owners: HashMap::new(),
             symbol_conflicts: Vec::new(),
@@ -1545,6 +1547,7 @@ struct FuncGen<'a, 'b> {
     module: &'a mut ObjectModule,
     gc_tlab_state: DataId,
     gc_bitmap_descriptors: &'a mut HashMap<Vec<u64>, (DataId, u64)>,
+    gc_layout_descriptors: &'a mut HashMap<willow_abi::GcLayoutDescriptor, DataId>,
     /// Lexical scope frames of registered `defer` actions: synthetic
     /// statements whose operands were already evaluated into hidden locals,
     /// plus (async only) the frame offset of the registration FLAG consumed

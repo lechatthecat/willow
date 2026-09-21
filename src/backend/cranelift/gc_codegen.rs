@@ -21,10 +21,8 @@ const GC_HEADER_MARKED_OFFSET: i32 = willow_abi::gc_header::MARKED_OFFSET as i32
 const GC_HEADER_ALLOCATED_OFFSET: i32 = willow_abi::gc_header::ALLOCATED_OFFSET as i32;
 const GC_HEADER_GENERATION_OFFSET: i32 = willow_abi::gc_header::GENERATION_OFFSET as i32;
 const GC_HEADER_AGE_OFFSET: i32 = willow_abi::gc_header::AGE_OFFSET as i32;
-const GC_HEADER_TYPE_ID_OFFSET: i32 = willow_abi::gc_header::TYPE_ID_OFFSET as i32;
-const GC_HEADER_LAYOUT_ID_OFFSET: i32 = willow_abi::gc_header::LAYOUT_ID_OFFSET as i32;
-const GC_HEADER_REF_MASK_OFFSET: i32 = willow_abi::gc_header::REF_MASK_OFFSET as i32;
-const GC_HEADER_SIZE_OFFSET: i32 = willow_abi::gc_header::SIZE_OFFSET as i32;
+const GC_HEADER_OWNED_OFFSET: i32 = willow_abi::gc_header::OWNED_OFFSET as i32;
+const GC_HEADER_DESCRIPTOR_OFFSET: i32 = willow_abi::gc_header::DESCRIPTOR_OFFSET as i32;
 const GC_TLAB_STATE_SIZE: u64 = willow_abi::tlab::STATE_SIZE as u64;
 const GC_TLAB_MAX_OBJECT_SIZE: i64 = willow_abi::tlab::MAX_OBJECT_SIZE as i64;
 
@@ -120,6 +118,33 @@ fn bitmap_descriptor(
     let descriptor = (data_id, willow_abi::gc_bitmap_fingerprint(bitmap));
     descriptors.insert(bitmap.to_vec(), descriptor);
     descriptor
+}
+
+/// One fixed-size record per distinct allocation shape, shared across sites.
+fn layout_descriptor(
+    module: &mut ObjectModule,
+    descriptors: &mut HashMap<willow_abi::GcLayoutDescriptor, DataId>,
+    layout: willow_abi::GcLayoutDescriptor,
+) -> DataId {
+    *descriptors.entry(layout).or_insert_with(|| {
+        let id = module
+            .declare_anonymous_data(false, false)
+            .expect("GC layout data");
+        let mut data = DataDescription::new();
+        let bytes: Vec<_> = [
+            layout.type_id,
+            layout.layout_id,
+            layout.gc_ref_mask,
+            layout.size,
+        ]
+        .into_iter()
+        .flat_map(u64::to_ne_bytes)
+        .collect();
+        data.define(bytes.into_boxed_slice());
+        data.set_align(8);
+        module.define_data(id, &data).expect("GC layout definition");
+        id
+    })
 }
 
 /// Shared allocation path for wide class objects and async frames.
@@ -313,53 +338,33 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder
             .ins()
             .store(MemFlagsData::trusted(), zero8, cursor, GC_HEADER_AGE_OFFSET);
-        let layout_id = self
-            .builder
-            .ins()
-            .iconst(types::I64, layout.layout_id as i64);
-        let type_id = self
-            .builder
-            .ins()
-            .iconst(types::I64, layout.runtime_type_id);
-        let type_id32 = self.builder.ins().ireduce(types::I32, type_id);
         self.builder.ins().store(
             MemFlagsData::trusted(),
-            type_id32,
+            zero8,
             cursor,
-            GC_HEADER_TYPE_ID_OFFSET,
+            GC_HEADER_OWNED_OFFSET,
         );
-        self.builder.ins().store(
-            MemFlagsData::trusted(),
-            layout_id,
-            cursor,
-            GC_HEADER_LAYOUT_ID_OFFSET,
+        let descriptor = layout_descriptor(
+            self.module,
+            self.gc_layout_descriptors,
+            willow_abi::GcLayoutDescriptor {
+                type_id: layout.runtime_type_id as u32 as u64,
+                layout_id: layout.layout_id,
+                gc_ref_mask: layout.gc_ref_mask,
+                size: total_size as u64,
+            },
         );
-        let mask = self
-            .builder
-            .ins()
-            .iconst(types::I64, layout.gc_ref_mask as i64);
+        let global = self
+            .module
+            .declare_data_in_func(descriptor, self.builder.func);
+        let address = self.builder.ins().symbol_value(ptr_ty, global);
         self.builder.ins().store(
             MemFlagsData::trusted(),
-            mask,
+            address,
             cursor,
-            GC_HEADER_REF_MASK_OFFSET,
-        );
-        // GcHeader::size is usize; the separate allocation counters are u64.
-        let header_size_value = self.builder.ins().iconst(ptr_ty, total_size);
-        self.builder.ins().store(
-            MemFlagsData::trusted(),
-            header_size_value,
-            cursor,
-            GC_HEADER_SIZE_OFFSET,
+            GC_HEADER_DESCRIPTOR_OFFSET,
         );
         let total_size_value = self.builder.ins().iconst(types::I64, total_size);
-        let null = self.builder.ins().iconst(ptr_ty, 0);
-        self.builder.ins().store(
-            MemFlagsData::trusted(),
-            null,
-            cursor,
-            willow_abi::gc_header::next_offset(pointer_bytes) as i32,
-        );
 
         emit_tlab_start_publication(self.builder, tlab, cursor, limit, pointer_bytes);
         let one64 = self.builder.ins().iconst(types::I64, 1);
@@ -531,6 +536,53 @@ mod tests {
     }
 
     #[test]
+    fn compact_descriptors_scale_with_shapes_not_sites() {
+        for sites in [1, 16, 256, 4096] {
+            let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+            let before = codegen.module.declarations().get_data_objects().count();
+            let key = willow_abi::GcLayoutDescriptor {
+                type_id: 2,
+                layout_id: 7,
+                gc_ref_mask: 1,
+                size: 24,
+            };
+            let first =
+                layout_descriptor(&mut codegen.module, &mut codegen.gc_layout_descriptors, key);
+            for _ in 1..sites {
+                assert_eq!(
+                    layout_descriptor(&mut codegen.module, &mut codegen.gc_layout_descriptors, key),
+                    first
+                );
+            }
+            assert_eq!(
+                codegen.module.declarations().get_data_objects().count() - before,
+                1
+            );
+            for other in [
+                willow_abi::GcLayoutDescriptor { type_id: 3, ..key },
+                willow_abi::GcLayoutDescriptor {
+                    gc_ref_mask: 2,
+                    ..key
+                },
+                willow_abi::GcLayoutDescriptor { size: 32, ..key },
+            ] {
+                assert_ne!(
+                    layout_descriptor(
+                        &mut codegen.module,
+                        &mut codegen.gc_layout_descriptors,
+                        other
+                    ),
+                    first
+                );
+            }
+            assert_eq!(codegen.gc_layout_descriptors.len(), 4);
+            println!(
+                "sites={sites} repeated_shape_records=1 distinct_shape_records=4 descriptor_bytes=128"
+            );
+        }
+    }
+
+    #[test]
     fn bitmap_descriptors_scale_with_unique_contents_not_sites() {
         for words in [2, 8, 64] {
             for sites in [1, 16, 256] {
@@ -642,15 +694,12 @@ mod tests {
 
     #[test]
     fn generated_header_and_tlab_layout_contract_is_stable() {
-        assert_eq!(willow_abi::gc_header::size(8), 40);
+        assert_eq!(willow_abi::gc_header::size(8), 16);
         assert_eq!(GC_HEADER_ALLOCATED_OFFSET, 1);
         assert_eq!(GC_HEADER_GENERATION_OFFSET, 2);
         assert_eq!(GC_HEADER_AGE_OFFSET, 3);
-        assert_eq!(GC_HEADER_TYPE_ID_OFFSET, 4);
-        assert_eq!(GC_HEADER_LAYOUT_ID_OFFSET, 8);
-        assert_eq!(GC_HEADER_REF_MASK_OFFSET, 16);
-        assert_eq!(GC_HEADER_SIZE_OFFSET, 24);
-        assert_eq!(willow_abi::gc_header::next_offset(8), 32);
+        assert_eq!(GC_HEADER_OWNED_OFFSET, 4);
+        assert_eq!(GC_HEADER_DESCRIPTOR_OFFSET, 8);
         assert_eq!(GC_TLAB_STATE_SIZE, 40);
         assert_eq!(GC_TLAB_MAX_OBJECT_SIZE, 4096);
         assert_eq!(willow_abi::tlab::start_bits_offset(8), 32);
