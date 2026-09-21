@@ -1648,18 +1648,69 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(resume);
     }
 
+    /// The dedicated sleep operand slot becomes an absolute deadline. A wake
+    /// may belong to an earlier operation, so recheck without restarting sleep
+    /// or reevaluating its operand. Zero/negative sleeps still yield once.
     pub(super) fn emit_coop_sleep_value(
         &mut self,
         millis: cranelift_codegen::ir::Value,
+        deadline_slot: i32,
         suspends: &mut CoopSuspendPoints,
         frame: cranelift_codegen::ir::Value,
     ) {
-        let sleep_fid = self.func_id("willow_sched_sleep");
-        let sleep_ref = self
-            .module
-            .declare_func_in_func(sleep_fid, self.builder.func);
-        self.builder.ins().call(sleep_ref, &[millis]);
-        self.finish_coop_builtin_suspend(suspends, frame);
+        let now = self.emit_value_runtime_call("willow_monotonic_millis", &[]);
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        let positive = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::SignedGreaterThan, millis, 0);
+        // Round a positive duration up to the next clock tick, and saturate
+        // before addition so very large durations cannot wrap into the past.
+        let maximum = self.builder.ins().iconst(types::I64, i64::MAX - 1);
+        let room = self.builder.ins().isub(maximum, now);
+        let bounded = self.builder.ins().smin(millis, room);
+        let rounded = self.builder.ins().iadd_imm_s(bounded, 1);
+        let duration = self.builder.ins().select(positive, rounded, zero);
+        let deadline = self.builder.ins().iadd(now, duration);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), deadline, frame, deadline_slot);
+
+        let park = self.builder.create_block();
+        self.builder.append_block_param(park, types::I64);
+        self.builder.ins().jump(park, &[duration.into()]);
+        self.builder.switch_to_block(park);
+        let remaining = self.builder.block_params(park)[0];
+        self.emit_void_runtime_call("willow_sched_sleep", &[remaining]);
+        let state = self
+            .builder
+            .ins()
+            .iconst(types::I64, (suspends.len() + 1) as i64);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), state, frame, 0);
+        self.emit_coop_unwind_poll_roots();
+        let pending = self.builder.ins().iconst(types::I32, 0);
+        self.builder.ins().return_(&[pending]);
+
+        let check = self.builder.create_block();
+        self.record_coop_suspend(suspends, check);
+        self.builder.switch_to_block(check);
+        let deadline =
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), frame, deadline_slot);
+        let now = self.emit_value_runtime_call("willow_monotonic_millis", &[]);
+        let remaining = self.builder.ins().isub(deadline, now);
+        let waiting = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::SignedGreaterThan, remaining, 0);
+        let done = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(waiting, park, &[remaining.into()], done, &[]);
+        self.builder.switch_to_block(done);
     }
 
     pub(super) fn emit_coop_yield(

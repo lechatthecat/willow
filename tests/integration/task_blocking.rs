@@ -135,3 +135,62 @@ fn task_await_rechecks_share_one_call_site_per_suspension() {
         println!("awaits={awaits} terminal_check_call_sites={calls}");
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn task_sleep_rechecks_deadline_after_injected_early_wakes() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/sleep_wake_repro.py");
+    let output = Command::new("python3")
+        .arg(script)
+        .args(["--compiler", env!("CARGO_BIN_EXE_willowc")])
+        .output()
+        .expect("run deterministic sleep wake regression");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn task_sleep_deadline_checks_have_linear_code_size() {
+    for sleeps in [1, 8, 64] {
+        let source = format!("async fn main() {{ {} }}", "await sleep(1);".repeat(sleeps));
+        let targets = compile_and_collect_relocation_targets_all(&source, &[]);
+        let count = |symbol| targets.iter().filter(|name| *name == symbol).count();
+        assert_eq!(count("willow_sched_sleep"), sleeps);
+        assert_eq!(count("willow_monotonic_millis"), 2 * sleeps);
+        println!(
+            "sleeps={sleeps} timer_sites={} clock_sites={}",
+            sleeps,
+            2 * sleeps
+        );
+    }
+}
+
+#[test]
+fn task_sleep_nonpositive_and_repeated_operands_preserve_values() {
+    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        r#"
+async fn main() {
+    let millis = 1;
+    let mut i = 0;
+    while i < 3 {
+        await sleep(millis);
+        println(millis);
+        i = i + 1;
+    }
+    await sleep(0);
+    await sleep(-1);
+    await sleep(-9223372036854775807 - 1);
+    println("done");
+}
+"#,
+        &[("WILLOW_WORKERS", "1"), ("WILLOW_TASK_BUDGET", "1")],
+        Duration::from_secs(10),
+    );
+    assert!(!timed_out, "{out}");
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n1\n1\ndone\n");
+}

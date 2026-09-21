@@ -250,6 +250,8 @@ pub(crate) struct SourceBlock {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SuspendOp {
     Sleep {
+        /// Dedicated synthetic operand slot; codegen reuses it for the sleep
+        /// deadline across wakes. Never aliases a source-level local.
         millis: LirLocalId,
     },
     Yield,

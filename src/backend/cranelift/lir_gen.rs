@@ -5605,8 +5605,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) {
         match operation {
             SuspendOp::Sleep { millis } => {
+                let deadline_slot = self.lir_frame_offsets[millis];
                 let millis = self.load_lir_local(function, *millis);
-                self.emit_coop_sleep_value(millis, suspends, frame);
+                self.emit_coop_sleep_value(millis, deadline_slot, suspends, frame);
             }
             SuspendOp::Yield => self.emit_coop_yield(suspends, frame),
             SuspendOp::Preempt => self.emit_coop_statement_safepoint(suspends, frame),
