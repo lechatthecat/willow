@@ -311,13 +311,19 @@ fn trampoline(yielder: &Yielder<(), ()>) {
 /// Yield the active task's native call chain after a tripped quantum check.
 /// Returns false outside task stacks (ordinary synchronous entry code).
 pub(crate) fn suspend() -> bool {
+    suspend_with_result(RUNTIME_POLL_PREEMPTED)
+}
+
+/// Suspend a synchronous runtime operation on its existing task stack. The
+/// scheduler must preserve the wait reason rather than immediately requeue it.
+pub(crate) fn suspend_with_result(result: i32) -> bool {
     let stack = CURRENT.with(Cell::get);
     if stack.is_null() {
         return false;
     }
     unsafe {
         (*stack).parked_roots = Some(crate::gc::park_current_roots((*stack).root_depth));
-        (*stack).result = RUNTIME_POLL_PREEMPTED;
+        (*stack).result = result;
         (*stack).suspended = true;
         (*(*stack).yielder).suspend(());
     }
@@ -370,6 +376,151 @@ mod tests {
     use super::*;
     use crate::preempt::{PreemptConfig, begin_quantum, willow_preempt_end, willow_sync_safepoint};
     use crate::task::RUNTIME_POLL_READY;
+
+    #[test]
+    fn blocking_work_parks_without_stalling_the_scheduler() {
+        use crate::scheduler::*;
+        use std::sync::{Mutex, mpsc};
+        use std::time::Duration;
+        static GATE: Mutex<Option<mpsc::Receiver<()>>> = Mutex::new(None);
+        static COMPLETED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        unsafe extern "C" fn blocked(_: *mut c_void) -> i32 {
+            let gate = GATE.lock().unwrap().take().unwrap();
+            let result = crate::blocking::run_owned(move || {
+                gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                73
+            });
+            COMPLETED.store(result.unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
+            RUNTIME_POLL_READY
+        }
+        let _guard = crate::gc::runtime_test_guard();
+        for cancel in [false, true] {
+            reset_global_scheduler_for_test();
+            COMPLETED.store(999, std::sync::atomic::Ordering::SeqCst);
+            let (send, receive) = mpsc::channel();
+            *GATE.lock().unwrap() = Some(receive);
+            let task = willow_sched_spawn(blocked, std::ptr::null_mut());
+            willow_sched_run_until_deadline(willow_monotonic_millis() + 20);
+            assert_eq!(willow_sched_task_state(task), 7);
+            assert_eq!(COMPLETED.load(std::sync::atomic::Ordering::SeqCst), 999);
+            if cancel {
+                willow_sched_cancel(task);
+                willow_sched_run_until(task);
+                assert_eq!(COMPLETED.load(std::sync::atomic::Ordering::SeqCst), 0);
+            }
+            send.send(()).unwrap();
+            if !cancel {
+                willow_sched_run_until(task);
+                assert_eq!(COMPLETED.load(std::sync::atomic::Ordering::SeqCst), 73);
+            }
+            crate::blocking::test_support::wait_until("owned job completes", || {
+                crate::blocking::willow_blocking_active_jobs() == 0
+                    && crate::blocking::willow_blocking_queued_jobs() == 0
+            });
+        }
+        reset_global_scheduler_for_test();
+    }
+
+    #[test]
+    fn owned_work_backpressure_cancellation_drops_unsubmitted_jobs() {
+        use crate::blocking::test_support::*;
+        use crate::scheduler::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        static RAN: AtomicUsize = AtomicUsize::new(0);
+        struct Owned;
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        unsafe extern "C" fn blocked(_: *mut c_void) -> i32 {
+            let owned = Owned;
+            assert!(
+                crate::blocking::run_owned(move || {
+                    RAN.fetch_add(1, Ordering::SeqCst);
+                    drop(owned);
+                })
+                .is_none()
+            );
+            RUNTIME_POLL_READY
+        }
+        let _guard = crate::gc::runtime_test_guard();
+        for count in [1, 16, 64] {
+            reset_global_scheduler_for_test();
+            DROPS.store(0, Ordering::SeqCst);
+            RAN.store(0, Ordering::SeqCst);
+            let mut stalled = stall_pool_threads();
+            stalled.fill_queue_gated(crate::blocking::willow_blocking_queue_capacity() as usize);
+            let ids: Vec<_> = (0..count)
+                .map(|_| willow_sched_spawn(blocked, std::ptr::null_mut()))
+                .collect();
+            willow_sched_run_until_deadline(willow_monotonic_millis() + 50);
+            assert_eq!(crate::blocking::willow_blocking_slot_waiters(), count);
+            for &id in ids.iter().rev() {
+                willow_sched_cancel(id);
+            }
+            for &id in &ids {
+                willow_sched_run_until(id);
+            }
+            assert_eq!(DROPS.load(Ordering::SeqCst), count as usize);
+            assert_eq!(RAN.load(Ordering::SeqCst), 0);
+            assert_eq!(crate::blocking::willow_blocking_slot_waiters(), 0);
+            println!(
+                "owned-backpressure tasks={count} drops={count} jobs_run=0 remaining_waiters=0"
+            );
+            stalled.release_all();
+            wait_until("pool drains", || {
+                crate::blocking::willow_blocking_queued_jobs() == 0
+                    && crate::blocking::willow_blocking_active_jobs() == 0
+            });
+        }
+        reset_global_scheduler_for_test();
+    }
+
+    #[test]
+    fn legacy_timer_wait_completes_through_cooperative_boundary() {
+        use crate::scheduler::*;
+        unsafe extern "C" fn sleep(_: *mut c_void) -> i32 {
+            let future = crate::timer::willow_runtime_sleep(5);
+            crate::future::willow_future_await_void(future);
+            assert_eq!(crate::future::willow_future_is_ready_void(future), 1);
+            crate::future::willow_future_await_void(future);
+            unsafe { crate::future::willow_future_release_void(future) };
+            RUNTIME_POLL_READY
+        }
+        unsafe extern "C" fn poll(_: *mut c_void) -> i32 {
+            let result = willow_task_stack_enter(sleep, std::ptr::null_mut());
+            willow_task_stack_leave();
+            assert!(result == crate::task::RUNTIME_POLL_PENDING || result == RUNTIME_POLL_READY);
+            result
+        }
+        let _guard = crate::gc::runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let task = willow_sched_spawn_cooperative(poll, std::ptr::null_mut()) as u64;
+        willow_sched_run_until(task);
+        reset_global_scheduler_for_test();
+    }
+
+    #[test]
+    fn legacy_timer_wait_parks_and_cancels_without_sleeping_worker() {
+        use crate::scheduler::*;
+        unsafe extern "C" fn sleeper(_: *mut c_void) -> i32 {
+            let future = crate::timer::willow_runtime_sleep(60_000);
+            crate::future::willow_future_await_void(future);
+            unsafe { crate::future::willow_future_release_void(future) };
+            assert_ne!(cancelled(), 0);
+            RUNTIME_POLL_READY
+        }
+        let _guard = crate::gc::runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let task = willow_sched_spawn(sleeper, std::ptr::null_mut());
+        willow_sched_run_until_deadline(willow_monotonic_millis() + 20);
+        assert_eq!(willow_sched_task_state(task), 2);
+        willow_sched_cancel(task);
+        willow_sched_run_until(task);
+        reset_global_scheduler_for_test();
+    }
 
     #[test]
     fn affinity_bound_counts_shared_and_sparse_workers() {

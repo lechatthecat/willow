@@ -8617,7 +8617,8 @@ fn flat_static_reference_call_supported(
 /// User calls can run synchronous safepoints. Builtin scalar/collection
 /// operations and task creation remain on the ordinary poll stack.
 /// Frame slots consumed by one callback, including reference owners/indices.
-/// Boundary functions use `frame_all`, so these are existing parent slots.
+/// The physical layout guarantees parent slots for these locals. Print-only
+/// boundaries retain liveness narrowing and add just missing operand slots.
 pub(super) fn task_boundary_locals(
     function: &LirFunction,
     result: LirLocalId,
@@ -8655,7 +8656,11 @@ pub(super) fn task_stack_boundary(value: &crate::ir::lowered::LirRvalue) -> bool
         return true;
     }
     match value {
-        R::DirectCall { .. } | R::IndirectCall { .. } | R::IntoError { .. } => true,
+        R::DirectCall { .. }
+        | R::IndirectCall { .. }
+        | R::IntoError { .. }
+        | R::Print { .. }
+        | R::AwaitFuture { .. } => true,
         R::StaticCall { class, .. } | R::ConstructorCall { class, .. } => {
             crate::semantic::builtin_types::resolve(&Type::Named(*class)).is_none()
         }
@@ -8838,11 +8843,7 @@ impl FuncGen<'_, '_> {
             .ins()
             .store(MemFlagsData::new(), state, frame, 0);
         self.emit_coop_unwind_poll_roots();
-        let preempted = self
-            .builder
-            .ins()
-            .iconst(types::I32, super::COOP_POLL_PREEMPTED);
-        self.builder.ins().return_(&[preempted]);
+        self.builder.ins().return_(&[status]);
         self.record_coop_suspend(suspends, resume);
         self.builder.switch_to_block(ready);
         if let Some(R::MethodCall { method, .. }) = value

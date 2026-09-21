@@ -7,22 +7,46 @@ pub fn bool_text(value: u8) -> &'static str {
     if value != 0 { "true" } else { "false" }
 }
 
-fn write_stdout(text: &str) {
+fn write_stdout<'a>(text: impl Into<std::borrow::Cow<'a, str>>) {
+    let text = text.into();
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+    ))]
+    if crate::native_stack::is_active() {
+        // A parked caller's managed string may move, and cancellation may
+        // destroy its frame. The job owns only a native copy of the bytes.
+        let text = text.into_owned();
+        if let Some(result) = crate::blocking::run_owned(move || write_stdout_direct(&text)) {
+            result.expect("failed to write Willow stdout");
+        }
+        return;
+    }
+    write_stdout_direct(&text).expect("failed to write Willow stdout");
+}
+
+fn write_stdout_direct(text: &str) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
-    stdout
-        .write_all(text.as_bytes())
-        .expect("failed to write Willow stdout");
-    stdout.flush().expect("failed to flush Willow stdout");
+    stdout.write_all(text.as_bytes())?;
+    stdout.flush()
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_print_i64(value: i64) {
-    write_stdout(&value.to_string());
+    write_stdout(value.to_string());
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_println_i64(value: i64) {
-    write_stdout(&format!("{value}\n"));
+    write_stdout(format!("{value}\n"));
 }
 
 #[unsafe(no_mangle)]
@@ -32,17 +56,17 @@ pub extern "C" fn willow_print_bool(value: u8) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_println_bool(value: u8) {
-    write_stdout(&format!("{}\n", bool_text(value)));
+    write_stdout(format!("{}\n", bool_text(value)));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_print_f64(value: f64) {
-    write_stdout(&format_f64_shortest(value));
+    write_stdout(format_f64_shortest(value));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_println_f64(value: f64) {
-    write_stdout(&format!("{}\n", format_f64_shortest(value)));
+    write_stdout(format!("{}\n", format_f64_shortest(value)));
 }
 
 /// Print a WillowString (GC-managed heap object: len at offset 0, bytes at offset 8).
@@ -56,7 +80,7 @@ pub extern "C" fn willow_print_string(value: *const u8) {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_println_string(value: *const u8) {
     let s = unsafe { willow_string_as_str(value) };
-    write_stdout(&format!("{s}\n"));
+    write_stdout(format!("{s}\n"));
 }
 
 #[cfg(test)]

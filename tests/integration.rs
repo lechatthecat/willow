@@ -228,3 +228,6 @@ mod never_values;
 
 #[path = "integration/literal_slots.rs"]
 mod literal_slots;
+
+#[path = "integration/task_blocking.rs"]
+mod task_blocking;

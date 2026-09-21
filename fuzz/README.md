@@ -1,4 +1,4 @@
-# Lexer/parser fuzzing
+# Compiler fuzzing and runtime properties
 
 This standalone cargo-fuzz package exercises UTF-8 validation, the production
 lexer, parser recovery, and destruction of the resulting AST and diagnostics.
@@ -62,16 +62,44 @@ standard library with AddressSanitizer, using an explicit target and a separate
 sanitizer failure fails the job. This follows the
 [Rust sanitizer instructions](https://doc.rust-lang.org/unstable-book/compiler-flags/sanitizer.html).
 
-Coverage includes seven minor-collection relocation/root tests, two runtime-root
-ownership tests, and channel cancellation ownership after simulated wrapper
-relocation at 1, 32, and 256 channel pairs. This does not run generated Willow
-machine code, prove race freedom, or exercise actual concurrent old evacuation.
-GC objects suballocated inside one region do not gain individual ASan redzones.
-ThreadSanitizer and broader scheduler/async stress remain separate work.
+Coverage includes minor-collection relocation/root tests, runtime-root ownership,
+GC reset teardown, the full channel unit suite, and nine generated nursery graphs
+at 8/64/512 nodes. Each graph checks actual movement, payloads, two edges per
+live node through three collections, and reclamation after root release.
+The former channel fixture teardown leaks have been fixed; leak detection remains
+enabled. This does not run generated Willow machine code, prove race freedom, or
+exercise concurrent old evacuation. GC objects suballocated inside one region do
+not gain individual ASan redzones. ThreadSanitizer is not enabled.
 
-The full channel unit suite is not yet a leak-clean gate: an initial instrumented
-run passed all 63 assertions but reported 8,573,104 leaked bytes in 136 allocations
-at exit, including native channel storage from test fixtures. The focused gate
-does not suppress those reports or disable leak detection; expanding its coverage
-requires investigating the suite's fixture/GC teardown first. Ordinary push/PR CI
-is unaffected; dispatch the optional workflow explicitly when needed.
+## Type-checker fuzzing
+
+The `type_checker` target validates UTF-8, lexes, parses, desugars, then checks
+accepted programs. Diagnostics are expected; panics propagate. It does not
+resolve filesystem imports or execute compiled code. Check the seeds actually
+reach semantic checking, then run a bounded campaign:
+
+```sh
+cargo test --manifest-path fuzz/Cargo.toml --lib --locked
+mkdir -p fuzz/corpus/type_checker
+cargo +nightly fuzz run type_checker fuzz/corpus/type_checker fuzz/seeds/type_checker -- -seed=20260921 -runs=20000 -max_len=4096 -timeout=5 -rss_limit_mb=2048
+```
+
+The compiler's process-global symbol interner retains spellings between inputs
+(willow-9tls.26). Bound RSS and campaign length and restart for longer campaigns.
+
+## Runtime properties and cancellation
+
+```sh
+bash scripts/runtime_properties.sh
+```
+
+This opt-in runner checks generated moving graphs, modeled old-graph reachability
+under `WILLOW_GC_STRESS=minor` and `alloc`, channel/select ownership and handoff,
+cancellation races and cleanup, representative invalid FFI inputs, and four
+compiled async/select/recovery regressions. Tests serialize access to global
+runtime state. The runner clears inherited allocation stress where nursery
+movement is required; the separate stress invocations explicitly select modes.
+Fixed graph seeds and operation counts print with `--nocapture`; failures can be
+replayed with the same command. These bounded checks are not exhaustive schedule
+exploration or a proof of memory/race safety. Ordinary push/PR CI is unaffected;
+dispatch the optional ASan workflow explicitly when needed.

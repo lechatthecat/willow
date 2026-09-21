@@ -160,7 +160,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 user_callee = symbol.clone();
             } else {
                 let plan = self.plan_virtual_call(&owner.to_string(), callee.name());
-                symbol = plan.mangled;
+                symbol = plan.mangled.clone();
                 user_callee = if callee.name() == "init" {
                     symbol.clone()
                 } else {

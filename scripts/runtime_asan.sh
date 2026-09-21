@@ -25,3 +25,10 @@ do
         --target "$target" -p willow_runtime --lib "$test_filter" \
         -- --test-threads=1 --nocapture
 done
+
+# Generated nursery graphs must actually move, so allocation stress is disabled
+# for this subprocess (alloc/all deliberately routes allocations to old space).
+env -u WILLOW_GC_STRESS cargo +"$toolchain" test --locked -Zbuild-std \
+    --target "$target" -p willow_runtime --lib \
+    stress_region_11_generated_graph_preserves_edges_through_moving_collection \
+    -- --ignored --test-threads=1 --nocapture

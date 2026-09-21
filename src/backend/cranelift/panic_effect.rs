@@ -193,6 +193,7 @@ impl Codegen {
         );
         let mut ordered = effects.into_iter().collect::<Vec<_>>();
         ordered.sort_by(|left, right| left.0.cmp(&right.0));
+        *self.dispatch_cache.get_mut() = Default::default();
         let log = std::env::var_os("WILLOW_PANIC_EFFECTS_LOG").is_some();
         for (name, may_panic) in ordered {
             if log {
@@ -219,19 +220,6 @@ impl FuncGen<'_, '_> {
         callee: &str,
     ) -> Option<cranelift_codegen::ir::Value> {
         self.user_function_may_panic(callee)
-            .then(|| self.emit_pre_willow_call_panic_depth())
-            .flatten()
-    }
-
-    /// Dynamic class dispatch may omit its shared check only when every
-    /// possible concrete target has an explicit `NO_PANIC` summary.
-    pub(super) fn emit_pre_user_dispatch_panic_depth<'a>(
-        &mut self,
-        callees: impl IntoIterator<Item = &'a str>,
-    ) -> Option<cranelift_codegen::ir::Value> {
-        callees
-            .into_iter()
-            .any(|callee| self.user_function_may_panic(callee))
             .then(|| self.emit_pre_willow_call_panic_depth())
             .flatten()
     }

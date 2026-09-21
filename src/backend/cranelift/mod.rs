@@ -159,6 +159,7 @@ pub struct Codegen {
     enum_infos: TypeMap<EnumInfo>,
     /// Maps child class name → base class name for inherited method dispatch.
     class_base: TypeMap<TypeId>,
+    dispatch_cache: std::cell::RefCell<emit_interface::DispatchCache>,
     /// Maps each class name to a unique integer type_id for runtime dynamic dispatch.
     /// Type ids start at 1; 0 is reserved for null/unknown.
     class_type_ids: TypeMap<i64>,
@@ -445,6 +446,7 @@ impl Codegen {
             source_file: String::new(),
             enum_infos: TypeMap::with_scope(type_scope.clone()),
             class_base: TypeMap::with_scope(type_scope.clone()),
+            dispatch_cache: Default::default(),
             class_type_ids: TypeMap::with_scope(type_scope.clone()),
             class_own_fields: TypeMap::with_scope(type_scope.clone()),
             class_dependents: HashMap::new(),
@@ -562,6 +564,7 @@ impl Codegen {
     }
 
     fn install_function_scope(&mut self, scope: crate::semantic::ids::FunctionScope) {
+        *self.dispatch_cache.get_mut() = Default::default();
         self.func_ids.set_scope(scope.clone());
         self.func_return_types.set_scope(scope.clone());
         self.fn_types.set_scope(scope.clone());
@@ -584,6 +587,7 @@ impl Codegen {
     /// Install one immutable resolution snapshot in every type-index view.
     /// Updating another unit's snapshot never mutates a previously held view.
     fn install_type_scope(&mut self, scope: TypeScope) {
+        *self.dispatch_cache.get_mut() = Default::default();
         self.type_scope = scope.clone();
         self.class_layouts.set_scope(scope.clone());
         self.enum_infos.set_scope(scope.clone());
@@ -955,6 +959,7 @@ impl Codegen {
                 continue;
             }
             if let Some(id) = self.known_modules.resolve(&spelling.graph_name) {
+                *self.dispatch_cache.get_mut() = Default::default();
                 self.known_modules.bind(spelling.access.clone(), id);
             }
             for name in &spelling.types {
@@ -1054,6 +1059,7 @@ impl Codegen {
             let source_qualified = format!("{}::{}", item.module, item.item);
             if table_module != item.module {
                 if let Some(id) = self.known_modules.resolve(&table_module) {
+                    *self.dispatch_cache.get_mut() = Default::default();
                     self.known_modules.bind(item.module.clone(), id);
                 }
                 if self.registered_type(&qualified) {
@@ -1103,6 +1109,7 @@ impl Codegen {
     // ── Class helpers ─────────────────────────────────────────────────────────
 
     fn register_class_layout(&mut self, c: &ClassDecl) -> Result<()> {
+        *self.dispatch_cache.get_mut() = Default::default();
         self.restore_type_alias(&c.name, None);
         let own: Vec<(String, Type)> = c
             .fields
@@ -1204,6 +1211,7 @@ impl Codegen {
     /// descriptors to the methods that actually vary. Static methods and
     /// constructors have no receiver to dispatch on at all.
     fn register_class_own_vmethods(&mut self, c: &ClassDecl) {
+        *self.dispatch_cache.get_mut() = Default::default();
         let own: Vec<String> = c
             .methods
             .iter()
@@ -1398,20 +1406,22 @@ impl Codegen {
     /// Find the func_id for `class_name::method_name`, searching the class and
     /// then its ancestors (an inherited method satisfies the interface).
     fn resolve_class_method_func_id(&self, class_name: &str, method_name: &str) -> Option<FuncId> {
-        let mut search = Some(TypeId::from_source_name(class_name));
-        let mut seen = HashSet::new();
-        while let Some(name) = search {
-            if !seen.insert(name) {
-                break;
-            }
-            let mangled =
-                class_method_symbol_name(&self.known_modules, &name.to_string(), method_name);
-            if let Some(&fid) = self.func_ids.get(&mangled) {
-                return Some(fid);
-            }
-            search = self.class_base.get_id(&name).cloned();
-        }
-        None
+        let defining =
+            self.dispatch_cache
+                .borrow_mut()
+                .defining
+                .resolve(class_name, method_name, |name| {
+                    let mangled = class_method_symbol_name(&self.known_modules, name, method_name);
+                    let defines = self.func_ids.contains_key(&mangled);
+                    let parent = if defines {
+                        None
+                    } else {
+                        self.class_base.get(name).map(ToString::to_string)
+                    };
+                    (defines, parent)
+                })?;
+        let mangled = class_method_symbol_name(&self.known_modules, &defining, method_name);
+        self.func_ids.get(&mangled).copied()
     }
 
     pub fn embed_runtime_metadata(&mut self, metadata: &str) -> Result<()> {
@@ -1642,8 +1652,8 @@ struct FuncGen<'a, 'b> {
     class_descriptor_ids: &'a TypeMap<DataId>,
     /// Per-class virtual method slot order, indexed by slot (willow-fm7t).
     class_vslots: &'a TypeMap<crate::semantic::method_slots::MethodSlots>,
-    /// Valid only for this function's immutable, scoped class/function tables.
-    defining_class_cache: std::cell::RefCell<emit_interface::DefiningClassCache>,
+    /// Shared across functions until scoped metadata changes.
+    dispatch_cache: &'a std::cell::RefCell<emit_interface::DispatchCache>,
     /// Interface metadata for method dispatch + boxing.
     interface_infos: &'a TypeMap<InterfaceInfo>,
     /// Static `(class, interface)` vtable data objects for class→interface boxing.

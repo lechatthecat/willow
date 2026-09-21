@@ -369,3 +369,58 @@ fn pow_f64_35_unit_bases_dynamic_exponent_matrix() {
         }
     }
 }
+
+#[test]
+fn pow_f64_36_negative_integral_range_and_path_agreement() {
+    // Exact powers of two straddle normal, subnormal, and round-to-zero
+    // boundaries. The nonbinary case was checked with 100/200-digit Decimal.
+    let cases: &[(f64, f64, u64)] = &[
+        (2.0, -1022.0, 0x0010_0000_0000_0000),
+        (2.0, -1023.0, 0x0008_0000_0000_0000),
+        (2.0, -1024.0, 0x0004_0000_0000_0000),
+        (2.0, -1073.0, 2),
+        (2.0, -1074.0, 1),
+        (2.0, -1075.0, 0),
+        (2.0, -1076.0, 0),
+        (1.5, -1800.0, 0x0021_8862),
+        (0.5, -1023.0, 0x7fe0_0000_0000_0000),
+        (0.5, -1024.0, 0x7ff0_0000_0000_0000),
+    ];
+    let mut source = String::from(
+        "fn dynamic(x: f64, y: f64) -> f64 { return x ** y; }\nfn main() {\n\
+         let captured: fn(f64, f64) -> f64 = pow;\n",
+    );
+    let mut expected = Vec::new();
+    for &(base, exponent, bits) in cases {
+        for negative in [false, true] {
+            let base = willow_f64_literal(if negative { -base } else { base });
+            let odd = exponent.abs() as u64 & 1 != 0;
+            let bits = bits | if negative && odd { 1 << 63 } else { 0 };
+            let exponent = willow_f64_literal(exponent);
+            for expression in [
+                format!("({base}) ** ({exponent})"),
+                format!("dynamic({base}, {exponent})"),
+                format!("pow({base}, {exponent})"),
+                format!("powf({base}, {exponent})"),
+                format!("captured({base}, {exponent})"),
+            ] {
+                source.push_str(&format!("println({expression});\n"));
+                expected.push(bits);
+            }
+        }
+    }
+    source.push_str("}\n");
+    for release in [false, true] {
+        let (out, ok) = if release {
+            compile_and_run_release(&source)
+        } else {
+            compile_and_run(&source)
+        };
+        assert!(ok, "range corpus failed: {out}");
+        let actual: Vec<u64> = out
+            .lines()
+            .map(|line| line.parse::<f64>().unwrap().to_bits())
+            .collect();
+        assert_eq!(actual, expected, "release={release}");
+    }
+}

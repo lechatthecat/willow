@@ -161,6 +161,32 @@ impl WillowFutureVoid {
 
     pub fn block_until_ready(&self) {
         if let WillowFutureVoid::Sleep { deadline } = self {
+            #[cfg(any(
+                all(
+                    target_os = "linux",
+                    target_env = "gnu",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(
+                    target_os = "macos",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+            ))]
+            if crate::native_stack::is_active() {
+                while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                    if crate::native_stack::cancelled() != 0 {
+                        return;
+                    }
+                    // Round up so a sub-millisecond tail does not busy-poll.
+                    let millis = remaining
+                        .as_millis()
+                        .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0));
+                    crate::scheduler::willow_sched_sleep(millis.min(i64::MAX as u128) as i64);
+                    crate::native_stack::suspend_with_result(crate::task::RUNTIME_POLL_PENDING);
+                }
+                return;
+            }
             let remaining = deadline.checked_duration_since(Instant::now());
             if let Some(remaining) = remaining {
                 std::thread::sleep(remaining);

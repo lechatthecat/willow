@@ -1,6 +1,5 @@
 //! Direct dispatch over pre-evaluated, ABI-ready operands. Reference arguments
 //! carry place addresses; their owners remain rooted by the call preparation.
-use super::emit_interface::VirtualCallPlan;
 use super::*;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, Value, types};
 use cranelift_module::Module;
@@ -74,12 +73,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let class = class_name_for_object_type(receiver_ty)
             .expect("class receiver type vetted by LIR eligibility");
         let self_ptr = receiver;
-        let VirtualCallPlan {
-            static_class: _,
-            mangled,
-            dispatch_targets,
-            virtual_slot,
-        } = self.plan_virtual_call(&class.to_string(), method);
+        let plan = self.plan_virtual_call(&class.to_string(), method);
+        let mangled = plan.mangled.as_str();
+        let virtual_slot = plan.virtual_slot;
 
         let pushed = if frame_prepared {
             self.flat_method_frame_enabled(method)
@@ -94,17 +90,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         // An indirect call cannot be cleared by one implementation's summary:
         // any reachable target's panic is this call site's panic.
-        let panic_depth = match virtual_slot {
-            None => self.emit_pre_user_call_panic_depth(&mangled),
-            Some(_) => {
-                self.emit_pre_user_dispatch_panic_depth(dispatch_targets.iter().map(String::as_str))
-            }
-        };
+        let panic_depth = plan
+            .may_panic
+            .then(|| self.emit_pre_willow_call_panic_depth())
+            .flatten();
         // Descriptor and vtable slots are immutable. Resolve them without an
         // intervening allocation after the prepared arguments are available.
         let fnptr = virtual_slot.map(|slot| self.emit_vtable_slot_load(self_ptr, slot));
-        let params = self.method_param_types(&mangled);
-        let modes = self.func_param_modes.get(&mangled).cloned();
+        let params = self.method_param_types(mangled);
+        let modes = self.func_param_modes.get(mangled).cloned();
         let has_reference_args = modes.as_ref().is_some_and(|modes| {
             modes
                 .iter()
@@ -120,7 +114,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         call_args.extend(arg_vals);
         let call = match fnptr {
             None => {
-                let fid = self.func_ids[&mangled];
+                let fid = self.func_ids[mangled];
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
                 self.builder.ins().call(fref, &call_args)
             }
@@ -131,7 +125,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // the pointer ABI their declaration gave them.
                 let ret_type = self
                     .func_return_types
-                    .get(&mangled)
+                    .get(mangled)
                     .cloned()
                     .unwrap_or(Type::Void);
                 let mut sig = self.module.make_signature();

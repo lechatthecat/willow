@@ -38,7 +38,8 @@
 //! `willow_blocking_queued_jobs` depth gauge, `willow_blocking_slot_waiters`,
 //! and `willow_blocking_queue_capacity`.
 
-use std::collections::VecDeque;
+use crate::wait_queue::WaitQueue;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex};
 
@@ -66,10 +67,10 @@ impl ForeignCallClass {
 struct PoolState {
     /// Admitted jobs, `len() <= capacity`. Pool threads pop from the front.
     queue: VecDeque<BlockingWork>,
-    /// Tasks whose job is still owned by the Task, oldest first. An entry is
-    /// removed only by that Task (admission) or its cancel path. The first
-    /// `capacity - queue.len()` entries each hold a slot reservation.
-    waiters: VecDeque<u64>,
+    /// Tasks not yet assigned a slot, in FIFO registration order.
+    waiters: WaitQueue<u64>,
+    /// Admitted slot owners may submit out of order without losing fairness.
+    reserved: HashSet<u64>,
 }
 
 impl PoolState {
@@ -77,13 +78,15 @@ impl PoolState {
         capacity - self.queue.len()
     }
 
-    /// The waiter holding the newest reservation: the one that gains a slot
-    /// when `free_slots` has just grown by one, or that inherits the
-    /// reservation a removed waiter held.
-    fn last_reserved(&self, capacity: usize) -> Option<u64> {
-        self.waiters
-            .get(self.free_slots(capacity).checked_sub(1)?)
-            .copied()
+    fn waiter_count(&self) -> usize {
+        self.waiters.len() + self.reserved.len()
+    }
+
+    /// Each dequeue or cancelled reservation frees exactly one slot.
+    fn reserve_next(&mut self) -> Option<u64> {
+        let next = self.waiters.pop_front()?;
+        assert!(self.reserved.insert(next));
+        Some(next)
     }
 }
 
@@ -108,7 +111,8 @@ impl BlockingPool {
         let pool = Self {
             state: Mutex::new(PoolState {
                 queue: VecDeque::with_capacity(capacity),
-                waiters: VecDeque::new(),
+                waiters: WaitQueue::default(),
+                reserved: HashSet::new(),
             }),
             work_ready: Condvar::new(),
             capacity,
@@ -150,7 +154,7 @@ impl BlockingPool {
         loop {
             if let Some(work) = state.queue.pop_front() {
                 QUEUED_JOBS.fetch_sub(1, Ordering::AcqRel);
-                return (work, state.last_reserved(self.capacity));
+                return (work, state.reserve_next());
             }
             state = self
                 .work_ready
@@ -160,22 +164,21 @@ impl BlockingPool {
     }
 
     /// Admit `work` unless every free slot is reserved for an older waiter.
-    /// `registered` is the submitter's index in `waiters`; an unregistered
-    /// submitter counts as standing behind every waiter. Admitting a waiter
-    /// consumes its own reservation, so no other waiter's changes.
+    /// A registered submitter consumes its own reservation; a newcomer may
+    /// consume only an unreserved slot. All membership/removal is indexed.
     fn admit(
         &self,
         state: &mut PoolState,
-        registered: Option<usize>,
+        registered: Option<u64>,
         work: BlockingWork,
     ) -> Result<(), BlockingWork> {
-        let position = registered.unwrap_or(state.waiters.len());
-        if position >= state.free_slots(self.capacity) {
+        let reserved = registered.is_some_and(|id| state.reserved.contains(&id));
+        if !reserved && state.free_slots(self.capacity) <= state.reserved.len() {
             return Err(work);
         }
-        if let Some(index) = registered {
-            state.waiters.remove(index);
-            SLOT_WAITERS.store(state.waiters.len(), Ordering::Release);
+        if let Some(id) = registered {
+            state.reserved.remove(&id);
+            SLOT_WAITERS.store(state.waiter_count(), Ordering::Release);
         }
         state.queue.push_back(work);
         QUEUED_JOBS.fetch_add(1, Ordering::AcqRel);
@@ -192,7 +195,8 @@ impl BlockingPool {
 
     fn try_submit_or_wait(&self, task_id: u64, work: BlockingWork) -> Result<(), BlockingWork> {
         let mut state = self.lock();
-        let registered = state.waiters.iter().position(|id| *id == task_id);
+        let registered = (state.waiters.contains(&task_id) || state.reserved.contains(&task_id))
+            .then_some(task_id);
         match self.admit(&mut state, registered, work) {
             Ok(()) => {
                 drop(state);
@@ -202,8 +206,8 @@ impl BlockingPool {
             Err(work) => {
                 // A spurious wake re-polls a registered waiter; keep one entry.
                 if registered.is_none() {
-                    state.waiters.push_back(task_id);
-                    let waiters = state.waiters.len();
+                    state.waiters.register(task_id);
+                    let waiters = state.waiter_count();
                     SLOT_WAITERS.store(waiters, Ordering::Release);
                     drop(state);
                     crate::observability::record(
@@ -220,18 +224,12 @@ impl BlockingPool {
 
     fn forget_waiter(&self, task_id: u64) {
         let mut state = self.lock();
-        let Some(index) = state.waiters.iter().position(|id| *id == task_id) else {
+        let reserved = state.reserved.remove(&task_id);
+        if !reserved && !state.waiters.remove(task_id) {
             return;
-        };
-        state.waiters.remove(index);
-        SLOT_WAITERS.store(state.waiters.len(), Ordering::Release);
-        // A removed waiter that held a reservation may already have been
-        // woken for it; pass the reservation on so nobody is stranded.
-        let next = if index < state.free_slots(self.capacity) {
-            state.last_reserved(self.capacity)
-        } else {
-            None
-        };
+        }
+        let next = if reserved { state.reserve_next() } else { None };
+        SLOT_WAITERS.store(state.waiter_count(), Ordering::Release);
         drop(state);
         if let Some(next) = next {
             crate::scheduler::willow_sched_wake(next);
@@ -244,6 +242,57 @@ static ACTIVE_JOBS: AtomicUsize = AtomicUsize::new(0);
 static QUEUED_JOBS: AtomicUsize = AtomicUsize::new(0);
 static SLOT_WAITERS: AtomicUsize = AtomicUsize::new(0);
 static COMPLETED_JOBS: AtomicU64 = AtomicU64::new(0);
+
+/// Run owned native work while parking the current task's native stack. No
+/// managed pointers may be captured by `work`: it can outlive cancellation.
+#[cfg(any(
+    all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+))]
+pub(crate) fn run_owned<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    use std::sync::Arc;
+    if !crate::native_stack::is_active() {
+        return Some(work());
+    }
+    let task = crate::scheduler::willow_sched_current_task();
+    let result = Arc::new(Mutex::new(None));
+    let output = Arc::clone(&result);
+    let mut job: BlockingWork = Box::new(move || {
+        let value = work();
+        *output.lock().unwrap_or_else(|e| e.into_inner()) = Some(value);
+        crate::scheduler::willow_sched_wake(task);
+    });
+    loop {
+        if crate::native_stack::cancelled() != 0 {
+            forget_waiter(task);
+            return None;
+        }
+        match try_submit_or_wait(task, job) {
+            Ok(()) => break,
+            Err(returned) => job = returned,
+        }
+        crate::native_stack::suspend_with_result(crate::task::RUNTIME_POLL_BLOCKED_SYSCALL);
+    }
+    loop {
+        // Drop the mutex before switching stacks; pool completion needs it.
+        let value = result.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if value.is_some() {
+            return value;
+        }
+        if crate::native_stack::cancelled() != 0 {
+            return None;
+        }
+        crate::native_stack::suspend_with_result(crate::task::RUNTIME_POLL_BLOCKED_SYSCALL);
+    }
+}
 
 /// Queue `work` if the bounded queue has a slot that no waiting Task holds a
 /// reservation on; otherwise hand it back so the caller's Task can keep it and
@@ -275,7 +324,8 @@ pub(crate) fn reset_slot_waiters_for_test() {
         return;
     };
     let mut state = pool.lock();
-    state.waiters.clear();
+    state.waiters = WaitQueue::default();
+    state.reserved.clear();
     SLOT_WAITERS.store(0, Ordering::Release);
 }
 

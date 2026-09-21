@@ -11,8 +11,7 @@ thread_local! {
     static DESCENDANT_WORK: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
 }
 
-/// Function-local memoization: all metadata borrowed by `FuncGen` is immutable
-/// for this cache's lifetime. Keep source spellings as keys/results so scoped
+/// Snapshot-local memoization: scoped metadata is immutable for the cache lifetime. Keep source spellings as keys/results so scoped
 /// aliases retain the exact symbol lookup semantics of the uncached walk.
 #[derive(Default)]
 pub(super) struct DefiningClassCache {
@@ -20,7 +19,7 @@ pub(super) struct DefiningClassCache {
 }
 
 impl DefiningClassCache {
-    fn resolve(
+    pub(super) fn resolve(
         &mut self,
         class_name: &str,
         method_name: &str,
@@ -59,11 +58,121 @@ impl DefiningClassCache {
             search = parent;
         };
         // Cache every suffix, not just the requested leaf: querying all nodes
-        // in a deep chain then visits each class once per method per function.
+        // in a deep chain then visits each class once per method per snapshot.
         for name in path {
             *classes.get_mut(&name).expect("visited class") = result.clone();
         }
         result.as_deref().map(str::to_owned)
+    }
+}
+
+/// A scope or declaration change invalidates all three dependent analyses.
+#[derive(Default)]
+pub(super) struct DispatchCache {
+    pub(super) defining: DefiningClassCache,
+    plans: HashMap<String, HashMap<String, std::rc::Rc<VirtualCallPlan>>>,
+    hierarchy: Option<std::rc::Rc<DispatchHierarchy>>,
+    fallback_names: Option<std::rc::Rc<[TypeId]>>,
+    fallback: HashMap<String, (DispatchSummary, Option<String>)>,
+}
+
+/// The questions code generation needs form a constant-size summary, not a
+/// set of every target. Combining child summaries avoids quadratic storage and
+/// traversal when calls use every receiver in a deep override chain.
+#[derive(Clone, Copy, Default)]
+struct DispatchSummary {
+    first: Option<FuncId>,
+    multiple: bool,
+    may_panic: bool,
+}
+
+impl DispatchSummary {
+    fn merge(&mut self, other: Self) {
+        self.multiple |=
+            other.multiple || matches!((self.first, other.first), (Some(a), Some(b)) if a != b);
+        self.first = self.first.or(other.first);
+        self.may_panic |= other.may_panic;
+    }
+}
+
+struct DispatchHierarchy {
+    children: HashMap<i64, Vec<i64>>,
+    names: HashMap<i64, Vec<TypeId>>,
+    summaries: std::cell::RefCell<HashMap<String, HashMap<i64, DispatchSummary>>>,
+}
+
+impl DispatchHierarchy {
+    fn new(bases: &TypeMap<TypeId>, types: &TypeMap<i64>) -> Self {
+        let mut children: HashMap<i64, Vec<i64>> = HashMap::new();
+        for (child, base) in class_base_ids(bases, types) {
+            children.entry(base).or_default().push(child);
+            #[cfg(test)]
+            DESCENDANT_WORK.with(|w| {
+                let [b, v] = w.get();
+                w.set([b + 1, v]);
+            });
+        }
+        let mut names: HashMap<i64, Vec<TypeId>> = HashMap::new();
+        for (name, &id) in types.iter() {
+            names.entry(id).or_default().push(*name);
+        }
+        Self {
+            children,
+            names,
+            summaries: Default::default(),
+        }
+    }
+
+    fn summary(
+        &self,
+        receiver: i64,
+        method: &str,
+        mut own: impl FnMut(&str) -> DispatchSummary,
+    ) -> DispatchSummary {
+        let mut summaries = self.summaries.borrow_mut();
+        if let Some(summary) = summaries.get(method).and_then(|all| all.get(&receiver)) {
+            return *summary;
+        }
+        let summaries = summaries.entry(method.to_owned()).or_default();
+        let mut pending = vec![(receiver, false)];
+        let mut visiting = HashSet::new();
+        while let Some((id, finish)) = pending.pop() {
+            if summaries.contains_key(&id) {
+                continue;
+            }
+            if !finish {
+                assert!(
+                    visiting.insert(id),
+                    "compiler invariant violated: cyclic class hierarchy"
+                );
+                pending.push((id, true));
+                if let Some(children) = self.children.get(&id) {
+                    for &child in children {
+                        #[cfg(test)]
+                        DESCENDANT_WORK.with(|w| {
+                            let [b, v] = w.get();
+                            w.set([b, v + 1]);
+                        });
+                        pending.push((child, false));
+                    }
+                }
+                continue;
+            }
+            let mut summary = DispatchSummary::default();
+            if let Some(names) = self.names.get(&id) {
+                for name in names {
+                    summary.merge(own(&name.to_string()));
+                }
+            }
+            if let Some(children) = self.children.get(&id) {
+                for child in children {
+                    summary.merge(summaries[child]);
+                }
+            }
+            summaries.insert(id, summary);
+            visiting.remove(&id);
+        }
+        summaries[&receiver]
     }
 }
 
@@ -80,9 +189,8 @@ pub(super) struct VirtualCallPlan {
     /// callee, and the source of the return type, parameter modes and debug
     /// metadata for both call shapes.
     pub(super) mangled: String,
-    /// Every implementation the receiver could reach. Compile-time only — used
-    /// for panic-effect analysis, never to branch on.
-    pub(super) dispatch_targets: Vec<String>,
+    /// Whether any reachable implementation may panic, reduced once per plan.
+    pub(super) may_panic: bool,
     /// `Some(slot)` when the call must go through the descriptor; `None` when
     /// exactly one implementation exists and the call is direct.
     pub(super) virtual_slot: Option<usize>,
@@ -205,94 +313,105 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_box_with_vtable(object, target_vtable)
     }
 
-    /// This program's `extends` graph in runtime-`type_id` space — the form the
-    /// dispatch-chain filter asks its question in (willow-au5k).
-    fn class_base_ids(&self) -> HashMap<i64, i64> {
-        class_base_ids(self.class_base, self.class_type_ids)
+    fn own_dispatch_summary(&self, class: &str, method: &str) -> (DispatchSummary, Option<String>) {
+        let Some(defining) = self.resolve_defining_class(class, method) else {
+            return (DispatchSummary::default(), None);
+        };
+        let mangled = class_method_symbol_name(self.known_modules, &defining, method);
+        (
+            DispatchSummary {
+                first: self.func_ids.get(&mangled).copied(),
+                multiple: false,
+                may_panic: self.user_function_may_panic(&mangled),
+            },
+            Some(defining),
+        )
     }
 
-    /// Every class the receiver could actually BE at runtime that supplies its
-    /// own implementation of `method_name`, with the statically resolved one
-    /// first.
-    ///
-    /// Only used to answer compile-time questions about the call — whether any
-    /// reachable target can panic, and whether there is exactly one target and
-    /// the call can therefore be made directly. The dispatch itself no longer
-    /// enumerates classes at all (willow-fm7t).
-    ///
-    /// The question is asked in `type_id` space rather than over class NAMES,
-    /// because a directly imported class is registered twice — once
-    /// canonically (`zoo::Dog`) and once under the local alias (`Dog`) — while
-    /// `class_base` keeps whichever spelling each declaration used. Both
-    /// spellings share one `type_id`, so ids are the canonical form here. Over
-    /// names, an aliased base class would look like a leaf and its subclasses
-    /// would drop out of their own candidate set (the `lir_diff_74`
-    /// regression).
-    ///
-    /// The result is deduplicated by resolved `FuncId` for the same reason: two
-    /// spellings of one class mangle to two symbols that share a function, and
-    /// counting both would report a monomorphic call as polymorphic.
-    fn virtual_dispatch_candidates(&self, class_name: &str, method_name: &str) -> Vec<String> {
+    /// Runtime IDs collapse aliases, and FuncIds collapse alternate spellings
+    /// of one implementation. Summaries retain polymorphism and panic effects
+    /// without retaining or repeatedly sorting all reachable implementations.
+    fn virtual_dispatch_summary(
+        &self,
+        class: &str,
+        method: &str,
+    ) -> (DispatchSummary, Option<String>) {
         #[cfg(test)]
         DISPATCH_WORK.with(|work| {
             let [queries, visits] = work.get();
             work.set([queries + 1, visits]);
         });
-        let mut out: Vec<String> = Vec::new();
-        let mut seen_targets: HashSet<FuncId> = HashSet::new();
-        let push = |out: &mut Vec<String>, seen: &mut HashSet<FuncId>, cls: String| {
-            let mangled = class_method_symbol_name(self.known_modules, &cls, method_name);
-            match self.func_ids.get(&mangled) {
-                Some(&fid) if seen.insert(fid) => out.push(cls),
-                _ => {}
-            }
-        };
-
-        if let Some(defining) = self.resolve_defining_class(class_name, method_name) {
-            push(&mut out, &mut seen_targets, defining);
-        }
-
-        let Some(receiver_id) = self.class_type_ids.get(class_name).copied() else {
-            // Not a registered class at all. The only receiver that reaches
-            // class dispatch this way is an interface whose `InterfaceInfo` did
-            // not resolve under the spelling this compilation unit used — a
-            // cross-module default method (`iface_adv_07`). The ancestry walk
-            // cannot answer for it, so fall back to every class that supplies
-            // the method, which is what this call site emitted before
-            // willow-fm7t.
-            let mut names: Vec<&TypeId> = self.class_type_ids.keys().collect();
-            names.sort();
-            for cls in names {
-                if let Some(defining) = self.resolve_defining_class(&cls.to_string(), method_name) {
-                    push(&mut out, &mut seen_targets, defining);
+        let (mut summary, mut defining) = self.own_dispatch_summary(class, method);
+        if let Some(&receiver) = self.class_type_ids.get(class) {
+            let hierarchy = {
+                let mut cache = self.dispatch_cache.borrow_mut();
+                cache
+                    .hierarchy
+                    .get_or_insert_with(|| {
+                        std::rc::Rc::new(DispatchHierarchy::new(
+                            self.class_base,
+                            self.class_type_ids,
+                        ))
+                    })
+                    .clone()
+            };
+            summary.merge(hierarchy.summary(receiver, method, |name| {
+                self.own_dispatch_summary(name, method).0
+            }));
+        } else {
+            // Preserve the default-interface fallback's deterministic first
+            // implementation, sharing its sorted names and result per method.
+            let cached = self.dispatch_cache.borrow().fallback.get(method).cloned();
+            let (all, first) = cached.unwrap_or_else(|| {
+                let names = {
+                    let mut cache = self.dispatch_cache.borrow_mut();
+                    cache
+                        .fallback_names
+                        .get_or_insert_with(|| {
+                            let mut names: Vec<_> = self.class_type_ids.keys().copied().collect();
+                            names.sort();
+                            names.into()
+                        })
+                        .clone()
+                };
+                let mut all = DispatchSummary::default();
+                let mut first = None;
+                for name in names.iter() {
+                    let (summary, defining) = self.own_dispatch_summary(&name.to_string(), method);
+                    first = first.or(defining);
+                    all.merge(summary);
                 }
-            }
-            return out;
-        };
-
-        let base_ids = self.class_base_ids();
-        let reachable = descendant_ids(&base_ids, receiver_id);
-        let mut descendants: Vec<(i64, TypeId)> = self
-            .class_type_ids
-            .iter()
-            .filter(|&(_, &id)| id != receiver_id && reachable.contains(&id))
-            .map(|(cls, &id)| (id, *cls))
-            .collect();
-        descendants.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        for (_, cls) in descendants {
-            if let Some(defining) = self.resolve_defining_class(&cls.to_string(), method_name) {
-                push(&mut out, &mut seen_targets, defining);
-            }
+                self.dispatch_cache
+                    .borrow_mut()
+                    .fallback
+                    .insert(method.to_owned(), (all, first.clone()));
+                (all, first)
+            });
+            summary.merge(all);
+            defining = defining.or(first);
         }
-        out
+        (summary, defining)
     }
 
     /// How a call to `class_name::method_name` on a receiver of STATIC type
     /// `class_name` must be emitted (willow-fm7t).
     ///
-    /// Resolve dispatch from the class tables once for each call site. Static
-    /// initializers use the same LIR emission and dispatch rules as other bodies.
-    pub(super) fn plan_virtual_call(&self, class_name: &str, method_name: &str) -> VirtualCallPlan {
+    /// Resolve once per scoped (receiver, method) pair. Static initializers and
+    /// emitted functions share plans until registration or resolution changes.
+    pub(super) fn plan_virtual_call(
+        &self,
+        class_name: &str,
+        method_name: &str,
+    ) -> std::rc::Rc<VirtualCallPlan> {
+        if let Some(plan) = self
+            .dispatch_cache
+            .borrow()
+            .plans
+            .get(class_name)
+            .and_then(|m| m.get(method_name))
+        {
+            return plan.clone();
+        }
         // A method with no slot is neither `open` nor an `override`. It can
         // neither be overridden nor override anything, so its callee is fixed
         // at compile time and a direct call is the whole answer.
@@ -301,48 +420,38 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .get(class_name)
             .and_then(|slots| slots.slot_of(method_name));
 
-        // The candidate set answers two compile-time questions only: can any
-        // reachable target panic, and is there exactly one target (so the
-        // indirect call can be devirtualized).
-        let candidates = if vslot.is_none() && self.class_type_ids.contains_key(class_name) {
-            // Checked non-virtual methods cannot be overridden. Resolve only
-            // the inherited implementation; descendants cannot add targets.
-            // Unregistered names retain the cross-module interface fallback.
-            self.resolve_defining_class(class_name, method_name)
-                .into_iter()
-                .collect()
+        let (summary, defining) = if vslot.is_none() && self.class_type_ids.contains_key(class_name)
+        {
+            self.own_dispatch_summary(class_name, method_name)
         } else {
-            self.virtual_dispatch_candidates(class_name, method_name)
+            self.virtual_dispatch_summary(class_name, method_name)
         };
-        let Some(static_class) = candidates.first().cloned() else {
+        let Some(static_class) = defining else {
             panic!(
                 "compiler invariant violated: checked class method `{class_name}::{method_name}` has no dispatch target"
             );
         };
-
-        // Devirtualize when the hierarchy holds exactly one implementation: the
-        // slot can only ever contain that address, so the load and the indirect
-        // call buy nothing. This is also the only path for a method with no
-        // slot at all.
         let virtual_slot = match vslot {
-            Some(slot) if candidates.len() > 1 => Some(slot),
-            None if candidates.len() > 1 => panic!(
-                "compiler invariant violated: method `{class_name}::{method_name}` has no virtual slot but {} candidate implementations",
-                candidates.len()
+            Some(slot) if summary.multiple => Some(slot),
+            None if summary.multiple => panic!(
+                "compiler invariant violated: method `{class_name}::{method_name}` has no virtual slot but multiple candidate implementations"
             ),
             _ => None,
         };
-
-        let dispatch_targets = candidates
-            .iter()
-            .map(|cls| class_method_symbol_name(self.known_modules, cls, method_name))
-            .collect::<Vec<_>>();
-        VirtualCallPlan {
+        let may_panic = summary.may_panic;
+        let plan = std::rc::Rc::new(VirtualCallPlan {
             mangled: class_method_symbol_name(self.known_modules, &static_class, method_name),
             static_class,
-            dispatch_targets,
+            may_panic,
             virtual_slot,
-        }
+        });
+        self.dispatch_cache
+            .borrow_mut()
+            .plans
+            .entry(class_name.to_owned())
+            .or_default()
+            .insert(method_name.to_owned(), plan.clone());
+        plan
     }
 
     /// Load the function address in virtual slot `slot` of `self_ptr`'s class.
@@ -380,8 +489,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// defines `method_name`, so a subclass that INHERITS a method resolves to
     /// the implementation it actually inherits (willow-ftk).
     fn resolve_defining_class(&self, class_name: &str, method_name: &str) -> Option<String> {
-        self.defining_class_cache
+        self.dispatch_cache
             .borrow_mut()
+            .defining
             .resolve(class_name, method_name, |name| {
                 let mangled = class_method_symbol_name(self.known_modules, name, method_name);
                 let defines = self.func_ids.contains_key(&mangled);
@@ -463,6 +573,7 @@ pub(super) fn is_self_or_descendant(
 /// Reverse edges cost O(E) to build; the iterative walk costs O(Vr + Er) for
 /// reachable vertices/edges. IDs preserve alias identity, and insertion before
 /// enqueueing ensures even malformed cycles visit each vertex at most once.
+#[cfg(test)]
 fn descendant_ids(base_of: &HashMap<i64, i64>, ancestor_id: i64) -> HashSet<i64> {
     let mut children: HashMap<i64, Vec<i64>> = HashMap::new();
     for (&child, &base) in base_of {
@@ -569,31 +680,193 @@ mod tests {
         for shape in ["chain", "fanout"] {
             for edges in [1, 8, 32] {
                 for calls in [1, 4, 16] {
-                    let mut source = String::from(
-                        "open class C0 { pub open fn value(self) -> i64 { return 0; } }\n",
-                    );
-                    for child in 1..=edges {
-                        let parent = if shape == "chain" { child - 1 } else { 0 };
-                        source.push_str(&format!(
-                            "open class C{child} extends C{parent} {{ pub open override fn value(self) -> i64 {{ return {child}; }} }}\n"
-                        ));
+                    for functions in [1, 4] {
+                        let mut source = String::from(
+                            "open class C0 { pub open fn value(self) -> i64 { return 0; } }\n",
+                        );
+                        for child in 1..=edges {
+                            let parent = if shape == "chain" { child - 1 } else { 0 };
+                            source.push_str(&format!(
+                                "open class C{child} extends C{parent} {{ pub open override fn value(self) -> i64 {{ return {child}; }} }}\n"
+                            ));
+                        }
+                        for f in 0..functions {
+                            source.push_str(&format!("fn probe{f}(value: C0) -> i64 {{\n"));
+                            for _ in 1..calls {
+                                source.push_str("value.value();\n");
+                            }
+                            source.push_str("return value.value(); }\n");
+                        }
+                        source.push_str("fn main() {}\n");
+                        DESCENDANT_WORK.with(|work| work.set([0; 2]));
+                        DISPATCH_WORK.with(|work| work.set([0; 2]));
+                        compile_dispatch_fixture(&source);
+                        let work = DESCENDANT_WORK.with(|work| work.get());
+                        assert_eq!(work, [edges; 2], "{shape}, {edges}, {calls}, {functions}");
+                        assert_eq!(DISPATCH_WORK.with(|w| w.get()), [1, 2 * (edges + 1)]);
+                        eprintln!(
+                            "virtual-descendants shape={shape} edges={edges} calls={calls} functions={functions} built={} visited={} candidate_queries=1 defining_visits={}",
+                            work[0],
+                            work[1],
+                            2 * (edges + 1)
+                        );
                     }
-                    source.push_str("fn probe(value: C0) -> i64 {\n");
-                    for _ in 1..calls {
-                        source.push_str("value.value();\n");
-                    }
-                    source.push_str("return value.value(); } fn main() {}\n");
-                    DESCENDANT_WORK.with(|work| work.set([0; 2]));
-                    compile_dispatch_fixture(&source);
-                    let work = DESCENDANT_WORK.with(|work| work.get());
-                    assert_eq!(work, [edges * calls; 2], "{shape}, {edges}, {calls}");
-                    eprintln!(
-                        "virtual-descendants shape={shape} edges={edges} calls={calls} built={} visited={}",
-                        work[0], work[1]
-                    );
                 }
             }
         }
+    }
+
+    #[test]
+    fn subtree_summaries_share_work_across_every_receiver_and_method() {
+        for shape in ["chain", "fanout"] {
+            for count in [1, 32, 256, 4096] {
+                let mut bases = TypeMap::default();
+                let mut ids = TypeMap::default();
+                for id in 0..count {
+                    ids.insert(TypeId::local(format!("C{id}")), id as i64);
+                    if id > 0 {
+                        let base = if shape == "chain" { id - 1 } else { 0 };
+                        bases.insert(
+                            TypeId::local(format!("C{id}")),
+                            TypeId::local(format!("C{base}")),
+                        );
+                    }
+                }
+                DESCENDANT_WORK.with(|w| w.set([0; 2]));
+                let hierarchy = DispatchHierarchy::new(&bases, &ids);
+                let mut visits = 0;
+                for method in ["fixed", "override"] {
+                    for _ in 0..4 {
+                        for receiver in (0..count).rev() {
+                            let summary = hierarchy.summary(receiver as i64, method, |name| {
+                                visits += 1;
+                                let id: u32 = name[1..].parse().unwrap();
+                                DispatchSummary {
+                                    first: Some(FuncId::from_u32(if method == "fixed" {
+                                        0
+                                    } else {
+                                        id
+                                    })),
+                                    multiple: false,
+                                    may_panic: id == (count - 1) as u32,
+                                }
+                            });
+                            let has_descendant = if shape == "chain" {
+                                receiver + 1 < count
+                            } else {
+                                receiver == 0 && count > 1
+                            };
+                            assert_eq!(summary.multiple, method == "override" && has_descendant);
+                            let reaches_last =
+                                shape == "chain" || receiver == 0 || receiver == count - 1;
+                            assert_eq!(summary.may_panic, reaches_last);
+                        }
+                    }
+                }
+                assert_eq!(visits, 2 * count);
+                assert_eq!(
+                    DESCENDANT_WORK.with(|w| w.get()),
+                    [count - 1, 2 * (count - 1)]
+                );
+                assert_eq!(
+                    hierarchy
+                        .summaries
+                        .borrow()
+                        .values()
+                        .map(HashMap::len)
+                        .sum::<usize>(),
+                    2 * count
+                );
+                println!(
+                    "summary shape={shape} nodes={count} methods=2 repeats=4 node_visits={visits} edges_built={} edges_visited={} entries={}",
+                    count - 1,
+                    2 * (count - 1),
+                    2 * count
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_descriptors_remain_one_slot_per_override_class() {
+        for count in [1, 8, 32] {
+            let mut source =
+                String::from("open class C0 { pub open fn value(self) -> i64 { return 0; } }\n");
+            for child in 1..count {
+                source.push_str(&format!("open class C{child} extends C{} {{ pub open override fn value(self) -> i64 {{ return {child}; }} }}\n", child - 1));
+            }
+            source.push_str("fn main() {}\n");
+            let bytes = compile_dispatch_fixture(&source);
+            let object = object::File::parse(&*bytes).unwrap();
+            let expected = 8 + if object.is_64() { 8 } else { 4 };
+            let mut measured = 0;
+            for id in 0..count {
+                let name = class_descriptor_symbol(&format!("C{id}"));
+                let symbol = object
+                    .symbol_by_name(&name)
+                    .or_else(|| object.symbol_by_name(&format!("_{name}")))
+                    .expect("descriptor symbol");
+                // ELF gives exact data-symbol extents. COFF/Mach-O may report
+                // zero; layout formula is covered by ABI tests on those hosts.
+                if symbol.size() != 0 {
+                    assert_eq!(symbol.size(), expected);
+                    measured += symbol.size();
+                }
+            }
+            println!(
+                "descriptor classes={count} bytes_per_class={expected} measured_bytes={measured}"
+            );
+        }
+    }
+
+    #[test]
+    fn defining_cache_invalidates_on_reparent_and_function_alias_changes() {
+        fn declare(cg: &mut Codegen, source: &str) {
+            let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
+            let (program, errors) = crate::parser::Parser::new(tokens).parse();
+            assert!(errors.is_empty());
+            for item in program.items {
+                if let Item::Class(class) = item {
+                    cg.register_class_layout(&class).unwrap();
+                    cg.declare_class_methods(&class).unwrap();
+                }
+            }
+        }
+        let mut cg = Codegen::new(&CompilerOptions::debug()).unwrap();
+        declare(
+            &mut cg,
+            "open class A { pub fn value(self) -> i64 { return 1; } } open class X { pub fn value(self) -> i64 { return 2; } } class B extends A {}",
+        );
+        let a = cg.resolve_class_method_func_id("A", "value").unwrap();
+        let x = cg.resolve_class_method_func_id("X", "value").unwrap();
+        assert_ne!(a, x);
+        for _ in 0..4 {
+            assert_eq!(cg.resolve_class_method_func_id("B", "value"), Some(a));
+        }
+        declare(&mut cg, "class B extends X {}");
+        assert_eq!(cg.resolve_class_method_func_id("B", "value"), Some(x));
+        assert_eq!(cg.resolve_class_method_func_id("Alias", "value"), None);
+        let alias = cg.class_method_symbol("Alias", "value");
+        let a_name = cg.class_method_symbol("A", "value");
+        let x_name = cg.class_method_symbol("X", "value");
+        cg.alias_function_symbol(&alias, &a_name);
+        assert_eq!(cg.resolve_class_method_func_id("Alias", "value"), Some(a));
+        cg.alias_function_symbol(&alias, &x_name);
+        assert_eq!(cg.resolve_class_method_func_id("Alias", "value"), Some(x));
+        assert_eq!(cg.resolve_class_method_func_id("Late", "value"), None);
+        let tokens =
+            crate::lexer::Lexer::new("class Late { pub fn value(self) -> i64 { return 3; } }")
+                .tokenize()
+                .unwrap();
+        let (program, errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(errors.is_empty());
+        let Item::Class(class) = &program.items[0] else {
+            panic!("class fixture")
+        };
+        // Declare methods after a cached miss without a layout registration
+        // or scope change that would otherwise conceal missing invalidation.
+        cg.declare_class_methods(class).unwrap();
+        assert!(cg.resolve_class_method_func_id("Late", "value").is_some());
     }
 
     #[test]
@@ -827,7 +1100,7 @@ fn main() {}
                     let depth = if shape == "chain" { classes + 1 } else { 2 };
                     assert_eq!(
                         work,
-                        [0, depth + 1],
+                        [0, depth],
                         "{shape}, classes={classes}, calls={calls}"
                     );
                     eprintln!(

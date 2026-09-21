@@ -367,9 +367,15 @@ fn stress_region_06_many_sparse_pinned_chunks_are_eventually_released() {
 fn stress_region_07_deterministic_random_graph_matches_reachability_model() {
     let _guard = stress_guard();
     reset_gc();
-    const OBJECTS: usize = 18_000;
-    let mut objects = Vec::with_capacity(OBJECTS);
-    for index in 0..OBJECTS {
+    // Allocation stress collects before every allocation: retaining N roots
+    // necessarily visits 1 + ... + N objects. Bound that mode's fixture size.
+    let objects_count = if gc_stress_enabled("alloc") {
+        512
+    } else {
+        18_000
+    };
+    let mut objects = Vec::with_capacity(objects_count);
+    for index in 0..objects_count {
         objects.push(willow_gc_alloc_layout(
             index as u64 + 1,
             index as i64 + 1,
@@ -378,21 +384,21 @@ fn stress_region_07_deterministic_random_graph_matches_reachability_model() {
         ));
         willow_push_root(objects.last_mut().unwrap());
     }
-    for index in 0..OBJECTS {
-        let target = (index.wrapping_mul(1103515245).wrapping_add(12345)) % OBJECTS;
+    for index in 0..objects_count {
+        let target = (index.wrapping_mul(1103515245).wrapping_add(12345)) % objects_count;
         unsafe { *(objects[index] as *mut *mut u8) = objects[target] };
     }
     let mut roots: Vec<*mut u8> = objects.iter().step_by(997).copied().collect();
-    willow_pop_roots(OBJECTS as i32);
+    willow_pop_roots(objects_count as i32);
     for root in &mut roots {
         willow_push_root(root);
     }
 
     let mut expected = HashSet::new();
-    let mut worklist: Vec<usize> = (0..OBJECTS).step_by(997).collect();
+    let mut worklist: Vec<usize> = (0..objects_count).step_by(997).collect();
     while let Some(index) = worklist.pop() {
         if expected.insert(index as u32 + 1) {
-            let target = (index.wrapping_mul(1103515245).wrapping_add(12345)) % OBJECTS;
+            let target = (index.wrapping_mul(1103515245).wrapping_add(12345)) % objects_count;
             worklist.push(target);
         }
     }
@@ -413,6 +419,98 @@ fn stress_region_07_deterministic_random_graph_matches_reachability_model() {
     willow_gc_collect();
     assert_eq!(willow_gc_old_region_count(), 0);
     reset_gc();
+}
+
+#[test]
+#[ignore = "explicit GC stress suite"]
+fn stress_region_11_generated_graph_preserves_edges_through_moving_collection() {
+    let _guard = stress_guard();
+    // Allocation stress deliberately bypasses the nursery. The runner also
+    // runs this test without that mode so relocation cannot pass vacuously.
+    if skip_pinned_tlab_fixture("stress_region_11") {
+        return;
+    }
+    for count in [8usize, 64, 512] {
+        for initial_seed in [1u64, 0x5eed, 0xdead_beef] {
+            reset_gc();
+            let live = count * 3 / 4;
+            let mut seed = initial_seed;
+            let mut edges = Vec::with_capacity(count);
+            for index in 0..count {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                // A ring guarantees live-node coverage; the other edge adds
+                // aliases, self-edges, and fan-in. The last quarter is garbage.
+                edges.push(if index < live {
+                    [(index + 1) % live, (seed >> 32) as usize % live]
+                } else {
+                    [index, index]
+                });
+            }
+            let mut parent = willow_gc_alloc_layout(1, 0, 8, 1);
+            willow_push_root(&mut parent);
+            let mut tls = new_tlab_state();
+            let mut objects = Vec::with_capacity(count);
+            for index in 0..count {
+                let object = if index == 0 {
+                    willow_gc_alloc_slow(&mut tls, 2, 0, 24, 0b11)
+                } else {
+                    tlab_fast_alloc(&tls, 2, 0, 24, 0b11)
+                };
+                assert!(!object.is_null());
+                unsafe { *object.add(16).cast::<u64>() = index as u64 };
+                objects.push(object);
+            }
+            for (index, targets) in edges.iter().enumerate() {
+                for (slot, &target) in targets.iter().enumerate() {
+                    unsafe { *objects[index].cast::<*mut u8>().add(slot) = objects[target] };
+                }
+            }
+            willow_gc_write_barrier(
+                parent,
+                std::ptr::null_mut(),
+                objects[0],
+                GcStoreDestination::ObjectField as i64,
+            );
+            unsafe { *parent.cast::<*mut u8>() = objects[0] };
+
+            let mut relocated = Vec::with_capacity(live);
+            for round in 0..3 {
+                willow_gc_minor_collect();
+                let mut current = unsafe { *parent.cast::<*mut u8>() };
+                relocated.clear();
+                for (index, &original) in objects.iter().take(live).enumerate() {
+                    assert_eq!(unsafe { *current.add(16).cast::<u64>() }, index as u64);
+                    if round == 0 {
+                        assert_ne!(current, original, "seed={initial_seed} count={count}");
+                    }
+                    relocated.push(current);
+                    current = unsafe { *current.cast::<*mut u8>() };
+                }
+                assert_eq!(current, unsafe { *parent.cast::<*mut u8>() });
+                for (index, targets) in edges.iter().take(live).enumerate() {
+                    for (slot, &target) in targets.iter().enumerate() {
+                        let child = unsafe { *relocated[index].cast::<*mut u8>().add(slot) };
+                        assert_eq!(child, relocated[target]);
+                    }
+                }
+                assert_eq!(
+                    willow_gc_allocated_bytes(),
+                    (live * (GC_HEADER_SIZE + 24) + GC_HEADER_SIZE + 8) as i64,
+                    "disconnected nursery garbage must be reclaimed"
+                );
+            }
+            assert!(willow_gc_moved_objects() >= live as i64);
+            willow_pop_root();
+            willow_gc_collect();
+            assert_eq!(willow_gc_allocated_bytes(), 0);
+            assert_global_regions_valid();
+            eprintln!(
+                "moving graph: seed={initial_seed} nodes={count} live={live} checked_edges={}",
+                3 * 2 * live
+            );
+            reset_gc();
+        }
+    }
 }
 
 #[test]

@@ -3510,19 +3510,26 @@ fn scheduler_run_loop(
                         .with(id, RuntimeTask::preempt_flag_ptr)
                         .unwrap_or(std::ptr::null());
                     crate::preempt::willow_preempt_begin(flag);
-                    unsafe {
-                        crate::native_stack::NativeStack::resume(&mut *stack);
-                    }
+                    let result = unsafe { crate::native_stack::NativeStack::resume(&mut *stack) };
                     crate::preempt::willow_preempt_end();
                     if stack.is_suspended() {
                         global_task_table().with_mut(id, |task| task.native_stack = Some(stack));
-                        finish_global_poll_boundary(id, GlobalPollBoundary::Runnable);
-                        crate::observability::record(
-                            crate::observability::RuntimeEventKind::TaskPreempt,
-                            Some(worker),
-                            id,
-                            i64::from(RUNTIME_POLL_PREEMPTED),
-                        );
+                        let boundary = match result {
+                            RUNTIME_POLL_PENDING => GlobalPollBoundary::Pending,
+                            RUNTIME_POLL_BLOCKED_SYSCALL => GlobalPollBoundary::BlockedSyscall,
+                            _ => GlobalPollBoundary::Runnable,
+                        };
+                        finish_global_poll_boundary(id, boundary);
+                        let event = match result {
+                            RUNTIME_POLL_PENDING => {
+                                crate::observability::RuntimeEventKind::TaskPark
+                            }
+                            RUNTIME_POLL_BLOCKED_SYSCALL => {
+                                crate::observability::RuntimeEventKind::BlockingDetach
+                            }
+                            _ => crate::observability::RuntimeEventKind::TaskPreempt,
+                        };
+                        crate::observability::record(event, Some(worker), id, i64::from(result));
                         set_current_task(None);
                         finish_active_poll(shared);
                         continue;
@@ -3872,7 +3879,10 @@ pub extern "C" fn willow_task_stack_enter(callback: RuntimePollFn, frame: *mut c
         let pending = stack.is_suspended() || stack.is_cancelled();
         global_task_table().with_mut(id, |task| task.native_stack = Some(stack));
         if pending && !(result == RUNTIME_POLL_PANICKED && new_panic) {
-            RUNTIME_POLL_PREEMPTED
+            match result {
+                RUNTIME_POLL_PENDING | RUNTIME_POLL_BLOCKED_SYSCALL => result,
+                _ => RUNTIME_POLL_PREEMPTED,
+            }
         } else {
             result
         }

@@ -131,8 +131,18 @@ impl Codegen {
             );
         }
         let frame_all = std::env::var("WILLOW_ASYNC_FRAME_ALL").is_ok()
-            || lir.blocks.iter().any(|b| b.instrs.iter().any(|i| matches!(i, LirInst::Defer { .. })))
-            || lir.blocks.iter().flat_map(|b| &b.instrs).any(|inst| matches!(inst, LirInst::Compute { value, .. } if super::lir_gen::task_stack_boundary(value)));
+            || lir
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instrs)
+                .any(|inst| match inst {
+                    LirInst::Defer { .. } => true,
+                    LirInst::Compute { value, .. } => {
+                        super::lir_gen::task_stack_boundary(value)
+                            && !matches!(value, crate::ir::lowered::LirRvalue::Print { .. })
+                    }
+                    _ => false,
+                });
         let selected: Vec<_> = if frame_all {
             lir.locals
                 .iter()
@@ -167,6 +177,37 @@ impl Codegen {
             for (local, slot) in &lir.async_frame.locals {
                 let representative = lir.async_frame.slots[slot.index];
                 offsets.insert(*local, offsets[&representative]);
+            }
+            // Printing runs on a resumable task stack, but its preceding LIR
+            // preemption edge already frames source locals needed afterwards.
+            // Only its operand can be newly produced after that edge. Keep
+            // such temporaries in exclusive slots: the logical layout has no
+            // interference proof for them. Do not frame unrelated dead locals.
+            for instruction in lir.blocks.iter().flat_map(|block| &block.instrs) {
+                if let LirInst::Compute {
+                    value:
+                        crate::ir::lowered::LirRvalue::Print {
+                            value: crate::ir::lowered::LirOperand::Local(id),
+                            ..
+                        },
+                    ..
+                } = instruction
+                {
+                    offsets.entry(*id).or_insert_with(|| {
+                        let local = &lir.locals[id.0 as usize];
+                        let offset = async_frame_slot_offset(
+                            reserved.len(),
+                            reference_type(self.module.target_config()).bytes(),
+                        );
+                        reserved.push(AsyncFrameSlot {
+                            storage_kind: local.storage_kind,
+                            source_span: local.source_span,
+                            name: local.name.clone(),
+                            ty: local.ty.clone(),
+                        });
+                        offset
+                    });
+                }
             }
         }
         let mut defer_sites: Vec<_> = lir
@@ -1119,7 +1160,7 @@ impl Codegen {
                 class_type_ids: &self.class_type_ids,
                 class_descriptor_ids: &self.class_descriptor_ids,
                 class_vslots: &self.class_vslots,
-                defining_class_cache: Default::default(),
+                dispatch_cache: &self.dispatch_cache,
                 interface_infos: &self.interface_infos,
                 vtable_ids: &self.vtable_ids,
                 coop_frame: None,
@@ -1335,7 +1376,7 @@ impl Codegen {
                 class_type_ids: &self.class_type_ids,
                 class_descriptor_ids: &self.class_descriptor_ids,
                 class_vslots: &self.class_vslots,
-                defining_class_cache: Default::default(),
+                dispatch_cache: &self.dispatch_cache,
                 interface_infos: &self.interface_infos,
                 vtable_ids: &self.vtable_ids,
                 coop_frame: None,
@@ -2214,6 +2255,79 @@ mod async_mutex_abi_tests {
 mod task_boundary_callback_tests {
     use super::*;
 
+    fn print_frame_layout(
+        source: &str,
+    ) -> (LirFunction, AsyncFrameLayout, HashMap<LirLocalId, i32>) {
+        let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
+        let (program, errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(errors.is_empty(), "{errors:?}");
+        let mut checker = crate::semantic::TypeChecker::new();
+        crate::register_prelude(&mut checker).unwrap();
+        checker.check_program(&program);
+        assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+        let tables = crate::ir::lower::CheckerTables::from_checker(&checker);
+        let (hir, errors) = crate::ir::lower::lower_program_with(&program, &tables);
+        assert!(errors.is_empty(), "{errors:?}");
+        let lir = crate::ir::lowered::lower_program(&hir).functions.remove(0);
+        let codegen = Codegen::new(&crate::CompilerOptions::debug()).unwrap();
+        let (layout, offsets, _) = codegen.lir_async_layout(&lir, Vec::new(), 0).unwrap();
+        (lir, layout, offsets)
+    }
+
+    #[test]
+    fn print_frame_stays_constant_with_dead_locals_and_repeated_operands() {
+        for locals in [16, 64, 256, 1024] {
+            for prints in [1, 8, 32] {
+                let mut source = String::from("async fn main() { let mut total: i64 = 0;");
+                for index in 0..locals {
+                    source.push_str(&format!(
+                        "let value_{index}: i64 = {index}; total = total + value_{index};"
+                    ));
+                }
+                for _ in 0..prints {
+                    source.push_str("println(total);");
+                }
+                source.push('}');
+                let (_, layout, _) = print_frame_layout(&source);
+                assert_eq!(layout.slots.len(), 1, "locals={locals} prints={prints}");
+                println!("locals={locals} prints={prints} frame_slots=1");
+            }
+        }
+    }
+
+    #[test]
+    fn print_temporaries_have_callback_slots_and_gc_metadata() {
+        use crate::ir::lowered::{LirOperand, LirRvalue};
+        let (lir, layout, offsets) = print_frame_layout(
+            r#"async fn main() {
+                let value = 7;
+                println(value + 3);
+                println("managed" + " temporary");
+                println(value);
+            }"#,
+        );
+        let mut prints = 0;
+        for instruction in lir.blocks.iter().flat_map(|block| &block.instrs) {
+            if let LirInst::Compute {
+                value:
+                    LirRvalue::Print {
+                        value: LirOperand::Local(id),
+                        ..
+                    },
+                ..
+            } = instruction
+            {
+                assert!(offsets.contains_key(id), "missing callback operand {id:?}");
+                prints += 1;
+            }
+        }
+        assert_eq!(prints, 3);
+        assert_ne!(
+            layout.gc_slot_mask, 0,
+            "managed print operand must be traced"
+        );
+    }
+
     /// `fn work` must not be an inlinable scalar leaf, or the optimizer folds
     /// the call away and no task-stack boundary exists to compile (willow-ssl7.3).
     const WORK: &str = "fn work(x: i64) -> i64 { println(x); return x + 1; }";
@@ -2263,7 +2377,7 @@ mod task_boundary_callback_tests {
         for callbacks in [1, 4, 16] {
             let calls = "println(work(input));".repeat(callbacks);
             let (_, count, _, _) = callback_work(&async_main(0, &calls));
-            assert_eq!(count, callbacks);
+            assert_eq!(count, 2 * callbacks);
         }
     }
 
@@ -2278,8 +2392,8 @@ mod task_boundary_callback_tests {
             for callbacks in [4, 16] {
                 let calls = "println(work(input));".repeat(callbacks);
                 let (_, count, copies, bindings) = callback_work(&async_main(locals, &calls));
-                assert_eq!(count, callbacks);
-                assert_eq!(copies, 2 * callbacks, "locals={locals}");
+                assert_eq!(count, 2 * callbacks + locals);
+                assert_eq!(copies, 3 * callbacks + locals, "locals={locals}");
                 assert_eq!(bindings, copies, "locals={locals}");
                 println!(
                     "locals={locals} callbacks={callbacks} copies={copies} bindings={bindings}"
@@ -2297,7 +2411,7 @@ mod task_boundary_callback_tests {
         for callbacks in [4, 16, 64] {
             let calls = "println(work(input));".repeat(callbacks);
             let (visits, count, _, _) = callback_work(&async_main(8, &calls));
-            assert_eq!(count, callbacks);
+            assert_eq!(count, 2 * callbacks + 8);
             assert!(visits <= 8 * (8 + callbacks + 1), "{visits}");
             assert!(visits > previous, "{visits} <= {previous}");
             previous = visits;
@@ -2312,9 +2426,9 @@ mod task_boundary_callback_tests {
         let source = "fn three(a: i64, b: i64, c: i64) -> i64 { println(a); return a + b + c; } \
              async fn main() { let x = 1; let y = 2; let z = 3; println(three(x, y, z)); }";
         let (_, count, copies, bindings) = callback_work(source);
-        assert_eq!(count, 1);
-        assert_eq!(copies, 4);
-        assert_eq!(bindings, 4);
+        assert_eq!(count, 2);
+        assert_eq!(copies, 5);
+        assert_eq!(bindings, 5);
     }
 
     /// Perspective 5: a void result is not a frame slot, so a no-argument void
@@ -2337,9 +2451,9 @@ mod task_boundary_callback_tests {
         let source = "fn tag(s: String) -> String { println(s); return s; } \
              async fn main() { let name = \"a\"; println(tag(name)); }";
         let (_, count, copies, bindings) = callback_work(source);
-        assert_eq!(count, 1);
-        assert_eq!(copies, 2);
-        assert_eq!(bindings, 2);
+        assert_eq!(count, 2);
+        assert_eq!(copies, 3);
+        assert_eq!(bindings, 3);
     }
 
     /// Perspective 7: a user method call is a boundary too, and its receiver is
@@ -2349,16 +2463,16 @@ mod task_boundary_callback_tests {
         let source = "class C { pub v: i64; pub fn get(self) -> i64 { println(self.v); return self.v; } } \
              async fn main() { let c = new C(1); println(c.get()); }";
         let (_, count, copies, bindings) = callback_work(source);
-        assert_eq!(count, 1);
-        assert_eq!(copies, 2);
-        assert_eq!(bindings, 2);
+        assert_eq!(count, 2);
+        assert_eq!(copies, 3);
+        assert_eq!(bindings, 3);
     }
 
-    /// Perspective 8: bodies with no user calls need no callbacks at all, so the
-    /// guarded preparation never runs for them.
+    /// Printing may block even without a user call. A literal needs no frame
+    /// operand binding, but still needs one suspendable callback.
     #[test]
-    fn builtin_only_bodies_emit_no_callbacks() {
+    fn printing_emits_a_boundary_even_without_user_calls() {
         let (_, count, copies, bindings) = callback_work("async fn main() { println(1); }");
-        assert_eq!((count, copies, bindings), (0, 0, 0));
+        assert_eq!((count, copies, bindings), (1, 0, 0));
     }
 }

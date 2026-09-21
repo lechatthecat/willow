@@ -1190,6 +1190,7 @@ impl Codegen {
         f: &FunctionDecl,
         export: bool,
     ) -> Result<()> {
+        *self.dispatch_cache.get_mut() = Default::default();
         let mut sig = self.module.make_signature();
         let ptr_ty = reference_type(self.module.target_config());
         // `willow_user_main` is parameterless even when `fn main(args:
@@ -1397,7 +1398,7 @@ impl Codegen {
             class_type_ids: &self.class_type_ids,
             class_descriptor_ids: &self.class_descriptor_ids,
             class_vslots: &self.class_vslots,
-            defining_class_cache: Default::default(),
+            dispatch_cache: &self.dispatch_cache,
             interface_infos: &self.interface_infos,
             vtable_ids: &self.vtable_ids,
             coop_frame: None,
@@ -1530,6 +1531,7 @@ impl Codegen {
     }
 
     pub(super) fn declare_class_methods(&mut self, c: &ClassDecl) -> Result<()> {
+        *self.dispatch_cache.get_mut() = Default::default();
         // Constructors lower to an ordinary `init` method (self receiver, void
         // return) so they reuse the method machinery (willow-scq2).
         let mut all_methods: Vec<MethodDecl> = c.methods.clone();
@@ -1795,7 +1797,7 @@ impl Codegen {
             class_type_ids: &self.class_type_ids,
             class_descriptor_ids: &self.class_descriptor_ids,
             class_vslots: &self.class_vslots,
-            defining_class_cache: Default::default(),
+            dispatch_cache: &self.dispatch_cache,
             interface_infos: &self.interface_infos,
             vtable_ids: &self.vtable_ids,
             coop_frame: None,
@@ -2343,7 +2345,7 @@ impl Codegen {
             class_type_ids: &self.class_type_ids,
             class_descriptor_ids: &self.class_descriptor_ids,
             class_vslots: &self.class_vslots,
-            defining_class_cache: Default::default(),
+            dispatch_cache: &self.dispatch_cache,
             interface_infos: &self.interface_infos,
             vtable_ids: &self.vtable_ids,
             coop_frame: None,

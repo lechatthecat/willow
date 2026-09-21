@@ -55,7 +55,7 @@ jobs:
           name: gc-stops-${{ matrix.target }}
           path: ${{ runner.temp }}/willow-gc-stops/
       - name: Workspace tests
-        run: cargo test --locked --workspace -- --skip runtime::test_runnable_example_files_compile_and_run
+        run: cargo test --locked --workspace -- --skip runtime::examples::test_runnable_example_files_compile_and_run
       - name: GC region and concurrency stress (Linux)
         if: runner.os == 'Linux'
         run: cargo test --locked -p willow_runtime gc::stress_viewpoint_tests -- --ignored --nocapture
@@ -69,4 +69,4 @@ jobs:
         if: runner.os != 'Linux'
         run: cargo test --locked -p willow_runtime stress_region_08 -- --ignored --nocapture
       - name: Runnable example audit
-        run: cargo test --locked --test integration runtime::test_runnable_example_files_compile_and_run -- --exact --nocapture
+        run: cargo test --locked --test integration runtime::examples::test_runnable_example_files_compile_and_run -- --exact --nocapture

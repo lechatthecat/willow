@@ -16,12 +16,13 @@
 //!
 //! This is not fdlibm's integral-exponent algorithm: after special cases,
 //! integral exponents with |y| <= 2^53 use canonical binary exponentiation,
-//! followed by a reciprocal for negative y. Literal unrolling preserves that
-//! multiplication order. There is no uniform small-ULP accuracy guarantee for
-//! this path: squaring amplifies earlier rounding errors, and intermediate
-//! overflow/underflow can lose range before the reciprocal. The sampled maximum
-//! in willow-zeow's grid/near-one corpus is 27,174,730,217 ULP, not a global
-//! error bound; separate range probes lose subnormal results entirely. See
+//! followed by a reciprocal for negative y. If the positive power overflows
+//! for negative y, the general kernel computes the result without that
+//! intermediate. Negative literals share the dispatcher; nonnegative literals
+//! unroll the same multiplication order. There is no uniform small-ULP accuracy
+//! guarantee for the integral path: squaring amplifies earlier rounding errors.
+//! The sampled maximum in willow-zeow's grid/near-one corpus is 27,174,730,217
+//! ULP, not a global error bound. See
 //! docs/f64_power_contract.md and its reproducible numerical audit.
 
 use anyhow::Result;
@@ -835,6 +836,17 @@ impl Codegen {
             b.switch_to_block(done);
             b.seal_block(done);
             let magnitude = b.block_params(done)[0];
+            // A reciprocal of an overflowing positive power would erase a
+            // representable subnormal. Reuse the compensated general kernel
+            // only here, preserving the canonical normal-range rounding.
+            let magnitude_bits = as_i64_bits(&mut b, magnitude);
+            let overflowed = b.ins().icmp(IntCC::Equal, magnitude_bits, inf_bits);
+            let needs_range = b.ins().band(exponent_negative, overflowed);
+            let integral_result = b.create_block();
+            b.ins()
+                .brif(needs_range, generic, &[], integral_result, &[]);
+            b.switch_to_block(integral_result);
+            b.seal_block(integral_result);
             let reciprocal = b.ins().fdiv(one, magnitude);
             let magnitude = b.ins().select(exponent_negative, reciprocal, magnitude);
             let negative = b.ins().band(x_negative, is_odd);
@@ -901,13 +913,14 @@ fn const_f64_operand(builder: &FunctionBuilder<'_>, mut value: Value) -> Option<
 }
 
 impl FuncGen<'_, '_> {
-    /// Emit `f64 ** f64`. Integral literals within the exact i64 conversion
-    /// range are unrolled at the call site; all other inputs use the one local
-    /// dispatcher, which includes the matching dynamic integral loop.
+    /// Emit `f64 ** f64`. Nonnegative integral literals within the exact i64
+    /// conversion range are unrolled. Negative literals share the dispatcher
+    /// so range recovery is emitted once per object, without recomputing powers.
     pub(super) fn emit_pow_f64(&mut self, base: Value, exponent: Value) -> Value {
         if let Some(value) = const_f64_operand(self.builder, exponent)
             && value.is_finite()
             && value.fract() == 0.0
+            && value >= 0.0
             && value.abs() <= (1u64 << 53) as f64
         {
             return self.emit_pow_f64_integral_literal(base, value);
@@ -919,7 +932,6 @@ impl FuncGen<'_, '_> {
     }
 
     fn emit_pow_f64_integral_literal(&mut self, base: Value, exponent: f64) -> Value {
-        let negative = exponent.is_sign_negative() && exponent != 0.0;
         let magnitude = exponent.abs() as u64;
         let steps = super::emit_pow::pow_unroll_steps(magnitude);
         let mut accumulator = base;
@@ -938,11 +950,55 @@ impl FuncGen<'_, '_> {
             }
         }
         let one = self.builder.ins().f64const(1.0);
-        let result = result.unwrap_or(one);
-        if negative {
-            self.builder.ins().fdiv(one, result)
+        result.unwrap_or(one)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CompilerOptions;
+    use cranelift_codegen::settings::{self, Configurable};
+    use cranelift_object::{ObjectBuilder, ObjectModule};
+
+    #[test]
+    fn pow_f64_helpers_compile_for_supported_host_arch_targets() {
+        // Native execution is covered by integration tests on each CI host.
+        // Also compile every supported ABI for the enabled host architecture;
+        // this catches helper signatures/CFGs that only fail on Windows/macOS.
+        let triples: &[&str] = if cfg!(target_arch = "x86_64") {
+            &[
+                "x86_64-unknown-linux-gnu",
+                "x86_64-apple-darwin",
+                "x86_64-pc-windows-msvc",
+            ]
+        } else if cfg!(target_arch = "aarch64") {
+            &["aarch64-apple-darwin"]
         } else {
-            result
+            &[]
+        };
+        for triple in triples {
+            for optimization in ["none", "speed"] {
+                let mut flags = settings::builder();
+                flags.set("opt_level", optimization).unwrap();
+                let isa = cranelift_codegen::isa::lookup(triple.parse().unwrap())
+                    .unwrap()
+                    .finish(settings::Flags::new(flags))
+                    .unwrap();
+                let module = ObjectModule::new(
+                    ObjectBuilder::new(
+                        isa,
+                        "pow_target_gate",
+                        cranelift_module::default_libcall_names(),
+                    )
+                    .unwrap(),
+                );
+                let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+                codegen.module = module;
+                codegen.func_ids = Default::default();
+                codegen.declare_native_pow_f64().unwrap();
+                codegen.module.finish().emit().unwrap();
+            }
         }
     }
 }
