@@ -169,6 +169,84 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.block_params(done)[0]
     }
 
+    /// Scalar buffers have no concurrent GC tracer. Update their live length
+    /// with ordinary stores; reference buffers retain runtime atomic publication
+    /// and barriers. No raw buffer survives the allocating slow path.
+    pub(super) fn emit_scalar_array_push(&mut self, array: Value, word: Value) -> Value {
+        use willow_abi::array_layout as layout;
+        let inspect = self.builder.create_block();
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        self.builder.set_cold_block(slow);
+        let done = self.builder.create_block();
+        let null = self.builder.ins().icmp_imm_s(IntCC::Equal, array, 0);
+        self.builder.ins().brif(null, slow, &[], inspect, &[]);
+        self.builder.switch_to_block(inspect);
+        self.builder.seal_block(inspect);
+        let len = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            array,
+            layout::handle_offset(layout::H_LEN),
+        );
+        let cap = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            array,
+            layout::handle_offset(layout::H_CAP),
+        );
+        let available = self.builder.ins().icmp(IntCC::UnsignedLessThan, len, cap);
+        self.builder.ins().brif(available, fast, &[], slow, &[]);
+        self.builder.switch_to_block(fast);
+        self.builder.seal_block(fast);
+        let ptr_ty = reference_type(self.module.target_config());
+        let buffer = self.builder.ins().load(
+            ptr_ty,
+            MemFlagsData::new(),
+            array,
+            layout::handle_offset(layout::H_BUF),
+        );
+        let offset = self
+            .builder
+            .ins()
+            .imul_imm_s(len, i64::from(layout::WORD_BYTES));
+        let offset = if ptr_ty == types::I64 {
+            offset
+        } else {
+            self.builder.ins().ireduce(ptr_ty, offset)
+        };
+        let slot = self.builder.ins().iadd(buffer, offset);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            word,
+            slot,
+            layout::BUFFER_HEADER_WORDS as i32 * layout::WORD_BYTES,
+        );
+        let next_len = self.builder.ins().iadd_imm_s(len, 1);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), next_len, buffer, 0);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            next_len,
+            array,
+            layout::handle_offset(layout::H_LEN),
+        );
+        self.builder.ins().jump(done, &[]);
+
+        self.builder.switch_to_block(slow);
+        self.builder.seal_block(slow);
+        // Also pin frame-backed SSA receivers while runtime growth allocates.
+        self.emit_push_root(array);
+        self.emit_void_runtime_call("willow_array_push", &[array, word]);
+        self.emit_pop_roots_n(1);
+        self.gc_root_count -= 1;
+        self.builder.ins().jump(done, &[]);
+        self.builder.switch_to_block(done);
+        self.builder.seal_block(done);
+        self.builder.ins().iconst(types::I8, 0)
+    }
+
     pub(super) fn emit_flat_object_alloc(&mut self, class: &TypeId) -> Value {
         let layout = self
             .class_layouts

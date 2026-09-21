@@ -199,9 +199,15 @@ fn concurrent_publishers_and_stealers_do_not_lose_events() {
     let metrics = queues.metrics_snapshot();
     assert_eq!(popped.load(Ordering::Relaxed), 4096);
     assert_eq!(metrics.global_pushes, 2048);
-    assert_eq!(metrics.local_pushes, 2048);
-    assert_eq!(metrics.global_pop_hits, 2048);
-    assert_eq!(metrics.local_pop_hits + metrics.steal_successes, 2048);
+    assert!(metrics.local_pushes >= 2048);
+    assert_eq!(
+        metrics.global_pop_hits + metrics.local_pop_hits + metrics.steal_successes,
+        4096
+    );
+    assert_eq!(
+        metrics.local_pop_hits + metrics.steal_successes,
+        metrics.local_pushes
+    );
     assert_eq!(
         metrics.steal_attempts,
         metrics.steal_successes + metrics.steal_failures
@@ -300,7 +306,7 @@ fn empty_global_batch_returns_while_global_mutex_is_held() {
 #[test]
 fn global_batch_tokens_are_popped_exactly_once_by_concurrent_workers() {
     use crate::task_state::AtomicTaskState;
-    for size in [1, 16, 256, 4096] {
+    for size in [1, 16, 256, 4096, 100_000] {
         let queues = RunQueues::new(8);
         let states = (0..size)
             .map(|_| AtomicTaskState::new())
@@ -332,7 +338,11 @@ fn global_batch_tokens_are_popped_exactly_once_by_concurrent_workers() {
         });
         assert!(seen.iter().all(|count| count.load(Ordering::Relaxed) == 1));
         assert_eq!(queues.len(), 0);
-        assert_eq!(queues.metrics_snapshot().global_pop_hits, size as u64);
+        let metrics = queues.metrics_snapshot();
+        assert_eq!(
+            metrics.global_pop_hits + metrics.local_pop_hits + metrics.steal_successes,
+            size as u64
+        );
     }
 }
 
@@ -359,4 +369,119 @@ fn global_batch_single_id_caller_rejects_terminal_and_reaped_tasks() {
         WakeOutcome::Terminal
     );
     assert_eq!(scheduler.run_queues.metrics_snapshot(), before);
+}
+
+#[test]
+fn wake_routes_by_active_worker_context_not_default_tls_index() {
+    let mut scheduler = RuntimeScheduler::with_worker_count(4);
+    let external = scheduler.spawn_parked_placeholder();
+    let local = scheduler.spawn_parked_placeholder();
+    assert!(scheduler.wake(external));
+    assert_eq!(
+        RunQueues::lock(&scheduler.run_queues.global).front(),
+        Some(&external)
+    );
+    let old_depth = SCHED_RUN_DEPTH.with(|depth| depth.replace(1));
+    let old_worker = CURRENT_WORKER.with(|worker| worker.replace(2));
+    let woke = scheduler.wake(local);
+    CURRENT_WORKER.with(|worker| worker.set(old_worker));
+    SCHED_RUN_DEPTH.with(|depth| depth.set(old_depth));
+    assert!(woke);
+    assert_eq!(
+        RunQueues::lock(&scheduler.run_queues.locals[2]).front(),
+        Some(&local)
+    );
+    assert_eq!(scheduler.run_queues.metrics_snapshot().global_pushes, 1);
+    assert_eq!(scheduler.run_queues.metrics_snapshot().local_pushes, 1);
+}
+
+#[test]
+fn global_refill_is_bounded_and_amortizes_successful_global_locks() {
+    for count in [64, 256, 4096, 100_000] {
+        let queues = RunQueues::new(8);
+        queues.push_global_batch(&(0..count).collect::<Vec<_>>());
+        assert_eq!(queues.pop_for_worker(0), Some(0));
+        assert_eq!(RunQueues::lock(&queues.locals[0]).len(), 31);
+        assert_eq!(queues.metrics_snapshot().global_pop_hits, 1);
+        assert_eq!(queues.metrics_snapshot().global_pop_attempts, 1);
+        let mut seen = std::collections::HashSet::from([0]);
+        while let Some(id) = queues.pop_for_worker(0) {
+            assert!(seen.insert(id));
+        }
+        assert_eq!(seen.len(), count as usize);
+        assert_eq!(queues.len(), 0);
+    }
+}
+
+#[test]
+fn global_burst_notifies_once_and_refill_shares_with_one_successor() {
+    for size in [2, 64, 4096, 100_000] {
+        for worker_publisher in [false, true] {
+            let queues = RunQueues::new(8);
+            let saved_depth =
+                SCHED_RUN_DEPTH.with(|depth| depth.replace(u32::from(worker_publisher)));
+            for id in 0..size {
+                queues.push_global(id);
+            }
+            SCHED_RUN_DEPTH.with(|depth| depth.set(saved_depth));
+            let initial = usize::from(!worker_publisher || size >= 2);
+            assert_eq!(queues.idle_notifications.load(Ordering::Relaxed), initial);
+            assert_eq!(queues.pop_for_worker(0), Some(0));
+            let expected = initial + usize::from(size > 2);
+            assert_eq!(queues.idle_notifications.load(Ordering::Relaxed), expected);
+            println!(
+                "burst={size} worker_publisher={worker_publisher} notifications={initial} refill_notifications={}",
+                expected - initial
+            );
+        }
+    }
+}
+
+#[test]
+fn global_priority_probe_does_not_lock_local_for_refill() {
+    let queues = RunQueues::new(2);
+    queues.push_global_batch(&(0..64).collect::<Vec<_>>());
+    queues.prefer_global[0].store(true, Ordering::Relaxed);
+    let local = RunQueues::lock(&queues.locals[0]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| tx.send(queues.pop_for_worker(0)).unwrap());
+        let result = rx.recv_timeout(Duration::from_secs(5));
+        // Release before asserting so a regression cannot strand the thread.
+        drop(local);
+        assert_eq!(result.unwrap(), Some(0));
+    });
+    assert_eq!(queues.metrics_snapshot().global_pop_hits, 1);
+    assert_eq!(queues.metrics_snapshot().local_pushes, 0);
+}
+
+#[test]
+fn drained_injection_queue_rearms_external_single_task_notification() {
+    let queues = RunQueues::new(1);
+    for id in 0..1000 {
+        queues.push_global(id);
+        assert_eq!(queues.pop_for_worker(0), Some(id));
+    }
+    assert_eq!(queues.idle_notifications.load(Ordering::Relaxed), 1000);
+}
+
+#[test]
+fn worker_spawn_burst_defers_one_notification_until_scheduler_boundary() {
+    for size in [1, 16, 256, 4096, 100_000] {
+        let queues = RunQueues::new(8);
+        let saved_depth = SCHED_RUN_DEPTH.with(|depth| depth.replace(1));
+        let saved_pending = SPAWN_NOTIFICATION_PENDING.with(|pending| pending.replace(false));
+        for id in 0..size {
+            queues.push_spawned(id);
+        }
+        let pending = SPAWN_NOTIFICATION_PENDING.with(|pending| pending.replace(false));
+        let second = SPAWN_NOTIFICATION_PENDING.with(|pending| pending.replace(false));
+        SPAWN_NOTIFICATION_PENDING.with(|pending| pending.set(saved_pending));
+        SCHED_RUN_DEPTH.with(|depth| depth.set(saved_depth));
+        assert!(pending);
+        assert!(!second);
+        assert_eq!(queues.idle_notifications.load(Ordering::Relaxed), 0);
+        assert_eq!(queues.len(), size as usize);
+        println!("spawn_burst={size} publication_notifications=0 boundary_notifications=1");
+    }
 }

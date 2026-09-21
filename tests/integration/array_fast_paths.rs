@@ -125,3 +125,20 @@ fn array_fast_paths_do_not_add_temporary_root_pairs_per_access() {
     assert!(counts[0] > 0);
     assert!(counts.iter().all(|count| *count == counts[0]), "{counts:?}");
 }
+
+#[test]
+fn array_push_fast_paths_growth_pop_and_frame_gc() {
+    let source = include_str!("../../example/array_push_growth.wi");
+    for (out, ok) in [
+        compile_and_run(source),
+        compile_and_run_release(source),
+        compile_and_run_with_runtime_env(
+            source,
+            &[("WILLOW_GC_STRESS", "alloc"), ("WILLOW_TASK_BUDGET", "1")],
+            Duration::from_secs(30),
+        ),
+    ] {
+        assert!(ok, "{out}");
+        assert_eq!(out, "true\ntrue\ntrue\ntrue\ntrue\ntrue\n");
+    }
+}

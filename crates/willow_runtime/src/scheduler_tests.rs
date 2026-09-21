@@ -26,7 +26,7 @@ static NESTED_QUANTUM_RESTORED: TestAtomicBool = TestAtomicBool::new(false);
 #[test]
 fn idle_wait_observes_wake_between_snapshot_and_wait() {
     let generation = current_wake_generation();
-    notify_idle_waiters();
+    notify_all_idle_waiters();
     assert!(
         wait_for_wake_since(generation, Duration::ZERO),
         "a wake after the snapshot must prevent the fallback timeout"
@@ -4215,8 +4215,10 @@ fn stress_10k_blocked_syscall_tasks_reap_all_scheduler_metadata() {
         .map(|_| scheduler.spawn_placeholder())
         .collect::<Vec<_>>();
 
-    for &task_id in &task_ids {
-        assert_eq!(scheduler.claim_ready_for_worker(0), Some(task_id));
+    let mut seen = HashSet::new();
+    for _ in &task_ids {
+        let task_id = scheduler.claim_ready_for_worker(0).unwrap();
+        assert!(seen.insert(task_id));
         scheduler.finish_blocked_syscall_poll(task_id);
         scheduler.clear_running();
     }
@@ -4235,8 +4237,10 @@ fn stress_10k_blocked_syscall_tasks_reap_all_scheduler_metadata() {
     for &task_id in &task_ids {
         assert!(scheduler.wake(task_id));
     }
-    for &task_id in &task_ids {
-        assert_eq!(scheduler.claim_ready_for_worker(0), Some(task_id));
+    let mut seen = HashSet::new();
+    for _ in &task_ids {
+        let task_id = scheduler.claim_ready_for_worker(0).unwrap();
+        assert!(seen.insert(task_id));
         scheduler.complete(task_id);
         scheduler.clear_running();
     }
@@ -4437,7 +4441,7 @@ fn sched_wake_09_idle_step_waits_for_an_in_flight_claim() {
     reset_global_scheduler_for_test();
     let _claim = ClaimInFlight::enter();
     assert!(
-        scheduler_idle_step(0, None, false, None),
+        scheduler_idle_step(0, None, false, None, current_wake_generation()),
         "the run loop must keep going while a claim is in flight"
     );
 }
@@ -4449,7 +4453,7 @@ fn sched_wake_10_idle_step_still_reports_genuine_idle() {
     let _guard = runtime_test_guard();
     reset_global_scheduler_for_test();
     assert!(
-        !scheduler_idle_step(0, None, false, None),
+        !scheduler_idle_step(0, None, false, None, current_wake_generation()),
         "an empty scheduler with no claim is genuinely idle"
     );
 }
@@ -4615,4 +4619,20 @@ fn sched_wake_20_repeated_parallel_drives_settle_at_zero() {
     assert!(!claims_in_flight());
     assert_eq!(global_run_queues().len(), 0);
     assert_eq!(willow_sched_run(), 0, "a settled scheduler drives to zero");
+}
+
+#[test]
+fn idle_timer_wait_observes_work_published_after_empty_probe() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    let timer = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
+    with_current_task_for_test(timer, || set_global_wake_after_millis(5_000));
+    let task = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
+    let generation = current_wake_generation();
+    assert!(try_wake_parked_task(task));
+    let start = Instant::now();
+    assert!(scheduler_idle_step(0, None, false, None, generation));
+    assert!(start.elapsed() < Duration::from_secs(1));
+    assert!(global_run_queues().contains(task));
+    reset_global_scheduler_for_test();
 }

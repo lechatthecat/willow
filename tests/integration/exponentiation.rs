@@ -1258,3 +1258,59 @@ async fn main() {
     assert!(ok, "async f64 power failed: {out}");
     assert_eq!(out, "1.414213562373095\n");
 }
+
+#[test]
+fn pow_f64_35_unit_bases_dynamic_exponent_matrix() {
+    let exponents = [
+        "3.0",
+        "4.0",
+        "-3.0",
+        "-4.0",
+        "9007199254740991.0",
+        "9007199254740992.0",
+        "9007199254740994.0",
+        "1.0 / 0.0",
+        "-1.0 / 0.0",
+        "0.0 / 0.0",
+        "0.0",
+        "-0.0",
+        "0.5",
+        "-1.25",
+    ];
+    let mut source =
+        String::from("fn dynamic(x: f64, y: f64) -> f64 { return x ** y; } fn main() {\n");
+    for base in ["1.0", "-1.0"] {
+        for exponent in exponents {
+            source.push_str(&format!("println(dynamic({base}, {exponent}));\n"));
+        }
+    }
+    source.push('}');
+    let (out, ok) = compile_and_run_release(&source);
+    assert!(ok, "{out}");
+    let actual: Vec<f64> = out.lines().map(|s| s.parse().unwrap()).collect();
+    let negative = [
+        -1.0,
+        1.0,
+        -1.0,
+        1.0,
+        -1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        f64::NAN,
+        1.0,
+        1.0,
+        f64::NAN,
+        f64::NAN,
+    ];
+    let expected = [1.0f64; 14].into_iter().chain(negative);
+    assert_eq!(actual.len(), 28);
+    for (actual, expected) in actual.into_iter().zip(expected) {
+        if expected.is_nan() {
+            assert!(actual.is_nan());
+        } else {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+    }
+}

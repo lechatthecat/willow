@@ -7553,6 +7553,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if matches!(intrinsic, Intrinsic::ArrayLen | Intrinsic::FrozenArrayLen) {
             return self.emit_array_access(receiver, None, None);
         }
+        if intrinsic == Intrinsic::ArrayPush {
+            let element = array_element_type(receiver_ty);
+            if matches!(element, Type::I64 | Type::F64 | Type::Bool) {
+                // Primitive coercions cannot allocate. Root only on growth.
+                let value = self.coerce_to_target(args[0], &arg_types[0], &element);
+                let word = self.coerce_to_i64(value, &element);
+                return self.emit_scalar_array_push(receiver, word);
+            }
+        }
         // Frame-backed references can otherwise move during a coercion or a
         // blocking runtime call. Direct roots pin every loaded SSA operand.
         let roots_before = self.gc_root_count;

@@ -1,0 +1,31 @@
+// Exercise empty/full/spare capacity, scalar word encodings and rooted growth.
+import std::collections::Array;
+interface Value extends Send { fn get() -> i64; }
+class Box implements Value { pub n: i64; pub fn get() -> i64 { return self.n; } }
+async fn main() {
+    let xs: Array<i64> = [];
+    let floats: Array<f64> = [];
+    let flags: Array<bool> = [];
+    let refs: Array<Value> = [];
+    await sleep(1);
+    let mut i = 0;
+    while i < 129 {
+        xs.push(i);
+        floats.push(-1.25);
+        flags.push(true);
+        refs.push(new Box(i));
+        i = i + 1;
+    }
+    gc_minor_collect();
+    let mut sum = 0;
+    i = 0;
+    while i < 129 { sum = sum + xs[i] + refs[i].get(); i = i + 1; }
+    println(sum == 16512);
+    println(floats[128] == -1.25);
+    println(flags[128]);
+    println(xs.pop() == 128);
+    xs.push(777);
+    gc_collect();
+    println(xs[128] == 777);
+    println(xs.len() == 129);
+}

@@ -199,12 +199,16 @@ struct RunQueues {
     global: Mutex<VecDeque<RuntimeTaskId>>,
     metrics: crate::observability::RunQueueMetrics,
     worker_metrics: Vec<crate::observability::RunQueueMetrics>,
+    #[cfg(test)]
+    idle_notifications: AtomicUsize,
 }
 
 impl RunQueues {
     fn new(worker_count: usize) -> Self {
         let worker_count = worker_count.max(1);
         Self {
+            #[cfg(test)]
+            idle_notifications: AtomicUsize::new(0),
             locals: (0..worker_count)
                 .map(|_| Mutex::new(VecDeque::new()))
                 .collect(),
@@ -229,6 +233,12 @@ impl RunQueues {
         self.locals.len()
     }
 
+    fn notify_idle(&self) {
+        #[cfg(test)]
+        self.idle_notifications.fetch_add(1, Ordering::Relaxed);
+        notify_idle_waiters();
+    }
+
     fn push_global(&self, id: RuntimeTaskId) {
         self.push_global_batch(std::slice::from_ref(&id));
     }
@@ -238,11 +248,43 @@ impl RunQueues {
     /// `wake` or `claim_queue_slot`) or retained when returning an unclaimed id.
     /// This storage layer neither validates task lifecycle nor deduplicates ids.
     fn push_global_batch(&self, ids: &[RuntimeTaskId]) {
+        self.publish_global_batch(ids, true);
+    }
+
+    fn push_spawned(&self, id: RuntimeTaskId) {
+        let defer = SCHED_RUN_DEPTH.with(|depth| depth.get() > 0);
+        self.publish_global_batch(std::slice::from_ref(&id), !defer);
+        if defer {
+            // Spawning cannot suspend its publishing worker. Coalesce all
+            // spawns in this poll; flush before its next scheduler probe,
+            // including entry into a nested drive. External spawns stay prompt.
+            SPAWN_NOTIFICATION_PENDING.with(|pending| pending.set(true));
+        }
+    }
+
+    fn publish_global_batch(&self, ids: &[RuntimeTaskId], notify: bool) {
         if ids.is_empty() {
             return;
         }
         let mut queue = Self::lock(&self.global);
+        let previous_len = queue.len();
         queue.extend(ids.iter().copied());
+        let backlog = queue.len();
+        drop(queue);
+        // A running publisher can consume a sole continuation itself. Wake
+        // another worker when a burst first contains additional work. Keep
+        // subsequent publications in that burst off the shared notifier.
+        // Foreign publishers must wake a worker even for a single task.
+        if notify {
+            let threshold = if SCHED_RUN_DEPTH.with(|depth| depth.get() > 0) {
+                2
+            } else {
+                1
+            };
+            if previous_len < threshold && backlog >= threshold {
+                self.notify_idle();
+            }
+        }
         self.metrics
             .global_pushes
             .fetch_add(ids.len() as u64, Ordering::Relaxed);
@@ -251,12 +293,43 @@ impl RunQueues {
     fn push_local(&self, worker: usize, id: RuntimeTaskId) {
         match self.locals.get(worker) {
             Some(queue) => {
-                Self::lock(queue).push_back(id);
+                let backlog = {
+                    let mut queue = Self::lock(queue);
+                    queue.push_back(id);
+                    queue.len()
+                };
+                if SCHED_RUN_DEPTH.with(|depth| depth.get() > 0) && worker == current_worker() {
+                    notify_local_work(backlog);
+                } else {
+                    self.notify_idle();
+                }
                 self.worker_metrics[worker]
                     .local_pushes
                     .fetch_add(1, Ordering::Relaxed);
             }
             None => self.push_global(id),
+        }
+    }
+
+    fn push_woken_batch(&self, ids: &[RuntimeTaskId]) {
+        if ids.is_empty() {
+            return;
+        }
+        // CURRENT_WORKER defaults to zero even on foreign threads. The drive
+        // depth, unlike that index, distinguishes a worker from an external waker.
+        let worker = SCHED_RUN_DEPTH.with(|depth| (depth.get() > 0).then(current_worker));
+        if let Some(worker) = worker.filter(|&worker| worker < self.locals.len()) {
+            let backlog = {
+                let mut queue = Self::lock(&self.locals[worker]);
+                queue.extend(ids.iter().copied());
+                queue.len()
+            };
+            self.worker_metrics[worker]
+                .local_pushes
+                .fetch_add(ids.len() as u64, Ordering::Relaxed);
+            notify_local_work(backlog);
+        } else {
+            self.push_global_batch(ids);
         }
     }
 
@@ -281,13 +354,43 @@ impl RunQueues {
         self.push_global(id);
     }
 
-    fn pop_global(&self, metrics: &crate::observability::RunQueueMetrics) -> Option<RuntimeTaskId> {
+    fn pop_global(
+        &self,
+        worker: usize,
+        metrics: &crate::observability::RunQueueMetrics,
+        refill: bool,
+    ) -> Option<RuntimeTaskId> {
         metrics.global_pop_attempts.fetch_add(1, Ordering::Relaxed);
-        let id = Self::lock(&self.global).pop_front();
-        if id.is_some() {
-            metrics.global_pop_hits.fetch_add(1, Ordering::Relaxed);
+        let mut global = Self::lock(&self.global);
+        let id = global.pop_front()?;
+        // Refill an empty local queue from half the remaining burst, capped
+        // at 31 additional tokens. Do not accumulate global batches behind
+        // existing local work: that changes task/GC lifetimes unnecessarily.
+        let count = if refill && self.locals.len() > 1 && self.locals.get(worker).is_some() {
+            (global.len() / 2).min(31)
+        } else {
+            0
+        };
+        // Lock order is global -> local; no other path holds both locks.
+        let mut refilled = false;
+        if count > 0 {
+            let mut local = Self::lock(&self.locals[worker]);
+            if local.is_empty() {
+                local.extend(global.drain(..count));
+                refilled = true;
+                metrics
+                    .local_pushes
+                    .fetch_add(count as u64, Ordering::Relaxed);
+            }
         }
-        id
+        drop(global);
+        if refilled {
+            // A newly active worker shares a burst with one successor. This
+            // keeps large injected batches parallel without notifying per ID.
+            self.notify_idle();
+        }
+        metrics.global_pop_hits.fetch_add(1, Ordering::Relaxed);
+        Some(id)
     }
 
     fn pop_for_worker(&self, worker: usize) -> Option<RuntimeTaskId> {
@@ -298,7 +401,7 @@ impl RunQueues {
             .map(|preference| preference.fetch_xor(true, Ordering::Relaxed))
             .unwrap_or(true);
         if prefer_global {
-            if let Some(id) = self.pop_global(metrics) {
+            if let Some(id) = self.pop_global(worker, metrics, false) {
                 return Some(id);
             }
             if let Some(queue) = self.locals.get(worker)
@@ -314,7 +417,7 @@ impl RunQueues {
                 metrics.local_pop_hits.fetch_add(1, Ordering::Relaxed);
                 return Some(id);
             }
-            if let Some(id) = self.pop_global(metrics) {
+            if let Some(id) = self.pop_global(worker, metrics, true) {
                 return Some(id);
             }
         }
@@ -645,7 +748,7 @@ fn wake_task_matching_in(
             }
             let (before, outcome) = wake_task_state(task);
             if outcome == WakeOutcome::Enqueue {
-                run_queues.push_global(id);
+                run_queues.push_woken_batch(std::slice::from_ref(&id));
             }
             tasks.reconcile_blocked_transition(before, task.state.lifecycle());
             Some(outcome)
@@ -804,11 +907,11 @@ impl RuntimeScheduler {
             .unwrap_or(true)
     }
 
-    /// Enqueue a runnable task. New and woken tasks go to the shared global
-    /// queue; any idle worker can then pick them up (willow-gyaa.4).
+    /// Publish a newly spawned task to the injection queue. Worker spawns
+    /// share one notification at the next scheduler boundary.
     fn enqueue_ready(&mut self, id: RuntimeTaskId) {
         if self.mark_queued(id) {
-            self.run_queues.push_global(id);
+            self.run_queues.push_spawned(id);
         }
     }
 
@@ -1733,6 +1836,7 @@ thread_local! {
     /// Worker-local index used for local-queue affinity and nested scheduler
     /// drives from inside a poll.
     static CURRENT_WORKER: Cell<usize> = const { Cell::new(0) };
+    static SPAWN_NOTIFICATION_PENDING: Cell<bool> = const { Cell::new(false) };
     /// The active parallel run, if this thread is inside a worker pool.
     static CURRENT_RUN_STATE: RefCell<Option<Arc<ParallelRunState>>> = const { RefCell::new(None) };
 }
@@ -1878,9 +1982,6 @@ pub(crate) fn try_wake_parked_task(id: u64) -> bool {
             0,
         );
     }
-    // Signal idle keep-alive waiters (blocked-syscall arm) that new work may
-    // exist (willow-5if8).
-    notify_idle_waiters();
     crate::gc::stress_collect("scheduler");
     transitioned
 }
@@ -1899,7 +2000,6 @@ pub(crate) fn wake_channel_owner(id: u64) -> bool {
             0,
         );
     }
-    notify_idle_waiters();
     crate::gc::stress_collect("scheduler");
     outcome != WakeOutcome::Terminal
 }
@@ -2138,7 +2238,6 @@ pub(crate) fn task_waiter_count_for_test(task_id: RuntimeTaskId) -> usize {
 pub(crate) fn wake_lock_waiter(task_id: RuntimeTaskId) -> WakeOutcome {
     crate::gc::stress_collect("scheduler");
     let outcome = wake_global_task_outcome(task_id);
-    notify_idle_waiters();
     crate::gc::stress_collect("scheduler");
     outcome
 }
@@ -2245,40 +2344,14 @@ pub extern "C" fn willow_sched_tag_current_task(name: *const u8, name_len: i64) 
     }
 }
 
-/// Render the active async chain (currently-running task first, then the tasks
-/// awaiting it, transitively) for panic diagnostics. Empty when no async task is
-/// running (willow-9lw).
-/// Idle notification (willow-5if8): a generation counter + condvar bumped by
-/// `willow_sched_wake`, so a worker keeping the scheduler alive for a
-/// BlockedSyscall task WAITS for the completion signal instead of spinning at
-/// 1ms. A 50ms bounded wait remains as a portable fallback/timeout.
-static IDLE_GEN: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
-static IDLE_CONDVAR: std::sync::Condvar = std::sync::Condvar::new();
+#[path = "scheduler_parking.rs"]
+mod parking;
+use parking::{
+    current_wake_generation, notify_all_idle_waiters, notify_idle_waiters, notify_local_work,
+    wait_for_wake_since,
+};
 
-fn notify_idle_waiters() {
-    let mut generation = IDLE_GEN.lock().unwrap_or_else(|p| p.into_inner());
-    *generation = generation.wrapping_add(1);
-    IDLE_CONDVAR.notify_all();
-}
-
-fn current_wake_generation() -> u64 {
-    *IDLE_GEN.lock().unwrap_or_else(|p| p.into_inner())
-}
-
-/// Wait until a wake advances beyond the caller's snapshot, bounded by
-/// `timeout`. A wake that occurs between the scheduler-state check and this
-/// function is observed immediately instead of being lost.
-fn wait_for_wake_since(start: u64, timeout: Duration) -> bool {
-    let generation = IDLE_GEN.lock().unwrap_or_else(|p| p.into_inner());
-    if *generation != start {
-        return true;
-    }
-    let (generation, _) = IDLE_CONDVAR
-        .wait_timeout_while(generation, timeout, |generation| *generation == start)
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *generation != start
-}
-
+/// Render the active async chain for panic diagnostics (willow-9lw).
 pub fn async_chain_text() -> String {
     with_global(|sched| {
         let Some(mut id) = current_task_id() else {
@@ -3060,11 +3133,21 @@ fn deadline_bounded(wait: Duration, deadline: Option<Instant>) -> Duration {
     }
 }
 
+// Park is interruptible by work publication. Keep the existing 1ms upper
+// bound because parked threads remain GC mutators and must reach safepoints.
+fn idle_wait_bound(deadline: Option<Instant>) -> Duration {
+    let wait = global_next_timer_deadline()
+        .map(|(_, timer)| bounded_parallel_wait(duration_until(timer)))
+        .unwrap_or(Duration::from_millis(1));
+    deadline_bounded(wait, deadline)
+}
+
 fn scheduler_idle_step(
     worker: usize,
     shared: Option<&ParallelRunState>,
     keep_alive_for_paused: bool,
     deadline: Option<Instant>,
+    generation: u64,
 ) -> bool {
     let parallel = shared.is_some();
 
@@ -3078,7 +3161,7 @@ fn scheduler_idle_step(
     if claims_in_flight()
         || shared.is_some_and(|state| state.active_polls.load(Ordering::Acquire) > 0)
     {
-        std::thread::sleep(Duration::from_millis(1));
+        wait_for_wake_since(generation, idle_wait_bound(deadline));
         return true;
     }
 
@@ -3111,7 +3194,7 @@ fn scheduler_idle_step(
                 return true;
             }
         } else {
-            std::thread::sleep(Duration::from_millis(1));
+            wait_for_wake_since(generation, idle_wait_bound(deadline));
             return true;
         }
     }
@@ -3127,7 +3210,7 @@ fn scheduler_idle_step(
                 };
                 let wait = deadline_bounded(wait, deadline);
                 if !wait.is_zero() {
-                    std::thread::sleep(wait);
+                    wait_for_wake_since(generation, wait);
                 }
             }
             let woken = wake_global_due_timers(Instant::now());
@@ -3140,7 +3223,7 @@ fn scheduler_idle_step(
             && keep_alive_for_paused
             && shared.is_some_and(|state| state.paused_polls.load(Ordering::Acquire) > 0) =>
         {
-            std::thread::sleep(Duration::from_millis(1));
+            wait_for_wake_since(generation, idle_wait_bound(deadline));
             true
         }
         None => {
@@ -3258,6 +3341,9 @@ fn scheduler_run_loop(
 ) -> i64 {
     let mut completed = 0i64;
     loop {
+        if SPAWN_NOTIFICATION_PENDING.with(|pending| pending.replace(false)) {
+            notify_idle_waiters();
+        }
         if fatal_panic_pending() {
             park_until_fatal_abort();
         }
@@ -3298,6 +3384,7 @@ fn scheduler_run_loop(
                         false
                     } else {
                         state.stop.store(true, Ordering::Release);
+                        notify_all_idle_waiters();
                         true
                     }
                 };
@@ -3322,6 +3409,7 @@ fn scheduler_run_loop(
         // every worker on every iteration, so it must stay cheap when no timer
         // exists: `wake_global_due_timers` answers that case with one atomic
         // load and takes no lock at all (willow-9ha4).
+        let wake_generation = current_wake_generation();
         let woken_timers = wake_global_due_timers(Instant::now());
         let next = if shared.is_some_and(|state| state.stop.load(Ordering::Acquire)) {
             None
@@ -3346,7 +3434,7 @@ fn scheduler_run_loop(
             // Letting any worker stop the pool races with another worker that
             // is publishing a timer/netpoll waiter as its poll returns Pending.
             if stop_pool_on_exit && shared.is_some() && worker != 0 {
-                std::thread::sleep(Duration::from_millis(1));
+                wait_for_wake_since(wake_generation, idle_wait_bound(deadline));
                 continue;
             }
             // A nested run_until may wait on a target whose poll is itself
@@ -3358,6 +3446,7 @@ fn scheduler_run_loop(
                 shared,
                 stop_pool_on_exit || target.is_some(),
                 deadline,
+                wake_generation,
             ) {
                 continue;
             }
@@ -3379,6 +3468,7 @@ fn scheduler_run_loop(
                 // window left the pool for good, and any claim that read it
                 // requeued the task it was holding and went idle (willow-6wd6).
                 state.stop.store(true, Ordering::Release);
+                notify_all_idle_waiters();
             }
             break;
         };
@@ -3721,6 +3811,7 @@ pub fn reset_global_scheduler_for_test() {
     }
     set_current_task(None);
     CURRENT_WORKER.with(|worker| worker.set(0));
+    SPAWN_NOTIFICATION_PENDING.with(|pending| pending.set(false));
     CURRENT_RUN_STATE.with(|state| {
         state.replace(None);
     });

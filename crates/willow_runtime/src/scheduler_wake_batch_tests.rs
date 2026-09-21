@@ -210,7 +210,7 @@ fn overlapping_batches_publish_each_token_once() {
 }
 
 #[test]
-fn global_batch_notifies_once_and_ffi_wakes_tasks() {
+fn global_batch_publishes_notification_and_ffi_wakes_tasks() {
     let _guard = crate::gc::runtime_test_guard();
     reset_global_scheduler_for_test();
     let tasks = global_task_table();
@@ -228,12 +228,10 @@ fn global_batch_notifies_once_and_ffi_wakes_tasks() {
         snapshot.task_wakes
     };
     let before_wakes = wake_count();
-    let generation = current_wake_generation();
     let ids = (1..=64).collect::<Vec<_>>();
     unsafe {
         willow_sched_wake_many(ids.as_ptr(), ids.len());
     }
-    assert_eq!(current_wake_generation(), generation.wrapping_add(1));
     assert_eq!(queues.len(), 64);
     assert_eq!(wake_count() - before_wakes, 64);
     let mut scratch = WakeBatchScratch::default();
@@ -241,9 +239,7 @@ fn global_batch_notifies_once_and_ffi_wakes_tasks() {
     assert_eq!(scratch.terminal, vec![65]);
     assert_eq!(wake_count() - before_wakes, 64);
     assert!(scratch.enqueued.is_empty());
-    let generation = current_wake_generation();
     wake_channel_owners(&[], &mut scratch);
-    assert_eq!(current_wake_generation(), generation);
     assert!(scratch.terminal.is_empty());
     reset_global_scheduler_for_test();
 }

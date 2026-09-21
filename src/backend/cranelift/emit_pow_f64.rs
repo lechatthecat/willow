@@ -722,13 +722,29 @@ impl Codegen {
             let not_integral = b.ins().bxor_imm_s(is_integral, 1);
             let invalid_negative = b.ins().band(x_negative, not_integral);
             let invalid = b.create_block();
-            let fast_path_test = b.create_block();
-            b.ins()
-                .brif(invalid_negative, invalid, &[], fast_path_test, &[]);
+            let unit_test = b.create_block();
+            b.ins().brif(invalid_negative, invalid, &[], unit_test, &[]);
             b.switch_to_block(invalid);
             b.seal_block(invalid);
             let qnan = f64_bits(&mut b, QUIET_NAN);
             b.ins().return_(&[qnan]);
+
+            // Check the domain first: (-1) ** nonintegral must remain NaN.
+            // Unit magnitudes need no multiplication, regardless of |y|.
+            b.switch_to_block(unit_test);
+            b.seal_block(unit_test);
+            let unit = b.create_block();
+            let fast_path_test = b.create_block();
+            let is_unit = b
+                .ins()
+                .icmp_imm_u(IntCC::Equal, ax_bits, 1.0f64.to_bits() as i64);
+            b.ins().brif(is_unit, unit, &[], fast_path_test, &[]);
+            b.switch_to_block(unit);
+            b.seal_block(unit);
+            let negative = b.ins().band(x_negative, is_odd);
+            let minus_one = f64_bits(&mut b, (-1.0f64).to_bits());
+            let answer = b.ins().select(negative, minus_one, one_f);
+            b.ins().return_(&[answer]);
 
             b.switch_to_block(fast_path_test);
             b.seal_block(fast_path_test);

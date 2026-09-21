@@ -334,8 +334,18 @@ pub extern "C" fn willow_array_push(mut arr: *mut u8, mut value: i64) {
         }
         unsafe {
             let old_buf = handle_buffer(arr);
-            for i in 0..len {
-                store_buffer_slot(new_buf, i, *buf_slot(old_buf, i), is_ref);
+            if is_ref {
+                for i in 0..len {
+                    store_buffer_slot(new_buf, i, *buf_slot(old_buf, i), true);
+                }
+            } else if len != 0 {
+                // Separate live allocations; copy only initialized scalar slots.
+                // Empty arrays may have a null old buffer.
+                std::ptr::copy_nonoverlapping(
+                    buf_slot(old_buf, 0),
+                    buf_slot(new_buf, 0),
+                    len as usize,
+                );
             }
             set_buffer_len(new_buf, len);
             willow_gc_write_barrier(
@@ -784,6 +794,27 @@ mod tests {
             );
         }
         willow_pop_roots(1);
+    }
+
+    #[test]
+    fn array_null_push_preserves_error_and_root_depth() {
+        use crate::panic_context::*;
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let previous = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(903))));
+        let depth = crate::gc::willow_root_depth();
+        willow_array_push(std::ptr::null_mut(), 42);
+        assert_eq!(crate::gc::willow_root_depth(), depth);
+        assert_eq!(willow_panic_depth(), 1);
+        willow_panic_enter_defer();
+        let info = willow_panic_recover();
+        willow_panic_leave_defer();
+        assert_eq!(
+            unsafe { panic_info_message(info) },
+            "cannot push to a null array"
+        );
+        willow_panic_release_recovered(info);
+        replace_current_context(previous);
     }
 
     // Synthetic handle lengths force checked overflow without huge allocations.

@@ -83,7 +83,7 @@ impl ShardedTaskTable {
                 }
             }
         }
-        run_queues.push_global_batch(&scratch.enqueued);
+        run_queues.push_woken_batch(&scratch.enqueued);
         #[cfg(test)]
         {
             scratch.queue_batches = usize::from(!scratch.enqueued.is_empty());
@@ -126,7 +126,6 @@ pub(crate) fn wake_channel_owners(ids: &[u64], scratch: &mut WakeBatchScratch) {
             0,
         );
     }
-    notify_idle_waiters();
     crate::gc::stress_collect("scheduler");
 }
 
