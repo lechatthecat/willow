@@ -7,6 +7,23 @@ use std::collections::HashMap;
 
 use super::FileId;
 
+/// Read-only source lookup shared by human and structured diagnostics.
+pub trait SourceLookup {
+    fn get(&self, file_id: FileId) -> Option<&SourceMap>;
+}
+
+impl SourceLookup for SourceMap {
+    fn get(&self, file_id: FileId) -> Option<&SourceMap> {
+        (self.file_id == file_id).then_some(self)
+    }
+}
+
+impl SourceLookup for SourceMaps {
+    fn get(&self, file_id: FileId) -> Option<&SourceMap> {
+        self.get(file_id)
+    }
+}
+
 /// Holds the source text for a single file, enabling line/column lookups.
 #[derive(Clone)]
 pub struct SourceMap {

@@ -397,21 +397,38 @@ fn run_frontend(
     map: &diagnostics::SourceMap,
     options: &CompilerOptions,
 ) -> Result<Frontend> {
-    let tokens = lex_phase(source).map_err(|errs| {
-        diagnostics::emit_all(&errs, map);
-        anyhow::anyhow!("aborting due to {} lexer error(s)", errs.len())
-    })?;
+    run_frontend_with_emitter(source, root, map, options, &mut diagnostics::HumanEmitter)
+}
+
+fn run_frontend_with_emitter(
+    source: &str,
+    root: &std::path::Path,
+    map: &diagnostics::SourceMap,
+    options: &CompilerOptions,
+    emitter: &mut dyn diagnostics::DiagnosticEmitter,
+) -> Result<Frontend> {
+    let tokens = match lex_phase(source) {
+        Ok(tokens) => tokens,
+        Err(errors) => {
+            for diagnostic in errors.iter() {
+                emitter.emit(diagnostic, map)?;
+            }
+            anyhow::bail!("aborting due to {} lexer error(s)", errors.len());
+        }
+    };
     let ParsePhase {
         mut program,
         outcome: parse,
     } = parse_phase(tokens);
-    diagnostics::emit_all(&parse.diagnostics, map);
+    for diagnostic in &parse.diagnostics {
+        emitter.emit(diagnostic, map)?;
+    }
     let mut artifacts = module::artifacts::UnitArtifacts::new()?;
     artifacts.snapshot_source(diagnostics::FileId::ENTRY, source)?;
     artifacts.offload(&mut program)?;
     let resolution = module::resolver::resolve_imports_spooled(&program, root, artifacts);
     let mut graph = resolution.graph;
-    emit_frontend_diagnostics(&resolution.diagnostics, map, &graph)?;
+    emit_frontend_diagnostics(&resolution.diagnostics, map, &graph, emitter)?;
     let imports = PhaseDiagnostics::new(resolution.diagnostics);
     let item_imports = if imports.error_count == 0 {
         resolution.item_imports
@@ -420,7 +437,7 @@ fn run_frontend(
         vec![]
     };
     let desugar = desugar_phase(&mut program, &mut graph.files);
-    emit_frontend_diagnostics(&desugar.diagnostics, map, &graph)?;
+    emit_frontend_diagnostics(&desugar.diagnostics, map, &graph, emitter)?;
     let artifacts = graph.artifacts.as_ref().expect("spooled import graph");
     let dependencies = ModuleDependencies::new(&graph.files);
     let mut helpers = HelperIndex::new();
@@ -444,7 +461,7 @@ fn run_frontend(
             options,
         )?;
         error_count += diagnostic_error_count(&checker.errors);
-        emit_frontend_diagnostics(&checker.errors, map, &graph)?;
+        emit_frontend_diagnostics(&checker.errors, map, &graph, emitter)?;
         let concurrency = check_unit_concurrency(
             &body,
             &graph.files,
@@ -454,7 +471,7 @@ fn run_frontend(
             &checker.reference_arg_modes,
         );
         error_count += diagnostic_error_count(&concurrency);
-        emit_frontend_diagnostics(&concurrency, map, &graph)?;
+        emit_frontend_diagnostics(&concurrency, map, &graph, emitter)?;
     }
     {
         let body = artifacts.hydrate(&program, diagnostics::FileId::ENTRY)?;
@@ -467,7 +484,7 @@ fn run_frontend(
             options,
         )?;
         error_count += checked.error_count;
-        emit_frontend_diagnostics(&checked.checker.errors, map, &graph)?;
+        emit_frontend_diagnostics(&checked.checker.errors, map, &graph, emitter)?;
         let concurrency = check_unit_concurrency(
             &body,
             &graph.files,
@@ -477,11 +494,11 @@ fn run_frontend(
             &checked.checker.reference_arg_modes,
         );
         error_count += diagnostic_error_count(&concurrency);
-        emit_frontend_diagnostics(&concurrency, map, &graph)?;
+        emit_frontend_diagnostics(&concurrency, map, &graph, emitter)?;
     }
     let entry = validate_entry_point(&program);
     error_count += diagnostic_error_count(&entry);
-    emit_frontend_diagnostics(&entry, map, &graph)?;
+    emit_frontend_diagnostics(&entry, map, &graph, emitter)?;
     if error_count > 0 {
         anyhow::bail!("aborting due to {} error(s)", error_count);
     }
@@ -939,39 +956,145 @@ fn check_unit_concurrency(
     errors
 }
 
+#[cfg(test)]
+mod diagnostic_emission_tests {
+    use super::*;
+    use diagnostics::{
+        Diagnostic, DiagnosticEmitter, ErrorCode, FileId, FixSuggestion, Severity, SourceMap,
+        source_map::SourceLookup,
+    };
+
+    #[test]
+    fn batches_borrow_entry_and_share_sources_referenced_only_by_fixes() {
+        struct Inspect<'a> {
+            entry: &'a SourceMap,
+            imported: Option<usize>,
+            emissions: usize,
+        }
+        impl DiagnosticEmitter for Inspect<'_> {
+            fn emit(
+                &mut self,
+                diagnostic: &Diagnostic,
+                sources: &dyn SourceLookup,
+            ) -> std::io::Result<()> {
+                assert!(std::ptr::eq(
+                    sources.get(FileId::ENTRY).unwrap(),
+                    self.entry
+                ));
+                let fix = &diagnostic.fix_suggestions[0];
+                let source = sources.get(fix.span.file_id).expect("fix-only source");
+                assert_eq!(source.path, "helper.wi");
+                assert_eq!(source.source, "é");
+                let address = source as *const SourceMap as usize;
+                if let Some(previous) = self.imported {
+                    assert_eq!(address, previous, "one source map per batch");
+                }
+                self.imported = Some(address);
+                self.emissions += 1;
+                Ok(())
+            }
+        }
+
+        let entry = SourceMap::new("main.wi", "fn main() {}");
+        let mut graph = module::ModuleGraph::default();
+        graph.files.push(module::ResolvedModule {
+            id: module::ModuleId(17),
+            name: "helper".into(),
+            canonical_path: "helper".into(),
+            path: "helper.wi".into(),
+            source: "é".into(),
+            program: parser::ast::Program {
+                module: None,
+                imports: vec![],
+                items: vec![],
+            },
+        });
+        for n in [16, 64, 256, 1024] {
+            let diagnostic = Diagnostic::new(Severity::Warning, ErrorCode::W2002, "fix").with_fix(
+                FixSuggestion::new(
+                    diagnostics::Span::in_file(module::ModuleId(17).file_id(), 0, 2, 1, 1),
+                    "e",
+                    "replace",
+                ),
+            );
+            let mut inspect = Inspect {
+                entry: &entry,
+                imported: None,
+                emissions: 0,
+            };
+            emit_frontend_diagnostics(&vec![diagnostic; n], &entry, &graph, &mut inspect).unwrap();
+            assert_eq!(inspect.emissions, n);
+            eprintln!(
+                "batch-count n={n} emissions={} imported_maps=1 entry_borrowed=true",
+                inspect.emissions
+            );
+        }
+    }
+}
+
 /// Render only the sources a diagnostic actually references. Successful builds
 /// never materialize a build-wide collection of source strings/source maps.
 fn emit_frontend_diagnostics(
     diagnostics: &[diagnostics::Diagnostic],
     entry: &diagnostics::SourceMap,
     graph: &module::ModuleGraph,
+    emitter: &mut dyn diagnostics::DiagnosticEmitter,
 ) -> Result<()> {
-    for diagnostic in diagnostics {
-        let mut maps = diagnostics::SourceMaps::new(entry.clone());
-        let ids: std::collections::HashSet<_> = diagnostic
-            .labels
-            .iter()
-            .map(|label| label.span.file_id)
-            .collect();
-        for module in &graph.files {
-            if ids.contains(&module.id.file_id()) {
-                let source = if module.source.is_empty() {
-                    graph
-                        .artifacts
-                        .as_ref()
-                        .expect("spooled sources")
-                        .source(module.id.file_id())?
-                } else {
-                    module.source.clone()
-                };
-                maps.insert(diagnostics::SourceMap::with_file_id(
-                    module.id.file_id(),
-                    module.path.to_string_lossy().into_owned(),
-                    source,
-                ));
+    if diagnostics.is_empty() {
+        return Ok(());
+    }
+    // Load each referenced file once per diagnostic batch, including fixes
+    // whose source is different from every label. Never clone the entry text.
+    let ids: std::collections::HashSet<_> = diagnostics
+        .iter()
+        .flat_map(|diagnostic| {
+            diagnostic
+                .labels
+                .iter()
+                .map(|label| label.span.file_id)
+                .chain(
+                    diagnostic
+                        .fix_suggestions
+                        .iter()
+                        .map(|fix| fix.span.file_id),
+                )
+        })
+        .collect();
+    let mut imports = diagnostics::SourceMaps::default();
+    for module in &graph.files {
+        if ids.contains(&module.id.file_id()) {
+            let source = if module.source.is_empty() {
+                graph
+                    .artifacts
+                    .as_ref()
+                    .expect("spooled sources")
+                    .source(module.id.file_id())?
+            } else {
+                module.source.clone()
+            };
+            imports.insert(diagnostics::SourceMap::with_file_id(
+                module.id.file_id(),
+                module.path.to_string_lossy().into_owned(),
+                source,
+            ));
+        }
+    }
+    struct Sources<'a> {
+        entry: &'a diagnostics::SourceMap,
+        imports: diagnostics::SourceMaps,
+    }
+    impl diagnostics::source_map::SourceLookup for Sources<'_> {
+        fn get(&self, file_id: diagnostics::FileId) -> Option<&diagnostics::SourceMap> {
+            if file_id == self.entry.file_id {
+                Some(self.entry)
+            } else {
+                self.imports.get(file_id)
             }
         }
-        diagnostics::emit_multi(diagnostic, &maps);
+    }
+    let sources = Sources { entry, imports };
+    for diagnostic in diagnostics {
+        emitter.emit(diagnostic, &sources)?;
     }
     Ok(())
 }
@@ -1465,6 +1588,32 @@ pub fn compile(
     project_root: Option<PathBuf>,
 ) -> Result<()> {
     CompilerSession::new(src, out, opts, project_root).run()
+}
+
+/// Check an executable source file with a request-local diagnostic destination.
+///
+/// Runs the normal frontend, including imports, type/concurrency checks and
+/// entry-point validation, without code generation, linking or runtime builds.
+/// Source IO and emitter failures are returned directly; language diagnostics
+/// are sent to `emitter` before returning an error for a failed check.
+pub fn check_file(
+    src: &str,
+    options: &CompilerOptions,
+    emitter: &mut dyn diagnostics::DiagnosticEmitter,
+) -> Result<()> {
+    let _query_stats = query_stats::Session::enter();
+    let _node_ids = parser::ast::NodeIdSession::enter();
+    let path = Path::new(src);
+    let source = std::fs::read_to_string(path).with_context(|| format!("cannot read {src}"))?;
+    let map = diagnostics::SourceMap::new(src, &source);
+    run_frontend_with_emitter(
+        &source,
+        path.parent().unwrap_or_else(|| Path::new(".")),
+        &map,
+        &options.clone().resolve_environment(),
+        emitter,
+    )
+    .map(|_| ())
 }
 
 /// Lower a source file to typed HIR and render it as text (the `--emit-hir`
