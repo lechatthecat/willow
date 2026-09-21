@@ -42,6 +42,7 @@ impl ChannelOwnershipToken {
 #[cfg(test)]
 thread_local! {
     static CHANNEL_OWNERSHIP_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CHANNEL_OWNERSHIP_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -129,7 +130,10 @@ pub(crate) struct TaskWaitLinks {
     /// task does (the handles sit in its rooted frame).
     // Cancellation groups these by channel; registration order is immaterial.
     wait_channels: Vec<ChannelOwnershipToken>,
-    channel_ownership_index: HashMap<ChannelOwnershipKey, usize>,
+    // Keep the common one/two-channel wait free of hash-table allocations and
+    // inline HashMap metadata. Once promoted, retain the index until drained.
+    #[allow(clippy::box_collection)] // Saves inline map metadata on every small wait.
+    channel_ownership_index: Option<Box<HashMap<ChannelOwnershipKey, usize>>>,
     /// The lock this task is queued on, or holds a reserved handoff for
     /// (willow-38w.1.2). At most one: a critical section may not nest and may
     /// not suspend, so a task waits on one lock at a time. Cancellation takes
@@ -140,6 +144,17 @@ pub(crate) struct TaskWaitLinks {
 }
 
 impl TaskWaitLinks {
+    fn channel_index(&self, key: ChannelOwnershipKey) -> Option<usize> {
+        match &self.channel_ownership_index {
+            Some(index) => index.get(&key).copied(),
+            None => self.wait_channels.iter().position(|token| {
+                #[cfg(test)]
+                CHANNEL_OWNERSHIP_SCANS.with(|count| count.set(count.get() + 1));
+                token.key() == key
+            }),
+        }
+    }
+
     /// Whether every relationship is gone, including waiter tombstones, so the
     /// owning task can drop the allocation.
     fn is_vacant(&self) -> bool {
@@ -383,16 +398,21 @@ impl RuntimeTask {
     /// Install exact ownership; repeated publication of the same token succeeds.
     pub(crate) fn install_channel_ownership(&mut self, token: ChannelOwnershipToken) -> bool {
         let wait = self.wait_mut();
-        match wait.channel_ownership_index.entry(token.key()) {
-            std::collections::hash_map::Entry::Occupied(entry) => {
-                wait.wait_channels[*entry.get()] == token
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(wait.wait_channels.len());
-                wait.wait_channels.push(token);
-                true
-            }
+        if let Some(index) = wait.channel_index(token.key()) {
+            return wait.wait_channels[index] == token;
         }
+        if let Some(index) = &mut wait.channel_ownership_index {
+            index.insert(token.key(), wait.wait_channels.len());
+        } else if wait.wait_channels.len() == 2 {
+            let mut index = HashMap::with_capacity(3);
+            for (slot, existing) in wait.wait_channels.iter().enumerate() {
+                index.insert(existing.key(), slot);
+            }
+            index.insert(token.key(), wait.wait_channels.len());
+            wait.channel_ownership_index = Some(Box::new(index));
+        }
+        wait.wait_channels.push(token);
+        true
     }
 
     /// Replace only the ownership generation observed by the channel caller.
@@ -404,18 +424,20 @@ impl RuntimeTask {
         let Some(wait) = self.wait.as_mut() else {
             return false;
         };
-        let Some(&index) = wait.channel_ownership_index.get(&old.key()) else {
+        let Some(index) = wait.channel_index(old.key()) else {
             return false;
         };
         if wait.wait_channels[index] != old {
             return false;
         }
         if old.key() != new.key() {
-            if wait.channel_ownership_index.contains_key(&new.key()) {
+            if wait.channel_index(new.key()).is_some() {
                 return false;
             }
-            wait.channel_ownership_index.remove(&old.key());
-            wait.channel_ownership_index.insert(new.key(), index);
+            if let Some(lookup) = &mut wait.channel_ownership_index {
+                lookup.remove(&old.key());
+                lookup.insert(new.key(), index);
+            }
         }
         wait.wait_channels[index] = new;
         true
@@ -425,16 +447,21 @@ impl RuntimeTask {
         let Some(wait) = self.wait.as_mut() else {
             return false;
         };
-        let Some(&index) = wait.channel_ownership_index.get(&token.key()) else {
+        let Some(index) = wait.channel_index(token.key()) else {
             return false;
         };
         if wait.wait_channels[index] != token {
             return false;
         }
-        wait.channel_ownership_index.remove(&token.key());
         wait.wait_channels.swap_remove(index);
-        if let Some(moved) = wait.wait_channels.get(index) {
-            *wait.channel_ownership_index.get_mut(&moved.key()).unwrap() = index;
+        if let Some(lookup) = &mut wait.channel_ownership_index {
+            lookup.remove(&token.key());
+            if let Some(moved) = wait.wait_channels.get(index) {
+                *lookup.get_mut(&moved.key()).unwrap() = index;
+            }
+        }
+        if wait.wait_channels.is_empty() {
+            wait.channel_ownership_index = None;
         }
         self.release_wait_if_vacant();
         true
@@ -445,7 +472,7 @@ impl RuntimeTask {
         let channels = match self.wait.as_mut() {
             Some(wait) => {
                 // Release capacity too, even if other kinds of wait links remain.
-                wait.channel_ownership_index = HashMap::new();
+                wait.channel_ownership_index = None;
                 std::mem::take(&mut wait.wait_channels)
             }
             None => Vec::new(),
@@ -929,10 +956,84 @@ mod footprint {
     }
 
     #[test]
+    fn channel_ownership_small_wait_allocation_budget() {
+        use crate::scheduler::scaling_measurements::counting_allocator as counter;
+
+        for channels in [1, 2] {
+            for tasks in [1, 64, 1024] {
+                let mut owners: Vec<_> = (0..tasks).map(RuntimeTask::new).collect();
+                let bytes_before = counter::thread_bytes();
+                let allocs_before = counter::thread_allocations();
+                for task in &mut owners {
+                    for channel in 1..=channels {
+                        assert!(task.install_channel_ownership(channel_token(channel)));
+                    }
+                }
+                let bytes = counter::thread_bytes() - bytes_before;
+                let allocs = counter::thread_allocations() - allocs_before;
+                println!("tasks={tasks} channels={channels} bytes={bytes} allocations={allocs}");
+                // Only the wait-links box and token vector: no hash table.
+                assert_eq!(allocs, 2 * tasks as usize);
+            }
+        }
+    }
+
+    #[test]
+    fn channel_ownership_index_promotion_and_drain() {
+        let mut task = RuntimeTask::new(1);
+        task.add_awaiting(2);
+        for channel in 1..=3 {
+            assert!(task.install_channel_ownership(channel_token(channel)));
+            assert_eq!(
+                task.wait
+                    .as_ref()
+                    .unwrap()
+                    .channel_ownership_index
+                    .is_some(),
+                channel == 3
+            );
+        }
+        // Removing the middle slot repairs the moved token's index. Retaining
+        // the table avoids repeated promotion on oscillation around the limit.
+        assert!(task.clear_channel_ownership(channel_token(2)));
+        for _ in 0..32 {
+            assert!(task.install_channel_ownership(channel_token(2)));
+            assert!(task.clear_channel_ownership(channel_token(2)));
+            assert!(
+                task.wait
+                    .as_ref()
+                    .unwrap()
+                    .channel_ownership_index
+                    .is_some()
+            );
+        }
+        assert!(task.clear_channel_ownership(channel_token(3)));
+        assert!(task.clear_channel_ownership(channel_token(1)));
+        assert!(
+            task.wait
+                .as_ref()
+                .unwrap()
+                .channel_ownership_index
+                .is_none()
+        );
+        assert!(task.install_channel_ownership(channel_token(1)));
+        assert!(
+            task.wait
+                .as_ref()
+                .unwrap()
+                .channel_ownership_index
+                .is_none()
+        );
+        assert_eq!(task.take_wait_channels(), vec![channel_token(1)]);
+        assert!(task.is_awaiting(2));
+    }
+
+    #[test]
     fn channel_ownership_index_scales_across_roles_and_compensation() {
         for n in [64, 256, 1024, 4096] {
             let mut task = RuntimeTask::new(1);
             CHANNEL_OWNERSHIP_HASHES.with(|count| count.set(0));
+            CHANNEL_OWNERSHIP_SCANS.with(|count| count.set(0));
             let roles = [
                 ChannelRole::RecvWait,
                 ChannelRole::RecvClaim,
@@ -973,7 +1074,12 @@ mod footprint {
                 }
             }
             let hashes = CHANNEL_OWNERSHIP_HASHES.with(|count| count.get());
-            println!("channels={n} tokens={} hashes={hashes}", 4 * n);
+            let scans = CHANNEL_OWNERSHIP_SCANS.with(|count| count.get());
+            println!(
+                "channels={n} tokens={} hashes={hashes} scans={scans}",
+                4 * n
+            );
+            assert_eq!(scans, 9, "only the first two tokens use linear lookup");
             // Includes growth rehashes and moved-slot index repair. Hash-table
             // probes are expected O(1); this bounds actual key hashing work.
             assert!(hashes <= 80 * n, "{hashes} hashes for {n} channels");
