@@ -1828,7 +1828,10 @@ fn nested_scope_remembers_young_frames_without_an_independent_child_root() {
         "unrooted young frame is evacuated through its stable cell"
     );
     assert_eq!(unsafe { *retained.cast::<u64>() }, 1234);
-    assert_eq!(runtime().heap.lock().unwrap().young_allocated_bytes, 0);
+    assert_eq!(
+        runtime().heap.lock().unwrap().young_allocated_bytes,
+        GC_HEADER_SIZE + 128
+    );
     willow_gc_collect();
     assert_eq!(unsafe { *retained.cast::<u64>() }, 1234);
     willow_pop_root();

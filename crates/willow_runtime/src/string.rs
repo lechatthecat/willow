@@ -10,8 +10,8 @@
 // String literals are allocated once and kept alive permanently via
 // willow_gc_add_runtime_root so that gc_collect() never frees them.
 
-use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::gc::{GcObjectKind, willow_alloc_with_layout, willow_gc_add_runtime_root};
 
@@ -67,65 +67,63 @@ unsafe fn alloc_validated_bytes(bytes: *const u8, len_usize: usize, payload_size
 // Literal interning: lazily allocate once, root permanently.
 // ---------------------------------------------------------------------------
 
-// SAFETY: WillowString pointers in this cache are valid GC heap objects
-// permanently registered via willow_gc_add_runtime_root, so they are never
-// freed or moved. Sharing the raw pointer value across threads is safe
-// because the GC is stop-the-world and the value itself is never mutated.
-struct SendPtr(*mut u8);
-unsafe impl Send for SendPtr {}
-unsafe impl Sync for SendPtr {}
+// Only initialized slots are retained, for heap reset. This is not a lookup
+// cache: normal evaluation never takes this lock or searches this vector.
+static INITIALIZED_LITERAL_SLOTS: Mutex<Vec<&'static AtomicPtr<u8>>> = Mutex::new(Vec::new());
 
-type LiteralCache = HashMap<(usize, i64), SendPtr>;
+// GC payloads are aligned and can never have this address.
+const INITIALIZING: *mut u8 = std::ptr::without_provenance_mut(1);
 
-static LITERAL_CACHE: Mutex<Option<LiteralCache>> = Mutex::new(None);
-
-fn lock_literal_cache() -> MutexGuard<'static, Option<LiteralCache>> {
-    loop {
-        match LITERAL_CACHE.try_lock() {
-            Ok(guard) => return guard,
-            Err(TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => {
-                // Literal initialization can allocate (and therefore collect)
-                // while holding this cache lock. A competing mutator must keep
-                // reaching safepoints instead of blocking in the OS mutex, or
-                // a stop-the-world collector can wait forever for it to park.
-                crate::gc::willow_gc_safepoint();
-                std::thread::yield_now();
-            }
-        }
+/// Reset is quiescent: no compiled code or literal initializer may be running.
+/// Registered slots have process lifetime, including across GC lifetimes.
+pub(crate) fn clear_string_literal_slots() {
+    for slot in INITIALIZED_LITERAL_SLOTS.lock().unwrap().drain(..) {
+        slot.store(std::ptr::null_mut(), Ordering::Release);
     }
 }
 
-/// Clear the string literal cache.
-/// Must be called from willow_gc_init / reset_internal so that stale pointers
-/// from a previous GC lifetime are never returned after the heap is reset.
-pub(crate) fn clear_string_literal_cache() {
-    let mut guard = lock_literal_cache();
-    if let Some(cache) = guard.as_mut() {
-        cache.clear();
-    }
-}
-
-/// Allocate or retrieve a permanently-rooted WillowString for a string literal.
+/// Retrieve a permanently rooted literal using compiler-owned static storage.
 ///
-/// `bytes` must point to static read-only data for the lifetime of the process.
-/// `len` is the byte length of the string (excluding NUL).
-///
-/// The first call with a given (`bytes`, `len`) pair allocates a WillowString
-/// and registers it as a permanent GC root. Subsequent calls with that pair
-/// return the same pointer; prefixes at the same address remain distinct.
+/// `slot` must point to a pointer-aligned, initially zero atomic pointer with
+/// process lifetime. Every use of a slot must supply the same valid static UTF-8
+/// bytes and length. Different literals (including prefixes) need distinct slots.
+/// Heap reset must be quiescent; it clears every initialized slot before reuse.
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_string_literal(bytes: *const u8, len: i64) -> *mut u8 {
-    let key = (bytes as usize, len);
-    let mut guard = lock_literal_cache();
-    let cache = guard.get_or_insert_with(HashMap::new);
-    if let Some(p) = cache.get(&key) {
-        return p.0;
+pub extern "C" fn willow_string_literal_slot(
+    slot: *const AtomicPtr<u8>,
+    bytes: *const u8,
+    len: i64,
+) -> *mut u8 {
+    // SAFETY: compiler-generated writable static slot obeys the contract above.
+    let slot: &'static AtomicPtr<u8> = unsafe { &*slot };
+    loop {
+        let value = slot.load(Ordering::Acquire);
+        if value != INITIALIZING && !value.is_null() {
+            return value;
+        }
+        if value.is_null()
+            && slot
+                .compare_exchange(value, INITIALIZING, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        {
+            let ptr = willow_string_alloc(bytes, len);
+            if !ptr.is_null() {
+                willow_gc_add_runtime_root(ptr);
+                // No GC allocation/safepoint while holding the reset registry
+                // lock, and no scheduler preemption can strand its owner.
+                let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+                INITIALIZED_LITERAL_SLOTS.lock().unwrap().push(slot);
+            }
+            // Root and fully initialized bytes become visible together. A
+            // failed allocation restores empty storage so a later call retries.
+            slot.store(ptr, Ordering::Release);
+            return ptr;
+        }
+        // The winning mutator may allocate/collect. Losers must participate in
+        // safepoints rather than block a collector waiting for them to park.
+        crate::gc::willow_gc_safepoint();
+        std::thread::yield_now();
     }
-    let ptr = willow_string_alloc(bytes, len);
-    willow_gc_add_runtime_root(ptr);
-    cache.insert(key, SendPtr(ptr));
-    ptr
 }
 
 // ---------------------------------------------------------------------------
@@ -162,8 +160,8 @@ pub extern "C" fn willow_string_eq(lhs: *const u8, rhs: *const u8) -> i64 {
 /// Concatenate two WillowStrings and return a new GC-managed WillowString.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_string_concat(lhs: *const u8, rhs: *const u8) -> *mut u8 {
-    let (lhs_bytes, lhs_len) = unsafe { ws_as_bytes(lhs) };
-    let (rhs_bytes, rhs_len) = unsafe { ws_as_bytes(rhs) };
+    let (_, lhs_len) = unsafe { ws_as_bytes(lhs) };
+    let (_, rhs_len) = unsafe { ws_as_bytes(rhs) };
     let Some((total_len, payload_size)) = lhs_len
         .checked_add(rhs_len)
         .and_then(|len| string_payload_size(len).map(|size| (len, size)))
@@ -171,10 +169,18 @@ pub extern "C" fn willow_string_concat(lhs: *const u8, rhs: *const u8) -> *mut u
         crate::panic_context::raise_language_message("string concatenation size overflow");
         return std::ptr::null_mut();
     };
+    let mut lhs = lhs.cast_mut();
+    let mut rhs = rhs.cast_mut();
+    crate::gc::willow_push_root(&mut lhs);
+    crate::gc::willow_push_root(&mut rhs);
     let ptr = willow_alloc_with_layout(GcObjectKind::String, 0, payload_size, 0);
     if ptr.is_null() {
+        crate::gc::willow_pop_roots(2);
         return ptr;
     }
+    // Derive interior addresses from the root slots after the allocation.
+    let (lhs_bytes, _) = unsafe { ws_as_bytes(lhs) };
+    let (rhs_bytes, _) = unsafe { ws_as_bytes(rhs) };
     unsafe {
         *(ptr as *mut i64) = total_len as i64;
         if lhs_len > 0 {
@@ -185,6 +191,7 @@ pub extern "C" fn willow_string_concat(lhs: *const u8, rhs: *const u8) -> *mut u
         }
         *ptr.add(8 + total_len) = 0;
     }
+    crate::gc::willow_pop_roots(2);
     ptr
 }
 
@@ -231,6 +238,27 @@ mod tests {
     use crate::gc::{runtime_test_guard, willow_gc_init};
 
     #[test]
+    #[ignore = "manual literal hot-path measurement"]
+    fn literal_hot_path_measurement() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        static SLOT: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+        let text = b"literal-heavy loop";
+        willow_string_literal_slot(&SLOT, text.as_ptr(), text.len() as i64);
+        for hits in [1_000_000, 4_000_000, 16_000_000] {
+            let start = std::time::Instant::now();
+            for _ in 0..hits {
+                std::hint::black_box(willow_string_literal_slot(
+                    &SLOT,
+                    std::hint::black_box(text.as_ptr()),
+                    text.len() as i64,
+                ));
+            }
+            println!("hits={hits} elapsed_ns={}", start.elapsed().as_nanos());
+        }
+    }
+
+    #[test]
     fn invalid_utf8_is_process_fatal() {
         const CHILD: &str = "WILLOW_TEST_INVALID_STRING_UTF8";
         if let Ok(case) = std::env::var(CHILD) {
@@ -241,7 +269,8 @@ mod tests {
                     willow_string_alloc([0xff].as_ptr(), 1);
                 }
                 "literal" => {
-                    willow_string_literal(b"\xc0\x80".as_ptr(), 2);
+                    static SLOT: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+                    willow_string_literal_slot(&SLOT, b"\xc0\x80".as_ptr(), 2);
                 }
                 "truncated" => {
                     willow_string_alloc(b"\xe2\x82".as_ptr(), 2);
@@ -295,10 +324,14 @@ mod tests {
             assert_eq!(unsafe { willow_string_as_str(ptr) }, text);
             assert_eq!(unsafe { *ptr.add(8 + text.len()) }, 0);
         }
+        static SLOT: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
         let text = "literal é水🦀";
-        let ptr = willow_string_literal(text.as_ptr(), text.len() as i64);
+        let ptr = willow_string_literal_slot(&SLOT, text.as_ptr(), text.len() as i64);
         assert_eq!(unsafe { willow_string_as_str(ptr) }, text);
-        assert_eq!(willow_string_literal(text.as_ptr(), text.len() as i64), ptr);
+        assert_eq!(
+            willow_string_literal_slot(&SLOT, text.as_ptr(), text.len() as i64),
+            ptr
+        );
         assert_eq!(unsafe { willow_string_as_str(std::ptr::null()) }, "");
     }
 
@@ -326,6 +359,39 @@ mod tests {
             assert_eq!(unsafe { *result.add(8 + left_len + right_len) }, 0);
             crate::gc::willow_pop_roots(2);
         }
+    }
+
+    #[test]
+    fn concat_roots_inputs_across_allocation_and_balances_depth() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        struct RestoreStress;
+        impl Drop for RestoreStress {
+            fn drop(&mut self) {
+                crate::gc::set_gc_stress_for_test(None);
+            }
+        }
+        let _restore = RestoreStress;
+        crate::gc::set_gc_stress_for_test(Some("alloc"));
+        for (left, right) in [("", ""), ("left", "右"), ("same", "same")] {
+            let mut lhs = willow_string_from_str(left);
+            crate::gc::willow_push_root(&mut lhs);
+            let rhs = willow_string_from_str(right);
+            crate::gc::willow_pop_roots(1);
+            // No caller roots remain: concat must protect its own inputs.
+            let depth = crate::gc::willow_root_depth();
+            let result = willow_string_concat(lhs, rhs);
+            assert_eq!(crate::gc::willow_root_depth(), depth);
+            assert_eq!(
+                unsafe { willow_string_as_str(result) },
+                format!("{left}{right}")
+            );
+            assert_eq!(unsafe { *result.add(8 + left.len() + right.len()) }, 0);
+        }
+        let depth = crate::gc::willow_root_depth();
+        let result = willow_string_concat(std::ptr::null(), std::ptr::null());
+        assert_eq!(unsafe { willow_string_as_str(result) }, "");
+        assert_eq!(crate::gc::willow_root_depth(), depth);
     }
 
     #[test]
@@ -404,78 +470,70 @@ mod tests {
     }
 
     #[test]
-    fn string_unit_06_literal_is_stable_across_gc() {
-        use crate::gc::willow_gc_collect;
+    fn literal_slots_preserve_prefixes_content_gc_and_reset() {
         let _guard = runtime_test_guard();
-        willow_gc_init();
-        let bytes = b"stable";
-        let p1 = willow_string_literal(bytes.as_ptr(), 6);
-        willow_gc_collect();
-        // Second call should return the same pointer
-        let p2 = willow_string_literal(bytes.as_ptr(), 6);
-        assert_eq!(p1, p2);
-        assert_eq!(unsafe { ws_to_string(p1) }, "stable");
-    }
-
-    #[test]
-    fn literal_cache_distinguishes_lengths_at_the_same_address() {
-        let _guard = runtime_test_guard();
+        static SLOTS: [AtomicPtr<u8>; 3] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 3];
         static TEXT: &str = "éclair";
-        for lengths in [[0, 2, 7], [7, 2, 0]] {
+        for _ in 0..3 {
             willow_gc_init();
-            let pointers = lengths.map(|len| willow_string_literal(TEXT.as_ptr(), len));
-            for (index, len) in lengths.into_iter().enumerate() {
-                let ptr = pointers[index];
-                assert_eq!(unsafe { willow_string_as_str(ptr) }, &TEXT[..len as usize]);
-                assert_eq!(unsafe { *ptr.add(8 + len as usize) }, 0);
-                for other in &pointers[..index] {
-                    assert_ne!(ptr, *other);
-                }
-            }
+            assert!(
+                SLOTS
+                    .iter()
+                    .all(|slot| slot.load(Ordering::Acquire).is_null())
+            );
+            let pointers: Vec<_> = SLOTS
+                .iter()
+                .zip([0, 2, 7])
+                .map(|(slot, len)| willow_string_literal_slot(slot, TEXT.as_ptr(), len))
+                .collect();
             crate::gc::willow_gc_collect();
-            for (len, ptr) in lengths.into_iter().zip(pointers) {
-                assert_eq!(willow_string_literal(TEXT.as_ptr(), len), ptr);
-                assert_eq!(unsafe { willow_string_as_str(ptr) }, &TEXT[..len as usize]);
+            for ((slot, len), ptr) in SLOTS.iter().zip([0, 2, 7]).zip(&pointers) {
+                assert_eq!(willow_string_literal_slot(slot, TEXT.as_ptr(), len), *ptr);
+                assert_eq!(unsafe { willow_string_as_str(*ptr) }, &TEXT[..len as usize]);
+                assert_eq!(unsafe { *ptr.add(8 + len as usize) }, 0);
             }
+            assert_ne!(pointers[0], pointers[1]);
+            assert_ne!(pointers[1], pointers[2]);
         }
     }
 
     #[test]
-    fn literal_cache_invalid_length_does_not_alias_valid_literal() {
+    fn literal_slots_invalid_input_restores_empty_slot() {
         let _guard = runtime_test_guard();
-        for invalid_first in [true, false] {
-            willow_gc_init();
-            let bytes = b"abc";
-            if invalid_first {
-                assert!(willow_string_literal(bytes.as_ptr(), -1).is_null());
-            }
-            let ptr = willow_string_literal(bytes.as_ptr(), 3);
-            assert!(!ptr.is_null());
-            assert_eq!(unsafe { willow_string_as_str(ptr) }, "abc");
-            assert!(willow_string_literal(bytes.as_ptr(), -1).is_null());
-            assert_eq!(willow_string_literal(bytes.as_ptr(), 3), ptr);
+        static SLOT: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+        willow_gc_init();
+        for (bytes, len) in [(b"abc".as_ptr(), -1), (std::ptr::null(), 3)] {
+            assert!(willow_string_literal_slot(&SLOT, bytes, len).is_null());
+            assert!(SLOT.load(Ordering::Acquire).is_null());
+            assert!(INITIALIZED_LITERAL_SLOTS.lock().unwrap().is_empty());
         }
+        let ptr = willow_string_literal_slot(&SLOT, b"abc".as_ptr(), 3);
+        assert_eq!(unsafe { willow_string_as_str(ptr) }, "abc");
     }
 
     #[test]
-    fn literal_cache_repeated_hits_do_not_allocate() {
+    fn literal_slots_repeated_hits_do_not_allocate() {
         let _guard = runtime_test_guard();
-        static BYTES: [u8; 264] = [b'x'; 264];
+        static SLOTS: [AtomicPtr<u8>; 256] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 256];
         for count in [16, 64, 256] {
             for repetitions in [1, 8, 32] {
                 willow_gc_init();
                 let before = crate::gc::telemetry_heap_snapshot().0.allocation_count;
-                let pointers: Vec<_> = (0..count)
-                    .map(|offset| willow_string_literal(BYTES[offset..].as_ptr(), 8))
+                let pointers: Vec<_> = SLOTS[..count]
+                    .iter()
+                    .map(|slot| willow_string_literal_slot(slot, b"literal".as_ptr(), 7))
                     .collect();
                 let after_misses = crate::gc::telemetry_heap_snapshot().0.allocation_count;
                 assert_eq!(after_misses - before, count as u64);
                 for _ in 0..repetitions {
-                    for (offset, ptr) in pointers.iter().enumerate() {
-                        assert_eq!(willow_string_literal(BYTES[offset..].as_ptr(), 8), *ptr);
+                    for (slot, ptr) in SLOTS.iter().zip(&pointers) {
+                        assert_eq!(
+                            willow_string_literal_slot(slot, b"literal".as_ptr(), 7),
+                            *ptr
+                        );
                     }
                 }
-                assert_eq!(lock_literal_cache().as_ref().unwrap().len(), count);
+                assert_eq!(INITIALIZED_LITERAL_SLOTS.lock().unwrap().len(), count);
                 assert_eq!(
                     crate::gc::telemetry_heap_snapshot().0.allocation_count,
                     after_misses
@@ -486,6 +544,69 @@ mod tests {
                     after_misses - before
                 );
             }
+        }
+    }
+
+    #[test]
+    fn literal_slots_waiters_cooperate_with_gc() {
+        use crate::gc::*;
+        use std::sync::atomic::AtomicBool;
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        static SLOT: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+        SLOT.store(INITIALIZING, Ordering::Release);
+        let ready = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                willow_gc_register_mutator();
+                ready.store(true, Ordering::Release);
+                let ptr = willow_string_literal_slot(&SLOT, b"waiting".as_ptr(), 7);
+                assert_eq!(unsafe { willow_string_as_str(ptr) }, "waiting");
+                willow_gc_unregister_mutator();
+            });
+            while !ready.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            // The only safepoint available to the registered worker is the
+            // slot wait loop. This collection must finish before we release it.
+            willow_gc_collect();
+            SLOT.store(std::ptr::null_mut(), Ordering::Release);
+        });
+        assert_eq!(INITIALIZED_LITERAL_SLOTS.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn literal_slots_concurrent_first_use_and_collection() {
+        use crate::gc::*;
+        let _guard = runtime_test_guard();
+        static SLOTS: [AtomicPtr<u8>; 64] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 64];
+        for workers in [2, 8] {
+            willow_gc_init();
+            let before = telemetry_heap_snapshot().0.allocation_count;
+            let barrier = std::sync::Barrier::new(workers);
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        // Barrier before registration: blocking a registered
+                        // mutator outside GC cooperation would deadlock STW.
+                        barrier.wait();
+                        willow_gc_register_mutator();
+                        for slot in &SLOTS {
+                            let ptr = willow_string_literal_slot(slot, b"racing".as_ptr(), 6);
+                            willow_gc_collect();
+                            assert_eq!(unsafe { willow_string_as_str(ptr) }, "racing");
+                            assert_eq!(
+                                willow_string_literal_slot(slot, b"racing".as_ptr(), 6),
+                                ptr
+                            );
+                        }
+                        willow_gc_unregister_mutator();
+                    });
+                }
+            });
+            assert_eq!(telemetry_heap_snapshot().0.allocation_count - before, 64);
+            assert_eq!(INITIALIZED_LITERAL_SLOTS.lock().unwrap().len(), 64);
         }
     }
 
@@ -521,25 +642,5 @@ mod tests {
         let ptr = willow_string_alloc(std::ptr::null(), 0);
         assert!(!ptr.is_null());
         assert_eq!(unsafe { willow_string_as_str(ptr) }, "");
-    }
-
-    // Fix 4: string literal cache cleared on GC reset
-    #[test]
-    fn string_unit_11_literal_cache_safe_after_gc_init() {
-        use crate::gc::{willow_gc_collect, willow_gc_init};
-        let _guard = runtime_test_guard();
-        willow_gc_init();
-        let bytes = b"abc";
-        let p1 = willow_string_literal(bytes.as_ptr(), 3);
-        assert!(!p1.is_null());
-        // Reset GC — this must clear the cache so p1 is no longer returned.
-        willow_gc_init();
-        let p2 = willow_string_literal(bytes.as_ptr(), 3);
-        assert!(!p2.is_null());
-        // p2 must be a fresh, valid allocation regardless of whether it
-        // happens to reuse the same address.
-        assert_eq!(unsafe { willow_string_as_str(p2) }, "abc");
-        willow_gc_collect();
-        assert_eq!(unsafe { willow_string_as_str(p2) }, "abc");
     }
 }

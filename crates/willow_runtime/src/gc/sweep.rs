@@ -195,6 +195,11 @@ fn sweep_chunk(
         // start bits concurrently published by generated allocation.
         return (0, false);
     }
+    let was_survivor = state.tlab_chunks[chunk_index].kind == RegionKind::Survivor;
+    if was_survivor {
+        state.survivor_stats.survivor_space_live -=
+            state.tlab_chunks[chunk_index].live_bytes as u64;
+    }
     state.tlab_chunks[chunk_index].live_bytes = 0;
     state.tlab_chunks[chunk_index].mark_bitmap.clear();
     let mut offset = 0usize;
@@ -255,9 +260,20 @@ fn sweep_chunk(
 
     state.tlab_chunks[chunk_index].kind = if has_old_objects {
         RegionKind::Pinned
+    } else if state.tlab_chunks[chunk_index].kind == RegionKind::Survivor {
+        RegionKind::Survivor
     } else {
         RegionKind::Nursery
     };
+    if was_survivor {
+        if state.tlab_chunks[chunk_index].kind == RegionKind::Survivor {
+            state.survivor_stats.survivor_space_live +=
+                state.tlab_chunks[chunk_index].live_bytes as u64;
+        } else {
+            state.survivor_stats.survivor_space_reserved -=
+                state.tlab_chunks[chunk_index].capacity as u64;
+        }
+    }
     (freed_bytes, !has_live_objects && owner_state.is_none())
 }
 
@@ -302,6 +318,9 @@ fn finish(state: &mut GcState, dead_chunks: &[bool]) {
         let dead = dead_chunks.get(old_index).copied().unwrap_or(false);
         old_index += 1;
         if dead {
+            if chunk.kind == RegionKind::Survivor {
+                state.survivor_stats.survivor_space_reserved -= chunk.capacity as u64;
+            }
             assert!(chunk.owner_state.is_none());
             positions.push(None);
             let layout =

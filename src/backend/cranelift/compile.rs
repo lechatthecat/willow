@@ -1154,7 +1154,23 @@ impl Codegen {
         bytes.push(0);
         data.define(bytes.into_boxed_slice());
         self.module.define_data(data_id, &data)?;
-        self.string_literals.insert(value.to_string(), data_id);
+        // Writable, pointer-aligned, zero-initialized atomic slot. Its address is
+        // process-lifetime storage; runtime reset clears initialized slots.
+        let slot =
+            self.module
+                .declare_data(&format!("{name}_slot"), Linkage::Local, true, false)?;
+        let mut slot_data = DataDescription::new();
+        let pointer_bytes = self.module.target_config().pointer_bytes();
+        slot_data.define_zeroinit(pointer_bytes as usize);
+        slot_data.set_align(pointer_bytes as u64);
+        self.module.define_data(slot, &slot_data)?;
+        self.string_literals.insert(
+            value.to_string(),
+            StringLiteralData {
+                bytes: data_id,
+                slot,
+            },
+        );
         Ok(())
     }
 

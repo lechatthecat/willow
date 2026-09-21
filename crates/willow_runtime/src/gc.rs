@@ -15,7 +15,8 @@
 // allocation enumeration, storage, mark bits, free spans, and liveness accounting.
 // Generated young objects live
 // in nursery TLAB regions; directly rooted survivors retain that storage as
-// pinned old regions.
+// pinned old regions. Heap-only survivors copy to collector-owned young chunks
+// once, then tenure into old regions on their second minor survival.
 
 mod address_index;
 mod assist;
@@ -162,7 +163,7 @@ pub struct GcHeader {
     /// TLAB objects start young. Region-allocated and promoted objects are old
     /// and never move again.
     pub generation: u8,
-    /// Reserved for survivor aging. Stage 4 promotes every minor survivor.
+    /// Number of copying minor collections survived while young.
     pub age: u8,
     /// Runtime type identifier (0 = unknown/opaque for now).
     pub type_id: u32,
@@ -411,7 +412,8 @@ mod raw_heap {
 
         pub(super) fn load(self) -> Option<Payload> {
             // SAFETY: generated code keeps a registered root slot alive until
-            // its matching pop, and only its owning thread reads it.
+            // its matching pop. Foreign slots are read only while their owner
+            // is parked under the stop-the-world coordinator.
             Payload::from_raw(unsafe { *self.0.as_ptr() })
         }
     }
@@ -428,8 +430,9 @@ struct GcState {
     sweeping: Option<ThreadId>,
     satb: satb::SatbBuffers,
     /// Bump-allocation chunks. Active chunks are owned by one TLS state;
-    /// collection retires them before walking their object headers.
-    tlab_chunks: Vec<TlabChunk>,
+    /// collection retires them before walking their object headers. Collector-only
+    /// survivor chunks share this index but never belong to a TLS state.
+    tlab_chunks: Vec<BumpChunk>,
     tlab_addresses: address_index::AddressIndex,
     /// Non-moving old-generation storage. Regular regions serve old/runtime
     /// allocations from a bump tail or region-local free spans. Large objects
@@ -453,7 +456,7 @@ struct GcState {
     last_major_mark_work: u64,
     pacer: pacer::Sampler,
     pacer_trigger: u64,
-    /// Bytes occupied by allocated young objects in retired or active TLABs.
+    /// Bytes occupied by young objects in TLABs and collector survivor chunks.
     young_allocated_bytes: usize,
     /// Trigger a minor collection at the next TLAB refill after this threshold.
     nursery_threshold_bytes: usize,
@@ -470,6 +473,7 @@ struct GcState {
     tlab_refills: u64,
     tlab_large_allocations: u64,
     tlab_fast_allocated_bytes: u64,
+    /// Legacy combined bump-storage reservation: nursery, pinned, and survivor.
     tlab_reserved_bytes: usize,
     /// Old objects that may contain at least one young reference. Owners are
     /// payload addresses and remain stable because the old generation does not
@@ -484,6 +488,7 @@ struct GcState {
     promoted_objects: u64,
     promoted_bytes: u64,
     moved_objects: u64,
+    survivor_stats: crate::gc_telemetry::GcSurvivorStats,
     old_region_allocations: u64,
     old_region_reuses: u64,
     old_regions_released: u64,
@@ -493,6 +498,7 @@ struct GcState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegionKind {
     Nursery,
+    Survivor,
     Old,
     LargeObject,
     Pinned,
@@ -553,7 +559,9 @@ struct OldRegion {
     concurrent_marks: Arc<concurrent_bitmap::ConcurrentMarkBits>,
 }
 
-struct TlabChunk {
+/// Shared indexed storage for mutator TLABs and collector-only survivor chunks.
+/// Survivor chunks never have an owner_state and are never refilled by mutators.
+struct BumpChunk {
     base: *mut u8,
     capacity: usize,
     /// Allocated prefix in bytes. For an active chunk this is refreshed from
@@ -971,6 +979,7 @@ impl Default for GcState {
             promoted_objects: 0,
             promoted_bytes: 0,
             moved_objects: 0,
+            survivor_stats: Default::default(),
             old_region_allocations: 0,
             old_region_reuses: 0,
             old_regions_released: 0,
@@ -1005,19 +1014,19 @@ std::thread_local! {
 // When more than one mutator thread is registered (for example, a
 // `WILLOW_WORKERS=N` worker pool), a collection stops the world: it asks every
 // other registered mutator to reach a safepoint, where the mutator publishes a
-// SNAPSHOT of its own root pointers under `COORD`'s lock and parks. The
+// SNAPSHOT of its root-slot locations under `COORD`'s lock and parks. The
 // collector then scans every registered mutator's published roots. Each thread
 // only ever reads its OWN thread-local stack, so there is no cross-thread
-// TLS/RefCell aliasing — the shared state is just `Vec<usize>` address snapshots
-// behind a mutex.
+// TLS/RefCell aliasing. The collector accesses published slots only while
+// their owners are parked; it does not access another thread's RefCell.
 //
 // Major collection uses an independent root-publication handshake initially
 // and this parking protocol for final remark. Tracing reads atomic references
 // and concurrent container snapshots while SATB/insertion barriers retain edges.
 #[derive(Default)]
 struct GcCoord {
-    /// Registered mutator threads → their most recently published root snapshot
-    /// (object payload addresses). Empty vec until the thread parks at a safepoint.
+    /// Registered mutators → writable root-slot addresses, valid only while
+    /// the owner is parked. Empty until the first stop-the-world publication.
     mutators: HashMap<ThreadId, Vec<usize>>,
     /// A collector has requested all mutators to reach a safepoint and park.
     stop_requested: bool,
@@ -1100,6 +1109,21 @@ fn snapshot_local_roots() -> Vec<usize> {
                     .and_then(RootSlot::load)
                     .map(|payload| payload.as_ptr() as usize)
             })
+            .collect()
+    })
+}
+
+/// Publish live root locations rather than object values. Null-valued slots
+/// need no rewrite; omitting them avoids retaining a snapshot entry for every
+/// dead local. The owning stack cannot mutate until STW ends.
+fn snapshot_local_root_slots() -> Vec<usize> {
+    ROOT_STACK.with(|roots| {
+        roots
+            .borrow()
+            .iter()
+            .copied()
+            .filter(|&slot| RootSlot::from_raw(slot).and_then(RootSlot::load).is_some())
+            .map(|slot| slot as usize)
             .collect()
     })
 }
@@ -1201,7 +1225,7 @@ pub extern "C" fn willow_gc_safepoint() {
     let id = std::thread::current().id();
     // Publish our roots so the collector can scan them while we are parked, then
     // park until the world resumes.
-    let roots = snapshot_local_roots();
+    let roots = snapshot_local_root_slots();
     if let Some(slot) = coord.mutators.get_mut(&id) {
         *slot = roots;
     }
@@ -1267,19 +1291,30 @@ fn with_stw<R>(
 
 /// All roots to scan under stop-the-world: this (collector) thread's LIVE
 /// thread-local roots plus every OTHER registered mutator's published snapshot.
-fn all_registered_stack_roots(coord: &GcCoord) -> Vec<*mut u8> {
+fn all_registered_stack_root_slots(coord: &GcCoord) -> Vec<*mut *mut u8> {
     let me = std::thread::current().id();
-    let mut roots: Vec<*mut u8> = snapshot_local_roots()
+    let mut roots: Vec<*mut *mut u8> = snapshot_local_root_slots()
         .into_iter()
-        .map(|a| a as *mut u8)
+        .map(|a| a as *mut *mut u8)
         .collect();
     for (&id, published) in coord.mutators.iter() {
         if id == me {
             continue; // self uses the live snapshot above, not a stale publish
         }
-        roots.extend(published.iter().map(|&a| a as *mut u8));
+        roots.extend(published.iter().map(|&a| a as *mut *mut u8));
     }
     roots
+}
+
+/// Value view for the existing nonrelocating root consumers. Slot publication
+/// is distinct from the concurrent mark handshake's value snapshots: those
+/// snapshots must never expose stack locations after their owners resume.
+fn all_registered_stack_roots(coord: &GcCoord) -> Vec<*mut u8> {
+    all_registered_stack_root_slots(coord)
+        .into_iter()
+        .filter_map(|slot| RootSlot::from_raw(slot).and_then(RootSlot::load))
+        .map(GcPayload::as_ptr)
+        .collect()
 }
 
 /// Trace the GC graph from `worklist` (the marked-set fixpoint via the TypeInfo
@@ -2457,7 +2492,7 @@ fn allocate_tlab_chunk(state: &mut GcState, owner_state: usize) -> Option<*mut u
     state
         .tlab_addresses
         .insert(base as usize, state.tlab_chunks.len());
-    state.tlab_chunks.push(TlabChunk {
+    state.tlab_chunks.push(BumpChunk {
         base,
         capacity: GC_TLAB_CHUNK_SIZE,
         used: 0,
@@ -2883,7 +2918,7 @@ pub extern "C" fn willow_gc_alloc_slow(
     header.payload().as_ptr()
 }
 
-fn chunk_used_bytes(state: &GcState, chunk: &TlabChunk) -> usize {
+fn chunk_used_bytes(state: &GcState, chunk: &BumpChunk) -> usize {
     let start = chunk.base as usize;
     chunk
         .owner_state
@@ -2904,7 +2939,7 @@ fn chunk_used_bytes(state: &GcState, chunk: &TlabChunk) -> usize {
 thread_local! { static RETIRED_LOOKUP_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 fn object_in_retired_chunk(
-    chunk: &TlabChunk,
+    chunk: &BumpChunk,
     address: usize,
     interior: bool,
 ) -> Option<HeapObject> {
@@ -2957,7 +2992,7 @@ fn find_old_region_object(state: &GcState, address: usize, interior: bool) -> Op
     state.old_regions[index].object_for_address(address, interior)
 }
 
-fn find_tlab_chunk(state: &GcState, address: usize) -> Option<&TlabChunk> {
+fn find_tlab_chunk(state: &GcState, address: usize) -> Option<&BumpChunk> {
     let chunk = &state.tlab_chunks[state
         .tlab_addresses
         .candidate(address.checked_sub(GC_HEADER_SIZE)?)?];
@@ -3298,8 +3333,8 @@ pub extern "C" fn willow_gc_collect() {
 
 /// Trigger a stop-the-world minor collection. Explicit roots are promoted
 /// in-place because current generated SSA aliases are not reloaded after every
-/// allocation; young objects reachable only through heap slots are copied to
-/// the non-moving old generation and those slots are updated.
+/// allocation. Heap-only survivors copy to young survivor storage at age 1,
+/// then to non-moving old storage at age 2; their reference slots are updated.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_minor_collect() {
     minor_collect_internal();
@@ -3429,6 +3464,60 @@ pub(crate) fn telemetry_heap_snapshot() -> (
             minor_trigger_bytes: state.nursery_threshold_bytes as u64,
         },
     )
+}
+
+pub(crate) fn survivor_snapshot() -> crate::gc_telemetry::GcSurvivorStats {
+    runtime().heap.lock().unwrap().survivor_stats
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_survivor_copies() -> i64 {
+    runtime()
+        .heap
+        .lock()
+        .unwrap()
+        .survivor_stats
+        .survivor_copies as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_survivor_bytes() -> i64 {
+    runtime().heap.lock().unwrap().survivor_stats.survivor_bytes as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_tenured_objects() -> i64 {
+    runtime()
+        .heap
+        .lock()
+        .unwrap()
+        .survivor_stats
+        .tenured_objects as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_tenured_bytes() -> i64 {
+    runtime().heap.lock().unwrap().survivor_stats.tenured_bytes as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_pinned_promotions() -> i64 {
+    runtime()
+        .heap
+        .lock()
+        .unwrap()
+        .survivor_stats
+        .pinned_promotions as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_survivor_space_reserved() -> i64 {
+    survivor_snapshot().survivor_space_reserved as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_survivor_space_live() -> i64 {
+    survivor_snapshot().survivor_space_live as i64
 }
 
 #[unsafe(no_mangle)]
@@ -3818,7 +3907,15 @@ fn verify_old_region_metadata(state: &GcState) -> Result<(), String> {
                 chunk.kind, chunk.base as usize, chunk.used, chunk.capacity
             ));
         }
-        if chunk.kind == RegionKind::Pinned {
+        if matches!(chunk.kind, RegionKind::Pinned | RegionKind::Survivor) {
+            if chunk.owner_state.is_some() {
+                return Err("collector/pinned chunk has a mutator owner".into());
+            }
+            let expected_generation = if chunk.kind == RegionKind::Survivor {
+                GC_GENERATION_YOUNG
+            } else {
+                GC_GENERATION_OLD
+            };
             let mut offset = 0usize;
             let mut live = 0usize;
             while offset < chunk.used {
@@ -3826,7 +3923,7 @@ fn verify_old_region_metadata(state: &GcState) -> Result<(), String> {
                 let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast())
                     .expect("pinned-region object address is non-null");
                 if object.allocated() {
-                    if object.generation() != GC_GENERATION_OLD
+                    if object.generation() != expected_generation
                         || !chunk.mark_bitmap.is_marked(offset)
                     {
                         return Err(format!(
@@ -4380,6 +4477,7 @@ fn reset_internal() {
     state.promoted_objects = 0;
     state.promoted_bytes = 0;
     state.moved_objects = 0;
+    state.survivor_stats = Default::default();
     state.old_region_allocations = 0;
     state.old_region_reuses = 0;
     state.old_regions_released = 0;
@@ -4407,9 +4505,9 @@ fn reset_internal() {
     runtime().poll_requested.store(false, Ordering::Release);
     ROOT_DEPTH.set(0);
     HAS_REGISTERED_TLAB.set(false);
-    // Clear the string literal interning cache: cached pointers are into the
+    // Clear compiler-owned literal slots: their pointers are into the
     // heap that was just freed above and must not be returned again.
-    crate::string::clear_string_literal_cache();
+    crate::string::clear_string_literal_slots();
 }
 
 // ---------------------------------------------------------------------------
@@ -4725,6 +4823,91 @@ mod tests {
         willow_gc_register_mutator();
         willow_gc_safepoint();
         willow_gc_unregister_mutator();
+    }
+
+    #[test]
+    fn published_root_slots_are_writable_and_preserve_nulls() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        let _guard = gc_test_guard();
+        reset_gc();
+        willow_gc_register_mutator();
+        let mut replacement = willow_alloc_object(0, 8);
+        willow_push_root(&mut replacement);
+        let replacement_address = replacement as usize;
+        let ready = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let worker_ready = ready.clone();
+        let worker_done = done.clone();
+        let worker = std::thread::spawn(move || {
+            willow_gc_register_mutator();
+            let mut first = willow_alloc_object(0, 8);
+            let mut alias = first;
+            let mut empty = std::ptr::null_mut();
+            willow_push_root(&mut first);
+            willow_push_root(&mut alias);
+            willow_push_root(&mut empty);
+            worker_ready.store(true, Ordering::Release);
+            while !worker_done.load(Ordering::Acquire) {
+                willow_gc_safepoint();
+                std::thread::yield_now();
+            }
+            assert_eq!(first as usize, replacement_address);
+            assert_eq!(alias, first);
+            assert!(empty.is_null());
+            willow_pop_roots(3);
+            willow_gc_unregister_mutator();
+        });
+        while !ready.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        with_stw(crate::gc_telemetry::stops::StopReason::Minor, |coord, _| {
+            let slots = all_registered_stack_root_slots(coord);
+            assert_eq!(slots.len(), 3);
+            let mut rewritten = 0;
+            for slot in slots {
+                // SAFETY: the coordinator keeps all owning stacks parked.
+                unsafe {
+                    if !(*slot).is_null() && *slot != replacement {
+                        *slot = replacement;
+                        rewritten += 1;
+                    }
+                }
+            }
+            assert_eq!(rewritten, 2);
+            assert_eq!(all_registered_stack_roots(coord), vec![replacement; 3]);
+            done.store(true, Ordering::Release);
+        });
+        worker.join().unwrap();
+        willow_pop_roots(1);
+        willow_gc_unregister_mutator();
+    }
+
+    #[test]
+    fn published_root_slot_count_is_linear_in_registered_slots() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        for count in [1, 16, 256, 4096] {
+            let mut slots = vec![willow_alloc_object(0, 8); count];
+            for slot in &mut slots {
+                willow_push_root(slot);
+            }
+            with_stw(crate::gc_telemetry::stops::StopReason::Minor, |coord, _| {
+                let published = all_registered_stack_root_slots(coord);
+                assert_eq!(published.len(), count);
+                assert!(
+                    published
+                        .into_iter()
+                        .zip(&mut slots)
+                        .all(|(published, slot)| { std::ptr::eq(published, slot) })
+                );
+            });
+            slots.fill(std::ptr::null_mut());
+            with_stw(crate::gc_telemetry::stops::StopReason::Minor, |coord, _| {
+                assert!(all_registered_stack_root_slots(coord).is_empty());
+            });
+            willow_pop_roots(count as i32);
+            println!("registered slots={count} published slots={count}");
+        }
     }
 
     #[test]
@@ -5198,8 +5381,10 @@ mod tests {
             after.counters.allocation_bytes,
             before.counters.allocation_bytes
         );
-        assert_eq!(after.counters.promoted_objects, 1);
-        assert_eq!(after.counters.promoted_bytes, (GC_HEADER_SIZE + 8) as u64);
+        assert_eq!(after.counters.promoted_objects, 0);
+        assert_eq!(after.counters.promoted_bytes, 0);
+        assert_eq!(willow_gc_survivor_copies(), 1);
+        assert_eq!(willow_gc_survivor_bytes(), (GC_HEADER_SIZE + 8) as i64);
         assert_eq!(after.last_cycle.reclaimed_bytes, 0);
         assert_eq!(after.counters.released_bytes, GC_TLAB_CHUNK_SIZE as u64);
         assert_eq!(
@@ -5297,11 +5482,11 @@ mod tests {
         assert_eq!(unsafe { *(moved as *mut i64) }, 0x1234);
         assert_eq!(
             unsafe { (*payload_to_header(moved)).generation },
-            GC_GENERATION_OLD
+            GC_GENERATION_YOUNG
         );
         assert_eq!(willow_gc_moved_objects(), 1);
-        assert_eq!(willow_gc_remembered_set_size(), 0);
-        assert_eq!(willow_gc_tlab_reserved_bytes(), 0);
+        assert_eq!(willow_gc_remembered_set_size(), 1);
+        assert_eq!(willow_gc_tlab_reserved_bytes(), GC_TLAB_CHUNK_SIZE as i64);
 
         willow_pop_root();
         willow_gc_collect();
@@ -5395,7 +5580,11 @@ mod tests {
         let moved = crate::array::willow_array_get(array, 0) as *mut u8;
         assert_ne!(moved, young);
         assert_eq!(unsafe { *(moved as *mut i64) }, 901);
+        assert!(willow_gc_dirty_card_count() > 0);
+        willow_gc_minor_collect();
         assert_eq!(willow_gc_dirty_card_count(), 0);
+        let tenured = crate::array::willow_array_get(array, 0) as *mut u8;
+        assert_eq!(unsafe { *tenured.cast::<i64>() }, 901);
         willow_pop_root();
         willow_gc_collect();
         reset_gc();
@@ -5987,6 +6176,8 @@ mod tests {
         unsafe { *(parent as *mut *mut u8) = young };
         willow_push_root(&mut parent);
 
+        willow_gc_minor_collect();
+        assert_eq!(willow_gc_survivor_copies(), 1);
         willow_gc_minor_collect();
 
         let promoted = unsafe { *(parent as *mut *mut u8) };

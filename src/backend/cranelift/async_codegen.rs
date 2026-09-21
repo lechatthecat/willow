@@ -1041,7 +1041,9 @@ impl Codegen {
         if let Some(name) = &tag_name
             && let Some(&data_id) = self.string_literals.get(name)
         {
-            let gv = self.module.declare_data_in_func(data_id, builder.func);
+            let gv = self
+                .module
+                .declare_data_in_func(data_id.bytes, builder.func);
             let name_ptr = builder.ins().symbol_value(ptr_ty, gv);
             let name_len = builder.ins().iconst(types::I64, name.len() as i64);
             let tag_id = self.func_id("willow_sched_tag_current_task");
@@ -1220,8 +1222,12 @@ impl Codegen {
                     .string_literals
                     .get(self.source_file.as_str())
                     .expect("prepared source file registered");
-                let name_global = self.module.declare_data_in_func(name_data, builder.func);
-                let file_global = self.module.declare_data_in_func(file_data, builder.func);
+                let name_global = self
+                    .module
+                    .declare_data_in_func(name_data.bytes, builder.func);
+                let file_global = self
+                    .module
+                    .declare_data_in_func(file_data.bytes, builder.func);
                 let name = builder.ins().symbol_value(ptr_ty, name_global);
                 let file = builder.ins().symbol_value(ptr_ty, file_global);
                 let name_len = builder.ins().iconst(types::I64, method.len() as i64);

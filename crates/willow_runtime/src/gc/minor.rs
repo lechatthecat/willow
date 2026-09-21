@@ -1,4 +1,6 @@
-//! Stop-the-world minor collection and nursery survivor promotion.
+//! Stop-the-world minor collection, survivor copying, and tenuring.
+
+const TENURE_THRESHOLD: u8 = 2;
 
 use std::alloc::{Layout, dealloc};
 use std::collections::{HashMap, HashSet};
@@ -19,6 +21,7 @@ struct MinorCollector<'a> {
     work: crate::gc_telemetry::MarkWork,
     stop_work: &'a mut crate::gc_telemetry::stops::StopWorkV2,
     state: &'a mut GcState,
+    survivor_destination: Option<usize>,
     young_objects: HashMap<usize, HeapObject>,
     forwarding: HashMap<usize, *mut u8>,
     worklist: Vec<HeapObject>,
@@ -65,6 +68,7 @@ impl<'a> MinorCollector<'a> {
             work: crate::gc_telemetry::MarkWork::default(),
             stop_work,
             state,
+            survivor_destination: None,
             young_objects,
             forwarding: HashMap::new(),
             worklist: Vec::new(),
@@ -87,6 +91,7 @@ impl<'a> MinorCollector<'a> {
             && object.generation() == GC_GENERATION_YOUNG
         {
             object.set_generation(GC_GENERATION_OLD);
+            self.state.survivor_stats.pinned_promotions += 1;
             let size = object.size();
             self.state.young_allocated_bytes =
                 self.state.young_allocated_bytes.saturating_sub(size);
@@ -104,6 +109,76 @@ impl<'a> MinorCollector<'a> {
         }
         #[cfg(debug_assertions)]
         panic!("willow gc: invalid root 0x{address:x} during minor collection");
+    }
+
+    /// A per-cycle bump cursor: destinations are never evacuation sources in
+    /// this cycle, and no search over old survivor chunks is needed per copy.
+    fn allocate_survivor(&mut self, source: HeapObject, age: u8) -> Option<HeapObject> {
+        use super::{BumpChunk, GC_REGION_MARK_GRANULE, GC_TLAB_CHUNK_SIZE, RegionMarkBitmap};
+        let size = source.size();
+        if size > GC_TLAB_CHUNK_SIZE {
+            return None;
+        }
+        if self.survivor_destination.is_none_or(|index| {
+            let chunk = &self.state.tlab_chunks[index];
+            chunk.capacity - chunk.used < size
+        }) {
+            if !super::can_reserve(self.state, GC_TLAB_CHUNK_SIZE) {
+                return None;
+            }
+            let layout =
+                Layout::from_size_align(GC_TLAB_CHUNK_SIZE, std::mem::align_of::<GcHeader>())
+                    .ok()?;
+            // SAFETY: valid aligned layout, owned until the common chunk cleanup.
+            let base = unsafe { super::allocate_region_storage(layout) };
+            if base.is_null() {
+                return None;
+            }
+            let index = self.state.tlab_chunks.len();
+            self.state.tlab_addresses.insert(base as usize, index);
+            self.state.tlab_chunks.push(BumpChunk {
+                base,
+                capacity: GC_TLAB_CHUNK_SIZE,
+                used: 0,
+                owner_state: None,
+                kind: RegionKind::Survivor,
+                live_bytes: 0,
+                mark_bitmap: RegionMarkBitmap::new(GC_TLAB_CHUNK_SIZE),
+                concurrent_marks: std::sync::Arc::new(
+                    super::concurrent_bitmap::ConcurrentMarkBits::new(
+                        GC_TLAB_CHUNK_SIZE / GC_REGION_MARK_GRANULE,
+                    ),
+                ),
+                header_offsets: Vec::new(),
+            });
+            self.state.tlab_reserved_bytes += GC_TLAB_CHUNK_SIZE;
+            self.state.survivor_stats.survivor_space_reserved += GC_TLAB_CHUNK_SIZE as u64;
+            self.survivor_destination = Some(index);
+        }
+        let chunk = &mut self.state.tlab_chunks[self.survivor_destination.unwrap()];
+        let metadata = source.trace_metadata();
+        // SAFETY: this exclusive collector cursor owns sufficient aligned space.
+        let target = HeapObject::initialize_at(
+            unsafe { chunk.base.add(chunk.used) },
+            size,
+            metadata.type_id,
+            metadata.layout_id,
+            metadata.gc_ref_mask,
+            GC_GENERATION_YOUNG,
+        )?;
+        unsafe {
+            (*target.as_ptr()).age = age;
+        }
+        chunk
+            .header_offsets
+            .push(u16::try_from(chunk.used).expect("chunk offset fits u16"));
+        chunk.mark_bitmap.mark(chunk.used);
+        chunk.used += size;
+        chunk.live_bytes += size;
+        self.state.survivor_stats.survivor_space_live += size as u64;
+        self.state.allocated_bytes += size;
+        self.state.young_allocated_bytes += size;
+        Some(target)
     }
 
     fn evacuate(&mut self, payload: *mut u8) -> *mut u8 {
@@ -124,14 +199,21 @@ impl<'a> MinorCollector<'a> {
 
         let metadata = source.trace_metadata();
         let size = source.size();
-        let Some(target) = allocate_old_region_object_locked(
-            self.state,
-            metadata.layout_id,
-            metadata.type_id,
-            metadata.payload_size,
-            metadata.gc_ref_mask,
-            false,
-        ) else {
+        // SAFETY: the source is a validated young allocation under STW.
+        let age = unsafe { (*source.as_ptr()).age }.saturating_add(1);
+        let target = if age < TENURE_THRESHOLD {
+            self.allocate_survivor(source, age)
+        } else {
+            allocate_old_region_object_locked(
+                self.state,
+                metadata.layout_id,
+                metadata.type_id,
+                metadata.payload_size,
+                metadata.gc_ref_mask,
+                false,
+            )
+        };
+        let Some(target) = target else {
             if self.state.memory_limit_bytes.is_some() {
                 // A hard region budget must not require extra evacuation
                 // storage. Retain this nursery object in place, using the same
@@ -150,8 +232,15 @@ impl<'a> MinorCollector<'a> {
                 metadata.payload_size,
             );
         }
-        self.state.promoted_objects = self.state.promoted_objects.saturating_add(1);
-        self.state.promoted_bytes = self.state.promoted_bytes.saturating_add(size as u64);
+        if target.generation() == GC_GENERATION_OLD {
+            self.state.promoted_objects = self.state.promoted_objects.saturating_add(1);
+            self.state.promoted_bytes = self.state.promoted_bytes.saturating_add(size as u64);
+            self.state.survivor_stats.tenured_objects += 1;
+            self.state.survivor_stats.tenured_bytes += size as u64;
+        } else {
+            self.state.survivor_stats.survivor_copies += 1;
+            self.state.survivor_stats.survivor_bytes += size as u64;
+        }
         self.state.moved_objects = self.state.moved_objects.saturating_add(1);
         let forwarded = target.payload().as_ptr();
         self.forwarding.insert(address, forwarded);
@@ -182,8 +271,24 @@ impl<'a> MinorCollector<'a> {
             object.size(),
             slots.iter().filter(|slot| !slot.is_null()).count(),
         );
+        let old_owner = object.generation() == GC_GENERATION_OLD;
+        let mut has_young_child = false;
         for slot in slots {
             self.scan_slot(slot);
+            if old_owner && !has_young_child && !slot.is_null() {
+                // SAFETY: scan_slot has updated this validated reference slot.
+                let child = unsafe { *slot };
+                if !child.is_null()
+                    && HeapObject::from_payload(GcPayload::from_raw(child).unwrap()).generation()
+                        == GC_GENERATION_YOUNG
+                {
+                    has_young_child = true;
+                }
+            }
+        }
+        if has_young_child {
+            self.state.remembered_set.insert(address);
+            self.state.dirty_cards.insert(address / super::GC_CARD_SIZE);
         }
     }
 
@@ -230,6 +335,8 @@ impl<'a> MinorCollector<'a> {
             reclaimed_bytes = reclaimed_bytes.saturating_add(size);
         }
 
+        self.state.survivor_stats.survivor_space_reserved = 0;
+        self.state.survivor_stats.survivor_space_live = 0;
         let mut chunk_identities: Vec<_> = (0..self.state.tlab_chunks.len()).collect();
         let mut chunk_positions = vec![None; self.state.tlab_chunks.len()];
         let mut chunk_index = 0usize;
@@ -238,6 +345,7 @@ impl<'a> MinorCollector<'a> {
             let used = self.state.tlab_chunks[chunk_index].used;
             let mut offset = 0usize;
             let mut has_allocated = false;
+            let mut has_young = false;
             let mut live_bytes = 0usize;
             self.state.tlab_chunks[chunk_index].mark_bitmap.clear();
             while offset < used {
@@ -247,10 +355,11 @@ impl<'a> MinorCollector<'a> {
                 let object = HeapObject::from_raw(unsafe { base.add(offset) }.cast())
                     .expect("TLAB header address is non-null");
                 if object.allocated() {
-                    debug_assert_eq!(
-                        object.generation(),
-                        GC_GENERATION_OLD,
-                        "every minor survivor is promoted"
+                    has_young |= object.generation() == GC_GENERATION_YOUNG;
+                    debug_assert!(
+                        object.generation() == GC_GENERATION_OLD
+                            || self.state.tlab_chunks[chunk_index].kind == RegionKind::Survivor,
+                        "young survivors must be in collector-owned destination storage"
                     );
                     has_allocated = true;
                     live_bytes = live_bytes.saturating_add(object.size());
@@ -275,7 +384,13 @@ impl<'a> MinorCollector<'a> {
                     .tlab_reserved_bytes
                     .saturating_sub(chunk.capacity);
             } else {
-                self.state.tlab_chunks[chunk_index].kind = RegionKind::Pinned;
+                if !has_young {
+                    self.state.tlab_chunks[chunk_index].kind = RegionKind::Pinned;
+                } else {
+                    self.state.survivor_stats.survivor_space_reserved +=
+                        self.state.tlab_chunks[chunk_index].capacity as u64;
+                    self.state.survivor_stats.survivor_space_live += live_bytes as u64;
+                }
                 self.state.tlab_chunks[chunk_index].live_bytes = live_bytes;
                 chunk_index += 1;
             }
@@ -307,12 +422,17 @@ fn minor_collect_with_roots(
     let before = state.allocated_bytes as u64;
     let young_before = state.young_allocated_bytes;
     let promoted_before = state.promoted_bytes;
+    let copied_before = state.survivor_stats.survivor_bytes;
     let (_, work) = MinorCollector::new(&mut state, trace_registry, drop_registry, stop_work)
         .run(roots, remembered);
     state.nursery_threshold_bytes = state.nursery_policy.next(
         state.nursery_threshold_bytes,
         young_before,
-        state.promoted_bytes.saturating_sub(promoted_before),
+        state.promoted_bytes.saturating_sub(promoted_before)
+            + state
+                .survivor_stats
+                .survivor_bytes
+                .saturating_sub(copied_before),
         state.memory_limit_bytes,
     );
     if std::env::var("WILLOW_GC_VERIFY_REGIONS").is_ok()

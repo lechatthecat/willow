@@ -229,10 +229,13 @@ fn alloc_string_or_empty(input: *const u8, fallback: &str) -> *mut u8 {
 }
 
 fn alloc_panic_info(message: *const u8, file: *const u8, line: i64, column: i64) -> *mut u8 {
-    let mut message = alloc_string_or_empty(message, "explicit panic");
+    let mut message = message.cast_mut();
+    let mut file = file.cast_mut();
     willow_push_root(&mut message);
-    let mut file = alloc_string_or_empty(file, "");
     willow_push_root(&mut file);
+    // Either fallback can allocate; protect both supplied inputs first.
+    message = alloc_string_or_empty(message, "explicit panic");
+    file = alloc_string_or_empty(file, "");
 
     let info = willow_alloc_typed(PANIC_INFO_PAYLOAD_SIZE, PANIC_INFO_REF_MASK);
     if info.is_null() {
@@ -590,6 +593,27 @@ mod tests {
         let info = willow_panic_recover();
         willow_panic_leave_defer();
         info
+    }
+
+    #[test]
+    fn panic_info_roots_supplied_file_before_message_fallback() {
+        let _heap = runtime_test_guard();
+        willow_gc_init();
+        struct RestoreStress;
+        impl Drop for RestoreStress {
+            fn drop(&mut self) {
+                crate::gc::set_gc_stress_for_test(None);
+            }
+        }
+        let _restore = RestoreStress;
+        crate::gc::set_gc_stress_for_test(Some("alloc"));
+        let file = ws("fallback.wi");
+        let depth = crate::gc::willow_root_depth();
+        let info = alloc_panic_info(std::ptr::null(), file, 7, 9);
+        assert_eq!(crate::gc::willow_root_depth(), depth);
+        assert_eq!(unsafe { panic_info_message(info) }, "explicit panic");
+        assert_eq!(unsafe { panic_info_file(info) }, "fallback.wi");
+        willow_gc_remove_runtime_root(info);
     }
 
     #[test]

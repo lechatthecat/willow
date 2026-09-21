@@ -100,6 +100,12 @@ pub struct EnumAliasScope {
     types: TypeScope,
 }
 
+#[derive(Clone, Copy)]
+struct StringLiteralData {
+    bytes: DataId,
+    slot: DataId,
+}
+
 pub struct Codegen {
     type_scope: TypeScope,
     module: ObjectModule,
@@ -140,7 +146,7 @@ pub struct Codegen {
     /// Source names of async fns lowered as cooperative tasks (constructor +
     /// poll fn). Calling one schedules the task and returns its frame.
     cooperative_leaves: std::collections::HashSet<FunctionId>,
-    string_literals: HashMap<String, DataId>,
+    string_literals: HashMap<String, StringLiteralData>,
     string_counter: usize,
     runtime_declared: bool,
     /// Per-class ordered field list: class_name -> [(field_name, type)].
@@ -1619,7 +1625,7 @@ struct FuncGen<'a, 'b> {
     /// compiled (willow-nswv). Only the LIR path reads it.
     builtin_module_aliases: &'a HashMap<String, String>,
     lambda_names: &'a HashMap<ExprId, FunctionId>,
-    string_literals: &'a HashMap<String, DataId>,
+    string_literals: &'a HashMap<String, StringLiteralData>,
     class_layouts: &'a TypeMap<Vec<(String, Type)>>,
     static_storage: &'a TypeMap<HashMap<String, StaticStorageInfo>>,
     enum_infos: &'a TypeMap<EnumInfo>,

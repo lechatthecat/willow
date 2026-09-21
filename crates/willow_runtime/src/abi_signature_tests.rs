@@ -87,6 +87,9 @@ fn gc_objects_metadata_and_root_slots_are_pointers() {
 
 #[test]
 fn collection_handles_are_pointers_and_payload_words_remain_i64() {
+    let _: extern "C" fn(*const std::sync::atomic::AtomicPtr<u8>, *const u8, i64) -> *mut u8 =
+        string::willow_string_literal_slot;
+    assert_schema("willow_string_literal_slot", &[Ptr, Ptr, I64], Some(Ptr));
     let _: extern "C" fn(*const u8, i64) -> *mut u8 = string::willow_string_alloc;
     let _: extern "C" fn(*const u8, *const u8) -> *mut u8 = string::willow_string_concat;
     let _: extern "C" fn(*const u8, *const u8) -> i64 = string::willow_string_eq;
@@ -350,4 +353,22 @@ fn tlab_storage_size_matches_target_contract() {
         willow_abi::tlab::state_size(width) as usize,
         std::mem::size_of::<crate::gc::GcTlabState>()
     );
+}
+
+#[test]
+fn survivor_counter_abi() {
+    let _: extern "C" fn() -> i64 = gc::willow_gc_survivor_copies;
+    assert_schema("willow_gc_survivor_copies", &[], Some(I64));
+    let _: extern "C" fn() -> i64 = gc::willow_gc_survivor_bytes;
+    assert_schema("willow_gc_survivor_bytes", &[], Some(I64));
+    let _: extern "C" fn() -> i64 = gc::willow_gc_tenured_objects;
+    assert_schema("willow_gc_tenured_objects", &[], Some(I64));
+    let _: extern "C" fn() -> i64 = gc::willow_gc_tenured_bytes;
+    assert_schema("willow_gc_tenured_bytes", &[], Some(I64));
+    let _: extern "C" fn() -> i64 = gc::willow_gc_pinned_promotions;
+    assert_schema("willow_gc_pinned_promotions", &[], Some(I64));
+    let _: extern "C" fn() -> i64 = gc::willow_gc_survivor_space_reserved;
+    assert_schema("willow_gc_survivor_space_reserved", &[], Some(I64));
+    let _: extern "C" fn() -> i64 = gc::willow_gc_survivor_space_live;
+    assert_schema("willow_gc_survivor_space_live", &[], Some(I64));
 }

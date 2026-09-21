@@ -103,7 +103,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         };
 
         // Root the object across the box allocation (the alloc may collect).
-        self.emit_push_root(object);
+        let object_root = self.emit_push_root(object);
         let box_ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
             GcObjectKind::InterfaceBox,
             willow_abi::dispatch_layout::interface_bytes(
@@ -113,8 +113,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             willow_abi::dispatch_layout::INTERFACE_GC_REF_MASK,
         ));
 
-        // word 0: concrete object pointer (GC-traced). Direct roots are
-        // pinned/promoted, so `object` remains valid across the allocation.
+        // word 0: concrete object pointer (GC-traced). Reload the root because
+        // the allocation may have moved the concrete object.
+        let object = self.stack_load(reference_type(self.module.target_config()), object_root);
         self.emit_gc_heap_store_classified(
             box_ptr,
             0,

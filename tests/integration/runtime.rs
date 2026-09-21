@@ -448,6 +448,7 @@ class Holder {
 fn main() {
     let h = new Holder(new Node(1));
     gc_minor_collect();
+    gc_minor_collect();
     let hits = gc_write_barrier_hits();
     let moved = gc_moved_objects();
     h.child = new Node(42);
@@ -461,7 +462,7 @@ fn main() {
 "#;
     assert_gc_allocation_modes(
         src,
-        "true\ntrue\n42\ntrue\n0\n",
+        "true\ntrue\n42\ntrue\n1\n",
         "false\nfalse\n42\nfalse\n0\n",
     );
 }
@@ -484,7 +485,7 @@ fn main() {
     println(gc_remembered_set_size());
 }
 "#;
-    assert_gc_allocation_modes(src, "true\n77\ntrue\n0\n", "false\n77\nfalse\n0\n");
+    assert_gc_allocation_modes(src, "true\n77\ntrue\n1\n", "false\n77\nfalse\n0\n");
 }
 
 #[test]
@@ -6288,4 +6289,44 @@ fn main() {
     );
     assert!(ok, "same-named interface dispatch failed: {out}");
     assert_eq!(out, "11\n22\n11\n22\n");
+}
+
+#[test]
+fn gc_survivor_age_two_and_short_lived_batch() {
+    let source = r#"
+import std::collections::Array;
+class Payload { pub value: i64; }
+fn fill(values: Array<Payload>) {
+    for i in 0..32 { values.push(new Payload(i)); }
+}
+fn drain(values: Array<Payload>) {
+    while values.len() > 0 { values.pop(); }
+}
+fn main() {
+    let values: Array<Payload> = [];
+    fill(values);
+    let promoted = gc_promoted_objects();
+    let copied = gc_survivor_copies();
+    gc_minor_collect();
+    println(gc_survivor_copies() - copied);
+    println(gc_promoted_objects() - promoted);
+    println(gc_survivor_space_live() > 0);
+    gc_minor_collect();
+    println(gc_tenured_objects());
+    println(values[31].value);
+    let temporary: Array<Payload> = [];
+    fill(temporary);
+    // Discard obsolete array buffers from growth before measuring lifetime.
+    gc_collect();
+    let before = gc_promoted_objects();
+    gc_minor_collect();
+    drain(temporary);
+    gc_minor_collect();
+    println(gc_promoted_objects() - before);
+    println(gc_survivor_space_live());
+}
+"#;
+    let (out, ok) = compile_and_run_with_env(source, &[]);
+    assert!(ok, "survivor program failed: {out}");
+    assert_eq!(out, "32\n0\ntrue\n32\n31\n0\n0\n");
 }

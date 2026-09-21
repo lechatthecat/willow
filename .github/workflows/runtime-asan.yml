@@ -1,0 +1,18 @@
+name: Runtime AddressSanitizer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime-asan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned nightly and standard library sources
+        run: rustup toolchain install nightly-2026-09-20 --profile minimal --component rust-src
+      - name: GC roots, relocation, and channel ownership
+        run: bash scripts/runtime_asan.sh

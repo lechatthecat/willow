@@ -566,15 +566,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // trigger before we store it into the new enum. Only reference payloads
         // are rooted; rooting a scalar word would make the GC mark it as a
         // bogus object pointer.
-        if payload_is_gc {
-            self.emit_push_root(payload_val);
-        }
+        let payload_root = payload_is_gc.then(|| self.emit_push_root(payload_val));
         let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
             GcObjectKind::Enum,
             i64::from(layout.payload_bytes(pointer_bytes)),
             0,
             layout.gc_ref_mask(),
         ));
+        let payload_val = payload_root.map_or(payload_val, |slot| {
+            self.stack_load(reference_type(self.module.target_config()), slot)
+        });
         let tag_val = self.builder.ins().iconst(types::I64, tag);
         self.builder
             .ins()
@@ -619,15 +620,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let pointer_bytes = reference_type(self.module.target_config()).bytes();
         // See `emit_alloc_enum_variant`: root a GC-managed payload across the
         // allocation so a collection cannot free it before it is stored.
-        if payload_is_gc {
-            self.emit_push_root(payload_raw);
-        }
+        let payload_root = payload_is_gc.then(|| self.emit_push_root(payload_raw));
         let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
             GcObjectKind::Enum,
             i64::from(layout.payload_bytes(pointer_bytes)),
             0,
             layout.gc_ref_mask(),
         ));
+        let payload_raw = payload_root.map_or(payload_raw, |slot| {
+            self.stack_load(reference_type(self.module.target_config()), slot)
+        });
         let tag_val = self.builder.ins().iconst(types::I64, tag);
         self.builder
             .ins()

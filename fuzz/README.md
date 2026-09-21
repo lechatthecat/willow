@@ -45,3 +45,33 @@ and malformed records. The case number reproduces each generated source; this
 bounded suite does not perform random mutation or shrinking. The
 [test generator](../src/module/artifact_property_tests.rs) contains the synthetic
 inputs and exact record-count assertions.
+
+## Optional runtime AddressSanitizer checks
+
+The manual **Runtime AddressSanitizer** GitHub Actions workflow runs focused
+runtime tests on Linux x86_64. Run the identical gate locally with:
+
+```sh
+rustup toolchain install nightly-2026-09-20 --profile minimal --component rust-src
+bash scripts/runtime_asan.sh
+```
+
+The [runner](../scripts/runtime_asan.sh) instruments the runtime and rebuilds the
+standard library with AddressSanitizer, using an explicit target and a separate
+`target/runtime-asan` build directory. Leak detection stays enabled; any test or
+sanitizer failure fails the job. This follows the
+[Rust sanitizer instructions](https://doc.rust-lang.org/unstable-book/compiler-flags/sanitizer.html).
+
+Coverage includes seven minor-collection relocation/root tests, two runtime-root
+ownership tests, and channel cancellation ownership after simulated wrapper
+relocation at 1, 32, and 256 channel pairs. This does not run generated Willow
+machine code, prove race freedom, or exercise actual concurrent old evacuation.
+GC objects suballocated inside one region do not gain individual ASan redzones.
+ThreadSanitizer and broader scheduler/async stress remain separate work.
+
+The full channel unit suite is not yet a leak-clean gate: an initial instrumented
+run passed all 63 assertions but reported 8,573,104 leaked bytes in 136 allocations
+at exit, including native channel storage from test fixtures. The focused gate
+does not suppress those reports or disable leak detection; expanding its coverage
+requires investigating the suite's fixture/GC teardown first. Ordinary push/PR CI
+is unaffected; dispatch the optional workflow explicitly when needed.

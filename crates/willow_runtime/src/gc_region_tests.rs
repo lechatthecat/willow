@@ -1151,6 +1151,8 @@ fn remembered_region_05_pinned_owner_tracks_new_young_child() {
     let moved = unsafe { *(owner as *mut *mut u8) };
     assert_ne!(moved, child);
     assert_eq!(unsafe { *(moved as *mut i64) }, 77);
+    assert_eq!(willow_gc_remembered_set_size(), 1);
+    willow_gc_minor_collect();
     assert_eq!(willow_gc_remembered_set_size(), 0);
     willow_pop_root();
     willow_gc_collect();

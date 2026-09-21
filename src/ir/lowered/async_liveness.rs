@@ -52,6 +52,11 @@ pub(crate) fn analyze(blocks: &[SourceBlock], locals: &[LirLocal]) -> LirAsyncFr
             }
             let mut input = uses[block.id.0].clone();
             input.extend(out.difference(&defs[block.id.0]).copied());
+            // Recovery can leave from any instruction, including before a
+            // later assignment to a local read by the recovery continuation.
+            for target in &block.recovery {
+                input.extend(&live_in[target.0]);
+            }
             changed |= out != live_out[block.id.0] || input != live_in[block.id.0];
             live_out[block.id.0] = out;
             live_in[block.id.0] = input;

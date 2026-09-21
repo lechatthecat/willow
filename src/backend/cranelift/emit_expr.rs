@@ -9,14 +9,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // Load the address of the static raw bytes.
             let gv = self
                 .module
-                .declare_data_in_func(*data_id, self.builder.func);
+                .declare_data_in_func(data_id.bytes, self.builder.func);
             let ptr_ty = reference_type(self.module.target_config());
             let bytes_ptr = self.builder.ins().symbol_value(ptr_ty, gv);
-            // Call willow_string_literal to get (or create) a permanent WillowString.
+            let slot_gv = self
+                .module
+                .declare_data_in_func(data_id.slot, self.builder.func);
+            let slot_ptr = self.builder.ins().symbol_value(ptr_ty, slot_gv);
+            // The helper performs an acquire load on hits; only first use allocates.
             let len_val = self.builder.ins().iconst(types::I64, value.len() as i64);
-            let fid = self.func_id("willow_string_literal");
+            let fid = self.func_id("willow_string_literal_slot");
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            let call = self.builder.ins().call(fref, &[bytes_ptr, len_val]);
+            let call = self
+                .builder
+                .ins()
+                .call(fref, &[slot_ptr, bytes_ptr, len_val]);
             return self.builder.inst_results(call)[0];
         }
         self.builder
@@ -160,7 +167,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         value: &str,
     ) -> Option<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value)> {
-        let data_id = *self.string_literals.get(value)?;
+        let data_id = self.string_literals.get(value)?.bytes;
         let gv = self.module.declare_data_in_func(data_id, self.builder.func);
         let ptr_ty = reference_type(self.module.target_config());
         let bytes_ptr = self.builder.ins().symbol_value(ptr_ty, gv);

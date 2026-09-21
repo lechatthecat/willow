@@ -225,3 +225,6 @@ mod constructor_flow;
 mod array_fast_paths;
 #[path = "integration/never_values.rs"]
 mod never_values;
+
+#[path = "integration/literal_slots.rs"]
+mod literal_slots;

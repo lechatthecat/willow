@@ -136,7 +136,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         object: cranelift_codegen::ir::Value,
         vtable_ptr: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
-        self.emit_push_root(object);
+        let object_root = self.emit_push_root(object);
         let box_ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
             GcObjectKind::InterfaceBox,
             willow_abi::dispatch_layout::interface_bytes(
@@ -145,6 +145,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             0,
             willow_abi::dispatch_layout::INTERFACE_GC_REF_MASK,
         ));
+        let object = self.stack_load(reference_type(self.module.target_config()), object_root);
         self.emit_gc_heap_store_classified(
             box_ptr,
             0,

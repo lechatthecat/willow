@@ -1195,3 +1195,110 @@ fn main() {{
     assert!(ok, "run failed under WILLOW_GC_STRESS=alloc: {out}");
     assert_eq!(out, "survivor\n");
 }
+
+// willow-8hq4.13: a source local held across one suspension must stop
+// retaining its object after its last use, even before its lexical scope ends.
+#[test]
+fn async_last_use_releases_frame_root_before_next_await() {
+    let source = r#"
+class Payload { pub value: i64; }
+async fn main() {
+    gc_minor_collect();
+    let promotions = gc_promoted_objects();
+    let p = new Payload(42);
+    await yield();
+    println(p.value);
+    let before = gc_allocated_bytes();
+    await yield();
+    gc_minor_collect();
+    gc_minor_collect();
+    println(gc_allocated_bytes() < before);
+    println(gc_promoted_objects() - promotions);
+}
+"#;
+    assert_project_output(source, "42\ntrue\n0\n");
+}
+
+#[test]
+fn async_last_use_preserves_loop_branches_and_cleanup() {
+    let source = r#"
+class Payload { pub value: i64; }
+async fn probe(flag: bool) {
+    let kept = new Payload(7);
+    defer { println(kept.value); }
+    let mut i = 0;
+    while i < 3 {
+        let p = new Payload(i);
+        await yield();
+        if flag { println(p.value); } else { println(p.value + 10); }
+        await yield();
+        gc_minor_collect();
+        i = i + 1;
+    }
+    if true {
+        let recovered = new Payload(9);
+        defer match recover() {
+            Some(info) => println(recovered.value),
+            None => {}
+        }
+        await yield();
+        panic("expected");
+    }
+}
+async fn main() { await probe(true); await probe(false); }
+"#;
+    for mode in ["alloc", "minor"] {
+        let (out, ok) = compile_and_run_gc_stress_mode(source, mode);
+        assert!(ok, "{mode}: {out}");
+        assert_eq!(out, "0\n1\n2\n9\n7\n10\n11\n12\n9\n7\n");
+    }
+}
+
+#[test]
+fn async_last_use_clears_branch_that_never_reads_local() {
+    let source = r#"
+class Payload { pub value: i64; }
+async fn probe(flag: bool) {
+    gc_minor_collect();
+    let promotions = gc_promoted_objects();
+    let p = new Payload(42);
+    await yield();
+    if flag { println(p.value); } else {
+        await yield();
+        gc_minor_collect();
+        println(gc_promoted_objects() - promotions);
+    }
+}
+async fn main() { await probe(false); await probe(true); }
+"#;
+    assert_project_output(source, "0\n42\n");
+}
+
+#[test]
+fn async_last_use_preserves_value_before_panicking_overwrite() {
+    let source = r#"
+class Payload { pub value: i64; }
+fn divide(a: i64, b: i64) -> i64 { return a / b; }
+async fn main() {
+    let mut p = new Payload(7);
+    let replacement = new Payload(8);
+    await yield();
+    if true {
+        defer match recover() {
+            Some(info) => {},
+            None => {}
+        }
+        println(p.value);
+        println(divide(1, 0));
+        p = replacement;
+    }
+    gc_minor_collect();
+    println(p.value);
+}
+"#;
+    for mode in ["alloc", "minor"] {
+        let (out, ok) = compile_and_run_gc_stress_mode(source, mode);
+        assert!(ok, "{mode}: {out}");
+        assert_eq!(out, "7\n7\n", "{mode}");
+    }
+}

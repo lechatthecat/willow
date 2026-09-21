@@ -60,6 +60,7 @@ pub struct GcCountersV1 {
     pub tlab_fast_allocations: u64,
     pub tlab_slow_allocations: u64,
     pub tlab_refills: u64,
+    /// Objects reaching old generation, including promotion in place.
     pub promoted_objects: u64,
     pub promoted_bytes: u64,
     pub moved_objects: u64,
@@ -67,6 +68,24 @@ pub struct GcCountersV1 {
     /// SATB marking is inactive, both of which require no barrier work.
     pub barrier_calls: u64,
     pub barrier_hits: u64,
+}
+
+/// Survivor aging measurements, separate from the stable V1 snapshot layout.
+/// Copies are physical movement, not logical allocations. Promotions count only
+/// objects reaching old generation; pinned promotions do not copy payloads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GcSurvivorStats {
+    pub survivor_copies: u64,
+    pub survivor_bytes: u64,
+    pub tenured_objects: u64,
+    pub tenured_bytes: u64,
+    pub pinned_promotions: u64,
+    pub survivor_space_reserved: u64,
+    pub survivor_space_live: u64,
+}
+
+pub fn survivor_snapshot() -> GcSurvivorStats {
+    crate::gc::survivor_snapshot()
 }
 
 /// GC-owned storage, excluding Rust container buffers and allocator overhead.
@@ -80,6 +99,8 @@ pub struct GcHeapV1 {
     pub reserved_bytes: u64,
     pub committed_bytes: u64,
     pub old_reserved_bytes: u64,
+    /// Combined bump storage (nursery, pinned, survivor); survivor_snapshot
+    /// separately exposes the survivor subset without changing this V1 layout.
     pub nursery_reserved_bytes: u64,
     pub old_regions: u64,
     pub remembered_objects: u64,

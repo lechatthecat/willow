@@ -220,15 +220,17 @@ pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
 /// safe to treat as immutable. Shallow per the element word (ref elements share
 /// their — Sync — referents).
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_array_copy(arr: *mut u8) -> *mut u8 {
+pub extern "C" fn willow_array_copy(mut arr: *mut u8) -> *mut u8 {
     if arr.is_null() {
         raise_with("cannot freeze a null array");
         return std::ptr::null_mut();
     }
     let len = willow_array_len(arr);
     let is_ref = unsafe { handle_word(arr, H_IS_REF) };
+    willow_push_root(&mut arr);
     let mut copy = willow_array_new(len, is_ref);
     if copy.is_null() {
+        willow_pop_roots(1);
         return copy;
     }
     willow_push_root(&mut copy as *mut *mut u8);
@@ -237,7 +239,7 @@ pub extern "C" fn willow_array_copy(arr: *mut u8) -> *mut u8 {
         willow_array_set(copy, i, willow_array_get(arr, i));
         i += 1;
     }
-    willow_pop_roots(1);
+    willow_pop_roots(2);
     copy
 }
 
@@ -299,7 +301,7 @@ pub extern "C" fn willow_array_reference_owner(arr: *mut u8, index: i64) -> *mut
 
 /// Append `value`, growing the buffer (doubling, min 4) when full.
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_array_push(arr: *mut u8, value: i64) {
+pub extern "C" fn willow_array_push(mut arr: *mut u8, mut value: i64) {
     if arr.is_null() {
         raise_with("cannot push to a null array");
         return;
@@ -314,10 +316,9 @@ pub extern "C" fn willow_array_push(arr: *mut u8, value: i64) {
         // allocation, which may trigger a collection. The old buffer stays
         // reachable through the rooted handle. Only root the pushed value when
         // it is a GC pointer — rooting a scalar word (e.g. an i64 like 42) would
-        // make the collector treat it as an object pointer and crash. Directly
-        // rooted young values are pinned/promoted, so `value` stays valid.
-        let mut handle = arr;
-        willow_push_root(&mut handle as *mut *mut u8);
+        // make the collector treat it as an object pointer and crash. Use the
+        // updated root slots after allocation in case the collector moves them.
+        willow_push_root(&mut arr);
         let mut val = value as *mut u8;
         let root_val = is_ref && !val.is_null();
         if root_val {
@@ -327,6 +328,9 @@ pub extern "C" fn willow_array_push(arr: *mut u8, value: i64) {
         if new_buf.is_null() {
             willow_pop_roots(1 + i32::from(root_val));
             return;
+        }
+        if root_val {
+            value = val as i64;
         }
         unsafe {
             let old_buf = handle_buffer(arr);
@@ -749,6 +753,36 @@ mod tests {
         assert_eq!(willow_array_len(arr), 12);
         assert_eq!(willow_array_get(arr, 0), 0);
         assert_eq!(willow_array_get(arr, 11), 77);
+        willow_pop_roots(1);
+    }
+
+    #[test]
+    fn array_copy_and_reference_growth_keep_temporary_roots_under_gc_stress() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let mut arr = willow_array_new(0, 1);
+        willow_push_root(&mut arr);
+        let depth = crate::gc::willow_root_depth();
+        crate::gc::set_gc_stress_for_test(Some("alloc"));
+        for i in 0..12 {
+            let value = willow_string_from_str(&format!("temporary-{i}"));
+            willow_array_push(arr, value as i64);
+            assert_eq!(crate::gc::willow_root_depth(), depth);
+        }
+        // Leave source liveness to array_copy's own root during its allocations.
+        willow_pop_roots(1);
+        let mut copy = willow_array_copy(arr);
+        crate::gc::set_gc_stress_for_test(None);
+        assert_eq!(crate::gc::willow_root_depth(), depth - 1);
+        willow_push_root(&mut copy);
+        willow_gc_collect();
+        assert_eq!(willow_array_len(copy), 12);
+        for i in 0..12 {
+            assert_eq!(
+                unsafe { willow_string_as_str(willow_array_get(copy, i) as *mut u8) },
+                format!("temporary-{i}")
+            );
+        }
         willow_pop_roots(1);
     }
 

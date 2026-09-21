@@ -2,7 +2,7 @@
 //! (willow-0g8j.3.1).
 //!
 //! `gc_collect()` and `gc_minor_collect()` — the two VOID collection triggers —
-//! were already in the walker's subset. Their twenty-two read-only siblings,
+//! were already in the walker's subset. Their read-only siblings,
 //! `gc_allocated_bytes()` and the rest, were not: each one took its enclosing
 //! function out of the lowered IR and onto the AST emitter. They are the same
 //! shape — a zero-argument runtime call with no AST-only metadata behind it,
@@ -20,7 +20,7 @@
 //!
 //! 24 perspectives:
 //!   1 the read is in the subset at all    13 read inside a `defer` body
-//!   2 all twenty-two counters             14 read inside a class method
+//!   2 all GC counters             14 read inside a class method
 //!   3 the void pair still works           15 read inside a static method
 //!   4 read in a `let` initializer         16 read inside a lambda
 //!   5 read in statement position          17 read inside a module function
@@ -43,7 +43,7 @@ const PLAIN: [(&str, &str); 0] = [];
 const LOG: [(&str, &str); 1] = [("WILLOW_LIR_LOG", "1")];
 
 /// Every counter the language exposes, in declaration order.
-const COUNTERS: [&str; 22] = [
+const COUNTERS: [&str; 29] = [
     "gc_allocated_bytes",
     "gc_tlab_fast_allocations",
     "gc_tlab_slow_allocations",
@@ -53,6 +53,13 @@ const COUNTERS: [&str; 22] = [
     "gc_minor_collections",
     "gc_promoted_objects",
     "gc_moved_objects",
+    "gc_survivor_copies",
+    "gc_survivor_bytes",
+    "gc_tenured_objects",
+    "gc_tenured_bytes",
+    "gc_pinned_promotions",
+    "gc_survivor_space_reserved",
+    "gc_survivor_space_live",
     "gc_remembered_set_size",
     "gc_dirty_card_count",
     "gc_write_barrier_hits",
