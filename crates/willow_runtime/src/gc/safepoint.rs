@@ -88,6 +88,111 @@ pub extern "C" fn willow_gc_unregister_mutator() {
     cv.notify_all();
 }
 
+/// Registers the calling thread as a GC mutator until the guard is dropped.
+///
+/// A thread that stops while still registered leaves its id in
+/// `GcCoord::mutators`, and every later collection then waits for an
+/// acknowledgement that can never arrive (willow-utqy). An explicit
+/// register/unregister pair is skipped by an unwind, so one panic on a worker
+/// wedges the whole process; the guard runs the unregistration on the unwind
+/// path as well. Prefer it over the bare pair wherever the registered region
+/// can panic.
+#[must_use = "dropping the guard unregisters the mutator immediately"]
+pub struct MutatorRegistration(());
+
+impl MutatorRegistration {
+    /// Register the calling thread, joining a collection that has already
+    /// requested a stop exactly as `willow_gc_register_mutator` does.
+    pub fn new() -> Self {
+        willow_gc_register_mutator();
+        Self(())
+    }
+}
+
+impl Default for MutatorRegistration {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for MutatorRegistration {
+    fn drop(&mut self) {
+        willow_gc_unregister_mutator();
+    }
+}
+
+/// How long a collector waits for registered mutators to acknowledge a
+/// handshake or park before treating the wait as wedged.
+const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 120;
+
+/// The configured bound, or `None` to wait indefinitely.
+///
+/// An acknowledgement that never arrives means a registered thread stopped
+/// without unregistering. The wait then cannot end, and the process produces
+/// no further output at all — willow-utqy is a Windows CI job that spent its
+/// whole 90-minute budget inside one such wait. Debug builds, which is every
+/// test binary, give up after the bound and name the threads instead. Release
+/// builds keep the unbounded wait unless the environment asks otherwise.
+/// `WILLOW_GC_HANDSHAKE_TIMEOUT_SECS=0` disables the bound everywhere.
+///
+/// Read once: `std::env::var` allocates for the key on Windows (willow-ssl7.12).
+fn handshake_timeout() -> Option<std::time::Duration> {
+    static TIMEOUT: LazyLock<Option<std::time::Duration>> = LazyLock::new(|| {
+        let seconds = match std::env::var("WILLOW_GC_HANDSHAKE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+        {
+            Some(seconds) => seconds,
+            None if cfg!(debug_assertions) => DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+            None => 0,
+        };
+        (seconds != 0).then(|| std::time::Duration::from_secs(seconds))
+    });
+    *TIMEOUT
+}
+
+/// Wait on the coordination condvar until `ready` holds.
+///
+/// `outstanding` names the mutators still being waited on. It is consulted
+/// only once the wait has exceeded `handshake_timeout`, which means a
+/// registered mutator can no longer respond. There is no safe recovery from
+/// that: the collector cannot scan a stack whose owner is gone, and dropping
+/// the id from the registry would let a merely slow thread run unscanned. So
+/// report the ids and abort rather than block with no diagnostic.
+pub(super) fn wait_for_mutators<'a>(
+    cv: &Condvar,
+    mut coord: std::sync::MutexGuard<'a, GcCoord>,
+    phase: &str,
+    ready: impl Fn(&GcCoord) -> bool,
+    outstanding: impl Fn(&GcCoord) -> Vec<ThreadId>,
+) -> std::sync::MutexGuard<'a, GcCoord> {
+    let deadline = handshake_timeout().map(|limit| std::time::Instant::now() + limit);
+    while !ready(&coord) {
+        let Some(deadline) = deadline else {
+            coord = cv.wait(coord).unwrap_or_else(|poison| poison.into_inner());
+            continue;
+        };
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            let stuck = outstanding(&coord);
+            eprintln!(
+                "[gc] {phase} did not complete within {}s: {} registered mutator(s) never \
+                 acknowledged: {stuck:?}. A thread that stops while registered must go \
+                 through gc::MutatorRegistration, which unregisters on the unwind path too. \
+                 Raise or disable the bound with WILLOW_GC_HANDSHAKE_TIMEOUT_SECS (0 waits \
+                 indefinitely) if a mutator legitimately needs longer to reach a safepoint.",
+                handshake_timeout().unwrap_or_default().as_secs(),
+                stuck.len(),
+            );
+            std::process::abort();
+        };
+        coord = cv
+            .wait_timeout(coord, remaining)
+            .unwrap_or_else(|poison| poison.into_inner())
+            .0;
+    }
+    coord
+}
+
 /// Process-lifetime address of the GC poll gate for generated atomic byte loads.
 /// A set gate requests either independent root publication or a global stop.
 /// Generated code must reload this flag at every poll, with acquire ordering or
@@ -158,17 +263,26 @@ pub(super) fn with_stw<R>(
     runtime().poll_requested.store(true, Ordering::Release);
     let mut coord = lock.lock().unwrap_or_else(|poison| poison.into_inner());
     coord.stop_requested = true;
-    loop {
-        let all_parked = coord
-            .mutators
-            .keys()
-            .filter(|&&id| id != me)
-            .all(|id| coord.parked.contains(id));
-        if all_parked {
-            break;
-        }
-        coord = cv.wait(coord).unwrap_or_else(|poison| poison.into_inner());
-    }
+    coord = wait_for_mutators(
+        cv,
+        coord,
+        "stop-the-world park",
+        |coord| {
+            coord
+                .mutators
+                .keys()
+                .filter(|&&id| id != me)
+                .all(|id| coord.parked.contains(id))
+        },
+        |coord| {
+            coord
+                .mutators
+                .keys()
+                .copied()
+                .filter(|&id| id != me && !coord.parked.contains(&id))
+                .collect()
+        },
+    );
     // A collection can panic: the debug pointer validation aborts the cycle on
     // a corrupt root, and callers catch that. The world has to be resumed
     // either way — an unwind that leaves `stop_requested` set parks every other

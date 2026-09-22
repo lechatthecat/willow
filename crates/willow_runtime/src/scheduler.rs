@@ -2716,9 +2716,10 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instan
         debug_assert!(previous > 0, "parallel poll depth underflow");
         state.paused_polls.fetch_add(1, Ordering::AcqRel);
     }
-    if outermost {
-        crate::gc::willow_gc_register_mutator();
-    }
+    // Held for the whole drive so an unwinding task or run loop still
+    // unregisters; a driver that dies registered blocks every later
+    // collection forever (willow-utqy).
+    let mutator = outermost.then(crate::gc::MutatorRegistration::new);
     let active_workers = runtime_worker_config().active_workers();
     let completed = if outermost {
         willow_sched_run_parallel(target, active_workers, deadline)
@@ -2756,13 +2757,13 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instan
         // retired during this outer drive.
         release_pending_frame_roots();
     }
-    if SCHED_RUN_DEPTH.with(|d| {
+    let outermost_exit = SCHED_RUN_DEPTH.with(|d| {
         let depth = d.get() - 1;
         d.set(depth);
         depth == 0
-    }) {
-        crate::gc::willow_gc_unregister_mutator();
-    }
+    });
+    debug_assert_eq!(outermost_exit, mutator.is_some());
+    drop(mutator);
     completed
 }
 
@@ -2920,13 +2921,15 @@ fn run_parallel_worker(
 ) {
     crate::stack_overflow::protect_current_thread();
     SCHED_RUN_DEPTH.with(|depth| depth.set(1));
-    crate::gc::willow_gc_register_mutator();
+    // An unwind out of the run loop must still unregister: a worker that dies
+    // registered blocks every later collection forever (willow-utqy).
+    let mutator = crate::gc::MutatorRegistration::new();
     let worker_state = Arc::clone(&state);
     with_parallel_context(worker, worker_state, || {
         scheduler_run_loop(target, worker, Some(state.as_ref()), true, deadline);
     });
     set_current_task(None);
-    crate::gc::willow_gc_unregister_mutator();
+    drop(mutator);
     SCHED_RUN_DEPTH.with(|depth| depth.set(0));
 }
 

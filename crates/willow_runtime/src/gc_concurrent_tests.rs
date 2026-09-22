@@ -499,27 +499,105 @@ fn memory_limit_bounds_region_reservations_and_recovers_after_sweep() {
 static ASSIST_READY: AtomicBool = AtomicBool::new(false);
 static ASSIST_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static ASSIST_SAW_REMARK: AtomicBool = AtomicBool::new(false);
+/// Set by whichever participant gives up first, so the others leave their
+/// rendezvous instead of each burning its own full budget in turn.
+static ASSIST_ABORT: AtomicBool = AtomicBool::new(false);
+
+// Preserve the cause without unwinding out of a GC trace callback or off a
+// worker thread. The collector owns live cycle state while a callback runs,
+// and a thread that unwinds out of the fixture cannot report anything itself,
+// so every failure becomes a flag the main thread asserts on (willow-utqy).
+const MARKER_NEVER_TRACED: usize = 1;
+const ASSIST_NEVER_STARTED: usize = 2;
+const REMARK_NEVER_REQUESTED: usize = 4;
+const CYCLE_MISSING: usize = 8;
+const CLAIM_REFUSED: usize = 16;
+const ASSIST_SLOT_UNAVAILABLE: usize = 32;
+const ASSIST_PUSH_FAILED: usize = 64;
+static ASSIST_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+/// Generous enough that an oversubscribed CI runner cannot lose the rendezvous
+/// on scheduling alone; the fixture reports rather than hangs when it expires.
+const ASSIST_RENDEZVOUS: Duration = Duration::from_secs(30);
+
+fn assist_failed(cause: usize) {
+    ASSIST_FAILURES.fetch_or(cause, Ordering::Release);
+    ASSIST_ABORT.store(true, Ordering::Release);
+}
+
+/// Spin until `done` holds, giving up at `ASSIST_RENDEZVOUS`. Returns false
+/// when the wait was abandoned, so the caller can skip the rest of its part.
+fn await_assist_step(cause: usize, mut poll: impl FnMut(), done: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + ASSIST_RENDEZVOUS;
+    while !done() {
+        if ASSIST_ABORT.load(Ordering::Acquire) {
+            return false;
+        }
+        if Instant::now() >= deadline {
+            assist_failed(cause);
+            return false;
+        }
+        poll();
+        std::thread::yield_now();
+    }
+    true
+}
 
 unsafe fn hold_marker_for_assistant(_: *mut u8, _: &mut Vec<*mut u8>) {
     ASSIST_READY.store(true, Ordering::Release);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !ASSIST_IN_FLIGHT.load(Ordering::Acquire) {
-        assert!(Instant::now() < deadline, "allocation assist never started");
-        std::thread::yield_now();
-    }
+    await_assist_step(
+        ASSIST_NEVER_STARTED,
+        || {},
+        || ASSIST_IN_FLIGHT.load(Ordering::Acquire),
+    );
 }
 
 unsafe fn assist_overlaps_remark(_: *mut u8, _: &mut Vec<*mut u8>) {
     ASSIST_IN_FLIGHT.store(true, Ordering::Release);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !runtime().stop_requested.load(Ordering::Acquire) {
-        assert!(
-            Instant::now() < deadline,
-            "collector never requested final remark"
-        );
-        std::thread::yield_now();
+    if await_assist_step(
+        REMARK_NEVER_REQUESTED,
+        || {},
+        || runtime().stop_requested.load(Ordering::Acquire),
+    ) {
+        ASSIST_SAW_REMARK.store(true, Ordering::Release);
     }
-    ASSIST_SAW_REMARK.store(true, Ordering::Release);
+}
+
+/// Run the mutator-side assist that must overlap the collector's final remark.
+///
+/// Records a cause and returns instead of asserting: this runs on a worker
+/// thread, where a panic would report nothing and would abandon the private
+/// assist slot mid-cycle.
+fn run_mutator_assist(child: *mut u8) {
+    let cycle = {
+        let state = runtime().heap.lock().unwrap();
+        state.concurrent_cycle.clone()
+    };
+    let Some(cycle) = cycle else {
+        assist_failed(CYCLE_MISSING);
+        return;
+    };
+    // Reserve a private assist job so a background worker cannot steal the
+    // fixture whose purpose is to overlap a *mutator* with remark.
+    if !cycle.objects.claim(child as usize) {
+        assist_failed(CLAIM_REFUSED);
+        return;
+    }
+    let mut consumer = cycle.queue.register_assist();
+    if consumer.slot().is_none() {
+        assist_failed(ASSIST_SLOT_UNAVAILABLE);
+        return;
+    }
+    let pushed = crate::gc_mark_queue::ObjectRef::from_ptr(child).is_some_and(|object| {
+        consumer
+            .push(crate::gc_mark_queue::MarkWorkItem::Object(object))
+            .is_ok()
+    });
+    if !pushed {
+        assist_failed(ASSIST_PUSH_FAILED);
+        return;
+    }
+    cycle.drain_worker(1, &mut Vec::new(), &mut consumer);
 }
 
 #[test]
@@ -529,6 +607,8 @@ fn remark_waits_for_an_in_flight_mutator_assist() {
     ASSIST_READY.store(false, Ordering::Relaxed);
     ASSIST_IN_FLIGHT.store(false, Ordering::Relaxed);
     ASSIST_SAW_REMARK.store(false, Ordering::Relaxed);
+    ASSIST_ABORT.store(false, Ordering::Relaxed);
+    ASSIST_FAILURES.store(0, Ordering::Relaxed);
     for (id, callback) in [
         (0xFD01, hold_marker_for_assistant as ConcurrentTraceFn),
         (0xFD02, assist_overlaps_remark as ConcurrentTraceFn),
@@ -556,46 +636,36 @@ fn remark_waits_for_an_in_flight_mutator_assist() {
         let (ready, stop) = (Arc::clone(&ready), Arc::clone(&stop));
         let source = source as usize;
         std::thread::spawn(move || {
-            willow_gc_register_mutator();
+            // The guard, not a trailing call, owns the unregistration: this
+            // thread must leave the mutator registry even if it unwinds, or
+            // the collector waits for it forever (willow-utqy).
+            let _mutator = crate::gc::MutatorRegistration::new();
             ready.store(true, Ordering::Release);
-            while !ASSIST_READY.load(Ordering::Acquire) {
-                willow_gc_safepoint();
-                std::thread::yield_now();
+            if await_assist_step(
+                MARKER_NEVER_TRACED,
+                || willow_gc_safepoint(),
+                || ASSIST_READY.load(Ordering::Acquire),
+            ) {
+                let source = source as *mut u8;
+                let child = unsafe { load_gc_reference(source.cast()) };
+                run_mutator_assist(child);
             }
-            let source = source as *mut u8;
-            let child = unsafe { load_gc_reference(source.cast()) };
-            let cycle = runtime()
-                .heap
-                .lock()
-                .unwrap()
-                .concurrent_cycle
-                .clone()
-                .unwrap();
-            // Reserve a private assist job so a background worker cannot steal
-            // the fixture whose purpose is to overlap a *mutator* with remark.
-            assert!(cycle.objects.claim(child as usize));
-            let mut consumer = cycle.queue.register_assist();
-            assert!(consumer.slot().is_some());
-            consumer
-                .push(crate::gc_mark_queue::MarkWorkItem::Object(
-                    crate::gc_mark_queue::ObjectRef::from_ptr(child).unwrap(),
-                ))
-                .unwrap();
-            cycle.drain_worker(1, &mut Vec::new(), &mut consumer);
-            drop(consumer);
-            while !stop.load(Ordering::Acquire) {
-                willow_gc_safepoint();
-                std::thread::yield_now();
-            }
-            willow_gc_unregister_mutator();
+            // Stay registered and cooperating until the collection is over, so
+            // the drive that follows it observes a quiesced worker.
+            await_assist_step(0, || willow_gc_safepoint(), || stop.load(Ordering::Acquire));
         })
     };
-    while !ready.load(Ordering::Acquire) {
-        std::thread::yield_now();
-    }
+    await_assist_step(MARKER_NEVER_TRACED, || {}, || ready.load(Ordering::Acquire));
     willow_gc_collect();
     stop.store(true, Ordering::Release);
     worker.join().unwrap();
+    let failures = ASSIST_FAILURES.load(Ordering::Acquire);
+    assert_eq!(
+        failures, 0,
+        "assist rendezvous failures: {failures:#x} (1=marker never traced, \
+         2=assist never started, 4=remark never requested, 8=cycle missing, \
+         16=claim refused, 32=no assist slot, 64=push failed)"
+    );
     assert!(ASSIST_SAW_REMARK.load(Ordering::Acquire));
     assert!(runtime().heap.lock().unwrap().concurrent_cycle.is_none());
     willow_pop_roots(2);
@@ -2881,4 +2951,80 @@ fn root_activation_late_registration_joins_the_current_round() {
         assert_eq!(willow_gc_allocated_bytes(), 0);
     }
     reset_internal_for_test();
+}
+
+/// A registered mutator that unwinds must leave the registry, or the next
+/// collection waits for an acknowledgement that can never arrive (willow-utqy).
+#[test]
+fn a_registered_mutator_that_panics_still_unregisters() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    willow_gc_register_mutator();
+    let registered = registered_mutator_count();
+    let worker = std::thread::spawn(|| {
+        let _mutator = crate::gc::MutatorRegistration::new();
+        panic!("worker unwinds while registered as a mutator");
+    });
+    assert!(worker.join().is_err());
+    assert_eq!(registered_mutator_count(), registered);
+    // Both handshake rounds must find every participant, so this returns
+    // rather than blocking on the thread that is already gone.
+    willow_gc_collect();
+    willow_gc_unregister_mutator();
+    reset_internal_for_test();
+}
+
+/// Contain the wedge in a child process: the collector cannot recover from a
+/// mutator that stopped without unregistering, so it reports and aborts.
+fn run_wedge_child(test: &str) -> std::process::Output {
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env("WILLOW_HANDSHAKE_WEDGE_CHILD", "1")
+        .env("WILLOW_GC_HANDSHAKE_TIMEOUT_SECS", "2")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!("wedged collector never reported: {output:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
+}
+
+/// Without the bound, this is the shape that spent a whole 90-minute Windows
+/// CI job inside one `cv.wait` and printed nothing at all (willow-utqy).
+#[test]
+fn a_mutator_that_dies_registered_reports_instead_of_hanging_the_collector() {
+    let test = "gc::concurrent_tests::a_mutator_that_dies_registered_reports_instead_of_hanging_the_collector";
+    if std::env::var_os("WILLOW_HANDSHAKE_WEDGE_CHILD").is_none() {
+        let output = run_wedge_child(test);
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("root handshake activation round did not complete within 2s"),
+            "{output:?}"
+        );
+        assert!(
+            stderr.contains("registered mutator(s) never acknowledged"),
+            "{output:?}"
+        );
+        assert!(stderr.contains("gc::MutatorRegistration"), "{output:?}");
+        return;
+    }
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    willow_gc_register_mutator();
+    // Deliberately violate the contract the guard exists to keep: register
+    // through the raw entry point and let the thread end still registered.
+    std::thread::spawn(|| willow_gc_register_mutator())
+        .join()
+        .unwrap();
+    willow_gc_collect();
+    unreachable!("the collector returned from a wedged handshake");
 }

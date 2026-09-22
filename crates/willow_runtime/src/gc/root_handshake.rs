@@ -64,6 +64,36 @@ fn flush_satb_all_for_current(state: &mut GcState) {
         });
 }
 
+/// Wait until every participant of the current round has acknowledged.
+///
+/// Bounded by `wait_for_mutators`: a participant that stopped without
+/// unregistering can never acknowledge, and an unbounded wait there hides the
+/// cause behind a silent hang (willow-utqy).
+fn wait_pending<'a>(
+    cv: &Condvar,
+    coord: std::sync::MutexGuard<'a, GcCoord>,
+    phase: &str,
+) -> std::sync::MutexGuard<'a, GcCoord> {
+    wait_for_mutators(
+        cv,
+        coord,
+        phase,
+        |coord| {
+            coord
+                .handshake
+                .as_ref()
+                .is_none_or(|handshake| handshake.pending.is_empty())
+        },
+        |coord| {
+            coord
+                .handshake
+                .as_ref()
+                .map(|handshake| handshake.pending.iter().copied().collect())
+                .unwrap_or_default()
+        },
+    )
+}
+
 pub(super) fn begin() -> (u64, Arc<ConcurrentCycle>) {
     let (lock, cv) = &runtime().coord;
     let mut coord = lock.lock().unwrap();
@@ -109,9 +139,7 @@ pub(super) fn begin() -> (u64, Arc<ConcurrentCycle>) {
     });
     runtime().poll_requested.store(true, Ordering::Release);
     publish_current(&mut coord);
-    while !coord.handshake.as_ref().unwrap().pending.is_empty() {
-        coord = cv.wait(coord).unwrap();
-    }
+    coord = wait_pending(cv, coord, "root handshake activation round");
     // All pre-activation stores are now complete. Only now can root snapshots
     // and tracing establish a consistent SATB cut. Rebuild participants once:
     // threads that left need no snapshot, and new registrations join this round.
@@ -123,9 +151,7 @@ pub(super) fn begin() -> (u64, Arc<ConcurrentCycle>) {
     });
     cycle.tracing_enabled.store(true, Ordering::Release);
     publish_current(&mut coord);
-    while !coord.handshake.as_ref().unwrap().pending.is_empty() {
-        coord = cv.wait(coord).unwrap();
-    }
+    coord = wait_pending(cv, coord, "root handshake publication round");
     coord.handshake = None;
     runtime().poll_requested.store(false, Ordering::Release);
     drop(coord);
