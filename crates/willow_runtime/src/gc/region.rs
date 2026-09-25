@@ -86,6 +86,12 @@ pub(super) struct TlabStateRecord {
     pub(super) address: usize,
     pub(super) owner: ThreadId,
     pub(super) current_chunk: Option<usize>,
+    /// Cursor just past the slow-path first object of `current_chunk`; the
+    /// fast-path bytes of the active chunk are `cursor - chunk_fast_start`.
+    pub(super) chunk_fast_start: usize,
+    /// Fast-path totals of this TLAB's already retired chunks.
+    pub(super) retired_fast_allocations: u64,
+    pub(super) retired_fast_bytes: u64,
     pub(super) observed_fast_allocations: u64,
     pub(super) observed_fast_allocated_bytes: u64,
     pub(super) assist_observed_fast_bytes: u64,

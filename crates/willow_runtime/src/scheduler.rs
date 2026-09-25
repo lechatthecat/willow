@@ -1,8 +1,9 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::hash::BuildHasherDefault;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use willow_abi::workers::{default_worker_count, parse_worker_count};
 
@@ -191,16 +192,65 @@ pub fn runtime_worker_config() -> RuntimeWorkerConfig {
 /// short queue lock only after the state CAS has granted one queue token.
 #[derive(Debug)]
 struct RunQueues {
-    locals: Vec<Mutex<VecDeque<RuntimeTaskId>>>,
+    locals: Vec<HintedQueue>,
     /// Alternate local and overflow priority per worker. Always preferring the
     /// local queue can starve newly spawned or externally woken tasks when
     /// every worker repeatedly requeues CPU-bound work to itself.
     prefer_global: Vec<AtomicBool>,
-    global: Mutex<VecDeque<RuntimeTaskId>>,
+    global: HintedQueue,
     metrics: crate::observability::RunQueueMetrics,
     worker_metrics: Vec<crate::observability::RunQueueMetrics>,
     #[cfg(test)]
     idle_notifications: AtomicUsize,
+}
+
+/// A run queue with a lock-free emptiness hint (willow-8hq4.19).
+///
+/// Every worker probes the global queue on alternate iterations and scans
+/// every other worker's local queue when its own is empty, and those queues
+/// are usually empty. Probes read `len` and skip the lock for an empty queue.
+/// A push that a probe misses is no different from one that lands just after
+/// a locked probe: the worker falls through to the idle path, whose snapshot
+/// counts the queues under their locks (`RunQueues::len`), and the push
+/// itself notifies idle waiters. `QueueGuard` stores `len` before every
+/// unlock, so the hint never lags a completed mutation.
+#[derive(Debug, Default)]
+struct HintedQueue {
+    queue: Mutex<VecDeque<RuntimeTaskId>>,
+    len: AtomicUsize,
+}
+
+impl HintedQueue {
+    fn looks_empty(&self) -> bool {
+        self.len.load(Ordering::Acquire) == 0
+    }
+}
+
+/// A locked run queue; publishes its length to the hint before unlocking.
+struct QueueGuard<'a> {
+    queue: std::sync::MutexGuard<'a, VecDeque<RuntimeTaskId>>,
+    len: &'a AtomicUsize,
+}
+
+impl std::ops::Deref for QueueGuard<'_> {
+    type Target = VecDeque<RuntimeTaskId>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.queue
+    }
+}
+
+impl std::ops::DerefMut for QueueGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.queue
+    }
+}
+
+impl Drop for QueueGuard<'_> {
+    fn drop(&mut self) {
+        // Runs before the `queue` field drops, i.e. while still locked.
+        self.len.store(self.queue.len(), Ordering::Release);
+    }
 }
 
 impl RunQueues {
@@ -209,11 +259,9 @@ impl RunQueues {
         Self {
             #[cfg(test)]
             idle_notifications: AtomicUsize::new(0),
-            locals: (0..worker_count)
-                .map(|_| Mutex::new(VecDeque::new()))
-                .collect(),
+            locals: (0..worker_count).map(|_| HintedQueue::default()).collect(),
             prefer_global: (0..worker_count).map(|_| AtomicBool::new(false)).collect(),
-            global: Mutex::new(VecDeque::new()),
+            global: HintedQueue::default(),
             metrics: crate::observability::RunQueueMetrics::default(),
             worker_metrics: (0..worker_count)
                 .map(|_| crate::observability::RunQueueMetrics::default())
@@ -221,12 +269,14 @@ impl RunQueues {
         }
     }
 
-    fn lock(
-        queue: &Mutex<VecDeque<RuntimeTaskId>>,
-    ) -> std::sync::MutexGuard<'_, VecDeque<RuntimeTaskId>> {
-        queue
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn lock(queue: &HintedQueue) -> QueueGuard<'_> {
+        QueueGuard {
+            queue: queue
+                .queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            len: &queue.len,
+        }
     }
 
     fn worker_count(&self) -> usize {
@@ -361,6 +411,9 @@ impl RunQueues {
         refill: bool,
     ) -> Option<RuntimeTaskId> {
         metrics.global_pop_attempts.fetch_add(1, Ordering::Relaxed);
+        if self.global.looks_empty() {
+            return None;
+        }
         let mut global = Self::lock(&self.global);
         let id = global.pop_front()?;
         // Refill an empty local queue from half the remaining burst, capped
@@ -405,6 +458,7 @@ impl RunQueues {
                 return Some(id);
             }
             if let Some(queue) = self.locals.get(worker)
+                && !queue.looks_empty()
                 && let Some(id) = Self::lock(queue).pop_front()
             {
                 metrics.local_pop_hits.fetch_add(1, Ordering::Relaxed);
@@ -412,6 +466,7 @@ impl RunQueues {
             }
         } else {
             if let Some(queue) = self.locals.get(worker)
+                && !queue.looks_empty()
                 && let Some(id) = Self::lock(queue).pop_front()
             {
                 metrics.local_pop_hits.fetch_add(1, Ordering::Relaxed);
@@ -426,8 +481,12 @@ impl RunQueues {
         let count = self.locals.len();
         for offset in 1..count {
             let victim = (worker + offset) % count;
+            let queue = &self.locals[victim];
+            if queue.looks_empty() {
+                continue;
+            }
             metrics.victim_locks.fetch_add(1, Ordering::Relaxed);
-            if let Some(id) = Self::lock(&self.locals[victim]).pop_back() {
+            if let Some(id) = Self::lock(queue).pop_back() {
                 metrics.steal_successes.fetch_add(1, Ordering::Relaxed);
                 return Some(id);
             }
@@ -497,7 +556,45 @@ impl RunQueues {
     }
 }
 
-const TASK_TABLE_SHARDS: usize = 32;
+/// Every poll locks its task's shard several times (claim, affinity, poll
+/// boundary), so workers polling distinct tasks collide on a shard with
+/// probability about workers / shards per lock. At 32 shards, 8 workers of
+/// `yield_switch` spent 2-3% of their samples in contended shard locks
+/// (willow-8hq4.19). Whole-table walks (`len`, `for_each`, `drain`) are
+/// diagnostic or teardown paths; a wake batch groups by sort below this
+/// count, so no per-operation path scales with it.
+const TASK_TABLE_SHARDS: usize = 256;
+
+/// Hasher for task-id keys (willow-8hq4.18).
+///
+/// Task ids are process-local sequential integers, so SipHash's flooding
+/// resistance buys nothing and costs a keyed multi-round hash per lookup. Ids
+/// in one shard share `id % TASK_TABLE_SHARDS` (the low eight bits), and
+/// hashbrown indexes buckets with the low hash bits and tags with the top
+/// seven, so both ends of the hash must depend on the high id bits.
+#[derive(Debug, Default, Clone, Copy)]
+struct TaskIdHasher(u64);
+
+impl std::hash::Hasher for TaskIdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(u64::from(byte));
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        // Folded multiply: one widening `mul` whose two halves are xored, so
+        // every input bit reaches both the low and the high output bits.
+        let full = u128::from(self.0 ^ value) * 0x9E37_79B9_7F4A_7C15;
+        self.0 = (full as u64) ^ ((full >> 64) as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type TaskShard = HashMap<RuntimeTaskId, RuntimeTask, BuildHasherDefault<TaskIdHasher>>;
 
 /// Task records partitioned by task id (willow-6qtv).
 ///
@@ -507,7 +604,7 @@ const TASK_TABLE_SHARDS: usize = 32;
 /// table's ownership lock.
 #[derive(Debug)]
 struct ShardedTaskTable {
-    shards: Vec<Mutex<HashMap<RuntimeTaskId, RuntimeTask>>>,
+    shards: Vec<Mutex<TaskShard>>,
     /// Exact O(1) summary of tasks in `BlockedSyscall`.
     ///
     /// This lives beside the sharded task states instead of in
@@ -515,26 +612,43 @@ struct ShardedTaskTable {
     /// published while the same task shard is locked. Readers use it without
     /// taking the scheduler metadata mutex.
     blocked_syscall: AtomicUsize,
+    /// Advances after every `Terminal` transition and every record removal
+    /// (willow-8hq4.19).
+    ///
+    /// A drive whose target is still live keeps the epoch it read BEFORE its
+    /// last look at the target and looks again only once the epoch moves, so
+    /// the workers of a drive stop locking the target's shard on every loop
+    /// iteration. A transition publishes the state, then advances the epoch;
+    /// a watcher reads the epoch, then the state. Either the watcher's state
+    /// read sees the transition, or its epoch read precedes the advance and
+    /// the next iteration looks again.
+    terminal_epoch: AtomicU64,
 }
 
 impl ShardedTaskTable {
     fn new() -> Self {
         Self {
             shards: (0..TASK_TABLE_SHARDS)
-                .map(|_| Mutex::new(HashMap::new()))
+                .map(|_| Mutex::new(TaskShard::default()))
                 .collect(),
             blocked_syscall: AtomicUsize::new(0),
+            terminal_epoch: AtomicU64::new(0),
         }
+    }
+
+    fn terminal_epoch(&self) -> u64 {
+        self.terminal_epoch.load(Ordering::Acquire)
+    }
+
+    fn advance_terminal_epoch(&self) {
+        self.terminal_epoch.fetch_add(1, Ordering::Release);
     }
 
     fn shard_index(&self, id: RuntimeTaskId) -> usize {
         id as usize % self.shards.len()
     }
 
-    fn lock_shard(
-        &self,
-        index: usize,
-    ) -> std::sync::MutexGuard<'_, HashMap<RuntimeTaskId, RuntimeTask>> {
+    fn lock_shard(&self, index: usize) -> std::sync::MutexGuard<'_, TaskShard> {
         self.shards[index]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -594,7 +708,11 @@ impl ShardedTaskTable {
     }
 
     fn remove(&self, id: RuntimeTaskId) -> Option<RuntimeTask> {
-        self.lock_shard(self.shard_index(id)).remove(&id)
+        let removed = self.lock_shard(self.shard_index(id)).remove(&id);
+        if removed.is_some() {
+            self.advance_terminal_epoch();
+        }
+        removed
     }
 
     fn len(&self) -> usize {
@@ -619,6 +737,7 @@ impl ShardedTaskTable {
             tasks.extend(self.lock_shard(index).drain().map(|(_, task)| task));
         }
         self.blocked_syscall.store(0, Ordering::Release);
+        self.advance_terminal_epoch();
         tasks
     }
 
@@ -651,7 +770,7 @@ impl ShardedTaskTable {
         terminal_status: i64,
         after_transition: impl FnOnce(),
     ) -> Option<bool> {
-        self.with(id, |task| {
+        let transitioned = self.with(id, |task| {
             let before = task.state.lifecycle();
             let transitioned = task.state.finish_terminal();
             if transitioned {
@@ -660,7 +779,11 @@ impl ShardedTaskTable {
             }
             self.reconcile_blocked_transition(before, task.state.lifecycle());
             transitioned
-        })
+        });
+        if transitioned == Some(true) {
+            self.advance_terminal_epoch();
+        }
+        transitioned
     }
 }
 
@@ -815,6 +938,11 @@ pub struct RuntimeScheduler {
     /// OUTSIDE the scheduler lock. Channel addresses are captured before the
     /// heavy task record is removed (willow-ezs.1.4).
     pending_terminal_cleanups: Vec<TerminalCleanup>,
+    /// Set whenever `pending_terminal_cleanups` may be non-empty. Written only
+    /// under the scheduler mutex, read without it, so the run loop's
+    /// per-iteration drain skips `GLOBAL_SCHEDULER` when nothing is pending
+    /// (willow-8hq4.19).
+    terminal_cleanups_pending: Arc<AtomicBool>,
     /// Frame runtime roots retired by terminal tasks. The heavy task record is
     /// removed immediately, but these roots remain until the outermost
     /// scheduler drive has quiesced every worker.
@@ -848,6 +976,7 @@ impl RuntimeScheduler {
             run_queues,
             Arc::new(ShardedTaskTable::new()),
             Arc::new(TimerQueue::new()),
+            Arc::new(AtomicBool::new(false)),
         )
     }
 
@@ -855,6 +984,7 @@ impl RuntimeScheduler {
         run_queues: Arc<RunQueues>,
         tasks: Arc<ShardedTaskTable>,
         timers: Arc<TimerQueue>,
+        terminal_cleanups_pending: Arc<AtomicBool>,
     ) -> Self {
         Self {
             next_task_id: 1,
@@ -862,9 +992,19 @@ impl RuntimeScheduler {
             run_queues,
             timers,
             pending_terminal_cleanups: Vec::new(),
+            terminal_cleanups_pending,
             pending_frame_unroots: Vec::new(),
             frame_roots: 0,
         }
+    }
+
+    fn from_components(components: &SchedulerComponents) -> Self {
+        Self::with_components(
+            Arc::clone(&components.run_queues),
+            Arc::clone(&components.tasks),
+            Arc::clone(&components.timers),
+            Arc::clone(&components.terminal_cleanups_pending),
+        )
     }
 
     /// Reconcile scheduler counters around one atomic task-state transition.
@@ -962,7 +1102,7 @@ impl RuntimeScheduler {
 
     /// Validate and acquire one id that has already been physically removed
     /// from a run queue. Production workers call this only after popping from
-    /// [`GLOBAL_RUN_QUEUES`] without holding the scheduler metadata mutex.
+    /// [`global_run_queues`] without holding the scheduler metadata mutex.
     fn claim_popped(&mut self, id: RuntimeTaskId) -> Option<RuntimeTaskId> {
         let (outcome, has_cleanup, panic_context) = self.tasks.with_mut(id, |task| {
             let outcome = task.claim_for_poll();
@@ -1119,6 +1259,8 @@ impl RuntimeScheduler {
                 channel_waits,
                 lock_wait,
             });
+            self.terminal_cleanups_pending
+                .store(true, Ordering::Release);
         }
 
         // `RuntimeTask::roots` and all diagnostic/wait metadata are active-task
@@ -1169,6 +1311,8 @@ impl RuntimeScheduler {
     }
 
     fn take_pending_terminal_cleanups(&mut self) -> Vec<TerminalCleanup> {
+        self.terminal_cleanups_pending
+            .store(false, Ordering::Relaxed);
         std::mem::take(&mut self.pending_terminal_cleanups)
     }
 
@@ -1587,16 +1731,57 @@ impl RuntimeScheduler {
 // the task is pending/running, so a parked/ready task's live values survive
 // collection even though no native stack frame holds them (spec §8.2 / §9).
 
-/// Swappable only by test reset; ordinary scheduling clones this pointer under
-/// a read lock and performs queue operations without `GLOBAL_SCHEDULER`.
-static GLOBAL_RUN_QUEUES: LazyLock<RwLock<Arc<RunQueues>>> = LazyLock::new(|| {
-    RwLock::new(Arc::new(RunQueues::new(
-        runtime_worker_config().active_workers(),
-    )))
+/// The run queues, task table and timers every scheduler entry point shares
+/// (willow-8hq4.18).
+///
+/// Only test reset replaces them. The hot path runs once per task poll on every
+/// worker, so reaching the components must not write a shared cache line: a
+/// `RwLock` read bumps its reader count and an `Arc` clone bumps its refcount,
+/// and either one bounces between cores. The pointer is published once from
+/// `Box::into_raw` and read with one acquire load. A replaced set is leaked
+/// rather than freed, because callers hold `&'static` borrows without any
+/// guard; that happens only under `cfg(test)`.
+struct SchedulerComponents {
+    run_queues: Arc<RunQueues>,
+    tasks: Arc<ShardedTaskTable>,
+    timers: Arc<TimerQueue>,
+    terminal_cleanups_pending: Arc<AtomicBool>,
+}
+
+impl SchedulerComponents {
+    fn new(worker_count: usize) -> Self {
+        Self {
+            run_queues: Arc::new(RunQueues::new(worker_count)),
+            tasks: Arc::new(ShardedTaskTable::new()),
+            timers: Arc::new(TimerQueue::new()),
+            terminal_cleanups_pending: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn publish(self) -> *mut Self {
+        Box::into_raw(Box::new(self))
+    }
+}
+
+static GLOBAL_COMPONENTS: LazyLock<AtomicPtr<SchedulerComponents>> = LazyLock::new(|| {
+    AtomicPtr::new(SchedulerComponents::new(runtime_worker_config().active_workers()).publish())
 });
 
-static GLOBAL_TASK_TABLE: LazyLock<RwLock<Arc<ShardedTaskTable>>> =
-    LazyLock::new(|| RwLock::new(Arc::new(ShardedTaskTable::new())));
+fn global_components() -> &'static SchedulerComponents {
+    // SAFETY: every stored pointer comes from `SchedulerComponents::publish`
+    // and is never freed, so the referent lives for the rest of the process.
+    unsafe { &*GLOBAL_COMPONENTS.load(Ordering::Acquire) }
+}
+
+/// Install fresh components and return them. The old set is leaked (see
+/// [`SchedulerComponents`]).
+#[cfg(test)]
+fn replace_global_components(worker_count: usize) -> &'static SchedulerComponents {
+    let fresh = SchedulerComponents::new(worker_count).publish();
+    GLOBAL_COMPONENTS.store(fresh, Ordering::Release);
+    // SAFETY: `fresh` was just produced by `publish` and is never freed.
+    unsafe { &*fresh }
+}
 
 pub(crate) fn run_queue_global_pushes() -> u64 {
     global_run_queues()
@@ -1621,18 +1806,12 @@ pub(crate) fn run_queue_metrics_snapshot() -> crate::observability::RunQueueMetr
     global_run_queues().metrics_snapshot()
 }
 
-fn global_run_queues() -> Arc<RunQueues> {
-    GLOBAL_RUN_QUEUES
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
+fn global_run_queues() -> &'static Arc<RunQueues> {
+    &global_components().run_queues
 }
 
-fn global_task_table() -> Arc<ShardedTaskTable> {
-    GLOBAL_TASK_TABLE
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
+fn global_task_table() -> &'static Arc<ShardedTaskTable> {
+    &global_components().tasks
 }
 
 /// Tasks popped from a run queue but not yet registered as an active poll.
@@ -1648,55 +1827,72 @@ fn global_task_table() -> Arc<ShardedTaskTable> {
 ///
 /// Counted globally rather than per `ParallelRunState` so a nested drive and a
 /// foreign driver thread observe each other's claims too.
-static CLAIMS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+///
+/// The low [`CLAIM_COUNT_BITS`] bits count claims in flight. The high bits are
+/// an epoch that every claim holding a popped id advances when it resolves.
+/// A stop decision reads the word before and after its snapshot and accepts
+/// only an unchanged word with a zero count, so no claim can pop, resolve and
+/// republish work between two of its reads unseen (willow-8hq4.19). All
+/// accesses are `SeqCst`: the word is one half of the store/load handshake with
+/// [`ParallelRunState::stop_intent`] that lets claims skip `claim_gate`.
+static CLAIM_WORD: AtomicU64 = AtomicU64::new(0);
+
+const CLAIM_COUNT_BITS: u32 = 32;
+const CLAIM_COUNT_MASK: u64 = (1 << CLAIM_COUNT_BITS) - 1;
+/// Leave the pop→claim window and advance the epoch in one step.
+const CLAIM_RESOLVE: u64 = (1 << CLAIM_COUNT_BITS) - 1;
+
+fn claim_word() -> u64 {
+    CLAIM_WORD.load(Ordering::SeqCst)
+}
 
 /// RAII marker for the pop→claim window. Dropped only after the claim has
-/// resolved: either `active_polls` has been incremented (under `claim_gate`),
-/// or the id has been pushed back / dropped, so idleness is never observable
-/// between the two states.
-struct ClaimInFlight;
+/// resolved: either `active_polls` has been incremented, or the id has been
+/// pushed back / dropped, so idleness is never observable between the two
+/// states.
+struct ClaimInFlight {
+    popped: bool,
+}
 
 impl ClaimInFlight {
     fn enter() -> Self {
-        CLAIMS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
-        Self
+        CLAIM_WORD.fetch_add(1, Ordering::SeqCst);
+        Self { popped: false }
+    }
+
+    /// The pop returned an id. Its resolution may publish work (a requeue, a
+    /// reroute, a wake from cancellation), so leaving must advance the epoch.
+    /// A claim that popped nothing changed nothing and leaves without it.
+    fn popped(&mut self) {
+        self.popped = true;
     }
 }
 
 impl Drop for ClaimInFlight {
     fn drop(&mut self) {
-        let previous = CLAIMS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "claim-in-flight underflow");
+        let delta = if self.popped { CLAIM_RESOLVE } else { u64::MAX };
+        // `u64::MAX` wraps to a plain decrement of the count.
+        let previous = CLAIM_WORD.fetch_add(delta, Ordering::SeqCst);
+        debug_assert!(previous & CLAIM_COUNT_MASK > 0, "claim-in-flight underflow");
     }
 }
 
 /// True while any thread holds a popped-but-unclaimed task. Idle detection must
 /// treat this as pending work.
 fn claims_in_flight() -> bool {
-    CLAIMS_IN_FLIGHT.load(Ordering::Acquire) > 0
+    claim_word() & CLAIM_COUNT_MASK > 0
 }
 
 /// Wake-deadlines, shared with the scheduler instance the same way the run
 /// queues and the task table are (willow-9ha4). Timer work reaches this through
 /// its own lock, so the run loop's per-iteration timer promotion no longer
 /// serializes every worker on `GLOBAL_SCHEDULER`.
-static GLOBAL_TIMERS: LazyLock<RwLock<Arc<TimerQueue>>> =
-    LazyLock::new(|| RwLock::new(Arc::new(TimerQueue::new())));
-
-fn global_timers() -> Arc<TimerQueue> {
-    GLOBAL_TIMERS
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
+fn global_timers() -> &'static Arc<TimerQueue> {
+    &global_components().timers
 }
 
-static GLOBAL_SCHEDULER: LazyLock<Mutex<RuntimeScheduler>> = LazyLock::new(|| {
-    Mutex::new(RuntimeScheduler::with_components(
-        global_run_queues(),
-        global_task_table(),
-        global_timers(),
-    ))
-});
+static GLOBAL_SCHEDULER: LazyLock<Mutex<RuntimeScheduler>> =
+    LazyLock::new(|| Mutex::new(RuntimeScheduler::from_components(global_components())));
 
 fn with_global<R>(f: impl FnOnce(&mut RuntimeScheduler) -> R) -> R {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
@@ -1709,17 +1905,17 @@ fn with_global<R>(f: impl FnOnce(&mut RuntimeScheduler) -> R) -> R {
 /// Hot wake path: state, blocked-syscall accounting, and queue publication are
 /// completed while one task shard is locked (willow-6qtv/8agm).
 fn wake_global_task(id: RuntimeTaskId) -> bool {
-    wake_task_in(&global_task_table(), &global_run_queues(), id)
+    wake_task_in(global_task_table(), global_run_queues(), id)
 }
 
 fn wake_global_task_outcome(id: RuntimeTaskId) -> WakeOutcome {
-    wake_task_outcome_in(&global_task_table(), &global_run_queues(), id)
+    wake_task_outcome_in(global_task_table(), global_run_queues(), id)
 }
 
 /// Register the running task's sleep deadline without the scheduler metadata
 /// mutex (willow-9ha4).
 fn set_global_wake_after_millis(millis: i64) {
-    set_wake_after_millis_in(&global_task_table(), &global_timers(), millis);
+    set_wake_after_millis_in(global_task_table(), global_timers(), millis);
 }
 
 /// The earliest live wake-deadline, for the idle path's "how long may I sleep?"
@@ -1727,7 +1923,7 @@ fn set_global_wake_after_millis(millis: i64) {
 /// hint, which is allowed to be transiently stale-empty.
 fn global_next_timer_deadline() -> Option<(RuntimeTaskId, Instant)> {
     let tasks = global_task_table();
-    global_timers().next_deadline(|wake| timer_entry_is_current(&tasks, wake))
+    global_timers().next_deadline(|wake| timer_entry_is_current(tasks, wake))
 }
 
 /// Promote every timer due at `now` onto a run queue.
@@ -1747,9 +1943,9 @@ fn wake_global_due_timers(now: Instant) -> usize {
     let run_queues = global_run_queues();
     let woken = timers.wake_due(
         now,
-        |wake| timer_entry_is_current(&tasks, wake),
+        |wake| timer_entry_is_current(tasks, wake),
         |entry| {
-            wake_task_matching_in(&tasks, &run_queues, entry.task_id, Some(entry.deadline));
+            wake_task_matching_in(tasks, run_queues, entry.task_id, Some(entry.deadline));
         },
     );
     if woken > 0 {
@@ -2456,7 +2652,7 @@ pub extern "C" fn willow_sched_yield() {
 pub extern "C" fn willow_sched_await(awaitee: u64) -> i32 {
     let tasks = global_task_table();
     let ready = match current_task_id() {
-        Some(waiter) if register_waiter_sharded(&tasks, awaitee, waiter) => 0,
+        Some(waiter) if register_waiter_sharded(tasks, awaitee, waiter) => 0,
         Some(_) => 1,
         None => i32::from(tasks.with(awaitee, |_| ()).is_none()),
     };
@@ -2539,7 +2735,7 @@ pub extern "C" fn willow_sched_unregister_task_waiter(awaitee: u64) {
     let Some(current) = current_task_id() else {
         return;
     };
-    unregister_waiter_sharded(&global_task_table(), awaitee, current);
+    unregister_waiter_sharded(global_task_table(), awaitee, current);
 }
 
 /// Current state of a task as an integer: 0 ready, 1 running, 2 parked,
@@ -2650,7 +2846,7 @@ pub(crate) fn scheduler_has_wake_source() -> bool {
                 // This caller may itself be a running task blocked in recv or
                 // send. Counting it would turn genuine deadlocks into spins.
                 let caller = usize::from(current_task_id().is_some());
-                state.active_polls.load(Ordering::Acquire) > caller
+                state.active_polls() > caller
             })
         })
         || crate::netpoll::has_waiters()
@@ -2712,9 +2908,7 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instan
     let shared_state = CURRENT_RUN_STATE.with(|slot| slot.borrow().clone());
     let paused_parallel_poll = !outermost && shared_state.is_some() && saved_running.is_some();
     if paused_parallel_poll && let Some(state) = shared_state.as_ref() {
-        let previous = state.active_polls.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "parallel poll depth underflow");
-        state.paused_polls.fetch_add(1, Ordering::AcqRel);
+        state.pause_active_poll();
     }
     // Held for the whole drive so an unwinding task or run loop still
     // unregisters; a driver that dies registered blocks every later
@@ -2747,9 +2941,7 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instan
         crate::panic_context::replace_current_context(saved_panic_context);
     }
     if paused_parallel_poll && let Some(state) = shared_state.as_ref() {
-        let previous = state.paused_polls.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "parallel paused poll underflow");
-        state.active_polls.fetch_add(1, Ordering::AcqRel);
+        state.resume_paused_poll();
     }
     if outermost {
         // The parallel pool has joined and nested polls have resumed or
@@ -2767,7 +2959,30 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instan
     completed
 }
 
+/// Purge captured external registrations of terminal tasks. Runs on every
+/// run-loop iteration, so the empty case must not take `GLOBAL_SCHEDULER`
+/// (willow-8hq4.19): the flag is set under the mutex after the push, and a
+/// push seen by no drain yet keeps it raised until some drain takes the list,
+/// at the latest the drive-end drain, which runs after the workers have joined.
+///
+/// One caller takes a burst: the swap hands the list to its winner, and a push
+/// after the swap raises the flag again. The winner can be a worker with no
+/// active poll, and a purge can publish work (re-handing a lock reservation
+/// wakes the next waiter), so the drain holds a [`ClaimInFlight`] marker that
+/// resolves after its purges, entered BEFORE the swap. A caller that loses
+/// the swap then returns only after the winner's marker is in the claim word,
+/// so a stop decision that follows the loser's poll sees the drain as a claim
+/// in flight, or its epoch advance, and refuses.
 fn drain_terminal_cleanups() {
+    let pending = &global_components().terminal_cleanups_pending;
+    if !pending.load(Ordering::Acquire) {
+        return;
+    }
+    let mut in_flight = ClaimInFlight::enter();
+    if !pending.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    in_flight.popped();
     let cleanups = with_global(|sched| sched.take_pending_terminal_cleanups());
     for cleanup in cleanups {
         crate::netpoll::purge_task(cleanup.task_id);
@@ -2790,10 +3005,128 @@ fn release_pending_frame_roots() {
 #[derive(Debug, Default)]
 struct ParallelRunState {
     stop: AtomicBool,
+    /// Serializes stop decisions. A claim takes it only while
+    /// `stop_intent` is raised, so the claim hot path writes no shared lock
+    /// word (willow-8hq4.19).
     claim_gate: Mutex<()>,
-    active_polls: AtomicUsize,
-    paused_polls: AtomicUsize,
+    /// Raised by a stop decision, under `claim_gate`, for the whole snapshot.
+    /// With [`CLAIM_WORD`] it forms a store/load handshake: a claim increments
+    /// the word and then reads this flag, a decision raises this flag and then
+    /// reads the word, all `SeqCst`. Either the decision sees the claim, or
+    /// the claim sees the flag and waits on `claim_gate` for the decision.
+    stop_intent: AtomicBool,
+    /// Polls of this run: the low [`POLL_ACTIVE_BITS`] bits count running
+    /// polls, the high bits polls paused inside a nested drive. One word, so a
+    /// pause or resume moves a poll in one step and no read can see it in
+    /// neither half (willow-8hq4.19).
+    polls: AtomicU64,
+    /// The pool's shared view of the drive target, used by the pool workers
+    /// (`stop_pool_on_exit`) only. A nested drive has its own target.
+    target: SharedTargetCheck,
     completed: AtomicI64,
+}
+
+/// One look at the drive target per terminal epoch for the whole pool
+/// (willow-8hq4.19). Every completion advances the epoch, and without this
+/// every worker would lock the target's shard after every completion.
+#[derive(Debug, Default)]
+struct SharedTargetCheck {
+    /// One past the highest epoch some worker has claimed to check; 0 before
+    /// any check.
+    checked: AtomicU64,
+    /// Set once a check found the target done. Final.
+    done: AtomicBool,
+}
+
+const POLL_ACTIVE_BITS: u32 = 32;
+const POLL_ACTIVE_MASK: u64 = (1 << POLL_ACTIVE_BITS) - 1;
+/// Adding this moves one poll from active to paused; subtracting it moves one
+/// back.
+const POLL_PAUSE: u64 = (1 << POLL_ACTIVE_BITS) - 1;
+
+impl ParallelRunState {
+    /// Publish `stop` if `quiescent` holds with every claim excluded. Returns
+    /// whether the stop was published.
+    ///
+    /// Claims do not take `claim_gate` unless `stop_intent` is raised, so the
+    /// decision excludes them through the handshake instead: raise the intent,
+    /// then require that no claim is in flight and that none entered, popped
+    /// and resolved while `quiescent` was evaluated. A claim that entered
+    /// before the intent was raised is in the word; one that entered after it
+    /// reads the intent and queues on `claim_gate` behind this decision, then
+    /// observes the stop. The stop is published only once it is final
+    /// (willow-6wd6), and before the intent is lowered, so a claim that reads
+    /// the lowered intent also reads the stop.
+    fn publish_stop_if(&self, quiescent: impl FnOnce(&Self) -> bool) -> bool {
+        let _gate = self
+            .claim_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.stop_intent.store(true, Ordering::SeqCst);
+        let before = claim_word();
+        let stop = before & CLAIM_COUNT_MASK == 0 && quiescent(self) && claim_word() == before;
+        if stop {
+            self.stop.store(true, Ordering::SeqCst);
+            notify_all_idle_waiters();
+        }
+        self.stop_intent.store(false, Ordering::SeqCst);
+        stop
+    }
+
+    fn active_polls(&self) -> usize {
+        (self.polls.load(Ordering::Acquire) & POLL_ACTIVE_MASK) as usize
+    }
+
+    fn paused_polls(&self) -> usize {
+        (self.polls.load(Ordering::Acquire) >> POLL_ACTIVE_BITS) as usize
+    }
+
+    /// Is a poll running, or paused inside a nested drive?
+    fn has_live_poll(&self) -> bool {
+        self.polls.load(Ordering::Acquire) != 0
+    }
+
+    fn begin_poll(&self) {
+        self.polls.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn end_poll(&self) {
+        let previous = self.polls.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(
+            previous & POLL_ACTIVE_MASK > 0,
+            "parallel poll depth underflow"
+        );
+    }
+
+    /// Move the current poll from active to paused for a nested drive.
+    fn pause_active_poll(&self) {
+        let previous = self.polls.fetch_add(POLL_PAUSE, Ordering::AcqRel);
+        debug_assert!(
+            previous & POLL_ACTIVE_MASK > 0,
+            "parallel poll depth underflow"
+        );
+    }
+
+    fn resume_paused_poll(&self) {
+        let previous = self.polls.fetch_sub(POLL_PAUSE, Ordering::AcqRel);
+        debug_assert!(
+            previous >> POLL_ACTIVE_BITS > 0,
+            "parallel paused poll underflow"
+        );
+    }
+
+    #[cfg(test)]
+    fn set_polls_for_test(&self, active: usize, paused: usize) {
+        self.polls.store(
+            ((paused as u64) << POLL_ACTIVE_BITS) | active as u64,
+            Ordering::Release,
+        );
+    }
+
+    /// A stop decision is in progress; the claim must wait for it.
+    fn stop_decision_pending(&self) -> bool {
+        self.stop_intent.load(Ordering::SeqCst)
+    }
 }
 
 struct WorkerDrive {
@@ -2961,10 +3294,73 @@ fn target_is_done(target: Option<RuntimeTaskId>) -> bool {
         .unwrap_or(false)
 }
 
+/// Per-loop view of `target_is_done` that locks the target's shard only after
+/// the task table's terminal epoch moves (willow-8hq4.19).
+///
+/// Every worker of a drive asks on every iteration. Before, each question
+/// locked the one shard holding the target, so the workers contended on it.
+/// A target is done once its record is `Terminal` or gone, and both are
+/// final, so a done answer is cached; a live answer holds only until the
+/// epoch advances. The pool workers of one drive share one look per epoch
+/// through [`SharedTargetCheck`].
+struct TargetWatch<'a> {
+    target: Option<RuntimeTaskId>,
+    shared: Option<&'a SharedTargetCheck>,
+    checked_at: Option<u64>,
+    done: bool,
+}
+
+impl<'a> TargetWatch<'a> {
+    fn new(target: Option<RuntimeTaskId>, shared: Option<&'a SharedTargetCheck>) -> Self {
+        Self {
+            target,
+            shared,
+            checked_at: None,
+            done: false,
+        }
+    }
+
+    fn is_done(&mut self) -> bool {
+        if self.done || self.target.is_none() {
+            return self.done;
+        }
+        if let Some(shared) = self.shared
+            && shared.done.load(Ordering::Acquire)
+        {
+            self.done = true;
+            return true;
+        }
+        // Read the epoch BEFORE the state: a transition after this read
+        // advances the epoch past it, so a later call looks again.
+        let epoch = global_task_table().terminal_epoch();
+        if self.checked_at == Some(epoch) {
+            return false;
+        }
+        self.checked_at = Some(epoch);
+        if let Some(shared) = self.shared {
+            // Only the worker that raises `checked` past this epoch looks. A
+            // worker that raised it further read a later epoch, so its look
+            // also follows every transition this epoch covers.
+            let claim = epoch + 1;
+            if shared.checked.load(Ordering::Relaxed) >= claim
+                || shared.checked.fetch_max(claim, Ordering::Relaxed) >= claim
+            {
+                return false;
+            }
+        }
+        self.done = target_is_done(self.target);
+        if self.done
+            && let Some(shared) = self.shared
+        {
+            shared.done.store(true, Ordering::Release);
+        }
+        self.done
+    }
+}
+
 fn finish_active_poll(shared: Option<&ParallelRunState>) {
     if let Some(state) = shared {
-        let previous = state.active_polls.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "parallel poll depth underflow");
+        state.end_poll();
     }
 }
 
@@ -3036,17 +3432,23 @@ fn claim_global_ready_for_worker(
         // Publish the claim BEFORE the pop removes the id from every queue, and
         // keep it published until the claim has resolved into an active poll or
         // a requeue (willow-atth).
-        let _in_flight = ClaimInFlight::enter();
+        let mut in_flight = ClaimInFlight::enter();
         let id = queues.pop_for_worker(worker)?;
-        // Even a foreign-affinity reroute must resolve under the idle
-        // snapshot gate. Otherwise the snapshot can read an empty queue,
-        // then miss the claim after it requeues and clears its marker.
-        let claim_guard = shared.map(|state| {
-            state
-                .claim_gate
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-        });
+        in_flight.popped();
+        // Only a stop decision in progress sends the claim through the gate
+        // (willow-8hq4.19). Outside one, the in-flight word already makes the
+        // whole resolution, including a foreign-affinity reroute or a
+        // requeue, visible to any later decision: resolving advances the
+        // epoch, so a snapshot that read an empty queue before the requeue
+        // cannot accept a word read after it.
+        let claim_guard = shared
+            .filter(|state| state.stop_decision_pending())
+            .map(|state| {
+                state
+                    .claim_gate
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            });
         #[cfg(any(
             all(
                 target_os = "linux",
@@ -3097,7 +3499,7 @@ fn claim_global_ready_for_worker(
         if matches!(claim, Claim::Work(..))
             && let Some(state) = shared
         {
-            state.active_polls.fetch_add(1, Ordering::AcqRel);
+            state.begin_poll();
         }
         drop(claim_guard);
         match claim {
@@ -3164,9 +3566,7 @@ fn scheduler_idle_step(
     // A claim that has popped its task but not yet reached `active_polls` is
     // equally in-flight work, and is invisible in every other check
     // (willow-atth).
-    if claims_in_flight()
-        || shared.is_some_and(|state| state.active_polls.load(Ordering::Acquire) > 0)
-    {
+    if claims_in_flight() || shared.is_some_and(|state| state.active_polls() > 0) {
         wait_for_wake_since(generation, idle_wait_bound(deadline));
         return true;
     }
@@ -3227,7 +3627,7 @@ fn scheduler_idle_step(
         }
         None if parallel
             && keep_alive_for_paused
-            && shared.is_some_and(|state| state.paused_polls.load(Ordering::Acquire) > 0) =>
+            && shared.is_some_and(|state| state.paused_polls() > 0) =>
         {
             wait_for_wake_since(generation, idle_wait_bound(deadline));
             true
@@ -3264,6 +3664,9 @@ fn scheduler_idle_step(
 /// A source that can hold — or produce — a runnable task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkSource {
+    /// A poll running or paused inside a nested drive. It can still requeue
+    /// its task or wake another one before it ends.
+    Poll,
     /// An armed wake-deadline in the global timer heap.
     Timer,
     /// A task the blocking pool still owes a completion wake.
@@ -3291,6 +3694,11 @@ enum WorkSource {
 /// * Blocked-syscall completion publishes its queue entry before decrementing
 ///   the counter, so [`WorkSource::BlockedSyscall`] is read BEFORE
 ///   [`WorkSource::RunQueue`].
+/// * A poll publishes its requeue or wakes BEFORE `finish_active_poll`, so
+///   [`WorkSource::Poll`] is read BEFORE [`WorkSource::RunQueue`]. Reading
+///   the poll counters only after the queue permits: `idle: queue empty` /
+///   `worker: yield pushes the task, poll ends` / `idle: no active poll ->
+///   stop` (willow-8hq4.19).
 /// * A claim publishes its in-flight marker BEFORE it pops, so
 ///   [`WorkSource::Claim`] is read AFTER [`WorkSource::RunQueue`]. Reversing
 ///   that permits: `idle: no claims` / `worker: enter claim, pop the last
@@ -3303,7 +3711,8 @@ enum WorkSource {
 ///
 /// None of these independently synchronized structures requires
 /// `GLOBAL_SCHEDULER` (willow-9ha4).
-const IDLE_READ_ORDER: [WorkSource; 5] = [
+const IDLE_READ_ORDER: [WorkSource; 6] = [
+    WorkSource::Poll,
     WorkSource::Timer,
     WorkSource::BlockedSyscall,
     WorkSource::RunQueue,
@@ -3313,14 +3722,11 @@ const IDLE_READ_ORDER: [WorkSource; 5] = [
 
 fn work_source_is_live(state: &ParallelRunState, source: WorkSource) -> bool {
     match source {
+        WorkSource::Poll => state.has_live_poll(),
         WorkSource::Timer => global_next_timer_deadline().is_some(),
         WorkSource::BlockedSyscall => global_task_table().blocked_syscall_count() > 0,
         WorkSource::RunQueue => global_run_queues().len() > 0,
-        WorkSource::Claim => {
-            claims_in_flight()
-                || state.active_polls.load(Ordering::Acquire) > 0
-                || state.paused_polls.load(Ordering::Acquire) > 0
-        }
+        WorkSource::Claim => claims_in_flight() || state.has_live_poll(),
         WorkSource::Netpoll => crate::netpoll::has_waiters(),
     }
 }
@@ -3328,10 +3734,10 @@ fn work_source_is_live(state: &ParallelRunState, source: WorkSource) -> bool {
 /// Is this parallel run globally idle — nothing runnable now, and no source
 /// that could make something runnable later?
 ///
-/// The caller must already hold `state.claim_gate`; the reads are only
-/// coherent with claims excluded, and the stop that follows a `true` must be
-/// published under the same gate. See [`IDLE_READ_ORDER`] for why the order of
-/// the reads is what makes this answer trustworthy.
+/// Only coherent with claims excluded: production calls it through
+/// [`ParallelRunState::publish_stop_if`], which also validates the claim
+/// word around it and publishes the stop. See [`IDLE_READ_ORDER`] for why the
+/// order of the reads is what makes this answer trustworthy.
 fn parallel_run_is_idle_locked(state: &ParallelRunState) -> bool {
     !IDLE_READ_ORDER
         .iter()
@@ -3346,6 +3752,12 @@ fn scheduler_run_loop(
     deadline: Option<Instant>,
 ) -> i64 {
     let mut completed = 0i64;
+    let mut target_watch = TargetWatch::new(
+        target,
+        shared
+            .filter(|_| stop_pool_on_exit)
+            .map(|state| &state.target),
+    );
     loop {
         if SPAWN_NOTIFICATION_PENDING.with(|pending| pending.replace(false)) {
             notify_idle_waiters();
@@ -3369,31 +3781,24 @@ fn scheduler_run_loop(
         // cannot hang on an unrelated non-terminating task (willow-bsqy). A
         // completed task may have been pruned (state None); treat that as done
         // too — the awaiter reads the result from the frame, not the task.
-        if target_is_done(target) {
+        if target_watch.is_done() {
             // The task state becomes Completed before its worker runs the
             // post-poll GC boundaries. Do not tear down the scoped pool while
             // that worker may still be collecting: the collector would wait
             // for worker 0 at a safepoint while worker 0 waits to join it.
             if stop_pool_on_exit && let Some(state) = shared {
-                // Publish the stop while holding the same lock used to claim
-                // work. Either an in-flight claim increments active_polls
-                // before us, or it observes stop after us; there is no gap in
-                // which worker 0 can start joining a newly active collector.
-                let stopped = {
-                    let _claim_gate = state
-                        .claim_gate
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if state.active_polls.load(Ordering::Acquire) > 0
-                        || state.paused_polls.load(Ordering::Acquire) > 0
-                    {
-                        false
-                    } else {
-                        state.stop.store(true, Ordering::Release);
-                        notify_all_idle_waiters();
-                        true
-                    }
-                };
+                // Publish the stop with every claim excluded. Either an
+                // in-flight claim is visible to the decision (and it retries),
+                // or it observes the stop after us; there is no gap in which
+                // worker 0 can start joining a newly active collector.
+                let stopped = state.publish_stop_if(|state| !state.has_live_poll());
+                if !stopped && !state.has_live_poll() {
+                    // Only a claim was in flight. It resolves within a few
+                    // instructions, so retry without the poll back-off.
+                    crate::gc::willow_gc_safepoint();
+                    std::thread::yield_now();
+                    continue;
+                }
                 if !stopped {
                     // Never enter the GC while holding `claim_gate`: a
                     // collector can be waiting for a worker that needs this
@@ -3460,21 +3865,15 @@ fn scheduler_run_loop(
                 // Revalidate global idleness while claims are excluded. Work
                 // can be published between the earlier empty pop and this
                 // point; stopping without this check strands that task in the
-                // queue.
-                let _claim_gate = state
-                    .claim_gate
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if !parallel_run_is_idle_locked(state) {
+                // queue. The stop is published only once it is FINAL: an
+                // earlier version set it optimistically and rolled it back
+                // when a later check failed; any worker that read the flag
+                // inside that rollback window left the pool for good, and any
+                // claim that read it requeued the task it was holding and went
+                // idle (willow-6wd6).
+                if !state.publish_stop_if(parallel_run_is_idle_locked) {
                     continue;
                 }
-                // Publish the stop only once it is FINAL. An earlier version
-                // set it optimistically and rolled it back when a later check
-                // failed; any worker that read the flag inside that rollback
-                // window left the pool for good, and any claim that read it
-                // requeued the task it was holding and went idle (willow-6wd6).
-                state.stop.store(true, Ordering::Release);
-                notify_all_idle_waiters();
             }
             break;
         };
@@ -3804,19 +4203,9 @@ pub fn reset_global_scheduler_for_test() {
                 None
             }
         }));
-        let run_queues = Arc::new(RunQueues::new(runtime_worker_config().active_workers()));
-        let tasks = Arc::new(ShardedTaskTable::new());
-        let timers = Arc::new(TimerQueue::new());
-        *GLOBAL_RUN_QUEUES
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&run_queues);
-        *GLOBAL_TASK_TABLE
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&tasks);
-        *GLOBAL_TIMERS
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&timers);
-        *sched = RuntimeScheduler::with_components(run_queues, tasks, timers);
+        *sched = RuntimeScheduler::from_components(replace_global_components(
+            runtime_worker_config().active_workers(),
+        ));
         frames
     });
     for frame in frames {
@@ -3834,25 +4223,13 @@ pub fn reset_global_scheduler_for_test() {
     FATAL_PANIC_PENDING.store(false, Ordering::Release);
     // Claims are strictly scoped to a pop; a leftover count would make every
     // later test's idle detection report pending work.
-    CLAIMS_IN_FLIGHT.store(0, Ordering::Release);
+    CLAIM_WORD.store(0, Ordering::SeqCst);
 }
 
 #[cfg(test)]
 fn replace_global_scheduler_for_test(worker_count: usize) {
     with_global(|sched| {
-        let run_queues = Arc::new(RunQueues::new(worker_count));
-        let tasks = Arc::new(ShardedTaskTable::new());
-        let timers = Arc::new(TimerQueue::new());
-        *GLOBAL_RUN_QUEUES
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&run_queues);
-        *GLOBAL_TASK_TABLE
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&tasks);
-        *GLOBAL_TIMERS
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&timers);
-        *sched = RuntimeScheduler::with_components(run_queues, tasks, timers);
+        *sched = RuntimeScheduler::from_components(replace_global_components(worker_count));
     });
 }
 

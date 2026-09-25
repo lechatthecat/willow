@@ -13,21 +13,59 @@ pub(super) unsafe fn tlab_state_at(address: usize) -> &'static GcTlabState {
 #[cfg(test)]
 pub(super) static TLAB_ACCOUNTING_RECORD_VISITS: AtomicUsize = AtomicUsize::new(0);
 
-pub(super) fn read_tlab_delta(record: &mut TlabStateRecord) -> (u64, u64) {
+/// Fast-path bytes this TLAB has allocated so far: retired chunks plus the
+/// active chunk's bump distance past its slow-path first object. O(1).
+pub(super) fn fast_bytes_total(record: &TlabStateRecord) -> u64 {
+    let active = if record.current_chunk.is_some() {
+        // SAFETY: records are removed before their owner's generated TLS expires.
+        let cursor = unsafe { tlab_state_at(record.address) }
+            .cursor
+            .load(Ordering::Acquire);
+        cursor.saturating_sub(record.chunk_fast_start) as u64
+    } else {
+        0
+    };
+    record.retired_fast_bytes.saturating_add(active)
+}
+
+/// Fast-path objects this TLAB has allocated so far. The active chunk's start
+/// words hold one bit per published header, including the slow-path first
+/// object. O(chunk words), a constant 64 for the fixed chunk size.
+fn fast_allocations_total(
+    record: &TlabStateRecord,
+    chunks: &[BumpChunk],
+    addresses: &address_index::AddressIndex,
+) -> u64 {
+    let active = record
+        .current_chunk
+        .and_then(|base| addresses.exact(base))
+        .map_or(0, |index| {
+            (chunks[index].mark_bitmap.bits.count() as u64).saturating_sub(1)
+        });
+    record.retired_fast_allocations.saturating_add(active)
+}
+
+/// Bytes-only delta for allocation-path pacing; never scans start words.
+fn read_tlab_bytes_delta(record: &mut TlabStateRecord) -> u64 {
     #[cfg(test)]
     TLAB_ACCOUNTING_RECORD_VISITS.fetch_add(1, Ordering::Relaxed);
-    // SAFETY: records are removed before their owner's generated TLS expires.
-    let tls = unsafe { tlab_state_at(record.address) };
-    let allocations = tls.fast_allocations.load(Ordering::Acquire);
-    let bytes = tls.fast_allocated_bytes.load(Ordering::Acquire);
-    let delta = (
-        allocations.saturating_sub(record.observed_fast_allocations),
-        bytes.saturating_sub(record.observed_fast_allocated_bytes),
-    );
-    record.observed_fast_allocations = allocations;
+    let bytes = fast_bytes_total(record);
+    let delta = bytes.saturating_sub(record.observed_fast_allocated_bytes);
     record.observed_fast_allocated_bytes = bytes;
     delta
 }
+
+fn read_tlab_allocations_delta(
+    record: &mut TlabStateRecord,
+    chunks: &[BumpChunk],
+    addresses: &address_index::AddressIndex,
+) -> u64 {
+    let allocations = fast_allocations_total(record, chunks, addresses);
+    let delta = allocations.saturating_sub(record.observed_fast_allocations);
+    record.observed_fast_allocations = allocations;
+    delta
+}
+
 pub(super) fn add_tlab_accounting(state: &mut GcState, allocations: u64, bytes: u64) {
     state.total_allocs = state.total_allocs.saturating_add(allocations);
     state.total_allocated_bytes = state.total_allocated_bytes.saturating_add(bytes);
@@ -36,12 +74,33 @@ pub(super) fn add_tlab_accounting(state: &mut GcState, allocations: u64, bytes: 
     state.allocated_bytes = state.allocated_bytes.saturating_add(bytes as usize);
     state.young_allocated_bytes = state.young_allocated_bytes.saturating_add(bytes as usize);
 }
+
+/// Merge fast-path bytes for pacing and nursery triggers: O(TLABs), one cursor
+/// load each. Object counts lag until [`sync_tlab_accounting`] or retirement.
+pub(super) fn sync_tlab_bytes(state: &mut GcState) {
+    let mut bytes = 0u64;
+    for record in state.tlab_states.values_mut() {
+        bytes = bytes.saturating_add(read_tlab_bytes_delta(record));
+    }
+    add_tlab_accounting(state, 0, bytes);
+}
+
+/// Merge fast-path bytes and object counts, for telemetry readers.
 pub(super) fn sync_tlab_accounting(state: &mut GcState) {
     let (mut allocations, mut bytes) = (0u64, 0u64);
-    for record in state.tlab_states.values_mut() {
-        let delta = read_tlab_delta(record);
-        allocations = allocations.saturating_add(delta.0);
-        bytes = bytes.saturating_add(delta.1);
+    let GcState {
+        tlab_states,
+        tlab_chunks,
+        tlab_addresses,
+        ..
+    } = state;
+    for record in tlab_states.values_mut() {
+        bytes = bytes.saturating_add(read_tlab_bytes_delta(record));
+        allocations = allocations.saturating_add(read_tlab_allocations_delta(
+            record,
+            tlab_chunks,
+            tlab_addresses,
+        ));
     }
     add_tlab_accounting(state, allocations, bytes);
 }
@@ -64,6 +123,9 @@ pub(super) fn register_tlab_state(state: &mut GcState, address: usize) {
             address,
             owner: std::thread::current().id(),
             current_chunk: None,
+            chunk_fast_start: 0,
+            retired_fast_allocations: 0,
+            retired_fast_bytes: 0,
             assist_observed_fast_bytes: 0,
             observed_fast_allocations: 0,
             observed_fast_allocated_bytes: 0,
@@ -75,6 +137,9 @@ pub(super) fn retire_tlab_locked(state: &mut GcState, address: usize) -> usize {
     let Some(record) = state.tlab_states.get_mut(&address) else {
         return 0;
     };
+    // Fold the active chunk into the retired totals so the derived counts stay
+    // continuous across retirement.
+    record.retired_fast_bytes = fast_bytes_total(record);
     // SAFETY: the record owns this generated TLS state until unregister/reset.
     let tls = unsafe { tlab_state_at(record.address) };
     let cursor = tls.cursor.swap(0, Ordering::AcqRel);
@@ -95,25 +160,39 @@ pub(super) fn retire_tlab_locked(state: &mut GcState, address: usize) -> usize {
         );
         // The owner is stopped or retiring its own chunk; generated headers
         // are now immutable except for collector liveness/generation fields.
-        let mut offset = 0;
-        while offset < chunk.used {
+        // Take header addresses from the published start bits rather than
+        // chasing `offset += size`: each header load is then independent of
+        // the previous one, and the size chain is only compared, never used
+        // as an address (willow-8hq4.16). An unpublished header shows up as
+        // a gap and an extra bit as an overlap.
+        let used = chunk.used;
+        let mut expected = 0;
+        let mut offsets = std::mem::take(&mut chunk.header_offsets);
+        chunk.mark_bitmap.bits.for_each_set(|index| {
+            let offset = index * GC_REGION_MARK_GRANULE;
+            assert!(
+                offset == expected && offset < used,
+                "generated TLAB header was not published"
+            );
+            // SAFETY: `offset` is inside the retired prefix and equals the
+            // end of the previous validated object, so it names a header.
             let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast()).unwrap();
             let size = object.size();
             assert!(
                 size >= GC_HEADER_SIZE
-                    && size <= chunk.used - offset
+                    && size <= used - offset
                     && size.is_multiple_of(GC_REGION_MARK_GRANULE),
                 "corrupt retired TLAB header"
             );
-            assert!(
-                chunk.mark_bitmap.is_marked(offset),
-                "generated TLAB header was not published"
-            );
-            chunk
-                .header_offsets
-                .push(u16::try_from(offset).expect("TLAB offset fits bounded chunk"));
-            offset += size;
-        }
+            offsets.push(u16::try_from(offset).expect("TLAB offset fits bounded chunk"));
+            expected = offset + size;
+        });
+        assert!(expected == used, "generated TLAB header was not published");
+        chunk.header_offsets = offsets;
+        // Every header but the slow-path first object came from the fast path.
+        record.retired_fast_allocations = record
+            .retired_fast_allocations
+            .saturating_add(chunk.header_offsets.len().saturating_sub(1) as u64);
         return chunk.header_offsets.len();
     }
     0
@@ -151,12 +230,22 @@ pub(super) fn retire_owned_tlabs_locked(state: &mut GcState, owner: ThreadId, un
             .get_mut(&address)
             .expect("owner index has a TLS record");
         debug_assert_eq!(record.owner, owner);
-        let (allocations, bytes) = read_tlab_delta(record);
+        let bytes = read_tlab_bytes_delta(record);
         // Retirement at the initial root handshake starts this owner's epoch
         // after all pre-snapshot allocation. Do not bill it to the new cycle.
         record.assist_observed_fast_bytes = record.observed_fast_allocated_bytes;
-        add_tlab_accounting(state, allocations, bytes);
+        add_tlab_accounting(state, 0, bytes);
         retire_tlab_locked(state, address);
+        // With no active chunk this merges only the retired count: O(1).
+        let GcState {
+            tlab_states,
+            tlab_chunks,
+            tlab_addresses,
+            ..
+        } = &mut *state;
+        let record = tlab_states.get_mut(&address).expect("retired record");
+        let allocations = read_tlab_allocations_delta(record, tlab_chunks, tlab_addresses);
+        add_tlab_accounting(state, allocations, 0);
         if unregister {
             state.tlab_states.remove(&address);
         }

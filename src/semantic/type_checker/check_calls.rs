@@ -244,9 +244,9 @@ impl TypeChecker {
         // A `match` in value position is the same story one arm wider: the
         // expected type reaches every arm VALUE (willow-0g8j.3).
         if let Expr::Match(m) = expr {
-            let previous = self.match_expected.replace(expected.clone());
+            let previous = self.local.match_expected.replace(expected.clone());
             let ty = self.check_match_expr(m);
-            self.match_expected = previous;
+            self.local.match_expected = previous;
             return ty;
         }
         // Unqualified enum-variant construction resolved by the expected type
@@ -641,7 +641,7 @@ impl TypeChecker {
     /// AST-level `ConcurrencyAnalyzer`; this covers the typed-receiver case it
     /// cannot resolve, so the two never overlap (willow-0a6k.2).
     pub(super) fn check_task_method_call(&mut self, obj_ty: &Type, m: &MethodCallExpr) {
-        if self.task_sync_preemption || !self.current_async_context {
+        if self.task_sync_preemption || !self.local.current_async_context {
             return;
         }
         if matches!(&m.object, Expr::Var(name, _, _) if name == "self") {
@@ -661,6 +661,38 @@ impl TypeChecker {
             crate::semantic::ids::TypeId::from_source_name(&declaring),
             m.method.as_str(),
         );
+        self.task_method_calls
+            .push(crate::compiler_db::effects::TaskMethodCall {
+                callee: key,
+                span: m.span,
+                diagnostic_index: self.errors.len(),
+            });
+    }
+
+    pub(super) fn report_task_method_calls(&mut self) {
+        let sites = std::mem::take(&mut self.task_method_calls);
+        let original = std::mem::take(&mut self.errors);
+        let mut sites = sites.into_iter().peekable();
+        for (index, diagnostic) in original
+            .into_iter()
+            .map(Some)
+            .chain(std::iter::once(None))
+            .enumerate()
+        {
+            while sites
+                .peek()
+                .is_some_and(|site| site.diagnostic_index == index)
+            {
+                let site = sites.next().unwrap();
+                self.report_task_method_call(site.callee, site.span);
+            }
+            if let Some(diagnostic) = diagnostic {
+                self.errors.push(diagnostic);
+            }
+        }
+    }
+
+    fn report_task_method_call(&mut self, key: FunctionId, span: Span) {
         // Resolve the reason before building the headline: recursion and loops
         // are reported differently so the message never claims a source loop
         // that is not there.
@@ -674,7 +706,7 @@ impl TypeChecker {
         };
         let diagnostic =
             Diagnostic::new(Severity::Error, ErrorCode::E0810, reason.message(&key)).with_label(
-                Label::primary(m.span, "this call can monopolize the scheduler worker"),
+                Label::primary(span, "this call can monopolize the scheduler worker"),
             );
         let diagnostic = match (same_program, &imported) {
             (Some(helper), _) => {

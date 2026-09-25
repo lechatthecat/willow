@@ -993,7 +993,7 @@ mod tests {
                     )
                     .unwrap(),
                 );
-                let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+                let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
                 codegen.module = module;
                 codegen.func_ids = Default::default();
                 codegen.declare_native_pow_f64().unwrap();

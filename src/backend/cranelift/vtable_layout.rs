@@ -81,30 +81,6 @@ pub(super) fn super_path<
     None
 }
 
-impl IfaceShapes for super::type_index::TypeMap<super::InterfaceInfo> {
-    fn canonical(&self, iface: &super::TypeId) -> super::TypeId {
-        self.get_id(iface)
-            .map(|info| info.name)
-            .unwrap_or_else(|| *iface)
-    }
-    fn supers(&self, iface: &super::TypeId) -> Vec<super::TypeId> {
-        self.get_id(iface)
-            .map(|info| info.extends.clone())
-            .unwrap_or_default()
-    }
-    fn method_slot(&self, iface: &super::TypeId, method: &str) -> Option<usize> {
-        self.get_id(iface)?.method_order.slot_of(method)
-    }
-    fn method_count(&self, iface: &super::TypeId) -> usize {
-        self.get_id(iface).map_or(0, |info| info.method_order.len())
-    }
-    fn methods(&self, iface: &super::TypeId) -> Vec<String> {
-        self.get_id(iface)
-            .map(|info| info.method_order.as_slice().to_vec())
-            .unwrap_or_default()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

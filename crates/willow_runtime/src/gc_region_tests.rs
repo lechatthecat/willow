@@ -55,9 +55,6 @@ fn tlab_fast_alloc_for_test(
     .unwrap();
     publish_tlab_start_for_test(tls, cursor as *mut u8);
     tls.cursor.store(cursor + total_size, Ordering::Release);
-    tls.fast_allocations.fetch_add(1, Ordering::Relaxed);
-    tls.fast_allocated_bytes
-        .fetch_add(total_size as u64, Ordering::Relaxed);
     object.payload().as_ptr()
 }
 
@@ -802,8 +799,6 @@ fn pinned_region_01_metrics_include_in_place_survivor() {
     let mut tls = GcTlabState {
         cursor: AtomicUsize::new(0),
         limit: AtomicUsize::new(0),
-        fast_allocations: AtomicU64::new(0),
-        fast_allocated_bytes: AtomicU64::new(0),
         start_bits: AtomicUsize::new(0),
     };
     let mut young = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
@@ -831,8 +826,6 @@ fn pinned_region_02_major_collection_releases_unrooted_chunk() {
     let mut tls = GcTlabState {
         cursor: AtomicUsize::new(0),
         limit: AtomicUsize::new(0),
-        fast_allocations: AtomicU64::new(0),
-        fast_allocated_bytes: AtomicU64::new(0),
         start_bits: AtomicUsize::new(0),
     };
     let mut young = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
@@ -852,8 +845,6 @@ fn pinned_region_03_verifier_rejects_missing_mark() {
     let mut tls = GcTlabState {
         cursor: AtomicUsize::new(0),
         limit: AtomicUsize::new(0),
-        fast_allocations: AtomicU64::new(0),
-        fast_allocated_bytes: AtomicU64::new(0),
         start_bits: AtomicUsize::new(0),
     };
     let mut young = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
@@ -881,8 +872,6 @@ fn pinned_region_04_verifier_rejects_live_byte_mismatch() {
     let mut tls = GcTlabState {
         cursor: AtomicUsize::new(0),
         limit: AtomicUsize::new(0),
-        fast_allocations: AtomicU64::new(0),
-        fast_allocated_bytes: AtomicU64::new(0),
         start_bits: AtomicUsize::new(0),
     };
     let mut young = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
@@ -910,8 +899,6 @@ fn pinned_region_05_one_survivor_retains_chunk_and_reports_sparse_liveness() {
     let mut tls = GcTlabState {
         cursor: AtomicUsize::new(0),
         limit: AtomicUsize::new(0),
-        fast_allocations: AtomicU64::new(0),
-        fast_allocated_bytes: AtomicU64::new(0),
         start_bits: AtomicUsize::new(0),
     };
     let mut survivor = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
@@ -961,8 +948,6 @@ fn pinned_region_06_dead_holes_are_not_reused_for_new_tlab_allocations() {
     let mut tls = GcTlabState {
         cursor: AtomicUsize::new(0),
         limit: AtomicUsize::new(0),
-        fast_allocations: AtomicU64::new(0),
-        fast_allocated_bytes: AtomicU64::new(0),
         start_bits: AtomicUsize::new(0),
     };
     let mut survivor = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
@@ -1004,8 +989,6 @@ fn remembered_region_01_duplicate_barrier_hits_only_once() {
     let mut tls = GcTlabState {
         cursor: AtomicUsize::new(0),
         limit: AtomicUsize::new(0),
-        fast_allocations: AtomicU64::new(0),
-        fast_allocated_bytes: AtomicU64::new(0),
         start_bits: AtomicUsize::new(0),
     };
     let young = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
@@ -1039,8 +1022,6 @@ fn remembered_region_02_two_owners_can_share_one_card() {
     let mut tls = GcTlabState {
         cursor: AtomicUsize::new(0),
         limit: AtomicUsize::new(0),
-        fast_allocations: AtomicU64::new(0),
-        fast_allocated_bytes: AtomicU64::new(0),
         start_bits: AtomicUsize::new(0),
     };
     let young = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
@@ -1071,8 +1052,6 @@ fn remembered_region_03_sweeping_one_shared_card_owner_keeps_card_dirty() {
     let mut tls = GcTlabState {
         cursor: AtomicUsize::new(0),
         limit: AtomicUsize::new(0),
-        fast_allocations: AtomicU64::new(0),
-        fast_allocated_bytes: AtomicU64::new(0),
         start_bits: AtomicUsize::new(0),
     };
     let young = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
@@ -1110,8 +1089,6 @@ fn remembered_region_04_global_destination_is_not_remembered() {
     let mut tls = GcTlabState {
         cursor: AtomicUsize::new(0),
         limit: AtomicUsize::new(0),
-        fast_allocations: AtomicU64::new(0),
-        fast_allocated_bytes: AtomicU64::new(0),
         start_bits: AtomicUsize::new(0),
     };
     let young = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
@@ -1134,8 +1111,6 @@ fn remembered_region_05_pinned_owner_tracks_new_young_child() {
     let mut tls = GcTlabState {
         cursor: AtomicUsize::new(0),
         limit: AtomicUsize::new(0),
-        fast_allocations: AtomicU64::new(0),
-        fast_allocated_bytes: AtomicU64::new(0),
         start_bits: AtomicUsize::new(0),
     };
     let mut owner = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0b1);
@@ -1432,10 +1407,6 @@ fn retired_tlab_header_index_bounds_lookup_work_and_rejects_dead_headers() {
         }
         tls.cursor
             .store(base as usize + count * size, Ordering::Release);
-        tls.fast_allocations
-            .store((count - 1) as u64, Ordering::Release);
-        tls.fast_allocated_bytes
-            .store(((count - 1) * size) as u64, Ordering::Release);
         let mut state = runtime().heap.lock().unwrap();
         assert_eq!(retire_all_tlabs_locked(&mut state), count);
         let chunk = &state.tlab_chunks[0];
@@ -1819,9 +1790,6 @@ fn active_tlab_validation_requires_publication_not_just_an_advanced_cursor() {
     initialize_object_at(header, bytes, 0, 0, 0).unwrap();
     assert!(validate_payload_pointer(payload, "initialized but unpublished").is_err());
     publish_tlab_start_for_test(&tls, header);
-    tls.fast_allocations.store(1, Ordering::Release);
-    tls.fast_allocated_bytes
-        .store(bytes as u64, Ordering::Release);
     assert!(
         std::thread::spawn(
             move || validate_payload_pointer(address as *mut u8, "published tail").is_ok()

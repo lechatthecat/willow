@@ -17,6 +17,7 @@ pub enum InitUnitId {
 pub struct ModuleInitPlan {
     order: Vec<InitUnitId>,
     modules: HashMap<String, ModuleId>,
+    next_module_id: u32,
 }
 
 impl Default for ModuleInitPlan {
@@ -24,6 +25,7 @@ impl Default for ModuleInitPlan {
         Self {
             order: vec![InitUnitId::Entry],
             modules: HashMap::new(),
+            next_module_id: 1,
         }
     }
 }
@@ -33,6 +35,9 @@ impl ModuleInitPlan {
         let mut plan = Self::default();
         for file in &graph.files {
             plan.modules.insert(file.canonical_path.clone(), file.id);
+            plan.next_module_id = plan
+                .next_module_id
+                .max(file.id.0.checked_add(1).expect("module identity exhausted"));
             plan.order
                 .insert(plan.order.len() - 1, InitUnitId::Module(file.id));
         }
@@ -49,9 +54,11 @@ impl ModuleInitPlan {
         if let Some(id) = self.modules.get(canonical_path) {
             return InitUnitId::Module(*id);
         }
-        let id = ModuleId(self.modules.values().map(|id| id.0).max().map_or(0, |id| {
-            id.checked_add(1).expect("module identity exhausted")
-        }));
+        let id = ModuleId(self.next_module_id);
+        self.next_module_id = self
+            .next_module_id
+            .checked_add(1)
+            .expect("module identity exhausted");
         self.modules.insert(canonical_path.to_string(), id);
         let unit = InitUnitId::Module(id);
         self.order.insert(self.order.len() - 1, unit);

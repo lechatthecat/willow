@@ -1,0 +1,21 @@
+// A lambda written inside a constructor is its own callable: it may return a
+// value even though `init` itself cannot.
+class Scaled {
+    pub value: i64;
+
+    pub init(self, base: i64) {
+        let scale = |x: i64| {
+            let offset = |y: i64| { return y + base; };
+            return offset(x) * 2;
+        };
+        self.value = scale(1);
+        if base > 100 {
+            return;
+        }
+    }
+}
+
+fn main() {
+    println(new Scaled(3).value);
+    println(new Scaled(200).value);
+}

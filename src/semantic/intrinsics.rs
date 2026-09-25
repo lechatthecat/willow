@@ -49,7 +49,7 @@ use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 /// representation. Width and element types stay in the receiver `Type`, which
 /// every caller already holds, so this enum can be `Copy`/`Eq`/`Hash` and can be
 /// enumerated exhaustively by [`Intrinsic::ALL`] for round-trip tests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Intrinsic {
     /// `i64.toString()` → `willow_i64_to_string`.
     I64ToString,

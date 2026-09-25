@@ -7,11 +7,23 @@ use crate::parser::ast::{BinOp, ExprId, UnaryOp};
 use crate::semantic::ids::{FunctionId, SemanticType as Type, TypeId};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq)]
+// JSON numbers cannot preserve every IEEE-754 value. Store the payload bits,
+// including signed zero, infinities, and distinct NaN payloads.
+mod float_bits {
+    use serde::{Deserialize, Serialize};
+    pub fn serialize<S: serde::Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+        value.to_bits().serialize(serializer)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+        u64::deserialize(deserializer).map(f64::from_bits)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LirOperand {
     Local(LirLocalId),
     Int(i64),
-    Float(f64),
+    Float(#[serde(with = "float_bits")] f64),
     Bool(bool),
     Reference {
         place: LirPlace,
@@ -21,7 +33,7 @@ pub enum LirOperand {
 }
 
 /// Captured storage identity, independent of subsequent array resizing.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LirPlace {
     Local(LirLocalId),
     Field {
@@ -97,7 +109,7 @@ impl LirOperand {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LirRvalue {
     BeginReferenceCall,
     Use(LirOperand),
@@ -476,6 +488,28 @@ pub(super) use lower::{lower_blocks, lower_calls};
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn float_operand_artifacts_preserve_every_payload_bit() {
+        for bits in [
+            0_u64,
+            1_u64,
+            (-0.0_f64).to_bits(),
+            1.25_f64.to_bits(),
+            f64::INFINITY.to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+            0x7ff8_0000_0000_0001,
+            0x7ff0_0000_0000_0001,
+            0xfff8_1234_5678_9abc,
+        ] {
+            let wire = serde_json::to_vec(&super::LirOperand::Float(f64::from_bits(bits))).unwrap();
+            let restored: super::LirOperand = serde_json::from_slice(&wire).unwrap();
+            let super::LirOperand::Float(value) = restored else {
+                panic!("float operand");
+            };
+            assert_eq!(value.to_bits(), bits);
+        }
+    }
+
     use super::*;
 
     #[test]

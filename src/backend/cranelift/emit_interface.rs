@@ -102,19 +102,33 @@ struct DispatchHierarchy {
 }
 
 impl DispatchHierarchy {
-    fn new(bases: &TypeMap<TypeId>, types: &TypeMap<i64>) -> Self {
+    /// The `extends` graph of every class with a runtime `type_id`, projected
+    /// into id space (willow-au5k): `classes` lists each class NAME with its
+    /// id and `base_id_of` answers the id of a name's direct base. Every name
+    /// for one class shares one id, so the projection collapses aliases onto
+    /// exactly the relation the emitted dispatch chain tests. An edge to a
+    /// class without an id contributes nothing: such a class is not a
+    /// dispatch candidate in the first place.
+    fn new(
+        classes: impl IntoIterator<Item = (TypeId, i64)>,
+        base_id_of: impl Fn(&TypeId) -> Option<i64>,
+    ) -> Self {
         let mut children: HashMap<i64, Vec<i64>> = HashMap::new();
-        for (child, base) in class_base_ids(bases, types) {
-            children.entry(base).or_default().push(child);
-            #[cfg(test)]
-            DESCENDANT_WORK.with(|w| {
-                let [b, v] = w.get();
-                w.set([b + 1, v]);
-            });
-        }
         let mut names: HashMap<i64, Vec<TypeId>> = HashMap::new();
-        for (name, &id) in types.iter() {
-            names.entry(id).or_default().push(*name);
+        let mut edges = HashSet::new();
+        for (name, id) in classes {
+            names.entry(id).or_default().push(name);
+            // Two spellings of one class name one edge.
+            if let Some(base) = base_id_of(&name)
+                && edges.insert((id, base))
+            {
+                children.entry(base).or_default().push(id);
+                #[cfg(test)]
+                DESCENDANT_WORK.with(|w| {
+                    let [b, v] = w.get();
+                    w.set([b + 1, v]);
+                });
+            }
         }
         Self {
             children,
@@ -342,15 +356,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             work.set([queries + 1, visits]);
         });
         let (mut summary, mut defining) = self.own_dispatch_summary(class, method);
-        if let Some(&receiver) = self.class_type_ids.get(class) {
+        if let Some(receiver) = self.classes.type_id(class) {
             let hierarchy = {
                 let mut cache = self.dispatch_cache.borrow_mut();
                 cache
                     .hierarchy
                     .get_or_insert_with(|| {
+                        // Over DECLARATION identities, not this unit's
+                        // spellings: the graph is build-wide (willow-kd1v).
                         std::rc::Rc::new(DispatchHierarchy::new(
-                            self.class_base,
-                            self.class_type_ids,
+                            self.classes.runtime_classes(),
+                            |name| {
+                                self.classes
+                                    .base_canonical(name)
+                                    .and_then(|base| self.classes.type_id_canonical(&base))
+                            },
                         ))
                     })
                     .clone()
@@ -368,7 +388,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     cache
                         .fallback_names
                         .get_or_insert_with(|| {
-                            let mut names: Vec<_> = self.class_type_ids.keys().copied().collect();
+                            let mut names: Vec<_> = self
+                                .classes
+                                .runtime_classes()
+                                .into_iter()
+                                .map(|(name, _)| name)
+                                .collect();
                             names.sort();
                             names.into()
                         })
@@ -416,12 +441,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // neither be overridden nor override anything, so its callee is fixed
         // at compile time and a direct call is the whole answer.
         let vslot = self
-            .class_vslots
-            .get(class_name)
+            .classes
+            .slots(class_name)
             .and_then(|slots| slots.slot_of(method_name));
 
-        let (summary, defining) = if vslot.is_none() && self.class_type_ids.contains_key(class_name)
-        {
+        let (summary, defining) = if vslot.is_none() && self.classes.type_id(class_name).is_some() {
             self.own_dispatch_summary(class_name, method_name)
         } else {
             self.virtual_dispatch_summary(class_name, method_name)
@@ -498,7 +522,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let parent = if defines {
                     None
                 } else {
-                    self.class_base.get(name).map(ToString::to_string)
+                    self.classes.base(name).map(|base| base.to_string())
                 };
                 (defines, parent)
             })
@@ -517,56 +541,44 @@ pub(super) fn collection_elem_kind(ty: &Type) -> Option<i64> {
     }
 }
 
-/// This program's `extends` graph keyed by runtime `type_id`.
-///
-/// `class_base` is keyed by class NAME, and one class can appear under more
-/// than one name: a directly imported class (`import zoo::Dog;`) is registered
-/// both canonically and under its local alias, and the two entries can record
-/// their base under different spellings. Every name for one class shares one
-/// `type_id`, so projecting the graph into id space collapses the aliases and
-/// leaves exactly the relation the emitted dispatch chain tests (willow-au5k).
-///
-/// Names with no `type_id` are dropped: a class that has no runtime id is not a
-/// dispatch candidate in the first place.
-pub(super) fn class_base_ids(
-    class_base: &TypeMap<TypeId>,
-    class_type_ids: &TypeMap<i64>,
-) -> HashMap<i64, i64> {
-    class_base
-        .iter()
-        .filter_map(|(child, base)| {
-            Some((
-                *class_type_ids.get_canonical_id(child)?,
-                *class_type_ids.get_canonical_id(base)?,
-            ))
-        })
-        .collect()
-}
-
 /// Whether a receiver whose static class has `ancestor_id` can hold an object
-/// whose runtime class has `class_id` — the dispatch-chain filter's question.
+/// of `class` — the dispatch-chain filter's question — by walking `class`'s
+/// `extends` chain through `base_of` and comparing runtime `type_id`s from
+/// `id_of`.
 ///
-/// The relation is DIRECTED: a base class is not a candidate for a receiver
-/// typed as one of its subclasses. The `seen` set makes a malformed `extends`
-/// cycle terminate instead of hanging the compiler — a cycle is a checker
-/// error, and codegen must not be the place where it turns into a hang.
-pub(super) fn is_self_or_descendant(
-    base_of: &HashMap<i64, i64>,
-    class_id: i64,
+/// The walk runs over whatever node the caller's tables are keyed by (names
+/// in the LIR walker, ids in the perspectives below) but COMPARES ids, so a
+/// class reached under an alias still meets its canonical spelling: every
+/// name for one class shares one `type_id` (willow-au5k). The relation is
+/// DIRECTED: a base class is not a candidate for a receiver typed as one of
+/// its subclasses. The `seen` set makes a malformed `extends` cycle terminate
+/// instead of hanging the compiler — a cycle is a checker error, and codegen
+/// must not be the place where it turns into a hang. Cost is one step per
+/// ancestor, independent of the number of classes in the program.
+pub(super) fn is_self_or_descendant<N: Copy + Eq + std::hash::Hash>(
+    class: N,
     ancestor_id: i64,
+    id_of: impl Fn(N) -> Option<i64>,
+    base_of: impl Fn(N) -> Option<N>,
 ) -> bool {
     let mut seen = HashSet::new();
-    let mut current = Some(class_id);
-    while let Some(id) = current {
-        if id == ancestor_id {
+    let mut current = Some(class);
+    while let Some(node) = current {
+        if id_of(node) == Some(ancestor_id) {
             return true;
         }
-        if !seen.insert(id) {
+        if !seen.insert(node) {
             return false;
         }
-        current = base_of.get(&id).copied();
+        current = base_of(node);
     }
     false
+}
+
+/// [`is_self_or_descendant`] over an `extends` graph already in id space.
+#[cfg(test)]
+fn reaches(base_of: &HashMap<i64, i64>, class_id: i64, ancestor_id: i64) -> bool {
+    is_self_or_descendant(class_id, ancestor_id, Some, |id| base_of.get(&id).copied())
 }
 
 /// Collect the receiver subtree once instead of walking every class's ancestry.
@@ -644,7 +656,7 @@ mod tests {
                 for candidate in 0..=4 {
                     assert_eq!(
                         reachable.contains(&candidate),
-                        is_self_or_descendant(&bases, candidate, receiver),
+                        reaches(&bases, candidate, receiver),
                         "graph={bases:?} receiver={receiver} candidate={candidate}"
                     );
                 }
@@ -733,7 +745,12 @@ mod tests {
                     }
                 }
                 DESCENDANT_WORK.with(|w| w.set([0; 2]));
-                let hierarchy = DispatchHierarchy::new(&bases, &ids);
+                let hierarchy =
+                    DispatchHierarchy::new(ids.iter().map(|(name, id)| (*name, *id)), |name| {
+                        bases
+                            .get_canonical_id(name)
+                            .and_then(|base| ids.get_canonical_id(base).copied())
+                    });
                 let mut visits = 0;
                 for method in ["fixed", "override"] {
                     for _ in 0..4 {
@@ -820,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn defining_cache_invalidates_on_reparent_and_function_alias_changes() {
+    fn defining_cache_follows_frozen_bases_and_function_alias_changes() {
         fn declare(cg: &mut Codegen, source: &str) {
             let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
             let (program, errors) = crate::parser::Parser::new(tokens).parse();
@@ -832,7 +849,7 @@ mod tests {
                 }
             }
         }
-        let mut cg = Codegen::new(&CompilerOptions::debug()).unwrap();
+        let mut cg = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
         declare(
             &mut cg,
             "open class A { pub fn value(self) -> i64 { return 1; } } open class X { pub fn value(self) -> i64 { return 2; } } class B extends A {}",
@@ -843,8 +860,11 @@ mod tests {
         for _ in 0..4 {
             assert_eq!(cg.resolve_class_method_func_id("B", "value"), Some(a));
         }
+        // A declaration identity's base is frozen at its first registration
+        // (willow-afb5.16): re-declaring `B` under another parent requests the
+        // same edge again, so the inherited method stays `A::value`.
         declare(&mut cg, "class B extends X {}");
-        assert_eq!(cg.resolve_class_method_func_id("B", "value"), Some(x));
+        assert_eq!(cg.resolve_class_method_func_id("B", "value"), Some(a));
         assert_eq!(cg.resolve_class_method_func_id("Alias", "value"), None);
         let alias = cg.class_method_symbol("Alias", "value");
         let a_name = cg.class_method_symbol("A", "value");
@@ -871,34 +891,34 @@ mod tests {
 
     #[test]
     fn dispatch_01_a_class_is_a_candidate_for_its_own_type() {
-        assert!(is_self_or_descendant(&hierarchy(), BASE, BASE));
-        assert!(is_self_or_descendant(&hierarchy(), UNRELATED, UNRELATED));
+        assert!(reaches(&hierarchy(), BASE, BASE));
+        assert!(reaches(&hierarchy(), UNRELATED, UNRELATED));
     }
 
     #[test]
     fn dispatch_02_a_direct_subclass_is_a_candidate() {
-        assert!(is_self_or_descendant(&hierarchy(), MIDDLE, BASE));
+        assert!(reaches(&hierarchy(), MIDDLE, BASE));
     }
 
     #[test]
     fn dispatch_03_a_transitive_subclass_is_a_candidate() {
-        assert!(is_self_or_descendant(&hierarchy(), LEAF, BASE));
+        assert!(reaches(&hierarchy(), LEAF, BASE));
     }
 
     /// The whole point of the filter: a class that merely shares a method NAME
     /// with the receiver's class can never carry the receiver's type_id.
     #[test]
     fn dispatch_04_an_unrelated_class_is_not_a_candidate() {
-        assert!(!is_self_or_descendant(&hierarchy(), UNRELATED, BASE));
-        assert!(!is_self_or_descendant(&hierarchy(), BASE, UNRELATED));
+        assert!(!reaches(&hierarchy(), UNRELATED, BASE));
+        assert!(!reaches(&hierarchy(), BASE, UNRELATED));
     }
 
     /// Direction matters. A receiver typed `Leaf` holds a `Leaf`, never the
     /// `Base` it inherits from, so `Base` is not one of its candidates.
     #[test]
     fn dispatch_05_the_relation_is_directed() {
-        assert!(is_self_or_descendant(&hierarchy(), LEAF, BASE));
-        assert!(!is_self_or_descendant(&hierarchy(), BASE, LEAF));
+        assert!(reaches(&hierarchy(), LEAF, BASE));
+        assert!(!reaches(&hierarchy(), BASE, LEAF));
     }
 
     /// A sibling branch is excluded even though both sides share an ancestor.
@@ -907,9 +927,9 @@ mod tests {
         const OTHER: i64 = 5;
         let mut classes = hierarchy();
         classes.insert(OTHER, BASE);
-        assert!(!is_self_or_descendant(&classes, OTHER, MIDDLE));
-        assert!(!is_self_or_descendant(&classes, MIDDLE, OTHER));
-        assert!(is_self_or_descendant(&classes, OTHER, BASE));
+        assert!(!reaches(&classes, OTHER, MIDDLE));
+        assert!(!reaches(&classes, MIDDLE, OTHER));
+        assert!(reaches(&classes, OTHER, BASE));
     }
 
     /// An `extends` cycle is a checker error. If one ever reaches codegen the
@@ -918,15 +938,15 @@ mod tests {
     #[test]
     fn dispatch_07_an_extends_cycle_terminates() {
         let cyclic = HashMap::from([(1i64, 2i64), (2, 1)]);
-        assert!(!is_self_or_descendant(&cyclic, 1, 99));
+        assert!(!reaches(&cyclic, 1, 99));
     }
 
     /// ...and still answers correctly when the target IS in the cycle.
     #[test]
     fn dispatch_08_a_cycle_still_reports_a_reachable_ancestor() {
         let cyclic = HashMap::from([(1i64, 2i64), (2, 1)]);
-        assert!(is_self_or_descendant(&cyclic, 1, 2));
-        assert!(is_self_or_descendant(&cyclic, 2, 1));
+        assert!(reaches(&cyclic, 1, 2));
+        assert!(reaches(&cyclic, 2, 1));
     }
 
     /// With no inheritance at all, identity is the only relation — which is
@@ -934,15 +954,15 @@ mod tests {
     #[test]
     fn dispatch_09_without_inheritance_only_identity_holds() {
         let flat = HashMap::new();
-        assert!(is_self_or_descendant(&flat, BASE, BASE));
-        assert!(!is_self_or_descendant(&flat, UNRELATED, BASE));
+        assert!(reaches(&flat, BASE, BASE));
+        assert!(!reaches(&flat, UNRELATED, BASE));
     }
 
     /// A class the graph has never heard of resolves to nothing rather than to
     /// a default answer.
     #[test]
     fn dispatch_10_an_unknown_class_is_not_a_candidate() {
-        assert!(!is_self_or_descendant(&hierarchy(), 404, BASE));
+        assert!(!reaches(&hierarchy(), 404, BASE));
     }
 
     /// Depth is not bounded by anything in the language, so the walk must not
@@ -950,9 +970,9 @@ mod tests {
     #[test]
     fn dispatch_11_a_deep_hierarchy_resolves_to_its_root() {
         let deep: HashMap<i64, i64> = (1..64).map(|level| (level, level - 1)).collect();
-        assert!(is_self_or_descendant(&deep, 63, 0));
-        assert!(is_self_or_descendant(&deep, 63, 62));
-        assert!(!is_self_or_descendant(&deep, 0, 63));
+        assert!(reaches(&deep, 63, 0));
+        assert!(reaches(&deep, 63, 62));
+        assert!(!reaches(&deep, 0, 63));
     }
 
     /// The reason the graph is projected into id space at all: a directly
@@ -977,13 +997,39 @@ mod tests {
             ("Dog".to_string(), TypeId::from_source_name("zoo::Animal")),
         ]);
 
-        let base_ids = class_base_ids(&class_base, &type_ids);
-        assert_eq!(base_ids, HashMap::from([(2i64, 1i64)]));
+        let id_of = |name: TypeId| type_ids.get_canonical_id(&name).copied();
+        let base_of = |name: TypeId| class_base.get_canonical_id(&name).copied();
+        // The name walk meets the receiver's alias through the canonical id.
         assert!(is_self_or_descendant(
-            &base_ids,
-            type_ids["Dog"],
-            type_ids["Animal"]
+            TypeId::from_source_name("Dog"),
+            type_ids["Animal"],
+            id_of,
+            base_of
         ));
+        assert!(is_self_or_descendant(
+            TypeId::from_source_name("zoo::Dog"),
+            type_ids["Animal"],
+            id_of,
+            base_of
+        ));
+        assert!(!is_self_or_descendant(
+            TypeId::from_source_name("Animal"),
+            type_ids["Dog"],
+            id_of,
+            base_of
+        ));
+        // Projected into id space, the aliases collapse onto one edge.
+        let hierarchy =
+            DispatchHierarchy::new(type_ids.iter().map(|(name, id)| (*name, *id)), |name| {
+                base_of(*name).and_then(id_of)
+            });
+        assert_eq!(hierarchy.children, HashMap::from([(1i64, vec![2i64])]));
+        let base_ids: HashMap<i64, i64> = hierarchy
+            .children
+            .iter()
+            .flat_map(|(base, children)| children.iter().map(move |child| (*child, *base)))
+            .collect();
+        assert_eq!(base_ids, HashMap::from([(2i64, 1i64)]));
         assert_eq!(
             descendant_ids(&base_ids, type_ids["Animal"]),
             HashSet::from([1, 2])
@@ -999,7 +1045,19 @@ mod tests {
             ("Known".to_string(), TypeId::from_source_name("Vanished")),
             ("Vanished".to_string(), TypeId::from_source_name("Known")),
         ]);
-        assert!(class_base_ids(&class_base, &type_ids).is_empty());
+        let hierarchy =
+            DispatchHierarchy::new(type_ids.iter().map(|(name, id)| (*name, *id)), |name| {
+                class_base
+                    .get_canonical_id(name)
+                    .and_then(|base| type_ids.get_canonical_id(base).copied())
+            });
+        assert!(hierarchy.children.is_empty());
+        assert!(!is_self_or_descendant(
+            TypeId::from_source_name("Known"),
+            2,
+            |name| type_ids.get_canonical_id(&name).copied(),
+            |name| class_base.get_canonical_id(&name).copied()
+        ));
     }
 
     const INVALID_BOX_FIXTURE_SOURCE: &str = r#"
@@ -1049,12 +1107,18 @@ fn main() {}
         );
 
         let mut codegen =
-            Codegen::new(&CompilerOptions::debug()).expect("codegen should initialize");
+            Codegen::for_tests(&CompilerOptions::debug()).expect("codegen should initialize");
         for (name, info) in &checker.symbols.enums {
             codegen.register_enum_info(name.to_string(), info.to_semantic());
         }
         for (name, info) in &checker.symbols.interfaces {
-            codegen.register_interface_info(name.to_string(), info.to_semantic());
+            codegen
+                .register_interface_info(
+                    name.to_string(),
+                    TypeId::from_source_name(&info.name),
+                    || info.to_semantic(),
+                )
+                .unwrap();
         }
         codegen.register_expr_types(
             checker

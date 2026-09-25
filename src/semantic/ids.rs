@@ -250,6 +250,13 @@ impl FunctionId {
         let owner = owner.spelling();
         Self::intern(owner.namespace, Some(owner.name), name.as_ref())
     }
+    /// The callable identity of a lambda body, shared by the checker's
+    /// resolved call graph and the backend's effect inventory. Body identities
+    /// are process-unique and the spelling is not a legal identifier, so it
+    /// cannot collide with a source function.
+    pub fn lambda(body: crate::parser::ast::BodyId) -> Self {
+        Self::free(format!("<lambda {body}>"))
+    }
     pub fn in_namespace(self, namespace: impl AsRef<str>) -> Self {
         let name = self.spelling();
         Self::intern(Some(namespace.as_ref()), name.owner, name.name)
@@ -452,6 +459,32 @@ pub struct FunctionMap<V> {
 impl<V> Default for FunctionMap<V> {
     fn default() -> Self {
         Self::with_scope(FunctionScope::default())
+    }
+}
+
+/// Equal maps hold equal entries, aliases and backend spellings, so either
+/// one reproduces the other's serialized form exactly.
+impl<V: PartialEq> PartialEq for FunctionMap<V> {
+    fn eq(&self, other: &Self) -> bool {
+        self.values == other.values
+            && *self.scope.aliases == *other.scope.aliases
+            && *self.scope.declarations.borrow() == *other.scope.declarations.borrow()
+    }
+}
+
+impl<V: Clone> FunctionMap<V> {
+    /// A copy that shares no spelling registry with `self`, as a decoded copy
+    /// would not: later `declare` calls on either side stay private to it.
+    pub fn detached_clone(&self) -> Self {
+        Self {
+            values: self.values.clone(),
+            scope: FunctionScope {
+                aliases: std::rc::Rc::clone(&self.scope.aliases),
+                declarations: std::rc::Rc::new(std::cell::RefCell::new(
+                    self.scope.declarations.borrow().clone(),
+                )),
+            },
+        }
     }
 }
 
@@ -759,5 +792,34 @@ mod intern_tests {
             .map(|thread| thread.join().unwrap())
             .collect();
         assert!(values.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+}
+
+// Session artifacts preserve resolution scope as well as declaration identity.
+impl<V: serde::Serialize> serde::Serialize for FunctionMap<V> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let values: Vec<_> = self.values.iter().collect();
+        let aliases: Vec<_> = self.scope.aliases.iter().collect();
+        serde::Serialize::serialize(
+            &(values, aliases, &*self.scope.declarations.borrow()),
+            serializer,
+        )
+    }
+}
+impl<'de, V: serde::Deserialize<'de>> serde::Deserialize<'de> for FunctionMap<V> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        type Stored<V> = (
+            Vec<(FunctionId, V)>,
+            Vec<(FunctionId, FunctionId)>,
+            HashMap<String, FunctionId>,
+        );
+        let (values, aliases, declarations) = Stored::<V>::deserialize(deserializer)?;
+        Ok(Self {
+            values: values.into_iter().collect(),
+            scope: FunctionScope {
+                aliases: std::rc::Rc::new(aliases.into_iter().collect()),
+                declarations: std::rc::Rc::new(std::cell::RefCell::new(declarations)),
+            },
+        })
     }
 }

@@ -47,7 +47,16 @@ impl ConcurrentMarkBits {
             word.fetch_and(!(1u64 << (index % 64)), Ordering::Release);
         }
     }
-    #[cfg(test)]
+    /// Visit set indices in ascending order: O(words + set bits).
+    pub(super) fn for_each_set(&self, mut visit: impl FnMut(usize)) {
+        for (word_index, word) in self.words.iter().enumerate() {
+            let mut bits = word.load(Ordering::Acquire);
+            while bits != 0 {
+                visit(word_index * 64 + bits.trailing_zeros() as usize);
+                bits &= bits - 1;
+            }
+        }
+    }
     pub(super) fn count(&self) -> usize {
         self.words
             .iter()
@@ -60,6 +69,22 @@ impl ConcurrentMarkBits {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn for_each_set_visits_ascending_indices_across_words() {
+        for objects in [1, 63, 64, 65, 4096] {
+            let bits = ConcurrentMarkBits::new(objects);
+            let expected: Vec<_> = (0..objects)
+                .filter(|i| i % 3 == 0 || i % 64 == 63)
+                .collect();
+            for &index in &expected {
+                bits.set(index);
+            }
+            let mut seen = Vec::new();
+            bits.for_each_set(|index| seen.push(index));
+            assert_eq!(seen, expected);
+        }
+    }
 
     #[test]
     fn concurrent_claims_have_exactly_one_owner_across_word_boundaries() {

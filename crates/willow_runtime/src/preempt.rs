@@ -21,6 +21,7 @@
 
 use std::cell::Cell;
 use std::ffi::c_void;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -65,14 +66,23 @@ impl PreemptConfig {
     }
 }
 
-/// Read the active preemption config from the environment. Read per quantum
-/// (like [`crate::scheduler::runtime_worker_config`]) so tests and tuning can
-/// override it without a process restart.
+/// The preemption config from the environment, read once per process.
+///
+/// The scheduler starts a quantum around every task poll, so this is on the
+/// per-poll path. `std::env::var` takes std's process-global environment
+/// `RwLock` and scans `environ`; with every worker doing that per poll, the
+/// lock's reader count bounces between cores and cost ~10% of `yield_switch`
+/// (willow-g7cs). Tuning goes through the environment of a fresh process, which
+/// is how every test that sets these variables runs; tests that need a specific
+/// config in-process use [`begin_quantum`] instead.
 pub fn runtime_preempt_config() -> PreemptConfig {
-    PreemptConfig::from_env_values(
-        std::env::var("WILLOW_TASK_BUDGET").ok().as_deref(),
-        std::env::var("WILLOW_TIME_QUANTUM_MS").ok().as_deref(),
-    )
+    static CONFIG: LazyLock<PreemptConfig> = LazyLock::new(|| {
+        PreemptConfig::from_env_values(
+            std::env::var("WILLOW_TASK_BUDGET").ok().as_deref(),
+            std::env::var("WILLOW_TIME_QUANTUM_MS").ok().as_deref(),
+        )
+    });
+    *CONFIG
 }
 
 /// Per-worker-thread quantum state. A worker runs at most one task at a time, so
@@ -673,7 +683,7 @@ mod tests {
     // so this stays deterministic under parallel test execution).
     #[test]
     fn abi_config_getters_default() {
-        // These read the live env; no test sets WILLOW_TASK_BUDGET /
+        // These read the process env once; no test sets WILLOW_TASK_BUDGET /
         // WILLOW_TIME_QUANTUM_MS, so defaults must hold. Env *override* is
         // covered by the pure-parse tests (#2/#3).
         assert_eq!(willow_preempt_task_budget(), DEFAULT_TASK_BUDGET);

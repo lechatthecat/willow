@@ -105,19 +105,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 field,
                 ..
             } => {
-                let layout = self.lir_class_layout(object_ty);
-                let index = layout
-                    .iter()
-                    .position(|(name, _)| name == field)
+                let (offset, _) = self
+                    .lir_class_layout(object_ty)
+                    .field(field)
                     .expect("checked reference field");
                 let owner = self.load_lir_local(function, *object);
-                self.builder.ins().iadd_imm_s(
-                    owner,
-                    (index as i64 + 1)
-                        * willow_abi::storage_word_bytes(
-                            reference_type(self.module.target_config()).bytes(),
-                        ) as i64,
-                )
+                self.builder.ins().iadd_imm_s(owner, offset)
             }
             LirPlace::ArrayElement { owner, index, .. } => {
                 let owner = self.load_lir_local(function, *owner);
@@ -150,7 +143,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let mut user_callee = symbol.clone();
         let mut interface = false;
         if let Some(owner) = callee.owner_type() {
-            interface = self.interface_infos.contains_key(&owner);
+            interface = self.classes.is_interface(&owner);
             if interface {
                 user_callee = callee.name().to_owned();
             } else if callee.name() == "init" {
@@ -179,10 +172,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let mode = if interface {
             callee
                 .owner_type()
-                .and_then(|owner| self.interface_infos.get(&owner))
-                .and_then(|info| info.methods.get(callee.name()))
-                .and_then(|method| method.param_infos.get(index))
-                .map(|param| param.mode.clone())
+                .and_then(|owner| self.classes.interface(&owner))
+                .and_then(|info| {
+                    let method = info.methods.get(callee.name())?;
+                    Some(method.param_infos.get(index)?.mode.clone())
+                })
         } else {
             self.func_param_modes
                 .get(&symbol)

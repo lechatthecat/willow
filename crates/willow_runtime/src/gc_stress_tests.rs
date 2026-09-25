@@ -21,8 +21,6 @@ fn new_tlab_state() -> GcTlabState {
     GcTlabState {
         cursor: AtomicUsize::new(0),
         limit: AtomicUsize::new(0),
-        fast_allocations: AtomicU64::new(0),
-        fast_allocated_bytes: AtomicU64::new(0),
         start_bits: AtomicUsize::new(0),
     }
 }
@@ -64,9 +62,6 @@ fn tlab_fast_alloc(
     .unwrap();
     publish_tlab_start_for_test(tls, cursor as *mut u8);
     tls.cursor.store(cursor + total_size, Ordering::Release);
-    tls.fast_allocations.fetch_add(1, Ordering::Relaxed);
-    tls.fast_allocated_bytes
-        .fetch_add(total_size as u64, Ordering::Relaxed);
     object.payload().as_ptr()
 }
 

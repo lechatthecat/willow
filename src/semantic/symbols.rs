@@ -2,9 +2,9 @@ use crate::diagnostics::Span;
 use crate::module::ModuleId;
 use crate::parser::ast::{ParamMode, Type};
 use crate::semantic::ids::{FunctionId, FunctionMap, TypeId};
-use std::collections::HashMap;
+use std::{collections::HashMap, rc::Rc};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EnumVariantInfo<N = String> {
     pub name: String,
     pub payload_types: Vec<Type<N>>,
@@ -12,7 +12,7 @@ pub struct EnumVariantInfo<N = String> {
     pub declaration_span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EnumInfo<N = String> {
     pub name: N,
     pub public: bool,
@@ -66,7 +66,7 @@ pub fn substitute_type<N: Clone + Eq + std::hash::Hash>(
     ty.substitute_names(|name| param_map.get(name).cloned())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VarInfo {
     pub ty: Type,
     pub mutable: bool,
@@ -74,7 +74,7 @@ pub struct VarInfo {
     pub declaration_span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FuncInfo {
     pub params: Vec<Type>,
     pub param_infos: Vec<ParamInfo>,
@@ -85,7 +85,7 @@ pub struct FuncInfo {
     pub module_path: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ParamInfo<N = String> {
     pub ty: Type<N>,
     pub mode: ParamMode,
@@ -93,7 +93,7 @@ pub struct ParamInfo<N = String> {
     pub type_span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FieldInfo {
     pub ty: Type,
     pub public: bool,
@@ -103,7 +103,7 @@ pub struct FieldInfo {
 
 /// An `init(...)` constructor's resolved signature (willow-scq2). MVP allows at
 /// most one constructor per class.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ConstructorInfo {
     pub params: Vec<Type>,
     pub param_infos: Vec<ParamInfo>,
@@ -114,7 +114,7 @@ pub struct ConstructorInfo {
 
 /// A `static [mut] name: T = expr` class property (willow-qsqf). Lives in global
 /// storage, not instance layout.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StaticPropInfo {
     pub ty: Type,
     pub is_mut: bool,
@@ -129,7 +129,7 @@ pub struct StaticPropInfo {
     pub declaration_span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MethodInfo {
     pub params: Vec<Type>,
     pub param_infos: Vec<ParamInfo>,
@@ -146,7 +146,7 @@ pub struct MethodInfo {
     pub declaration_span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClassInfo {
     pub name: String,
     pub public: bool,
@@ -170,7 +170,7 @@ pub struct ClassInfo {
 }
 
 /// A required method signature declared inside an `interface`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct InterfaceMethodInfo<N = String> {
     pub name: String,
     pub params: Vec<Type<N>>,
@@ -187,7 +187,7 @@ pub struct InterfaceMethodInfo<N = String> {
 }
 
 /// A registered `interface` declaration: a named set of required methods.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct InterfaceInfo<N = String> {
     pub name: N,
     // `public`/`module_path` drive import visibility (willow-k6g); `declaration_span`
@@ -213,27 +213,38 @@ pub struct InterfaceInfo<N = String> {
 }
 
 /// Functions declared by an imported module.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ModuleInfo {
     pub functions: FunctionMap<FuncInfo>,
 }
 
-#[derive(Debug)]
-pub struct SymbolTable {
-    scopes: Vec<HashMap<String, VarInfo>>,
+impl ModuleInfo {
+    /// See [`FunctionMap::detached_clone`].
+    pub fn detached_clone(&self) -> Self {
+        Self {
+            functions: self.functions.detached_clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DeclarationSymbols {
+    #[serde(with = "crate::compiler_db::map_entries")]
     pub functions: HashMap<FunctionId, FuncInfo>,
+    #[serde(with = "crate::compiler_db::map_entries")]
     pub classes: HashMap<TypeId, ClassInfo>,
     pub modules: HashMap<ModuleId, ModuleInfo>,
     module_names: HashMap<String, ModuleId>,
     next_synthetic_module_id: u32,
+    #[serde(with = "crate::compiler_db::map_entries")]
     pub enums: HashMap<TypeId, EnumInfo>,
+    #[serde(with = "crate::compiler_db::map_entries")]
     pub interfaces: HashMap<TypeId, InterfaceInfo>,
 }
 
-impl Default for SymbolTable {
+impl Default for DeclarationSymbols {
     fn default() -> Self {
         Self {
-            scopes: Vec::new(),
             functions: HashMap::new(),
             classes: HashMap::new(),
             modules: HashMap::new(),
@@ -245,7 +256,72 @@ impl Default for SymbolTable {
     }
 }
 
+/// Body-local bindings share immutable declaration metadata. Legacy declaration
+/// registration uses copy-on-write only when a declaration actually mutates.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct SymbolTable {
+    scopes: Vec<HashMap<String, VarInfo>>,
+    #[serde(with = "declaration_rc")]
+    declarations: Rc<DeclarationSymbols>,
+}
+
+impl std::ops::Deref for SymbolTable {
+    type Target = DeclarationSymbols;
+    fn deref(&self) -> &Self::Target {
+        &self.declarations
+    }
+}
+
+impl std::ops::DerefMut for SymbolTable {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Rc::make_mut(&mut self.declarations)
+    }
+}
+
+mod declaration_rc {
+    use super::*;
+    pub fn serialize<S: serde::Serializer>(
+        value: &Rc<DeclarationSymbols>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(value.as_ref(), serializer)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Rc<DeclarationSymbols>, D::Error> {
+        serde::Deserialize::deserialize(deserializer).map(Rc::new)
+    }
+}
+
 impl SymbolTable {
+    /// Start an independent body with no inherited local scopes. Sharing global
+    /// declarations is O(1), regardless of the number of registered symbols.
+    pub(crate) fn fork_body_scope(&self) -> Self {
+        Self {
+            scopes: Vec::new(),
+            declarations: Rc::clone(&self.declarations),
+        }
+    }
+
+    /// Unit visibility without separately stored function/type payloads or
+    /// the `shared` modules, which the caller restores from its own copy.
+    pub(crate) fn declaration_shell(&self, shared: &[ModuleId]) -> Self {
+        Self {
+            scopes: Vec::new(),
+            declarations: Rc::new(DeclarationSymbols {
+                modules: self
+                    .modules
+                    .iter()
+                    .filter(|(id, _)| !shared.contains(id))
+                    .map(|(id, info)| (*id, info.clone()))
+                    .collect(),
+                module_names: self.module_names.clone(),
+                next_synthetic_module_id: self.next_synthetic_module_id,
+                ..DeclarationSymbols::default()
+            }),
+        }
+    }
+
     pub fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
     }
@@ -430,5 +506,107 @@ mod tests {
         let symbols = SymbolTable::default();
         let _: &HashMap<FunctionId, FuncInfo> = &symbols.functions;
         let _: &HashMap<TypeId, ClassInfo> = &symbols.classes;
+    }
+    fn function_info(ty: Type) -> FuncInfo {
+        FuncInfo {
+            params: vec![],
+            param_infos: vec![],
+            return_type: ty,
+            public: true,
+            is_async: false,
+            declaration_span: Span::dummy(),
+            module_path: None,
+        }
+    }
+
+    fn variable_info(ty: Type) -> VarInfo {
+        VarInfo {
+            ty,
+            mutable: true,
+            is_param: false,
+            declaration_span: Span::dummy(),
+        }
+    }
+
+    #[test]
+    fn body_forks_share_declarations_and_isolate_local_bindings() {
+        for size in [16, 64, 256, 1024] {
+            let mut declarations = SymbolTable::default();
+            for index in 0..size {
+                declarations.define_func(format!("f{index}"), function_info(Type::I64));
+            }
+            declarations.push_scope();
+            declarations.define_var("outer".into(), variable_info(Type::Bool));
+            let mut forks = Vec::with_capacity(size);
+            for index in 0..size {
+                let mut body = declarations.fork_body_scope();
+                assert!(body.lookup_var("outer").is_none());
+                body.push_scope();
+                body.define_var(format!("local{index}"), variable_info(Type::I64));
+                body.lookup_var_mut(&format!("local{index}")).unwrap().ty = Type::Bool;
+                assert!(Rc::ptr_eq(&declarations.declarations, &body.declarations));
+                assert_eq!(body.functions.len(), size);
+                forks.push(body);
+            }
+            assert_eq!(Rc::strong_count(&declarations.declarations), size + 1);
+            assert!(forks[0].lookup_var("local1").is_none());
+            assert!(declarations.lookup_var("local0").is_none());
+            forks[0].pop_scope();
+            assert!(forks[0].lookup_var("local0").is_none());
+            eprintln!("body-symbols declarations={size} forks={size} shared_allocations=1");
+        }
+    }
+
+    #[test]
+    fn declaration_mutation_copies_only_the_mutating_fork() {
+        let mut original = SymbolTable::default();
+        original.define_func("f".into(), function_info(Type::I64));
+        original.define_module_with_id("module".into(), ModuleId(1), ModuleInfo::default());
+        let mut fork = original.fork_body_scope();
+        let sibling = original.fork_body_scope();
+        fork.define_func("f".into(), function_info(Type::Bool));
+        fork.hide_module_spelling("module");
+        assert!(!Rc::ptr_eq(&original.declarations, &fork.declarations));
+        assert!(Rc::ptr_eq(&original.declarations, &sibling.declarations));
+        assert_eq!(original.lookup_func("f").unwrap().return_type, Type::I64);
+        assert_eq!(fork.lookup_func("f").unwrap().return_type, Type::Bool);
+        assert!(original.lookup_module("module").is_some());
+        assert!(fork.lookup_module("module").is_none());
+    }
+
+    #[test]
+    fn shared_declarations_roundtrip_canonical_functions_and_module_aliases() {
+        let mut symbols = SymbolTable::default();
+        symbols.define_func("pkg::run".into(), function_info(Type::I64));
+        let mut module = ModuleInfo::default();
+        module
+            .functions
+            .insert("pkg::run", function_info(Type::Bool));
+        symbols.define_module_with_id("pkg".into(), ModuleId(9), module.clone());
+        symbols.define_module_with_id("alias".into(), ModuleId(9), module);
+        symbols.push_scope();
+        symbols.define_var("local".into(), variable_info(Type::I64));
+        let wire = serde_json::to_vec(&symbols).unwrap();
+        let restored: SymbolTable = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(
+            restored.lookup_func("pkg::run").unwrap().return_type,
+            Type::I64
+        );
+        assert!(std::ptr::eq(
+            restored.lookup_module("pkg").unwrap(),
+            restored.lookup_module("alias").unwrap()
+        ));
+        assert_eq!(
+            restored
+                .lookup_module("alias")
+                .unwrap()
+                .functions
+                .get("pkg::run")
+                .unwrap()
+                .return_type,
+            Type::Bool
+        );
+        assert_eq!(restored.lookup_var("local").unwrap().ty, Type::I64);
+        assert_eq!(restored.next_synthetic_module_id, u32::MAX);
     }
 }

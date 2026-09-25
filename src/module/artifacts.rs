@@ -5,7 +5,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result};
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::diagnostics::{FileId, Span};
-use crate::parser::ast::{Block, Expr, ExprId, Item, Program};
+use crate::diagnostics::FileId;
+use crate::parser::ast::{Block, BodyId, Expr, Item, Program};
 
 #[cfg(test)]
 #[path = "artifact_property_tests.rs"]
@@ -38,6 +38,11 @@ pub(crate) struct LiveUnit<T> {
     value: T,
     _lease: UnitLease,
 }
+impl<T> LiveUnit<T> {
+    pub(crate) fn into_inner(self) -> T {
+        self.value
+    }
+}
 impl<T> std::ops::Deref for LiveUnit<T> {
     type Target = T;
     fn deref(&self) -> &T {
@@ -56,15 +61,197 @@ impl Drop for UnitLease {
 
 #[derive(Debug)]
 pub(crate) struct UnitArtifacts {
-    directory: PathBuf,
+    pub(crate) store: Rc<ArtifactStore>,
     metrics: Rc<RefCell<UnitMetrics>>,
-    next: usize,
-    blocks: HashMap<Span, usize>,
-    initializers: HashMap<ExprId, usize>,
+    blocks: HashMap<BodyId, usize>,
+    initializers: HashMap<crate::compiler_db::ids::StaticId, usize>,
     sources: HashMap<FileId, usize>,
+    pub(crate) bodies: Rc<crate::compiler_db::ids::BodyIndex>,
+}
+
+/// Shared session pack. Query handles can retain it independently of declaration
+/// shells; the final owner closes the file and removes its private directory.
+#[derive(Debug)]
+pub(crate) struct ArtifactStore {
+    directory: PathBuf,
+    pack: RefCell<Option<ArtifactPack>>,
+    entries: RefCell<Vec<(u64, u64)>>,
+    read_windows: RefCell<ReadWindows>,
+}
+
+/// Read-ahead copies of flushed pack ranges, most recently used first. The
+/// pack is append-only, so a filled range never goes stale; nearby small
+/// records decode from memory without a seek/read pair each. A few windows let
+/// a unit's records and a hot shared record (read once per unit) coexist.
+#[derive(Debug, Default)]
+struct ReadWindows {
+    windows: Vec<ReadWindow>,
+    /// Pack reads issued to fill windows, for deterministic I/O counts.
+    #[cfg(test)]
+    fills: usize,
+}
+
+#[derive(Debug, Default)]
+struct ReadWindow {
+    start: u64,
+    bytes: Vec<u8>,
+}
+
+/// Small query records decode from memory; larger syntax artifacts stream.
+const READ_WINDOW_BYTES: u64 = 64 * 1024;
+/// Retained read scratch is at most `READ_WINDOWS * READ_WINDOW_BYTES`.
+const READ_WINDOWS: usize = 4;
+/// Keep appends buffered across a unit's many small declaration records.
+const WRITE_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Appends and reads have independent file offsets. Keeping the writer alive
+/// amortizes allocation and flushing across consecutive small query records.
+#[derive(Debug)]
+struct ArtifactPack {
+    writer: BufWriter<File>,
+    reader: File,
+    written: u64,
+}
+
+/// Count bytes accepted by the buffered writer without flushing or seeking.
+/// Failed serialization still advances the append offset for its partial data.
+struct CountedWriter<'a> {
+    writer: &'a mut BufWriter<File>,
+    written: &'a mut u64,
+}
+
+impl Write for CountedWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let count = self.writer.write(bytes)?;
+        *self.written += count as u64;
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+impl ArtifactStore {
+    pub(crate) fn write<T: Serialize>(&self, value: &T) -> Result<usize> {
+        let mut borrowed = self.pack.borrow_mut();
+        let pack = borrowed.as_mut().expect("open artifact pack");
+        let start = pack.written;
+        let mut writer = CountedWriter {
+            writer: &mut pack.writer,
+            written: &mut pack.written,
+        };
+        serde_json::to_writer(&mut writer, value).context("write compiler unit artifact")?;
+        let end = pack.written;
+        let mut entries = self.entries.borrow_mut();
+        let id = entries.len();
+        entries.push((start, end - start));
+        Ok(id)
+    }
+
+    /// Bytes written to the pack so far, for deterministic size measurements.
+    #[cfg(test)]
+    pub(crate) fn written(&self) -> u64 {
+        self.pack.borrow().as_ref().map_or(0, |pack| pack.written)
+    }
+
+    pub(crate) fn read<T: DeserializeOwned>(&self, id: usize) -> Result<T> {
+        let &(start, length) = self
+            .entries
+            .borrow()
+            .get(id)
+            .context("missing compiler unit artifact")?;
+        let end = start + length;
+        let mut borrowed = self.pack.borrow_mut();
+        let pack = borrowed.as_mut().expect("open artifact pack");
+        // Records still in the append buffer decode in place: no flush, no I/O.
+        let flushed = pack.written - pack.writer.buffer().len() as u64;
+        if start >= flushed {
+            let buffered =
+                &pack.writer.buffer()[(start - flushed) as usize..(end - flushed) as usize];
+            return serde_json::from_slice(buffered).context("decode compiler unit artifact");
+        }
+        if end > flushed {
+            pack.writer
+                .flush()
+                .context("flush compiler unit artifacts")?;
+        }
+        let reader = &mut pack.reader;
+        if length > READ_WINDOW_BYTES {
+            reader.seek(SeekFrom::Start(start))?;
+            return serde_json::from_reader(BufReader::new(reader.take(length)))
+                .context("read compiler unit artifact");
+        }
+        let mut cache = self.read_windows.borrow_mut();
+        let hit = cache.windows.iter().position(|window| {
+            window.start <= start && end <= window.start + window.bytes.len() as u64
+        });
+        let index = match hit {
+            Some(index) => index,
+            None => {
+                // Fill the aligned block holding the record, so reads that walk
+                // back to a unit's earlier records hit too; a record crossing a
+                // block boundary starts its own window. Windows never cover
+                // bytes still in the writer (flushing cannot change them anyway).
+                let offset = start % READ_WINDOW_BYTES;
+                let fill_start = if offset + length <= READ_WINDOW_BYTES {
+                    start - offset
+                } else {
+                    start
+                };
+                let available = (pack.written - pack.writer.buffer().len() as u64) - fill_start;
+                let fill = READ_WINDOW_BYTES.min(available) as usize;
+                let mut window = if cache.windows.len() < READ_WINDOWS {
+                    ReadWindow::default()
+                } else {
+                    cache.windows.pop().expect("full window cache")
+                };
+                window.bytes.clear();
+                if window.bytes.capacity() < fill {
+                    window.bytes.reserve_exact(fill);
+                }
+                window.bytes.resize(fill, 0);
+                window.start = fill_start;
+                reader.seek(SeekFrom::Start(fill_start))?;
+                reader
+                    .read_exact(&mut window.bytes)
+                    .context("read compiler unit artifact")?;
+                cache.windows.push(window);
+                #[cfg(test)]
+                {
+                    cache.fills += 1;
+                }
+                cache.windows.len() - 1
+            }
+        };
+        // Keep most recently used first; eviction pops the last.
+        cache.windows[..=index].rotate_right(1);
+        let window = &cache.windows[0];
+        let offset = (start - window.start) as usize;
+        serde_json::from_slice(&window.bytes[offset..offset + length as usize])
+            .context("decode compiler unit artifact")
+    }
+}
+
+impl Drop for ArtifactStore {
+    fn drop(&mut self) {
+        self.pack.get_mut().take();
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+impl std::ops::Deref for UnitArtifacts {
+    type Target = ArtifactStore;
+    fn deref(&self) -> &Self::Target {
+        &self.store
+    }
 }
 
 impl UnitArtifacts {
+    pub(crate) fn body_index_mut(&mut self) -> &mut crate::compiler_db::ids::BodyIndex {
+        Rc::get_mut(&mut self.bodies).expect("body inputs are frozen after CompilerDb creation")
+    }
+
     pub(crate) fn new() -> Result<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         loop {
@@ -83,14 +270,36 @@ impl UnitArtifacts {
             };
             match builder.create(&directory) {
                 Ok(()) => {
-                    return Ok(Self {
+                    // Own the directory before opening its pack, so an open
+                    // failure follows the same cleanup path as every later error.
+                    let mut store = ArtifactStore {
+                        pack: RefCell::new(None),
                         directory,
+                        entries: RefCell::default(),
+                        read_windows: RefCell::default(),
+                    };
+                    let path = store.directory.join("artifacts.pack");
+                    let writer = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                        .context("open compiler unit pack")?;
+                    // try_clone shares a seek position on Unix; reopen instead.
+                    let reader = File::open(&path).context("open compiler unit reader")?;
+                    *store.pack.get_mut() = Some(ArtifactPack {
+                        writer: BufWriter::with_capacity(WRITE_BUFFER_BYTES, writer),
+                        reader,
+                        written: 0,
+                    });
+                    let artifacts = Self {
+                        store: Rc::new(store),
                         metrics: Rc::default(),
-                        next: 0,
                         blocks: HashMap::new(),
                         initializers: HashMap::new(),
                         sources: HashMap::new(),
-                    });
+                        bodies: Default::default(),
+                    };
+                    return Ok(artifacts);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error).context("create compiler unit storage"),
@@ -121,25 +330,6 @@ impl UnitArtifacts {
         self.metrics.borrow().peak
     }
 
-    pub(crate) fn write<T: Serialize>(&mut self, value: &T) -> Result<usize> {
-        let id = self.next;
-        self.next += 1;
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(self.directory.join(id.to_string()))?;
-        let mut writer = BufWriter::new(file);
-        serde_json::to_writer(&mut writer, value).context("write compiler unit artifact")?;
-        writer.flush()?;
-        Ok(id)
-    }
-
-    pub(crate) fn read<T: DeserializeOwned>(&self, id: usize) -> Result<T> {
-        let file = File::open(self.directory.join(id.to_string()))
-            .context("open compiler unit artifact")?;
-        serde_json::from_reader(BufReader::new(file)).context("read compiler unit artifact")
-    }
-
     pub(crate) fn snapshot_source(&mut self, id: FileId, source: &str) -> Result<()> {
         if !self.sources.contains_key(&id) {
             let artifact = self.write(&source)?;
@@ -153,9 +343,9 @@ impl UnitArtifacts {
     }
 
     fn offload_block(&mut self, block: &mut Block) -> Result<()> {
-        if !self.blocks.contains_key(&block.span) {
+        if !self.blocks.contains_key(&block.id) {
             let id = self.write(block)?;
-            self.blocks.insert(block.span, id);
+            self.blocks.insert(block.id, id);
         }
         block.stmts = Vec::new();
         Ok(())
@@ -165,6 +355,7 @@ impl UnitArtifacts {
     /// initializers. Nested syntax is serialized with its owning slot.
     pub(crate) fn offload(&mut self, program: &mut Program) -> Result<()> {
         let _live = self.live(UnitKind::Ast);
+        self.body_index_mut().register_program(program);
         for item in &mut program.items {
             match item {
                 Item::Function(function) => self.offload_block(&mut function.body)?,
@@ -177,12 +368,15 @@ impl UnitArtifacts {
                     }
                     for field in &mut class.fields {
                         if let Some(expr) = &mut field.initializer {
-                            let id = expr.id();
+                            let id = self
+                                .bodies
+                                .static_id(expr.id())
+                                .expect("indexed initializer");
                             if !self.initializers.contains_key(&id) {
                                 let artifact = self.write(expr)?;
                                 self.initializers.insert(id, artifact);
                             }
-                            *expr = Expr::Bool(false, expr.span(), id);
+                            *expr = Expr::Bool(false, expr.span(), expr.id());
                         }
                     }
                 }
@@ -203,12 +397,14 @@ impl UnitArtifacts {
         crate::query_stats::hydrate(file);
         let mut program = summary.clone();
         let hydrate_block = |block: &mut Block| -> Result<()> {
+            let id = block.id;
             *block = self.read(
                 *self
                     .blocks
-                    .get(&block.span)
+                    .get(&self.bodies.source_body(id))
                     .context("missing body artifact")?,
             )?;
+            block.id = id;
             Ok(())
         };
         for item in &mut program.items {
@@ -226,7 +422,12 @@ impl UnitArtifacts {
                             *expr = self.read(
                                 *self
                                     .initializers
-                                    .get(&expr.id())
+                                    .get(
+                                        &self
+                                            .bodies
+                                            .static_id(expr.id())
+                                            .context("missing static identity")?,
+                                    )
                                     .context("missing initializer artifact")?,
                             )?;
                         }
@@ -256,7 +457,6 @@ impl Drop for UnitArtifacts {
                 peak[0], peak[1], peak[2], peak[3]
             );
         }
-        let _ = std::fs::remove_dir_all(&self.directory);
     }
 }
 
@@ -363,10 +563,32 @@ mod tests {
     }
 
     #[test]
+    fn shared_store_survives_shells_and_cleans_up_after_last_owner() {
+        let artifacts = UnitArtifacts::new().unwrap();
+        let directory = artifacts.directory.clone();
+        let payload = artifacts.write(&"retained source").unwrap();
+        let store = Rc::clone(&artifacts.store);
+        drop(artifacts);
+        assert!(directory.exists());
+        assert_eq!(store.read::<String>(payload).unwrap(), "retained source");
+        let later = store.write(&vec![1, 2, 3]).unwrap();
+        assert_eq!(store.read::<Vec<u32>>(later).unwrap(), [1, 2, 3]);
+        let final_owner = Rc::clone(&store);
+        drop(store);
+        assert!(directory.exists());
+        assert_eq!(
+            final_owner.read::<String>(payload).unwrap(),
+            "retained source"
+        );
+        drop(final_owner);
+        assert!(!directory.exists());
+    }
+
+    #[test]
     fn artifact_directory_is_removed_on_success_and_error() {
         let directory;
         {
-            let mut artifacts = UnitArtifacts::new().unwrap();
+            let artifacts = UnitArtifacts::new().unwrap();
             directory = artifacts.directory.clone();
             artifacts.write(&"payload").unwrap();
             assert!(artifacts.read::<String>(999).is_err());

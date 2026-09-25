@@ -22,8 +22,9 @@
 //! 10. the requeue that follows such a claim is not idle
 //! 11. idleness returns once the task is actually gone
 //! 12. the predicate is a pure read: two calls agree
-//! 13. the declared read order puts the queue before the claim marker
-//! 13b. ordering stress: a claim racing the queue read is never reported idle
+//! 13. the declared read order puts polls before the queue and the queue
+//!     before the claim marker
+//! 13b. ordering stress: a claim racing the stop decision is never missed
 //! 14. `run_until` returns only once its target is terminal
 //! 15. `run_until` on a target nothing can ever wake still RETURNS
 //! 16. `run_until` on an unknown id returns immediately
@@ -32,6 +33,19 @@
 //! 19. a drive with more tasks than workers completes all of them
 //! 20. a three-deep await chain resolves end to end in one `run_until`
 //! 21. a nested drive keeps its paused outer poll visible to the snapshot
+//!
+//! Gate-free claims (willow-8hq4.19): a claim takes `claim_gate` only while a
+//! stop decision has raised `stop_intent`.
+//!
+//! 22. a quiescent decision publishes the stop and lowers the intent
+//! 23. a claim in flight when the decision starts refuses the stop
+//! 24. a claim that pops and requeues during the snapshot refuses the stop
+//! 25. a claim that pops nothing during the snapshot does not refuse it
+//! 26. a claim with no decision in progress never waits for `claim_gate`
+//! 27. a claim that sees the intent waits and then honours a published stop
+//! 28. a claim that sees the intent proceeds when the decision refuses
+//! 29. a pause/resume in progress is never seen as "no poll"
+//! 30. a poll that requeues and ends mid-snapshot is never missed
 
 use super::*;
 use crate::gc::{reset_internal_for_test, runtime_test_guard};
@@ -67,8 +81,9 @@ fn fresh_scheduler() -> std::sync::MutexGuard<'static, ()> {
     guard
 }
 
-/// The predicate's contract is "caller holds `claim_gate`". No test thread
-/// competes for it, but taking it keeps the tests honest about the contract.
+/// The bare predicate, read with claims excluded. No test thread competes for
+/// the gate here, but taking it keeps the tests honest about the contract;
+/// racing tests use the full decision, [`ParallelRunState::publish_stop_if`].
 fn is_idle(state: &ParallelRunState) -> bool {
     let _claim_gate = state
         .claim_gate
@@ -179,14 +194,8 @@ unsafe extern "C" fn poll_nested_drive_child(frame: *mut c_void) -> i32 {
         // before the poll resumes, or the snapshot would stop counting a poll
         // that is once again running.
         if let Some(state) = CURRENT_RUN_STATE.with(|slot| slot.borrow().clone()) {
-            NESTED_RESUMED_ACTIVE.store(
-                state.active_polls.load(Ordering::Acquire) >= 1,
-                Ordering::Release,
-            );
-            NESTED_RESUMED_PAUSED.store(
-                state.paused_polls.load(Ordering::Acquire),
-                Ordering::Release,
-            );
+            NESTED_RESUMED_ACTIVE.store(state.active_polls() >= 1, Ordering::Release);
+            NESTED_RESUMED_PAUSED.store(state.paused_polls(), Ordering::Release);
         }
     }
     RUNTIME_POLL_READY
@@ -205,7 +214,7 @@ unsafe extern "C" fn poll_observe_nested_state(frame: *mut c_void) -> i32 {
         // pause and nothing to observe.
         return RUNTIME_POLL_READY;
     };
-    let paused = state.paused_polls.load(Ordering::Acquire);
+    let paused = state.paused_polls();
     NESTED_PAUSED_PEAK.fetch_max(paused, Ordering::AcqRel);
     if work_source_is_live(&state, WorkSource::Claim) {
         NESTED_CLAIM_LIVE.store(true, Ordering::Release);
@@ -285,9 +294,9 @@ fn idle_05_a_blocked_syscall_task_is_not_idle() {
 fn idle_06_an_active_poll_is_not_idle() {
     let _guard = fresh_scheduler();
     let state = ParallelRunState::default();
-    state.active_polls.fetch_add(1, Ordering::AcqRel);
+    state.begin_poll();
     assert!(!is_idle(&state));
-    state.active_polls.fetch_sub(1, Ordering::AcqRel);
+    state.end_poll();
     assert!(is_idle(&state));
 }
 
@@ -295,9 +304,9 @@ fn idle_06_an_active_poll_is_not_idle() {
 fn idle_07_a_paused_nested_poll_is_not_idle() {
     let _guard = fresh_scheduler();
     let state = ParallelRunState::default();
-    state.paused_polls.fetch_add(1, Ordering::AcqRel);
+    state.set_polls_for_test(0, 1);
     assert!(!is_idle(&state));
-    state.paused_polls.fetch_sub(1, Ordering::AcqRel);
+    state.set_polls_for_test(0, 0);
     assert!(is_idle(&state));
 }
 
@@ -313,7 +322,7 @@ fn idle_08_a_claim_holding_the_last_task_is_not_idle() {
     let in_flight = ClaimInFlight::enter();
     assert_eq!(global_run_queues().pop_for_worker(0), Some(id));
     assert_eq!(global_run_queues().len(), 0);
-    assert_eq!(state.active_polls.load(Ordering::Acquire), 0);
+    assert_eq!(state.active_polls(), 0);
 
     assert!(
         !is_idle(&state),
@@ -381,6 +390,12 @@ fn idle_13_the_declared_read_order_is_the_one_the_argument_needs() {
             .position(|declared| *declared == source)
             .unwrap_or_else(|| panic!("{source:?} must be one of the checked work sources"))
     };
+    // A poll publishes its requeue BEFORE it leaves `active_polls`, so the
+    // poll counters must be read before the queue (willow-8hq4.19).
+    assert!(
+        position(WorkSource::Poll) < position(WorkSource::RunQueue),
+        "the poll counters must be read before the run queue: {IDLE_READ_ORDER:?}"
+    );
     // A claim publishes its in-flight marker BEFORE it pops, so an empty-queue
     // observation that missed the popped task is always followed by a marker
     // observation that sees the claim. Reading the marker first leaves a window
@@ -402,48 +417,51 @@ fn idle_13_the_declared_read_order_is_the_one_the_argument_needs() {
     );
     assert_eq!(
         IDLE_READ_ORDER.len(),
-        5,
+        6,
         "a new work source needs its own place in this order"
     );
 }
 
 #[test]
-fn idle_13b_a_claim_racing_the_queue_read_is_never_reported_idle() {
+fn idle_13b_a_claim_racing_the_stop_decision_is_never_missed() {
     let _guard = fresh_scheduler();
-    let state = Arc::new(ParallelRunState::default());
     let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
 
-    // The interleaving the bug needed: the claim publishes its marker and pops
-    // the last task while the snapshot is in progress. This mirrors
-    // `claim_global_ready_for_worker` exactly — marker, then pop, then the gate
-    // — because the requeue that follows a stop is what strands the task, and
-    // that requeue is ordered by the same gate the snapshot holds.
+    // The task is always either queued, held by a claim, or being polled, so
+    // no decision may ever stop. The claimer runs the real claim, including
+    // its gate-free fast path, and a claimed poll requeues through the real
+    // poll boundary, so every interleaving of pop, claim and requeue against
+    // the decision's reads is exercised.
     for round in 0..2_000 {
+        let state = Arc::new(ParallelRunState::default());
         let gate = Arc::new(Barrier::new(2));
         let claim_gate = Arc::clone(&gate);
         let claim_state = Arc::clone(&state);
         let claimer = std::thread::spawn(move || {
             claim_gate.wait();
-            let _in_flight = ClaimInFlight::enter();
-            let popped = global_run_queues().pop_for_worker(0);
-            let _gate = claim_state
-                .claim_gate
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(popped) = popped {
-                global_run_queues().push_global(popped);
+            match claim_global_ready_for_worker(0, Some(&claim_state)) {
+                Some((claimed, _work)) => {
+                    finish_global_poll_boundary(claimed, GlobalPollBoundary::Runnable);
+                    finish_active_poll(Some(&claim_state));
+                    set_current_task(None);
+                    true
+                }
+                None => false,
             }
         });
         gate.wait();
         std::thread::yield_now();
-        let idle = is_idle(&state);
-        claimer.join().unwrap();
+        let stopped = state.publish_stop_if(parallel_run_is_idle_locked);
+        let claimed = claimer.join().unwrap();
         assert!(
-            !idle,
-            "round {round}: reported idle while a claim held the last task"
+            !stopped,
+            "round {round}: stopped while the task was live (claimed: {claimed})"
         );
-        // The claimer always puts it back, so every round starts the same way.
-        assert!(global_run_queues().contains(id));
+        assert!(
+            !state.stop_decision_pending(),
+            "round {round}: intent left raised"
+        );
+        assert!(global_run_queues().contains(id), "round {round}: task lost");
     }
 }
 
@@ -639,5 +657,252 @@ fn idle_21_a_nested_drive_keeps_its_paused_outer_poll_visible() {
             0,
             "the pause must be given back, not left on the paused counter"
         );
+    }
+}
+
+fn claim_word_count() -> u64 {
+    claim_word() & CLAIM_COUNT_MASK
+}
+
+#[test]
+fn idle_22_a_quiescent_decision_publishes_the_stop() {
+    let _guard = fresh_scheduler();
+    let state = ParallelRunState::default();
+    assert!(state.publish_stop_if(parallel_run_is_idle_locked));
+    assert!(state.stop.load(Ordering::Acquire));
+    assert!(!state.stop_decision_pending(), "the intent must be lowered");
+}
+
+#[test]
+fn idle_23_a_claim_in_flight_refuses_the_stop() {
+    let _guard = fresh_scheduler();
+    let state = ParallelRunState::default();
+    let in_flight = ClaimInFlight::enter();
+    assert!(
+        !state.publish_stop_if(|_| true),
+        "even a quiescent snapshot cannot stop past a claim in flight"
+    );
+    assert!(!state.stop.load(Ordering::Acquire));
+    assert!(!state.stop_decision_pending());
+    drop(in_flight);
+    assert!(state.publish_stop_if(|_| true));
+}
+
+#[test]
+fn idle_24_a_claim_that_resolves_mid_snapshot_refuses_the_stop() {
+    let _guard = fresh_scheduler();
+    let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    // Enter, pop, requeue and leave between two of the decision's reads, at
+    // every position: the count is back to zero, but the epoch moved.
+    for split in 0..=IDLE_READ_ORDER.len() {
+        let state = ParallelRunState::default();
+        let stopped = state.publish_stop_if(|state| {
+            idle_with_event_at(state, split, || {
+                let mut in_flight = ClaimInFlight::enter();
+                assert_eq!(global_run_queues().pop_for_worker(0), Some(id));
+                in_flight.popped();
+                global_run_queues().push_global(id);
+                drop(in_flight);
+                assert_eq!(claim_word_count(), 0);
+            })
+        });
+        assert!(
+            !stopped,
+            "a claim resolved after read {split} of {IDLE_READ_ORDER:?} was missed"
+        );
+        assert!(!state.stop.load(Ordering::Acquire));
+        assert!(global_run_queues().contains(id));
+    }
+    // The epoch alone carries it: with the queue read last, the bare
+    // predicate reports idle for this interleaving.
+    let state = ParallelRunState::default();
+    let stopped = state.publish_stop_if(|_| {
+        let mut in_flight = ClaimInFlight::enter();
+        assert_eq!(global_run_queues().pop_for_worker(0), Some(id));
+        in_flight.popped();
+        global_run_queues().push_global(id);
+        true
+    });
+    assert!(!stopped, "a resolved claim may have republished work");
+}
+
+#[test]
+fn idle_25_a_claim_that_popped_nothing_does_not_refuse_the_stop() {
+    let _guard = fresh_scheduler();
+    let state = ParallelRunState::default();
+    let before = claim_word();
+    let stopped = state.publish_stop_if(|_| {
+        let in_flight = ClaimInFlight::enter();
+        assert_eq!(global_run_queues().pop_for_worker(0), None);
+        drop(in_flight);
+        true
+    });
+    assert!(
+        stopped,
+        "an empty claim changes nothing and must not livelock"
+    );
+    assert_eq!(
+        claim_word(),
+        before,
+        "an empty claim leaves the word as it was"
+    );
+}
+
+#[test]
+fn idle_26_a_claim_without_a_decision_never_waits_for_the_gate() {
+    let _guard = fresh_scheduler();
+    let state = Arc::new(ParallelRunState::default());
+    let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    let held = state.claim_gate.lock().unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let claim_state = Arc::clone(&state);
+    let claimer = std::thread::spawn(move || {
+        let claimed = claim_global_ready_for_worker(0, Some(&claim_state)).map(|(id, _)| id);
+        set_current_task(None);
+        done_tx.send(claimed).unwrap();
+    });
+    let claimed = done_rx.recv_timeout(Duration::from_secs(5));
+    drop(held);
+    claimer.join().unwrap();
+    assert_eq!(
+        claimed,
+        Ok(Some(id)),
+        "the claim fast path blocked on claim_gate"
+    );
+    assert_eq!(state.active_polls(), 1);
+    assert_eq!(claim_word_count(), 0);
+}
+
+/// Hold the gate with the intent raised, exactly as a decision in progress
+/// does, and start a claim against it.
+fn claim_behind_a_decision(
+    state: &Arc<ParallelRunState>,
+) -> (
+    std::sync::MutexGuard<'_, ()>,
+    std::sync::mpsc::Receiver<Option<RuntimeTaskId>>,
+    std::thread::JoinHandle<()>,
+) {
+    let held = state.claim_gate.lock().unwrap();
+    state.stop_intent.store(true, Ordering::SeqCst);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let claim_state = Arc::clone(state);
+    let claimer = std::thread::spawn(move || {
+        let claimed = claim_global_ready_for_worker(0, Some(&claim_state)).map(|(id, _)| id);
+        set_current_task(None);
+        done_tx.send(claimed).unwrap();
+    });
+    // The claim is visible (and holding the popped task) before it blocks.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while claim_word_count() == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    (held, done_rx, claimer)
+}
+
+#[test]
+fn idle_27_a_claim_behind_a_decision_honours_its_stop() {
+    let _guard = fresh_scheduler();
+    let state = Arc::new(ParallelRunState::default());
+    let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    let (held, done_rx, claimer) = claim_behind_a_decision(&state);
+    assert!(
+        claims_in_flight(),
+        "the claim must be visible while it waits"
+    );
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "a claim must not resolve while a decision is in progress"
+    );
+    // Publish a stop the way a decision would, then release the gate.
+    state.stop.store(true, Ordering::SeqCst);
+    state.stop_intent.store(false, Ordering::SeqCst);
+    drop(held);
+    let claimed = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    claimer.join().unwrap();
+    assert_eq!(claimed, None, "a stopped run claims nothing");
+    assert!(
+        global_run_queues().contains(id),
+        "the popped task is requeued"
+    );
+    assert_eq!(state.active_polls(), 0);
+    assert_eq!(claim_word_count(), 0);
+}
+
+#[test]
+fn idle_28_a_claim_behind_a_refused_decision_proceeds() {
+    let _guard = fresh_scheduler();
+    let state = Arc::new(ParallelRunState::default());
+    let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    let (held, done_rx, claimer) = claim_behind_a_decision(&state);
+    state.stop_intent.store(false, Ordering::SeqCst);
+    drop(held);
+    let claimed = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    claimer.join().unwrap();
+    assert_eq!(claimed, Some(id));
+    assert_eq!(state.active_polls(), 1);
+}
+
+#[test]
+fn idle_29_a_moving_poll_is_always_live() {
+    let _guard = fresh_scheduler();
+    let state = Arc::new(ParallelRunState::default());
+    state.begin_poll();
+    let done = Arc::new(AtomicBool::new(false));
+    let mover_state = Arc::clone(&state);
+    let mover_done = Arc::clone(&done);
+    let mover = std::thread::spawn(move || {
+        for _ in 0..200_000 {
+            mover_state.pause_active_poll();
+            mover_state.resume_paused_poll();
+        }
+        mover_done.store(true, Ordering::Release);
+    });
+    let mut reads = 0u64;
+    while !done.load(Ordering::Acquire) {
+        assert!(
+            work_source_is_live(&state, WorkSource::Poll),
+            "a poll moving between active and paused read as absent"
+        );
+        reads += 1;
+    }
+    mover.join().unwrap();
+    assert!(reads > 0);
+    assert_eq!(state.active_polls(), 1);
+    assert_eq!(state.paused_polls(), 0);
+}
+
+/// Evaluate the idle predicate with `between` run after the first `split`
+/// reads, exactly as a producer racing the snapshot could.
+fn idle_with_event_at(state: &ParallelRunState, split: usize, between: impl FnOnce()) -> bool {
+    let live = |source: &WorkSource| work_source_is_live(state, *source);
+    let before = IDLE_READ_ORDER[..split].iter().any(live);
+    between();
+    let after = IDLE_READ_ORDER[split..].iter().any(live);
+    !before && !after
+}
+
+#[test]
+fn idle_30_a_poll_that_requeues_and_ends_mid_snapshot_is_never_missed() {
+    let _guard = fresh_scheduler();
+    let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    for split in 0..=IDLE_READ_ORDER.len() {
+        let state = ParallelRunState::default();
+        // A claimed poll in progress: the task is in no queue, one poll active.
+        let (claimed, _) = claim_global_ready_for_worker(0, Some(&state)).unwrap();
+        set_current_task(None);
+        assert_eq!(claimed, id);
+        let stopped = state.publish_stop_if(|state| {
+            idle_with_event_at(state, split, || {
+                // A yield: requeue first, then leave the poll count.
+                finish_global_poll_boundary(id, GlobalPollBoundary::Runnable);
+                finish_active_poll(Some(state));
+            })
+        });
+        assert!(
+            !stopped,
+            "stopped with the task requeued when the poll ended after read {split} \
+             of {IDLE_READ_ORDER:?}"
+        );
+        assert!(global_run_queues().contains(id));
     }
 }

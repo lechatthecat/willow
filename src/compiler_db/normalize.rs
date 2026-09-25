@@ -1,0 +1,626 @@
+//! Compiler-owned standard-library name normalization. Rewrites imported or
+//! aliased collection references and builtin module aliases before lowering.
+
+use std::collections::{HashMap, HashSet};
+
+use crate::module::std_registry;
+use crate::parser::ast::*;
+use crate::stdlib_schema;
+
+#[willow_continuations::function(
+    normalize_std_collection_program,
+    normalize_std_collection_item,
+    normalize_std_collection_function,
+    normalize_std_collection_method,
+    normalize_std_collection_block,
+    normalize_std_collection_stmt,
+    normalize_std_collection_expr,
+    normalize_std_collection_call_arg,
+    normalize_std_collection_type
+)]
+pub(crate) fn normalize_std_collection_program(program: &Program) -> Program {
+    let imports = std_collection_imports(program);
+    let mut program = program.clone();
+    for item in &mut program.items {
+        normalize_std_collection_item(item, &imports);
+    }
+    program
+}
+
+pub(crate) struct StdCollectionImports {
+    modules: HashSet<String>,
+    aliases: HashMap<String, String>,
+    /// Local alias -> canonical builtin module (`import std::fs as files;`
+    /// records files -> fs), collected PER MODULE so each file's aliases only
+    /// apply to its own static calls (willow-2s3 review fix).
+    builtin_module_aliases: HashMap<String, String>,
+    /// False for a walk that must leave every spelling as written: bodies
+    /// outside the normalization boundary still have lambdas to split.
+    rewrite: bool,
+    /// Installed while one body query walks its syntax (willow-afb5.17).
+    split: std::cell::RefCell<Option<LambdaSplit>>,
+}
+
+impl StdCollectionImports {
+    /// A walk that rewrites nothing, for splitting lambdas out of bodies the
+    /// normalization boundary leaves unchanged (constructors, statics).
+    pub(crate) fn walk_only() -> Self {
+        Self {
+            modules: HashSet::new(),
+            aliases: HashMap::new(),
+            builtin_module_aliases: HashMap::new(),
+            rewrite: false,
+            split: Default::default(),
+        }
+    }
+
+    pub(crate) fn install_split(&self, split: LambdaSplit) {
+        *self.split.borrow_mut() = Some(split);
+    }
+
+    pub(crate) fn take_split(&self) -> Option<LambdaSplit> {
+        self.split.borrow_mut().take()
+    }
+
+    fn enter_lambda(&self, lambda: &mut LambdaExpr) {
+        if let Some(split) = &*self.split.borrow() {
+            split.enter(lambda);
+        }
+    }
+
+    fn exit_lambda(&self, lambda: &mut LambdaExpr) {
+        if let Some(split) = &*self.split.borrow() {
+            split.exit(lambda);
+        }
+    }
+}
+
+/// Separates a body's lambdas from its normalized syntax, or puts them back
+/// (willow-afb5.17). Each lambda body is stored once, under its own
+/// contextual `BodyId`; its parent keeps an empty placeholder in its place.
+pub(crate) struct LambdaSplit {
+    index: std::rc::Rc<crate::compiler_db::ids::BodyIndex>,
+    /// Innermost enclosing body, and whether the lambda that pushed it split.
+    parents: std::cell::RefCell<Vec<(BodyId, bool)>>,
+    mode: SplitMode,
+    error: std::cell::RefCell<Option<anyhow::Error>>,
+}
+
+enum SplitMode {
+    /// Postorder: a lambda is detached after its own lambdas were.
+    Detach(std::cell::RefCell<Vec<(BodyId, LambdaBody)>>),
+    /// Preorder: a lambda is reattached before its own lambdas are.
+    Attach(std::cell::RefCell<HashMap<BodyId, LambdaBody>>),
+}
+
+impl LambdaSplit {
+    pub(crate) fn detach(
+        index: std::rc::Rc<crate::compiler_db::ids::BodyIndex>,
+        root: BodyId,
+    ) -> Self {
+        Self::new(index, root, SplitMode::Detach(Default::default()))
+    }
+
+    pub(crate) fn attach(
+        index: std::rc::Rc<crate::compiler_db::ids::BodyIndex>,
+        root: BodyId,
+        bodies: HashMap<BodyId, LambdaBody>,
+    ) -> Self {
+        Self::new(
+            index,
+            root,
+            SplitMode::Attach(std::cell::RefCell::new(bodies)),
+        )
+    }
+
+    fn new(
+        index: std::rc::Rc<crate::compiler_db::ids::BodyIndex>,
+        root: BodyId,
+        mode: SplitMode,
+    ) -> Self {
+        Self {
+            index,
+            parents: std::cell::RefCell::new(vec![(root, false)]),
+            mode,
+            error: Default::default(),
+        }
+    }
+
+    /// The detached lambda bodies, children before parents.
+    pub(crate) fn finish(self) -> anyhow::Result<Vec<(BodyId, LambdaBody)>> {
+        if let Some(error) = self.error.into_inner() {
+            return Err(error);
+        }
+        match self.mode {
+            SplitMode::Detach(bodies) => Ok(bodies.into_inner()),
+            SplitMode::Attach(bodies) => {
+                let left = bodies.into_inner().len();
+                anyhow::ensure!(left == 0, "{left} lambda bodies were not reattached");
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    fn fail(&self, error: anyhow::Error) {
+        self.error.borrow_mut().get_or_insert(error);
+    }
+
+    fn enter(&self, lambda: &mut LambdaExpr) {
+        let parent = self.parents.borrow().last().expect("split root").0;
+        // A lambda without a contextual identity is checked inline by its
+        // parent (see check_lambda_body), so it also stays inline here.
+        let Some(id) = self.index.lambda_in(parent, lambda.id) else {
+            self.parents.borrow_mut().push((parent, false));
+            return;
+        };
+        self.parents.borrow_mut().push((id, true));
+        if let SplitMode::Attach(bodies) = &self.mode {
+            match bodies.borrow_mut().remove(&id) {
+                Some(body) => lambda.body = body,
+                None => self.fail(anyhow::anyhow!("normalized lambda body {id:?} is missing")),
+            }
+        }
+    }
+
+    fn exit(&self, lambda: &mut LambdaExpr) {
+        let (id, split) = self.parents.borrow_mut().pop().expect("entered lambda");
+        if !split {
+            return;
+        }
+        if let SplitMode::Detach(bodies) = &self.mode {
+            let placeholder = LambdaBody::Block(Block {
+                id,
+                stmts: Vec::new(),
+                span: lambda.span,
+            });
+            bodies
+                .borrow_mut()
+                .push((id, std::mem::replace(&mut lambda.body, placeholder)));
+        }
+    }
+}
+
+pub(crate) fn std_collection_imports(program: &Program) -> StdCollectionImports {
+    let mut modules = HashSet::new();
+    let mut aliases = HashMap::new();
+    let mut builtin_module_aliases = HashMap::new();
+    for import in &program.imports {
+        if !std_registry::is_std_path(&import.path) {
+            continue;
+        }
+        match std_registry::resolve_std_import(&import.path, import.span) {
+            Ok(std_registry::StdImport::Module { module })
+                if module == "collections" && import.alias.is_none() =>
+            {
+                modules.insert("collections".to_string());
+            }
+            Ok(std_registry::StdImport::Module { module })
+                if matches!(module.as_str(), "fs" | "env" | "net" | "parallel") =>
+            {
+                if let Some(alias) = &import.alias {
+                    builtin_module_aliases.insert(alias.clone(), module.clone());
+                }
+            }
+            Ok(std_registry::StdImport::Item { module, item })
+                if module == "collections" && matches!(item.as_str(), "Array" | "Map") =>
+            {
+                aliases.insert(import.alias.clone().unwrap_or_else(|| item.clone()), item);
+            }
+            _ => {}
+        }
+    }
+    StdCollectionImports {
+        modules,
+        aliases,
+        builtin_module_aliases,
+        rewrite: true,
+        split: Default::default(),
+    }
+}
+
+/// The local aliases of the builtin schema namespaces declared by `program`
+/// (`import std::fs as files;` records `files -> fs`), on their own.
+///
+/// [`normalize_std_collection_program`] canonicalizes aliases for declaration
+/// processing. HIR is lowered from the original frontend program, so LIR
+/// emission also canonicalizes aliases at each use (willow-nswv).
+pub(crate) fn builtin_module_aliases(program: &Program) -> HashMap<String, String> {
+    std_collection_imports(program).builtin_module_aliases
+}
+
+#[willow_continuations::function(
+    normalize_std_collection_program,
+    normalize_std_collection_item,
+    normalize_std_collection_function,
+    normalize_std_collection_method,
+    normalize_std_collection_block,
+    normalize_std_collection_stmt,
+    normalize_std_collection_expr,
+    normalize_std_collection_call_arg,
+    normalize_std_collection_type
+)]
+pub(crate) fn normalize_std_collection_item(item: &mut Item, imports: &StdCollectionImports) {
+    match item {
+        Item::Function(function) => normalize_std_collection_function(function, imports),
+        Item::Class(class) => {
+            for field in &mut class.fields {
+                normalize_std_collection_type(&mut field.ty, imports);
+            }
+            for method in &mut class.methods {
+                normalize_std_collection_method(method, imports);
+            }
+        }
+        Item::Enum(en) => {
+            for variant in &mut en.variants {
+                for ty in &mut variant.payload {
+                    normalize_std_collection_type(ty, imports);
+                }
+            }
+        }
+        Item::Interface(interface) => {
+            for method in &mut interface.methods {
+                for param in &mut method.params {
+                    normalize_std_collection_type(&mut param.ty, imports);
+                }
+                normalize_std_collection_type(&mut method.return_type, imports);
+            }
+        }
+    }
+}
+
+#[willow_continuations::function(
+    normalize_std_collection_program,
+    normalize_std_collection_item,
+    normalize_std_collection_function,
+    normalize_std_collection_method,
+    normalize_std_collection_block,
+    normalize_std_collection_stmt,
+    normalize_std_collection_expr,
+    normalize_std_collection_call_arg,
+    normalize_std_collection_type
+)]
+pub(crate) fn normalize_std_collection_function(
+    function: &mut FunctionDecl,
+    imports: &StdCollectionImports,
+) {
+    for param in &mut function.params {
+        normalize_std_collection_type(&mut param.ty, imports);
+    }
+    normalize_std_collection_type(&mut function.return_type, imports);
+    normalize_std_collection_block(&mut function.body, imports);
+}
+
+#[willow_continuations::function(
+    normalize_std_collection_program,
+    normalize_std_collection_item,
+    normalize_std_collection_function,
+    normalize_std_collection_method,
+    normalize_std_collection_block,
+    normalize_std_collection_stmt,
+    normalize_std_collection_expr,
+    normalize_std_collection_call_arg,
+    normalize_std_collection_type
+)]
+pub(crate) fn normalize_std_collection_method(
+    method: &mut MethodDecl,
+    imports: &StdCollectionImports,
+) {
+    for param in &mut method.params {
+        normalize_std_collection_type(&mut param.ty, imports);
+    }
+    normalize_std_collection_type(&mut method.return_type, imports);
+    normalize_std_collection_block(&mut method.body, imports);
+}
+
+#[willow_continuations::function(
+    normalize_std_collection_program,
+    normalize_std_collection_item,
+    normalize_std_collection_function,
+    normalize_std_collection_method,
+    normalize_std_collection_block,
+    normalize_std_collection_stmt,
+    normalize_std_collection_expr,
+    normalize_std_collection_call_arg,
+    normalize_std_collection_type
+)]
+pub(crate) fn normalize_std_collection_block(block: &mut Block, imports: &StdCollectionImports) {
+    for stmt in &mut block.stmts {
+        normalize_std_collection_stmt(stmt, imports);
+    }
+}
+
+#[willow_continuations::function(
+    normalize_std_collection_program,
+    normalize_std_collection_item,
+    normalize_std_collection_function,
+    normalize_std_collection_method,
+    normalize_std_collection_block,
+    normalize_std_collection_stmt,
+    normalize_std_collection_expr,
+    normalize_std_collection_call_arg,
+    normalize_std_collection_type
+)]
+pub(crate) fn normalize_std_collection_stmt(stmt: &mut Stmt, imports: &StdCollectionImports) {
+    match stmt {
+        Stmt::Defer(d) => match &mut d.body {
+            DeferBody::Expr(expr) => normalize_std_collection_expr(expr, imports),
+            DeferBody::Block(block) => normalize_std_collection_block(block, imports),
+        },
+        Stmt::Break(_) | Stmt::Continue(_) => {}
+        Stmt::Let(s) => {
+            if let Some(ty) = &mut s.ty {
+                normalize_std_collection_type(ty, imports);
+            }
+            normalize_std_collection_expr(&mut s.init, imports);
+        }
+        Stmt::Assign(s) => normalize_std_collection_expr(&mut s.value, imports),
+        Stmt::SuperInit(s) => {
+            for arg in &mut s.args {
+                normalize_std_collection_call_arg(arg, imports);
+            }
+        }
+        Stmt::StaticFieldAssign(s) => normalize_std_collection_expr(&mut s.value, imports),
+        Stmt::FieldAssign(s) => {
+            normalize_std_collection_expr(&mut s.object, imports);
+            normalize_std_collection_expr(&mut s.value, imports);
+        }
+        Stmt::IndexAssign(s) => {
+            normalize_std_collection_expr(&mut s.array, imports);
+            normalize_std_collection_expr(&mut s.index, imports);
+            normalize_std_collection_expr(&mut s.value, imports);
+        }
+        Stmt::If(s) => {
+            normalize_std_collection_expr(&mut s.cond, imports);
+            normalize_std_collection_block(&mut s.then_block, imports);
+            if let Some(block) = &mut s.else_block {
+                normalize_std_collection_block(block, imports);
+            }
+        }
+        Stmt::While(s) => {
+            normalize_std_collection_expr(&mut s.cond, imports);
+            normalize_std_collection_block(&mut s.body, imports);
+        }
+        Stmt::For(s) => {
+            normalize_std_collection_expr(&mut s.iterable, imports);
+            normalize_std_collection_block(&mut s.body, imports);
+        }
+        Stmt::Lock(s) => {
+            normalize_std_collection_expr(&mut s.target, imports);
+            normalize_std_collection_block(&mut s.body, imports);
+        }
+        Stmt::Return(s) => {
+            if let Some(value) = &mut s.value {
+                normalize_std_collection_expr(value, imports);
+            }
+        }
+        Stmt::Expr(s) => normalize_std_collection_expr(&mut s.expr, imports),
+    }
+}
+
+#[willow_continuations::function(
+    normalize_std_collection_program,
+    normalize_std_collection_item,
+    normalize_std_collection_function,
+    normalize_std_collection_method,
+    normalize_std_collection_block,
+    normalize_std_collection_stmt,
+    normalize_std_collection_expr,
+    normalize_std_collection_call_arg,
+    normalize_std_collection_type
+)]
+pub(crate) fn normalize_std_collection_expr(expr: &mut Expr, imports: &StdCollectionImports) {
+    match expr {
+        Expr::StaticField(_) => {}
+        Expr::Binary(binary) => {
+            normalize_std_collection_expr(&mut binary.lhs, imports);
+            normalize_std_collection_expr(&mut binary.rhs, imports);
+        }
+        Expr::Unary(unary) => normalize_std_collection_expr(&mut unary.expr, imports),
+        Expr::Call(call) => {
+            for arg in &mut call.args {
+                normalize_std_collection_call_arg(arg, imports);
+            }
+        }
+        Expr::FieldAccess(object, _, _, _) => {
+            normalize_std_collection_expr(object, imports);
+        }
+        Expr::MethodCall(call) => {
+            normalize_std_collection_expr(&mut call.object, imports);
+            for arg in &mut call.args {
+                normalize_std_collection_call_arg(arg, imports);
+            }
+        }
+        Expr::StaticCall(call) => {
+            if let Some(item) = std_collection_item_name(&call.class, imports) {
+                call.class = item.to_string();
+            }
+            // `files::exists(..)` under `import std::fs as files;` rewrites
+            // to the canonical builtin module name (willow-2s3 review fix).
+            if let Some(canonical) = imports.builtin_module_aliases.get(&call.class) {
+                call.class = canonical.clone();
+            }
+            for ty in &mut call.type_args {
+                normalize_std_collection_type(ty, imports);
+            }
+            for arg in &mut call.args {
+                normalize_std_collection_call_arg(arg, imports);
+            }
+        }
+        Expr::New(n) => {
+            for ty in &mut n.type_args {
+                normalize_std_collection_type(ty, imports);
+            }
+            for arg in &mut n.args {
+                normalize_std_collection_call_arg(arg, imports);
+            }
+        }
+        Expr::ObjectLiteral(object) => {
+            for field in &mut object.fields {
+                normalize_std_collection_expr(&mut field.value, imports);
+            }
+        }
+        Expr::Await(await_expr) => {
+            normalize_std_collection_expr(&mut await_expr.expr, imports);
+        }
+        Expr::Print(arg, _, _, _) => normalize_std_collection_expr(arg, imports),
+        Expr::Ternary(ternary) => {
+            normalize_std_collection_expr(&mut ternary.condition, imports);
+            normalize_std_collection_expr(&mut ternary.then_expr, imports);
+            normalize_std_collection_expr(&mut ternary.else_expr, imports);
+        }
+        Expr::Range(range) => {
+            normalize_std_collection_expr(&mut range.start, imports);
+            normalize_std_collection_expr(&mut range.end, imports);
+        }
+        Expr::Lambda(lambda) => {
+            imports.enter_lambda(lambda);
+            for param in &mut lambda.params {
+                if let Some(ty) = &mut param.ty {
+                    normalize_std_collection_type(ty, imports);
+                }
+            }
+            if let Some(ty) = &mut lambda.return_type {
+                normalize_std_collection_type(ty, imports);
+            }
+            match &mut lambda.body {
+                LambdaBody::Expr(body) => normalize_std_collection_expr(body, imports),
+                LambdaBody::Block(block) => normalize_std_collection_block(block, imports),
+            }
+            imports.exit_lambda(lambda);
+        }
+        Expr::Match(match_expr) => {
+            normalize_std_collection_expr(&mut match_expr.scrutinee, imports);
+            for arm in &mut match_expr.arms {
+                match &mut arm.body {
+                    MatchBody::Expr(body) => normalize_std_collection_expr(body, imports),
+                    MatchBody::Block(block) => normalize_std_collection_block(block, imports),
+                }
+            }
+        }
+        Expr::TryPropagate(inner, _, _) => normalize_std_collection_expr(inner, imports),
+        Expr::ArrayLiteral(elements, _, _) => {
+            for element in elements {
+                normalize_std_collection_expr(element, imports);
+            }
+        }
+        Expr::Index(array, index, _, _) => {
+            normalize_std_collection_expr(array, imports);
+            normalize_std_collection_expr(index, imports);
+        }
+        Expr::Select(s) => {
+            for case in &mut s.cases {
+                match &mut case.kind {
+                    SelectCaseKind::Recv { channel, .. } => {
+                        normalize_std_collection_expr(channel, imports)
+                    }
+                    SelectCaseKind::Send { channel, value } => {
+                        normalize_std_collection_expr(channel, imports);
+                        normalize_std_collection_expr(value, imports);
+                    }
+                    SelectCaseKind::Timeout { millis } => {
+                        normalize_std_collection_expr(millis, imports)
+                    }
+                    SelectCaseKind::Join { task, .. } => {
+                        normalize_std_collection_expr(task, imports)
+                    }
+                    SelectCaseKind::Default => {}
+                }
+                normalize_std_collection_block(&mut case.body, imports);
+            }
+        }
+        Expr::Integer(_, _, _)
+        | Expr::Float(_, _, _)
+        | Expr::Bool(_, _, _)
+        | Expr::String(_, _, _)
+        | Expr::Var(_, _, _) => {}
+    }
+}
+
+#[willow_continuations::function(
+    normalize_std_collection_program,
+    normalize_std_collection_item,
+    normalize_std_collection_function,
+    normalize_std_collection_method,
+    normalize_std_collection_block,
+    normalize_std_collection_stmt,
+    normalize_std_collection_expr,
+    normalize_std_collection_call_arg,
+    normalize_std_collection_type
+)]
+pub(crate) fn normalize_std_collection_call_arg(arg: &mut CallArg, imports: &StdCollectionImports) {
+    normalize_std_collection_expr(&mut arg.expr, imports);
+}
+
+#[willow_continuations::function(
+    normalize_std_collection_program,
+    normalize_std_collection_item,
+    normalize_std_collection_function,
+    normalize_std_collection_method,
+    normalize_std_collection_block,
+    normalize_std_collection_stmt,
+    normalize_std_collection_expr,
+    normalize_std_collection_call_arg,
+    normalize_std_collection_type
+)]
+pub(crate) fn normalize_std_collection_type(ty: &mut Type, imports: &StdCollectionImports) {
+    match ty {
+        Type::Array(element) => normalize_std_collection_type(element, imports),
+        Type::Generic(name, args) => {
+            for arg in args.iter_mut() {
+                normalize_std_collection_type(arg, imports);
+            }
+            match std_collection_item_name(name, imports) {
+                Some("Array") if args.len() == 1 => {
+                    let element = args.remove(0);
+                    *ty = Type::Array(Box::new(element));
+                }
+                Some("Map") => {
+                    *name = "Map".to_string();
+                }
+                Some("Option") => {
+                    *name = "Option".to_string();
+                }
+                Some("Result") => {
+                    *name = "Result".to_string();
+                }
+                _ => {}
+            }
+        }
+        Type::Fn(params, ret) | Type::Closure(params, ret) => {
+            for param in params {
+                normalize_std_collection_type(param, imports);
+            }
+            normalize_std_collection_type(ret, imports);
+        }
+        Type::I64
+        | Type::F64
+        | Type::Bool
+        | Type::String
+        | Type::Void
+        | Type::Named(_)
+        | Type::Never => {}
+    }
+}
+
+pub(crate) fn std_collection_item_name<'a>(
+    qualified_name: &'a str,
+    imports: &'a StdCollectionImports,
+) -> Option<&'a str> {
+    if !imports.rewrite {
+        return None;
+    }
+    if let Some(item) = imports.aliases.get(qualified_name) {
+        return Some(item.as_str());
+    }
+    if let Some((module, item)) = qualified_name
+        .strip_prefix("std::")
+        .and_then(|path| path.split_once("::"))
+        && let Some((_, builtin_name)) = stdlib_schema::type_item(module, item)
+    {
+        return Some(builtin_name);
+    }
+    let (module, item) = qualified_name.split_once("::")?;
+    imports.modules.contains(module).then(|| {
+        stdlib_schema::type_item("collections", item).map(|(_, builtin_name)| builtin_name)
+    })?
+}

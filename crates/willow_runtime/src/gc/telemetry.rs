@@ -98,7 +98,7 @@ pub extern "C" fn willow_gc_survivor_space_live() -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_allocated_bytes() -> i64 {
     let mut state = runtime().heap.lock().unwrap();
-    sync_tlab_accounting(&mut state);
+    sync_tlab_bytes(&mut state);
     state.allocated_bytes as i64
 }
 

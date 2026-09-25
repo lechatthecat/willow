@@ -335,11 +335,13 @@ fn constructor_flow_deep_branches_use_small_native_stack() {
         .spawn(|| {
             let span = crate::diagnostics::Span::new(0, 0, 1, 1);
             let mut body = Block {
+                id: crate::parser::ast::BodyId::fresh(),
                 stmts: vec![],
                 span,
             };
             for _ in 0..50_000 {
                 body = Block {
+                    id: crate::parser::ast::BodyId::fresh(),
                     stmts: vec![Stmt::If(IfStmt {
                         cond: Expr::Var("flag".into(), span, ExprId::fresh()),
                         then_block: body,

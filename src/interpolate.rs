@@ -17,7 +17,7 @@ pub enum Segment {
     F64(F64Format),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum F64Format {
     G17,
     F16,

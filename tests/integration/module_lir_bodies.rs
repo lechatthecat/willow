@@ -20,9 +20,9 @@
 //!    function is `module_item_symbol(prefix, name)` (`shapes.area`), and a
 //!    method belongs to the QUALIFIED class decl (`shapes::Rect::area`), while
 //!    `lower_function` names it with the module's own bare class name
-//!    (`Rect::area`). `register_module_lir` re-keys every function before
-//!    inserting it, and merges rather than replacing, so the entry program's
-//!    registration and each module's coexist.
+//!    (`Rect::area`). Emission addresses each body by its `BodyId`
+//!    (willow-afb5.18), so the symbol a body is compiled under is chosen at the
+//!    emission site and no name re-keying pass is needed.
 //! 3. Eligibility that survives a class with two spellings. A module class's
 //!    declared field types are qualified (`inner: shapes::Rect`) while the
 //!    module's own bodies say `Rect`. `same_repr`/`same_class` treat two names
@@ -242,10 +242,10 @@ fn main() {
     assert_eq!(out, "12\n");
 }
 
-// 4. The entry program is still lowered — registering a module must MERGE into
-//    `lir_functions`, not replace what the entry put there.
+// 4. The entry program is still lowered — every unit's bodies are stored under
+//    their own `BodyId`, so lowering a module cannot displace the entry's.
 #[test]
-fn registering_a_module_does_not_evict_the_entry_program() {
+fn lowering_a_module_does_not_evict_the_entry_program() {
     let entry = r#"
 import shapes;
 

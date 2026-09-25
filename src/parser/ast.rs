@@ -16,6 +16,33 @@ pub struct ExprId(u64);
 )]
 pub struct PatternId(u64);
 
+/// Identity of executable syntax, independent of source spans. Cloning a body
+/// preserves its immutable source artifact; new syntax receives a fresh ID.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub struct BodyId(u64);
+impl BodyId {
+    pub fn fresh() -> Self {
+        // Body identities use a separate typed namespace: registering blocks
+        // must not renumber expressions or their stable textual LIR names.
+        static NEXT_RANGE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(FIRST_RANGE_START);
+        Self(BODY_IDS.with(|slot| {
+            let mut ids = slot.get();
+            let id = ids.fresh_from(&NEXT_RANGE);
+            slot.set(ids);
+            id
+        }))
+    }
+}
+
+impl std::fmt::Display for BodyId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 impl std::fmt::Display for ExprId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -74,6 +101,9 @@ impl NodeIds {
 }
 
 thread_local! {
+    static BODY_IDS: std::cell::Cell<NodeIds> = const {
+        std::cell::Cell::new(NodeIds { next: 0, end: 0 })
+    };
     static NODE_IDS: std::cell::Cell<NodeIds> = const {
         std::cell::Cell::new(NodeIds { next: 0, end: 0 })
     };
@@ -97,6 +127,7 @@ fn fresh_node_id() -> u64 {
 /// cannot move across threads; syntax IDs themselves remain freely movable.
 pub(crate) struct NodeIdSession {
     previous: NodeIds,
+    previous_bodies: NodeIds,
     _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
@@ -104,6 +135,7 @@ impl NodeIdSession {
     pub(crate) fn enter() -> Self {
         Self {
             previous: NODE_IDS.with(|slot| slot.replace(NodeIds::default())),
+            previous_bodies: BODY_IDS.with(|slot| slot.replace(NodeIds::default())),
             _thread_bound: std::marker::PhantomData,
         }
     }
@@ -112,6 +144,7 @@ impl NodeIdSession {
 impl Drop for NodeIdSession {
     fn drop(&mut self) {
         NODE_IDS.with(|slot| slot.set(self.previous));
+        BODY_IDS.with(|slot| slot.set(self.previous_bodies));
     }
 }
 
@@ -387,6 +420,7 @@ pub enum CallArgMode {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Block {
+    pub id: BodyId,
     pub stmts: Vec<Stmt>,
     pub span: Span,
 }
@@ -1109,6 +1143,28 @@ pub enum UnaryOp {
 
 #[cfg(test)]
 mod node_identity_tests {
+    #[test]
+    fn body_identity_allocation_preserves_expression_numbers_and_nested_sessions() {
+        use super::*;
+        let _session = NodeIdSession::enter();
+        let first = ExprId::fresh();
+        let first_body = BodyId::fresh();
+        for _ in 0..100 {
+            BodyId::fresh();
+        }
+        assert_eq!(ExprId::fresh().0, first.0 + 1);
+        let nested;
+        {
+            let _nested_session = NodeIdSession::enter();
+            nested = BodyId::fresh();
+            assert_ne!(nested, first_body);
+        }
+        assert_eq!(ExprId::fresh().0, first.0 + 2);
+        let last_body = BodyId::fresh();
+        assert_eq!(last_body.0, first_body.0 + 101);
+        assert_ne!(last_body, nested);
+    }
+
     use super::*;
     use std::collections::HashSet;
 

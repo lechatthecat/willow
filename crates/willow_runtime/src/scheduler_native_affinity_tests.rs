@@ -215,7 +215,11 @@ fn affinity_reroute_keeps_claim_visible_until_idle_snapshot_finishes() {
     let owner = stack.worker;
     global_task_table().with_mut(task, |record| record.native_stack = Some(stack));
     let state = Arc::new(ParallelRunState::default());
+    // A stop decision in progress: the gate held with the intent raised. A
+    // claim with no decision in progress does not take the gate at all
+    // (willow-8hq4.19); its resolution is covered by the claim-word epoch.
     let gate = state.claim_gate.lock().unwrap();
+    state.stop_intent.store(true, Ordering::SeqCst);
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let claim_state = Arc::clone(&state);
     let claimer = std::thread::spawn(move || {
@@ -235,6 +239,7 @@ fn affinity_reroute_keeps_claim_visible_until_idle_snapshot_finishes() {
     }
     let escaped = escaped.or_else(|| done_rx.recv_timeout(Duration::from_millis(100)).ok());
     let visible = claims_in_flight();
+    state.stop_intent.store(false, Ordering::SeqCst);
     drop(gate);
     let no_work = escaped.unwrap_or_else(|| done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
     claimer.join().unwrap();

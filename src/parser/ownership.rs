@@ -422,7 +422,7 @@ clone_shell_struct!(CallArg {
     syntax: [expr]
 });
 clone_shell_struct!(Block {
-    metadata: [span],
+    metadata: [id, span],
     syntax: [stmts]
 });
 clone_shell_struct!(BinaryExpr {
@@ -957,6 +957,7 @@ mod tests {
                             params: vec![],
                             return_type: None,
                             body: LambdaBody::Block(Block {
+                                id: crate::parser::ast::BodyId::fresh(),
                                 stmts: vec![Stmt::Return(ReturnStmt {
                                     value: Some(expr),
                                     span,
@@ -982,6 +983,7 @@ mod tests {
                     stmt = Stmt::While(WhileStmt {
                         cond: placeholder_expr(),
                         body: Block {
+                            id: crate::parser::ast::BodyId::fresh(),
                             stmts: vec![stmt],
                             span,
                         },

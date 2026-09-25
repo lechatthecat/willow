@@ -24,7 +24,7 @@
 //! restored on resume. Defer scopes and recovery edges likewise come from LIR;
 //! cleanup graphs are replayed with their captured locals and fresh region state.
 
-use super::type_index::TypeMap;
+use super::class_view::ClassTables;
 use super::{FlatReferenceDebug, ModuleSymbols};
 use crate::semantic::ids::SemanticType as Type;
 use std::borrow::Cow;
@@ -58,7 +58,7 @@ use crate::semantic::intrinsics::Intrinsic;
 use crate::semantic::type_checker::types::await_output_type;
 use crate::semantic::type_checker::types::type_name;
 
-use super::emit_interface::{class_base_ids, collection_elem_kind, is_self_or_descendant};
+use super::emit_interface::{collection_elem_kind, is_self_or_descendant};
 use super::gc_codegen::{GcLayoutMetadata, GcObjectKind, GcStoreDestination};
 use super::option_repr::{OptionRepr, option_repr};
 use super::symbols::{class_method_symbol_name, class_name_for_object_type, module_item_symbol};
@@ -413,13 +413,11 @@ impl LirEnumDef {
 pub(super) struct LirTypeCtx<'x> {
     /// Whether a symbol name is a declared/linkable function.
     pub known_fn: &'x dyn Fn(&str) -> bool,
-    pub class_layouts: &'x TypeMap<Vec<(String, Type)>>,
-    pub class_base: &'x TypeMap<TypeId>,
-    /// Runtime `type_id` per class NAME. A direct type import (`import
-    /// zoo::Animal;`) registers the imported class a second time under its
-    /// unqualified name, sharing the canonical class's id — so this is what
-    /// makes class IDENTITY comparable across those two names.
-    pub class_type_ids: &'x TypeMap<i64>,
+    /// Field layouts, base edges and runtime `type_id`s per class NAME. A
+    /// direct type import (`import zoo::Animal;`) aliases the imported class
+    /// under its unqualified name, so both spellings answer with the canonical
+    /// class's id — which is what makes class IDENTITY comparable across them.
+    pub classes: &'x dyn ClassTables,
     /// Whether a name is registered as an interface (never a class here).
     pub is_interface: &'x dyn Fn(&TypeId) -> bool,
     /// The build-wide identity of an interface NAME, or `None` when the name is
@@ -550,22 +548,22 @@ fn normalize_void_payloads(payloads: &mut Vec<Type>) {
 /// nothing, so no name that resolves today stops resolving — a class reached
 /// through a module that only another module imports keeps working.
 fn resolve_class_key<Q: super::type_index::TypeLookup + ?Sized>(
-    class_layouts: &TypeMap<Vec<(String, Type)>>,
-    class_type_ids: &TypeMap<i64>,
+    classes: &dyn ClassTables,
     known_modules: &ModuleSymbols,
     visible_modules: &HashSet<String>,
     name: &Q,
 ) -> Option<TypeId> {
     let name = &name.type_id();
-    if class_layouts.contains_key(name) {
+    if classes.is_class(name) {
         return Some(*name);
     }
     // One runtime class is one `type_id`, so two spellings that carry the same
     // id are one answer; a class with no id at all is never merged by name.
-    let same_class = |a: &TypeId, b: &TypeId| match (class_type_ids.get(a), class_type_ids.get(b)) {
-        (Some(x), Some(y)) => x == y,
-        _ => false,
-    };
+    let same_class =
+        |a: &TypeId, b: &TypeId| match (classes.class_type_id(a), classes.class_type_id(b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        };
     // `Err` is "these modules disagree", which is not the same answer as `None`
     // ("none of them has such a class") — only the first makes the name
     // genuinely ambiguous at this site.
@@ -576,7 +574,7 @@ fn resolve_class_key<Q: super::type_index::TypeLookup + ?Sized>(
                 continue;
             }
             let qualified = (*name).in_namespace(module);
-            if !class_layouts.contains_key(&qualified) {
+            if !classes.is_class(&qualified) {
                 continue;
             }
             match &found {
@@ -947,13 +945,7 @@ impl LirTypeCtx<'_> {
     /// [`resolve_class_key`] — eligibility and emission must resolve a name the
     /// same way or the walker admits a body the emitter then cannot key.
     fn class_key(&self, name: &TypeId) -> Option<TypeId> {
-        resolve_class_key(
-            self.class_layouts,
-            self.class_type_ids,
-            self.known_modules,
-            self.visible_modules,
-            name,
-        )
+        resolve_class_key(self.classes, self.known_modules, self.visible_modules, name)
     }
 
     fn supported_class_inner(&self, name: &TypeId, open: &mut HashSet<Type>) -> bool {
@@ -963,7 +955,7 @@ impl LirTypeCtx<'_> {
         let Some(key) = self.class_key(name) else {
             return false;
         };
-        let Some(layout) = self.class_layouts.get(&key) else {
+        let Some(layout) = self.classes.class_fields(&key) else {
             return false;
         };
         // A self- or mutually-referential field (`class Node { next: Node; }`)
@@ -993,13 +985,14 @@ impl LirTypeCtx<'_> {
     /// `target`'s slot indices — and a subclass extends both rather than
     /// rearranging either, so both remain valid.
     ///
-    /// The question is asked in `type_id` space rather than over NAMES. A
-    /// direct type import (`import zoo::Animal;`) copies the imported class's
-    /// tables under the unqualified `Animal`, while `class_base` keeps
-    /// CANONICAL names on both sides of every edge (`zoo::Dog` → `zoo::Animal`)
-    /// — so comparing `"Animal"` to those strings finds nothing and an aliased
-    /// base looks like a leaf. Aliased and canonical spellings share one
-    /// runtime `type_id`.
+    /// The question is answered in `type_id` space rather than over NAMES. A
+    /// direct type import (`import zoo::Animal;`) aliases the imported class
+    /// under the unqualified `Animal`, while base edges keep CANONICAL names
+    /// on both sides (`zoo::Dog` → `zoo::Animal`) — so comparing `"Animal"` to
+    /// those strings finds nothing and an aliased base looks like a leaf.
+    /// Aliased and canonical spellings share one runtime `type_id`, so the
+    /// walk up `sub`'s chain compares ids at every step and costs one step per
+    /// ancestor rather than a projection of the whole class graph.
     fn class_widening(&self, target: &Type, value: &Type) -> bool {
         let (Type::Named(base), Type::Named(sub)) = (target, value) else {
             return false;
@@ -1011,8 +1004,8 @@ impl LirTypeCtx<'_> {
             return false;
         };
         let (Some(base_id), Some(sub_id)) = (
-            self.class_type_ids.get(&base_key).copied(),
-            self.class_type_ids.get(&sub_key).copied(),
+            self.classes.class_type_id(&base_key),
+            self.classes.class_type_id(&sub_key),
         ) else {
             return false;
         };
@@ -1020,9 +1013,10 @@ impl LirTypeCtx<'_> {
         // strictly-wider case.
         base_id != sub_id
             && is_self_or_descendant(
-                &class_base_ids(self.class_base, self.class_type_ids),
-                sub_id,
+                sub_key,
                 base_id,
+                |name| self.classes.class_type_id(&name),
+                |name| self.classes.class_base(&name),
             )
     }
 
@@ -1148,7 +1142,7 @@ impl LirTypeCtx<'_> {
             return true;
         }
         matches!(
-            (self.class_type_ids.get(&ka), self.class_type_ids.get(&kb)),
+            (self.classes.class_type_id(&ka), self.classes.class_type_id(&kb)),
             (Some(x), Some(y)) if x == y
         )
     }
@@ -1205,18 +1199,18 @@ impl LirTypeCtx<'_> {
             if (self.known_fn)(&mangled) {
                 return Some(mangled);
             }
-            search = self.class_base.get(&name).cloned();
+            search = self.classes.class_base(&name);
         }
         None
     }
 
     /// The declared field layout of a supported class named by `ty`.
-    fn class_layout_of(&self, ty: &Type) -> Option<&Vec<(String, Type)>> {
+    fn class_layout_of(&self, ty: &Type) -> Option<std::sync::Arc<Vec<(String, Type)>>> {
         let Type::Named(name) = ty else { return None };
         if !self.supported_class(name) {
             return None;
         }
-        self.class_layouts.get(&self.class_key(name)?)
+        self.classes.class_fields(&self.class_key(name)?)
     }
 
     /// The declared callable type of a symbol that is about to be used as a
@@ -2706,7 +2700,7 @@ fn supported_lir_pattern<'n>(
             if !(ctx.is_interface)(iface)
                 || !matches!(binding_ty, Type::Named(n) if n == class_name)
                 || !ctx.supported_class(&class_name.to_string())
-                || !ctx.class_type_ids.contains_key(class_name)
+                || ctx.classes.class_type_id(class_name).is_none()
             {
                 return false;
             }
@@ -2829,7 +2823,7 @@ fn supported_pattern<'n>(
             if !(ctx.is_interface)(iface)
                 || !matches!(binding_ty, Type::Named(n) if n == class_name)
                 || !ctx.supported_class(&class_name.to_string())
-                || !ctx.class_type_ids.contains_key(class_name)
+                || ctx.classes.class_type_id(class_name).is_none()
             {
                 return false;
             }
@@ -3522,16 +3516,17 @@ fn supported_body_stmt<'n>(
             value,
             ..
         } => {
-            let Some(field_ty) = ctx
-                .class_layout_of(&object.ty)
-                .and_then(|layout| layout.iter().find(|(name, _)| name == field))
-                .map(|(_, ty)| ty)
-            else {
+            let Some(field_ty) = ctx.class_layout_of(&object.ty).and_then(|layout| {
+                layout
+                    .iter()
+                    .find(|(name, _)| name == field)
+                    .map(|(_, ty)| ty.clone())
+            }) else {
                 return false;
             };
             !lir_expr_suspends(object)
                 && !lir_expr_suspends(value)
-                && ctx.storable(field_ty, &value.ty)
+                && ctx.storable(&field_ty, &value.ty)
                 && supported_expr(object, ctx, names)
                 && supported_expr(value, ctx, names)
         }
@@ -4260,10 +4255,11 @@ fn supported_expr_node<'n>(
                     && e.ty == Type::I64
                     && child_supported(object);
             }
-            ctx.class_layout_of(&object.ty)
-                .and_then(|l| l.iter().find(|(n, _)| n == field))
-                .is_some_and(|(_, fty)| ctx.same_repr(fty, &e.ty))
-                && child_supported(object)
+            ctx.class_layout_of(&object.ty).is_some_and(|l| {
+                l.iter()
+                    .find(|(n, _)| n == field)
+                    .is_some_and(|(_, fty)| ctx.same_repr(fty, &e.ty))
+            }) && child_supported(object)
         }
         // The builtin array methods the walker emits, plus a direct call to a
         // method of a simple class. Anything else on an array (`freeze`,
@@ -4820,10 +4816,12 @@ fn supported_reference_place<'n>(
             .get(name.as_str())
             .is_some_and(|bound| ctx.same_repr(bound, &place.ty)),
         HirExprKind::FieldAccess { object, field } => {
-            ctx.class_layout_of(&object.ty)
-                .and_then(|layout| layout.iter().find(|(name, _)| name == field))
-                .is_some_and(|(_, ty)| ctx.same_repr(ty, &place.ty))
-                && child_supported(object)
+            ctx.class_layout_of(&object.ty).is_some_and(|layout| {
+                layout
+                    .iter()
+                    .find(|(name, _)| name == field)
+                    .is_some_and(|(_, ty)| ctx.same_repr(ty, &place.ty))
+            }) && child_supported(object)
         }
         HirExprKind::Index { array, index } => {
             matches!(&array.ty, Type::Array(elem) if ctx.same_repr(elem, &place.ty))
@@ -6761,7 +6759,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // `Pattern::ClassDowncast`, including its exactness: a subclass
             // instance does NOT match its base's arm on either backend.
             crate::ir::lowered::LirPattern::ClassDowncast { class_name, .. } => {
-                let type_id = self.class_type_ids.get(class_name).copied().unwrap_or_else(|| {
+                let type_id = self.classes.type_id(class_name).unwrap_or_else(|| {
                     panic!(
                         "compiler invariant violated: checked downcast pattern class `{class_name}` has no type id"
                     )
@@ -6966,7 +6964,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 };
                 let receiver = self.emit_lir_operand(function, receiver);
                 let (args, roots) = self.emit_flat_call_operands(function, args);
-                let result = if matches!(receiver_ty, Type::Named(name) | Type::Generic(name, _) if self.interface_infos.contains_key(name))
+                let result = if matches!(receiver_ty, Type::Named(name) | Type::Generic(name, _) if self.classes.is_interface(name))
                 {
                     self.emit_flat_interface_call(
                         receiver,
@@ -7409,22 +7407,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
-    pub(super) fn lir_class_layout(&self, ty: &Type) -> Vec<(String, Type)> {
+    /// The byte layout of the class `ty` names on this target: one shared
+    /// result per class, so a field access indexes it instead of copying the
+    /// field list.
+    pub(super) fn lir_class_layout(
+        &self,
+        ty: &Type,
+    ) -> std::sync::Arc<crate::compiler_db::layout::ObjectLayout> {
         let class =
             class_name_for_object_type(ty).expect("class receiver type vetted by LIR eligibility");
         // Resolved exactly as eligibility resolved it, so a bare module class
         // name reaches the layout the module registered (willow-0g8j.2.19).
         let key = resolve_class_key(
-            self.class_layouts,
-            self.class_type_ids,
+            &self.classes,
             self.known_modules,
             self.visible_modules,
             &class,
         )
         .expect("class layout vetted by LIR eligibility");
-        self.class_layouts
-            .get(&key)
-            .cloned()
+        self.classes
+            .object_layout(&key, reference_type(self.module.target_config()).bytes())
             .expect("class layout vetted by LIR eligibility")
     }
     fn map_is_ref_flag(&mut self, ty: &Type) -> cranelift_codegen::ir::Value {
@@ -8448,7 +8450,7 @@ fn flat_rvalue_supported(
         V::ArrayAlloc { length, element } => *length <= i64::MAX as usize && ctx.supported_type(&Type::Array(Box::new(element.clone()))),
         V::ArrayStore { array, value, element, .. } => ty(array).is_some_and(|array| ctx.supported_type(&array) && matches!(&array, Type::Array(inner) if ctx.same_repr(inner, element))) && ctx.supported_type(element) && ty(value).is_some_and(|value| ctx.storable(element, &value)),
         V::Index { array, element, .. } => ctx.supported_type(element) && ty(array).is_some_and(|array| ctx.supported_type(&array) && (matches!(&array, Type::Array(_)) || matches!(lir_collection(&array), Some((LirCollection::FrozenArray, _)))) && ctx.same_repr(&array_element_type(&array), element)),
-        V::ObjectAlloc { class } => ctx.supported_class(class) && ctx.class_layouts.get(class).is_some() && ctx.class_type_ids.get(class).is_some(),
+        V::ObjectAlloc { class } => ctx.supported_class(class) && ctx.classes.is_class(class) && ctx.classes.class_type_id(class).is_some(),
         V::FieldLoad { object_ty, field, result, .. } => ctx.supported_type(object_ty) && ctx.supported_type(result) && field_type(object_ty, field).is_some_and(|field| ctx.same_repr(&field, result)),
         V::FieldStore { object_ty, field, value, .. } => ctx.class_layout_of(object_ty).is_some() && field_type(object_ty, field).is_some_and(|field| ty(value).is_some_and(|value| ctx.supported_type(&value) && ctx.storable(&field, &value))),
         V::StaticField { class, field, result } => (ctx.static_field)(ctx.resolved_class(&class.to_string()), field).is_some_and(|field| ctx.supported_type(&field) && ctx.same_repr(&field, result)),
@@ -8881,6 +8883,7 @@ impl FuncGen<'_, '_> {
 mod tests {
     use super::*;
     use crate::backend::cranelift::symbols::{backend_symbol_component, class_member_symbol};
+    use crate::backend::cranelift::type_index::TypeMap;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
 
@@ -8956,7 +8959,7 @@ mod tests {
 
     struct TestTables {
         known: HashSet<String>,
-        class_layouts: TypeMap<Vec<(String, Type)>>,
+        class_layouts: TypeMap<std::sync::Arc<Vec<(String, Type)>>>,
         static_fields: HashMap<(String, String), Type>,
         class_base: TypeMap<TypeId>,
         class_type_ids: TypeMap<i64>,
@@ -9035,6 +9038,20 @@ mod tests {
                 .get(&iface.to_string())
                 .map(|methods| methods.iter().map(|(name, ..)| name.clone()).collect())
                 .unwrap_or_default()
+        }
+    }
+
+    impl ClassTables for TestTables {
+        fn class_fields(&self, class: &TypeId) -> Option<std::sync::Arc<Vec<(String, Type)>>> {
+            self.class_layouts.get(class).cloned()
+        }
+
+        fn class_type_id(&self, class: &TypeId) -> Option<i64> {
+            self.class_type_ids.get(class).copied()
+        }
+
+        fn class_base(&self, class: &TypeId) -> Option<TypeId> {
+            self.class_base.get(class).copied()
         }
     }
 
@@ -9179,7 +9196,8 @@ mod tests {
                                 .iter()
                                 .filter(|f| !f.is_static)
                                 .map(|f| (f.name.clone(), f.ty.clone().into()))
-                                .collect(),
+                                .collect::<Vec<_>>()
+                                .into(),
                         );
                         if let Some(base) = &c.base_class {
                             t.class_base
@@ -9246,13 +9264,13 @@ mod tests {
                     let Some(ancestor_own) = own.get(ancestor) else {
                         continue;
                     };
-                    for (name, ty) in ancestor_own {
+                    for (name, ty) in ancestor_own.iter() {
                         if !fields.iter().any(|(n, _)| n == name) {
                             fields.push((name.clone(), ty.clone()));
                         }
                     }
                 }
-                t.class_layouts.insert(*class_name, fields);
+                t.class_layouts.insert(*class_name, fields.into());
             }
             t
         }
@@ -9262,9 +9280,7 @@ mod tests {
         fn with_ctx<R>(&self, body: impl FnOnce(&LirTypeCtx<'_>) -> R) -> R {
             body(&LirTypeCtx {
                 known_fn: &|n| self.known.contains(n),
-                class_layouts: &self.class_layouts,
-                class_base: &self.class_base,
-                class_type_ids: &self.class_type_ids,
+                classes: self,
                 is_interface: &|n| self.interfaces.contains(&n.to_string()),
                 iface_identity: &|n| self.interfaces.contains(&n.to_string()).then_some(*n),
                 can_box: &|class, iface| {
@@ -11121,19 +11137,36 @@ mod tests {
     /// The two tables [`resolve_class_key`] reads: layouts by class key, and
     /// the runtime type id of each (a negative id in the fixture means the
     /// class has none).
-    type ClassTables = (TypeMap<Vec<(String, Type)>>, TypeMap<i64>);
+    struct ResolveTables {
+        layouts: TypeMap<std::sync::Arc<Vec<(String, Type)>>>,
+        ids: TypeMap<i64>,
+    }
 
-    /// `class_layouts` and `class_type_ids` holding one empty class per entry.
-    fn class_tables(classes: &[(&str, i64)]) -> ClassTables {
+    impl ClassTables for ResolveTables {
+        fn class_fields(&self, class: &TypeId) -> Option<std::sync::Arc<Vec<(String, Type)>>> {
+            self.layouts.get(class).cloned()
+        }
+
+        fn class_type_id(&self, class: &TypeId) -> Option<i64> {
+            self.ids.get(class).copied()
+        }
+
+        fn class_base(&self, _class: &TypeId) -> Option<TypeId> {
+            None
+        }
+    }
+
+    /// Class layouts and runtime ids holding one empty class per entry.
+    fn class_tables(classes: &[(&str, i64)]) -> ResolveTables {
         let mut layouts = TypeMap::new();
         let mut ids = TypeMap::new();
         for (name, id) in classes {
-            layouts.insert((*name).to_string(), Vec::new());
+            layouts.insert((*name).to_string(), Vec::new().into());
             if *id >= 0 {
                 ids.insert((*name).to_string(), *id);
             }
         }
-        (layouts, ids)
+        ResolveTables { layouts, ids }
     }
 
     fn modules(names: &[&str]) -> ModuleSymbols {
@@ -11149,18 +11182,18 @@ mod tests {
 
     #[test]
     fn vm1_an_own_class_is_never_re_resolved() {
-        let (layouts, ids) = class_tables(&[("Point", 1), ("a::Point", 2)]);
+        let tables = class_tables(&[("Point", 1), ("a::Point", 2)]);
         assert_eq!(
-            resolve_class_key(&layouts, &ids, &modules(&["a"]), &visible(&["a"]), "Point"),
+            resolve_class_key(&tables, &modules(&["a"]), &visible(&["a"]), "Point"),
             Some(TypeId::from_source_name("Point"))
         );
     }
 
     #[test]
     fn vm2_the_visible_module_answers() {
-        let (layouts, ids) = class_tables(&[("a::Point", 1)]);
+        let tables = class_tables(&[("a::Point", 1)]);
         assert_eq!(
-            resolve_class_key(&layouts, &ids, &modules(&["a"]), &visible(&["a"]), "Point"),
+            resolve_class_key(&tables, &modules(&["a"]), &visible(&["a"]), "Point"),
             Some(TypeId::from_source_name("a::Point"))
         );
     }
@@ -11170,15 +11203,9 @@ mod tests {
         // The bug this fixes: `b` is a module the entry never imported, and its
         // unrelated `Point` used to make the name ambiguous and cost the body
         // its lowering.
-        let (layouts, ids) = class_tables(&[("a::Point", 1), ("b::Point", 2)]);
+        let tables = class_tables(&[("a::Point", 1), ("b::Point", 2)]);
         assert_eq!(
-            resolve_class_key(
-                &layouts,
-                &ids,
-                &modules(&["a", "b"]),
-                &visible(&["a"]),
-                "Point"
-            ),
+            resolve_class_key(&tables, &modules(&["a", "b"]), &visible(&["a"]), "Point"),
             Some(TypeId::from_source_name("a::Point"))
         );
     }
@@ -11187,11 +11214,10 @@ mod tests {
     fn vm4_two_visible_modules_of_the_same_name_are_ambiguous() {
         // Both are in scope at this site, so nothing here can say which layout
         // the name means: refuse, rather than pick one.
-        let (layouts, ids) = class_tables(&[("a::Point", 1), ("b::Point", 2)]);
+        let tables = class_tables(&[("a::Point", 1), ("b::Point", 2)]);
         assert_eq!(
             resolve_class_key(
-                &layouts,
-                &ids,
+                &tables,
                 &modules(&["a", "b"]),
                 &visible(&["a", "b"]),
                 "Point"
@@ -11204,10 +11230,9 @@ mod tests {
     fn vm5_two_spellings_of_one_class_are_one_answer() {
         // One module imported under two access names is one runtime class, so
         // the shared type_id makes the two keys agree.
-        let (layouts, ids) = class_tables(&[("c::Point", 7), ("checks::Point", 7)]);
+        let tables = class_tables(&[("c::Point", 7), ("checks::Point", 7)]);
         let key = resolve_class_key(
-            &layouts,
-            &ids,
+            &tables,
             &modules(&["c", "checks"]),
             &visible(&["c", "checks"]),
             "Point",
@@ -11223,11 +11248,10 @@ mod tests {
     fn vm6_an_invisible_module_still_answers_when_nothing_visible_does() {
         // A class reached through a module only ANOTHER module imports keeps
         // resolving: the visible pass is a preference, not a filter.
-        let (layouts, ids) = class_tables(&[("deep::Point", 1)]);
+        let tables = class_tables(&[("deep::Point", 1)]);
         assert_eq!(
             resolve_class_key(
-                &layouts,
-                &ids,
+                &tables,
                 &modules(&["deep"]),
                 &visible(&["shallow"]),
                 "Point"
@@ -11238,24 +11262,18 @@ mod tests {
 
     #[test]
     fn vm7_invisible_modules_that_disagree_are_still_ambiguous() {
-        let (layouts, ids) = class_tables(&[("a::Point", 1), ("b::Point", 2)]);
+        let tables = class_tables(&[("a::Point", 1), ("b::Point", 2)]);
         assert_eq!(
-            resolve_class_key(
-                &layouts,
-                &ids,
-                &modules(&["a", "b"]),
-                &HashSet::new(),
-                "Point"
-            ),
+            resolve_class_key(&tables, &modules(&["a", "b"]), &HashSet::new(), "Point"),
             None
         );
     }
 
     #[test]
     fn vm8_a_class_no_module_declares_resolves_to_nothing() {
-        let (layouts, ids) = class_tables(&[("a::Point", 1)]);
+        let tables = class_tables(&[("a::Point", 1)]);
         assert_eq!(
-            resolve_class_key(&layouts, &ids, &modules(&["a"]), &visible(&["a"]), "Rect"),
+            resolve_class_key(&tables, &modules(&["a"]), &visible(&["a"]), "Rect"),
             None
         );
     }
@@ -11264,11 +11282,10 @@ mod tests {
     fn vm9_a_candidate_without_a_type_id_is_never_merged() {
         // No id means no proof the two names are one class, so they cannot be
         // merged even when they are both visible.
-        let (layouts, ids) = class_tables(&[("a::Point", -1), ("b::Point", -1)]);
+        let tables = class_tables(&[("a::Point", -1), ("b::Point", -1)]);
         assert_eq!(
             resolve_class_key(
-                &layouts,
-                &ids,
+                &tables,
                 &modules(&["a", "b"]),
                 &visible(&["a", "b"]),
                 "Point"
@@ -11281,11 +11298,10 @@ mod tests {
     fn vm10_a_visible_name_that_is_not_a_module_is_ignored() {
         // A unit's visible set can hold names that are not modules of this
         // build at all; only the ones `known_modules` knows select a candidate.
-        let (layouts, ids) = class_tables(&[("a::Point", 1)]);
+        let tables = class_tables(&[("a::Point", 1)]);
         assert_eq!(
             resolve_class_key(
-                &layouts,
-                &ids,
+                &tables,
                 &modules(&["a"]),
                 &visible(&["fs", "Point", "a"]),
                 "Point"

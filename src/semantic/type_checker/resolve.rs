@@ -2101,7 +2101,7 @@ impl TypeChecker {
                     )
                     .with_label(Label::primary(span, "instance method called with `::`"));
 
-                    diagnostic = if class_name == self.current_class.as_deref().unwrap_or("")
+                    diagnostic = if class_name == self.local.current_class.as_deref().unwrap_or("")
                         && self.symbols.lookup_var("self").is_some()
                     {
                         diagnostic.with_help(format!("write `self.{}` instead", method_name))
@@ -2238,7 +2238,7 @@ impl TypeChecker {
     /// and the LIR walker rejects the call as outside its subset (willow-njot).
     pub(super) fn resolve_static_call_class_quiet(&self, class_name: &str) -> Option<String> {
         if class_name == "Self" {
-            return self.current_class.clone();
+            return self.local.current_class.clone();
         }
         if let Some(item) = self.imported_collection_aliases.get(class_name) {
             return Some(item.clone());
@@ -2316,7 +2316,7 @@ impl TypeChecker {
             return Some(self.canonical_type_name(class_name));
         }
 
-        match self.current_class.clone() {
+        match self.local.current_class.clone() {
             Some(class_name) => Some(class_name),
             None => {
                 self.push(

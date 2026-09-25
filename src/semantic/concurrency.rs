@@ -1,14 +1,8 @@
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
 use crate::parser::iter::{AstEvent, AstWalk};
-use crate::semantic::call_graph::{CallGraph, CallSites};
-use crate::semantic::effects::{EffectProblem, RuntimeEffects, cycle_members};
 use crate::semantic::ids::{FunctionId, TypeId};
-use std::collections::{HashMap, HashSet};
-
-/// "Cannot yield to the scheduler": the single effect bit E0810 reads out of
-/// the shared lattice.
-const NO_PREEMPT: RuntimeEffects = RuntimeEffects::NO_PREEMPT_REGION;
+use std::collections::HashMap;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ConcurrencyReport {
@@ -124,22 +118,8 @@ impl Default for ConcurrencyAnalyzer {
             errors: Vec::new(),
             report: ConcurrencyReport::default(),
             current_async_context: false,
-            sync_stack_preemption: cfg!(any(
-                all(
-                    target_os = "linux",
-                    target_env = "gnu",
-                    any(target_arch = "x86_64", target_arch = "aarch64")
-                ),
-                all(
-                    target_os = "macos",
-                    any(target_arch = "x86_64", target_arch = "aarch64")
-                ),
-                all(
-                    target_os = "windows",
-                    target_env = "msvc",
-                    target_arch = "x86_64"
-                )
-            )),
+            sync_stack_preemption: crate::compiler_db::inputs::TargetCapabilities::native()
+                .sync_stack_preemption,
             current_class: None,
             nonpreemptible_sync_helpers: HashMap::new(),
         }
@@ -230,8 +210,17 @@ impl ConcurrencyAnalyzer {
         self
     }
 
-    pub fn check_program(mut self, program: &Program) -> Self {
-        self.index_nonpreemptible_sync_helpers(program);
+    pub fn check_program(self, program: &Program) -> Self {
+        let helpers = compute_nonpreemptible_helpers(program);
+        self.check_program_with_helpers(program, &helpers)
+    }
+
+    pub(crate) fn check_program_with_helpers(
+        mut self,
+        program: &Program,
+        helpers: &crate::compiler_db::HelperSummary,
+    ) -> Self {
+        self.index_nonpreemptible_sync_helpers(helpers);
         for item in &program.items {
             match item {
                 Item::Function(function) => self.check_function(function),
@@ -247,11 +236,11 @@ impl ConcurrencyAnalyzer {
         self
     }
 
-    fn index_nonpreemptible_sync_helpers(&mut self, program: &Program) {
+    fn index_nonpreemptible_sync_helpers(&mut self, helpers: &crate::compiler_db::HelperSummary) {
         // Own (same-program) helpers carry `module: None` so the diagnostic can
         // point a secondary label at their definition. Keys are bare names or
         // `Class::method`; they never collide with seeded `module::*` keys.
-        for (name, helper) in compute_nonpreemptible_helpers(program) {
+        for (&name, helper) in helpers {
             self.nonpreemptible_sync_helpers
                 .entry(name)
                 .or_insert(SyncHelperRef {
@@ -430,228 +419,22 @@ impl ConcurrencyAnalyzer {
     }
 }
 
-/// One synchronous helper in the call graph built by
-/// [`compute_nonpreemptible_helpers`].
-struct HelperNode {
-    id: FunctionId,
-    span: Span,
-    contains_loop: bool,
-    calls: HashSet<FunctionId>,
-}
-
-/// Compute the synchronous helpers in `program` that cannot yield to the
-/// scheduler when called from a task context, keyed by typed function identity.
-///
-/// A helper is non-preemptible when it (1) contains a loop, (2) transitively
-/// calls a helper with a loop, (3) belongs to a recursive call cycle, or
-/// (4) transitively reaches one. Clauses 3 and 4 matter because unbounded work
-/// needs no `while`: `fib(40)` monopolizes a worker with nothing but recursion.
-///
-/// Shared by the same-program index and the imported-module seeding so the
-/// reachability fixpoint behaves identically in both, and by the type checker
-/// to flag non-preemptible methods called through a typed non-`self` receiver
-/// (willow-0a6k.2).
+/// Standalone consumers use the same typed inventory and combined solve as a
+/// compilation session. Session callers borrow the already-computed projection.
 pub(crate) fn compute_nonpreemptible_helpers(
     program: &Program,
 ) -> HashMap<FunctionId, NonpreemptibleHelper> {
-    crate::query_stats::add(crate::query_stats::Counter::NonpreemptibleHelpers, 1);
-    let mut helpers: Vec<HelperNode> = Vec::new();
-    for item in &program.items {
-        match item {
-            Item::Function(function) if !function.is_async => helpers.push(HelperNode {
-                id: FunctionId::free(function.name.as_str()),
-                span: function.span,
-                contains_loop: block_contains_loop(&function.body),
-                calls: called_helpers(&function.body, &function.params),
-            }),
-            Item::Class(class) => {
-                for method in &class.methods {
-                    if !method.is_async {
-                        let calls = called_helpers(&method.body, &method.params)
-                            .into_iter()
-                            .map(|callee| {
-                                qualify_self_call(&TypeId::local(class.name.as_str()), callee)
-                            })
-                            .collect();
-                        helpers.push(HelperNode {
-                            id: FunctionId::method(
-                                TypeId::local(class.name.as_str()),
-                                method.name.as_str(),
-                            ),
-                            span: method.span,
-                            contains_loop: block_contains_loop(&method.body),
-                            calls,
-                        });
-                    }
-                }
-            }
-            Item::Function(_) | Item::Enum(_) | Item::Interface(_) => {}
-        }
-    }
-
-    // Only edges whose callee is itself an analyzed sync helper are kept: async
-    // callees run on their own safepoints, and an unknown callee (builtin,
-    // unresolved interface target) carries no summary here. That filter is why
-    // this graph is built from the typed helper set rather than reused from the
-    // backend's `CallGraph::build`, which is deliberately conservative about
-    // both.
-    let known: HashSet<&FunctionId> = helpers.iter().map(|helper| &helper.id).collect();
-    let mut graph = CallGraph::default();
-    for helper in &helpers {
-        graph.merge(
-            helper.id,
-            CallSites {
-                targets: helper
-                    .calls
-                    .iter()
-                    .filter(|callee| known.contains(callee))
-                    .cloned()
-                    .collect(),
-                has_unknown: false,
-            },
-        );
-    }
-
-    // Seed: a loop in the body, or membership in a recursive cycle. Unbounded
-    // work needs no `while`, so cycle membership is its own seed.
-    let cycles = cycle_members(&graph, std::iter::empty());
-    let mut problem: EffectProblem<NonpreemptibleReason> = EffectProblem::new()
-        // Nothing outside the helper set carries a summary, and nothing here is
-        // a safety property: an unseen callee is not evidence of a loop.
-        .external_callee(RuntimeEffects::NONE)
-        .unknown_callee(RuntimeEffects::NONE)
-        .missing_body(RuntimeEffects::NONE);
-    for helper in &helpers {
-        problem = problem.body(helper.id);
-        if helper.contains_loop {
-            problem = problem.seed(helper.id, NO_PREEMPT, Some(NonpreemptibleReason::Loop));
-        } else if cycles.contains(&helper.id) {
-            problem = problem.seed(helper.id, NO_PREEMPT, Some(NonpreemptibleReason::Recursion));
-        }
-    }
-
-    // The witness join is `min` and `Loop` sorts before `Recursion`, which is
-    // exactly `NonpreemptibleReason::join`: a helper that both loops and
-    // reaches recursion is still reported as looping.
-    let facts = problem.solve(&graph);
-    helpers
-        .into_iter()
-        .filter_map(|helper| {
-            let summary = facts.get(&helper.id)?;
-            let reason = *summary.witness(NO_PREEMPT)?;
-            Some((
-                helper.id,
-                NonpreemptibleHelper {
-                    span: helper.span,
-                    reason,
-                },
-            ))
-        })
-        .collect()
-}
-
-/// Does this body contain a source-level loop that the scheduler cannot preempt?
-///
-/// Two subtrees are deliberately excluded, and both predate the shared walker:
-///
-/// * a `defer` body runs at scope exit rather than inline, so a loop inside one
-///   is attributed to the deferred callable, not to this one;
-/// * a lambda body is a separate callable with its own summary.
-fn block_contains_loop(block: &Block) -> bool {
-    let mut walk = AstWalk::new(AstEvent::Block(block));
-    while let Some(event) = walk.next() {
-        match event {
-            AstEvent::Stmt(Stmt::While(_) | Stmt::For(_)) => return true,
-            AstEvent::Stmt(Stmt::Defer(_)) | AstEvent::Lambda(_) => walk.skip_children(),
-            _ => {}
-        }
-    }
-    false
-}
-
-fn called_helpers(block: &Block, params: &[Param]) -> HashSet<FunctionId> {
-    let mut collector = CallCollector {
-        calls: HashSet::new(),
-        scopes: vec![params.iter().map(|param| param.name.clone()).collect()],
-    };
-    let mut walk = AstWalk::new(AstEvent::Block(block));
-    while let Some(event) = walk.next() {
-        match event {
-            AstEvent::EnterScope => collector.enter_scope(),
-            AstEvent::ExitScope => collector.exit_scope(),
-            AstEvent::Bind(name) => collector.bind(name),
-            AstEvent::Expr(expr) => collector.visit_expr(expr),
-            AstEvent::Lambda(_) => walk.skip_children(),
-            _ => {}
-        }
-    }
-    collector.calls
-}
-
-fn qualify_self_call(class_name: &TypeId, callee: FunctionId) -> FunctionId {
-    callee.resolve_self_owner(class_name)
-}
-
-/// Direct call edges out of one body, with local bindings excluded.
-///
-/// A call through a local name is indirect: its target is whatever value the
-/// binding currently holds, which is not a static edge to a same-named
-/// top-level helper (willow-bv9.1). The shared walker supplies the shadowing
-/// rule — a `let` binds only after its own initializer, and `for`, `lock`,
-/// lambda parameters, `match` arms and `select` cases each scope their binding
-/// to their body.
-struct CallCollector {
-    calls: HashSet<FunctionId>,
-    scopes: Vec<HashSet<String>>,
-}
-
-impl CallCollector {
-    fn is_local(&self, name: &str) -> bool {
-        self.scopes.iter().rev().any(|scope| scope.contains(name))
-    }
-}
-
-impl CallCollector {
-    fn enter_scope(&mut self) {
-        self.scopes.push(HashSet::new());
-    }
-
-    fn exit_scope(&mut self) {
-        self.scopes.pop();
-    }
-
-    fn bind(&mut self, name: &str) {
-        self.scopes
-            .last_mut()
-            .expect("call collector scope")
-            .insert(name.to_string());
-    }
-
-    fn visit_expr(&mut self, expr: &Expr) {
-        match expr {
-            // A shadowed name is an indirect call through a function value,
-            // which has no static target and so contributes no edge.
-            Expr::Call(call) if !self.is_local(&call.callee) => {
-                self.calls
-                    .insert(FunctionId::free_from_source_name(&call.callee));
-            }
-            Expr::StaticCall(call) => {
-                self.calls.insert(FunctionId::method(
-                    TypeId::from_source_name(&call.class),
-                    call.method.as_str(),
-                ));
-            }
-            Expr::MethodCall(call) => {
-                if matches!(&call.object, Expr::Var(name, _, _) if name == "self") {
-                    self.calls.insert(FunctionId::method(
-                        TypeId::local("self"),
-                        call.method.as_str(),
-                    ));
-                }
-            }
-            _ => {}
-        }
-    }
+    let graph = crate::semantic::TypeChecker::resolved_effect_graph(program);
+    let effects = crate::compiler_db::effects::solve_unit(
+        program,
+        &graph,
+        &HashMap::<ExprId, Type>::new(),
+        None,
+        &HashMap::new(),
+        &HashMap::new(),
+        |_| crate::semantic::effects::RuntimeEffects::MAY_PANIC,
+    );
+    std::sync::Arc::try_unwrap(effects.helpers).expect("fresh helper projection")
 }
 
 #[cfg(test)]
@@ -680,11 +463,16 @@ mod tests {
                     expr = Expr::TryPropagate(Box::new(expr), span, ExprId::fresh());
                 }
                 body.stmts.push(Stmt::Expr(ExprStmt { expr, span }));
-                assert!(!block_contains_loop(&body));
-                assert_eq!(
-                    called_helpers(&body, &[]),
-                    HashSet::from([FunctionId::free("heavy")])
-                );
+                let program = Program {
+                    items: vec![Item::Function(FunctionDecl { body, ..function })],
+                    ..program
+                };
+                let helpers = compute_nonpreemptible_helpers(&program);
+                assert!(helpers.is_empty());
+                let Item::Function(mut function) = program.items.into_iter().next().unwrap() else {
+                    unreachable!()
+                };
+                let body = &mut function.body;
                 let Stmt::Expr(statement) = &mut body.stmts.pop().unwrap() else {
                     unreachable!()
                 };
