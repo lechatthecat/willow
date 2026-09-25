@@ -61,6 +61,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "2\ntrue\n2\n-1\nhello Alice\n11\n12\nBob\n12\nBob scored 12\n14\n8\n21\n-1\n12\n7\n",
         ),
         ("example/constructor_flow.wi", "zero\n0\none\n1\nmany\n2\n"),
+        ("example/constructor_lambdas.wi", "8\n402\n"),
         (
             "example/map_float_keys.wi",
             "true\n1\n20\n20\n{0.0: 20}\ntrue\nfalse\nNaN cannot be used as a Map key\n1\n",
