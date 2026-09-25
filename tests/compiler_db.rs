@@ -58,8 +58,9 @@ impl Project {
                 .replace(self.0.to_str().unwrap(), "<project>")
                 .lines()
                 // The runtime auto-build's cargo status line carries a
-                // wall-clock duration.
-                .filter(|line| !line.trim_start().starts_with("Finished `"))
+                // wall-clock duration; it is ANSI-colored when
+                // CARGO_TERM_COLOR=always (as in CI).
+                .filter(|line| !strip_ansi(line).trim_start().starts_with("Finished `"))
                 .fold(String::new(), |mut text, line| {
                     text.push_str(line);
                     text.push('\n');
@@ -147,6 +148,26 @@ impl Project {
             format!("{expected}\n")
         );
     }
+}
+
+/// Remove ANSI CSI escape sequences (`ESC [ ... final-byte`).
+fn strip_ansi(line: &str) -> String {
+    let mut plain = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    plain
 }
 
 /// Each unit is hydrated once to check it and once to declare it, in debug
