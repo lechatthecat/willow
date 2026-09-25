@@ -16,7 +16,8 @@ impl Fixture {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir(&path).unwrap();
-        Self(path)
+        // Identity and cycle diagnostics contain canonical package paths.
+        Self(std::fs::canonicalize(path).unwrap())
     }
 
     fn package(&self, name: &str, marker: bool, extra: &str) -> PathBuf {

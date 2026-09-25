@@ -17,7 +17,8 @@ impl Fixture {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&root).unwrap();
-        Self(root)
+        // Match resolved packages even when the OS temp directory is a symlink.
+        Self(std::fs::canonicalize(root).unwrap())
     }
     fn file(&self, package: u32, path: &str, source: &str) {
         let file = self.0.join(format!("p{package}/src/{path}"));

@@ -165,7 +165,11 @@ fn remove_tree(root: &Path) -> std::io::Result<()> {
                 permissions.set_mode(permissions.mode() | 0o700);
             }
             #[cfg(windows)]
-            permissions.set_readonly(false);
+            {
+                // Windows clears the read-only attribute, not Unix access bits.
+                #[allow(clippy::permissions_set_readonly_false)]
+                permissions.set_readonly(false);
+            }
             fs::set_permissions(&path, permissions)?;
         }
         if metadata.is_dir() {

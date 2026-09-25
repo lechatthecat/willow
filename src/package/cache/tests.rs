@@ -1,5 +1,22 @@
 use super::*;
 
+#[cfg(windows)]
+#[test]
+fn remove_tree_clears_readonly_files_in_nested_directories() {
+    let temp = Temporary::new(&std::env::temp_dir()).unwrap();
+    let root = temp.0.join("tree");
+    let nested = root.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    for path in [root.join("file"), nested.join("file")] {
+        fs::write(&path, "cached content").unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+    remove_tree(&root).unwrap();
+    assert!(!root.exists());
+}
+
 #[test]
 fn home_defaults_and_explicit_override_are_platform_independent() {
     for windows in [false, true] {
