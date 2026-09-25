@@ -7,7 +7,7 @@
 //! * `backend::cranelift::panic_effect` built a backend-symbol keyed graph from
 //!   the raw AST at codegen time, with a private `class_bases` map and its own
 //!   `dispatch_targets` / `is_same_or_subclass`;
-//! * `semantic::type_checker::check` builds `lock_effect_edges` keyed by
+//! * `semantic::type_checker::check` builds typed call edges keyed by
 //!   [`FunctionId`] as a side effect of the checker's own type-directed walk.
 //!
 //! The willow-s9ej.11 bug — a `self.method()` fast path that bypassed dispatch
@@ -35,7 +35,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
 use crate::parser::ast::*;
-use crate::parser::iter::{AstEvent, AstWalk};
 use crate::semantic::ids::{FunctionId, TypeId};
 
 /// The class inheritance relation and the set of methods each class declares.
@@ -274,7 +273,7 @@ impl ClassHierarchy {
 }
 
 /// What one body can reach.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CallSites {
     /// Statically resolved targets, including the full virtual-dispatch union.
     pub targets: BTreeSet<FunctionId>,
@@ -290,96 +289,6 @@ pub struct CallGraph {
 }
 
 impl CallGraph {
-    /// Build the graph for `program`. `lambdas` are the lifted lambda bodies,
-    /// each already given the id it will be known by; their call sites are still
-    /// indirect at every caller, so a lambda contributes a node but never an
-    /// inbound static edge.
-    pub fn build(
-        program: &Program,
-        hierarchy: &ClassHierarchy,
-        lambdas: &[(FunctionId, &LambdaExpr)],
-    ) -> Self {
-        let mut graph = Self::default();
-        let free_functions: HashSet<&str> = program
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Function(function) => Some(function.name.as_str()),
-                _ => None,
-            })
-            .collect();
-
-        for item in &program.items {
-            match item {
-                Item::Function(function) => {
-                    let id = FunctionId::free(function.name.as_str());
-                    let sites = collect_call_sites(
-                        &function.params,
-                        &function.body,
-                        None,
-                        hierarchy,
-                        &free_functions,
-                    );
-                    graph.merge(id, sites);
-                }
-                Item::Class(class) => {
-                    let owner = TypeId::local(class.name.as_str());
-                    for method in &class.methods {
-                        let id = FunctionId::method(owner, method.name.as_str());
-                        let sites = collect_call_sites(
-                            &method.params,
-                            &method.body,
-                            Some(class.name.as_str()),
-                            hierarchy,
-                            &free_functions,
-                        );
-                        graph.merge(id, sites);
-                    }
-                    for constructor in &class.constructors {
-                        let id = FunctionId::method(owner, "init");
-                        let sites = collect_call_sites(
-                            &constructor.params,
-                            &constructor.body,
-                            Some(class.name.as_str()),
-                            hierarchy,
-                            &free_functions,
-                        );
-                        graph.merge(id, sites);
-                    }
-                }
-                Item::Enum(_) | Item::Interface(_) => {}
-            }
-        }
-
-        for (id, lambda) in lambdas {
-            if let LambdaBody::Block(body) = &lambda.body {
-                // The lifted body is walked standalone, so its own parameters
-                // have to be seeded here: a call spelled with a parameter name
-                // is a call through a function value, not a static edge to a
-                // same-named top-level helper.
-                let mut sites = collect_call_sites(&[], body, None, hierarchy, &free_functions);
-                let param_names: HashSet<&str> =
-                    lambda.params.iter().map(|p| p.name.as_str()).collect();
-                let shadowed: Vec<FunctionId> = sites
-                    .targets
-                    .iter()
-                    .filter(|target| {
-                        target.owner().is_none()
-                            && target.namespace().is_none()
-                            && param_names.contains(target.name())
-                    })
-                    .cloned()
-                    .collect();
-                for target in shadowed {
-                    sites.targets.remove(&target);
-                    sites.has_unknown = true;
-                }
-                graph.merge(*id, sites);
-            }
-        }
-        graph
-    }
-
     /// Union `sites` into the node for `id`. Several declarations can share one
     /// id — multiple constructors currently do — and the union keeps an earlier
     /// hazard from being erased by a later declaration.
@@ -409,243 +318,6 @@ impl CallGraph {
         self.nodes.is_empty()
     }
 }
-
-/// Walk one body and record what it calls.
-fn collect_call_sites(
-    params: &[Param],
-    body: &Block,
-    current_class: Option<&str>,
-    hierarchy: &ClassHierarchy,
-    free_functions: &HashSet<&str>,
-) -> CallSites {
-    let mut collector = CallSiteCollector {
-        hierarchy,
-        free_functions,
-        current_class,
-        bindings: LexicalBindings::default(),
-        sites: CallSites::default(),
-    };
-    for param in params {
-        collector.bindings.bind(&param.name, Some(param.ty.clone()));
-    }
-    collector.walk(body);
-    collector.sites
-}
-
-struct CallSiteCollector<'a> {
-    hierarchy: &'a ClassHierarchy,
-    free_functions: &'a HashSet<&'a str>,
-    current_class: Option<&'a str>,
-    bindings: LexicalBindings,
-    sites: CallSites,
-}
-
-/// One visible-name index with an undo log: lookup never scans scope depth.
-/// Each scope/name pair is restored once; same-scope rebinding reuses its slot.
-#[derive(Default)]
-struct LexicalBindings {
-    visible: HashMap<String, ScopedBinding>,
-    undo: Vec<(String, Option<ScopedBinding>)>,
-    scopes: Vec<usize>,
-    #[cfg(test)]
-    probes: std::cell::Cell<usize>,
-}
-
-struct ScopedBinding {
-    depth: usize,
-    ty: Option<Type>,
-}
-
-impl LexicalBindings {
-    fn lookup(&self, name: &str) -> Option<&Option<Type>> {
-        #[cfg(test)]
-        self.probes.set(self.probes.get() + 1);
-        self.visible.get(name).map(|binding| &binding.ty)
-    }
-
-    fn bind(&mut self, name: &str, ty: Option<Type>) {
-        let depth = self.scopes.len();
-        if let Some(binding) = self.visible.get_mut(name)
-            && binding.depth == depth
-        {
-            binding.ty = ty;
-            return;
-        }
-        let previous = self
-            .visible
-            .insert(name.to_owned(), ScopedBinding { depth, ty });
-        self.undo.push((name.to_owned(), previous));
-    }
-
-    fn enter_scope(&mut self) {
-        self.scopes.push(self.undo.len());
-    }
-
-    fn exit_scope(&mut self) {
-        let Some(start) = self.scopes.pop() else {
-            return;
-        };
-        while self.undo.len() > start {
-            let (name, previous) = self.undo.pop().expect("binding in scope");
-            if let Some(ty) = previous {
-                self.visible.insert(name, ty);
-            } else {
-                self.visible.remove(&name);
-            }
-        }
-    }
-}
-
-impl CallSiteCollector<'_> {
-    fn record(&mut self, id: FunctionId) {
-        self.sites.targets.insert(id);
-    }
-
-    fn record_unknown(&mut self) {
-        self.sites.has_unknown = true;
-    }
-
-    /// The innermost binding of `name`, or `None` when the name is not a local.
-    fn lookup(&self, name: &str) -> Option<&Option<Type>> {
-        self.bindings.lookup(name)
-    }
-
-    /// The class a receiver expression is known to hold. Only the forms the
-    /// backend can see without type information are recognised; everything else
-    /// is unknown, which is the fail-closed answer.
-    fn receiver_class(&self, expression: &Expr) -> Option<String> {
-        let ty = match expression {
-            Expr::New(new) => Some(Type::Named(new.class_name.clone())),
-            Expr::ObjectLiteral(object) => Some(Type::Named(object.class.clone())),
-            Expr::Var(name, _, _) => self.lookup(name).cloned().flatten(),
-            _ => None,
-        }?;
-        match &ty {
-            // Deliberately `Named` only. A generic instantiation is not treated
-            // as a class receiver, which keeps the answer conservative rather
-            // than resolving a dispatch the backend cannot name.
-            Type::Named(name) if self.hierarchy.is_known_class(name) => Some(name.clone()),
-            _ => None,
-        }
-    }
-}
-
-/// Call sites are read off the shared structural walk (willow-uqzx.1.1). Every
-/// arm is POST-order: the children are already recorded by `walk_*` before this
-/// node is classified.
-impl CallSiteCollector<'_> {
-    fn walk(&mut self, body: &Block) {
-        let mut walk = AstWalk::new(AstEvent::Block(body));
-        while let Some(event) = walk.next() {
-            match event {
-                AstEvent::Lambda(_) => walk.skip_children(),
-                AstEvent::EnterScope => self.enter_scope(),
-                AstEvent::ExitScope => self.exit_scope(),
-                AstEvent::Bind(name) => self.bind(name),
-                AstEvent::ExitStmt(stmt) => self.visit_stmt(stmt),
-                AstEvent::ExitExpr(expr) => self.visit_expr(expr),
-                _ => {}
-            }
-        }
-    }
-
-    fn enter_scope(&mut self) {
-        self.bindings.enter_scope();
-    }
-
-    /// The parameter scope is not the walker's to close.
-    fn exit_scope(&mut self) {
-        self.bindings.exit_scope();
-    }
-
-    fn bind(&mut self, name: &str) {
-        self.bindings.bind(name, None);
-    }
-
-    fn visit_stmt(&mut self, statement: &Stmt) {
-        match statement {
-            Stmt::Let(stmt) => {
-                // The Bind event already introduced the name in the innermost scope,
-                // after the initializer was walked. Fill in its type there.
-                if let Some(ty) = stmt.ty.clone().or_else(|| match &stmt.init {
-                    Expr::New(new) => Some(Type::Named(new.class_name.clone())),
-                    Expr::ObjectLiteral(object) => Some(Type::Named(object.class.clone())),
-                    _ => None,
-                }) && let Some(slot) = self.bindings.visible.get_mut(&stmt.name)
-                {
-                    slot.ty = Some(ty);
-                }
-            }
-            // Resolving the base constructor needs the hierarchy plus the
-            // enclosing class; `super.init` is rare enough that leaving the edge
-            // unknown costs little and cannot be wrong.
-            Stmt::SuperInit(_) => self.record_unknown(),
-            _ => {}
-        }
-    }
-
-    fn visit_expr(&mut self, expression: &Expr) {
-        match expression {
-            Expr::Call(call) => {
-                let callee = call.callee.as_str();
-                if self.lookup(callee).is_some() {
-                    // Call through a function value: no static target even when
-                    // the value is currently a source lambda.
-                    self.record_unknown();
-                } else if self.free_functions.contains(callee) {
-                    self.record(FunctionId::free(callee));
-                } else {
-                    // Builtins, enum constructors and imported names. The
-                    // consumer decides what a name it does not own means.
-                    self.record(FunctionId::free_from_source_name(callee));
-                }
-            }
-            Expr::MethodCall(call) => {
-                // `self.method()` is virtual just like a call through any other
-                // class-typed receiver: an inherited body running on a subclass
-                // instance selects that subclass's override (willow-s9ej.11).
-                let declared_class = if matches!(&call.object, Expr::Var(name, _, _) if name == "self")
-                {
-                    self.current_class.map(str::to_owned)
-                } else {
-                    self.receiver_class(&call.object)
-                };
-                let targets = declared_class
-                    .map(|class| self.hierarchy.dispatch_targets(&class, &call.method))
-                    .unwrap_or_default();
-                if targets.is_empty() {
-                    // Interface dispatch, builtin collection helpers, and any
-                    // receiver whose class this unit cannot name.
-                    self.record_unknown();
-                } else {
-                    for target in targets {
-                        self.record(target);
-                    }
-                }
-            }
-            Expr::StaticCall(call) => {
-                let class = if call.class == "Self" {
-                    self.current_class.map(str::to_owned)
-                } else {
-                    Some(call.class.clone())
-                };
-                match class {
-                    Some(class) => self.record(FunctionId::method(
-                        TypeId::from_source_name(&class),
-                        call.method.as_str(),
-                    )),
-                    None => self.record_unknown(),
-                }
-            }
-            Expr::New(new) => self.record(FunctionId::method(
-                TypeId::from_source_name(&new.class_name),
-                "init",
-            )),
-            _ => {}
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     //! Resolution perspectives for the shared call graph (willow-uqzx.1.2).
@@ -677,85 +349,6 @@ mod tests {
     //! parameter stays local inside a nested block.
     use super::*;
 
-    #[test]
-    fn lexical_index_probes_are_independent_of_scope_depth() {
-        for n in [16, 64, 256, 1024] {
-            let mut bindings = LexicalBindings::default();
-            bindings.bind("receiver", Some(Type::Named("Outer".into())));
-            for i in 0..n {
-                bindings.enter_scope();
-                bindings.bind(&format!("local{i}"), None);
-                bindings.bind("receiver", Some(Type::Named(format!("Inner{i}"))));
-                // Same-scope rebinding must restore the enclosing scope too.
-                bindings.bind("receiver", None);
-                assert_eq!(bindings.lookup("receiver"), Some(&None));
-                assert_eq!(bindings.lookup("local0"), Some(&None));
-                assert_eq!(bindings.lookup("missing"), None);
-                assert_eq!(bindings.undo.len(), 1 + 2 * (i + 1));
-            }
-            for i in (0..n).rev() {
-                bindings.exit_scope();
-                assert_eq!(bindings.lookup(&format!("local{i}")), None);
-                if i > 0 {
-                    assert_eq!(bindings.lookup("receiver"), Some(&None));
-                }
-            }
-            assert_eq!(
-                bindings.lookup("receiver"),
-                Some(&Some(Type::Named("Outer".into())))
-            );
-            assert_eq!(bindings.probes.get(), 5 * n);
-            assert_eq!(bindings.visible.len(), 1);
-            assert_eq!(bindings.undo.len(), 1);
-            eprintln!(
-                "lexical-index n={n} bindings={} probes={} restored=1",
-                3 * n + 1,
-                bindings.probes.get()
-            );
-        }
-    }
-
-    #[test]
-    fn deep_call_site_scan_uses_a_one_megabyte_stack() {
-        std::thread::Builder::new()
-            .stack_size(1024 * 1024)
-            .spawn(|| {
-                let mut program = parse("fn caller() { helper(); }");
-                let Item::Function(function) = &mut program.items[0] else {
-                    unreachable!()
-                };
-                let Stmt::Expr(statement) = &mut function.body.stmts.remove(0) else {
-                    unreachable!()
-                };
-                let span = statement.span;
-                let mut expr = statement.expr.take();
-                for _ in 0..50_000 {
-                    expr = Expr::TryPropagate(Box::new(expr), span, ExprId::fresh());
-                }
-                function
-                    .body
-                    .stmts
-                    .push(Stmt::Expr(ExprStmt { expr, span }));
-                let sites = collect_call_sites(
-                    &[],
-                    &function.body,
-                    None,
-                    &ClassHierarchy::default(),
-                    &HashSet::from(["helper"]),
-                );
-                let Stmt::Expr(statement) = &mut function.body.stmts.remove(0) else {
-                    unreachable!()
-                };
-                let expr = statement.expr.take();
-                drop(expr);
-                assert_eq!(sites.targets, BTreeSet::from([FunctionId::free("helper")]));
-                assert!(!sites.has_unknown);
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
     fn parse(source: &str) -> Program {
         let tokens = crate::lexer::Lexer::new(source).tokenize().expect("lex");
         let (program, errors) = crate::parser::Parser::new(tokens).parse();
@@ -766,7 +359,7 @@ mod tests {
     fn graph_of(source: &str) -> (CallGraph, ClassHierarchy) {
         let program = parse(source);
         let hierarchy = ClassHierarchy::from_program(&program);
-        let graph = CallGraph::build(&program, &hierarchy, &[]);
+        let graph = crate::semantic::TypeChecker::resolved_effect_graph(&program);
         (graph, hierarchy)
     }
 
@@ -1081,15 +674,15 @@ mod tests {
     }
 
     #[test]
-    fn p18_an_interface_typed_receiver_is_unknown() {
+    fn p18_an_interface_typed_receiver_reaches_its_dispatch_union() {
         let source = "interface Speaker { fn speak(self) -> i64; }\n\
                       fn caller(s: Speaker) -> i64 { return s.speak(); }";
-        assert!(free_targets(source, "caller").is_empty());
-        assert!(has_unknown(source, "caller"));
+        assert_eq!(free_targets(source, "caller"), vec!["Speaker::speak"]);
+        assert!(!has_unknown(source, "caller"));
     }
 
     #[test]
-    fn p19_a_receiver_with_no_inferable_class_is_unknown() {
+    fn p19_a_call_result_receiver_uses_its_checked_class() {
         let source = "class Cell {\n\
                         pub value: i64;\n\
                         init(self, value: i64) { self.value = value; }\n\
@@ -1097,9 +690,8 @@ mod tests {
                       }\n\
                       fn make() -> Cell { return new Cell(1); }\n\
                       fn caller() -> i64 { return make().take(); }";
-        // The receiver is a call result; without types the class is unknown.
-        assert!(has_unknown(source, "caller"));
-        assert_eq!(free_targets(source, "caller"), vec!["make"]);
+        assert!(!has_unknown(source, "caller"));
+        assert_eq!(free_targets(source, "caller"), vec!["make", "Cell::take"]);
     }
 
     #[test]

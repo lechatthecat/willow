@@ -12,9 +12,24 @@ use super::source_file::SourceFile;
 pub struct ModuleId(pub u32);
 
 impl ModuleId {
+    pub const ENTRY: Self = Self(0);
     pub fn file_id(self) -> FileId {
-        FileId(self.0 + 1)
+        FileId(self.0)
     }
+    pub fn role(self) -> UnitRole {
+        if self == Self::ENTRY {
+            UnitRole::Entry
+        } else {
+            UnitRole::Imported
+        }
+    }
+}
+
+pub type UnitId = ModuleId;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitRole {
+    Entry,
+    Imported,
 }
 
 #[derive(Debug, Default)]
@@ -27,6 +42,8 @@ struct Dependencies {
 #[derive(Debug, Default)]
 pub struct ModuleGraph {
     pub root: PathBuf,
+    /// Canonical file-backed entry identity; absent for an in-memory entry.
+    pub entry_path: Option<PathBuf>,
     /// Dependency-first order, suitable for type registration and codegen.
     pub files: Vec<SourceFile>,
     pub(crate) artifacts: Option<super::artifacts::UnitArtifacts>,
@@ -65,7 +82,11 @@ impl ModuleGraph {
         if let Some(id) = self.module_id(canonical_path) {
             return id;
         }
-        let id = ModuleId(self.next_module_id);
+        let id = ModuleId(
+            self.next_module_id
+                .checked_add(1)
+                .expect("module identity exhausted"),
+        );
         self.next_module_id += 1;
         self.by_canonical_path
             .insert(canonical_path.to_string(), id);

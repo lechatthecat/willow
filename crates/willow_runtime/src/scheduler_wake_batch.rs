@@ -31,41 +31,59 @@ impl ShardedTaskTable {
         if ids.is_empty() {
             return;
         }
-        // Stable counting partition: one reusable allocation instead of one
-        // high-water allocation per shard when successive batches change shape.
-        let mut offsets = [0; TASK_TABLE_SHARDS + 1];
-        for &id in ids {
-            offsets[self.shard_index(id) + 1] += 1;
-        }
-        for index in 0..TASK_TABLE_SHARDS {
-            offsets[index + 1] += offsets[index];
-        }
-        let mut next = offsets;
-        scratch.grouped.resize(ids.len(), 0);
-        for &id in ids {
-            let slot = &mut next[self.shard_index(id)];
-            scratch.grouped[*slot] = id;
-            *slot += 1;
-        }
-        // Lock participating shards in the same ascending order as with_two_mut.
-        // Retain them through queue publication and blocked-count reconciliation:
-        // releasing early could let cancellation/reaping consume an unpublished
-        // token, or let idle detection miss the last blocked-syscall completion.
-        let mut shards: [_; TASK_TABLE_SHARDS] = std::array::from_fn(|index| {
-            if offsets[index] == offsets[index + 1] {
-                None
-            } else {
-                #[cfg(test)]
-                {
-                    scratch.shard_locks += 1;
-                }
-                Some(self.lock_shard(index))
+        // Group ids by shard, stable within a shard, so each shard is locked
+        // once and in ascending index order (as with_two_mut). A batch at
+        // least as large as the shard count uses a counting partition,
+        // O(ids + shards) = O(ids); a smaller one a stable sort, O(ids log ids),
+        // so a small batch pays nothing per shard (willow-8hq4.19). Both group
+        // in the reused `grouped` buffer.
+        scratch.grouped.extend_from_slice(ids);
+        if ids.len() >= TASK_TABLE_SHARDS {
+            let mut offsets = [0; TASK_TABLE_SHARDS + 1];
+            for &id in ids {
+                offsets[self.shard_index(id) + 1] += 1;
             }
-        });
+            for index in 0..TASK_TABLE_SHARDS {
+                offsets[index + 1] += offsets[index];
+            }
+            for &id in ids {
+                let slot = &mut offsets[self.shard_index(id)];
+                scratch.grouped[*slot] = id;
+                *slot += 1;
+            }
+        } else {
+            scratch.grouped.sort_by_key(|&id| self.shard_index(id));
+        }
+        // Retain every participating shard through queue publication and
+        // blocked-count reconciliation: releasing early could let
+        // cancellation/reaping consume an unpublished token, or let idle
+        // detection miss the last blocked-syscall completion. A one-id batch,
+        // the common channel handoff, holds its guard without allocating; a
+        // larger one allocates one guard vector, O(1) per batch.
+        let mut single = None;
+        let mut several = Vec::new();
+        if ids.len() == 1 {
+            single = Some((0..1, self.lock_shard(self.shard_index(ids[0]))));
+        } else {
+            let mut start = 0;
+            while start < scratch.grouped.len() {
+                let index = self.shard_index(scratch.grouped[start]);
+                let mut end = start + 1;
+                while end < scratch.grouped.len() && self.shard_index(scratch.grouped[end]) == index
+                {
+                    end += 1;
+                }
+                several.push((start..end, self.lock_shard(index)));
+                start = end;
+            }
+        }
+        #[cfg(test)]
+        {
+            scratch.shard_locks = usize::from(single.is_some()) + several.len();
+        }
         let mut unblocked = 0;
-        for (index, shard) in shards.iter_mut().enumerate() {
-            let Some(shard) = shard else { continue };
-            for &id in &scratch.grouped[offsets[index]..offsets[index + 1]] {
+        for (range, shard) in single.iter_mut().chain(several.iter_mut()) {
+            for &id in &scratch.grouped[range.clone()] {
                 let Some(task) = shard.get_mut(&id) else {
                     scratch.terminal.push(id);
                     continue;
@@ -116,7 +134,7 @@ pub(crate) fn wake_channel_owners(ids: &[u64], scratch: &mut WakeBatchScratch) {
         return;
     }
     crate::gc::stress_collect("scheduler");
-    wake_tasks_outcome_in(&global_task_table(), &global_run_queues(), ids, scratch);
+    wake_tasks_outcome_in(global_task_table(), global_run_queues(), ids, scratch);
     let worker = current_task_id().map(|_| current_worker());
     for &id in &scratch.enqueued {
         crate::observability::record(

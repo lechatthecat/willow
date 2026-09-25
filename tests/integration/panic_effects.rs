@@ -940,6 +940,284 @@ fn main() {
     );
 }
 
+/// A lambda body's own summary comes from the same checked call graph as a
+/// named body: a call to a panicking function makes the lifted lambda
+/// may-panic, a pure body proves it no-panic, and the definer stays no-panic
+/// whether or not the value is ever invoked.
+/// A copied interface default is checked once; its lambdas' facts come from
+/// the canonical body, not from a missing per-copy node.
+#[test]
+fn pe_33_injected_default_lambdas_share_the_canonical_body_facts() {
+    let source = r#"
+fn boom(n: i64) -> i64 { if n < 0 { panic("negative"); } return n; }
+interface Value {
+    fn value(self) -> i64 {
+        let risky = |x: i64| { return boom(x); };
+        let safe = |x: i64| { return x; };
+        return safe(1);
+    }
+}
+class A implements Value {}
+class B implements Value {}
+fn main() { let a = new A(); let b = new B(); println(a.value() + b.value()); }
+"#;
+    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
+    assert!(ok, "{stderr}");
+    for (index, expected) in [
+        (0, "may-panic"),
+        (1, "no-panic"),
+        (2, "may-panic"),
+        (3, "no-panic"),
+    ] {
+        assert!(
+            stderr.contains(&format!("[panic-effects] $lambda.{index}: {expected}")),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn pe_33_cross_unit_default_lambdas_use_the_source_unit_facts() {
+    let project = TestProject::new(
+        "panic_effect_default_origin",
+        &[
+            (
+                "values.wi",
+                r#"
+module values;
+pub fn boom(n: i64) -> i64 { if n < 0 { panic("negative"); } return n; }
+pub fn pure(n: i64) -> i64 { return n; }
+pub interface Value {
+    fn value(self) -> i64 {
+        let risky = |x: i64| { return boom(x); };
+        let safe = |x: i64| { return pure(x); };
+        return safe(1);
+    }
+}
+"#,
+            ),
+            (
+                "main.wi",
+                r#"
+import values::Value;
+import values::boom;
+import values::pure;
+class A implements Value {}
+class B implements Value {}
+fn main() { println(new A().value() + new B().value()); }
+"#,
+            ),
+        ],
+    );
+    let compile = project.compile_with_env(
+        "main.wi",
+        &[
+            ("WILLOW_PANIC_EFFECTS_LOG", "1"),
+            ("WILLOW_QUERY_STATS", "1"),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(compile.status.success(), "{stderr}");
+    for (index, expected) in [
+        (0, "may-panic"),
+        (1, "no-panic"),
+        (2, "may-panic"),
+        (3, "no-panic"),
+    ] {
+        assert!(
+            stderr.contains(&format!("[panic-effects] $lambda.{index}: {expected}")),
+            "{stderr}"
+        );
+    }
+    assert!(stderr.contains("effect_solves=2 "), "{stderr}");
+    let run = project.run();
+    assert!(run.status.success());
+    assert_eq!(run.stdout, b"2\n");
+}
+
+#[test]
+fn pe_33_cross_unit_default_copy_keeps_its_resolved_free_call_effects() {
+    let project = TestProject::new(
+        "panic_effect_default_copy_binding",
+        &[
+            (
+                "values.wi",
+                r#"
+module values;
+fn pure(n: i64) -> i64 { return n; }
+pub interface Value {
+    fn value(self) -> i64 { let f = |x: i64| { return pure(x); }; return f(1); }
+}
+"#,
+            ),
+            (
+                "main.wi",
+                r#"
+import values::Value;
+fn pure(n: i64) -> i64 { panic("copy binding"); return n; }
+class A implements Value {}
+fn main() { let a = new A(); }
+"#,
+            ),
+        ],
+    );
+    let compile = project.compile_with_env("main.wi", &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(compile.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("[panic-effects] $lambda.0: may-panic"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn pe_33_cross_unit_default_copy_keeps_its_type_dependent_guards() {
+    let project = TestProject::new(
+        "panic_effect_default_copy_types",
+        &[
+            (
+                "values.wi",
+                r#"
+module values;
+fn value() -> i64 { return 1; }
+pub interface Value {
+    fn define(self) { let f = || { let x = value(); return x + x; }; }
+}
+"#,
+            ),
+            (
+                "main.wi",
+                r#"
+import values::Value;
+fn value() -> String { return "text"; }
+class A implements Value {}
+fn main() { let a = new A(); }
+"#,
+            ),
+        ],
+    );
+    let compile = project.compile_with_env("main.wi", &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(compile.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("[panic-effects] $lambda.0: may-panic"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn pe_35_frontend_external_facts_follow_function_and_class_aliases() {
+    let project = TestProject::new(
+        "panic_effect_semantic_imports",
+        &[
+            (
+                "values.wi",
+                r#"
+module values;
+pub fn pure(n: i64) -> i64 { return n; }
+pub class Plain { pub n: i64; }
+pub class Math {
+    pub static fn safe(n: i64) -> i64 { return n * 2; }
+    pub static fn risky(n: i64) -> i64 { if n < 0 { panic("negative"); } return n; }
+}
+"#,
+            ),
+            (
+                "main.wi",
+                r#"
+import values as v;
+import values::pure as identity;
+import values::Math as Calc;
+import values::Plain;
+fn constructor_wrapper() { let value = new Plain(1); }
+fn safe_wrapper() -> i64 { return Calc::safe(identity(2)) + v::pure(1); }
+fn risky_wrapper() -> i64 { return Calc::risky(1); }
+fn main() { println(safe_wrapper()); }
+"#,
+            ),
+        ],
+    );
+    let compile = project.compile_with_env("main.wi", &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(compile.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("[panic-effects] safe_wrapper: no-panic"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("[panic-effects] risky_wrapper: may-panic"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("[panic-effects] constructor_wrapper: no-panic"),
+        "{stderr}"
+    );
+    let run = project.run();
+    assert!(run.status.success());
+    assert_eq!(run.stdout, b"5\n");
+}
+
+#[test]
+fn pe_34_nested_lambda_facts_use_contextual_body_identities() {
+    let source = r#"
+fn nested() {
+    let outer = || { let inner = |x: i64| { return x + 1; }; return inner(1); };
+}
+fn main() { nested(); println(1); }
+"#;
+    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stderr.contains("[panic-effects] $lambda.0: no-panic"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("[panic-effects] $lambda.1: may-panic"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("[panic-effects] nested: no-panic"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn pe_32_lambda_bodies_get_their_own_resolved_call_edges() {
+    let source = r#"
+fn boom(n: i64) -> i64 { if n < 0 { panic("negative"); } return n; }
+fn pure(n: i64) -> i64 { return n * 2; }
+fn defines(n: i64) -> i64 {
+    let risky: fn(i64) -> i64 = |x: i64| -> i64 { return boom(x); };
+    let safe: fn(i64) -> i64 = |x: i64| -> i64 { return pure(x); };
+    let leaf = |x: i64| { return x; };
+    return n + 1;
+}
+
+fn main() {
+    println(defines(1));
+}
+"#;
+    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stderr.contains("[panic-effects] $lambda.0: may-panic"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("[panic-effects] $lambda.1: no-panic"),
+        "{stderr}"
+    );
+    // A lambda with no call sites owns an empty graph node, not a missing one.
+    assert!(
+        stderr.contains("[panic-effects] $lambda.2: no-panic"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("[panic-effects] defines: no-panic"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn string_concat_keeps_panic_checks_and_balanced_roots() {
     let source = r#"

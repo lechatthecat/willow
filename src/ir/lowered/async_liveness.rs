@@ -12,12 +12,12 @@ use super::{
     BlockId, LirLocal, LirLocalId, LirSelectOp, SourceBlock, SourceInst, SourceTerminator,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FrameSlot {
     pub index: usize,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LirAsyncFrameLayout {
     pub locals: HashMap<LirLocalId, FrameSlot>,
     pub slots: Vec<LirLocalId>,
@@ -467,6 +467,21 @@ fn successors(block: &SourceBlock) -> Vec<BlockId> {
 mod coalescing_tests {
     use super::*;
     use crate::semantic::ids::SemanticType as Type;
+
+    #[test]
+    fn async_frame_artifact_preserves_local_slot_mapping() {
+        let frame = LirAsyncFrameLayout {
+            locals: HashMap::from([
+                (LirLocalId(3), FrameSlot { index: 0 }),
+                (LirLocalId(9), FrameSlot { index: 1 }),
+                (LirLocalId(17), FrameSlot { index: 0 }),
+            ]),
+            slots: vec![LirLocalId(3), LirLocalId(9)],
+        };
+        let wire = serde_json::to_vec(&frame).unwrap();
+        let restored: LirAsyncFrameLayout = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(restored, frame);
+    }
 
     #[test]
     fn deep_local_use_collection_uses_a_one_megabyte_stack() {

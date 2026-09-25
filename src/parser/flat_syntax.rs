@@ -286,6 +286,7 @@ mod tests {
                 for _ in 0..8_000 {
                     stmt = Stmt::Defer(DeferStmt {
                         body: DeferBody::Block(Block {
+                            id: crate::parser::ast::BodyId::fresh(),
                             stmts: vec![stmt],
                             span: Span::dummy(),
                         }),
@@ -312,6 +313,7 @@ mod tests {
         let span = Span::dummy();
         let leaf = |value| Expr::Integer(value, span, ExprId::fresh());
         let block = || Block {
+            id: crate::parser::ast::BodyId::fresh(),
             stmts: vec![Stmt::Break(span)],
             span,
         };
@@ -347,6 +349,7 @@ mod tests {
                             task: leaf(0),
                         },
                         body: Block {
+                            id: crate::parser::ast::BodyId::fresh(),
                             stmts: vec![],
                             span,
                         },

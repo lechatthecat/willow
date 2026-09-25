@@ -12,6 +12,12 @@ pub use runtime_type_ids::GC_BITMAP_TYPE_ID;
 /// Maximum number of payload words represented by the inline GC reference mask.
 pub const GC_REF_MASK_BITS: usize = u64::BITS as usize;
 
+/// Revision of the object layout rules below (storage word stride, header
+/// word, field placement). Backend layout caches key on it together with the
+/// target pointer width, so a rule change here can never reuse a byte layout
+/// computed under the previous rules.
+pub const OBJECT_LAYOUT_REVISION: u32 = 1;
+
 /// Stride of a mixed i64/f64/reference storage slot. Narrow pointers do not
 /// shrink scalar payloads or header fields. Pointer-only dispatch structures
 /// use their own packed pointer layout instead. This policy alone does not
@@ -329,22 +335,20 @@ pub mod tlab {
     pub const fn limit_offset(pointer_bytes: u32) -> u32 {
         pointer_bytes
     }
-    pub const fn fast_allocations_offset(pointer_bytes: u32) -> u32 {
-        (2 * pointer_bytes + 7) & !7
-    }
-    pub const fn fast_bytes_offset(pointer_bytes: u32) -> u32 {
-        fast_allocations_offset(pointer_bytes) + 8
-    }
+    /// While a chunk is active its owner thread is the only writer of the
+    /// cursor and the chunk's start words; other threads read them only after
+    /// synchronizing with the owner (stop handshake or a published reference).
+    /// Generated code therefore uses plain loads/stores, and allocation counts
+    /// are derived by the runtime from the cursor and start words instead of
+    /// per-object counters (willow-8hq4.16).
     pub const fn start_bits_offset(pointer_bytes: u32) -> u32 {
-        fast_bytes_offset(pointer_bytes) + 8
+        2 * pointer_bytes
     }
     pub const fn state_size(pointer_bytes: u32) -> u32 {
         (start_bits_offset(pointer_bytes) + pointer_bytes + 7) & !7
     }
     pub const CURSOR_OFFSET: u32 = 0;
     pub const LIMIT_OFFSET: u32 = limit_offset(8);
-    pub const FAST_ALLOCATIONS_OFFSET: u32 = fast_allocations_offset(8);
-    pub const FAST_BYTES_OFFSET: u32 = fast_bytes_offset(8);
     pub const STATE_SIZE: u32 = state_size(8);
     pub const MAX_OBJECT_SIZE: u32 = 4 * 1024;
     pub const CHUNK_SIZE: u32 = 32 * 1024;

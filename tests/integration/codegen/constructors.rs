@@ -808,3 +808,72 @@ fn main() {
     assert!(ok);
     assert_eq!(out, "55\n");
 }
+
+// A lambda written inside `init` is its own callable, not the constructor:
+// its `return value` is legal and `super.init` inside it is not.
+
+#[test]
+fn test_ctor_lambda_may_return_a_value() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Scaled {
+    pub value: i64;
+    pub init(self, base: i64) {
+        let scale = |x: i64| {
+            let offset = |y: i64| { return y + base; };
+            return offset(x) * 2;
+        };
+        self.value = scale(1);
+        if base > 100 {
+            return;
+        }
+    }
+}
+fn main() {
+    println(new Scaled(3).value);
+    println(new Scaled(200).value);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "8\n402\n");
+}
+
+#[test]
+fn test_ctor_value_return_after_lambda_is_still_rejected() {
+    assert_compile_error_contains(
+        r#"
+class User {
+    pub id: i64;
+    pub init(self, id: i64) {
+        let f = |x: i64| { return x + 1; };
+        self.id = f(id);
+        return self.id;
+    }
+}
+fn main() {}
+"#,
+        &["error[E0841]", "cannot return a value"],
+    );
+}
+
+#[test]
+fn test_ctor_super_init_inside_lambda_is_rejected() {
+    assert_compile_error_contains(
+        r#"
+class Base {
+    pub n: i64;
+    pub init(self, n: i64) { self.n = n; }
+}
+class Child extends Base {
+    pub init(self) {
+        super.init(1);
+        let f = || { super.init(2); };
+        f();
+    }
+}
+fn main() {}
+"#,
+        &["error[E0848]", "can only be used inside a constructor"],
+    );
+}

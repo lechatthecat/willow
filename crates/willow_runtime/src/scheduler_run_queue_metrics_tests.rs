@@ -92,7 +92,8 @@ fn steal_counts_visited_victims_and_preserves_lifo() {
             global_pop_attempts: 2,
             steal_attempts: 2,
             steal_successes: 2,
-            victim_locks: 4,
+            // Empty victims are skipped by their length hint (willow-8hq4.19).
+            victim_locks: 2,
             ..Default::default()
         }
     );
@@ -100,8 +101,9 @@ fn steal_counts_visited_victims_and_preserves_lifo() {
 
 #[test]
 fn empty_scan_and_last_victim_counts_scale_with_workers_and_attempts() {
-    // Exact work, not a wall-clock inference: A scans acquire A*(W-1)
-    // victim locks. A successful last-victim scan has the same lower bound.
+    // Exact work, not a wall-clock inference: A scans visit A*(W-1) victims
+    // but lock none of them, because every length hint reads empty
+    // (willow-8hq4.19). A successful last-victim scan locks only that victim.
     for workers in [1, 2, 4, 8, 16, 32] {
         for attempts in [1, 8, 64] {
             let queues = RunQueues::new(workers);
@@ -112,7 +114,7 @@ fn empty_scan_and_last_victim_counts_scale_with_workers_and_attempts() {
             assert_eq!(metrics.global_pop_attempts, attempts);
             assert_eq!(metrics.steal_attempts, attempts);
             assert_eq!(metrics.steal_failures, attempts);
-            assert_eq!(metrics.victim_locks, attempts * (workers as u64 - 1));
+            assert_eq!(metrics.victim_locks, 0);
             assert_eq!(metrics.steal_successes, 0);
             println!(
                 "workers={workers} scans={attempts} victim_locks={} global_pop_attempts={}",
@@ -122,10 +124,7 @@ fn empty_scan_and_last_victim_counts_scale_with_workers_and_attempts() {
                 queues.push_local(workers - 1, 42);
                 assert_eq!(queues.pop_for_worker(0), Some(42));
                 let after = queues.metrics_snapshot();
-                assert_eq!(
-                    after.victim_locks - metrics.victim_locks,
-                    workers as u64 - 1
-                );
+                assert_eq!(after.victim_locks - metrics.victim_locks, 1);
                 assert_eq!(after.steal_successes, 1);
                 assert_eq!(after.steal_failures, attempts);
             }
@@ -483,5 +482,86 @@ fn worker_spawn_burst_defers_one_notification_until_scheduler_boundary() {
         assert_eq!(queues.idle_notifications.load(Ordering::Relaxed), 0);
         assert_eq!(queues.len(), size as usize);
         println!("spawn_burst={size} publication_notifications=0 boundary_notifications=1");
+    }
+}
+
+/// Every hint equals its queue's length, read under the queue's own lock
+/// without a `QueueGuard` (whose drop would rewrite the hint).
+fn assert_hints_match(queues: &RunQueues) {
+    for queue in std::iter::once(&queues.global).chain(&queues.locals) {
+        let locked = queue.queue.lock().unwrap();
+        assert_eq!(queue.len.load(Ordering::Acquire), locked.len());
+    }
+}
+
+#[test]
+fn t8hq4_19_length_hints_track_every_queue_mutation() {
+    let queues = RunQueues::new(3);
+    assert_hints_match(&queues);
+    queues.push_local(0, 1);
+    queues.push_local(1, 2);
+    queues.push_local_front(1, 3);
+    queues.push_global(4);
+    queues.push_global_batch(&[5, 6, 7]);
+    queues.push_woken_batch(&[8, 9]);
+    queues.push_spawned(10);
+    assert_hints_match(&queues);
+    assert!(queues.remove(6));
+    assert!(queues.remove(2));
+    assert!(!queues.remove(99));
+    assert_hints_match(&queues);
+    // Local pops, global pops with refill, and steals from worker 2's view.
+    while queues.pop_for_worker(2).is_some() {
+        assert_hints_match(&queues);
+    }
+    assert_eq!(queues.len(), 0);
+    queues.push_local(0, 11);
+    queues.push_global(12);
+    queues.clear();
+    assert_hints_match(&queues);
+    assert!(queues.global.looks_empty());
+    assert!(queues.locals.iter().all(HintedQueue::looks_empty));
+}
+
+#[test]
+fn t8hq4_19_empty_probes_take_no_queue_lock() {
+    let queues = RunQueues::new(4);
+    // Hold every queue lock: a probe that locks an empty queue would block.
+    let held = std::iter::once(&queues.global)
+        .chain(&queues.locals[1..])
+        .map(|queue| queue.queue.lock().unwrap())
+        .collect::<Vec<_>>();
+    std::thread::scope(|scope| {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let queues = &queues;
+        let prober = scope.spawn(move || {
+            for _ in 0..8 {
+                done_tx.send(queues.pop_for_worker(0)).unwrap();
+            }
+        });
+        for _ in 0..8 {
+            let popped = done_rx.recv_timeout(Duration::from_secs(2));
+            assert_eq!(popped, Ok(None), "an empty probe blocked on a lock");
+        }
+        drop(held);
+        prober.join().unwrap();
+    });
+    let metrics = queues.metrics_snapshot();
+    assert_eq!(metrics.global_pop_attempts, 8);
+    assert_eq!(metrics.steal_attempts, 8);
+    assert_eq!(metrics.victim_locks, 0);
+}
+
+#[test]
+fn t8hq4_19_a_published_push_is_never_skipped() {
+    // A push's hint store happens before its unlock, so a probe that starts
+    // after the push returns always sees it, locally, globally or by steal.
+    for worker in 0..4 {
+        let queues = RunQueues::new(4);
+        queues.push_local(worker, 1);
+        assert_eq!(queues.pop_for_worker(0), Some(1));
+        queues.push_global(2);
+        assert_eq!(queues.pop_for_worker(0), Some(2));
+        assert_eq!(queues.pop_for_worker(0), None);
     }
 }

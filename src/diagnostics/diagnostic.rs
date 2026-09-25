@@ -2,7 +2,7 @@ use super::error_code::ErrorCode;
 use super::label::{FixSuggestion, Label};
 use super::span::Span;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Severity {
     Error,
     Warning,
@@ -17,7 +17,7 @@ impl Severity {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Diagnostic {
     pub severity: Severity,
     pub code: ErrorCode,

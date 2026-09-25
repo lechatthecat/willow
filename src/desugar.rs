@@ -946,8 +946,14 @@ fn inject_default_interface_methods(
     for item in &mut program.items {
         let Item::Class(class) = item else { continue };
         let overridden: HashSet<String> = class.methods.iter().map(|m| m.name.clone()).collect();
-        // method name -> (providing interface, the synthesized decl).
-        let mut chosen: HashMap<String, (String, MethodDecl)> = HashMap::new();
+        // (providing interface, the synthesized decl), in the order the
+        // interfaces were listed and each interface declared its methods. The
+        // order these are appended in reaches HIR, the LIR dump and the emitted
+        // symbols, so a hash map's arbitrary iteration order made those outputs
+        // differ between runs of the same compiler on the same source
+        // (willow-afb5.21). The name index keeps the conflict check O(1).
+        let mut chosen: Vec<(String, MethodDecl)> = Vec::new();
+        let mut chosen_at: HashMap<String, usize> = HashMap::new();
         for iface_ty in &class.implements {
             let (iface_name, type_args): (&str, &[Type]) = match iface_ty {
                 Type::Named(n) => (n.as_str(), &[]),
@@ -975,7 +981,8 @@ fn inject_default_interface_methods(
                 let Some(body) = &dm.default_body else {
                     continue;
                 };
-                if let Some((prev_iface, _)) = chosen.get(&dm.name) {
+                if let Some(&at) = chosen_at.get(&dm.name) {
+                    let prev_iface = &chosen[at].0;
                     // Two interfaces providing the same default: only ambiguous if
                     // they are independent (neither extends the other).
                     if !related(prev_iface, iface_name) {
@@ -1006,37 +1013,35 @@ fn inject_default_interface_methods(
                         p
                     })
                     .collect();
-                chosen.insert(
-                    dm.name.clone(),
-                    (
-                        iface_name.to_string(),
-                        MethodDecl {
-                            name: dm.name.clone(),
-                            public: true, // interface methods are public by contract
-                            protected: false,
-                            is_async: false,
-                            is_open: false,
-                            is_override: false,
-                            is_static: false,
-                            params,
+                chosen_at.insert(dm.name.clone(), chosen.len());
+                chosen.push((
+                    iface_name.to_string(),
+                    MethodDecl {
+                        name: dm.name.clone(),
+                        public: true, // interface methods are public by contract
+                        protected: false,
+                        is_async: false,
+                        is_open: false,
+                        is_override: false,
+                        is_static: false,
+                        params,
 
-                            return_type: subst_iface_type(&dm.return_type, &subst),
-                            body: body.clone(),
-                            span: dm.span,
-                            // Non-generic default bodies of an interface declared
-                            // in THIS program are checked once at the interface
-                            // level (skipped on the class to avoid duplicate
-                            // diagnostics); generic ones and cross-module ones need
-                            // the (substituted) copy checked here (willow-1js.7).
-                            is_default_injected: type_params.is_empty()
-                                && own_iface_names.contains(iface_name),
-                            is_interface_default: true,
-                        },
-                    ),
-                );
+                        return_type: subst_iface_type(&dm.return_type, &subst),
+                        body: body.clone(),
+                        span: dm.span,
+                        // Non-generic default bodies of an interface declared
+                        // in THIS program are checked once at the interface
+                        // level (skipped on the class to avoid duplicate
+                        // diagnostics); generic ones and cross-module ones need
+                        // the (substituted) copy checked here (willow-1js.7).
+                        is_default_injected: type_params.is_empty()
+                            && own_iface_names.contains(iface_name),
+                        is_interface_default: true,
+                    },
+                ));
             }
         }
-        class.methods.extend(chosen.into_values().map(|(_, m)| m));
+        class.methods.extend(chosen.into_iter().map(|(_, m)| m));
     }
     diags
 }
@@ -1335,6 +1340,50 @@ mod tests {
         let (program, diagnostics) = Parser::new(tokens).parse();
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         program
+    }
+
+    /// Injected defaults must land in interface-declaration order, identically
+    /// on every run. Their order reaches HIR, the `--emit-lir` dump and the
+    /// emitted symbol order, and `RandomState` reseeds per map instance, so
+    /// collecting them in a `HashMap` made one compiler produce two different
+    /// binaries for the same source (willow-afb5.21).
+    #[test]
+    fn injected_defaults_keep_declaration_order_on_every_run() {
+        let source = r#"
+interface Alpha {
+    fn name(self) -> String;
+    fn a1(self) -> String { return self.name(); }
+    fn a2(self) -> String { return self.a1(); }
+    fn a3(self) -> String { return self.a2(); }
+    fn a4(self) -> String { return self.a3(); }
+}
+interface Beta {
+    fn b1(self) -> String { return "b1"; }
+    fn b2(self) -> String { return "b2"; }
+    fn b3(self) -> String { return "b3"; }
+    fn b4(self) -> String { return "b4"; }
+}
+class Thing implements Alpha, Beta {
+    pub fn name(self) -> String { return "thing"; }
+}
+fn main() {}
+"#;
+        let expected = ["name", "a1", "a2", "a3", "a4", "b1", "b2", "b3", "b4"];
+        for _ in 0..16 {
+            let mut program = parse(source);
+            let output = DesugarPass::run(&mut program, &mut []);
+            assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+            let class = program
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    Item::Class(c) if c.name == "Thing" => Some(c),
+                    _ => None,
+                })
+                .expect("class Thing");
+            let names: Vec<&str> = class.methods.iter().map(|m| m.name.as_str()).collect();
+            assert_eq!(names, expected);
+        }
     }
 
     #[test]

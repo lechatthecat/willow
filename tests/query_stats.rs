@@ -58,6 +58,13 @@ fn query_stats_reports_real_operations_and_keeps_empty_modules_distinct() {
                     "{counter}: {stderr}"
                 );
             }
+            assert_eq!(fields["type_checkers"], "3", "{stderr}");
+            assert_eq!(fields["nonpreemptible_helpers"], "3", "{stderr}");
+            assert_eq!(fields["effect_solves"], "3", "{stderr}");
+            assert!(
+                lines[0].contains("unit_effects[calls=3,hits=0,computations=3,"),
+                "{stderr}"
+            );
             let units: Vec<_> = fields["hydrates_by_file"]
                 .split(',')
                 .map(|pair| pair.split_once(':').unwrap())
@@ -72,6 +79,21 @@ fn query_stats_reports_real_operations_and_keeps_empty_modules_distinct() {
                     .map(|(_, count)| count.parse::<usize>().unwrap())
                     .sum::<usize>(),
                 fields["hydrates"].parse::<usize>().unwrap()
+            );
+            // `C` is laid out once; the allocation and the `.n` read reuse it.
+            let object_layout = lines[0]
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("object_layout["))
+                .and_then(|field| field.strip_suffix(']'))
+                .unwrap_or_else(|| panic!("no object_layout stats: {stderr}"));
+            let object_layout: HashMap<_, _> = object_layout
+                .split(',')
+                .map(|pair| pair.split_once('=').unwrap())
+                .collect();
+            assert_eq!(object_layout["computations"], "1", "{stderr}");
+            assert!(
+                object_layout["frozen_reads"].parse::<usize>().unwrap() >= 1,
+                "{stderr}"
             );
             for peak in ["peak_ast", "peak_checker", "peak_declared", "peak_lir"] {
                 assert_eq!(fields[peak], "1", "{stderr}");

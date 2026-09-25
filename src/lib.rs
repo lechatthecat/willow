@@ -4,6 +4,8 @@
 #![allow(clippy::result_large_err)]
 
 pub mod backend;
+pub mod compiler_db;
+use compiler_db::dependencies::ModuleDependencies;
 pub(crate) mod compiler_stack;
 pub mod desugar;
 pub mod diagnostics;
@@ -289,21 +291,12 @@ fn register_prelude(checker: &mut semantic::TypeChecker) -> Result<()> {
 /// Front-end artifacts produced by [`run_frontend`] and consumed by
 /// [`run_backend`]: checked declaration summaries and lazy, immutable body
 /// artifacts. Checkers and executable trees are owned only by their unit pass.
-type HelperIndex = std::collections::HashMap<
-    String,
-    std::collections::HashMap<
-        semantic::ids::FunctionId,
-        semantic::concurrency::NonpreemptibleHelper,
-    >,
->;
-
 struct Frontend {
     // These programs contain declarations only. Their body slots are immutable
     // references (source spans / syntax IDs) into module_graph.artifacts.
     program: parser::ast::Program,
     module_graph: module::ModuleGraph,
-    helpers: HelperIndex,
-    dependencies: ModuleDependencies,
+    db: compiler_db::CompilerDb,
 }
 
 /// A single compilation request. Owns the shared context (paths, options,
@@ -388,6 +381,7 @@ struct ImportPhase {
 
 struct TypecheckPhase {
     checker: LiveUnit<semantic::TypeChecker>,
+    #[cfg(test)]
     error_count: usize,
 }
 
@@ -426,7 +420,12 @@ fn run_frontend_with_emitter(
     let mut artifacts = module::artifacts::UnitArtifacts::new()?;
     artifacts.snapshot_source(diagnostics::FileId::ENTRY, source)?;
     artifacts.offload(&mut program)?;
-    let resolution = module::resolver::resolve_imports_spooled(&program, root, artifacts);
+    let resolution = module::resolver::resolve_imports_spooled_entry(
+        &program,
+        root,
+        artifacts,
+        std::fs::canonicalize(&map.path).ok(),
+    );
     let mut graph = resolution.graph;
     let mut diagnostic_modules = DiagnosticModuleIndex::new(&graph);
     emit_frontend_diagnostics(
@@ -452,69 +451,83 @@ fn run_frontend_with_emitter(
         &diagnostic_modules,
         emitter,
     )?;
-    let artifacts = graph.artifacts.as_ref().expect("spooled import graph");
-    let dependencies = ModuleDependencies::new(&graph.files);
-    let mut helpers = HelperIndex::new();
-    for module in &graph.files {
-        let body = artifacts.hydrate(&module.program, module.id.file_id())?;
-        helpers.insert(
-            module.canonical_path.clone(),
-            semantic::concurrency::compute_nonpreemptible_helpers(&body),
-        );
+    let mut artifacts = graph.artifacts.take().expect("spooled import graph");
+    artifacts
+        .body_index_mut()
+        .register_unit(&mut program, module::UnitId::ENTRY);
+    for module in &mut graph.files {
+        artifacts
+            .body_index_mut()
+            .register_unit(&mut module.program, module.id);
     }
+    let db = compiler_db::CompilerDb::new(
+        compiler_db::inputs::CompilerInputs::native(options.clone(), root.to_path_buf()),
+        &graph.files,
+        std::rc::Rc::clone(&artifacts.bodies),
+        std::rc::Rc::clone(&artifacts.store),
+    );
     let mut error_count = parse.error_count + imports.error_count + desugar.error_count;
     for module in &graph.files {
-        let body = artifacts.hydrate(&module.program, module.id.file_id())?;
-        let checker = check_module(
-            &body,
-            module,
-            &graph.files,
-            &dependencies,
-            &helpers,
-            artifacts,
-            options,
-        )?;
-        error_count += diagnostic_error_count(&checker.errors);
-        emit_frontend_diagnostics(&checker.errors, map, &graph, &diagnostic_modules, emitter)?;
-        let concurrency = check_unit_concurrency(
-            &body,
-            &graph.files,
-            &helpers,
-            None,
-            &checker.expr_types,
-            &checker.reference_arg_modes,
-        );
-        error_count += diagnostic_error_count(&concurrency);
-        emit_frontend_diagnostics(&concurrency, map, &graph, &diagnostic_modules, emitter)?;
+        db.check_unit(module.id, &mut artifacts, |artifacts| {
+            let body = artifacts.hydrate(&module.program, module.id.file_id())?;
+            let checker = check_module(&body, module, &graph.files, artifacts, &db)?;
+            let local_helpers = db.nonpreemptible_helpers(module.id, &body)?;
+            let mut concurrency = check_unit_concurrency(
+                &body,
+                &graph.files,
+                db.dependencies(),
+                &db.effects,
+                None,
+                Some((&local_helpers, db.inputs().target)),
+            );
+            concurrency.extend(db.typed_bodies.check_async_borrows(
+                &body,
+                &checker.expr_types,
+                &checker.reference_arg_modes,
+            )?);
+            let mut checked = compiler_db::CheckedUnit::from(checker.into_inner());
+            checked.diagnostics.extend(concurrency);
+            Ok(checked)
+        })?;
     }
-    {
+    db.check_unit(module::UnitId::ENTRY, &mut artifacts, |artifacts| {
         let body = artifacts.hydrate(&program, diagnostics::FileId::ENTRY)?;
         let checked = typecheck_phase(
             &body,
             &graph.files,
             &item_imports,
-            &helpers,
             artifacts,
             options,
+            Some(&db),
         )?;
-        error_count += checked.error_count;
-        emit_frontend_diagnostics(
-            &checked.checker.errors,
-            map,
-            &graph,
-            &diagnostic_modules,
-            emitter,
-        )?;
-        let concurrency = check_unit_concurrency(
+        let local_helpers = db.nonpreemptible_helpers(module::UnitId::ENTRY, &body)?;
+        let mut concurrency = check_unit_concurrency(
             &body,
             &graph.files,
-            &helpers,
+            db.dependencies(),
+            &db.effects,
             Some(&item_imports),
+            Some((&local_helpers, db.inputs().target)),
+        );
+        concurrency.extend(db.typed_bodies.check_async_borrows(
+            &body,
             &checked.checker.expr_types,
             &checked.checker.reference_arg_modes,
-        );
-        error_count += diagnostic_error_count(&concurrency);
-        emit_frontend_diagnostics(&concurrency, map, &graph, &diagnostic_modules, emitter)?;
+        )?);
+        let mut checked = compiler_db::CheckedUnit::from(checked.checker.into_inner());
+        checked.diagnostics.extend(concurrency);
+        Ok(checked)
+    })?;
+    graph.artifacts = Some(artifacts);
+    for file in graph
+        .files
+        .iter()
+        .map(|m| m.id)
+        .chain(std::iter::once(module::UnitId::ENTRY))
+    {
+        let diagnostics = db.unit_diagnostics(file)?;
+        error_count += diagnostic_error_count(&diagnostics);
+        emit_frontend_diagnostics(&diagnostics, map, &graph, &diagnostic_modules, emitter)?;
     }
     let entry = validate_entry_point(&program);
     error_count += diagnostic_error_count(&entry);
@@ -525,8 +538,7 @@ fn run_frontend_with_emitter(
     Ok(Frontend {
         program,
         module_graph: graph,
-        helpers,
-        dependencies,
+        db,
     })
 }
 
@@ -579,15 +591,26 @@ fn typecheck_phase(
     program: &parser::ast::Program,
     modules: &[module::ResolvedModule],
     item_imports: &[module::resolver::ItemImport],
-    helpers_index: &HelperIndex,
     artifacts: &UnitArtifacts,
     options: &CompilerOptions,
+    queries: Option<&compiler_db::CompilerDb>,
 ) -> Result<TypecheckPhase> {
+    let db = queries;
     let mut checker = semantic::TypeChecker::new();
+    if let Some(db) = queries {
+        checker = checker.with_sync_stack_preemption(db.inputs().target.sync_stack_preemption);
+        checker.set_effect_queries(std::rc::Rc::clone(&db.effects), module::UnitId::ENTRY);
+        checker.set_body_queries(std::rc::Rc::clone(&db.typed_bodies));
+        checker
+            .set_declaration_queries(std::rc::Rc::clone(&db.declarations), module::UnitId::ENTRY);
+    }
     if options.enforce_send_sync {
         checker.set_enforce_send_sync(true);
     }
     register_prelude(&mut checker)?;
+    if let Some(db) = queries {
+        db.declarations.set_prelude(&checker.symbols);
+    }
     for m in modules {
         checker.register_module_with_id(
             m.id,
@@ -621,15 +644,22 @@ fn typecheck_phase(
         }
     }
 
-    checker.set_nonpreemptible_module_methods(imported_nonpreemptible_method_owners(
-        program,
-        modules,
-        helpers_index,
-    ));
+    // Without a session there are no checked dependencies to import from.
+    if let Some(db) = db {
+        checker.set_nonpreemptible_module_methods(imported_nonpreemptible_method_owners(
+            program,
+            modules,
+            &db.effects,
+            db.dependencies(),
+        ));
+    }
     checker.check_program(program);
+    checker.finish_body_queries()?;
+    #[cfg(test)]
     let error_count = diagnostic_error_count(&checker.errors);
     Ok(TypecheckPhase {
         checker: artifacts.track(UnitKind::Checker, checker),
+        #[cfg(test)]
         error_count,
     })
 }
@@ -638,20 +668,30 @@ fn check_module(
     body: &parser::ast::Program,
     module: &module::ResolvedModule,
     modules: &[module::ResolvedModule],
-    dependencies: &ModuleDependencies,
-    helpers: &HelperIndex,
     artifacts: &UnitArtifacts,
-    options: &CompilerOptions,
+    db: &compiler_db::CompilerDb,
 ) -> Result<LiveUnit<semantic::TypeChecker>> {
-    let mut checker = semantic::TypeChecker::new();
+    let options = &db.inputs().options;
+    let dependencies = db.dependencies();
+    let mut checker = semantic::TypeChecker::new()
+        .with_sync_stack_preemption(db.inputs().target.sync_stack_preemption);
+    checker.set_effect_queries(std::rc::Rc::clone(&db.effects), module.id);
+    checker.set_body_queries(std::rc::Rc::clone(&db.typed_bodies));
+    checker.set_declaration_queries(std::rc::Rc::clone(&db.declarations), module.id);
     checker.set_enforce_send_sync(options.enforce_send_sync);
     register_prelude(&mut checker)?;
-    register_module_imports(&mut checker, body, modules, dependencies);
+    db.declarations.set_prelude(&checker.symbols);
+    let needed = dependencies.unit_closure(module.id, artifacts)?;
+    register_module_imports_with_closure(&mut checker, body, modules, dependencies, Some(&needed));
     checker.set_module_path(&module.canonical_path);
     checker.set_nonpreemptible_module_methods(imported_nonpreemptible_method_owners(
-        body, modules, helpers,
+        body,
+        modules,
+        &db.effects,
+        dependencies,
     ));
     checker.check_module_program(body);
+    checker.finish_body_queries()?;
     Ok(artifacts.track(UnitKind::Checker, checker))
 }
 
@@ -707,11 +747,22 @@ fn entry_module_spellings(
 /// only -- see `register_module_type_signatures`. Registration follows graph
 /// order, which is dependency order, because a module's exported signature is
 /// qualified against the spellings its own dependencies already answer to.
+#[cfg(test)]
 fn register_module_imports(
     checker: &mut semantic::TypeChecker,
     program: &parser::ast::Program,
     modules: &[module::ResolvedModule],
     dependencies: &ModuleDependencies,
+) {
+    register_module_imports_with_closure(checker, program, modules, dependencies, None)
+}
+
+fn register_module_imports_with_closure(
+    checker: &mut semantic::TypeChecker,
+    program: &parser::ast::Program,
+    modules: &[module::ResolvedModule],
+    dependencies: &ModuleDependencies,
+    needed: Option<&[usize]>,
 ) {
     // `(canonical path, access spelling)` for each module this program imports.
     // A module can appear twice under two spellings -- `import base as b;` next
@@ -751,12 +802,17 @@ fn register_module_imports(
         item_imports.push((local, module_path, item, import.span));
     }
 
-    let needed = dependencies.closure(imported.keys().copied());
-    for (id, dep) in modules.iter().enumerate() {
-        let canonical = dep.canonical_path.as_str();
-        if !needed[id] {
-            continue;
+    let computed;
+    let needed = match needed {
+        Some(needed) => needed,
+        None => {
+            computed = dependencies.reachable(imported.keys().copied());
+            &computed
         }
+    };
+    for &id in needed {
+        let dep = &modules[id];
+        let canonical = dep.canonical_path.as_str();
         let dep_path = dep.path.to_string_lossy();
         let Some(spellings) = imported.get(&id) else {
             checker.register_module_type_signatures(canonical, &dep_path, &dep.program);
@@ -782,77 +838,9 @@ fn register_module_imports(
     }
 }
 
-/// Compilation-owned graph metadata; contains no hydrated bodies or checkers.
-struct ModuleDependencies {
-    by_path: std::collections::HashMap<String, usize>,
-    edges: Vec<Vec<usize>>,
-}
-
 #[cfg(test)]
 thread_local! {
     static DEPENDENCY_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
-}
-
-impl ModuleDependencies {
-    fn new(modules: &[module::ResolvedModule]) -> Self {
-        let by_path: std::collections::HashMap<_, _> = modules
-            .iter()
-            .enumerate()
-            .map(|(id, module)| (module.canonical_path.clone(), id))
-            .collect();
-        let edges = modules
-            .iter()
-            .map(|module| {
-                let mut seen = std::collections::HashSet::new();
-                module
-                    .program
-                    .imports
-                    .iter()
-                    .filter_map(|import| {
-                        #[cfg(test)]
-                        DEPENDENCY_WORK.with(|work| {
-                            let (lookups, visits) = work.get();
-                            work.set((lookups + 1, visits));
-                        });
-                        let id = by_path.get(&import.path).copied().or_else(|| {
-                            let (path, _) = import.path.rsplit_once("::")?;
-                            #[cfg(test)]
-                            DEPENDENCY_WORK.with(|work| {
-                                let (lookups, visits) = work.get();
-                                work.set((lookups + 1, visits));
-                            });
-                            by_path.get(path).copied()
-                        })?;
-                        seen.insert(id).then_some(id)
-                    })
-                    .collect()
-            })
-            .collect();
-        Self { by_path, edges }
-    }
-
-    fn closure(&self, roots: impl Iterator<Item = usize>) -> Vec<bool> {
-        let mut seen = vec![false; self.edges.len()];
-        let mut pending = Vec::new();
-        for id in roots {
-            if !std::mem::replace(&mut seen[id], true) {
-                pending.push(id);
-            }
-        }
-        while let Some(id) = pending.pop() {
-            for &dependency in &self.edges[id] {
-                #[cfg(test)]
-                DEPENDENCY_WORK.with(|work| {
-                    let (lookups, visits) = work.get();
-                    work.set((lookups, visits + 1));
-                });
-                if !std::mem::replace(&mut seen[dependency], true) {
-                    pending.push(dependency);
-                }
-            }
-        }
-        seen
-    }
 }
 
 /// Index non-preemptible methods visible through one module's own imports.
@@ -865,16 +853,18 @@ impl ModuleDependencies {
 fn imported_nonpreemptible_method_owners(
     program: &parser::ast::Program,
     modules: &[module::ResolvedModule],
-    helpers: &HelperIndex,
+    effects: &compiler_db::effects::EffectQueries,
+    dependencies: &ModuleDependencies,
 ) -> std::collections::HashMap<
     semantic::ids::FunctionId,
     (String, semantic::concurrency::NonpreemptibleReason),
 > {
     let mut out = std::collections::HashMap::new();
     for import in &program.imports {
-        let (dependency, access, direct_item) = if let Some(dependency) = modules
-            .iter()
-            .find(|module| module.canonical_path == import.path)
+        let (dependency, access, direct_item) = if let Some(dependency) = dependencies
+            .by_path
+            .get(&import.path)
+            .map(|&index| &modules[index])
         {
             let access = import.alias.as_deref().unwrap_or_else(|| {
                 import
@@ -888,9 +878,10 @@ fn imported_nonpreemptible_method_owners(
             let Some((module_path, item)) = import.path.rsplit_once("::") else {
                 continue;
             };
-            let Some(dependency) = modules
-                .iter()
-                .find(|module| module.canonical_path == module_path)
+            let Some(dependency) = dependencies
+                .by_path
+                .get(module_path)
+                .map(|&index| &modules[index])
             else {
                 continue;
             };
@@ -901,11 +892,8 @@ fn imported_nonpreemptible_method_owners(
             )
         };
 
-        for (key, helper) in helpers
-            .get(&dependency.canonical_path)
-            .into_iter()
-            .flatten()
-        {
+        let helpers = effects.completed_helpers(dependency.id);
+        for (key, helper) in helpers.iter().flat_map(|index| index.iter()) {
             if key.owner().is_none() {
                 continue;
             }
@@ -930,50 +918,63 @@ fn imported_nonpreemptible_method_owners(
     out
 }
 
-/// Seed concurrency analysis from immutable body-free helper summaries.
+/// Seed concurrency analysis from immutable body-free helper summaries of
+/// the already-checked units this program imports.
 fn check_unit_concurrency(
     program: &parser::ast::Program,
     modules: &[module::ResolvedModule],
-    helpers: &HelperIndex,
+    dependencies: &ModuleDependencies,
+    effects: &compiler_db::effects::EffectQueries,
     entry_items: Option<&[module::resolver::ItemImport]>,
-    expr_types: &std::collections::HashMap<parser::ast::ExprId, parser::ast::Type>,
-    reference_modes: &std::collections::HashMap<parser::ast::ExprId, parser::ast::ParamMode>,
+    local_helpers: Option<(
+        &compiler_db::HelperSummary,
+        compiler_db::inputs::TargetCapabilities,
+    )>,
 ) -> Vec<diagnostics::Diagnostic> {
+    let helpers_of = |path: &str| {
+        let index = *dependencies.by_path.get(path)?;
+        effects.completed_helpers(modules[index].id)
+    };
     let mut analyzer = semantic::ConcurrencyAnalyzer::new();
+    if let Some((_, target)) = local_helpers {
+        analyzer = analyzer.with_sync_stack_preemption(target.sync_stack_preemption);
+    }
+    // The analyzer borrows each summary for its whole run.
+    let mut held = Vec::new();
     if let Some(items) = entry_items {
         for module in modules {
-            if let Some(index) = helpers.get(&module.canonical_path) {
-                analyzer = analyzer.with_module_helper_index(&module.name, index);
+            if let Some(index) = effects.completed_helpers(module.id) {
+                held.push((module.name.as_str(), None, index));
             }
         }
         for item in items {
-            if let Some(index) = helpers.get(&item.canonical_module) {
-                analyzer = analyzer.with_item_helper_index(
-                    &item.local,
-                    &item.item,
-                    &item.canonical_module,
-                    index,
-                );
+            if let Some(index) = helpers_of(&item.canonical_module) {
+                held.push((item.local.as_str(), Some(item), index));
             }
         }
     } else {
         for import in &program.imports {
-            if let Some(index) = helpers.get(&import.path) {
+            if let Some(index) = helpers_of(&import.path) {
                 let access = import
                     .alias
                     .as_deref()
                     .unwrap_or_else(|| import.path.rsplit("::").next().unwrap_or(&import.path));
-                analyzer = analyzer.with_module_helper_index(access, index);
+                held.push((access, None, index));
             }
         }
     }
-    let mut errors = analyzer.check_program(program).errors;
-    errors.extend(semantic::async_borrows::check(
-        program,
-        expr_types,
-        reference_modes,
-    ));
-    errors
+    for (access, item, index) in &held {
+        analyzer = match item {
+            Some(item) => {
+                analyzer.with_item_helper_index(access, &item.item, &item.canonical_module, index)
+            }
+            None => analyzer.with_module_helper_index(access, index),
+        };
+    }
+    match local_helpers {
+        Some((helpers, _)) => analyzer.check_program_with_helpers(program, helpers).errors,
+        None => analyzer.check_program(program).errors,
+    }
 }
 
 #[cfg(test)]
@@ -1227,11 +1228,18 @@ fn emit_frontend_diagnostics(
 fn backend_unit_imports(
     program: &parser::ast::Program,
     modules: &[module::ResolvedModule],
+    dependencies: &ModuleDependencies,
 ) -> backend::cranelift::UnitImports {
-    let classified = module::resolver::classify_unit_imports(program, modules);
+    let classified = module::resolver::classify_unit_imports_with(program, |path| {
+        dependencies.by_path.get(path).map(|&index| &modules[index])
+    });
     let mut visible_modules = std::collections::HashSet::new();
     let mut module_spellings = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for binding in &classified.modules {
+        if !seen.insert((&binding.canonical_path, &binding.access)) {
+            continue;
+        }
         // Both spellings: this file writes `access`, while the back end's
         // module tables are keyed by the name the graph registered, which is
         // the first importer's alias when that was another file.
@@ -1245,9 +1253,10 @@ fn backend_unit_imports(
         if binding.access == binding.graph_name {
             continue;
         }
-        let Some(dependency) = modules
-            .iter()
-            .find(|m| m.canonical_path == binding.canonical_path)
+        let Some(dependency) = dependencies
+            .by_path
+            .get(&binding.canonical_path)
+            .map(|&index| &modules[index])
         else {
             continue;
         };
@@ -1319,26 +1328,49 @@ fn run_backend(
     let Frontend {
         program,
         mut module_graph,
-        helpers,
-        dependencies,
+        db,
     } = frontend;
     let module_init_plan = ir::module_init::ModuleInitPlan::from_graph(&module_graph);
-    let mut artifacts = module_graph.artifacts.take().expect("spooled frontend");
+    let artifacts = module_graph.artifacts.take().expect("spooled frontend");
     let modules = module_graph.files;
-    let debug_metadata = if opts.target.emit_debug_info || opts.target.emit_source_map {
-        let entry = artifacts.hydrate(&program, diagnostics::FileId::ENTRY)?;
-        let mut text =
-            diagnostics::DebugSourceMap::from_program(&map.path, map.total_lines(), &entry)
-                .to_text();
-        drop(entry);
-        for module in &modules {
-            let body = artifacts.hydrate(&module.program, module.id.file_id())?;
+    // Debug metadata is read from the same hydrated trees the declare pass
+    // uses, so a debug build hydrates each unit no more often than a release
+    // build (willow-afb5.13). Entry first, then modules in graph order.
+    let emit_debug_metadata = opts.target.emit_debug_info || opts.target.emit_source_map;
+    let mut module_debug_metadata = Vec::new();
+    let mut codegen =
+        backend::Codegen::new(opts, std::rc::Rc::clone(&db.layouts)).map_err(|error| {
+            emit_codegen_error(
+                errors::CodegenError::new(errors::CodegenStage::Initialize, error),
+                map,
+            )
+        })?;
+    codegen.body_queries = Some(std::rc::Rc::clone(&db.typed_bodies));
+    codegen.lir_queries = Some(std::rc::Rc::clone(&db.lir));
+    codegen.set_module_init_plan(module_init_plan);
+    // Shared declaration metadata comes from the checked entry artifact.
+    {
+        let checked = db.unit_declarations(module::UnitId::ENTRY, &artifacts)?;
+        for (name, info) in &checked.symbols.enums {
+            codegen.register_enum_info(name.to_string(), info.to_semantic());
+        }
+        for (name, info) in &checked.symbols.interfaces {
+            let identity = semantic::ids::TypeId::from_source_name(&info.name);
+            codegen.register_interface_info(name.to_string(), identity, || info.to_semantic())?;
+        }
+    }
+    // Declare every unit before emitting any body: later overrides must be
+    // visible to devirtualization in earlier modules. Each declaration artifact
+    // is written and dropped immediately, preserving its lambda symbols/IDs.
+    let mut declared_modules = Vec::with_capacity(modules.len());
+    for module in &modules {
+        let body = artifacts.hydrate(&module.program, module.id.file_id())?;
+        if emit_debug_metadata {
             let source = artifacts.source(module.id.file_id())?;
             let source_map =
                 diagnostics::SourceMap::new(module.path.to_string_lossy().into_owned(), source);
-            text.push_str("\n---\n");
-            text.push_str(
-                &diagnostics::DebugSourceMap::from_program(
+            module_debug_metadata.push(
+                diagnostics::DebugSourceMap::from_program(
                     &source_map.path,
                     source_map.total_lines(),
                     &body,
@@ -1346,73 +1378,25 @@ fn run_backend(
                 .to_text(),
             );
         }
-        Some(text)
-    } else {
-        None
-    };
-    let mut codegen = backend::Codegen::new(opts).map_err(|error| {
-        emit_codegen_error(
-            errors::CodegenError::new(errors::CodegenStage::Initialize, error),
-            map,
-        )
-    })?;
-    codegen.set_module_init_plan(module_init_plan);
-    let entry_items = module::resolver::classify_unit_imports(&program, &modules).items;
-    // Immutable global type declarations contain no executable syntax.
-    {
-        let body = artifacts.hydrate(&program, diagnostics::FileId::ENTRY)?;
-        let checked = typecheck_phase(&body, &modules, &entry_items, &helpers, &artifacts, opts)?;
-        for (name, info) in &checked.checker.symbols.enums {
-            codegen.register_enum_info(name.to_string(), info.to_semantic());
-        }
-        for (name, info) in &checked.checker.symbols.interfaces {
-            codegen.register_interface_info(name.to_string(), info.to_semantic());
-        }
-    }
-    let unit_enum_aliases = |checker: &semantic::TypeChecker| -> Vec<(
-        String,
-        semantic::symbols::EnumInfo<semantic::ids::TypeId>,
-    )> {
-        checker
-            .symbols
-            .enums
-            .iter()
-            .filter(|(name, info)| {
-                name.to_string() != info.name
-                    && !checker.symbols.classes.contains_key(*name)
-                    && !checker.symbols.interfaces.contains_key(*name)
-            })
-            .map(|(name, info)| (name.to_string(), info.to_semantic()))
-            .collect()
-    };
-    // Declare every unit before emitting any body: later overrides must be
-    // visible to devirtualization in earlier modules. Each declaration artifact
-    // is written and dropped immediately, preserving its lambda symbols/IDs.
-    let mut declared_modules = Vec::with_capacity(modules.len());
-    for module in &modules {
-        let body = artifacts.hydrate(&module.program, module.id.file_id())?;
-        let checker = check_module(
-            &body,
-            module,
-            &modules,
-            &dependencies,
-            &helpers,
-            &artifacts,
-            opts,
-        )?;
+        let checker = db.checked_unit(module.id, &artifacts)?;
         for info in checker.symbols.enums.values() {
             codegen.register_enum_info(info.name.clone(), info.to_semantic());
         }
-        codegen.register_module_checker_tables(&checker);
-        codegen.set_unit_imports(backend_unit_imports(&body, &modules));
-        let displaced = codegen.install_enum_aliases(&unit_enum_aliases(&checker));
-        let declared = codegen.declare_module(
+        let expr_types = checker
+            .expr_types
+            .iter()
+            .map(|(id, ty)| (*id, ty.into()))
+            .collect();
+        let scope = db.unit_scope(module.id, &body, &modules, &checker.symbols)?;
+        codegen.effect_queries = Some((std::rc::Rc::clone(&db.effects), module.id));
+        let declared = codegen.declare_module_with_types(
             &module.name,
             &module.canonical_path,
             &body,
             &module.path.to_string_lossy(),
+            &expr_types,
+            scope,
         );
-        codegen.restore_enum_aliases(displaced);
         let unit = declared.map_err(|error| {
             report_backend_failure(
                 &mut codegen,
@@ -1424,22 +1408,28 @@ fn run_backend(
         let unit = artifacts.track(UnitKind::Declared, unit);
         declared_modules.push(artifacts.write(&*unit)?);
     }
+    let mut debug_metadata = None;
     let entry_artifact = {
         let body = artifacts.hydrate(&program, diagnostics::FileId::ENTRY)?;
-        let checked = typecheck_phase(&body, &modules, &entry_items, &helpers, &artifacts, opts)?;
-        codegen.set_unit_imports(backend_unit_imports(&body, &modules));
-        let displaced = codegen.install_enum_aliases(&unit_enum_aliases(&checked.checker));
-        codegen.register_expr_types(
-            checked
-                .checker
-                .expr_types
-                .iter()
-                .map(|(id, ty)| (*id, ty.into()))
-                .collect(),
-        );
-        let declared = codegen.declare_program(&body, src);
-        codegen.register_expr_types(Default::default());
-        codegen.restore_enum_aliases(displaced);
+        if emit_debug_metadata {
+            let mut text =
+                diagnostics::DebugSourceMap::from_program(&map.path, map.total_lines(), &body)
+                    .to_text();
+            for module in module_debug_metadata.drain(..) {
+                text.push_str("\n---\n");
+                text.push_str(&module);
+            }
+            debug_metadata = Some(text);
+        }
+        let checked = db.checked_unit(module::UnitId::ENTRY, &artifacts)?;
+        let scope = db.unit_scope(module::UnitId::ENTRY, &body, &modules, &checked.symbols)?;
+        let expr_types = checked
+            .expr_types
+            .iter()
+            .map(|(id, ty)| (*id, ty.into()))
+            .collect();
+        codegen.effect_queries = Some((std::rc::Rc::clone(&db.effects), module::UnitId::ENTRY));
+        let declared = codegen.declare_program_with_types(&body, src, &expr_types, scope);
         let unit = declared.map_err(|error| {
             report_backend_failure(
                 &mut codegen,
@@ -1455,33 +1445,30 @@ fn run_backend(
         let unit: backend::cranelift::DeclaredModule = artifacts.read(artifact)?;
         let unit = artifacts.track(UnitKind::Declared, unit);
         let _lir = artifacts.live(UnitKind::Lir);
-        let aliases = {
-            let body = artifacts.hydrate(&module.program, module.id.file_id())?;
-            let checker = check_module(
-                &body,
-                module,
-                &modules,
-                &dependencies,
-                &helpers,
-                &artifacts,
-                opts,
-            )?;
-            let aliases = unit_enum_aliases(&checker);
-            drop(body);
+        {
+            let checker = db.checked_unit(module.id, &artifacts)?;
             // ANF declarations may hoist a lambda before an await and create
             // fresh temporary IDs. Preserve source resolutions/captures, but
             // lower the exact declared tree with its extended payload types.
-            let mut tables = ir::lower::CheckerTables::from_checker(&checker);
+            let mut tables = checker.tables();
             tables.expr_types = Some(unit.normalized_expr_types());
-            let (hir, gaps) = ir::lower::lower_program_with(unit.normalized_program(), &tables);
-            log_hir_gaps(&gaps);
-            codegen.register_module_lir(&unit, ir::lowered::lower_program(&hir));
-            aliases
-        };
-        let displaced = codegen.install_enum_aliases(&aliases);
-        let compiled = codegen.compile_module_bodies(&unit);
-        codegen.release_unit_transients();
-        codegen.restore_enum_aliases(displaced);
+            log_hir_gaps(&db.lir.lower_unit(
+                module.id,
+                unit.normalized_program(),
+                db.bodies(),
+                &tables,
+            )?);
+        }
+        // Emission is addressed one body at a time: each target names the
+        // semantic body whose lowered IR the artifact store holds, so no
+        // whole-unit IR is materialized here (willow-afb5.18).
+        let plan = codegen.module_body_plan(&unit);
+        let compiled = codegen.with_module_bodies(&unit, |backend| {
+            for target in &plan {
+                backend.compile_body(target)?;
+            }
+            Ok(())
+        });
         compiled.map_err(|error| {
             report_backend_failure(
                 &mut codegen,
@@ -1494,22 +1481,24 @@ fn run_backend(
     let entry_unit: backend::cranelift::DeclaredProgram = artifacts.read(entry_artifact)?;
     let entry_unit = artifacts.track(UnitKind::Declared, entry_unit);
     let _entry_lir = artifacts.live(UnitKind::Lir);
-    let entry_aliases = {
-        let body = artifacts.hydrate(&program, diagnostics::FileId::ENTRY)?;
-        let checked = typecheck_phase(&body, &modules, &entry_items, &helpers, &artifacts, opts)?;
-        let aliases = unit_enum_aliases(&checked.checker);
-        drop(body);
-        let mut tables = ir::lower::CheckerTables::from_checker(&checked.checker);
+    {
+        let checked = db.checked_unit(module::UnitId::ENTRY, &artifacts)?;
+        let mut tables = checked.tables();
         tables.expr_types = Some(entry_unit.normalized_expr_types());
-        let (hir, gaps) = ir::lower::lower_program_with(entry_unit.normalized_program(), &tables);
-        log_hir_gaps(&gaps);
-        codegen.register_lir_functions(ir::lowered::lower_program(&hir));
-        aliases
-    };
-    let displaced = codegen.install_enum_aliases(&entry_aliases);
-    let compiled = codegen.compile_program_bodies(&entry_unit);
-    codegen.release_unit_transients();
-    codegen.restore_enum_aliases(displaced);
+        log_hir_gaps(&db.lir.lower_unit(
+            module::UnitId::ENTRY,
+            entry_unit.normalized_program(),
+            db.bodies(),
+            &tables,
+        )?);
+    }
+    let plan = codegen.program_body_plan(&entry_unit);
+    let compiled = codegen.with_program_bodies(&entry_unit, |backend| {
+        for target in &plan {
+            backend.compile_body(target)?;
+        }
+        Ok(())
+    });
     compiled.map_err(|error| {
         report_backend_failure(
             &mut codegen,
@@ -1759,18 +1748,11 @@ pub fn emit_hir_text(src: &str) -> Result<String> {
         .as_ref()
         .expect("spooled frontend")
         .hydrate(&frontend.program, diagnostics::FileId::ENTRY)?;
-    let items =
-        module::resolver::classify_unit_imports(&frontend.program, &frontend.module_graph.files)
-            .items;
-    let checked = typecheck_phase(
-        &body,
-        &frontend.module_graph.files,
-        &items,
-        &frontend.helpers,
+    let checked = frontend.db.checked_unit(
+        module::UnitId::ENTRY,
         frontend.module_graph.artifacts.as_ref().unwrap(),
-        &options,
     )?;
-    let tables = ir::lower::CheckerTables::from_checker(&checked.checker);
+    let tables = checked.tables();
     let (hir, lowering_diagnostics) = ir::lower::lower_program_with(&body, &tables);
     let mut text = ir::dump::format_program(&hir);
     if !lowering_diagnostics.is_empty() {
@@ -1805,24 +1787,23 @@ pub fn emit_lir_text(src: &str) -> Result<String> {
         .as_ref()
         .expect("spooled frontend")
         .hydrate(&frontend.program, diagnostics::FileId::ENTRY)?;
-    let items =
-        module::resolver::classify_unit_imports(&frontend.program, &frontend.module_graph.files)
-            .items;
-    let checked = typecheck_phase(
-        &body,
-        &frontend.module_graph.files,
-        &items,
-        &frontend.helpers,
+    let checked = frontend.db.checked_unit(
+        module::UnitId::ENTRY,
         frontend.module_graph.artifacts.as_ref().unwrap(),
-        &options,
     )?;
-    let tables = ir::lower::CheckerTables::from_checker(&checked.checker);
-    let (hir, lowering_diagnostics) = ir::lower::lower_program_with(&body, &tables);
-    let lir = ir::lowered::lower_program(&hir);
+    let tables = checked.tables();
+    // The source dump historically retains import spellings. Its fresh db
+    // session is separate from native emission, which uses the declared tree.
+    let gaps =
+        frontend
+            .db
+            .lir
+            .lower_unit(module::UnitId::ENTRY, &body, frontend.db.bodies(), &tables)?;
+    let lir = frontend.db.lir.unit_program(module::UnitId::ENTRY)?;
     let mut text = ir::lowered::format_program(&lir);
-    if !lowering_diagnostics.is_empty() {
+    if !gaps.is_empty() {
         text.push_str("\n// constructs not yet lowered to HIR (willow-mb5):\n");
-        for diagnostic in &lowering_diagnostics {
+        for diagnostic in gaps.iter() {
             text.push_str(&format!("//   {}\n", diagnostic.message));
         }
     }
@@ -2018,9 +1999,9 @@ mod frontend_phase_tests {
             &program,
             &[],
             &[],
-            &HelperIndex::new(),
             &UnitArtifacts::new().unwrap(),
             &CompilerOptions::debug(),
+            None,
         )
         .unwrap();
         assert_eq!(phase.error_count, 0);
@@ -2031,10 +2012,21 @@ mod frontend_phase_tests {
     fn imported_nonpreemptible_methods_follow_each_units_aliases() {
         let source = "pub class Work { pub fn heavy(self) { while true {} } }";
         let program = parse_source(source);
-        let helpers = HelperIndex::from([(
-            "worker".to_string(),
-            semantic::concurrency::compute_nonpreemptible_helpers(&program),
-        )]);
+        let effects = compiler_db::effects::EffectQueries::default();
+        let graph = semantic::TypeChecker::resolved_effect_graph(&program);
+        effects
+            .complete(module::ModuleId(0), || {
+                compiler_db::effects::solve_unit(
+                    &program,
+                    &graph,
+                    &std::collections::HashMap::<parser::ast::ExprId, parser::ast::Type>::new(),
+                    None,
+                    &Default::default(),
+                    &Default::default(),
+                    |_| semantic::effects::RuntimeEffects::MAY_PANIC,
+                )
+            })
+            .unwrap();
         let modules = [module::ResolvedModule {
             id: module::ModuleId(0),
             name: "another_units_alias".into(),
@@ -2060,7 +2052,10 @@ mod frontend_phase_tests {
                 &ModuleDependencies::new(&modules),
             );
             checker.set_nonpreemptible_module_methods(imported_nonpreemptible_method_owners(
-                &body, &modules, &helpers,
+                &body,
+                &modules,
+                &effects,
+                &ModuleDependencies::new(&modules),
             ));
             checker.check_module_program(&body);
             assert!(
@@ -2080,10 +2075,10 @@ mod frontend_phase_tests {
         let phase = check_unit_concurrency(
             &program,
             &[],
-            &HelperIndex::new(),
+            &ModuleDependencies::new(&[]),
+            &compiler_db::effects::EffectQueries::default(),
             Some(&[]),
-            &Default::default(),
-            &Default::default(),
+            None,
         );
         assert!(diagnostic_error_count(&phase) > 0);
         assert!(!phase.is_empty());

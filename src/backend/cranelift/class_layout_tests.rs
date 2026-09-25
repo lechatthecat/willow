@@ -1,4 +1,5 @@
 use super::*;
+use crate::semantic::method_slots::MethodSlots;
 
 fn classes(source: &str) -> Vec<ClassDecl> {
     let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
@@ -11,6 +12,28 @@ fn classes(source: &str) -> Vec<ClassDecl> {
             Item::Class(class) => Some(class),
             _ => None,
         })
+        .collect()
+}
+
+/// The frozen layout under `name`'s DECLARATION identity, aliases ignored.
+fn fields(codegen: &Codegen, name: &str) -> Option<std::sync::Arc<Vec<(String, Type)>>> {
+    codegen
+        .layout_queries
+        .fields(TypeId::from_source_name(name))
+}
+
+fn slots(codegen: &Codegen, name: &str) -> std::sync::Arc<MethodSlots> {
+    codegen
+        .layout_queries
+        .slots(TypeId::from_source_name(name))
+        .unwrap()
+}
+
+fn field_names(codegen: &Codegen, name: &str) -> Vec<String> {
+    fields(codegen, name)
+        .unwrap()
+        .iter()
+        .map(|(name, _)| name.clone())
         .collect()
 }
 
@@ -28,161 +51,156 @@ fn field_layout_counts_are_output_sensitive_in_both_declaration_orders() {
                 } else {
                     format!(" extends C{}", if shape == "fanout" { 0 } else { i - 1 })
                 };
-                let field = if shape == "redeclared" {
-                    "field0".into()
+                let (field, method) = if shape == "redeclared" {
+                    ("field0".to_string(), "m0".to_string())
                 } else {
-                    format!("field{i}")
+                    (format!("field{i}"), format!("m{i}"))
                 };
-                source.push_str(&format!("open class C{i}{base} {{ pub {field}: i64; }}"));
+                let modifier = if i == 0 || shape == "fanout" {
+                    "open"
+                } else {
+                    "override"
+                };
+                source.push_str(&format!(
+                    "open class C{i}{base} {{ pub {field}: i64; pub {modifier} fn {method}(self) {{}} }}"
+                ));
             }
             let declarations = classes(&source);
             for reverse in [false, true] {
-                let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+                let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
                 for index in 0..size {
                     let i = if reverse { size - 1 - index } else { index };
                     codegen.register_class_layout(&declarations[i]).unwrap();
                 }
-                codegen.finalize_class_layouts();
-                codegen.finalize_class_vslots();
+                codegen.finalize_class_layouts().unwrap();
                 let copied = if shape == "chain" {
                     size * (size - 1) / 2
                 } else {
                     size - 1
                 };
-                let edges = if reverse { size - 1 } else { 0 };
-                assert_eq!(codegen.layout_work, [size, copied, size, size, edges]);
+                // One visit per declaration, one copy per inherited entry, one
+                // insertion per own declaration: independent of registration order.
+                assert_eq!(codegen.layout_queries.declaration_visits(), size);
+                assert_eq!(codegen.layout_queries.work(), [copied, size, copied, size]);
                 for i in 0..size {
-                    let fields = codegen
-                        .class_layouts
-                        .get_canonical(&format!("C{i}"))
-                        .unwrap();
-                    let expected: Vec<_> = match shape {
+                    let expected: Vec<String> = match shape {
                         "chain" => (0..=i).map(|j| format!("field{j}")).collect(),
                         "fanout" if i > 0 => vec!["field0".into(), format!("field{i}")],
                         _ => vec!["field0".into()],
                     };
-                    assert_eq!(
-                        fields.iter().map(|(name, _)| name).collect::<Vec<_>>(),
-                        expected.iter().collect::<Vec<_>>()
-                    );
+                    assert_eq!(field_names(&codegen, &format!("C{i}")), expected);
+                    let slots = slots(&codegen, &format!("C{i}"));
+                    let expected_slots = match shape {
+                        "chain" => (0..=i).map(|j| format!("m{j}")).collect(),
+                        "fanout" if i > 0 => vec!["m0".into(), format!("m{i}")],
+                        _ => vec!["m0".into()],
+                    };
+                    assert_eq!(slots.as_slice(), expected_slots.as_slice());
                 }
                 println!(
-                    "shape={shape} size={size} reverse={reverse} work={:?}",
-                    codegen.layout_work
+                    "shape={shape} size={size} reverse={reverse} visits={} work={:?}",
+                    codegen.layout_queries.declaration_visits(),
+                    codegen.layout_queries.work()
                 );
-                codegen.layout_work = [0; 5];
+                // Nothing pending: repeated finalization does no work.
                 for _ in 0..8 {
-                    codegen.finalize_class_layouts();
+                    codegen.finalize_class_layouts().unwrap();
                 }
-                assert_eq!(codegen.layout_work, [0; 5]);
-                // Repeated equivalent invalidations share descendant traversal.
+                assert_eq!(codegen.layout_queries.declaration_visits(), size);
+                assert_eq!(codegen.layout_queries.work(), [copied, size, copied, size]);
+                // Re-registering an already frozen declaration requests the same
+                // completed result without revisiting its ancestors.
                 for _ in 0..8 {
-                    codegen.invalidate_class_layout("C0");
+                    codegen
+                        .register_class_layout(&declarations[size - 1])
+                        .unwrap();
                 }
-                assert_eq!(codegen.layout_work, [0, 0, 0, size, size - 1]);
-                codegen.finalize_class_layouts();
-                codegen.finalize_class_vslots();
-                codegen.layout_work = [0; 5];
-                codegen.invalidate_class_layout(&format!("C{}", size - 1));
-                codegen.finalize_class_layouts();
-                let inherited = if shape == "chain" {
-                    size - 1
-                } else {
-                    usize::from(size > 1)
-                };
-                assert_eq!(codegen.layout_work, [1, inherited, 1, 1, 0]);
+                codegen.finalize_class_layouts().unwrap();
+                assert_eq!(codegen.layout_queries.declaration_visits(), size);
+                assert_eq!(codegen.layout_queries.work(), [copied, size, copied, size]);
             }
         }
     }
 }
 
 #[test]
-fn field_layout_updates_preserve_types_order_and_independent_dirty_passes() {
+fn field_layouts_preserve_inherited_types_and_order_under_redeclaration() {
     let declarations = classes(
-        "open class A { pub a: i64; } open class B extends A { pub a: bool; pub b: bool; } class C extends B { pub c: i64; }",
+        "open class A { pub a: i64; pub open fn a(self) {} } open class B extends A { pub a: bool; pub b: bool; pub override fn a(self) {} pub open fn b(self) {} } class C extends B { pub c: i64; pub override fn b(self) {} }",
     );
-    let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+    let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
     for class in declarations.iter().rev() {
         codegen.register_class_layout(class).unwrap();
     }
-    codegen.finalize_class_layouts();
-    // Slots remain dirty when fields are rebuilt after a parent update.
-    let updated = classes("open class A { pub a: String; pub z: bool; }");
-    codegen.register_class_layout(&updated[0]).unwrap();
-    codegen.finalize_class_layouts();
-    codegen.finalize_class_vslots();
+    codegen.finalize_class_layouts().unwrap();
     assert_eq!(
-        codegen.class_layouts.get_canonical("C").unwrap(),
+        fields(&codegen, "C").unwrap().as_ref(),
         &vec![
-            ("a".into(), Type::String),
-            ("z".into(), Type::Bool),
+            ("a".into(), Type::I64),
             ("b".into(), Type::Bool),
             ("c".into(), Type::I64),
         ]
     );
-    // Conversely, field dirtiness cannot prevent slot invalidation.
-    codegen.invalidate_class_layout("C");
-    codegen.finalize_class_vslots();
-    codegen.invalidate_class_layout("A");
-    assert_eq!(codegen.dirty_class_vslots.len(), 3);
-    codegen.finalize_class_layouts();
-    codegen.finalize_class_vslots();
-    // A newly registered child of an already-dirty parent still gets rebuilt.
-    codegen.invalidate_class_layout("A");
+    let slots = slots(&codegen, "C");
+    assert_eq!(slots.as_slice(), ["a", "b"]);
+    assert_eq!(slots.slot_of("a"), Some(0));
+    assert_eq!(slots.slot_of("b"), Some(1));
+    // A later unit extends the frozen chain without reopening it.
+    let visits = codegen.layout_queries.declaration_visits();
     let child = classes("class D extends C { pub d: bool; }");
     codegen.register_class_layout(&child[0]).unwrap();
-    codegen.finalize_class_layouts();
-    assert_eq!(codegen.class_layouts.get_canonical("D").unwrap().len(), 5);
+    codegen.finalize_class_layouts().unwrap();
+    assert_eq!(field_names(&codegen, "D"), ["a", "b", "c", "d"]);
+    assert_eq!(codegen.layout_queries.declaration_visits(), visits + 1);
 }
 
 #[test]
-fn field_layouts_keep_canonical_identity_under_aliases_and_cycle_fallback() {
-    let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+fn field_layouts_keep_canonical_identity_under_aliases_and_reject_cycles() {
+    let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
     for class in classes(
         "open class A { pub a: i64; } class B extends A { pub b: bool; } class Other { pub other: String; }",
     ) {
         codegen.register_class_layout(&class).unwrap();
     }
+    // The base edge was resolved at registration; a later alias cannot move it.
     codegen.bind_type_alias("A", "Other");
-    codegen.finalize_class_layouts();
+    codegen.finalize_class_layouts().unwrap();
     assert_eq!(
-        codegen.class_layouts.get_canonical("B").unwrap(),
+        fields(&codegen, "B").unwrap().as_ref(),
         &vec![("a".into(), Type::I64), ("b".into(), Type::Bool)]
     );
-    let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+    // A cyclic `extends` is a checker error; a backend driven directly with
+    // one gets a diagnosed failure instead of a partial layout.
+    let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
     for class in classes(
         "open class A extends B { pub a: i64; } open class B extends A { pub b: bool; } class C extends A { pub c: String; }",
     ) {
         codegen.register_class_layout(&class).unwrap();
     }
-    codegen.finalize_class_layouts();
-    for (name, expected) in [
-        ("A", vec!["b", "a"]),
-        ("B", vec!["a", "b"]),
-        ("C", vec!["b", "a", "c"]),
-    ] {
-        assert_eq!(
-            codegen
-                .class_layouts
-                .get_canonical(name)
-                .unwrap()
-                .iter()
-                .map(|(name, _)| name.as_str())
-                .collect::<Vec<_>>(),
-            expected
-        );
+    for _ in 0..2 {
+        let error = codegen.finalize_class_layouts().unwrap_err().to_string();
+        assert!(error.contains("cyclic class layout"), "{error}");
     }
+    assert!(fields(&codegen, "A").is_none());
+    assert!(fields(&codegen, "C").is_none());
 }
 
 #[test]
 fn field_layouts_do_not_inherit_unregistered_builtin_layouts() {
-    let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+    let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
     for class in classes("class C extends PanicInfo { pub own: i64; }") {
         codegen.register_class_layout(&class).unwrap();
     }
-    codegen.finalize_class_layouts();
+    codegen.finalize_class_layouts().unwrap();
     assert_eq!(
-        codegen.class_layouts.get_canonical("C").unwrap(),
+        fields(&codegen, "C").unwrap().as_ref(),
         &vec![("own".into(), Type::I64)]
     );
+    // The builtin keeps its own layout for panic handlers, without a runtime
+    // type id: it is never allocated by user code.
+    assert_eq!(
+        field_names(&codegen, "PanicInfo"),
+        ["message", "file", "line", "column"]
+    );
+    assert!(codegen.classes().type_id("PanicInfo").is_none());
 }

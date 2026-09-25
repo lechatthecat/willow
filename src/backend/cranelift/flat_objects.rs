@@ -249,23 +249,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     pub(super) fn emit_flat_object_alloc(&mut self, class: &TypeId) -> Value {
         let layout = self
-            .class_layouts
-            .get(class)
-            .cloned()
+            .classes
+            .object_layout(class, reference_type(self.module.target_config()).bytes())
             .expect("checked class layout");
         let type_id = self
-            .class_type_ids
-            .get(class)
-            .copied()
+            .classes
+            .type_id(class)
             .expect("checked class runtime type id");
         let name = class.to_string();
-        let ptr = self.emit_gc_alloc(GcLayoutMetadata::class(
-            &name,
-            type_id,
-            &layout,
-            self.enum_infos,
-            reference_type(self.module.target_config()).bytes(),
-        ));
+        let ptr = self.emit_gc_alloc(GcLayoutMetadata::class(type_id, &layout, self.enum_infos));
         self.emit_store_class_descriptor(ptr, &name);
         ptr
     }
@@ -288,21 +280,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             );
         }
         let layout = self.lir_class_layout(object_ty);
-        let index = layout
-            .iter()
-            .position(|(name, _)| name == field)
-            .expect("checked field");
+        let (offset, field_ty) = layout.field(field).expect("checked field");
         self.builder.ins().load(
-            clif_type(
-                reference_type(self.module.target_config()),
-                &layout[index].1,
-            ),
+            clif_type(reference_type(self.module.target_config()), field_ty),
             MemFlagsData::new(),
             object,
-            (index as i32 + 1)
-                * willow_abi::storage_word_bytes(
-                    reference_type(self.module.target_config()).bytes(),
-                ) as i32,
+            offset as i32,
         )
     }
 
@@ -315,28 +298,29 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         object_ty: &Type,
     ) -> Value {
         let layout = self.lir_class_layout(object_ty);
-        let index = layout
-            .iter()
-            .position(|(name, _)| name == field)
-            .expect("checked field");
-        let target_ty = &layout[index].1;
+        let (offset, target_ty) = layout.field(field).expect("checked field");
         let object = self.emit_lir_operand(function, object);
-        self.emit_push_root(object);
         let source_ty = Self::flat_operand_type(function, value);
+        // The store and its barrier never reach a safepoint; only an
+        // interface-boxing coercion allocates, so only it needs the owner
+        // rooted (willow-8hq4.16).
+        let boxes = self.coercion_boxes(&source_ty, target_ty);
+        if boxes {
+            self.emit_push_root(object);
+        }
         let value = self.emit_lir_operand(function, value);
         let value = self.coerce_to_target(value, &source_ty, target_ty);
         self.emit_gc_heap_store(
             object,
-            (index as i32 + 1)
-                * willow_abi::storage_word_bytes(
-                    reference_type(self.module.target_config()).bytes(),
-                ) as i32,
+            offset as i32,
             value,
             target_ty,
             GcStoreDestination::ObjectField,
         );
-        self.emit_pop_roots_n(1);
-        self.gc_root_count -= 1;
+        if boxes {
+            self.emit_pop_roots_n(1);
+            self.gc_root_count -= 1;
+        }
         self.builder.ins().iconst(types::I64, 0)
     }
 

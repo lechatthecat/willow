@@ -3299,6 +3299,7 @@ mod tests {
                             params: vec![],
                             return_type: Type::Void,
                             body: Block {
+                                id: crate::parser::ast::BodyId::fresh(),
                                 stmts: vec![Stmt::Expr(crate::parser::ast::ExprStmt {
                                     expr,
                                     span,

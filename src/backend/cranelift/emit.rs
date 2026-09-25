@@ -22,12 +22,12 @@ use super::*;
 /// actually build, and the two must use the same scoped type identities.
 pub(super) fn resolve_vtable_id(
     vtable_ids: &VtableMap<DataId>,
-    interface_infos: &TypeMap<InterfaceInfo>,
+    classes: &ClassView<'_>,
     class_name: &str,
     interface_name: &str,
 ) -> Option<DataId> {
-    let canonical_iface = interface_infos
-        .get(interface_name)
+    let canonical_iface = classes
+        .interface(interface_name)
         .map(|i| i.name)
         .unwrap_or_else(|| interface_name.to_string().into());
     vtable_ids
@@ -90,12 +90,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         class_name: &str,
         interface_name: &str,
     ) -> cranelift_codegen::ir::Value {
-        let vtable_id = resolve_vtable_id(
-            self.vtable_ids,
-            self.interface_infos,
-            class_name,
-            interface_name,
-        );
+        let vtable_id =
+            resolve_vtable_id(self.vtable_ids, &self.classes, class_name, interface_name);
         let Some(vtable_id) = vtable_id else {
             // No vtable registered (e.g. unknown interface already diagnosed):
             // fall back to the raw object so codegen stays total.
@@ -167,17 +163,20 @@ mod vtable_resolution_tests {
                     DataId::from_u32(index as u32),
                 );
             }
-            let interfaces = TypeMap::new();
+            // No interface is registered, so every name stands for itself.
+            let scope = type_index::TypeScope::default();
+            let layouts = crate::compiler_db::layout::LayoutQueries::default();
+            let classes = ClassView::new(&scope, &layouts);
             assert_eq!(
-                resolve_vtable_id(&tables, &interfaces, "Concrete", "one::View"),
+                resolve_vtable_id(&tables, &classes, "Concrete", "one::View"),
                 Some(DataId::from_u32(0))
             );
             assert_eq!(
-                resolve_vtable_id(&tables, &interfaces, "Concrete", "two::View"),
+                resolve_vtable_id(&tables, &classes, "Concrete", "two::View"),
                 None
             );
             assert_eq!(
-                resolve_vtable_id(&tables, &interfaces, "Concrete", "View"),
+                resolve_vtable_id(&tables, &classes, "Concrete", "View"),
                 None
             );
         }

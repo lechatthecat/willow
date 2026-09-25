@@ -2499,9 +2499,409 @@ fn t9ha4_17_reset_installs_a_fresh_empty_timer_queue() {
         TimerQueue::empty_hint()
     );
     assert!(
-        !Arc::ptr_eq(&leaked, &global_timers()),
+        !Arc::ptr_eq(leaked, global_timers()),
         "reset must install a NEW queue, not drain the old one in place"
     );
+}
+
+#[test]
+fn t8hq4_18_component_access_is_stable_until_reset() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    let (queues, tasks, timers) = (global_run_queues(), global_task_table(), global_timers());
+    assert!(Arc::ptr_eq(queues, global_run_queues()));
+    assert!(Arc::ptr_eq(tasks, global_task_table()));
+    assert!(Arc::ptr_eq(timers, global_timers()));
+    let id = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
+    assert_eq!(tasks.len(), 1);
+
+    reset_global_scheduler_for_test();
+
+    assert!(!Arc::ptr_eq(queues, global_run_queues()));
+    assert!(!Arc::ptr_eq(tasks, global_task_table()));
+    assert!(!Arc::ptr_eq(timers, global_timers()));
+    // A borrow taken before the reset stays valid: the old set is leaked.
+    assert_eq!(tasks.len(), 0, "reset drains the old table");
+    assert!(global_task_table().with(id, |_| ()).is_none());
+    // The scheduler instance shares the newly published components.
+    let spawned = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
+    assert!(global_task_table().with(spawned, |_| ()).is_some());
+    reset_global_scheduler_for_test();
+}
+
+#[test]
+fn t8hq4_18_task_id_hash_spreads_ids_of_one_shard() {
+    use std::hash::BuildHasher;
+    const IDS: u64 = 4096;
+    let build = BuildHasherDefault::<TaskIdHasher>::default();
+    for residue in [0, 1, 17, (TASK_TABLE_SHARDS - 1) as u64] {
+        let hashes: Vec<u64> = (0..IDS)
+            .map(|k| build.hash_one(residue + k * TASK_TABLE_SHARDS as u64))
+            .collect();
+        // hashbrown picks the bucket from the low bits; a random hash fills
+        // about 63% of 4096 buckets with 4096 keys (this hash: about 66%).
+        let buckets: HashSet<u64> = hashes.iter().map(|hash| hash & (IDS - 1)).collect();
+        assert!(
+            buckets.len() * 10 >= IDS as usize * 6,
+            "residue {residue}: {} of {IDS} buckets used",
+            buckets.len()
+        );
+        // ...and the control tag from the top seven bits.
+        let tags: HashSet<u64> = hashes.iter().map(|hash| hash >> 57).collect();
+        assert_eq!(tags.len(), 128, "residue {residue}");
+    }
+}
+
+fn terminal_cleanups_pending() -> bool {
+    global_components()
+        .terminal_cleanups_pending
+        .load(Ordering::Acquire)
+}
+
+/// Complete an executable task directly, so its terminal cleanup record is
+/// queued but not yet drained. Executable tasks always queue one.
+fn complete_executable_without_drain() -> RuntimeTaskId {
+    let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    with_global_for_test(|sched| {
+        sched.set_running(id);
+        sched.complete(id);
+        sched.clear_running();
+    });
+    id
+}
+
+fn pending_cleanup_count() -> usize {
+    with_global_for_test(|sched| sched.metadata_snapshot().pending_cleanups)
+}
+
+#[test]
+fn t8hq4_19_cleanup_flag_follows_the_pending_list() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    assert!(!terminal_cleanups_pending(), "a fresh scheduler has none");
+    complete_executable_without_drain();
+    complete_executable_without_drain();
+    assert!(terminal_cleanups_pending());
+    assert_eq!(pending_cleanup_count(), 2);
+
+    drain_terminal_cleanups();
+
+    assert!(!terminal_cleanups_pending());
+    assert_eq!(pending_cleanup_count(), 0);
+    drain_terminal_cleanups();
+    assert!(
+        !terminal_cleanups_pending(),
+        "an empty drain keeps it clear"
+    );
+}
+
+#[test]
+fn t8hq4_19_empty_drain_does_not_take_the_scheduler_mutex() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    let held = GLOBAL_SCHEDULER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let drainer = std::thread::spawn(move || {
+        drain_terminal_cleanups();
+        done_tx.send(()).unwrap();
+    });
+    let finished = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+    drop(held);
+    drainer.join().unwrap();
+    assert!(
+        finished,
+        "a drain with nothing pending blocked on GLOBAL_SCHEDULER"
+    );
+}
+
+#[test]
+fn t8hq4_19_pending_drain_still_takes_the_list() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    complete_executable_without_drain();
+    let held = GLOBAL_SCHEDULER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let drainer = std::thread::spawn(move || {
+        drain_terminal_cleanups();
+        done_tx.send(()).unwrap();
+    });
+    let early = done_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+    drop(held);
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_else(|_| assert!(early, "drain never finished"));
+    drainer.join().unwrap();
+    assert!(!early, "a pending cleanup must be taken under the mutex");
+    assert_eq!(pending_cleanup_count(), 0);
+    assert!(!terminal_cleanups_pending());
+}
+
+#[test]
+fn t8hq4_19_reset_installs_a_clear_flag() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    complete_executable_without_drain();
+    assert!(terminal_cleanups_pending());
+    reset_global_scheduler_for_test();
+    assert!(!terminal_cleanups_pending());
+    assert_eq!(pending_cleanup_count(), 0);
+}
+
+#[test]
+fn t8hq4_19_a_private_scheduler_does_not_touch_the_global_flag() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    let mut scheduler = RuntimeScheduler::with_worker_count(TEST_WORKERS);
+    let id = scheduler.spawn_task(poll_ready_now, std::ptr::null_mut());
+    scheduler.set_running(id);
+    scheduler.complete(id);
+    scheduler.clear_running();
+    assert!(scheduler.terminal_cleanups_pending.load(Ordering::Acquire));
+    assert!(!terminal_cleanups_pending());
+    assert_eq!(scheduler.take_pending_terminal_cleanups().len(), 1);
+    assert!(!scheduler.terminal_cleanups_pending.load(Ordering::Acquire));
+}
+
+#[test]
+fn t8hq4_19_cleanups_published_during_drains_are_never_lost() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    const TASKS: usize = 2_000;
+    let stop = Arc::new(AtomicBool::new(false));
+    let drainer_stop = Arc::clone(&stop);
+    let drainer = std::thread::spawn(move || {
+        while !drainer_stop.load(Ordering::Acquire) {
+            drain_terminal_cleanups();
+        }
+    });
+    for _ in 0..TASKS {
+        complete_executable_without_drain();
+    }
+    stop.store(true, Ordering::Release);
+    drainer.join().unwrap();
+    // The drive-end drain runs after the workers have joined.
+    drain_terminal_cleanups();
+    assert_eq!(pending_cleanup_count(), 0);
+    assert!(!terminal_cleanups_pending());
+}
+
+fn terminal_epoch() -> u64 {
+    global_task_table().terminal_epoch()
+}
+
+/// Run `f` on another thread while this thread holds `id`'s task shard, and
+/// report whether it finished without that shard (bounded wait).
+fn finishes_without_shard<R: Send>(id: RuntimeTaskId, f: impl FnOnce() -> R + Send) -> Option<R> {
+    let table = global_task_table();
+    let held = table.lock_shard(table.shard_index(id));
+    std::thread::scope(|scope| {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = scope.spawn(move || done_tx.send(f()).unwrap());
+        let result = done_rx.recv_timeout(Duration::from_secs(2)).ok();
+        drop(held);
+        worker.join().unwrap();
+        result
+    })
+}
+
+#[test]
+fn t8hq4_19_terminal_epoch_advances_on_terminal_transitions_and_removals_only() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    let start = terminal_epoch();
+    let parked = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
+    let runnable = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    assert_eq!(terminal_epoch(), start, "spawning is not terminal");
+    complete_executable_without_drain();
+    let after_complete = terminal_epoch();
+    assert!(after_complete > start, "a completion advances the epoch");
+    assert!(global_task_table().remove(parked).is_some());
+    let after_remove = terminal_epoch();
+    assert!(
+        after_remove > after_complete,
+        "a removal advances the epoch"
+    );
+    assert!(global_task_table().remove(parked).is_none());
+    assert_eq!(terminal_epoch(), after_remove, "a missed removal does not");
+    assert!(global_task_table().with(runnable, |_| ()).is_some());
+    drain_terminal_cleanups();
+    reset_global_scheduler_for_test();
+}
+
+#[test]
+fn t8hq4_19_target_watch_looks_again_only_after_the_epoch_moves() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    let target = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    let mut watch = TargetWatch::new(Some(target), None);
+    assert!(!watch.is_done(), "the first question looks");
+    // No epoch change: answered without the target's shard.
+    let (live, watch) = finishes_without_shard(target, move || (watch.is_done(), watch))
+        .expect("an unchanged epoch must not lock the target shard");
+    let mut watch = watch;
+    assert!(!live);
+    // An unrelated completion moves the epoch; the target is still live.
+    complete_executable_without_drain();
+    assert!(!watch.is_done());
+    // The target's own completion is seen on the next question.
+    with_global_for_test(|sched| {
+        sched.set_running(target);
+        sched.complete(target);
+        sched.clear_running();
+    });
+    assert!(watch.is_done());
+    // Done is final: answered without the shard even after the epoch moves.
+    complete_executable_without_drain();
+    let done = finishes_without_shard(target, move || watch.is_done())
+        .expect("a done answer must not lock the target shard");
+    assert!(done);
+    assert!(
+        !TargetWatch::new(None, None).is_done(),
+        "no target never ends"
+    );
+    drain_terminal_cleanups();
+    reset_global_scheduler_for_test();
+}
+
+#[test]
+fn t8hq4_19_a_removed_target_is_done() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    let target = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
+    let mut watch = TargetWatch::new(Some(target), None);
+    assert!(!watch.is_done());
+    assert!(global_task_table().remove(target).is_some());
+    assert!(watch.is_done());
+    reset_global_scheduler_for_test();
+}
+
+#[test]
+fn t8hq4_19_pool_workers_share_one_look_per_epoch() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    let target = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    let shared = SharedTargetCheck::default();
+    let mut first = TargetWatch::new(Some(target), Some(&shared));
+    assert!(!first.is_done(), "the first worker looks for this epoch");
+    let second = TargetWatch::new(Some(target), Some(&shared));
+    let (live, mut second) = finishes_without_shard(target, move || {
+        let mut second = second;
+        (second.is_done(), second)
+    })
+    .expect("a second worker must not look in an epoch already claimed");
+    assert!(!live);
+    with_global_for_test(|sched| {
+        sched.set_running(target);
+        sched.complete(target);
+        sched.clear_running();
+    });
+    assert!(
+        second.is_done(),
+        "the next epoch's look sees the target done"
+    );
+    assert!(shared.done.load(Ordering::Acquire));
+    let done = finishes_without_shard(target, move || first.is_done())
+        .expect("a published done must not lock the target shard");
+    assert!(done, "every worker of the pool sees the shared done");
+    drain_terminal_cleanups();
+    reset_global_scheduler_for_test();
+}
+
+#[test]
+fn t8hq4_19_racing_pool_watchers_never_miss_the_target() {
+    let _guard = runtime_test_guard();
+    const WATCHERS: usize = 4;
+    for _ in 0..200 {
+        reset_global_scheduler_for_test();
+        let target = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+        let shared = SharedTargetCheck::default();
+        let start = Barrier::new(WATCHERS + 1);
+        std::thread::scope(|scope| {
+            let watchers = (0..WATCHERS)
+                .map(|_| {
+                    let (shared, start) = (&shared, &start);
+                    scope.spawn(move || {
+                        let mut watch = TargetWatch::new(Some(target), Some(shared));
+                        start.wait();
+                        let give_up = Instant::now() + Duration::from_secs(10);
+                        while !watch.is_done() {
+                            assert!(Instant::now() < give_up, "a watcher missed the target");
+                            std::hint::spin_loop();
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            start.wait();
+            for _ in 0..3 {
+                complete_executable_without_drain();
+            }
+            with_global_for_test(|sched| {
+                sched.set_running(target);
+                sched.complete(target);
+                sched.clear_running();
+            });
+            for watcher in watchers {
+                watcher.join().unwrap();
+            }
+        });
+        drain_terminal_cleanups();
+    }
+    reset_global_scheduler_for_test();
+}
+
+#[test]
+fn t8hq4_19_a_draining_worker_holds_a_claim_in_flight() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    complete_executable_without_drain();
+    let before = claim_word();
+    let state = ParallelRunState::default();
+    let held = GLOBAL_SCHEDULER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let drainer = std::thread::spawn(drain_terminal_cleanups);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !claims_in_flight() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let visible = claims_in_flight();
+    // The drainer won the swap; a second caller returns without the list
+    // while the winner's marker is still in the claim word.
+    let (loser_tx, loser_rx) = std::sync::mpsc::channel();
+    let loser = std::thread::spawn(move || {
+        drain_terminal_cleanups();
+        loser_tx.send(claims_in_flight()).unwrap();
+    });
+    let loser_saw_marker = loser_rx.recv_timeout(Duration::from_secs(5));
+    let refused = !state.publish_stop_if(|_| true);
+    drop(held);
+    drainer.join().unwrap();
+    loser.join().unwrap();
+    assert!(visible, "a drain in progress must be a claim in flight");
+    assert_eq!(
+        loser_saw_marker,
+        Ok(true),
+        "the losing drain must not block"
+    );
+    assert!(refused, "a stop decision must not pass a drain in progress");
+    assert_eq!(claim_word() & CLAIM_COUNT_MASK, 0);
+    assert_ne!(claim_word(), before, "a finished drain advances the epoch");
+    assert_eq!(pending_cleanup_count(), 0);
+    assert!(state.publish_stop_if(|_| true));
+    reset_global_scheduler_for_test();
+}
+
+#[test]
+fn t8hq4_19_an_empty_drain_leaves_the_claim_word_alone() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    let before = claim_word();
+    drain_terminal_cleanups();
+    assert_eq!(claim_word(), before);
 }
 
 #[test]
@@ -4437,12 +4837,12 @@ fn sched_wake_running_peer_is_a_wake_source_but_current_poll_is_not() {
     reset_global_scheduler_for_test();
     let current = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
     let state = Arc::new(ParallelRunState::default());
-    state.active_polls.store(2, Ordering::Release);
+    state.set_polls_for_test(2, 0);
     let (peer_can_progress, caller_alone_can_progress) =
         with_parallel_context(0, Arc::clone(&state), || {
             with_current_task_for_test(current, || {
                 let peer_can_progress = scheduler_has_wake_source();
-                state.active_polls.store(1, Ordering::Release);
+                state.set_polls_for_test(1, 0);
                 (peer_can_progress, scheduler_has_wake_source())
             })
         });

@@ -11,8 +11,6 @@ use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::parser::ast::*;
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
-use crate::semantic::call_graph::{CallGraph, CallSites};
-use crate::semantic::effects::EffectProblem;
 use crate::semantic::symbols::*;
 
 use super::*;
@@ -95,8 +93,9 @@ impl TypeChecker {
         // typed non-`self` receiver (`obj.heavy()`) in a task context is flagged
         // E0810 — the AST-only ConcurrencyAnalyzer cannot resolve the receiver
         // type (willow-0a6k.2).
-        self.nonpreemptible_methods =
-            crate::semantic::concurrency::compute_nonpreemptible_helpers(program);
+        // Helper effects depend on checked call resolution. Collect their
+        // diagnostic sites while checking; solve and replay them afterward.
+        self.task_method_calls.clear();
 
         // Pass 0: enum identities. Normalizing a written type canonicalizes a
         // bare enum name by lookup, so every enum must be findable before any
@@ -203,6 +202,16 @@ impl TypeChecker {
         // in the lock-effect fixpoint just like backward calls do.
         self.prepare_lock_effect_analysis(program);
 
+        if let Some((queries, unit)) = &self.declaration_queries {
+            match queries.freeze(*unit, &self.symbols) {
+                Ok(symbols) => self.symbols = symbols,
+                Err(error) => {
+                    self.body_query_error = Some(error);
+                    return;
+                }
+            }
+        }
+
         // Pass 3: check bodies
         for item in &program.items {
             match item {
@@ -213,36 +222,53 @@ impl TypeChecker {
             }
         }
 
-        self.report_transitive_lock_effects();
+        self.finish_effect_analysis(program);
+    }
+
+    /// Standalone backend callers use the same typed edge collector. This
+    /// mode collects only; the caller supplies external facts before solving.
+    pub(crate) fn resolved_effect_graph(
+        program: &Program,
+    ) -> crate::semantic::call_graph::CallGraph {
+        let mut checker = Self::new();
+        checker.effect_graph_only = Some(Default::default());
+        checker.check_program(program);
+        checker
+            .effect_graph_only
+            .take()
+            .expect("graph collection mode")
     }
 
     /// Reset and index the named callables consumed by the semantic
     /// `MAY_BLOCK | MAY_SUSPEND` analysis for E2604 (willow-38w.1.4).
     fn prepare_lock_effect_analysis(&mut self, program: &Program) {
-        self.current_effect_callable = None;
-        self.lock_effect_callables.clear();
-        self.lock_effect_hierarchy = self.build_lock_effect_hierarchy();
-        self.lock_effect_edges.clear();
-        self.lock_direct_effects.clear();
-        self.lock_direct_effect_callsites.clear();
-        self.lock_effect_callsites.clear();
+        self.local.current_effect_callable = None;
+        self.effect_index.callables.clear();
+        self.effect_index.hierarchy = self.build_lock_effect_hierarchy();
+        self.effect_inputs.edges.clear();
+        self.resolved_calls.clear();
+        self.effect_inputs.direct.clear();
+        self.effect_inputs.direct_sites.clear();
+        self.effect_inputs.sites.clear();
 
         for item in &program.items {
             match item {
                 Item::Function(function) => {
-                    self.lock_effect_callables
+                    self.effect_index
+                        .callables
                         .insert(FunctionId::free(function.name.as_str()), function.is_async);
                 }
                 Item::Class(class) => {
                     let owner = TypeId::local(class.name.as_str());
                     for method in &class.methods {
-                        self.lock_effect_callables.insert(
+                        self.effect_index.callables.insert(
                             FunctionId::method(owner, method.name.as_str()),
                             method.is_async,
                         );
                     }
                     if !class.constructors.is_empty() {
-                        self.lock_effect_callables
+                        self.effect_index
+                            .callables
                             .insert(FunctionId::method(owner, "init"), false);
                     }
                 }
@@ -266,7 +292,7 @@ impl TypeChecker {
             })
             .collect::<Vec<_>>();
         for callable in interface_callables {
-            self.lock_effect_callables.insert(callable, false);
+            self.effect_index.callables.insert(callable, false);
         }
         for interface in program.items.iter().filter_map(|item| match item {
             Item::Interface(interface) => Some(interface),
@@ -274,7 +300,7 @@ impl TypeChecker {
         }) {
             for method in &interface.methods {
                 if method.default_body.is_some() && interface.type_params.is_empty() {
-                    self.lock_effect_callables.insert(
+                    self.effect_index.callables.insert(
                         interface_default_effect_id(&interface.name, &method.name),
                         false,
                     );
@@ -330,11 +356,30 @@ impl TypeChecker {
                 class.methods.iter().map(move |method| {
                     (
                         (class.name.clone(), method.name.clone()),
-                        method.is_default_injected,
+                        (method.is_default_injected, method.body.id),
                     )
                 })
             })
             .collect::<HashMap<_, _>>();
+
+        let defaults: HashMap<_, _> = program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Interface(interface) => Some(interface),
+                _ => None,
+            })
+            .flat_map(|interface| {
+                interface.methods.iter().filter_map(move |method| {
+                    method.default_body.as_ref().map(|body| {
+                        (
+                            body.id,
+                            interface_default_effect_id(&interface.name, &method.name),
+                        )
+                    })
+                })
+            })
+            .collect();
 
         // Aliased item imports can insert the same ClassInfo under multiple
         // symbol keys. Canonical ClassInfo::name keeps the union deterministic
@@ -367,18 +412,35 @@ impl TypeChecker {
                         method_name.as_str(),
                     );
                     match local_methods.get(&(declaring.clone(), method_name.clone())) {
-                        Some(true) => {
+                        Some((true, body)) => {
                             // A non-generic injected default is checked once as
                             // its own synthetic callable. Connect it only when
                             // this implementation actually selects the default;
                             // overrides must not inherit an unused body effect.
-                            self.lock_effect_edges
+                            let source = self
+                                .body_queries
+                                .as_ref()
+                                .map_or(*body, |q| q.index().source_body(*body));
+                            let default = defaults.get(&source).copied().unwrap_or_else(|| {
+                                interface_default_effect_id(&interface.name, method_name)
+                            });
+                            // Concrete receivers select this same default too.
+                            // Its waiting effects must reach C::method as well
+                            // as the interface dispatch union (E2604).
+                            self.effect_inputs
+                                .edges
+                                .entry(implementation_id)
+                                .or_default()
+                                .insert(default);
+                            self.effect_inputs
+                                .edges
                                 .entry(interface_id)
                                 .or_default()
                                 .insert(interface_default_effect_id(&interface.name, method_name));
                         }
-                        Some(false) => {
-                            self.lock_effect_edges
+                        Some((false, _)) => {
+                            self.effect_inputs
+                                .edges
                                 .entry(interface_id)
                                 .or_default()
                                 .insert(implementation_id);
@@ -389,10 +451,11 @@ impl TypeChecker {
                                 .lookup_class(&declaring)
                                 .and_then(|info| info.methods.get(method_name))
                                 .map_or(class.declaration_span, |method| method.declaration_span);
-                            self.lock_direct_effects.entry(interface_id).or_insert(
+                            self.effect_inputs.direct.entry(interface_id).or_insert(
                                 LockEffectCause {
                                     span,
-                                    operation: "interface dispatch to an imported implementation",
+                                    operation: "interface dispatch to an imported implementation"
+                                        .into(),
                                     kind: LockEffectKind::SuspendOrBlock,
                                 },
                             );
@@ -453,21 +516,25 @@ impl TypeChecker {
     /// graph stays complete without the wait leaking into the caller. For the
     /// same reason a bare async call is never itself a lock-held wait site.
     pub(super) fn record_lock_effect_call(&mut self, callee: FunctionId, span: Span) {
-        let Some(callee_is_async) = self.lock_effect_callables.get(&callee).copied() else {
+        let Some(callee_is_async) = self.effect_index.callables.get(&callee).copied() else {
             return;
         };
-        let Some(caller) = self.current_effect_callable else {
-            return;
-        };
-        self.lock_effect_edges
-            .entry(caller)
-            .or_default()
-            .insert(callee);
+        // A lock-held call site does not depend on the caller having a graph
+        // node: non-callable contexts have none, and their direct waits are
+        // diagnosed the same way (record_direct_lock_effect).
+        if let Some(caller) = self.local.current_effect_callable {
+            self.effect_inputs
+                .edges
+                .entry(caller)
+                .or_default()
+                .insert(callee);
+        }
         if callee_is_async {
             return;
         }
-        if self.lock_depth > 0 {
-            self.lock_effect_callsites
+        if self.local.lock_depth > 0 {
+            self.effect_inputs
+                .sites
                 .push(LockEffectCallsite { callee, span });
         }
     }
@@ -481,21 +548,22 @@ impl TypeChecker {
         operation: &'static str,
         kind: LockEffectKind,
     ) {
-        // A lambda has no named call-graph node, but a lock inside its own
-        // body still needs direct-site diagnostics.
-        if let Some(caller) = self.current_effect_callable {
-            self.lock_direct_effects
+        // Callable bodies contribute transitive effects. Direct lock-held
+        // sites must still be diagnosed when no callable identity is available.
+        if let Some(caller) = self.local.current_effect_callable {
+            self.effect_inputs
+                .direct
                 .entry(caller)
                 .or_insert(LockEffectCause {
                     span,
-                    operation,
+                    operation: operation.into(),
                     kind,
                 });
         }
-        if self.lock_depth > 0 {
-            self.lock_direct_effect_callsites.push(LockEffectCause {
+        if self.local.lock_depth > 0 {
+            self.effect_inputs.direct_sites.push(LockEffectCause {
                 span,
-                operation,
+                operation: operation.into(),
                 kind,
             });
         }
@@ -531,7 +599,8 @@ impl TypeChecker {
         let Some(info) = self.symbols.lookup_class(class) else {
             return Vec::new();
         };
-        self.lock_effect_hierarchy
+        self.effect_index
+            .hierarchy
             .dispatch_targets(&info.name, method)
     }
 
@@ -539,7 +608,7 @@ impl TypeChecker {
     /// emitting diagnostics a second time.
     pub(super) fn static_method_effect_id(&self, class: &str, method: &str) -> Option<FunctionId> {
         let class = if class == "Self" {
-            self.current_class.as_deref()?
+            self.local.current_class.as_deref()?
         } else {
             class
         };
@@ -557,51 +626,101 @@ impl TypeChecker {
 
     /// Close the same-program call graph and report lock-held helper calls
     /// whose synchronous execution can block or suspend before returning.
-    fn report_transitive_lock_effects(&mut self) {
-        // The propagation is the shared fixpoint (willow-uqzx.1.3). Only the
-        // edges are local: `record_lock_effect_call` already filtered them to
-        // same-program *synchronous* callables, because calling an `async fn`
-        // eagerly creates a Task without suspending the caller. Everything the
-        // checker cannot see is worth nothing here rather than everything: an
-        // opaque imported callable is seeded explicitly as `SuspendOrBlock` by
-        // `prepare_lock_effect_analysis`, so a silent unknown really is a leaf
-        // with no wait.
+    fn finish_effect_analysis(&mut self, program: &Program) {
+        use crate::semantic::call_graph::{CallGraph, CallSites};
         let mut graph = CallGraph::default();
-        for (caller, callees) in &self.lock_effect_edges {
+        for &id in self.effect_index.callables.keys() {
+            graph.merge(id, CallSites::default());
+        }
+        for (id, sites) in &self.resolved_calls {
+            graph.merge(*id, sites.clone());
+        }
+        for item in &program.items {
+            if let Item::Class(class) = item {
+                for method in &class.methods {
+                    if method.is_default_injected {
+                        // These bodies are checked under the canonical interface
+                        // identity. Until backend default identities match it,
+                        // never interpret an absent concrete edge as no panic.
+                        graph.merge(
+                            FunctionId::method(TypeId::local(&class.name), &method.name),
+                            CallSites {
+                                targets: Default::default(),
+                                has_unknown: true,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        // Interface union/default edges are declaration facts, not call sites.
+        for (id, targets) in &self.effect_inputs.edges {
             graph.merge(
-                *caller,
+                *id,
                 CallSites {
-                    targets: callees.iter().cloned().collect(),
+                    targets: targets.iter().copied().collect(),
                     has_unknown: false,
                 },
             );
         }
-        let mut problem: EffectProblem<LockEffectWitness> = EffectProblem::new()
-            .external_callee(RuntimeEffects::NONE)
-            .unknown_callee(RuntimeEffects::NONE)
-            .missing_body(RuntimeEffects::NONE);
-        // An eager async call allocates a Task in the caller but does not make
-        // the caller wait, so the edge keeps everything except the two wait
-        // bits. This is the `NO_PREEMPT_REGION` distinction the lattice exists
-        // to express: the effect is real, it just belongs to the Task.
-        for (callable, is_async) in &self.lock_effect_callables {
-            if *is_async {
-                problem =
-                    problem.transmit(*callable, RuntimeEffects::ALL.difference(LOCK_EFFECT_WAIT));
-            }
+        if self.effect_graph_only.is_some() {
+            self.effect_graph_only = Some(graph);
+            return;
         }
-        for (owner, cause) in &self.lock_direct_effects {
-            problem = problem.seed(
-                *owner,
-                cause.kind.effects(),
-                Some(LockEffectWitness {
-                    owner: *owner,
-                    cause: *cause,
-                }),
-            );
-        }
-        let facts = problem.solve(&graph);
+        let imports = program
+            .imports
+            .iter()
+            .map(|import| {
+                (
+                    import.alias.clone().unwrap_or_else(|| {
+                        import
+                            .path
+                            .rsplit("::")
+                            .next()
+                            .unwrap_or(&import.path)
+                            .to_string()
+                    }),
+                    import.path.clone(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let compute = || {
+            crate::compiler_db::effects::solve_unit(
+                program,
+                &graph,
+                &self.expr_types,
+                self.body_queries
+                    .as_ref()
+                    .zip(self.effect_queries.as_ref())
+                    .map(|(b, (q, _))| (b.index(), q.as_ref())),
+                &self.effect_index.callables,
+                &self.effect_inputs.direct,
+                |target| match &self.effect_queries {
+                    Some((queries, _)) => queries.external(target, &imports),
+                    None => crate::compiler_db::effects::intrinsic_effects(target)
+                        .unwrap_or(crate::semantic::effects::RuntimeEffects::MAY_PANIC),
+                },
+            )
+        };
+        let effects = match &self.effect_queries {
+            Some((queries, unit)) => match queries.complete(*unit, compute) {
+                Ok(effects) => effects,
+                Err(error) => {
+                    self.body_query_error = Some(error);
+                    return;
+                }
+            },
+            None => std::sync::Arc::new(compute()),
+        };
+        self.nonpreemptible_methods = std::sync::Arc::clone(&effects.helpers);
+        self.report_task_method_calls();
+        self.report_transitive_lock_effects(&effects.facts);
+    }
 
+    fn report_transitive_lock_effects(
+        &mut self,
+        facts: &crate::semantic::effects::EffectFacts<crate::compiler_db::effects::EffectWitness>,
+    ) {
         // Direct and transitive waits use the same typed effect inventory.
         // Deferred-body validation owns E0905; do not report its sites twice.
         let already_reported = self
@@ -610,7 +729,7 @@ impl TypeChecker {
             .filter(|diagnostic| diagnostic.code == ErrorCode::E0905)
             .flat_map(|diagnostic| diagnostic.labels.iter().map(|label| label.span))
             .collect::<Vec<_>>();
-        let mut direct_callsites = self.lock_direct_effect_callsites.clone();
+        let mut direct_callsites = self.effect_inputs.direct_sites.clone();
         direct_callsites.sort_by_key(|cause| (cause.span.start, cause.span.end));
         direct_callsites.dedup_by_key(|cause| cause.span);
         for cause in direct_callsites {
@@ -644,7 +763,7 @@ impl TypeChecker {
             );
         }
 
-        let mut callsites = self.lock_effect_callsites.clone();
+        let mut callsites = self.effect_inputs.sites.clone();
         callsites.sort_by(|left, right| {
             (left.span.start, left.span.end)
                 .cmp(&(right.span.start, right.span.end))
@@ -661,15 +780,16 @@ impl TypeChecker {
             // operation; only a purely transitive effect needs the propagated
             // witness.
             let Some(cause) = self
-                .lock_direct_effects
+                .effect_inputs
+                .direct
                 .get(&site.callee)
-                .copied()
+                .cloned()
                 .or_else(|| {
                     facts
                         .get(&site.callee)
                         .filter(|summary| summary.intersects(LOCK_EFFECT_WAIT))
                         .and_then(|summary| summary.witness(LOCK_EFFECT_WAIT))
-                        .map(|witness| witness.cause)
+                        .and_then(|witness| witness.lock().cloned())
                 })
             else {
                 continue;
@@ -702,15 +822,18 @@ impl TypeChecker {
     }
 
     pub(super) fn check_block(&mut self, block: &Block) {
-        self.lexical_block_depth += 1;
+        self.local.lexical_block_depth += 1;
         self.symbols.push_scope();
         for stmt in &block.stmts {
             self.check_stmt(stmt);
         }
         for stmt in &block.stmts {
             if let Stmt::Let(binding) = stmt
-                && self.inferred_maps.remove(&binding.span).is_some()
+                && let Some((uses, _)) = self.local.inferred_maps.remove(&binding.span)
             {
+                for id in uses {
+                    self.local.pending_map_uses.remove(&id);
+                }
                 self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
                     "cannot infer map key and value types")
                     .with_label(Label::primary(binding.span, "map needs type information"))
@@ -718,7 +841,7 @@ impl TypeChecker {
             }
         }
         self.symbols.pop_scope();
-        self.lexical_block_depth -= 1;
+        self.local.lexical_block_depth -= 1;
     }
 
     /// Type-check `lock <target> as [mut] <binding> { .. }` (willow-38w.1.1).
@@ -736,9 +859,9 @@ impl TypeChecker {
         // A target that already reported its own error (an unknown name, a bad
         // call) has a placeholder type; a second "wrong lock type" diagnostic on
         // top of it would only be noise.
-        let errors_before = self.errors.len();
+        let errors_before = self.error_count();
         let target_ty = self.check_expr(&s.target);
-        let target_is_broken = self.errors.len() > errors_before;
+        let target_is_broken = self.error_count() > errors_before;
         let protected = if target_is_broken {
             None
         } else {
@@ -748,7 +871,7 @@ impl TypeChecker {
         // The lock statement parks the task on contention, so it needs an async
         // frame to resume into. The blocking primitive is a separate type
         // (`BlockingCell<T>`); `Mutex<T>` never changes meaning by context.
-        if !self.current_async_context {
+        if !self.local.current_async_context {
             self.push(
                 Diagnostic::new(
                     Severity::Error,
@@ -765,7 +888,7 @@ impl TypeChecker {
             );
         }
 
-        let outermost = self.lock_depth == 0;
+        let outermost = self.local.lock_depth == 0;
         if !outermost {
             self.push(
                 Diagnostic::new(
@@ -789,11 +912,11 @@ impl TypeChecker {
         // and so do the three pieces of compiler-owned state the resumed poll
         // and the cancel entry need: the evaluated lock handle, this
         // acquisition's registration token, and its phase (willow-38w.1.4).
-        if self.current_async_context {
-            self.async_local_types.push(binding_ty.clone());
-            self.async_local_types.push(target_ty.clone());
-            self.async_local_types.push(Type::I64);
-            self.async_local_types.push(Type::I64);
+        if self.local.current_async_context {
+            self.local.async_local_types.push(binding_ty.clone());
+            self.local.async_local_types.push(target_ty.clone());
+            self.local.async_local_types.push(Type::I64);
+            self.local.async_local_types.push(Type::I64);
         }
 
         self.symbols.push_scope();
@@ -806,13 +929,13 @@ impl TypeChecker {
                 declaration_span: s.binding_span,
             },
         );
-        self.lock_depth += 1;
-        self.lexical_block_depth += 1;
+        self.local.lock_depth += 1;
+        self.local.lexical_block_depth += 1;
         for stmt in &s.body.stmts {
             self.check_stmt(stmt);
         }
-        self.lexical_block_depth -= 1;
-        self.lock_depth -= 1;
+        self.local.lexical_block_depth -= 1;
+        self.local.lock_depth -= 1;
         self.symbols.pop_scope();
 
         // Direct waits were recorded while checking the body. They are
@@ -943,20 +1066,21 @@ impl TypeChecker {
                     && builtin_types::binary_args(&ty, B::Map)
                         .is_some_and(|(key, value)| *key == Type::Void && *value == Type::Void)
                 {
-                    self.inferred_maps.insert(
+                    self.local.inferred_maps.insert(
                         s.span,
                         (
                             vec![s.init.id()],
-                            self.current_async_context
-                                .then_some(self.async_local_types.len()),
+                            self.local
+                                .current_async_context
+                                .then_some(self.local.async_local_types.len()),
                         ),
                     );
                 }
                 // Record the resolved type of locals inside async fns so the
                 // backend can frame-back unannotated live-across-await locals
                 // (willow-lpn.5c).
-                if self.current_async_context {
-                    self.async_local_types.push(ty.clone());
+                if self.local.current_async_context {
+                    self.local.async_local_types.push(ty.clone());
                 }
                 // `_` is a wildcard: evaluate the initializer for side effects but do
                 // not bind a variable (allows multiple `let _ = expr;` in the same scope).
@@ -1024,7 +1148,12 @@ impl TypeChecker {
                 }
             }
             Stmt::StaticFieldAssign(s) => self.check_static_field_assign(s),
-            Stmt::SuperInit(s) => self.check_super_init(s),
+            Stmt::SuperInit(s) => {
+                if let Some(caller) = self.local.current_effect_callable {
+                    self.resolved_calls.entry(caller).or_default().has_unknown = true;
+                }
+                self.check_super_init(s)
+            }
             Stmt::IndexAssign(s) => {
                 let arr_ty = self.check_expr(&s.array);
                 let idx_ty = self.check_expr(&s.index);
@@ -1108,7 +1237,7 @@ impl TypeChecker {
                         // capture (willow-0g8j.2.12); reporting the enclosing
                         // local's mutability on top of it would point at a fix
                         // that does not exist.
-                        if !info.mutable && !self.capture_writes.contains(&s.span) {
+                        if !info.mutable && !self.local.capture_writes.contains(&s.span) {
                             if info.is_param {
                                 self.push(
                                     Diagnostic::new(
@@ -1221,9 +1350,9 @@ impl TypeChecker {
                         .with_help("use an explicit comparison, e.g. `!= 0`"),
                     );
                 }
-                self.loop_depth += 1;
+                self.local.loop_depth += 1;
                 self.check_block(&s.body);
-                self.loop_depth -= 1;
+                self.local.loop_depth -= 1;
             }
             Stmt::For(s) => {
                 let iterable_ty = self.check_expr(&s.iterable);
@@ -1254,16 +1383,16 @@ impl TypeChecker {
                     }
                 };
 
-                if self.current_async_context {
+                if self.local.current_async_context {
                     let iter_slot_ty = if is_i64_range_type(&iterable_ty) {
                         Type::I64
                     } else {
                         iterable_ty.clone()
                     };
-                    self.async_local_types.push(iter_slot_ty);
-                    self.async_local_types.push(Type::I64);
+                    self.local.async_local_types.push(iter_slot_ty);
+                    self.local.async_local_types.push(Type::I64);
                     if s.name != "_" {
-                        self.async_local_types.push(elem_ty.clone());
+                        self.local.async_local_types.push(elem_ty.clone());
                     }
                 }
 
@@ -1279,17 +1408,17 @@ impl TypeChecker {
                         },
                     );
                 }
-                self.loop_depth += 1;
-                self.lexical_block_depth += 1;
+                self.local.loop_depth += 1;
+                self.local.lexical_block_depth += 1;
                 for stmt in &s.body.stmts {
                     self.check_stmt(stmt);
                 }
-                self.lexical_block_depth -= 1;
-                self.loop_depth -= 1;
+                self.local.lexical_block_depth -= 1;
+                self.local.loop_depth -= 1;
                 self.symbols.pop_scope();
             }
             Stmt::Break(span) | Stmt::Continue(span) => {
-                if self.loop_depth == 0 {
+                if self.local.loop_depth == 0 {
                     let kw = if matches!(stmt, Stmt::Break(_)) {
                         "break"
                     } else {
@@ -1354,8 +1483,8 @@ impl TypeChecker {
                 }
                 let recovery_capable = defer_body_contains_direct_recover(&d.body);
                 if recovery_capable
-                    && self.lexical_block_depth == 1
-                    && self.current_return_type != Type::Void
+                    && self.local.lexical_block_depth == 1
+                    && self.local.current_return_type != Type::Void
                 {
                     self.push(
                         Diagnostic::new(
@@ -1460,14 +1589,14 @@ impl TypeChecker {
                 // Async defer (willow-vynv.3): operands are stashed into the
                 // task frame at registration — record their types (keyed by
                 // operand span) so codegen can lay out + GC-mask the slots.
-                if self.current_async_context {
+                if self.local.current_async_context {
                     let mut record = |expr: &Expr| {
                         let ty = self
                             .expr_types
                             .get(&expr.id())
                             .cloned()
                             .unwrap_or(Type::I64);
-                        self.async_local_types.push(ty);
+                        self.local.async_local_types.push(ty);
                     };
                     match &d.body {
                         DeferBody::Expr(Expr::Call(c)) => {
@@ -1504,7 +1633,7 @@ impl TypeChecker {
             Stmt::Return(s) => {
                 // In a constructor, a bare `return;` is fine but `return <value>`
                 // is rejected (willow-scq2 §8 → E0841).
-                if self.in_constructor {
+                if self.local.in_constructor {
                     if let Some(v) = &s.value {
                         self.check_expr(v);
                         self.push(
@@ -1524,7 +1653,7 @@ impl TypeChecker {
                 // argument is required (willow-exg).
                 if let Some(Expr::StaticCall(sc)) = &s.value {
                     let returns_result_void =
-                        builtin_types::binary_args(&self.current_return_type, B::Result)
+                        builtin_types::binary_args(&self.local.current_return_type, B::Result)
                             .is_some_and(|(ok, _)| *ok == Type::Void);
                     if returns_result_void
                         && sc.class == "Result"
@@ -1535,7 +1664,7 @@ impl TypeChecker {
                         // and HIR lowering asks the checker for the type of any
                         // static call it cannot resolve itself (willow-0g8j.2.14).
                         self.expr_types
-                            .insert(sc.id, self.current_return_type.clone());
+                            .insert(sc.id, self.local.current_return_type.clone());
                         return;
                     }
                 }
@@ -1543,34 +1672,34 @@ impl TypeChecker {
                     // Resolve an unqualified variant in `return Ok(42)` against
                     // the function's return type (willow-60o.1). Skipped inside a
                     // lambda, where `current_return_type` is not the lambda's.
-                    Some(v) if self.lambda_return_stack.is_empty() => {
-                        let expected = self.current_return_type.clone();
+                    Some(v) if self.local.lambda_return_stack.is_empty() => {
+                        let expected = self.local.current_return_type.clone();
                         self.check_expr_expecting(v, &expected)
                     }
                     Some(v) => self.check_expr(v),
                     None => Type::Void,
                 };
                 // Inside a lambda with no annotation: record the return type for inference.
-                if let Some(slot) = self.lambda_return_stack.last_mut() {
+                if let Some(slot) = self.local.lambda_return_stack.last_mut() {
                     if slot.is_none() {
                         *slot = Some(ret_ty.clone());
                     }
                     return; // don't validate against outer current_return_type
                 }
-                if !self.types_compatible(&self.current_return_type, &ret_ty) {
+                if !self.types_compatible(&self.local.current_return_type, &ret_ty) {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
-                            self.type_mismatch_error_code(&self.current_return_type, &ret_ty),
+                            self.type_mismatch_error_code(&self.local.current_return_type, &ret_ty),
                             format!(
                                 "mismatched types: expected `{}`, found `{}`",
-                                type_name(&self.current_return_type),
+                                type_name(&self.local.current_return_type),
                                 type_name(&ret_ty)
                             ),
                         )
                         .with_label(Label::primary(
                             s.span,
-                            format!("expected `{}`", type_name(&self.current_return_type)),
+                            format!("expected `{}`", type_name(&self.local.current_return_type)),
                         )),
                     );
                 }
@@ -1603,7 +1732,52 @@ impl TypeChecker {
         // or duplicates syntax cannot inherit another node's entry the way two
         // nodes sharing a span could (willow-njot).
         self.expr_types.insert(expr.id(), ty.clone());
+        self.record_resolved_call(expr);
         ty
+    }
+
+    /// Record resolution at the checked expression, while lexical bindings and
+    /// receiver types are still available. Unknown is explicit for panic safety.
+    fn record_resolved_call(&mut self, expr: &Expr) {
+        let Some(caller) = self.local.current_effect_callable else {
+            return;
+        };
+        let targets = match expr {
+            Expr::Call(call) => {
+                if self.symbols.lookup_var(&call.callee).is_some() {
+                    Vec::new()
+                } else {
+                    vec![FunctionId::free_from_source_name(&call.callee)]
+                }
+            }
+            Expr::MethodCall(call) => self
+                .expr_types
+                .get(&call.object.id())
+                .map(|ty| self.method_effect_ids(ty, &call.method))
+                .unwrap_or_default(),
+            Expr::StaticCall(call) => vec![
+                self.static_method_effect_id(&call.class, &call.method)
+                    .unwrap_or_else(|| {
+                        FunctionId::method(
+                            TypeId::from_source_name(
+                                self.static_call_classes
+                                    .get(&call.id)
+                                    .map(String::as_str)
+                                    .unwrap_or(&call.class),
+                            ),
+                            &call.method,
+                        )
+                    }),
+            ],
+            Expr::New(call) => vec![FunctionId::method(
+                TypeId::from_source_name(&call.class_name),
+                "init",
+            )],
+            _ => return,
+        };
+        let sites = self.resolved_calls.entry(caller).or_default();
+        sites.has_unknown |= targets.is_empty();
+        sites.targets.extend(targets);
     }
 
     fn check_expr_inner(&mut self, expr: &Expr) -> Type {
@@ -1619,8 +1793,11 @@ impl TypeChecker {
                 }
                 // Local variable?
                 if let Some(info) = self.symbols.lookup_var(name) {
-                    if let Some((uses, _)) = self.inferred_maps.get_mut(&info.declaration_span) {
+                    if let Some((uses, _)) =
+                        self.local.inferred_maps.get_mut(&info.declaration_span)
+                    {
                         uses.push(expr.id());
+                        self.local.pending_map_uses.insert(expr.id());
                     }
                     return info.ty.clone();
                 }
@@ -1632,8 +1809,9 @@ impl TypeChecker {
                 }
                 // Give a specialized error for receiver keywords used outside instance methods.
                 if name == "self" {
-                    let diag = if self.in_static_method {
+                    let diag = if self.local.in_static_method {
                         let where_ = self
+                            .local
                             .current_class
                             .as_deref()
                             .map(|c| format!(" `{}`", c))
@@ -1647,7 +1825,7 @@ impl TypeChecker {
                         .with_help(
                             "static methods have no receiver; use an instance method instead",
                         )
-                    } else if self.in_static_initializer {
+                    } else if self.local.in_static_initializer {
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0837,
@@ -1867,7 +2045,7 @@ impl TypeChecker {
             Expr::Await(a) => {
                 self.record_direct_lock_effect(a.span, "await", LockEffectKind::Suspend);
                 let awaited_ty = self.check_expr(&a.expr);
-                if !self.current_async_context {
+                if !self.local.current_async_context {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,

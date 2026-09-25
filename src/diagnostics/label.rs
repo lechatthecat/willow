@@ -1,12 +1,12 @@
 use super::span::Span;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LabelKind {
     Primary,
     Secondary,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Label {
     pub span: Span,
     pub message: String,
@@ -36,7 +36,7 @@ impl Label {
 /// When `span.start == span.end` the fix is a pure insertion.
 /// The reporter renders the fixed line and diff markers (`+` for inserted
 /// text, `~` for replaced text) below the help message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FixSuggestion {
     pub span: Span,
     pub replacement: String,

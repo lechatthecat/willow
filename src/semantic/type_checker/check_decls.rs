@@ -111,20 +111,27 @@ impl TypeChecker {
         m: &InterfaceMethodDecl,
         iface_name: &str,
     ) {
+        if let Some(body) = &m.default_body {
+            self.query_body(body.id, |checker| checker.check_default_body(m, iface_name));
+        }
+    }
+
+    fn check_default_body(&mut self, m: &InterfaceMethodDecl, iface_name: &str) {
         let Some(body) = &m.default_body else {
             return;
         };
         let return_type = self.normalize_type(&m.return_type, m.span);
         let param_types = self.normalize_param_types(&m.params);
-        let previous_class = self.current_class.replace(iface_name.to_string());
+        let previous_class = self.local.current_class.replace(iface_name.to_string());
         let previous_effect_callable = self
+            .local
             .current_effect_callable
             .replace(interface_default_effect_id(iface_name, &m.name));
-        let previous_async = self.current_async_context;
-        let previous_static = self.in_static_method;
-        let previous_return = std::mem::replace(&mut self.current_return_type, return_type);
-        self.current_async_context = false;
-        self.in_static_method = false;
+        let previous_async = self.local.current_async_context;
+        let previous_static = self.local.in_static_method;
+        let previous_return = std::mem::replace(&mut self.local.current_return_type, return_type);
+        self.local.current_async_context = false;
+        self.local.in_static_method = false;
         self.symbols.push_scope();
         self.define_var(
             "self".to_string(),
@@ -149,7 +156,7 @@ impl TypeChecker {
         self.check_block(body);
         self.check_all_paths_return(
             body,
-            &self.current_return_type.clone(),
+            &self.local.current_return_type.clone(),
             m.span,
             ReturnSite::Method {
                 class: iface_name,
@@ -157,11 +164,11 @@ impl TypeChecker {
             },
         );
         self.symbols.pop_scope();
-        self.current_class = previous_class;
-        self.current_effect_callable = previous_effect_callable;
-        self.current_async_context = previous_async;
-        self.in_static_method = previous_static;
-        self.current_return_type = previous_return;
+        self.local.current_class = previous_class;
+        self.local.current_effect_callable = previous_effect_callable;
+        self.local.current_async_context = previous_async;
+        self.local.in_static_method = previous_static;
+        self.local.current_return_type = previous_return;
     }
 
     pub(super) fn check_collection_type_imported(&mut self, name: &str, span: Span) {
@@ -231,17 +238,24 @@ impl TypeChecker {
     /// reject returning a value (E0841), and require every instance field to be
     /// assigned (E0842).
     pub(super) fn check_constructor(&mut self, ctor: &ConstructorDecl, c: &ClassDecl) {
+        self.query_body(ctor.body.id, |checker| {
+            checker.check_constructor_body(ctor, c)
+        });
+    }
+
+    fn check_constructor_body(&mut self, ctor: &ConstructorDecl, c: &ClassDecl) {
         let param_types = self.normalize_param_types(&ctor.params);
         for (param, ty) in ctor.params.iter().zip(param_types.iter()) {
             self.validate_type(ty, param.span);
         }
-        let previous_class = self.current_class.replace(c.name.clone());
+        let previous_class = self.local.current_class.replace(c.name.clone());
         let previous_effect_callable = self
+            .local
             .current_effect_callable
             .replace(FunctionId::method(TypeId::local(c.name.as_str()), "init"));
-        let previous_return = std::mem::replace(&mut self.current_return_type, Type::Void);
-        let previous_ctor = self.in_constructor;
-        self.in_constructor = true;
+        let previous_return = std::mem::replace(&mut self.local.current_return_type, Type::Void);
+        let previous_ctor = self.local.in_constructor;
+        self.local.in_constructor = true;
         self.symbols.push_scope();
         // `self` is the new instance being constructed.
         self.define_var(
@@ -270,13 +284,25 @@ impl TypeChecker {
 
         // E0842: every successful exit must initialize every instance field.
         let fields: Vec<_> = c.fields.iter().filter(|field| !field.is_static).collect();
-        let missing = super::constructor_flow::uninitialized_fields(
-            &ctor.body,
-            fields.iter().map(|field| field.name.as_str()),
-            &self.expr_types,
-        );
-        for (field, missing) in fields.iter().zip(missing) {
-            if missing {
+        let compute = || {
+            super::constructor_flow::uninitialized_fields(
+                &ctor.body,
+                fields.iter().map(|field| field.name.as_str()),
+                &self.expr_types,
+            )
+        };
+        let missing = match &self.body_queries {
+            Some(queries) => match queries.definite_assignment(ctor.body.id, compute) {
+                Ok(missing) => missing,
+                Err(error) => {
+                    self.body_query_error = Some(error);
+                    return;
+                }
+            },
+            None => std::sync::Arc::new(compute()),
+        };
+        for (field, missing) in fields.iter().zip(missing.iter()) {
+            if *missing {
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
@@ -299,10 +325,10 @@ impl TypeChecker {
         }
 
         self.symbols.pop_scope();
-        self.current_class = previous_class;
-        self.current_effect_callable = previous_effect_callable;
-        self.current_return_type = previous_return;
-        self.in_constructor = previous_ctor;
+        self.local.current_class = previous_class;
+        self.local.current_effect_callable = previous_effect_callable;
+        self.local.current_return_type = previous_return;
+        self.local.in_constructor = previous_ctor;
     }
 
     pub(super) fn check_constructor_inheritance_rules(&mut self, c: &ClassDecl) {
@@ -365,7 +391,7 @@ impl TypeChecker {
     }
 
     pub(super) fn check_super_init(&mut self, s: &SuperInitStmt) {
-        if !self.in_constructor {
+        if !self.local.in_constructor {
             for arg in &s.args {
                 self.check_expr(&arg.expr);
             }
@@ -380,7 +406,7 @@ impl TypeChecker {
             return;
         }
 
-        let Some(current_class) = self.current_class.clone() else {
+        let Some(current_class) = self.local.current_class.clone() else {
             for arg in &s.args {
                 self.check_expr(&arg.expr);
             }
@@ -718,47 +744,65 @@ impl TypeChecker {
     /// `self`, and may only reference earlier static properties of the same class
     /// (no forward references / cycles in MVP).
     pub(super) fn check_static_property_initializers(&mut self, c: &ClassDecl) {
-        // Static properties declared so far in this class, in order — used to
-        // reject forward references (`static b = C::a` before `a`).
         let mut initialized: HashSet<String> = HashSet::new();
-        let previous_class = self.current_class.replace(c.name.clone());
         for field in &c.fields {
             if !field.is_static {
                 continue;
             }
             let Some(init) = &field.initializer else {
-                continue; // parser already requires an initializer for static
+                continue;
             };
-            let declared = self.normalize_type(&field.ty, field.span);
-
-            // Reject forward references to not-yet-initialized statics of THIS
-            // class (`C::later` used before `later` is declared).
-            self.check_static_forward_references(init, &c.name, &initialized);
-
-            let previous_init_ctx = self.in_static_initializer;
-            self.in_static_initializer = true;
-            let init_ty = self.check_expr(init);
-            self.in_static_initializer = previous_init_ctx;
-
-            if !self.types_compatible(&declared, &init_ty) && init_ty != Type::Void {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0301,
-                        format!(
-                            "static property `{}::{}` has type `{}` but its initializer is `{}`",
-                            c.name,
-                            field.name,
-                            type_name(&declared),
-                            type_name(&init_ty)
-                        ),
-                    )
-                    .with_label(Label::primary(init.span(), "initializer type mismatch")),
-                );
+            let id = self
+                .body_queries
+                .as_ref()
+                .and_then(|queries| queries.initializer(init.id()));
+            if let Some(id) = id {
+                self.query_body(id, |checker| {
+                    checker.check_static_initializer(field, init, c, &initialized)
+                });
+            } else {
+                self.check_static_initializer(field, init, c, &initialized);
             }
             initialized.insert(field.name.clone());
         }
-        self.current_class = previous_class;
+    }
+
+    fn check_static_initializer(
+        &mut self,
+        field: &FieldDecl,
+        init: &Expr,
+        c: &ClassDecl,
+        initialized: &HashSet<String>,
+    ) {
+        let previous_class = self.local.current_class.replace(c.name.clone());
+        let declared = self.normalize_type(&field.ty, field.span);
+
+        // Reject forward references to not-yet-initialized statics of THIS
+        // class (`C::later` used before `later` is declared).
+        self.check_static_forward_references(init, &c.name, initialized);
+
+        let previous_init_ctx = self.local.in_static_initializer;
+        self.local.in_static_initializer = true;
+        let init_ty = self.check_expr(init);
+        self.local.in_static_initializer = previous_init_ctx;
+
+        if !self.types_compatible(&declared, &init_ty) && init_ty != Type::Void {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0301,
+                    format!(
+                        "static property `{}::{}` has type `{}` but its initializer is `{}`",
+                        c.name,
+                        field.name,
+                        type_name(&declared),
+                        type_name(&init_ty)
+                    ),
+                )
+                .with_label(Label::primary(init.span(), "initializer type mismatch")),
+            );
+        }
+        self.local.current_class = previous_class;
     }
 
     /// Walk an initializer expression and reject `C::prop` references to static
@@ -1357,6 +1401,12 @@ impl TypeChecker {
     }
 
     pub(super) fn check_method(&mut self, m: &MethodDecl, class_name: &str) {
+        self.query_body(m.body.id, |checker| {
+            checker.check_method_body(m, class_name)
+        });
+    }
+
+    fn check_method_body(&mut self, m: &MethodDecl, class_name: &str) {
         let return_type = self.normalize_type(&m.return_type, m.span);
         let param_types = self.normalize_param_types(&m.params);
         self.validate_type(&return_type, m.span);
@@ -1379,18 +1429,21 @@ impl TypeChecker {
                 ),
             );
         }
-        let previous_class = self.current_class.replace(class_name.to_string());
-        let previous_effect_callable = self.current_effect_callable.replace(FunctionId::method(
-            TypeId::local(class_name),
-            m.name.as_str(),
-        ));
-        let previous_async_context = self.current_async_context;
-        let previous_static_method = self.in_static_method;
-        self.current_async_context = m.is_async;
-        self.in_static_method = m.is_static;
-        self.current_return_type = return_type.clone();
+        let previous_class = self.local.current_class.replace(class_name.to_string());
+        let previous_effect_callable =
+            self.local
+                .current_effect_callable
+                .replace(FunctionId::method(
+                    TypeId::local(class_name),
+                    m.name.as_str(),
+                ));
+        let previous_async_context = self.local.current_async_context;
+        let previous_static_method = self.local.in_static_method;
+        self.local.current_async_context = m.is_async;
+        self.local.in_static_method = m.is_static;
+        self.local.current_return_type = return_type.clone();
         self.symbols.push_scope();
-        let async_locals_before = self.async_local_types.len();
+        let async_locals_before = self.local.async_local_types.len();
 
         // Instance methods bind `self` to the enclosing class — implicitly, whether
         // or not the (legacy) explicit `self` parameter was written (willow-qsqf
@@ -1430,7 +1483,7 @@ impl TypeChecker {
                 name: m.name.as_str(),
             },
         );
-        let locals = self.async_local_types.split_off(async_locals_before);
+        let locals = self.local.async_local_types.split_off(async_locals_before);
         if m.is_async {
             let task_params = if m.is_static {
                 param_types.clone()
@@ -1443,13 +1496,17 @@ impl TypeChecker {
             self.check_async_task_send(m.span, &return_type, &task_params, &locals);
         }
         self.symbols.pop_scope();
-        self.current_class = previous_class;
-        self.current_effect_callable = previous_effect_callable;
-        self.current_async_context = previous_async_context;
-        self.in_static_method = previous_static_method;
+        self.local.current_class = previous_class;
+        self.local.current_effect_callable = previous_effect_callable;
+        self.local.current_async_context = previous_async_context;
+        self.local.in_static_method = previous_static_method;
     }
 
     pub(super) fn check_function(&mut self, f: &FunctionDecl) {
+        self.query_body(f.body.id, |checker| checker.check_function_body(f));
+    }
+
+    fn check_function_body(&mut self, f: &FunctionDecl) {
         let return_type = self.normalize_type(&f.return_type, f.span);
         let param_types = self.normalize_param_types(&f.params);
         self.validate_type(&return_type, f.span);
@@ -1476,14 +1533,15 @@ impl TypeChecker {
                 ),
             );
         }
-        let previous_async_context = self.current_async_context;
+        let previous_async_context = self.local.current_async_context;
         let previous_effect_callable = self
+            .local
             .current_effect_callable
             .replace(FunctionId::free(f.name.as_str()));
-        self.current_async_context = f.is_async;
-        self.current_return_type = return_type.clone();
+        self.local.current_async_context = f.is_async;
+        self.local.current_return_type = return_type.clone();
         self.symbols.push_scope();
-        let async_locals_before = self.async_local_types.len();
+        let async_locals_before = self.local.async_local_types.len();
         for (param, ty) in f.params.iter().zip(param_types.iter()) {
             self.define_var(
                 param.name.clone(),
@@ -1505,12 +1563,12 @@ impl TypeChecker {
             ReturnSite::Function(f.name.as_str())
         };
         self.check_all_paths_return(&f.body, &return_type, f.span, site);
-        let locals = self.async_local_types.split_off(async_locals_before);
+        let locals = self.local.async_local_types.split_off(async_locals_before);
         if f.is_async {
             self.check_async_task_send(f.span, &return_type, &param_types, &locals);
         }
         self.symbols.pop_scope();
-        self.current_effect_callable = previous_effect_callable;
-        self.current_async_context = previous_async_context;
+        self.local.current_effect_callable = previous_effect_callable;
+        self.local.current_async_context = previous_async_context;
     }
 }

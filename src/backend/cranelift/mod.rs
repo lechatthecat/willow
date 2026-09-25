@@ -24,6 +24,8 @@ mod type_index;
 use type_index::{TypeMap, TypeScope, VtableMap};
 mod ast_passes;
 mod async_codegen;
+mod class_view;
+use class_view::ClassView;
 mod compile;
 pub use compile::{DeclaredModule, DeclaredProgram, ItemBinding, ModuleSpelling, UnitImports};
 mod emit;
@@ -93,13 +95,6 @@ struct UnitResolutionContext {
     modules: module_index::ModuleResolutionContext,
 }
 
-/// What one unit's bare enum aliases displaced, so the tables can be put back
-/// the way the next unit needs them (willow-nm0g).
-#[derive(Default)]
-pub struct EnumAliasScope {
-    types: TypeScope,
-}
-
 #[derive(Clone, Copy)]
 struct StringLiteralData {
     bytes: DataId,
@@ -131,10 +126,6 @@ pub struct Codegen {
     /// eligibility; resolution consults these first. Installed per unit exactly
     /// like `builtin_module_aliases`.
     visible_modules: HashSet<String>,
-    /// The imports the resolver classified for the unit about to be declared,
-    /// handed over by `set_unit_imports` (willow-vtlr, willow-28h8). Taken by
-    /// the declaration phase, which installs each half where it belongs.
-    unit_imports: compile::UnitImports,
     /// Local alias -> canonical builtin schema module (`import std::fs as
     /// files;` records `files -> fs`), for the file currently being compiled.
     /// Declaration normalization folds these aliases into its program; LIR
@@ -143,68 +134,47 @@ pub struct Codegen {
     builtin_module_aliases: HashMap<String, String>,
     /// Maps each lambda's source span to its generated private function name.
     lambda_names: HashMap<ExprId, FunctionId>,
+    lambda_body_names: HashMap<crate::parser::ast::BodyId, FunctionId>,
     /// Source names of async fns lowered as cooperative tasks (constructor +
     /// poll fn). Calling one schedules the task and returns its frame.
     cooperative_leaves: std::collections::HashSet<FunctionId>,
     string_literals: HashMap<String, StringLiteralData>,
     string_counter: usize,
     runtime_declared: bool,
-    /// Per-class ordered field list: class_name -> [(field_name, type)].
-    class_layouts: TypeMap<Vec<(String, Type)>>,
+    /// Compiler-owned body transformations shared across declaration/lowering.
+    pub(crate) body_queries: Option<std::rc::Rc<crate::compiler_db::body::BodyQueries>>,
+    pub(crate) effect_queries: Option<(
+        std::rc::Rc<crate::compiler_db::effects::EffectQueries>,
+        crate::module::UnitId,
+    )>,
+    /// Frozen canonical class layout/base/slot/runtime-id and interface
+    /// composition queries. The driver shares one table across every unit; a
+    /// standalone backend owns its own. Read through [`Codegen::classes`],
+    /// which resolves the unit's aliases.
+    pub(crate) layout_queries: std::rc::Rc<crate::compiler_db::layout::LayoutQueries>,
     /// Build mode for source locations, call stacks, and debug instrumentation.
     build_mode: BuildMode,
     /// Source file path of the current compilation unit, used in diagnostics.
     source_file: String,
     /// Enum info for enum variant construction in generated code.
     enum_infos: TypeMap<EnumInfo>,
-    /// Maps child class name → base class name for inherited method dispatch.
-    class_base: TypeMap<TypeId>,
     dispatch_cache: std::cell::RefCell<emit_interface::DispatchCache>,
-    /// Maps each class name to a unique integer type_id for runtime dynamic dispatch.
-    /// Type ids start at 1; 0 is reserved for null/unknown.
-    class_type_ids: TypeMap<i64>,
-    /// The non-static fields each class declares ITSELF, in declaration order
-    /// (willow-59gx). Recorded as classes are registered;
-    /// [`Codegen::finalize_class_layouts`] turns it into `class_layouts`.
-    class_own_fields: TypeMap<Vec<(String, Type)>>,
-    class_dependents: HashMap<TypeId, HashSet<TypeId>>,
-    dirty_class_layouts: HashSet<TypeId>,
-    dirty_class_vslots: HashSet<TypeId>,
-    #[cfg(test)]
-    vslot_work: [usize; 3], // visited classes, copied slots, own declarations
-    #[cfg(test)]
-    layout_work: [usize; 5], // visited classes, copied fields, own fields, invalidations, edges
-    /// The `open`/`override` instance methods each class declares ITSELF, in
-    /// declaration order (willow-fm7t). Recorded as classes are registered;
-    /// [`Codegen::finalize_class_vslots`] turns it into `class_vslots`.
-    class_own_vmethods: TypeMap<Vec<String>>,
-    /// Per-class VIRTUAL METHOD SLOT ORDER: the names of the methods this class
-    /// dispatches through its descriptor, in slot order (willow-fm7t).
-    ///
-    /// A subclass's order EXTENDS its base's, so an inherited method keeps the
-    /// ancestor's slot and an `override` rewrites that same slot instead of
-    /// appending a new one. A method that is neither `open` nor `override` gets
-    /// no slot: it can neither be overridden nor override anything, so a direct
-    /// call to it is always right.
-    class_vslots: TypeMap<crate::semantic::method_slots::MethodSlots>,
     /// Maps each class name to its descriptor data symbol — word 0 of every
     /// object of that class (willow-fm7t). Offset 0 of the descriptor is the
-    /// class's `type_id`; the virtual method slots follow it in
-    /// [`Codegen::class_vslots`] order.
+    /// class's `type_id`; the virtual method slots follow it in the class's
+    /// frozen slot order (willow-fm7t; `LayoutQueries::slots`).
     class_descriptor_ids: TypeMap<DataId>,
     /// Current declaration unit's checked expression types, used to establish
     /// lambda signatures. Body emission reads the declared callable signatures.
     expr_types: HashMap<ExprId, Type>,
     /// Current unit's lowered bodies, consumed individually during emission.
     lir_functions: HashMap<FunctionId, crate::ir::lowered::LirFunction>,
+    pub(crate) lir_queries: Option<std::rc::Rc<crate::compiler_db::lir::LirQueries>>,
     /// Lifted lambda bodies in lowered IR, keyed by the lambda expression's
     /// ID (willow-0g8j.2.2). The LIR cannot know the `$lambda.N` symbol, so
     /// `compile_program` moves these into `lir_functions` once it has assigned
     /// the names.
     lir_lambdas: HashMap<ExprId, crate::ir::lowered::LirFunction>,
-    /// Interface metadata (method order + signatures) for vtable codegen and
-    /// interface method dispatch. Registered from the type checker.
-    interface_infos: TypeMap<InterfaceInfo>,
     /// Static vtable data object per `(class, interface)` pair, used to box a
     /// concrete class value into an interface value (willow-xds).
     vtable_ids: VtableMap<DataId>,
@@ -316,6 +286,10 @@ struct StaticInitItem {
     class_key: String,
     field: String,
     initializer: FunctionDecl,
+    /// The initializer expression's own semantic body, so its lowered IR is
+    /// read by identity like every other emission target. `None` on the
+    /// standalone path, which has no body index.
+    body: Option<crate::parser::ast::BodyId>,
     ty: Type,
 }
 
@@ -323,6 +297,14 @@ struct StaticInitItem {
 struct UnitStaticInit {
     items: Vec<StaticInitItem>,
     function: Option<FuncId>,
+}
+
+#[cfg(test)]
+impl Codegen {
+    /// A backend over fresh layout tables, for unit tests without a session.
+    pub(crate) fn for_tests(opts: &CompilerOptions) -> Result<Self> {
+        Self::new(opts, Default::default())
+    }
 }
 
 impl Codegen {
@@ -349,7 +331,12 @@ impl Codegen {
             .get(name)
             .unwrap_or_else(|| panic!("backend: undeclared runtime symbol `{name}`"))
     }
-    pub fn new(opts: &CompilerOptions) -> Result<Self> {
+    /// Builds a backend that reads class/interface facts from the session's
+    /// `layouts` tables; it never allocates tables of its own.
+    pub(crate) fn new(
+        opts: &CompilerOptions,
+        layouts: std::rc::Rc<crate::compiler_db::layout::LayoutQueries>,
+    ) -> Result<Self> {
         let isa_builder = cranelift_native::builder().map_err(|e| anyhow::anyhow!("{}", e))?;
         let mut flag_builder = settings::builder();
         // Keep function cache-line placement stable across runtime-only link
@@ -414,14 +401,6 @@ impl Codegen {
         ) as u64);
         module.define_data(gc_tlab_state, &tlab_data)?;
         let type_scope = TypeScope::default();
-        let mut class_layouts = TypeMap::with_scope(type_scope.clone());
-        class_layouts.insert(
-            "PanicInfo".to_string(),
-            crate::semantic::builtin_types::panic_info_fields()
-                .into_iter()
-                .map(|(name, ty)| (name.to_string(), ty.into()))
-                .collect(),
-        );
         let function_scope = crate::semantic::ids::FunctionScope::default();
         let mut codegen = Self {
             type_scope: type_scope.clone(),
@@ -434,35 +413,25 @@ impl Codegen {
             function_may_panic: FunctionMap::with_scope(function_scope.clone()),
             known_modules: ModuleSymbols::default(),
             visible_modules: HashSet::new(),
-            unit_imports: compile::UnitImports::default(),
             builtin_module_aliases: HashMap::new(),
             lambda_names: HashMap::new(),
+            lambda_body_names: HashMap::new(),
             cooperative_leaves: std::collections::HashSet::new(),
             string_literals: HashMap::new(),
             string_counter: 0,
             runtime_declared: false,
-            class_layouts,
+            layout_queries: layouts,
+            effect_queries: None,
+            body_queries: None,
             build_mode: opts.target.build_mode,
             source_file: String::new(),
             enum_infos: TypeMap::with_scope(type_scope.clone()),
-            class_base: TypeMap::with_scope(type_scope.clone()),
             dispatch_cache: Default::default(),
-            class_type_ids: TypeMap::with_scope(type_scope.clone()),
-            class_own_fields: TypeMap::with_scope(type_scope.clone()),
-            class_dependents: HashMap::new(),
-            dirty_class_layouts: HashSet::new(),
-            dirty_class_vslots: HashSet::new(),
-            #[cfg(test)]
-            vslot_work: [0; 3],
-            #[cfg(test)]
-            layout_work: [0; 5],
-            class_own_vmethods: TypeMap::with_scope(type_scope.clone()),
-            class_vslots: TypeMap::with_scope(type_scope.clone()),
             class_descriptor_ids: TypeMap::with_scope(type_scope.clone()),
             expr_types: HashMap::new(),
             lir_functions: HashMap::new(),
+            lir_queries: None,
             lir_lambdas: HashMap::new(),
-            interface_infos: TypeMap::with_scope(type_scope.clone()),
             vtable_ids: VtableMap::with_scope(type_scope.clone()),
             vtable_thunk_ids: HashMap::new(),
             static_storage: TypeMap::with_scope(type_scope.clone()),
@@ -589,15 +558,8 @@ impl Codegen {
     fn install_type_scope(&mut self, scope: TypeScope) {
         *self.dispatch_cache.get_mut() = Default::default();
         self.type_scope = scope.clone();
-        self.class_layouts.set_scope(scope.clone());
         self.enum_infos.set_scope(scope.clone());
-        self.class_base.set_scope(scope.clone());
-        self.class_type_ids.set_scope(scope.clone());
-        self.class_own_fields.set_scope(scope.clone());
-        self.class_own_vmethods.set_scope(scope.clone());
-        self.class_vslots.set_scope(scope.clone());
         self.class_descriptor_ids.set_scope(scope.clone());
-        self.interface_infos.set_scope(scope.clone());
         self.vtable_ids.set_scope(scope.clone());
         self.static_storage.set_scope(scope);
     }
@@ -651,32 +613,39 @@ impl Codegen {
     /// unit's `interface Point` standing, the declaring module's own
     /// `Point::Near` reads as an interface and is refused. The alias is this
     /// unit's answer for the name, so nothing else may answer for it here.
-    pub fn install_enum_aliases(&mut self, aliases: &[(String, EnumInfo)]) -> EnumAliasScope {
-        let scope = EnumAliasScope {
-            types: self.type_scope.clone(),
-        };
+    fn bind_unit_enum_aliases(&mut self, aliases: &[(String, EnumInfo)]) {
+        let mut scope = self.type_scope.clone();
         for (name, info) in aliases {
             // The unit checker supplies identity; metadata remains build-wide.
             if self.enum_infos.get_canonical(&info.name).is_none() {
                 self.enum_infos.insert(info.name, info.clone());
             }
-            self.bind_canonical_type_alias(name, &info.name.to_string());
+            scope.bind_canonical(name, &info.name.to_string());
         }
-        scope
+        self.install_type_scope(scope);
     }
 
-    pub fn restore_enum_aliases(&mut self, scope: EnumAliasScope) {
-        self.install_type_scope(scope.types);
-    }
-
-    /// Register interface metadata for vtable generation and method dispatch.
-    pub fn register_interface_info(&mut self, name: String, info: InterfaceInfo) {
-        let identity = info.name;
+    /// Register interface metadata for vtable generation and method dispatch:
+    /// the session's composition of `identity` (computed once, on first
+    /// registration) plus this unit's spelling `name` of it.
+    pub fn register_interface_info(
+        &mut self,
+        name: String,
+        identity: TypeId,
+        info: impl FnOnce() -> InterfaceInfo,
+    ) -> Result<()> {
+        self.layout_queries.interface_composition(identity, info)?;
         self.restore_type_alias(&identity.to_string(), None);
-        self.interface_infos.insert(identity, info);
         if TypeId::from_source_name(&name) != identity {
             self.bind_canonical_type_alias(&name, &identity.to_string());
         }
+        Ok(())
+    }
+
+    /// This unit's alias-resolving view of the frozen class and interface
+    /// layouts.
+    fn classes(&self) -> ClassView<'_> {
+        ClassView::new(&self.type_scope, &self.layout_queries)
     }
 
     /// Register resolved async-fn local types (willow-lpn.5c) for frame-backing
@@ -685,10 +654,91 @@ impl Codegen {
         self.expr_types = types;
     }
 
-    pub fn release_unit_transients(&mut self) {
+    /// Drop the per-unit state a body phase built up, once that unit's last
+    /// body has been emitted.
+    ///
+    /// On the session path `lir_functions`/`lir_lambdas` are empty — every body
+    /// is read from the artifact store one at a time — and this clears only the
+    /// declaration-phase `expr_types`. The standalone path
+    /// ([`Codegen::register_lir_functions`]) holds a whole unit's IR in memory,
+    /// and leaving it resident would keep every compiled unit's bodies alive
+    /// for the length of the build.
+    fn release_unit_transients(&mut self) {
         self.lir_functions.clear();
         self.lir_lambdas.clear();
         self.expr_types.clear();
+    }
+
+    /// The lowered IR for one emission target.
+    ///
+    /// On the session path the caller supplies the body's own identity, so no
+    /// name re-keying stands between a unit's lowering and its emission: the
+    /// artifact is read straight out of `lir_body(BodyId)` and renamed to the
+    /// symbol this unit compiles it under. `None` is the standalone path, which
+    /// has no body index and holds a whole unit's IR in `lir_functions`.
+    fn take_lir_body(
+        &mut self,
+        body: Option<crate::parser::ast::BodyId>,
+        name: FunctionId,
+    ) -> Result<crate::ir::lowered::LirFunction> {
+        if let Some(body) = body {
+            // ExprIds identify source syntax; copied defaults have distinct
+            // BodyIds. Expose only this body's direct lambda constructions.
+            self.lambda_names.clear();
+            if let Some(queries) = &self.body_queries {
+                for (expr, child) in queries.index().child_lambdas(body) {
+                    let name = *self.lambda_body_names.get(&child).ok_or_else(|| {
+                        anyhow::anyhow!("lambda body {child:?} has no declared symbol")
+                    })?;
+                    self.lambda_names.insert(expr, name);
+                }
+            }
+            let mut function = self
+                .lir_queries
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing LIR query session"))?
+                .body(body)?;
+            function.name = name;
+            return Ok(function);
+        }
+        self.lir_functions
+            .remove(&name)
+            .ok_or_else(|| anyhow::anyhow!("function `{name}` has no lowered IR"))
+    }
+
+    /// The lifted lambdas of one unit, in declaration order, paired with the
+    /// symbols this unit's declaration phase gave them.
+    ///
+    /// Walking the unit for lambda identities is O(AST); the declaration phase,
+    /// the panic-effect analysis and the emission plan all need the same list in
+    /// the same order, so it is walked once here and carried on the declared
+    /// unit (willow-afb5.18). Empty on the standalone path, which has no body
+    /// index.
+    fn unit_lambda_bodies(
+        &self,
+        program: &Program,
+        lambdas: &[(String, LambdaExpr)],
+    ) -> Result<Vec<crate::parser::ast::BodyId>> {
+        let Some(queries) = &self.body_queries else {
+            return Ok(Vec::new());
+        };
+        let bodies = queries.index().lambda_declarations(program)?;
+        anyhow::ensure!(
+            bodies.len() == lambdas.len(),
+            "lambda identity/declaration count mismatch"
+        );
+        Ok(bodies)
+    }
+
+    fn bind_lambda_body_names(
+        &mut self,
+        bodies: &[crate::parser::ast::BodyId],
+        lambdas: &[(String, LambdaExpr)],
+    ) {
+        for (body, (name, _)) in bodies.iter().zip(lambdas) {
+            self.lambda_body_names
+                .insert(*body, self.func_ids.scope().lookup_id(name));
+        }
     }
 
     pub fn register_lir_functions(&mut self, lir: crate::ir::lowered::LirProgram) {
@@ -702,19 +752,6 @@ impl Codegen {
                 self.lir_lambdas.insert(lambda.id, lambda.function);
             }
         }
-    }
-
-    /// Install only the current unit's expression types for lambda declaration.
-    /// Declared callable signatures live in `fn_types`; body emission does not
-    /// need to retain every checked expression from every imported module.
-    pub fn register_module_checker_tables(&mut self, checker: &crate::semantic::TypeChecker) {
-        self.register_expr_types(
-            checker
-                .expr_types
-                .iter()
-                .map(|(id, ty)| (*id, ty.into()))
-                .collect(),
-        );
     }
 
     /// The type as the ENUM tables spell it: every enum name replaced by the one
@@ -749,7 +786,7 @@ impl Codegen {
     /// `signal::Level`, `Grade` under `import signal::Level as Grade;`,
     /// `sales::Amount` for a class the graph registered as `market::Amount`
     /// — and those spellings live only for that unit's own phase
-    /// ([`Codegen::install_enum_aliases`],
+    /// ([`Codegen::bind_unit_enum_aliases`],
     /// [`Codegen::alias_unit_module_spellings`]). The tables outlive it, are
     /// rebuilt by every LATER unit's declaration phase, and are compared
     /// against HIR types the checker already normalized, so recording the
@@ -769,24 +806,14 @@ impl Codegen {
             return info.name;
         }
         let resolved = self.type_scope.resolve(id);
-        if self.class_layouts.get_canonical_id(&resolved).is_some()
-            || self.interface_infos.get_canonical_id(&resolved).is_some()
+        if self.layout_queries.has_layout(resolved)
+            || self.layout_queries.has_class(resolved)
+            || self.layout_queries.has_interface(resolved)
         {
             resolved
         } else {
             *id
         }
-    }
-
-    /// Hand the back end the imports the module resolver classified for the
-    /// next unit to be declared (willow-vtlr, willow-28h8).
-    ///
-    /// Must be called before that unit's `declare_module`/`declare_program`,
-    /// which takes them: the visible-module half decides which module a bare
-    /// class name in this file may come from, and the item half is bound now
-    /// and rebound before this unit's bodies.
-    pub fn set_unit_imports(&mut self, imports: compile::UnitImports) {
-        self.unit_imports = imports;
     }
 
     /// Rebind the FUNCTION half of one unit's single-item imports, in import
@@ -820,9 +847,9 @@ impl Codegen {
         // module-qualified type (`module::Item`) under the unqualified `local`
         // name, so the entry's use of `local` resolves to the module's symbols.
         let qualified = format!("{}::{item}", self.table_module_name(module));
-        if self.class_layouts.contains_key(&qualified)
+        if self.classes().is_class(&qualified)
             || self.enum_infos.contains_key(&qualified)
-            || self.interface_infos.contains_key(&qualified)
+            || self.classes().is_interface(&qualified)
         {
             self.bind_type_alias(local, &qualified);
         }
@@ -874,7 +901,7 @@ impl Codegen {
     ) -> Vec<(String, String)> {
         let module = self.table_module_name(module);
         let qualified = format!("{module}::{item}");
-        if !self.class_layouts.contains_key(&qualified) {
+        if !self.classes().is_class(&qualified) {
             return Vec::new();
         }
         let owner = TypeId::from_source_name(&qualified);
@@ -919,7 +946,7 @@ impl Codegen {
     }
 
     fn alias_class_symbol(&mut self, alias: &str, canonical: &str) {
-        if self.class_layouts.contains_key(canonical) {
+        if self.classes().is_class(canonical) {
             self.bind_type_alias(alias, canonical);
         }
     }
@@ -995,9 +1022,9 @@ impl Codegen {
     /// Whether `name` reaches a registered class, enum or interface — directly
     /// or through a binding already in the shared type scope.
     fn registered_type(&self, name: &str) -> bool {
-        self.class_layouts.contains_key(name)
+        self.classes().is_class(name)
             || self.enum_infos.contains_key(name)
-            || self.interface_infos.contains_key(name)
+            || self.classes().is_interface(name)
     }
 
     fn resolution_context(&self) -> UnitResolutionContext {
@@ -1048,7 +1075,7 @@ impl Codegen {
     /// Classes need no such alias: [`resolve_class_key`] already resolves a
     /// bare class name against every module's tables. Enums have their own, per
     /// unit and from that unit's own checker
-    /// ([`Codegen::install_enum_aliases`]).
+    /// ([`Codegen::bind_unit_enum_aliases`]).
     ///
     /// Installed BEFORE [`Codegen::alias_module_local_types`] so a module's own
     /// declaration still wins over anything it imported under the same name.
@@ -1066,8 +1093,8 @@ impl Codegen {
                     self.bind_type_alias(&source_qualified, &qualified);
                 }
             }
-            if self.interface_infos.contains_key(&qualified)
-                || self.class_layouts.contains_key(&qualified)
+            if self.classes().is_interface(&qualified)
+                || self.classes().is_class(&qualified)
                 || self.enum_infos.contains_key(&qualified)
             {
                 self.bind_type_alias(&item.local, &qualified);
@@ -1088,7 +1115,7 @@ impl Codegen {
 
     /// Bind module-local interfaces under their unqualified names for body
     /// compilation (willow-64gs.1). Enum aliases are installed from the unit's
-    /// checker by `install_enum_aliases`: their identity uses the canonical
+    /// checker by `bind_unit_enum_aliases`: their identity uses the canonical
     /// path, which can differ from `mod_name`. Rebinding them here would
     /// overwrite that identity and lose variant metadata (willow-wvlw).
     fn alias_module_local_types(&mut self, program: &Program, mod_name: &str) {
@@ -1120,286 +1147,50 @@ impl Codegen {
             // reads it with its own aliases installed (willow-kd1v).
             .map(|f| (f.name.clone(), self.canonical_declared_type(&f.ty)))
             .collect();
-        // A provisional layout so nothing that runs before
-        // `finalize_class_layouts` sees a missing class, and the whole answer
-        // for a class with no base.
-        self.class_layouts.insert(c.name.clone(), own.clone());
-        self.class_own_fields.insert(c.name.clone(), own);
-        // Replace both directions of the canonical edge. Removing an empty
-        // adjacency bucket prevents historical parents accumulating on reparent.
         let class_id = TypeId::from_source_name(&c.name);
-        if let Some(old_base) = self.class_base.remove_canonical_id(&class_id)
-            && let std::collections::hash_map::Entry::Occupied(mut entry) =
-                self.class_dependents.entry(old_base)
-        {
-            entry.get_mut().remove(&class_id);
-            if entry.get().is_empty() {
-                entry.remove();
-            }
-        }
-        if let Some(base_path) = &c.base_class {
-            // `TypePath::name()` deliberately returns only the final segment,
-            // which is right for diagnostics but not for backend identity. A
-            // qualified base must keep its module/alias prefix so it matches
-            // the key `declare_module` registered (`lib::Parcel`), otherwise
-            // `finalize_class_layouts` drops every inherited field (willow-b929).
-            let base_name = match base_path {
-                TypePath::Local(name) => name.clone(),
-                TypePath::Qualified(parts) => parts.join("::"),
-            };
-            // Recorded as the tables key it, NOW, while this unit's own
-            // spellings are still installed. `finalize_class_layouts` runs
-            // again for every later unit and walks this chain each time; a base
-            // kept under a spelling only this unit binds resolved to nothing
-            // then, and the subclass's layout was quietly rewritten to its own
-            // fields alone — `new Sub` then fell out of the walker's subset and
-            // every inherited field read the wrong offset (willow-kd1v).
-            let base = self
-                .type_scope
-                .resolve(&TypeId::from_source_name(&base_name));
-            self.class_dependents
-                .entry(base)
-                .or_default()
-                .insert(class_id);
-            self.class_base.insert(c.name.clone(), base);
-        }
-        // Assign a unique type_id for runtime dynamic dispatch. It lives at
-        // offset 0 of the class DESCRIPTOR, which word 0 of every object of the
-        // class points at (willow-fm7t).
-        if self.class_type_ids.get_canonical(&c.name).is_none() {
-            let id = willow_abi::runtime_type_ids::generated_type_id(self.class_type_ids.len())
-                .ok_or_else(|| anyhow::anyhow!("generated runtime type ID range exhausted"))?;
-            self.class_type_ids
-                .entry(c.name.clone())
-                .or_insert(i64::from(id));
-        }
-        self.register_class_own_vmethods(c);
-        self.invalidate_class_layout(&c.name);
+        let base = self.layout_queries.class_base(class_id, || {
+            c.base_class.as_ref().map(|path| {
+                // `TypePath::name()` deliberately returns only the final segment,
+                // which is right for diagnostics but not for backend identity. A
+                // qualified base must keep its module/alias prefix so it matches
+                // the key `declare_module` registered (`lib::Parcel`) (willow-b929).
+                // Resolved NOW, while this unit's own spellings are installed: the
+                // frozen edge is read again by every later unit (willow-kd1v).
+                let name = match path {
+                    TypePath::Local(name) => name.clone(),
+                    TypePath::Qualified(parts) => parts.join("::"),
+                };
+                self.type_scope.resolve(&TypeId::from_source_name(&name))
+            })
+        })?;
+        // Only `open` and `override` instance methods get a virtual slot. A
+        // plain method can neither be overridden nor override anything, so its
+        // callee is fixed at compile time; static methods and constructors have
+        // no receiver to dispatch on at all (willow-fm7t).
+        let methods = c
+            .methods
+            .iter()
+            .filter(|method| !method.is_static && (method.is_open || method.is_override))
+            .map(|method| method.name.clone())
+            .collect();
+        self.layout_queries
+            .register_class(class_id, base, own, methods);
+        // The runtime type_id lives at offset 0 of the class DESCRIPTOR, which
+        // word 0 of every object of the class points at (willow-fm7t).
+        self.layout_queries.register_runtime_type(class_id)?;
         Ok(())
     }
 
-    fn invalidate_class_layout(&mut self, name: &str) {
-        let mut pending = vec![TypeId::from_source_name(name)];
-        while let Some(name) = pending.pop() {
-            // An already-dirty node has propagated to its existing children.
-            // New child edges are covered by registration invalidating the child.
-            // Check both passes: either one can be finalized independently.
-            let fields_changed = self.dirty_class_layouts.insert(name);
-            let slots_changed = self.dirty_class_vslots.insert(name);
-            if !fields_changed && !slots_changed {
-                continue;
-            }
-            #[cfg(test)]
-            {
-                self.layout_work[3] += 1;
-            }
-            if let Some(children) = self.class_dependents.get(&name) {
-                #[cfg(test)]
-                {
-                    self.layout_work[4] += children.len();
-                }
-                pending.extend(children.iter().copied());
-            }
-        }
-    }
-
-    /// Record the `open`/`override` instance methods `c` declares itself.
-    ///
-    /// Only `open` and `override` methods get a slot. A plain method can
-    /// neither be overridden nor override anything, so its callee is fixed at
-    /// compile time and a direct call is always correct; leaving it out keeps
-    /// descriptors to the methods that actually vary. Static methods and
-    /// constructors have no receiver to dispatch on at all.
-    fn register_class_own_vmethods(&mut self, c: &ClassDecl) {
-        *self.dispatch_cache.get_mut() = Default::default();
-        let own: Vec<String> = c
-            .methods
-            .iter()
-            // Static methods have no receiver or virtual dispatch slot.
-            .filter(|m| !m.is_static && (m.is_open || m.is_override))
-            .map(|m| m.name.clone())
-            .collect();
-        self.class_own_vmethods.insert(c.name.clone(), own);
-    }
-
-    /// Build dirty field layouts parent first, reusing completed parent layouts.
-    /// Base fields keep their order and type, including when a child redeclares
-    /// a name. Name indexing makes work proportional to the materialized layouts
-    /// plus own declarations, rather than replaying and scanning every ancestor.
-    fn finalize_class_layouts(&mut self) {
-        let mut pending = std::mem::take(&mut self.dirty_class_layouts);
-        crate::query_stats::add(crate::query_stats::Counter::ClassLayout, pending.len());
-        let starts: Vec<_> = pending.iter().copied().collect();
-        let mut path = Vec::new();
-        let mut visiting = HashSet::new();
-        for start in starts {
-            path.clear();
-            let mut current = start;
-            while pending.contains(&current) {
-                if !visiting.insert(current) {
-                    // Invalid source is rejected by the checker. Preserve the
-                    // finite, root-relative replay for standalone backend users.
-                    for name in path.drain(..) {
-                        visiting.remove(&name);
-                        let mut fields = Vec::new();
-                        let mut names = HashSet::new();
-                        for ancestor in self.ancestor_chain(&name).iter().rev() {
-                            if let Some(own) = self.class_own_fields.get_canonical_id(ancestor) {
-                                for (field, ty) in own {
-                                    if names.insert(field.as_str()) {
-                                        fields.push((field.clone(), ty.clone()));
-                                    }
-                                }
-                            }
-                        }
-                        self.class_layouts.insert_canonical_id(name, fields);
-                        pending.remove(&name);
-                    }
-                    break;
-                }
-                path.push(current);
-                #[cfg(test)]
-                {
-                    self.layout_work[0] += 1;
-                }
-                let Some(base) = self.class_base.get_canonical_id(&current) else {
-                    break;
-                };
-                current = *base;
-            }
-            while let Some(name) = path.pop() {
-                visiting.remove(&name);
-                let parent = self
-                    .class_base
-                    .get_canonical_id(&name)
-                    // Only registered classes participated in ancestor replay.
-                    // Do not inherit a synthetic builtin-only layout.
-                    .filter(|base| self.class_own_fields.get_canonical_id(base).is_some())
-                    .and_then(|base| self.class_layouts.get_canonical_id(base));
-                let mut fields = parent.cloned().unwrap_or_default();
-                let mut names: HashSet<&str> = parent
-                    .into_iter()
-                    .flatten()
-                    .map(|(field, _)| field.as_str())
-                    .collect();
-                #[cfg(test)]
-                {
-                    self.layout_work[1] += fields.len();
-                }
-                if let Some(own) = self.class_own_fields.get_canonical_id(&name) {
-                    #[cfg(test)]
-                    {
-                        self.layout_work[2] += own.len();
-                    }
-                    for (field, ty) in own {
-                        if names.insert(field.as_str()) {
-                            fields.push((field.clone(), ty.clone()));
-                        }
-                    }
-                }
-                self.class_layouts.insert_canonical_id(name, fields);
-                pending.remove(&name);
-            }
-        }
-    }
-
-    /// `class_name` followed by its bases, nearest first.
-    ///
-    /// A cyclic `extends` -- already a checker error, but reachable here when
-    /// the backend is driven directly -- stops at the repeat rather than
-    /// looping forever.
-    fn ancestor_chain(&self, class_name: &TypeId) -> Vec<TypeId> {
-        let mut chain = vec![*class_name];
-        let mut seen = HashSet::from([*class_name]);
-        // `class_base` records canonical names (`register_class_layout`
-        // canonicalizes as it stores), so the walk reads them as identities
-        // rather than through the aliases of whichever unit is compiling.
-        while let Some(base) = self
-            .class_base
-            .get_canonical_id(chain.last().expect("non-empty"))
-        {
-            if !seen.insert(*base) {
-                break;
-            }
-            chain.push(*base);
-        }
-        chain
-    }
-
-    /// Build dirty slot tables parent first, reusing completed parent summaries.
-    /// Overrides retain their inherited index; new names append in declaration
-    /// order. Canonical IDs keep summaries independent of the active unit aliases.
-    /// The explicit path handles arbitrarily deep, out-of-order declarations.
-    fn finalize_class_vslots(&mut self) {
-        let mut pending = std::mem::take(&mut self.dirty_class_vslots);
-        crate::query_stats::add(crate::query_stats::Counter::ClassVslots, pending.len());
-        let starts: Vec<_> = pending.iter().copied().collect();
-        let mut path = Vec::new();
-        let mut visiting = HashSet::new();
-        for start in starts {
-            path.clear();
-            let mut current = start;
-            while pending.contains(&current) {
-                if !visiting.insert(current) {
-                    // The checker rejects cycles. Standalone backend callers
-                    // historically get a finite, root-relative ancestor replay;
-                    // preserve that fallback rather than caching a partial cycle.
-                    for name in path.drain(..) {
-                        visiting.remove(&name);
-                        let mut slots = crate::semantic::method_slots::MethodSlots::default();
-                        for ancestor in self.ancestor_chain(&name).iter().rev() {
-                            if let Some(own) = self.class_own_vmethods.get_canonical_id(ancestor) {
-                                for method in own {
-                                    slots.insert(method);
-                                }
-                            }
-                        }
-                        self.class_vslots.insert_canonical_id(name, slots);
-                        pending.remove(&name);
-                    }
-                    break;
-                }
-                path.push(current);
-                #[cfg(test)]
-                {
-                    self.vslot_work[0] += 1;
-                }
-                let Some(base) = self.class_base.get_canonical_id(&current) else {
-                    break;
-                };
-                current = *base;
-            }
-            while let Some(name) = path.pop() {
-                visiting.remove(&name);
-                let mut slots = self
-                    .class_base
-                    .get_canonical_id(&name)
-                    .and_then(|base| self.class_vslots.get_canonical_id(base))
-                    .cloned()
-                    .unwrap_or_default();
-                #[cfg(test)]
-                {
-                    self.vslot_work[1] += slots.len();
-                }
-                if let Some(own) = self.class_own_vmethods.get_canonical_id(&name) {
-                    #[cfg(test)]
-                    {
-                        self.vslot_work[2] += own.len();
-                    }
-                    for method in own {
-                        slots.insert(method);
-                    }
-                }
-                self.class_vslots.insert_canonical_id(name, slots);
-                pending.remove(&name);
-            }
-        }
-    }
-
-    fn validate_gc_ref_mask_layouts(&self) -> Result<()> {
-        for (class_name, layout) in self.class_layouts.iter() {
-            try_gc_ref_mask_for_layout(&class_name.to_string(), layout, &self.enum_infos)?;
-        }
+    /// Complete every layout registered since the last call. Field layouts and
+    /// virtual slot orders are one parent-first query evaluation, so a class's
+    /// inherited fields keep their order and type when a child redeclares a
+    /// name, and an override keeps its inherited slot index. Work is bounded
+    /// by the newly registered declarations plus the layouts they copy. The
+    /// results stay in the shared queries; [`Codegen::classes`] reads them.
+    fn finalize_class_layouts(&mut self) -> Result<()> {
+        let completed = self.layout_queries.complete_pending_classes()?;
+        crate::query_stats::add(crate::query_stats::Counter::ClassLayout, completed.len());
+        crate::query_stats::add(crate::query_stats::Counter::ClassVslots, completed.len());
         Ok(())
     }
 
@@ -1416,7 +1207,7 @@ impl Codegen {
                     let parent = if defines {
                         None
                     } else {
-                        self.class_base.get(name).map(ToString::to_string)
+                        self.classes().base(name).map(|base| base.to_string())
                     };
                     (defines, parent)
                 })?;
@@ -1639,23 +1430,19 @@ struct FuncGen<'a, 'b> {
     builtin_module_aliases: &'a HashMap<String, String>,
     lambda_names: &'a HashMap<ExprId, FunctionId>,
     string_literals: &'a HashMap<String, StringLiteralData>,
-    class_layouts: &'a TypeMap<Vec<(String, Type)>>,
+    /// This unit's alias-resolving view of the frozen class layouts, base
+    /// edges, runtime type ids, virtual slot orders and interface
+    /// compositions. Since willow-fm7t the runtime id is no longer stored
+    /// inline in the object: word 0 points at the class DESCRIPTOR, which
+    /// holds the id at its own offset 0.
+    classes: ClassView<'a>,
     static_storage: &'a TypeMap<HashMap<String, StaticStorageInfo>>,
     enum_infos: &'a TypeMap<EnumInfo>,
-    class_base: &'a TypeMap<TypeId>,
-    /// Maps class name → unique type_id (i64). Since willow-fm7t the id is no
-    /// longer stored inline in the object: word 0 points at the class
-    /// DESCRIPTOR, which holds the id at its own offset 0.
-    class_type_ids: &'a TypeMap<i64>,
     /// Maps class name → its descriptor data symbol, the value stored in word 0
     /// of every object of that class (willow-fm7t).
     class_descriptor_ids: &'a TypeMap<DataId>,
-    /// Per-class virtual method slot order, indexed by slot (willow-fm7t).
-    class_vslots: &'a TypeMap<crate::semantic::method_slots::MethodSlots>,
     /// Shared across functions until scoped metadata changes.
     dispatch_cache: &'a std::cell::RefCell<emit_interface::DispatchCache>,
-    /// Interface metadata for method dispatch + boxing.
-    interface_infos: &'a TypeMap<InterfaceInfo>,
     /// Static `(class, interface)` vtable data objects for class→interface boxing.
     vtable_ids: &'a VtableMap<DataId>,
     /// When emitting a cooperative poll fn: the async frame pointer, so a
@@ -2009,7 +1796,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Type::Named(n) | Type::Generic(n, _) => n,
             _ => return value,
         };
-        if !self.interface_infos.contains_key(iface_name) {
+        if !self.classes.is_interface(iface_name) {
             return value;
         }
         // Already an interface value (same interface): identity.
@@ -2021,15 +1808,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Shared supertables preserve the target's method numbering. Only
         // static table pointers are followed; the object stays unchanged.
         if let Type::Named(vn) | Type::Generic(vn, _) = value_ty
-            && self.interface_infos.contains_key(vn)
+            && self.classes.is_interface(vn)
         {
-            return match vtable_layout::super_path(self.interface_infos, vn, iface_name) {
+            return match vtable_layout::super_path(&self.classes, vn, iface_name) {
                 Some(path) if !path.is_empty() => self.emit_interface_rewiden(value, &path),
                 _ => value,
             };
         }
-        if let Type::Named(class_name) = value_ty
-            && self.class_layouts.contains_key(class_name)
+        if self.coercion_boxes(value_ty, target_ty)
+            && let Type::Named(class_name) = value_ty
         {
             return self.emit_interface_box(
                 value,
@@ -2038,6 +1825,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             );
         }
         value
+    }
+
+    /// Whether [`Self::coerce_to_target`] allocates an interface box, the only
+    /// coercion that can reach a GC safepoint.
+    fn coercion_boxes(&self, value_ty: &Type, target_ty: &Type) -> bool {
+        matches!(target_ty, Type::Named(n) | Type::Generic(n, _) if self.classes.is_interface(n))
+            && matches!(value_ty, Type::Named(n) if self.classes.is_class(n))
     }
 
     /// Declared explicit method parameter types, excluding the receiver.
@@ -2146,7 +1940,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// inherited static (`Child::prop` declared on `Base`) resolves to the
     /// declaring class (willow-qsqf §16.2). Static members are non-virtual.
     fn lookup_static_storage(&self, class: &str, field: &str) -> Option<StaticStorageInfo> {
-        lookup_static_storage_in(self.static_storage, self.class_base, class, field)
+        lookup_static_storage_in(self.static_storage, &self.classes, class, field)
     }
 }
 
@@ -2155,7 +1949,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 /// the walker must not admit a read the emitter would then resolve differently.
 fn lookup_static_storage_in(
     static_storage: &TypeMap<HashMap<String, StaticStorageInfo>>,
-    class_base: &TypeMap<TypeId>,
+    classes: &ClassView<'_>,
     class: &str,
     field: &str,
 ) -> Option<StaticStorageInfo> {
@@ -2171,7 +1965,7 @@ fn lookup_static_storage_in(
         {
             return Some(info.clone());
         }
-        current = class_base.get_id(&name).cloned();
+        current = classes.base(&name);
     }
     None
 }
@@ -2283,20 +2077,7 @@ fn param_abi_type(
     }
 }
 
-fn gc_ref_mask_for_layout(
-    class_name: &str,
-    layout: &[(String, Type)],
-    enum_infos: &TypeMap<EnumInfo>,
-) -> u64 {
-    try_gc_ref_mask_for_layout(class_name, layout, enum_infos)
-        .expect("class GC ref mask layout should have been validated before codegen")
-}
-
-fn try_gc_ref_mask_for_layout(
-    _class_name: &str,
-    layout: &[(String, Type)],
-    enum_infos: &TypeMap<EnumInfo>,
-) -> Result<u64> {
+fn gc_ref_mask_for_layout(layout: &[(String, Type)], enum_infos: &TypeMap<EnumInfo>) -> u64 {
     // Object layout: word 0 = the class DESCRIPTOR address, words 1..N = fields.
     // Bit i in the mask corresponds to word i; field[idx] lives at word (idx+1).
     //
@@ -2315,7 +2096,7 @@ fn try_gc_ref_mask_for_layout(
         }
         mask |= 1u64 << word;
     }
-    Ok(mask)
+    mask
 }
 
 // ─── Async frame GC metadata (willow-lpn.4) ──────────────────────────────────
@@ -2652,6 +2433,162 @@ mod symbol_namespace_tests {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn class_layouts_complete_subclass_first_declarations_from_frozen_queries() {
+        let source = "
+            class Leaf extends Middle { pub c: bool; pub override fn one(self) {} }
+            open class Root { pub a: i64; pub open fn one(self) {} }
+            open class Middle extends Root { pub b: f64; pub open fn two(self) {} }
+        ";
+        let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
+        let (program, errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(errors.is_empty(), "{errors:?}");
+        let mut session = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+        for item in &program.items {
+            let Item::Class(class) = item else {
+                panic!("expected class")
+            };
+            session.register_class_layout(class).unwrap();
+            // Registration never installs a provisional layout: nothing may
+            // read an inherited field before the chain is complete.
+            let id = TypeId::from_source_name(&class.name);
+            assert!(!session.layout_queries.has_layout(id));
+            assert!(session.layout_queries.slots(id).is_none());
+        }
+        session.finalize_class_layouts().unwrap();
+        fn fields(session: &Codegen, name: &str) -> std::sync::Arc<Vec<(String, Type)>> {
+            session
+                .layout_queries
+                .fields(TypeId::from_source_name(name))
+                .unwrap()
+        }
+        fn names(session: &Codegen, name: &str) -> Vec<String> {
+            fields(session, name)
+                .iter()
+                .map(|(field, _)| field.clone())
+                .collect()
+        }
+        fn slots(
+            session: &Codegen,
+            name: &str,
+        ) -> std::sync::Arc<crate::semantic::method_slots::MethodSlots> {
+            session
+                .layout_queries
+                .slots(TypeId::from_source_name(name))
+                .unwrap()
+        }
+        fn runtime_id(session: &Codegen, name: &str) -> Option<i64> {
+            session
+                .layout_queries
+                .runtime_id(TypeId::from_source_name(name))
+        }
+        assert_eq!(names(&session, "Root"), ["a"]);
+        assert_eq!(names(&session, "Middle"), ["a", "b"]);
+        assert_eq!(names(&session, "Leaf"), ["a", "b", "c"]);
+        assert_eq!(fields(&session, "Leaf")[1].1, Type::F64);
+        assert_eq!(slots(&session, "Root").as_slice(), ["one"]);
+        assert_eq!(slots(&session, "Middle").as_slice(), ["one", "two"]);
+        assert_eq!(slots(&session, "Leaf").as_slice(), ["one", "two"]);
+        assert_eq!(slots(&session, "Leaf").slot_of("one"), Some(0));
+        // Runtime ids follow registration order, not the finalized chain.
+        assert_eq!(runtime_id(&session, "Leaf"), Some(1));
+        assert_eq!(runtime_id(&session, "Root"), Some(2));
+        assert_eq!(runtime_id(&session, "Middle"), Some(3));
+        assert_eq!(session.layout_queries.declaration_visits(), 3);
+        let work = session.layout_queries.work();
+        // Re-registering a frozen declaration under a different base or
+        // field list is a request for the same result, not a reparent.
+        let updated = crate::parser::Parser::new(
+            crate::lexer::Lexer::new("class Leaf extends Root { pub z: bool; }")
+                .tokenize()
+                .unwrap(),
+        )
+        .parse()
+        .0;
+        let Item::Class(updated) = &updated.items[0] else {
+            panic!("expected class")
+        };
+        for _ in 0..8 {
+            session.register_class_layout(updated).unwrap();
+            session.finalize_class_layouts().unwrap();
+        }
+        assert_eq!(names(&session, "Leaf"), ["a", "b", "c"]);
+        assert_eq!(runtime_id(&session, "Leaf"), Some(1));
+        assert_eq!(session.layout_queries.declaration_visits(), 3);
+        assert_eq!(session.layout_queries.work(), work);
+    }
+
+    #[test]
+    fn class_base_queries_keep_canonical_edges_across_scope_changes() {
+        let tokens = crate::lexer::Lexer::new("class Root {} class Child extends Alias {}")
+            .tokenize()
+            .unwrap();
+        let (program, errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(errors.is_empty(), "{errors:?}");
+        let Item::Class(root) = &program.items[0] else {
+            panic!("expected class")
+        };
+        let Item::Class(child) = &program.items[1] else {
+            panic!("expected class")
+        };
+        let queries = std::rc::Rc::new(crate::compiler_db::layout::LayoutQueries::default());
+        let mut codegen =
+            Codegen::new(&CompilerOptions::debug(), std::rc::Rc::clone(&queries)).unwrap();
+        codegen.bind_canonical_type_alias("Alias", "Root");
+        // The parent need not be registered for its identity to be final.
+        codegen.register_class_layout(child).unwrap();
+        codegen.register_class_layout(root).unwrap();
+        codegen.bind_canonical_type_alias("Alias", "Other");
+        let mut canonical_child = child.clone();
+        canonical_child.base_class = Some(TypePath::Local("Root".into()));
+        codegen.register_class_layout(&canonical_child).unwrap();
+        let root_id = TypeId::local("Root");
+        let child_id = TypeId::local("Child");
+        assert_eq!(codegen.layout_queries.base(child_id), Some(root_id));
+        assert_eq!(
+            queries
+                .class_base(child_id, || panic!("edge recomputed"))
+                .unwrap(),
+            Some(root_id)
+        );
+        assert_eq!(
+            queries
+                .class_base(root_id, || panic!("root recomputed"))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn generated_class_type_ids_use_shared_query_identity_across_backends() {
+        let tokens = crate::lexer::Lexer::new("class A {} class B {}")
+            .tokenize()
+            .unwrap();
+        let (program, errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(errors.is_empty(), "{errors:?}");
+        let queries = std::rc::Rc::new(crate::compiler_db::layout::LayoutQueries::default());
+        let mut first =
+            Codegen::new(&CompilerOptions::debug(), std::rc::Rc::clone(&queries)).unwrap();
+        for item in &program.items {
+            let Item::Class(class) = item else {
+                panic!("expected class")
+            };
+            first.register_class_layout(class).unwrap();
+        }
+        let mut second = Codegen::new(&CompilerOptions::debug(), queries).unwrap();
+        for item in program.items.iter().rev() {
+            let Item::Class(class) = item else {
+                panic!("expected class")
+            };
+            second.register_class_layout(class).unwrap();
+            let id = TypeId::from_source_name(&class.name);
+            assert_eq!(
+                second.layout_queries.runtime_id(id),
+                first.layout_queries.runtime_id(id)
+            );
+        }
+    }
+
+    #[test]
     fn generated_class_type_ids_preserve_identity_across_redeclaration_and_aliases() {
         for count in [1, 16, 64, 256] {
             let source = (0..count)
@@ -2660,7 +2597,7 @@ mod tests {
             let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
             let (program, errors) = crate::parser::Parser::new(tokens).parse();
             assert!(errors.is_empty(), "{errors:?}");
-            let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+            let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
             for (i, item) in program.items.iter().enumerate() {
                 let Item::Class(class) = item else {
                     panic!("expected class")
@@ -2669,17 +2606,20 @@ mod tests {
                 codegen.register_class_layout(class).unwrap();
                 let alias = format!("Alias{i}");
                 codegen.bind_canonical_type_alias(&alias, &class.name);
-                assert_eq!(codegen.class_type_ids[&class.name], i as i64 + 1);
-                assert_eq!(codegen.class_type_ids[&alias], i as i64 + 1);
-                assert_eq!(codegen.class_type_ids.len(), i + 1);
+                assert_eq!(codegen.classes().type_id(&class.name), Some(i as i64 + 1));
+                assert_eq!(
+                    codegen.classes().type_id(alias.as_str()),
+                    Some(i as i64 + 1)
+                );
+                assert_eq!(codegen.layout_queries.runtime_classes().len(), i + 1);
             }
-            assert_eq!(codegen.class_type_ids.len(), count);
+            assert_eq!(codegen.layout_queries.runtime_classes().len(), count);
         }
     }
 
     #[test]
     fn production_stack_probes_use_inline_four_kib_pages() {
-        let codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+        let codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
         let flags = codegen.module.isa().flags();
         assert!(flags.enable_probestack());
         assert_eq!(
@@ -2693,7 +2633,7 @@ mod tests {
     fn closure_type_canonicalization_perspectives() {
         use super::*;
 
-        let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+        let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
         codegen.enum_infos.insert(
             "origin::Choice",
             EnumInfo {
@@ -2706,7 +2646,13 @@ mod tests {
         );
         codegen.bind_canonical_type_alias("Alias", "origin::Choice");
         codegen.bind_type_alias("Forward", "Alias");
-        codegen.class_layouts.insert("origin::Record", vec![]);
+        codegen.layout_queries.register_class(
+            TypeId::from_source_name("origin::Record"),
+            None,
+            vec![],
+            vec![],
+        );
+        codegen.finalize_class_layouts().unwrap();
         codegen.bind_canonical_type_alias("Record", "origin::Record");
 
         let named = |name: &str| Type::Named(name.into());
@@ -2826,167 +2772,70 @@ mod tests {
         assert_eq!(codegen.canonical_declared_type(&unchanged), unchanged);
     }
     #[test]
-    fn vslot_summaries_scale_with_output_and_reuse_clean_parents() {
-        for size in [1, 16, 256, 1024] {
-            for shape in ["chain", "fanout", "growing"] {
-                if shape == "growing" && size > 256 {
-                    continue;
-                }
-                let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
-                // Reverse registration, without layout finalization: measure
-                // only the slot pass, independently of the field-layout pass.
-                for i in (0..size).rev() {
-                    let name = format!("C{i}");
-                    let id = TypeId::from_source_name(&name);
-                    if i > 0 {
-                        let base = if shape == "fanout" { 0 } else { i - 1 };
-                        codegen
-                            .class_base
-                            .insert(name.clone(), TypeId::from_source_name(&format!("C{base}")));
-                    }
-                    let method = if shape == "growing" {
-                        format!("m{i}")
-                    } else {
-                        "m".into()
-                    };
-                    codegen.class_own_vmethods.insert(name, vec![method]);
-                    codegen.dirty_class_vslots.insert(id);
-                }
-                codegen.finalize_class_vslots();
-                let copied = if shape == "growing" {
-                    size * (size - 1) / 2
+    fn later_units_complete_only_their_own_class_declarations() {
+        for length in [1, 4, 10, 64] {
+            let mut source = String::new();
+            for i in 0..length {
+                let base = if i == 0 {
+                    String::new()
                 } else {
-                    size - 1
+                    format!(" extends C{}", i - 1)
                 };
-                assert_eq!(codegen.vslot_work, [size, copied, size]);
-                let mut stored = 0;
-                for i in 0..size {
-                    let slots = codegen
-                        .class_vslots
-                        .get_canonical(&format!("C{i}"))
-                        .unwrap();
-                    stored += slots.len();
-                    if shape == "growing" {
-                        assert_eq!(slots.len(), i + 1);
-                        for j in 0..=i {
-                            assert_eq!(slots.slot_of(&format!("m{j}")), Some(j));
-                        }
-                    } else {
-                        assert_eq!(slots.as_slice(), ["m"]);
-                    }
-                }
-                eprintln!(
-                    "shape={shape} size={size} visited={size} copied={copied} declarations={size} stored={stored}"
-                );
-                codegen.vslot_work = [0; 3];
-                for _ in 0..8 {
-                    codegen.finalize_class_vslots();
-                }
-                assert_eq!(codegen.vslot_work, [0; 3]);
-                let leaf = format!("C{}", size - 1);
-                codegen.invalidate_class_layout(&leaf);
-                codegen.finalize_class_vslots();
-                let inherited = if shape == "growing" {
-                    size - 1
-                } else {
-                    usize::from(size > 1)
-                };
-                assert_eq!(codegen.vslot_work, [1, inherited, 1]);
+                source.push_str(&format!("open class C{i}{base} {{ pub f{i}: i64; pub open fn m{i}(self) -> i64 {{ return {i}; }} }}"));
             }
-        }
-    }
-
-    #[test]
-    fn vslot_summaries_preserve_standalone_cycle_fallback() {
-        let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
-        for (name, base, method) in [("A", "B", "a"), ("B", "A", "b"), ("C", "A", "c")] {
-            codegen
-                .class_base
-                .insert(name, TypeId::from_source_name(base));
-            codegen.class_own_vmethods.insert(name, vec![method.into()]);
-            codegen
-                .dirty_class_vslots
-                .insert(TypeId::from_source_name(name));
-        }
-        codegen.finalize_class_vslots();
-        assert_eq!(
-            codegen.class_vslots.get_canonical("A").unwrap().as_slice(),
-            ["b", "a"]
-        );
-        assert_eq!(
-            codegen.class_vslots.get_canonical("B").unwrap().as_slice(),
-            ["a", "b"]
-        );
-        assert_eq!(
-            codegen.class_vslots.get_canonical("C").unwrap().as_slice(),
-            ["b", "a", "c"]
-        );
-    }
-
-    #[test]
-    fn incremental_layouts_track_only_changed_dependency_subtrees() {
-        for length in 1..=10 {
-            for reverse in [false, true] {
-                let mut source = String::new();
-                for i in 0..length {
-                    let base = if i == 0 {
-                        String::new()
+            let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+            let (program, errors) = crate::parser::Parser::new(tokens).parse();
+            assert!(errors.is_empty(), "{errors:?}");
+            let classes: Vec<_> = program
+                .items
+                .iter()
+                .filter_map(|item| {
+                    if let Item::Class(class) = item {
+                        Some(class)
                     } else {
-                        format!(" extends C{}", i - 1)
-                    };
-                    source.push_str(&format!("open class C{i}{base} {{ pub f{i}: i64; pub open fn m{i}(self) -> i64 {{ return {i}; }} }}"));
-                }
-                let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
-                let (program, errors) = crate::parser::Parser::new(tokens).parse();
-                assert!(errors.is_empty(), "{errors:?}");
-                let mut classes: Vec<_> = program
-                    .items
-                    .iter()
-                    .filter_map(|item| {
-                        if let Item::Class(class) = item {
-                            Some(class)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if reverse {
-                    classes.reverse();
-                }
-                let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
-                for class in classes {
-                    codegen.register_class_layout(class).unwrap();
-                    codegen.finalize_class_layouts();
-                    codegen.finalize_class_vslots();
-                    assert!(codegen.dirty_class_layouts.is_empty());
-                    assert!(codegen.dirty_class_vslots.is_empty());
-                }
-                for i in 0..length {
-                    let name = format!("C{i}");
-                    assert_eq!(
-                        codegen.class_layouts.get_canonical(&name).unwrap().len(),
-                        i + 1
-                    );
-                    assert_eq!(
-                        codegen.class_vslots.get_canonical(&name).unwrap().len(),
-                        i + 1
-                    );
-                }
-                let leaf = format!("C{}", length - 1);
-                codegen.invalidate_class_layout(&leaf);
+                        None
+                    }
+                })
+                .collect();
+            // Dependencies are declared before dependents, one unit each: the
+            // pass for unit i visits declaration i alone and copies its parent.
+            let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+            for (i, class) in classes.iter().enumerate() {
+                codegen.register_class_layout(class).unwrap();
+                codegen.finalize_class_layouts().unwrap();
+                assert_eq!(codegen.layout_queries.declaration_visits(), i + 1);
                 assert_eq!(
-                    codegen.dirty_class_layouts,
-                    HashSet::from([TypeId::from_source_name(&leaf)])
+                    codegen.layout_queries.work(),
+                    [i * (i + 1) / 2, i + 1, i * (i + 1) / 2, i + 1]
                 );
-                assert_eq!(
-                    codegen.dirty_class_vslots,
-                    HashSet::from([TypeId::from_source_name(&leaf)])
-                );
-                codegen.finalize_class_layouts();
-                codegen.finalize_class_vslots();
-                codegen.finalize_class_layouts();
-                codegen.finalize_class_vslots();
-                assert!(codegen.dirty_class_layouts.is_empty());
+                codegen.finalize_class_layouts().unwrap();
+                assert_eq!(codegen.layout_queries.declaration_visits(), i + 1);
+            }
+            // One unit declaring the whole chain subclass-first: one pass, one
+            // visit per declaration, same layouts.
+            let mut reversed = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+            for class in classes.iter().rev() {
+                reversed.register_class_layout(class).unwrap();
+            }
+            reversed.finalize_class_layouts().unwrap();
+            assert_eq!(reversed.layout_queries.declaration_visits(), length);
+            assert_eq!(
+                reversed.layout_queries.work(),
+                codegen.layout_queries.work()
+            );
+            for i in 0..length {
+                let name = format!("C{i}");
+                for codegen in [&codegen, &reversed] {
+                    let id = TypeId::from_source_name(&name);
+                    let fields = codegen.layout_queries.fields(id).unwrap();
+                    let slots = codegen.layout_queries.slots(id).unwrap();
+                    assert_eq!(fields.len(), i + 1);
+                    assert_eq!(slots.len(), i + 1);
+                    for j in 0..=i {
+                        assert_eq!(fields[j].0, format!("f{j}"));
+                        assert_eq!(slots.slot_of(&format!("m{j}")), Some(j));
+                    }
+                }
             }
         }
     }
@@ -3000,7 +2849,7 @@ mod tests {
         // three tables on every path, including repeated and nested shadowing.
         for binding_shape in 0..4 {
             for exit in 0..5 {
-                let mut codegen = Codegen::new(&CompilerOptions::debug()).unwrap();
+                let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
                 let function = FunctionId::free_from_source_name("local");
                 let original = FunctionId::free_from_source_name("original");
                 if binding_shape != 0 {
@@ -3163,7 +3012,7 @@ mod tests {
         let layout: Vec<(String, Type)> = (0..OBJECT_FIELD_MASK_CAPACITY)
             .map(|i| (format!("f{i}"), Type::String))
             .collect();
-        let mask = try_gc_ref_mask_for_layout("ManyRefs", &layout, &TypeMap::new()).unwrap();
+        let mask = gc_ref_mask_for_layout(&layout, &TypeMap::new());
         // Word 0 is the class descriptor, so fields occupy mask bits 1..63.
         assert_eq!(mask, u64::MAX << 1);
     }
@@ -3173,7 +3022,8 @@ mod tests {
         let mut fields: Vec<(String, Type)> =
             (0..64).map(|i| (format!("n{i}"), Type::I64)).collect();
         fields.push(("late".into(), Type::String));
-        let layout = gc_codegen::GcLayoutMetadata::class("Wide", 1, &fields, &TypeMap::new(), 8);
+        let object = crate::compiler_db::layout::ObjectLayout::new(fields.into(), 8);
+        let layout = gc_codegen::GcLayoutMetadata::class(1, &object, &TypeMap::new());
         assert_eq!(layout.gc_ref_mask, 0);
         assert_eq!(layout.bitmap, [0, 2]);
     }
@@ -3461,6 +3311,7 @@ mod tests {
         }];
         // body: let y: String = ...; while ... { let z: i64 = ...; }
         let body = Block {
+            id: crate::parser::ast::BodyId::fresh(),
             stmts: vec![
                 Stmt::Let(LetStmt {
                     name: "y".to_string(),
@@ -3472,6 +3323,7 @@ mod tests {
                 Stmt::While(WhileStmt {
                     cond: Expr::Bool(true, Span::dummy(), ExprId::fresh()),
                     body: Block {
+                        id: crate::parser::ast::BodyId::fresh(),
                         stmts: vec![Stmt::Let(LetStmt {
                             name: "z".to_string(),
                             mutable: false,
@@ -3501,6 +3353,7 @@ mod tests {
     #[test]
     fn async_frame_22_collector_skips_unannotated_lets() {
         let body = Block {
+            id: crate::parser::ast::BodyId::fresh(),
             stmts: vec![Stmt::Let(LetStmt {
                 name: "inferred".to_string(),
                 mutable: false,
@@ -3523,6 +3376,7 @@ mod tests {
             params: Vec::new(),
             return_type: crate::parser::ast::Type::I64,
             body: Block {
+                id: crate::parser::ast::BodyId::fresh(),
                 stmts: Vec::new(),
                 span: crate::diagnostics::Span::dummy(),
             },
@@ -3607,6 +3461,3 @@ pub(super) fn lir_address_taken_locals(
 
 #[cfg(test)]
 mod class_layout_tests;
-
-#[cfg(test)]
-mod class_reparent_tests;

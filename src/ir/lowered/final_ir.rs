@@ -8,25 +8,25 @@ use crate::diagnostics::Span;
 use crate::parser::ast::ExprId;
 use crate::semantic::ids::{FunctionId, SemanticType as Type, TypeId};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LirProgram {
     pub functions: Vec<LirFunction>,
     pub lambdas: Vec<LirLambda>,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LirLambda {
     pub id: ExprId,
     pub span: Span,
     pub function: LirFunction,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LirParam {
     pub name: String,
     pub ty: Type,
     pub by_reference: bool,
     pub span: Span,
 }
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LirFunction {
     pub name: FunctionId,
     pub is_async: bool,
@@ -37,6 +37,12 @@ pub struct LirFunction {
     pub async_frame: LirAsyncFrameLayout,
     pub captures: Vec<LirCapture>,
 }
+impl LirFunction {
+    pub(crate) fn empty_artifact_region() -> Self {
+        empty_function()
+    }
+}
+
 // Cleanup regions form an ownership tree. Keep its depth off the native stack.
 impl Drop for LirFunction {
     fn drop(&mut self) {
@@ -126,14 +132,14 @@ impl Clone for LirFunction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LirBlock {
     pub id: BlockId,
     pub instrs: Vec<LirInst>,
     pub terminator: Terminator,
     pub recovery: Vec<BlockId>,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LirDeferBody {
     pub function: Box<LirFunction>,
     pub captures: Vec<LirLocalId>,
@@ -145,7 +151,7 @@ impl LirDeferBody {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LirPattern {
     Wildcard,
     Binding {
@@ -170,7 +176,7 @@ pub enum LirPattern {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 // Keep the hot instruction stream contiguous; boxing changes every emitter.
 #[allow(clippy::large_enum_variant)]
 pub enum LirInst {
@@ -249,7 +255,7 @@ pub enum LirInst {
         reason: String,
     },
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Terminator {
     Jump(BlockId),
     Branch {
@@ -387,7 +393,7 @@ pub(super) fn finish_program(source: super::SourceProgram) -> LirProgram {
 }
 
 /// Convert cleanup regions in postorder without consuming native stack depth.
-fn finish_function(source: super::SourceFunction) -> LirFunction {
+pub(super) fn finish_function(source: super::SourceFunction) -> LirFunction {
     enum Work {
         Enter(usize, super::SourceFunction),
         Finish(usize, LirFunction, Vec<(usize, usize, usize)>),

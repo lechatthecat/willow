@@ -201,13 +201,14 @@ pub struct GcHeader {
 /// The compiler defines one zero-initialized TLS instance of this layout in
 /// each Willow executable. The runtime receives its address only on the slow
 /// path, registers the owning chunk, and may invalidate cursor/limit while the
-/// mutator is stopped for collection.
+/// mutator is stopped for collection. Generated code writes cursor and start
+/// words with plain stores and keeps no per-object counters; the runtime
+/// derives fast-path bytes from the cursor and counts from the start words
+/// (willow-8hq4.16).
 #[repr(C)]
 pub struct GcTlabState {
     cursor: AtomicUsize,
     limit: AtomicUsize,
-    fast_allocations: AtomicU64,
-    fast_allocated_bytes: AtomicU64,
     /// Stable pointer to this chunk's atomic object-start words. Published
     /// before cursor; generated allocation sets its bit after header writes.
     start_bits: AtomicUsize,
@@ -621,7 +622,7 @@ fn allocation_should_collect() -> bool {
     if !stress && (state.concurrent_cycle.is_some() || state.sweeping.is_some()) {
         return false;
     }
-    sync_tlab_accounting(&mut state);
+    sync_tlab_bytes(&mut state);
     if state.pacer.sample_due(state.total_allocated_bytes) {
         let bytes = state.total_allocated_bytes;
         state
@@ -647,7 +648,7 @@ fn allocation_should_collect() -> bool {
 fn allocation_should_minor_collect() -> bool {
     let stress = gc_stress_enabled("minor");
     let mut state = runtime().heap.lock().unwrap();
-    sync_tlab_accounting(&mut state);
+    sync_tlab_bytes(&mut state);
     stress || state.young_allocated_bytes >= state.nursery_threshold_bytes
 }
 
@@ -766,12 +767,10 @@ pub extern "C" fn willow_gc_alloc_slow(
         let mut state = runtime().heap.lock().unwrap();
         register_tlab_state(&mut state, state_address);
         let record = state.tlab_states.get_mut(&state_address).unwrap();
-        let fast = unsafe { tlab_state_at(state_address) }
-            .fast_allocated_bytes
-            .load(Ordering::Acquire);
+        let fast = fast_bytes_total(record);
         let fast_bytes = fast.saturating_sub(record.assist_observed_fast_bytes);
         record.assist_observed_fast_bytes = fast;
-        sync_tlab_accounting(&mut state);
+        sync_tlab_bytes(&mut state);
         if small {
             // A small-object miss means the active chunk has insufficient tail
             // space. Seal it before collection/refill.
@@ -820,6 +819,12 @@ pub extern "C" fn willow_gc_alloc_slow(
         .store(base as usize + GC_TLAB_CHUNK_SIZE, Ordering::Release);
     tls.cursor
         .store(base as usize + total_size, Ordering::Release);
+    // Fast-path bytes in this chunk are measured from here.
+    state
+        .tlab_states
+        .get_mut(&state_address)
+        .expect("TLAB state is registered before refill")
+        .chunk_fast_start = base as usize + total_size;
     state.allocated_bytes = state.allocated_bytes.saturating_add(total_size);
     state.young_allocated_bytes = state.young_allocated_bytes.saturating_add(total_size);
     state.total_allocs = state.total_allocs.saturating_add(1);
@@ -1022,7 +1027,7 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
     }
     let payload_size = payload_size as usize;
     let mut state = runtime().heap.lock().unwrap();
-    sync_tlab_accounting(&mut state);
+    sync_tlab_bytes(&mut state);
     let mut header = allocate_old_region_object_locked(
         &mut state,
         layout_id,
@@ -1404,7 +1409,7 @@ fn collect_internal() {
         let (work, plan, stopped_freed) = result;
         let freed = plan.map_or(stopped_freed, sweep::concurrent);
         let mut state = runtime().heap.lock().unwrap();
-        sync_tlab_accounting(&mut state);
+        sync_tlab_bytes(&mut state);
         let after = state.allocated_bytes as u64;
         let previous_goal = state.threshold_bytes as u64;
         state.threshold_bytes = state.allocated_bytes.saturating_mul(2).max(1024 * 1024);
@@ -1600,8 +1605,6 @@ fn reset_internal() {
             }
             tls.limit.store(0, Ordering::Release);
             tls.start_bits.store(0, Ordering::Release);
-            tls.fast_allocations.store(0, Ordering::Release);
-            tls.fast_allocated_bytes.store(0, Ordering::Release);
         }
     }
     // Reset owns every remaining payload, including rooted objects. Finalize
@@ -1739,8 +1742,6 @@ pub(crate) fn tlab_state_for_test() -> GcTlabState {
     GcTlabState {
         cursor: AtomicUsize::new(0),
         limit: AtomicUsize::new(0),
-        fast_allocations: AtomicU64::new(0),
-        fast_allocated_bytes: AtomicU64::new(0),
         start_bits: AtomicUsize::new(0),
     }
 }

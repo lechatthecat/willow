@@ -710,13 +710,10 @@ fn telemetry_merges_fast_tlab_deltas_once_and_on_unregister() {
     assert!(!first.is_null());
     let bytes = GC_HEADER_SIZE + 8;
     let cursor = tls.cursor.load(Ordering::Acquire);
-    // Reproduce the generated bump fast path, including its TLS counters.
+    // Reproduce the generated bump fast path: header, start bit, cursor.
     initialize_object_at(cursor as *mut u8, bytes, 0, 1, 0).unwrap();
     publish_tlab_start_for_test(&tls, cursor as *mut u8);
     tls.cursor.store(cursor + bytes, Ordering::Release);
-    tls.fast_allocations.store(1, Ordering::Release);
-    tls.fast_allocated_bytes
-        .store(bytes as u64, Ordering::Release);
     let first = crate::gc_telemetry::snapshot();
     let second = crate::gc_telemetry::snapshot();
     assert_eq!(first.counters.allocation_count, 2);
@@ -737,6 +734,88 @@ fn telemetry_merges_fast_tlab_deltas_once_and_on_unregister() {
     );
     willow_gc_collect();
     assert_eq!(crate::gc_telemetry::snapshot().heap.occupied_bytes, 0);
+    reset_gc();
+}
+
+/// Reproduce one generated bump allocation: header, start bit, cursor.
+fn fast_alloc_for_test(tls: &GcTlabState, bytes: usize) -> usize {
+    let cursor = tls.cursor.load(Ordering::Acquire);
+    initialize_object_at(cursor as *mut u8, bytes, 0, 1, 0).unwrap();
+    publish_tlab_start_for_test(tls, cursor as *mut u8);
+    tls.cursor.store(cursor + bytes, Ordering::Release);
+    cursor
+}
+
+/// Generated code keeps no counters (willow-8hq4.16): fast counts come from
+/// start bits and bytes from the cursor. Both must stay continuous across
+/// refills, retirement and unregister, without double counting.
+#[test]
+fn derived_fast_tlab_counts_survive_refills_retirement_and_unregister() {
+    let _guard = gc_test_guard();
+    reset_gc();
+    willow_gc_register_mutator();
+    let mut tls = new_tlab_state();
+    let bytes = GC_HEADER_SIZE + 8;
+    let mut fast = 0u64;
+    let mut slow = 0u64;
+    for round in 0..3 {
+        assert!(!willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0).is_null());
+        slow += 1;
+        for _ in 0..(round + 1) * 5 {
+            fast_alloc_for_test(&tls, bytes);
+            fast += 1;
+        }
+        assert_eq!(willow_gc_tlab_fast_allocations() as u64, fast);
+        assert_eq!(
+            willow_gc_allocated_bytes() as u64,
+            (fast + slow) * bytes as u64
+        );
+    }
+    retire_all_tlabs_locked(&mut runtime().heap.lock().unwrap());
+    assert_eq!(willow_gc_tlab_fast_allocations() as u64, fast);
+    assert!(!willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0).is_null());
+    slow += 1;
+    fast_alloc_for_test(&tls, bytes);
+    fast_alloc_for_test(&tls, bytes);
+    fast += 2;
+    willow_gc_unregister_mutator();
+    let counters = crate::gc_telemetry::snapshot().counters;
+    assert_eq!(counters.tlab_fast_allocations, fast);
+    assert_eq!(counters.allocation_count, fast + slow);
+    assert_eq!(counters.allocation_bytes, (fast + slow) * bytes as u64);
+    reset_gc();
+}
+
+/// Retirement indexes headers from start bits; a missing bit (gap) and an
+/// extra bit inside an object (overlap) must both be rejected.
+#[test]
+fn retirement_rejects_unpublished_and_overlapping_start_bits() {
+    let _guard = gc_test_guard();
+    for extra_bit in [false, true] {
+        reset_gc();
+        let mut tls = new_tlab_state();
+        assert!(!willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0).is_null());
+        let bytes = GC_HEADER_SIZE + 8;
+        let cursor = tls.cursor.load(Ordering::Acquire);
+        initialize_object_at(cursor as *mut u8, bytes, 0, 1, 0).unwrap();
+        if extra_bit {
+            publish_tlab_start_for_test(&tls, cursor as *mut u8);
+            publish_tlab_start_for_test(&tls, (cursor + GC_REGION_MARK_GRANULE) as *mut u8);
+        }
+        tls.cursor.store(cursor + bytes, Ordering::Release);
+        let result = std::panic::catch_unwind(|| {
+            let mut state = runtime().heap.lock().unwrap_or_else(|p| p.into_inner());
+            retire_all_tlabs_locked(&mut state);
+        });
+        runtime().heap.clear_poison();
+        let payload = result.expect_err("inconsistent start bits must be rejected");
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or_default();
+        assert!(message.contains("was not published"), "{message}");
+    }
     reset_gc();
 }
 
@@ -879,12 +958,14 @@ fn test_gc_generated_header_and_tlab_abi_layout() {
     assert_eq!(std::mem::offset_of!(GcHeader, age), 3);
     assert_eq!(std::mem::offset_of!(GcHeader, descriptor_owned), 4);
     assert_eq!(std::mem::offset_of!(GcHeader, descriptor), 8);
-    assert_eq!(GC_TLAB_STATE_SIZE, 40);
+    assert_eq!(GC_TLAB_STATE_SIZE, 24);
+    assert_eq!(GC_TLAB_STATE_SIZE as u32, willow_abi::tlab::STATE_SIZE);
     assert_eq!(std::mem::offset_of!(GcTlabState, cursor), 0);
     assert_eq!(std::mem::offset_of!(GcTlabState, limit), 8);
-    assert_eq!(std::mem::offset_of!(GcTlabState, fast_allocations), 16);
-    assert_eq!(std::mem::offset_of!(GcTlabState, fast_allocated_bytes), 24);
-    assert_eq!(std::mem::offset_of!(GcTlabState, start_bits), 32);
+    assert_eq!(
+        std::mem::offset_of!(GcTlabState, start_bits) as u32,
+        willow_abi::tlab::start_bits_offset(8)
+    );
 }
 
 #[test]

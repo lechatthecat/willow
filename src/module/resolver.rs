@@ -58,7 +58,17 @@ pub struct UnitImports {
 /// symbol per file: two files can bind the same local name to different
 /// modules' functions (willow-28h8).
 pub fn classify_unit_imports(program: &Program, modules: &[SourceFile]) -> UnitImports {
-    let find = |path: &str| modules.iter().find(|m| m.canonical_path == path);
+    classify_unit_imports_with(program, |path| {
+        modules.iter().find(|m| m.canonical_path == path)
+    })
+}
+
+/// Session callers supply the shared canonical-path index. Keep classification
+/// semantics in the resolver instead of duplicating them in a query consumer.
+pub(crate) fn classify_unit_imports_with<'a>(
+    program: &Program,
+    find: impl Fn(&str) -> Option<&'a SourceFile>,
+) -> UnitImports {
     let mut out = UnitImports::default();
     for import in &program.imports {
         if std_registry::is_std_path(&import.path) {
@@ -109,12 +119,23 @@ pub fn resolve_imports(entry_program: &Program, src_root: &Path) -> ImportResolu
     )
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_imports_spooled(
     entry_program: &Program,
     src_root: &Path,
     artifacts: super::artifacts::UnitArtifacts,
 ) -> ImportResolution {
+    resolve_imports_spooled_entry(entry_program, src_root, artifacts, None)
+}
+
+pub(crate) fn resolve_imports_spooled_entry(
+    entry_program: &Program,
+    src_root: &Path,
+    artifacts: super::artifacts::UnitArtifacts,
+    entry_path: Option<PathBuf>,
+) -> ImportResolution {
     let mut graph = ModuleGraph::new(src_root.to_path_buf());
+    graph.entry_path = entry_path;
     graph.artifacts = Some(artifacts);
     resolve_imports_in_graph(entry_program, src_root, graph)
 }
@@ -309,6 +330,25 @@ fn resolve_one(
         );
         return;
     };
+
+    if graph
+        .entry_path
+        .as_ref()
+        .is_some_and(|entry| std::fs::canonicalize(&module_path).ok().as_ref() == Some(entry))
+    {
+        errors.push(
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0403,
+                "import cycle reaches the entry program",
+            )
+            .with_label(Label::primary(
+                span,
+                "the entry already owns this source file",
+            )),
+        );
+        return;
+    }
 
     let source = match std::fs::read_to_string(&module_path) {
         Ok(s) => s,
@@ -680,7 +720,7 @@ mod tests {
         assert_eq!(resolution.graph.dependencies("b"), ["c"]);
         assert_eq!(
             resolution.graph.module_id("c"),
-            Some(super::super::ModuleId(2))
+            Some(super::super::ModuleId(3))
         );
     }
 

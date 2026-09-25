@@ -267,3 +267,53 @@ fn concentrated_batches_reuse_one_buffer_across_shard_shapes() {
         }
     }
 }
+
+#[test]
+fn t8hq4_19_small_batches_group_by_shard_in_input_order() {
+    let tasks = ShardedTaskTable::new();
+    let queues = RunQueues::new(1);
+    let mut scratch = WakeBatchScratch::default();
+    let s = TASK_TABLE_SHARDS as u64;
+    // Missing IDs report terminal in grouped order: shard 1, then shard 2.
+    let ids = [2 * s + 1, 1, s + 1, 2, 3 * s + 1];
+    wake_tasks_outcome_in(&tasks, &queues, &ids, &mut scratch);
+    assert_eq!(scratch.terminal, [2 * s + 1, 1, s + 1, 3 * s + 1, 2]);
+    assert_eq!(scratch.shard_locks, 2);
+    wake_tasks_outcome_in(&tasks, &queues, &[s + 7], &mut scratch);
+    assert_eq!(scratch.terminal, [s + 7]);
+    assert_eq!(scratch.shard_locks, 1);
+}
+
+#[test]
+fn t8hq4_19_sort_and_partition_paths_agree_around_the_threshold() {
+    let tasks = ShardedTaskTable::new();
+    let queues = RunQueues::new(1);
+    let mut scratch = WakeBatchScratch::default();
+    for len in [
+        2,
+        17,
+        TASK_TABLE_SHARDS - 1,
+        TASK_TABLE_SHARDS,
+        TASK_TABLE_SHARDS + 1,
+        4096,
+    ] {
+        // A deterministic scatter that repeats shards and IDs.
+        let ids = (0..len as u64)
+            .map(|i| i.wrapping_mul(2_654_435_761) % (3 * TASK_TABLE_SHARDS as u64) + 1)
+            .collect::<Vec<_>>();
+        let expected = (0..TASK_TABLE_SHARDS)
+            .flat_map(|shard| {
+                ids.iter()
+                    .copied()
+                    .filter(move |id| *id as usize % TASK_TABLE_SHARDS == shard)
+            })
+            .collect::<Vec<_>>();
+        wake_tasks_outcome_in(&tasks, &queues, &ids, &mut scratch);
+        assert_eq!(scratch.terminal, expected, "len={len}");
+        let shards = ids
+            .iter()
+            .map(|id| *id as usize % TASK_TABLE_SHARDS)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(scratch.shard_locks, shards.len(), "len={len}");
+    }
+}

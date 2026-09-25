@@ -16,24 +16,35 @@ pub(crate) enum Counter {
     ClassLayout,
     ClassVslots,
     EffectSolve,
+    EffectInventory,
+    EffectEdges,
 }
 
 #[derive(Default)]
 struct Stats {
-    counts: [usize; 5],
+    counts: [usize; 7],
     hydrates: usize,
     // File IDs are dense and session-local, including entry file zero. Keeping
     // an indexed vector gives O(1) updates and O(units) ordered reporting.
     hydrates_by_file: Vec<usize>,
     peaks: [usize; 4],
+    queries: std::collections::BTreeMap<&'static str, crate::compiler_db::query::QueryStats>,
 }
 
 impl Stats {
     fn report(&self) -> String {
-        let [checkers, helpers, layouts, vslots, solves] = self.counts;
+        let [
+            checkers,
+            helpers,
+            layouts,
+            vslots,
+            solves,
+            effect_inventory,
+            effect_edges,
+        ] = self.counts;
         let [ast, checker, declared, lir] = self.peaks;
         let mut line = format!(
-            "[query-stats] hydrates={} type_checkers={checkers} nonpreemptible_helpers={helpers} class_layouts={layouts} class_vslots={vslots} effect_solves={solves} peak_ast={ast} peak_checker={checker} peak_declared={declared} peak_lir={lir} hydrates_by_file=",
+            "[query-stats] hydrates={} type_checkers={checkers} nonpreemptible_helpers={helpers} class_layouts={layouts} class_vslots={vslots} effect_solves={solves} effect_inventory={effect_inventory} effect_edges={effect_edges} peak_ast={ast} peak_checker={checker} peak_declared={declared} peak_lir={lir} hydrates_by_file=",
             self.hydrates,
         );
         let mut separator = "";
@@ -46,32 +57,50 @@ impl Stats {
         if separator.is_empty() {
             line.push('-');
         }
+        for (name, query) in &self.queries {
+            write!(
+                line,
+                " {name}[calls={},hits={},computations={},compute_ns={},max_depth={},frozen_reads={}]",
+                query.calls,
+                query.hits,
+                query.computations,
+                query.compute_ns,
+                query.max_depth,
+                query.frozen_reads
+            )
+            .unwrap();
+        }
         line
     }
 }
 
 thread_local! {
+    static LOG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static ACTIVE: RefCell<Option<Stats>> = const { RefCell::new(None) };
 }
 
 pub(crate) struct Session {
     previous: Option<Stats>,
     emit: bool,
+    previous_log: bool,
     _thread_bound: PhantomData<Rc<()>>,
 }
 
 impl Session {
     pub(crate) fn enter() -> Self {
-        Self::start(
+        let session = Self::start(
             std::env::var_os("WILLOW_QUERY_STATS").is_some_and(|v| v == "1"),
             true,
-        )
+        );
+        LOG.with(|log| log.set(std::env::var_os("WILLOW_QUERY_LOG").is_some_and(|v| v == "1")));
+        session
     }
 
-    fn start(enabled: bool, emit: bool) -> Self {
+    pub(crate) fn start(enabled: bool, emit: bool) -> Self {
         Self {
             previous: ACTIVE.with(|slot| slot.replace(enabled.then(Stats::default))),
             emit,
+            previous_log: LOG.with(|log| log.replace(false)),
             _thread_bound: PhantomData,
         }
     }
@@ -79,6 +108,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        LOG.with(|log| log.set(self.previous_log));
         let finished = ACTIVE.with(|slot| slot.replace(self.previous.take()));
         if self.emit
             && let Some(stats) = finished
@@ -94,6 +124,16 @@ fn record(update: impl FnOnce(&mut Stats)) {
             update(stats);
         }
     });
+}
+
+#[cfg(test)]
+pub(crate) fn count(counter: Counter) -> usize {
+    ACTIVE.with(|active| {
+        active
+            .borrow()
+            .as_ref()
+            .map_or(0, |stats| stats.counts[counter as usize])
+    })
 }
 
 pub(crate) fn add(counter: Counter, count: usize) {
@@ -119,12 +159,89 @@ pub(crate) fn peaks(peaks: [usize; 4]) {
     });
 }
 
+pub(crate) fn timing_enabled() -> bool {
+    ACTIVE.with(|slot| slot.borrow().is_some())
+}
+
+pub(crate) fn query_call(name: &'static str) {
+    record(|stats| stats.queries.entry(name).or_default().calls += 1);
+}
+
+pub(crate) fn query_hit(name: &'static str) {
+    record(|stats| stats.queries.entry(name).or_default().hits += 1);
+}
+
+pub(crate) fn query_frozen_read(name: &'static str) {
+    record(|stats| stats.queries.entry(name).or_default().frozen_reads += 1);
+}
+
+pub(crate) fn query_enter(
+    name: &'static str,
+    depth: usize,
+    frame: impl FnOnce(&mut dyn FnMut(&str)),
+) {
+    record(|stats| {
+        let query = stats.queries.entry(name).or_default();
+        query.computations += 1;
+        query.max_depth = query.max_depth.max(depth);
+    });
+    if LOG.with(|log| log.get()) {
+        frame(&mut |frame| trace(format_args!("enter depth={depth} {frame}")));
+    }
+}
+
+pub(crate) fn query_exit(
+    name: &'static str,
+    depth: usize,
+    elapsed: u128,
+    frame: impl FnOnce(&mut dyn FnMut(&str)),
+) {
+    record(|stats| stats.queries.entry(name).or_default().compute_ns += elapsed);
+    if LOG.with(|log| log.get()) {
+        frame(&mut |frame| {
+            trace(format_args!(
+                "exit depth={depth} {frame} compute_ns={elapsed}"
+            ))
+        });
+    }
+}
+
+fn trace(message: std::fmt::Arguments<'_>) {
+    // A closed stderr must not panic while an evaluator is unwinding.
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr().lock(), "[query-log] {message}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn report() -> String {
         ACTIVE.with(|slot| slot.borrow().as_ref().unwrap().report())
+    }
+
+    #[test]
+    fn named_query_counts_and_timing_are_session_local() {
+        let _session = Session::start(true, false);
+        let table = crate::compiler_db::query::QueryTable::named("checked_body");
+        table.query(1, || Ok(42)).unwrap();
+        table.query(1, || Ok(0)).unwrap();
+        let expected = table.stats();
+        ACTIVE.with(|slot| {
+            assert_eq!(
+                slot.borrow().as_ref().unwrap().queries["checked_body"],
+                expected
+            )
+        });
+        assert!(report().contains("checked_body[calls=2,hits=1,computations=1,compute_ns="));
+    }
+
+    #[test]
+    fn disabled_logging_does_not_evaluate_trace_formatter() {
+        let _session = Session::start(false, false);
+        query_enter("unused", 1, |_| panic!("disabled trace formatter"));
+        query_exit("unused", 1, 0, |_| panic!("disabled trace formatter"));
+        assert!(!timing_enabled());
     }
 
     #[test]
@@ -146,7 +263,7 @@ mod tests {
         peaks([2, 1, 1, 1]);
         assert_eq!(
             report(),
-            "[query-stats] hydrates=3 type_checkers=3 nonpreemptible_helpers=3 class_layouts=3 class_vslots=3 effect_solves=3 peak_ast=2 peak_checker=2 peak_declared=1 peak_lir=1 hydrates_by_file=0:1,2:2"
+            "[query-stats] hydrates=3 type_checkers=3 nonpreemptible_helpers=3 class_layouts=3 class_vslots=3 effect_solves=3 effect_inventory=0 effect_edges=0 peak_ast=2 peak_checker=2 peak_declared=1 peak_lir=1 hydrates_by_file=0:1,2:2"
         );
     }
 

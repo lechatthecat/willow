@@ -255,12 +255,14 @@ mod tests {
             .spawn(|| {
                 let span = Span::new(0, 0, 1, 1);
                 let returning = || Block {
+                    id: crate::parser::ast::BodyId::fresh(),
                     stmts: vec![Stmt::Return(ReturnStmt { value: None, span })],
                     span,
                 };
                 let mut body = returning();
                 for _ in 0..50_000 {
                     body = Block {
+                        id: crate::parser::ast::BodyId::fresh(),
                         stmts: vec![Stmt::If(IfStmt {
                             cond: Expr::Bool(true, span, ExprId::fresh()),
                             then_block: body,
@@ -289,11 +291,13 @@ mod tests {
             .spawn(|| {
                 let span = Span::new(0, 0, 1, 1);
                 let mut body = Block {
+                    id: crate::parser::ast::BodyId::fresh(),
                     stmts: vec![Stmt::SuperInit(SuperInitStmt { args: vec![], span })],
                     span,
                 };
                 for _ in 0..50_000 {
                     body = Block {
+                        id: crate::parser::ast::BodyId::fresh(),
                         stmts: vec![Stmt::If(IfStmt {
                             cond: Expr::Bool(true, span, ExprId::fresh()),
                             then_block: body,

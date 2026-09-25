@@ -13,7 +13,7 @@ impl TypeChecker {
         let operand_ty = self.check_expr(inner);
 
         if let Some(some_ty) = builtin_types::unary_arg(&operand_ty, B::Option).cloned() {
-            let return_ty = self.current_return_type.clone();
+            let return_ty = self.local.current_return_type.clone();
             if builtin_types::unary_arg(&return_ty, B::Option).is_some() {
                 return some_ty;
             } else {
@@ -58,7 +58,7 @@ impl TypeChecker {
         };
 
         // The enclosing function must return Result<U,E> with matching error type
-        let return_ty = self.current_return_type.clone();
+        let return_ty = self.local.current_return_type.clone();
         match builtin_types::binary_args(&return_ty, B::Result) {
             Some((_, return_err)) => {
                 if *return_err == err_ty || *return_err == Type::Void || err_ty == Type::Void {
@@ -123,7 +123,7 @@ impl TypeChecker {
         if params.len() != l.params.len() {
             return self.check_lambda(l);
         }
-        let actual = self.check_lambda_with_context(
+        let (actual, captured) = self.check_lambda_in_context(
             l,
             Some(params.as_slice()),
             Some(ret.as_ref()),
@@ -135,16 +135,11 @@ impl TypeChecker {
         // about the capture rather than about a type mismatch the user cannot
         // act on.
         if matches!(expected, Type::Fn(..)) && matches!(actual, Type::Closure(..)) {
-            let captured = self
-                .lambda_captures
-                .get(&l.id)
-                .map(|c| {
-                    c.iter()
-                        .map(|c| format!("`{}`", c.name))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .unwrap_or_default();
+            let captured = captured
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
             self.push(
                 Diagnostic::new(
                     Severity::Error,
@@ -203,7 +198,7 @@ impl TypeChecker {
         // the three answers, so every such write is rejected.
         for (name, span) in writes {
             if captures.iter().any(|c| c.name == name) {
-                self.capture_writes.insert(span);
+                self.local.capture_writes.insert(span);
                 self.push_capture_write(&name, span, &captures);
             }
         }
@@ -291,23 +286,84 @@ impl TypeChecker {
         expected_return: Option<&Type>,
         expected_closure: bool,
     ) -> Type {
+        self.check_lambda_in_context(l, expected_params, expected_return, expected_closure)
+            .0
+    }
+
+    /// Check a lambda and return its type with the names it captures.
+    fn check_lambda_in_context(
+        &mut self,
+        l: &LambdaExpr,
+        expected_params: Option<&[Type]>,
+        expected_return: Option<&Type>,
+        expected_closure: bool,
+    ) -> (Type, Vec<String>) {
         // A lambda is a separate callable value. Do not attribute waits or
         // named-call edges in its body to the enclosing function (or to a lock
-        // that merely constructs the lambda).
-        let previous_effect_callable = self.current_effect_callable.take();
-        let saved_loop = std::mem::take(&mut self.loop_depth);
-        let saved_lock = std::mem::take(&mut self.lock_depth);
-        let saved_async = std::mem::replace(&mut self.current_async_context, false);
+        // that merely constructs the lambda). Under body queries the lambda
+        // has its own contextual identity, so its edges join the resolved
+        // graph under the same id the backend's effect inventory uses, and its
+        // checked tables are its own `typed_body` (willow-afb5.17).
+        let lambda_body = self
+            .local
+            .current_body
+            .zip(self.body_queries.as_ref())
+            .and_then(|(parent, queries)| queries.index().lambda_in(parent, l.id));
+        let check = move |checker: &mut TypeChecker| {
+            checker.check_lambda_scoped(
+                l,
+                lambda_body,
+                expected_params,
+                expected_return,
+                expected_closure,
+            )
+        };
+        match self.check_lambda_body(l, lambda_body, check) {
+            Ok(result) => result,
+            Err(check) => check(self),
+        }
+    }
+
+    fn check_lambda_scoped(
+        &mut self,
+        l: &LambdaExpr,
+        lambda_body: Option<BodyId>,
+        expected_params: Option<&[Type]>,
+        expected_return: Option<&Type>,
+        expected_closure: bool,
+    ) -> (Type, Vec<String>) {
+        let previous_body = std::mem::replace(&mut self.local.current_body, lambda_body);
+        let lambda_callable = lambda_body
+            .or(match &l.body {
+                LambdaBody::Block(body) => Some(body.id),
+                LambdaBody::Expr(_) => None,
+            })
+            .map(FunctionId::lambda);
+        if let Some(callable) = lambda_callable {
+            // A lambda without call sites still owns a graph node; a missing
+            // node would read as an unchecked body and pessimize its facts.
+            self.resolved_calls.entry(callable).or_default();
+        }
+        let previous_effect_callable =
+            std::mem::replace(&mut self.local.current_effect_callable, lambda_callable);
+        let saved_loop = std::mem::take(&mut self.local.loop_depth);
+        let saved_lock = std::mem::take(&mut self.local.lock_depth);
+        let saved_async = std::mem::replace(&mut self.local.current_async_context, false);
+        // A lambda written in a constructor is not the constructor: its own
+        // `return value` is legal and `super.init` inside it is not.
+        let saved_constructor = std::mem::take(&mut self.local.in_constructor);
         let result = self.check_lambda_with_context_inner(
             l,
             expected_params,
             expected_return,
             expected_closure,
         );
-        self.loop_depth = saved_loop;
-        self.lock_depth = saved_lock;
-        self.current_async_context = saved_async;
-        self.current_effect_callable = previous_effect_callable;
+        self.local.loop_depth = saved_loop;
+        self.local.lock_depth = saved_lock;
+        self.local.current_async_context = saved_async;
+        self.local.in_constructor = saved_constructor;
+        self.local.current_effect_callable = previous_effect_callable;
+        self.local.current_body = previous_body;
         result
     }
 
@@ -317,7 +373,7 @@ impl TypeChecker {
         expected_params: Option<&[Type]>,
         expected_return: Option<&Type>,
         expected_closure: bool,
-    ) -> Type {
+    ) -> (Type, Vec<String>) {
         // What the lambda takes from the enclosing function decides which of
         // the two callable types it has, so this runs first — and it must run
         // while the enclosing function's locals are still the visible variable
@@ -383,16 +439,16 @@ impl TypeChecker {
 
         // Save/restore outer return type so `return` stmts in the lambda body
         // are checked against the lambda's return type, not the enclosing function's.
-        let saved_ret_ty = self.current_return_type.clone();
-        let saved_block_depth = self.lexical_block_depth;
-        self.lexical_block_depth = 0;
+        let saved_ret_ty = self.local.current_return_type.clone();
+        let saved_block_depth = self.local.lexical_block_depth;
+        self.local.lexical_block_depth = 0;
 
         let body_ty = match &l.body {
             LambdaBody::Expr(e) => self.check_expr(e),
             LambdaBody::Block(b) => {
                 if let Some(ann) = expected_ret {
                     // Annotation provided: validate return stmts against it.
-                    self.current_return_type = ann.clone();
+                    self.local.current_return_type = ann.clone();
                     for stmt in &b.stmts {
                         self.check_stmt(stmt);
                     }
@@ -409,12 +465,13 @@ impl TypeChecker {
                     annotation
                 } else {
                     // No annotation: collect the return type via the lambda stack.
-                    self.lambda_return_stack.push(None);
+                    self.local.lambda_return_stack.push(None);
                     for stmt in &b.stmts {
                         self.check_stmt(stmt);
                     }
 
                     let inferred = self
+                        .local
                         .lambda_return_stack
                         .pop()
                         .flatten()
@@ -435,8 +492,8 @@ impl TypeChecker {
                 }
             }
         };
-        self.lexical_block_depth = saved_block_depth;
-        self.current_return_type = saved_ret_ty;
+        self.local.lexical_block_depth = saved_block_depth;
+        self.local.current_return_type = saved_ret_ty;
         self.symbols.pop_scope();
 
         let ret_ty = match &annotated_return {
@@ -491,6 +548,7 @@ impl TypeChecker {
         } else {
             Type::Closure(param_types, Box::new(ret_ty))
         };
+        let captured = captures.iter().map(|c| c.name.clone()).collect();
         self.lambda_captures.insert(l.id, captures);
         // Record the lambda's type here rather than leaving it to `check_expr`:
         // a lambda passed as a call argument is checked through
@@ -500,7 +558,7 @@ impl TypeChecker {
         // backend and the HIR lowering would have no type for it at all
         // (willow-0g8j.3, replacing the `lambda_fn_types` side table).
         self.expr_types.insert(l.id, fn_ty.clone());
-        fn_ty
+        (fn_ty, captured)
     }
 
     /// Reinterpret an unqualified match pattern as an enum-variant pattern when
@@ -600,7 +658,7 @@ impl TypeChecker {
         // `check_expr_expecting` (willow-0g8j.3). Taken, not borrowed: a
         // `match` nested anywhere inside an arm gets its own context or none,
         // never this one by accident.
-        let expected = self.match_expected.take();
+        let expected = self.local.match_expected.take();
         let scrutinee_ty = self.check_expr(&m.scrutinee);
 
         if m.arms.is_empty() {
@@ -1123,7 +1181,7 @@ impl TypeChecker {
 /// The name is the enclosing function's spelling, which is also the name the
 /// lifted body binds the environment slot under, so the body's own references
 /// resolve to it without renaming.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LambdaCapture {
     pub name: String,
     pub ty: Type,

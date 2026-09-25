@@ -24,6 +24,7 @@ impl Parser {
         let end = self.current_span();
         self.expect(TokenKind::RBrace)?;
         Ok(Block {
+            id: crate::parser::ast::BodyId::fresh(),
             stmts,
             span: start.to(end),
         })

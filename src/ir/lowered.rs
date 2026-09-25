@@ -83,7 +83,7 @@ pub(crate) struct SourceFunction {
 }
 
 /// One slot of a lifted lambda's closure environment.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LirCapture {
     /// The local this slot binds inside the lifted body.
     pub name: String,
@@ -183,24 +183,28 @@ impl SourceFunction {
 
 /// Function-local variable identity. Unlike a source span it also exists for
 /// compiler-generated bindings and cannot alias another declaration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct LirLocalId(pub u32);
 
 /// Stable identity of one source `defer` registration site. Its source span
 /// is diagnostic metadata; frame flags and cancellation cleanup use this id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct LirDeferId(pub u32);
 
 /// Physical storage is independent of source-language types. GcOwner holds
 /// an opaque managed allocation base used only by lowered reference places.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum LirStorageKind {
     #[default]
     Value,
     GcOwner,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LirLocal {
     pub storage_kind: LirStorageKind,
     pub id: LirLocalId,
@@ -218,7 +222,7 @@ impl LirLocal {
 }
 
 /// A basic-block index into [`SourceFunction::blocks`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockId(pub usize);
 
 /// A straight-line run of instructions ended by exactly one terminator.
@@ -247,7 +251,7 @@ pub(crate) struct SourceBlock {
 
 /// A scheduler-visible operation. Its operands are stable LIR locals, never
 /// source spans or backend-created Cranelift values.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SuspendOp {
     Sleep {
         /// Dedicated synthetic operand slot; codegen reuses it for the sleep
@@ -301,7 +305,7 @@ pub enum SuspendOp {
     Preempt,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LirSelectWaitOp {
     Recv {
         channel: LirLocalId,
@@ -318,7 +322,7 @@ pub enum LirSelectWaitOp {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LirSelectOp {
     Recv {
         channel: LirLocalId,
@@ -422,7 +426,7 @@ pub(crate) struct SourceDeferBody {
 /// The same four locals appear at the acquisition, at every release, and on the
 /// scope that owns the section's panic cleanup, so they travel together: a
 /// consumer that gets them from one of the three is looking at the same lock.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LirLockSlots {
     /// Which state machine the runtime calls — `Mutex` and `RwLock` have
     /// separate acquire/poll/load/release entry points.
@@ -6338,6 +6342,11 @@ pub use final_ir::{
 
 pub fn lower_program(program: &HirProgram) -> LirProgram {
     final_ir::finish_program(lower_source_program(program))
+}
+
+/// Finish one independently stored body after the unit's shared optimization.
+pub(crate) fn finish_body(body: SourceFunction) -> LirFunction {
+    final_ir::finish_function(body)
 }
 
 pub fn format_program(program: &LirProgram) -> String {

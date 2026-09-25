@@ -15,7 +15,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         span: crate::diagnostics::Span,
         push_frame: bool,
     ) -> Value {
-        let interface = matches!(receiver_ty, Type::Named(name) | Type::Generic(name, _) if self.interface_infos.contains_key(name));
+        let interface = matches!(receiver_ty, Type::Named(name) | Type::Generic(name, _) if self.classes.is_interface(name));
         if interface {
             self.emit_interface_dispatch_nil_check(receiver, span, method);
         }
@@ -201,13 +201,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             _ => unreachable!("interface receiver type vetted by LIR eligibility"),
         };
         let info = self
-            .interface_infos
-            .get(&iface_name)
-            .cloned()
+            .classes
+            .interface(&iface_name)
             .expect("interface info vetted by LIR eligibility");
         // The composed layout the vtables are emitted from, so the slot indexed
         // here is the slot the data object holds (willow-1fc6).
-        let slot = super::vtable_layout::slot_of(self.interface_infos, &info.name, method)
+        let slot = super::vtable_layout::slot_of(&self.classes, &info.name, method)
             .expect("interface method slot vetted by LIR eligibility");
         let sig_info = info.methods[method].clone();
         let type_args = match receiver_ty {

@@ -56,7 +56,9 @@ fn minor_tracing_work_scales_with_graph_and_roots() {
                 work.root_scan_bytes,
                 (root_count * size_of::<usize>()) as u64
             );
-            assert_eq!(stop.metadata_objects, (5 * n - 1) as u64);
+            // One sweep walk over 2n source headers plus n - 1 copies; the
+            // young set is not pre-indexed (willow-8hq4.16).
+            assert_eq!(stop.metadata_objects, (3 * n - 1) as u64);
             assert_eq!(state.promoted_objects, 1);
             assert_eq!(state.survivor_stats.survivor_copies, (n - 1) as u64);
             assert_eq!(state.moved_objects, (n - 1) as u64);
@@ -284,7 +286,8 @@ fn minor_metadata_skips_pinned_chunks_across_repeated_collections() {
                     &mut stop,
                 )
                 .run(roots, remembered);
-                let expected = if cycle % 2 == 0 { 5 * young } else { 2 * young };
+                // One sweep walk: sources plus this cycle's survivor copies.
+                let expected = if cycle % 2 == 0 { 3 * young } else { young };
                 assert_eq!(stop.metadata_objects, expected as u64);
                 if young == 0 {
                     assert_eq!(work.marked_bytes, 0);
@@ -393,5 +396,46 @@ fn tenure_budget_failure_retains_survivor_chunk_as_pinned() {
     assert_eq!(willow_gc_tenured_objects(), 0);
     assert_eq!(willow_gc_survivor_space_reserved(), 0);
     assert_eq!(willow_gc_pinned_region_count(), 2);
+    reset_internal();
+}
+
+/// Membership comes from the chunk index and start bitmap (willow-8hq4.16):
+/// only exact payload starts of young objects in pre-cycle chunks qualify.
+#[test]
+fn young_source_accepts_only_exact_pre_cycle_young_payloads() {
+    let _guard = runtime_test_guard();
+    reset_internal();
+    let mut tls = tlab_state_for_test();
+    let young = willow_gc_alloc_slow(&mut tls, 1, 0, 16, 0);
+    assert!(!young.is_null());
+    let mut state = runtime().heap.lock().unwrap();
+    retire_all_tlabs_locked(&mut state);
+    let mut stop = crate::gc_telemetry::stops::StopWorkV2::default();
+    let mut collector = MinorCollector::new(
+        &mut state,
+        Default::default(),
+        Default::default(),
+        &mut stop,
+    );
+    let address = young as usize;
+    assert!(collector.young_source(address).is_some());
+    assert!(collector.young_source(address + 8).is_none(), "interior");
+    assert!(
+        collector.young_source(address - GC_HEADER_SIZE).is_none(),
+        "header"
+    );
+    assert!(
+        collector.young_source(GC_HEADER_SIZE).is_none(),
+        "outside heap"
+    );
+    let copy = collector.evacuate(young);
+    assert_ne!(copy, young);
+    assert!(
+        collector.young_source(copy as usize).is_none(),
+        "destinations are never sources"
+    );
+    assert_eq!(collector.evacuate(young), copy, "forwarded exactly once");
+    drop(collector);
+    drop(state);
     reset_internal();
 }

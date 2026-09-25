@@ -1,4 +1,5 @@
 pub(crate) mod analysis;
+pub(crate) mod body;
 mod check;
 mod check_calls;
 mod check_collections;
@@ -27,20 +28,23 @@ use returns::ReturnSite;
 pub(crate) use types::*;
 
 use super::symbols::{ClassInfo, FieldInfo, MethodInfo, ParamInfo, StaticPropInfo, SymbolTable};
+use crate::compiler_db::effects::{
+    LOCK_EFFECT_WAIT, LockEffectCallsite, LockEffectCause, LockEffectKind,
+};
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::module::std_registry;
 use crate::parser::ast::*;
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::call_graph::ClassHierarchy;
-use crate::semantic::concurrency::{NonpreemptibleHelper, NonpreemptibleReason};
-use crate::semantic::effects::RuntimeEffects;
+use crate::semantic::concurrency::NonpreemptibleReason;
 use crate::semantic::ids::{FunctionId, TypeId};
 use crate::stdlib_schema;
 use std::collections::{HashMap, HashSet};
 
-pub struct TypeChecker {
-    pub symbols: SymbolTable,
-    pub errors: Vec<Diagnostic>,
+/// Unit-level declaration and name-resolution inputs. Body evaluators share
+/// this allocation; declaration registration is the only mutating phase.
+#[derive(Clone)]
+pub struct ResolutionContext {
     /// Whether the items being checked belong to the ENTRY program rather than
     /// an imported module. Only [`ReturnSite::EntryMain`] reads it, and only to
     /// decide whether a `main` is the real entry point — a module's `main` is
@@ -54,102 +58,7 @@ pub struct TypeChecker {
     /// so one enum has ONE name in every unit that can see it. `None` for the
     /// entry program, whose declarations are already unique build-wide.
     pub(crate) module_path: Option<String>,
-    /// Nesting depth of enclosing loops; `break`/`continue` outside a loop is
-    /// E0904. Reset to 0 inside a lambda body (a loop outside the lambda is
-    /// not breakable from within it) (willow-kzka).
-    pub(crate) loop_depth: u32,
-    /// Nesting depth of enclosing `lock` statements. V1 rejects a `lock` inside
-    /// another lock's critical section (E2605), and the depth also keeps the
-    /// await scan from reporting the same `await` once per enclosing lock
-    /// (willow-38w.1.1). Reset inside a lambda body, which only gets
-    /// CONSTRUCTED in the section and holds nothing when it runs (willow-3kty).
-    pub(crate) lock_depth: u32,
-    /// Lexical statement-block depth within the current function-like body.
-    /// The outer function/method body is depth 1. Reset for lambdas so recovery
-    /// capability cannot cross a function boundary (willow-s9ej.3).
-    pub(crate) lexical_block_depth: u32,
-    /// Types carried by the current callable's async locals and suspension
-    /// temporaries. Each occurrence has its own slot, independent of source
-    /// spans; callable checking drains its slots after checking Send.
-    async_local_types: Vec<Type>,
-    /// The type parameters of the generic declaration whose written types are
-    /// being normalized or validated (`T` inside `enum Wrap<T>` or `interface Conv<T>`).
-    /// A bare `T` there names a parameter, not a missing type, so
-    /// [`Self::validate_type`] accepts it; every other position sees an empty
-    /// list and reports the name as unknown (willow-rlq9).
-    declared_type_params: Vec<String>,
-    /// Maps the ID of an UNQUALIFIED enum-variant construction (`Ok(42)` in an
-    /// expected-enum position) to the enum it resolved to. The backend consults
-    /// this to lower such a `Call` as a variant allocation instead of a function
-    /// call (willow-60o.1). The variant name is the call's callee.
-    pub enum_variant_resolutions: HashMap<ExprId, String>,
-    /// Maps an unqualified match pattern's ID (`Ok(v)` / `Closed`, which parse as
-    /// `ClassDowncast` / `Binding`) to the enum-variant pattern it was
-    /// reinterpreted as when the scrutinee is an enum. The backend consults this
-    /// to lower the arm as a variant match (willow-60o.1).
-    pub pattern_resolutions: HashMap<PatternId, Pattern>,
-    /// The resolved type of every checked expression, keyed by its node ID. The
-    /// authoritative record for consumers (HIR lowering) that must not
-    /// re-derive types from the AST (willow-mb5 checker pivot). A node ID is
-    /// syntax identity rather than a source coordinate, so a pass that rebuilds
-    /// a node cannot silently inherit its neighbour's type (willow-njot).
-    pub expr_types: HashMap<ExprId, Type>,
-    /// Reference-parameter modes of resolved async calls, keyed by argument identity.
-    pub reference_arg_modes: HashMap<ExprId, ParamMode>,
-    /// Unannotated map constructors and uses awaiting their first insertion.
-    inferred_maps: HashMap<Span, (Vec<ExprId>, Option<usize>)>,
-    /// What every type ANNOTATION the checker normalized became: the written
-    /// spelling (`Arr<i64>`, `std::result::Result<i64, String>`, a module's own
-    /// `Level`) mapped to the type the rest of the compiler uses for it
-    /// (willow-0g8j.3). HIR lowering takes annotations straight off the AST,
-    /// which is the one place a written spelling could still reach the back end
-    /// and be turned down as an unknown type.
-    pub normalized_types: HashMap<Type, Type>,
-    /// What each static call's written class name resolved to, keyed by the
-    /// call expression's ID, when the two differ: `Dict::new()` under
-    /// `import std::collections::Map as Dict` records `Map` (willow-0g8j.3).
-    pub static_call_classes: HashMap<ExprId, String>,
-    /// What each lambda captures from its enclosing function, keyed by the
-    /// lambda expression's ID and ordered as the closure environment lays the
-    /// slots out (willow-0g8j.2.12). An absent entry and an empty vector mean
-    /// the same thing — a non-capturing lambda, which stays a plain `fn` value.
-    pub lambda_captures: HashMap<ExprId, Vec<LambdaCapture>>,
-    /// Assignment statements already reported as writes to a capture
-    /// (willow-0g8j.2.12). The lambda body is checked again afterwards, where
-    /// the target still resolves to the enclosing function's immutable local;
-    /// without this the same statement would also be reported as an ordinary
-    /// mutability error, which points the reader at the wrong fix.
-    capture_writes: HashSet<Span>,
-    /// The type a `match` in value position flows into, set for the duration of
-    /// that one `match` by [`TypeChecker::check_expr_expecting`] and taken by
-    /// [`TypeChecker::check_match_expr`] (willow-0g8j.3).
-    match_expected: Option<Type>,
-    current_return_type: Type,
-    /// Stack of lambda return types being inferred. When non-empty, `return` stmts
-    /// record their type here instead of checking against `current_return_type`.
-    lambda_return_stack: Vec<Option<Type>>,
-    current_class: Option<String>,
-    /// Whether the body being checked is an `async fn` (or async method), i.e.
-    /// whether it has a task frame to suspend into. Cleared inside a lambda
-    /// body: a lambda has no `async` form and the backend lifts it into a plain
-    /// private function, so `lock` and `await` written there are E2603/E0801
-    /// however the enclosing function was declared (willow-3kty).
-    current_async_context: bool,
     task_sync_preemption: bool,
-    /// Set while checking a `static fn` body — `self` is unavailable there
-    /// (willow-qsqf §9.2 → E0831).
-    in_static_method: bool,
-    /// Set while checking a `static` property initializer — `self` is unavailable
-    /// there (willow-qsqf §10.3 → E0837).
-    in_static_initializer: bool,
-    /// Set while checking an `init(...)` constructor body — `return <value>` is
-    /// rejected (willow-scq2 §8 → E0841).
-    in_constructor: bool,
-    /// Canonical names of every class already labelled by an E0426 class
-    /// `extends` cycle diagnostic. Each member of a cycle discovers the same
-    /// cycle from its own declaration; the first one in declaration order
-    /// reports it and the rest stay silent (willow-jlky).
-    reported_class_cycles: HashSet<String>,
     /// Names introduced by imports (module access names and item-import locals),
     /// used to reject local declarations that collide with an import. The span
     /// is the item-import's location, or `None` for module access names.
@@ -170,15 +79,11 @@ pub struct TypeChecker {
     imported_collection_types: HashSet<String>,
     /// Local aliases for collection types imported from `std::collections`.
     imported_collection_aliases: HashMap<String, String>,
-    /// Collection type names referenced through fully-qualified `std` paths.
-    fully_qualified_collection_types: HashSet<String>,
     /// Imported std module namespaces, keyed by their local access name.
     imported_std_modules: HashMap<String, ImportedStdModule>,
     /// Directly imported synchronous std::fs functions, keyed by their local
     /// alias. These block a native worker and therefore participate in E2604.
     imported_blocking_std_functions: HashMap<String, &'static str>,
-    /// Suppress duplicate missing-import diagnostics per type name.
-    missing_collection_imports_reported: HashSet<String>,
     /// Enforce the Send/Sync async checks (E2402-E2405). Compiler entry points
     /// always enable these; direct checker tests can isolate individual rules.
     enforce_send_sync: bool,
@@ -188,7 +93,7 @@ pub struct TypeChecker {
     /// to flag such a method called through a typed NON-`self` receiver from a
     /// task context (E0810) — the AST-only `ConcurrencyAnalyzer` cannot resolve
     /// such a receiver's class (willow-0a6k.2).
-    nonpreemptible_methods: HashMap<FunctionId, NonpreemptibleHelper>,
+    nonpreemptible_methods: std::sync::Arc<crate::compiler_db::HelperSummary>,
     /// Non-preemptible methods of IMPORTED classes, keyed by the receiver class
     /// name as the type checker sees it (`module::Class::method` for a
     /// whole-module import, `Local::method` for a direct class import), mapped
@@ -197,109 +102,78 @@ pub struct TypeChecker {
     /// another file the entry diagnostic map cannot render, so the E0810 uses a
     /// note instead of a secondary label (willow-0a6k.2).
     nonpreemptible_module_methods: HashMap<FunctionId, (String, NonpreemptibleReason)>,
-    /// The function-like body currently being checked. Lambdas deliberately
-    /// clear this: they are separate callable values and are not reached by a
-    /// named user-call edge.
-    current_effect_callable: Option<FunctionId>,
-    /// Same-program functions and methods known to the transitive lock-effect
-    /// analysis. The value is `true` for async callables: invoking one only
-    /// creates a `Task`, so a bare call must not propagate the callee's waits
-    /// into the caller (willow-38w.1.4).
-    lock_effect_callables: HashMap<FunctionId, bool>,
-    /// The shared inheritance relation used to resolve a virtual call to every
-    /// body it can reach (willow-uqzx.1.2). The backend's panic-effect analysis
-    /// builds the same structure from the raw AST, so the two agree on dispatch.
-    lock_effect_hierarchy: ClassHierarchy,
-    /// Typed, same-program calls made by each named callable. Only synchronous
-    /// callees are entered, because those execute before returning to the
-    /// caller and can therefore wait while its lock remains held.
-    lock_effect_edges: HashMap<FunctionId, HashSet<FunctionId>>,
-    /// A direct blocking/suspending operation in each callable. One witness is
-    /// enough to reject every lock-held call that reaches it.
-    lock_direct_effects: HashMap<FunctionId, LockEffectCause>,
-    /// All direct waits physically written in a critical section, recorded
-    /// during type checking and diagnosed alongside call-graph effects.
-    lock_direct_effect_callsites: Vec<LockEffectCause>,
-    /// Calls written in a lock body. They are diagnosed after all bodies have
-    /// been checked and the call graph fixpoint is complete, which also covers
-    /// forward declarations and recursion.
-    lock_effect_callsites: Vec<LockEffectCallsite>,
+    effect_index: crate::compiler_db::effects::CallableIndex,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LockEffectKind {
-    Suspend,
-    Block,
-    /// A separately compiled/imported synchronous implementation whose body
-    /// is not available to this checker. Treat it conservatively as capable of
-    /// either kind of wait instead of silently weakening E2604.
-    SuspendOrBlock,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct LockEffectCause {
-    span: Span,
-    operation: &'static str,
-    kind: LockEffectKind,
-}
-
-impl LockEffectKind {
-    /// The lattice bits this wait contributes to the shared effect fixpoint
-    /// (willow-uqzx.1.3).
-    fn effects(self) -> RuntimeEffects {
-        match self {
-            Self::Suspend => RuntimeEffects::MAY_SUSPEND,
-            Self::Block => RuntimeEffects::MAY_BLOCK,
-            Self::SuspendOrBlock => RuntimeEffects::MAY_SUSPEND.union(RuntimeEffects::MAY_BLOCK),
-        }
-    }
-}
-
-/// Either kind of wait. E2604 fires on one or the other, never on both at once,
-/// so the query is an intersection rather than a containment.
-const LOCK_EFFECT_WAIT: RuntimeEffects =
-    RuntimeEffects::MAY_SUSPEND.union(RuntimeEffects::MAY_BLOCK);
-
-/// Which callable's direct wait explains a propagated lock effect.
-///
-/// This is the witness carried through [`crate::semantic::effects`]. Witnesses
-/// there join by `min`, and ordering by owner alone reproduces the rule this
-/// analysis has always used: report the lexicographically smallest reachable
-/// owner, so diagnostics do not depend on hash iteration order.
-///
-/// `Eq` is deliberately owner-only too, keeping `Ord` consistent with it. That
-/// is sound because `lock_direct_effects` holds exactly one cause per owner, so
-/// two witnesses naming the same owner carry the same cause.
-#[derive(Debug, Clone)]
-struct LockEffectWitness {
-    owner: FunctionId,
-    cause: LockEffectCause,
-}
-
-impl PartialEq for LockEffectWitness {
-    fn eq(&self, other: &Self) -> bool {
-        self.owner == other.owner
-    }
-}
-
-impl Eq for LockEffectWitness {}
-
-impl PartialOrd for LockEffectWitness {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for LockEffectWitness {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.owner.cmp(&other.owner)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct LockEffectCallsite {
-    callee: FunctionId,
-    span: Span,
+pub struct TypeChecker {
+    resolution: std::rc::Rc<ResolutionContext>,
+    body_queries: Option<std::rc::Rc<crate::compiler_db::body::BodyQueries>>,
+    body_query_error: Option<anyhow::Error>,
+    effect_queries: Option<(
+        std::rc::Rc<crate::compiler_db::effects::EffectQueries>,
+        crate::module::UnitId,
+    )>,
+    declaration_queries: Option<(
+        std::rc::Rc<crate::compiler_db::declarations::DeclarationQueries>,
+        crate::module::UnitId,
+    )>,
+    pub(crate) checked_bodies: Vec<BodyId>,
+    /// Lambdas checked as their own `typed_body` inside the current body.
+    lambdas: body::LambdaChildren,
+    /// Lambdas that were checked inline because their body query had already
+    /// been evaluated (willow-afb5.17); tests assert this stays zero.
+    #[cfg(test)]
+    pub(crate) inline_lambda_rechecks: usize,
+    local: body::BodyState,
+    pub symbols: SymbolTable,
+    pub errors: Vec<Diagnostic>,
+    /// Maps the ID of an UNQUALIFIED enum-variant construction (`Ok(42)` in an
+    /// expected-enum position) to the enum it resolved to. The backend consults
+    /// this to lower such a `Call` as a variant allocation instead of a function
+    /// call (willow-60o.1). The variant name is the call's callee.
+    pub enum_variant_resolutions: HashMap<ExprId, String>,
+    /// Maps an unqualified match pattern's ID (`Ok(v)` / `Closed`, which parse as
+    /// `ClassDowncast` / `Binding`) to the enum-variant pattern it was
+    /// reinterpreted as when the scrutinee is an enum. The backend consults this
+    /// to lower the arm as a variant match (willow-60o.1).
+    pub pattern_resolutions: HashMap<PatternId, Pattern>,
+    /// The resolved type of every checked expression, keyed by its node ID. The
+    /// authoritative record for consumers (HIR lowering) that must not
+    /// re-derive types from the AST (willow-mb5 checker pivot). A node ID is
+    /// syntax identity rather than a source coordinate, so a pass that rebuilds
+    /// a node cannot silently inherit its neighbour's type (willow-njot).
+    pub expr_types: HashMap<ExprId, Type>,
+    /// Reference-parameter modes of resolved async calls, keyed by argument identity.
+    pub reference_arg_modes: HashMap<ExprId, ParamMode>,
+    /// What every type ANNOTATION the checker normalized became: the written
+    /// spelling (`Arr<i64>`, `std::result::Result<i64, String>`, a module's own
+    /// `Level`) mapped to the type the rest of the compiler uses for it
+    /// (willow-0g8j.3). HIR lowering takes annotations straight off the AST,
+    /// which is the one place a written spelling could still reach the back end
+    /// and be turned down as an unknown type.
+    pub normalized_types: HashMap<Type, Type>,
+    /// What each static call's written class name resolved to, keyed by the
+    /// call expression's ID, when the two differ: `Dict::new()` under
+    /// `import std::collections::Map as Dict` records `Map` (willow-0g8j.3).
+    pub static_call_classes: HashMap<ExprId, String>,
+    /// What each lambda captures from its enclosing function, keyed by the
+    /// lambda expression's ID and ordered as the closure environment lays the
+    /// slots out (willow-0g8j.2.12). An absent entry and an empty vector mean
+    /// the same thing — a non-capturing lambda, which stays a plain `fn` value.
+    pub lambda_captures: HashMap<ExprId, Vec<LambdaCapture>>,
+    /// Canonical names of every class already labelled by an E0426 class
+    /// `extends` cycle diagnostic. Each member of a cycle discovers the same
+    /// cycle from its own declaration; the first one in declaration order
+    /// reports it and the rest stay silent (willow-jlky).
+    reported_class_cycles: HashSet<String>,
+    /// Collection type names referenced through fully-qualified `std` paths.
+    fully_qualified_collection_types: HashSet<String>,
+    /// Suppress duplicate missing-import diagnostics per type name.
+    missing_collection_imports_reported: HashSet<String>,
+    resolved_calls: HashMap<FunctionId, crate::semantic::call_graph::CallSites>,
+    task_method_calls: Vec<crate::compiler_db::effects::TaskMethodCall>,
+    effect_inputs: crate::compiler_db::effects::EffectInputs,
+    effect_graph_only: Option<crate::semantic::call_graph::CallGraph>,
 }
 
 /// Internal callable identity for a non-generic interface default body. The
@@ -333,6 +207,18 @@ struct ReferencePlaceInfo {
     immutable_reason: Option<&'static str>,
 }
 
+impl std::ops::Deref for TypeChecker {
+    type Target = ResolutionContext;
+    fn deref(&self) -> &Self::Target {
+        &self.resolution
+    }
+}
+impl std::ops::DerefMut for TypeChecker {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        std::rc::Rc::make_mut(&mut self.resolution)
+    }
+}
+
 impl Default for TypeChecker {
     fn default() -> Self {
         Self::new()
@@ -342,6 +228,22 @@ impl Default for TypeChecker {
 #[willow_continuations::checker]
 impl TypeChecker {
     /// Configure native synchronous-stack support for the compilation target.
+    pub(crate) fn set_declaration_queries(
+        &mut self,
+        queries: std::rc::Rc<crate::compiler_db::declarations::DeclarationQueries>,
+        unit: crate::module::UnitId,
+    ) {
+        self.declaration_queries = Some((queries, unit));
+    }
+
+    pub(crate) fn set_effect_queries(
+        &mut self,
+        queries: std::rc::Rc<crate::compiler_db::effects::EffectQueries>,
+        unit: crate::module::UnitId,
+    ) {
+        self.effect_queries = Some((queries, unit));
+    }
+
     pub fn with_sync_stack_preemption(mut self, supported: bool) -> Self {
         self.task_sync_preemption = supported;
         self
@@ -349,74 +251,59 @@ impl TypeChecker {
 
     pub fn new() -> Self {
         crate::query_stats::add(crate::query_stats::Counter::TypeChecker, 1);
-        let mut checker = Self {
-            symbols: SymbolTable::default(),
-            errors: Vec::new(),
+        let resolution = std::rc::Rc::new(ResolutionContext {
             entry_program: false,
             module_path: None,
-            loop_depth: 0,
-            lock_depth: 0,
-            lexical_block_depth: 0,
-            async_local_types: Vec::new(),
-            declared_type_params: Vec::new(),
-            enum_variant_resolutions: HashMap::new(),
-            pattern_resolutions: HashMap::new(),
-            expr_types: HashMap::new(),
-            reference_arg_modes: HashMap::new(),
-            inferred_maps: HashMap::new(),
-            normalized_types: HashMap::new(),
-            static_call_classes: HashMap::new(),
-            lambda_captures: HashMap::new(),
-            capture_writes: HashSet::new(),
-            match_expected: None,
-            current_return_type: Type::Void,
-            lambda_return_stack: Vec::new(),
-            current_class: None,
-            current_async_context: false,
-            task_sync_preemption: cfg!(any(
-                all(
-                    target_os = "linux",
-                    target_env = "gnu",
-                    any(target_arch = "x86_64", target_arch = "aarch64")
-                ),
-                all(
-                    target_os = "macos",
-                    any(target_arch = "x86_64", target_arch = "aarch64")
-                ),
-                all(
-                    target_os = "windows",
-                    target_env = "msvc",
-                    target_arch = "x86_64"
-                )
-            )),
-            in_static_method: false,
-            in_static_initializer: false,
-            in_constructor: false,
-            reported_class_cycles: HashSet::new(),
+            task_sync_preemption: crate::compiler_db::inputs::TargetCapabilities::native()
+                .sync_stack_preemption,
             imported_names: HashMap::new(),
             module_access_names: HashMap::new(),
             signature_only_modules: HashSet::new(),
             imported_collection_types: HashSet::new(),
             imported_collection_aliases: HashMap::new(),
-            fully_qualified_collection_types: HashSet::new(),
             imported_std_modules: HashMap::new(),
             imported_blocking_std_functions: HashMap::new(),
-            missing_collection_imports_reported: HashSet::new(),
             enforce_send_sync: false,
-            nonpreemptible_methods: HashMap::new(),
+            nonpreemptible_methods: Default::default(),
             nonpreemptible_module_methods: HashMap::new(),
-            current_effect_callable: None,
-            lock_effect_callables: HashMap::new(),
-            lock_effect_hierarchy: ClassHierarchy::default(),
-            lock_effect_edges: HashMap::new(),
-            lock_direct_effects: HashMap::new(),
-            lock_direct_effect_callsites: Vec::new(),
-            lock_effect_callsites: Vec::new(),
-        };
+            effect_index: Default::default(),
+        });
+        let mut checker = Self::empty(resolution, SymbolTable::default());
         checker.register_builtin_functions();
         checker.register_builtin_modules();
         checker.register_builtin_panic_surface();
         checker
+    }
+
+    fn empty(resolution: std::rc::Rc<ResolutionContext>, symbols: SymbolTable) -> Self {
+        Self {
+            resolution,
+            body_queries: None,
+            body_query_error: None,
+            effect_queries: None,
+            declaration_queries: None,
+            checked_bodies: Vec::new(),
+            lambdas: Default::default(),
+            #[cfg(test)]
+            inline_lambda_rechecks: 0,
+            symbols,
+            local: body::BodyState::default(),
+            errors: Vec::new(),
+            enum_variant_resolutions: HashMap::new(),
+            pattern_resolutions: HashMap::new(),
+            expr_types: HashMap::new(),
+            reference_arg_modes: HashMap::new(),
+            normalized_types: HashMap::new(),
+            static_call_classes: HashMap::new(),
+            lambda_captures: HashMap::new(),
+            reported_class_cycles: HashSet::new(),
+            fully_qualified_collection_types: HashSet::new(),
+            missing_collection_imports_reported: HashSet::new(),
+            resolved_calls: HashMap::new(),
+            task_method_calls: Vec::new(),
+            effect_inputs: Default::default(),
+            effect_graph_only: None,
+        }
     }
 
     /// Name the module whose items this checker is about to check
@@ -523,7 +410,7 @@ impl TypeChecker {
         // Declaration parameters shadow module types, including enum names
         // predeclared before registration. Preserve them for substitution.
         if let Type::Named(name) = ty
-            && self.declared_type_params.contains(name)
+            && self.local.declared_type_params.contains(name)
         {
             return ty.clone();
         }
@@ -1111,7 +998,7 @@ impl TypeChecker {
             }
             // A type parameter of the declaration under validation: `T` in
             // `enum Wrap<T> { Val(T) }` is bound by the declaration itself.
-            Type::Named(name) if self.declared_type_params.iter().any(|p| p == name) => {}
+            Type::Named(name) if self.local.declared_type_params.iter().any(|p| p == name) => {}
             Type::Named(name) => {
                 // A named type must resolve to a known class or enum (including
                 // module-qualified ones like `geometry::Point`, which are
@@ -1152,9 +1039,9 @@ impl TypeChecker {
     }
 
     fn normalize_declared_type(&mut self, ty: &Type, type_params: &[String], span: Span) -> Type {
-        let outer = std::mem::replace(&mut self.declared_type_params, type_params.to_vec());
+        let outer = std::mem::replace(&mut self.local.declared_type_params, type_params.to_vec());
         let normalized = self.normalize_type(ty, span);
-        self.declared_type_params = outer;
+        self.local.declared_type_params = outer;
         normalized
     }
 
@@ -1163,9 +1050,9 @@ impl TypeChecker {
     /// forward reference resolves, and with the parameters in scope, so `T`
     /// is a parameter rather than an unknown type.
     pub(super) fn validate_declared_type(&mut self, ty: &Type, type_params: &[String], span: Span) {
-        let outer = std::mem::replace(&mut self.declared_type_params, type_params.to_vec());
+        let outer = std::mem::replace(&mut self.local.declared_type_params, type_params.to_vec());
         self.validate_type(ty, span);
-        self.declared_type_params = outer;
+        self.local.declared_type_params = outer;
     }
 
     /// Check a written type's type-argument count against the declaration
@@ -1525,12 +1412,12 @@ impl TypeChecker {
     }
 
     fn can_access_private_member(&self, owner: &str) -> bool {
-        self.current_class.as_deref() == Some(owner)
+        self.local.current_class.as_deref() == Some(owner)
     }
 
     /// Returns true when the current class is `owner` or a subclass of `owner`.
     fn can_access_protected_member(&self, owner: &str) -> bool {
-        match self.current_class.as_deref() {
+        match self.local.current_class.as_deref() {
             Some(current) => current == owner || self.class_extends(current, owner),
             None => false,
         }
@@ -1756,7 +1643,7 @@ mod tests {
                     "count={scalar_count}, bad_first={bad_first}: {:?}",
                     checker.errors
                 );
-                assert!(checker.async_local_types.is_empty());
+                assert!(checker.local.async_local_types.is_empty());
             }
         }
     }
@@ -1786,7 +1673,7 @@ async fn run() {
             "{:?}",
             checker.errors
         );
-        assert!(checker.async_local_types.is_empty());
+        assert!(checker.local.async_local_types.is_empty());
     }
 
     fn assert_typecheck_ok(source: &str) {

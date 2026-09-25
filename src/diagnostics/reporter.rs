@@ -39,8 +39,12 @@ pub fn emit_with(
 ) -> io::Result<()> {
     emit_header(diag, writer)?;
 
+    // Primary locations lead regardless of how file ids were assigned, so the
+    // rendering does not depend on import order. Ties keep file-id order.
     let mut files: Vec<_> = group_labels(&diag.labels).into_iter().collect();
-    files.sort_unstable_by_key(|(file_id, _)| *file_id);
+    files.sort_unstable_by_key(|(file_id, labels)| {
+        (labels.location.kind != LabelKind::Primary, *file_id)
+    });
     for (file_id, labels) in files {
         // Legacy multi-file output omits files with only line-zero labels.
         if !labels.lines.is_empty()
@@ -362,6 +366,30 @@ mod tests {
         assert_eq!(
             String::from_utf8(single).unwrap(),
             "error[E0001]: order\n ::: other.wi:0:2\n"
+        );
+    }
+
+    #[test]
+    fn primary_file_renders_first_regardless_of_file_id_order() {
+        let mut maps = SourceMaps::new(SourceMap::new("entry.wi", "base"));
+        maps.insert(SourceMap::with_file_id(FileId(1), "leaf.wi", "derived"));
+        let diagnostic = Diagnostic::new(Severity::Error, ErrorCode::E0001, "order")
+            .with_label(Label::secondary(Span::new(0, 4, 1, 1), "defined here"))
+            .with_label(Label::primary(
+                Span::in_file(FileId(1), 0, 7, 1, 1),
+                "cannot extend",
+            ));
+        let mut output = Vec::new();
+        emit_with(&diagnostic, &maps, &mut output).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            concat!(
+                "error[E0001]: order\n",
+                " --> leaf.wi:1:1\n",
+                "  |\n1 | derived\n  | ^^^^^^^ cannot extend\n  |\n",
+                " ::: entry.wi:1:1\n",
+                "  |\n1 | base\n  | ---- defined here\n  |\n",
+            )
         );
     }
 

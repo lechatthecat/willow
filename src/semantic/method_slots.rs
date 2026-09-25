@@ -13,7 +13,7 @@ impl MethodId {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct MethodSlots {
     names: Vec<String>,
     index: HashMap<MethodId, usize>,
@@ -59,6 +59,17 @@ impl<'a> IntoIterator for &'a MethodSlots {
     type IntoIter = std::slice::Iter<'a, String>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
+    }
+}
+
+impl serde::Serialize for MethodSlots {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&self.names, serializer)
+    }
+}
+impl<'de> serde::Deserialize<'de> for MethodSlots {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::<String>::deserialize(deserializer).map(Self::from)
     }
 }
 

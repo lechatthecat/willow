@@ -975,6 +975,7 @@ impl Parser {
                 let end = self.previous_span();
                 let block_span = ret_span.to(end);
                 MatchBody::Block(Block {
+                    id: crate::parser::ast::BodyId::fresh(),
                     stmts: vec![Stmt::Return(ReturnStmt {
                         value,
                         span: ret_span,

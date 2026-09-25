@@ -21,11 +21,32 @@ pub fn check(
     types: &HashMap<ExprId, Type>,
     modes: &HashMap<ExprId, ParamMode>,
 ) -> Vec<Diagnostic> {
+    check_with(program, types, modes, |_, compute| Ok(compute()))
+        .expect("standalone borrow analysis is infallible")
+}
+
+pub(crate) enum BorrowRoot {
+    Block(BodyId),
+    Initializer(ExprId),
+}
+
+/// Preserve the established initializer-first emission order while allowing
+/// the session to memoize each root independently. One shared deduplication
+/// set at aggregation retains injected defaults with shared source ExprIds.
+pub(crate) fn check_with(
+    program: &Program,
+    types: &HashMap<ExprId, Type>,
+    modes: &HashMap<ExprId, ParamMode>,
+    mut evaluate: impl FnMut(
+        BorrowRoot,
+        &mut dyn FnMut() -> BorrowReport,
+    ) -> anyhow::Result<BorrowReport>,
+) -> anyhow::Result<Vec<Diagnostic>> {
     if !modes
         .values()
         .any(|mode| matches!(mode, ParamMode::Reference { .. }))
     {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut blocks = Vec::new();
     let mut initializers = Vec::new();
@@ -56,25 +77,41 @@ pub fn check(
         errors: Vec::new(),
         reported: HashSet::new(),
     };
+    let mut reports = Vec::new();
     for (initializer, boundary) in initializers {
         // Field initializers report escapes at the whole initializer, as
         // before the single-walk rewrite; bodies report at the call itself.
-        checker.walk(
-            AstEvent::Expr(initializer),
-            boundary,
-            Some(initializer.span()),
-        );
+        let id = initializer.id();
+        reports.extend(evaluate(BorrowRoot::Initializer(id), &mut || {
+            checker.reported = HashSet::new();
+            checker.walk(
+                AstEvent::Expr(initializer),
+                boundary,
+                Some(initializer.span()),
+            );
+            std::mem::take(&mut checker.errors)
+        })?);
     }
     for block in blocks {
-        checker.walk(AstEvent::Block(block), block.span, None);
+        reports.extend(evaluate(BorrowRoot::Block(block.id), &mut || {
+            checker.reported = HashSet::new();
+            checker.walk(AstEvent::Block(block), block.span, None);
+            std::mem::take(&mut checker.errors)
+        })?);
     }
-    checker.errors
+    let mut reported = HashSet::new();
+    Ok(reports
+        .into_iter()
+        .filter_map(|(id, diagnostic)| reported.insert(id).then_some(diagnostic))
+        .collect())
 }
+
+pub(crate) type BorrowReport = Vec<(ExprId, Diagnostic)>;
 
 struct Checker<'a> {
     types: &'a HashMap<ExprId, Type>,
     modes: &'a HashMap<ExprId, ParamMode>,
-    errors: Vec<Diagnostic>,
+    errors: BorrowReport,
     reported: HashSet<ExprId>,
 }
 
@@ -130,7 +167,7 @@ impl Checker<'_> {
                 },
             ));
         }
-        self.errors.push(diagnostic);
+        self.errors.push((task.call, diagnostic));
     }
 
     /// One source-order walk handles both local discharge and ancestor uses.

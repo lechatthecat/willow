@@ -781,6 +781,7 @@ impl Codegen {
             params: m.params.clone(),
             return_type: m.return_type.clone(),
             body: Block {
+                id: crate::parser::ast::BodyId::fresh(),
                 stmts: Vec::new(),
                 span: m.span,
             },
@@ -1153,15 +1154,11 @@ impl Codegen {
                 builtin_module_aliases: &self.builtin_module_aliases,
                 lambda_names: &self.lambda_names,
                 string_literals: &self.string_literals,
-                class_layouts: &self.class_layouts,
+                classes: ClassView::new(&self.type_scope, &self.layout_queries),
                 static_storage: &self.static_storage,
                 enum_infos: &self.enum_infos,
-                class_base: &self.class_base,
-                class_type_ids: &self.class_type_ids,
                 class_descriptor_ids: &self.class_descriptor_ids,
-                class_vslots: &self.class_vslots,
                 dispatch_cache: &self.dispatch_cache,
-                interface_infos: &self.interface_infos,
                 vtable_ids: &self.vtable_ids,
                 coop_frame: None,
                 coop_suspend_points: None,
@@ -1369,15 +1366,11 @@ impl Codegen {
                 builtin_module_aliases: &self.builtin_module_aliases,
                 lambda_names: &self.lambda_names,
                 string_literals: &self.string_literals,
-                class_layouts: &self.class_layouts,
+                classes: ClassView::new(&self.type_scope, &self.layout_queries),
                 static_storage: &self.static_storage,
                 enum_infos: &self.enum_infos,
-                class_base: &self.class_base,
-                class_type_ids: &self.class_type_ids,
                 class_descriptor_ids: &self.class_descriptor_ids,
-                class_vslots: &self.class_vslots,
                 dispatch_cache: &self.dispatch_cache,
-                interface_infos: &self.interface_infos,
                 vtable_ids: &self.vtable_ids,
                 coop_frame: None,
                 coop_suspend_points: None,
@@ -2297,7 +2290,7 @@ mod task_boundary_callback_tests {
         let (hir, errors) = crate::ir::lower::lower_program_with(&program, &tables);
         assert!(errors.is_empty(), "{errors:?}");
         let lir = crate::ir::lowered::lower_program(&hir).functions.remove(0);
-        let codegen = Codegen::new(&crate::CompilerOptions::debug()).unwrap();
+        let codegen = Codegen::for_tests(&crate::CompilerOptions::debug()).unwrap();
         let (layout, offsets, _) = codegen.lir_async_layout(&lir, Vec::new(), 0).unwrap();
         (lir, layout, offsets)
     }
@@ -2375,7 +2368,7 @@ mod task_boundary_callback_tests {
         let tables = crate::ir::lower::CheckerTables::from_checker(&checker);
         let (hir, diagnostics) = crate::ir::lower::lower_program_with(&program, &tables);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        let mut codegen = Codegen::new(&crate::CompilerOptions::debug()).unwrap();
+        let mut codegen = Codegen::for_tests(&crate::CompilerOptions::debug()).unwrap();
         codegen.register_lir_functions(crate::ir::lowered::lower_program(&hir));
         CALLBACK_WORK.with(|work| work.set((0, 0, 0, 0)));
         codegen

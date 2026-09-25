@@ -324,6 +324,35 @@ async fn main() {
     );
 }
 
+#[test]
+fn lock_default_body_wait_is_rejected_through_a_concrete_receiver() {
+    assert_compile_error_contains(
+        r#"
+interface Receiver extends Send {
+    fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+class Impl implements Receiver {}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let receiver = new Impl();
+    lock m as value {
+        receiver.run(ch);
+    }
+}
+"#,
+        &[
+            "error[E2604]",
+            "cannot call a waiting helper while holding a Willow lock",
+            "Channel.recv",
+        ],
+    );
+}
+
 /// Perspective 39: imported implementation bodies are not part of the entry
 /// TypeChecker's call graph yet. Interface dispatch therefore fails closed
 /// instead of assuming that an unavailable implementation is pure.

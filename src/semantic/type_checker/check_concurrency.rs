@@ -18,8 +18,8 @@ impl TypeChecker {
                     if binding != "_" {
                         // Include the received binding in the task's Send check,
                         // independently of other bindings at the same source span.
-                        if self.current_async_context {
-                            self.async_local_types.push(elem.clone());
+                        if self.local.current_async_context {
+                            self.local.async_local_types.push(elem.clone());
                         }
                         self.define_var(
                             binding.clone(),
@@ -38,8 +38,8 @@ impl TypeChecker {
                     let v_ty = self.check_expr(value);
                     // A bounded send can suspend while holding the value,
                     // so its type participates in the task's Send check.
-                    if self.current_async_context && elem != Type::Void {
-                        self.async_local_types.push(elem.clone());
+                    if self.local.current_async_context && elem != Type::Void {
+                        self.local.async_local_types.push(elem.clone());
                     }
                     if elem != Type::Void && v_ty != elem {
                         self.push(
@@ -77,7 +77,7 @@ impl TypeChecker {
                     // one written outside a select: waiting on a task is only
                     // possible in an async fn (willow-qrj9). Channel and
                     // `sleep` cases stay legal in a sync select.
-                    if !self.current_async_context {
+                    if !self.local.current_async_context {
                         self.push(
                             Diagnostic::new(
                                 Severity::Error,
@@ -123,8 +123,8 @@ impl TypeChecker {
                     };
                     if binding != "_" {
                         // Include the join binding just like a received binding.
-                        if self.current_async_context {
-                            self.async_local_types.push(result_ty.clone());
+                        if self.local.current_async_context {
+                            self.local.async_local_types.push(result_ty.clone());
                         }
                         self.define_var(
                             binding.clone(),
@@ -1131,8 +1131,8 @@ impl TypeChecker {
                     // cooperative `send` on a bounded channel is a suspend
                     // point, so the lowering frame-backs channel + value and
                     // carries the value into the task (willow-o038).
-                    if self.current_async_context && element_ty != Type::Void {
-                        self.async_local_types.push(element_ty.clone());
+                    if self.local.current_async_context && element_ty != Type::Void {
+                        self.local.async_local_types.push(element_ty.clone());
                     }
                     if matches!(arg.mode, CallArgMode::Reference { .. }) {
                         self.push(

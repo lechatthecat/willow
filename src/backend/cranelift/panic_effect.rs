@@ -9,31 +9,29 @@
 //! The call edges come from the shared graph in [`crate::semantic::call_graph`]
 //! (willow-uqzx.1.2) and the propagation from the shared fixpoint in
 //! [`crate::semantic::effects`] (willow-uqzx.1.3); this module owns only the
-//! hazard classification and the [`FunctionId`] -> linker-symbol mapping in
+//! standalone external-call adaptation and [`FunctionId`] -> linker-symbol mapping in
 //! [`backend_symbol`].
 
 use super::ModuleSymbols;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
+use crate::compiler_db::effects::EffectQueries;
+use crate::module::UnitId;
 use crate::parser::ast::*;
-use crate::parser::iter::{AstEvent, AstWalk};
-use crate::semantic::call_graph::{CallGraph, ClassHierarchy};
-use crate::semantic::effects::{EffectProblem, RuntimeEffects};
+use crate::semantic::effects::RuntimeEffects;
 use crate::semantic::ids::{FunctionId, FunctionMap};
 
 use super::symbols::{
     class_member_symbol, class_method_symbol_name, module_item_symbol, module_symbol_prefix,
 };
-use super::type_helpers::builtin_call_runtime_name;
 use super::{Codegen, FuncGen};
 
 /// The only effect this analysis reads out of the shared lattice.
 const PANIC: RuntimeEffects = RuntimeEffects::MAY_PANIC;
 
-struct Candidate<'a> {
+struct Candidate {
     key: String,
     id: FunctionId,
-    body: &'a Block,
 }
 
 /// Naming information for one compilation unit. Imported modules have a
@@ -54,6 +52,39 @@ pub(super) fn analyze_program(
     lambdas: &[(String, LambdaExpr)],
     expr_types: &HashMap<ExprId, Type<crate::semantic::ids::TypeId>>,
 ) -> HashMap<String, bool> {
+    analyze_program_with_queries(
+        program,
+        naming,
+        known,
+        known_modules,
+        lambdas,
+        expr_types,
+        None,
+    )
+    .expect("standalone panic analysis has no fallible query")
+}
+
+/// The session's effect queries for one unit. `lambda_bodies` runs parallel
+/// to the lifted lambdas: the checked body identity of each, whose resolved
+/// call edges the session graph already holds under [`FunctionId::lambda`].
+struct Session<'a> {
+    queries: &'a EffectQueries,
+    unit: UnitId,
+    lambda_bodies: Vec<BodyId>,
+    lambda_units: HashMap<FunctionId, UnitId>,
+}
+
+/// Without a session, the shared type checker collects resolved edges and
+/// the standalone adapter maps lambda block identities to lifted symbols.
+fn analyze_program_with_queries(
+    program: &Program,
+    naming: UnitNaming<'_>,
+    known: &FunctionMap<bool>,
+    known_modules: &ModuleSymbols,
+    lambdas: &[(String, LambdaExpr)],
+    expr_types: &HashMap<ExprId, Type<crate::semantic::ids::TypeId>>,
+    session: Option<Session<'_>>,
+) -> anyhow::Result<HashMap<String, bool>> {
     let mut free_keys = HashMap::new();
     let mut method_keys = HashMap::new();
     let mut candidates = Vec::new();
@@ -66,7 +97,6 @@ pub(super) fn analyze_program(
                 candidates.push(Candidate {
                     key,
                     id: FunctionId::free(function.name.as_str()),
-                    body: &function.body,
                 });
             }
             Item::Class(class) => {
@@ -77,16 +107,14 @@ pub(super) fn analyze_program(
                     candidates.push(Candidate {
                         key,
                         id: FunctionId::method(owner, method.name.as_str()),
-                        body: &method.body,
                     });
                 }
-                for constructor in &class.constructors {
+                for _constructor in &class.constructors {
                     let key = method_key(&class.name, "init", naming, known_modules);
                     method_keys.insert((class.name.clone(), "init".to_string()), key.clone());
                     candidates.push(Candidate {
                         key,
                         id: FunctionId::method(owner, "init"),
-                        body: &constructor.body,
                     });
                 }
             }
@@ -96,23 +124,31 @@ pub(super) fn analyze_program(
 
     // Lambda calls remain indirect and therefore conservative at their call
     // sites, but recording their own fact keeps the callable inventory total.
-    // The lifted symbol doubles as the lambda's graph id: it cannot collide
-    // with a source function name.
+    // The graph id is the checked body identity when the session has one;
+    // otherwise the lifted symbol, which cannot collide with a source name.
+    let lambda_bodies = session
+        .as_ref()
+        .map(|session| session.lambda_bodies.as_slice());
+    if let Some(bodies) = lambda_bodies {
+        anyhow::ensure!(
+            bodies.len() == lambdas.len(),
+            "lambda identity/declaration count mismatch"
+        );
+    }
     let mut lambda_ids = Vec::new();
-    for (name, lambda) in lambdas {
-        if let LambdaBody::Block(body) = &lambda.body {
-            let id = FunctionId::free(name.as_str());
+    for (index, (name, lambda)) in lambdas.iter().enumerate() {
+        if let LambdaBody::Block(_) = &lambda.body {
+            let id = match lambda_bodies {
+                Some(bodies) => FunctionId::lambda(bodies[index]),
+                None => FunctionId::free(name.as_str()),
+            };
             lambda_ids.push((id, lambda));
             candidates.push(Candidate {
                 key: name.clone(),
                 id,
-                body,
             });
         }
     }
-
-    let hierarchy = ClassHierarchy::from_program(program);
-    let graph = CallGraph::build(program, &hierarchy, &lambda_ids);
 
     let context = AnalysisContext {
         known,
@@ -121,53 +157,37 @@ pub(super) fn analyze_program(
         method_keys: &method_keys,
     };
 
-    // Every "cannot see it" answer is `MAY_PANIC`: an unresolved call site, an
-    // edge that escapes the problem, and a declared body with no graph node all
-    // stay conservative. A pure recursive cycle has no seed at all and is
-    // therefore still proved safe.
-    let mut problem: EffectProblem<()> = EffectProblem::new()
-        .external_callee(PANIC)
-        .unknown_callee(PANIC)
-        .missing_body(PANIC);
-
-    let own_bodies: HashSet<&FunctionId> =
-        candidates.iter().map(|candidate| &candidate.id).collect();
-    for candidate in &candidates {
-        let mut hazards = HazardVisitor {
-            panics: false,
+    let facts = match session {
+        Some(session) => std::sync::Arc::new(
+            candidates
+                .iter()
+                .map(|candidate| {
+                    let unit = session
+                        .lambda_units
+                        .get(&candidate.id)
+                        .copied()
+                        .unwrap_or(session.unit);
+                    (candidate.id, session.queries.panic(unit, candidate.id))
+                })
+                .collect(),
+        ),
+        None => std::sync::Arc::new(crate::compiler_db::effects::analyze(
+            program,
+            &lambda_ids,
             expr_types,
-        };
-        hazards.visit_block(candidate.body);
-        problem = problem.body(candidate.id);
-        if hazards.panics {
-            problem = problem.seed(candidate.id, PANIC, None);
-        }
-    }
-
-    // Resolve every edge target this unit does not own into a leaf fact:
-    // a language intrinsic, a runtime ABI row, or an already-analyzed imported
-    // symbol. Seeding them as leaves keeps the classification in one place and
-    // lets the shared fixpoint own the propagation.
-    for (_, sites) in graph.iter() {
-        for target in &sites.targets {
-            if own_bodies.contains(target) {
-                continue;
-            }
-            problem = problem.seed(*target, external_effects(target, &context), None);
-        }
-    }
-
-    let facts = problem.solve(&graph);
+            |target| external_effects(target, &context),
+        )),
+    };
 
     let mut effects: HashMap<String, bool> = HashMap::new();
     for candidate in candidates {
         // Multiple constructors currently share one backend `init` symbol.
         // Union their facts rather than letting a later declaration erase an
         // earlier hazard.
-        let may_panic = facts.intersects(&candidate.id, PANIC);
+        let may_panic = facts.get(&candidate.id).copied().unwrap_or(true);
         *effects.entry(candidate.key).or_insert(false) |= may_panic;
     }
-    effects
+    Ok(effects)
 }
 
 fn optimization_enabled() -> bool {
@@ -182,15 +202,73 @@ impl Codegen {
         program: &Program,
         naming: UnitNaming<'_>,
         lambdas: &[(String, LambdaExpr)],
-    ) {
-        let effects = analyze_program(
-            program,
-            naming,
-            &self.function_may_panic,
-            &self.known_modules,
-            lambdas,
-            &self.expr_types,
-        );
+        lambda_declarations: &[crate::parser::ast::BodyId],
+        expr_types: &HashMap<ExprId, Type<crate::semantic::ids::TypeId>>,
+    ) -> anyhow::Result<()> {
+        let effects = if let Some((queries, unit)) = &self.effect_queries {
+            // The checker publishes lambda edges under checked body identities,
+            // so a session without body queries would read every lambda as an
+            // unchecked body. A copied interface default is checked once under
+            // its canonical body: its lambdas' edges live under the source
+            // lambda identity. Cross-unit copies read the source unit's facts;
+            // generic instances without a canonical proof keep their own facts.
+            let index = self
+                .body_queries
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("effect queries require body queries"))?
+                .index();
+            let lambda_bodies: Vec<_> = lambda_declarations
+                .iter()
+                .map(|body| {
+                    // A checked copy combines canonical hazards with its own
+                    // resolved edges. Prefer it when present, so a differently
+                    // bound free call cannot inherit a false no-panic proof.
+                    if queries.has_fact(*unit, FunctionId::lambda(*body)) {
+                        return *body;
+                    }
+                    let source = index.source_body(*body);
+                    if index
+                        .owner(source)
+                        .is_some_and(|(unit, _)| queries.has_fact(unit, FunctionId::lambda(source)))
+                    {
+                        source
+                    } else {
+                        *body
+                    }
+                })
+                .collect();
+            let lambda_units = lambda_bodies
+                .iter()
+                .filter_map(|body| {
+                    index
+                        .owner(*body)
+                        .map(|(unit, _)| (FunctionId::lambda(*body), unit))
+                })
+                .collect();
+            analyze_program_with_queries(
+                program,
+                naming,
+                &self.function_may_panic,
+                &self.known_modules,
+                lambdas,
+                expr_types,
+                Some(Session {
+                    queries,
+                    unit: *unit,
+                    lambda_bodies,
+                    lambda_units,
+                }),
+            )?
+        } else {
+            analyze_program(
+                program,
+                naming,
+                &self.function_may_panic,
+                &self.known_modules,
+                lambdas,
+                expr_types,
+            )
+        };
         let mut ordered = effects.into_iter().collect::<Vec<_>>();
         ordered.sort_by(|left, right| left.0.cmp(&right.0));
         *self.dispatch_cache.get_mut() = Default::default();
@@ -204,6 +282,7 @@ impl Codegen {
             }
             self.function_may_panic.insert(name, may_panic);
         }
+        Ok(())
     }
 }
 
@@ -298,21 +377,8 @@ fn backend_symbol(id: &FunctionId, context: &AnalysisContext<'_>) -> String {
 /// shared lattice is [`RuntimeEffects`] — the fact comes straight off the ABI
 /// table rather than a list maintained per analysis.
 fn external_effects(target: &FunctionId, context: &AnalysisContext<'_>) -> RuntimeEffects {
-    // Language intrinsics and runtime builtins have no user body to reach, so
-    // they are classified by source name before any symbol mapping.
-    if target.owner().is_none() && target.namespace().is_none() {
-        match target.name() {
-            "panic" | "format" => return PANIC,
-            "recover" | "pow" | "powf" => return RuntimeEffects::NONE,
-            name => {
-                if let Some(runtime_name) = builtin_call_runtime_name(name) {
-                    return crate::backend::abi::runtime_symbol(runtime_name)
-                        .map(|symbol| symbol.effects().intersection(PANIC))
-                        // An unclassified builtin is not proof of safety.
-                        .unwrap_or(PANIC);
-                }
-            }
-        }
+    if let Some(effects) = crate::compiler_db::effects::intrinsic_effects(target) {
+        return effects;
     }
 
     let key = backend_symbol(target, context);
@@ -326,151 +392,9 @@ fn external_effects(target: &FunctionId, context: &AnalysisContext<'_>) -> Runti
     }
 }
 
-/// Direct hazards a body performs itself, independent of what it calls.
-///
-/// Direct hazards accumulate independently of traversal order. The explicit
-/// worklist keeps this read-only analysis independent of expression depth.
-struct HazardVisitor<'a> {
-    panics: bool,
-    expr_types: &'a HashMap<ExprId, Type<crate::semantic::ids::TypeId>>,
-}
-
-impl HazardVisitor<'_> {
-    fn mark_direct(&mut self) {
-        self.panics = true;
-    }
-}
-
-impl HazardVisitor<'_> {
-    fn visit_block(&mut self, block: &Block) {
-        let mut walk = AstWalk::new(AstEvent::Block(block));
-        while let Some(event) = walk.next() {
-            match event {
-                // A lambda is analyzed as its own callable.
-                AstEvent::Lambda(_) => walk.skip_children(),
-                AstEvent::Stmt(stmt) => self.visit_stmt(stmt),
-                AstEvent::Expr(expr) => self.visit_expr(expr),
-                _ => {}
-            }
-        }
-    }
-
-    fn visit_stmt(&mut self, statement: &Stmt) {
-        match statement {
-            // Bounds guard.
-            Stmt::IndexAssign(_) => self.mark_direct(),
-            // Recursive acquisition and a lost ownership token are recoverable
-            // language faults.
-            Stmt::Lock(_) => self.mark_direct(),
-            // `super.init` is an unresolved edge in the shared graph, which
-            // already makes the body conservative.
-            Stmt::Let(_)
-            | Stmt::SuperInit(_)
-            | Stmt::Assign(_)
-            | Stmt::FieldAssign(_)
-            | Stmt::StaticFieldAssign(_)
-            | Stmt::If(_)
-            | Stmt::While(_)
-            | Stmt::Break(_)
-            | Stmt::Continue(_)
-            | Stmt::Defer(_)
-            | Stmt::For(_)
-            | Stmt::Return(_)
-            | Stmt::Expr(_) => {}
-        }
-    }
-
-    fn visit_expr(&mut self, expression: &Expr) {
-        match expression {
-            Expr::Binary(expr) => {
-                // Reuse checked expression types; unknown additions remain
-                // conservative for direct backend users without artifacts.
-                let concat = expr.op == BinOp::Add
-                    && !matches!(self.expr_types.get(&expr.id), Some(Type::I64 | Type::F64));
-                if concat || matches!(expr.op, BinOp::Div | BinOp::Rem | BinOp::Pow) {
-                    self.mark_direct();
-                }
-            }
-            Expr::FieldAccess(..) => self.mark_direct(),
-            // Strict await can turn cancellation into a language panic.
-            // TaskResult awaits are intentionally not distinguished here:
-            // retaining a check is conservative.
-            Expr::Await(_) => self.mark_direct(),
-            Expr::Select(_) => self.mark_direct(),
-            // Object/interface display may invoke user `toString` code.
-            Expr::Print(..) => self.mark_direct(),
-            // Bounds guard.
-            Expr::Index(..) => self.mark_direct(),
-            // Every call form is an edge in the shared graph, classified by
-            // `classify_edge` rather than here.
-            Expr::Call(_)
-            | Expr::MethodCall(_)
-            | Expr::StaticCall(_)
-            | Expr::New(_)
-            | Expr::Integer(..)
-            | Expr::Float(..)
-            | Expr::Bool(..)
-            | Expr::String(..)
-            | Expr::Var(..)
-            | Expr::StaticField(_)
-            | Expr::Unary(_)
-            | Expr::ObjectLiteral(_)
-            | Expr::Ternary(_)
-            | Expr::Range(_)
-            | Expr::Lambda(_)
-            | Expr::Match(_)
-            | Expr::TryPropagate(..)
-            | Expr::ArrayLiteral(..) => {}
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn deep_read_only_scans_use_a_one_megabyte_stack() {
-        std::thread::Builder::new()
-            .stack_size(1024 * 1024)
-            .spawn(|| {
-                let tokens = crate::lexer::Lexer::new("async fn f() { await sleep(1); }")
-                    .tokenize()
-                    .unwrap();
-                let (mut program, errors) = crate::parser::Parser::new(tokens).parse();
-                assert!(errors.is_empty());
-                let Item::Function(function) = &mut program.items[0] else {
-                    unreachable!()
-                };
-                let Stmt::Expr(expr) = &mut function.body.stmts[0] else {
-                    unreachable!()
-                };
-                let span = crate::diagnostics::Span::new(0, 0, 1, 1);
-                let mut expr =
-                    std::mem::replace(&mut expr.expr, crate::parser::ownership::placeholder_expr());
-                for _ in 0..50_000 {
-                    expr = Expr::TryPropagate(
-                        Box::new(expr),
-                        span,
-                        crate::parser::ast::ExprId::fresh(),
-                    );
-                }
-                function
-                    .body
-                    .stmts
-                    .push(Stmt::Expr(crate::parser::ast::ExprStmt { expr, span }));
-                let mut hazards = HazardVisitor {
-                    panics: false,
-                    expr_types: &HashMap::new(),
-                };
-                hazards.visit_block(&function.body);
-                assert!(hazards.panics);
-                drop(program);
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
 
     use crate::lexer::Lexer;
     use crate::parser::Parser;
