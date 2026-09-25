@@ -1741,7 +1741,7 @@ fn native_reference_arrays_use_bounded_continuations_in_the_real_engine() {
         for slot in 0..slots {
             crate::array::willow_array_set(array, slot as i64, child as i64);
         }
-        let (_, cycle) = root_handshake::begin();
+        let (_, cycle) = root_handshake::begin().expect("no foreign root owner");
         let mut consumer = cycle.queue.register_assist();
         let mut jobs = 0;
         while !cycle.queue.snapshot().is_drained() {
@@ -1786,7 +1786,7 @@ fn array_shrink_between_slices_preserves_unscanned_deleted_references() {
         );
     }
     willow_pop_roots(2);
-    let (_, cycle) = root_handshake::begin();
+    let (_, cycle) = root_handshake::begin().expect("no foreign root owner");
     let mut consumer = cycle.queue.register_assist();
     assert_eq!(cycle.drain_worker(2, &mut Vec::new(), &mut consumer).0, 2);
     assert!(!cycle.is_marked(deleted as usize));
@@ -1832,7 +1832,7 @@ fn map_growth_during_slices_has_a_finite_cursor_and_preserves_deleted_values() {
             );
         }
         willow_pop_roots(2);
-        let (_, cycle) = root_handshake::begin();
+        let (_, cycle) = root_handshake::begin().expect("no foreign root owner");
         let mut consumer = cycle.queue.register_assist();
         assert_eq!(cycle.drain_worker(1, &mut Vec::new(), &mut consumer).0, 1);
         assert_eq!(cycle.work.lock().unwrap().scanned_bytes, 512 * 8);
@@ -1936,7 +1936,7 @@ fn task_scope_graph_traces_each_scope_and_frame_once() {
             }
             // Every handle is independently rooted: a transitive hook would
             // visit N(N+1)/2 scopes on the chain, instead of N scopes here.
-            let (_, cycle) = root_handshake::begin();
+            let (_, cycle) = root_handshake::begin().expect("no foreign root owner");
             let mut consumer = cycle.queue.register_assist();
             let mut jobs = 0;
             while !cycle.queue.snapshot().is_drained() {
@@ -1992,7 +1992,7 @@ fn channel_pops_and_appends_do_not_shift_or_extend_the_snapshot() {
             );
         }
         willow_pop_roots(2);
-        let (_, cycle) = root_handshake::begin();
+        let (_, cycle) = root_handshake::begin().expect("no foreign root owner");
         let mut consumer = cycle.queue.register_assist();
         assert_eq!(cycle.drain_worker(1, &mut Vec::new(), &mut consumer).0, 1);
         assert_eq!(cycle.work.lock().unwrap().scanned_bytes, 512 * 8);
@@ -2185,7 +2185,10 @@ fn root_handshake_tlab_owner_index_avoids_mutator_squared_accounting() {
         TLAB_ACCOUNTING_RECORD_VISITS.store(0, Ordering::Relaxed);
         root_handshake::ACTIVATION_ACKS.store(0, Ordering::Relaxed);
         root_handshake::ROOT_ACKS.store(0, Ordering::Relaxed);
+        root_handshake::ACK_NOTIFICATIONS.store(0, Ordering::Relaxed);
         willow_gc_collect();
+        assert_eq!(root_handshake::ACK_NOTIFICATIONS.load(Ordering::Relaxed), 2);
+        println!("root_handshake mutators={count} ack_notifications=2");
         assert_eq!(
             willow_gc_allocated_bytes(),
             (count * (GC_HEADER_SIZE + 8)) as i64
@@ -2223,6 +2226,99 @@ fn root_handshake_tlab_owner_index_avoids_mutator_squared_accounting() {
             4 * count
         );
     }
+    reset_internal_for_test();
+}
+
+#[test]
+fn legacy_owner_unregistering_during_activation_still_publishes_its_roots() {
+    // A legacy owner (explicit root stack claimed before registering) that
+    // acknowledges activation and then unregisters must not leave before the
+    // publication round: it keeps using its roots, so dropping them from the
+    // snapshot freed its live object (chroot_01 hang on ubuntu CI).
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    let leaving = Arc::new(AtomicBool::new(false));
+    let collected = Arc::new(AtomicBool::new(false));
+    let owner = {
+        let (leaving, collected) = (leaving.clone(), collected.clone());
+        std::thread::spawn(move || {
+            let mut tls = tlab_state_for_test();
+            let mut object = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
+            willow_push_root(&mut object);
+            willow_gc_register_mutator();
+            while !runtime().poll_requested.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            // Acknowledge the activation round only; roots are not taken yet.
+            willow_gc_safepoint();
+            leaving.store(true, Ordering::Release);
+            willow_gc_unregister_mutator();
+            while !collected.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            assert_eq!(willow_gc_allocated_bytes(), (GC_HEADER_SIZE + 8) as i64);
+            willow_pop_root();
+        })
+    };
+    let blocker = {
+        let leaving = leaving.clone();
+        std::thread::spawn(move || {
+            willow_gc_register_mutator();
+            while !leaving.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            // Hold the activation round open until the owner has left the
+            // registry; with the owner held back, give up after a bound.
+            let owner_left = || runtime().coord.0.lock().unwrap().mutators.len() == 1;
+            let deadline = Instant::now() + Duration::from_millis(200);
+            while !owner_left() && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            willow_gc_safepoint();
+            willow_gc_unregister_mutator();
+        })
+    };
+    while runtime().coord.0.lock().unwrap().mutators.len() != 2 {
+        std::thread::yield_now();
+    }
+    willow_gc_collect();
+    assert_eq!(
+        willow_gc_allocated_bytes(),
+        (GC_HEADER_SIZE + 8) as i64,
+        "the leaving owner's rooted object was reclaimed"
+    );
+    collected.store(true, Ordering::Release);
+    blocker.join().unwrap();
+    owner.join().unwrap();
+    willow_gc_collect();
+    assert_eq!(willow_gc_allocated_bytes(), 0);
+    reset_internal_for_test();
+}
+
+#[test]
+fn root_handshake_refuses_an_unregistered_owner_with_a_nonempty_stack() {
+    // collect_internal's early skip releases coord before begin(); begin must
+    // decide again under its own hold or an owner leaving in between is lost.
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let owner = std::thread::spawn(move || {
+        let mut tls = tlab_state_for_test();
+        let mut object = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
+        willow_push_root(&mut object);
+        willow_gc_register_mutator();
+        willow_gc_unregister_mutator();
+        held_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        willow_pop_root();
+    });
+    held_rx.recv().unwrap();
+    assert!(root_handshake::begin().is_none());
+    assert!(runtime().coord.0.lock().unwrap().handshake.is_none());
+    assert_eq!(GC_MARK_PHASE.load(Ordering::Acquire), 0);
+    release_tx.send(()).unwrap();
+    owner.join().unwrap();
     reset_internal_for_test();
 }
 

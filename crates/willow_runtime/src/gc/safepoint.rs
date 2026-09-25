@@ -72,7 +72,8 @@ pub extern "C" fn willow_gc_unregister_mutator() {
     flush_satb_current(true);
     let id = std::thread::current().id();
     let (lock, cv) = &runtime().coord;
-    let mut coord = lock.lock().unwrap();
+    let coord = lock.lock().unwrap();
+    let mut coord = root_handshake::wait_for_publication_round(cv, coord);
     root_handshake::publish_current(&mut coord);
     coord.mutators.remove(&id);
     coord.parked.remove(&id);

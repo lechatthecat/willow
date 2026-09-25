@@ -1287,7 +1287,12 @@ fn collect_internal() {
     // independently. Payload tracing is gated until the activation round ends;
     // late TLAB starts are retried after the root-publication round.
     let started = std::time::Instant::now();
-    let (heap_before, marking) = root_handshake::begin();
+    let Some((heap_before, marking)) = root_handshake::begin() else {
+        runtime()
+            .skipped_foreign_owner_collections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Bounded chunks allow a producer-heavy workload to reach remark;
         // finishing relies on quiescing producers, never a racy empty sample.

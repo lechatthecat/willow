@@ -10,8 +10,9 @@ use super::{
     DropFn, GC_GENERATION_OLD, GC_GENERATION_YOUNG, GC_HEADER_SIZE, GC_REGION_MARK_GRANULE,
     GcHeader, GcPayload, GcState, HeapObject, RegionKind, TraceFn, all_registered_stack_roots,
     allocate_old_region_object_locked, drop_registry, foreign_root_stack_owner_active,
-    object_reference_slots, retire_tlabs_with_work, runtime, runtime_roots_snapshot, type_registry,
-    verify_old_region_metadata, verify_remembered_set, willow_gc_safepoint, with_stw,
+    foreign_root_stack_owner_active_locked, object_reference_slots, retire_tlabs_with_work,
+    runtime, runtime_roots_snapshot, type_registry, verify_old_region_metadata,
+    verify_remembered_set, willow_gc_safepoint, with_stw,
 };
 
 /// Folded-multiply hash for aligned heap addresses. SipHash's DoS resistance
@@ -547,17 +548,28 @@ pub(super) fn minor_collect_internal() {
     // Stop the world and scan every registered mutator, for the reason spelled
     // out over the major cycle's mark phase: a registration that races a
     // single-mutator scan leaves the newcomer's objects unmarked (willow-v6k0).
-    let (before, after, work) = with_stw(
+    let collected = with_stw(
         crate::gc_telemetry::stops::StopReason::Minor,
         |coord, stop_work| {
+            // Recheck under the stop's coord hold: an owner may have left the
+            // registry, stack still nonempty, after the unlocked check above.
+            if foreign_root_stack_owner_active_locked(coord) {
+                return None;
+            }
             {
                 let mut state = runtime().heap.lock().unwrap();
                 retire_tlabs_with_work(&mut state, stop_work);
             }
             let roots = all_registered_stack_roots(coord);
-            minor_collect_with_roots(roots, stop_work)
+            Some(minor_collect_with_roots(roots, stop_work))
         },
     );
+    let Some((before, after, work)) = collected else {
+        runtime()
+            .skipped_foreign_owner_collections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    };
     let event = cycle.finish(before, after, work);
     drop(_serialize);
     crate::gc_telemetry::emit_cycle(event);

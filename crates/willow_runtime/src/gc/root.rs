@@ -209,8 +209,13 @@ pub(super) fn clear_root_stack_owner_if_empty() {
 }
 
 pub(super) fn foreign_root_stack_owner_active() -> bool {
+    foreign_root_stack_owner_active_locked(&runtime().coord.0.lock().unwrap())
+}
+
+/// Unregistration also runs under coord, so a collector that decides under the
+/// same lock hold cannot miss a legacy owner that leaves the registry in between.
+pub(super) fn foreign_root_stack_owner_active_locked(coord: &GcCoord) -> bool {
     let current = std::thread::current().id();
-    let coord = runtime().coord.0.lock().unwrap();
     runtime()
         .root_stack_owner
         .lock()
