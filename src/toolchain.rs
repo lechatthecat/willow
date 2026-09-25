@@ -99,6 +99,20 @@ impl Toolchain for HostToolchain {
         if let Some(path) = &self.target.runtime_lib {
             return validate_runtime_library(path);
         }
+        // Relocatable installs keep bin/willowc beside lib/<runtime>. Do not
+        // touch the build tree or invoke Cargo when the bundled library exists.
+        if let Ok(executable) = std::env::current_exe()
+            && let Some(root) = executable.parent().and_then(Path::parent)
+        {
+            let bundled = root.join("lib").join(if cfg!(target_env = "msvc") {
+                "willow_runtime.lib"
+            } else {
+                "libwillow_runtime.a"
+            });
+            if bundled.is_file() {
+                return Ok(bundled);
+            }
+        }
         let path = self.default_runtime_library_path();
         // Cargo may replace the un-hashed staticlib alias even for a fresh
         // build. Hold a process-shared lock through linking so another Willow

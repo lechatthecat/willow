@@ -611,6 +611,63 @@ fn test_runtime_calls_preserve_native_import_relocations() {
 }
 
 #[test]
+fn test_runtime_lib_relocatable_bundle() {
+    let root = PathBuf::from(temp_path(format!("willow bundle {}", unique_test_id())));
+    let original = root.join("original");
+    fs::create_dir_all(original.join("bin")).unwrap();
+    fs::create_dir_all(original.join("lib")).unwrap();
+    let executable = format!("willowc{}", std::env::consts::EXE_SUFFIX);
+    fs::copy(
+        env!("CARGO_BIN_EXE_willowc"),
+        original.join("bin").join(&executable),
+    )
+    .unwrap();
+    {
+        let runtime = build_runtime_staticlib(false);
+        fs::copy(
+            &*runtime,
+            original.join("lib").join(runtime.file_name().unwrap()),
+        )
+        .unwrap();
+    }
+    let relocated = root.join("relocated");
+    fs::rename(&original, &relocated).unwrap();
+    let working = root.join("unrelated cwd");
+    fs::create_dir(&working).unwrap();
+    fs::write(working.join("hello.wi"), "fn main() { println(42); }").unwrap();
+    // Any attempt to enter the development fallback fails before Cargo starts.
+    let blocked_target = root.join("not a directory");
+    fs::write(&blocked_target, "blocked").unwrap();
+    for mode in ["--debug", "--release"] {
+        let output = Command::new(relocated.join("bin").join(&executable))
+            .current_dir(&working)
+            .env_remove("WILLOW_RUNTIME_LIB")
+            .env("CARGO_TARGET_DIR", &blocked_target)
+            .args(["run", "hello.wi", mode])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"42\n");
+    }
+    // An invalid explicit override must not silently select the valid bundle.
+    for cli_override in [false, true] {
+        let mut command = Command::new(relocated.join("bin").join(&executable));
+        command.current_dir(&working).args(["run", "hello.wi"]);
+        if cli_override {
+            command
+                .env_remove("WILLOW_RUNTIME_LIB")
+                .args(["--runtime-lib", "missing-runtime"]);
+        } else {
+            command.env("WILLOW_RUNTIME_LIB", "missing-runtime");
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("missing-runtime"));
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn test_runtime_lib_cli_override_links_program() {
     let runtime_lib = build_runtime_staticlib(false);
     let id = unique_test_id();

@@ -1582,7 +1582,7 @@ fn run_backend(
             ErrorCode::E0700,
             format!("runtime library unavailable: {err}"),
         )
-        .with_help("build willow_runtime with Cargo or pass --runtime-lib / WILLOW_RUNTIME_LIB");
+        .with_help("place the bundled runtime in ../lib relative to willowc, build willow_runtime with Cargo, or pass --runtime-lib / WILLOW_RUNTIME_LIB");
         diagnostics::emit(&d, map);
         anyhow::anyhow!("runtime library unavailable")
     })?;
