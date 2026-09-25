@@ -31,7 +31,7 @@ impl Fixture {
         self.cli_from("app", args)
     }
     fn cli_from(&self, dir: &str, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_willowc"))
+        Command::new(env!("CARGO_BIN_EXE_willow"))
             .current_dir(self.0.join(dir))
             .env("WILLOW_HOME", self.0.join("cache"))
             .args(args)

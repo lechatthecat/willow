@@ -1,4 +1,4 @@
-// Run: willowc build example/current_unit_memory/main.wi -o /tmp/current-unit
+// Run: willow build example/current_unit_memory/main.wi -o /tmp/current-unit
 // WILLOW_UNIT_MEMORY_LOG=1 reports bounded live compilation-unit counts.
 import base;
 

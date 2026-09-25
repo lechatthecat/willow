@@ -3,7 +3,7 @@
 Build from the repository root:
 
 ```sh
-cargo run -p willowc -- build example/package_paths/app -o /tmp/willow-package-paths
+cargo run -p willow -- build example/package_paths/app -o /tmp/willow-package-paths
 /tmp/willow-package-paths
 ```
 

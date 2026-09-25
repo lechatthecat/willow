@@ -70,7 +70,7 @@ fn native_stack_overflow_twenty_call_and_frame_perspectives() {
                 "import std::collections::Array;\n{declarations}\nfn main(args: Array<String>) {{ let depth = args.len() == 0 ? 8 : 1000000; println({call}); }}"
             );
             fs::write(&source_path, source).unwrap();
-            let mut command = Command::new(env!("CARGO_BIN_EXE_willowc"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_willow"));
             command.args(["build", &source_path, "-o", &binary_path]);
             if release {
                 command.arg("--release");

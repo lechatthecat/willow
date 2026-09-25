@@ -13,7 +13,7 @@
 // property's type, and compiles from LIR like everything else. Watch the
 // walker claim each one, by the name the class and field give it:
 //
-//   WILLOW_LIR_LOG=1 willowc build example/lir_static_initializers.wi -o /tmp/a
+//   WILLOW_LIR_LOG=1 willow build example/lir_static_initializers.wi -o /tmp/a
 //   [lir] compiling `Config::$static_init.answer` from lowered IR
 //
 // The initializers still run in DECLARATION order, within a class and across

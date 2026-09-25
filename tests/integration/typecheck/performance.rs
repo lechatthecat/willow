@@ -17,7 +17,7 @@ fn test_leibniz_pi_release_output_and_optional_time_budget() {
     let id = unique_test_id();
     let bin_path = temp_path(format!("willow_leibniz_perf_{}", id));
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let status = Command::new(compiler)
         .args([
             "build",

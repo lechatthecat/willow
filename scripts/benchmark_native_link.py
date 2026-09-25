@@ -70,7 +70,7 @@ def main():
     if system not in {"Linux", "Darwin", "Windows"}:
         parser.error(f"unsupported native platform: {system}")
     windows = system == "Windows"
-    compiler = (args.compiler or ROOT / "target/debug" / ("willowc.exe" if windows else "willowc")).resolve()
+    compiler = (args.compiler or ROOT / "target/debug" / ("willow.exe" if windows else "willow")).resolve()
     linker, env = windows_linker() if windows else (shutil.which("cc") or "cc", os.environ.copy())
     report = {"platform": system, "architecture": platform.machine(), "compiler": str(compiler), "linker": linker, "iterations": args.iterations, "method": "Same object/archive per profile; before/after order alternates each iteration; link wall time excludes executable validation; every result must print 42.", "profiles": []}
     with tempfile.TemporaryDirectory(prefix="willow-native-link-") as directory:

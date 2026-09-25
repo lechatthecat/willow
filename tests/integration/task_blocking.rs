@@ -52,7 +52,7 @@ async fn main() {{ let w = writer(); let p = progress(); await p; await w; }}
         marker_literal
     );
     fs::write(&source_path, source).unwrap();
-    let compiled = Command::new(env!("CARGO_BIN_EXE_willowc"))
+    let compiled = Command::new(env!("CARGO_BIN_EXE_willow"))
         .args(["build", &source_path, "-o", &binary])
         .output()
         .unwrap();
@@ -142,7 +142,7 @@ fn task_sleep_rechecks_deadline_after_injected_early_wakes() {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/sleep_wake_repro.py");
     let output = Command::new("python3")
         .arg(script)
-        .args(["--compiler", env!("CARGO_BIN_EXE_willowc")])
+        .args(["--compiler", env!("CARGO_BIN_EXE_willow")])
         .output()
         .expect("run deterministic sleep wake regression");
     assert!(

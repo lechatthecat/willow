@@ -25,7 +25,7 @@ impl Project {
     fn verify(&self, ok: bool, kind: &str) -> serde_json::Value {
         let mut result = serde_json::Value::Null;
         for format in ["human", "json", "ndjson"] {
-            let out = Command::new(env!("CARGO_BIN_EXE_willowc"))
+            let out = Command::new(env!("CARGO_BIN_EXE_willow"))
                 .current_dir(&self.0)
                 .args(["package", "verify", "--format", format])
                 .output()
@@ -207,7 +207,7 @@ fn git_head_tag_matches_manifest_version() {
 #[test]
 fn explicit_path_and_equals_format() {
     let p = Project::new();
-    let output = Command::new(env!("CARGO_BIN_EXE_willowc"))
+    let output = Command::new(env!("CARGO_BIN_EXE_willow"))
         .args(["package", "verify"])
         .arg(&p.0)
         .arg("--format=json")

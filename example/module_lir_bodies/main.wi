@@ -19,7 +19,7 @@
 // module body used to ICE the compiler.
 //
 // Build it with the selection log — the whole project, module included:
-//   WILLOW_LIR_LOG=1 willowc build example/module_lir_bodies/main.wi -o /tmp/a
+//   WILLOW_LIR_LOG=1 willow build example/module_lir_bodies/main.wi -o /tmp/a
 import shapes;
 
 fn main() {

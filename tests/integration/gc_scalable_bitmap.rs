@@ -287,7 +287,7 @@ fn repeated_wide_class_sites_emit_one_bitmap_descriptor() {
             format!("class Wide {{ {fields} }} {functions} fn main() {{ {calls} }}"),
         )
         .unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_willowc"))
+        let output = Command::new(env!("CARGO_BIN_EXE_willow"))
             .args(["build", &src, "-o", &bin])
             .env("WILLOW_KEEP_OBJECT", "1")
             .output()

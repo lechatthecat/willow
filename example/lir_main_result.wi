@@ -15,7 +15,7 @@
 // which means the entire program below -- helpers and entry point -- is walker
 // compiled. Watch it happen:
 //
-//   WILLOW_LIR_LOG=1 willowc run example/lir_main_result.wi
+//   WILLOW_LIR_LOG=1 willow run example/lir_main_result.wi
 //
 // The program takes the success path so its output is deterministic; the two
 // failure exits are exercised by `tests/integration/lir_main_result.rs`.

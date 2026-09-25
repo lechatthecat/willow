@@ -13,7 +13,7 @@ fn compile_and_run_release_check_exit(source: &str) -> (String, bool) {
     let bin_path = temp_path(format!("willow_release_exit_{id}"));
     fs::write(&src_path, source).expect("write release fixture");
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let compiled = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path, "--release"])
         .output()

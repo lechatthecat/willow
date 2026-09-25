@@ -19,7 +19,7 @@
 // AST emitter always has.
 //
 // Build it with the selection log to see the walker take every function:
-//   WILLOW_LIR_LOG=1 willowc build example/module_class_values/main.wi -o /tmp/a
+//   WILLOW_LIR_LOG=1 willow build example/module_class_values/main.wi -o /tmp/a
 import geom;
 
 // A module class value is fine as a LOCAL in any entry function; it is only

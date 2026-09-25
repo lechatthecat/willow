@@ -17,7 +17,7 @@ def run(command, **kwargs):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--compiler", type=Path, default=Path("target/debug/willowc"))
+    parser.add_argument("--compiler", type=Path, default=Path("target/debug/willow"))
     args = parser.parse_args()
     compiler = args.compiler.resolve()
     runtime = compiler.parent / "libwillow_runtime.a"

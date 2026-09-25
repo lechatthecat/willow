@@ -19,7 +19,7 @@
 // and `let` stores into what is already there.
 //
 // Every function here hands a value out of a critical section through a local
-// declared outside it. Run: `willowc run example/lir_local_binding_order.wi`.
+// declared outside it. Run: `willow run example/lir_local_binding_order.wi`.
 
 import std::collections::Array;
 

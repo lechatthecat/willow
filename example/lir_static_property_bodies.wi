@@ -21,7 +21,7 @@
 // unwinder replays can run it at every exit the registration is live for.
 //
 // Watch the walker claim each body:
-//   WILLOW_LIR_LOG=1 willowc build example/lir_static_property_bodies.wi -o /tmp/a
+//   WILLOW_LIR_LOG=1 willow build example/lir_static_property_bodies.wi -o /tmp/a
 import std::collections::Array;
 
 class Registry {

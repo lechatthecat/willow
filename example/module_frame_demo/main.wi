@@ -15,7 +15,7 @@
 //
 // The frame is built during lowering, so it names the call the same way
 // wherever the call appears:
-//   WILLOW_LIR_LOG=1 willowc build example/module_frame_demo/main.wi -o /tmp/a
+//   WILLOW_LIR_LOG=1 willow build example/module_frame_demo/main.wi -o /tmp/a
 //
 // The frames go to stderr with the panic report, so this program recovers what
 // it raises and its stdout stays deterministic. Delete the `recover` guarding

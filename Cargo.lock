@@ -717,6 +717,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "willow"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cc",
+ "cranelift-codegen",
+ "cranelift-frontend",
+ "cranelift-module",
+ "cranelift-native",
+ "cranelift-object",
+ "object 0.40.0",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "target-lexicon",
+ "thiserror",
+ "toml",
+ "toml_edit",
+ "willow_abi",
+ "willow_continuations",
+]
+
+[[package]]
 name = "willow_abi"
 version = "0.1.0"
 
@@ -738,30 +762,6 @@ dependencies = [
  "ryu",
  "socket2",
  "willow_abi",
-]
-
-[[package]]
-name = "willowc"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cc",
- "cranelift-codegen",
- "cranelift-frontend",
- "cranelift-module",
- "cranelift-native",
- "cranelift-object",
- "object 0.40.0",
- "semver",
- "serde",
- "serde_json",
- "sha2",
- "target-lexicon",
- "thiserror",
- "toml",
- "toml_edit",
- "willow_abi",
- "willow_continuations",
 ]
 
 [[package]]

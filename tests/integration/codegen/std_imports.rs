@@ -281,7 +281,7 @@ fn main() { println(55); }
     )
     .unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let output = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path])
         .output()
@@ -707,7 +707,7 @@ fn main() {
     )
     .unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let output = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path])
         .output()

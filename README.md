@@ -85,13 +85,13 @@ cargo build --release
 Run a Willow program directly:
 
 ```bash
-./target/release/willowc run example/hello_world.wi --release
+./target/release/willow run example/hello_world.wi --release
 ```
 
 Or compile it to a native executable:
 
 ```bash
-./target/release/willowc example/hello_world.wi -o hello_world --release
+./target/release/willow example/hello_world.wi -o hello_world --release
 ./hello_world
 ```
 
@@ -253,7 +253,7 @@ A few useful starting points:
 Run the Game of Life example with an initial pattern:
 
 ```bash
-./target/release/willowc run example/game_of_life.wi --release -- \
+./target/release/willow run example/game_of_life.wi --release -- \
   2,1 3,2 1,3 2,3 3,3
 ```
 
@@ -274,3 +274,80 @@ The project intentionally focuses on making the compiler and runtime architectur
 ## License
 
 Willow is available under the [MIT License](LICENSE).
+
+## Dependencies
+
+A Willow project can depend on other Willow packages hosted in Git repositories (or on a local path). Dependencies are declared in `project.toml` and pinned in `project.lock`.
+
+The commands below assume `willow` is on your `PATH`. After building (see [Quick start](#quick-start)), either add `target/release` to `PATH` or invoke `./target/release/willow` directly.
+
+### Publishing a library
+
+A library is a project without `main()`. Its `project.toml` declares the package name and version:
+
+```toml
+[project]
+name = "willow_greeting"
+version = "0.1.0"
+
+[willow]
+manifest-version = 1
+```
+
+To publish a version:
+
+1. (Optional) Check the library with `willow package verify .`. It type-checks every module under `src/` and confirms the Git tag on `HEAD` matches `project.version`. It is not required by `add` or `run`.
+2. Commit the library with Git.
+3. Create a Git tag for the version. The tag (`v0.1.0` or `0.1.0`) must match `project.version`.
+4. Push the branch and the tag.
+
+```bash
+willow package verify .           # optional
+git add project.toml src/
+git commit -m "Release 0.1.0"
+git tag v0.1.0
+git push origin main v0.1.0
+```
+
+### Adding a dependency
+
+```bash
+willow add willow_greeting \
+    --git https://github.com/lechatthecat/willow_greeting.git \
+    --version "^0.1"
+```
+
+Without `--version`, `add` selects the newest stable (non-prerelease) tag and records `^<that version>` as the requirement. Use `--path DIR` for a local dependency and `--dry-run` to preview the change.
+
+Modules of a dependency are imported through its alias:
+
+```rust
+import willow_greeting::message;
+
+fn main() {
+    println(message::hello());
+}
+```
+
+### Managing dependencies
+
+| Command | Effect |
+| --- | --- |
+| `willow add [alias] --git URL [--version REQ]` | Add a Git dependency (newest stable tag if `--version` is omitted) |
+| `willow add [alias] --path DIR` | Add a local path dependency |
+| `willow deps tree` | Show the resolved dependency graph |
+| `willow deps why <name>` | Explain why a package is in the graph |
+| `willow update [alias]` | Move to the newest version within the requirement |
+| `willow update [alias] --breaking` | Also allow versions outside the current requirement |
+| `willow remove <alias>` | Remove a dependency |
+| `willow fetch` | Resolve and download dependencies into the cache |
+
+`project.lock` records the exact revision and checksum of each package; a build keeps using the locked revision until `willow update` is run. Commit `project.lock` in applications for reproducible builds.
+
+`build`, `run`, and `fetch` accept:
+
+- `--locked` — fail if `project.lock` is missing or out of date
+- `--offline` — use only the local cache; do not contact remotes
+- `--frozen` — both `--locked` and `--offline`
+
+Fetched sources are cached under `~/.willow` (`%USERPROFILE%\.willow` on Windows); set `WILLOW_HOME` to change the location.

@@ -113,7 +113,7 @@ pub(super) fn compile_and_run(source: &str) -> (String, bool) {
 
     fs::write(&src_path, source).unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let output = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path])
         .output()
@@ -155,7 +155,7 @@ pub(super) fn compile_and_run_release(source: &str) -> (String, bool) {
 
     fs::write(&src_path, source).unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let output = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path, "--release"])
         .output()
@@ -204,7 +204,7 @@ pub(super) fn compile_and_run_with_env_timeout(
 
     fs::write(&src_path, source).unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let mut compiler_cmd = Command::new(compiler);
     compiler_cmd.args(["build", &src_path, "-o", &bin_path]);
     for (key, value) in env {
@@ -263,7 +263,7 @@ pub(super) fn compile_and_run_check_exit(source: &str) -> (String, bool) {
 
     fs::write(&src_path, source).unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let status = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path])
         .stderr(Stdio::null())
@@ -311,7 +311,7 @@ pub(super) fn compile_and_run_gc_stress_mode(source: &str, mode: &str) -> (Strin
 
     fs::write(&src_path, source).unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let compiler_output = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path])
         .output()
@@ -361,7 +361,7 @@ pub(super) fn compile_and_run_with_env(source: &str, env: &[(&str, &str)]) -> (S
 
     fs::write(&src_path, source).unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let mut compiler_cmd = Command::new(compiler);
     compiler_cmd.args(["build", &src_path, "-o", &bin_path]);
     for (key, value) in env {
@@ -477,7 +477,7 @@ pub(super) fn compile_and_collect_relocations_by_section(
 
     fs::write(&src_path, source).unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let mut command = Command::new(compiler);
     command
         .args(["build", &src_path, "-o", &bin_path])
@@ -563,7 +563,7 @@ pub(super) fn compile_and_collect_defined_symbols(
     };
     fs::write(&src_path, source).unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let mut command = Command::new(compiler);
     command
         .args(["build", &src_path, "-o", &bin_path])
@@ -607,7 +607,7 @@ pub(super) fn compile_and_run_with_program_args(
 
     fs::write(&src_path, source).unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let status = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path])
         .stderr(Stdio::null())
@@ -640,7 +640,7 @@ pub(super) fn run_command_with_program_args(source: &str, program_args: &[&str])
 
     fs::write(&src_path, source).unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let mut command = Command::new(compiler);
     command.args(["run", &src_path, "--"]);
     command.args(program_args);
@@ -672,7 +672,7 @@ pub(super) fn compile_file_error_stderr(src_path: &str) -> String {
     let id = unique_test_id();
     let bin_path = temp_path(format!("willow_example_error_test_{}", id));
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let out = Command::new(compiler)
         .args(["build", src_path, "-o", &bin_path])
         .output()
@@ -697,7 +697,7 @@ pub(super) fn compile_file_and_run_with_args(
     let id = unique_test_id();
     let bin_path = temp_path(format!("willow_example_test_{}", id));
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let mut command = Command::new(compiler);
     command.args(["build", src_path, "-o", &bin_path]);
     command.args(extra_args);
@@ -773,7 +773,7 @@ impl TestProject {
 
     pub(super) fn compile(&self, entry: &str) -> std::process::Output {
         let src_path = self.root.join(entry);
-        Command::new(env!("CARGO_BIN_EXE_willowc"))
+        Command::new(env!("CARGO_BIN_EXE_willow"))
             .args(["build", path_str(&src_path), "-o", path_str(&self.bin_path)])
             .output()
             .expect("failed to run compiler")
@@ -787,7 +787,7 @@ impl TestProject {
         env: &[(&str, &str)],
     ) -> std::process::Output {
         let src_path = self.root.join(entry);
-        let mut command = Command::new(env!("CARGO_BIN_EXE_willowc"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_willow"));
         command.args(["build", path_str(&src_path), "-o", path_str(&self.bin_path)]);
         for (key, value) in env {
             command.env(key, value);
@@ -799,7 +799,7 @@ impl TestProject {
     /// the build mode carrying none of the debug instrumentation.
     pub(super) fn compile_release(&self, entry: &str) -> std::process::Output {
         let src_path = self.root.join(entry);
-        Command::new(env!("CARGO_BIN_EXE_willowc"))
+        Command::new(env!("CARGO_BIN_EXE_willow"))
             .args([
                 "build",
                 path_str(&src_path),
@@ -991,7 +991,7 @@ pub(super) fn expect_compile_error(source: &str) -> bool {
 
     fs::write(&src_path, source).unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let status = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path])
         .stderr(Stdio::null())
@@ -1011,7 +1011,7 @@ pub(super) fn compile_error_stderr(source: &str) -> String {
 
     fs::write(&src_path, source).unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let out = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path])
         .output()
@@ -1045,7 +1045,7 @@ pub(super) fn compile_with_compiler_env(source: &str, env: &[(&str, &str)]) -> (
     let src_path = temp_path(format!("willow_drc_{}.wi", id));
     let bin_path = temp_path(format!("willow_drc_{}", id));
     fs::write(&src_path, source).unwrap();
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let mut cmd = Command::new(compiler);
     cmd.args(["build", &src_path, "-o", &bin_path]);
     cmd.env_remove("WILLOW_DATA_RACE_CHECK");
@@ -1087,7 +1087,7 @@ pub(super) fn compile_and_run_with_runtime_env(
     let bin_path = temp_path(format!("willow_rtenv_test_{}", id));
 
     fs::write(&src_path, source).unwrap();
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let output = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path])
         .output()
@@ -1150,7 +1150,7 @@ pub(super) fn compile_with_env_and_run_combined(
 
     fs::write(&src_path, source).unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let mut cmd = Command::new(compiler);
     cmd.args(["build", &src_path, "-o", &bin_path]);
     for (k, v) in compile_env {
@@ -1199,7 +1199,7 @@ pub(super) fn compile_with_env_and_run_under(
 
     fs::write(&src_path, source).unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let mut cmd = Command::new(compiler);
     cmd.args(["build", &src_path, "-o", &bin_path]);
     for (k, v) in compile_env {
@@ -1243,7 +1243,7 @@ pub(super) fn compile_with_env_and_run(source: &str, env: &[(&str, &str)]) -> (S
 
     fs::write(&src_path, source).unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let mut cmd = Command::new(compiler);
     cmd.args(["build", &src_path, "-o", &bin_path]);
     for (k, v) in env {

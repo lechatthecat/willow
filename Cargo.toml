@@ -1,9 +1,11 @@
 [package]
-name = "willowc"
+name = "willow"
+default-run = "willow"
 version = "0.1.0"
 edition = "2024"
 # Only explicitly registered benchmark sources are public.
 autobenches = false
+autobins = false
 
 [workspace]
 members = [".", "crates/willow_abi", "crates/willow_runtime", "crates/willow_continuations"]
@@ -11,8 +13,8 @@ default-members = [".", "crates/willow_abi", "crates/willow_runtime", "crates/wi
 resolver = "3"
 
 [[bin]]
-name = "willowc"
-path = "src/main.rs"
+name = "willow"
+path = "src/willow.rs"
 
 [lib]
 name = "willow_compiler"

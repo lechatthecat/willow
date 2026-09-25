@@ -36,7 +36,7 @@ The private `UnitArtifacts` store also has deterministic generated-property test
 that run without cargo-fuzz or a nightly toolchain:
 
 ```sh
-cargo test -p willowc --lib module::artifacts:: -- --test-threads=1
+cargo test -p willow --lib module::artifacts:: -- --test-threads=1
 ```
 
 These exercise real disk serialization and hydration, including AST identities,

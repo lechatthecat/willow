@@ -144,7 +144,7 @@ fn git_project_compiles_runs_reuses_lock_and_ignores_hooks_and_filters() {
     };
     let app = f.0.join("app");
     let invoke = |args: &[&str]| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_willowc"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_willow"));
         command
             .current_dir(&app)
             .args(args)

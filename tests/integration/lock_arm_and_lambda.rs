@@ -10,7 +10,7 @@
 //!   function, so E2603 and E0801 both waved the body through (willow-3kty).
 //!
 //! The unit tests in `src/semantic/type_checker/mod.rs` cover which diagnostic
-//! each shape gets. These run the real `willowc` binary, because the property
+//! each shape gets. These run the real `willow` binary, because the property
 //! that regressed is one only the process can show: it exits with an error
 //! instead of aborting. Every case asserts the absence of a panic explicitly,
 //! since a panicking compiler also "fails to compile" and would otherwise pass

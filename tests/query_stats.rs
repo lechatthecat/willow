@@ -21,7 +21,7 @@ fn query_stats_reports_real_operations_and_keeps_empty_modules_distinct() {
     std::fs::write(root.join("main.wi"),
         "import empty; import value; class C { pub n: i64; } fn main() { println(new C(value::value()).n); }").unwrap();
     for enabled in [false, true] {
-        let mut build = Command::new(env!("CARGO_BIN_EXE_willowc"));
+        let mut build = Command::new(env!("CARGO_BIN_EXE_willow"));
         build
             .arg("build")
             .arg(root.join("main.wi"))
@@ -104,7 +104,7 @@ fn query_stats_reports_real_operations_and_keeps_empty_modules_distinct() {
         assert_eq!(output.stdout, b"42\n");
     }
     // Early errors still close the session and emit exactly one zero report.
-    let output = Command::new(env!("CARGO_BIN_EXE_willowc"))
+    let output = Command::new(env!("CARGO_BIN_EXE_willow"))
         .arg("build")
         .arg(root.join("missing.wi"))
         .env("WILLOW_QUERY_STATS", "1")

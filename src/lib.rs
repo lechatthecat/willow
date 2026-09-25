@@ -338,6 +338,24 @@ impl<'a> CompilerSession<'a> {
     }
 
     pub fn run(self) -> Result<()> {
+        self.run_with_emitter(&mut diagnostics::HumanEmitter)
+    }
+
+    /// Compile once, routing frontend and backend diagnostics to the caller.
+    /// Tool progress remains on stderr; IO failures are returned to the caller.
+    pub fn run_with_emitter(self, emitter: &mut dyn diagnostics::DiagnosticEmitter) -> Result<()> {
+        self.execute(emitter, true)
+    }
+
+    /// Run the identical project-aware frontend without native artifacts.
+    pub fn check_with_emitter(
+        self,
+        emitter: &mut dyn diagnostics::DiagnosticEmitter,
+    ) -> Result<()> {
+        self.execute(emitter, false)
+    }
+
+    fn execute(self, emitter: &mut dyn diagnostics::DiagnosticEmitter, build: bool) -> Result<()> {
         let _query_stats = query_stats::Session::enter();
         let _node_ids = parser::ast::NodeIdSession::enter();
         let src_path = PathBuf::from(self.src);
@@ -354,9 +372,14 @@ impl<'a> CompilerSession<'a> {
 
         let inputs = compiler_db::inputs::CompilerInputs::native(self.opts.clone(), root.clone())
             .resolve_project(self.project_root.as_deref())?;
-        let frontend =
-            run_frontend_with_inputs(&source, &root, &map, inputs, &mut diagnostics::HumanEmitter)?;
-        run_backend(frontend, self.src, self.out, source, &self.opts, &map)
+        let frontend = run_frontend_with_inputs(&source, &root, &map, inputs, emitter)?;
+        if build {
+            run_backend(
+                frontend, self.src, self.out, source, &self.opts, &map, emitter,
+            )
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1404,6 +1427,7 @@ fn run_backend(
     source: String,
     opts: &CompilerOptions,
     map: &diagnostics::SourceMap,
+    emitter: &mut dyn diagnostics::DiagnosticEmitter,
 ) -> Result<()> {
     use diagnostics::{Diagnostic, ErrorCode, Severity};
     use toolchain::{HostToolchain, Toolchain};
@@ -1428,6 +1452,7 @@ fn run_backend(
             emit_codegen_error(
                 errors::CodegenError::new(errors::CodegenStage::Initialize, error),
                 map,
+                emitter,
             )
         })?;
     codegen.body_queries = Some(std::rc::Rc::clone(&db.typed_bodies));
@@ -1487,6 +1512,7 @@ fn run_backend(
                 &mut codegen,
                 errors::CodegenError::new(errors::CodegenStage::Module(module.name.clone()), error),
                 map,
+                emitter,
                 &artifacts,
             )
         })?;
@@ -1520,6 +1546,7 @@ fn run_backend(
                 &mut codegen,
                 errors::CodegenError::new(errors::CodegenStage::Entry, error),
                 map,
+                emitter,
                 &artifacts,
             )
         })?;
@@ -1559,6 +1586,7 @@ fn run_backend(
                 &mut codegen,
                 errors::CodegenError::new(errors::CodegenStage::Module(module.name.clone()), error),
                 map,
+                emitter,
                 &artifacts,
             )
         })?;
@@ -1589,24 +1617,45 @@ fn run_backend(
             &mut codegen,
             errors::CodegenError::new(errors::CodegenStage::Entry, error),
             map,
+            emitter,
             &artifacts,
         )
     })?;
     drop(entry_unit);
 
-    for warning in codegen.take_async_frame_size_warnings() {
-        let warning_source = if warning.source_file == src {
-            source.clone()
-        } else {
-            modules
-                .iter()
-                .find(|module| module.path.to_string_lossy() == warning.source_file)
-                .map(|module| artifacts.source(module.id.file_id()))
-                .transpose()?
-                .unwrap_or_default()
+    let warnings = codegen.take_async_frame_size_warnings();
+    // Index once and load each warned file once, even with many large frames.
+    let module_paths: std::collections::HashMap<_, _> = if warnings.is_empty() {
+        Default::default()
+    } else {
+        modules
+            .iter()
+            .map(|module| (module.path.to_string_lossy(), module.id))
+            .collect()
+    };
+    let mut warning_maps = std::collections::HashMap::new();
+    for warning in &warnings {
+        let warning_map = match warning_maps.entry(warning.source_file.as_str()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let warning_source = if warning.source_file == src {
+                    source.clone()
+                } else {
+                    module_paths
+                        .get(warning.source_file.as_str())
+                        .map(|id| artifacts.source(id.file_id()))
+                        .transpose()?
+                        .unwrap_or_default()
+                };
+                entry.insert(diagnostics::SourceMap::with_file_id(
+                    warning.span.file_id,
+                    &warning.source_file,
+                    warning_source,
+                ))
+            }
         };
-        let warning_map = diagnostics::SourceMap::new(&warning.source_file, &warning_source);
-        let point_span = diagnostics::Span::new(
+        let point_span = diagnostics::Span::in_file(
+            warning.span.file_id,
             warning.span.start,
             warning.span.start.saturating_add(1),
             warning.span.line,
@@ -1625,7 +1674,7 @@ fn run_backend(
             "large async frame allocated here",
         ))
         .with_help("avoid keeping large arrays or objects live across await points");
-        diagnostics::emit(&diagnostic, &warning_map);
+        emitter.emit(&diagnostic, warning_map)?;
     }
 
     if opts.target.emit_debug_info {
@@ -1635,6 +1684,7 @@ fn run_backend(
                 emit_codegen_error(
                     errors::CodegenError::new(errors::CodegenStage::Metadata, error),
                     map,
+                    emitter,
                 )
             })?;
     }
@@ -1643,6 +1693,7 @@ fn run_backend(
         emit_codegen_error(
             errors::CodegenError::new(errors::CodegenStage::Finish, error),
             map,
+            emitter,
         )
     })?;
 
@@ -1667,9 +1718,11 @@ fn run_backend(
             ErrorCode::E0700,
             format!("runtime library unavailable: {err}"),
         )
-        .with_help("place the bundled runtime in ../lib relative to willowc, build willow_runtime with Cargo, or pass --runtime-lib / WILLOW_RUNTIME_LIB");
-        diagnostics::emit(&d, map);
-        anyhow::anyhow!("runtime library unavailable")
+        .with_help("place the bundled runtime in ../lib relative to willow, build willow_runtime with Cargo, or pass --runtime-lib / WILLOW_RUNTIME_LIB");
+        match emitter.emit(&d, map) {
+            Ok(()) => anyhow::anyhow!("runtime library unavailable"),
+            Err(error) => error.into(),
+        }
     })?;
 
     let link_result = toolchain.link(&obj_path, &runtime_lib, out);
@@ -1686,7 +1739,7 @@ fn run_backend(
             "check that {} exports the required Willow runtime ABI symbols",
             runtime_lib.display()
         ));
-        diagnostics::emit(&d, map);
+        emitter.emit(&d, map)?;
         anyhow::bail!("linking failed");
     }
 
@@ -1706,8 +1759,14 @@ fn run_backend(
     Ok(())
 }
 
-fn emit_codegen_error(error: errors::CodegenError, map: &diagnostics::SourceMap) -> anyhow::Error {
-    diagnostics::emit(&error.diagnostic(), map);
+fn emit_codegen_error(
+    error: errors::CodegenError,
+    map: &diagnostics::SourceMap,
+    emitter: &mut dyn diagnostics::DiagnosticEmitter,
+) -> anyhow::Error {
+    if let Err(error) = emitter.emit(&error.diagnostic(), map) {
+        return error.into();
+    }
     anyhow::Error::new(error)
 }
 
@@ -1722,19 +1781,39 @@ fn report_backend_failure(
     codegen: &mut backend::Codegen,
     fallback: errors::CodegenError,
     map: &diagnostics::SourceMap,
+    emitter: &mut dyn diagnostics::DiagnosticEmitter,
     artifacts: &UnitArtifacts,
 ) -> anyhow::Error {
     let conflicts = codegen.take_symbol_conflicts();
     if conflicts.is_empty() {
-        return emit_codegen_error(fallback, map);
+        return emit_codegen_error(fallback, map, emitter);
     }
+    let mut sources = diagnostics::SourceMaps::default();
     for conflict in &conflicts {
-        emit_symbol_conflict(conflict, artifacts);
+        let owner = &conflict.owner;
+        if sources.get(owner.span.file_id).is_none() {
+            let source = match artifacts.source(owner.span.file_id) {
+                Ok(source) => source,
+                Err(error) => return error,
+            };
+            sources.insert(diagnostics::SourceMap::with_file_id(
+                owner.span.file_id,
+                &owner.source_file,
+                source,
+            ));
+        }
+        if let Err(error) = emit_symbol_conflict(conflict, &sources, emitter) {
+            return error.into();
+        }
     }
     anyhow::anyhow!("aborting due to {} error(s)", conflicts.len())
 }
 
-fn emit_symbol_conflict(conflict: &backend::SymbolConflict, artifacts: &UnitArtifacts) {
+fn emit_symbol_conflict(
+    conflict: &backend::SymbolConflict,
+    sources: &diagnostics::SourceMaps,
+    emitter: &mut dyn diagnostics::DiagnosticEmitter,
+) -> std::io::Result<()> {
     use diagnostics::{Diagnostic, ErrorCode, Label, Severity};
 
     let symbol = &conflict.symbol;
@@ -1766,11 +1845,7 @@ fn emit_symbol_conflict(conflict: &backend::SymbolConflict, artifacts: &UnitArti
         )),
     };
 
-    let source = artifacts.source(owner.span.file_id).unwrap_or_default();
-    diagnostics::emit(
-        &diagnostic,
-        &diagnostics::SourceMap::new(&owner.source_file, source),
-    );
+    emitter.emit(&diagnostic, sources)
 }
 
 pub fn compile(
@@ -1793,19 +1868,7 @@ pub fn check_file(
     options: &CompilerOptions,
     emitter: &mut dyn diagnostics::DiagnosticEmitter,
 ) -> Result<()> {
-    let _query_stats = query_stats::Session::enter();
-    let _node_ids = parser::ast::NodeIdSession::enter();
-    let path = Path::new(src);
-    let source = std::fs::read_to_string(path).with_context(|| format!("cannot read {src}"))?;
-    let map = diagnostics::SourceMap::new(src, &source);
-    run_frontend_with_emitter(
-        &source,
-        path.parent().unwrap_or_else(|| Path::new(".")),
-        &map,
-        &options.clone().resolve_environment(),
-        emitter,
-    )
-    .map(|_| ())
+    CompilerSession::new(src, "", options, None).check_with_emitter(emitter)
 }
 
 /// Lower a source file to typed HIR and render it as text (the `--emit-hir`

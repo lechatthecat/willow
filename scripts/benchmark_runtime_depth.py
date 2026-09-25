@@ -109,7 +109,7 @@ fn main() {
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--compiler", type=pathlib.Path, default=pathlib.Path("target/debug/willowc.exe" if os.name == "nt" else "target/debug/willowc"))
+    parser.add_argument("--compiler", type=pathlib.Path, default=pathlib.Path("target/debug/willow.exe" if os.name == "nt" else "target/debug/willow"))
     parser.add_argument("--before-compiler", type=pathlib.Path)
     parser.add_argument("--after-compiler", type=pathlib.Path)
     parser.add_argument("--before", required=True, type=pathlib.Path)

@@ -21,7 +21,7 @@ impl Fixture {
         fs::write(path, content).unwrap();
     }
     fn command(&self, app: &str, args: &[&str]) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_willowc"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_willow"));
         cmd.current_dir(self.0.join(app))
             .args(args)
             .env("WILLOW_HOME", self.0.join("cache"));

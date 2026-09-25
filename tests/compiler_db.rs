@@ -30,7 +30,7 @@ impl Project {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_willowc"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_willow"));
         command
             .current_dir(&self.0)
             .arg("build")

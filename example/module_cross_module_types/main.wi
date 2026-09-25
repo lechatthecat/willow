@@ -6,7 +6,7 @@
 // hand one back, so what makes this program run is that the module exported the
 // identities `shipping` declared rather than names of its own invention.
 //
-// Run: willowc run example/module_cross_module_types/main.wi
+// Run: willow run example/module_cross_module_types/main.wi
 import depot;
 import shipping::Parcel;
 import shipping::Grade;

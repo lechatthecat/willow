@@ -78,6 +78,7 @@ impl HostToolchain {
             );
         }
         let status = command
+            .stdout(std::process::Stdio::from(std::io::stderr()))
             .status()
             .with_context(|| "failed to run cargo to build willow_runtime")?;
         if status.success() {
@@ -99,7 +100,7 @@ impl Toolchain for HostToolchain {
         if let Some(path) = &self.target.runtime_lib {
             return validate_runtime_library(path);
         }
-        // Relocatable installs keep bin/willowc beside lib/<runtime>. Do not
+        // Relocatable installs keep bin/willow beside lib/<runtime>. Do not
         // touch the build tree or invoke Cargo when the bundled library exists.
         if let Ok(executable) = std::env::current_exe()
             && let Some(root) = executable.parent().and_then(Path::parent)
@@ -168,6 +169,7 @@ impl Toolchain for HostToolchain {
                 command.args(retain_debug_metadata_args("windows", "msvc"));
             }
             command
+                .stdout(std::process::Stdio::from(std::io::stderr()))
                 .status()
                 .with_context(|| "failed to run MSVC compiler driver")
         }
@@ -198,7 +200,10 @@ impl Toolchain for HostToolchain {
             if self.target.strip_symbols {
                 command.arg("-s");
             }
-            command.status().with_context(|| "failed to run linker")
+            command
+                .stdout(std::process::Stdio::from(std::io::stderr()))
+                .status()
+                .with_context(|| "failed to run linker")
         }
     }
 

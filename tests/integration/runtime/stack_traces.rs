@@ -77,7 +77,7 @@ fn callchain_03_release_build_omits_chain() {
     )
     .unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let status = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path, "--release"])
         .stderr(Stdio::null())

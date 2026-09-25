@@ -1,6 +1,6 @@
 // module_alias_spellings — one module named three ways across four files.
 //
-// Run: willowc run example/module_alias_spellings/main.wi
+// Run: willow run example/module_alias_spellings/main.wi
 import sales as market;
 import ledger;
 import audit;

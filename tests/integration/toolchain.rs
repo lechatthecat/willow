@@ -349,7 +349,7 @@ fn main() {
 "#,
         &["from-run"],
     );
-    assert!(ok, "willowc run should forward program args after --");
+    assert!(ok, "willow run should forward program args after --");
     assert_eq!(out, "1\nfrom-run\n");
 }
 
@@ -478,7 +478,7 @@ fn test_build_uses_rust_runtime_without_generated_c_artifacts() {
     let bin_path = temp_path(format!("willow_rust_runtime_no_c_{id}"));
     fs::write(&src_path, "fn main() { println(42); }").unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let status = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path])
         .status()
@@ -566,7 +566,7 @@ fn test_runtime_calls_preserve_native_import_relocations() {
     let binary = temp_path(format!("willow_import_runtime_{id}"));
     fs::write(&source, "fn main() { println(42); }").unwrap();
     for mode in ["--debug", "--release"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_willowc"))
+        let output = Command::new(env!("CARGO_BIN_EXE_willow"))
             .args(["build", &source, "-o", &binary, mode])
             .env("WILLOW_KEEP_OBJECT", "1")
             .output()
@@ -616,9 +616,9 @@ fn test_runtime_lib_relocatable_bundle() {
     let original = root.join("original");
     fs::create_dir_all(original.join("bin")).unwrap();
     fs::create_dir_all(original.join("lib")).unwrap();
-    let executable = format!("willowc{}", std::env::consts::EXE_SUFFIX);
+    let executable = format!("willow{}", std::env::consts::EXE_SUFFIX);
     fs::copy(
-        env!("CARGO_BIN_EXE_willowc"),
+        env!("CARGO_BIN_EXE_willow"),
         original.join("bin").join(&executable),
     )
     .unwrap();
@@ -686,7 +686,7 @@ async fn main() {
     )
     .unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let status = Command::new(compiler)
         .args([
             "build",
@@ -729,7 +729,7 @@ async fn main() {
     )
     .unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let status = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path])
         .env("WILLOW_RUNTIME_LIB", &runtime_lib)
@@ -755,7 +755,7 @@ fn test_missing_runtime_lib_reports_actionable_diagnostic() {
     let missing = temp_path(format!("willow_runtime_missing_{id}.a"));
     fs::write(&src_path, "fn main() { println(1); }").unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let output = Command::new(compiler)
         .args([
             "build",
@@ -1235,7 +1235,7 @@ async fn main() {
     )
     .unwrap();
     for mode in ["--debug", "--release"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_willowc"))
+        let output = Command::new(env!("CARGO_BIN_EXE_willow"))
             .args(["build", &source, "-o", &binary, mode])
             .env("WILLOW_KEEP_OBJECT", "1")
             .output()

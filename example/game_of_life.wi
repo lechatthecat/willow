@@ -9,7 +9,7 @@
 // Pass each initially-live cell as an `x,y` command-line argument. For example,
 // this starts with a glider:
 //
-//   willowc run example/game_of_life.wi -- 2,1 3,2 1,3 2,3 3,3
+//   willow run example/game_of_life.wi -- 2,1 3,2 1,3 2,3 3,3
 //
 // The simulation runs forever. Press Ctrl+C to stop it.
 

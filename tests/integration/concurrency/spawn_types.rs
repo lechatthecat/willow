@@ -139,7 +139,7 @@ async fn main() {
 "#;
     std::fs::write(&src_path, source).unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let output = std::process::Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path, "--release"])
         .output()

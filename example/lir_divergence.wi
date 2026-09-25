@@ -4,7 +4,7 @@
 // Every function here stays inside the LIR walker's subset, which since
 // willow-0g8j.3 is the only way a function body gets compiled at all:
 //
-//     WILLOW_LIR_LOG=1 willowc build example/lir_divergence.wi
+//     WILLOW_LIR_LOG=1 willow build example/lir_divergence.wi
 //
 // The three shapes this file is about:
 //

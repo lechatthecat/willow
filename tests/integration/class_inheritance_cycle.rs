@@ -1,4 +1,4 @@
-//! A class `extends` cycle is rejected by `willowc` with E0426 (willow-jlky).
+//! A class `extends` cycle is rejected by `willow` with E0426 (willow-jlky).
 //!
 //! Before the checker owned this, `open class A extends B {}` /
 //! `open class B extends A {}` compiled to a program, and the same ring with

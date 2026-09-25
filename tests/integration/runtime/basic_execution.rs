@@ -27,7 +27,7 @@ fn main() {
 "#;
     fs::write(&src_path, source).unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let output = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path])
         .output()
@@ -69,7 +69,7 @@ fn test_release_build_removes_source_map_sidecar() {
     fs::write(&src_path, "fn main() { println(1); }").unwrap();
     fs::write(&map_path, "stale debug source map").unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let output = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path, "--release"])
         .output()
@@ -114,7 +114,7 @@ fn main() {
     )
     .unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let output = Command::new(compiler)
         .args([
             "build",
@@ -170,7 +170,7 @@ fn main() {
 "#;
     fs::write(&src_path, source).unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let output = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path])
         .output()
@@ -220,7 +220,7 @@ async fn main() {
 "#;
     fs::write(&src_path, source).unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let output = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path])
         .output()
@@ -270,7 +270,7 @@ fn main() {
 "#;
     fs::write(&src_path, source).unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let output = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path])
         .output()
@@ -339,7 +339,7 @@ fn test_release_build_omits_runtime_metadata_from_binary() {
 
     fs::write(&src_path, "fn main() { println(1); }").unwrap();
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let output = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path, "--release"])
         .output()

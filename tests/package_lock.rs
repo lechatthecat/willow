@@ -34,7 +34,7 @@ impl Project {
         fs::write(path, text).unwrap();
     }
     fn command(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_willowc"));
+        let mut c = Command::new(env!("CARGO_BIN_EXE_willow"));
         c.current_dir(&self.0).args(args);
         c
     }

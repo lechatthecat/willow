@@ -4,10 +4,12 @@ use std::process::{Command, ExitStatus};
 use willow_compiler::{CompilerOptions, compile, emit_hir_text, emit_lir_text, project};
 
 mod package;
+mod protocol;
 
 #[derive(Debug)]
 enum CliCommand {
     Build(BuildCommand),
+    Check(BuildCommand),
     Run(RunCommand),
     Debug(DebugCommand),
     Fetch(FetchCommand),
@@ -120,6 +122,14 @@ impl CliCommand {
             "add" | "remove" | "update" | "deps" => Ok(Self::Package(
                 package::PackageCommand::parse(command, &args[1..])?,
             )),
+            "check" => {
+                let command = BuildCommand::parse(&args[1..])?;
+                anyhow::ensure!(
+                    !command.emit_hir && !command.emit_lir && command.output.is_none(),
+                    "check does not emit artifacts"
+                );
+                Ok(Self::Check(command))
+            }
             "build" => Ok(Self::Build(BuildCommand::parse(&args[1..])?)),
             "run" => Ok(Self::Run(RunCommand::parse(&args[1..])?)),
             "package" if args.get(1).is_some_and(|arg| arg == "verify") => {
@@ -141,6 +151,9 @@ impl CliCommand {
         match self {
             Self::Package(command) => command.execute(),
             Self::Build(command) => command.execute(),
+            Self::Check(command) => {
+                command.execute_with(&mut willow_compiler::diagnostics::HumanEmitter, false)
+            }
             Self::Run(command) => command.execute(),
             Self::Debug(command) => command.execute(),
             Self::Fetch(command) => command.execute(),
@@ -280,6 +293,14 @@ impl BuildCommand {
         };
         let emit_hir = flags.emit_hir;
         let emit_lir = flags.emit_lir;
+        anyhow::ensure!(
+            !((flags.locked || flags.offline) && source.is_some()),
+            "`--locked` requires project mode (also --offline/--frozen)"
+        );
+        anyhow::ensure!(
+            !(emit_hir || emit_lir) || source.is_some(),
+            "`--emit-hir`/`--emit-lir` require a `.wi` source file"
+        );
         Ok(Self {
             source,
             project_dir,
@@ -291,6 +312,14 @@ impl BuildCommand {
     }
 
     fn execute(self) -> Result<()> {
+        self.execute_with(&mut willow_compiler::diagnostics::HumanEmitter, true)
+    }
+
+    fn execute_with(
+        self,
+        emitter: &mut dyn willow_compiler::diagnostics::DiagnosticEmitter,
+        build: bool,
+    ) -> Result<()> {
         if (self.options.locked || self.options.offline) && self.source.is_some() {
             anyhow::bail!("`--locked` requires project mode (also --offline/--frozen)");
         }
@@ -308,7 +337,7 @@ impl BuildCommand {
         }
         if let Some(source) = self.source {
             let output = self.output.unwrap_or_else(|| stem(&source));
-            return compile(&source, &output, &self.options, None);
+            return execute_compiler(&source, &output, &self.options, None, emitter, build);
         }
 
         let search_dir = self
@@ -333,14 +362,18 @@ impl BuildCommand {
 
         let output = self.output.unwrap_or_else(|| manifest.project.name.clone());
         eprintln!(
-            "building project '{}' v{}",
-            manifest.project.name, manifest.project.version
+            "{} project '{}' v{}",
+            if build { "building" } else { "checking" },
+            manifest.project.name,
+            manifest.project.version
         );
-        compile(
-            entry.to_str().unwrap(),
+        execute_compiler(
+            entry.to_str().context("entry path is not UTF-8")?,
             &output,
             &self.options,
             Some(project_root),
+            emitter,
+            build,
         )
     }
 }
@@ -496,11 +529,18 @@ fn child_exit_code(status: ExitStatus) -> i32 {
 }
 
 pub(super) fn run(args: Vec<String>) -> Result<()> {
+    if protocol::requested(&args) {
+        let code = protocol::run(args)?;
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
     CliCommand::parse(&args)?.execute()
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  willowc add [alias] --git URL [--version REQ] [--dry-run] [--project-dir DIR]\n  willowc add [alias] --path DIR [--dry-run] [--project-dir DIR]\n  willowc add URL [--dry-run] [--project-dir DIR]\n  willowc remove alias [--dry-run] [--project-dir DIR]\n  willowc update [alias] [--breaking] [--dry-run] [--project-dir DIR]\n  willowc deps tree [--project-dir DIR]\n  willowc deps why <alias|package-name> [--project-dir DIR]\n  willowc package verify [PATH] [--format human|json|ndjson]\n  willowc build <source.wi|project-dir> [-o <output>] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--emit-hir] [--emit-lir] [--runtime-lib <path>]\n  willowc run [source.wi|project-dir] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--runtime-lib <path>] [-- <args>...]\n  willowc fetch [project-dir] [--locked|--offline|--frozen] [--format human|json|ndjson]\n  willowc debug <source.wi> [--runtime-lib <path>]"
+    "Usage:\n  willow check <source.wi|project-dir> [--format human|ndjson]\n  willow build <source.wi|project-dir> [--format human|ndjson] [--protocol-version 1]\n  willow add [alias] --git URL [--version REQ] [--dry-run] [--project-dir DIR]\n  willow add [alias] --path DIR [--dry-run] [--project-dir DIR]\n  willow add URL [--dry-run] [--project-dir DIR]\n  willow remove alias [--dry-run] [--project-dir DIR]\n  willow update [alias] [--breaking] [--dry-run] [--project-dir DIR]\n  willow deps tree [--project-dir DIR]\n  willow deps why <alias|package-name> [--project-dir DIR]\n  willow package verify [PATH] [--format human|json|ndjson]\n  willow build <source.wi|project-dir> [-o <output>] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--emit-hir] [--emit-lir] [--runtime-lib <path>]\n  willow run [source.wi|project-dir] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--runtime-lib <path>] [-- <args>...]\n  willow fetch [project-dir] [--locked|--offline|--frozen] [--format human|json|ndjson]\n  willow debug <source.wi> [--runtime-lib <path>]"
 }
 
 fn stem(path: &str) -> String {
@@ -516,6 +556,22 @@ fn temp_path(path: impl AsRef<std::path::Path>) -> String {
         .join(path)
         .to_string_lossy()
         .into_owned()
+}
+
+fn execute_compiler(
+    src: &str,
+    out: &str,
+    options: &CompilerOptions,
+    root: Option<PathBuf>,
+    emitter: &mut dyn willow_compiler::diagnostics::DiagnosticEmitter,
+    build: bool,
+) -> Result<()> {
+    let session = willow_compiler::CompilerSession::new(src, out, options, root);
+    if build {
+        session.run_with_emitter(emitter)
+    } else {
+        session.check_with_emitter(emitter)
+    }
 }
 
 #[cfg(test)]

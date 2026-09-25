@@ -31,7 +31,7 @@ fn compile_and_run_repeatedly(source: &str, runs: usize, env: &[(&str, &str)]) -
     let bin_path = temp_path(format!("willow_sched_wake_{id}"));
     fs::write(&src_path, source).expect("write scheduler fixture");
 
-    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let compiler = env!("CARGO_BIN_EXE_willow");
     let compiled = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path])
         .output()

@@ -21,6 +21,6 @@ done
 # Execute generated code, including select suspension, GC stress, and recovery
 # scope cancellation. Fixtures assert output and cleanup counts themselves.
 for filter in async_lir_55_ async_lir_58_ async_lir_85_ async_lir_86_; do
-    env -u WILLOW_GC_STRESS cargo test --locked -p willowc --test integration "$filter" \
+    env -u WILLOW_GC_STRESS cargo test --locked -p willow --test integration "$filter" \
         -- --test-threads=1
 done

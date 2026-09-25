@@ -1,0 +1,242 @@
+{
+  "type": "object",
+  "required": [
+    "schema_version",
+    "stream_id",
+    "seq",
+    "event",
+    "code",
+    "data"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "stream_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "event": {
+      "type": "string"
+    },
+    "code": {
+      "type": "string"
+    },
+    "data": {
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Willow toolchain event schema version 1",
+  "$defs": {
+    "span": {
+      "type": "object",
+      "required": [
+        "file_id",
+        "start",
+        "end",
+        "line",
+        "col"
+      ],
+      "properties": {
+        "file_id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "col": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "request.started"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "compiler_version"
+            ],
+            "properties": {
+              "compiler_version": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "diagnostic"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "severity",
+              "message",
+              "labels",
+              "notes",
+              "helps",
+              "fix_suggestions"
+            ],
+            "properties": {
+              "severity": {
+                "enum": [
+                  "error",
+                  "warning"
+                ]
+              },
+              "message": {
+                "type": "string"
+              },
+              "labels": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "span",
+                    "kind",
+                    "message",
+                    "path"
+                  ],
+                  "properties": {
+                    "span": {
+                      "$ref": "#/$defs/span"
+                    },
+                    "kind": {
+                      "enum": [
+                        "Primary",
+                        "Secondary"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "path": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              },
+              "fix_suggestions": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "span",
+                    "replacement",
+                    "message",
+                    "path"
+                  ],
+                  "properties": {
+                    "span": {
+                      "$ref": "#/$defs/span"
+                    },
+                    "replacement": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "path": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              },
+              "notes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "helps": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "request.finished"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "status",
+              "exit_code",
+              "message"
+            ],
+            "properties": {
+              "status": {
+                "enum": [
+                  "ok",
+                  "error"
+                ]
+              },
+              "exit_code": {
+                "enum": [
+                  0,
+                  1,
+                  2
+                ]
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

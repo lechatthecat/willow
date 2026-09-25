@@ -15,7 +15,7 @@ impl Project {
         Self(path)
     }
     fn build(&self, release: bool) -> std::process::Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_willowc"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_willow"));
         command
             .arg("build")
             .arg(self.0.join("main.wi"))

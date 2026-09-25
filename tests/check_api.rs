@@ -145,7 +145,7 @@ fn emitter_failure_stops_the_request_and_does_not_leak_into_the_next_one() {
 #[test]
 fn ordinary_build_keeps_human_diagnostics() {
     let fixture = Fixture::new("fn main() { missing(); }");
-    let output = Command::new(env!("CARGO_BIN_EXE_willowc"))
+    let output = Command::new(env!("CARGO_BIN_EXE_willow"))
         .arg("build")
         .arg(fixture.0.join("main.wi"))
         .output()
