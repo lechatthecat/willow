@@ -1,0 +1,13 @@
+import left::util as first;
+import right::util as second;
+import again::util::value as same_value;
+
+fn main() {
+    println(first::value());
+    println(second::value());
+    println(same_value());
+    let a = new first::Value(1);
+    let b = new second::Value(2);
+    println(a.read());
+    println(b.read());
+}

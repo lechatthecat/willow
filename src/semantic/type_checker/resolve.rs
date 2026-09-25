@@ -10,6 +10,11 @@ use crate::semantic::symbols::*;
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    static ENUM_IDENTITY_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Qualify a type's module-LOCAL declared type names to `module::Type`, leaving
 /// builtin generics (Array/Map/Result/Option/Channel/Future/...) and primitives
 /// untouched. Used so a module function signature that references one of its own
@@ -79,6 +84,45 @@ fn std_schema_type(ty: crate::stdlib_schema::StdType) -> Type {
     ty.to_ast_type().unwrap_or_else(|| {
         unreachable!("polymorphic printable types are handled by std::io resolution")
     })
+}
+
+fn imported_enum_info(
+    decl: &EnumDecl,
+    canonical: &str,
+    qualify: &dyn Fn(&Type) -> Type,
+) -> EnumInfo {
+    let mut variant_infos = Vec::new();
+    for (tag, variant) in decl.variants.iter().enumerate() {
+        variant_infos.push(EnumVariantInfo {
+            name: variant.name.clone(),
+            payload_types: variant
+                .payload
+                .iter()
+                .map(|ty| {
+                    // Imported metadata must preserve the same parameter
+                    // bindings as the declaring module's normalization.
+                    ty.map_names(|name| {
+                        if decl.type_params.contains(name) {
+                            return name.clone();
+                        }
+                        let Type::Named(ref qualified) = qualify(&Type::Named(name.clone())) else {
+                            unreachable!("module qualification preserves named types");
+                        };
+                        qualified.clone()
+                    })
+                })
+                .collect(),
+            tag: tag as i64,
+            declaration_span: variant.span,
+        });
+    }
+    EnumInfo {
+        name: format!("{canonical}::{}", decl.name),
+        public: decl.public,
+        type_params: decl.type_params.clone(),
+        variants: variant_infos,
+        declaration_span: decl.span,
+    }
 }
 
 #[willow_continuations::checker]
@@ -327,6 +371,10 @@ impl TypeChecker {
         self.register_interface(decl, None);
     }
 
+    pub(crate) fn set_registration_import_paths(&mut self, paths: HashMap<String, String>) {
+        self.module_access_names = paths;
+    }
+
     pub fn register_module(&mut self, name: &str, canonical: &str, path: &str, program: &Program) {
         self.register_module_impl(None, name, canonical, path, program, ModuleScope::Imported);
     }
@@ -531,6 +579,9 @@ impl TypeChecker {
                     .map(String::as_str)
                     .unwrap_or(module_path);
                 let registered = format!("{access}::{item}");
+                if let Some(info) = self.symbols.lookup_enum(&registered) {
+                    return Some((local, info.name.clone()));
+                }
                 (self.symbols.lookup_class(&registered).is_some()
                     || self.symbols.lookup_interface(&registered).is_some())
                 .then_some((local, registered))
@@ -560,36 +611,36 @@ impl TypeChecker {
                 (access != *registered).then(|| (access, registered.clone()))
             })
             .collect();
-        // ...and an ENUM has one identity build-wide (willow-itcw), which is
-        // not the access spelling its module answers to here. Snapshotted
-        // before the loop below starts defining types, since what a signature
-        // may name is already registered by then.
-        let enum_identities: HashMap<String, String> = self
-            .symbols
-            .enums
-            .iter()
-            .map(|(key, info)| (key.to_string(), info.name.clone()))
-            .collect();
-        let qualify = |ty: &Type| {
-            // Rewrite only paths the source wrote. Names introduced below are
-            // already identities in this checker, even if their prefix also
-            // happens to be one of the source module's import aliases.
-            let ty = rename_module_prefix(ty, &own_module_prefixes);
-            let ty = qualify_local_type(&ty, name, &local_interfaces);
-            let ty = qualify_local_type(&ty, name, &local_classes);
-            let ty = qualify_local_type(&ty, canonical, &local_enums);
-            let ty = rename_imported_type(&ty, &imported_types);
-            rename_imported_type(&ty, &enum_identities)
-        };
-
         let mut functions = crate::semantic::ids::FunctionMap::default();
         for item in &program.items {
+            let qualify = |ty: &Type| {
+                // Rewrite only paths the source wrote. Names introduced below are
+                // already identities in this checker, even if their prefix also
+                // happens to be one of the source module's import aliases.
+                let ty = rename_module_prefix(ty, &own_module_prefixes);
+                let ty = qualify_local_type(&ty, name, &local_interfaces);
+                let ty = qualify_local_type(&ty, name, &local_classes);
+                let ty = qualify_local_type(&ty, canonical, &local_enums);
+                let ty = rename_imported_type(&ty, &imported_types);
+                ty.map_names(|name| {
+                    #[cfg(test)]
+                    ENUM_IDENTITY_LOOKUPS.with(|count| count.set(count.get() + 1));
+                    self.symbols
+                        .lookup_enum(name)
+                        .map_or_else(|| name.clone(), |info| info.name.clone())
+                })
+            };
+
             match item {
                 Item::Function(f) => {
                     let params = f.params.iter().map(|p| qualify(&p.ty)).collect::<Vec<_>>();
                     let mut param_infos = param_infos_from_decl(&f.params, None);
                     for pi in &mut param_infos {
                         pi.ty = qualify(&pi.ty);
+                    }
+                    let identity = FunctionId::free(&f.name).in_namespace(canonical);
+                    if identity.module().is_some() {
+                        functions.scope().declare(&f.name, identity);
                     }
                     functions.insert(
                         f.name.clone(),
@@ -609,11 +660,47 @@ impl TypeChecker {
                     let info = imported_class_info_from_decl(c, &class_name, &qualify);
                     self.symbols.define_class(class_name, info);
                 }
-                Item::Enum(e) => self.register_enum_with_module(e, name, canonical, &qualify),
+                Item::Enum(e) => {
+                    let info = imported_enum_info(e, canonical, &qualify);
+                    let access = format!("{name}::{}", e.name);
+                    if access != info.name {
+                        self.symbols.define_enum(info.name.clone(), info.clone());
+                    }
+                    self.symbols.define_enum(access, info);
+                }
                 Item::Interface(i) => {
                     // Register imported interfaces under `module::Interface` so
                     // `animals::Animal` resolves as a type and in `implements`.
-                    self.register_interface(i, Some(name));
+                    let mut declaration = i.clone();
+                    let qualify_bound = |ty: &Type| {
+                        ty.map_names(|n| {
+                            if n == "Self" || i.type_params.contains(n) {
+                                return n.clone();
+                            }
+                            let Type::Named(ref result) = qualify(&Type::Named(n.clone())) else {
+                                unreachable!()
+                            };
+                            result.clone()
+                        })
+                    };
+                    for method in &mut declaration.methods {
+                        method.return_type = qualify_bound(&method.return_type);
+                        for param in &mut method.params {
+                            param.ty = qualify_bound(&param.ty);
+                        }
+                    }
+                    declaration.extends = i
+                        .extends
+                        .iter()
+                        .map(|base| {
+                            let Type::Named(ref result) = qualify(&Type::Named(base.clone()))
+                            else {
+                                unreachable!()
+                            };
+                            result.clone()
+                        })
+                        .collect();
+                    self.register_interface(&declaration, Some(name));
                 }
             }
         }
@@ -877,70 +964,6 @@ impl TypeChecker {
             self.symbols.define_enum(canonical, info.clone());
         }
         self.symbols.define_enum(decl.name.clone(), info);
-    }
-
-    /// Register an enum imported from a module under its `module::Name` key, so
-    /// `module::Enum` resolves as a type and `module::Enum::Variant` constructs
-    /// / matches (willow-64gs).
-    ///
-    /// `module` is the spelling THIS unit uses -- an alias, or the tail of the
-    /// import path -- and `canonical` is the module's identity in the build.
-    /// They differ under `import a::b as c;`, and then the enum answers to both
-    /// keys but carries only the canonical name, so an aliasing unit and the
-    /// declaring module agree on which type it is (willow-itcw).
-    ///
-    /// A PAYLOAD type goes through the module's own `qualify`, the same
-    /// translation its fields and function signatures get: prefixing a bare
-    /// payload with the canonical path named a class no table here holds
-    /// whenever the module answers to another spelling, and a payload the
-    /// module wrote under its own module alias (`Filled(biz::Amount)`) named
-    /// one nothing declares (willow-uvlp).
-    pub(super) fn register_enum_with_module(
-        &mut self,
-        decl: &EnumDecl,
-        module: &str,
-        canonical: &str,
-        qualify: &dyn Fn(&Type) -> Type,
-    ) {
-        let qualified = format!("{module}::{}", decl.name);
-        let canonical_name = format!("{canonical}::{}", decl.name);
-        let mut variant_infos = Vec::new();
-        for (tag, variant) in decl.variants.iter().enumerate() {
-            variant_infos.push(EnumVariantInfo {
-                name: variant.name.clone(),
-                payload_types: variant
-                    .payload
-                    .iter()
-                    .map(|ty| {
-                        // Imported metadata must preserve the same parameter
-                        // bindings as the declaring module's normalization.
-                        ty.map_names(|name| {
-                            if decl.type_params.contains(name) {
-                                return name.clone();
-                            }
-                            let Type::Named(ref qualified) = qualify(&Type::Named(name.clone()))
-                            else {
-                                unreachable!("module qualification preserves named types");
-                            };
-                            qualified.clone()
-                        })
-                    })
-                    .collect(),
-                tag: tag as i64,
-                declaration_span: variant.span,
-            });
-        }
-        let info = EnumInfo {
-            name: canonical_name.clone(),
-            public: decl.public,
-            type_params: decl.type_params.clone(),
-            variants: variant_infos,
-            declaration_span: decl.span,
-        };
-        if qualified != canonical_name {
-            self.symbols.define_enum(canonical_name, info.clone());
-        }
-        self.symbols.define_enum(qualified, info);
     }
 
     pub(super) fn register_class(&mut self, c: &ClassDecl) {
@@ -2556,5 +2579,30 @@ mod iterative_resolution_tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod package_registration_scaling {
+    use super::*;
+    #[test]
+    fn enum_identity_qualification_looks_up_only_signature_names() {
+        for modules in [16, 64, 256, 1024] {
+            let source = "pub enum Kind { Value } pub fn kind() -> Kind { return Kind::Value; }";
+            let program =
+                crate::parser::Parser::new(crate::lexer::Lexer::new(source).tokenize().unwrap())
+                    .parse()
+                    .0;
+            let mut checker = TypeChecker::new();
+            ENUM_IDENTITY_LOOKUPS.with(|count| count.set(0));
+            for module in 0..modules {
+                let name = format!("m{module}");
+                checker.register_module(&name, &name, "scaling.wi", &program);
+            }
+            let lookups = ENUM_IDENTITY_LOOKUPS.with(|count| count.get());
+            assert_eq!(lookups, modules);
+            assert_eq!(checker.symbols.enums.len(), modules);
+            eprintln!("enum registration modules={modules} lookups={lookups}");
+        }
     }
 }

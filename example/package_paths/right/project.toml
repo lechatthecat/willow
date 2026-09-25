@@ -1,0 +1,9 @@
+[project]
+name = 'more_numbers'
+version = '1.0.0'
+
+[willow]
+manifest-version = 1
+
+[dependencies]
+base = { path = '../left' }

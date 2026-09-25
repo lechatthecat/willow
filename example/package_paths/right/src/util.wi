@@ -1,0 +1,10 @@
+module util;
+import base::util as inner;
+
+pub class Value {
+    pub n: i64;
+    pub init(self, n: i64) { self.n = n; }
+    pub fn read(self) -> i64 { return self.n + inner::value(); }
+}
+
+pub fn value() -> i64 { return inner::value() * 2; }

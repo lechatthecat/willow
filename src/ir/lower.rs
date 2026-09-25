@@ -2969,7 +2969,7 @@ fn lower_resolution(
                         .get_id(id)
                         .expect("declared module function");
                     (
-                        id.unqualified_name().to_owned(),
+                        id.name().to_owned(),
                         checked_signature(
                             &function.params,
                             &function.param_infos,

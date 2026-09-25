@@ -64,7 +64,7 @@ pub(crate) struct UnitArtifacts {
     pub(crate) store: Rc<ArtifactStore>,
     metrics: Rc<RefCell<UnitMetrics>>,
     blocks: HashMap<BodyId, usize>,
-    initializers: HashMap<crate::compiler_db::ids::StaticId, usize>,
+    initializers: HashMap<crate::parser::ast::BodyId, usize>,
     sources: HashMap<FileId, usize>,
     pub(crate) bodies: Rc<crate::compiler_db::ids::BodyIndex>,
 }
@@ -370,7 +370,7 @@ impl UnitArtifacts {
                         if let Some(expr) = &mut field.initializer {
                             let id = self
                                 .bodies
-                                .static_id(expr.id())
+                                .initializer_body(expr.id())
                                 .expect("indexed initializer");
                             if !self.initializers.contains_key(&id) {
                                 let artifact = self.write(expr)?;
@@ -425,7 +425,7 @@ impl UnitArtifacts {
                                     .get(
                                         &self
                                             .bodies
-                                            .static_id(expr.id())
+                                            .initializer_body(expr.id())
                                             .context("missing static identity")?,
                                     )
                                     .context("missing initializer artifact")?,
@@ -664,6 +664,8 @@ mod tests {
         artifacts.offload(&mut dependency).unwrap();
         artifacts.offload(&mut entry).unwrap();
         let mut modules = vec![crate::module::ResolvedModule {
+            package: crate::package::PackageId(0),
+            symbol_module: None,
             id: crate::module::ModuleId(0),
             name: "base".into(),
             canonical_path: "base".into(),

@@ -32,15 +32,51 @@ impl TargetCapabilities {
 pub struct CompilerInputs {
     pub options: crate::CompilerOptions,
     pub project_root: PathBuf,
+    /// An explicitly selected project, including legacy manifests without packages.
+    pub(crate) project_mode: bool,
     pub target: TargetCapabilities,
+    pub package_graph: Option<std::sync::Arc<crate::package::PackageGraph>>,
+    pub root_package: Option<crate::package::PackageId>,
 }
 
 impl CompilerInputs {
+    pub(crate) fn resolve_project(
+        mut self,
+        root: Option<&std::path::Path>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            root.is_some() || !(self.options.locked || self.options.offline),
+            "`--locked` requires project mode (also --offline/--frozen)"
+        );
+        if let Some(root) = root {
+            self.project_mode = true;
+            // Lock all projects, while preserving legacy compiler identities.
+            if let Some(graph) = crate::package::resolve_project_packages(
+                root,
+                self.options.locked,
+                self.options.offline,
+            )? {
+                self = self.with_packages(std::sync::Arc::new(graph));
+            }
+        }
+        Ok(self)
+    }
+
+    pub fn with_packages(mut self, graph: std::sync::Arc<crate::package::PackageGraph>) -> Self {
+        self.project_mode = true;
+        self.root_package = Some(graph.root);
+        self.package_graph = Some(graph);
+        self
+    }
+
     pub fn native(options: crate::CompilerOptions, project_root: PathBuf) -> Self {
         Self {
             options,
             project_root,
+            project_mode: false,
             target: TargetCapabilities::native(),
+            package_graph: None,
+            root_package: None,
         }
     }
 }

@@ -329,9 +329,7 @@ impl BodyQueries {
     }
 
     pub(crate) fn initializer(&self, expr: crate::parser::ast::ExprId) -> Option<BodyId> {
-        let id = self.index.static_id(expr)?;
-        self.index
-            .body(id.unit, super::ids::BodyOwner::StaticInitializer(id))
+        self.index.initializer_body(expr)
     }
 }
 

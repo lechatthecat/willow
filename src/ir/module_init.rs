@@ -34,7 +34,8 @@ impl ModuleInitPlan {
     pub fn from_graph(graph: &ModuleGraph) -> Self {
         let mut plan = Self::default();
         for file in &graph.files {
-            plan.modules.insert(file.canonical_path.clone(), file.id);
+            plan.modules
+                .insert(file.identity_path().to_string(), file.id);
             plan.next_module_id = plan
                 .next_module_id
                 .max(file.id.0.checked_add(1).expect("module identity exhausted"));
@@ -87,6 +88,8 @@ mod tests {
                         position
                     };
                     graph.files.push(ResolvedModule {
+                        package: crate::package::PackageId(0),
+                        symbol_module: None,
                         id: ModuleId(id),
                         name: format!("alias_{position}"),
                         canonical_path: format!("pkg::unit_{position}"),

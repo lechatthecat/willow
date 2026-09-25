@@ -46,23 +46,33 @@ pub(crate) struct UnitEffects {
 pub(crate) struct EffectQueries {
     units: QueryTable<UnitId, UnitEffects>,
     names: HashMap<String, UnitId>,
+    dependencies: Option<std::rc::Rc<super::dependencies::ModuleDependencies>>,
 }
 impl Default for EffectQueries {
     fn default() -> Self {
         Self {
             units: QueryTable::named("unit_effects"),
             names: HashMap::new(),
+            dependencies: None,
         }
     }
 }
 impl EffectQueries {
-    pub(crate) fn new(modules: &[crate::module::ResolvedModule]) -> Self {
-        let mut result = Self::default();
+    pub(crate) fn new(
+        modules: &[crate::module::ResolvedModule],
+        dependencies: std::rc::Rc<super::dependencies::ModuleDependencies>,
+    ) -> Self {
+        let mut result = Self {
+            dependencies: Some(dependencies),
+            ..Self::default()
+        };
         for module in modules {
             result
                 .names
-                .insert(module.canonical_path.clone(), module.id);
-            result.names.insert(module.name.clone(), module.id);
+                .insert(module.identity_path().to_string(), module.id);
+            result
+                .names
+                .insert(module.registration_name().to_string(), module.id);
         }
         result
     }
@@ -101,8 +111,18 @@ impl EffectQueries {
             effects.loop_bodies.contains(&body),
         ))
     }
+    fn resolve_module(&self, consumer: UnitId, path: &str) -> Option<UnitId> {
+        // Package modules register only their unspellable canonical namespace.
+        // Legacy sessions retain their historical canonical/access-name adapter.
+        self.names
+            .get(path)
+            .copied()
+            .or_else(|| self.dependencies.as_ref()?.unit_for_path(consumer, path))
+    }
+
     pub(crate) fn external(
         &self,
+        consumer: UnitId,
         target: &FunctionId,
         imports: &HashMap<String, String>,
     ) -> RuntimeEffects {
@@ -124,7 +144,7 @@ impl EffectQueries {
             )
         } else if let Some(owner) = owner {
             let path = imports.get(owner).map(String::as_str).unwrap_or(owner);
-            if self.names.contains_key(path) {
+            if self.resolve_module(consumer, path).is_some() {
                 (path, FunctionId::free(target.name()))
             } else if let Some((module, item)) = path.rsplit_once("::") {
                 (
@@ -142,10 +162,10 @@ impl EffectQueries {
         } else {
             return default_external(target);
         };
-        self.names.get(path).map_or_else(
+        self.resolve_module(consumer, path).map_or_else(
             || default_external(target),
             |unit| {
-                let Some(effects) = self.units.ready(unit) else {
+                let Some(effects) = self.units.ready(&unit) else {
                     return PANIC;
                 };
                 effects.facts.get(&id).map_or_else(
@@ -422,12 +442,17 @@ pub(crate) fn solve_unit<N>(
 fn source_callable(index: &super::ids::BodyIndex, body: BodyId) -> FunctionId {
     use super::ids::BodyOwner;
     match index.owner(body).map(|(_, owner)| owner) {
-        Some(BodyOwner::Function(id)) => id,
+        Some(BodyOwner::Function(id)) => match id.owner() {
+            Some(owner) => FunctionId::method(TypeId::local(owner), id.name()),
+            None => FunctionId::free(id.name()),
+        },
         Some(BodyOwner::InterfaceDefault(id)) => FunctionId::method(
             TypeId::local(id.owner().expect("interface owner")),
             format!("$default${}", id.name()),
         ),
-        Some(BodyOwner::Constructor { owner, .. }) => FunctionId::method(owner, "init"),
+        Some(BodyOwner::Constructor { owner, .. }) => {
+            FunctionId::method(TypeId::local(owner.name()), "init")
+        }
         Some(BodyOwner::Lambda { .. }) => FunctionId::lambda(body),
         _ => FunctionId::lambda(body),
     }

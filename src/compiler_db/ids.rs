@@ -184,6 +184,8 @@ pub enum BodyOwner {
 #[derive(Debug, Default)]
 pub struct BodyIndex {
     owners: HashMap<BodyId, (UnitId, BodyOwner)>,
+    units: HashMap<UnitId, Vec<BodyId>>,
+    symbol_modules: HashMap<UnitId, crate::semantic::ids::SymbolModule>,
     bodies: HashMap<(UnitId, BodyOwner), BodyId>,
     lambdas: HashMap<ExprId, BodyId>,
     static_ids: HashMap<ExprId, StaticId>,
@@ -191,14 +193,63 @@ pub struct BodyIndex {
     children: HashMap<BodyId, Vec<BodyId>>,
     #[cfg(test)]
     visits: usize,
+    #[cfg(test)]
+    origin_visits: usize,
 }
 
 impl BodyIndex {
+    fn qualify_owner(&self, unit: UnitId, owner: BodyOwner) -> BodyOwner {
+        let Some(&module) = self.symbol_modules.get(&unit) else {
+            return owner;
+        };
+        match owner {
+            BodyOwner::Function(id) => BodyOwner::Function(id.in_module(module)),
+            BodyOwner::InterfaceDefault(id) => BodyOwner::InterfaceDefault(id.in_module(module)),
+            BodyOwner::Constructor { owner, ordinal } => BodyOwner::Constructor {
+                owner: owner.in_module(module),
+                ordinal,
+            },
+            BodyOwner::StaticInitializer(id) => BodyOwner::StaticInitializer(StaticId {
+                owner: id.owner.in_module(module),
+                ..id
+            }),
+            other => other,
+        }
+    }
+
+    /// Attach an origin once after loading. Only this unit's existing ownership
+    /// skeleton is visited; executable bodies remain spooled.
+    pub(crate) fn set_symbol_module(
+        &mut self,
+        unit: UnitId,
+        module: crate::semantic::ids::SymbolModule,
+    ) {
+        if let Some(previous) = self.symbol_modules.insert(unit, module) {
+            assert_eq!(previous, module);
+            return;
+        }
+        if let Some(bodies) = self.units.get(&unit) {
+            for &body in bodies {
+                #[cfg(test)]
+                {
+                    self.origin_visits += 1;
+                }
+                let (_, old) = self.owners[&body];
+                let owner = self.qualify_owner(unit, old);
+                self.bodies.remove(&(unit, old));
+                self.bodies.insert((unit, owner), body);
+                self.owners.insert(body, (unit, owner));
+            }
+        }
+    }
+
     pub fn owner(&self, body: BodyId) -> Option<(UnitId, BodyOwner)> {
         self.owners.get(&body).copied()
     }
     pub fn body(&self, unit: UnitId, owner: BodyOwner) -> Option<BodyId> {
-        self.bodies.get(&(unit, owner)).copied()
+        self.bodies
+            .get(&(unit, self.qualify_owner(unit, owner)))
+            .copied()
     }
     pub fn lambda(&self, expr: ExprId) -> Option<BodyId> {
         self.lambdas.get(&expr).copied()
@@ -280,8 +331,19 @@ impl BodyIndex {
         self.origins.get(&body).copied().unwrap_or(body)
     }
     pub fn static_id(&self, expr: ExprId) -> Option<StaticId> {
-        self.static_ids.get(&expr).copied()
+        let id = *self.static_ids.get(&expr)?;
+        let BodyOwner::StaticInitializer(id) =
+            self.qualify_owner(id.unit, BodyOwner::StaticInitializer(id))
+        else {
+            unreachable!()
+        };
+        Some(id)
     }
+    pub(crate) fn initializer_body(&self, expr: ExprId) -> Option<BodyId> {
+        let id = self.static_id(expr)?;
+        self.body(id.unit, BodyOwner::StaticInitializer(id))
+    }
+
     pub fn len(&self) -> usize {
         self.owners.len()
     }
@@ -297,6 +359,8 @@ impl BodyIndex {
         if self.owners.contains_key(&id) {
             return false;
         }
+        let owner = self.qualify_owner(unit, owner);
+        self.units.entry(unit).or_default().push(id);
         self.owners.insert(id, (unit, owner));
         self.bodies.insert((unit, owner), id);
         if let BodyOwner::Lambda { parent, .. } = owner {
@@ -341,6 +405,7 @@ impl BodyIndex {
     }
 
     fn instantiate_block(&mut self, block: &mut Block, unit: UnitId, owner: BodyOwner) {
+        let owner = self.qualify_owner(unit, owner);
         if self.owner(block.id) == Some((unit, owner)) {
             return;
         }
@@ -482,6 +547,58 @@ impl BodyIndex {
                     }
                 }
                 Item::Enum(_) => {}
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod package_owner_tests {
+    use super::*;
+    #[test]
+    fn package_owner_attachment_visits_each_body_once() {
+        for modules in [16, 64, 256, 1024] {
+            for bodies in [1, 8, 16] {
+                let mut index = BodyIndex::default();
+                for module in 0..modules {
+                    let unit = crate::module::ModuleId(module + 1);
+                    for body in 0..bodies {
+                        index.register(
+                            BodyId::fresh(),
+                            unit,
+                            BodyOwner::Function(FunctionId::free(format!("f{body}"))),
+                        );
+                    }
+                    let origin = crate::semantic::ids::SymbolModule::new(
+                        crate::package::PackageIdentity {
+                            name: "scaling".into(),
+                            version: "1.0.0".into(),
+                            source: crate::package::PackageSourceIdentity::Path {
+                                path: "package-owner-scaling".into(),
+                            },
+                            revision: None,
+                        },
+                        crate::module::ModulePath(format!("m{module}")),
+                    );
+                    for _ in 0..8 {
+                        index.set_symbol_module(unit, origin);
+                    }
+                    for body in 0..bodies {
+                        let owner = BodyOwner::Function(FunctionId::free(format!("f{body}")));
+                        let id = index.body(unit, owner).unwrap();
+                        let (_, BodyOwner::Function(id)) = index.owner(id).unwrap() else {
+                            panic!()
+                        };
+                        assert_eq!(id.module(), Some(origin));
+                    }
+                }
+                let expected = modules as usize * bodies;
+                assert_eq!(index.origin_visits, expected);
+                assert_eq!(index.len(), expected);
+                assert_eq!(index.bodies.len(), expected);
+                eprintln!(
+                    "package owners modules={modules} bodies_per_module={bodies} visits={expected} stored={expected}"
+                );
             }
         }
     }

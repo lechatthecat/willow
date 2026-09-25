@@ -766,11 +766,33 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
+fn runnable_project_example_cases() -> &'static [(&'static str, &'static str, &'static str)] {
+    &[(
+        "example/package_paths/app",
+        "example/package_paths/app/src/main.wi",
+        "11\n22\n11\n1\n13\n",
+    )]
+}
+
+#[test]
+fn test_package_paths_project_example() {
+    for &(project, _, expected) in runnable_project_example_cases() {
+        let (out, ok) = compile_file_and_run(project);
+        assert!(ok, "{project} failed");
+        assert_eq!(out, expected);
+    }
+}
+
 #[test]
 fn test_runnable_example_catalog_is_complete() {
     let mut expected_paths = runnable_example_cases()
         .iter()
         .map(|(path, _)| path.to_string())
+        .chain(
+            runnable_project_example_cases()
+                .iter()
+                .map(|(_, entry, _)| entry.to_string()),
+        )
         .collect::<Vec<_>>();
     expected_paths.sort();
     let actual_paths = collect_runnable_example_entries();

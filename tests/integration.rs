@@ -231,3 +231,6 @@ mod literal_slots;
 
 #[path = "integration/task_blocking.rs"]
 mod task_blocking;
+
+#[path = "integration/package_identity.rs"]
+mod package_identity;

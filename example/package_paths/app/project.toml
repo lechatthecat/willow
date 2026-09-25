@@ -1,0 +1,11 @@
+[project]
+name = 'package_demo'
+version = '1.0.0'
+
+[willow]
+manifest-version = 1
+
+[dependencies]
+left = { path = '../left' }
+right = { path = '../right' }
+again = { path = '../left' }

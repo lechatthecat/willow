@@ -3,11 +3,16 @@ use std::path::PathBuf;
 use std::process::{Command, ExitStatus};
 use willow_compiler::{CompilerOptions, compile, emit_hir_text, emit_lir_text, project};
 
+mod package;
+
 #[derive(Debug)]
 enum CliCommand {
     Build(BuildCommand),
     Run(RunCommand),
     Debug(DebugCommand),
+    Fetch(FetchCommand),
+    Verify(FetchCommand),
+    Package(package::PackageCommand),
 }
 
 #[derive(Debug)]
@@ -36,6 +41,8 @@ struct DebugCommand {
 #[derive(Default)]
 struct CompilerFlags {
     debug: bool,
+    locked: bool,
+    offline: bool,
     release: bool,
     debug_info: bool,
     emit_hir: bool,
@@ -48,6 +55,12 @@ impl CompilerFlags {
         let arg = &args[*index];
         match arg.as_str() {
             "--debug" => self.debug = true,
+            "--locked" => self.locked = true,
+            "--offline" => self.offline = true,
+            "--frozen" => {
+                self.locked = true;
+                self.offline = true;
+            }
             "--release" => self.release = true,
             "--debug-info" => self.debug_info = true,
             "--emit-hir" => self.emit_hir = true,
@@ -91,6 +104,8 @@ impl CompilerFlags {
             CompilerOptions::debug()
         };
         options.target.runtime_lib = self.runtime_lib;
+        options.locked = self.locked;
+        options.offline = self.offline;
         Ok(options)
     }
 }
@@ -102,8 +117,20 @@ impl CliCommand {
         };
 
         match command.as_str() {
+            "add" | "remove" | "update" | "deps" => Ok(Self::Package(
+                package::PackageCommand::parse(command, &args[1..])?,
+            )),
             "build" => Ok(Self::Build(BuildCommand::parse(&args[1..])?)),
             "run" => Ok(Self::Run(RunCommand::parse(&args[1..])?)),
+            "package" if args.get(1).is_some_and(|arg| arg == "verify") => {
+                let command = FetchCommand::parse_named(&args[2..], "package verify")?;
+                anyhow::ensure!(
+                    !command.locked && !command.offline,
+                    "package verify resolves independently of project.lock"
+                );
+                Ok(Self::Verify(command))
+            }
+            "fetch" => Ok(Self::Fetch(FetchCommand::parse(&args[1..])?)),
             "debug" => Ok(Self::Debug(DebugCommand::parse(&args[1..])?)),
             source if source.ends_with(".wi") => Ok(Self::Build(BuildCommand::parse(args)?)),
             unknown => anyhow::bail!("unknown command `{unknown}`\n\n{}", usage()),
@@ -112,9 +139,103 @@ impl CliCommand {
 
     fn execute(self) -> Result<()> {
         match self {
+            Self::Package(command) => command.execute(),
             Self::Build(command) => command.execute(),
             Self::Run(command) => command.execute(),
             Self::Debug(command) => command.execute(),
+            Self::Fetch(command) => command.execute(),
+            Self::Verify(command) => {
+                let report = willow_compiler::package::verify_package(&command.directory);
+                if command.format == "human" {
+                    print!("{}", report.human());
+                } else {
+                    println!("{}", serde_json::to_string(&report)?);
+                }
+                if !report.ok {
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FetchCommand {
+    directory: PathBuf,
+    locked: bool,
+    offline: bool,
+    format: String,
+}
+impl FetchCommand {
+    fn parse(args: &[String]) -> Result<Self> {
+        Self::parse_named(args, "fetch")
+    }
+    fn parse_named(args: &[String], command: &str) -> Result<Self> {
+        let mut directory = None;
+        let mut locked = false;
+        let mut offline = false;
+        let mut format = "human".to_string();
+        let mut args = args.iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--locked" => locked = true,
+                "--offline" => offline = true,
+                "--frozen" => {
+                    locked = true;
+                    offline = true;
+                }
+                "--format" => format = args.next().context("missing --format value")?.clone(),
+                value if value.starts_with("--format=") => format = value[9..].into(),
+                option if option.starts_with('-') => {
+                    anyhow::bail!("unknown {command} option `{option}`")
+                }
+                value => {
+                    anyhow::ensure!(
+                        directory.replace(PathBuf::from(value)).is_none(),
+                        "{command} accepts one project directory"
+                    );
+                }
+            }
+        }
+        anyhow::ensure!(
+            matches!(format.as_str(), "human" | "json" | "ndjson"),
+            "invalid {command} format `{format}`"
+        );
+        Ok(Self {
+            directory: directory.unwrap_or_else(|| PathBuf::from(".")),
+            locked,
+            offline,
+            format,
+        })
+    }
+    fn execute(self) -> Result<()> {
+        let result = (|| {
+            let (_, root) =
+                project::find_project_manifest(&self.directory).context("no project.toml found")?;
+            willow_compiler::package::fetch_packages(&root, self.locked, self.offline)
+        })();
+        match result {
+            Ok(graph) => {
+                if self.format == "human" {
+                    println!("Fetched {} dependency packages", graph.packages.len() - 1);
+                } else {
+                    println!(
+                        "{}",
+                        serde_json::json!({"kind":"fetch", "status":"ok", "dependencies":graph.packages.len()-1})
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if self.format != "human" {
+                    println!(
+                        "{}",
+                        serde_json::json!({"kind":"error", "message":error.to_string()})
+                    );
+                }
+                Err(error)
+            }
         }
     }
 }
@@ -170,6 +291,9 @@ impl BuildCommand {
     }
 
     fn execute(self) -> Result<()> {
+        if (self.options.locked || self.options.offline) && self.source.is_some() {
+            anyhow::bail!("`--locked` requires project mode (also --offline/--frozen)");
+        }
         if self.emit_hir || self.emit_lir {
             let Some(source) = self.source.as_deref() else {
                 anyhow::bail!("`--emit-hir`/`--emit-lir` require a `.wi` source file");
@@ -240,29 +364,75 @@ impl RunCommand {
             if arg.starts_with('-') {
                 anyhow::bail!("unknown run option `{arg}`");
             }
-            if !arg.ends_with(".wi") {
-                anyhow::bail!("unexpected run argument `{arg}`; expected a `.wi` source file");
-            }
             if source.replace(arg.clone()).is_some() {
-                anyhow::bail!("run accepts exactly one source file");
+                anyhow::bail!("run accepts only one source file or project directory");
             }
             index += 1;
         }
         Ok(Self {
-            source: source.ok_or_else(|| anyhow::anyhow!("no source file specified"))?,
+            source: source.unwrap_or_else(|| ".".into()),
             program_args,
             options: flags.finish()?,
         })
     }
 
     fn execute(self) -> Result<()> {
-        let output = temp_path(format!("willow_run_{}", stem(&self.source)));
-        compile(&self.source, &output, &self.options, None)?;
+        let temporary = RunDirectory::create()?;
+        let output = temporary.0.join(if cfg!(windows) {
+            "program.exe"
+        } else {
+            "program"
+        });
+        let output = output
+            .to_str()
+            .context("run output path is not UTF-8")?
+            .to_owned();
+        if self.source.ends_with(".wi") {
+            anyhow::ensure!(
+                !(self.options.locked || self.options.offline),
+                "`--locked` requires project mode (also --offline/--frozen)"
+            );
+            compile(&self.source, &output, &self.options, None)?;
+        } else {
+            BuildCommand {
+                source: None,
+                project_dir: Some(PathBuf::from(&self.source)),
+                output: Some(output.clone()),
+                emit_hir: false,
+                emit_lir: false,
+                options: self.options,
+            }
+            .execute()?;
+        }
         let status = Command::new(&output)
             .args(&self.program_args)
             .status()
             .with_context(|| format!("failed to run {output}"))?;
+        drop(temporary);
         std::process::exit(child_exit_code(status));
+    }
+}
+
+/// Isolate concurrent project runs and clean compiler artifacts before exit.
+struct RunDirectory(PathBuf);
+impl RunDirectory {
+    fn create() -> Result<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        loop {
+            let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("willow_run_{}_{sequence}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+}
+impl Drop for RunDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -287,6 +457,9 @@ impl DebugCommand {
                 anyhow::bail!("debug accepts exactly one source file");
             }
             index += 1;
+        }
+        if flags.locked || flags.offline {
+            anyhow::bail!("debug command does not accept --locked/--offline/--frozen");
         }
         if flags.release || flags.debug_info {
             anyhow::bail!("debug command does not accept release-mode options");
@@ -327,7 +500,7 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  willowc build <source.wi|project-dir> [-o <output>] [--debug|--release] [--debug-info] [--emit-hir] [--emit-lir] [--runtime-lib <path>]\n  willowc run <source.wi> [--debug|--release] [--debug-info] [--runtime-lib <path>] [-- <args>...]\n  willowc debug <source.wi> [--runtime-lib <path>]"
+    "Usage:\n  willowc add [alias] --git URL [--version REQ] [--dry-run] [--project-dir DIR]\n  willowc add [alias] --path DIR [--dry-run] [--project-dir DIR]\n  willowc add URL [--dry-run] [--project-dir DIR]\n  willowc remove alias [--dry-run] [--project-dir DIR]\n  willowc update [alias] [--breaking] [--dry-run] [--project-dir DIR]\n  willowc deps tree [--project-dir DIR]\n  willowc deps why <alias|package-name> [--project-dir DIR]\n  willowc package verify [PATH] [--format human|json|ndjson]\n  willowc build <source.wi|project-dir> [-o <output>] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--emit-hir] [--emit-lir] [--runtime-lib <path>]\n  willowc run [source.wi|project-dir] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--runtime-lib <path>] [-- <args>...]\n  willowc fetch [project-dir] [--locked|--offline|--frozen] [--format human|json|ndjson]\n  willowc debug <source.wi> [--runtime-lib <path>]"
 }
 
 fn stem(path: &str) -> String {
@@ -394,8 +567,8 @@ mod tests {
             (&["build", "a.wi", "b.wi"], false),        // 14 duplicate input
             (&["run", "main.wi"], true),                // 15 run source
             (&["run", "main.wi", "--", "x", "--flag"], true), // 16 program args
-            (&["run"], false),                          // 17 missing run source
-            (&["run", "project"], false),               // 18 non-source run arg
+            (&["run"], true),                           // 17 current-dir project run
+            (&["run", "project"], true),                // 18 explicit project run
             (&["debug", "main.wi"], true),              // 19 debug source
             (&["debug", "main.wi", "--release"], false), // 20 invalid debug mode
             (&["main.wi", "-o", "app"], true),          // 21 legacy build
@@ -406,6 +579,52 @@ mod tests {
                 *expected,
                 "case: {case:?}"
             );
+        }
+    }
+
+    #[test]
+    fn package_flags_and_fetch_parser() {
+        for name in ["build", "run"] {
+            let command = CliCommand::parse(&args(&[name, "--frozen"])).unwrap();
+            let options = match command {
+                CliCommand::Build(c) => c.options,
+                CliCommand::Run(c) => c.options,
+                _ => unreachable!(),
+            };
+            assert!(options.locked && options.offline);
+        }
+        let CliCommand::Fetch(fetch) =
+            CliCommand::parse(&args(&["fetch", "dir", "--frozen", "--format=json"])).unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(fetch.locked && fetch.offline);
+        assert_eq!(fetch.directory, PathBuf::from("dir"));
+        assert_eq!(fetch.format, "json");
+        for input in [
+            &["fetch", "--format"][..],
+            &["fetch", "--format", "xml"],
+            &["fetch", "a", "b"],
+            &["fetch", "--release"],
+            &["debug", "main.wi", "--offline"],
+        ] {
+            assert!(CliCommand::parse(&args(input)).is_err(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn verify_parser_rejects_extra_paths_flags_and_formats() {
+        for input in [
+            &["package", "verify", "a", "b"][..],
+            &["package", "verify", "--format"],
+            &["package", "verify", "--format=xml"],
+            &["package", "verify", "--locked"],
+            &["package", "verify", "--offline"],
+            &["package", "verify", "--frozen"],
+            &["package", "verify", "--release"],
+            &["package", "unknown"],
+        ] {
+            assert!(CliCommand::parse(&args(input)).is_err(), "{input:?}");
         }
     }
 

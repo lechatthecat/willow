@@ -1,0 +1,6 @@
+[project]
+name = 'numbers'
+version = '1.0.0'
+
+[willow]
+manifest-version = 1

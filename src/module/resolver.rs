@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity};
 use crate::lexer::Lexer;
 use crate::module::source_file::SourceFile;
-use crate::module::{ModuleGraph, std_registry};
+use crate::module::{ModuleGraph, ModuleKey, std_registry};
+use crate::package::{PackageId, PackageImport, PackageImports};
 use crate::parser::{Parser, ast::Program};
 
 /// A single-item import (`import math::add;`), binding a local name to a public
@@ -14,8 +15,10 @@ use crate::parser::{Parser, ast::Program};
 pub struct ItemImport {
     /// Local name introduced into scope (the alias, or the item name).
     pub local: String,
-    /// Canonical module path used for validation and symbol mangling.
+    /// Package-local module path; combine with `package` for identity.
     pub canonical_module: String,
+    /// Owning package; aliases never participate in this identity.
+    pub package: PackageId,
     /// The item's own name in that module (e.g. `add`).
     pub item: String,
     pub span: crate::diagnostics::Span,
@@ -24,6 +27,8 @@ pub struct ItemImport {
 /// One `import module;` binding, as seen from a single file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleBinding {
+    /// Build-global identity retained across consumer alias classification.
+    pub unit: super::ModuleId,
     /// The name this file calls the module by: its alias, or the last segment
     /// of the path.
     pub access: String,
@@ -76,6 +81,7 @@ pub(crate) fn classify_unit_imports_with<'a>(
         }
         if let Some(dependency) = find(&import.path) {
             out.modules.push(ModuleBinding {
+                unit: dependency.id,
                 access: import
                     .alias
                     .clone()
@@ -91,6 +97,7 @@ pub(crate) fn classify_unit_imports_with<'a>(
             out.items.push(ItemImport {
                 local: import.alias.clone().unwrap_or_else(|| item.to_string()),
                 canonical_module: dependency.canonical_path.clone(),
+                package: dependency.package,
                 item: item.to_string(),
                 span: import.span,
             });
@@ -125,7 +132,7 @@ pub(crate) fn resolve_imports_spooled(
     src_root: &Path,
     artifacts: super::artifacts::UnitArtifacts,
 ) -> ImportResolution {
-    resolve_imports_spooled_entry(entry_program, src_root, artifacts, None)
+    resolve_imports_spooled_entry(entry_program, src_root, artifacts, None, None, false)
 }
 
 pub(crate) fn resolve_imports_spooled_entry(
@@ -133,9 +140,13 @@ pub(crate) fn resolve_imports_spooled_entry(
     src_root: &Path,
     artifacts: super::artifacts::UnitArtifacts,
     entry_path: Option<PathBuf>,
+    package_graph: Option<std::sync::Arc<crate::package::PackageGraph>>,
+    project_mode: bool,
 ) -> ImportResolution {
     let mut graph = ModuleGraph::new(src_root.to_path_buf());
     graph.entry_path = entry_path;
+    graph.project_mode = project_mode;
+    graph.package_graph = package_graph;
     graph.artifacts = Some(artifacts);
     resolve_imports_in_graph(entry_program, src_root, graph)
 }
@@ -158,6 +169,25 @@ fn resolve_imports_in_graph(
     // for detecting import-vs-import collisions (duplicate aliases / items).
     let mut bound: HashMap<String, BoundImport> = HashMap::new();
 
+    let packages = graph.package_graph.clone();
+    let routing = match packages.as_deref().map(PackageImports::new).transpose() {
+        Ok(routing) => routing,
+        Err(error) => {
+            return ImportResolution {
+                graph,
+                item_imports,
+                diagnostics: vec![Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0401,
+                    error.to_string(),
+                )],
+            };
+        }
+    };
+    let consumer = packages
+        .as_ref()
+        .map_or(PackageId(0), |packages| packages.root);
+
     for import in &entry_program.imports {
         let item_count_before = item_imports.len();
         resolve_import(
@@ -165,6 +195,8 @@ fn resolve_imports_in_graph(
             import.alias.as_deref(),
             import.span,
             src_root,
+            consumer,
+            routing.as_ref(),
             &mut graph,
             &mut errors,
             Some(&mut item_imports),
@@ -242,10 +274,12 @@ fn resolve_import(
     alias: Option<&str>,
     span: crate::diagnostics::Span,
     src_root: &Path,
+    consumer: PackageId,
+    routing: Option<&PackageImports<'_>>,
     graph: &mut ModuleGraph,
     errors: &mut Vec<Diagnostic>,
     item_sink: Option<&mut Vec<ItemImport>>,
-) {
+) -> Option<ModuleKey> {
     // The reserved `std` namespace resolves against the built-in registry.
     if std_registry::is_std_path(path) {
         if graph.mark_import_seen(path)
@@ -253,83 +287,109 @@ fn resolve_import(
         {
             errors.push(diag);
         }
-        return;
+        return None;
     }
 
-    // A path that names a module file directly is a module import. This
-    // module-first precedence also applies to paths expanded from grouped
-    // syntax: if both `math.wi` and `math/add.wi` exist, `math::{add}` resolves
-    // `math::add` as a child module, exactly like `import math::add;`.
-    if find_module_file(src_root, path).is_some() {
-        resolve_one(path, alias, span, src_root, graph, errors);
-        return;
-    }
-
-    // Otherwise, treat the last segment as an item of the parent module
-    // (`import math::add;` → item `add` of module `math`).
-    if let Some((parent, item)) = path.rsplit_once("::")
-        && !parent.is_empty()
-        && find_module_file(src_root, parent).is_some()
+    #[cfg(test)]
     {
-        resolve_one(parent, None, span, src_root, graph, errors);
-        if let Some(sink) = item_sink {
-            sink.push(ItemImport {
-                local: alias.unwrap_or(item).to_string(),
-                canonical_module: parent.to_string(),
-                item: item.to_string(),
-                span,
-            });
-        }
-        return;
+        graph.import_routes += 1;
     }
-
-    // Neither a module nor a known item — report the unresolved import.
-    resolve_one(path, alias, span, src_root, graph, errors);
+    let resolved = if let Some(routing) = routing {
+        match routing.resolve(consumer, path) {
+            Ok(PackageImport::Module { key, file, item }) => Some((key, file, item)),
+            Ok(PackageImport::Std) => unreachable!("std handled above"),
+            Err(error) => {
+                errors.push(
+                    Diagnostic::new(Severity::Error, ErrorCode::E0401, error.to_string())
+                        .with_label(Label::primary(span, "module not found")),
+                );
+                return None;
+            }
+        }
+    } else {
+        find_module_file(src_root, path)
+            .map(|file| (ModuleKey::new(consumer, path), file, None))
+            .or_else(|| {
+                let (parent, item) = path.rsplit_once("::")?;
+                find_module_file(src_root, parent).map(|file| {
+                    (
+                        ModuleKey::new(consumer, parent),
+                        file,
+                        Some(item.to_string()),
+                    )
+                })
+            })
+    };
+    let Some((key, file, item)) = resolved else {
+        let candidates = candidate_module_paths(src_root, path);
+        let mut diagnostic = Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0401,
+            format!("unresolved import `{path}`"),
+        )
+        .with_label(Label::primary(span, "module not found"))
+        .with_note(format!(
+            "tried to find module at:\n{}",
+            candidates
+                .iter()
+                .map(|candidate| format!("  - {}", candidate.display()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ))
+        .with_help(format!(
+            "create `{}` or check the import name",
+            candidates[0].display()
+        ));
+        // A missing qualified name can also be a misspelled local module.
+        // Preserve the lookup diagnostic and explain the external-package case
+        // without guessing an alias or discovering a manifest implicitly.
+        if !graph.project_mode && path.contains("::") {
+            diagnostic = diagnostic.with_note(
+                "external dependency requires a project.toml; declare the dependency in a project and build that project",
+            );
+        }
+        errors.push(diagnostic);
+        return None;
+    };
+    let module_alias = if item.is_some() { None } else { alias };
+    resolve_one(
+        &key,
+        file,
+        module_alias,
+        span,
+        src_root,
+        routing,
+        graph,
+        errors,
+    );
+    if let (Some(item), Some(sink)) = (item, item_sink) {
+        sink.push(ItemImport {
+            local: alias.unwrap_or(&item).to_string(),
+            canonical_module: key.path.0.clone(),
+            package: key.package,
+            item,
+            span,
+        });
+    }
+    graph.contains_key(&key).then_some(key)
 }
 
 #[allow(clippy::too_many_arguments)]
 #[willow_continuations::function(resolve_import, resolve_one)]
 fn resolve_one(
-    path: &str,
+    key: &ModuleKey,
+    module_path: PathBuf,
     alias: Option<&str>,
     span: crate::diagnostics::Span,
     src_root: &Path,
+    routing: Option<&PackageImports<'_>>,
     graph: &mut ModuleGraph,
     errors: &mut Vec<Diagnostic>,
 ) {
-    // Already fully resolved — skip (also deduplicates repeated imports).
-    // `std` and module-vs-item classification are handled by `resolve_import`.
-    if graph.contains(path) {
+    if graph.contains_key(key) {
         return;
     }
-
-    let candidates = candidate_module_paths(src_root, path);
-    let module_path = candidates
-        .iter()
-        .find(|candidate| candidate.exists())
-        .cloned();
-
-    let Some(module_path) = module_path else {
-        let tried = candidates
-            .iter()
-            .map(|candidate| format!("  - {}", candidate.display()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        errors.push(
-            Diagnostic::new(
-                Severity::Error,
-                ErrorCode::E0401,
-                format!("unresolved import `{}`", path),
-            )
-            .with_label(Label::primary(span, "module not found"))
-            .with_note(format!("tried to find module at:\n{}", tried))
-            .with_help(format!(
-                "create `{}` or check the import name",
-                candidates[0].display()
-            )),
-        );
-        return;
-    };
+    let path = key.path.0.as_str();
 
     if graph
         .entry_path
@@ -350,6 +410,33 @@ fn resolve_one(
         return;
     }
 
+    if let Err(cycle) = graph.begin_key_visit(key) {
+        errors.push(
+            Diagnostic::new(Severity::Error, ErrorCode::E0403, "import cycle detected")
+                .with_label(Label::primary(span, "this import creates a cycle"))
+                .with_note(format!(
+                    "import cycle: {}",
+                    cycle
+                        .iter()
+                        .map(|key| if routing.is_some() {
+                            format!("{}:{}", key.package.0, key.path.0)
+                        } else {
+                            key.path.0.clone()
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" -> ")
+                ))
+                .with_help(
+                    "remove one of the imports or move shared declarations into another module",
+                ),
+        );
+        return;
+    }
+
+    #[cfg(test)]
+    {
+        graph.source_loads += 1;
+    }
     let source = match std::fs::read_to_string(&module_path) {
         Ok(s) => s,
         Err(e) => {
@@ -361,15 +448,44 @@ fn resolve_one(
                 )
                 .with_label(Label::primary(span, "failed to read")),
             );
+            graph.end_key_visit(key);
             return;
         }
     };
 
-    let module_id = graph.reserve_module_id(path);
+    let module_id = graph.reserve_key(key.clone());
     let tokens = match Lexer::with_file_id(&source, module_id.file_id()).tokenize() {
         Ok(t) => t,
         Err(errs) => {
             errors.extend(errs);
+            // Keep the imported file addressable by lexer diagnostic FileIds,
+            // just as parse-error recovery below does.
+            let mut source = source;
+            if let Some(artifacts) = &mut graph.artifacts {
+                match artifacts.snapshot_source(module_id.file_id(), &source) {
+                    Ok(()) => source.clear(),
+                    Err(error) => errors.push(Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0700,
+                        format!("cannot store compiler unit: {error:#}"),
+                    )),
+                }
+            }
+            let name = alias
+                .unwrap_or_else(|| module_access_name(path))
+                .to_string();
+            graph.add_package_file(
+                name,
+                key.clone(),
+                module_path,
+                source,
+                Program {
+                    module: None,
+                    imports: vec![],
+                    items: vec![],
+                },
+            );
+            graph.end_key_visit(key);
             return;
         }
     };
@@ -388,6 +504,7 @@ fn resolve_one(
                 ErrorCode::E0700,
                 format!("cannot store compiler unit: {error:#}"),
             ));
+            graph.end_key_visit(key);
             return;
         }
         source = String::new();
@@ -402,7 +519,8 @@ fn resolve_one(
         let name = alias
             .map(str::to_string)
             .unwrap_or_else(|| module_access_name(path).to_string());
-        graph.add_file(name, path.to_string(), module_path, source, program);
+        graph.add_package_file(name, key.clone(), module_path, source, program);
+        graph.end_key_visit(key);
         return;
     }
 
@@ -430,56 +548,32 @@ fn resolve_one(
         );
     }
 
-    if let Err(cycle) = graph.begin_visit(path) {
-        errors.push(
-            Diagnostic::new(Severity::Error, ErrorCode::E0403, "import cycle detected")
-                .with_label(Label::primary(span, "this import creates a cycle"))
-                .with_note(format!("import cycle: {}", cycle.join(" -> ")))
-                .with_help(
-                    "remove one of the imports or move shared declarations into another module",
-                ),
-        );
-        return;
-    }
-
     // Recursively resolve this module's own imports first. Transitive item
     // imports are classified (so their files load) but not yet bound into the
     // importing module's scope — that is a later stage.
     for sub_import in &program.imports {
-        let dependency = imported_module_path(src_root, &sub_import.path);
-        resolve_import(
+        let dependency = resolve_import(
             &sub_import.path,
             sub_import.alias.as_deref(),
             sub_import.span,
             src_root,
+            key.package,
+            routing,
             graph,
             errors,
             None,
         );
-        if let Some(dependency) = dependency
-            && graph.contains(&dependency)
-        {
-            graph.add_dependency(path, &dependency);
+        if let Some(dependency) = dependency {
+            graph.add_key_dependency(key, &dependency);
         }
     }
 
-    graph.end_visit(path);
+    graph.end_key_visit(key);
 
     let name = alias
         .map(str::to_string)
         .unwrap_or_else(|| module_access_name(path).to_string());
-    graph.add_file(name, path.to_string(), module_path, source, program);
-}
-
-fn imported_module_path(src_root: &Path, path: &str) -> Option<String> {
-    if std_registry::is_std_path(path) {
-        return None;
-    }
-    if find_module_file(src_root, path).is_some() {
-        return Some(path.to_string());
-    }
-    path.rsplit_once("::")
-        .and_then(|(parent, _)| find_module_file(src_root, parent).map(|_| parent.to_string()))
+    graph.add_package_file(name, key.clone(), module_path, source, program);
 }
 
 /// The existing module source file for `path`, if any.
@@ -850,3 +944,7 @@ mod tests {
         assert!(cycle.notes.iter().any(|note| note.contains("a -> b -> a")));
     }
 }
+
+#[cfg(test)]
+#[path = "package_loader_tests.rs"]
+mod package_loader_tests;

@@ -15,24 +15,149 @@ impl DesugarPass {
         program: &mut parser::ast::Program,
         modules: &mut [module::ResolvedModule],
     ) -> DesugarOutput {
-        let iface_index = build_module_iface_index(modules);
+        Self::run_resolved(program, modules, None)
+    }
+
+    pub(crate) fn run_resolved(
+        program: &mut parser::ast::Program,
+        modules: &mut [module::ResolvedModule],
+        dependencies: Option<&crate::compiler_db::dependencies::ModuleDependencies>,
+    ) -> DesugarOutput {
+        let package_aware = dependencies.is_some();
+        let resolve = |program: &parser::ast::Program| {
+            let Some(dependencies) = dependencies else {
+                return program.imports.clone();
+            };
+            let paths = dependencies.paths_for(program);
+            program
+                .imports
+                .iter()
+                .map(|import| {
+                    let mut resolved = import.clone();
+                    let (target, item) = if let Some(&target) = paths.get(&import.path) {
+                        (Some(target), None)
+                    } else if let Some((parent, item)) = import.path.rsplit_once("::") {
+                        (paths.get(parent).copied(), Some(item))
+                    } else {
+                        (None, None)
+                    };
+                    if let Some(target) = target {
+                        resolved.alias = Some(import.alias.clone().unwrap_or_else(|| {
+                            import.path.rsplit("::").next().unwrap().to_string()
+                        }));
+                        resolved.path = match item {
+                            Some(item) => {
+                                format!("{}::{item}", modules[target].registration_name())
+                            }
+                            None => modules[target].registration_name().to_string(),
+                        };
+                    }
+                    resolved
+                })
+                .collect()
+        };
+        let entry_imports = resolve(program);
+        let module_imports: Vec<_> = modules
+            .iter()
+            .map(|module| resolve(&module.program))
+            .collect();
+        let iface_index =
+            build_module_iface_index_with_imports(modules, &module_imports, package_aware);
         let default_index = build_module_default_methods(modules, &iface_index);
-        let class_shape_index = build_module_class_shapes(modules, &default_index);
-        let entry_ifaces = augment_index_with_import_aliases(&iface_index, &program.imports);
-        let entry_defaults = augment_index_with_import_aliases(&default_index, &program.imports);
-        let entry_class_shapes =
-            augment_index_with_import_aliases(&class_shape_index, &program.imports);
+        let class_shape_index = build_module_class_shapes_with_imports(
+            modules,
+            &default_index,
+            &module_imports,
+            package_aware,
+        );
+        let iface_groups = group_module_names(&iface_index);
+        let default_groups = group_module_names(&default_index);
+        let class_groups = group_module_names(&class_shape_index);
+        // Only reached dependency metadata belongs in a package unit's view.
+        // Avoid copying every other package's declarations into disconnected units.
+        let names: Vec<_> = modules
+            .iter()
+            .map(|m| m.registration_name().to_string())
+            .collect();
+        let entry_scope = dependencies.map(|dependencies| {
+            let paths = dependencies.paths_for(program);
+            let roots = program.imports.iter().filter_map(|import| {
+                paths.get(&import.path).copied().or_else(|| {
+                    let (parent, _) = import.path.rsplit_once("::")?;
+                    paths.get(parent).copied()
+                })
+            });
+            dependencies
+                .reachable(roots)
+                .into_iter()
+                .map(|id| names[id].as_str())
+                .collect::<Vec<_>>()
+        });
+        let module_scope = |unit| {
+            dependencies.map(|dependencies| {
+                dependencies
+                    .reachable(dependencies.direct(unit).unwrap_or(&[]).iter().copied())
+                    .into_iter()
+                    .map(|id| names[id].as_str())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let entry_ifaces = augment_resolved_imports(
+            &iface_index,
+            &iface_groups,
+            &entry_imports,
+            package_aware,
+            entry_scope.as_deref(),
+        );
+        let entry_defaults = augment_resolved_imports(
+            &default_index,
+            &default_groups,
+            &entry_imports,
+            package_aware,
+            entry_scope.as_deref(),
+        );
+        let entry_class_shapes = augment_resolved_imports(
+            &class_shape_index,
+            &class_groups,
+            &entry_imports,
+            package_aware,
+            entry_scope.as_deref(),
+        );
 
         let mut diagnostics =
             resolve_interface_inheritance(program, &entry_ifaces, &entry_class_shapes);
-        for module in modules.iter_mut() {
-            let module_ifaces =
-                augment_index_with_import_aliases(&iface_index, &module.program.imports);
-            let module_class_shapes =
-                augment_index_with_import_aliases(&class_shape_index, &module.program.imports);
+        let mut default_diagnostics = Vec::new();
+        for (module, imports) in modules.iter_mut().zip(&module_imports) {
+            let scope = module_scope(module.id);
+            let module_ifaces = augment_resolved_imports(
+                &iface_index,
+                &iface_groups,
+                imports,
+                package_aware,
+                scope.as_deref(),
+            );
+            let module_class_shapes = augment_resolved_imports(
+                &class_shape_index,
+                &class_groups,
+                imports,
+                package_aware,
+                scope.as_deref(),
+            );
             diagnostics.extend(resolve_interface_inheritance(
                 &mut module.program,
                 &module_ifaces,
+                &module_class_shapes,
+            ));
+            let module_defaults = augment_resolved_imports(
+                &default_index,
+                &default_groups,
+                imports,
+                package_aware,
+                scope.as_deref(),
+            );
+            default_diagnostics.extend(inject_default_interface_methods(
+                &mut module.program,
+                &module_defaults,
                 &module_class_shapes,
             ));
         }
@@ -42,17 +167,7 @@ impl DesugarPass {
             &entry_defaults,
             &entry_class_shapes,
         ));
-        for module in modules.iter_mut() {
-            let module_defaults =
-                augment_index_with_import_aliases(&default_index, &module.program.imports);
-            let module_class_shapes =
-                augment_index_with_import_aliases(&class_shape_index, &module.program.imports);
-            diagnostics.extend(inject_default_interface_methods(
-                &mut module.program,
-                &module_defaults,
-                &module_class_shapes,
-            ));
-        }
+        diagnostics.extend(default_diagnostics);
         DesugarOutput { diagnostics }
     }
 }
@@ -381,10 +496,19 @@ fn iface_inherited_default_conflicts<'a>(
 /// qualified to `mod::Super`; an already-qualified super is kept as written.
 /// This lets a class in one module `implements`/`extends` an interface defined
 /// in another (willow-1js.7, willow-1js.8).
-fn build_module_iface_index(modules: &[module::ResolvedModule]) -> IfaceIndex {
+fn build_module_iface_index_with_imports(
+    modules: &[module::ResolvedModule],
+    imports: &[Vec<parser::ast::ImportDecl>],
+    package_aware: bool,
+) -> IfaceIndex {
     use parser::ast::Item;
     let mut index = IfaceIndex::new();
-    for m in modules {
+    for (m, imports) in modules.iter().zip(imports) {
+        let import_names = if package_aware {
+            import_name_index(imports)
+        } else {
+            Default::default()
+        };
         // Local interface names declared by this module (to detect same-module
         // supers that need qualifying).
         let local: std::collections::HashSet<&str> = m
@@ -398,15 +522,15 @@ fn build_module_iface_index(modules: &[module::ResolvedModule]) -> IfaceIndex {
             .collect();
         for it in &m.program.items {
             if let Item::Interface(i) = it {
-                let qualified = format!("{}::{}", m.name, i.name);
+                let qualified = format!("{}::{}", m.registration_name(), i.name);
                 let supers = i
                     .extends
                     .iter()
                     .map(|s| {
                         if !s.contains("::") && local.contains(s.as_str()) {
-                            format!("{}::{}", m.name, s)
+                            format!("{}::{}", m.registration_name(), s)
                         } else {
-                            s.clone()
+                            qualify_imported_name(s, &import_names)
                         }
                     })
                     .collect();
@@ -417,31 +541,79 @@ fn build_module_iface_index(modules: &[module::ResolvedModule]) -> IfaceIndex {
     index
 }
 
-/// Return a copy of `base` with each of `imports`' directly-imported type names
-/// bound: `import mod::Iface` (path `mod::Iface`) aliases the bare local name
-/// (`Iface`, or the `as` alias) to the qualified index entry. A whole-module
-/// import (`import mod`, single segment) is skipped. Used so each program
-/// resolves its own direct-import interface aliases during desugar
-/// (willow-1js.7, willow-1js.8).
-fn augment_index_with_import_aliases<V: Clone>(
+fn group_module_names<V>(
     base: &std::collections::HashMap<String, V>,
-    imports: &[parser::ast::ImportDecl],
-) -> std::collections::HashMap<String, V> {
-    let mut out = base.clone();
-    for imp in imports {
-        let segs: Vec<&str> = imp.path.split("::").collect();
-        if segs.len() < 2 {
-            continue; // whole-module import, not a direct type import
+) -> std::collections::HashMap<&str, Vec<&str>> {
+    let mut groups = std::collections::HashMap::<_, Vec<_>>::new();
+    for key in base.keys() {
+        if let Some((module, _)) = key.rsplit_once("::") {
+            groups.entry(module).or_default().push(key.as_str());
         }
-        let local = imp
+    }
+    groups
+}
+
+fn augment_resolved_imports<V: Clone>(
+    base: &std::collections::HashMap<String, V>,
+    groups: &std::collections::HashMap<&str, Vec<&str>>,
+    imports: &[parser::ast::ImportDecl],
+    package_aware: bool,
+    scope: Option<&[&str]>,
+) -> std::collections::HashMap<String, V> {
+    let mut out = match scope {
+        None => base.clone(),
+        Some(scope) => scope
+            .iter()
+            .filter_map(|module| groups.get(module))
+            .flatten()
+            .map(|&key| (key.to_string(), base[key].clone()))
+            .collect(),
+    };
+    let mut seen = std::collections::HashSet::new();
+    for import in imports {
+        let access = import
             .alias
-            .clone()
-            .unwrap_or_else(|| (*segs.last().unwrap()).to_string());
-        if let Some(v) = base.get(&imp.path) {
-            out.entry(local).or_insert_with(|| v.clone());
+            .as_deref()
+            .unwrap_or_else(|| import.path.rsplit("::").next().unwrap());
+        if !seen.insert((import.path.as_str(), access)) {
+            continue;
+        }
+        if let Some(value) = base.get(&import.path) {
+            out.insert(access.to_string(), value.clone());
+        }
+        if package_aware && let Some(keys) = groups.get(import.path.as_str()) {
+            for &key in keys {
+                let (_, item) = key.rsplit_once("::").unwrap();
+                out.insert(format!("{access}::{item}"), base[key].clone());
+            }
         }
     }
     out
+}
+
+fn import_name_index(imports: &[parser::ast::ImportDecl]) -> std::collections::HashMap<&str, &str> {
+    imports
+        .iter()
+        .map(|import| {
+            (
+                import
+                    .alias
+                    .as_deref()
+                    .unwrap_or_else(|| import.path.rsplit("::").next().unwrap()),
+                import.path.as_str(),
+            )
+        })
+        .collect()
+}
+
+fn qualify_imported_name(name: &str, imports: &std::collections::HashMap<&str, &str>) -> String {
+    let (head, tail) = name
+        .split_once("::")
+        .map_or((name, None), |(head, tail)| (head, Some(tail)));
+    match imports.get(head) {
+        Some(path) => tail.map_or_else(|| (*path).to_string(), |tail| format!("{path}::{tail}")),
+        None => name.to_string(),
+    }
 }
 
 /// Resolve interface inheritance (willow-1js.2 / willow-1js.8) by desugaring on
@@ -676,7 +848,7 @@ fn build_module_default_methods(
     for m in modules {
         for it in &m.program.items {
             if let Item::Interface(i) = it {
-                let qualified = format!("{}::{}", m.name, i.name);
+                let qualified = format!("{}::{}", m.registration_name(), i.name);
                 let composed = composition.methods(
                     iface_index.get_key_value(&qualified).unwrap().0,
                     iface_index,
@@ -700,15 +872,22 @@ fn build_module_default_methods(
 /// will synthesize later in this pass. This lets an entry subclass inherit that
 /// method from an imported base instead of receiving a second copy merely
 /// because the base's AST lives in another `Program` (willow-3eo1).
-fn build_module_class_shapes(
+fn build_module_class_shapes_with_imports(
     modules: &[module::ResolvedModule],
     defaults: &DefaultMethodIndex,
+    imports: &[Vec<parser::ast::ImportDecl>],
+    package_aware: bool,
 ) -> std::collections::HashMap<String, ClassShape> {
     use parser::ast::{Item, Type, TypePath};
     use std::collections::{HashMap, HashSet};
 
     let mut out = HashMap::new();
-    for module in modules {
+    for (module, imports) in modules.iter().zip(imports) {
+        let import_names = if package_aware {
+            import_name_index(imports)
+        } else {
+            Default::default()
+        };
         let local_classes: HashSet<&str> = module
             .program
             .items
@@ -727,9 +906,7 @@ fn build_module_class_shapes(
                 _ => None,
             })
             .collect();
-        let import_aliases: HashMap<String, String> = module
-            .program
-            .imports
+        let import_aliases: HashMap<String, String> = imports
             .iter()
             .filter_map(|import| {
                 import.path.rsplit_once("::").map(|(_, item)| {
@@ -753,23 +930,23 @@ fn build_module_class_shapes(
                 let qualified = match interface_ty {
                     Type::Named(name) => {
                         let name = if local_interfaces.contains(name.as_str()) {
-                            format!("{}::{name}", module.name)
+                            format!("{}::{name}", module.registration_name())
                         } else {
                             import_aliases
                                 .get(name)
                                 .cloned()
-                                .unwrap_or_else(|| name.clone())
+                                .unwrap_or_else(|| qualify_imported_name(name, &import_names))
                         };
                         Type::Named(name)
                     }
                     Type::Generic(name, args) => {
                         let name = if local_interfaces.contains(name.as_str()) {
-                            format!("{}::{name}", module.name)
+                            format!("{}::{name}", module.registration_name())
                         } else {
                             import_aliases
                                 .get(name)
                                 .cloned()
-                                .unwrap_or_else(|| name.clone())
+                                .unwrap_or_else(|| qualify_imported_name(name, &import_names))
                         };
                         Type::Generic(name, args.clone())
                     }
@@ -787,16 +964,18 @@ fn build_module_class_shapes(
 
             let base = class.base_class.as_ref().map(|base| match base {
                 TypePath::Local(name) if local_classes.contains(name.as_str()) => {
-                    format!("{}::{name}", module.name)
+                    format!("{}::{name}", module.registration_name())
                 }
                 TypePath::Local(name) => import_aliases
                     .get(name)
                     .cloned()
-                    .unwrap_or_else(|| name.clone()),
-                TypePath::Qualified(parts) => parts.join("::"),
+                    .unwrap_or_else(|| qualify_imported_name(name, &import_names)),
+                TypePath::Qualified(parts) => {
+                    qualify_imported_name(&parts.join("::"), &import_names)
+                }
             });
             out.insert(
-                format!("{}::{}", module.name, class.name),
+                format!("{}::{}", module.registration_name(), class.name),
                 ClassShape {
                     base,
                     declared,
@@ -1430,6 +1609,8 @@ fn main() {}
     /// A one-file module, as the driver hands them to [`DesugarPass::run`].
     fn resolved_module(name: &str, source: &str) -> module::ResolvedModule {
         module::ResolvedModule {
+            package: crate::package::PackageId(0),
+            symbol_module: None,
             id: crate::module::ModuleId(0),
             name: name.to_string(),
             canonical_path: name.to_string(),
@@ -1531,5 +1712,65 @@ fn main() {}
                 .iter()
                 .any(|method| method.name == "greet")
         );
+    }
+}
+
+#[cfg(test)]
+mod package_scope_scaling {
+    use super::*;
+    use std::{cell::Cell, rc::Rc};
+    struct Counted(Rc<Cell<usize>>);
+    impl Clone for Counted {
+        fn clone(&self) -> Self {
+            self.0.set(self.0.get() + 1);
+            Self(Rc::clone(&self.0))
+        }
+    }
+    #[test]
+    fn package_desugar_copies_only_reached_metadata_and_unique_aliases() {
+        for modules in [16, 64, 256, 1024] {
+            let count = Rc::new(Cell::new(0));
+            let names: Vec<_> = (0..modules).map(|n| format!("m{n}")).collect();
+            let base = names
+                .iter()
+                .map(|name| (format!("{name}::Type"), Counted(Rc::clone(&count))))
+                .collect();
+            let groups = group_module_names(&base);
+            for aliases in [1, 8, modules] {
+                count.set(0);
+                for _ in 0..modules {
+                    let empty = augment_resolved_imports(&base, &groups, &[], true, Some(&[]));
+                    assert!(empty.is_empty());
+                }
+                let source = (0..aliases)
+                    .map(|i| format!("import m0 as a{i}; import m0 as a{i};"))
+                    .collect::<String>();
+                let program = crate::parser::Parser::new(
+                    crate::lexer::Lexer::new(&source).tokenize().unwrap(),
+                )
+                .parse()
+                .0;
+                let scope = names.iter().map(String::as_str).collect::<Vec<_>>();
+                let view =
+                    augment_resolved_imports(&base, &groups, &program.imports, true, Some(&scope));
+                assert_eq!(view.len(), modules + aliases);
+                assert_eq!(count.get(), modules + aliases);
+                eprintln!(
+                    "desugar fanout modules={modules} aliases={aliases} clones={}",
+                    count.get()
+                );
+            }
+            count.set(0);
+            for end in 0..modules {
+                let scope = names[..end].iter().map(String::as_str).collect::<Vec<_>>();
+                let view = augment_resolved_imports(&base, &groups, &[], true, Some(&scope));
+                assert_eq!(view.len(), end);
+            }
+            assert_eq!(count.get(), modules * (modules - 1) / 2);
+            eprintln!(
+                "desugar chain modules={modules} required_scope_entries={}",
+                count.get()
+            );
+        }
     }
 }

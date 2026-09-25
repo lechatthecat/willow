@@ -40,17 +40,19 @@ pub struct CompilerDb {
     pub(crate) typed_bodies: std::rc::Rc<body::BodyQueries>,
     pub(crate) lir: std::rc::Rc<lir::LirQueries>,
     bodies: std::rc::Rc<ids::BodyIndex>,
-    dependencies: dependencies::ModuleDependencies,
+    dependencies: std::rc::Rc<dependencies::ModuleDependencies>,
     checked: QueryTable<UnitId, CheckedUnitRecord>,
 }
 
 impl CompilerDb {
-    pub(crate) fn new(
+    pub(crate) fn with_dependencies(
         inputs: inputs::CompilerInputs,
         modules: &[crate::module::ResolvedModule],
         bodies: std::rc::Rc<ids::BodyIndex>,
         store: std::rc::Rc<crate::module::artifacts::ArtifactStore>,
+        dependencies: dependencies::ModuleDependencies,
     ) -> Self {
+        let dependencies = std::rc::Rc::new(dependencies);
         Self {
             scopes: scope::ScopeQueries::new(std::rc::Rc::clone(&store)),
             declarations: std::rc::Rc::new(declarations::DeclarationQueries::new(
@@ -63,9 +65,12 @@ impl CompilerDb {
             )),
             inputs,
             layouts: Default::default(),
-            effects: std::rc::Rc::new(effects::EffectQueries::new(modules)),
+            effects: std::rc::Rc::new(effects::EffectQueries::new(
+                modules,
+                std::rc::Rc::clone(&dependencies),
+            )),
             bodies,
-            dependencies: dependencies::ModuleDependencies::new(modules),
+            dependencies,
             checked: QueryTable::named("checked_unit"),
         }
     }

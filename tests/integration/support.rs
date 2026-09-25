@@ -733,6 +733,26 @@ pub(super) struct TestProject {
 }
 
 impl TestProject {
+    pub(super) fn write_file(&self, path: &str, source: &str) {
+        fs::write(self.root.join(path), source).unwrap();
+    }
+
+    pub(super) fn defined_object_symbols(&self) -> Vec<String> {
+        use object::read::{Object, ObjectSymbol};
+        let path = object_path(path_str(&self.bin_path));
+        let bytes = fs::read(&path).unwrap();
+        let object = object::File::parse(&*bytes).unwrap();
+        let mut names: Vec<_> = object
+            .symbols()
+            .filter(|symbol| symbol.is_definition())
+            .filter_map(|symbol| symbol.name().ok())
+            .map(|name| name.trim_start_matches('_').to_string())
+            .collect();
+        names.sort();
+        fs::remove_file(path).unwrap();
+        names
+    }
+
     pub(super) fn new(prefix: &str, files: &[(&str, &str)]) -> Self {
         let id = unique_test_id();
         let root = std::env::temp_dir().join(format!("willow_{prefix}_{id}"));

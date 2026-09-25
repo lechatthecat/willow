@@ -12,21 +12,127 @@ use std::fmt;
 use std::ops::Index;
 use std::sync::{LazyLock, RwLock};
 
+/// Persistent declaration origin; dependency aliases and session-local package
+/// indices are deliberately absent. Intern once per module, then reuse its handle.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+struct SymbolModuleName {
+    package: crate::package::PackageIdentity,
+    path: crate::module::ModulePath,
+    #[serde(skip)]
+    namespace: String,
+}
+
+/// Process-local module handle used by compact symbol IDs. Artifacts serialize
+/// the underlying package identity and logical path, never the numeric handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SymbolModule(u32);
+
+impl SymbolModule {
+    pub fn new(package: crate::package::PackageIdentity, path: crate::module::ModulePath) -> Self {
+        // Stable FNV-1a-128 over the canonical identity (not a security hash).
+        // A collision is detected below rather than silently merging declarations.
+        let mut hash = 0x6c62272e07bb014262b821756295c58du128;
+        for byte in serde_json::to_vec(&package).expect("package identity serializes") {
+            hash = (hash ^ u128::from(byte)).wrapping_mul(0x1000000000000000000013b);
+        }
+        let namespace = format!("$pkg{hash:032x}::{}", path.0);
+        let name = SymbolModuleName {
+            package,
+            path,
+            namespace,
+        };
+        if let Some(id) = SYMBOLS
+            .read()
+            .expect("symbol table poisoned")
+            .module_ids
+            .get(&name)
+        {
+            return *id;
+        }
+        let mut table = SYMBOLS.write().expect("symbol table poisoned");
+        if let Some(id) = table.module_ids.get(&name) {
+            return *id;
+        }
+        let id = Self(u32::try_from(table.modules.len()).expect("symbol module table exhausted"));
+        let stored = Box::leak(Box::new(name));
+        if let Some(previous) = table.module_names.insert(&stored.namespace, id) {
+            assert_eq!(
+                table.modules[previous.0 as usize], stored,
+                "package symbol hash collision"
+            );
+        }
+        table.modules.push(stored);
+        table.module_ids.insert(stored, id);
+        id
+    }
+    fn spelling(self) -> &'static SymbolModuleName {
+        SYMBOLS.read().expect("symbol table poisoned").modules[self.0 as usize]
+    }
+    /// Unspellable compiler adapter used by existing string-based type tables.
+    pub fn namespace(self) -> &'static str {
+        &self.spelling().namespace
+    }
+    fn for_namespace(namespace: &str) -> Option<Self> {
+        SYMBOLS
+            .read()
+            .expect("symbol table poisoned")
+            .module_names
+            .get(namespace)
+            .copied()
+    }
+    pub fn package(self) -> &'static crate::package::PackageIdentity {
+        &self.spelling().package
+    }
+    pub fn path(self) -> &'static crate::module::ModulePath {
+        &self.spelling().path
+    }
+}
+impl Ord for SymbolModule {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.spelling().cmp(other.spelling())
+    }
+}
+impl PartialOrd for SymbolModule {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl serde::Serialize for SymbolModule {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(self.spelling(), serializer)
+    }
+}
+impl<'de> serde::Deserialize<'de> for SymbolModule {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = <SymbolModuleName as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Self::new(name.package, name.path))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename = "TypeId")]
 struct TypeName {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    module: Option<SymbolModule>,
     namespace: Option<&'static str>,
     name: &'static str,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename = "FunctionId")]
 struct FunctionName {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    module: Option<SymbolModule>,
     namespace: Option<&'static str>,
     owner: Option<&'static str>,
     name: &'static str,
 }
 #[derive(Default)]
 struct SymbolTable {
+    modules: Vec<&'static SymbolModuleName>,
+    module_ids: HashMap<&'static SymbolModuleName, SymbolModule>,
+    module_names: HashMap<&'static str, SymbolModule>,
     strings: HashSet<&'static str>,
     types: Vec<TypeName>,
     type_ids: HashMap<TypeName, TypeId>,
@@ -36,13 +142,19 @@ struct SymbolTable {
 static SYMBOLS: LazyLock<RwLock<SymbolTable>> =
     LazyLock::new(|| RwLock::new(SymbolTable::default()));
 impl SymbolTable {
-    fn find_type(&self, namespace: Option<&str>, name: &str) -> Option<TypeId> {
+    fn find_type(
+        &self,
+        module: Option<SymbolModule>,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Option<TypeId> {
         let namespace = match namespace {
             Some(n) => Some(*self.strings.get(n)?),
             None => None,
         };
         self.type_ids
             .get(&TypeName {
+                module,
                 namespace,
                 name: self.strings.get(name)?,
             })
@@ -50,6 +162,7 @@ impl SymbolTable {
     }
     fn find_function(
         &self,
+        module: Option<SymbolModule>,
         namespace: Option<&str>,
         owner: Option<&str>,
         name: &str,
@@ -64,6 +177,7 @@ impl SymbolTable {
         };
         self.function_ids
             .get(&FunctionName {
+                module,
                 namespace,
                 owner,
                 name: self.strings.get(name)?,
@@ -79,8 +193,14 @@ impl SymbolTable {
         self.strings.insert(value);
         value
     }
-    fn type_id(&mut self, namespace: Option<&str>, name: &str) -> TypeId {
+    fn type_id(
+        &mut self,
+        module: Option<SymbolModule>,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> TypeId {
         let key = TypeName {
+            module,
             namespace: namespace.map(|n| self.string(n)),
             name: self.string(name),
         };
@@ -94,11 +214,13 @@ impl SymbolTable {
     }
     fn function_id(
         &mut self,
+        module: Option<SymbolModule>,
         namespace: Option<&str>,
         owner: Option<&str>,
         name: &str,
     ) -> FunctionId {
         let key = FunctionName {
+            module,
             namespace: namespace.map(|n| self.string(n)),
             owner: owner.map(|n| self.string(n)),
             name: self.string(name),
@@ -120,17 +242,23 @@ impl SymbolTable {
 pub struct TypeId(u32);
 impl TypeId {
     fn intern(namespace: Option<&str>, name: &str) -> Self {
+        match namespace.and_then(SymbolModule::for_namespace) {
+            Some(module) => Self::intern_in(Some(module), None, name),
+            None => Self::intern_in(None, namespace, name),
+        }
+    }
+    fn intern_in(module: Option<SymbolModule>, namespace: Option<&str>, name: &str) -> Self {
         if let Some(id) = SYMBOLS
             .read()
             .expect("symbol table poisoned")
-            .find_type(namespace, name)
+            .find_type(module, namespace, name)
         {
             return id;
         }
         SYMBOLS
             .write()
             .expect("symbol table poisoned")
-            .type_id(namespace, name)
+            .type_id(module, namespace, name)
     }
     fn spelling(&self) -> TypeName {
         SYMBOLS.read().expect("symbol table poisoned").types[self.0 as usize]
@@ -144,11 +272,24 @@ impl TypeId {
             None => Self::local(name),
         }
     }
+    /// Legacy spelling qualification. Resolved declarations retain their identity;
+    /// consumer aliases belong in the scope, not in the canonical symbol.
     pub fn in_namespace(self, namespace: impl AsRef<str>) -> Self {
+        if self.module().is_some() {
+            return self;
+        }
         Self::intern(Some(namespace.as_ref()), self.name())
     }
+    /// Attach the declaring module, discarding any consumer-local namespace.
+    pub fn in_module(self, module: SymbolModule) -> Self {
+        Self::intern_in(Some(module), None, self.name())
+    }
+    pub fn module(&self) -> Option<SymbolModule> {
+        self.spelling().module
+    }
     pub fn namespace(&self) -> Option<&str> {
-        self.spelling().namespace
+        let name = self.spelling();
+        name.module.map(SymbolModule::namespace).or(name.namespace)
     }
     pub fn name(&self) -> &str {
         self.spelling().name
@@ -172,7 +313,7 @@ impl Default for TypeId {
 impl fmt::Display for TypeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let spelling = self.spelling();
-        if let Some(namespace) = spelling.namespace {
+        if let Some(namespace) = self.namespace() {
             write!(f, "{namespace}::")?;
         }
         f.write_str(spelling.name)
@@ -181,7 +322,11 @@ impl fmt::Display for TypeId {
 impl fmt::Debug for TypeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let spelling = self.spelling();
-        f.debug_struct("TypeId")
+        let mut debug = f.debug_struct("TypeId");
+        if let Some(module) = spelling.module {
+            debug.field("module", module.spelling());
+        }
+        debug
             .field("namespace", &spelling.namespace)
             .field("name", &spelling.name)
             .finish()
@@ -209,11 +354,16 @@ impl<'de> serde::Deserialize<'de> for TypeId {
         #[derive(serde::Deserialize)]
         #[serde(rename = "TypeId")]
         struct Name {
+            module: Option<SymbolModule>,
             namespace: Option<String>,
             name: String,
         }
         let spelling = <Name as serde::Deserialize>::deserialize(deserializer)?;
-        Ok(Self::intern(spelling.namespace.as_deref(), &spelling.name))
+        Ok(Self::intern_in(
+            spelling.module,
+            spelling.namespace.as_deref(),
+            &spelling.name,
+        ))
     }
 }
 
@@ -222,17 +372,28 @@ impl<'de> serde::Deserialize<'de> for TypeId {
 pub struct FunctionId(u32);
 impl FunctionId {
     fn intern(namespace: Option<&str>, owner: Option<&str>, name: &str) -> Self {
+        match namespace.and_then(SymbolModule::for_namespace) {
+            Some(module) => Self::intern_in(Some(module), None, owner, name),
+            None => Self::intern_in(None, namespace, owner, name),
+        }
+    }
+    fn intern_in(
+        module: Option<SymbolModule>,
+        namespace: Option<&str>,
+        owner: Option<&str>,
+        name: &str,
+    ) -> Self {
         if let Some(id) = SYMBOLS
             .read()
             .expect("symbol table poisoned")
-            .find_function(namespace, owner, name)
+            .find_function(module, namespace, owner, name)
         {
             return id;
         }
         SYMBOLS
             .write()
             .expect("symbol table poisoned")
-            .function_id(namespace, owner, name)
+            .function_id(module, namespace, owner, name)
     }
     fn spelling(&self) -> FunctionName {
         SYMBOLS.read().expect("symbol table poisoned").functions[self.0 as usize]
@@ -248,7 +409,12 @@ impl FunctionId {
     }
     pub fn method(owner: TypeId, name: impl AsRef<str>) -> Self {
         let owner = owner.spelling();
-        Self::intern(owner.namespace, Some(owner.name), name.as_ref())
+        Self::intern_in(
+            owner.module,
+            owner.namespace,
+            Some(owner.name),
+            name.as_ref(),
+        )
     }
     /// The callable identity of a lambda body, shared by the checker's
     /// resolved call graph and the backend's effect inventory. Body identities
@@ -257,12 +423,26 @@ impl FunctionId {
     pub fn lambda(body: crate::parser::ast::BodyId) -> Self {
         Self::free(format!("<lambda {body}>"))
     }
+    /// Legacy spelling qualification. Resolved declarations retain their identity;
+    /// consumer aliases belong in the scope, not in the canonical symbol.
     pub fn in_namespace(self, namespace: impl AsRef<str>) -> Self {
+        if self.module().is_some() {
+            return self;
+        }
         let name = self.spelling();
         Self::intern(Some(namespace.as_ref()), name.owner, name.name)
     }
+    /// Attach the declaring module, discarding any consumer-local namespace.
+    pub fn in_module(self, module: SymbolModule) -> Self {
+        let name = self.spelling();
+        Self::intern_in(Some(module), None, name.owner, name.name)
+    }
+    pub fn module(&self) -> Option<SymbolModule> {
+        self.spelling().module
+    }
     pub fn namespace(&self) -> Option<&str> {
-        self.spelling().namespace
+        let name = self.spelling();
+        name.module.map(SymbolModule::namespace).or(name.namespace)
     }
     pub fn owner(&self) -> Option<&str> {
         self.spelling().owner
@@ -272,7 +452,7 @@ impl FunctionId {
     }
     pub fn unqualified_name(&self) -> &str {
         let name = self.spelling();
-        if name.namespace.is_none() && name.owner.is_none() {
+        if name.module.is_none() && name.namespace.is_none() && name.owner.is_none() {
             name.name
         } else {
             ""
@@ -281,15 +461,18 @@ impl FunctionId {
     pub fn owner_type(&self) -> Option<TypeId> {
         let name = self.spelling();
         name.owner
-            .map(|owner| TypeId::intern(name.namespace, owner))
+            .map(|owner| TypeId::intern_in(name.module, name.namespace, owner))
     }
     pub fn is_free_named(&self, expected: &str) -> bool {
         let name = self.spelling();
-        name.namespace.is_none() && name.owner.is_none() && name.name == expected
+        name.module.is_none()
+            && name.namespace.is_none()
+            && name.owner.is_none()
+            && name.name == expected
     }
     pub fn is_method_of(&self, expected: &str) -> bool {
         let name = self.spelling();
-        name.namespace.is_none() && name.owner == Some(expected)
+        name.module.is_none() && name.namespace.is_none() && name.owner == Some(expected)
     }
     pub fn remap_imported_item(&self, item: &str, local: &str) -> Option<Self> {
         if self.is_free_named(item) {
@@ -326,7 +509,7 @@ impl Default for FunctionId {
 impl fmt::Display for FunctionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = self.spelling();
-        if let Some(namespace) = name.namespace {
+        if let Some(namespace) = self.namespace() {
             write!(f, "{namespace}::")?;
         }
         if let Some(owner) = name.owner {
@@ -338,7 +521,11 @@ impl fmt::Display for FunctionId {
 impl fmt::Debug for FunctionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = self.spelling();
-        f.debug_struct("FunctionId")
+        let mut debug = f.debug_struct("FunctionId");
+        if let Some(module) = name.module {
+            debug.field("module", module.spelling());
+        }
+        debug
             .field("namespace", &name.namespace)
             .field("owner", &name.owner)
             .field("name", &name.name)
@@ -365,12 +552,14 @@ impl<'de> serde::Deserialize<'de> for FunctionId {
         #[derive(serde::Deserialize)]
         #[serde(rename = "FunctionId")]
         struct Name {
+            module: Option<SymbolModule>,
             namespace: Option<String>,
             owner: Option<String>,
             name: String,
         }
         let name = <Name as serde::Deserialize>::deserialize(deserializer)?;
-        Ok(Self::intern(
+        Ok(Self::intern_in(
+            name.module,
             name.namespace.as_deref(),
             name.owner.as_deref(),
             &name.name,
@@ -378,7 +567,7 @@ impl<'de> serde::Deserialize<'de> for FunctionId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SymbolId {
     Type(TypeId),
     Function(FunctionId),
@@ -390,6 +579,15 @@ pub enum SymbolId {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResolvedSymbolId {
     pub module: ModuleId,
+    pub symbol: SymbolId,
+}
+
+/// Persistent identity carries source identity rather than a session-local
+/// package number or the consumer's dependency alias.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ResolvedSymbolRef {
+    pub package: crate::package::PackageIdentity,
+    pub module: crate::module::ModulePath,
     pub symbol: SymbolId,
 }
 
@@ -406,7 +604,9 @@ impl FunctionScope {
     /// Associate an emitted/lookup spelling with its declaration identity.
     pub fn declare(&self, spelling: &str, id: FunctionId) {
         let mut declarations = self.declarations.borrow_mut();
-        declarations.insert(id.to_string(), id);
+        if id.module().is_none() {
+            declarations.insert(id.to_string(), id);
+        }
         declarations.insert(spelling.to_owned(), id);
     }
     pub fn lookup_id(&self, spelling: &str) -> FunctionId {
@@ -421,6 +621,9 @@ impl FunctionScope {
     }
     pub fn resolve(&self, id: &FunctionId) -> FunctionId {
         self.aliases.get(id).copied().unwrap_or_else(|| {
+            if id.module().is_some() {
+                return *id;
+            }
             self.declarations
                 .borrow()
                 .get(&id.to_string())
@@ -582,6 +785,40 @@ mod tests {
         let original = FunctionId::method(TypeId::local("Worker"), "heavy");
         let imported = original.remap_imported_item("Worker", "W").unwrap();
         assert_eq!(imported, FunctionId::method(TypeId::local("W"), "heavy"));
+    }
+
+    #[test]
+    fn persistent_symbol_reference_distinguishes_packages_and_roundtrips() {
+        use crate::package::{PackageIdentity, PackageSourceIdentity};
+        let a = ResolvedSymbolRef {
+            package: PackageIdentity {
+                name: "utility".into(),
+                version: "1.0.0".into(),
+                source: PackageSourceIdentity::Git {
+                    url: "https://example.test/a".into(),
+                },
+                revision: Some("abc".into()),
+            },
+            module: crate::module::ModulePath("util::format".into()),
+            symbol: SymbolId::Function(FunctionId::free("format")),
+        };
+        let mut b = a.clone();
+        b.package.source = PackageSourceIdentity::Git {
+            url: "https://example.test/b".into(),
+        };
+        assert_ne!(a, b);
+        for symbol in [a.symbol.clone(), SymbolId::Type(TypeId::local("Formatter"))] {
+            let original = ResolvedSymbolRef {
+                symbol,
+                ..a.clone()
+            };
+            let json = serde_json::to_string(&original).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ResolvedSymbolRef>(&json).unwrap(),
+                original
+            );
+            assert!(!json.contains("alias"));
+        }
     }
 
     #[test]
@@ -821,5 +1058,130 @@ impl<'de, V: serde::Deserialize<'de>> serde::Deserialize<'de> for FunctionMap<V>
                 declarations: std::rc::Rc::new(std::cell::RefCell::new(declarations)),
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod package_symbol_tests {
+    use super::*;
+
+    fn origin(package: usize, path: &str) -> SymbolModule {
+        SymbolModule::new(
+            crate::package::PackageIdentity {
+                name: "utility".into(),
+                version: "1.0.0".into(),
+                source: crate::package::PackageSourceIdentity::Git {
+                    url: format!("https://example.test/package-{package}"),
+                },
+                revision: Some("abc".into()),
+            },
+            crate::module::ModulePath(path.into()),
+        )
+    }
+
+    #[test]
+    fn package_symbols_preserve_origin_through_methods_and_artifacts() {
+        let a = origin(0, "util::format");
+        let b = origin(1, "util::format");
+        let first = TypeId::local("Formatter")
+            .in_namespace("first_alias")
+            .in_module(a);
+        let alias = TypeId::local("Formatter")
+            .in_namespace("other_alias")
+            .in_module(a);
+        let other = TypeId::local("Formatter").in_module(b);
+        assert_eq!(first, alias);
+        assert_ne!(first, other);
+        assert_ne!(
+            first,
+            TypeId::local("Formatter").in_module(origin(0, "other"))
+        );
+        let method = FunctionId::method(first, "format");
+        assert_eq!(method.owner_type(), Some(first));
+        assert_ne!(method, FunctionId::method(other, "format"));
+        assert_eq!(method.in_namespace("visible"), method);
+        assert_eq!(first.in_namespace("visible"), first);
+        assert_eq!(
+            FunctionId::method(TypeId::local("Self"), "format").resolve_self_owner(&first),
+            method
+        );
+        assert!(
+            !FunctionId::free("format")
+                .in_module(a)
+                .is_free_named("format")
+        );
+        assert!(!method.is_method_of("Formatter"));
+        for id in [
+            SymbolId::Type(first),
+            SymbolId::Function(method),
+            SymbolId::Function(FunctionId::free("format").in_module(a)),
+        ] {
+            let json = serde_json::to_string(&id).unwrap();
+            assert_eq!(serde_json::from_str::<SymbolId>(&json).unwrap(), id);
+            assert!(!json.contains("alias"));
+            assert!(json.contains("package-0"));
+        }
+        assert_eq!(std::mem::size_of::<TypeId>(), 4);
+        assert_eq!(std::mem::size_of::<FunctionId>(), 4);
+    }
+
+    #[test]
+    fn same_spelling_functions_do_not_collapse_in_scopes_or_maps() {
+        let a = FunctionId::free("format").in_module(origin(0, "util"));
+        let b = FunctionId::free("format").in_module(origin(1, "util"));
+        let mut scope = FunctionScope::default();
+        scope.declare("link_a", a);
+        scope.declare("link_b", b);
+        // A source spelling with the same display must not override canonical IDs.
+        scope.declare("format", FunctionId::free("shadow"));
+        scope.bind(FunctionId::free("alias_a"), a);
+        scope.bind(FunctionId::free("alias_b"), b);
+        let mut map = FunctionMap::with_scope(scope);
+        map.insert("link_a", 1);
+        map.insert("link_b", 2);
+        for restored in [
+            map.detached_clone(),
+            serde_json::from_str::<FunctionMap<i32>>(&serde_json::to_string(&map).unwrap())
+                .unwrap(),
+        ] {
+            assert_eq!(restored.get_id(&a), Some(&1));
+            assert_eq!(restored.get_id(&b), Some(&2));
+            assert_eq!(restored.get("alias_a"), Some(&1));
+            assert_eq!(restored.get("alias_b"), Some(&2));
+            assert_eq!(restored.ids().count(), 2);
+        }
+    }
+
+    #[test]
+    fn repeated_symbols_share_module_handles_across_package_counts() {
+        for size in [16, 64, 256, 1024] {
+            for packages in [1, 8, size] {
+                let mut table = SymbolTable::default();
+                let mut modules = HashSet::new();
+                let mut symbols = HashSet::new();
+                let mut requests = 0;
+                for i in 0..size {
+                    let module = origin(i % packages, &format!("scaling::m{i}"));
+                    modules.insert(module);
+                    for _ in 0..8 {
+                        let ty = TypeId::local("Formatter").in_module(module);
+                        symbols.insert(FunctionId::method(ty, "format"));
+                        table.type_id(Some(module), None, "Formatter");
+                        table.function_id(Some(module), None, Some("Formatter"), "format");
+                        requests += 1;
+                    }
+                }
+                assert_eq!(modules.len(), size);
+                assert_eq!(symbols.len(), size);
+                assert_eq!(requests, size * 8);
+                assert_eq!(table.types.len(), size);
+                assert_eq!(table.functions.len(), size);
+                assert_eq!(table.strings.len(), 2);
+                eprintln!(
+                    "symbol modules={size} packages={packages} requests={requests} unique={}",
+                    symbols.len()
+                );
+            }
+        }
     }
 }

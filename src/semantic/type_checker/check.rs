@@ -696,7 +696,7 @@ impl TypeChecker {
                 &self.effect_index.callables,
                 &self.effect_inputs.direct,
                 |target| match &self.effect_queries {
-                    Some((queries, _)) => queries.external(target, &imports),
+                    Some((queries, unit)) => queries.external(*unit, target, &imports),
                     None => crate::compiler_db::effects::intrinsic_effects(target)
                         .unwrap_or(crate::semantic::effects::RuntimeEffects::MAY_PANIC),
                 },

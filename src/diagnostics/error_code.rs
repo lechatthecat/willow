@@ -198,6 +198,10 @@ error_codes! {
     E2009, // duplicate module declaration
     E2010, // `std` cannot be a user module namespace
     E2011, // module declaration does not match import path
+    // Project manifests
+    E2012, // invalid manifest
+    E2013, // invalid dependency alias
+    E2014, // unsupported manifest version
     // Send / Sync marker interfaces & data-race policy E24xx (willow-dgwo)
     E2401, // `Send`/`Sync` are compiler-known markers and cannot be implemented manually
     E2402, // cannot pass a non-Sync GC reference (or non-Send value) to an async call
