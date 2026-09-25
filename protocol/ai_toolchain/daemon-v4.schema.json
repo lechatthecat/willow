@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Willow warm daemon request (one JSON object per line)",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": [
+        "id",
+        "operation",
+        "request"
+      ],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operation": {
+          "const": "query"
+        },
+        "request": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "function"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "symbol-info"
+                },
+                "revision": {
+                  "type": "string"
+                },
+                "function": {
+                  "type": "string"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "function"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "references"
+                },
+                "revision": {
+                  "type": "string"
+                },
+                "function": {
+                  "type": "string"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "function"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "effects"
+                },
+                "revision": {
+                  "type": "string"
+                },
+                "function": {
+                  "type": "string"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "file",
+                "byte"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "type-at"
+                },
+                "revision": {
+                  "type": "string"
+                },
+                "file": {
+                  "type": "string"
+                },
+                "byte": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": [
+        "id",
+        "operation"
+      ],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operation": {
+          "const": "refresh"
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": [
+        "id",
+        "operation"
+      ],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operation": {
+          "const": "stats"
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": [
+        "id",
+        "operation"
+      ],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operation": {
+          "const": "shutdown"
+        }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

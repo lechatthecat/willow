@@ -11,3 +11,5 @@ pub mod type_checker;
 
 pub use concurrency::ConcurrencyAnalyzer;
 pub use type_checker::TypeChecker;
+
+pub(crate) mod analysis_symbols;

@@ -288,6 +288,7 @@ impl Parser {
             _ => unreachable!("is_field_assign_ahead checked"),
         };
         self.expect(TokenKind::Dot)?;
+        let target_span = self.current_span();
         let field = self.expect_ident()?;
         self.expect(TokenKind::Eq)?;
         let value = self.parse_expr()?;
@@ -295,6 +296,7 @@ impl Parser {
         let end = self.previous_span();
         let stmt_span = span.to(end);
         Ok(Stmt::FieldAssign(FieldAssignStmt {
+            target_span,
             object,
             field,
             value,
@@ -331,6 +333,7 @@ impl Parser {
         };
         self.expect(TokenKind::Eq)?;
         let init = self.parse_expr()?;
+        let span = span.to(self.current_span());
         self.expect(TokenKind::Semicolon)?;
         Ok(Stmt::Let(LetStmt {
             name,
@@ -487,6 +490,7 @@ impl Parser {
                 unreachable!("checked Expr::FieldAccess above");
             };
             return Ok(Stmt::FieldAssign(FieldAssignStmt {
+                target_span: *fa_span,
                 object: object.take(),
                 field: std::mem::take(field),
                 value,

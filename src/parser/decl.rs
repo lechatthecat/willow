@@ -9,6 +9,7 @@ impl Parser {
         let span = self.current_span();
         self.expect(TokenKind::Module)?;
         let path = self.parse_module_path()?;
+        let span = span.to(self.current_span());
         self.expect(TokenKind::Semicolon)?;
         // `std` is a reserved namespace; user files may not claim it.
         if path == "std" || path.starts_with("std::") {
@@ -56,6 +57,7 @@ impl Parser {
         } else {
             None
         };
+        let span = span.to(self.current_span());
         self.expect(TokenKind::Semicolon)?;
         Ok(vec![ImportDecl { path, alias, span }])
     }
@@ -82,6 +84,7 @@ impl Parser {
             } else {
                 None
             };
+            let span = span.to(self.tokens[self.pos - 1].span);
             imports.push(ImportDecl {
                 path: format!("{prefix}::{item}"),
                 alias,
@@ -344,9 +347,21 @@ impl Parser {
         // Optional super-interfaces: `interface B extends A` (willow-1js.2).
         let mut extends = Vec::new();
         if self.eat(TokenKind::Extends) {
-            extends.push(self.parse_module_path()?);
+            let start = self.current_span();
+            let name = self.parse_module_path()?;
+            self.type_uses.push(TypeUse {
+                name: name.clone(),
+                span: start.to(self.tokens[self.pos - 1].span),
+            });
+            extends.push(name);
             while self.eat(TokenKind::Comma) {
-                extends.push(self.parse_module_path()?);
+                let start = self.current_span();
+                let name = self.parse_module_path()?;
+                self.type_uses.push(TypeUse {
+                    name: name.clone(),
+                    span: start.to(self.tokens[self.pos - 1].span),
+                });
+                extends.push(name);
             }
         }
         self.expect(TokenKind::LBrace)?;
@@ -483,17 +498,19 @@ impl Parser {
     }
 
     pub(super) fn parse_type_path(&mut self) -> Result<TypePath, Diagnostic> {
-        let first = self.expect_ident()?;
-        if self.eat(TokenKind::ColonColon) {
-            let mut parts = vec![first];
+        let start = self.current_span();
+        let mut parts = vec![self.expect_ident()?];
+        while self.eat(TokenKind::ColonColon) {
             parts.push(self.expect_ident()?);
-            // allow more segments: a::b::C
-            while self.eat(TokenKind::ColonColon) {
-                parts.push(self.expect_ident()?);
-            }
-            Ok(TypePath::Qualified(parts))
+        }
+        self.type_uses.push(TypeUse {
+            name: parts.join("::"),
+            span: start.to(self.tokens[self.pos - 1].span),
+        });
+        if parts.len() == 1 {
+            Ok(TypePath::Local(parts.remove(0)))
         } else {
-            Ok(TypePath::Local(first))
+            Ok(TypePath::Qualified(parts))
         }
     }
 

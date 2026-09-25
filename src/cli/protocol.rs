@@ -14,7 +14,11 @@ pub(super) fn requested(args: &[String]) -> bool {
     ) {
         return false;
     }
-    args.iter()
+    matches!(
+        args.first().map(String::as_str),
+        Some("impact" | "snapshot" | "risk" | "query" | "edit" | "daemon")
+    ) || args
+        .iter()
         .take_while(|arg| arg.as_str() != "--")
         .any(|arg| {
             arg == "--format"
@@ -24,7 +28,7 @@ pub(super) fn requested(args: &[String]) -> bool {
         })
 }
 
-struct EventWriter<W> {
+pub(super) struct EventWriter<W> {
     writer: W,
     stream_id: String,
     seq: u64,
@@ -52,7 +56,7 @@ impl<W: Write> EventWriter<W> {
         }
     }
 
-    fn event(&mut self, event: &str, code: &str, data: Value) -> io::Result<()> {
+    pub(super) fn event(&mut self, event: &str, code: &str, data: Value) -> io::Result<()> {
         if self.failed {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -177,8 +181,36 @@ pub(super) fn run(args: Vec<String>) -> anyhow::Result<i32> {
             2,
             format!("unsupported protocol version {version}"),
         ),
+        Ok((args, _, _)) if args.first().is_some_and(|a| a == "daemon") => {
+            match super::daemon::serve(&args[1..], &mut events) {
+                Ok(()) => ("WT0000", 0, String::new()),
+                Err(error) => ("WT2002", 1, format!("{error:#}")),
+            }
+        }
         Ok((args, _, _)) => match CliCommand::parse(&args) {
             Err(error) => ("WT1001", 2, error.to_string()),
+            Ok(CliCommand::Edit(command)) => match command.execute(&mut events) {
+                Ok(value) => {
+                    events.event("analysis.result", "WT0010", value)?;
+                    ("WT0000", 0, String::new())
+                }
+                Err(error) => ("WT2002", 1, format!("{error:#}")),
+            },
+            Ok(CliCommand::Analysis(command)) => match command.execute(&mut events) {
+                Ok(value) => {
+                    events.event("analysis.result", "WT0010", value)?;
+                    ("WT0000", 0, String::new())
+                }
+                Err(error) => (
+                    if events.errors > 0 {
+                        "WT2001"
+                    } else {
+                        "WT2002"
+                    },
+                    1,
+                    format!("{error:#}"),
+                ),
+            },
             Ok(command) => {
                 let operation = match command {
                     CliCommand::Check(command) => Some((command, false)),

@@ -596,6 +596,10 @@ impl TypeChecker {
                 Some(Pattern::EnumVariantTuple {
                     enum_name: enum_name.clone(),
                     variant: class_name.clone(),
+                    variant_span: Span {
+                        end: span.start + class_name.len(),
+                        ..*span
+                    },
                     bindings: vec![binding.clone()],
                     span: *span,
                     id: PatternId::fresh(),
@@ -609,6 +613,7 @@ impl TypeChecker {
                 Some(Pattern::EnumVariant {
                     enum_name: enum_name.clone(),
                     variant: name.clone(),
+                    variant_span: *span,
                     span: *span,
                     id: PatternId::fresh(),
                 })
@@ -622,12 +627,14 @@ impl TypeChecker {
             Pattern::EnumVariant {
                 enum_name: written,
                 variant,
+                variant_span,
                 span,
                 ..
             } if written != enum_name && self.canonical_type_name(written) == info.name => {
                 Some(Pattern::EnumVariant {
                     enum_name: enum_name.clone(),
                     variant: variant.clone(),
+                    variant_span: *variant_span,
                     span: *span,
                     id: PatternId::fresh(),
                 })
@@ -635,6 +642,7 @@ impl TypeChecker {
             Pattern::EnumVariantTuple {
                 enum_name: written,
                 variant,
+                variant_span,
                 bindings,
                 span,
                 ..
@@ -644,6 +652,7 @@ impl TypeChecker {
                 Some(Pattern::EnumVariantTuple {
                     enum_name: enum_name.clone(),
                     variant: variant.clone(),
+                    variant_span: *variant_span,
                     bindings: bindings.clone(),
                     span: *span,
                     id: PatternId::fresh(),
@@ -715,6 +724,34 @@ impl TypeChecker {
             }
             let pattern: &Pattern = reinterpreted.as_ref().unwrap_or(&arm.pattern);
 
+            if let Pattern::EnumVariant {
+                enum_name,
+                variant,
+                variant_span,
+                span,
+                ..
+            }
+            | Pattern::EnumVariantTuple {
+                enum_name,
+                variant,
+                variant_span,
+                span,
+                ..
+            } = pattern
+            {
+                self.record_variant_use(enum_name, variant, *variant_span);
+                self.record_type_use(enum_name, &scrutinee_ty, *span);
+            }
+            if let Pattern::ClassDowncast {
+                class_name, span, ..
+            } = pattern
+            {
+                self.record_type_use(
+                    class_name,
+                    &Type::Named(self.canonical_type_name(class_name)),
+                    *span,
+                );
+            }
             // Validate pattern and track coverage
             match pattern {
                 Pattern::Wildcard(_, _) => {

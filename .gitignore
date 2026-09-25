@@ -39,3 +39,7 @@ AGENTS.md
 # Publish only the standalone compiler benchmark harness.
 /benches/*
 !/benches/compiler_bench.rs
+
+# Local structured-edit candidates and recovery journals
+.willow-edits/
+.willow-write-*

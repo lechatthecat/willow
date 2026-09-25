@@ -276,6 +276,7 @@ impl TypeChecker {
                 && let Some((enum_name, payloads, result)) = self.expected_variant(name, expected)
                 && payloads.is_empty()
             {
+                self.record_variant_use(&enum_name, name, expr.span());
                 self.enum_variant_resolutions.insert(expr.id(), enum_name);
                 return result;
             }
@@ -452,6 +453,7 @@ impl TypeChecker {
                 );
             }
         }
+        self.record_variant_use(enum_name, &c.callee, c.span);
         self.enum_variant_resolutions
             .insert(c.id, enum_name.to_string());
         result
@@ -524,6 +526,7 @@ impl TypeChecker {
         payload_types: &[Type],
         result: Type,
     ) -> Type {
+        self.record_variant_use(enum_name, &call.method, call.method_span);
         self.check_source_type_name(&call.class, call.span);
         for ty in &call.type_args {
             self.check_source_type_access(ty, call.span);

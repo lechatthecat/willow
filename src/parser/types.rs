@@ -29,6 +29,18 @@ impl Parser {
         }
         let mut frames = Vec::new();
         loop {
+            let type_start = self.current_span();
+            if let TokenKind::I64 | TokenKind::F64 | TokenKind::Bool = self.peek_kind() {
+                let name = match self.peek_kind() {
+                    TokenKind::I64 => "i64",
+                    TokenKind::F64 => "f64",
+                    _ => "bool",
+                };
+                self.type_uses.push(TypeUse {
+                    name: name.into(),
+                    span: type_start,
+                });
+            }
             let mut value = match self.peek_kind().clone() {
                 TokenKind::I64 => {
                     self.advance();
@@ -79,6 +91,10 @@ impl Parser {
                         parts.push(self.expect_ident()?);
                     }
                     let name = parts.join("::");
+                    self.type_uses.push(TypeUse {
+                        name: name.clone(),
+                        span: type_start.to(self.tokens[self.pos - 1].span),
+                    });
                     if self.eat(TokenKind::Lt) {
                         if !self.check(TokenKind::Gt) && !self.at_eof() {
                             frames.push(Frame::Generic(name, Vec::new()));

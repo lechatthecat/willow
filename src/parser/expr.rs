@@ -430,8 +430,10 @@ impl Parser {
                 if let Some(expr) = self.try_parse_generic_static_call(name.clone(), span)? {
                     Ok(expr)
                 } else if self.eat(TokenKind::ColonColon) {
+                    let member_span = self.current_span();
                     let member = self.expect_ident()?;
                     if self.eat(TokenKind::ColonColon) {
+                        let method_span = self.current_span();
                         let method = self.expect_ident()?;
                         let class = format!("{name}::{member}");
                         if super::is_type_constructor_name(&method)
@@ -444,15 +446,16 @@ impl Parser {
                                 type_args: vec![],
                                 method,
                                 args: vec![],
-                                span,
+                                span: span.to(self.previous_span()),
                                 id: ExprId::fresh(),
+                                method_span,
                             })))
                         } else if !matches!(self.peek_kind(), TokenKind::LParen) {
                             // `mod::Class::property` — static property read.
                             Ok(Expr::StaticField(StaticFieldExpr {
                                 class,
                                 field: method,
-                                span,
+                                span: span.to(self.previous_span()),
                                 id: ExprId::fresh(),
                             }))
                         } else {
@@ -463,8 +466,9 @@ impl Parser {
                                 type_args: vec![],
                                 method,
                                 args,
-                                span,
+                                span: span.to(self.previous_span()),
                                 id: ExprId::fresh(),
+                                method_span,
                             })))
                         }
                     } else if super::is_type_constructor_name(&member)
@@ -480,15 +484,16 @@ impl Parser {
                             type_args: vec![],
                             method: member,
                             args: vec![],
-                            span,
+                            span: span.to(self.previous_span()),
                             id: ExprId::fresh(),
+                            method_span: member_span,
                         })))
                     } else if !matches!(self.peek_kind(), TokenKind::LParen) {
                         // `Class::property` — static property read (no parens).
                         Ok(Expr::StaticField(StaticFieldExpr {
                             class: name,
                             field: member,
-                            span,
+                            span: span.to(self.previous_span()),
                             id: ExprId::fresh(),
                         }))
                     } else {
@@ -499,8 +504,9 @@ impl Parser {
                             type_args: vec![],
                             method: member,
                             args,
-                            span,
+                            span: span.to(self.previous_span()),
                             id: ExprId::fresh(),
+                            method_span: member_span,
                         })))
                     }
                 } else if self.eat(TokenKind::LParen) {
@@ -539,6 +545,7 @@ impl Parser {
         class: String,
         span: Span,
     ) -> Result<Expr, Diagnostic> {
+        let method_span = self.current_span();
         let method = self.expect_ident()?;
         self.expect(TokenKind::LParen)?;
         let args = self.parse_call_args_after_lparen()?;
@@ -547,8 +554,9 @@ impl Parser {
             type_args: vec![],
             method,
             args,
-            span,
+            span: span.to(self.previous_span()),
             id: ExprId::fresh(),
+            method_span,
         })))
     }
 
@@ -560,6 +568,7 @@ impl Parser {
             parts.push(self.expect_path_segment()?);
         }
 
+        let method_span = self.previous_span();
         if self.eat(TokenKind::LParen) {
             let args = self.parse_call_args_after_lparen()?;
             if parts.as_slice() == ["std", "io", "print"]
@@ -572,8 +581,9 @@ impl Parser {
                         type_args: vec![],
                         method: parts.last().cloned().unwrap_or_default(),
                         args,
-                        span,
+                        span: span.to(self.previous_span()),
                         id: ExprId::fresh(),
+                        method_span,
                     })));
                 }
                 let mut args = args;
@@ -596,8 +606,9 @@ impl Parser {
                 type_args: vec![],
                 method,
                 args,
-                span,
+                span: span.to(self.previous_span()),
                 id: ExprId::fresh(),
+                method_span,
             })));
         }
 
@@ -608,8 +619,9 @@ impl Parser {
                 type_args: vec![],
                 method,
                 args: vec![],
-                span,
+                span: span.to(self.previous_span()),
                 id: ExprId::fresh(),
+                method_span,
             })));
         }
 
@@ -626,6 +638,7 @@ impl Parser {
         }
 
         let saved = self.pos;
+        let saved_type_uses = self.type_uses.len();
         self.advance();
         let mut type_args = Vec::new();
         while !self.check(TokenKind::Gt) && !self.at_eof() {
@@ -633,6 +646,7 @@ impl Parser {
                 Ok(ty) => type_args.push(ty),
                 Err(_) => {
                     self.pos = saved;
+                    self.type_uses.truncate(saved_type_uses);
                     return Ok(None);
                 }
             }
@@ -643,9 +657,11 @@ impl Parser {
 
         if !self.eat(TokenKind::Gt) || !self.eat(TokenKind::ColonColon) {
             self.pos = saved;
+            self.type_uses.truncate(saved_type_uses);
             return Ok(None);
         }
 
+        let method_span = self.current_span();
         let method = self.expect_ident()?;
         self.expect(TokenKind::LParen)?;
         let args = self.parse_call_args_after_lparen()?;
@@ -654,8 +670,9 @@ impl Parser {
             type_args,
             method,
             args,
-            span,
+            span: span.to(self.previous_span()),
             id: ExprId::fresh(),
+            method_span,
         }))))
     }
 
@@ -684,7 +701,10 @@ impl Parser {
             });
         }
 
-        Ok(CallArg::value(self.parse_expr()?))
+        let start = self.current_span();
+        let mut argument = CallArg::value(self.parse_expr()?);
+        argument.span = start.to(self.previous_span());
+        Ok(argument)
     }
 
     pub(super) fn parse_object_literal_fields(
@@ -742,7 +762,7 @@ impl Parser {
             class_name,
             type_args,
             args,
-            span,
+            span: span.to(self.previous_span()),
             id: ExprId::fresh(),
         })))
     }
@@ -943,7 +963,7 @@ impl Parser {
             params,
             return_type,
             body,
-            span,
+            span: span.to(self.previous_span()),
             id: ExprId::fresh(),
         })))
     }

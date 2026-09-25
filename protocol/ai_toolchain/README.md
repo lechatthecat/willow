@@ -51,3 +51,47 @@ cross-revision matching will be separate; impact distance and synthetic-node
 presentation remain V1 decisions.
 
 The machine-readable envelope and known payloads are defined in [toolchain-v1.schema.json](toolchain-v1.schema.json). Unknown additive fields and events remain permitted.
+
+Structured editing and the warm query process are documented in [STRUCTURED_EDITS.md](STRUCTURED_EDITS.md), including their isolation, recovery, refresh and retention boundaries.
+
+Risk side-effect classification distinguishes `new_operation` (source operation
+addition) from `new_side_effect`: `not-new`, `proven-absent` for captured pure
+direct calls, `proven-operation` for explicit I/O/writes, or
+`conservative-candidate`. `proven-operation` describes an operation in the source;
+it does not prove predicate feasibility, an external business write, or retry
+intent. Binding assignments remain candidates until local versus reference
+writes are distinguished. `effect_edge_visits` counts the shared reverse-graph
+side-effect propagation. Lock bodies preserve branch and loop-exit paths.
+`new_execution` and `new_repetition` compare structural reachability and local or
+inherited repetition with the baseline. An unchanged operation can therefore
+produce a new side-effect candidate and review question. Identical operations
+are compared as multisets of total, reachable, and repeating occurrences;
+reordering equivalent operations alone does not enable a new effect.
+`baseline_edge_visits` and `baseline_call_edge_visits` expose the baseline graph
+work separately from the current revision's counters.
+
+V2 query batches use [query-v2.schema.json](query-v2.schema.json). `symbols`
+lists compiler-resolved declarations; `symbol-at` takes a file and byte offset.
+`symbol-info` and `references` accept either a callable ID or a declaration ID
+in the historical `function` field. Source declarations and references include
+bindings, parameters, types, type parameters, fields, enum variants, imports,
+modules, methods and constructors. Builtins have no source declaration location.
+Reference results include value/import uses and possible virtual dispatch;
+signature-compatible indirect calls remain unresolved candidates, not resolved
+references. `type-at` includes checked declaration types and expression types.
+Successful query envelopes carry `revision` and `result`; an invalid revision
+returns top-level `status: stale` before lookup. Unknown positions/identities,
+ambiguous source positions and incomplete evidence remain distinct.
+
+Risk evaluates expression order, short-circuit constants, match/select branches,
+loop exits and defer registration/cleanup. It separates `retry_detection`
+(repetition only, timeout/fallible candidates, inherited candidates),
+`execution_reachability`, and `new_side_effect`. Structural paths do not prove
+predicate feasibility or business retry intent. V1.2 uses snapshots directly
+and does not instantiate a V2 query session.
+
+`effects` preserves compiler capability bits and supplies `effect_evidence`
+for each set bit, with a source witness or explicit missing evidence. Compiler
+facts, runtime capability bounds and external boundaries are distinguished.
+A missing witness produces `incomplete`; unknown callees produce `unknown`.
+These are capability facts, not proof of external business writes.

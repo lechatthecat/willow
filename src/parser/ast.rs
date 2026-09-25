@@ -193,11 +193,19 @@ mod type_tree;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Program {
+    /// Source spelling/position of each explicit type head, recorded once by the parser.
+    pub type_uses: Vec<TypeUse>,
     /// Optional `module path;` declaration at the top of the file. The path is
     /// normalized to a `::`-joined canonical form (see ImportDecl.path).
     pub module: Option<ModuleDecl>,
     pub imports: Vec<ImportDecl>,
     pub items: Vec<Item>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TypeUse {
+    pub name: String,
+    pub span: Span,
 }
 
 /// `module myapp::util;` — the namespace this source file claims to define.
@@ -608,6 +616,7 @@ pub struct AssignStmt {
 /// `object.field = value;` — field assignment through self or any object.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FieldAssignStmt {
+    pub target_span: Span,
     pub object: Expr,
     pub field: String,
     pub value: Expr,
@@ -935,6 +944,8 @@ pub struct StaticCallExpr {
     pub method: String,
     pub args: Vec<CallArg>,
     pub span: Span,
+    /// Exact member token, even when qualifier or arguments use the same name.
+    pub method_span: Span,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1025,6 +1036,7 @@ pub enum Pattern {
     EnumVariant {
         enum_name: String,
         variant: String,
+        variant_span: Span,
         span: Span,
         id: PatternId,
     },
@@ -1033,6 +1045,7 @@ pub enum Pattern {
         enum_name: String,
         variant: String,
         bindings: Vec<String>,
+        variant_span: Span,
         span: Span,
         id: PatternId,
     },

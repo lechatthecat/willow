@@ -3290,6 +3290,7 @@ mod tests {
                         }));
                     }
                     let program = Program {
+                        type_uses: Vec::new(),
                         module: None,
                         imports: vec![],
                         items: vec![Item::Function(FunctionDecl {

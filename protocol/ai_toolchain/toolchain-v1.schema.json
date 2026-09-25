@@ -64,6 +64,257 @@
           "minimum": 0
         }
       }
+    },
+    "location": {
+      "type": "object",
+      "required": [
+        "path",
+        "start",
+        "end"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "function": {
+      "type": "object",
+      "required": [
+        "id",
+        "module",
+        "name",
+        "locations",
+        "synthetic",
+        "fingerprint",
+        "body_fingerprint",
+        "callees",
+        "runtime_effects",
+        "unknown",
+        "unresolved"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "module": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "locations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/location"
+          }
+        },
+        "synthetic": {
+          "type": "boolean"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "body_fingerprint": {
+          "type": "string"
+        },
+        "callees": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "runtime_effects": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 63
+        },
+        "unknown": {
+          "type": "boolean"
+        },
+        "unresolved": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "impactNode": {
+      "type": "object",
+      "required": [
+        "id",
+        "level",
+        "distance",
+        "graph_distance",
+        "runtime_effects",
+        "unknown"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "level": {
+          "enum": [
+            1,
+            2,
+            3
+          ]
+        },
+        "distance": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "graph_distance": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "runtime_effects": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 63
+        },
+        "unknown": {
+          "type": "boolean"
+        }
+      }
+    },
+    "impact": {
+      "type": "object",
+      "required": [
+        "revision",
+        "nodes",
+        "truncated",
+        "unknown",
+        "edge_visits"
+      ],
+      "properties": {
+        "revision": {
+          "type": "string"
+        },
+        "nodes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/impactNode"
+          }
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "unknown": {
+          "type": "boolean"
+        },
+        "edge_visits": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "functionChange": {
+      "type": "object",
+      "required": [
+        "before",
+        "after",
+        "kind",
+        "added_effects",
+        "removed_effects",
+        "added_callees",
+        "removed_callees"
+      ],
+      "properties": {
+        "before": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "after": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "enum": [
+            "added",
+            "deleted",
+            "modified",
+            "renamed"
+          ]
+        },
+        "added_effects": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "removed_effects": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "added_callees": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "removed_callees": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "difference": {
+      "type": "object",
+      "required": [
+        "before_revision",
+        "after_revision",
+        "changes",
+        "before_impact",
+        "after_impact"
+      ],
+      "properties": {
+        "before_revision": {
+          "type": "string"
+        },
+        "after_revision": {
+          "type": "string"
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/functionChange"
+          }
+        },
+        "before_impact": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/impact"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "after_impact": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/impact"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
     }
   },
   "allOf": [
@@ -234,6 +485,320 @@
                 "type": "string"
               }
             }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "analysis.result"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "code": {
+            "const": "WT0010"
+          },
+          "data": {
+            "oneOf": [
+              {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "impact",
+                  "functions"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "impact"
+                  },
+                  "impact": {
+                    "$ref": "#/$defs/impact"
+                  },
+                  "functions": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/$defs/function"
+                    }
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "revision",
+                  "path",
+                  "function_count"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "snapshot.saved"
+                  },
+                  "revision": {
+                    "type": "string"
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "function_count": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "difference"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "snapshot.diff"
+                  },
+                  "difference": {
+                    "$ref": "#/$defs/difference"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "risk"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "risk"
+                  },
+                  "risk": {
+                    "type": "object",
+                    "required": [
+                      "revision",
+                      "baseline_revision",
+                      "operations",
+                      "evidence",
+                      "call_paths",
+                      "edge_visits",
+                      "call_edge_visits",
+                      "limitations",
+                      "unresolved_retry_calls"
+                    ],
+                    "properties": {
+                      "revision": {
+                        "type": "string"
+                      },
+                      "baseline_revision": {
+                        "type": "string"
+                      },
+                      "operations": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "required": [
+                            "function",
+                            "location",
+                            "operation",
+                            "new_operation",
+                            "new_side_effect",
+                            "retry_reachability",
+                            "retry_intent",
+                            "effect_certainty",
+                            "evidence",
+                            "review_question"
+                          ],
+                          "properties": {
+                            "function": {
+                              "type": "string"
+                            },
+                            "location": {
+                              "$ref": "#/$defs/location"
+                            },
+                            "operation": {
+                              "type": "string"
+                            },
+                            "new_operation": {
+                              "type": "boolean"
+                            },
+                            "new_execution": {
+                              "type": "boolean",
+                              "description": "Existing or added operation gains structural reachability relative to the baseline."
+                            },
+                            "new_repetition": {
+                              "type": "boolean",
+                              "description": "Existing or added operation gains local or inherited structural repetition relative to the baseline."
+                            },
+                            "new_side_effect": {
+                              "enum": [
+                                "not-new",
+                                "proven-absent",
+                                "proven-operation",
+                                "conservative-candidate"
+                              ]
+                            },
+                            "retry_reachability": {
+                              "enum": [
+                                "unanalyzed",
+                                "structural-cycle",
+                                "no-structural-cycle",
+                                "conservative-call-path"
+                              ]
+                            },
+                            "retry_intent": {
+                              "type": "string"
+                            },
+                            "effect_certainty": {
+                              "enum": [
+                                "proven-operation",
+                                "proven-absent",
+                                "unknown",
+                                "conservative-candidate"
+                              ]
+                            },
+                            "evidence": {
+                              "type": "object",
+                              "required": [
+                                "flow",
+                                "node",
+                                "target"
+                              ]
+                            },
+                            "review_question": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            }
+                          }
+                        }
+                      },
+                      "evidence": {
+                        "type": "array"
+                      },
+                      "call_paths": {
+                        "type": "object"
+                      },
+                      "edge_visits": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "call_edge_visits": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "effect_edge_visits": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "limitations": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "unresolved_retry_calls": {
+                        "type": "boolean"
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "revision",
+                  "results"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "query"
+                  },
+                  "revision": {
+                    "type": "string"
+                  },
+                  "results": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "revision"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "transaction"
+                ],
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "edit.preview",
+                      "edit.validated",
+                      "edit.applied",
+                      "edit.recovered"
+                    ]
+                  },
+                  "transaction": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "revision"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "daemon.ready"
+                  },
+                  "revision": {
+                    "type": "string"
+                  },
+                  "stats": {
+                    "type": "object"
+                  }
+                },
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "id"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "daemon.response"
+                  },
+                  "id": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "revision": {
+                    "type": "string"
+                  },
+                  "result": {},
+                  "error": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false
+              }
+            ]
           }
         }
       }

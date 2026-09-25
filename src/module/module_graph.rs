@@ -272,6 +272,7 @@ mod tests {
 
     fn empty_program() -> crate::parser::ast::Program {
         crate::parser::ast::Program {
+            type_uses: Vec::new(),
             module: None,
             imports: vec![],
             items: vec![],

@@ -457,6 +457,7 @@ impl TypeChecker {
 
         let param_infos: Vec<ParamInfo> = match base.constructor.clone() {
             Some(ci) => {
+                self.record_method_use("init", "constructor", s.span, ci.declaration_span, &s.args);
                 if !ci.public {
                     let allowed = if ci.protected {
                         self.can_access_protected_member(&base_name)

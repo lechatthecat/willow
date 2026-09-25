@@ -30,6 +30,7 @@ impl TargetCapabilities {
 
 #[derive(Debug, Clone)]
 pub struct CompilerInputs {
+    pub(crate) capture_analysis: bool,
     pub options: crate::CompilerOptions,
     pub project_root: PathBuf,
     /// An explicitly selected project, including legacy manifests without packages.
@@ -71,6 +72,7 @@ impl CompilerInputs {
 
     pub fn native(options: crate::CompilerOptions, project_root: PathBuf) -> Self {
         Self {
+            capture_analysis: false,
             options,
             project_root,
             project_mode: false,

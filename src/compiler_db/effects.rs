@@ -27,6 +27,11 @@ const NO_PREEMPT: RuntimeEffects = RuntimeEffects::NO_PREEMPT_REGION;
 pub(crate) enum EffectWitness {
     Lock(LockEffectWitness),
     Helper(NonpreemptibleReason),
+    Panic {
+        owner: FunctionId,
+        source: (u32, usize, usize),
+    },
+    External(FunctionId),
 }
 impl EffectWitness {
     pub(crate) fn lock(&self) -> Option<&LockEffectCause> {
@@ -44,6 +49,7 @@ pub(crate) struct UnitEffects {
 }
 
 pub(crate) struct EffectQueries {
+    pub(crate) analysis: std::cell::RefCell<Option<HashMap<UnitId, crate::ai::CapturedUnit>>>,
     units: QueryTable<UnitId, UnitEffects>,
     names: HashMap<String, UnitId>,
     dependencies: Option<std::rc::Rc<super::dependencies::ModuleDependencies>>,
@@ -51,6 +57,7 @@ pub(crate) struct EffectQueries {
 impl Default for EffectQueries {
     fn default() -> Self {
         Self {
+            analysis: Default::default(),
             units: QueryTable::named("unit_effects"),
             names: HashMap::new(),
             dependencies: None,
@@ -309,6 +316,7 @@ pub(crate) fn solve_unit<N>(
 
         let mut hazards = HazardVisitor {
             panics: false,
+            panic_span: None,
             expr_types: types,
         };
         let mut defer_depth = 0;
@@ -342,7 +350,11 @@ pub(crate) fn solve_unit<N>(
             }
         }
         if hazards.panics {
-            problem = problem.seed(id, PANIC, None);
+            let witness = hazards.panic_span.map(|span| EffectWitness::Panic {
+                owner: id,
+                source: (span.file_id.0, span.start, span.end),
+            });
+            problem = problem.seed(id, PANIC, witness);
         }
     }
     for (id, source) in copies {
@@ -413,7 +425,11 @@ pub(crate) fn solve_unit<N>(
         for target in &sites.targets {
             edge_visits += 1;
             if !own.contains(target) && classified.insert(*target) {
-                problem = problem.seed(*target, external(target).intersection(PANIC), None);
+                problem = problem.seed(
+                    *target,
+                    external(target).intersection(PANIC),
+                    Some(EffectWitness::External(*target)),
+                );
             }
         }
     }
@@ -498,12 +514,18 @@ pub(crate) fn analyze(
 /// worklist keeps this read-only analysis independent of expression depth.
 struct HazardVisitor<'a, N> {
     panics: bool,
+    panic_span: Option<crate::diagnostics::Span>,
     expr_types: &'a HashMap<ExprId, Type<N>>,
 }
 
 impl<N> HazardVisitor<'_, N> {
-    fn mark_direct(&mut self) {
+    fn mark_direct(&mut self, span: crate::diagnostics::Span) {
         self.panics = true;
+        if self.panic_span.is_none_or(|old| {
+            (span.file_id.0, span.start, span.end) < (old.file_id.0, old.start, old.end)
+        }) {
+            self.panic_span = Some(span);
+        }
     }
 }
 
@@ -525,10 +547,10 @@ impl<N> HazardVisitor<'_, N> {
     fn visit_stmt(&mut self, statement: &Stmt) {
         match statement {
             // Bounds guard.
-            Stmt::IndexAssign(_) => self.mark_direct(),
+            Stmt::IndexAssign(_) => self.mark_direct(statement.span()),
             // Recursive acquisition and a lost ownership token are recoverable
             // language faults.
-            Stmt::Lock(_) => self.mark_direct(),
+            Stmt::Lock(_) => self.mark_direct(statement.span()),
             // `super.init` is an unresolved edge in the shared graph, which
             // already makes the body conservative.
             Stmt::Let(_)
@@ -555,19 +577,19 @@ impl<N> HazardVisitor<'_, N> {
                 let concat = expr.op == BinOp::Add
                     && !matches!(self.expr_types.get(&expr.id), Some(Type::I64 | Type::F64));
                 if concat || matches!(expr.op, BinOp::Div | BinOp::Rem | BinOp::Pow) {
-                    self.mark_direct();
+                    self.mark_direct(expression.span());
                 }
             }
-            Expr::FieldAccess(..) => self.mark_direct(),
+            Expr::FieldAccess(..) => self.mark_direct(expression.span()),
             // Strict await can turn cancellation into a language panic.
             // TaskResult awaits are intentionally not distinguished here:
             // retaining a check is conservative.
-            Expr::Await(_) => self.mark_direct(),
-            Expr::Select(_) => self.mark_direct(),
+            Expr::Await(_) => self.mark_direct(expression.span()),
+            Expr::Select(_) => self.mark_direct(expression.span()),
             // Object/interface display may invoke user `toString` code.
-            Expr::Print(..) => self.mark_direct(),
+            Expr::Print(..) => self.mark_direct(expression.span()),
             // Bounds guard.
-            Expr::Index(..) => self.mark_direct(),
+            Expr::Index(..) => self.mark_direct(expression.span()),
             // Every call form is an edge in the shared graph, classified by
             // `classify_edge` rather than here.
             Expr::Call(_)
@@ -713,6 +735,7 @@ mod tests {
                     .push(Stmt::Expr(crate::parser::ast::ExprStmt { expr, span }));
                 let mut hazards = HazardVisitor {
                     panics: false,
+                    panic_span: None,
                     expr_types: &HashMap::<ExprId, Type<TypeId>>::new(),
                 };
                 hazards.visit_block(&function.body);

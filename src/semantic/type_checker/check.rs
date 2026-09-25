@@ -44,6 +44,20 @@ impl TypeChecker {
                 ),
             );
         }
+        if self.capture_call_sites {
+            self.analysis_symbols.declarations.push(
+                crate::semantic::analysis_symbols::Declaration::new(
+                    &name,
+                    if info.is_param {
+                        "parameter"
+                    } else {
+                        "binding"
+                    },
+                    info.declaration_span,
+                    Some(info.ty.clone()),
+                ),
+            );
+        }
         self.symbols.define_var(name, info);
     }
 
@@ -247,6 +261,7 @@ impl TypeChecker {
         self.effect_index.hierarchy = self.build_lock_effect_hierarchy();
         self.effect_inputs.edges.clear();
         self.resolved_calls.clear();
+        self.analysis_calls.clear();
         self.effect_inputs.direct.clear();
         self.effect_inputs.direct_sites.clear();
         self.effect_inputs.sites.clear();
@@ -712,6 +727,27 @@ impl TypeChecker {
             },
             None => std::sync::Arc::new(compute()),
         };
+        self.record_annotation_uses(program);
+        if let Some((queries, unit)) = &self.effect_queries
+            && let Some(captured) = queries.analysis.borrow_mut().as_mut()
+        {
+            captured.insert(
+                *unit,
+                crate::ai::capture(
+                    program,
+                    &graph,
+                    crate::ai::CaptureInputs {
+                        types: &self.expr_types,
+                        calls: &self.analysis_calls,
+                        patterns: &self.pattern_resolutions,
+                        symbols: &self.analysis_symbols,
+                    },
+                    &effects.facts,
+                    &self.symbols,
+                    self.body_queries.as_ref().map(|q| q.index()),
+                ),
+            );
+        }
         self.nonpreemptible_methods = std::sync::Arc::clone(&effects.helpers);
         self.report_task_method_calls();
         self.report_transitive_lock_effects(&effects.facts);
@@ -1110,7 +1146,7 @@ impl TypeChecker {
             }
             Stmt::FieldAssign(s) => {
                 let obj_ty = self.check_expr(&s.object);
-                let field_ty = self.resolve_field(&obj_ty, &s.field, s.span, true);
+                let field_ty = self.resolve_field(&obj_ty, &s.field, s.target_span, true);
                 let val_ty = if field_ty == Type::Void {
                     self.check_expr(&s.value)
                 } else {
@@ -1205,6 +1241,7 @@ impl TypeChecker {
                 }
             }
             Stmt::Assign(s) => {
+                self.record_binding_use(&s.name, s.span, "write");
                 if s.name == "this" {
                     self.push_legacy_this_error(s.span);
                     return;
@@ -1733,16 +1770,23 @@ impl TypeChecker {
         // nodes sharing a span could (willow-njot).
         self.expr_types.insert(expr.id(), ty.clone());
         self.record_resolved_call(expr);
+        self.record_symbol_use(expr);
         ty
     }
 
     /// Record resolution at the checked expression, while lexical bindings and
     /// receiver types are still available. Unknown is explicit for panic safety.
     fn record_resolved_call(&mut self, expr: &Expr) {
-        let Some(caller) = self.local.current_effect_callable else {
-            return;
-        };
         let targets = match expr {
+            Expr::Var(name, _, id)
+                if self.capture_call_sites
+                    && self.symbols.lookup_var(name).is_none()
+                    && self.symbols.lookup_func(name).is_some() =>
+            {
+                self.analysis_calls
+                    .insert(*id, Some(FunctionId::free_from_source_name(name)));
+                return;
+            }
             Expr::Call(call) => {
                 if self.symbols.lookup_var(&call.callee).is_some() {
                     Vec::new()
@@ -1774,6 +1818,21 @@ impl TypeChecker {
                 "init",
             )],
             _ => return,
+        };
+        if self.capture_call_sites {
+            // Keep only a unique compiler-resolved target. Polymorphic sites
+            // remain explicit unknowns, without copying dispatch fan-out per site.
+            self.analysis_calls.insert(
+                expr.id(),
+                if targets.len() == 1 {
+                    Some(targets[0])
+                } else {
+                    None
+                },
+            );
+        }
+        let Some(caller) = self.local.current_effect_callable else {
+            return;
         };
         let sites = self.resolved_calls.entry(caller).or_default();
         sites.has_unknown |= targets.is_empty();
@@ -2025,8 +2084,14 @@ impl TypeChecker {
             Expr::StaticCall(s) => {
                 self.record_static_builtin_lock_effect(s);
                 let callee = self.static_method_effect_id(&s.class, &s.method);
-                let result =
-                    self.resolve_static_call(&s.class, &s.type_args, &s.method, &s.args, s.span);
+                let result = self.resolve_static_call(
+                    &s.class,
+                    &s.type_args,
+                    &s.method,
+                    &s.args,
+                    s.span,
+                    s.method_span,
+                );
                 if let Some(callee) = callee {
                     self.record_lock_effect_call(callee, s.span);
                 }

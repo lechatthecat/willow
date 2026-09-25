@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Willow structured edit request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "revision",
+    "operations"
+  ],
+  "properties": {
+    "revision": {
+      "type": "string"
+    },
+    "operations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "function",
+              "name"
+            ],
+            "properties": {
+              "kind": {
+                "const": "rename"
+              },
+              "function": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "function",
+              "body"
+            ],
+            "properties": {
+              "kind": {
+                "const": "replace-body"
+              },
+              "function": {
+                "type": "string"
+              },
+              "body": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

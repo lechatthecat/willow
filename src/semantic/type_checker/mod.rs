@@ -171,6 +171,9 @@ pub struct TypeChecker {
     /// Suppress duplicate missing-import diagnostics per type name.
     missing_collection_imports_reported: HashSet<String>,
     resolved_calls: HashMap<FunctionId, crate::semantic::call_graph::CallSites>,
+    analysis_calls: HashMap<ExprId, Option<FunctionId>>,
+    analysis_symbols: crate::semantic::analysis_symbols::Facts,
+    capture_call_sites: bool,
     task_method_calls: Vec<crate::compiler_db::effects::TaskMethodCall>,
     effect_inputs: crate::compiler_db::effects::EffectInputs,
     effect_graph_only: Option<crate::semantic::call_graph::CallGraph>,
@@ -241,6 +244,7 @@ impl TypeChecker {
         queries: std::rc::Rc<crate::compiler_db::effects::EffectQueries>,
         unit: crate::module::UnitId,
     ) {
+        self.capture_call_sites = queries.analysis.borrow().is_some();
         self.effect_queries = Some((queries, unit));
     }
 
@@ -300,6 +304,9 @@ impl TypeChecker {
             fully_qualified_collection_types: HashSet::new(),
             missing_collection_imports_reported: HashSet::new(),
             resolved_calls: HashMap::new(),
+            analysis_calls: HashMap::new(),
+            analysis_symbols: Default::default(),
+            capture_call_sites: false,
             task_method_calls: Vec::new(),
             effect_inputs: Default::default(),
             effect_graph_only: None,
@@ -768,6 +775,7 @@ impl TypeChecker {
     fn reference_place_info(&mut self, expr: &Expr, arg_span: Span) -> Option<ReferencePlaceInfo> {
         match expr {
             Expr::Var(name, _, _) => {
+                self.record_binding_use(name, expr.span(), "reference-argument");
                 let Some(var_info) = self.symbols.lookup_var(name).cloned() else {
                     self.check_expr(expr);
                     return None;
@@ -8038,3 +8046,5 @@ mod continuation_depth_tests {
             .unwrap();
     }
 }
+
+mod analysis_symbols;

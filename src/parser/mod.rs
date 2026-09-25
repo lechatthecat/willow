@@ -14,6 +14,7 @@ use crate::lexer::token::{Token, TokenKind};
 use ast::*;
 
 pub struct Parser {
+    type_uses: Vec<TypeUse>,
     tokens: Vec<Token>,
     pos: usize,
     /// Statement-level errors recovered inside blocks (willow-qzxg): the block
@@ -27,6 +28,7 @@ pub struct Parser {
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
         Self {
+            type_uses: Vec::new(),
             tokens,
             pos: 0,
             recovered_errors: Vec::new(),
@@ -97,6 +99,7 @@ impl Parser {
         errors.append(&mut self.recovered_errors);
         (
             Program {
+                type_uses: std::mem::take(&mut self.type_uses),
                 module,
                 imports,
                 items,

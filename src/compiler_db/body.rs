@@ -322,6 +322,7 @@ impl BodyQueries {
             });
         }
         Ok(Program {
+            type_uses: program.type_uses.clone(),
             module: program.module.clone(),
             imports: program.imports.clone(),
             items,

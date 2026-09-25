@@ -1211,6 +1211,14 @@ impl TypeChecker {
                 Type::Void
             }
             Some((owner, fi)) => {
+                self.record_member_use(
+                    field_name,
+                    "field",
+                    span,
+                    fi.declaration_span,
+                    fi.ty.clone(),
+                    true,
+                );
                 if check_visibility && !fi.public {
                     if fi.protected {
                         if !self.can_access_protected_member(&owner) {
@@ -1376,6 +1384,7 @@ impl TypeChecker {
                 Type::Void
             }
             Some((owner, mi)) => {
+                self.record_method_use(method_name, "method", span, mi.declaration_span, args);
                 if mi.is_static {
                     self.push(
                         Diagnostic::new(
@@ -1479,6 +1488,7 @@ impl TypeChecker {
             return Type::Void;
         };
 
+        self.record_method_use(method_name, "method", span, m.declaration_span, args);
         if m.params.len() != args.len() {
             self.push(
                 Diagnostic::new(
@@ -1547,6 +1557,7 @@ impl TypeChecker {
         method_name: &str,
         args: &[CallArg],
         span: Span,
+        method_span: Span,
     ) -> Type {
         if let Some(ty) =
             self.resolve_fully_qualified_std_module_call(class_name, method_name, args, span)
@@ -1609,6 +1620,7 @@ impl TypeChecker {
                 // Handled by the generic enum block further down.
             } else if let Some(variant) = enum_info.variants.iter().find(|v| v.name == method_name)
             {
+                self.record_variant_use(&enum_info.name, method_name, method_span);
                 if variant.payload_types.is_empty() {
                     // Fieldless variant: no args expected
                     if !args.is_empty() {
@@ -1689,6 +1701,7 @@ impl TypeChecker {
             && !enum_info.type_params.is_empty()
         {
             if let Some(variant) = enum_info.variants.iter().find(|v| v.name == method_name) {
+                self.record_variant_use(&enum_info.name, method_name, method_span);
                 // Validate arg count.
                 if args.len() != variant.payload_types.len() {
                     self.push(
@@ -2016,6 +2029,13 @@ impl TypeChecker {
                     Type::Void
                 }
                 Some(fi) => {
+                    self.record_method_use(
+                        method_name,
+                        "function",
+                        span,
+                        fi.declaration_span,
+                        args,
+                    );
                     if !fi.public {
                         let defined_at = fi
                             .module_path
@@ -2113,6 +2133,7 @@ impl TypeChecker {
                 Type::Void
             }
             Some(mi) => {
+                self.record_method_use(method_name, "method", span, mi.declaration_span, args);
                 if !mi.is_static {
                     let mut diagnostic = Diagnostic::new(
                         Severity::Error,
@@ -2368,6 +2389,14 @@ impl TypeChecker {
         };
         match self.lookup_static_prop_in_hierarchy(&resolved, field) {
             Some((owner, info)) => {
+                self.record_member_use(
+                    field,
+                    "static-field",
+                    span,
+                    info.declaration_span,
+                    info.ty.clone(),
+                    true,
+                );
                 // Visibility: non-public static props are reachable only from
                 // inside the class (private) or subclasses (protected).
                 if !info.public {

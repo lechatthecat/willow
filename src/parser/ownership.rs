@@ -442,7 +442,7 @@ clone_shell_struct!(MethodCallExpr {
     syntax: [object, args]
 });
 clone_shell_struct!(StaticCallExpr {
-    metadata: [id, class, type_args, method, span],
+    metadata: [id, class, type_args, method, span, method_span],
     syntax: [args]
 });
 clone_shell_struct!(NewExpr {
@@ -498,7 +498,7 @@ clone_shell_struct!(AssignStmt {
     syntax: [value]
 });
 clone_shell_struct!(FieldAssignStmt {
-    metadata: [field, span],
+    metadata: [field, span, target_span],
     syntax: [object, value]
 });
 clone_shell_struct!(SuperInitStmt {

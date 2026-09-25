@@ -480,6 +480,7 @@ fn resolve_one(
                 module_path,
                 source,
                 Program {
+                    type_uses: Vec::new(),
                     module: None,
                     imports: vec![],
                     items: vec![],

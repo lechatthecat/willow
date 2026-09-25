@@ -391,6 +391,16 @@ impl TypeChecker {
             );
             return;
         };
+        let target_span = s.span;
+        self.record_type_use(&s.class, &Type::Named(resolved), target_span);
+        self.record_member_use(
+            &s.field,
+            "static-field",
+            target_span,
+            info.declaration_span,
+            info.ty.clone(),
+            true,
+        );
         let val_ty = self.check_expr_expecting(&s.value, &info.ty);
         if !info.is_mut {
             self.push(

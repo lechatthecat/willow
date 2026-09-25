@@ -10297,6 +10297,7 @@ mod tests {
     #[test]
     fn eligibility_operator_positions_preserve_leaf_validation() {
         let program = crate::parser::ast::Program {
+            type_uses: Vec::new(),
             module: None,
             imports: vec![],
             items: vec![],
@@ -10388,6 +10389,7 @@ mod tests {
     #[test]
     fn operator_rejection_preserves_first_child_and_parent_fallback() {
         let program = crate::parser::ast::Program {
+            type_uses: Vec::new(),
             module: None,
             imports: vec![],
             items: vec![],
@@ -10436,6 +10438,7 @@ mod tests {
             .stack_size(1024 * 1024)
             .spawn(|| {
                 let program = crate::parser::ast::Program {
+                    type_uses: Vec::new(),
                     module: None,
                     imports: vec![],
                     items: vec![],

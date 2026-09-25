@@ -48,6 +48,18 @@ impl<K, V> QueryTable<K, V> {
 }
 
 impl<K: Clone + Eq + Hash + Debug, V> QueryTable<K, V> {
+    /// Remove obsolete revision inputs at the owning query family's update
+    /// boundary. Evaluation is synchronous; invalidating an active query is a bug.
+    pub(crate) fn retain(&self, mut keep: impl FnMut(&K) -> bool) {
+        let mut states = self.states.borrow_mut();
+        assert!(!states.values().any(|s| matches!(s, State::Computing)));
+        states.retain(|key, _| keep(key));
+    }
+    pub(crate) fn remove(&self, key: &K) {
+        let mut states = self.states.borrow_mut();
+        assert!(!matches!(states.get(key), Some(State::Computing)));
+        states.remove(key);
+    }
     pub fn stats(&self) -> QueryStats {
         *self.stats.borrow()
     }

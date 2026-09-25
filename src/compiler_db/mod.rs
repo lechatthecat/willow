@@ -1,5 +1,6 @@
 //! Immutable, session-local compiler query results. Executable side tables are
 //! stored in the existing unit artifact store rather than retained per module.
+pub(crate) mod analysis;
 pub(crate) mod body;
 mod checked;
 pub(crate) mod declarations;

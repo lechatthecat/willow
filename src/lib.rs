@@ -3,6 +3,7 @@
 // shrink the cold `Err` path is churn not worth it here, so allow it crate-wide.
 #![allow(clippy::result_large_err)]
 
+pub mod ai;
 pub mod backend;
 pub mod compiler_db;
 use compiler_db::dependencies::ModuleDependencies;
@@ -355,6 +356,24 @@ impl<'a> CompilerSession<'a> {
         self.execute(emitter, false)
     }
 
+    /// Build an analysis snapshot from the same checked frontend, without codegen.
+    pub fn analysis_with_emitter(
+        self,
+        emitter: &mut dyn diagnostics::DiagnosticEmitter,
+    ) -> Result<ai::Snapshot> {
+        let _query_stats = query_stats::Session::enter();
+        let _node_ids = parser::ast::NodeIdSession::enter();
+        let path = std::fs::canonicalize(self.src)?;
+        let source = std::fs::read_to_string(&path)?;
+        let root = path.parent().context("source has no parent")?;
+        let map = diagnostics::SourceMap::new(path.to_str().context("non UTF-8 path")?, &source);
+        let mut inputs = compiler_db::inputs::CompilerInputs::native(self.opts, root.to_path_buf())
+            .resolve_project(self.project_root.as_deref())?;
+        inputs.capture_analysis = true;
+        let frontend = run_frontend_with_inputs(&source, root, &map, inputs, emitter)?;
+        ai::snapshot(frontend, &path, &source, self.project_root.as_deref())
+    }
+
     fn execute(self, emitter: &mut dyn diagnostics::DiagnosticEmitter, build: bool) -> Result<()> {
         let _query_stats = query_stats::Session::enter();
         let _node_ids = parser::ast::NodeIdSession::enter();
@@ -551,6 +570,9 @@ fn run_frontend_with_inputs(
         std::rc::Rc::clone(&artifacts.store),
         desugar_dependencies,
     );
+    if db.inputs().capture_analysis {
+        *db.effects.analysis.borrow_mut() = Some(Default::default());
+    }
     let options = &db.inputs().options;
     let mut error_count = parse.error_count + imports.error_count + desugar.error_count;
     for module in &graph.files {
@@ -1108,6 +1130,7 @@ mod diagnostic_emission_tests {
                     path: format!("m{i}.wi").into(),
                     source: "é".into(),
                     program: parser::ast::Program {
+                        type_uses: Vec::new(),
                         module: None,
                         imports: vec![],
                         items: vec![],
@@ -1185,6 +1208,7 @@ mod diagnostic_emission_tests {
             path: "helper.wi".into(),
             source: "é".into(),
             program: parser::ast::Program {
+                type_uses: Vec::new(),
                 module: None,
                 imports: vec![],
                 items: vec![],

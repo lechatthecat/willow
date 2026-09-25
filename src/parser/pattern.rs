@@ -48,6 +48,7 @@ impl Parser {
                     while self.eat(TokenKind::ColonColon) {
                         segments.push(self.expect_ident()?);
                     }
+                    let variant_span = self.previous_span();
                     let variant = segments.pop().unwrap();
                     let name = segments.join("::");
                     if matches!(self.peek_kind(), TokenKind::LParen) {
@@ -65,6 +66,7 @@ impl Parser {
                         Ok(Pattern::EnumVariantTuple {
                             enum_name: name,
                             variant,
+                            variant_span,
                             bindings,
                             span: merged,
                             id: PatternId::fresh(),
@@ -75,6 +77,7 @@ impl Parser {
                         Ok(Pattern::EnumVariant {
                             enum_name: name,
                             variant,
+                            variant_span,
                             span: merged,
                             id: PatternId::fresh(),
                         })
@@ -107,6 +110,7 @@ impl Parser {
                         Ok(Pattern::EnumVariantTuple {
                             enum_name: String::new(),
                             variant: name,
+                            variant_span: span,
                             bindings,
                             span: merged,
                             id: PatternId::fresh(),

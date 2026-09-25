@@ -134,6 +134,8 @@ pub(super) struct BodyOutputs {
     lambda_captures: HashMap<ExprId, Vec<LambdaCapture>>,
     lock_edges: HashMap<FunctionId, HashSet<FunctionId>>,
     resolved_calls: HashMap<FunctionId, crate::semantic::call_graph::CallSites>,
+    analysis_calls: HashMap<ExprId, Option<FunctionId>>,
+    analysis_symbols: crate::semantic::analysis_symbols::Facts,
     task_method_calls: Vec<crate::compiler_db::effects::TaskMethodCall>,
     lock_direct: HashMap<FunctionId, LockEffectCause>,
     lock_direct_sites: Vec<LockEffectCause>,
@@ -160,6 +162,8 @@ pub(crate) struct TypedBody {
     lock_edges: HashMap<FunctionId, HashSet<FunctionId>>,
     #[serde(with = "crate::compiler_db::map_entries")]
     resolved_calls: HashMap<FunctionId, crate::semantic::call_graph::CallSites>,
+    analysis_calls: HashMap<ExprId, Option<FunctionId>>,
+    analysis_symbols: crate::semantic::analysis_symbols::Facts,
     task_method_calls: Vec<crate::compiler_db::effects::TaskMethodCall>,
     #[serde(with = "crate::compiler_db::map_entries")]
     lock_direct: HashMap<FunctionId, LockEffectCause>,
@@ -192,6 +196,8 @@ impl TypedBody {
             lambda_captures: outputs.lambda_captures,
             lock_edges: outputs.lock_edges,
             resolved_calls: outputs.resolved_calls,
+            analysis_calls: outputs.analysis_calls,
+            analysis_symbols: outputs.analysis_symbols,
             task_method_calls: outputs.task_method_calls,
             lock_direct: outputs.lock_direct,
             lock_direct_sites: outputs.lock_direct_sites,
@@ -266,6 +272,7 @@ impl TypeChecker {
             std::rc::Rc::clone(&self.resolution),
             self.symbols.fork_body_scope(),
         );
+        body.capture_call_sites = self.capture_call_sites;
         body.fully_qualified_collection_types = self.fully_qualified_collection_types.clone();
         body.missing_collection_imports_reported = self.missing_collection_imports_reported.clone();
         body
@@ -328,6 +335,8 @@ impl TypeChecker {
             current.has_unknown |= sites.has_unknown;
         }
         self.expr_types.extend(body.expr_types);
+        self.analysis_calls.extend(body.analysis_calls);
+        self.analysis_symbols.extend(body.analysis_symbols);
         self.reference_arg_modes.extend(body.reference_arg_modes);
         self.enum_variant_resolutions
             .extend(body.enum_variant_resolutions);
@@ -397,6 +406,8 @@ impl TypeChecker {
         swap(&mut self.lambda_captures, &mut outputs.lambda_captures);
         swap(&mut self.effect_inputs.edges, &mut outputs.lock_edges);
         swap(&mut self.resolved_calls, &mut outputs.resolved_calls);
+        swap(&mut self.analysis_calls, &mut outputs.analysis_calls);
+        swap(&mut self.analysis_symbols, &mut outputs.analysis_symbols);
         swap(&mut self.task_method_calls, &mut outputs.task_method_calls);
         swap(&mut self.effect_inputs.direct, &mut outputs.lock_direct);
         swap(
