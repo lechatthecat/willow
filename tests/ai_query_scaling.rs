@@ -34,6 +34,9 @@ static ALLOCATOR: MeasuredAllocator = MeasuredAllocator;
 fn increasing_graphs_and_repeated_queries_retain_no_query_history() {
     let directory = std::env::temp_dir().join(format!("willow-query-audit-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
+    // Snapshot locations are canonical; temp_dir can traverse symlinks on macOS
+    // and lacks the canonical verbatim prefix on Windows.
+    let directory = std::fs::canonicalize(directory).unwrap();
     let path = directory.join("main.wi");
     for n in [16, 64, 256] {
         let mut source =
