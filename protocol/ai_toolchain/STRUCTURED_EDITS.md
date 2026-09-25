@@ -43,7 +43,11 @@ intermediate files. Non-cooperating writers are detected at the input checks,
 before each replacement and during recovery, but an uncooperative write racing
 the final check/rename cannot be protected by a portable advisory lock. Power-loss
 durability requires filesystem support for file and directory synchronization;
-this implementation is validated on Linux. No Git operation is performed.
+Unix synchronizes parent directories after replacement and marker removal.
+Windows synchronizes file contents before replacement, but does not synchronize
+directory entries, so power-loss durability is not promised there. Process-crash
+recovery uses the same journal on both platforms. Native recovery validation has
+been run locally on Linux. No Git operation is performed.
 
 The initial edit surface uses debug/default compiler options and workspace-local,
 regular, non-symlink source files. `--project` selects project mode. External

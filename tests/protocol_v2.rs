@@ -16,7 +16,8 @@ impl Fixture {
         ));
         fs::create_dir(&path).unwrap();
         fs::write(path.join("main.wi"), source).unwrap();
-        Self(path)
+        // Query paths must match the canonical paths recorded in snapshots.
+        Self(fs::canonicalize(path).unwrap())
     }
     fn write(&self, name: &str, source: &str) {
         fs::write(self.0.join(name), source).unwrap();

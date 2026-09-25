@@ -445,7 +445,7 @@ impl Workspace {
     }
     fn clear_active(&self) -> Result<()> {
         fs::remove_file(self.directory.join("active"))?;
-        File::open(&self.directory)?.sync_all()?;
+        sync_directory(&self.directory)?;
         Ok(())
     }
     pub fn recover(&self, id: &str) -> Result<serde_json::Value> {
@@ -514,6 +514,17 @@ fn candidate(plan: &Plan) -> Result<String> {
         &plan.absent,
     ))?))
 }
+// Unix supports syncing directory entries after rename/unlink. Windows cannot
+// open a directory through File::open; file contents are still synced before
+// replacement there. Process-crash recovery is supported on both platforms;
+// power-loss durability of directory entries is not promised on Windows.
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
 fn durable_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("missing parent")?;
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -536,7 +547,7 @@ fn durable_write(path: &Path, bytes: &[u8]) -> Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;
-        File::open(parent)?.sync_all()?;
+        sync_directory(parent)?;
         Ok(())
     })();
     if result.is_err() {
@@ -890,6 +901,26 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+    #[test]
+    fn durable_write_creates_replaces_and_cleans_up_failed_publication() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("journal");
+        durable_write(&path, b"prepared").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"prepared");
+        durable_write(&path, b"applied").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"applied");
+        let directory = fixture.0.join("directory");
+        fs::create_dir(&directory).unwrap();
+        assert!(durable_write(&directory, b"invalid").is_err());
+        assert!(directory.is_dir());
+        assert!(fs::read_dir(&fixture.0).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".willow-write-")
+        }));
     }
     #[test]
     fn isolated_preview_validate_apply_and_replay_rejection() {
