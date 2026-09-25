@@ -129,6 +129,11 @@ fn path_add_remove_round_trips_comments_tables_and_dry_run_is_read_only() {
             success(f.cli(&["add", "--path", "../lib"])),
             "Add my_library = { path = \"../lib\" }\nResolved 1 dependency packages\n"
         );
+        let added = f.read("app/project.toml");
+        assert!(added.contains("[dependencies]\n"));
+        assert!(added.contains("my_library = { path = \"../lib\" }"));
+        assert!(!added.contains("dependencies.my_library"));
+        assert!(added.find("[project]").unwrap() < added.find("[dependencies]").unwrap());
         let state = snapshot(&f.0);
         assert!(
             success(f.cli(&["remove", "my_library", "--dry-run"]))
@@ -140,7 +145,12 @@ fn path_add_remove_round_trips_comments_tables_and_dry_run_is_read_only() {
         );
         assert_eq!(snapshot(&f.0), state);
         assert!(success(f.cli(&["remove", "my_library"])).starts_with("Remove my_library\n"));
-        assert_eq!(f.read("app/project.toml"), before);
+        let expected = if deps.is_empty() {
+            format!("{before}\n[dependencies]\n")
+        } else {
+            before
+        };
+        assert_eq!(f.read("app/project.toml"), expected);
     }
 }
 
@@ -199,6 +209,7 @@ fn git_shorthand_stable_update_bounds_breaking_and_cache_preservation() {
     assert!(output.contains("Add _1_web_client"));
     assert!(output.contains("version = \"^1.1.0\""));
     let added = f.read("app/project.toml");
+    assert!(added.contains("[dependencies]\n_1_web_client = { git = "));
     assert!(!added.contains("branch"));
     f.release("remote", "1-web.client", "1.2.0");
     f.release("remote", "1-web.client", "2.0.0");
@@ -225,7 +236,10 @@ fn git_shorthand_stable_update_bounds_breaking_and_cache_preservation() {
     let cache = snapshot(&f.0.join("cache"));
     success(f.cli(&["remove", "_1_web_client"]));
     assert_eq!(snapshot(&f.0.join("cache")), cache);
-    assert_eq!(f.read("app/project.toml"), original);
+    assert_eq!(
+        f.read("app/project.toml"),
+        format!("{original}\n[dependencies]\n")
+    );
     let state = snapshot(&f.0);
     assert!(success(f.cli(&["add", &url, "--dry-run"])).contains("version = \"^2.0.0\""));
     assert_eq!(snapshot(&f.0), state);
@@ -360,8 +374,25 @@ fn editor_preserves_line_endings_and_final_newline() {
     for original in [base.trim_end().to_string(), base.replace('\n', "\r\n")] {
         f.write("app/project.toml", &original);
         success(f.cli(&["add", "added", "--path=../lib"]));
+        let added = f.read("app/project.toml");
+        let newline = if original.contains("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        assert_eq!(added.ends_with('\n'), original.ends_with('\n'));
+        assert_eq!(added.matches('\n').count(), added.matches(newline).count());
         success(f.cli(&["remove", "added"]));
-        assert_eq!(f.read("app/project.toml"), original);
+        let expected = format!(
+            "{}{newline}{newline}[dependencies]{}",
+            original.trim_end_matches(['\r', '\n']),
+            if original.ends_with('\n') {
+                newline
+            } else {
+                ""
+            }
+        );
+        assert_eq!(f.read("app/project.toml"), expected);
     }
 }
 

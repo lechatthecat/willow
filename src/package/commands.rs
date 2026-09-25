@@ -47,13 +47,9 @@ fn derived_alias(name: &str) -> String {
 
 fn dependencies(doc: &mut DocumentMut) -> Result<&mut dyn toml_edit::TableLike> {
     if !doc.contains_key("dependencies") {
-        // A dotted root entry disappears cleanly on removal. In particular, do
-        // not invent an explicit empty table that cannot be distinguished from
-        // a user's pre-existing empty [dependencies] table on a later remove.
-        let mut table = Table::new();
-        table.set_dotted(true);
-        table.set_implicit(true);
-        doc.insert("dependencies", Item::Table(table));
+        // Use a readable section for new dependencies. Keep it when emptied,
+        // just as we preserve a user's pre-existing [dependencies] section.
+        doc.insert("dependencies", Item::Table(Table::new()));
     }
     doc["dependencies"]
         .as_table_like_mut()
