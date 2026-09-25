@@ -374,7 +374,7 @@ fn concurrent_allocation_registration_collection_and_100k_snapshots() {
             std::thread::spawn(move || {
                 // Wait before registering: a barrier wait is not a GC safepoint.
                 start.wait();
-                willow_gc_register_mutator();
+                let mutator = crate::gc::MutatorRegistration::new();
                 ready.fetch_add(1, Ordering::Release);
                 for _ in 0..64 {
                     std::hint::black_box(willow_alloc(8));
@@ -384,7 +384,7 @@ fn concurrent_allocation_registration_collection_and_100k_snapshots() {
                     willow_gc_safepoint();
                     std::thread::yield_now();
                 }
-                willow_gc_unregister_mutator();
+                drop(mutator);
             })
         })
         .collect();

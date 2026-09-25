@@ -109,7 +109,7 @@ fn check_affinity_case(cancel: bool, task_count: usize, rendezvous_millis: u64) 
     let tasks: Vec<_> = (0..task_count)
         .map(|_| willow_sched_spawn(deep_affinity_poll, std::ptr::null_mut()))
         .collect();
-    crate::gc::willow_gc_register_mutator();
+    let mutator = crate::gc::MutatorRegistration::new();
     let completed = willow_sched_run_parallel(None, 4, None);
     let entered = ENTERED.load(Ordering::SeqCst);
     let required = crate::native_stack::required_workers();
@@ -124,7 +124,7 @@ fn check_affinity_case(cancel: bool, task_count: usize, rendezvous_millis: u64) 
     // their original OS threads, including workers 1, 2 and 3. Drain BEFORE
     // checking setup observations so a failed assertion leaves no live stacks.
     willow_sched_run_parallel(None, 1, Some(Instant::now() + Duration::from_secs(5)));
-    crate::gc::willow_gc_unregister_mutator();
+    drop(mutator);
     for task in tasks {
         assert_eq!(willow_sched_task_state(task), -1, "affinity cleanup failed");
     }
@@ -185,11 +185,11 @@ fn native_affinity_queries_scale_with_drives_not_resident_tasks() {
             });
             assert_eq!(global_task_table().len(), residents);
             let (queries, updates) = crate::native_stack::affinity_counts_for_test();
-            crate::gc::willow_gc_register_mutator();
+            let mutator = crate::gc::MutatorRegistration::new();
             for _ in 0..drives {
                 assert_eq!(willow_sched_run_parallel(None, 1, None), 0);
             }
-            crate::gc::willow_gc_unregister_mutator();
+            drop(mutator);
             let (after_queries, after_updates) = crate::native_stack::affinity_counts_for_test();
             assert_eq!(after_queries - queries, drives);
             assert_eq!(after_updates - updates, 0);

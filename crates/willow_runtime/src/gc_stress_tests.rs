@@ -516,7 +516,7 @@ fn stress_region_08_five_mutators_allocate_and_collect_concurrently() {
     let handles: Vec<_> = (0..5)
         .map(|worker| {
             std::thread::spawn(move || {
-                willow_gc_register_mutator();
+                let mutator = crate::gc::MutatorRegistration::new();
                 for iteration in 0..500 {
                     let object = willow_alloc_object(worker + 1, 8);
                     unsafe { *(object as *mut i64) = iteration };
@@ -526,7 +526,7 @@ fn stress_region_08_five_mutators_allocate_and_collect_concurrently() {
                         willow_gc_safepoint();
                     }
                 }
-                willow_gc_unregister_mutator();
+                drop(mutator);
             })
         })
         .collect();

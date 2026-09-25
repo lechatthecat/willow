@@ -558,11 +558,11 @@ mod tests {
         let ready = AtomicBool::new(false);
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                willow_gc_register_mutator();
+                let mutator = crate::gc::MutatorRegistration::new();
                 ready.store(true, Ordering::Release);
                 let ptr = willow_string_literal_slot(&SLOT, b"waiting".as_ptr(), 7);
                 assert_eq!(unsafe { willow_string_as_str(ptr) }, "waiting");
-                willow_gc_unregister_mutator();
+                drop(mutator);
             });
             while !ready.load(Ordering::Acquire) {
                 std::thread::yield_now();
@@ -591,7 +591,7 @@ mod tests {
                         // Barrier before registration: blocking a registered
                         // mutator outside GC cooperation would deadlock STW.
                         barrier.wait();
-                        willow_gc_register_mutator();
+                        let mutator = crate::gc::MutatorRegistration::new();
                         for slot in &SLOTS {
                             let ptr = willow_string_literal_slot(slot, b"racing".as_ptr(), 6);
                             willow_gc_collect();
@@ -601,7 +601,7 @@ mod tests {
                                 ptr
                             );
                         }
-                        willow_gc_unregister_mutator();
+                        drop(mutator);
                     });
                 }
             });

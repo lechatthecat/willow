@@ -894,9 +894,9 @@ fn parallel_worker_pool_polls_tasks_on_multiple_threads() {
     let a = willow_sched_spawn(poll_record_parallel_worker, std::ptr::null_mut());
     let b = willow_sched_spawn(poll_record_parallel_worker, std::ptr::null_mut());
 
-    crate::gc::willow_gc_register_mutator();
+    let mutator = crate::gc::MutatorRegistration::new();
     let completed = willow_sched_run_parallel(None, 2, None);
-    crate::gc::willow_gc_unregister_mutator();
+    drop(mutator);
 
     assert_eq!(completed, 2);
     assert_eq!(willow_sched_task_state(a), -1);
@@ -970,9 +970,9 @@ fn parallel_completion_allows_worker_gc_and_nested_drive() {
     crate::gc::reset_internal_for_test();
     replace_global_scheduler_for_test(2);
     willow_sched_spawn(poll_collect_and_nested_drive, std::ptr::null_mut());
-    crate::gc::willow_gc_register_mutator();
+    let mutator = crate::gc::MutatorRegistration::new();
     assert_eq!(willow_sched_run_parallel(None, 2, None), 2);
-    crate::gc::willow_gc_unregister_mutator();
+    drop(mutator);
     reset_internal_for_test();
 }
 
@@ -1003,13 +1003,13 @@ fn parallel_completion_driver_cpu_below_five_percent() {
     reset_global_scheduler_for_test();
     replace_global_scheduler_for_test(2);
     willow_sched_spawn(poll_one_second_of_work, std::ptr::null_mut());
-    crate::gc::willow_gc_register_mutator();
+    let mutator = crate::gc::MutatorRegistration::new();
     let cpu_start = thread_cpu_seconds();
     let start = Instant::now();
     let completed = willow_sched_run_parallel(None, 2, None);
     let wall = start.elapsed().as_secs_f64();
     let cpu = thread_cpu_seconds() - cpu_start;
-    crate::gc::willow_gc_unregister_mutator();
+    drop(mutator);
     assert_eq!(completed, 1);
     eprintln!("parallel driver: cpu={cpu:.6}s wall={wall:.6}s");
     assert!(
@@ -1062,9 +1062,9 @@ fn parallel_wake_while_waiter_running_requeues_after_pending() {
     }
     let a = willow_sched_spawn(poll_await_with_running_wake_race, a_frame);
 
-    crate::gc::willow_gc_register_mutator();
+    let mutator = crate::gc::MutatorRegistration::new();
     let completed = willow_sched_run_parallel(None, 2, None);
-    crate::gc::willow_gc_unregister_mutator();
+    drop(mutator);
 
     assert_eq!(
         completed, 2,
@@ -5079,4 +5079,93 @@ fn idle_timer_wait_observes_work_published_after_empty_probe() {
     assert!(start.elapsed() < Duration::from_secs(1));
     assert!(global_run_queues().contains(task));
     reset_global_scheduler_for_test();
+}
+
+fn unwind_at_drive_entry() {
+    assert!(crate::gc::registered_mutator_count() > 0);
+    // Simulate task switching before a Rust failure escapes the run loop.
+    set_current_task(Some(u64::MAX));
+    panic!("injected scheduler drive unwind");
+}
+
+#[test]
+fn sched_drive_unwind_restores_state_and_can_drive_again() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    reset_internal_for_test();
+    let _context = install_test_panic_context(303);
+    let context = crate::panic_context::current_context().unwrap();
+    let before = crate::gc::registered_mutator_count();
+    DRIVE_ENTRY_HOOK.with(|hook| hook.set(Some(unwind_at_drive_entry)));
+    assert!(std::panic::catch_unwind(|| sched_run_with_mutator(None, None)).is_err());
+    assert_eq!(SCHED_RUN_DEPTH.with(Cell::get), 0);
+    assert_eq!(current_task_id(), None);
+    assert!(Arc::ptr_eq(
+        &context,
+        &crate::panic_context::current_context().unwrap()
+    ));
+    assert_eq!(crate::gc::registered_mutator_count(), before);
+
+    DRIVE_ENTRY_HOOK.with(|hook| {
+        hook.set(Some(|| {
+            assert_eq!(SCHED_RUN_DEPTH.with(Cell::get), 1);
+            assert!(crate::gc::registered_mutator_count() > 0);
+        }))
+    });
+    willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    assert_eq!(willow_sched_run(), 1);
+    assert_eq!(SCHED_RUN_DEPTH.with(Cell::get), 0);
+    assert_eq!(crate::gc::registered_mutator_count(), before);
+    assert!(Arc::ptr_eq(
+        &context,
+        &crate::panic_context::current_context().unwrap()
+    ));
+    reset_internal_for_test();
+}
+
+#[test]
+fn sched_drive_nested_unwind_restores_poll_and_outer_task() {
+    let _guard = runtime_test_guard();
+    reset_global_scheduler_for_test();
+    reset_internal_for_test();
+    let outer = SchedulerDriveGuard::new();
+    let task = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+    set_current_task(Some(task));
+    let context = crate::panic_context::current_context().unwrap();
+    let state = Arc::new(ParallelRunState::default());
+    state.begin_poll();
+    CURRENT_RUN_STATE.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&state)));
+    // Increasing pre-existing nesting depths must restore exactly, with one
+    // pause/resume pair per drive, independent of depth.
+    for depth in [1, 2, 16, 256] {
+        SCHED_RUN_DEPTH.with(|slot| slot.set(depth));
+        DRIVE_ENTRY_HOOK.with(|hook| {
+            hook.set(Some(|| {
+                CURRENT_RUN_STATE.with(|slot| {
+                    let state = slot.borrow();
+                    let state = state.as_ref().unwrap();
+                    assert_eq!(state.active_polls(), 0);
+                    assert_eq!(state.paused_polls(), 1);
+                });
+                unwind_at_drive_entry();
+            }))
+        });
+        assert!(std::panic::catch_unwind(|| sched_run_with_mutator(None, None)).is_err());
+        assert_eq!(SCHED_RUN_DEPTH.with(Cell::get), depth);
+        assert_eq!(current_task_id(), Some(task));
+        assert!(Arc::ptr_eq(
+            &context,
+            &crate::panic_context::current_context().unwrap()
+        ));
+        assert_eq!(state.active_polls(), 1);
+        assert_eq!(state.paused_polls(), 0);
+        assert!(crate::gc::registered_mutator_count() > 0);
+    }
+    CURRENT_RUN_STATE.with(|slot| slot.borrow_mut().take());
+    state.end_poll();
+    SCHED_RUN_DEPTH.with(|slot| slot.set(1));
+    drop(outer);
+    assert_eq!(current_task_id(), None);
+    assert_eq!(willow_sched_run(), 1);
+    reset_internal_for_test();
 }

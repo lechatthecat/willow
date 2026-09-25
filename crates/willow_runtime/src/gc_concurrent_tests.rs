@@ -381,7 +381,7 @@ fn concurrent_edge_publication_and_new_allocation_survive_remark() {
         let (target, source) = (target as usize, source as usize);
         let (ready, stop, newborn) = (Arc::clone(&ready), Arc::clone(&stop), Arc::clone(&newborn));
         std::thread::spawn(move || {
-            willow_gc_register_mutator();
+            let mutator = crate::gc::MutatorRegistration::new();
             ready.store(true, Ordering::Release);
             while !SNAPSHOT_READY.load(Ordering::Acquire) {
                 willow_gc_safepoint();
@@ -422,7 +422,7 @@ fn concurrent_edge_publication_and_new_allocation_survive_remark() {
                 willow_gc_safepoint();
                 std::thread::yield_now();
             }
-            willow_gc_unregister_mutator();
+            drop(mutator);
         })
     };
     while !ready.load(Ordering::Acquire) {
@@ -1198,7 +1198,7 @@ fn concurrent_sweep_retains_new_allocations_and_quarantines_processed_spans() {
         let worker = {
             let (ready, stop, address) = (ready.clone(), stop.clone(), address.clone());
             std::thread::spawn(move || {
-                willow_gc_register_mutator();
+                let mutator = crate::gc::MutatorRegistration::new();
                 ready.store(true, Ordering::Release);
                 while !SWEEP_MUTATOR_READY.load(Ordering::Acquire) {
                     willow_gc_safepoint();
@@ -1216,7 +1216,7 @@ fn concurrent_sweep_retains_new_allocations_and_quarantines_processed_spans() {
                     std::thread::yield_now();
                 }
                 willow_pop_root();
-                willow_gc_unregister_mutator();
+                drop(mutator);
             })
         };
         while !ready.load(Ordering::Acquire) {
@@ -1277,7 +1277,7 @@ fn reservation_pressure_waits_until_concurrent_sweep_releases_quarantine() {
     let worker = {
         let ready = ready.clone();
         std::thread::spawn(move || {
-            willow_gc_register_mutator();
+            let mutator = crate::gc::MutatorRegistration::new();
             ready.store(true, Ordering::Release);
             while !SWEEP_MUTATOR_READY.load(Ordering::Acquire) {
                 willow_gc_safepoint();
@@ -1305,7 +1305,7 @@ fn reservation_pressure_waits_until_concurrent_sweep_releases_quarantine() {
             )
             .expect("sweep must free reservations before retry");
             let address = object.payload().as_ptr() as usize;
-            willow_gc_unregister_mutator();
+            drop(mutator);
             address
         })
     };
@@ -1339,7 +1339,7 @@ fn concurrent_sweep_excludes_new_active_and_retired_tlab_chunks() {
     let worker = {
         let (ready, stop) = (ready.clone(), stop.clone());
         std::thread::spawn(move || {
-            willow_gc_register_mutator();
+            let mutator = crate::gc::MutatorRegistration::new();
             let mut tls = tlab_state_for_test();
             ready.store(true, Ordering::Release);
             while !SWEEP_MUTATOR_READY.load(Ordering::Acquire) {
@@ -1353,7 +1353,7 @@ fn concurrent_sweep_excludes_new_active_and_retired_tlab_chunks() {
                 willow_gc_safepoint();
                 std::thread::yield_now();
             }
-            willow_gc_unregister_mutator();
+            drop(mutator);
             [first, second]
         })
     };
@@ -1390,10 +1390,10 @@ fn reservation_retry_waits_for_election_before_phase_publication() {
     let worker = {
         let done = done.clone();
         std::thread::spawn(move || {
-            willow_gc_register_mutator();
+            let mutator = crate::gc::MutatorRegistration::new();
             collect_for_budget();
             done.store(true, Ordering::Release);
-            willow_gc_unregister_mutator();
+            drop(mutator);
         })
     };
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -2082,7 +2082,7 @@ fn root_handshake_resumes_early_mutator_and_replays_unretired_tlab_deletion() {
             let parent = parent as usize;
             let (ready, deleted, finished) = (ready.clone(), deleted.clone(), finished.clone());
             std::thread::spawn(move || {
-                willow_gc_register_mutator();
+                let mutator = crate::gc::MutatorRegistration::new();
                 ready.store(true, Ordering::Release);
                 while !runtime().poll_requested.load(Ordering::Acquire) {
                     std::thread::yield_now();
@@ -2126,7 +2126,7 @@ fn root_handshake_resumes_early_mutator_and_replays_unretired_tlab_deletion() {
                     willow_gc_safepoint();
                     std::thread::yield_now();
                 }
-                willow_gc_unregister_mutator();
+                drop(mutator);
             })
         };
         while !ready.load(Ordering::Acquire) {
@@ -2165,7 +2165,7 @@ fn root_handshake_tlab_owner_index_avoids_mutator_squared_accounting() {
             .map(|_| {
                 let (ready, done) = (ready.clone(), done.clone());
                 std::thread::spawn(move || {
-                    willow_gc_register_mutator();
+                    let mutator = crate::gc::MutatorRegistration::new();
                     let mut tls = tlab_state_for_test();
                     let mut object = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
                     willow_push_root(&mut object);
@@ -2175,7 +2175,7 @@ fn root_handshake_tlab_owner_index_avoids_mutator_squared_accounting() {
                         std::thread::yield_now();
                     }
                     willow_pop_root();
-                    willow_gc_unregister_mutator();
+                    drop(mutator);
                 })
             })
             .collect();
@@ -2365,24 +2365,24 @@ fn registered_peers_do_not_hide_an_unregistered_foreign_root_owner() {
     let peer = {
         let (ready, done) = (ready.clone(), done.clone());
         std::thread::spawn(move || {
-            willow_gc_register_mutator();
+            let mutator = crate::gc::MutatorRegistration::new();
             ready.store(true, Ordering::Release);
             while !done.load(Ordering::Acquire) {
                 willow_gc_safepoint();
                 std::thread::yield_now();
             }
-            willow_gc_unregister_mutator();
+            drop(mutator);
         })
     };
     while !ready.load(Ordering::Acquire) {
         std::thread::yield_now();
     }
     std::thread::spawn(|| {
-        willow_gc_register_mutator();
+        let mutator = crate::gc::MutatorRegistration::new();
         assert!(multi_mutator_active());
         willow_gc_collect();
         willow_gc_minor_collect();
-        willow_gc_unregister_mutator();
+        drop(mutator);
     })
     .join()
     .unwrap();
@@ -2524,7 +2524,7 @@ fn concurrent_closure_and_sweep_preserve_a_new_active_tlab_without_stopping_its_
         let (ready, done, published) = (ready.clone(), done.clone(), published.clone());
         let (control, leaf) = (control as usize, leaf as usize);
         std::thread::spawn(move || {
-            willow_gc_register_mutator();
+            let mutator = crate::gc::MutatorRegistration::new();
             let mut tls = tlab_state_for_test();
             ready.store(true, Ordering::Release);
             while !SNAPSHOT_READY.load(Ordering::Acquire) {
@@ -2561,7 +2561,7 @@ fn concurrent_closure_and_sweep_preserve_a_new_active_tlab_without_stopping_its_
                 0,
                 "normal closure retired a post-snapshot TLAB"
             );
-            willow_gc_unregister_mutator();
+            drop(mutator);
         })
     };
     while !ready.load(Ordering::Acquire) {
@@ -2623,7 +2623,7 @@ fn closing_phase_publishes_deletions_directly_instead_of_hiding_new_buffer_work(
     let producer = {
         let (cycle, ready) = (cycle.clone(), ready.clone());
         std::thread::spawn(move || {
-            willow_gc_register_mutator();
+            let mutator = crate::gc::MutatorRegistration::new();
             cycle.active_drains.fetch_add(1, Ordering::AcqRel);
             let mut batch = MarkBatch {
                 cpu_start: None,
@@ -2649,7 +2649,7 @@ fn closing_phase_publishes_deletions_directly_instead_of_hiding_new_buffer_work(
             assert!(runtime().heap.lock().unwrap().satb.is_empty());
             assert!(cycle.is_marked(child));
             drop(batch);
-            willow_gc_unregister_mutator();
+            drop(mutator);
         })
     };
     while !ready.load(Ordering::Acquire) {
@@ -2889,7 +2889,7 @@ fn root_activation_crosses_pending_stores_before_snapshots_or_assist_scans() {
             let reader = {
                 let done = done.clone();
                 std::thread::spawn(move || {
-                    willow_gc_register_mutator();
+                    let mutator = crate::gc::MutatorRegistration::new();
                     let mut parent_root = parent as *mut u8;
                     let mut local = std::ptr::null_mut();
                     willow_push_root(&mut parent_root);
@@ -2929,7 +2929,7 @@ fn root_activation_crosses_pending_stores_before_snapshots_or_assist_scans() {
                     }
                     std::hint::black_box(local);
                     willow_pop_roots(2);
-                    willow_gc_unregister_mutator();
+                    drop(mutator);
                 })
             };
             ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -2975,9 +2975,9 @@ fn root_activation_late_registration_joins_the_current_round() {
         let collector = {
             let done = done.clone();
             std::thread::spawn(move || {
-                willow_gc_register_mutator();
+                let mutator = crate::gc::MutatorRegistration::new();
                 willow_gc_collect();
-                willow_gc_unregister_mutator();
+                drop(mutator);
                 done.store(true, Ordering::Release);
             })
         };

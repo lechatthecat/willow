@@ -1239,6 +1239,11 @@ fn automatic_collect(stress: bool) {
     }
 }
 
+#[cfg(all(test, debug_assertions))]
+pub(crate) fn collect_for_worker_panic_test() {
+    collect_internal();
+}
+
 fn collect_internal() {
     // Collector election (willow-6fv.5.6): only one thread collects at a time.
     // A thread that cannot become the collector must NOT block on runtime().collect_lock —

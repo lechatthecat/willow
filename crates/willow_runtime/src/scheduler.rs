@@ -2887,6 +2887,70 @@ pub extern "C" fn willow_select_idle_wait() {
     );
 }
 
+/// Restore drive-local bookkeeping on both return and Rust unwind. Frame-root
+/// retirement stays on the successful path: an unwinding pool may not be quiescent.
+struct SchedulerDriveGuard {
+    saved_depth: u32,
+    saved_running: Option<RuntimeTaskId>,
+    saved_panic_context: Option<Arc<crate::panic_context::PanicContext>>,
+    shared_state: Option<Arc<ParallelRunState>>,
+    paused_parallel_poll: bool,
+    mutator: Option<crate::gc::MutatorRegistration>,
+}
+
+impl SchedulerDriveGuard {
+    fn new() -> Self {
+        let saved_depth = SCHED_RUN_DEPTH.with(Cell::get);
+        let saved_running = current_task_id();
+        let saved_panic_context = crate::panic_context::current_context();
+        let shared_state = CURRENT_RUN_STATE.with(|slot| slot.borrow().clone());
+        let mutator = (saved_depth == 0).then(crate::gc::MutatorRegistration::new);
+        let paused_parallel_poll =
+            saved_depth != 0 && shared_state.is_some() && saved_running.is_some();
+        SCHED_RUN_DEPTH.with(|depth| depth.set(saved_depth + 1));
+        if paused_parallel_poll && let Some(state) = shared_state.as_ref() {
+            state.pause_active_poll();
+        }
+        Self {
+            saved_depth,
+            saved_running,
+            saved_panic_context,
+            shared_state,
+            paused_parallel_poll,
+            mutator,
+        }
+    }
+}
+
+impl Drop for SchedulerDriveGuard {
+    fn drop(&mut self) {
+        CURRENT_TASK.with(|current| current.set(self.saved_running));
+        crate::panic_context::replace_current_context(self.saved_panic_context.take());
+        if let Some(id) = self.saved_running {
+            // The outer task still owns its frame and lifecycle; only its TLS
+            // marker and preemption budget were displaced by the nested drive.
+            if let Some(flag) = global_task_table().with(id, RuntimeTask::preempt_flag_ptr) {
+                crate::preempt::willow_preempt_begin(flag);
+            }
+        }
+        if self.paused_parallel_poll
+            && let Some(state) = self.shared_state.as_ref()
+        {
+            state.resume_paused_poll();
+        }
+        SCHED_RUN_DEPTH.with(|depth| depth.set(self.saved_depth));
+        let outermost_exit = self.saved_depth == 0;
+        debug_assert_eq!(outermost_exit, self.mutator.is_some());
+        // The mutator field unregisters after all bookkeeping is restored.
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    // Inject a Rust unwind without crossing an extern "C" task-poll boundary.
+    static DRIVE_ENTRY_HOOK: Cell<Option<fn()>> = const { Cell::new(None) };
+}
+
 fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instant>) -> i64 {
     crate::stack_overflow::protect_current_thread();
     if crate::panic_context::panic_unwind_cleanup_active() {
@@ -2898,26 +2962,19 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instan
     // future parallel collector can stop it at a safepoint. Single-mutator runs
     // have exactly one registered thread, so `multi_mutator_active()` stays false
     // and GC behavior is unchanged (willow-6fv.5.6).
-    let saved_panic_context = crate::panic_context::current_context();
-    let outermost = SCHED_RUN_DEPTH.with(|d| {
-        let depth = d.get();
-        d.set(depth + 1);
-        depth == 0
+    let drive = SchedulerDriveGuard::new();
+    #[cfg(test)]
+    DRIVE_ENTRY_HOOK.with(|hook| {
+        if let Some(hook) = hook.take() {
+            hook();
+        }
     });
-    let saved_running = if outermost { None } else { current_task_id() };
-    let shared_state = CURRENT_RUN_STATE.with(|slot| slot.borrow().clone());
-    let paused_parallel_poll = !outermost && shared_state.is_some() && saved_running.is_some();
-    if paused_parallel_poll && let Some(state) = shared_state.as_ref() {
-        state.pause_active_poll();
-    }
-    // Held for the whole drive so an unwinding task or run loop still
-    // unregisters; a driver that dies registered blocks every later
-    // collection forever (willow-utqy).
-    let mutator = outermost.then(crate::gc::MutatorRegistration::new);
+    let outermost = drive.mutator.is_some();
+    let shared_state = drive.shared_state.as_deref();
     let active_workers = runtime_worker_config().active_workers();
     let completed = if outermost {
         willow_sched_run_parallel(target, active_workers, deadline)
-    } else if let Some(state) = shared_state.as_deref() {
+    } else if let Some(state) = shared_state {
         scheduler_run_loop(target, current_worker(), Some(state), false, deadline)
     } else {
         scheduler_run_loop(target, current_worker(), None, false, deadline)
@@ -2925,37 +2982,13 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instan
     // External registrations never require the worker pool to remain alive,
     // so purge them promptly after each drive, including nested drives.
     drain_terminal_cleanups();
-    if let Some(id) = saved_running {
-        set_current_task(Some(id));
-        // A nested drive temporarily replaces only the thread-local
-        // current-task marker. The outer task continues to own its frame, so
-        // its atomic lifecycle remains Running/Cancelling throughout.
-        let preempt_flag = global_task_table().with(id, RuntimeTask::preempt_flag_ptr);
-        if let Some(flag) = preempt_flag {
-            crate::preempt::willow_preempt_begin(flag);
-        }
-    } else {
-        // Restore the synchronous entry context (or the caller's explicit
-        // context) after an outer scheduler drive. Worker task switches clear
-        // TLS between polls, so restoration belongs to the drive boundary.
-        crate::panic_context::replace_current_context(saved_panic_context);
-    }
-    if paused_parallel_poll && let Some(state) = shared_state.as_ref() {
-        state.resume_paused_poll();
-    }
     if outermost {
         // The parallel pool has joined and nested polls have resumed or
         // quiesced. It is now safe to remove every terminal frame runtime root
         // retired during this outer drive.
         release_pending_frame_roots();
     }
-    let outermost_exit = SCHED_RUN_DEPTH.with(|d| {
-        let depth = d.get() - 1;
-        d.set(depth);
-        depth == 0
-    });
-    debug_assert_eq!(outermost_exit, mutator.is_some());
-    drop(mutator);
+    drop(drive);
     completed
 }
 
@@ -3134,7 +3167,34 @@ struct WorkerDrive {
     state: Arc<ParallelRunState>,
     deadline: Option<Instant>,
     finished: Arc<ParallelCompletion>,
+    #[cfg(test)]
+    entry_hook: Option<fn()>,
 }
+
+fn persistent_worker_loop(worker: usize, receiver: std::sync::mpsc::Receiver<WorkerDrive>) {
+    // A Rust invariant panic cannot leave this thread: its driver is waiting
+    // for completion, and the runtime may already be partially unwound. Willow
+    // language panics use task outcomes and never unwind through this boundary.
+    // The panic hook emits the original diagnostic before we terminate. Do not
+    // drop the panic payload (its destructor can itself panic).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        while let Ok(drive) = receiver.recv() {
+            #[cfg(test)]
+            if let Some(hook) = drive.entry_hook {
+                hook();
+            }
+            run_parallel_worker(worker, drive.target, drive.state, drive.deadline);
+            drive.finished.finish();
+        }
+    }));
+    if result.is_err() {
+        std::process::abort();
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+#[path = "scheduler_worker_failure_tests.rs"]
+mod worker_failure_tests;
 
 #[derive(Default)]
 struct PersistentWorkers {
@@ -3180,12 +3240,7 @@ fn willow_sched_run_parallel(
         let (sender, receiver) = std::sync::mpsc::channel::<WorkerDrive>();
         std::thread::Builder::new()
             .name(format!("willow-worker-{worker}"))
-            .spawn(move || {
-                while let Ok(drive) = receiver.recv() {
-                    run_parallel_worker(worker, drive.target, drive.state, drive.deadline);
-                    drive.finished.finish();
-                }
-            })
+            .spawn(move || persistent_worker_loop(worker, receiver))
             .expect("cannot start persistent scheduler worker");
         pool.senders.push(sender);
     }
@@ -3198,6 +3253,8 @@ fn willow_sched_run_parallel(
                 state: Arc::clone(&state),
                 deadline,
                 finished: Arc::clone(&finished),
+                #[cfg(test)]
+                entry_hook: None,
             })
             .expect("scheduler worker terminated");
     }

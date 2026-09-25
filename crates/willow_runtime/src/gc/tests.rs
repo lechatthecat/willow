@@ -226,7 +226,7 @@ fn published_root_slots_are_writable_and_preserve_nulls() {
     let worker_ready = ready.clone();
     let worker_done = done.clone();
     let worker = std::thread::spawn(move || {
-        willow_gc_register_mutator();
+        let mutator = crate::gc::MutatorRegistration::new();
         let mut first = willow_alloc_object(0, 8);
         let mut alias = first;
         let mut empty = std::ptr::null_mut();
@@ -242,7 +242,7 @@ fn published_root_slots_are_writable_and_preserve_nulls() {
         assert_eq!(alias, first);
         assert!(empty.is_null());
         willow_pop_roots(3);
-        willow_gc_unregister_mutator();
+        drop(mutator);
     });
     while !ready.load(Ordering::Acquire) {
         std::thread::yield_now();
@@ -314,7 +314,7 @@ fn multi_mutator_stw_keeps_other_thread_roots_alive_through_generated_gate() {
     let done = Arc::new(AtomicBool::new(false));
     let (r2, d2) = (ready.clone(), done.clone());
     let worker = std::thread::spawn(move || {
-        willow_gc_register_mutator();
+        let mutator = crate::gc::MutatorRegistration::new();
         // Worker holds root B and keeps polling safepoints (so it parks
         // during the collector's stop-the-world).
         let b = willow_alloc_object(0, 8);
@@ -334,7 +334,7 @@ fn multi_mutator_stw_keeps_other_thread_roots_alive_through_generated_gate() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         willow_pop_root();
-        willow_gc_unregister_mutator();
+        drop(mutator);
     });
 
     while !ready.load(Ordering::SeqCst) {
@@ -367,13 +367,13 @@ fn multi_mutator_concurrent_collection_does_not_deadlock() {
     let handles: Vec<_> = (0..2)
         .map(|_| {
             std::thread::spawn(|| {
-                willow_gc_register_mutator();
+                let mutator = crate::gc::MutatorRegistration::new();
                 for _ in 0..30 {
                     let _garbage = willow_alloc_object(0, 8); // unrooted
                     willow_gc_safepoint();
                     willow_gc_collect();
                 }
-                willow_gc_unregister_mutator();
+                drop(mutator);
             })
         })
         .collect();
@@ -401,14 +401,14 @@ fn multi_mutator_stw_frees_unrooted_object() {
     let done = Arc::new(AtomicBool::new(false));
     let (r2, d2) = (ready.clone(), done.clone());
     let worker = std::thread::spawn(move || {
-        willow_gc_register_mutator();
+        let mutator = crate::gc::MutatorRegistration::new();
         // Worker registers but holds NO root; it just parks at safepoints.
         r2.store(true, Ordering::SeqCst);
         while !d2.load(Ordering::SeqCst) {
             willow_gc_safepoint();
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        willow_gc_unregister_mutator();
+        drop(mutator);
     });
     while !ready.load(Ordering::SeqCst) {
         std::thread::sleep(std::time::Duration::from_millis(1));
