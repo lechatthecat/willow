@@ -46,12 +46,51 @@ pub(crate) struct BodyQueries {
     store: Rc<ArtifactStore>,
     index: Rc<BodyIndex>,
     typed: QueryTable<BodyId, usize>,
+    typechecks: std::cell::Cell<usize>,
+    reused: std::cell::Cell<usize>,
+    seeded: std::cell::RefCell<std::collections::HashSet<BodyId>>,
     normalized: QueryTable<BodyId, usize>,
     assignment: QueryTable<BodyId, Vec<bool>>,
     borrows: QueryTable<BodyId, usize>,
 }
 
 impl BodyQueries {
+    pub(crate) fn reuse_from(
+        &self,
+        previous: &Self,
+        units: &std::collections::HashSet<crate::module::UnitId>,
+    ) -> Result<()> {
+        // Injected defaults can have several keys referencing one immutable
+        // record. Preserve that sharing when compacting a revision's pack.
+        let mut copied = std::collections::HashMap::new();
+        for (id, unit) in self.index.entries() {
+            if units.contains(&unit)
+                && let Some(record) = previous.typed.ready(&id)
+            {
+                let target = match copied.entry(*record) {
+                    std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let body: TypedBody = previous.store.read(*record)?;
+                        *entry.insert(self.store.write(&body)?)
+                    }
+                };
+                self.typed.seed(id, target);
+                self.seeded.borrow_mut().insert(id);
+            }
+        }
+        Ok(())
+    }
+    fn mark_reused(&self, id: BodyId) {
+        if self.seeded.borrow_mut().remove(&id) {
+            self.reused.set(self.reused.get() + 1);
+        }
+    }
+    pub(crate) fn typechecks(&self) -> usize {
+        self.typechecks.get()
+    }
+    pub(crate) fn reused(&self) -> usize {
+        self.reused.get()
+    }
     pub(crate) fn index(&self) -> &BodyIndex {
         &self.index
     }
@@ -65,6 +104,9 @@ impl BodyQueries {
             store,
             index,
             typed: QueryTable::named("typed_body"),
+            typechecks: Default::default(),
+            reused: Default::default(),
+            seeded: Default::default(),
             normalized: QueryTable::named("normalized_body"),
             assignment: QueryTable::named("definite_assignment"),
             borrows: QueryTable::named("async_borrow_report"),
@@ -126,8 +168,10 @@ impl BodyQueries {
         id: BodyId,
         compute: impl FnOnce() -> Result<TypedBody>,
     ) -> Result<TypedBody> {
+        self.mark_reused(id);
         let mut fresh = None;
         let artifact = self.typed.query(id, || {
+            self.typechecks.set(self.typechecks.get() + 1);
             let value = compute()?;
             let artifact = self.store.write(&value)?;
             fresh = Some(value);
@@ -150,6 +194,7 @@ impl BodyQueries {
     }
 
     fn typed_record(&self, id: BodyId) -> Result<std::sync::Arc<usize>> {
+        self.mark_reused(id);
         self.typed.query(id, || {
             // An injected non-generic default uses the canonical interface's
             // checked body. Concrete generic instances already have own keys.
@@ -759,5 +804,57 @@ mod tests {
         }
         // Constant bytes per lambda (identifier widths grow logarithmically).
         assert!(per_lambda[2] <= per_lambda[0] * 2, "{per_lambda:?}");
+    }
+    #[test]
+    fn revision_copy_preserves_shared_default_artifacts() {
+        for count in [16, 64, 256] {
+            let source = format!(
+                "interface I {{ fn value(self) -> i64 {{ return 42; }} }} {}",
+                (0..count)
+                    .map(|i| format!("class C{i} implements I {{}}\n"))
+                    .collect::<String>()
+            );
+            let (program, previous, _) = prepare(&source, true);
+            let Item::Interface(interface) = &program.items[0] else {
+                panic!()
+            };
+            let canonical = interface.methods[0].default_body.as_ref().unwrap().id;
+            let aliases: Vec<_> = program
+                .items
+                .iter()
+                .filter_map(|item| {
+                    let Item::Class(class) = item else {
+                        return None;
+                    };
+                    Some(class.methods[0].body.id)
+                })
+                .collect();
+            for &id in &aliases {
+                previous.typed_record(id).unwrap();
+            }
+            let artifacts = UnitArtifacts::new().unwrap();
+            let next = BodyQueries::new(Rc::clone(&artifacts.store), Rc::clone(&previous.index));
+            next.reuse_from(&previous, &std::collections::HashSet::from([UnitId::ENTRY]))
+                .unwrap();
+            let record = *next.typed_record(canonical).unwrap();
+            for &id in &aliases {
+                assert_eq!(*next.typed_record(id).unwrap(), record);
+            }
+            let distinct = |queries: &BodyQueries| {
+                queries
+                    .index
+                    .entries()
+                    .filter_map(|(id, _)| queries.typed.ready(&id).map(|record| *record))
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+            };
+            assert_eq!(distinct(&next), distinct(&previous));
+            assert_eq!(next.typechecks(), 0);
+            println!(
+                "revision shared_defaults={count} distinct_records={} copied_bytes={}",
+                distinct(&next),
+                next.store.written()
+            );
+        }
     }
 }

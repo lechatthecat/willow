@@ -371,7 +371,7 @@ impl<'a> CompilerSession<'a> {
             .resolve_project(self.project_root.as_deref())?;
         inputs.capture_analysis = true;
         let frontend = run_frontend_with_inputs(&source, root, &map, inputs, emitter)?;
-        ai::snapshot(frontend, &path, &source, self.project_root.as_deref())
+        ai::snapshot(&frontend, &path, &source, self.project_root.as_deref())
     }
 
     fn execute(self, emitter: &mut dyn diagnostics::DiagnosticEmitter, build: bool) -> Result<()> {
@@ -472,23 +472,58 @@ fn run_frontend_with_inputs(
     inputs: compiler_db::inputs::CompilerInputs,
     emitter: &mut dyn diagnostics::DiagnosticEmitter,
 ) -> Result<Frontend> {
-    let tokens = match lex_phase(source) {
-        Ok(tokens) => tokens,
-        Err(errors) => {
-            for diagnostic in errors.iter() {
-                emitter.emit(diagnostic, map)?;
-            }
-            anyhow::bail!("aborting due to {} lexer error(s)", errors.len());
-        }
-    };
+    run_frontend_revision(source, root, map, inputs, emitter, None, false)
+}
+
+fn run_frontend_revision(
+    source: &str,
+    root: &std::path::Path,
+    map: &diagnostics::SourceMap,
+    inputs: compiler_db::inputs::CompilerInputs,
+    emitter: &mut dyn diagnostics::DiagnosticEmitter,
+    previous: Option<&Frontend>,
+    incremental: bool,
+) -> Result<Frontend> {
+    let mut artifacts = module::artifacts::UnitArtifacts::new()?;
+    artifacts.revision_enabled = incremental;
+    if let Some(previous) = previous {
+        let old = previous
+            .module_graph
+            .artifacts
+            .as_ref()
+            .expect("revision artifacts");
+        artifacts.previous_parsed = Some((std::rc::Rc::clone(&old.store), old.parsed.clone()));
+        artifacts
+            .body_index_mut()
+            .begin_revision(std::rc::Rc::clone(&old.bodies));
+    }
     let ParsePhase {
         mut program,
         outcome: parse,
-    } = parse_phase(tokens);
+    } = match artifacts.cached_parse(diagnostics::FileId::ENTRY, source)? {
+        Some(program) => ParsePhase {
+            program,
+            outcome: PhaseDiagnostics::new(Vec::new()),
+        },
+        None => {
+            let tokens = match lex_phase(source) {
+                Ok(tokens) => tokens,
+                Err(errors) => {
+                    for diagnostic in errors.iter() {
+                        emitter.emit(diagnostic, map)?;
+                    }
+                    anyhow::bail!("aborting due to {} lexer error(s)", errors.len());
+                }
+            };
+            parse_phase(tokens)
+        }
+    };
     for diagnostic in &parse.diagnostics {
         emitter.emit(diagnostic, map)?;
     }
-    let mut artifacts = module::artifacts::UnitArtifacts::new()?;
+    if incremental && parse.diagnostics.is_empty() {
+        artifacts.retain_parse(diagnostics::FileId::ENTRY, source, &program)?;
+    }
     artifacts.snapshot_source(diagnostics::FileId::ENTRY, source)?;
     artifacts.offload(&mut program)?;
     let resolution = module::resolver::resolve_imports_spooled_entry(
@@ -563,6 +598,8 @@ fn run_frontend_with_inputs(
             .body_index_mut()
             .register_unit(&mut module.program, module.id);
     }
+    artifacts.body_index_mut().finish_revision();
+    artifacts.previous_parsed = None;
     let db = compiler_db::CompilerDb::with_dependencies(
         inputs,
         &graph.files,
@@ -570,6 +607,12 @@ fn run_frontend_with_inputs(
         std::rc::Rc::clone(&artifacts.store),
         desugar_dependencies,
     );
+    if let Some(previous) = previous {
+        let reusable =
+            compiler_db::revision::reusable_units(previous, &graph.files, &artifacts, &db);
+        db.typed_bodies
+            .reuse_from(&previous.db.typed_bodies, &reusable)?;
+    }
     if db.inputs().capture_analysis {
         *db.effects.analysis.borrow_mut() = Some(Default::default());
     }

@@ -10,6 +10,7 @@ pub use graph::{Direction, Impact, ImpactNode, Limits};
 pub use semantic::{QueryRequest, QuerySession, SemanticFacts};
 pub use storage::{Difference, FunctionChange};
 pub use warm::WarmSession;
+pub(crate) use warm::check_size;
 
 use crate::{
     diagnostics::Span,
@@ -103,6 +104,7 @@ pub(crate) struct CapturedUnit {
     symbols: crate::semantic::analysis_symbols::Facts,
     declarations: HashMap<FunctionId, Vec<(Span, Span)>>,
     identities: HashMap<FunctionId, BodyId>,
+    lambda_names: HashMap<FunctionId, String>,
     rename_calls: Vec<(Span, FunctionId)>,
     direct: HashMap<FunctionId, u8>,
     dispatches: HashMap<FunctionId, BTreeSet<FunctionId>>,
@@ -136,6 +138,7 @@ pub(crate) fn capture(
         symbols: symbol_facts.clone(),
         declarations: HashMap::new(),
         identities: HashMap::new(),
+        lambda_names: HashMap::new(),
         rename_calls: Vec::new(),
         direct: HashMap::new(),
         dispatches: HashMap::new(),
@@ -203,6 +206,7 @@ pub(crate) fn capture(
             _ => {}
         }
     }
+    let mut lambda_roots = HashMap::new();
     while let Some((id, span, body_id, body)) = pending.pop() {
         result.identities.insert(id, body_id);
         let body_span = match body {
@@ -320,7 +324,14 @@ pub(crate) fn capture(
                             LambdaBody::Block(b) => AstEvent::Block(b),
                             LambdaBody::Expr(e) => AstEvent::Expr(e),
                         };
-                        pending.push((FunctionId::lambda(child), l.span, child, event));
+                        let child_id = FunctionId::lambda(child);
+                        let root = lambda_roots.get(&id).copied().unwrap_or(id);
+                        lambda_roots.insert(child_id, root);
+                        result.lambda_names.insert(
+                            child_id,
+                            format!("<lambda {root}@{}:{}>", l.span.start, l.span.end),
+                        );
+                        pending.push((child_id, l.span, child, event));
                     } else {
                         bits |= RuntimeEffects::ALL.bits();
                     }
@@ -369,7 +380,7 @@ pub(crate) fn capture(
 }
 
 pub(crate) fn snapshot(
-    frontend: crate::Frontend,
+    frontend: &crate::Frontend,
     entry: &Path,
     source: &str,
     project: Option<&Path>,
@@ -515,7 +526,11 @@ pub(crate) fn snapshot(
             let key = (owner, local);
             nodes.entry(key).or_insert_with(|| {
                 let module = paths[&owner].clone();
-                let name = local.to_string();
+                let name = captured[&owner]
+                    .lambda_names
+                    .get(&local)
+                    .cloned()
+                    .unwrap_or_else(|| local.to_string());
                 Function {
                     body_id: None,
                     body_location: None,

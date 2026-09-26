@@ -59,6 +59,8 @@ impl Drop for UnitLease {
     }
 }
 
+pub(crate) type ParsedRecords = HashMap<FileId, (String, usize)>;
+
 #[derive(Debug)]
 pub(crate) struct UnitArtifacts {
     pub(crate) store: Rc<ArtifactStore>,
@@ -67,6 +69,9 @@ pub(crate) struct UnitArtifacts {
     initializers: HashMap<crate::parser::ast::BodyId, usize>,
     sources: HashMap<FileId, usize>,
     pub(crate) bodies: Rc<crate::compiler_db::ids::BodyIndex>,
+    pub(crate) revision_enabled: bool,
+    pub(crate) parsed: ParsedRecords,
+    pub(crate) previous_parsed: Option<(Rc<ArtifactStore>, ParsedRecords)>,
 }
 
 /// Shared session pack. Query handles can retain it independently of declaration
@@ -150,7 +155,6 @@ impl ArtifactStore {
     }
 
     /// Bytes written to the pack so far, for deterministic size measurements.
-    #[cfg(test)]
     pub(crate) fn written(&self) -> u64 {
         self.pack.borrow().as_ref().map_or(0, |pack| pack.written)
     }
@@ -298,6 +302,9 @@ impl UnitArtifacts {
                         initializers: HashMap::new(),
                         sources: HashMap::new(),
                         bodies: Default::default(),
+                        revision_enabled: false,
+                        parsed: HashMap::new(),
+                        previous_parsed: None,
                     };
                     return Ok(artifacts);
                 }
@@ -328,6 +335,32 @@ impl UnitArtifacts {
     #[cfg(test)]
     pub(crate) fn peaks(&self) -> [usize; 4] {
         self.metrics.borrow().peak
+    }
+
+    pub(crate) fn cached_parse(&self, file: FileId, source: &str) -> Result<Option<Program>> {
+        use sha2::{Digest, Sha256};
+        let Some((store, records)) = &self.previous_parsed else {
+            return Ok(None);
+        };
+        let fingerprint = format!("{:x}", Sha256::digest(source.as_bytes()));
+        records
+            .get(&file)
+            .filter(|(hash, _)| hash == &fingerprint)
+            .map(|(_, record)| store.read(*record))
+            .transpose()
+    }
+
+    pub(crate) fn retain_parse(
+        &mut self,
+        file: FileId,
+        source: &str,
+        program: &Program,
+    ) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let fingerprint = format!("{:x}", Sha256::digest(source.as_bytes()));
+        let record = self.write(program)?;
+        self.parsed.insert(file, (fingerprint, record));
+        Ok(())
     }
 
     pub(crate) fn snapshot_source(&mut self, id: FileId, source: &str) -> Result<()> {

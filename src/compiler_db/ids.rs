@@ -191,6 +191,7 @@ pub struct BodyIndex {
     static_ids: HashMap<ExprId, StaticId>,
     origins: HashMap<BodyId, BodyId>,
     children: HashMap<BodyId, Vec<BodyId>>,
+    previous: Option<std::rc::Rc<BodyIndex>>,
     #[cfg(test)]
     visits: usize,
     #[cfg(test)]
@@ -198,6 +199,20 @@ pub struct BodyIndex {
 }
 
 impl BodyIndex {
+    pub(crate) fn begin_revision(&mut self, previous: std::rc::Rc<BodyIndex>) {
+        self.previous = Some(previous);
+    }
+    pub(crate) fn finish_revision(&mut self) {
+        self.previous = None;
+    }
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (BodyId, UnitId)> + '_ {
+        self.owners.iter().map(|(&id, &(unit, _))| (id, unit))
+    }
+    fn previous_instance(&self, unit: UnitId, owner: BodyOwner, source: BodyId) -> Option<BodyId> {
+        let previous = self.previous.as_ref()?;
+        let id = previous.body(unit, owner)?;
+        (previous.source_body(id) == source).then_some(id)
+    }
     fn qualify_owner(&self, unit: UnitId, owner: BodyOwner) -> BodyOwner {
         let Some(&module) = self.symbol_modules.get(&unit) else {
             return owner;
@@ -378,7 +393,15 @@ impl BodyIndex {
             }
             match event {
                 AstEvent::Expr(Expr::Lambda(lambda)) => {
-                    let id = *self.lambdas.entry(lambda.id).or_insert_with(BodyId::fresh);
+                    let previous = self
+                        .previous
+                        .as_ref()
+                        .and_then(|p| p.lambdas.get(&lambda.id))
+                        .copied();
+                    let id = *self
+                        .lambdas
+                        .entry(lambda.id)
+                        .or_insert_with(|| previous.unwrap_or_else(BodyId::fresh));
                     self.register(
                         id,
                         unit,
@@ -414,7 +437,9 @@ impl BodyIndex {
             return;
         }
         let source = self.source_body(block.id);
-        let id = BodyId::fresh();
+        let id = self
+            .previous_instance(unit, owner, source)
+            .unwrap_or_else(BodyId::fresh);
         self.register(id, unit, owner);
         self.origins.insert(id, source);
         block.id = id;
@@ -427,15 +452,14 @@ impl BodyIndex {
                 let Some((_, BodyOwner::Lambda { expr, .. })) = self.owner(child) else {
                     continue;
                 };
-                let id = BodyId::fresh();
-                self.register(
-                    id,
-                    unit,
-                    BodyOwner::Lambda {
-                        parent: instance,
-                        expr,
-                    },
-                );
+                let owner = BodyOwner::Lambda {
+                    parent: instance,
+                    expr,
+                };
+                let id = self
+                    .previous_instance(unit, owner, self.source_body(child))
+                    .unwrap_or_else(BodyId::fresh);
+                self.register(id, unit, owner);
                 self.origins.insert(id, self.source_body(child));
                 pending.push((child, id));
             }
@@ -526,7 +550,11 @@ impl BodyIndex {
                                 index: u32::try_from(i).expect("field index overflow"),
                             };
                             if self.static_ids.insert(expr.id(), id).is_none() {
-                                let body = BodyId::fresh();
+                                let body = self
+                                    .previous
+                                    .as_ref()
+                                    .and_then(|p| p.initializer_body(expr.id()))
+                                    .unwrap_or_else(BodyId::fresh);
                                 self.register(body, unit, BodyOwner::StaticInitializer(id));
                                 self.nested(unit, body, AstEvent::Expr(expr));
                             }

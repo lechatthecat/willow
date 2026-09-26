@@ -175,7 +175,7 @@ fn inputs(
     ))
 }
 
-fn check_size(snapshot: &Snapshot) -> Result<()> {
+pub(crate) fn check_size(snapshot: &Snapshot) -> Result<()> {
     struct Counter(usize);
     impl std::io::Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {

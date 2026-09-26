@@ -79,24 +79,43 @@ visible only after a successful `refresh`.
 {"id":4,"operation":"shutdown"}
 ```
 
-A refresh runs the existing cold frontend, then updates the BodyId-keyed
-CompilerDb analysis-query family. Symbol, references and effects results reuse
-unchanged values; transitive effect witnesses invalidate through both old and
-new dependency edges. Position queries retain the existing logarithmic index.
-This is incremental **query-result reuse**, not incremental parsing/typechecking
-or reuse of native build artifacts. Configuration changes require a fresh daemon.
-A failed refresh leaves the previous revision available. EOF or shutdown releases
-all retained state; there is no detached process or persistent compiler cache.
+A refresh uses the existing CompilerDb with module-granularity revision
+invalidation. Unchanged parsed inputs keep their syntax/BodyId identities;
+unchanged modules outside the reverse dependency closure replay typed-body
+artifacts and skip body type checking. Body, public signature, type definition,
+default-method and effect changes invalidate the changed module and its
+consumers. Declarations and whole-unit effect/concurrency aggregation are rebuilt.
+A change to resolver topology or compiler inputs starts a cold generation.
 
-The process permits at most 32 cold frontend attempts (including initialization
+The BodyId-keyed analysis-query family additionally reuses symbol, references
+and effects responses. Transitive effect witnesses invalidate through old and
+new call edges. Position queries retain their logarithmic index. This does not
+cache native build artifacts or introduce another query engine. Configuration
+changes require a fresh daemon. A failed refresh leaves the previous query
+revision available. EOF or shutdown releases all state; there is no detached
+process or persistent compiler cache.
+
+The process permits at most 32 frontend attempts (including initialization
 and failed refreshes), then responds that a restart is required and exits. This
 bounds lifetime growth of the existing process-wide compiler interner; it does
 not introduce a second interner or claim that interning is already session-local.
 
 Limits: 1 MiB per request, 64 MiB serialized current snapshot, 256 cached results
-and 8 MiB serialized cached values. Oversized individual results are returned but
+and 8 MiB serialized cached values. The accepted compiler revision retains at
+most 128 MiB of serialized artifacts in one temporary pack; each successful
+refresh copies live records into its new pack and releases the old one. Oversized individual results are returned but
 not cached. Bounds on serialized data imply proportional heap retention, not an
-8 MiB RSS guarantee. Refresh can temporarily hold the old/new snapshots and cold
-frontend working state. `stats` reports deterministic cache/recompute counts and
+8 MiB RSS guarantee. Refresh can temporarily hold the old/new snapshots and frontend
+working state, including both artifact packs. `stats` reports deterministic cache/recompute counts and
 retained serialized bytes. These limits concern retained query data; they do not
 bound peak memory needed to compile arbitrary inputs.
+
+Compiler counters in `stats` describe the last successful analysis:
+`typechecks` counts actual typed-body evaluator executions;
+`reused_typed_bodies` counts distinct imported typed records subsequently read;
+`semantic_input_visits` counts revision inputs compared;
+`semantic_invalidation_visits` counts traversed reverse edges;
+`retained_artifact_bytes` counts bytes in the current compiler pack.
+The existing `computations`/`hits` fields continue to describe response queries.
+Lambda public names use their lexical owner and source range, independent of
+process-local compiler IDs.

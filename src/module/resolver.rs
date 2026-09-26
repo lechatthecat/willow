@@ -454,44 +454,79 @@ fn resolve_one(
     };
 
     let module_id = graph.reserve_key(key.clone());
-    let tokens = match Lexer::with_file_id(&source, module_id.file_id()).tokenize() {
-        Ok(t) => t,
-        Err(errs) => {
-            errors.extend(errs);
-            // Keep the imported file addressable by lexer diagnostic FileIds,
-            // just as parse-error recovery below does.
-            let mut source = source;
-            if let Some(artifacts) = &mut graph.artifacts {
-                match artifacts.snapshot_source(module_id.file_id(), &source) {
-                    Ok(()) => source.clear(),
-                    Err(error) => errors.push(Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0700,
-                        format!("cannot store compiler unit: {error:#}"),
-                    )),
-                }
-            }
-            let name = alias
-                .unwrap_or_else(|| module_access_name(path))
-                .to_string();
-            graph.add_package_file(
-                name,
-                key.clone(),
-                module_path,
-                source,
-                Program {
-                    type_uses: Vec::new(),
-                    module: None,
-                    imports: vec![],
-                    items: vec![],
-                },
-            );
+    let cached = match graph
+        .artifacts
+        .as_ref()
+        .map(|a| a.cached_parse(module_id.file_id(), &source))
+        .transpose()
+    {
+        Ok(program) => program.flatten(),
+        Err(error) => {
+            errors.push(Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0700,
+                format!("cannot read parsed unit: {error:#}"),
+            ));
             graph.end_key_visit(key);
             return;
         }
     };
+    let (mut program, parse_errs) = match cached {
+        Some(program) => (program, Vec::new()),
+        None => {
+            let tokens = match Lexer::with_file_id(&source, module_id.file_id()).tokenize() {
+                Ok(t) => t,
+                Err(errs) => {
+                    errors.extend(errs);
+                    // Keep the imported file addressable by lexer diagnostic FileIds,
+                    // just as parse-error recovery below does.
+                    let mut source = source;
+                    if let Some(artifacts) = &mut graph.artifacts {
+                        match artifacts.snapshot_source(module_id.file_id(), &source) {
+                            Ok(()) => source.clear(),
+                            Err(error) => errors.push(Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0700,
+                                format!("cannot store compiler unit: {error:#}"),
+                            )),
+                        }
+                    }
+                    let name = alias
+                        .unwrap_or_else(|| module_access_name(path))
+                        .to_string();
+                    graph.add_package_file(
+                        name,
+                        key.clone(),
+                        module_path,
+                        source,
+                        Program {
+                            type_uses: Vec::new(),
+                            module: None,
+                            imports: vec![],
+                            items: vec![],
+                        },
+                    );
+                    graph.end_key_visit(key);
+                    return;
+                }
+            };
 
-    let (mut program, parse_errs) = Parser::new(tokens).parse();
+            Parser::new(tokens).parse()
+        }
+    };
+    if parse_errs.is_empty()
+        && let Some(artifacts) = &mut graph.artifacts
+        && artifacts.revision_enabled
+        && let Err(error) = artifacts.retain_parse(module_id.file_id(), &source, &program)
+    {
+        errors.push(Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0700,
+            format!("cannot retain parsed unit: {error:#}"),
+        ));
+        graph.end_key_visit(key);
+        return;
+    }
     // Release the current source/body before descending into dependencies.
     // Only declaration shells and import paths survive on the resolver stack.
     let mut source = source;

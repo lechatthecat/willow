@@ -60,6 +60,13 @@ impl<K: Clone + Eq + Hash + Debug, V> QueryTable<K, V> {
         assert!(!matches!(states.get(key), Some(State::Computing)));
         states.remove(key);
     }
+    /// Import an already validated immutable value at a revision boundary.
+    pub(crate) fn seed(&self, key: K, value: V) {
+        let mut states = self.states.borrow_mut();
+        assert!(!states.contains_key(&key));
+        states.insert(key, State::Ready(Arc::new(value)));
+    }
+
     pub fn stats(&self) -> QueryStats {
         *self.stats.borrow()
     }

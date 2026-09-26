@@ -39,18 +39,23 @@ pub(super) fn serve<W: Write>(
     };
     let entry = std::fs::canonicalize(entry)?;
     let root = project.as_deref().unwrap_or(entry.parent().unwrap());
-    let analyze = |events: &mut protocol::EventWriter<W>| -> Result<_> {
+    let mut revision = willow_compiler::compiler_db::revision::AnalysisRevision::default();
+    let analyze = |revision: &mut willow_compiler::compiler_db::revision::AnalysisRevision,
+                   events: &mut protocol::EventWriter<W>|
+     -> Result<_> {
         let workspace = Workspace::open(root)?;
         workspace.ensure_recovered()?;
-        CompilerSession::new(
-            entry.to_str().context("non UTF-8 entry")?,
-            "",
-            &build.options,
-            project.clone(),
+        revision.analyze(
+            CompilerSession::new(
+                entry.to_str().context("non UTF-8 entry")?,
+                "",
+                &build.options,
+                project.clone(),
+            ),
+            events,
         )
-        .analysis_with_emitter(events)
     };
-    let mut warm = WarmSession::new(analyze(events)?, 256, 8 * 1024 * 1024)?;
+    let mut warm = WarmSession::new(analyze(&mut revision, events)?, 256, 8 * 1024 * 1024)?;
     events.event(
         "analysis.result",
         "WT0010",
@@ -96,7 +101,7 @@ pub(super) fn serve<W: Write>(
                     ))
                 } else {
                     frontend_runs += 1;
-                    analyze(events).and_then(|snapshot| {
+                    analyze(&mut revision, events).and_then(|snapshot| {
                         warm.update(snapshot)?;
                         Ok(json!({"revision":warm.revision()}))
                     })
@@ -105,6 +110,11 @@ pub(super) fn serve<W: Write>(
             Request::Stats { .. } | Request::Shutdown { .. } => {
                 let mut stats = warm.stats();
                 stats["frontend_runs"] = json!(frontend_runs);
+                stats["retained_artifact_bytes"] = json!(revision.retained_artifact_bytes);
+                stats["semantic_input_visits"] = json!(revision.input_visits);
+                stats["semantic_invalidation_visits"] = json!(revision.invalidation_visits);
+                stats["typechecks"] = json!(revision.typechecks);
+                stats["reused_typed_bodies"] = json!(revision.reused_bodies);
                 Ok(stats)
             }
         };

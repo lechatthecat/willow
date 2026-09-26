@@ -13,6 +13,7 @@ pub(crate) mod lir;
 mod lir_artifact;
 pub(crate) mod normalize;
 pub mod query;
+pub mod revision;
 pub mod scope;
 pub use checked::CheckedUnit;
 pub type HelperSummary = std::collections::HashMap<
@@ -43,6 +44,7 @@ pub struct CompilerDb {
     bodies: std::rc::Rc<ids::BodyIndex>,
     dependencies: std::rc::Rc<dependencies::ModuleDependencies>,
     checked: QueryTable<UnitId, CheckedUnitRecord>,
+    pub(crate) revision_work: std::cell::Cell<(usize, usize)>,
 }
 
 impl CompilerDb {
@@ -73,6 +75,7 @@ impl CompilerDb {
             bodies,
             dependencies,
             checked: QueryTable::named("checked_unit"),
+            revision_work: Default::default(),
         }
     }
     pub(crate) fn unit_scope(

@@ -183,3 +183,44 @@ fn daemon_failed_refresh_preserves_revision_and_bounds_process_lifetime() {
     }
     assert!(child.wait().unwrap().success());
 }
+
+#[test]
+fn daemon_selectively_rechecks_semantics_and_reports_real_body_counts() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("main.wi"),
+        "import value; import independent; fn main() { println(value::get()); }",
+    )
+    .unwrap();
+    fs::write(f.0.join("value.wi"), "pub fn get() -> i64 { return 1; }").unwrap();
+    fs::write(f.0.join("independent.wi"), "pub fn untouched() {}").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_willow"))
+        .current_dir(&f.0)
+        .args(["daemon", "main.wi"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    result(&mut output);
+    for (id, source, checked, reused) in [
+        (1, "pub fn get() -> i64 { return 1; }", 0, 3),
+        (2, "pub fn get() -> i64 { return 2; }", 2, 1),
+        (3, "pub fn get() -> String { return \"value\"; }", 2, 1),
+    ] {
+        fs::write(f.0.join("value.wi"), source).unwrap();
+        writeln!(input, "{}", json!({"id":id,"operation":"refresh"})).unwrap();
+        let response = result(&mut output);
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["revision"], f.snapshot()["revision"]);
+        writeln!(input, "{}", json!({"id":id+10,"operation":"stats"})).unwrap();
+        let stats = result(&mut output);
+        assert_eq!(stats["result"]["typechecks"], checked);
+        assert_eq!(stats["result"]["reused_typed_bodies"], reused);
+        assert!(stats["result"]["retained_artifact_bytes"].as_u64().unwrap() > 0);
+    }
+    writeln!(input, "{}", json!({"id":100,"operation":"shutdown"})).unwrap();
+    result(&mut output);
+    assert!(child.wait().unwrap().success());
+}
