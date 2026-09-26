@@ -3,14 +3,18 @@ use std::path::PathBuf;
 use std::process::{Command, ExitStatus};
 use willow_compiler::{CompilerOptions, compile, emit_hir_text, emit_lir_text, project};
 
+mod agent;
 mod analysis;
 mod daemon;
 mod edit;
+mod init;
 mod package;
 mod protocol;
 
 #[derive(Debug)]
 enum CliCommand {
+    Agent(agent::AgentCommand),
+    Init(init::InitCommand),
     Analysis(Box<analysis::AnalysisCommand>),
     Edit(edit::EditCommand),
     Build(BuildCommand),
@@ -124,6 +128,8 @@ impl CliCommand {
         };
 
         match command.as_str() {
+            "agent" => Ok(Self::Agent(agent::AgentCommand::parse(&args[1..])?)),
+            "init" => Ok(Self::Init(init::InitCommand::parse(&args[1..])?)),
             "edit" => Ok(Self::Edit(edit::EditCommand::parse(&args[1..])?)),
             "impact" | "snapshot" | "risk" | "query" => Ok(Self::Analysis(Box::new(
                 analysis::AnalysisCommand::parse(args)?,
@@ -158,6 +164,8 @@ impl CliCommand {
 
     fn execute(self) -> Result<()> {
         match self {
+            Self::Agent(command) => command.execute(),
+            Self::Init(command) => command.execute(),
             Self::Edit(command) => {
                 println!(
                     "{}",
@@ -579,7 +587,7 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  willow metadata [project-dir] [--format human|json|ndjson]\n  Package commands accept --format human|json|ndjson (default human).\n  willow edit prepare --root DIR --entry main.wi --requests edits.json\n  willow edit <preview|validate|apply|recover> --root DIR --transaction ID\n  willow daemon <source.wi|project-dir>\n  willow risk --before baseline.json --after current.json\n  willow query <source.wi|project-dir> --requests queries.json\n  willow check <source.wi|project-dir> [--format human|ndjson]\n  willow build <source.wi|project-dir> [--format human|ndjson] [--protocol-version 1]\n  willow add [alias] --git URL [--version REQ] [--dry-run] [--project-dir DIR]\n  willow add [alias] --path DIR [--dry-run] [--project-dir DIR]\n  willow add URL [--dry-run] [--project-dir DIR]\n  willow remove alias [--dry-run] [--project-dir DIR]\n  willow update [alias] [--breaking] [--dry-run] [--project-dir DIR]\n  willow deps tree [--project-dir DIR]\n  willow deps why <alias|package-name> [--project-dir DIR]\n  willow package verify [PATH] [--format human|json|ndjson]\n  willow build <source.wi|project-dir> [-o <output>] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--emit-hir] [--emit-lir] [--runtime-lib <path>]\n  willow run [source.wi|project-dir] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--runtime-lib <path>] [-- <args>...]\n  willow fetch [project-dir] [--locked|--offline|--frozen] [--format human|json|ndjson]\n  willow debug <source.wi> [--runtime-lib <path>]"
+    "Usage:\n  willow agent instructions <codex|claude> [--format human|json]\n  willow agent sync [--yes]\n  willow init [DIR] [--name NAME] [--ai auto|none|codex|claude|codex,claude|all] [--yes]\n  willow metadata [project-dir] [--format human|json|ndjson]\n  Package commands accept --format human|json|ndjson (default human).\n  willow edit prepare --root DIR --entry main.wi --requests edits.json\n  willow edit <preview|validate|apply|recover> --root DIR --transaction ID\n  willow daemon <source.wi|project-dir>\n  willow risk --before baseline.json --after current.json\n  willow query <source.wi|project-dir> --requests queries.json\n  willow check <source.wi|project-dir> [--format human|ndjson]\n  willow build <source.wi|project-dir> [--format human|ndjson] [--protocol-version 1]\n  willow add [alias] --git URL [--version REQ] [--dry-run] [--project-dir DIR]\n  willow add [alias] --path DIR [--dry-run] [--project-dir DIR]\n  willow add URL [--dry-run] [--project-dir DIR]\n  willow remove alias [--dry-run] [--project-dir DIR]\n  willow update [alias] [--breaking] [--dry-run] [--project-dir DIR]\n  willow deps tree [--project-dir DIR]\n  willow deps why <alias|package-name> [--project-dir DIR]\n  willow package verify [PATH] [--format human|json|ndjson]\n  willow build <source.wi|project-dir> [-o <output>] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--emit-hir] [--emit-lir] [--runtime-lib <path>]\n  willow run [source.wi|project-dir] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--runtime-lib <path>] [-- <args>...]\n  willow fetch [project-dir] [--locked|--offline|--frozen] [--format human|json|ndjson]\n  willow debug <source.wi> [--runtime-lib <path>]"
 }
 
 fn stem(path: &str) -> String {

@@ -256,3 +256,10 @@ impl AnalysisCommand {
         Ok(json!({"kind":"impact", "impact":impact,"functions":functions}))
     }
 }
+
+pub(super) const SNAPSHOT_COMMAND: &str =
+    "willow snapshot save . --output snapshot.json --format ndjson --protocol-version 1";
+pub(super) const QUERY_COMMAND: &str =
+    "willow query . --requests queries.json --format ndjson --protocol-version 1";
+pub(super) const IMPACT_COMMAND: &str =
+    "willow impact . --file src/main.wi --byte 0 --format ndjson --protocol-version 1";

@@ -6,11 +6,24 @@ use willow_compiler::diagnostics::{
     Diagnostic, DiagnosticEmitter, Severity, source_map::SourceLookup,
 };
 
+pub(super) const CHECK_COMMAND: &str = "willow check . --format ndjson --protocol-version 1";
+pub(super) const BUILD_COMMAND: &str = "willow build . --format ndjson --protocol-version 1";
+
 pub(super) fn requested(args: &[String]) -> bool {
     // Existing package commands retain their own output contract.
     if matches!(
         args.first().map(String::as_str),
-        Some("fetch" | "package" | "add" | "remove" | "update" | "deps" | "metadata")
+        Some(
+            "agent"
+                | "init"
+                | "fetch"
+                | "package"
+                | "add"
+                | "remove"
+                | "update"
+                | "deps"
+                | "metadata"
+        )
     ) {
         return false;
     }
@@ -115,7 +128,7 @@ impl<W: Write> DiagnosticEmitter for EventWriter<W> {
     }
 }
 
-fn options(args: Vec<String>) -> anyhow::Result<(Vec<String>, String, Option<String>)> {
+pub(super) fn options(args: Vec<String>) -> anyhow::Result<(Vec<String>, String, Option<String>)> {
     let mut remaining = Vec::with_capacity(args.len());
     let mut format = None;
     let mut version = None;

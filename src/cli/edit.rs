@@ -89,3 +89,5 @@ impl EditCommand {
         }
     }
 }
+
+pub(super) const PREPARE_COMMAND: &str = "willow edit prepare --root . --entry src/main.wi --project --requests edits.json --format ndjson --protocol-version 1";

@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+pub mod agent;
 mod dependency;
+pub mod init;
 pub use dependency::{CanonicalGitUrl, DependencySource, GitSelector};
 
 use anyhow::Result;

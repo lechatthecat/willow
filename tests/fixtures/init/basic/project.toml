@@ -1,0 +1,9 @@
+[willow]
+manifest-version = 1
+
+[project]
+name = "basic"
+version = "0.1.0"
+entry = "src/main.wi"
+
+[dependencies]
