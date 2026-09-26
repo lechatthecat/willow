@@ -1,26 +1,49 @@
 # Willow
 
-> A statically typed, garbage-collected native programming language with class-based OOP, algebraic enums, pattern matching, and stackless async.
+> A statically typed, garbage-collected native programming language with its own runtime, package manager, incremental compiler infrastructure, and AI-oriented semantic tooling.
 
 ![Status](https://img.shields.io/badge/status-experimental-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-Willow combines familiar object-oriented programming with modern typed-language features such as payload-carrying enums, `match`, `Option`, `Result`, closures, and `async` / `await`.
+Willow is an experimental programming language that compiles to native code through [Cranelift](https://cranelift.dev/).
 
-Willow compiles to native binaries through [Cranelift](https://cranelift.dev/) and includes its own garbage collector and task runtime.
+It combines class-based object-oriented programming with algebraic enums, pattern matching, `Option`, `Result`, closures, and stackless `async` / `await`.
 
-## Why Willow?
+Willow also explores a second question:
 
-Willow is an experiment in building a native language that keeps memory management automatic without giving up expressive types or structured concurrency.
+> What should a programming language toolchain look like when AI coding agents are first-class users of the compiler?
 
-- **Native code** — compiles to native binaries through Cranelift.
-- **Garbage collected** — objects, strings, collections, closures, and async frames are GC-managed.
-- **OOP without forcing everything into classes** — classes, inheritance, interfaces, static members, and free functions coexist.
-- **Algebraic enums and pattern matching** — enum variants can carry values and can be destructured with `match`.
-- **`Option` and `Result`** — nullable/fallible values are represented explicitly; `?` propagation is supported.
-- **First-class functions and closures** — functions can be passed around, and closures can capture their environment.
-- **Stackless async runtime** — `async` / `await`, task cancellation, channels, `select`, locks, and scheduler-aware synchronization.
-- **Multi-module compilation** — imported modules are resolved with canonical semantic identities and dependency-ordered initialization.
+Instead of requiring an agent to reconstruct program structure from text search, Willow can expose compiler-resolved symbols, references, call relationships, snapshots, dependency impact, structured edits, and machine-readable diagnostics.
+
+Willow is under active development and is **not production-ready**.
+
+---
+
+## What makes Willow different?
+
+Willow is more than a parser and code generator. The project currently includes:
+
+- **Native compilation** through Cranelift
+- **Generational moving garbage collection**
+- **A stackless async runtime** with tasks, cancellation, channels, `select`, locks, and work stealing
+- **Class-based OOP** with inheritance, interfaces, virtual dispatch, static members, and free functions
+- **Algebraic enums and pattern matching**
+- **`Option<T>` and `Result<T, E>`**, including `?` propagation
+- **Closures and first-class functions**
+- **Multi-module and multi-package compilation**
+- **Git and local-path dependencies**, lockfiles, caching, offline and frozen builds
+- **Package-aware semantic identities**
+- **Compiler snapshots and semantic queries**
+- **Reference, caller, impact, effect, and risk analysis**
+- **Structured source edits with validation and recovery**
+- **A warm analysis daemon**
+- **Typed-body reuse across compiler revisions**
+- **A versioned NDJSON protocol for tools and AI agents**
+- **Automatic `AGENTS.md` and `CLAUDE.md` generation**
+
+The language, compiler, runtime, package system, and analysis infrastructure are developed together in one repository.
+
+---
 
 ## A taste of Willow
 
@@ -50,7 +73,7 @@ async fn main() {
 }
 ```
 
-Classes and interfaces are also first-class language features:
+Classes and interfaces are built into the language as well:
 
 ```rust
 interface Animal {
@@ -72,9 +95,11 @@ fn main() {
 }
 ```
 
+---
+
 ## Quick start
 
-A Rust toolchain is currently required to build the Willow compiler.
+A Rust toolchain is currently required to build Willow from source.
 
 ```bash
 git clone https://github.com/lechatthecat/willow.git
@@ -82,32 +107,115 @@ cd willow
 cargo build --release
 ```
 
-Run a Willow program directly:
+The user-facing tool is:
 
 ```bash
-./target/release/willow run example/hello_world.wi --release
+./target/release/willow
 ```
 
-Or compile it to a native executable:
+For convenience, add `target/release` to your `PATH`.
+
+### Create a project
 
 ```bash
-./target/release/willow example/hello_world.wi -o hello_world --release
+willow init hello
+cd hello
+willow run
+```
+
+`willow init` creates:
+
+```text
+hello/
+├── project.toml
+└── src/
+    └── main.wi
+```
+
+If Claude Code or Codex is detected, Willow can also offer to generate agent instructions:
+
+```text
+Claude Code detected.
+Create CLAUDE.md? [Y/n]
+
+Codex detected.
+Create AGENTS.md? [Y/n]
+```
+
+The generated instructions teach the agent how to use the Willow compiler protocol, snapshots, semantic queries, impact analysis, and structured edits instead of relying only on textual search.
+
+For non-interactive use:
+
+```bash
+willow init hello --ai none
+willow init hello --ai codex
+willow init hello --ai claude
+willow init hello --ai codex,claude
+```
+
+---
+
+## Build and run
+
+Run the current project:
+
+```bash
+willow run
+```
+
+Check it without producing a native executable:
+
+```bash
+willow check
+```
+
+Build it:
+
+```bash
+willow build
+```
+
+You can also compile a single source file directly:
+
+```bash
+willow example/hello_world.wi -o hello_world --release
 ./hello_world
 ```
 
-During compiler development you can also run through Cargo:
+Or run it without keeping the output binary:
 
 ```bash
-cargo run --release -- run example/hello_world.wi --release
+willow run example/hello_world.wi --release
 ```
 
-## Language highlights
+---
 
-### Types and inference
+# Language
 
-Willow currently includes scalar types such as `i64`, `f64`, and `bool`, plus GC-managed types such as `String`, arrays, maps, class instances, closures, interfaces, enums, and tasks.
+## Types and inference
 
-Type annotations are optional when the type can be inferred:
+Willow includes scalar types such as:
+
+```text
+i64
+f64
+bool
+```
+
+and GC-managed values such as:
+
+```text
+String
+arrays
+maps
+class instances
+interfaces
+enums
+closures
+tasks
+```
+
+Type annotations can often be inferred:
 
 ```rust
 let x: i64 = 10;
@@ -124,9 +232,9 @@ let mut y = 10;
 y = 20;
 ```
 
-### Classes and inheritance
+---
 
-Members are private by default; use `pub` to expose them.
+## Classes and inheritance
 
 ```rust
 class User {
@@ -149,11 +257,23 @@ fn main() {
 }
 ```
 
-Willow also supports interfaces, inheritance, virtual dispatch, static methods, and static properties.
+Willow supports:
 
-### Enums and `match`
+- classes
+- inheritance
+- interfaces
+- virtual dispatch
+- constructors
+- static methods
+- static properties
+- private-by-default members
+- free functions outside classes
 
-Enums can be simple tags or carry payloads:
+---
+
+## Enums and pattern matching
+
+Enums may carry payloads:
 
 ```rust
 enum ResultCode {
@@ -173,11 +293,32 @@ fn print_result(result: ResultCode) {
 }
 ```
 
-`Option<T>` and `Result<T, E>` use the same enum machinery and integrate with pattern matching and `?` propagation.
+`Option<T>` and `Result<T, E>` use the same enum machinery.
 
-### Async / await
+Fallible results can propagate with `?`.
 
-Calling an async function starts a task. Waiting is explicit with `await`:
+---
+
+## Closures
+
+Functions are first-class values, and closures may capture their environment.
+
+```rust
+fn main() {
+    let base = 10;
+    let add = |x: i64| x + base;
+
+    println(add(5));
+}
+```
+
+Nested closure bodies receive compiler identities of their own and participate in type checking and incremental analysis.
+
+---
+
+## Async / await
+
+Willow uses stackless async frames managed by its own runtime.
 
 ```rust
 async fn work(x: i64) -> i64 {
@@ -194,160 +335,553 @@ async fn main() {
 }
 ```
 
-Task cancellation can either propagate as a panic or be observed as a value:
+Calling an async function creates a task. Waiting is explicit.
+
+Cancellation may either propagate or be observed:
 
 | Operation | Result | Cancelled task |
 | --- | --- | --- |
 | `await task` | `T` | panics |
 | `await task.result()` | `Result<T, Cancelled>` | `Err(Cancelled)` |
 
-## Compiler architecture
+The runtime also includes channels, `select`, scheduler-aware synchronization, and cancellation-aware tasks.
 
-Willow has an explicit multi-stage compiler pipeline:
+---
 
-```text
-source
-  ↓
-AST
-  ↓
-type checking / typed HIR
-  ↓
-LIR (control-flow graph + async liveness)
-  ↓
-Cranelift IR
-  ↓
-native binary
-```
+# Projects and packages
 
-All checked source bodies, including static-property initializers, are emitted through the LIR path.
-
-The compiler uses stable semantic identities such as `ExprId`, `PatternId`, `TypeId`, `FunctionId`, and `ModuleId` instead of relying on source spans or linker spellings as identity.
-
-## Runtime architecture
-
-Willow's runtime is implemented alongside the compiler rather than delegated to a host-language async runtime.
-
-Highlights include:
-
-- generational moving garbage collection
-- scalable GC reference bitmaps for wide objects and async frames
-- stackless async frames whose layout is derived from LIR liveness
-- multi-worker task scheduling with work stealing
-- channels and `select`
-- scheduler-aware locks and synchronization
-- cancellation-aware tasks
-- GC telemetry and stress modes used by the test suite
-
-## Examples
-
-The [`example/`](example/) directory contains runnable programs covering the language and runtime.
-
-A few useful starting points:
-
-- [`example/hello_world.wi`](example/hello_world.wi) — smallest program
-- [`example/enum_match.wi`](example/enum_match.wi) — enums and pattern matching
-- [`example/async_concurrent.wi`](example/async_concurrent.wi) — concurrent async tasks
-- [`example/game_of_life.wi`](example/game_of_life.wi) — larger runnable example
-- [`example/gc_scalable_bitmap.wi`](example/gc_scalable_bitmap.wi) — GC tracing beyond the inline reference mask
-
-Run the Game of Life example with an initial pattern:
-
-```bash
-./target/release/willow run example/game_of_life.wi --release -- \
-  2,1 3,2 1,3 2,3 3,3
-```
-
-## Project status
-
-Willow is **experimental and under active development**. It is not yet intended as a production replacement for established languages.
-
-Current limitations include:
-
-- the standard library is still small: prelude plus `std::collections`, `std::option`, `std::result`, `std::io`, `std::env`, and `std::fs`
-- synchronous filesystem forms block the calling worker; `*_async` forms run on a bounded blocking pool (`WILLOW_BLOCKING_THREADS`, default 4; queue `WILLOW_BLOCKING_QUEUE`, default 16 per thread); when the queue is full an `*_async` Task waits for a slot, served oldest first, rather than failing
-- runs default to available CPU parallelism (one worker if detection fails); `WILLOW_WORKERS=N` honors any positive count, including one; Send/Sync checks are always enforced regardless of worker count
-- syntax, runtime APIs, and compiler internals may still change
-- the compiler currently requires a Rust toolchain to build from source
-
-The project intentionally focuses on making the compiler and runtime architecture solid before treating the language surface as stable.
-
-## License
-
-Willow is available under the [MIT License](LICENSE).
-
-## Dependencies
-
-A Willow project can depend on other Willow packages hosted in Git repositories (or on a local path). Dependencies are declared in `project.toml` and pinned in `project.lock`.
-
-The commands below assume `willow` is on your `PATH`. After building (see [Quick start](#quick-start)), either add `target/release` to `PATH` or invoke `./target/release/willow` directly.
-
-### Publishing a library
-
-A library is a project without `main()`. Its `project.toml` declares the package name and version:
+A Willow project is described by `project.toml`.
 
 ```toml
-[project]
-name = "willow_greeting"
-version = "0.1.0"
-
 [willow]
 manifest-version = 1
+
+[project]
+name = "hello"
+version = "0.1.0"
+entry = "src/main.wi"
+
+[dependencies]
 ```
 
-To publish a version:
+Willow projects may depend on packages from:
 
-1. (Optional) Check the library with `willow package verify .`. It type-checks every module under `src/` and confirms the Git tag on `HEAD` matches `project.version`. It is not required by `add` or `run`.
-2. Commit the library with Git.
-3. Create a Git tag for the version. The tag (`v0.1.0` or `0.1.0`) must match `project.version`.
-4. Push the branch and the tag.
+- Git repositories
+- local filesystem paths
 
-```bash
-willow package verify .           # optional
-git add project.toml src/
-git commit -m "Release 0.1.0"
-git tag v0.1.0
-git push origin main v0.1.0
-```
+There is currently no requirement for a central Willow package registry.
 
-### Adding a dependency
+---
+
+## Add a dependency
 
 ```bash
-willow add willow_greeting \
-    --git https://github.com/lechatthecat/willow_greeting.git \
+willow add greeting \
+    --git https://github.com/example/willow-greeting.git \
     --version "^0.1"
 ```
 
-Without `--version`, `add` selects the newest stable (non-prerelease) tag and records `^<that version>` as the requirement. Use `--path DIR` for a local dependency and `--dry-run` to preview the change.
+Or use a local package:
 
-Modules of a dependency are imported through its alias:
+```bash
+willow add greeting --path ../willow-greeting
+```
+
+Import through the consumer-local alias:
 
 ```rust
-import willow_greeting::message;
+import greeting::message;
 
 fn main() {
     println(message::hello());
 }
 ```
 
-### Managing dependencies
+The alias is not the package's semantic identity.
 
-| Command | Effect |
-| --- | --- |
-| `willow add [alias] --git URL [--version REQ]` | Add a Git dependency (newest stable tag if `--version` is omitted) |
-| `willow add [alias] --path DIR` | Add a local path dependency |
-| `willow deps tree` | Show the resolved dependency graph |
-| `willow deps why <name>` | Explain why a package is in the graph |
-| `willow update [alias]` | Move to the newest version within the requirement |
-| `willow update [alias] --breaking` | Also allow versions outside the current requirement |
-| `willow remove <alias>` | Remove a dependency |
-| `willow fetch` | Resolve and download dependencies into the cache |
+---
 
-`project.lock` records the exact revision and checksum of each package; a build keeps using the locked revision until `willow update` is run. Commit `project.lock` in applications for reproducible builds.
+## Dependency commands
 
-`build`, `run`, and `fetch` accept:
+```bash
+willow add ...
+willow remove ...
+willow update ...
+willow deps tree
+willow deps why <package>
+willow fetch
+willow metadata
+willow package verify
+```
 
-- `--locked` — fail if `project.lock` is missing or out of date
-- `--offline` — use only the local cache; do not contact remotes
-- `--frozen` — both `--locked` and `--offline`
+Dependency resolution is recorded in `project.lock`.
 
-Fetched sources are cached under `~/.willow` (`%USERPROFILE%\.willow` on Windows); set `WILLOW_HOME` to change the location.
+Application projects should normally commit this file.
+
+Build-related commands support:
+
+```text
+--locked
+--offline
+--frozen
+```
+
+where:
+
+- `--locked` rejects lockfile changes
+- `--offline` forbids network access
+- `--frozen` enables both
+
+Fetched package sources are cached under `WILLOW_HOME`, or the default Willow user cache.
+
+---
+
+# AI-oriented toolchain
+
+Willow exposes compiler information through a versioned machine-readable protocol.
+
+The goal is not to replace ordinary editors or AI agents.
+
+The goal is to let those tools ask the compiler questions that the compiler already knows how to answer.
+
+Instead of:
+
+```text
+grep
+read files
+guess symbol identity
+guess callers
+edit text
+build
+retry
+```
+
+an agent can use:
+
+```text
+compiler snapshot
+semantic query
+impact analysis
+structured edit
+compiler validation
+```
+
+---
+
+## Machine-readable diagnostics
+
+Use NDJSON output:
+
+```bash
+willow check . --format ndjson --protocol-version 1
+```
+
+or:
+
+```bash
+willow build . --format ndjson --protocol-version 1
+```
+
+The protocol provides structured lifecycle events and compiler diagnostics.
+
+Human-readable stderr is not part of the machine protocol.
+
+See [`protocol/ai_toolchain/`](protocol/ai_toolchain/) for the schemas and protocol documentation.
+
+---
+
+## Snapshots
+
+Create a compiler snapshot:
+
+```bash
+willow snapshot save . \
+    --output snapshot.json \
+    --format ndjson \
+    --protocol-version 1
+```
+
+A snapshot represents compiler-resolved information for one analysis revision.
+
+Snapshots include semantic information such as functions, symbols, package/module identities, call relationships, effects, and source locations.
+
+Source changes make an older snapshot stale for further semantic analysis.
+
+---
+
+## Semantic queries
+
+Willow can answer compiler-resolved queries such as:
+
+- symbols
+- symbol at a source position
+- symbol information
+- references
+- checked types
+- effects
+- package-related impact information
+
+Queries are supplied as JSON requests.
+
+```bash
+willow query . \
+    --requests queries.json \
+    --format ndjson \
+    --protocol-version 1
+```
+
+For example:
+
+```json
+[
+  {
+    "kind": "symbols",
+    "revision": "<revision>"
+  }
+]
+```
+
+Reference queries use compiler declaration identities rather than text matching.
+
+This allows local variables, parameters, fields, types, enum variants, imports, methods, constructors, shadowed bindings, and package-qualified declarations to be distinguished correctly.
+
+---
+
+## Impact analysis
+
+Call relationships can be traversed from a compiler-resolved function identity.
+
+```bash
+willow impact . \
+    --function FUNCTION_ID \
+    --revision REVISION \
+    --direction callers \
+    --format ndjson \
+    --protocol-version 1
+```
+
+Impact information includes unresolved or incomplete evidence instead of silently presenting uncertainty as certainty.
+
+Cross-package calls retain package-aware identities.
+
+---
+
+## Package-aware analysis
+
+Package commands support machine-readable output:
+
+```bash
+willow update --dry-run --format json
+```
+
+That result can be fed into semantic analysis to estimate which loaded modules, symbols, and explicitly supplied tests may be affected by a dependency change.
+
+This connects package resolution with compiler semantics instead of treating dependency updates as unrelated text changes.
+
+---
+
+## Structured edits
+
+Willow provides a transaction-oriented editing interface intended for tooling and AI agents.
+
+A typical workflow is:
+
+```text
+prepare
+   ↓
+preview
+   ↓
+validate
+   ↓
+apply
+```
+
+If an interrupted write must be restored:
+
+```text
+recover
+```
+
+Example:
+
+```bash
+willow edit prepare \
+    --root . \
+    --entry src/main.wi \
+    --project \
+    --requests edits.json
+```
+
+Prepared edits do not immediately modify the workspace.
+
+Validation checks the isolated candidate before application.
+
+The edit subsystem also keeps recovery information so interrupted or failed operations do not have to be repaired by guessing what was partially written.
+
+See [`protocol/ai_toolchain/STRUCTURED_EDITS.md`](protocol/ai_toolchain/STRUCTURED_EDITS.md).
+
+---
+
+## Warm analysis
+
+For repeated semantic queries:
+
+```bash
+willow daemon .
+```
+
+The daemon keeps one accepted analysis revision alive and accepts JSON requests over stdin.
+
+After source changes, a successful refresh installs a new revision.
+
+The current implementation can reuse:
+
+- typed-body artifacts
+- symbol-query results
+- reference-query results
+- effect-query results
+
+across revisions when their inputs remain valid.
+
+---
+
+## Incremental frontend reuse
+
+Willow's `CompilerDb` supports revision-aware analysis.
+
+When a source module changes, Willow computes a reverse dependency closure.
+
+Modules outside that invalidated region can reuse typed-body artifacts from the previous accepted revision.
+
+Conceptually:
+
+```text
+previous revision
+      │
+      ├── unchanged module ──→ reuse typed bodies
+      │
+      └── changed module
+              ↓
+       invalidate consumers
+              ↓
+         type-check again
+```
+
+Changes to bodies, public signatures, types, default methods, or effects invalidate affected modules and their consumers.
+
+Resolver-topology or compiler-configuration changes start a cold generation.
+
+The current invalidation granularity is primarily module-based; Willow does not claim fully fine-grained incremental type checking at every AST node.
+
+---
+
+## Agent bootstrap
+
+`willow init` can generate instructions for supported coding agents.
+
+```text
+Claude Code detected.
+Create CLAUDE.md? [Y/n]
+
+Codex detected.
+Create AGENTS.md? [Y/n]
+```
+
+The generated managed section teaches agents to:
+
+1. use machine-readable compiler diagnostics
+2. take a snapshot before semantic or cross-file work
+3. use compiler references and impact data instead of inferring them from text alone
+4. treat old snapshots as stale after source or dependency changes
+5. use Willow package commands rather than manually changing `project.lock`
+6. validate changes before finishing
+
+Existing user-written content outside the Willow-managed section is preserved.
+
+To update generated instructions later:
+
+```bash
+willow agent sync
+```
+
+To inspect what the current Willow binary would generate:
+
+```bash
+willow agent instructions codex
+willow agent instructions claude
+```
+
+---
+
+# Compiler architecture
+
+The compiler pipeline is roughly:
+
+```text
+source
+  ↓
+lexer / parser
+  ↓
+AST
+  ↓
+module + package resolution
+  ↓
+desugaring
+  ↓
+type checking / semantic analysis
+  ↓
+typed bodies / CompilerDb
+  ↓
+LIR
+  ↓
+Cranelift IR
+  ↓
+native object
+  ↓
+native executable
+```
+
+Semantic identities are not based only on source spelling.
+
+The compiler uses identities for entities such as:
+
+```text
+PackageIdentity
+Module identity
+TypeId
+FunctionId
+BodyId
+ExprId
+PatternId
+```
+
+This identity infrastructure is shared by compilation, incremental analysis, package-aware queries, and AI tooling.
+
+---
+
+# Runtime architecture
+
+Willow ships its own runtime rather than delegating concurrency and memory management to a host-language runtime.
+
+Current runtime work includes:
+
+- generational moving garbage collection
+- scalable object reference metadata
+- stackless async frames
+- frame layout based on LIR liveness
+- multi-worker task scheduling
+- work stealing
+- channels
+- `select`
+- scheduler-aware synchronization
+- cancellation
+- bounded blocking work
+- GC telemetry
+- stress-testing modes
+
+The compiler and runtime are designed together, allowing features such as async frame tracing, scheduler integration, and GC metadata generation to share compiler knowledge.
+
+---
+
+# Examples
+
+The [`example/`](example/) directory contains runnable Willow programs.
+
+Useful starting points include:
+
+- [`example/hello_world.wi`](example/hello_world.wi) — smallest program
+- [`example/enum_match.wi`](example/enum_match.wi) — enums and pattern matching
+- [`example/async_concurrent.wi`](example/async_concurrent.wi) — concurrent async tasks
+- [`example/game_of_life.wi`](example/game_of_life.wi) — larger runnable example
+- [`example/gc_scalable_bitmap.wi`](example/gc_scalable_bitmap.wi) — GC tracing with larger reference maps
+- [`example/package_paths/`](example/package_paths/) — package identity and path dependencies
+
+For example:
+
+```bash
+willow run example/game_of_life.wi --release -- \
+    2,1 3,2 1,3 2,3 3,3
+```
+
+---
+
+# Project status
+
+Willow is **experimental and under active development**.
+
+It is currently better viewed as a serious language/toolchain experiment than as a production replacement for Rust, Go, Java, or other established ecosystems.
+
+Some important limitations:
+
+- the standard library is still small
+- language syntax and runtime APIs may change
+- the public toolchain protocol is versioned, but higher-level analysis features are still evolving
+- the incremental frontend currently invalidates primarily at module granularity
+- the debugger is not yet a full interactive debugger
+- the ecosystem is very small
+- production hardening and real-world compatibility testing are still ongoing
+- building Willow itself from source currently requires Rust
+
+The project intentionally prioritizes compiler/runtime architecture, semantic tooling, and correctness before declaring the language surface stable.
+
+---
+
+# Repository layout
+
+```text
+src/
+├── ai/             AI snapshots, queries, impact and editing support
+├── backend/        native code generation
+├── compiler_db/    semantic queries and incremental compiler state
+├── module/         module loading and compilation graph
+├── package/        dependency resolution, cache and lockfiles
+├── parser/         syntax and AST
+├── semantic/       type checking and semantic analysis
+└── ...
+
+crates/
+├── willow_abi/
+├── willow_continuations/
+└── willow_runtime/
+
+protocol/
+└── ai_toolchain/
+
+example/
+tests/
+benches/
+```
+
+---
+
+# Development
+
+Run the test suite:
+
+```bash
+cargo test
+```
+
+Formatting:
+
+```bash
+cargo fmt --check
+```
+
+Clippy:
+
+```bash
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+During development:
+
+```bash
+cargo run -- run example/hello_world.wi
+```
+
+---
+
+# License
+
+Willow is available under the [MIT License](LICENSE).
