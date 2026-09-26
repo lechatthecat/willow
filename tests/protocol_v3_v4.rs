@@ -256,7 +256,8 @@ fn daemon_selectively_rechecks_semantics_and_reports_real_body_counts() {
     result(&mut output);
     for (id, source, checked, reused) in [
         (1, "pub fn get() -> i64 { return 1; }", 0, 3),
-        (2, "pub fn get() -> i64 { return 2; }", 2, 1),
+        // A body-only edit keeps `get`'s signature, so `main` stays reused.
+        (2, "pub fn get() -> i64 { return 2; }", 1, 2),
         (3, "pub fn get() -> String { return \"value\"; }", 2, 1),
     ] {
         fs::write(f.0.join("value.wi"), source).unwrap();
