@@ -368,22 +368,46 @@ impl Parser {
         }))
     }
 
+    /// Parse `if c { } [else if c { }]* [else { }]`. `else if` is sugar for
+    /// `else { if ... }`: each later rung becomes the only statement of a
+    /// synthetic else block, so later phases see ordinary nested `IfStmt`s.
+    /// Rungs are collected in a loop and folded from the last one, so a long
+    /// ladder costs no parser recursion.
     pub(super) fn parse_if(&mut self) -> Result<Stmt, Diagnostic> {
-        let span = self.current_span();
-        self.expect(TokenKind::If)?;
-        let cond = self.parse_expr()?;
-        let then_block = self.parse_block()?;
-        let else_block = if self.eat(TokenKind::Else) {
-            Some(self.parse_block()?)
-        } else {
-            None
+        let mut rungs = Vec::new();
+        let mut else_block = loop {
+            let span = self.current_span();
+            self.expect(TokenKind::If)?;
+            let cond = self.parse_expr()?;
+            let then_block = self.parse_block()?;
+            rungs.push((span, cond, then_block));
+            if !self.eat(TokenKind::Else) {
+                break None;
+            }
+            if !self.check(TokenKind::If) {
+                break Some(self.parse_block()?);
+            }
         };
-        Ok(Stmt::If(IfStmt {
-            cond,
-            then_block,
-            else_block,
-            span,
-        }))
+        loop {
+            let (span, cond, then_block) = rungs.pop().expect("parse_if pushes a rung");
+            let end = else_block
+                .as_ref()
+                .map_or(then_block.span, |b: &Block| b.span);
+            let stmt = Stmt::If(IfStmt {
+                cond,
+                then_block,
+                else_block,
+                span,
+            });
+            if rungs.is_empty() {
+                return Ok(stmt);
+            }
+            else_block = Some(Block {
+                id: crate::parser::ast::BodyId::fresh(),
+                stmts: vec![stmt],
+                span: span.to(end),
+            });
+        }
     }
 
     pub(super) fn parse_while(&mut self) -> Result<Stmt, Diagnostic> {

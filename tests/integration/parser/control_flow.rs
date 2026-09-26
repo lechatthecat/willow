@@ -351,3 +351,376 @@ fn main() {
     assert!(ok, "compilation failed");
     assert_eq!(out, "1\n0\n");
 }
+
+// ── `else if` chains (willow-hg6e) ───────────────────────────────────────────
+
+fn run_ok(src: &str) -> String {
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "compilation failed: {out}");
+    out
+}
+
+// Perspective 16: the first true rung runs and later conditions are never
+// evaluated.
+#[test]
+fn else_if_16_first_true_rung_wins_and_short_circuits() {
+    let src = r#"
+fn probe(label: i64, result: bool) -> bool {
+    println(label);
+    return result;
+}
+
+fn main() {
+    if probe(1, false) {
+        println(10);
+    } else if probe(2, true) {
+        println(20);
+    } else if probe(3, true) {
+        println(30);
+    } else {
+        println(40);
+    }
+}
+"#;
+    assert_eq!(run_ok(src), "1\n2\n20\n");
+}
+
+// Perspective 17: when no rung matches, the final else runs.
+#[test]
+fn else_if_17_falls_through_to_final_else() {
+    let src = r#"
+fn classify(n: i64) -> i64 {
+    if n < 0 {
+        return -1;
+    } else if n == 0 {
+        return 0;
+    } else if n < 10 {
+        return 1;
+    } else {
+        return 2;
+    }
+}
+
+fn main() {
+    println(classify(-4));
+    println(classify(0));
+    println(classify(7));
+    println(classify(99));
+}
+"#;
+    assert_eq!(run_ok(src), "-1\n0\n1\n2\n");
+}
+
+// Perspective 18: without a final else, no rung runs and control continues.
+#[test]
+fn else_if_18_no_final_else_runs_nothing() {
+    let src = r#"
+fn main() {
+    let n = 5;
+    if n == 1 {
+        println(1);
+    } else if n == 2 {
+        println(2);
+    }
+    println(99);
+}
+"#;
+    assert_eq!(run_ok(src), "99\n");
+}
+
+// Perspective 19: missing-return analysis accepts a ladder whose every rung
+// and final else return (the function body ends at the ladder).
+#[test]
+fn else_if_19_all_rungs_returning_satisfies_missing_return() {
+    let src = r#"
+fn grade(n: i64) -> String {
+    if n >= 90 {
+        return "A";
+    } else if n >= 80 {
+        return "B";
+    } else {
+        return "C";
+    }
+}
+
+fn main() {
+    println(grade(95));
+    println(grade(85));
+    println(grade(5));
+}
+"#;
+    assert_eq!(run_ok(src), "A\nB\nC\n");
+}
+
+// Perspective 20: a ladder with no final else can fall off the end, so E0205
+// still fires.
+#[test]
+fn else_if_20_ladder_without_final_else_reports_missing_return() {
+    let stderr = compile_error_stderr(
+        r#"
+fn grade(n: i64) -> i64 {
+    if n >= 90 {
+        return 1;
+    } else if n >= 80 {
+        return 2;
+    }
+}
+
+fn main() {
+    println(grade(1));
+}
+"#,
+    );
+    assert!(stderr.contains("E0205"), "{stderr}");
+}
+
+// Perspective 21: a binding introduced in one rung is scoped to that rung;
+// sibling rungs may reuse the name with another type.
+#[test]
+fn else_if_21_rung_bindings_are_rung_scoped() {
+    let src = r#"
+fn main() {
+    let n = 2;
+    if n == 1 {
+        let v = 10;
+        println(v);
+    } else if n == 2 {
+        let v = "two";
+        println(v);
+    } else {
+        let v = true;
+        println(v);
+    }
+}
+"#;
+    assert_eq!(run_ok(src), "two\n");
+    let stderr = compile_error_stderr(
+        r#"
+fn main() {
+    if true {
+        let a = 1;
+    } else if false {
+        println(a);
+    }
+}
+"#,
+    );
+    assert!(stderr.contains("cannot find variable `a`"), "{stderr}");
+}
+
+// Perspective 22: assignments in a rung are visible after the ladder.
+#[test]
+fn else_if_22_mutation_in_rung_is_visible_after() {
+    let src = r#"
+fn main() {
+    let mut total = 0;
+    let mut i = 0;
+    while i < 6 {
+        if i % 3 == 0 {
+            total = total + 100;
+        } else if i % 3 == 1 {
+            total = total + 10;
+        } else {
+            total = total + 1;
+        }
+        i = i + 1;
+    }
+    println(total);
+}
+"#;
+    assert_eq!(run_ok(src), "222\n");
+}
+
+// Perspective 23: `break` and `continue` inside rungs target the enclosing loop.
+#[test]
+fn else_if_23_break_and_continue_in_rungs() {
+    let src = r#"
+fn main() {
+    let mut i = 0;
+    while true {
+        i = i + 1;
+        if i == 2 {
+            continue;
+        } else if i == 5 {
+            break;
+        } else {
+            println(i);
+        }
+    }
+    println(i);
+}
+"#;
+    assert_eq!(run_ok(src), "1\n3\n4\n5\n");
+}
+
+// Perspective 24: `defer` inside rungs behaves exactly like the hand-written
+// nested form.
+#[test]
+fn else_if_24_defer_matches_hand_written_nesting() {
+    let sugar = r#"
+fn f(n: i64) {
+    defer println("fn");
+    if n == 0 {
+        defer println("zero");
+        println("a");
+    } else if n == 1 {
+        defer println("one");
+        println("b");
+    } else {
+        defer println("other");
+        println("c");
+    }
+    println("end");
+}
+
+fn main() {
+    f(0);
+    f(1);
+    f(2);
+}
+"#;
+    let nested = r#"
+fn f(n: i64) {
+    defer println("fn");
+    if n == 0 {
+        defer println("zero");
+        println("a");
+    } else {
+        if n == 1 {
+            defer println("one");
+            println("b");
+        } else {
+            defer println("other");
+            println("c");
+        }
+    }
+    println("end");
+}
+
+fn main() {
+    f(0);
+    f(1);
+    f(2);
+}
+"#;
+    let out = run_ok(sugar);
+    assert_eq!(out, run_ok(nested));
+    assert!(out.contains("b\n"), "{out}");
+}
+
+// Perspective 25: a non-bool condition in a later rung is a type error.
+#[test]
+fn else_if_25_non_bool_rung_condition_is_a_type_error() {
+    let stderr = compile_error_stderr(
+        r#"
+fn main() {
+    if false {
+        println(1);
+    } else if 42 {
+        println(2);
+    }
+}
+"#,
+    );
+    assert!(stderr.contains("bool"), "{stderr}");
+}
+
+// Perspective 26: `await` works inside a later rung of an async function.
+#[test]
+fn else_if_26_await_inside_rung() {
+    let src = r#"
+async fn value(n: i64) -> i64 {
+    await sleep(1);
+    return n;
+}
+
+async fn main() {
+    let n = 3;
+    if n == 1 {
+        println(1);
+    } else if n == 3 {
+        let v = await value(30);
+        println(v);
+    } else {
+        println(0);
+    }
+}
+"#;
+    assert_eq!(run_ok(src), "30\n");
+}
+
+// Perspective 27: rung conditions may be compound expressions.
+#[test]
+fn else_if_27_compound_conditions() {
+    let src = r#"
+fn pick(a: i64, b: i64) -> i64 {
+    if a > 0 && b > 0 {
+        return 1;
+    } else if a > 0 || b > 0 {
+        return 2;
+    } else if !(a == b) {
+        return 3;
+    } else {
+        return 4;
+    }
+}
+
+fn main() {
+    println(pick(1, 1));
+    println(pick(1, -1));
+    println(pick(-1, -2));
+    println(pick(-1, -1));
+}
+"#;
+    assert_eq!(run_ok(src), "1\n2\n3\n4\n");
+}
+
+// Perspective 28: heap values produced in rungs survive a collection.
+#[test]
+fn else_if_28_heap_values_across_rungs_survive_gc() {
+    let src = r#"
+fn label(n: i64) -> String {
+    let mut out = "none";
+    if n == 1 {
+        out = "one";
+    } else if n == 2 {
+        gc_collect();
+        out = "two";
+    }
+    gc_collect();
+    return out;
+}
+
+fn main() {
+    println(label(1));
+    println(label(2));
+    println(label(3));
+}
+"#;
+    assert_eq!(run_ok(src), "one\ntwo\nnone\n");
+}
+
+// Perspective 29: release builds agree with debug builds.
+#[test]
+fn else_if_29_release_build_matches() {
+    let src = r#"
+fn classify(n: i64) -> i64 {
+    if n < 0 {
+        return -1;
+    } else if n == 0 {
+        return 0;
+    } else {
+        return 1;
+    }
+}
+
+fn main() {
+    println(classify(-3));
+    println(classify(0));
+    println(classify(3));
+}
+"#;
+    let (out, ok) = compile_and_run_release(src);
+    assert!(ok, "compilation failed: {out}");
+    assert_eq!(out, "-1\n0\n1\n");
+}

@@ -5,6 +5,10 @@ use super::*;
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
         (
+            "example/else_if_chains.wi",
+            "A\nB\nC\nF\nfizzbuzz\n1\n2\nfizz\n4\nbuzz\nfizz\n7\n8\nfizz\nbuzz\ndone\n",
+        ),
+        (
             "example/incremental_dispatch_gc.wi",
             "child\nchild\nretained\n",
         ),

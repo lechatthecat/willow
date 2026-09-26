@@ -1,0 +1,43 @@
+// `else if` chains: the first true rung runs, later conditions are skipped,
+// and an optional final `else` catches everything else.
+// Expected output: A, B, C, F, fizzbuzz, 1, 2, fizz, 4, buzz, fizz, 7, 8, fizz, buzz, done.
+fn grade(score: i64) -> String {
+    if score >= 90 {
+        return "A";
+    } else if score >= 80 {
+        return "B";
+    } else if score >= 70 {
+        return "C";
+    } else {
+        return "F";
+    }
+}
+
+fn main() {
+    println(grade(95));
+    println(grade(85));
+    println(grade(75));
+    println(grade(10));
+
+    let mut i = 0;
+    while i <= 10 {
+        if i % 15 == 0 {
+            println("fizzbuzz");
+        } else if i % 3 == 0 {
+            println("fizz");
+        } else if i % 5 == 0 {
+            println("buzz");
+        } else {
+            println(i);
+        }
+        i = i + 1;
+    }
+
+    // No final `else`: nothing runs when no rung matches.
+    if i < 0 {
+        println("negative");
+    } else if i > 100 {
+        println("huge");
+    }
+    println("done");
+}

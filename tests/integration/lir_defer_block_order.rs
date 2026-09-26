@@ -187,9 +187,9 @@ fn main() { println(f(5)); println(f(50)); println(f(-1)); }
     );
 }
 
-// 7. An else-chain ladder. Willow has no `else if`, so each rung is a nested
-//    `if/else` and the chain produces a merge per level, all of them below their
-//    own predecessor by index.
+// 7. An else-chain ladder. Each rung is a nested `if/else` (the same tree an
+//    `else if` chain desugars to) and the chain produces a merge per level, all
+//    of them below their own predecessor by index.
 #[test]
 fn lir_defer_block_order_07_an_else_chain_ladder() {
     assert_defers(

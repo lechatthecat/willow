@@ -2710,4 +2710,244 @@ class ProtectedCtor { prot init(self) {} }
         assert!(first < second, "{first} is not before {second}");
         assert!(PatternId::fresh() < PatternId::fresh());
     }
+
+    // ── `else if` chains (willow-hg6e) ───────────────────────────────────
+
+    /// Structural rendering of an if-ladder: `if(<cond>){<n>}else{...}`.
+    /// Distinguishes a synthetic single-statement else block from a
+    /// hand-written one only by content, which is the point: they must match.
+    fn if_shape(stmt: &Stmt) -> String {
+        let Stmt::If(if_stmt) = stmt else {
+            return "stmt".to_string();
+        };
+        let cond = match &if_stmt.cond {
+            Expr::Var(name, _, _) => name.clone(),
+            Expr::Bool(value, _, _) => value.to_string(),
+            _ => "expr".to_string(),
+        };
+        let mut out = format!("if({cond}){{{}}}", if_stmt.then_block.stmts.len());
+        if let Some(else_block) = &if_stmt.else_block {
+            let inner: Vec<String> = else_block.stmts.iter().map(if_shape).collect();
+            out.push_str(&format!("else{{{}}}", inner.join(";")));
+        }
+        out
+    }
+
+    fn first_body_stmt(program: &Program) -> &Stmt {
+        &first_function(program).body.stmts[0]
+    }
+
+    fn if_parts(stmt: &Stmt) -> &IfStmt {
+        let Stmt::If(if_stmt) = stmt else {
+            panic!("expected an if statement, got {stmt:?}");
+        };
+        if_stmt
+    }
+
+    // Perspective 1: `else if` becomes an else block holding one `if`.
+    #[test]
+    fn else_if_01_desugars_to_single_statement_else_block() {
+        let p = parse_ok("fn main() { if a { f(); } else if b { g(); } }");
+        let outer = if_parts(first_body_stmt(&p));
+        let else_block = outer.else_block.as_ref().expect("else block");
+        assert_eq!(else_block.stmts.len(), 1);
+        let inner = if_parts(&else_block.stmts[0]);
+        assert!(matches!(&inner.cond, Expr::Var(name, _, _) if name == "b"));
+        assert!(inner.else_block.is_none());
+    }
+
+    // Perspective 2: a multi-rung ladder with a final else nests right.
+    #[test]
+    fn else_if_02_ladder_with_final_else_nests_to_the_right() {
+        let p = parse_ok(
+            "fn main() { if a { f(); } else if b { g(); } else if c { h(); h(); } else { i(); } }",
+        );
+        assert_eq!(
+            if_shape(first_body_stmt(&p)),
+            "if(a){1}else{if(b){1}else{if(c){2}else{stmt}}}"
+        );
+    }
+
+    // Perspective 3: a ladder without final else leaves the last rung bare.
+    #[test]
+    fn else_if_03_ladder_without_final_else() {
+        let p = parse_ok("fn main() { if a { } else if b { } else if c { } }");
+        assert_eq!(
+            if_shape(first_body_stmt(&p)),
+            "if(a){0}else{if(b){0}else{if(c){0}}}"
+        );
+    }
+
+    // Perspective 4: sugar and hand-written nesting produce the same tree.
+    #[test]
+    fn else_if_04_matches_hand_written_nesting() {
+        let sugar = parse_ok("fn main() { if a { f(); } else if b { g(); } else { h(); } }");
+        let nested = parse_ok("fn main() { if a { f(); } else { if b { g(); } else { h(); } } }");
+        assert_eq!(
+            if_shape(first_body_stmt(&sugar)),
+            if_shape(first_body_stmt(&nested))
+        );
+    }
+
+    // Perspective 5: each nested rung's span starts at its own `if` keyword.
+    #[test]
+    fn else_if_05_rung_span_points_at_its_if_keyword() {
+        let src = "fn main() { if a { } else if b { } }";
+        let p = parse_ok(src);
+        let outer = if_parts(first_body_stmt(&p));
+        let inner = if_parts(&outer.else_block.as_ref().unwrap().stmts[0]);
+        assert_eq!(outer.span.start, src.find("if a").unwrap());
+        assert_eq!(inner.span.start, src.find("if b").unwrap());
+    }
+
+    // Perspective 6: the synthetic block spans from the rung's `if` through
+    // the end of the ladder's last block.
+    #[test]
+    fn else_if_06_synthetic_block_span_covers_rest_of_ladder() {
+        let src = "fn main() { if a { } else if b { } else { f(); } }";
+        let p = parse_ok(src);
+        let outer = if_parts(first_body_stmt(&p));
+        let synthetic = outer.else_block.as_ref().unwrap();
+        let inner = if_parts(&synthetic.stmts[0]);
+        let last = inner.else_block.as_ref().unwrap();
+        assert_eq!(synthetic.span.start, src.find("if b").unwrap());
+        assert_eq!(synthetic.span.end, last.span.end);
+        let without_else = "fn main() { if a { } else if b { g(); } }";
+        let p = parse_ok(without_else);
+        let outer = if_parts(first_body_stmt(&p));
+        let synthetic = outer.else_block.as_ref().unwrap();
+        let inner = if_parts(&synthetic.stmts[0]);
+        assert_eq!(synthetic.span.end, inner.then_block.span.end);
+    }
+
+    // Perspective 7: every block of a ladder has a distinct body identity.
+    #[test]
+    fn else_if_07_blocks_get_distinct_body_ids() {
+        let p = parse_ok("fn main() { if a { } else if b { } else if c { } else { } }");
+        let mut ids = Vec::new();
+        let mut current = Some(first_body_stmt(&p));
+        while let Some(stmt) = current {
+            let if_stmt = if_parts(stmt);
+            ids.push(if_stmt.then_block.id);
+            current = if_stmt.else_block.as_ref().and_then(|block| {
+                ids.push(block.id);
+                block.stmts.first().filter(|s| matches!(s, Stmt::If(_)))
+            });
+        }
+        assert_eq!(ids.len(), 6);
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len());
+    }
+
+    // Perspective 8: a rung without a condition is a parse error.
+    #[test]
+    fn else_if_08_missing_condition_is_an_error() {
+        assert!(!parse_errors("fn main() { if a { } else if { } }").is_empty());
+    }
+
+    // Perspective 9: a rung without a block reports the missing `{`.
+    #[test]
+    fn else_if_09_missing_block_is_an_error() {
+        let errors = parse_errors("fn main() { if a { } else if b f(); }");
+        assert!(
+            errors.iter().any(|e| e.code == ErrorCode::E0102),
+            "{errors:#?}"
+        );
+    }
+
+    // Perspective 10: `else` followed by anything but `if`/`{` still fails.
+    #[test]
+    fn else_if_10_else_followed_by_other_token_is_an_error() {
+        let errors = parse_errors("fn main() { if a { } else while b { } }");
+        assert!(
+            errors.iter().any(|e| e.code == ErrorCode::E0102),
+            "{errors:#?}"
+        );
+    }
+
+    // Perspective 11: a bad rung does not swallow the following statements.
+    #[test]
+    fn else_if_11_error_recovery_resumes_after_bad_rung() {
+        let tokens = Lexer::new("fn main() { if a { } else if { } let x = 1; }\nfn other() { }")
+            .tokenize()
+            .unwrap();
+        let (program, errors) = Parser::new(tokens).parse();
+        assert!(!errors.is_empty());
+        assert!(
+            program
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::Function(function) if function.name == "other"))
+        );
+    }
+
+    // Perspective 12: ladders nest inside a rung's then block.
+    #[test]
+    fn else_if_12_ladder_inside_a_rung() {
+        let p = parse_ok(
+            "fn main() { if a { if b { } else if c { } } else if d { if e { } else if f { } } }",
+        );
+        assert_eq!(if_shape(first_body_stmt(&p)), "if(a){1}else{if(d){1}}");
+        let outer = if_parts(first_body_stmt(&p));
+        assert_eq!(
+            if_shape(&outer.then_block.stmts[0]),
+            "if(b){0}else{if(c){0}}"
+        );
+    }
+
+    // Perspective 13: whitespace, newlines and comments may separate the
+    // `else` and `if` keywords.
+    #[test]
+    fn else_if_13_else_and_if_may_be_separated_by_trivia() {
+        let p = parse_ok("fn main() { if a { }\n  else\n  // why\n  if b { }\n}");
+        assert_eq!(if_shape(first_body_stmt(&p)), "if(a){0}else{if(b){0}}");
+    }
+
+    // Perspective 14: the ladder is a statement; the next statement follows it
+    // rather than being absorbed by the last rung.
+    #[test]
+    fn else_if_14_statement_after_ladder_is_a_sibling() {
+        let p = parse_ok("fn main() { if a { } else if b { } g(); }");
+        let body = &first_function(&p).body.stmts;
+        assert_eq!(body.len(), 2);
+        assert_eq!(if_shape(&body[0]), "if(a){0}else{if(b){0}}");
+    }
+
+    // Perspective 15: the parser folds a long ladder without recursing, so a
+    // ladder far deeper than the stack can hold as recursive calls still parses
+    // on a small thread. Node drop is recursive, so the tree is leaked here.
+    #[test]
+    fn else_if_15_long_ladder_parses_on_small_stack() {
+        const RUNGS: usize = 20_000;
+        let mut source = String::from("fn main() { if x == 0 { }");
+        for index in 1..RUNGS {
+            source.push_str(&format!(" else if x == {index} {{ }}"));
+        }
+        source.push_str(" else { } }");
+        let tokens = Lexer::new(&source).tokenize().unwrap();
+        let depth = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let (program, errors) = Parser::new(tokens).parse();
+                assert!(errors.is_empty());
+                let program = Box::leak(Box::new(program));
+                let mut depth = 0;
+                let mut current = Some(first_body_stmt(program));
+                while let Some(stmt) = current {
+                    depth += 1;
+                    current = if_parts(stmt)
+                        .else_block
+                        .as_ref()
+                        .and_then(|block| block.stmts.first())
+                        .filter(|s| matches!(s, Stmt::If(_)));
+                }
+                depth
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(depth, RUNGS);
+    }
 }
