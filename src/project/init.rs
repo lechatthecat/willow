@@ -223,9 +223,10 @@ mod tests {
                 scaffold.directories.iter().map(|(_, n)| n).sum::<usize>(),
                 depth + 1
             );
-            assert_eq!(scaffold.files.len(), 2);
+            // project.toml, src/main.wi and .gitignore.
+            assert_eq!(scaffold.files.len(), 3);
             println!(
-                "depth={depth} journal_paths=2 directories={} files=2",
+                "depth={depth} journal_paths=2 directories={} files=3",
                 depth + 1
             );
             drop(scaffold);
