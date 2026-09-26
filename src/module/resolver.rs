@@ -438,8 +438,8 @@ fn resolve_one(
     {
         graph.source_loads += 1;
     }
-    let source = match std::fs::read_to_string(&module_path) {
-        Ok(s) => s,
+    let source = match crate::compiler_db::captured::FileInput::read(module_path.clone()) {
+        Ok(input) => input.source,
         Err(e) => {
             errors.push(
                 Diagnostic::new(

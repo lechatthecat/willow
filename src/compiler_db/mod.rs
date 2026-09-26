@@ -2,6 +2,7 @@
 //! stored in the existing unit artifact store rather than retained per module.
 pub(crate) mod analysis;
 pub(crate) mod body;
+pub(crate) mod captured;
 mod checked;
 pub(crate) mod declarations;
 pub(crate) mod dependencies;
@@ -15,6 +16,7 @@ pub(crate) mod normalize;
 pub mod query;
 pub mod revision;
 pub mod scope;
+pub(crate) mod tracked;
 pub use checked::CheckedUnit;
 pub type HelperSummary = std::collections::HashMap<
     crate::semantic::ids::FunctionId,

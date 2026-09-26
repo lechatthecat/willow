@@ -76,6 +76,7 @@ impl<K: Clone + Eq + Hash + Debug, V> QueryTable<K, V> {
     /// emission over frozen layouts) use this instead of [`Self::query`]; a
     /// successful read counts as one `frozen_reads` reuse.
     pub fn ready(&self, key: &K) -> Option<Arc<V>> {
+        super::tracked::assert_frozen_read();
         let value = match self.states.borrow().get(key) {
             Some(State::Ready(value)) => Arc::clone(value),
             _ => return None,
@@ -86,10 +87,12 @@ impl<K: Clone + Eq + Hash + Debug, V> QueryTable<K, V> {
     }
 
     pub fn is_ready(&self, key: &K) -> bool {
+        super::tracked::assert_frozen_read();
         matches!(self.states.borrow().get(key), Some(State::Ready(_)))
     }
 
     pub fn query(&self, key: K, compute: impl FnOnce() -> Result<V>) -> Result<Arc<V>> {
+        super::tracked::assert_frozen_read();
         self.stats.borrow_mut().calls += 1;
         crate::query_stats::query_call(self.name);
         match self.states.borrow().get(&key) {

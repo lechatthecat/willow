@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 #[derive(Default)]
 pub struct AnalysisRevision {
     frontend: Option<Frontend>,
-    configuration: Option<String>,
+    tracked: tracked::TrackedQueryTable,
     pub typechecks: usize,
     pub reused_bodies: usize,
     pub retained_artifact_bytes: u64,
@@ -35,23 +35,18 @@ impl AnalysisRevision {
         use anyhow::Context;
         let _query_stats = crate::query_stats::Session::enter();
         let _node_ids = crate::parser::ast::NodeIdSession::enter();
-        let path = std::fs::canonicalize(session.src)?;
-        let source = std::fs::read_to_string(&path)?;
+        let captured::FileInput { path, source } =
+            captured::FileInput::capture(std::path::Path::new(session.src))?;
         let root = path.parent().context("source has no parent")?;
         let map = diagnostics::SourceMap::new(path.to_str().context("non UTF-8 path")?, &source);
         let mut inputs = inputs::CompilerInputs::native(session.opts, root.to_path_buf())
             .resolve_project(session.project_root.as_deref())?;
         inputs.capture_analysis = true;
-        // Resolution work counters are observations, not semantic inputs.
-        let configuration = format!(
-            "{path:?}:{:?}:{:?}:{}:{:?}:{:?}",
-            inputs.options,
-            inputs.project_root,
-            inputs.project_mode,
-            inputs.target,
-            inputs.package_graph.as_ref().map(|g| (g.root, &g.packages))
-        );
-        let previous = (self.configuration.as_ref() == Some(&configuration))
+        let mut accepted =
+            captured::configuration(&inputs, &path, session.project_root.as_deref())?;
+        let previous = self
+            .tracked
+            .matches_inputs(&accepted)
             .then_some(self.frontend.as_ref())
             .flatten();
         let frontend =
@@ -69,12 +64,29 @@ impl AnalysisRevision {
         );
         let snapshot = ai::snapshot(&frontend, &path, &source, session.project_root.as_deref())?;
         ai::check_size(&snapshot)?;
+        accepted.push((
+            tracked::InputNode::Source(path.clone()),
+            captured::bytes(source.as_bytes().to_vec()),
+        ));
+        let artifacts = frontend
+            .module_graph
+            .artifacts
+            .as_ref()
+            .expect("revision artifacts");
+        for module in &frontend.module_graph.files {
+            // Use the exact source captured by resolution, never reread a file
+            // that could have changed while the frontend was evaluating.
+            accepted.push((
+                tracked::InputNode::Source(module.path.clone()),
+                captured::bytes(artifacts.source(module.id.file_id())?.into_bytes()),
+            ));
+        }
+        self.tracked.replace_inputs(accepted)?;
         self.retained_artifact_bytes = retained;
         (self.input_visits, self.invalidation_visits) = frontend.db.revision_work.get();
         self.typechecks = frontend.db.typed_bodies.typechecks();
         self.reused_bodies = frontend.db.typed_bodies.reused();
         self.frontend = Some(frontend);
-        self.configuration = Some(configuration);
         Ok(snapshot)
     }
 }
@@ -414,13 +426,16 @@ mod tests {
         f.write("main.wi", "fn main() {}");
         let mut warm = AnalysisRevision::default();
         assert!(f.compare(&mut warm));
+        let accepted_revision = warm.tracked.revision();
         for invalid in ["fn main() { missing(); }", "fn main( {", "fn main() { ` }"] {
             f.write("main.wi", invalid);
             assert!(!f.compare(&mut warm));
+            assert_eq!(warm.tracked.revision(), accepted_revision);
         }
         f.write("main.wi", "fn main() {}");
         assert!(f.compare(&mut warm));
         assert_eq!(warm.typechecks, 0);
+        assert_eq!(warm.tracked.revision(), accepted_revision);
         let path = f.0.join("main.wi");
         let options = crate::CompilerOptions::release();
         warm.analyze(
@@ -429,6 +444,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!((warm.typechecks, warm.reused_bodies), (1, 0));
+        assert_eq!(warm.tracked.revision().0, accepted_revision.0 + 1);
         f.write("dep.wi", "pub fn f() {}");
         f.write("main.wi", "import dep; fn main() {}");
         assert!(f.compare(&mut warm));
@@ -436,6 +452,44 @@ mod tests {
         f.write("main.wi", "fn main() {}");
         assert!(f.compare(&mut warm));
         assert_eq!((warm.typechecks, warm.reused_bodies), (1, 0));
+    }
+    #[test]
+    fn revision_configuration_manifest_and_entry_boundaries_match_cold() {
+        let f = Fixture::new();
+        f.write("main.wi", "fn main() {}");
+        f.write("project.toml", "[project]\nname='app'\nversion='1.0.0'\n");
+        let path = f.0.join("main.wi");
+        let options = crate::CompilerOptions::debug();
+        let mut warm = AnalysisRevision::default();
+        let mut compare = |project: Option<std::path::PathBuf>| {
+            let session =
+                || CompilerSession::new(path.to_str().unwrap(), "", &options, project.clone());
+            let mut a = Diagnostics::default();
+            let mut b = Diagnostics::default();
+            let incremental = warm.analyze(session(), &mut a).unwrap();
+            let cold = session().analysis_with_emitter(&mut b).unwrap();
+            assert_eq!(a.0, b.0);
+            assert_eq!(
+                serde_json::to_value(incremental).unwrap(),
+                serde_json::to_value(cold).unwrap()
+            );
+            warm.typechecks
+        };
+        assert_eq!(compare(Some(f.0.clone())), 1);
+        assert_eq!(compare(Some(f.0.clone())), 0);
+        f.write(
+            "project.toml",
+            "[project]\nname='app'\nversion='1.0.0'\n# edited manifest\n",
+        );
+        assert_eq!(compare(Some(f.0.clone())), 1);
+        assert_eq!(compare(Some(f.0.clone())), 0);
+        assert_eq!(compare(None), 1);
+        assert_eq!(compare(None), 0);
+        // Moving to another entry never reuses its resolver-local identities.
+        let other = Fixture::new();
+        other.write("main.wi", "fn main() {}");
+        assert!(other.compare(&mut warm));
+        assert_eq!(warm.typechecks, 1);
     }
     #[test]
     fn revision_artifact_limit_rejects_candidate_without_losing_previous() {
