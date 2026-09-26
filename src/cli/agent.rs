@@ -20,7 +20,7 @@ pub(super) fn capabilities() -> AgentCapabilities {
         snapshots: Some(super::analysis::SNAPSHOT_COMMAND),
         symbol_query: Some(super::analysis::QUERY_COMMAND),
         references: Some(super::analysis::QUERY_COMMAND),
-        callers: Some(super::analysis::QUERY_COMMAND),
+        callers: Some(super::analysis::IMPACT_COMMAND),
         impact: Some(super::analysis::IMPACT_COMMAND),
         structured_edits: Some(super::edit::PREPARE_COMMAND),
     }

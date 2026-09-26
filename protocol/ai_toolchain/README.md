@@ -52,6 +52,9 @@ presentation remain V1 decisions.
 
 The machine-readable envelope and known payloads are defined in [toolchain-v1.schema.json](toolchain-v1.schema.json). Unknown additive fields and events remain permitted.
 
+Agent instruction generation, capability flags and managed sync are documented
+in [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md).
+
 Structured editing and the warm query process are documented in [STRUCTURED_EDITS.md](STRUCTURED_EDITS.md), including their isolation, recovery, refresh and retention boundaries.
 
 Risk side-effect classification distinguishes `new_operation` (source operation
