@@ -62,9 +62,13 @@ impl<K: Clone + Eq + Hash + Debug, V> QueryTable<K, V> {
     }
     /// Import an already validated immutable value at a revision boundary.
     pub(crate) fn seed(&self, key: K, value: V) {
+        self.seed_shared(key, Arc::new(value));
+    }
+
+    pub(crate) fn seed_shared(&self, key: K, value: Arc<V>) {
         let mut states = self.states.borrow_mut();
         assert!(!states.contains_key(&key));
-        states.insert(key, State::Ready(Arc::new(value)));
+        states.insert(key, State::Ready(value));
     }
 
     pub fn stats(&self) -> QueryStats {

@@ -9,12 +9,12 @@ use crate::{
     },
     semantic::{
         call_graph::{CallGraph, ClassHierarchy},
-        effects::{EffectFacts, EffectProblem, RuntimeEffects},
+        effects::{EffectFacts, EffectProblem, EffectSummary, RuntimeEffects},
         ids::{FunctionId, TypeId},
     },
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
@@ -42,29 +42,114 @@ impl EffectWitness {
     }
 }
 
+/// Semantic capabilities extend the runtime ABI without changing ABI bit values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EffectCapabilities {
+    pub(crate) runtime: RuntimeEffects,
+    pub(crate) may_io: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EffectEvidence {
+    pub(crate) summary: EffectSummary<EffectWitness>,
+    // LockEffectWitness's in-solve ordering deliberately compares owners only.
+    // Across revisions, evidence equality must also compare locations/causes.
+    pub(crate) canonical: serde_json::Value,
+}
+impl EffectEvidence {
+    fn new(summary: EffectSummary<EffectWitness>) -> Self {
+        let witnesses: Vec<_> = (0..RuntimeEffects::BIT_COUNT)
+            .map(|bit| match summary.witness(RuntimeEffects::from_bit(bit)) {
+                Some(EffectWitness::Lock(witness)) => {
+                    serde_json::json!(["lock", witness.owner, witness.cause])
+                }
+                Some(EffectWitness::Helper(reason)) => serde_json::json!([
+                    "helper",
+                    match reason {
+                        NonpreemptibleReason::Loop => "loop",
+                        NonpreemptibleReason::Recursion => "recursion",
+                    }
+                ]),
+                Some(EffectWitness::Panic { owner, source }) => {
+                    serde_json::json!(["panic", owner, source])
+                }
+                Some(EffectWitness::External(owner)) => serde_json::json!(["external", owner]),
+                None => serde_json::Value::Null,
+            })
+            .collect();
+        let canonical = serde_json::json!([summary.effects().bits(), witnesses]);
+        Self { summary, canonical }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CapturedEffect {
+    pub(crate) capabilities: EffectCapabilities,
+    pub(crate) evidence: EffectEvidence,
+}
+
+#[derive(Clone)]
 pub(crate) struct UnitEffects {
     pub(crate) facts: EffectFacts<EffectWitness>,
     pub(crate) helpers: Arc<super::HelperSummary>,
     loop_bodies: HashSet<BodyId>,
+    may_io: HashSet<FunctionId>,
 }
 
 pub(crate) struct EffectQueries {
+    solutions: std::cell::RefCell<
+        HashMap<UnitId, Arc<crate::semantic::effects::EffectSolution<EffectWitness>>>,
+    >,
+    io_solutions:
+        std::cell::RefCell<HashMap<UnitId, Arc<crate::semantic::effects::EffectSolution<u8>>>>,
+    scanned: std::cell::Cell<usize>,
+    recomputed: std::cell::Cell<usize>,
+    body_queries: std::cell::RefCell<std::rc::Weak<super::body::BodyQueries>>,
     pub(crate) analysis: std::cell::RefCell<Option<HashMap<UnitId, crate::ai::CapturedUnit>>>,
+    // Frozen unit assembly for backend reads. Direct-body queries and callable
+    // equations own recomputation; this table does not invalidate their caches.
     units: QueryTable<UnitId, UnitEffects>,
+    completed: std::cell::RefCell<HashMap<UnitId, Arc<UnitEffects>>>,
+    previous: std::cell::RefCell<HashMap<UnitId, Arc<UnitEffects>>>,
+    capabilities: QueryTable<(UnitId, FunctionId), EffectCapabilities>,
+    evidence: QueryTable<(UnitId, FunctionId), EffectSummary<EffectWitness>>,
+    tracking:
+        std::cell::RefCell<std::rc::Weak<std::cell::RefCell<super::incremental::SyntaxQueries>>>,
+    imported_reads: std::cell::RefCell<HashMap<UnitId, HashSet<(UnitId, FunctionId)>>>,
+    source_reads: std::cell::RefCell<HashMap<UnitId, HashSet<UnitId>>>,
+    roots: std::cell::RefCell<HashMap<UnitId, Vec<BodyId>>>,
     names: HashMap<String, UnitId>,
     dependencies: Option<std::rc::Rc<super::dependencies::ModuleDependencies>>,
 }
 impl Default for EffectQueries {
     fn default() -> Self {
         Self {
+            solutions: Default::default(),
+            io_solutions: Default::default(),
+            scanned: Default::default(),
+            recomputed: Default::default(),
+            body_queries: Default::default(),
             analysis: Default::default(),
             units: QueryTable::named("unit_effects"),
+            completed: Default::default(),
+            previous: Default::default(),
+            capabilities: QueryTable::named("effect_capabilities"),
+            evidence: QueryTable::named("effect_evidence"),
+            tracking: Default::default(),
+            imported_reads: Default::default(),
+            source_reads: Default::default(),
+            roots: Default::default(),
             names: HashMap::new(),
             dependencies: None,
         }
     }
 }
 impl EffectQueries {
+    #[cfg(test)]
+    pub(crate) fn work(&self) -> (usize, usize) {
+        (self.scanned.get(), self.recomputed.get())
+    }
+
     pub(crate) fn new(
         modules: &[crate::module::ResolvedModule],
         dependencies: std::rc::Rc<super::dependencies::ModuleDependencies>,
@@ -83,12 +168,150 @@ impl EffectQueries {
         }
         result
     }
+    pub(crate) fn reuse_from(&self, previous: &Self) {
+        let completed = previous.completed.borrow();
+        *self.previous.borrow_mut() = completed.clone();
+        *self.solutions.borrow_mut() = previous
+            .solutions
+            .borrow()
+            .iter()
+            .filter(|(unit, _)| completed.contains_key(unit))
+            .map(|(&unit, solution)| (unit, solution.clone()))
+            .collect();
+        *self.io_solutions.borrow_mut() = previous
+            .io_solutions
+            .borrow()
+            .iter()
+            .filter(|(unit, _)| completed.contains_key(unit))
+            .map(|(&unit, solution)| (unit, solution.clone()))
+            .collect();
+    }
+
+    pub(crate) fn set_tracking(
+        &self,
+        syntax: std::rc::Rc<std::cell::RefCell<super::incremental::SyntaxQueries>>,
+        bodies: std::rc::Rc<super::ids::BodyIndex>,
+        body_queries: std::rc::Rc<super::body::BodyQueries>,
+    ) {
+        *self.body_queries.borrow_mut() = std::rc::Rc::downgrade(&body_queries);
+        let mut roots = self.roots.borrow_mut();
+        for (body, unit) in bodies.entries() {
+            if !matches!(
+                bodies.owner(body),
+                Some((_, super::ids::BodyOwner::Lambda { .. }))
+            ) {
+                roots.entry(unit).or_default().push(body);
+            }
+        }
+        for roots in roots.values_mut() {
+            roots.sort();
+        }
+        *self.tracking.borrow_mut() = std::rc::Rc::downgrade(&syntax);
+    }
+
     pub(crate) fn complete(
         &self,
         unit: UnitId,
         compute: impl FnOnce() -> UnitEffects,
     ) -> anyhow::Result<Arc<UnitEffects>> {
-        self.units.query(unit, || Ok(compute()))
+        let completed = self.units.query(unit, || {
+            let tracking = self.tracking.borrow().upgrade();
+            let roots = self.roots.borrow().get(&unit).cloned().unwrap_or_default();
+            let green = match &tracking {
+                Some(tracking) => tracking
+                    .borrow_mut()
+                    .validate_effects(unit, roots.clone())?,
+                None => false,
+            };
+            let previous = self.previous.borrow_mut().remove(&unit).filter(|_| green);
+            let reused = previous.is_some();
+            let result = match previous {
+                Some(previous) => (*previous).clone(),
+                None => compute(),
+            };
+            if let Some(tracking) = tracking.filter(|_| !reused) {
+                let inventory = result
+                    .facts
+                    .iter()
+                    .map(|(&id, summary)| {
+                        (
+                            id,
+                            CapturedEffect {
+                                capabilities: EffectCapabilities {
+                                    runtime: summary.effects(),
+                                    may_io: result.may_io.contains(&id),
+                                },
+                                evidence: EffectEvidence::new(summary.clone()),
+                            },
+                        )
+                    })
+                    .collect();
+                let imported = self
+                    .imported_reads
+                    .borrow_mut()
+                    .remove(&unit)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                let source_units = self
+                    .source_reads
+                    .borrow_mut()
+                    .remove(&unit)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                let mut loop_bodies: Vec<_> = result.loop_bodies.iter().copied().collect();
+                loop_bodies.sort();
+                let mut helpers: Vec<_> = result
+                    .helpers
+                    .iter()
+                    .map(|(id, helper)| {
+                        (
+                            *id,
+                            serde_json::json!([
+                                id,
+                                helper.span,
+                                match helper.reason {
+                                    NonpreemptibleReason::Loop => "loop",
+                                    NonpreemptibleReason::Recursion => "recursion",
+                                }
+                            ]),
+                        )
+                    })
+                    .collect();
+                helpers.sort_by_key(|(id, _)| *id);
+                let metadata = serde_json::json!([
+                    loop_bodies,
+                    helpers
+                        .into_iter()
+                        .map(|(_, value)| value)
+                        .collect::<Vec<_>>()
+                ]);
+                tracking.borrow_mut().publish_effects(
+                    unit,
+                    roots,
+                    imported,
+                    inventory,
+                    source_units,
+                    metadata,
+                )?;
+            }
+            for (&id, summary) in result.facts.iter() {
+                self.capabilities.seed(
+                    (unit, id),
+                    EffectCapabilities {
+                        runtime: summary.effects(),
+                        may_io: result.may_io.contains(&id),
+                    },
+                );
+                self.evidence.seed((unit, id), summary.clone());
+            }
+            Ok(result)
+        })?;
+        self.completed
+            .borrow_mut()
+            .insert(unit, Arc::clone(&completed));
+        Ok(completed)
     }
     pub(crate) fn completed_helpers(&self, unit: UnitId) -> Option<Arc<super::HelperSummary>> {
         Some(Arc::clone(&self.units.ready(&unit)?.helpers))
@@ -102,20 +325,59 @@ impl EffectQueries {
             .ok_or_else(|| anyhow::anyhow!("unit effects not completed"))
     }
     pub(crate) fn panic(&self, unit: UnitId, id: FunctionId) -> bool {
-        self.units
-            .ready(&unit)
-            .is_none_or(|effects| effects.facts.intersects(&id, PANIC))
+        self.effect_capabilities(unit, id)
+            .is_none_or(|effects| effects.runtime.intersects(PANIC))
     }
     pub(crate) fn has_fact(&self, unit: UnitId, id: FunctionId) -> bool {
-        self.units
-            .ready(&unit)
-            .is_some_and(|effects| effects.facts.get(&id).is_some())
+        self.effect_capabilities(unit, id).is_some()
     }
-    fn source_effects(&self, unit: UnitId, body: BodyId, id: FunctionId) -> Option<(bool, bool)> {
+    /// Frozen callable projection used by backend and cross-unit analysis.
+    pub(crate) fn effect_capabilities(
+        &self,
+        unit: UnitId,
+        id: FunctionId,
+    ) -> Option<Arc<EffectCapabilities>> {
+        self.capabilities.ready(&(unit, id))
+    }
+
+    /// Evidence includes locations; capability consumers never read this table.
+    pub(crate) fn effect_evidence(
+        &self,
+        unit: UnitId,
+        id: FunctionId,
+    ) -> Option<Arc<EffectSummary<EffectWitness>>> {
+        let frozen = self.evidence.ready(&(unit, id))?;
+        if let Some(tracking) = self.tracking.borrow().upgrade() {
+            let evidence = tracking
+                .borrow()
+                .effect_evidence(unit, id)
+                .expect("completed effect evidence query");
+            return Some(Arc::new(evidence.summary));
+        }
+        Some(frozen)
+    }
+
+    fn source_effects(
+        &self,
+        consumer: UnitId,
+        unit: UnitId,
+        body: BodyId,
+        id: FunctionId,
+    ) -> Option<(bool, bool, bool)> {
         let effects = self.units.ready(&unit)?;
+        if consumer != unit && self.tracking.borrow().upgrade().is_some() {
+            self.source_reads
+                .borrow_mut()
+                .entry(consumer)
+                .or_default()
+                .insert(unit);
+        }
         Some((
-            effects.facts.get(&id)?.intersects(PANIC),
+            self.effect_capabilities(unit, id)?
+                .runtime
+                .intersects(PANIC),
             effects.loop_bodies.contains(&body),
+            self.effect_capabilities(unit, id)?.may_io,
         ))
     }
     fn resolve_module(&self, consumer: UnitId, path: &str) -> Option<UnitId> {
@@ -133,8 +395,22 @@ impl EffectQueries {
         target: &FunctionId,
         imports: &HashMap<String, String>,
     ) -> RuntimeEffects {
+        self.external_capabilities(consumer, target, imports)
+            .runtime
+            .intersection(PANIC)
+    }
+
+    fn external_capabilities(
+        &self,
+        consumer: UnitId,
+        target: &FunctionId,
+        imports: &HashMap<String, String>,
+    ) -> EffectCapabilities {
         if let Some(effect) = intrinsic_effects(target) {
-            return effect;
+            return EffectCapabilities {
+                runtime: effect,
+                may_io: false,
+            };
         }
         let namespace = target.namespace();
         let owner = target.owner();
@@ -159,25 +435,43 @@ impl EffectQueries {
                     FunctionId::method(TypeId::local(item), target.name()),
                 )
             } else {
-                return default_external(target);
+                return unknown_external_capabilities(target);
             }
         } else if let Some(path) = imports.get(target.name()) {
             let Some((module, item)) = path.rsplit_once("::") else {
-                return PANIC;
+                return unknown_external_capabilities(target);
             };
             (module, FunctionId::free(item))
         } else {
-            return default_external(target);
+            return unknown_external_capabilities(target);
         };
         self.resolve_module(consumer, path).map_or_else(
-            || default_external(target),
+            || unknown_external_capabilities(target),
             |unit| {
-                let Some(effects) = self.units.ready(&unit) else {
-                    return PANIC;
-                };
-                effects.facts.get(&id).map_or_else(
-                    || default_external(target),
-                    |fact| fact.effects().intersection(PANIC),
+                if !self.units.is_ready(&unit) {
+                    return EffectCapabilities {
+                        runtime: PANIC,
+                        may_io: true,
+                    };
+                }
+                self.effect_capabilities(unit, id).map_or_else(
+                    || unknown_external_capabilities(target),
+                    |fact| {
+                        if let Some(tracking) = self.tracking.borrow().upgrade() {
+                            let capabilities = tracking
+                                .borrow()
+                                .effect_capabilities(unit, id)
+                                .expect("completed effect capability query");
+                            self.imported_reads
+                                .borrow_mut()
+                                .entry(consumer)
+                                .or_default()
+                                .insert((unit, id));
+                            capabilities
+                        } else {
+                            *fact
+                        }
+                    },
                 )
             },
         )
@@ -198,6 +492,13 @@ pub(crate) fn intrinsic_effects(target: &FunctionId) -> Option<RuntimeEffects> {
         }),
     }
 }
+fn unknown_external_capabilities(target: &FunctionId) -> EffectCapabilities {
+    EffectCapabilities {
+        runtime: default_external(target),
+        may_io: true,
+    }
+}
+
 fn default_external(target: &FunctionId) -> RuntimeEffects {
     if target.owner().is_some() && target.name() == "init" {
         RuntimeEffects::NONE
@@ -262,6 +563,28 @@ pub(crate) fn solve_unit<N>(
         }
     }
     let canonical_bodies: HashSet<_> = pending.iter().map(|(_, body, _)| *body).collect();
+    let consumer = index.and_then(|index| {
+        pending
+            .iter()
+            .find_map(|(_, body, _)| index.owner(*body).map(|(unit, _)| unit))
+    });
+    let imports: HashMap<_, _> = program
+        .imports
+        .iter()
+        .map(|import| {
+            (
+                import.alias.clone().unwrap_or_else(|| {
+                    import
+                        .path
+                        .rsplit("::")
+                        .next()
+                        .unwrap_or(&import.path)
+                        .to_owned()
+                }),
+                import.path.clone(),
+            )
+        })
+        .collect();
     let mut problem = EffectProblem::new()
         .external_callee(PANIC)
         .unknown_callee(PANIC)
@@ -271,6 +594,7 @@ pub(crate) fn solve_unit<N>(
     let mut loops = HashSet::new();
     let mut loop_bodies = HashSet::new();
     let mut copies = Vec::new();
+    let mut may_io = HashSet::new();
     let mut visits = 0;
     while let Some((id, body_id, body)) = pending.pop() {
         visits += 1;
@@ -282,13 +606,19 @@ pub(crate) fn solve_unit<N>(
             let source = index.source_body(body_id);
             if source != body_id {
                 let known = index.owner(source).and_then(|(unit, _)| {
-                    origins.expect("source index").1.source_effects(
-                        unit,
-                        source,
-                        source_callable(index, source),
-                    )
+                    consumer.and_then(|consumer| {
+                        origins.expect("source index").1.source_effects(
+                            consumer,
+                            unit,
+                            source,
+                            source_callable(index, source),
+                        )
+                    })
                 });
-                if let Some((panic, has_loop)) = known {
+                if let Some((panic, has_loop, source_io)) = known {
+                    if source_io {
+                        may_io.insert(id);
+                    }
                     if panic {
                         problem = problem.seed(id, PANIC, None);
                     }
@@ -314,50 +644,44 @@ pub(crate) fn solve_unit<N>(
             }
         }
 
-        let mut hazards = HazardVisitor {
-            panics: false,
-            panic_span: None,
-            expr_types: types,
+        let scan = || {
+            if let Some((_, queries)) = origins {
+                queries.scanned.set(queries.scanned.get() + 1);
+            }
+            Ok(scan_direct_effects(id, body_id, body, types, index))
         };
-        let mut defer_depth = 0;
-        let mut walk = AstWalk::new(AstEvent::Block(body));
-        while let Some(event) = walk.next() {
-            visits += 1;
-            match event {
-                AstEvent::Lambda(lambda) => {
-                    if let LambdaBody::Block(child) = &lambda.body {
-                        let child_id = index
-                            .and_then(|i| i.lambda_in(body_id, lambda.id))
-                            .unwrap_or(child.id);
-                        pending.push((FunctionId::lambda(child_id), child_id, child));
-                    }
-                    walk.skip_children();
-                }
-                AstEvent::Stmt(stmt) => {
-                    hazards.visit_stmt(stmt);
-                    match stmt {
-                        Stmt::Defer(_) => defer_depth += 1,
-                        Stmt::While(_) | Stmt::For(_) if defer_depth == 0 => {
-                            loops.insert(id);
-                            loop_bodies.insert(body_id);
-                        }
-                        _ => {}
-                    }
-                }
-                AstEvent::ExitStmt(Stmt::Defer(_)) => defer_depth -= 1,
-                AstEvent::Expr(expr) => hazards.visit_expr(expr),
-                _ => {}
+        let queries = origins.and_then(|(_, effects)| effects.body_queries.borrow().upgrade());
+        let direct_bodies = match queries {
+            Some(queries) => queries
+                .derived(
+                    body_id,
+                    super::tracked::QueryNode::DirectEffects(body_id),
+                    None,
+                    scan,
+                )
+                .expect("direct effect dependencies have completed"),
+            None => scan().expect("direct effect scan is infallible"),
+        };
+        for direct in direct_bodies {
+            own.insert(direct.id);
+            problem = problem.body(direct.id);
+            if direct.has_loop {
+                loops.insert(direct.id);
+                loop_bodies.insert(direct.body);
+            }
+            if direct.may_io {
+                may_io.insert(direct.id);
+            }
+            if direct.panics {
+                let witness = direct.panic_span.map(|span| EffectWitness::Panic {
+                    owner: direct.id,
+                    source: (span.file_id.0, span.start, span.end),
+                });
+                problem = problem.seed(direct.id, PANIC, witness);
             }
         }
-        if hazards.panics {
-            let witness = hazards.panic_span.map(|span| EffectWitness::Panic {
-                owner: id,
-                source: (span.file_id.0, span.start, span.end),
-            });
-            problem = problem.seed(id, PANIC, witness);
-        }
     }
-    for (id, source) in copies {
+    for &(id, source) in &copies {
         if loop_bodies.contains(&source) {
             loops.insert(id);
         }
@@ -421,10 +745,48 @@ pub(crate) fn solve_unit<N>(
         problem = problem.transmit(*id, mask);
     }
     let mut classified = HashSet::new();
-    for (_, sites) in graph.iter() {
+    let incremental = origins.is_some() && consumer.is_some();
+    let mut io_graph = std::borrow::Cow::Borrowed(graph);
+    let mut io_callers: HashMap<FunctionId, Vec<FunctionId>> = HashMap::new();
+    if let Some(index) = index {
+        for (id, source) in copies {
+            let source = source_callable(index, source);
+            if incremental {
+                io_graph.to_mut().merge(
+                    id,
+                    crate::semantic::call_graph::CallSites {
+                        targets: std::iter::once(source).collect(),
+                        has_unknown: false,
+                    },
+                );
+            } else {
+                io_callers.entry(source).or_default().push(id);
+            }
+            edge_visits += 1;
+        }
+    }
+    for (&caller, sites) in graph.iter() {
+        if sites.has_unknown {
+            may_io.insert(caller);
+        }
         for target in &sites.targets {
             edge_visits += 1;
+            if !incremental {
+                io_callers.entry(*target).or_default().push(caller);
+            }
             if !own.contains(target) && classified.insert(*target) {
+                // Every unproved external call is conservatively IO-capable.
+                // Known runtime/stat/math intrinsics are the only pure leaves;
+                // filesystem, networking, printing and foreign calls fail closed.
+                let external_io = match (origins, consumer) {
+                    (Some((_, queries)), Some(unit)) => {
+                        queries.external_capabilities(unit, target, &imports).may_io
+                    }
+                    _ => intrinsic_effects(target).is_none(),
+                };
+                if external_io {
+                    may_io.insert(*target);
+                }
                 problem = problem.seed(
                     *target,
                     external(target).intersection(PANIC),
@@ -433,8 +795,65 @@ pub(crate) fn solve_unit<N>(
             }
         }
     }
+    // The IO lattice has one bit: each vertex enters the queue once and each
+    // existing call edge is visited once, including mutually recursive bodies.
+    if let (Some((_, queries)), Some(unit)) = (origins, consumer) {
+        // The IO lattice uses a private carrier bit; it is never exposed as an
+        // ABI capability. Reuse the same masked fixed-point implementation.
+        let io_bit = RuntimeEffects::MAY_ALLOCATE;
+        let mut io_problem = EffectProblem::<u8>::new()
+            .external_callee(RuntimeEffects::NONE)
+            .unknown_callee(RuntimeEffects::NONE)
+            .missing_body(RuntimeEffects::NONE)
+            .default_transmit(io_bit);
+        for &id in &own {
+            io_problem = io_problem.body(id);
+        }
+        for &id in &may_io {
+            io_problem = io_problem.seed(id, io_bit, None);
+        }
+        let mut previous = queries.io_solutions.borrow_mut();
+        let solution =
+            io_problem.solve_incremental(&io_graph, previous.get(&unit).map(Arc::as_ref));
+        queries
+            .recomputed
+            .set(queries.recomputed.get() + solution.recomputed);
+        may_io = solution
+            .facts
+            .iter()
+            .filter(|(_, fact)| fact.intersects(io_bit))
+            .map(|(&id, _)| id)
+            .collect();
+        previous.insert(unit, Arc::new(solution));
+    } else {
+        let mut pending_io: VecDeque<_> = may_io.iter().copied().collect();
+        while let Some(callee) = pending_io.pop_front() {
+            for &caller in io_callers.get(&callee).into_iter().flatten() {
+                edge_visits += 1;
+                if may_io.insert(caller) {
+                    pending_io.push_back(caller);
+                }
+            }
+        }
+    }
     crate::query_stats::add(crate::query_stats::Counter::EffectEdges, edge_visits);
-    let facts = problem.solve(graph);
+    let facts = match (origins, consumer) {
+        (Some((_, queries)), Some(unit)) => {
+            let mut solutions = queries.solutions.borrow_mut();
+            let solution = problem.solve_incremental_by(
+                graph,
+                solutions.get(&unit).map(Arc::as_ref),
+                same_seed,
+            );
+            queries
+                .recomputed
+                .set(queries.recomputed.get() + solution.recomputed);
+            let facts = solution.facts.clone();
+            solutions.insert(unit, Arc::new(solution));
+            facts
+        }
+        _ => problem.solve(graph),
+    };
     let helpers = helpers
         .into_iter()
         .filter_map(|(id, span)| match facts.get(&id)?.witness(NO_PREEMPT)? {
@@ -452,7 +871,95 @@ pub(crate) fn solve_unit<N>(
         facts,
         helpers: Arc::new(helpers),
         loop_bodies,
+        may_io,
     }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DirectBodyEffects {
+    id: FunctionId,
+    body: BodyId,
+    panics: bool,
+    panic_span: Option<crate::diagnostics::Span>,
+    has_loop: bool,
+    may_io: bool,
+}
+
+fn scan_direct_effects<N>(
+    id: FunctionId,
+    body_id: BodyId,
+    body: &Block,
+    types: &HashMap<ExprId, Type<N>>,
+    index: Option<&super::ids::BodyIndex>,
+) -> Vec<DirectBodyEffects> {
+    let mut pending = vec![(id, body_id, body)];
+    let mut result = Vec::new();
+    let mut visits = 0;
+    while let Some((id, body_id, body)) = pending.pop() {
+        let mut hazards = HazardVisitor {
+            panics: false,
+            panic_span: None,
+            expr_types: types,
+        };
+        let mut has_loop = false;
+        let mut may_io = false;
+        let mut defer_depth = 0;
+        let mut walk = AstWalk::new(AstEvent::Block(body));
+        while let Some(event) = walk.next() {
+            visits += 1;
+            match event {
+                AstEvent::Lambda(lambda) => {
+                    if let LambdaBody::Block(child) = &lambda.body {
+                        let child_id = index
+                            .and_then(|i| i.lambda_in(body_id, lambda.id))
+                            .unwrap_or(child.id);
+                        pending.push((FunctionId::lambda(child_id), child_id, child));
+                    }
+                    walk.skip_children();
+                }
+                AstEvent::Stmt(stmt) => {
+                    hazards.visit_stmt(stmt);
+                    match stmt {
+                        Stmt::Defer(_) => defer_depth += 1,
+                        Stmt::While(_) | Stmt::For(_) if defer_depth == 0 => has_loop = true,
+                        _ => {}
+                    }
+                }
+                AstEvent::ExitStmt(Stmt::Defer(_)) => defer_depth -= 1,
+                AstEvent::Expr(expr) => {
+                    may_io |= matches!(expr, Expr::Print(..));
+                    hazards.visit_expr(expr);
+                }
+                _ => {}
+            }
+        }
+        result.push(DirectBodyEffects {
+            id,
+            body: body_id,
+            panics: hazards.panics,
+            panic_span: hazards.panic_span,
+            has_loop,
+            may_io,
+        });
+    }
+    crate::query_stats::add(crate::query_stats::Counter::EffectInventory, visits);
+    result
+}
+
+fn same_seed(a: &EffectSummary<EffectWitness>, b: &EffectSummary<EffectWitness>) -> bool {
+    a.effects() == b.effects()
+        && (0..RuntimeEffects::BIT_COUNT).all(|bit| {
+            let bit = RuntimeEffects::from_bit(bit);
+            match (a.witness(bit), b.witness(bit)) {
+                (Some(EffectWitness::Lock(a)), Some(EffectWitness::Lock(b))) => {
+                    a.owner == b.owner
+                        && a.cause.span == b.cause.span
+                        && a.cause.kind == b.cause.kind
+                        && a.cause.operation == b.cause.operation
+                }
+                (a, b) => a == b,
+            }
+        })
 }
 
 fn source_callable(index: &super::ids::BodyIndex, body: BodyId) -> FunctionId {
@@ -892,6 +1399,252 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn tracked_capabilities_backdate_and_gate_real_solver() {
+        use super::super::incremental::SyntaxQueries;
+        use std::{cell::RefCell, path::Path, rc::Rc};
+        let path = Path::new("tracked_effect.wi");
+        let root = BodyId::fresh();
+        let id = FunctionId::free("get");
+        let consumer = crate::module::ModuleId(123);
+        let consumer_id = FunctionId::free("consumer");
+        let mut accepted = SyntaxQueries::default();
+        let mut previous = None;
+        let solves = std::cell::Cell::new(0);
+        for (step, source) in [
+            "fn get() -> i64 { return 1; }",
+            "fn get() -> i64 { return 2; }",
+            "fn get() -> i64 { println(2); return 2; }",
+            "fn get() -> i64 { println(2); return 2; }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let tracking = Rc::new(RefCell::new(accepted.candidate().unwrap()));
+            let (mut source, _, _) = tracking
+                .borrow_mut()
+                .parse(path, crate::diagnostics::FileId::ENTRY, source)
+                .unwrap();
+            let Item::Function(function) = &mut source.items[0] else {
+                panic!()
+            };
+            function.body.id = root;
+            if !tracking
+                .borrow_mut()
+                .validate_body(UnitId::ENTRY, root, path, "Function:get", vec![])
+                .unwrap()
+            {
+                tracking
+                    .borrow_mut()
+                    .publish_body(UnitId::ENTRY, root, serde_json::Value::Null, vec![], vec![])
+                    .unwrap();
+            }
+            let queries = EffectQueries::default();
+            *queries.tracking.borrow_mut() = Rc::downgrade(&tracking);
+            queries.roots.borrow_mut().insert(UnitId::ENTRY, vec![root]);
+            if let Some(previous) = &previous {
+                queries.reuse_from(previous);
+            }
+            let graph = crate::semantic::TypeChecker::resolved_effect_graph(&source);
+            queries
+                .complete(UnitId::ENTRY, || {
+                    solves.set(solves.get() + 1);
+                    solve_unit(
+                        &source,
+                        &graph,
+                        &HashMap::<ExprId, Type>::new(),
+                        None,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                        |_| PANIC,
+                    )
+                })
+                .unwrap();
+            let capabilities = tracking
+                .borrow()
+                .effect_capabilities(UnitId::ENTRY, id)
+                .unwrap();
+            assert_eq!(capabilities.may_io, step >= 2);
+            let consumer_green = tracking
+                .borrow_mut()
+                .validate_effects(consumer, vec![])
+                .unwrap();
+            assert_eq!(consumer_green, step == 1 || step == 3);
+            if !consumer_green {
+                tracking
+                    .borrow_mut()
+                    .publish_effects(
+                        consumer,
+                        vec![],
+                        vec![(UnitId::ENTRY, id)],
+                        HashMap::from([(
+                            consumer_id,
+                            CapturedEffect {
+                                capabilities,
+                                evidence: EffectEvidence::new(EffectSummary::default()),
+                            },
+                        )]),
+                        vec![],
+                        serde_json::Value::Null,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(solves.get(), (step + 1).min(3));
+            previous = Some(queries);
+            accepted = Rc::try_unwrap(tracking).unwrap().into_inner();
+        }
+    }
+
+    #[test]
+    fn tracked_lock_evidence_equality_includes_location_and_cause() {
+        let summary = |offset| {
+            EffectSummary::new(
+                LOCK_EFFECT_WAIT,
+                Some(EffectWitness::Lock(LockEffectWitness {
+                    owner: FunctionId::free("wait"),
+                    cause: LockEffectCause {
+                        span: Span::new(offset, offset + 2, 1, offset + 1),
+                        operation: "sleep".into(),
+                        kind: LockEffectKind::Suspend,
+                    },
+                })),
+            )
+        };
+        // In-solve witness ordering intentionally identifies a cause by owner.
+        assert_eq!(summary(1), summary(7));
+        assert!(!same_seed(&summary(1), &summary(7)));
+        assert_ne!(
+            EffectEvidence::new(summary(1)),
+            EffectEvidence::new(summary(7))
+        );
+    }
+
+    #[test]
+    fn callable_capabilities_separate_io_and_evidence() {
+        fn evaluate(source: &str) -> EffectQueries {
+            let queries = EffectQueries::default();
+            let source = program(source);
+            let graph = crate::semantic::TypeChecker::resolved_effect_graph(&source);
+            queries
+                .complete(UnitId::ENTRY, || {
+                    solve_unit(
+                        &source,
+                        &graph,
+                        &HashMap::<ExprId, Type>::new(),
+                        None,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                        |_| PANIC,
+                    )
+                })
+                .unwrap();
+            queries
+        }
+        let first = evaluate("fn get() -> i64 { return 1; } fn caller() -> i64 { return get(); }");
+        let second = evaluate("fn get() -> i64 { return 2; } fn caller() -> i64 { return get(); }");
+        let io = evaluate(
+            "fn get() -> i64 { println(2); return 2; } fn caller() -> i64 { return get(); }",
+        );
+        for name in ["get", "caller"] {
+            let id = FunctionId::free(name);
+            assert_eq!(
+                first.effect_capabilities(UnitId::ENTRY, id),
+                second.effect_capabilities(UnitId::ENTRY, id)
+            );
+            assert!(!first.effect_capabilities(UnitId::ENTRY, id).unwrap().may_io);
+            assert!(io.effect_capabilities(UnitId::ENTRY, id).unwrap().may_io);
+        }
+        let first = evaluate("fn danger(n: i64) -> i64 { return 1 / n; }");
+        let shifted = evaluate("  fn danger(n: i64) -> i64 { return 1 / n; }");
+        let id = FunctionId::free("danger");
+        assert_eq!(
+            first.effect_capabilities(UnitId::ENTRY, id),
+            shifted.effect_capabilities(UnitId::ENTRY, id)
+        );
+        assert_ne!(
+            first.effect_evidence(UnitId::ENTRY, id),
+            shifted.effect_evidence(UnitId::ENTRY, id)
+        );
+    }
+
+    #[test]
+    fn imported_capabilities_resolve_aliases_and_keep_unknown_units_conservative() {
+        let mut queries = EffectQueries::default();
+        let dependency = crate::module::ModuleId(7);
+        queries.names.insert("dependency".to_owned(), dependency);
+        let source = program("fn pure() -> i64 { return 1; } fn output() { println(1); }");
+        let graph = crate::semantic::TypeChecker::resolved_effect_graph(&source);
+        let imports = HashMap::from([("alias".to_owned(), "dependency".to_owned())]);
+        let target = |name| FunctionId::method(TypeId::local("alias"), name);
+        let missing = queries.external_capabilities(UnitId::ENTRY, &target("init"), &imports);
+        assert!(missing.may_io);
+        assert!(missing.runtime.intersects(PANIC));
+        queries
+            .complete(dependency, || {
+                solve_unit(
+                    &source,
+                    &graph,
+                    &HashMap::<ExprId, Type>::new(),
+                    None,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    |_| PANIC,
+                )
+            })
+            .unwrap();
+        assert!(
+            !queries
+                .external_capabilities(UnitId::ENTRY, &target("pure"), &imports)
+                .may_io
+        );
+        assert!(
+            queries
+                .external_capabilities(UnitId::ENTRY, &target("output"), &imports)
+                .may_io
+        );
+        assert!(
+            queries
+                .external_capabilities(UnitId::ENTRY, &target("missing"), &imports)
+                .may_io
+        );
+    }
+
+    #[test]
+    fn io_propagates_through_cycles_and_unknown_calls() {
+        let queries = EffectQueries::default();
+        let source = program(
+            "fn a() { b(); } fn b() { a(); println(1); } fn indirect(f: fn() -> i64) -> i64 { return f(); } fn pure() { pow(2, 3); }",
+        );
+        let graph = crate::semantic::TypeChecker::resolved_effect_graph(&source);
+        queries
+            .complete(UnitId::ENTRY, || {
+                solve_unit(
+                    &source,
+                    &graph,
+                    &HashMap::<ExprId, Type>::new(),
+                    None,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    |_| PANIC,
+                )
+            })
+            .unwrap();
+        for name in ["a", "b", "indirect"] {
+            assert!(
+                queries
+                    .effect_capabilities(UnitId::ENTRY, FunctionId::free(name))
+                    .unwrap()
+                    .may_io
+            );
+        }
+        assert!(
+            !queries
+                .effect_capabilities(UnitId::ENTRY, FunctionId::free("pure"))
+                .unwrap()
+                .may_io
+        );
     }
 
     #[test]

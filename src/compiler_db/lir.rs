@@ -31,7 +31,21 @@ struct LirUnit {
     diagnostics: Arc<[Diagnostic]>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LirInventory {
+    functions: Vec<(FunctionId, BodyId)>,
+    lambdas: Vec<(ExprId, Span, BodyId)>,
+    diagnostics: Vec<Diagnostic>,
+    bodies: Vec<(BodyId, FlatLir)>,
+}
+
+struct Tracking {
+    queries: Rc<std::cell::RefCell<super::incremental::SyntaxQueries>>,
+    bodies: Rc<super::body::BodyQueries>,
+}
+
 pub(crate) struct LirQueries {
+    tracking: std::cell::RefCell<Option<Tracking>>,
     store: Rc<ArtifactStore>,
     units: QueryTable<UnitId, LirUnit>,
     bodies: QueryTable<BodyId, usize>,
@@ -40,10 +54,53 @@ pub(crate) struct LirQueries {
 impl LirQueries {
     pub(crate) fn new(store: Rc<ArtifactStore>) -> Self {
         Self {
+            tracking: Default::default(),
             store,
             units: QueryTable::named("lir_unit"),
             bodies: QueryTable::named("lir_body"),
         }
+    }
+
+    pub(crate) fn set_tracking(
+        &self,
+        queries: Rc<std::cell::RefCell<super::incremental::SyntaxQueries>>,
+        bodies: Rc<super::body::BodyQueries>,
+    ) {
+        *self.tracking.borrow_mut() = Some(Tracking { queries, bodies });
+    }
+
+    fn derived<V: serde::Serialize + serde::de::DeserializeOwned>(
+        &self,
+        node: super::tracked::QueryNode,
+        deps: Vec<super::tracked::QueryNode>,
+        compute: impl FnOnce() -> Result<V>,
+    ) -> Result<V> {
+        let tracking = self.tracking.borrow();
+        let Some(tracking) = tracking.as_ref() else {
+            return compute();
+        };
+        let cached = tracking
+            .queries
+            .borrow_mut()
+            .validate_derived(node.clone(), deps.clone())?;
+        if let Some(value) = cached {
+            let result = tracking
+                .bodies
+                .remap_cached(&serde_json::from_value::<V>(value)?)?;
+            tracking
+                .queries
+                .borrow_mut()
+                .refresh_derived(node, serde_json::to_value(&result)?)?;
+            return Ok(result);
+        }
+        let result = compute()?;
+        let wire = serde_json::to_value(&result)?;
+        tracking
+            .queries
+            .borrow_mut()
+            .publish_derived(node.clone(), wire.clone(), deps)?;
+        tracking.queries.borrow_mut().refresh_derived(node, wire)?;
+        Ok(result)
     }
 
     /// Lower one unit and store every body it produces, returning the
@@ -75,95 +132,132 @@ impl LirQueries {
         tables: &CheckerTables,
     ) -> Result<Arc<LirUnit>> {
         self.units.query(unit, || {
-            let mut names = HashMap::new();
-            let mut roots = Vec::new();
-            let mut methods = Vec::new();
-            for item in &program.items {
-                match item {
-                    Item::Function(f) => {
-                        names.insert(FunctionId::free(&f.name), f.body.id);
-                        roots.push((f.body.id, AstEvent::Block(&f.body)));
-                    }
-                    Item::Class(c) => {
-                        let owner = TypeId::from_source_name(&c.name);
-                        for ctor in &c.constructors {
-                            names.insert(FunctionId::method(owner, "init"), ctor.body.id);
-                            methods.push((ctor.body.id, AstEvent::Block(&ctor.body)));
+            let deps = self
+                .tracking
+                .borrow()
+                .as_ref()
+                .map(|tracking| tracking.bodies.lowering_dependencies(unit))
+                .unwrap_or_default();
+            let inventory = self.derived(super::tracked::QueryNode::LirUnit(unit), deps, || {
+                let mut names = HashMap::new();
+                let mut roots = Vec::new();
+                let mut methods = Vec::new();
+                for item in &program.items {
+                    match item {
+                        Item::Function(f) => {
+                            names.insert(FunctionId::free(&f.name), f.body.id);
+                            roots.push((f.body.id, AstEvent::Block(&f.body)));
                         }
-                        for m in &c.methods {
-                            names.insert(FunctionId::method(owner, &m.name), m.body.id);
-                            methods.push((m.body.id, AstEvent::Block(&m.body)));
-                        }
-                        for field in c.fields.iter().filter(|field| field.is_static) {
-                            if let Some(expr) = &field.initializer {
-                                let static_id = index
-                                    .static_id(expr.id())
-                                    .context("missing static identity")?;
-                                let body = index
-                                    .body(unit, super::ids::BodyOwner::StaticInitializer(static_id))
-                                    .context("missing static body identity")?;
-                                names.insert(
-                                    FunctionId::method(
-                                        owner,
-                                        format!("$static_init.{}", field.name),
-                                    ),
-                                    body,
-                                );
-                                roots.push((body, AstEvent::Expr(expr)));
+                        Item::Class(c) => {
+                            let owner = TypeId::from_source_name(&c.name);
+                            for ctor in &c.constructors {
+                                names.insert(FunctionId::method(owner, "init"), ctor.body.id);
+                                methods.push((ctor.body.id, AstEvent::Block(&ctor.body)));
                             }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // Source lowering visits free/static functions, then class bodies.
-            // Keep contextual lambda identities when injected defaults share
-            // source ExprIds. No scan over every body for each lookup.
-            roots.extend(methods);
-            let mut lambdas: HashMap<ExprId, VecDeque<BodyId>> = HashMap::new();
-            for (root, event) in roots {
-                let mut parents = vec![root];
-                for event in AstWalk::new(event) {
-                    match event {
-                        AstEvent::Expr(Expr::Lambda(lambda)) => {
-                            let body = index
-                                .lambda_in(*parents.last().unwrap(), lambda.id)
-                                .context("missing contextual lambda body identity")?;
-                            parents.push(body);
-                        }
-                        AstEvent::ExitExpr(Expr::Lambda(lambda)) => {
-                            lambdas
-                                .entry(lambda.id)
-                                .or_default()
-                                .push_back(parents.pop().unwrap());
+                            for m in &c.methods {
+                                names.insert(FunctionId::method(owner, &m.name), m.body.id);
+                                methods.push((m.body.id, AstEvent::Block(&m.body)));
+                            }
+                            for field in c.fields.iter().filter(|field| field.is_static) {
+                                if let Some(expr) = &field.initializer {
+                                    let static_id = index
+                                        .static_id(expr.id())
+                                        .context("missing static identity")?;
+                                    let body = index
+                                        .body(
+                                            unit,
+                                            super::ids::BodyOwner::StaticInitializer(static_id),
+                                        )
+                                        .context("missing static body identity")?;
+                                    names.insert(
+                                        FunctionId::method(
+                                            owner,
+                                            format!("$static_init.{}", field.name),
+                                        ),
+                                        body,
+                                    );
+                                    roots.push((body, AstEvent::Expr(expr)));
+                                }
+                            }
                         }
                         _ => {}
                     }
                 }
+                // Source lowering visits free/static functions, then class bodies.
+                // Keep contextual lambda identities when injected defaults share
+                // source ExprIds. No scan over every body for each lookup.
+                roots.extend(methods);
+                let mut lambdas: HashMap<ExprId, VecDeque<BodyId>> = HashMap::new();
+                for (root, event) in roots {
+                    let mut parents = vec![root];
+                    for event in AstWalk::new(event) {
+                        match event {
+                            AstEvent::Expr(Expr::Lambda(lambda)) => {
+                                let body = index
+                                    .lambda_in(*parents.last().unwrap(), lambda.id)
+                                    .context("missing contextual lambda body identity")?;
+                                parents.push(body);
+                            }
+                            AstEvent::ExitExpr(Expr::Lambda(lambda)) => {
+                                lambdas
+                                    .entry(lambda.id)
+                                    .or_default()
+                                    .push_back(parents.pop().unwrap());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let (hir, diagnostics) = lower::lower_program_with(program, tables);
+                let source = lowered::lower_source_program(&hir);
+                let mut result = LirInventory {
+                    diagnostics,
+                    functions: Vec::new(),
+                    lambdas: Vec::new(),
+                    bodies: Vec::new(),
+                };
+                for function in source.functions {
+                    let name = function.name;
+                    let body = *names
+                        .get(&name)
+                        .with_context(|| format!("missing body identity for {name}"))?;
+                    result
+                        .bodies
+                        .push((body, FlatLir::from_function(lowered::finish_body(function))));
+                    result.functions.push((name, body));
+                }
+                for lambda in source.lambdas {
+                    let body = lambdas
+                        .get_mut(&lambda.id)
+                        .and_then(VecDeque::pop_front)
+                        .context("missing lifted lambda body identity")?;
+                    result.bodies.push((
+                        body,
+                        FlatLir::from_function(lowered::finish_body(lambda.function)),
+                    ));
+                    result.lambdas.push((lambda.id, lambda.span, body));
+                }
+                Ok(result)
+            })?;
+            for (body, function) in inventory.bodies {
+                let mut function = self.derived(
+                    super::tracked::QueryNode::LirBody(body),
+                    vec![super::tracked::QueryNode::LirUnit(unit)],
+                    || Ok(function),
+                )?;
+                let frame = self.derived(
+                    super::tracked::QueryNode::AsyncFrameLayout(body),
+                    vec![super::tracked::QueryNode::LirBody(body)],
+                    || Ok(function.async_frame().clone()),
+                )?;
+                function.set_async_frame(frame);
+                self.bodies.query(body, || self.store.write(&function))?;
             }
-            let (hir, diagnostics) = lower::lower_program_with(program, tables);
-            let source = lowered::lower_source_program(&hir);
-            let mut result = LirUnit {
-                diagnostics: diagnostics.into(),
-                ..LirUnit::default()
-            };
-            for function in source.functions {
-                let name = function.name;
-                let body = *names
-                    .get(&name)
-                    .with_context(|| format!("missing body identity for {name}"))?;
-                self.store_body(body, function)?;
-                result.functions.push((name, body));
-            }
-            for lambda in source.lambdas {
-                let body = lambdas
-                    .get_mut(&lambda.id)
-                    .and_then(VecDeque::pop_front)
-                    .context("missing lifted lambda body identity")?;
-                self.store_body(body, lambda.function)?;
-                result.lambdas.push((lambda.id, lambda.span, body));
-            }
-            Ok(result)
+            Ok(LirUnit {
+                functions: inventory.functions,
+                lambdas: inventory.lambdas,
+                diagnostics: inventory.diagnostics.into(),
+            })
         })
     }
 
@@ -191,14 +285,6 @@ impl LirQueries {
                 })
                 .collect::<Result<_>>()?,
         })
-    }
-
-    fn store_body(&self, body: BodyId, function: lowered::SourceFunction) -> Result<()> {
-        self.bodies.query(body, || {
-            self.store
-                .write(&FlatLir::from_function(lowered::finish_body(function)))
-        })?;
-        Ok(())
     }
 
     pub(crate) fn body(&self, body: BodyId) -> Result<LirFunction> {

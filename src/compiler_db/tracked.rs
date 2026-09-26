@@ -34,6 +34,15 @@ impl ResultFingerprint {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum InputNode {
     Source(PathBuf),
+    SemanticSymbol(UnitId, String),
+    VisibleDeclarations(UnitId),
+    ResolvedReference(super::references::SymbolUseId),
+    ReferenceMembers(super::references::SymbolId),
+    LayoutDeclaration(crate::semantic::ids::TypeId),
+    InterfaceDeclaration(crate::semantic::ids::TypeId),
+    DerivedDependencies(QueryNode),
+    EffectRoots(UnitId),
+    ComputedEffect(UnitId, FunctionId),
     Manifest(PathBuf),
     Lock(PathBuf),
     PackageGraph,
@@ -51,12 +60,32 @@ pub(crate) enum InputNode {
 pub(crate) enum QueryNode {
     Parse(PathBuf),
     Declarations(UnitId),
+    SyntaxDeclarations(PathBuf),
+    SyntaxImports(PathBuf),
+    VisibleScope(UnitId, PathBuf),
+    SyntaxSignature(PathBuf, String),
+    BodySyntax(PathBuf, String),
+    SemanticSignature(UnitId, String),
     Signature(UnitId, FunctionId),
     TypedBody(BodyId),
+    NormalizedBody(BodyId),
+    DefiniteAssignment(BodyId),
+    AsyncBorrowReport(BodyId),
+    ResolvedReferences(BodyId),
+    ResolvedReference(super::references::SymbolUseId),
+    SymbolReferences(super::references::SymbolId),
     Effects(FunctionId),
+    DirectEffects(BodyId),
+    EffectInventory(UnitId),
+    EffectCapabilities(UnitId, FunctionId),
+    EffectEvidence(UnitId, FunctionId),
     References(UnitId),
     Layout(super::layout::TargetLayoutKey),
+    ClassLayout(crate::semantic::ids::TypeId),
+    InterfaceLayout(crate::semantic::ids::TypeId),
     LirBody(BodyId),
+    LirUnit(UnitId),
+    AsyncFrameLayout(BodyId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -113,6 +142,7 @@ struct Memo {
     changed_at: Revision,
     dependencies: Arc<[Dependency]>,
 }
+#[derive(Clone)]
 enum State {
     Computing { revision: Revision },
     Ready(Memo),
@@ -176,6 +206,12 @@ pub(crate) trait QueryProvider {
     }
 }
 
+/// A pure query needs work performed outside evaluation (artifact/checker I/O).
+/// This control-flow error is never memoized as a diagnostic.
+#[derive(Debug, thiserror::Error)]
+#[error("deferred compiler query: {0:?}")]
+pub(crate) struct DeferredQuery(pub QueryNode);
+
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 struct QueryCycle(Arc<str>);
@@ -190,10 +226,82 @@ pub(crate) struct TrackedQueryTable {
     // A cycle leaves an unrecorded dependency. Poison the active evaluation,
     // even if a provider catches or reformats the error, until its root unwinds.
     cycle_error: RefCell<Option<Arc<str>>>,
+    deferred: Cell<bool>,
 }
 impl TrackedQueryTable {
+    /// A refresh works on an isolated memo graph; failed candidates are dropped.
+    /// Payloads and dependency arrays remain shared through Arc.
+    pub(crate) fn candidate(&self) -> Result<Self> {
+        assert_frozen_read();
+        anyhow::ensure!(
+            self.stack.borrow().is_empty(),
+            "candidate during evaluation"
+        );
+        Ok(Self {
+            revision: self.revision,
+            inputs: self.inputs.clone(),
+            states: RefCell::new(self.states.borrow().clone()),
+            ..Default::default()
+        })
+    }
+
+    pub(crate) fn advance_candidate(&mut self) -> Result<()> {
+        self.revision = Revision(
+            self.revision
+                .0
+                .checked_add(1)
+                .context("revision overflow")?,
+        );
+        Ok(())
+    }
+    pub(crate) fn retain_sources(&mut self, paths: &HashSet<PathBuf>) {
+        self.inputs
+            .retain(|node, _| !matches!(node, InputNode::Source(path) if !paths.contains(path)));
+    }
+
+    /// Capture each source once before evaluating its queries in a candidate.
+    pub(crate) fn capture_candidate(&mut self, node: InputNode, value: QueryValue) {
+        assert_frozen_read();
+        assert!(self.stack.get_mut().is_empty(), "capture during evaluation");
+        if self
+            .inputs
+            .get(&node)
+            .is_none_or(|old| !old.value.equivalent(&value))
+        {
+            self.inputs.insert(
+                node,
+                Input {
+                    value,
+                    changed_at: self.revision,
+                    _durability: (),
+                },
+            );
+        }
+    }
+
     pub(crate) fn revision(&self) -> Revision {
         self.revision
+    }
+    /// Refresh presentation data only; semantic equality and clocks must stay intact.
+    pub(crate) fn refresh_value(&self, node: &QueryNode, value: QueryValue) -> Result<()> {
+        assert_frozen_read();
+        let mut states = self.states.borrow_mut();
+        let Some(State::Ready(memo)) = states.get_mut(node) else {
+            anyhow::bail!("refresh of unevaluated query {node:?}");
+        };
+        anyhow::ensure!(
+            memo.result.as_ref().is_ok_and(|old| old.equivalent(&value)),
+            "semantic result changed during presentation refresh: {node:?}"
+        );
+        memo.result = Ok(value);
+        Ok(())
+    }
+    pub(crate) fn peek(&self, node: &QueryNode) -> Option<QueryValue> {
+        assert_frozen_read();
+        match self.states.borrow().get(node) {
+            Some(State::Ready(memo)) => memo.result.as_ref().ok().cloned(),
+            _ => None,
+        }
     }
     pub(crate) fn stats(&self) -> TrackedStats {
         self.stats.get()
@@ -351,6 +459,7 @@ impl TrackedQueryTable {
             table: &'a TrackedQueryTable,
             node: QueryNode,
             depth: usize,
+            previous: Option<Memo>,
         }
         impl Drop for Guard<'_> {
             fn drop(&mut self) {
@@ -358,7 +467,9 @@ impl TrackedQueryTable {
                 debug_assert_eq!(stack.len(), self.depth + 1, "eval-stack leak");
                 debug_assert_eq!(stack.last().map(|f| &f.node), Some(&self.node));
                 stack.pop();
+                let deferred = self.table.deferred.get();
                 if self.depth == 0 {
+                    self.table.deferred.set(false);
                     self.table.cycle_error.borrow_mut().take();
                 }
                 ACTIVE.with(|n| {
@@ -367,7 +478,11 @@ impl TrackedQueryTable {
                 });
                 let mut states = self.table.states.borrow_mut();
                 if matches!(states.get(&self.node), Some(State::Computing { .. })) {
-                    states.remove(&self.node);
+                    if let Some(previous) = self.previous.take().filter(|_| deferred) {
+                        states.insert(self.node.clone(), State::Ready(previous));
+                    } else {
+                        states.remove(&self.node);
+                    }
                 }
             }
         }
@@ -375,6 +490,7 @@ impl TrackedQueryTable {
             table: self,
             node: node.clone(),
             depth,
+            previous: previous.clone(),
         };
         if let Some(old) = &previous {
             self.bump(|s| s.validated += 1);
@@ -402,8 +518,17 @@ impl TrackedQueryTable {
             }
         }
         self.stack.borrow_mut().last_mut().unwrap().recording = true;
-        self.bump(|s| s.recomputed += 1);
         let result = provider.compute(self, node);
+        if let Err(error) = &result
+            && error.downcast_ref::<DeferredQuery>().is_some()
+        {
+            self.deferred.set(true);
+            return Err(result.err().unwrap());
+        }
+        if self.deferred.get() {
+            return Err(DeferredQuery(node.clone()).into());
+        }
+        self.bump(|s| s.recomputed += 1);
         // Do not publish a failed memo (or a caught-error fallback) whose
         // dependency set is incomplete. Guard removes the Computing entry.
         self.check_cycle()?;

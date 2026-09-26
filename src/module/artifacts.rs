@@ -72,6 +72,10 @@ pub(crate) struct UnitArtifacts {
     pub(crate) revision_enabled: bool,
     pub(crate) parsed: ParsedRecords,
     pub(crate) previous_parsed: Option<(Rc<ArtifactStore>, ParsedRecords)>,
+    pub(crate) correspondence: crate::compiler_db::syntax::Correspondence,
+    pub(crate) syntax_queries: Option<Rc<RefCell<crate::compiler_db::incremental::SyntaxQueries>>>,
+    pub(crate) syntax_owners: HashMap<BodyId, (FileId, String)>,
+    pub(crate) initializer_owners: HashMap<crate::parser::ast::ExprId, (FileId, String)>,
 }
 
 /// Shared session pack. Query handles can retain it independently of declaration
@@ -305,6 +309,10 @@ impl UnitArtifacts {
                         revision_enabled: false,
                         parsed: HashMap::new(),
                         previous_parsed: None,
+                        correspondence: Default::default(),
+                        syntax_queries: None,
+                        syntax_owners: Default::default(),
+                        initializer_owners: Default::default(),
                     };
                     return Ok(artifacts);
                 }
@@ -353,11 +361,67 @@ impl UnitArtifacts {
     pub(crate) fn retain_parse(
         &mut self,
         file: FileId,
+        path: &std::path::Path,
         source: &str,
-        program: &Program,
+        program: &mut Program,
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
+        if let Some((store, records)) = &self.previous_parsed
+            && let Some((_, record)) = records.get(&file)
+        {
+            let old = store.read(*record)?;
+            self.correspondence.reconcile(&old, program)?;
+        }
+        if let Some(queries) = &self.syntax_queries
+            && let Some((old, new)) = queries.borrow_mut().take_token_pairs(path)
+        {
+            self.correspondence.map_tokens(&old, &new);
+        }
         let fingerprint = format!("{:x}", Sha256::digest(source.as_bytes()));
+        for item in &program.items {
+            match item {
+                Item::Function(f) => {
+                    self.syntax_owners
+                        .insert(f.body.id, (file, format!("Function:{}", f.name)));
+                }
+                Item::Class(c) => {
+                    for m in &c.methods {
+                        self.syntax_owners.insert(
+                            m.body.id,
+                            (file, format!("Class:{}/methods:{}", c.name, m.name)),
+                        );
+                    }
+                    for (i, constructor) in c.constructors.iter().enumerate() {
+                        self.syntax_owners.insert(
+                            constructor.body.id,
+                            (file, format!("Class:{}/constructors:{i}", c.name)),
+                        );
+                    }
+                    for field in &c.fields {
+                        if let Some(expr) = &field.initializer {
+                            self.initializer_owners.insert(
+                                expr.id(),
+                                (file, format!("Class:{}/fields:{}", c.name, field.name)),
+                            );
+                        }
+                    }
+                }
+                Item::Interface(interface) => {
+                    for method in &interface.methods {
+                        if let Some(body) = &method.default_body {
+                            self.syntax_owners.insert(
+                                body.id,
+                                (
+                                    file,
+                                    format!("Interface:{}/methods:{}", interface.name, method.name),
+                                ),
+                            );
+                        }
+                    }
+                }
+                Item::Enum(_) => {}
+            }
+        }
         let record = self.write(program)?;
         self.parsed.insert(file, (fingerprint, record));
         Ok(())

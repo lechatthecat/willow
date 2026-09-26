@@ -4,11 +4,19 @@ use super::{ids::BodyIndex, query::QueryTable};
 use crate::parser::ast::{
     ConstructorDecl, FieldDecl, FunctionDecl, Item, LambdaBody, MethodDecl, Program,
 };
+use crate::semantic::symbols::{SymbolRead, SymbolTable};
 use crate::{
     module::artifacts::ArtifactStore, parser::ast::BodyId, semantic::type_checker::body::TypedBody,
 };
 use anyhow::Result;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+
+type SignatureKey = (crate::module::UnitId, SymbolRead);
+struct ReuseCandidate {
+    record: usize,
+    signatures: Vec<(SymbolRead, Rc<serde_json::Value>)>,
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 enum NormalizedBody {
@@ -42,10 +50,59 @@ impl NormalizedBody {
     }
 }
 
+fn canonical_typed_body(body: &TypedBody) -> Result<serde_json::Value> {
+    let mut value = super::syntax::semantic(&serde_json::to_value(body)?);
+    // These fields use sequence encoding because their map keys are structured.
+    // Canonicalize only unordered collections, preserving diagnostic/source order.
+    for name in ["lock_edges", "resolved_calls"] {
+        if let Some(entries) = value
+            .get_mut(name)
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for entry in entries {
+                let targets = if name == "lock_edges" {
+                    entry.get_mut(1)
+                } else {
+                    entry.get_mut(1).and_then(|calls| calls.get_mut("targets"))
+                };
+                if let Some(targets) = targets.and_then(serde_json::Value::as_array_mut) {
+                    targets.sort_by_cached_key(|value| {
+                        serde_json::to_vec(value).expect("canonical key")
+                    });
+                }
+            }
+        }
+    }
+    for name in ["collection_names", "missing_collections"] {
+        if let Some(values) = value
+            .get_mut(name)
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            values.sort_by_cached_key(|value| serde_json::to_vec(value).expect("canonical key"));
+        }
+    }
+    Ok(value)
+}
+
+struct BodyTracking {
+    syntax: Rc<std::cell::RefCell<super::incremental::SyntaxQueries>>,
+    owners: HashMap<BodyId, (std::path::PathBuf, String)>,
+    units: HashMap<crate::module::UnitId, Vec<BodyId>>,
+}
+
 pub(crate) struct BodyQueries {
     store: Rc<ArtifactStore>,
     index: Rc<BodyIndex>,
     typed: QueryTable<BodyId, usize>,
+    tracking: std::cell::RefCell<Option<BodyTracking>>,
+    correspondence: std::cell::RefCell<super::syntax::Correspondence>,
+    module_gate: std::cell::RefCell<HashSet<crate::module::UnitId>>,
+    fine_allowed_module_refused: std::cell::Cell<usize>,
+    candidates: std::cell::RefCell<HashMap<BodyId, ReuseCandidate>>,
+    signatures: std::cell::RefCell<HashMap<SignatureKey, Rc<serde_json::Value>>>,
+    dependencies: std::cell::RefCell<
+        std::collections::HashMap<BodyId, Vec<crate::semantic::symbols::SymbolRead>>,
+    >,
     typechecks: std::cell::Cell<usize>,
     reused: std::cell::Cell<usize>,
     seeded: std::cell::RefCell<std::collections::HashSet<BodyId>>,
@@ -55,6 +112,7 @@ pub(crate) struct BodyQueries {
 }
 
 impl BodyQueries {
+    #[cfg(test)]
     pub(crate) fn reuse_from(
         &self,
         previous: &Self,
@@ -74,15 +132,342 @@ impl BodyQueries {
                         *entry.insert(self.store.write(&body)?)
                     }
                 };
+                if let Some(reads) = previous.dependencies.borrow().get(&id) {
+                    self.dependencies.borrow_mut().insert(id, reads.clone());
+                    for read in reads {
+                        let key = (unit, read.clone());
+                        if let Some(value) = previous.signatures.borrow().get(&key) {
+                            self.signatures.borrow_mut().insert(key, Rc::clone(value));
+                        }
+                    }
+                }
                 self.typed.seed(id, target);
                 self.seeded.borrow_mut().insert(id);
             }
         }
         Ok(())
     }
+    pub(crate) fn set_module_gate(&self, units: HashSet<crate::module::UnitId>) {
+        *self.module_gate.borrow_mut() = units;
+    }
+    pub(crate) fn fine_allowed_module_refused(&self) -> usize {
+        self.fine_allowed_module_refused.get()
+    }
+    pub(crate) fn signature_edge_count(&self) -> usize {
+        self.dependencies.borrow().values().map(Vec::len).sum()
+    }
+    pub(crate) fn distinct_signature_count(&self) -> usize {
+        self.signatures.borrow().len()
+    }
+
+    pub(crate) fn configure_tracking(
+        &self,
+        syntax: Rc<std::cell::RefCell<super::incremental::SyntaxQueries>>,
+        owners: HashMap<BodyId, (std::path::PathBuf, String)>,
+    ) {
+        let mut units: HashMap<_, Vec<_>> = HashMap::new();
+        for (&body, (path, owner)) in &owners {
+            if let Some((unit, _)) = self.index.owner(body) {
+                syntax.borrow_mut().register_body(unit, body, path, owner);
+                units.entry(unit).or_default().push(body);
+            }
+        }
+        *self.tracking.borrow_mut() = Some(BodyTracking {
+            syntax,
+            owners,
+            units,
+        });
+    }
+
+    pub(crate) fn remap_cached<V: serde::Serialize + serde::de::DeserializeOwned>(
+        &self,
+        value: &V,
+    ) -> Result<V> {
+        self.correspondence.borrow().remap(value)
+    }
+
+    pub(crate) fn lowering_dependencies(
+        &self,
+        unit: crate::module::UnitId,
+    ) -> Vec<super::tracked::QueryNode> {
+        use super::tracked::QueryNode;
+        let tracking = self.tracking.borrow();
+        let Some(tracking) = tracking.as_ref() else {
+            return Vec::new();
+        };
+        let mut deps = Vec::new();
+        if let Some(bodies) = tracking.units.get(&unit) {
+            for &body in bodies {
+                if self.normalized.is_ready(&body) {
+                    deps.push(QueryNode::NormalizedBody(body));
+                } else if self.typed.is_ready(&body) {
+                    deps.push(QueryNode::TypedBody(body));
+                } else if let Some((path, owner)) = tracking.owners.get(&body) {
+                    deps.push(QueryNode::BodySyntax(path.clone(), owner.clone()));
+                    deps.push(QueryNode::SyntaxSignature(path.clone(), owner.clone()));
+                }
+            }
+        }
+        deps.sort_by_cached_key(|node| format!("{node:?}"));
+        deps
+    }
+
+    fn tracked_reads(
+        &self,
+        id: BodyId,
+        symbols: &SymbolTable,
+    ) -> Vec<(String, Rc<serde_json::Value>)> {
+        let Some((unit, _)) = self.index.owner(id) else {
+            return Vec::new();
+        };
+        self.dependencies(id)
+            .unwrap_or_default()
+            .iter()
+            .map(|read| {
+                (
+                    serde_json::to_string(read).expect("symbol dependency serializes"),
+                    self.signature(unit, read, symbols),
+                )
+            })
+            .collect()
+    }
+
+    /// Copy syntax-stable candidate records, but do not publish a typed memo
+    /// until the checker supplies the current frozen declaration scope.
+    pub(crate) fn reuse_body_candidates(
+        &self,
+        previous: &Self,
+        bodies: &HashSet<BodyId>,
+        correspondence: &super::syntax::Correspondence,
+    ) -> Result<()> {
+        self.correspondence.borrow_mut().spans = correspondence.spans.clone();
+        let mut copied = HashMap::new();
+        for &id in bodies {
+            if self.typed.is_ready(&id) {
+                continue;
+            }
+            let Some((unit, _)) = previous.index.owner(id) else {
+                continue;
+            };
+            let Some(reads) = previous.dependencies(id) else {
+                continue;
+            };
+            let Some(record) = previous.typed.ready(&id) else {
+                continue;
+            };
+            let signatures: Option<Vec<_>> = reads
+                .iter()
+                .map(|read| {
+                    previous
+                        .signatures
+                        .borrow()
+                        .get(&(unit, read.clone()))
+                        .cloned()
+                        .map(|value| (read.clone(), value))
+                })
+                .collect();
+            let Some(signatures) = signatures else {
+                continue;
+            };
+            let target = match copied.entry(*record) {
+                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let body: TypedBody = previous.store.read(*record)?;
+                    *entry.insert(self.store.write(&correspondence.remap(&body)?)?)
+                }
+            };
+            self.dependencies.borrow_mut().insert(id, reads);
+            self.candidates.borrow_mut().insert(
+                id,
+                ReuseCandidate {
+                    record: target,
+                    signatures,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn signature(
+        &self,
+        unit: crate::module::UnitId,
+        read: &SymbolRead,
+        symbols: &SymbolTable,
+    ) -> Rc<serde_json::Value> {
+        self.signatures
+            .borrow_mut()
+            .entry((unit, read.clone()))
+            .or_insert_with(|| Rc::new(symbols.symbol_value(read)))
+            .clone()
+    }
+
+    /// The dependency check uses only recorded lookups. In particular a body
+    /// edit of a callee changes no declaration read by its caller.
+    pub(crate) fn validate_candidate(&self, id: BodyId, symbols: &SymbolTable) -> Result<()> {
+        let mut pending = vec![id];
+        let mut candidates = Vec::new();
+        while let Some(body) = pending.pop() {
+            let Some(candidate) = self.candidates.borrow_mut().remove(&body) else {
+                // A missing artifact still demands the semantic query before
+                // checking; its DeferredQuery is resolved by publication below.
+                if body == id
+                    && let Some(tracking) = self.tracking.borrow().as_ref()
+                    && let Some((path, owner)) = tracking.owners.get(&id)
+                    && let Some((unit, _)) = self.index.owner(id)
+                {
+                    tracking.syntax.borrow_mut().validate_body(
+                        unit,
+                        id,
+                        path,
+                        owner,
+                        self.tracked_reads(id, symbols),
+                    )?;
+                }
+                return Ok(());
+            };
+            let Some((unit, _)) = self.index.owner(body) else {
+                return Ok(());
+            };
+            if self.tracking.borrow().is_none()
+                && !candidate
+                    .signatures
+                    .iter()
+                    .all(|(read, old)| *self.signature(unit, read, symbols) == **old)
+            {
+                return Ok(());
+            }
+            candidates.push((body, candidate.record));
+            pending.extend(self.index.child_lambdas(body).map(|(_, child)| child));
+        }
+        if let Some(tracking) = self.tracking.borrow().as_ref() {
+            for (body, _) in &candidates {
+                let (unit, _) = self.index.owner(*body).expect("candidate owner");
+                tracking
+                    .syntax
+                    .borrow_mut()
+                    .capture_semantic(unit, self.tracked_reads(*body, symbols))?;
+            }
+            let Some((path, owner)) = tracking.owners.get(&id) else {
+                return Ok(());
+            };
+            let (unit, _) = self.index.owner(id).expect("candidate owner");
+            if !tracking.syntax.borrow_mut().validate_body(
+                unit,
+                id,
+                path,
+                owner,
+                self.tracked_reads(id, symbols),
+            )? {
+                return Ok(());
+            }
+        }
+        for (body, record) in candidates {
+            self.typed.seed(body, record);
+            self.seeded.borrow_mut().insert(body);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn snapshot_dependencies(&self, id: BodyId, symbols: &SymbolTable) {
+        use super::ids::BodyOwner;
+        let Some((unit, owner)) = self.index.owner(id) else {
+            return;
+        };
+        let owner_read = match owner {
+            BodyOwner::Function(function) => Some(match function.owner_type() {
+                Some(owner) => SymbolRead::Class(owner.name().to_owned()),
+                None => SymbolRead::Function(function.name().to_owned()),
+            }),
+            BodyOwner::InterfaceDefault(function) => function
+                .owner_type()
+                .map(|owner| SymbolRead::Interface(owner.name().to_owned())),
+            BodyOwner::Constructor { owner, .. } => {
+                Some(SymbolRead::Class(owner.name().to_owned()))
+            }
+            BodyOwner::StaticInitializer(field) => {
+                Some(SymbolRead::Class(field.owner.name().to_owned()))
+            }
+            BodyOwner::Lambda { .. } => None,
+        };
+        let mut dependencies = self.dependencies.borrow_mut();
+        let reads = dependencies.entry(id).or_default();
+        if let Some(owner) = owner_read
+            && !reads.contains(&owner)
+        {
+            reads.push(owner);
+        }
+        for read in reads {
+            self.signature(unit, read, symbols);
+        }
+        drop(dependencies);
+        for (_, child) in self.index.child_lambdas(id) {
+            self.snapshot_dependencies(child, symbols);
+        }
+    }
+
+    pub(crate) fn publish_tracked(&self, id: BodyId, symbols: &SymbolTable) -> Result<()> {
+        let tracking = self.tracking.borrow();
+        let Some(tracking) = tracking.as_ref() else {
+            return Ok(());
+        };
+        let mut pending = vec![id];
+        let mut order = Vec::new();
+        while let Some(body) = pending.pop() {
+            order.push(body);
+            pending.extend(self.index.child_lambdas(body).map(|(_, child)| child));
+        }
+        for body in order.into_iter().rev() {
+            let Some((path, owner)) = tracking.owners.get(&body) else {
+                continue;
+            };
+            let Some((unit, _)) = self.index.owner(body) else {
+                continue;
+            };
+            let Some(record) = self.typed.ready(&body) else {
+                continue;
+            };
+            let reads = self.tracked_reads(body, symbols);
+            if tracking
+                .syntax
+                .borrow_mut()
+                .validate_body(unit, body, path, owner, reads.clone())?
+            {
+                continue;
+            }
+            let result: TypedBody = self.store.read(*record)?;
+            let result = canonical_typed_body(&result)?;
+            let children = self
+                .index
+                .child_lambdas(body)
+                .map(|(_, child)| child)
+                .filter(|child| self.typed.is_ready(child))
+                .collect();
+            tracking
+                .syntax
+                .borrow_mut()
+                .publish_body(unit, body, result, reads, children)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn dependencies(
+        &self,
+        id: BodyId,
+    ) -> Option<Vec<crate::semantic::symbols::SymbolRead>> {
+        self.dependencies.borrow().get(&id).cloned()
+    }
+
     fn mark_reused(&self, id: BodyId) {
         if self.seeded.borrow_mut().remove(&id) {
             self.reused.set(self.reused.get() + 1);
+            if self
+                .index
+                .owner(id)
+                .is_some_and(|(unit, _)| !self.module_gate.borrow().contains(&unit))
+            {
+                self.fine_allowed_module_refused
+                    .set(self.fine_allowed_module_refused.get() + 1);
+            }
         }
     }
     pub(crate) fn typechecks(&self) -> usize {
@@ -104,6 +489,13 @@ impl BodyQueries {
             store,
             index,
             typed: QueryTable::named("typed_body"),
+            tracking: Default::default(),
+            correspondence: Default::default(),
+            module_gate: Default::default(),
+            fine_allowed_module_refused: Default::default(),
+            candidates: Default::default(),
+            signatures: Default::default(),
+            dependencies: Default::default(),
             typechecks: Default::default(),
             reused: Default::default(),
             seeded: Default::default(),
@@ -111,6 +503,104 @@ impl BodyQueries {
             assignment: QueryTable::named("definite_assignment"),
             borrows: QueryTable::named("async_borrow_report"),
         }
+    }
+
+    pub(crate) fn derived<V: serde::Serialize + serde::de::DeserializeOwned>(
+        &self,
+        id: BodyId,
+        node: super::tracked::QueryNode,
+        extra: Option<Vec<super::tracked::QueryNode>>,
+        compute: impl FnOnce() -> Result<V>,
+    ) -> Result<V> {
+        use super::tracked::QueryNode;
+        let tracking = self.tracking.borrow().as_ref().and_then(|tracking| {
+            tracking
+                .owners
+                .get(&id)
+                .map(|(path, _)| (Rc::clone(&tracking.syntax), path.clone()))
+        });
+        let Some((syntax, path)) = tracking else {
+            return compute();
+        };
+        let deps =
+            extra.unwrap_or_else(|| vec![QueryNode::TypedBody(id), QueryNode::SyntaxImports(path)]);
+        let cached = syntax
+            .borrow_mut()
+            .validate_derived(node.clone(), deps.clone())?;
+        if let Some(value) = cached {
+            let result: V = serde_json::from_value(value)?;
+            let result = self.correspondence.borrow().remap(&result)?;
+            syntax
+                .borrow_mut()
+                .refresh_derived(node, serde_json::to_value(&result)?)?;
+            return Ok(result);
+        }
+        let result = compute()?;
+        let wire = serde_json::to_value(&result)?;
+        syntax
+            .borrow_mut()
+            .publish_derived(node.clone(), wire.clone(), deps)?;
+        syntax.borrow_mut().refresh_derived(node, wire)?;
+        Ok(result)
+    }
+
+    pub(crate) fn resolved_references(
+        &self,
+        id: BodyId,
+        facts: &crate::semantic::analysis_symbols::Facts,
+    ) -> Result<crate::semantic::analysis_symbols::Facts> {
+        self.derived(
+            id,
+            super::tracked::QueryNode::ResolvedReferences(id),
+            None,
+            || Ok(facts.clone()),
+        )
+    }
+
+    pub(crate) fn definite_assignment_in_scope(
+        &self,
+        id: BodyId,
+        symbols: &SymbolTable,
+        compute: impl FnOnce() -> Vec<bool>,
+    ) -> Result<std::sync::Arc<Vec<bool>>> {
+        use super::tracked::QueryNode;
+        let info = self.tracking.borrow().as_ref().and_then(|tracking| {
+            tracking
+                .owners
+                .get(&id)
+                .map(|(path, owner)| (Rc::clone(&tracking.syntax), path.clone(), owner.clone()))
+        });
+        let Some((syntax, path, owner)) = info else {
+            return self.definite_assignment(id, compute);
+        };
+        let Some((unit, owner_id)) = self.index.owner(id) else {
+            return self.definite_assignment(id, compute);
+        };
+        let mut reads = crate::semantic::symbols::SymbolReadCapture::current();
+        if let super::ids::BodyOwner::Constructor { owner, .. } = owner_id {
+            let key = SymbolRead::Class(owner.name().to_owned());
+            if !reads.contains(&key) {
+                reads.push(key);
+            }
+        }
+        let mut deps = vec![
+            QueryNode::BodySyntax(path.clone(), owner.clone()),
+            QueryNode::SyntaxSignature(path, owner),
+        ];
+        let values = reads
+            .iter()
+            .map(|read| {
+                let key = serde_json::to_string(read).expect("symbol read serializes");
+                deps.push(QueryNode::SemanticSignature(unit, key.clone()));
+                (key, self.signature(unit, read, symbols))
+            })
+            .collect();
+        syntax.borrow_mut().capture_semantic(unit, values)?;
+        self.assignment.query(id, || {
+            self.derived(id, QueryNode::DefiniteAssignment(id), Some(deps), || {
+                Ok(compute())
+            })
+        })
     }
 
     /// Constructor flow depends on the current body's checked expression types.
@@ -131,7 +621,12 @@ impl BodyQueries {
     ) -> Result<crate::semantic::async_borrows::BorrowReport> {
         let mut fresh = None;
         let record = self.borrows.query(id, || {
-            let report = compute();
+            let report = self.derived(
+                id,
+                super::tracked::QueryNode::AsyncBorrowReport(id),
+                None,
+                || Ok(compute()),
+            )?;
             let record = self.store.write(&report)?;
             fresh = Some(report);
             Ok(record)
@@ -172,7 +667,9 @@ impl BodyQueries {
         let mut fresh = None;
         let artifact = self.typed.query(id, || {
             self.typechecks.set(self.typechecks.get() + 1);
+            let reads = crate::semantic::symbols::SymbolReadCapture::begin();
             let value = compute()?;
+            self.dependencies.borrow_mut().insert(id, reads.finish());
             let artifact = self.store.write(&value)?;
             fresh = Some(value);
             Ok(artifact)
@@ -217,21 +714,34 @@ impl BodyQueries {
         let mut fresh = None;
         let record = self.normalized.query(id, || {
             self.typed_record(id)?;
-            let mut body = source();
-            let target = if matches!(
-                body,
-                NormalizedBody::Function(_) | NormalizedBody::Method(_)
-            ) {
-                imports
-            } else {
-                walk_only
-            };
-            target.install_split(LambdaSplit::detach(Rc::clone(&self.index), id));
-            body.walk(imports, walk_only);
-            let lambdas = target.take_split().expect("installed split").finish()?;
+            let (body, lambdas) = self.derived(
+                id,
+                super::tracked::QueryNode::NormalizedBody(id),
+                None,
+                || {
+                    let mut body = source();
+                    let target = if matches!(
+                        body,
+                        NormalizedBody::Function(_) | NormalizedBody::Method(_)
+                    ) {
+                        imports
+                    } else {
+                        walk_only
+                    };
+                    target.install_split(LambdaSplit::detach(Rc::clone(&self.index), id));
+                    body.walk(imports, walk_only);
+                    let lambdas = target.take_split().expect("installed split").finish()?;
+                    Ok((body, lambdas))
+                },
+            )?;
             let mut resident = std::collections::HashMap::with_capacity(lambdas.len());
             for (lambda, lambda_body) in lambdas {
-                let record = NormalizedBody::Lambda(lambda_body);
+                let record = self.derived(
+                    lambda,
+                    super::tracked::QueryNode::NormalizedBody(lambda),
+                    None,
+                    || Ok(NormalizedBody::Lambda(lambda_body)),
+                )?;
                 self.normalized
                     .query(lambda, || self.store.write(&record))?;
                 let NormalizedBody::Lambda(lambda_body) = record else {
@@ -474,6 +984,90 @@ mod tests {
             assert_eq!(queries.normalized.stats().calls, count * (iteration + 1));
             assert_eq!(queries.normalized.stats().hits, count * iteration);
         }
+    }
+
+    #[test]
+    fn body_candidates_validate_only_signatures_actually_read() {
+        for count in [4, 16, 64] {
+            let source = format!(
+                "fn target() -> i64 {{ return 1; }} fn caller() -> i64 {{ return target(); }} {}",
+                (0..count)
+                    .map(|i| format!("fn other_{i}() -> i64 {{ return {i}; }}"))
+                    .collect::<String>()
+            );
+            let (mut program, previous, _) = prepare(&source, false);
+            let ids: HashSet<_> = previous.index.entries().map(|(id, _)| id).collect();
+            let Item::Function(target) = &mut program.items[0] else {
+                panic!()
+            };
+            target.return_type = Type::Bool;
+            let target_id = target.body.id;
+            let artifacts = UnitArtifacts::new().unwrap();
+            let next = Rc::new(BodyQueries::new(
+                Rc::clone(&artifacts.store),
+                Rc::clone(&previous.index),
+            ));
+            next.reuse_body_candidates(&previous, &ids, &Default::default())
+                .unwrap();
+            let mut checker = TypeChecker::new();
+            checker.set_body_queries(Rc::clone(&next));
+            checker.check_program(&program);
+            checker.finish_body_queries().unwrap();
+            assert!(!checker.errors.is_empty());
+            assert_eq!(
+                next.typechecks(),
+                2,
+                "only changed owner and its actual caller"
+            );
+            assert_eq!(next.reused(), count);
+            println!(
+                "typed signature unrelated={count} edges={} distinct_signatures={} typechecks={} reused={} aggregate_typechecks={}",
+                next.signature_edge_count(),
+                next.distinct_signature_count(),
+                next.typechecks(),
+                next.reused(),
+                count + 2
+            );
+            assert!(
+                next.dependencies(target_id)
+                    .unwrap()
+                    .contains(&SymbolRead::Function("target".into()))
+            );
+            // Every unique lookup signature is normalized only once, despite
+            // repeated consumers. There is no all-declarations scan per body.
+            assert!(next.signatures.borrow().len() < (count + 2) * 5);
+        }
+    }
+
+    #[test]
+    fn body_only_change_reuses_caller_and_unrelated_bodies() {
+        let (program, previous, _) = prepare(
+            "fn target() -> i64 { return 1; } fn caller() -> i64 { return target(); } fn unrelated() {}",
+            false,
+        );
+        let Item::Function(target) = &program.items[0] else {
+            panic!()
+        };
+        let ids: HashSet<_> = previous
+            .index
+            .entries()
+            .map(|(id, _)| id)
+            .filter(|id| *id != target.body.id)
+            .collect();
+        let artifacts = UnitArtifacts::new().unwrap();
+        let next = Rc::new(BodyQueries::new(
+            Rc::clone(&artifacts.store),
+            Rc::clone(&previous.index),
+        ));
+        next.reuse_body_candidates(&previous, &ids, &Default::default())
+            .unwrap();
+        let mut checker = TypeChecker::new();
+        checker.set_body_queries(Rc::clone(&next));
+        checker.check_program(&program);
+        checker.finish_body_queries().unwrap();
+        assert!(checker.errors.is_empty());
+        assert_eq!(next.typechecks(), 1);
+        assert_eq!(next.reused(), 2);
     }
 
     #[test]

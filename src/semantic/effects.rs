@@ -254,6 +254,23 @@ impl<W: Clone + Ord> EffectProblem<W> {
     /// seeded id. Iteration is a worklist over reverse edges, so each edge is
     /// revisited only when its callee's summary actually grows.
     pub fn solve(self, graph: &CallGraph) -> EffectFacts<W> {
+        self.solve_incremental(graph, None).facts
+    }
+
+    pub(crate) fn solve_incremental(
+        self,
+        graph: &CallGraph,
+        previous: Option<&EffectSolution<W>>,
+    ) -> EffectSolution<W> {
+        self.solve_incremental_by(graph, previous, |a, b| a == b)
+    }
+
+    pub(crate) fn solve_incremental_by(
+        self,
+        graph: &CallGraph,
+        previous: Option<&EffectSolution<W>>,
+        same_seed: impl Fn(&EffectSummary<W>, &EffectSummary<W>) -> bool,
+    ) -> EffectSolution<W> {
         crate::query_stats::add(crate::query_stats::Counter::EffectSolve, 1);
         let mut universe = self.bodies.clone();
         universe.extend(graph.ids().cloned());
@@ -301,10 +318,61 @@ impl<W: Clone + Ord> EffectProblem<W> {
             }
         }
 
-        // Seed the worklist with every node: a leaf's summary has to reach its
-        // callers even though nothing ever "changes" about the leaf.
-        let mut queued: HashSet<usize> = (0..nodes.len()).collect();
-        let mut work: VecDeque<usize> = (0..nodes.len()).collect();
+        let equations: BTreeMap<_, _> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                (
+                    *id,
+                    EffectEquation {
+                        seed: summaries[i].clone(),
+                        edges: edges[i]
+                            .iter()
+                            .map(|(target, mask)| (nodes[*target], *mask))
+                            .collect(),
+                    },
+                )
+            })
+            .collect();
+        // Reset the reverse closure of changed equations to their direct seeds.
+        // Keeping an old fixed point inside an affected cycle would retain
+        // effects after the last source of an effect is removed.
+        let mut dirty = vec![false; nodes.len()];
+        let mut invalidate = VecDeque::new();
+        for (position, id) in nodes.iter().enumerate() {
+            let unchanged = previous
+                .and_then(|old| old.equations.get(id))
+                .is_some_and(|old| {
+                    let current = &equations[id];
+                    old.edges == current.edges && same_seed(&old.seed, &current.seed)
+                });
+            if !unchanged {
+                dirty[position] = true;
+                invalidate.push_back(position);
+            }
+        }
+        while let Some(callee) = invalidate.pop_front() {
+            for &caller in &callers[callee] {
+                if !dirty[caller] {
+                    dirty[caller] = true;
+                    invalidate.push_back(caller);
+                }
+            }
+        }
+        if let Some(previous) = previous {
+            for (position, id) in nodes.iter().enumerate() {
+                if !dirty[position] {
+                    summaries[position] = previous
+                        .facts
+                        .get(id)
+                        .expect("unchanged equation has a fact")
+                        .clone();
+                }
+            }
+        }
+        let recomputed = dirty.iter().filter(|dirty| **dirty).count();
+        let mut queued: HashSet<usize> = (0..nodes.len()).filter(|i| dirty[*i]).collect();
+        let mut work: VecDeque<usize> = (0..nodes.len()).filter(|i| dirty[*i]).collect();
         while let Some(position) = work.pop_front() {
             queued.remove(&position);
             let mut changed = false;
@@ -330,10 +398,26 @@ impl<W: Clone + Ord> EffectProblem<W> {
             }
         }
 
-        EffectFacts {
-            summaries: nodes.into_iter().zip(summaries).collect(),
+        EffectSolution {
+            facts: EffectFacts {
+                summaries: nodes.into_iter().zip(summaries).collect(),
+            },
+            equations,
+            recomputed,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectEquation<W> {
+    seed: EffectSummary<W>,
+    edges: Vec<(FunctionId, RuntimeEffects)>,
+}
+#[derive(Debug, Clone)]
+pub(crate) struct EffectSolution<W> {
+    pub(crate) facts: EffectFacts<W>,
+    equations: BTreeMap<FunctionId, EffectEquation<W>>,
+    pub(crate) recomputed: usize,
 }
 
 /// The solved summaries, keyed by [`FunctionId`].
@@ -570,6 +654,82 @@ mod tests {
             .get(&id(name))
             .map(EffectSummary::effects)
             .unwrap_or(NONE)
+    }
+
+    #[test]
+    fn review_incremental_fixed_point_reuses_unrelated_and_clears_cycles() {
+        for count in [8, 32, 128] {
+            for shape in ["chain", "fanout", "cycle"] {
+                let mut graph = CallGraph::default();
+                let names: Vec<_> = (0..count).map(|i| format!("node_{i}")).collect();
+                for (i, name) in names.iter().enumerate() {
+                    let next = match shape {
+                        "fanout" if i > 0 => Some(names[0].as_str()),
+                        "chain" => names.get(i + 1).map(String::as_str),
+                        "cycle" => Some(names[(i + 1) % count].as_str()),
+                        _ => None,
+                    };
+                    calls(&mut graph, name, &next.into_iter().collect::<Vec<_>>());
+                }
+                calls(&mut graph, "isolated", &[]);
+                let make = |effect| {
+                    permissive::<&'static str>().seed(id(&names[0]), effect, Some("origin"))
+                };
+                let first = make(PANIC).solve_incremental(&graph, None);
+                let same = make(PANIC).solve_incremental(&graph, Some(&first));
+                assert_eq!(same.recomputed, 0);
+                let removed = make(NONE).solve_incremental(&graph, Some(&same));
+                let cold = make(NONE).solve(&graph);
+                assert_eq!(removed.facts.summaries, cold.summaries);
+                assert_eq!(removed.recomputed, if shape == "chain" { 1 } else { count });
+                assert!(removed.facts.iter().all(|(_, fact)| fact.is_empty()));
+                let isolated = make(NONE)
+                    .seed(id("isolated"), BLOCK, Some("local"))
+                    .solve_incremental(&graph, Some(&removed));
+                assert_eq!(isolated.recomputed, 1);
+                println!(
+                    "review_solver shape={shape} nodes={count} unchanged=0 isolated=1 removed={}",
+                    removed.recomputed
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review_incremental_edges_masks_missing_and_witness_changes_match_cold() {
+        let mut graph = CallGraph::default();
+        calls(&mut graph, "caller", &["leaf"]);
+        calls(&mut graph, "leaf", &[]);
+        let initial = permissive()
+            .seed(id("leaf"), BLOCK, Some("z"))
+            .solve_incremental(&graph, None);
+        let make = || {
+            permissive()
+                .seed(id("leaf"), BLOCK, Some("a"))
+                .transmit(id("leaf"), NONE)
+        };
+        let masked = make().solve_incremental(&graph, Some(&initial));
+        assert_eq!(masked.facts.summaries, make().solve(&graph).summaries);
+        assert!(masked.facts.get(&id("caller")).unwrap().is_empty());
+        let mut missing = CallGraph::default();
+        calls(&mut missing, "caller", &["missing"]);
+        let make = || {
+            EffectProblem::<&str>::new()
+                .external_callee(PANIC)
+                .body(id("caller"))
+        };
+        let incremental = make().solve_incremental(&missing, Some(&masked));
+        assert_eq!(
+            incremental.facts.summaries,
+            make().solve(&missing).summaries
+        );
+        assert!(
+            incremental
+                .facts
+                .get(&id("caller"))
+                .unwrap()
+                .intersects(PANIC)
+        );
     }
 
     #[test]

@@ -723,10 +723,7 @@ impl TypeChecker {
         self.imported_names.insert(local.to_string(), Some(span));
 
         // Functions are registered per-module in the ModuleInfo table.
-        let func = self
-            .symbols
-            .lookup_module(module)
-            .and_then(|m| m.functions.get(item).cloned());
+        let func = self.symbols.lookup_module_func(module, item).cloned();
         if let Some(info) = func {
             if info.public {
                 self.symbols.define_func(local.to_string(), info);
@@ -2012,8 +2009,12 @@ impl TypeChecker {
         }
 
         // Check if `class_name` refers to an imported module (e.g. `math::add`).
-        if let Some(module) = self.symbols.lookup_module(class_name).cloned() {
-            return match module.functions.get(method_name).cloned() {
+        if self.symbols.lookup_module(class_name).is_some() {
+            return match self
+                .symbols
+                .lookup_module_func(class_name, method_name)
+                .cloned()
+            {
                 None => {
                     self.push(
                         Diagnostic::new(

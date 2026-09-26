@@ -11,6 +11,16 @@ pub(crate) struct FlatLir {
 }
 
 impl FlatLir {
+    pub(crate) fn async_frame(&self) -> &crate::ir::lowered::async_liveness::LirAsyncFrameLayout {
+        &self.functions[0].async_frame
+    }
+    pub(crate) fn set_async_frame(
+        &mut self,
+        frame: crate::ir::lowered::async_liveness::LirAsyncFrameLayout,
+    ) {
+        self.functions[0].async_frame = frame;
+    }
+
     /// Move each region once into a flat array. No subtree is cloned or walked
     /// recursively, and each child index is greater than its parent's index.
     pub(crate) fn from_function(function: LirFunction) -> Self {

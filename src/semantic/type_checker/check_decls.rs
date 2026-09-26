@@ -292,13 +292,15 @@ impl TypeChecker {
             )
         };
         let missing = match &self.body_queries {
-            Some(queries) => match queries.definite_assignment(ctor.body.id, compute) {
-                Ok(missing) => missing,
-                Err(error) => {
-                    self.body_query_error = Some(error);
-                    return;
+            Some(queries) => {
+                match queries.definite_assignment_in_scope(ctor.body.id, &self.symbols, compute) {
+                    Ok(missing) => missing,
+                    Err(error) => {
+                        self.body_query_error = Some(error);
+                        return;
+                    }
                 }
-            },
+            }
             None => std::sync::Arc::new(compute()),
         };
         for (field, missing) in fields.iter().zip(missing.iter()) {

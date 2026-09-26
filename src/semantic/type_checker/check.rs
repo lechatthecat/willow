@@ -815,18 +815,22 @@ impl TypeChecker {
             // A callable that waits on its own is explained by its own
             // operation; only a purely transitive effect needs the propagated
             // witness.
-            let Some(cause) = self
-                .effect_inputs
-                .direct
-                .get(&site.callee)
-                .cloned()
-                .or_else(|| {
-                    facts
-                        .get(&site.callee)
-                        .filter(|summary| summary.intersects(LOCK_EFFECT_WAIT))
-                        .and_then(|summary| summary.witness(LOCK_EFFECT_WAIT))
-                        .and_then(|witness| witness.lock().cloned())
-                })
+            let Some(cause) =
+                self.effect_inputs
+                    .direct
+                    .get(&site.callee)
+                    .cloned()
+                    .or_else(|| {
+                        let evidence = self.effect_queries.as_ref().and_then(|(queries, unit)| {
+                            queries.effect_evidence(*unit, site.callee)
+                        });
+                        evidence
+                            .as_deref()
+                            .or_else(|| facts.get(&site.callee))
+                            .filter(|summary| summary.intersects(LOCK_EFFECT_WAIT))
+                            .and_then(|summary| summary.witness(LOCK_EFFECT_WAIT))
+                            .and_then(|witness| witness.lock().cloned())
+                    })
             else {
                 continue;
             };

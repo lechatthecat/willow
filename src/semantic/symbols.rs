@@ -4,6 +4,63 @@ use crate::parser::ast::{ParamMode, Type};
 use crate::semantic::ids::{FunctionId, FunctionMap, TypeId};
 use std::{collections::HashMap, rc::Rc};
 
+/// Semantic declaration reads made while checking a body, including misses.
+/// Spellings retain namespace distinctions and import aliases.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(crate) enum SymbolRead {
+    Function(String),
+    Class(String),
+    Enum(String),
+    EnumBare(String),
+    Interface(String),
+    Module(String),
+    ModuleFunction(String, String),
+}
+
+thread_local! {
+    static BODY_READS: std::cell::RefCell<Vec<std::collections::HashSet<SymbolRead>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(crate) struct SymbolReadCapture;
+impl SymbolReadCapture {
+    pub(crate) fn begin() -> Self {
+        BODY_READS.with(|reads| reads.borrow_mut().push(Default::default()));
+        Self
+    }
+    pub(crate) fn current() -> Vec<SymbolRead> {
+        BODY_READS.with(|reads| {
+            reads
+                .borrow()
+                .last()
+                .map(|reads| reads.iter().cloned().collect())
+                .unwrap_or_default()
+        })
+    }
+    pub(crate) fn finish(self) -> Vec<SymbolRead> {
+        let reads = BODY_READS.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            let reads = stack.pop().expect("body read capture");
+            reads.into_iter().collect()
+        });
+        std::mem::forget(self);
+        reads
+    }
+}
+impl Drop for SymbolReadCapture {
+    fn drop(&mut self) {
+        BODY_READS.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
+}
+fn record_read(make: impl FnOnce() -> SymbolRead) {
+    BODY_READS.with(|reads| {
+        if let Some(reads) = reads.borrow_mut().last_mut() {
+            reads.insert(make());
+        }
+    });
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EnumVariantInfo<N = String> {
     pub name: String,
@@ -261,6 +318,8 @@ impl Default for DeclarationSymbols {
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct SymbolTable {
     scopes: Vec<HashMap<String, VarInfo>>,
+    #[serde(skip)]
+    bare_enum_names: Rc<std::cell::RefCell<Option<std::collections::HashSet<String>>>>,
     #[serde(with = "declaration_rc")]
     declarations: Rc<DeclarationSymbols>,
 }
@@ -274,6 +333,7 @@ impl std::ops::Deref for SymbolTable {
 
 impl std::ops::DerefMut for SymbolTable {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        self.bare_enum_names = Default::default();
         Rc::make_mut(&mut self.declarations)
     }
 }
@@ -294,11 +354,30 @@ mod declaration_rc {
 }
 
 impl SymbolTable {
+    /// Current normalized value of one recorded lookup. Evaluated once per
+    /// revision/key by the body reuse scheduler, never by scanning the scope.
+    pub(crate) fn symbol_value(&self, read: &SymbolRead) -> serde_json::Value {
+        let value = match read {
+            SymbolRead::Function(name) => serde_json::to_value(self.lookup_func(name)),
+            SymbolRead::Class(name) => serde_json::to_value(self.lookup_class(name)),
+            SymbolRead::Enum(name) => serde_json::to_value(self.lookup_enum(name)),
+            SymbolRead::EnumBare(name) => serde_json::to_value(self.enum_nameable_bare(name)),
+            SymbolRead::Interface(name) => serde_json::to_value(self.lookup_interface(name)),
+            SymbolRead::Module(name) => serde_json::to_value(self.lookup_module(name).is_some()),
+            SymbolRead::ModuleFunction(module, name) => {
+                serde_json::to_value(self.lookup_module_func(module, name))
+            }
+        }
+        .expect("declaration serialization");
+        crate::compiler_db::syntax::semantic(&value)
+    }
+
     /// Start an independent body with no inherited local scopes. Sharing global
     /// declarations is O(1), regardless of the number of registered symbols.
     pub(crate) fn fork_body_scope(&self) -> Self {
         Self {
             scopes: Vec::new(),
+            bare_enum_names: Rc::clone(&self.bare_enum_names),
             declarations: Rc::clone(&self.declarations),
         }
     }
@@ -308,6 +387,7 @@ impl SymbolTable {
     pub(crate) fn declaration_shell(&self, shared: &[ModuleId]) -> Self {
         Self {
             scopes: Vec::new(),
+            bare_enum_names: Default::default(),
             declarations: Rc::new(DeclarationSymbols {
                 modules: self
                     .modules
@@ -363,6 +443,7 @@ impl SymbolTable {
     }
 
     pub fn lookup_func(&self, name: &str) -> Option<&FuncInfo> {
+        record_read(|| SymbolRead::Function(name.to_owned()));
         self.functions.get(&FunctionId::free_from_source_name(name))
     }
 
@@ -371,6 +452,7 @@ impl SymbolTable {
     }
 
     pub fn lookup_class(&self, name: &str) -> Option<&ClassInfo> {
+        record_read(|| SymbolRead::Class(name.to_owned()));
         self.classes.get(&TypeId::from_source_name(name))
     }
 
@@ -400,7 +482,16 @@ impl SymbolTable {
     }
 
     pub fn lookup_module(&self, name: &str) -> Option<&ModuleInfo> {
+        record_read(|| SymbolRead::Module(name.to_owned()));
         self.modules.get(self.module_names.get(name)?)
+    }
+
+    pub(crate) fn lookup_module_func(&self, module: &str, name: &str) -> Option<&FuncInfo> {
+        record_read(|| SymbolRead::ModuleFunction(module.to_owned(), name.to_owned()));
+        self.modules
+            .get(self.module_names.get(module)?)?
+            .functions
+            .get(name)
     }
 
     pub fn define_enum(&mut self, name: String, info: EnumInfo) {
@@ -408,7 +499,22 @@ impl SymbolTable {
     }
 
     pub fn lookup_enum(&self, name: &str) -> Option<&EnumInfo> {
+        record_read(|| SymbolRead::Enum(name.to_owned()));
         self.enums.get(&TypeId::from_source_name(name))
+    }
+
+    pub(crate) fn enum_nameable_bare(&self, identity: &str) -> bool {
+        record_read(|| SymbolRead::EnumBare(identity.to_owned()));
+        self.bare_enum_names
+            .borrow_mut()
+            .get_or_insert_with(|| {
+                self.enums
+                    .iter()
+                    .filter(|(alias, _)| !alias.to_string().contains("::"))
+                    .map(|(_, info)| info.name.clone())
+                    .collect()
+            })
+            .contains(identity)
     }
 
     pub fn define_interface(&mut self, name: String, info: InterfaceInfo) {
@@ -417,6 +523,7 @@ impl SymbolTable {
     }
 
     pub fn lookup_interface(&self, name: &str) -> Option<&InterfaceInfo> {
+        record_read(|| SymbolRead::Interface(name.to_owned()));
         self.interfaces.get(&TypeId::from_source_name(name))
     }
 }
@@ -488,6 +595,38 @@ impl InterfaceInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_reads_include_missing_symbols_and_select_only_module_member() {
+        let mut symbols = SymbolTable::default();
+        symbols.define_module(
+            "m".into(),
+            ModuleInfo {
+                functions: [
+                    ("f", function_info(Type::I64)),
+                    ("g", function_info(Type::Bool)),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        );
+        let capture = SymbolReadCapture::begin();
+        assert!(symbols.lookup_func("missing").is_none());
+        assert!(symbols.lookup_module("m").is_some());
+        assert!(symbols.lookup_module_func("m", "f").is_some());
+        assert!(symbols.lookup_module_func("m", "f").is_some());
+        let reads: std::collections::HashSet<_> = capture.finish().into_iter().collect();
+        assert_eq!(reads.len(), 3);
+        assert!(reads.contains(&SymbolRead::Function("missing".into())));
+        assert!(reads.contains(&SymbolRead::ModuleFunction("m".into(), "f".into())));
+        assert!(!reads.contains(&SymbolRead::ModuleFunction("m".into(), "g".into())));
+        let missing = symbols.symbol_value(&SymbolRead::Function("missing".into()));
+        symbols.define_func("missing".into(), function_info(Type::I64));
+        assert_ne!(
+            missing,
+            symbols.symbol_value(&SymbolRead::Function("missing".into()))
+        );
+    }
 
     #[test]
     fn module_aliases_share_one_stable_module_identity() {

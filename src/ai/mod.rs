@@ -6,7 +6,7 @@ mod packages;
 pub use packages::{ModuleEvidence, ModuleIdentity, SymbolIdentity, UpdateDelta};
 mod semantic;
 mod storage;
-mod symbols;
+pub(crate) mod symbols;
 mod warm;
 pub use graph::{Direction, Impact, ImpactNode, Limits};
 pub use semantic::{QueryRequest, QuerySession, SemanticFacts};
@@ -785,7 +785,21 @@ pub(crate) fn snapshot(
     let (symbol_definitions, symbol_references) =
         symbols::finish(&captured, &paths, &symbol_names, &functions);
     semantic.symbols = symbol_definitions;
-    semantic.references = symbol_references;
+    let ranges: Vec<_> = captured
+        .values()
+        .flat_map(|unit| &unit.symbol_owners)
+        .filter_map(|(span, owner)| {
+            Some((
+                Location {
+                    path: paths.get(&crate::module::ModuleId(span.file_id.0))?.clone(),
+                    start: span.start,
+                    end: span.end,
+                },
+                owner.clone(),
+            ))
+        })
+        .collect();
+    semantic.references = frontend.db.references.capture(symbol_references, &ranges)?;
     packages::attach(frontend, &paths, &captured, &mut functions, &mut semantic)?;
     captured.clear();
     let mut snapshot = Snapshot {

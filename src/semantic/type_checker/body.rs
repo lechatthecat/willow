@@ -302,6 +302,10 @@ impl TypeChecker {
         if self.body_query_error.is_some() {
             return;
         }
+        if let Err(error) = queries.validate_candidate(id, &self.symbols) {
+            self.body_query_error = Some(error);
+            return;
+        }
         let result = queries.evaluate(id, || {
             let mut body = BodyChecker::new(id, self);
             check(&mut body.state);
@@ -315,6 +319,11 @@ impl TypeChecker {
                 return;
             }
         };
+        queries.snapshot_dependencies(id, &self.symbols);
+        if let Err(error) = queries.publish_tracked(id, &self.symbols) {
+            self.body_query_error = Some(error);
+            return;
+        }
         self.checked_bodies.push(id);
         if let Err(error) = self.absorb_body(body, &queries) {
             self.body_query_error = Some(error);
@@ -336,7 +345,8 @@ impl TypeChecker {
         }
         self.expr_types.extend(body.expr_types);
         self.analysis_calls.extend(body.analysis_calls);
-        self.analysis_symbols.extend(body.analysis_symbols);
+        self.analysis_symbols
+            .extend(queries.resolved_references(body.id, &body.analysis_symbols)?);
         self.reference_arg_modes.extend(body.reference_arg_modes);
         self.enum_variant_resolutions
             .extend(body.enum_variant_resolutions);

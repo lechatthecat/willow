@@ -55,7 +55,12 @@ enum Stored {
     Prelude,
 }
 
+struct ScopeTracking {
+    syntax: Rc<std::cell::RefCell<super::incremental::SyntaxQueries>>,
+    paths: HashMap<UnitId, std::path::PathBuf>,
+}
 pub(crate) struct DeclarationQueries {
+    tracking: std::cell::RefCell<Option<ScopeTracking>>,
     store: Rc<ArtifactStore>,
     /// Declarations every unit starts from (built-in modules and the prelude).
     /// Its size is fixed by the compiler, not by the program being built.
@@ -87,6 +92,7 @@ fn partition<K: Copy + Eq + Hash, V: PartialEq>(
 impl DeclarationQueries {
     pub(crate) fn new(store: Rc<ArtifactStore>) -> Self {
         Self {
+            tracking: Default::default(),
             store,
             prelude: OnceCell::new(),
             scopes: QueryTable::named("visible_scope"),
@@ -94,6 +100,30 @@ impl DeclarationQueries {
             functions: QueryTable::named("function_signature"),
             types: QueryTable::named("type_decl"),
         }
+    }
+
+    pub(crate) fn set_tracking(
+        &self,
+        syntax: Rc<std::cell::RefCell<super::incremental::SyntaxQueries>>,
+        paths: HashMap<UnitId, std::path::PathBuf>,
+    ) {
+        *self.tracking.borrow_mut() = Some(ScopeTracking { syntax, paths });
+    }
+
+    fn track_scope(&self, unit: UnitId, symbols: &SymbolTable) -> Result<()> {
+        let tracking = self.tracking.borrow();
+        let Some(tracking) = tracking.as_ref() else {
+            return Ok(());
+        };
+        let Some(path) = tracking.paths.get(&unit) else {
+            return Ok(());
+        };
+        let canonical = super::syntax::without_spans(&serde_json::to_value(symbols)?);
+        tracking
+            .syntax
+            .borrow_mut()
+            .visible_scope(unit, path, canonical)?;
+        Ok(())
     }
 
     /// Record the declarations a checker holds right after prelude
@@ -191,6 +221,7 @@ impl DeclarationQueries {
                 .map(|record| *record)
         })?;
         if fresh {
+            self.track_scope(unit, symbols)?;
             Ok(symbols.fork_body_scope())
         } else {
             self.visible_scope(unit)
@@ -246,6 +277,11 @@ impl DeclarationQueries {
     }
 
     pub(crate) fn visible_scope(&self, unit: UnitId) -> Result<SymbolTable> {
+        if let Some(tracking) = self.tracking.borrow().as_ref()
+            && let Some(path) = tracking.paths.get(&unit)
+        {
+            tracking.syntax.borrow().read_visible_scope(unit, path)?;
+        }
         let record = self.module_declarations(unit)?;
         let mut scope = record.scope;
         for id in record.functions {

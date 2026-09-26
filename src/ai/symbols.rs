@@ -37,9 +37,9 @@ pub(super) fn owners(program: &Program) -> Vec<(Span, String)> {
                         owners.push((m.span, format!("{}::{}", c.name, m.name)));
                     }
                 }
-                for init in &c.constructors {
+                for (ordinal, init) in c.constructors.iter().enumerate() {
                     if c.span.contains(init.span) {
-                        owners.push((init.span, format!("{}::init@{}", c.name, init.span.start)));
+                        owners.push((init.span, format!("{}::init#{ordinal}", c.name)));
                     }
                 }
             }
@@ -283,6 +283,72 @@ pub(super) fn finish(
             callable.insert((l.path.as_str(), l.start, l.end), f.id.as_str());
         }
     }
+    let ranges: Vec<_> = captures
+        .values()
+        .flat_map(|unit| &unit.symbol_owners)
+        .filter_map(|(span, owner)| {
+            Some((
+                Location {
+                    path: paths.get(&crate::module::ModuleId(span.file_id.0))?.clone(),
+                    start: span.start,
+                    end: span.end,
+                },
+                owner.clone(),
+            ))
+        })
+        .collect();
+    let declaration_key = |d: &Declaration| {
+        (
+            d.span.file_id.0,
+            d.span.start,
+            d.span.end,
+            d.kind.clone(),
+            d.name.rsplit("::").next().unwrap_or(&d.name).to_owned(),
+        )
+    };
+    let declarations: HashMap<_, _> = captures
+        .values()
+        .flat_map(|unit| {
+            unit.symbols
+                .declarations
+                .iter()
+                .chain(unit.symbols.members.iter().map(|(_, d)| d))
+                .chain(unit.symbols.references.iter().map(|r| &r.target))
+        })
+        .map(|declaration| (declaration_key(declaration), declaration))
+        .collect();
+    let mut declarations: Vec<_> = declarations.into_values().collect();
+    declarations.sort_by_cached_key(|d| declaration_key(d));
+    let points: Vec<_> = declarations
+        .iter()
+        .map(|d| Location {
+            path: paths
+                .get(&crate::module::ModuleId(d.span.file_id.0))
+                .cloned()
+                .unwrap_or_default(),
+            start: d.span.start,
+            end: d.span.end,
+        })
+        .collect();
+    let owners = crate::compiler_db::references::owners(&points, &ranges);
+    let mut ordinals = HashMap::<(String, String, String), usize>::new();
+    let mut identities = HashMap::new();
+    for (d, owner) in declarations.into_iter().zip(owners) {
+        let key = (
+            owner,
+            d.kind.clone(),
+            d.name.rsplit("::").next().unwrap_or(&d.name).to_owned(),
+        );
+        let ordinal = ordinals.entry(key.clone()).or_default();
+        identities.insert(
+            declaration_key(d),
+            format!(
+                "symbol:{}",
+                serde_json::to_string(&(key, *ordinal)).expect("symbol identity serializes")
+            ),
+        );
+        *ordinal += 1;
+    }
     let mut symbols = BTreeMap::new();
     let mut register = |d: &Declaration| {
         let location = select(d.span, &d.name, false, names, paths);
@@ -297,7 +363,7 @@ pub(super) fn finish(
         let id = function
             .map(str::to_owned)
             .unwrap_or_else(|| match &location {
-                Some(l) => format!("symbol:{}:{}:{}:{}", l.path, l.start, l.end, d.kind),
+                Some(_) => identities[&declaration_key(d)].clone(),
                 None => format!("builtin:{}:{}", d.kind, d.name),
             });
         symbols.entry(id.clone()).or_insert_with(|| Symbol {

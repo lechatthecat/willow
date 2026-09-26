@@ -356,10 +356,7 @@ impl TypeChecker {
     /// importers even though both now agree on the enum's identity
     /// (willow-itcw).
     pub(super) fn enum_nameable_bare(&self, identity: &str) -> bool {
-        self.symbols
-            .enums
-            .iter()
-            .any(|(alias, info)| !alias.to_string().contains("::") && info.name == identity)
+        self.symbols.enum_nameable_bare(identity)
     }
 
     /// Check a name as written in source, before normalization turns an alias

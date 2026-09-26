@@ -472,7 +472,7 @@ fn run_frontend_with_inputs(
     inputs: compiler_db::inputs::CompilerInputs,
     emitter: &mut dyn diagnostics::DiagnosticEmitter,
 ) -> Result<Frontend> {
-    run_frontend_revision(source, root, map, inputs, emitter, None, false)
+    run_frontend_revision(source, root, map, inputs, emitter, None, None)
 }
 
 fn run_frontend_revision(
@@ -482,10 +482,14 @@ fn run_frontend_revision(
     inputs: compiler_db::inputs::CompilerInputs,
     emitter: &mut dyn diagnostics::DiagnosticEmitter,
     previous: Option<&Frontend>,
-    incremental: bool,
+    syntax_queries: Option<
+        std::rc::Rc<std::cell::RefCell<compiler_db::incremental::SyntaxQueries>>,
+    >,
 ) -> Result<Frontend> {
     let mut artifacts = module::artifacts::UnitArtifacts::new()?;
+    let incremental = syntax_queries.is_some();
     artifacts.revision_enabled = incremental;
+    artifacts.syntax_queries = syntax_queries;
     if let Some(previous) = previous {
         let old = previous
             .module_graph
@@ -500,29 +504,52 @@ fn run_frontend_revision(
     let ParsePhase {
         mut program,
         outcome: parse,
-    } = match artifacts.cached_parse(diagnostics::FileId::ENTRY, source)? {
-        Some(program) => ParsePhase {
+    } = if let Some(queries) = &artifacts.syntax_queries {
+        let (program, diagnostics, lexer_failed) = queries.borrow_mut().parse(
+            std::path::Path::new(&map.path),
+            diagnostics::FileId::ENTRY,
+            source,
+        )?;
+        if lexer_failed {
+            for diagnostic in &diagnostics {
+                emitter.emit(diagnostic, map)?;
+            }
+            anyhow::bail!("aborting due to {} lexer error(s)", diagnostics.len());
+        }
+        ParsePhase {
             program,
-            outcome: PhaseDiagnostics::new(Vec::new()),
-        },
-        None => {
-            let tokens = match lex_phase(source) {
-                Ok(tokens) => tokens,
-                Err(errors) => {
-                    for diagnostic in errors.iter() {
-                        emitter.emit(diagnostic, map)?;
+            outcome: PhaseDiagnostics::new(diagnostics),
+        }
+    } else {
+        match artifacts.cached_parse(diagnostics::FileId::ENTRY, source)? {
+            Some(program) => ParsePhase {
+                program,
+                outcome: PhaseDiagnostics::new(Vec::new()),
+            },
+            None => {
+                let tokens = match lex_phase(source) {
+                    Ok(tokens) => tokens,
+                    Err(errors) => {
+                        for diagnostic in errors.iter() {
+                            emitter.emit(diagnostic, map)?;
+                        }
+                        anyhow::bail!("aborting due to {} lexer error(s)", errors.len());
                     }
-                    anyhow::bail!("aborting due to {} lexer error(s)", errors.len());
-                }
-            };
-            parse_phase(tokens)
+                };
+                parse_phase(tokens)
+            }
         }
     };
     for diagnostic in &parse.diagnostics {
         emitter.emit(diagnostic, map)?;
     }
     if incremental && parse.diagnostics.is_empty() {
-        artifacts.retain_parse(diagnostics::FileId::ENTRY, source, &program)?;
+        artifacts.retain_parse(
+            diagnostics::FileId::ENTRY,
+            std::path::Path::new(&map.path),
+            source,
+            &mut program,
+        )?;
     }
     artifacts.snapshot_source(diagnostics::FileId::ENTRY, source)?;
     artifacts.offload(&mut program)?;
@@ -600,6 +627,7 @@ fn run_frontend_revision(
     }
     artifacts.body_index_mut().finish_revision();
     artifacts.previous_parsed = None;
+    let syntax_queries = artifacts.syntax_queries.take();
     let db = compiler_db::CompilerDb::with_dependencies(
         inputs,
         &graph.files,
@@ -607,11 +635,50 @@ fn run_frontend_revision(
         std::rc::Rc::clone(&artifacts.store),
         desugar_dependencies,
     );
+    if let Some(queries) = syntax_queries {
+        db.references.set_tracking(&queries);
+        let mut paths: std::collections::HashMap<_, _> = graph
+            .files
+            .iter()
+            .map(|module| (module.id, module.path.clone()))
+            .collect();
+        paths.insert(module::UnitId::ENTRY, std::path::PathBuf::from(&map.path));
+        db.declarations
+            .set_tracking(std::rc::Rc::clone(&queries), paths);
+        db.lir.set_tracking(
+            std::rc::Rc::clone(&queries),
+            std::rc::Rc::clone(&db.typed_bodies),
+        );
+        db.layouts.set_tracking(std::rc::Rc::clone(&queries));
+        db.effects.set_tracking(
+            std::rc::Rc::clone(&queries),
+            std::rc::Rc::clone(&artifacts.bodies),
+            std::rc::Rc::clone(&db.typed_bodies),
+        );
+        let owners = compiler_db::revision::tracked_body_owners(
+            std::path::Path::new(&map.path),
+            &graph.files,
+            &artifacts,
+        );
+        db.typed_bodies.configure_tracking(queries, owners);
+    }
     if let Some(previous) = previous {
         let reusable =
             compiler_db::revision::reusable_units(previous, &graph.files, &artifacts, &db);
-        db.typed_bodies
-            .reuse_from(&previous.db.typed_bodies, &reusable)?;
+        db.effects.reuse_from(&previous.db.effects);
+        let candidates = compiler_db::revision::candidate_bodies(
+            previous,
+            &graph.files,
+            &artifacts,
+            &db,
+            &reusable,
+        );
+        db.typed_bodies.set_module_gate(reusable);
+        db.typed_bodies.reuse_body_candidates(
+            &previous.db.typed_bodies,
+            &candidates,
+            &artifacts.correspondence,
+        )?;
     }
     if db.inputs().capture_analysis {
         *db.effects.analysis.borrow_mut() = Some(Default::default());

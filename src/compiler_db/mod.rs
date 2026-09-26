@@ -8,14 +8,17 @@ pub(crate) mod declarations;
 pub(crate) mod dependencies;
 pub(crate) mod effects;
 pub mod ids;
+pub(crate) mod incremental;
 pub mod inputs;
 pub(crate) mod layout;
 pub(crate) mod lir;
 mod lir_artifact;
 pub(crate) mod normalize;
 pub mod query;
+pub(crate) mod references;
 pub mod revision;
 pub mod scope;
+pub(crate) mod syntax;
 pub(crate) mod tracked;
 pub use checked::CheckedUnit;
 pub type HelperSummary = std::collections::HashMap<
@@ -39,6 +42,7 @@ pub struct CompilerDb {
     inputs: inputs::CompilerInputs,
     scopes: scope::ScopeQueries,
     pub(crate) declarations: std::rc::Rc<declarations::DeclarationQueries>,
+    pub(crate) references: references::ReferenceQueries,
     pub(crate) effects: std::rc::Rc<effects::EffectQueries>,
     pub(crate) layouts: std::rc::Rc<layout::LayoutQueries>,
     pub(crate) typed_bodies: std::rc::Rc<body::BodyQueries>,
@@ -59,6 +63,7 @@ impl CompilerDb {
     ) -> Self {
         let dependencies = std::rc::Rc::new(dependencies);
         Self {
+            references: Default::default(),
             scopes: scope::ScopeQueries::new(std::rc::Rc::clone(&store)),
             declarations: std::rc::Rc::new(declarations::DeclarationQueries::new(
                 std::rc::Rc::clone(&store),
@@ -208,7 +213,16 @@ pub(crate) mod map_entries {
         map: &HashMap<K, V>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(map.iter())
+        let mut entries = map
+            .iter()
+            .map(|(key, value)| {
+                serde_json::to_vec(key)
+                    .map(|order| (order, key, value))
+                    .map_err(serde::ser::Error::custom)
+            })
+            .collect::<Result<Vec<_>, S::Error>>()?;
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        serializer.collect_seq(entries.into_iter().map(|(_, key, value)| (key, value)))
     }
 
     pub fn deserialize<

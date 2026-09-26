@@ -11,10 +11,59 @@ use std::{
 
 type Type = crate::parser::ast::Type<TypeId>;
 
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
 struct ClassLayoutDeclaration {
     base: Option<TypeId>,
     fields: Vec<(String, Type)>,
     methods: Vec<String>,
+}
+
+#[derive(Clone, PartialEq)]
+struct TrackedLayout {
+    fields: Arc<Vec<(String, Type)>>,
+    slots: Arc<MethodSlots>,
+}
+impl Eq for TrackedLayout {}
+
+struct LayoutProvider;
+impl super::tracked::QueryProvider for LayoutProvider {
+    fn compute(
+        &self,
+        table: &super::tracked::TrackedQueryTable,
+        node: &super::tracked::QueryNode,
+    ) -> Result<super::tracked::QueryValue> {
+        use super::tracked::{InputNode, QueryNode, QueryValue, ResultFingerprint};
+        if let QueryNode::InterfaceLayout(id) = node {
+            return table.input(&InputNode::InterfaceDeclaration(*id));
+        }
+        let QueryNode::ClassLayout(id) = node else {
+            anyhow::bail!("unexpected layout query {node:?}")
+        };
+        let input = table.input(&InputNode::LayoutDeclaration(*id))?;
+        let declaration = input.get::<ClassLayoutDeclaration>();
+        let parent = declaration
+            .base
+            .map(|id| table.read(self, QueryNode::ClassLayout(id)))
+            .transpose()?;
+        let parent = parent.as_ref().map(|v| v.get::<TrackedLayout>());
+        let mut fields = parent.map(|p| (*p.fields).clone()).unwrap_or_default();
+        let mut names: HashSet<_> = fields.iter().map(|(name, _)| name.clone()).collect();
+        for (name, ty) in &declaration.fields {
+            if names.insert(name.clone()) {
+                fields.push((name.clone(), ty.clone()));
+            }
+        }
+        let mut slots = parent.map(|p| (*p.slots).clone()).unwrap_or_default();
+        for name in &declaration.methods {
+            slots.insert(name);
+        }
+        let fingerprint = ResultFingerprint::bytes(&serde_json::to_vec(&(&fields, &slots))?);
+        let result = TrackedLayout {
+            fields: Arc::new(fields),
+            slots: Arc::new(slots),
+        };
+        Ok(QueryValue::new(result, fingerprint))
+    }
 }
 
 /// One canonical class on one target: the key of every byte-level layout
@@ -88,6 +137,7 @@ impl ObjectLayout {
 }
 
 pub(crate) struct LayoutQueries {
+    tracking: RefCell<Option<std::rc::Rc<RefCell<super::incremental::SyntaxQueries>>>>,
     declarations: RefCell<HashMap<TypeId, ClassLayoutDeclaration>>,
     pending: RefCell<HashSet<TypeId>>,
     completed: RefCell<HashSet<TypeId>>,
@@ -107,6 +157,7 @@ pub(crate) struct LayoutQueries {
 impl Default for LayoutQueries {
     fn default() -> Self {
         let queries = Self {
+            tracking: Default::default(),
             declarations: Default::default(),
             pending: Default::default(),
             completed: Default::default(),
@@ -146,6 +197,12 @@ impl Default for LayoutQueries {
 }
 
 impl LayoutQueries {
+    pub(crate) fn set_tracking(
+        &self,
+        queries: std::rc::Rc<RefCell<super::incremental::SyntaxQueries>>,
+    ) {
+        *self.tracking.borrow_mut() = Some(queries);
+    }
     pub(crate) fn has_class(&self, id: TypeId) -> bool {
         self.declarations.borrow().contains_key(&id)
     }
@@ -280,6 +337,27 @@ impl LayoutQueries {
                 let parent = declaration
                     .base
                     .filter(|base| declarations.contains_key(base));
+                if let Some(queries) = self.tracking.borrow().as_ref() {
+                    use super::tracked::{InputNode, QueryNode, QueryValue, ResultFingerprint};
+                    let mut captured = declaration.clone();
+                    captured.base = parent;
+                    let fingerprint = ResultFingerprint::bytes(&serde_json::to_vec(&captured)?);
+                    queries.borrow_mut().capture_input(
+                        InputNode::LayoutDeclaration(id),
+                        QueryValue::new(captured, fingerprint),
+                    )?;
+                    let value = queries
+                        .borrow()
+                        .read_with(&LayoutProvider, QueryNode::ClassLayout(id))?;
+                    let value = value.get::<TrackedLayout>();
+                    self.fields.seed_shared(id, Arc::clone(&value.fields));
+                    self.slots.seed_shared(id, Arc::clone(&value.slots));
+                    completed.insert(id);
+                    visiting.remove(&id);
+                    pending.remove(&id);
+                    results.push(id);
+                    continue;
+                }
                 let parent_fields = parent
                     .map(|base| {
                         self.fields
@@ -364,6 +442,21 @@ impl LayoutQueries {
         self.interfaces.query(id, || {
             let info = compute();
             anyhow::ensure!(info.name == id, "interface query identity mismatch");
+            if let Some(queries) = self.tracking.borrow().as_ref() {
+                use super::tracked::{InputNode, QueryNode, QueryValue, ResultFingerprint};
+                // The composed header includes inherited member signatures.
+                // Keep current spans in the frozen record, but exclude them
+                // from semantic query equality, as for class declarations.
+                let value = super::syntax::semantic(&serde_json::to_value(&info)?);
+                let fingerprint = ResultFingerprint::bytes(&serde_json::to_vec(&value)?);
+                queries.borrow_mut().capture_input(
+                    InputNode::InterfaceDeclaration(id),
+                    QueryValue::new(value, fingerprint),
+                )?;
+                queries
+                    .borrow()
+                    .read_with(&LayoutProvider, QueryNode::InterfaceLayout(id))?;
+            }
             Ok(info)
         })
     }
@@ -444,6 +537,118 @@ impl LayoutQueries {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tracked_interface_layout_ignores_bodies_and_positions_but_tracks_signatures() {
+        use crate::compiler_db::incremental::SyntaxQueries;
+        use std::rc::Rc;
+        let mut accepted = SyntaxQueries::default();
+        for (step, source) in [
+            "interface I { fn get(self) -> i64 { return 1; } }",
+            "\ninterface I { fn get(self) -> i64 { return 2; } }",
+            "\n\ninterface I { fn get(self) -> String { return \"new\"; } }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (mut program, errors) =
+                crate::parser::Parser::new(crate::lexer::Lexer::new(source).tokenize().unwrap())
+                    .parse();
+            assert!(errors.is_empty());
+            assert!(
+                crate::desugar::DesugarPass::run(&mut program, &mut [])
+                    .diagnostics
+                    .is_empty()
+            );
+            let mut checker = crate::semantic::TypeChecker::new();
+            checker.check_program(&program);
+            assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+            let info = checker.symbols.lookup_interface("I").unwrap().to_semantic();
+            let tracking = Rc::new(RefCell::new(accepted.candidate().unwrap()));
+            let layouts = LayoutQueries::default();
+            layouts.set_tracking(Rc::clone(&tracking));
+            let id = TypeId::local("I");
+            let frozen = layouts.interface_composition(id, || info.clone()).unwrap();
+            assert_eq!(*frozen, info, "current declaration coordinates");
+            let stats = tracking.borrow().stats();
+            assert_eq!(stats.recomputed, usize::from(step != 1));
+            assert_eq!(stats.changed, usize::from(step != 1));
+            assert!(Arc::ptr_eq(&frozen, &layouts.interface(id).unwrap()));
+            assert_eq!(tracking.borrow().stats(), stats, "frozen emission read");
+            drop(layouts);
+            accepted = Rc::try_unwrap(tracking).unwrap().into_inner();
+        }
+    }
+
+    #[test]
+    fn tracked_layouts_reuse_and_invalidate_only_inheritance_consumers() {
+        use super::*;
+        use crate::compiler_db::incremental::SyntaxQueries;
+        use std::rc::Rc;
+        for size in [16, 64, 256] {
+            let mut accepted = SyntaxQueries::default();
+            for revision in 0..3 {
+                let tracking = Rc::new(RefCell::new(accepted.candidate().unwrap()));
+                let layouts = LayoutQueries::default();
+                layouts.set_tracking(Rc::clone(&tracking));
+                let base = TypeId::local("Base");
+                layouts.register_class(
+                    base,
+                    None,
+                    vec![(
+                        "value".into(),
+                        if revision < 2 {
+                            Type::I64
+                        } else {
+                            Type::String
+                        },
+                    )],
+                    vec!["get".into()],
+                );
+                let child = TypeId::local("Child");
+                layouts.register_class(
+                    child,
+                    Some(base),
+                    vec![],
+                    vec!["get".into(), "other".into()],
+                );
+                for i in 0..size {
+                    layouts.register_class(
+                        TypeId::local(format!("Unrelated{i}")),
+                        None,
+                        vec![],
+                        vec![],
+                    );
+                }
+                layouts.complete_pending_classes().unwrap();
+                let stats = tracking.borrow().stats();
+                assert_eq!(
+                    stats.recomputed,
+                    match revision {
+                        0 => size + 2,
+                        1 => 0,
+                        _ => 2,
+                    }
+                );
+                assert_eq!(layouts.slots(child).unwrap().as_slice(), ["get", "other"]);
+                let object = layouts
+                    .object_layout(TargetLayoutKey::new(child, 8))
+                    .unwrap();
+                assert_eq!(object.size_bytes(), 16);
+                assert_eq!(object.field("value").unwrap().0, 8);
+                assert_eq!(
+                    tracking.borrow().stats(),
+                    stats,
+                    "backend frozen reads record no edges"
+                );
+                println!(
+                    "tracked-layouts unrelated={size} revision={revision} recomputed={} edges={}",
+                    stats.recomputed, stats.dependency_edges_visited
+                );
+                drop(layouts);
+                accepted = Rc::try_unwrap(tracking).unwrap().into_inner();
+            }
+        }
+    }
     use super::*;
 
     /// The builtin layouts every `LayoutQueries` starts with: `PanicInfo`'s
