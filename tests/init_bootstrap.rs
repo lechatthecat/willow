@@ -31,10 +31,7 @@ impl Drop for Fixture {
 }
 #[test]
 fn init_new_current_and_named_projects_check() {
-    for args in [
-        vec!["init", "basic", "--ai", "none"],
-        vec!["init", ".", "--name", "basic", "--ai", "none"],
-    ] {
+    for args in [vec!["init", "basic"], vec!["init", ".", "--name", "basic"]] {
         let f = Fixture::new();
         let output = f.run(&args);
         assert!(
@@ -81,7 +78,7 @@ fn invalid_reserved_and_existing_manifest_are_untouched() {
         "bad name", "my-app", "1bad", "std", "std.foo", "std::foo", "",
     ] {
         let f = Fixture::new();
-        let result = f.run(&["init", "new", "--name", name, "--ai", "none"]);
+        let result = f.run(&["init", "new", "--name", name]);
         assert!(!result.status.success());
         assert!(String::from_utf8_lossy(&result.stderr).contains("--name"));
         assert!(!f.0.join("new").exists());
@@ -131,85 +128,41 @@ fn preserves_main_and_rolls_back_partial_failure() {
 }
 
 #[test]
-fn ai_selection_is_explicit_and_non_tty_auto_is_silent() {
-    for (selection, codex, claude) in [
-        ("none", false, false),
-        ("auto", false, false),
-        ("codex", true, false),
-        ("claude", false, true),
-        ("codex,claude", true, true),
-        ("all", true, true),
-    ] {
-        let f = Fixture::new();
-        let out = f.run(&["init", ".", "--ai", selection]);
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert_eq!(f.0.join("AGENTS.md").exists(), codex);
-        assert_eq!(f.0.join("CLAUDE.md").exists(), claude);
-        if codex {
-            let text = fs::read_to_string(f.0.join("AGENTS.md")).unwrap();
-            if claude {
-                assert_eq!(text, "Read and follow the instructions in CLAUDE.md.\n");
-                assert!(f.run(&["agent", "sync", "--yes"]).status.success());
-                assert_eq!(fs::read_to_string(f.0.join("AGENTS.md")).unwrap(), text);
-            } else {
-                assert!(text.contains("# Willow instructions for codex"));
-            }
-        }
-        assert!(!String::from_utf8_lossy(&out.stdout).contains("[Y/n]"));
-        assert!(!String::from_utf8_lossy(&out.stdout).contains("[y/N]"));
-    }
-}
+fn init_never_writes_agent_instruction_files() {
+    let f = Fixture::new();
+    let out = f.run(&["init", "."]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!f.0.join("AGENTS.md").exists());
+    assert!(!f.0.join("CLAUDE.md").exists());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("[Y/n]"));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("[y/N]"));
 
-#[test]
-fn reference_requires_both_instruction_files_to_be_new() {
-    for existing in ["CLAUDE.md", "AGENTS.md"] {
-        let f = Fixture::new();
-        fs::write(f.0.join(existing), "User text\r\n").unwrap();
-        assert!(
-            f.run(&["init", ".", "--ai", "all", "--yes"])
-                .status
-                .success()
-        );
-        assert_eq!(fs::read(f.0.join(existing)).unwrap(), b"User text\r\n");
-        let (new_file, agent) = if existing == "CLAUDE.md" {
-            ("AGENTS.md", "codex")
-        } else {
-            ("CLAUDE.md", "claude")
-        };
-        assert!(
-            fs::read_to_string(f.0.join(new_file))
-                .unwrap()
-                .contains(&format!("# Willow instructions for {agent}"))
-        );
-    }
-}
-
-#[test]
-fn existing_ai_files_preserved_and_ai_failure_rolls_back_project() {
     let f = Fixture::new();
     for name in ["AGENTS.md", "CLAUDE.md"] {
         fs::write(f.0.join(name), "User text\r\n").unwrap();
     }
-    assert!(
-        f.run(&["init", ".", "--ai", "all", "--yes"])
-            .status
-            .success()
-    );
+    assert!(f.run(&["init", "."]).status.success());
     for name in ["AGENTS.md", "CLAUDE.md"] {
         assert_eq!(fs::read(f.0.join(name)).unwrap(), b"User text\r\n");
     }
-    let f = Fixture::new();
-    fs::create_dir(f.0.join("AGENTS.md")).unwrap();
-    assert!(!f.run(&["init", ".", "--ai", "all"]).status.success());
-    assert!(!f.0.join("project.toml").exists());
-    assert!(!f.0.join("src").exists());
-    assert!(!f.0.join(".gitignore").exists());
-    assert!(!f.0.join("CLAUDE.md").exists());
-    assert!(f.0.join("AGENTS.md").is_dir());
+
+    for args in [
+        ["init", ".", "--ai", "all"].as_slice(),
+        &["init", ".", "--ai=codex"],
+        &["init", ".", "--yes"],
+    ] {
+        let f = Fixture::new();
+        let out = f.run(args);
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("unknown init argument"));
+        assert!(!f.0.join("project.toml").exists());
+        assert!(!f.0.join("AGENTS.md").exists());
+        assert!(!f.0.join("CLAUDE.md").exists());
+    }
 }
 
 #[test]
@@ -268,13 +221,13 @@ fn malformed_managed_blocks_are_rejected_without_writes() {
 }
 
 #[test]
-fn parent_components_resolve_for_project_and_ai_files() {
+fn parent_components_resolve_for_project_files() {
     for path in ["demo/child/..", "new/../demo", "new/a/../../demo"] {
         let f = Fixture::new();
         if path.starts_with("demo/") {
             fs::create_dir_all(f.0.join("demo/child")).unwrap();
         }
-        let out = f.run(&["init", path, "--ai", "all"]);
+        let out = f.run(&["init", path]);
         assert!(
             out.status.success(),
             "{}",
@@ -286,15 +239,15 @@ fn parent_components_resolve_for_project_and_ai_files() {
                 .unwrap()
                 .contains("name = \"demo\"")
         );
-        assert!(root.join("AGENTS.md").is_file());
-        assert!(root.join("CLAUDE.md").is_file());
+        assert!(!root.join("AGENTS.md").exists());
+        assert!(!root.join("CLAUDE.md").exists());
         assert!(!f.0.join("new").exists());
     }
     let f = Fixture::new();
     fs::create_dir_all(f.0.join("demo/child")).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_willow"))
         .current_dir(f.0.join("demo/child"))
-        .args(["init", "..", "--ai", "none"])
+        .args(["init", ".."])
         .output()
         .unwrap();
     assert!(
@@ -315,14 +268,14 @@ fn parent_components_follow_existing_symlinks() {
     let f = Fixture::new();
     fs::create_dir_all(f.0.join("actual/child")).unwrap();
     std::os::unix::fs::symlink("actual/child", f.0.join("link")).unwrap();
-    let out = f.run(&["init", "link/../new/../demo", "--ai", "all"]);
+    let out = f.run(&["init", "link/../new/../demo"]);
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(f.0.join("actual/demo/project.toml").is_file());
-    assert!(f.0.join("actual/demo/AGENTS.md").is_file());
+    assert!(!f.0.join("actual/demo/AGENTS.md").exists());
     assert!(!f.0.join("demo").exists());
 }
 
@@ -405,15 +358,15 @@ fn concurrent_readers_only_observe_complete_new_files() {
 #[test]
 fn generated_snapshot_query_and_callers_workflow_executes_and_detects_staleness() {
     let f = Fixture::new();
-    assert!(f.run(&["init", ".", "--ai", "all"]).status.success());
+    assert!(f.run(&["init", "."]).status.success());
     fs::write(
         f.0.join("src/main.wi"),
         "fn leaf() {} fn main() { leaf(); }",
     )
     .unwrap();
-    let markdown = fs::read_to_string(f.0.join("CLAUDE.md")).unwrap();
     let display = f.run(&["agent", "instructions", "claude"]);
-    assert_eq!(display.stdout, markdown.as_bytes());
+    assert!(display.status.success());
+    let markdown = String::from_utf8(display.stdout).unwrap();
 
     let run = |command: &str| {
         let args: Vec<_> = command.split_whitespace().skip(1).collect();
@@ -532,11 +485,11 @@ fn sync_validates_both_files_before_writing_and_leaves_missing_files_absent() {
 #[test]
 fn hyphenated_directory_requires_valid_explicit_name() {
     let f = Fixture::new();
-    let result = f.run(&["init", "my-app", "--ai", "none"]);
+    let result = f.run(&["init", "my-app"]);
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("--name"));
     assert!(!f.0.join("my-app").exists());
-    let result = f.run(&["init", "my-app", "--name", "my_app", "--ai", "none"]);
+    let result = f.run(&["init", "my-app", "--name", "my_app"]);
     assert!(
         result.status.success(),
         "{}",

@@ -1,9 +1,7 @@
 use anyhow::{Context, Result};
 use std::{
-    collections::HashSet,
-    ffi::OsStr,
     io::{BufRead, IsTerminal, Write},
-    path::{Path, PathBuf},
+    path::Path,
 };
 use willow_compiler::project::{
     agent::{
@@ -57,64 +55,6 @@ pub(super) fn ask<R: BufRead, W: Write>(
             _ => writeln!(output, "Please enter yes or no.")?,
         }
     }
-}
-
-/// PATH-only lookup; no agent subprocesses and no global environment mutation.
-pub(super) fn detect(
-    paths: impl IntoIterator<Item = PathBuf>,
-    extensions: &[String],
-    windows: bool,
-) -> [bool; 2] {
-    let mut found = [false; 2];
-    let mut seen = HashSet::new();
-    let mut suffixes: Vec<&str> = vec![""];
-    if windows {
-        suffixes.extend(extensions.iter().map(String::as_str));
-    }
-    for path in paths {
-        if !seen.insert(path.clone()) {
-            continue;
-        }
-        for (i, agent) in [Agent::Claude, Agent::Codex].into_iter().enumerate() {
-            if found[i] {
-                continue;
-            }
-            for suffix in &suffixes {
-                let file = path.join(format!("{}{suffix}", agent.name()));
-                if let Ok(metadata) = file.metadata() {
-                    if !metadata.is_file() {
-                        continue;
-                    }
-                    #[cfg(unix)]
-                    let executable = {
-                        use std::os::unix::fs::PermissionsExt;
-                        windows || metadata.permissions().mode() & 0o111 != 0
-                    };
-                    #[cfg(not(unix))]
-                    let executable = true;
-                    if executable {
-                        found[i] = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if found.iter().all(|v| *v) {
-            break;
-        }
-    }
-    found
-}
-pub(super) fn detected() -> [bool; 2] {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let extensions: Vec<_> = std::env::var_os("PATHEXT")
-        .unwrap_or_else(|| OsStr::new(".COM;.EXE;.BAT;.CMD").to_owned())
-        .to_string_lossy()
-        .split(';')
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect();
-    detect(std::env::split_paths(&path), &extensions, cfg!(windows))
 }
 
 #[derive(Debug)]
@@ -267,49 +207,6 @@ mod tests {
         assert!(!ask(&mut input, &mut output, "Agent?", true, false).unwrap());
         assert!(output.is_empty());
         assert_eq!(input, b"yes\n");
-    }
-    #[test]
-    fn path_detection_none_each_both_duplicates_and_windows_extensions() {
-        let root = std::env::temp_dir().join(format!("willow_agent_detect_{}", std::process::id()));
-        std::fs::create_dir(&root).unwrap();
-        assert_eq!(detect([root.clone()], &[], false), [false, false]);
-        let executable = |name: &str| {
-            let path = root.join(name);
-            std::fs::write(&path, "never run this").unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
-        };
-        executable("codex");
-        assert_eq!(detect([root.clone()], &[], false), [false, true]);
-        std::fs::remove_file(root.join("codex")).unwrap();
-        executable("claude");
-        assert_eq!(detect([root.clone()], &[], false), [true, false]);
-        executable("codex");
-        assert_eq!(
-            detect([root.clone(), root.clone()], &[], false),
-            [true, true]
-        );
-        std::fs::remove_file(root.join("codex")).unwrap();
-        std::fs::remove_file(root.join("claude")).unwrap();
-        std::fs::write(root.join("codex.EXE"), "fake").unwrap();
-        std::fs::write(root.join("claude.CMD"), "fake").unwrap();
-        assert_eq!(
-            detect(
-                [root.clone()],
-                &[".EXE".into(), ".CMD".into(), ".BAT".into()],
-                true
-            ),
-            [true, true]
-        );
-        #[cfg(unix)]
-        {
-            std::fs::write(root.join("codex"), "not executable").unwrap();
-            assert_eq!(detect([root.clone()], &[], false), [false, false]);
-        }
-        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn current_commands_are_from_protocol_and_parse() {
