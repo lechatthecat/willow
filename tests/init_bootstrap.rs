@@ -73,7 +73,9 @@ fn init_new_current_and_named_projects_check() {
 }
 #[test]
 fn invalid_reserved_and_existing_manifest_are_untouched() {
-    for name in ["bad name", "1bad", "std", "std.foo", "std::foo", ""] {
+    for name in [
+        "bad name", "my-app", "1bad", "std", "std.foo", "std::foo", "",
+    ] {
         let f = Fixture::new();
         let result = f.run(&["init", "new", "--name", name, "--ai", "none"]);
         assert!(!result.status.success());
@@ -482,4 +484,23 @@ fn sync_validates_both_files_before_writing_and_leaves_missing_files_absent() {
     fs::write(f.0.join("AGENTS.md"), "<!-- BEGIN WILLOW MANAGED -->").unwrap();
     assert!(!f.run(&["agent", "sync", "--yes"]).status.success());
     assert_eq!(fs::read_to_string(f.0.join("CLAUDE.md")).unwrap(), old);
+}
+#[test]
+fn hyphenated_directory_requires_valid_explicit_name() {
+    let f = Fixture::new();
+    let result = f.run(&["init", "my-app", "--ai", "none"]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("--name"));
+    assert!(!f.0.join("my-app").exists());
+    let result = f.run(&["init", "my-app", "--name", "my_app", "--ai", "none"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        fs::read_to_string(f.0.join("my-app/project.toml"))
+            .unwrap()
+            .contains(r#"name = "my_app""#)
+    );
 }

@@ -29,8 +29,8 @@ pub fn manifest(name: &str) -> Result<String> {
         chars
             .next()
             .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
-            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-')),
-        "invalid project name; help: use --name with letters, digits, underscores or hyphens, starting with a letter or underscore"
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == b'_'),
+        "invalid project name; help: use --name with letters, digits or underscores, starting with a letter or underscore"
     );
     Ok(format!(
         "[willow]\nmanifest-version = 1\n\n[project]\nname = \"{name}\"\nversion = \"0.1.0\"\nentry = \"src/main.wi\"\n\n[dependencies]\n"

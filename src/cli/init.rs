@@ -77,7 +77,7 @@ impl InitCommand {
                 "auto" => ask(
                     &mut std::io::stdin().lock(),
                     &mut std::io::stdout().lock(),
-                    &format!("Generate {} instructions?", agent.name()),
+                    &instruction_prompt(agent, detected[index]),
                     detected[index],
                     tty,
                 )?,
@@ -135,5 +135,48 @@ impl InitCommand {
         scaffold.commit();
         println!("Created Willow project");
         Ok(())
+    }
+}
+
+fn instruction_prompt(agent: Agent, detected: bool) -> String {
+    let name = match agent {
+        Agent::Claude => "Claude Code",
+        Agent::Codex => "Codex",
+    };
+    let status = if detected { "detected" } else { "not detected" };
+    format!("{name} {status}.\nCreate {}?", agent.file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instruction_prompts_show_detection_file_and_default() {
+        for (agent, name, file) in [
+            (Agent::Claude, "Claude Code", "CLAUDE.md"),
+            (Agent::Codex, "Codex", "AGENTS.md"),
+        ] {
+            for detected in [false, true] {
+                let mut output = Vec::new();
+                assert_eq!(
+                    ask(
+                        &mut "\n".as_bytes(),
+                        &mut output,
+                        &instruction_prompt(agent, detected),
+                        detected,
+                        true,
+                    )
+                    .unwrap(),
+                    detected
+                );
+                let status = if detected { "detected" } else { "not detected" };
+                let default = if detected { "[Y/n]" } else { "[y/N]" };
+                assert_eq!(
+                    String::from_utf8(output).unwrap(),
+                    format!("{name} {status}.\nCreate {file}? {default} ")
+                );
+            }
+        }
     }
 }
