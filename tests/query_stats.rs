@@ -61,6 +61,8 @@ fn query_stats_reports_real_operations_and_keeps_empty_modules_distinct() {
             assert_eq!(fields["type_checkers"], "3", "{stderr}");
             assert_eq!(fields["nonpreemptible_helpers"], "3", "{stderr}");
             assert_eq!(fields["effect_solves"], "3", "{stderr}");
+            // The body-free `empty` unit has no IO fixpoint to run.
+            assert_eq!(fields["effect_io_solves"], "2", "{stderr}");
             assert!(
                 lines[0].contains("unit_effects[calls=3,hits=0,computations=3,"),
                 "{stderr}"

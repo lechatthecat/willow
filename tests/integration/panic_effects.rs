@@ -1030,6 +1030,7 @@ fn main() { println(new A().value() + new B().value()); }
         );
     }
     assert!(stderr.contains("effect_solves=2 "), "{stderr}");
+    assert!(stderr.contains("effect_io_solves=2 "), "{stderr}");
     let run = project.run();
     assert!(run.status.success());
     assert_eq!(run.stdout, b"2\n");

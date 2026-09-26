@@ -803,6 +803,7 @@ pub(crate) fn solve_unit<N>(
             io_problem = io_problem.seed(id, io_bit, None);
         }
         let mut previous = queries.io_solutions.borrow_mut();
+        crate::query_stats::add(crate::query_stats::Counter::EffectIoSolve, 1);
         let solution =
             io_problem.solve_incremental(&io_graph, previous.get(&unit).map(Arc::as_ref));
         queries
@@ -827,6 +828,7 @@ pub(crate) fn solve_unit<N>(
         }
     }
     crate::query_stats::add(crate::query_stats::Counter::EffectEdges, edge_visits);
+    crate::query_stats::add(crate::query_stats::Counter::EffectSolve, 1);
     let facts = match (origins, consumer) {
         (Some((_, queries)), Some(unit)) => {
             let mut solutions = queries.solutions.borrow_mut();
@@ -1375,6 +1377,7 @@ mod tests {
                     },
                 );
                 assert_eq!(count(Counter::EffectSolve), 1);
+                assert_eq!(count(Counter::EffectIoSolve), 0);
                 assert_eq!(calls.get(), usize::from(shape != "cycle"));
                 let work = count(Counter::EffectInventory) + count(Counter::EffectEdges);
                 if let Some((previous_size, previous_work)) = previous {

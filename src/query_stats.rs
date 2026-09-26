@@ -16,13 +16,14 @@ pub(crate) enum Counter {
     ClassLayout,
     ClassVslots,
     EffectSolve,
+    EffectIoSolve,
     EffectInventory,
     EffectEdges,
 }
 
 #[derive(Default)]
 struct Stats {
-    counts: [usize; 7],
+    counts: [usize; 8],
     hydrates: usize,
     // File IDs are dense and session-local, including entry file zero. Keeping
     // an indexed vector gives O(1) updates and O(units) ordered reporting.
@@ -39,12 +40,13 @@ impl Stats {
             layouts,
             vslots,
             solves,
+            io_solves,
             effect_inventory,
             effect_edges,
         ] = self.counts;
         let [ast, checker, declared, lir] = self.peaks;
         let mut line = format!(
-            "[query-stats] hydrates={} type_checkers={checkers} nonpreemptible_helpers={helpers} class_layouts={layouts} class_vslots={vslots} effect_solves={solves} effect_inventory={effect_inventory} effect_edges={effect_edges} peak_ast={ast} peak_checker={checker} peak_declared={declared} peak_lir={lir} hydrates_by_file=",
+            "[query-stats] hydrates={} type_checkers={checkers} nonpreemptible_helpers={helpers} class_layouts={layouts} class_vslots={vslots} effect_solves={solves} effect_io_solves={io_solves} effect_inventory={effect_inventory} effect_edges={effect_edges} peak_ast={ast} peak_checker={checker} peak_declared={declared} peak_lir={lir} hydrates_by_file=",
             self.hydrates,
         );
         let mut separator = "";
@@ -256,6 +258,7 @@ mod tests {
             Counter::ClassLayout,
             Counter::ClassVslots,
             Counter::EffectSolve,
+            Counter::EffectIoSolve,
         ] {
             add(counter, 3);
         }
@@ -263,7 +266,7 @@ mod tests {
         peaks([2, 1, 1, 1]);
         assert_eq!(
             report(),
-            "[query-stats] hydrates=3 type_checkers=3 nonpreemptible_helpers=3 class_layouts=3 class_vslots=3 effect_solves=3 effect_inventory=0 effect_edges=0 peak_ast=2 peak_checker=2 peak_declared=1 peak_lir=1 hydrates_by_file=0:1,2:2"
+            "[query-stats] hydrates=3 type_checkers=3 nonpreemptible_helpers=3 class_layouts=3 class_vslots=3 effect_solves=3 effect_io_solves=3 effect_inventory=0 effect_edges=0 peak_ast=2 peak_checker=2 peak_declared=1 peak_lir=1 hydrates_by_file=0:1,2:2"
         );
     }
 

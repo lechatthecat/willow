@@ -271,7 +271,6 @@ impl<W: Clone + Ord> EffectProblem<W> {
         previous: Option<&EffectSolution<W>>,
         same_seed: impl Fn(&EffectSummary<W>, &EffectSummary<W>) -> bool,
     ) -> EffectSolution<W> {
-        crate::query_stats::add(crate::query_stats::Counter::EffectSolve, 1);
         let mut universe = self.bodies.clone();
         universe.extend(graph.ids().cloned());
         universe.extend(self.seeds.keys().cloned());

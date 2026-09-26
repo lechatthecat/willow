@@ -661,14 +661,12 @@ pub(crate) fn snapshot(
                     crate::semantic::intrinsics::builtin_target_effects(target)
                 {
                     bits |= effects.bits();
-                } else if let Some(effects) = bodyless_effects(&key_target)
-                    .or_else(|| {
-                        crate::semantic::intrinsics::builtin_static_effects(
-                            target,
-                            &module_aliases[&unit],
-                        )
-                    })
-                {
+                } else if let Some(effects) = bodyless_effects(&key_target).or_else(|| {
+                    crate::semantic::intrinsics::builtin_static_effects(
+                        target,
+                        &module_aliases[&unit],
+                    )
+                }) {
                     bits |= effects.bits();
                 } else {
                     unknown = true;
