@@ -10,6 +10,12 @@ use std::{
 
 pub const MAIN: &str = "fn main() {\n    println(\"Hello, Willow!\");\n}\n";
 
+/// Ignores local build output (`willow build .` writes the project-named
+/// binary) and structured-edit state. Never written over an existing file.
+pub fn gitignore(name: &str) -> String {
+    format!("/{name}\n/{name}.exe\n/.willow-edits/\n")
+}
+
 pub fn manifest(name: &str) -> Result<String> {
     ProjectManifest {
         project: ProjectSection {
@@ -85,10 +91,10 @@ impl Scaffold {
     pub fn create(root: &Path, name: Option<&str>) -> Result<Self> {
         let absolute = resolve_root(root)?;
         let default_name = absolute.file_name().and_then(|n| n.to_str());
-        let text = manifest(
-            name.or(default_name)
-                .context("cannot derive project name; help: use --name")?,
-        )?;
+        let name = name
+            .or(default_name)
+            .context("cannot derive project name; help: use --name")?;
+        let text = manifest(name)?;
         anyhow::ensure!(
             !absolute.join("project.toml").try_exists()?,
             "project.toml already exists"
@@ -97,13 +103,17 @@ impl Scaffold {
         result.create_dirs(&absolute)?;
         result.write_new(&absolute.join("project.toml"), text.as_bytes())?;
         result.create_dirs(&absolute.join("src"))?;
-        let main = absolute.join("src/main.wi");
-        match fs::symlink_metadata(&main) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                result.write_new(&main, MAIN.as_bytes())?
+        for (path, bytes) in [
+            (absolute.join("src/main.wi"), MAIN.to_owned()),
+            (absolute.join(".gitignore"), gitignore(name)),
+        ] {
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    result.write_new(&path, bytes.as_bytes())?
+                }
+                Err(error) => return Err(error.into()),
             }
-            Err(error) => return Err(error.into()),
         }
         Ok(result)
     }

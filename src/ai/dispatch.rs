@@ -103,6 +103,7 @@ pub(super) fn complete(
                 body_id: None,
                 body_location: None,
                 rename_calls: vec![],
+                rename_imports: vec![],
                 id,
                 module,
                 name,

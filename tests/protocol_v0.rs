@@ -371,3 +371,106 @@ fn backend_emitter_io_errors_propagate_without_panic() {
         assert!(!f.0.join("app.o").exists());
     }
 }
+
+#[test]
+fn cascaded_diagnostics_follow_their_roots_and_name_them() {
+    let f = Fixture::new(
+        "import util;\nfn step(n: i64) -> i64 {\n    if n > 1 { return 1 } else if { return 2; }\n    return 0;\n}\nfn main() { println(step(1) + util::k()); }",
+    );
+    fs::write(
+        f.0.join("util.wi"),
+        "pub fn k() -> i64 { return missing(); }\npub fn j() -> i64 { return true; }",
+    )
+    .unwrap();
+    let values = events(
+        &f.run(
+            env!("CARGO_BIN_EXE_willow"),
+            &["check", "main.wi", "--format=ndjson"],
+        ),
+        1,
+        "WT2001",
+    );
+    let diagnostics: Vec<_> = values
+        .iter()
+        .filter(|v| v["event"] == "diagnostic")
+        .collect();
+    let summary: Vec<_> = diagnostics
+        .iter()
+        .map(|v| {
+            (
+                v["code"].as_str().unwrap(),
+                v["data"]["labels"][0]["path"].as_str().unwrap(),
+                v["data"]["labels"][0]["span"]["line"].as_u64().unwrap(),
+                v["data"]["cascade"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    let first_cascade = summary.iter().position(|d| d.3).unwrap();
+    assert!(
+        summary[first_cascade..].iter().all(|d| d.3),
+        "roots precede cascades: {summary:?}"
+    );
+    for diagnostic in &diagnostics {
+        let root = &diagnostic["data"]["root_cause"];
+        if diagnostic["data"]["cascade"] == true {
+            let root = values
+                .iter()
+                .find(|v| v["seq"] == *root)
+                .expect("root_cause names an emitted event");
+            assert_eq!(root["event"], "diagnostic");
+            assert_eq!(root["data"]["cascade"], false);
+            assert!(root["seq"].as_u64() < diagnostic["seq"].as_u64());
+        } else {
+            assert!(root.is_null());
+        }
+    }
+    let root = |code: &str, path: &str| {
+        summary
+            .iter()
+            .any(|d| d.0 == code && d.1.ends_with(path) && !d.3)
+    };
+    assert!(root("E0101", "main.wi"), "{summary:?}");
+    assert!(root("E0350", "util.wi"), "{summary:?}");
+    // Unrelated type error on another line of util.wi stays a root.
+    assert!(
+        summary
+            .iter()
+            .any(|d| d.0 == "E0201" && d.1.ends_with("util.wi") && d.2 == 2 && !d.3),
+        "{summary:?}"
+    );
+    // Parse recovery noise and the `void` result of the unresolved call cascade.
+    assert!(
+        summary
+            .iter()
+            .any(|d| d.0 == "E0102" && d.1.ends_with("main.wi") && d.3),
+        "{summary:?}"
+    );
+    assert!(
+        summary
+            .iter()
+            .any(|d| d.0 == "E0201" && d.1.ends_with("util.wi") && d.2 == 1 && d.3),
+        "{summary:?}"
+    );
+}
+
+#[test]
+fn diagnostics_without_syntax_errors_are_all_roots() {
+    let f = Fixture::new("fn main() { let x: i64 = true; missing(); }");
+    let values = events(
+        &f.run(
+            env!("CARGO_BIN_EXE_willow"),
+            &["check", "main.wi", "--format=ndjson"],
+        ),
+        1,
+        "WT2001",
+    );
+    let diagnostics: Vec<_> = values
+        .iter()
+        .filter(|v| v["event"] == "diagnostic")
+        .collect();
+    assert!(!diagnostics.is_empty());
+    for diagnostic in diagnostics {
+        assert_eq!(diagnostic["data"]["cascade"], false, "{diagnostic}");
+        assert!(diagnostic["data"]["root_cause"].is_null());
+    }
+}

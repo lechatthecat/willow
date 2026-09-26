@@ -242,6 +242,7 @@ mod tests {
             body_id: None,
             body_location: None,
             rename_calls: vec![],
+            rename_imports: vec![],
             id: format!("f{i}"),
             module: "m".into(),
             name: format!("f{i}"),

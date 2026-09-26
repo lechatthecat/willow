@@ -26,7 +26,8 @@ willow edit recover --root . --transaction <transaction>
 
 `prepare` returns the transaction id and full before/after text for every changed
 file. It leaves workspace source files unchanged. `validate` performs cold,
-complete frontend validation in the isolated candidate. `apply` accepts only
+complete frontend validation in the isolated candidate; its diagnostics name
+workspace-relative source paths, never the `.willow-edits/<tx>/` copy. `apply` accepts only
 that unchanged candidate and unchanged base inputs, journals undo bytes before
 writing, and returns the resulting analysis revision. Repeated apply is rejected.
 Recovery restores the original bytes only if current bytes equal either the
@@ -52,12 +53,15 @@ been run locally on Linux. No Git operation is performed.
 The initial edit surface uses debug/default compiler options and workspace-local,
 regular, non-symlink source files. `--project` selects project mode. External
 source dependencies are rejected rather than validated against a different tree.
-Rename covers proven declarations, resolved direct/qualified calls and captured
-class dispatch families. It rejects an already-used destination identifier,
+Rename covers proven declarations, resolved direct/qualified calls, item imports
+(`import m::{f}`, `import m::f as g`; the alias and its uses are kept) and
+captured class dispatch families. It rejects an already-used destination identifier,
 ambiguous or uncovered occurrences (including unsupported aliases, function
 values and interface contracts), and overlapping edits. Body replacement must
 be exactly one block and uses the compiler's source range. Unsupported cases
-fail without changing source files. Local candidates and journals remain under
+fail without changing source files. A rejection tied to one occurrence adds
+`location` (`path` workspace-relative, zero-based byte `start`/`end`, one-based
+`line`/`column`) to the `request.finished` event. Local candidates and journals remain under
 `.willow-edits/`; retain interrupted journals until recovery. Completed candidate
 history may be removed manually while no edit operation is active.
 

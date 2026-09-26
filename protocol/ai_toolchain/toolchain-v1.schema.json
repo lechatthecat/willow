@@ -433,9 +433,21 @@
               "labels",
               "notes",
               "helps",
-              "fix_suggestions"
+              "fix_suggestions",
+              "cascade",
+              "root_cause"
             ],
             "properties": {
+              "cascade": {
+                "type": "boolean"
+              },
+              "root_cause": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              },
               "severity": {
                 "enum": [
                   "error",
@@ -556,6 +568,18 @@
               },
               "message": {
                 "type": "string"
+              },
+              "location": {
+                "description": "Source occurrence that caused a structured edit rejection (edit operations only).",
+                "type": "object",
+                "required": ["path", "start", "end", "line", "column"],
+                "properties": {
+                  "path": {"type": "string", "description": "Workspace-relative path."},
+                  "start": {"type": "integer", "minimum": 0},
+                  "end": {"type": "integer", "minimum": 0},
+                  "line": {"type": "integer", "minimum": 1},
+                  "column": {"type": "integer", "minimum": 1}
+                }
               }
             }
           }

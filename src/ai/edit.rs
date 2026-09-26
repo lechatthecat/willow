@@ -3,7 +3,10 @@
 //! readers can observe intermediate files; an interrupted apply is rolled back
 //! before the next edit operation. Recovery never overwrites a third-party edit.
 use super::{Snapshot, hash};
-use crate::{CompilerOptions, CompilerSession, diagnostics::DiagnosticEmitter};
+use crate::{
+    CompilerOptions, CompilerSession,
+    diagnostics::{Diagnostic, DiagnosticEmitter, FileId, SourceMap, source_map::SourceLookup},
+};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -326,7 +329,7 @@ impl Workspace {
             &CompilerOptions::debug(),
             plan.project.then_some(root.clone()),
         )
-        .analysis_with_emitter(emitter)?;
+        .analysis_with_emitter(&mut CandidatePaths::new(emitter, &root))?;
         for (path, digest) in &checked.sources {
             let relative = Path::new(path)
                 .strip_prefix(&root)
@@ -570,6 +573,92 @@ struct Patch {
     end: usize,
     text: String,
 }
+/// Reports candidate diagnostics against workspace-relative source paths, so
+/// agents never open or edit the isolated `.willow-edits/<tx>/` copy.
+struct CandidatePaths<'a> {
+    inner: &'a mut dyn DiagnosticEmitter,
+    prefix: String,
+    maps: std::collections::HashMap<FileId, SourceMap>,
+}
+impl<'a> CandidatePaths<'a> {
+    fn new(inner: &'a mut dyn DiagnosticEmitter, sandbox: &Path) -> Self {
+        Self {
+            inner,
+            prefix: format!("{}{}", sandbox.display(), std::path::MAIN_SEPARATOR),
+            maps: Default::default(),
+        }
+    }
+    fn relative(&self, text: &str) -> String {
+        text.replace(&self.prefix, "")
+    }
+}
+struct Remapped<'a> {
+    maps: &'a std::collections::HashMap<FileId, SourceMap>,
+    fallback: &'a dyn SourceLookup,
+}
+impl SourceLookup for Remapped<'_> {
+    fn get(&self, id: FileId) -> Option<&SourceMap> {
+        self.maps.get(&id).or_else(|| self.fallback.get(id))
+    }
+}
+impl DiagnosticEmitter for CandidatePaths<'_> {
+    fn emit(&mut self, diagnostic: &Diagnostic, sources: &dyn SourceLookup) -> std::io::Result<()> {
+        let ids = diagnostic
+            .labels
+            .iter()
+            .map(|l| l.span.file_id)
+            .chain(diagnostic.fix_suggestions.iter().map(|f| f.span.file_id));
+        for id in ids {
+            if !self.maps.contains_key(&id)
+                && let Some(map) = sources.get(id)
+                && map.path.starts_with(&self.prefix)
+            {
+                let mut map = map.clone();
+                map.path = self.relative(&map.path);
+                self.maps.insert(id, map);
+            }
+        }
+        let mut diagnostic = diagnostic.clone();
+        diagnostic.message = self.relative(&diagnostic.message);
+        for text in diagnostic
+            .notes
+            .iter_mut()
+            .chain(diagnostic.helps.iter_mut())
+            .chain(diagnostic.labels.iter_mut().map(|l| &mut l.message))
+        {
+            *text = self.relative(text);
+        }
+        let lookup = Remapped {
+            maps: &self.maps,
+            fallback: sources,
+        };
+        self.inner.emit(&diagnostic, &lookup)
+    }
+}
+
+/// Rejected edit tied to one source occurrence. `path` is workspace-relative;
+/// offsets are zero-based end-exclusive bytes; line/column are one-based.
+#[derive(Debug, Clone, Serialize)]
+pub struct RejectionLocation {
+    pub path: String,
+    pub start: usize,
+    pub end: usize,
+    pub line: usize,
+    pub column: usize,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct Rejection {
+    pub message: String,
+    pub location: RejectionLocation,
+}
+impl std::fmt::Display for Rejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let l = &self.location;
+        write!(f, "{} at {}:{}:{}", self.message, l.path, l.line, l.column)
+    }
+}
+impl std::error::Error for Rejection {}
+
 fn structured_changes(
     snapshot: &Snapshot,
     root: &Path,
@@ -595,7 +684,7 @@ fn structured_changes(
             );
         }
     }
-    let mut identifiers: BTreeMap<&str, Vec<(&str, usize, usize)>> = BTreeMap::new();
+    let mut identifiers: BTreeMap<&str, Vec<(&str, &crate::diagnostics::Span)>> = BTreeMap::new();
     let mut call_names = BTreeMap::new();
     for (path, ts) in &tokens {
         for (i, token) in ts.iter().enumerate() {
@@ -604,7 +693,7 @@ fn structured_changes(
                 identifiers
                     .entry(name)
                     .or_default()
-                    .push((path, token.span.start, token.span.end));
+                    .push((path, &token.span));
                 if ts.get(i + 1).is_some_and(|t| t.kind == TokenKind::LParen) {
                     let mut first = i;
                     while first >= 2
@@ -784,6 +873,30 @@ fn structured_changes(
                             allowed.entry(p.into()).or_default().insert(t.span.start);
                         }
                     }
+                    // Item imports (`import m::{f}` / `import m::f as g`) name the
+                    // target by its declared spelling: the final path segment.
+                    for location in &member.rename_imports {
+                        let p = Path::new(&location.path)
+                            .strip_prefix(root)?
+                            .to_str()
+                            .context("non UTF-8 path")?;
+                        let ts = &tokens[p];
+                        let a = ts.partition_point(|t| t.span.start < location.start);
+                        let b = ts.partition_point(|t| t.span.end <= location.end);
+                        for i in a..b {
+                            if matches!(&ts[i].kind, TokenKind::Ident(s) if s == old)
+                                && ts
+                                    .get(i + 1)
+                                    .is_none_or(|t| t.kind != TokenKind::ColonColon)
+                                && (i == 0 || ts[i - 1].kind != TokenKind::As)
+                            {
+                                allowed
+                                    .entry(p.into())
+                                    .or_default()
+                                    .insert(ts[i].span.start);
+                            }
+                        }
+                    }
                     for expression in references.get(id).into_iter().flatten() {
                         work.references_visited += 1;
                         let p = Path::new(&expression.location.path)
@@ -798,14 +911,23 @@ fn structured_changes(
                         }
                     }
                 }
-                for &(p, start, end) in identifiers.get(old.as_str()).into_iter().flatten() {
-                    ensure!(
-                        allowed.get(p).is_some_and(|a| a.contains(&start)),
-                        "rename coverage incomplete or ambiguous at {p}:{start}"
-                    );
+                for &(p, span) in identifiers.get(old.as_str()).into_iter().flatten() {
+                    if !allowed.get(p).is_some_and(|a| a.contains(&span.start)) {
+                        return Err(Rejection {
+                            message: "rename coverage incomplete or ambiguous".into(),
+                            location: RejectionLocation {
+                                path: p.into(),
+                                start: span.start,
+                                end: span.end,
+                                line: span.line,
+                                column: span.col,
+                            },
+                        }
+                        .into());
+                    }
                     patches.entry(p.into()).or_default().push(Patch {
-                        start,
-                        end,
+                        start: span.start,
+                        end: span.end,
                         text: name.clone(),
                     });
                 }
@@ -939,6 +1061,90 @@ mod tests {
                 .contains("return 2")
         );
         assert!(w.apply(&id, &mut crate::diagnostics::HumanEmitter).is_err());
+    }
+    #[derive(Default)]
+    struct Collect(Vec<(String, String, usize)>);
+    impl DiagnosticEmitter for Collect {
+        fn emit(&mut self, d: &Diagnostic, sources: &dyn SourceLookup) -> std::io::Result<()> {
+            for label in &d.labels {
+                let path = sources.get(label.span.file_id).unwrap().path.clone();
+                self.0.push((path, d.message.clone(), label.span.line));
+            }
+            Ok(())
+        }
+    }
+    #[test]
+    fn validation_diagnostics_use_workspace_relative_paths() {
+        let f = Fixture::new();
+        fs::create_dir(f.0.join("lib")).unwrap();
+        fs::write(
+            f.0.join("main.wi"),
+            "import lib::helper;\nfn value() -> i64 { return 1; }\nfn main() { println(value() + helper::get()); }",
+        )
+        .unwrap();
+        fs::write(
+            f.0.join("lib/helper.wi"),
+            "pub fn get() -> i64 {\n  return 2;\n}",
+        )
+        .unwrap();
+        let w = f.workspace();
+        let mut emitter = crate::diagnostics::HumanEmitter;
+        let snapshot = w
+            .analyze(&f.0.join("main.wi"), false, &mut emitter)
+            .unwrap();
+        let id = |name: &str| {
+            snapshot
+                .functions
+                .iter()
+                .find(|g| g.name == name)
+                .unwrap()
+                .id
+                .clone()
+        };
+        let result = w
+            .prepare(
+                &f.0.join("main.wi"),
+                false,
+                Request {
+                    revision: snapshot.revision.clone(),
+                    operations: vec![
+                        Operation::ReplaceBody {
+                            function: id("value"),
+                            body: "{ return false; }".into(),
+                        },
+                        Operation::ReplaceBody {
+                            function: id("get"),
+                            body: "{\n  return \"two\";\n}".into(),
+                        },
+                    ],
+                },
+                &mut emitter,
+            )
+            .unwrap();
+        let tx = result["transaction"].as_str().unwrap();
+        let mut collect = Collect::default();
+        assert!(w.validate(tx, &mut collect).is_err());
+        let paths: std::collections::BTreeSet<_> =
+            collect.0.iter().map(|(p, _, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "lib/helper.wi"
+                    .replace('/', std::path::MAIN_SEPARATOR_STR)
+                    .as_str(),
+                "main.wi"
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(
+            collect
+                .0
+                .iter()
+                .all(|(p, m, line)| !p.contains(".willow-edits")
+                    && !m.contains(".willow-edits")
+                    && *line > 0)
+        );
     }
     #[test]
     fn validation_failure_and_stale_source_preserve_existing_changes() {
@@ -1160,6 +1366,152 @@ mod tests {
                 .unwrap()
                 .contains("answer() -> i64 { return 42; }")
         );
+    }
+
+    /// Rename helper::value to `answer` in a two-or-more file fixture and apply.
+    fn rename_helper_value(files: &[(&str, &str)]) -> Result<Fixture> {
+        let f = Fixture::new();
+        for (path, source) in files {
+            fs::write(f.0.join(path), source).unwrap();
+        }
+        let w = f.workspace();
+        let mut emitter = crate::diagnostics::HumanEmitter;
+        let snapshot = w.analyze(&f.0.join("main.wi"), false, &mut emitter)?;
+        let function = snapshot
+            .functions
+            .iter()
+            .find(|g| g.name == "value" && g.module.ends_with("helper.wi"))
+            .unwrap()
+            .id
+            .clone();
+        let result = w.prepare(
+            &f.0.join("main.wi"),
+            false,
+            Request {
+                revision: snapshot.revision,
+                operations: vec![Operation::Rename {
+                    function,
+                    name: "answer".into(),
+                }],
+            },
+            &mut emitter,
+        )?;
+        let id = result["transaction"].as_str().unwrap().to_owned();
+        w.validate(&id, &mut emitter)?;
+        w.apply(&id, &mut emitter)?;
+        drop(w);
+        Ok(f)
+    }
+    const HELPER: (&str, &str) = (
+        "helper.wi",
+        "pub fn value() -> i64 { return 1; } pub fn other() -> i64 { return 2; }",
+    );
+
+    #[test]
+    fn rename_rewrites_grouped_item_import_and_bare_calls() {
+        let f = rename_helper_value(&[
+            HELPER,
+            (
+                "main.wi",
+                "import helper::{other, value};\nfn main() { println(value() + other()); }",
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(f.0.join("main.wi")).unwrap(),
+            "import helper::{other, answer};\nfn main() { println(answer() + other()); }"
+        );
+        assert!(
+            fs::read_to_string(f.0.join("helper.wi"))
+                .unwrap()
+                .starts_with("pub fn answer()")
+        );
+    }
+
+    #[test]
+    fn rename_rewrites_single_item_import() {
+        let f = rename_helper_value(&[
+            HELPER,
+            (
+                "main.wi",
+                "import helper::value;\nfn main() { println(value()); }",
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(f.0.join("main.wi")).unwrap(),
+            "import helper::answer;\nfn main() { println(answer()); }"
+        );
+    }
+
+    #[test]
+    fn rename_keeps_import_alias_and_alias_uses() {
+        let f = rename_helper_value(&[
+            HELPER,
+            (
+                "main.wi",
+                "import helper::{value as v};\nimport helper::value as w;\nfn main() { println(v() + w()); }",
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(f.0.join("main.wi")).unwrap(),
+            "import helper::{answer as v};\nimport helper::answer as w;\nfn main() { println(v() + w()); }"
+        );
+    }
+
+    #[test]
+    fn rename_follows_item_imports_in_every_consumer_module() {
+        let f = rename_helper_value(&[
+            HELPER,
+            (
+                "mid.wi",
+                "import helper::{value};\npub fn twice() -> i64 { return value() * 2; }",
+            ),
+            (
+                "main.wi",
+                "import helper;\nimport mid;\nfn main() { println(helper::value() + mid::twice()); }",
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(f.0.join("mid.wi")).unwrap(),
+            "import helper::{answer};\npub fn twice() -> i64 { return answer() * 2; }"
+        );
+        assert!(
+            fs::read_to_string(f.0.join("main.wi"))
+                .unwrap()
+                .contains("helper::answer()")
+        );
+    }
+
+    #[test]
+    fn rename_rejects_same_spelled_import_of_other_module_with_location() {
+        let main = "import helper;\nimport other::{value};\nfn main() { println(helper::value() + value()); }";
+        let error = rename_helper_value(&[
+            HELPER,
+            ("other.wi", "pub fn value() -> i64 { return 3; }"),
+            ("main.wi", main),
+        ])
+        .err()
+        .unwrap();
+        let rejection = error.downcast_ref::<Rejection>().unwrap();
+        let l = &rejection.location;
+        assert_eq!(l.path, "main.wi");
+        assert_eq!((l.line, l.column), (2, 16));
+        assert_eq!(&main[l.start..l.end], "value");
+        assert!(error.to_string().ends_with("at main.wi:2:16"));
+    }
+
+    #[test]
+    fn rename_rejects_function_value_with_structured_location() {
+        let main = "import helper::{value};\nfn main() {\n  let f = value;\n  println(f());\n}";
+        let error = rename_helper_value(&[HELPER, ("main.wi", main)])
+            .err()
+            .unwrap();
+        let l = &error.downcast_ref::<Rejection>().unwrap().location;
+        assert_eq!((l.path.as_str(), l.line, l.column), ("main.wi", 3, 11));
+        assert_eq!(&main[l.start..l.end], "value");
     }
 
     #[test]

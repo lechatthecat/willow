@@ -55,6 +55,10 @@ fn init_new_current_and_named_projects_check() {
             fs::read_to_string(root.join("src/main.wi")).unwrap(),
             include_str!("fixtures/init/basic/src/main.wi")
         );
+        assert_eq!(
+            fs::read_to_string(root.join(".gitignore")).unwrap(),
+            include_str!("fixtures/init/basic/.gitignore")
+        );
         assert!(!root.join("project.lock").exists());
         let output = f.run(&[
             "check",
@@ -95,10 +99,15 @@ fn preserves_main_and_rolls_back_partial_failure() {
     let f = Fixture::new();
     fs::create_dir(f.0.join("src")).unwrap();
     fs::write(f.0.join("src/main.wi"), "original").unwrap();
+    fs::write(f.0.join(".gitignore"), "user rules\n").unwrap();
     assert!(f.run(&["init", "."]).status.success());
     assert_eq!(
         fs::read_to_string(f.0.join("src/main.wi")).unwrap(),
         "original"
+    );
+    assert_eq!(
+        fs::read_to_string(f.0.join(".gitignore")).unwrap(),
+        "user rules\n"
     );
     let f = Fixture::new();
     fs::write(f.0.join("src"), "keep").unwrap();
@@ -198,6 +207,7 @@ fn existing_ai_files_preserved_and_ai_failure_rolls_back_project() {
     assert!(!f.run(&["init", ".", "--ai", "all"]).status.success());
     assert!(!f.0.join("project.toml").exists());
     assert!(!f.0.join("src").exists());
+    assert!(!f.0.join(".gitignore").exists());
     assert!(!f.0.join("CLAUDE.md").exists());
     assert!(f.0.join("AGENTS.md").is_dir());
 }

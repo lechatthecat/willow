@@ -969,3 +969,35 @@ fn same_named_enum_variant_uses_its_own_token() {
         assert_eq!(actual, expected, "{source}");
     }
 }
+#[test]
+fn method_references_are_unique_and_prelude_contracts_are_not_functions() {
+    let source = "open class Level { pub price: i64; pub open fn front(self) -> i64 { return self.price; } }\n\
+                  class Deep extends Level { pub override fn front(self) -> i64 { return 0; } }\n\
+                  fn show(x: i64) -> String { return \"v=${x}\"; }\n\
+                  fn main() { let l = new Level(3); println(l.front()); println(show(l.front())); }";
+    let f = Fixture::new(source);
+    let snapshot = f.save("snapshot.json");
+    let names: Vec<_> = snapshot["functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["name"].as_str().unwrap())
+        .collect();
+    assert!(!names.iter().any(|n| n.starts_with("Into::")), "{names:?}");
+    let front = named(&snapshot, "Level::front");
+    let requests = serde_json::json!([{"kind":"references","function":front["id"]}]);
+    f.write("requests.json", &requests.to_string());
+    let r = f.result(&["query", "main.wi", "--requests", "requests.json"]);
+    let refs = r["results"][0]["result"]["references"].as_array().unwrap();
+    let mut starts: Vec<_> = refs
+        .iter()
+        .map(|r| r["location"]["start"].as_u64().unwrap() as usize)
+        .collect();
+    starts.sort();
+    let calls: Vec<_> = source.match_indices("front()").map(|(i, _)| i).collect();
+    assert_eq!(starts, calls, "{refs:?}");
+    assert!(
+        refs.iter().all(|r| r["certainty"] == "resolved"),
+        "{refs:?}"
+    );
+}

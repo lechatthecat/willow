@@ -18,6 +18,13 @@ notes, helps, and fix suggestions. Labels/fixes contain spans and resolved file
 paths (null if unavailable). Byte offsets are zero-based and end-exclusive;
 line/column are compiler one-based coordinates (zero means unavailable).
 Internal file IDs are local to the request, not cross-request identities.
+Each diagnostic also carries `cascade` (bool) and `root_cause` (the `seq` of the
+diagnostic it likely follows from, or null). A request's diagnostics are written
+roots first, then cascades, so fixing the roots and re-checking is the intended
+loop. Cascade marking is a heuristic: later errors in a file after its first
+lexer/parser error (E005x/E010x) cascade from that error, and a type error
+(E02xx) on the line of an earlier name-resolution error (E035x) cascades from it.
+Warnings are never cascades.
 
 Human messages are not machine discriminators. Consumers ignore unknown fields
 and event/code values within a supported version. Existing names, field types

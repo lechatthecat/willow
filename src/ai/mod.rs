@@ -56,6 +56,9 @@ pub struct Function {
     pub(crate) body_location: Option<Location>,
     #[serde(skip)]
     pub(crate) rename_calls: Vec<Location>,
+    /// Import declarations naming this function as an item (`import m::{f}`).
+    #[serde(skip)]
+    pub(crate) rename_imports: Vec<Location>,
     pub id: String,
     pub module: String,
     pub name: String,
@@ -137,8 +140,23 @@ pub(crate) fn capture(
         patterns,
         symbols: symbol_facts,
     } = inputs;
+    // Bodiless interface contracts (e.g. prelude `Into::into`) are callable
+    // signatures, not functions. Calls through them stay unresolved/unknown.
+    let mut unit_graph = CallGraph::default();
+    for (id, sites) in graph.iter() {
+        let contract = id.namespace().is_none()
+            && !id.name().starts_with("$default$")
+            && id
+                .owner()
+                .is_some_and(|owner| symbols.lookup_interface(owner).is_some())
+            && sites.targets.is_empty()
+            && !sites.has_unknown;
+        if !contract {
+            unit_graph.merge(*id, sites.clone());
+        }
+    }
     let mut result = CapturedUnit {
-        graph: graph.clone(),
+        graph: unit_graph,
         semantic: semantic::Captured::default(),
         symbols: symbol_facts.clone(),
         symbol_owners: symbols::owners(program),
@@ -462,6 +480,7 @@ pub(crate) fn snapshot(
     }
     // Resolve aliases per consumer once, using the compiler's package index.
     let mut aliases = HashMap::new();
+    let mut item_imports = Vec::new();
     for (&unit, program) in &programs {
         let mut map = HashMap::new();
         for import in &program.imports {
@@ -492,6 +511,7 @@ pub(crate) fn snapshot(
                 && let Some(target) = frontend.db.dependencies().unit_for_path(unit, module)
             {
                 map.insert(local.to_string(), (target, Some(item.to_string())));
+                item_imports.push((unit, target, item, import.span));
             }
         }
         aliases.insert(unit, map);
@@ -542,6 +562,7 @@ pub(crate) fn snapshot(
                     body_id: None,
                     body_location: None,
                     rename_calls: vec![],
+                    rename_imports: vec![],
                     id: hash(serde_json::to_vec(&(&module, &name)).unwrap()),
                     module,
                     name,
@@ -568,6 +589,15 @@ pub(crate) fn snapshot(
                     end: span.end,
                 });
             }
+        }
+    }
+    for (unit, target, item, span) in item_imports {
+        if let Some(node) = nodes.get_mut(&(target, FunctionId::free(item))) {
+            node.rename_imports.push(Location {
+                path: paths[&unit].clone(),
+                start: span.start,
+                end: span.end,
+            });
         }
     }
     // Declared types whose calls have no Willow body: an implicit memberwise

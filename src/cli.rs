@@ -559,6 +559,10 @@ fn child_exit_code(status: ExitStatus) -> i32 {
 }
 
 pub(super) fn run(args: Vec<String>) -> Result<()> {
+    if let Some(text) = help(&args) {
+        println!("{text}");
+        return Ok(());
+    }
     if protocol::requested(&args) {
         let code = protocol::run(args)?;
         if code != 0 {
@@ -586,8 +590,37 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
     result
 }
 
+/// `willow --help`, `willow help [command]` and `willow <command> ... --help`
+/// print usage (restricted to that command when it is known). Arguments after
+/// `--` belong to the program run by `willow run`.
+fn help(args: &[String]) -> Option<String> {
+    let own = args.split(|arg| arg == "--").next().unwrap_or_default();
+    let command = match own.first().map(String::as_str) {
+        Some("help") => own.get(1).map(String::as_str),
+        _ if own.iter().any(|arg| arg == "--help" || arg == "-h") => own
+            .first()
+            .map(String::as_str)
+            .filter(|c| !c.starts_with('-')),
+        _ => return None,
+    };
+    let lines: Vec<_> = command
+        .map(|c| format!("  willow {c} "))
+        .map(|prefix| {
+            usage()
+                .lines()
+                .filter(|line| line.starts_with(&prefix) || line.trim_end() == prefix.trim_end())
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(if lines.is_empty() {
+        usage().into()
+    } else {
+        format!("Usage:\n{}", lines.join("\n"))
+    })
+}
+
 fn usage() -> &'static str {
-    "Usage:\n  willow agent instructions <codex|claude> [--format human|json]\n  willow agent sync [--yes]\n  willow init [DIR] [--name NAME] [--ai auto|none|codex|claude|codex,claude|all] [--yes]\n  willow metadata [project-dir] [--format human|json|ndjson]\n  Package commands accept --format human|json|ndjson (default human).\n  willow edit prepare --root DIR --entry main.wi --requests edits.json\n  willow edit <preview|validate|apply|recover> --root DIR --transaction ID\n  willow daemon <source.wi|project-dir>\n  willow risk --before baseline.json --after current.json\n  willow query <source.wi|project-dir> --requests queries.json\n  willow check <source.wi|project-dir> [--format human|ndjson]\n  willow build <source.wi|project-dir> [--format human|ndjson] [--protocol-version 1]\n  willow add [alias] --git URL [--version REQ] [--dry-run] [--project-dir DIR]\n  willow add [alias] --path DIR [--dry-run] [--project-dir DIR]\n  willow add URL [--dry-run] [--project-dir DIR]\n  willow remove alias [--dry-run] [--project-dir DIR]\n  willow update [alias] [--breaking] [--dry-run] [--project-dir DIR]\n  willow deps tree [--project-dir DIR]\n  willow deps why <alias|package-name> [--project-dir DIR]\n  willow package verify [PATH] [--format human|json|ndjson]\n  willow build <source.wi|project-dir> [-o <output>] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--emit-hir] [--emit-lir] [--runtime-lib <path>]\n  willow run [source.wi|project-dir] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--runtime-lib <path>] [-- <args>...]\n  willow fetch [project-dir] [--locked|--offline|--frozen] [--format human|json|ndjson]\n  willow debug <source.wi> [--runtime-lib <path>]"
+    "Usage:\n  willow agent instructions <codex|claude> [--format human|json]\n  willow agent sync [--yes]\n  willow init [DIR] [--name NAME] [--ai auto|none|codex|claude|codex,claude|all] [--yes]\n  willow metadata [project-dir] [--format human|json|ndjson]\n  Package commands accept --format human|json|ndjson (default human).\n  willow edit prepare --root DIR --entry main.wi --requests edits.json\n  willow edit <preview|validate|apply|recover> --root DIR --transaction ID\n  willow daemon <source.wi|project-dir>\n  willow snapshot save <source.wi|project-dir> --output snapshot.json\n  willow snapshot diff --before baseline.json --after current.json\n  willow impact <source.wi|project-dir> (--file PATH --byte N | --function ID --revision REV) [--direction callers|callees] [--max-nodes N] [--max-depth N]\n  willow risk --before baseline.json --after current.json\n  willow query <source.wi|project-dir> --requests queries.json\n  willow check <source.wi|project-dir> [--format human|ndjson]\n  willow build <source.wi|project-dir> [--format human|ndjson] [--protocol-version 1]\n  willow add [alias] --git URL [--version REQ] [--dry-run] [--project-dir DIR]\n  willow add [alias] --path DIR [--dry-run] [--project-dir DIR]\n  willow add URL [--dry-run] [--project-dir DIR]\n  willow remove alias [--dry-run] [--project-dir DIR]\n  willow update [alias] [--breaking] [--dry-run] [--project-dir DIR]\n  willow deps tree [--project-dir DIR]\n  willow deps why <alias|package-name> [--project-dir DIR]\n  willow package verify [PATH] [--format human|json|ndjson]\n  willow build <source.wi|project-dir> [-o <output>] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--emit-hir] [--emit-lir] [--runtime-lib <path>]\n  willow run [source.wi|project-dir] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--runtime-lib <path>] [-- <args>...]\n  willow fetch [project-dir] [--locked|--offline|--frozen] [--format human|json|ndjson]\n  willow debug <source.wi> [--runtime-lib <path>]"
 }
 
 fn stem(path: &str) -> String {
@@ -649,6 +682,40 @@ mod tests {
             let status = ExitStatus::from_raw(raw);
             assert_eq!(child_exit_code(status), 128 + (raw & 0x7f));
         }
+    }
+
+    #[test]
+    fn help_is_available_for_every_subcommand() {
+        let commands = [
+            "agent", "init", "metadata", "edit", "daemon", "risk", "query", "snapshot", "impact",
+            "check", "build", "add", "remove", "update", "deps", "package", "run", "fetch",
+            "debug",
+        ];
+        for command in commands {
+            for request in [
+                args(&[command, "--help"]),
+                args(&[command, "-h"]),
+                args(&["help", command]),
+            ] {
+                let text = help(&request).unwrap();
+                assert!(text.starts_with("Usage:\n"), "{request:?}");
+                assert!(
+                    text.lines()
+                        .skip(1)
+                        .all(|line| line.starts_with(&format!("  willow {command} "))),
+                    "{request:?}: {text}"
+                );
+            }
+        }
+        assert_eq!(help(&args(&["--help"])).unwrap(), usage());
+        assert_eq!(help(&args(&["help"])).unwrap(), usage());
+        assert_eq!(
+            help(&args(&["daemon", "main.wi", "--help"])).unwrap(),
+            help(&args(&["daemon", "-h"])).unwrap()
+        );
+        // Arguments after `--` belong to the program being run.
+        assert!(help(&args(&["run", "main.wi", "--", "--help"])).is_none());
+        assert!(help(&args(&["build", "main.wi"])).is_none());
     }
 
     #[test]

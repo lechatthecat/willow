@@ -88,6 +88,56 @@ fn structured_edit_cli_end_to_end() {
     );
     assert_ne!(f.snapshot()["revision"], snapshot["revision"]);
 }
+#[test]
+fn structured_edit_rejection_reports_source_location() {
+    let f = Fixture::new();
+    let main = "fn value() -> i64 { return 1; }\nfn main() {\n  let f = value;\n  println(f());\n}";
+    fs::write(f.0.join("main.wi"), main).unwrap();
+    let snapshot = f.snapshot();
+    let function = snapshot["functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == "value")
+        .unwrap()["id"]
+        .clone();
+    fs::write(f.0.join("request.json"), serde_json::to_vec(&json!({"revision":snapshot["revision"],"operations":[{"kind":"rename","function":function,"name":"answer"}]})).unwrap()).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_willow"))
+        .current_dir(&f.0)
+        .args([
+            "edit",
+            "prepare",
+            "--entry",
+            "main.wi",
+            "--requests",
+            "request.json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let finished: Value = serde_json::from_str(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(finished["event"], "request.finished");
+    assert_eq!(finished["code"], "WT2002");
+    let location = &finished["data"]["location"];
+    assert_eq!(location["path"], "main.wi");
+    assert_eq!(
+        (location["line"].as_u64(), location["column"].as_u64()),
+        (Some(3), Some(11))
+    );
+    let start = location["start"].as_u64().unwrap() as usize;
+    assert_eq!(
+        &main[start..location["end"].as_u64().unwrap() as usize],
+        "value"
+    );
+    assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), main);
+}
 fn result(reader: &mut impl BufRead) -> Value {
     loop {
         let mut line = String::new();

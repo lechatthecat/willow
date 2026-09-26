@@ -592,6 +592,32 @@ impl QuerySession {
                             refs.push(value);
                         }
                     }
+                    // One source occurrence is reported once: a resolved fact
+                    // outranks possible dispatch, and records merge their fields.
+                    let mut by_location = HashMap::new();
+                    let mut unique: Vec<Value> = Vec::with_capacity(refs.len());
+                    for reference in refs {
+                        let key = reference["location"].to_string();
+                        match by_location.get(&key) {
+                            None => {
+                                by_location.insert(key, unique.len());
+                                unique.push(reference);
+                            }
+                            Some(&i) => {
+                                let resolved = reference["certainty"] == "resolved"
+                                    && unique[i]["certainty"] != "resolved";
+                                let existing = unique[i].as_object_mut().unwrap();
+                                for (field, value) in reference.as_object().unwrap() {
+                                    if resolved && !value.is_null() {
+                                        existing.insert(field.clone(), value.clone());
+                                    } else {
+                                        existing.entry(field.clone()).or_insert(value.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let refs = unique;
                     let unresolved: Vec<_> = self
                         .symbols
                         .get(&function)
