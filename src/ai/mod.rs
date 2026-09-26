@@ -1,5 +1,7 @@
 //! Opt-in, compiler-owned impact facts. No backend or runtime dependency.
+mod diff;
 mod dispatch;
+mod display;
 pub mod edit;
 mod graph;
 mod packages;
@@ -10,7 +12,7 @@ pub(crate) mod symbols;
 mod warm;
 pub use graph::{Direction, Impact, ImpactNode, Limits};
 pub use semantic::{QueryRequest, QuerySession, SemanticFacts};
-pub use storage::{Difference, FunctionChange};
+pub use storage::{Difference, FunctionChange, expand_snapshot_paths};
 pub use warm::WarmSession;
 pub(crate) use warm::check_size;
 

@@ -213,8 +213,20 @@ pub enum QueryRequest {
         #[serde(default)]
         tests: Vec<String>,
     },
+    /// All declarations, optionally narrowed. Filters combine with AND;
+    /// `limit` caps the returned list after filtering (`total` is uncapped).
     Symbols {
         revision: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefix: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        module: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        symbol_kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
     },
     SymbolAt {
         revision: String,
@@ -242,6 +254,7 @@ pub enum QueryRequest {
 /// Own one immutable revision and its indexes. Query calls do no frontend work.
 pub struct QuerySession {
     packages: packages::PackageIndex,
+    names: display::TypeNames,
     pub(crate) snapshot: Snapshot,
     functions: HashMap<String, usize>,
     symbols: HashMap<String, usize>,
@@ -402,8 +415,10 @@ impl QuerySession {
                     .is_some_and(|op| op.starts_with("method:"))
             });
         let packages = packages::PackageIndex::new(&snapshot);
+        let names = display::TypeNames::new(&snapshot);
         Ok(Self {
             packages,
+            names,
             snapshot,
             functions,
             references,
@@ -446,16 +461,19 @@ impl QuerySession {
             .map(|&i| &self.snapshot.semantic.symbols[i])
             .collect()
     }
+    fn symbol_values(&self, symbols: &[&symbols::Symbol]) -> Vec<Value> {
+        symbols.iter().map(|s| self.names.symbol(s)).collect()
+    }
     fn symbol_at(&self, file: &str, byte: usize) -> Value {
         let symbols = self.symbols_at(file, byte);
         if symbols.is_empty() {
             json!({"status":"unknown"})
         } else if symbols.len() == 1 {
-            json!({"status":"ok","symbol":symbols[0]})
+            json!({"status":"ok","symbol":self.names.symbol(symbols[0])})
         } else if let Some(alias) = symbols.iter().find(|s| s.kind == "import") {
-            json!({"status":"ok","symbol":alias,"resolved_symbols":symbols})
+            json!({"status":"ok","symbol":self.names.symbol(alias),"resolved_symbols":self.symbol_values(&symbols)})
         } else {
-            json!({"status":"ambiguous","symbols":symbols})
+            json!({"status":"ambiguous","symbols":self.symbol_values(&symbols)})
         }
     }
     fn declared_type_at(&self, file: &str, byte: usize) -> Value {
@@ -463,9 +481,11 @@ impl QuerySession {
         let typed: Vec<_> = symbols.iter().filter(|s| s.ty.is_some()).collect();
         if let Some(first) = typed.first() {
             if typed.iter().all(|s| s.ty == first.ty) {
-                json!({"status":"ok","type":first.ty,"location":first.location})
+                let module = first.identity.as_ref().map(|i| i.module.as_str());
+                let display = self.names.render(first.ty.as_ref().unwrap(), module);
+                json!({"status":"ok","type":first.ty,"type_display":display,"location":first.location})
             } else {
-                json!({"status":"ambiguous","symbols":symbols})
+                json!({"status":"ambiguous","symbols":self.symbol_values(&symbols)})
             }
         } else {
             json!({"status":if symbols.is_empty(){"unknown"}else{"unanalyzed"}})
@@ -478,7 +498,7 @@ impl QuerySession {
         self.queries += 1;
         let revision = match &request {
             QueryRequest::Affected { revision, .. }
-            | QueryRequest::Symbols { revision }
+            | QueryRequest::Symbols { revision, .. }
             | QueryRequest::SymbolAt { revision, .. }
             | QueryRequest::SymbolInfo { revision, .. }
             | QueryRequest::References { revision, .. }
@@ -492,8 +512,36 @@ impl QuerySession {
             QueryRequest::Affected { delta, tests, .. } => {
                 self.packages.affected(&self.snapshot, &delta, &tests)
             }
-            QueryRequest::Symbols { .. } => {
-                json!({"status":"ok","symbols":self.snapshot.semantic.symbols})
+            QueryRequest::Symbols {
+                name,
+                prefix,
+                module,
+                symbol_kind,
+                limit,
+                ..
+            } => {
+                let matched: Vec<_> = self
+                    .snapshot
+                    .semantic
+                    .symbols
+                    .iter()
+                    .filter(|s| name.as_ref().is_none_or(|n| s.name == *n))
+                    .filter(|s| {
+                        prefix
+                            .as_ref()
+                            .is_none_or(|p| s.name.starts_with(p.as_str()))
+                    })
+                    .filter(|s| symbol_kind.as_ref().is_none_or(|k| s.kind == *k))
+                    .filter(|s| {
+                        module
+                            .as_ref()
+                            .is_none_or(|m| s.identity.as_ref().is_some_and(|i| i.module == *m))
+                    })
+                    .collect();
+                let total = matched.len();
+                let shown = limit.map_or(total, |l| l.min(total));
+                json!({"status":"ok","symbols":self.symbol_values(&matched[..shown]),
+                    "total":total,"truncated":shown < total})
             }
             QueryRequest::SymbolAt { file, byte, .. } => self.symbol_at(&file, byte),
             QueryRequest::TypeAt { file, byte, .. } => {
@@ -522,8 +570,14 @@ impl QuerySession {
                     return json!({"revision":self.revision(),"result":{"status":"ambiguous"}});
                 };
                 let e = &self.snapshot.semantic.expressions[index];
-                if e.ty.is_some() {
-                    json!({"status":"ok","type":e.ty,"location":e.location})
+                if let Some(ty) = &e.ty {
+                    let module = self
+                        .functions
+                        .get(&e.function)
+                        .and_then(|&i| self.snapshot.functions[i].identity.as_ref())
+                        .map(|i| i.module.as_str());
+                    let display = self.names.render(ty, module);
+                    json!({"status":"ok","type":ty,"type_display":display,"location":e.location})
                 } else {
                     let declared = self.declared_type_at(&file, byte);
                     if declared["status"] == "unknown" {
@@ -539,7 +593,9 @@ impl QuerySession {
                     json!({"status":if f.synthetic {"unanalyzed"}else if f.locations.len()>1 {"ambiguous"}else{"ok"}, "symbol":f})
                 }
                 None => match self.symbols.get(&function) {
-                    Some(&i) => json!({"status":"ok","symbol":self.snapshot.semantic.symbols[i]}),
+                    Some(&i) => {
+                        json!({"status":"ok","symbol":self.names.symbol(&self.snapshot.semantic.symbols[i])})
+                    }
                     None => json!({"status":"unknown"}),
                 },
             },

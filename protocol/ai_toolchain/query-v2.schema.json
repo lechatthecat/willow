@@ -97,6 +97,27 @@
           },
           "revision": {
             "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "description": "Exact declaration name."
+          },
+          "prefix": {
+            "type": "string",
+            "description": "Declaration name prefix (case-sensitive)."
+          },
+          "module": {
+            "type": "string",
+            "description": "Logical module path of identity.module, e.g. \"market\" or \"app::util\"."
+          },
+          "symbol_kind": {
+            "type": "string",
+            "description": "Declaration kind, e.g. function, method, class, enum, interface, field, variant, parameter, binding, import, module."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Maximum symbols returned after filtering; total and truncated report the uncapped count."
           }
         }
       },

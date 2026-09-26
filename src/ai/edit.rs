@@ -52,6 +52,16 @@ struct Plan {
     work: EditWork,
 }
 
+/// How `edit.preview` reports changed files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChangeFormat {
+    /// Full `before`/`after` text of every changed file.
+    #[default]
+    Full,
+    /// One unified diff (`diff -u`, three context lines) per changed file.
+    Diff,
+}
+
 pub struct Workspace {
     root: PathBuf,
     directory: PathBuf,
@@ -152,6 +162,7 @@ impl Workspace {
         entry: &Path,
         project: bool,
         request: Request,
+        format: ChangeFormat,
         emitter: &mut dyn DiagnosticEmitter,
     ) -> Result<serde_json::Value> {
         self.ensure_recovered()?;
@@ -226,7 +237,7 @@ impl Workspace {
             fs::write(sandbox.join(&change.path), &change.after)?;
         }
         self.store(&id, &plan)?;
-        self.preview(&id)
+        self.preview(&id, format)
     }
     fn analyze(
         &self,
@@ -242,12 +253,23 @@ impl Workspace {
         )
         .analysis_with_emitter(emitter)
     }
-    pub fn preview(&self, id: &str) -> Result<serde_json::Value> {
+    pub fn preview(&self, id: &str, format: ChangeFormat) -> Result<serde_json::Value> {
         self.ensure_recovered()?;
         let plan = self.load(id)?;
+        let changes = match format {
+            ChangeFormat::Full => serde_json::to_value(&plan.changes)?,
+            ChangeFormat::Diff => plan
+                .changes
+                .iter()
+                .map(|c| {
+                    serde_json::json!({"path":c.path,
+                        "diff":super::diff::unified(&c.path, &c.before, &c.after)})
+                })
+                .collect(),
+        };
         Ok(
             serde_json::json!({"kind":"edit.preview", "transaction":id, "revision":plan.revision,
-            "candidate":plan.candidate, "state":plan.state, "changes":plan.changes, "work":plan.work}),
+            "candidate":plan.candidate, "state":plan.state, "changes":changes, "work":plan.work}),
         )
     }
     fn check_candidate(&self, id: &str, plan: &Plan) -> Result<()> {
@@ -1013,6 +1035,7 @@ mod tests {
                             body: body.into(),
                         }],
                     },
+                    ChangeFormat::Full,
                     &mut emitter,
                 )
                 .unwrap();
@@ -1061,6 +1084,30 @@ mod tests {
                 .contains("return 2")
         );
         assert!(w.apply(&id, &mut crate::diagnostics::HumanEmitter).is_err());
+    }
+    #[test]
+    fn preview_formats_report_full_texts_or_unified_diffs() {
+        let f = Fixture::new();
+        let w = f.workspace();
+        let id = f.prepare(&w, "{ return 2; }");
+        let full = w.preview(&id, ChangeFormat::Full).unwrap();
+        let diff = w.preview(&id, ChangeFormat::Diff).unwrap();
+        assert_eq!(full["transaction"], diff["transaction"]);
+        let full = &full["changes"][0];
+        let change = &diff["changes"][0];
+        assert_eq!(change["path"], full["path"]);
+        assert!(change.get("before").is_none() && change.get("after").is_none());
+        let expected = super::super::diff::unified(
+            full["path"].as_str().unwrap(),
+            full["before"].as_str().unwrap(),
+            full["after"].as_str().unwrap(),
+        );
+        assert_eq!(change["diff"], expected);
+        assert!(expected.starts_with("--- a/main.wi\n+++ b/main.wi\n@@ -1,1 +1,1 @@\n-"));
+        assert!(expected.contains("+fn value() -> i64 { return 2; }"));
+        // Diff previews do not change the transaction; it still validates.
+        w.validate(&id, &mut crate::diagnostics::HumanEmitter)
+            .unwrap();
     }
     #[derive(Default)]
     struct Collect(Vec<(String, String, usize)>);
@@ -1118,6 +1165,7 @@ mod tests {
                         },
                     ],
                 },
+                ChangeFormat::Full,
                 &mut emitter,
             )
             .unwrap();
@@ -1208,7 +1256,7 @@ mod tests {
             .unwrap();
         assert_eq!(status.code(), Some(79));
         let w = f.workspace();
-        assert!(w.preview(&id).is_err());
+        assert!(w.preview(&id, ChangeFormat::Full).is_err());
         w.recover(&id).unwrap();
         for c in plan.changes {
             assert_eq!(fs::read_to_string(f.0.join(c.path)).unwrap(), c.before);
@@ -1263,6 +1311,7 @@ mod tests {
                         name: "answer".into(),
                     }],
                 },
+                ChangeFormat::Full,
                 &mut emitter,
             )
             .unwrap();
@@ -1301,6 +1350,7 @@ mod tests {
                         name: "execute".into(),
                     }],
                 },
+                ChangeFormat::Full,
                 &mut emitter,
             )
             .unwrap();
@@ -1349,6 +1399,7 @@ mod tests {
                         },
                     ],
                 },
+                ChangeFormat::Full,
                 &mut emitter,
             )
             .unwrap();
@@ -1394,6 +1445,7 @@ mod tests {
                     name: "answer".into(),
                 }],
             },
+            ChangeFormat::Full,
             &mut emitter,
         )?;
         let id = result["transaction"].as_str().unwrap().to_owned();
@@ -1549,6 +1601,7 @@ mod tests {
                             name: "answer".into(),
                         }],
                     },
+                    ChangeFormat::Full,
                     &mut emitter,
                 )
                 .unwrap();
@@ -1591,6 +1644,7 @@ mod tests {
                         revision: snapshot.revision.clone(),
                         operations: vec![operation]
                     },
+                    ChangeFormat::Full,
                     &mut emitter
                 )
                 .is_err()

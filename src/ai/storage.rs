@@ -177,7 +177,7 @@ impl Snapshot {
         let result = (|| -> Result<()> {
             {
                 let mut writer = std::io::BufWriter::new(&mut file);
-                serde_json::to_writer(&mut writer, self)?;
+                serde_json::to_writer(&mut writer, &compact_paths(self)?)?;
                 writer.flush()?;
             }
             ensure!(
@@ -206,11 +206,106 @@ impl Snapshot {
             bytes.len() as u64 <= MAX_BYTES,
             "snapshot exceeds 64 MiB limit"
         );
-        let snapshot: Self = serde_json::from_slice(&bytes)?;
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
         drop(bytes);
+        expand_snapshot_paths(&mut value)?;
+        let snapshot: Self = serde_json::from_value(value)?;
         snapshot.validate()?;
         Ok(snapshot)
     }
+}
+
+/// Marker for files whose workspace-rooted paths start with [`PLACEHOLDER`].
+const PATH_ENCODING: &str = "workspace-placeholder-v1";
+const PLACEHOLDER: &str = "${workspace}";
+
+/// Rewrite every string value and object key, iteratively.
+fn rewrite_strings(value: &mut serde_json::Value, f: &dyn Fn(&str) -> Option<String>) {
+    use serde_json::Value;
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::String(text) => {
+                if let Some(new) = f(text) {
+                    *text = new;
+                }
+            }
+            Value::Array(items) => pending.extend(items.iter_mut()),
+            Value::Object(map) => {
+                if map.keys().any(|k| f(k).is_some()) {
+                    let old = std::mem::take(map);
+                    for (key, item) in old {
+                        map.insert(f(&key).unwrap_or(key), item);
+                    }
+                }
+                pending.extend(map.values_mut());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Write the workspace path once: a path string that starts with it (locations,
+/// source keys, module paths, the root package source) is stored as
+/// `${workspace}/rest`. Opaque identities that embed a path are left intact so
+/// IDs copied from the file still match query results. [`expand_snapshot_paths`]
+/// restores the exact in-memory snapshot, so the revision digest is unaffected.
+/// Falls back to the plain form if any string already starts with the marker.
+fn compact_paths(snapshot: &Snapshot) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(snapshot)?;
+    let workspace = snapshot.workspace.as_str();
+    let rooted = |text: &str| {
+        text.strip_prefix(workspace)
+            .filter(|rest| rest.is_empty() || rest.starts_with(['/', '\\']))
+            .map(|rest| format!("{PLACEHOLDER}{rest}"))
+    };
+    let mut ambiguous = workspace.is_empty();
+    let mut pending = vec![&value];
+    while let Some(item) = pending.pop().filter(|_| !ambiguous) {
+        match item {
+            serde_json::Value::String(text) => ambiguous = text.starts_with(PLACEHOLDER),
+            serde_json::Value::Array(items) => pending.extend(items),
+            serde_json::Value::Object(map) => {
+                ambiguous = map.keys().any(|k| k.starts_with(PLACEHOLDER));
+                pending.extend(map.values());
+            }
+            _ => {}
+        }
+    }
+    if ambiguous {
+        return Ok(value);
+    }
+    rewrite_strings(&mut value, &rooted);
+    let map = value.as_object_mut().unwrap();
+    map.insert("workspace".into(), workspace.into());
+    map.insert("path_encoding".into(), PATH_ENCODING.into());
+    Ok(value)
+}
+
+/// Restore the plain JSON form of a saved snapshot file in place: expands
+/// `${workspace}` path prefixes and drops the encoding marker. Files without the
+/// marker are left unchanged. For tools that read snapshot files as raw JSON.
+pub fn expand_snapshot_paths(value: &mut serde_json::Value) -> Result<()> {
+    let Some(map) = value.as_object_mut() else {
+        return Ok(());
+    };
+    let Some(encoding) = map.remove("path_encoding") else {
+        return Ok(());
+    };
+    ensure!(
+        encoding == PATH_ENCODING,
+        "unsupported snapshot path encoding"
+    );
+    let workspace = map
+        .get("workspace")
+        .and_then(|w| w.as_str())
+        .context("snapshot workspace")?
+        .to_owned();
+    rewrite_strings(value, &|text| {
+        text.strip_prefix(PLACEHOLDER)
+            .map(|rest| format!("{workspace}{rest}"))
+    });
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -349,5 +444,95 @@ fn change(old: Option<&Function>, new: Option<&Function>, kind: &str) -> Functio
             .difference(&new_edges)
             .map(|s| (*s).clone())
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(workspace: &str, sep: &str) -> Snapshot {
+        let file = format!("{workspace}{sep}src{sep}main.wi");
+        let mut semantic = SemanticFacts::default();
+        let id = serde_json::to_string(&[&file, "Box"]).unwrap();
+        semantic.symbols.push(symbols::Symbol {
+            identity: None,
+            id: format!("symbol:{id}"),
+            name: "Box".into(),
+            kind: "class".into(),
+            location: Some(Location {
+                path: file.clone(),
+                start: 0,
+                end: 3,
+            }),
+            ty: None,
+        });
+        Snapshot {
+            version: 1,
+            compiler: "test".into(),
+            compatibility: "c".into(),
+            workspace: workspace.into(),
+            revision: "r".into(),
+            sources: BTreeMap::from([
+                (file, "h".into()),
+                (format!("{workspace}-other{sep}x.wi"), "h".into()),
+                ("/elsewhere/y.wi".into(), "h".into()),
+            ]),
+            functions: vec![],
+            semantic,
+        }
+    }
+
+    fn roundtrip(snapshot: &Snapshot) -> serde_json::Value {
+        let mut compact = compact_paths(snapshot).unwrap();
+        let written = compact.clone();
+        expand_snapshot_paths(&mut compact).unwrap();
+        assert_eq!(compact, serde_json::to_value(snapshot).unwrap());
+        written
+    }
+
+    #[test]
+    fn workspace_paths_are_written_once_and_restored_exactly() {
+        // Unix and Windows spellings round-trip exactly.
+        for (workspace, sep) in [("/home/u/app", "/"), (r"C:\Users\u\app", r"\")] {
+            let s = snapshot(workspace, sep);
+            let written = roundtrip(&s);
+            let text = written.to_string();
+            assert_eq!(written["workspace"], workspace);
+            assert_eq!(written["path_encoding"], PATH_ENCODING);
+            let symbol = &written["semantic"]["symbols"][0];
+            // Locations and source keys are rewritten...
+            assert_eq!(
+                symbol["location"]["path"],
+                format!("{PLACEHOLDER}{sep}src{sep}main.wi")
+            );
+            assert!(
+                written["sources"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key(&format!("{PLACEHOLDER}{sep}src{sep}main.wi"))
+            );
+            // ...but a sibling directory sharing the prefix, external paths
+            // and opaque IDs are not.
+            assert!(text.contains("-other"));
+            assert!(!text.contains(&format!("{PLACEHOLDER}-other")));
+            assert!(text.contains("/elsewhere/y.wi"));
+            assert_eq!(symbol["id"], s.semantic.symbols[0].id.as_str());
+        }
+        // A string that already starts with the marker disables compaction.
+        let mut s = snapshot("/w", "/");
+        s.semantic.symbols[0].name = format!("{PLACEHOLDER}/x");
+        let written = compact_paths(&s).unwrap();
+        assert!(written.get("path_encoding").is_none());
+        assert_eq!(written, serde_json::to_value(&s).unwrap());
+        // Files written before the encoding load unchanged.
+        let mut plain = serde_json::to_value(snapshot("/w", "/")).unwrap();
+        let before = plain.clone();
+        expand_snapshot_paths(&mut plain).unwrap();
+        assert_eq!(plain, before);
+        // Unknown encodings are rejected rather than misread.
+        let mut unknown = before.clone();
+        unknown["path_encoding"] = "future".into();
+        assert!(expand_snapshot_paths(&mut unknown).is_err());
     }
 }

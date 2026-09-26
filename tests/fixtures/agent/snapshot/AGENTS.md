@@ -19,14 +19,15 @@ Source, project.toml, project.lock, or path-dependency edits make the old snapsh
 - References: `willow query . --requests queries.json --format ndjson --protocol-version 1`.
 - Callers: `willow impact . --function FUNCTION_ID --revision REVISION --direction callers --format ndjson --protocol-version 1`.
 - Impact: `willow impact . --function FUNCTION_ID --revision REVISION --direction callers --format ndjson --protocol-version 1`.
-- Structured edits: `willow edit prepare --root . --entry src/main.wi --project --requests edits.json --format ndjson --protocol-version 1`.
+- Structured edits: `willow edit prepare --root . --entry src/main.wi --project --requests edits.json --changes diff --format ndjson --protocol-version 1`.
 Query request files are JSON arrays. Use compiler-returned IDs and the current revision; a stale, unknown or incomplete result is not proof of absence. The query command constructs its own immutable snapshot; bind requests to the saved revision to detect changes between commands.
 Replace REVISION with analysis.result.data.revision from snapshot.saved (or the current query result). Write each following JSON array to queries.json before running its command. Check each query result status as well as request.finished: a successful transport can contain stale or unknown results.
+Keep symbol lists small: replace NAME_PREFIX with a name prefix, or filter by `name`, `module` or `symbol_kind`; `total`/`truncated` report what `limit` cut. Read `type_display` for types.
 
 Run `willow query . --requests queries.json --format ndjson --protocol-version 1` with:
 
 ```json
-[{"kind":"symbols","revision":"REVISION"}]
+[{"kind":"symbols","revision":"REVISION","prefix":"NAME_PREFIX","limit":50}]
 ```
 
 Run `willow query . --requests queries.json --format ndjson --protocol-version 1` with:

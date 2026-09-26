@@ -56,7 +56,10 @@ impl Fixture {
     }
     fn save(&self, name: &str) -> Value {
         self.result(&["snapshot", "save", "main.wi", "--output", name]);
-        serde_json::from_slice(&fs::read(self.0.join(name)).unwrap()).unwrap()
+        // Decode like consumers do: workspace placeholders expand to paths.
+        let mut value = serde_json::from_slice(&fs::read(self.0.join(name)).unwrap()).unwrap();
+        willow_compiler::ai::expand_snapshot_paths(&mut value).unwrap();
+        value
     }
 }
 impl Drop for Fixture {
@@ -1000,4 +1003,127 @@ fn method_references_are_unique_and_prelude_contracts_are_not_functions() {
         refs.iter().all(|r| r["certainty"] == "resolved"),
         "{refs:?}"
     );
+}
+
+#[test]
+fn symbol_filters_readable_types_and_compact_snapshot_paths() {
+    let f = Fixture::new("");
+    fs::remove_file(f.0.join("main.wi")).unwrap();
+    f.write(
+        "project.toml",
+        "[willow]\nmanifest-version = 1\n\n[project]\nname = \"app\"\nversion = \"0.1.0\"\nentry = \"src/main.wi\"\n\n[dependencies]\n",
+    );
+    fs::create_dir(f.0.join("src")).unwrap();
+    f.write(
+        "src/shapes.wi",
+        "import std::collections::Array;\npub class Box { pub side: i64; }\npub fn wrap(n: i64) -> Box { return new Box(n); }\npub fn sides(xs: Array<Box>, f: fn(Box, i64) -> i64) -> i64 { return f(xs[0], 1); }\n",
+    );
+    let main = "import shapes;\nimport shapes::Box;\nfn area(b: Box, k: i64) -> i64 { return b.side * k; }\nfn main() { let b = shapes::wrap(2); println(area(b, 3)); }\n";
+    f.write("src/main.wi", main);
+    let names = |result: &Value| -> Vec<String> {
+        result["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let requests = serde_json::json!([
+        {"kind":"symbols","symbol_kind":"function"},
+        {"kind":"symbols","module":"shapes","prefix":"s","limit":1},
+        {"kind":"symbols","name":"wrap"},
+        {"kind":"symbols","name":"absent"},
+        {"kind":"symbols","module":"main","symbol_kind":"class"},
+        {"kind":"symbols","limit":0},
+        {"kind":"symbols"},
+        {"kind":"type-at","file":f.0.join("src/main.wi"),"byte":main.find("wrap(2)").unwrap()}
+    ]);
+    f.write("requests.json", &requests.to_string());
+    let r = f.result(&["query", ".", "--requests", "requests.json"]);
+    let results: Vec<&Value> = r["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| &v["result"])
+        .collect();
+    // Kind filter keeps only functions; every function carries a readable type
+    // whose names are canonical module paths, local and item-imported alike.
+    let mut functions = names(results[0]);
+    functions.sort();
+    assert_eq!(functions, ["area", "main", "sides", "wrap"]);
+    assert_eq!(results[0]["total"], 4);
+    assert_eq!(results[0]["truncated"], false);
+    let display = |name: &str| {
+        results[0]["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == name)
+            .unwrap()["type_display"]
+            .clone()
+    };
+    assert_eq!(display("area"), "fn(shapes::Box, i64) -> i64");
+    assert_eq!(display("wrap"), "fn(i64) -> shapes::Box");
+    assert_eq!(
+        display("sides"),
+        "fn(Array<shapes::Box>, fn(shapes::Box, i64) -> i64) -> i64"
+    );
+    assert_eq!(display("main"), "fn() -> void");
+    // The exact compiler tree stays beside the readable spelling.
+    assert!(results[0]["symbols"][0]["ty"].is_array());
+    // Filters combine; limit reports the cut.
+    assert_eq!(names(results[1]).len(), 1);
+    assert_eq!(results[1]["total"], 2);
+    assert_eq!(results[1]["truncated"], true);
+    assert_eq!(names(results[2]), ["wrap"]);
+    assert_eq!(results[2]["symbols"][0]["identity"]["module"], "shapes");
+    assert_eq!(names(results[3]).len(), 0);
+    assert_eq!(results[3]["total"], 0);
+    assert_eq!(names(results[4]).len(), 0);
+    assert_eq!(results[5]["truncated"], true);
+    assert_eq!(names(results[5]).len(), 0);
+    // No filter returns everything, including imports and the class.
+    let all = names(results[6]);
+    assert_eq!(results[6]["total"], all.len());
+    assert!(all.contains(&"Box".to_owned()));
+    assert_eq!(results[7]["status"], "ok");
+    assert_eq!(results[7]["type_display"], "shapes::Box");
+
+    // Saved snapshots write the workspace once; ids read from the file still
+    // resolve in queries against the live project.
+    f.result(&["snapshot", "save", ".", "--output", "snapshot.json"]);
+    let text = fs::read_to_string(f.0.join("snapshot.json")).unwrap();
+    let snapshot: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(snapshot["path_encoding"], "workspace-placeholder-v1");
+    assert_eq!(snapshot["workspace"], f.0.to_str().unwrap());
+    assert!(text.contains("${workspace}/src/shapes.wi"));
+    let wrap = named(&snapshot, "wrap");
+    let symbol = snapshot["semantic"]["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "Box" && s["kind"] == "class")
+        .unwrap();
+    let requests = serde_json::json!([
+        {"kind":"symbol-info","function":wrap["id"]},
+        {"kind":"symbol-info","function":symbol["id"]}
+    ]);
+    f.write("requests.json", &requests.to_string());
+    let r = f.result(&["query", ".", "--requests", "requests.json"]);
+    assert_eq!(r["revision"], snapshot["revision"]);
+    assert_eq!(r["results"][0]["result"]["symbol"]["name"], "wrap");
+    assert_eq!(r["results"][1]["result"]["status"], "ok");
+    assert_eq!(
+        r["results"][1]["result"]["symbol"]["type_display"],
+        "shapes::Box"
+    );
+    // The compacted file round-trips through snapshot diff.
+    f.result(&[
+        "snapshot",
+        "diff",
+        "--before",
+        "snapshot.json",
+        "--after",
+        "snapshot.json",
+    ]);
 }

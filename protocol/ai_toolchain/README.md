@@ -57,6 +57,16 @@ queries and edits remain later releases. Within-revision identities and
 cross-revision matching will be separate; impact distance and synthetic-node
 presentation remain V1 decisions.
 
+Saved snapshot files store the workspace path once in `workspace` and set
+`path_encoding: "workspace-placeholder-v1"`; any other string that is a path under
+the workspace is written as `${workspace}/rest`. Loading restores the exact
+snapshot (the revision digest is computed over the expanded form). Opaque IDs,
+including symbol IDs that embed a path, are never rewritten, so IDs copied from
+the file match query results. Files without `path_encoding` load unchanged.
+Tools reading the file as raw JSON expand it by replacing the `${workspace}`
+prefix of every string and object key with `workspace` and dropping
+`path_encoding`; Rust callers can use `willow_compiler::ai::expand_snapshot_paths`.
+
 The machine-readable envelope and known payloads are defined in [toolchain-v1.schema.json](toolchain-v1.schema.json). Unknown additive fields and events remain permitted.
 
 Agent instruction generation, capability flags and managed sync are documented
@@ -81,7 +91,21 @@ reordering equivalent operations alone does not enable a new effect.
 work separately from the current revision's counters.
 
 V2 query batches use [query-v2.schema.json](query-v2.schema.json). `symbols`
-lists compiler-resolved declarations; `symbol-at` takes a file and byte offset.
+lists compiler-resolved declarations. It accepts optional AND-combined filters
+`name` (exact), `prefix`, `module` (logical module path) and `symbol_kind`, plus
+`limit`; the result adds `total` (matches before `limit`) and `truncated`. Prefer
+filtered requests: an unfiltered list grows with every binding and parameter.
+`symbol-at` takes a file and byte offset.
+
+Typed results keep the exact compiler tree in `ty` (a flat node array rooted at
+index 0; child indices are traversal order, not parameter order) and add
+`type_display`, a source-like spelling such as `fn(shipping::Parcel) -> i64`.
+Its names are canonical across modules: the root package's types are
+`module::Name`, a dependency's are `package::module::Name`, and a bare name
+declared or item-imported as a type in the declaring module is replaced by the
+target's canonical name. Builtins and type parameters keep their spelling.
+`type_display` appears on declarations in `symbols`, `symbol-at`, `symbol-info`
+and on `type-at` results. Use it for reading; compare types by `ty`.
 `symbol-info` and `references` accept either a callable ID or a declaration ID
 in the historical `function` field. Source declarations and references include
 bindings, parameters, types, type parameters, fields, enum variants, imports,

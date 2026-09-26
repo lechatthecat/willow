@@ -16,8 +16,8 @@ and function id into a request conforming to the edit schema, for example:
 ```
 
 ```sh
-willow edit prepare --root . --entry main.wi --requests edits.json
-willow edit preview --root . --transaction <transaction>
+willow edit prepare --root . --entry main.wi --requests edits.json --changes diff
+willow edit preview --root . --transaction <transaction> [--changes diff]
 willow edit validate --root . --transaction <transaction>
 willow edit apply --root . --transaction <transaction>
 # After interruption or a write error:
@@ -25,7 +25,10 @@ willow edit recover --root . --transaction <transaction>
 ```
 
 `prepare` returns the transaction id and full before/after text for every changed
-file. It leaves workspace source files unchanged. `validate` performs cold,
+file. With `--changes diff` (accepted by `prepare` and `preview`) each change is
+instead `{"path", "diff"}`: a unified diff with three context lines and
+workspace-relative `a/`/`b/` headers, usually a small fraction of the file text.
+The stored transaction is identical in both modes. It leaves workspace source files unchanged. `validate` performs cold,
 complete frontend validation in the isolated candidate; its diagnostics name
 workspace-relative source paths, never the `.willow-edits/<tx>/` copy. `apply` accepts only
 that unchanged candidate and unchanged base inputs, journals undo bytes before

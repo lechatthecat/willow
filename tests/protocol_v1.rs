@@ -55,7 +55,10 @@ impl Fixture {
     }
     fn save(&self, name: &str) -> Value {
         self.result(&["snapshot", "save", "main.wi", "--output", name]);
-        serde_json::from_slice(&fs::read(self.0.join(name)).unwrap()).unwrap()
+        // Decode like consumers do: workspace placeholders expand to paths.
+        let mut value = serde_json::from_slice(&fs::read(self.0.join(name)).unwrap()).unwrap();
+        willow_compiler::ai::expand_snapshot_paths(&mut value).unwrap();
+        value
     }
     fn diff(&self, a: &str, b: &str) -> Value {
         self.result(&["snapshot", "diff", "--before", a, "--after", b])["difference"].clone()

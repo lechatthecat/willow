@@ -24,6 +24,17 @@ struct SymbolModuleName {
     namespace: String,
 }
 
+/// `$pkg<hash>` prefix of every type name declared by `package`. Stable
+/// FNV-1a-128 over the canonical identity (not a security hash); a collision is
+/// detected by [`SymbolModule::new`] rather than silently merging declarations.
+pub fn package_namespace(package: &crate::package::PackageIdentity) -> String {
+    let mut hash = 0x6c62272e07bb014262b821756295c58du128;
+    for byte in serde_json::to_vec(package).expect("package identity serializes") {
+        hash = (hash ^ u128::from(byte)).wrapping_mul(0x1000000000000000000013b);
+    }
+    format!("$pkg{hash:032x}")
+}
+
 /// Process-local module handle used by compact symbol IDs. Artifacts serialize
 /// the underlying package identity and logical path, never the numeric handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -31,13 +42,7 @@ pub struct SymbolModule(u32);
 
 impl SymbolModule {
     pub fn new(package: crate::package::PackageIdentity, path: crate::module::ModulePath) -> Self {
-        // Stable FNV-1a-128 over the canonical identity (not a security hash).
-        // A collision is detected below rather than silently merging declarations.
-        let mut hash = 0x6c62272e07bb014262b821756295c58du128;
-        for byte in serde_json::to_vec(&package).expect("package identity serializes") {
-            hash = (hash ^ u128::from(byte)).wrapping_mul(0x1000000000000000000013b);
-        }
-        let namespace = format!("$pkg{hash:032x}::{}", path.0);
+        let namespace = format!("{}::{}", package_namespace(&package), path.0);
         let name = SymbolModuleName {
             package,
             path,

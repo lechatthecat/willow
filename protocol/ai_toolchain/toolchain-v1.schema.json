@@ -847,6 +847,48 @@
                   "transaction": {
                     "type": "string",
                     "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "changes": {
+                    "description": "edit.preview only. --changes full (default) gives before/after text; --changes diff gives one unified diff (three context lines) per file.",
+                    "type": "array",
+                    "items": {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "required": [
+                            "path",
+                            "before",
+                            "after"
+                          ],
+                          "properties": {
+                            "path": {
+                              "type": "string"
+                            },
+                            "before": {
+                              "type": "string"
+                            },
+                            "after": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "required": [
+                            "path",
+                            "diff"
+                          ],
+                          "properties": {
+                            "path": {
+                              "type": "string"
+                            },
+                            "diff": {
+                              "type": "string"
+                            }
+                          }
+                        }
+                      ]
+                    }
                   }
                 }
               },

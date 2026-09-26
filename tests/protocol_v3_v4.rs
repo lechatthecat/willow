@@ -46,7 +46,11 @@ impl Fixture {
     fn snapshot(&self) -> Value {
         let _ = fs::remove_file(self.0.join("snapshot.json"));
         self.result(&["snapshot", "save", "main.wi", "--output", "snapshot.json"]);
-        serde_json::from_slice(&fs::read(self.0.join("snapshot.json")).unwrap()).unwrap()
+        // Decode like consumers do: workspace placeholders expand to paths.
+        let mut value =
+            serde_json::from_slice(&fs::read(self.0.join("snapshot.json")).unwrap()).unwrap();
+        willow_compiler::ai::expand_snapshot_paths(&mut value).unwrap();
+        value
     }
 }
 impl Drop for Fixture {
