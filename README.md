@@ -640,7 +640,7 @@ The current implementation reuses fine-grained compiler query results across rev
 
 ## Fine-grained incremental compilation
 
-Willow's `CompilerDb` includes its own dependency-tracked incremental query engine. Willow does not use Salsa; the query engine is implemented directly in the compiler.
+Willow's `CompilerDb` includes its own dependency-tracked incremental query engine.
 
 Queries automatically record the semantic inputs and other queries they read. Across revisions, Willow validates those dependencies and uses red-green recomputation: if a dependency must be recomputed but its semantic result is unchanged, that result is backdated and the change does not propagate further.
 
