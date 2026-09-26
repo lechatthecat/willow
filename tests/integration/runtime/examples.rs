@@ -785,9 +785,33 @@ fn runnable_project_example_cases() -> &'static [(&'static str, &'static str, &'
 #[test]
 fn test_package_paths_project_example() {
     for &(project, _, expected) in runnable_project_example_cases() {
-        let (out, ok) = compile_file_and_run(project);
-        assert!(ok, "{project} failed");
+        // Run from a copy of the enclosing directory (which holds the path
+        // dependencies) so the generated project.lock never lands in the tree.
+        let project = Path::new(project);
+        let workspace = project.parent().unwrap();
+        let copy = PathBuf::from(temp_path(format!(
+            "willow_project_example_{}",
+            unique_test_id()
+        )));
+        copy_dir(workspace, &copy);
+        let copied_project = copy.join(project.file_name().unwrap());
+        let (out, ok) = compile_file_and_run(copied_project.to_str().unwrap());
+        let _ = fs::remove_dir_all(&copy);
+        assert!(ok, "{} failed", project.display());
         assert_eq!(out, expected);
+    }
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
     }
 }
 

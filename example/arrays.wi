@@ -1,7 +1,9 @@
 // arrays.wi — GC-managed Array<T>: literals, indexing, assignment, .len().
 //
-// Arrays are fixed-length at creation. Elements are read/written with `a[i]`
-// (bounds-checked: an out-of-range index aborts) and counted with `a.len()`.
+// Arrays start with the length of their literal and can grow or shrink with
+// `a.push(x)` / `a.pop()` (see array_push_growth.wi). Elements are read/written
+// with `a[i]` (bounds-checked: an out-of-range index aborts) and counted with
+// `a.len()`.
 // Element types may be scalars (i64, bool, f64) or GC-managed references
 // (String, class instances).
 

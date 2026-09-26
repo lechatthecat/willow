@@ -7,6 +7,11 @@ use std::time::Instant;
 use willow_compiler::{CompilerOptions, compile};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
+const PROJECT_MANIFEST: &str =
+    "[project]\nname = 'bench'\nversion = '0.1.0'\n[willow]\nmanifest-version = 1\n";
+// Canonical lock for PROJECT_MANIFEST. Writing it up front keeps lock creation
+// (and its fsync) out of the timed compile.
+const PROJECT_LOCK: &str = "lock-version = 1\n\n[root]\npackage = \"path:.\"\n\n[[package]]\nid = \"path:.\"\nname = \"bench\"\nversion = \"0.1.0\"\ndependencies = []\n\n[package.source]\nkind = \"path\"\npath = \".\"\n";
 
 struct BenchmarkCase {
     name: &'static str,
@@ -30,8 +35,10 @@ impl TempBenchmark {
             id
         ));
         fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("project.toml"), PROJECT_MANIFEST).unwrap();
+        fs::write(root.join("project.lock"), PROJECT_LOCK).unwrap();
         for (path, source) in &case.files {
-            let path = root.join(path);
+            let path = root.join("src").join(path);
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).unwrap();
             }
@@ -65,7 +72,7 @@ fn main() {
 
 fn run_case(case: &BenchmarkCase, iteration: usize) {
     let project = TempBenchmark::new(case);
-    let entry = project.root.join(case.entry);
+    let entry = project.root.join("src").join(case.entry);
     let started = Instant::now();
     let _panic_effects = CompilerEnvOverride::new("WILLOW_PANIC_EFFECTS", case.panic_effects);
     compile(
@@ -76,6 +83,12 @@ fn run_case(case: &BenchmarkCase, iteration: usize) {
     )
     .unwrap_or_else(|error| panic!("{} compile failed: {error:#}", case.name));
     let compile_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    assert_eq!(
+        fs::read_to_string(project.root.join("project.lock")).unwrap(),
+        PROJECT_LOCK,
+        "{} rewrote project.lock; update PROJECT_LOCK",
+        case.name
+    );
     let artifact_bytes = fs::metadata(&project.binary).unwrap().len();
 
     let started = Instant::now();
