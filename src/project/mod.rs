@@ -4,7 +4,11 @@ use std::path::{Path, PathBuf};
 pub mod agent;
 mod dependency;
 pub mod init;
+mod rust;
 pub use dependency::{CanonicalGitUrl, DependencySource, GitSelector};
+pub use rust::{
+    RustDependency, RustDependencySource, RustDependencySpec, RustGitSelector, RustSection,
+};
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -23,6 +27,11 @@ pub struct ProjectManifest {
     #[serde(default)]
     pub dependencies: BTreeMap<String, DependencySource>,
     pub willow: Option<WillowSection>,
+    /// Cargo dependencies. Deliberately a separate section from
+    /// `[dependencies]`: these never reach the Willow package resolver.
+    #[serde(rename = "rust-dependencies", default)]
+    pub rust_dependencies: BTreeMap<String, RustDependencySpec>,
+    pub rust: Option<RustSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,6 +48,10 @@ pub enum ManifestError {
     InvalidAlias(String),
     #[error("error[{code}]: unsupported_manifest_version: found {found}, supported {supported}", code = crate::diagnostics::ErrorCode::E2014.as_str())]
     UnsupportedVersion { found: u64, supported: u64 },
+    #[error("error[{code}]: rust_dependency_invalid: {0}", code = crate::diagnostics::ErrorCode::E2015.as_str())]
+    RustDependencyInvalid(String),
+    #[error("error[{code}]: rust_bridge_missing: {0}", code = crate::diagnostics::ErrorCode::E2016.as_str())]
+    RustBridgeMissing(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +71,10 @@ impl ProjectManifest {
         let manifest: Self = toml::from_str(&text)
             .map_err(|e| ManifestError::Invalid(format!("{}: {e}", manifest_path.display())))?;
         manifest.validate()?;
+        // Bridge existence is the only rule that needs the project root.
+        if let Some(rust) = &manifest.rust {
+            rust.resolve_bridge(manifest_path.parent().unwrap_or(Path::new(".")))?;
+        }
         Ok(manifest)
     }
 
@@ -104,6 +121,12 @@ impl ProjectManifest {
             {
                 return Err(ManifestError::InvalidAlias(alias.clone()).into());
             }
+        }
+        for (alias, spec) in &self.rust_dependencies {
+            spec.normalize(alias)?;
+        }
+        if let Some(rust) = &self.rust {
+            rust.relative_bridge()?;
         }
         if is_reserved_package_name(&self.project.name) {
             anyhow::bail!(
@@ -397,5 +420,273 @@ mod dependency_tests {
         assert!(ProjectManifest::load(&path).is_err());
         std::fs::remove_file(&path).unwrap();
         assert!(ProjectManifest::load(&path).is_err());
+    }
+}
+
+#[cfg(test)]
+mod rust_manifest_tests {
+    use super::*;
+
+    /// A real directory, because bridge resolution touches the file system.
+    struct Project(PathBuf);
+
+    impl Project {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "willow-rust-manifest-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(std::fs::canonicalize(root).unwrap())
+        }
+
+        fn load(&self, extra: &str) -> Result<ProjectManifest> {
+            let path = self.0.join("project.toml");
+            std::fs::write(
+                &path,
+                format!("[project]\nname = \"demo\"\nversion = \"1.2.3\"\n{extra}"),
+            )
+            .unwrap();
+            ProjectManifest::load(&path)
+        }
+    }
+
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn dependency(spec: &str) -> Result<RustDependency> {
+        let project = Project::new();
+        let manifest = project.load(&format!("[rust-dependencies]\nlib = {spec}\n"))?;
+        Ok(manifest.rust_dependencies["lib"].normalize("lib")?)
+    }
+
+    fn rejection(extra: &str) -> String {
+        Project::new()
+            .load(extra)
+            .expect_err(&format!("should reject: {extra}"))
+            .to_string()
+    }
+
+    fn dependency_rejection(spec: &str) -> String {
+        rejection(&format!("[rust-dependencies]\nlib = {spec}\n"))
+    }
+
+    #[test]
+    fn short_and_expanded_registry_forms_agree() {
+        let short = dependency("\"1.12\"").unwrap();
+        assert_eq!(
+            short.source,
+            RustDependencySource::Registry {
+                version: "1.12".into()
+            }
+        );
+        // The requirement text reaches Cargo verbatim, not as a reformatted range.
+        assert_eq!(short, dependency("{ version = \"1.12\" }").unwrap());
+        assert!(short.default_features);
+        assert!(short.features.is_empty());
+    }
+
+    #[test]
+    fn git_sources_carry_rev_tag_or_default_selector() {
+        for (spec, expected) in [
+            (
+                "{ git = 'https://example.org/c.git', rev = '63d8c7' }",
+                RustGitSelector::Revision("63d8c7".into()),
+            ),
+            (
+                "{ git = 'https://example.org/c.git', tag = 'v2.1.0' }",
+                RustGitSelector::Tag("v2.1.0".into()),
+            ),
+            (
+                "{ git = 'https://example.org/c.git' }",
+                RustGitSelector::Default,
+            ),
+        ] {
+            let RustDependencySource::Git { url, selector } = dependency(spec).unwrap().source
+            else {
+                panic!("{spec} should be a git source");
+            };
+            assert_eq!(url.as_str(), "https://example.org/c");
+            assert_eq!(selector, expected, "{spec}");
+        }
+    }
+
+    #[test]
+    fn path_sources_may_leave_the_project_root() {
+        assert_eq!(
+            dependency("{ path = '../my-native' }").unwrap().source,
+            RustDependencySource::Path {
+                path: "../my-native".into()
+            }
+        );
+    }
+
+    #[test]
+    fn features_and_default_features_are_preserved() {
+        let json = dependency("{ version = '1', features = ['preserve_order'] }").unwrap();
+        assert_eq!(json.features, ["preserve_order"]);
+        assert!(json.default_features);
+        let foo =
+            dependency("{ version = '2', default-features = false, features = ['fast'] }").unwrap();
+        assert_eq!(foo.features, ["fast"]);
+        assert!(!foo.default_features);
+        // Features and default-features are orthogonal to the source kind.
+        assert!(
+            !dependency("{ path = '../n', default-features = false }")
+                .unwrap()
+                .default_features
+        );
+    }
+
+    #[test]
+    fn optional_true_is_rejected_and_optional_false_is_accepted() {
+        let error = dependency_rejection("{ version = '1', optional = true }");
+        assert!(error.contains("error[E2015]"), "{error}");
+        assert!(error.contains("rust_dependency_invalid"), "{error}");
+        assert!(
+            error.contains("`optional = true` is not supported"),
+            "{error}"
+        );
+        assert!(dependency("{ version = '1', optional = false }").is_ok());
+    }
+
+    #[test]
+    fn branch_is_rejected_by_name_rather_than_as_an_unknown_key() {
+        let error = dependency_rejection("{ git = 'x', branch = 'main' }");
+        assert!(error.contains("rust_dependency_invalid"), "{error}");
+        assert!(error.contains("use `rev` or `tag`"), "{error}");
+    }
+
+    #[test]
+    fn mixed_sources_and_stray_selectors_are_rejected() {
+        for spec in [
+            "{ version = '1', git = 'x' }",
+            "{ version = '1', path = '../n' }",
+            "{ git = 'x', path = '../n' }",
+            "{ version = '1', git = 'x', path = '../n' }",
+            "{ git = 'x', rev = 'a', tag = 'v1' }",
+            "{ version = '1', rev = 'a' }",
+            "{ path = '../n', tag = 'v1' }",
+            "{}",
+        ] {
+            let error = dependency_rejection(spec);
+            assert!(error.contains("rust_dependency_invalid"), "{spec}: {error}");
+        }
+    }
+
+    #[test]
+    fn unknown_keys_and_malformed_values_are_rejected() {
+        for spec in [
+            "{ version = '1', typo = 'x' }",
+            "{ version = '1', registry = 'private' }",
+            "{ version = 'not a version' }",
+            "{ version = '' }",
+            "{ git = '' }",
+            "{ path = '' }",
+            "{ git = 'x', rev = '  ' }",
+            "{ version = '1', features = [''] }",
+            "{ version = 1 }",
+            "true",
+        ] {
+            assert!(
+                !dependency_rejection(spec).is_empty(),
+                "{spec} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn aliases_follow_cargo_naming_not_willow_import_naming() {
+        // Hyphens are legal Cargo package names and must survive, unlike in
+        // `[dependencies]`, where the alias becomes a Willow identifier.
+        let project = Project::new();
+        let manifest = project
+            .load("[rust-dependencies]\nserde-json = '1'\n_private = '1'\n")
+            .unwrap();
+        assert_eq!(manifest.rust_dependencies.len(), 2);
+        for alias in ["1abc", "", "日本", "a.b", "a b", "-lead"] {
+            let error = rejection(&format!("[rust-dependencies]\n'{alias}' = '1'\n"));
+            assert!(
+                error.contains("rust_dependency_invalid"),
+                "{alias}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_resolves_against_the_project_root() {
+        let project = Project::new();
+        std::fs::create_dir_all(project.0.join("rust")).unwrap();
+        std::fs::write(project.0.join("rust/bridge.rs"), "pub fn f() {}\n").unwrap();
+        let manifest = project
+            .load("[rust]\nbridge = \"rust/bridge.rs\"\n\n[rust-dependencies]\nregex = \"1.12\"\n")
+            .unwrap();
+        let rust = manifest.rust.as_ref().unwrap();
+        assert_eq!(rust.relative_bridge().unwrap(), Path::new("rust/bridge.rs"));
+        assert_eq!(
+            rust.resolve_bridge(&project.0).unwrap(),
+            project.0.join("rust/bridge.rs")
+        );
+    }
+
+    #[test]
+    fn bridge_paths_escaping_the_project_root_are_rejected() {
+        let absolute = if cfg!(windows) {
+            "C:\\\\tmp\\\\bridge.rs"
+        } else {
+            "/tmp/bridge.rs"
+        };
+        for bridge in ["../bridge.rs", "rust/../../bridge.rs", absolute, "", "."] {
+            let error = rejection(&format!("[rust]\nbridge = \"{bridge}\"\n"));
+            assert!(
+                error.contains("error[E2015]") && error.contains("rust_dependency_invalid"),
+                "{bridge}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_bridge_file_is_its_own_diagnostic() {
+        let project = Project::new();
+        let error = project
+            .load("[rust]\nbridge = \"rust/bridge.rs\"\n")
+            .expect_err("missing bridge should fail")
+            .to_string();
+        assert!(error.contains("error[E2016]"), "{error}");
+        assert!(error.contains("rust_bridge_missing"), "{error}");
+
+        // A directory at the bridge path is missing, not a usable bridge.
+        std::fs::create_dir_all(project.0.join("rust/bridge.rs")).unwrap();
+        let error = project
+            .load("[rust]\nbridge = \"rust/bridge.rs\"\n")
+            .expect_err("directory bridge should fail")
+            .to_string();
+        assert!(error.contains("rust_bridge_missing"), "{error}");
+    }
+
+    #[test]
+    fn unknown_keys_in_the_rust_section_are_rejected() {
+        assert!(!rejection("[rust]\nbridge = 'rust/b.rs'\nextra = 1\n").is_empty());
+        assert!(!rejection("[rust]\n").is_empty());
+    }
+
+    #[test]
+    fn rust_sections_do_not_disturb_willow_dependency_parsing() {
+        let project = Project::new();
+        let manifest = project
+            .load(
+                "[dependencies]\nhttp = { git = 'https://example.org/h.git', version = '^1.4' }\n\n[rust-dependencies]\nregex = '1.12'\n",
+            )
+            .unwrap();
+        assert_eq!(manifest.dependencies.len(), 1);
+        assert_eq!(manifest.rust_dependencies.len(), 1);
+        // A manifest without Rust configuration keeps both fields empty.
+        let plain = project.load("").unwrap();
+        assert!(plain.rust_dependencies.is_empty() && plain.rust.is_none());
     }
 }

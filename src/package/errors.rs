@@ -32,6 +32,12 @@ fn manifest(error: &ManifestError) -> Value {
         ManifestError::UnsupportedVersion { found, supported } => {
             json!({"kind":"unsupported_manifest_version", "found":found, "supported":supported})
         }
+        ManifestError::RustDependencyInvalid(detail) => {
+            json!({"kind":"rust_dependency_invalid", "detail":detail})
+        }
+        ManifestError::RustBridgeMissing(detail) => {
+            json!({"kind":"rust_bridge_missing", "detail":detail})
+        }
     }
 }
 impl PackageError {

@@ -69,6 +69,8 @@ impl InitCommand {
             [false; 2]
         };
         let mut replacements = Vec::new();
+        let mut claude_created = false;
+        // Create Claude first so Codex can refer to instructions created in this invocation.
         for (index, agent) in [Agent::Claude, Agent::Codex].into_iter().enumerate() {
             let selected = match self.ai.as_str() {
                 "none" => false,
@@ -89,7 +91,17 @@ impl InitCommand {
             let path = root.join(agent.file());
             let rendered = render_agent_instructions(agent, capabilities());
             match read_instructions(&path)? {
-                None => scaffold.write_new(&path, rendered.as_bytes())?,
+                None => {
+                    let contents = if agent == Agent::Codex && claude_created {
+                        "Read and follow the instructions in CLAUDE.md.\n"
+                    } else {
+                        &rendered
+                    };
+                    scaffold.write_new(&path, contents.as_bytes())?;
+                    if agent == Agent::Claude {
+                        claude_created = true;
+                    }
+                }
                 Some(original) => {
                     if managed_range(&original)?.is_some() {
                         println!("{} already managed; use willow agent sync", agent.file());

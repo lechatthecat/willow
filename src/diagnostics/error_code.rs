@@ -202,6 +202,9 @@ error_codes! {
     E2012, // invalid manifest
     E2013, // invalid dependency alias
     E2014, // unsupported manifest version
+    // Rust dependency / bridge manifest configuration (willow-u2tk.1)
+    E2015, // invalid `[rust-dependencies]` entry or `[rust]` bridge path
+    E2016, // declared `[rust]` bridge file does not exist
     // Send / Sync marker interfaces & data-race policy E24xx (willow-dgwo)
     E2401, // `Send`/`Sync` are compiler-known markers and cannot be implemented manually
     E2402, // cannot pass a non-Sync GC reference (or non-Send value) to an async call

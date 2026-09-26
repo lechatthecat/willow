@@ -21,6 +21,8 @@ pub fn manifest(name: &str) -> Result<String> {
         willow: Some(WillowSection {
             manifest_version: 1,
         }),
+        rust_dependencies: BTreeMap::new(),
+        rust: None,
     }
     .validate()
     .context("help: use --name with a valid project name")?;

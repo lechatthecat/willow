@@ -378,3 +378,34 @@ fn compiler_inputs_share_resolved_graph_without_loading_unused_modules() {
     assert!(inputs.package_graph.is_none());
     assert!(inputs.root_package.is_none());
 }
+
+#[test]
+fn rust_dependencies_never_enter_the_package_graph() {
+    let fixture = Fixture::new();
+    let app = fixture.package(
+        "app",
+        false,
+        "[dependencies]\nb = { path = '../b' }\n\n[rust-dependencies]\nregex = '1.12'\nmy_native = { path = '../my-native' }\n\n[rust]\nbridge = 'rust/bridge.rs'",
+    );
+    std::fs::create_dir_all(app.join("rust")).unwrap();
+    std::fs::write(app.join("rust/bridge.rs"), "pub fn f() {}\n").unwrap();
+    fixture.package("b", true, "");
+    // `../my-native` does not exist as a Willow package and must never be visited.
+    let graph = resolve_path_packages(&app).unwrap();
+    assert_eq!(graph.packages.len(), 2);
+    let root = graph.get(graph.root).unwrap();
+    assert_eq!(root.dependencies.len(), 1);
+    assert_eq!(root.dependencies[0].alias, "b");
+    assert_eq!(graph.stats.dependencies_visited, 1);
+}
+
+#[test]
+fn rust_dependencies_alone_do_not_make_a_project_package_mode() {
+    let fixture = Fixture::new();
+    let app = fixture.package("app", false, "[rust-dependencies]\nregex = '1.12'");
+    assert!(
+        super::lock::resolve_project_packages(&app, false, false)
+            .unwrap()
+            .is_none()
+    );
+}

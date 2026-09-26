@@ -140,8 +140,42 @@ fn ai_selection_is_explicit_and_non_tty_auto_is_silent() {
         );
         assert_eq!(f.0.join("AGENTS.md").exists(), codex);
         assert_eq!(f.0.join("CLAUDE.md").exists(), claude);
+        if codex {
+            let text = fs::read_to_string(f.0.join("AGENTS.md")).unwrap();
+            if claude {
+                assert_eq!(text, "Read and follow the instructions in CLAUDE.md.\n");
+                assert!(f.run(&["agent", "sync", "--yes"]).status.success());
+                assert_eq!(fs::read_to_string(f.0.join("AGENTS.md")).unwrap(), text);
+            } else {
+                assert!(text.contains("# Willow instructions for codex"));
+            }
+        }
         assert!(!String::from_utf8_lossy(&out.stdout).contains("[Y/n]"));
         assert!(!String::from_utf8_lossy(&out.stdout).contains("[y/N]"));
+    }
+}
+
+#[test]
+fn reference_requires_both_instruction_files_to_be_new() {
+    for existing in ["CLAUDE.md", "AGENTS.md"] {
+        let f = Fixture::new();
+        fs::write(f.0.join(existing), "User text\r\n").unwrap();
+        assert!(
+            f.run(&["init", ".", "--ai", "all", "--yes"])
+                .status
+                .success()
+        );
+        assert_eq!(fs::read(f.0.join(existing)).unwrap(), b"User text\r\n");
+        let (new_file, agent) = if existing == "CLAUDE.md" {
+            ("AGENTS.md", "codex")
+        } else {
+            ("CLAUDE.md", "claude")
+        };
+        assert!(
+            fs::read_to_string(f.0.join(new_file))
+                .unwrap()
+                .contains(&format!("# Willow instructions for {agent}"))
+        );
     }
 }
 
@@ -367,8 +401,8 @@ fn generated_snapshot_query_and_callers_workflow_executes_and_detects_staleness(
         "fn leaf() {} fn main() { leaf(); }",
     )
     .unwrap();
-    let markdown = fs::read_to_string(f.0.join("AGENTS.md")).unwrap();
-    let display = f.run(&["agent", "instructions", "codex"]);
+    let markdown = fs::read_to_string(f.0.join("CLAUDE.md")).unwrap();
+    let display = f.run(&["agent", "instructions", "claude"]);
     assert_eq!(display.stdout, markdown.as_bytes());
 
     let run = |command: &str| {
