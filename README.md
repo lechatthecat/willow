@@ -27,9 +27,6 @@ The user-facing tool is:
 
 For convenience, add `target/release` to your `PATH`.
 
-### Examples
-https://github.com/lechatthecat/willow/tree/main/example
-
 ### Create a project
 
 ```bash
@@ -48,6 +45,9 @@ hello/
 ```
 
 ---
+
+# Examples
+https://github.com/lechatthecat/willow/tree/main/example
 
 # License
 
