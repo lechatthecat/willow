@@ -11,6 +11,7 @@ const NOTICE: &str = "Format and code validation do not guarantee security or tr
 #[derive(Debug, Serialize)]
 pub struct Verification {
     pub schema: u32,
+    pub kind: &'static str,
     pub ok: bool,
     pub package: Option<PackageSummary>,
     pub checks: BTreeMap<&'static str, bool>,
@@ -27,10 +28,12 @@ pub struct PackageSummary {
     name: String,
     version: String,
     manifest_version: u64,
+    source: super::PackageSourceIdentity,
+    revision: Option<String>,
 }
 #[derive(Debug, Serialize)]
 pub struct VerificationError {
-    kind: &'static str,
+    kind: String,
     reason: String,
 }
 impl Verification {
@@ -56,38 +59,27 @@ impl Verification {
         text
     }
 }
-fn failure(kind: &'static str, reason: impl ToString) -> VerificationError {
+fn failure(kind: &str, reason: impl ToString) -> VerificationError {
     VerificationError {
-        kind,
+        kind: kind.into(),
         reason: reason.to_string(),
     }
 }
 fn package_error(error: PackageError) -> VerificationError {
-    let kind = match &error {
-        PackageError::NotWillowPackage(_) => {
-            return failure("not_willow_package", "missing_willow_manifest_marker");
-        }
-        PackageError::ManifestInvalid { source, .. } => {
-            match source.downcast_ref::<crate::project::ManifestError>() {
-                Some(crate::project::ManifestError::UnsupportedVersion { .. }) => {
-                    "unsupported_manifest_version"
-                }
-                Some(crate::project::ManifestError::InvalidAlias(_)) => "dependency_alias_invalid",
-                _ => "manifest_invalid",
-            }
-        }
-        PackageError::PathEscape { .. } => "package_path_escape",
-        PackageError::SourceMissing(_) => "source_layout_invalid",
-        PackageError::ManifestMissing(_) => "not_willow_package",
-        PackageError::TagManifestVersionMismatch { .. } => "tag_manifest_version_mismatch",
-        _ => "dependency_resolution_failed",
-    };
+    if matches!(&error, PackageError::NotWillowPackage(_)) {
+        return failure("not_willow_package", "missing_willow_manifest_marker");
+    }
+    let detail = error.machine_error();
+    let kind = detail["kind"]
+        .as_str()
+        .unwrap_or("dependency_resolution_failed");
     failure(kind, error)
 }
 
 pub fn verify_package(path: &Path) -> Verification {
     let mut report = Verification {
         schema: 1,
+        kind: "package.verify",
         ok: false,
         package: None,
         #[cfg(test)]
@@ -120,6 +112,8 @@ fn verify(path: &Path, report: &mut Verification) -> Result<(), VerificationErro
         name: source.manifest.project.name.clone(),
         version: source.manifest.project.version.clone(),
         manifest_version: 1,
+        source: source.identity().source,
+        revision: None,
     });
     report.checks.insert("manifest", true);
     check_tags(&source)?;
@@ -131,7 +125,8 @@ fn verify(path: &Path, report: &mut Verification) -> Result<(), VerificationErro
         super::solve::resolve_source(source, Default::default(), Default::default(), false, false)
             .map_err(package_error)?;
     report.dependencies = graph.packages.len() - 1;
-    super::PackageImports::new(&graph).map_err(|error| failure("dependency_invalid", error))?;
+    super::PackageImports::new(&graph)
+        .map_err(|error| failure(error.machine_error()["kind"].as_str().unwrap(), &error))?;
     report.checks.insert("dependencies", true);
     let root = graph.get(graph.root).expect("root package").source_root();
     // One synthetic entry imports every source, with distinct local bindings.
@@ -157,11 +152,16 @@ fn verify(path: &Path, report: &mut Verification) -> Result<(), VerificationErro
         report.checks.insert("source_layout", false);
     }
     if let Err(error) = result {
+        let package_error = error
+            .downcast_ref::<super::PackageImportError>()
+            .map(super::PackageImportError::machine_error);
         return Err(failure(
             if diagnostics.layout_error {
                 "source_layout_invalid"
             } else if diagnostics.parse_error {
                 "parse_error"
+            } else if let Some(detail) = &package_error {
+                detail["kind"].as_str().expect("typed package error kind")
             } else {
                 "type_check_failed"
             },

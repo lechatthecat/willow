@@ -10,7 +10,7 @@ pub(super) fn requested(args: &[String]) -> bool {
     // Existing package commands retain their own output contract.
     if matches!(
         args.first().map(String::as_str),
-        Some("fetch" | "package" | "add" | "remove" | "update" | "deps")
+        Some("fetch" | "package" | "add" | "remove" | "update" | "deps" | "metadata")
     ) {
         return false;
     }

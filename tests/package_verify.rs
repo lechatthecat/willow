@@ -223,3 +223,48 @@ fn explicit_path_and_equals_format() {
     assert!(!p.0.join("project.lock").exists());
     assert!(!p.0.join("library").exists());
 }
+
+#[test]
+fn package_import_failure_keeps_stable_kind_through_frontend() {
+    let p = Project::new();
+    p.write(
+        "project.toml",
+        &format!("{MANIFEST}[dependencies]\na={{path='helper'}}\n"),
+    );
+    p.write("helper/project.toml", MANIFEST);
+    p.write(
+        "helper/src/value.wi",
+        "module value; pub fn value() -> i64 { return 1; }",
+    );
+    // The missing import is inside a loaded module, below verify's synthetic entry.
+    p.write(
+        "src/value.wi",
+        "module value; import a::missing; pub fn value() -> i64 { return 42; }",
+    );
+    let report = p.verify(false, "package_module_not_found");
+    assert!(
+        report["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("a::missing")
+    );
+}
+
+#[test]
+fn dependency_module_import_failure_keeps_stable_kind_through_frontend() {
+    let p = Project::new();
+    p.write(
+        "project.toml",
+        &format!("{MANIFEST}[dependencies]\na={{path='helper'}}\n"),
+    );
+    p.write("helper/project.toml", MANIFEST);
+    p.write(
+        "helper/src/value.wi",
+        "module value; import missing; pub fn value() -> i64 { return 1; }",
+    );
+    p.write(
+        "src/value.wi",
+        "module value; import a::value; pub fn value() -> i64 { return 42; }",
+    );
+    p.verify(false, "package_module_not_found");
+}

@@ -32,4 +32,12 @@ mod verify;
 pub use verify::{Verification, verify_package};
 
 mod commands;
-pub use commands::{PackageMutation, display_dependencies, inspect_packages, mutate_packages};
+pub use commands::{
+    MutationReport, PackageMutation, display_dependencies, inspect_packages, mutate_packages,
+    mutate_packages_report,
+};
+
+mod output;
+pub use output::{Metadata, MetadataDependency, MetadataPackage, PackageDelta};
+mod errors;
+pub use errors::{CommandError, package_error_json};

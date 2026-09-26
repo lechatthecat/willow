@@ -675,6 +675,10 @@ fn run_frontend_revision(
     error_count += diagnostic_error_count(&entry);
     emit_frontend_diagnostics(&entry, map, &graph, &diagnostic_modules, emitter)?;
     if error_count > 0 {
+        if let Some(error) = graph.package_import_error.take() {
+            return Err(anyhow::Error::new(error)
+                .context(format!("aborting due to {error_count} error(s)")));
+        }
         anyhow::bail!("aborting due to {} error(s)", error_count);
     }
     Ok(Frontend {

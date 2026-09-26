@@ -128,7 +128,7 @@ impl CliCommand {
             "impact" | "snapshot" | "risk" | "query" => Ok(Self::Analysis(Box::new(
                 analysis::AnalysisCommand::parse(args)?,
             ))),
-            "add" | "remove" | "update" | "deps" => Ok(Self::Package(
+            "add" | "remove" | "update" | "deps" | "metadata" => Ok(Self::Package(
                 package::PackageCommand::parse(command, &args[1..])?,
             )),
             "check" => {
@@ -210,6 +210,7 @@ impl FetchCommand {
         let mut locked = false;
         let mut offline = false;
         let mut format = "human".to_string();
+        let mut format_seen = false;
         let mut args = args.iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -219,8 +220,15 @@ impl FetchCommand {
                     locked = true;
                     offline = true;
                 }
-                "--format" => format = args.next().context("missing --format value")?.clone(),
-                value if value.starts_with("--format=") => format = value[9..].into(),
+                value if value == "--format" || value.starts_with("--format=") => {
+                    anyhow::ensure!(!format_seen, "duplicate --format");
+                    format_seen = true;
+                    format = if value == "--format" {
+                        args.next().context("missing --format value")?.clone()
+                    } else {
+                        value[9..].into()
+                    };
+                }
                 option if option.starts_with('-') => {
                     anyhow::bail!("unknown {command} option `{option}`")
                 }
@@ -245,32 +253,25 @@ impl FetchCommand {
     }
     fn execute(self) -> Result<()> {
         let result = (|| {
-            let (_, root) =
-                project::find_project_manifest(&self.directory).context("no project.toml found")?;
+            let (_, root) = project::find_project_manifest(&self.directory).ok_or_else(|| {
+                willow_compiler::package::CommandError::new(
+                    "not_willow_package",
+                    "no project.toml found",
+                )
+            })?;
             willow_compiler::package::fetch_packages(&root, self.locked, self.offline)
         })();
-        match result {
-            Ok(graph) => {
-                if self.format == "human" {
-                    println!("Fetched {} dependency packages", graph.packages.len() - 1);
-                } else {
-                    println!(
-                        "{}",
-                        serde_json::json!({"kind":"fetch", "status":"ok", "dependencies":graph.packages.len()-1})
-                    );
-                }
-                Ok(())
-            }
-            Err(error) => {
-                if self.format != "human" {
-                    println!(
-                        "{}",
-                        serde_json::json!({"kind":"error", "message":error.to_string()})
-                    );
-                }
-                Err(error)
-            }
+        let graph = result?;
+        if self.format == "human" {
+            println!("Fetched {} dependency packages", graph.packages.len() - 1);
+        } else {
+            let mut metadata = graph.metadata();
+            metadata.kind = "package.fetch";
+            let mut value = serde_json::to_value(&metadata)?;
+            value["dependencies"] = serde_json::json!(graph.packages.len() - 1);
+            println!("{value}");
         }
+        Ok(())
     }
 }
 
@@ -557,11 +558,28 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
         }
         return Ok(());
     }
-    CliCommand::parse(&args)?.execute()
+    let machine_package = args.first().is_some_and(|s| {
+        matches!(
+            s.as_str(),
+            "add" | "remove" | "update" | "deps" | "metadata" | "fetch" | "package"
+        )
+    }) && args.iter().enumerate().any(|(i, arg)| {
+        matches!(arg.as_str(), "--format=json" | "--format=ndjson")
+            || (arg == "--format"
+                && args
+                    .get(i + 1)
+                    .is_some_and(|v| matches!(v.as_str(), "json" | "ndjson")))
+    });
+    let result = CliCommand::parse(&args).and_then(CliCommand::execute);
+    if machine_package && let Err(error) = &result {
+        println!("{}", willow_compiler::package::package_error_json(error));
+        std::process::exit(1);
+    }
+    result
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  willow edit prepare --root DIR --entry main.wi --requests edits.json\n  willow edit <preview|validate|apply|recover> --root DIR --transaction ID\n  willow daemon <source.wi|project-dir>\n  willow risk --before baseline.json --after current.json\n  willow query <source.wi|project-dir> --requests queries.json\n  willow check <source.wi|project-dir> [--format human|ndjson]\n  willow build <source.wi|project-dir> [--format human|ndjson] [--protocol-version 1]\n  willow add [alias] --git URL [--version REQ] [--dry-run] [--project-dir DIR]\n  willow add [alias] --path DIR [--dry-run] [--project-dir DIR]\n  willow add URL [--dry-run] [--project-dir DIR]\n  willow remove alias [--dry-run] [--project-dir DIR]\n  willow update [alias] [--breaking] [--dry-run] [--project-dir DIR]\n  willow deps tree [--project-dir DIR]\n  willow deps why <alias|package-name> [--project-dir DIR]\n  willow package verify [PATH] [--format human|json|ndjson]\n  willow build <source.wi|project-dir> [-o <output>] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--emit-hir] [--emit-lir] [--runtime-lib <path>]\n  willow run [source.wi|project-dir] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--runtime-lib <path>] [-- <args>...]\n  willow fetch [project-dir] [--locked|--offline|--frozen] [--format human|json|ndjson]\n  willow debug <source.wi> [--runtime-lib <path>]"
+    "Usage:\n  willow metadata [project-dir] [--format human|json|ndjson]\n  Package commands accept --format human|json|ndjson (default human).\n  willow edit prepare --root DIR --entry main.wi --requests edits.json\n  willow edit <preview|validate|apply|recover> --root DIR --transaction ID\n  willow daemon <source.wi|project-dir>\n  willow risk --before baseline.json --after current.json\n  willow query <source.wi|project-dir> --requests queries.json\n  willow check <source.wi|project-dir> [--format human|ndjson]\n  willow build <source.wi|project-dir> [--format human|ndjson] [--protocol-version 1]\n  willow add [alias] --git URL [--version REQ] [--dry-run] [--project-dir DIR]\n  willow add [alias] --path DIR [--dry-run] [--project-dir DIR]\n  willow add URL [--dry-run] [--project-dir DIR]\n  willow remove alias [--dry-run] [--project-dir DIR]\n  willow update [alias] [--breaking] [--dry-run] [--project-dir DIR]\n  willow deps tree [--project-dir DIR]\n  willow deps why <alias|package-name> [--project-dir DIR]\n  willow package verify [PATH] [--format human|json|ndjson]\n  willow build <source.wi|project-dir> [-o <output>] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--emit-hir] [--emit-lir] [--runtime-lib <path>]\n  willow run [source.wi|project-dir] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--runtime-lib <path>] [-- <args>...]\n  willow fetch [project-dir] [--locked|--offline|--frozen] [--format human|json|ndjson]\n  willow debug <source.wi> [--runtime-lib <path>]"
 }
 
 fn stem(path: &str) -> String {

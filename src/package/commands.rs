@@ -78,6 +78,36 @@ pub fn mutate_packages(
     dry_run: bool,
     out: &mut impl Write,
 ) -> Result<()> {
+    mutate_packages_report(root, mutation, dry_run, out).map(|_| ())
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MutationReport {
+    pub schema: u32,
+    pub ok: bool,
+    pub kind: &'static str,
+    pub operation: &'static str,
+    pub dependency: Option<String>,
+    pub applied: bool,
+    pub manifest_changed: bool,
+    pub lockfile_changed: bool,
+    pub resolved: Vec<super::PackageIdentity>,
+    pub packages_added: Vec<super::PackageIdentity>,
+    pub changes: Vec<serde_json::Value>,
+    pub transitive_changes: Vec<super::PackageDelta>,
+}
+
+pub fn mutate_packages_report(
+    root: &Path,
+    mutation: PackageMutation,
+    dry_run: bool,
+    out: &mut impl Write,
+) -> Result<MutationReport> {
+    let (operation, mut dependency) = match &mutation {
+        PackageMutation::Add { alias, .. } => ("add", alias.clone()),
+        PackageMutation::Remove { alias } => ("remove", Some(alias.clone())),
+        PackageMutation::Update { alias, .. } => ("update", alias.clone()),
+    };
     let mut source = PathSource::open(root, false)?;
     let manifest_path = source.root.join("project.toml");
     let before = std::fs::read_to_string(&manifest_path)?;
@@ -134,10 +164,15 @@ pub fn mutate_packages(
                 }
             }
             let alias = alias.unwrap_or_else(|| derived_alias(&name));
-            ensure!(
-                !source.manifest.dependencies.contains_key(&alias),
-                "dependency `{alias}` already exists"
-            );
+            if source.manifest.dependencies.contains_key(&alias) {
+                return Err(super::CommandError::new(
+                    "dependency_alias_conflict",
+                    format!("dependency `{alias}` already exists"),
+                )
+                .with_field("alias", &alias)
+                .into());
+            }
+            dependency = Some(alias.clone());
             value.fmt();
             descriptions.push(format!("Add {alias} = {value}"));
             let implicit_parent = doc
@@ -235,7 +270,77 @@ pub fn mutate_packages(
                     "cannot resolve package plan"
                 }
             })?;
+    super::PackageImports::new(&graph)?;
     let lock_after = super::lock::command_lock(&graph)?;
+    let (previous, previous_direct) = super::lock::previous_identities(
+        lock_before.as_deref(),
+        &graph.get(graph.root).unwrap().root,
+    )?;
+    let (packages_added, mut transitive_changes) = super::output::delta(previous, &graph);
+    let before_manifest: toml::Value = toml::from_str(&before)?;
+    let after_manifest: toml::Value = toml::from_str(&after)?;
+    let empty = toml::map::Map::new();
+    let old_deps = before_manifest
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .unwrap_or(&empty);
+    let new_deps = after_manifest
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .unwrap_or(&empty);
+    let current_direct: HashMap<_, _> = graph
+        .get(graph.root)
+        .unwrap()
+        .dependencies
+        .iter()
+        .map(|d| (d.alias.as_str(), &graph.get(d.package).unwrap().identity))
+        .collect();
+    let aliases: std::collections::BTreeSet<_> = old_deps
+        .keys()
+        .chain(new_deps.keys())
+        .chain(previous_direct.keys())
+        .collect();
+    let changes = aliases.into_iter().filter(|alias| old_deps.get(*alias) != new_deps.get(*alias)
+        || previous_direct.get(alias.as_str()) != current_direct.get(alias.as_str()).copied()).map(|alias| {
+        serde_json::json!({"alias": alias, "before": old_deps.get(alias), "after": new_deps.get(alias),
+            "resolved_before": previous_direct.get(alias.as_str()), "resolved_after": current_direct.get(alias.as_str())})
+    }).collect();
+    let direct_sources: std::collections::HashSet<_> = previous_direct
+        .values()
+        .map(|p| &p.source)
+        .chain(current_direct.values().map(|p| &p.source))
+        .collect();
+    transitive_changes.retain(|delta| {
+        !direct_sources.contains(
+            &delta
+                .after
+                .as_ref()
+                .or(delta.before.as_ref())
+                .unwrap()
+                .source,
+        )
+    });
+    let mut resolved: Vec<_> = graph
+        .packages
+        .iter()
+        .filter(|p| p.id != graph.root)
+        .map(|p| p.identity.clone())
+        .collect();
+    resolved.sort_unstable();
+    let report = MutationReport {
+        schema: 1,
+        ok: true,
+        kind: "package.mutation",
+        operation,
+        dependency,
+        applied: !dry_run,
+        manifest_changed: before != after,
+        lockfile_changed: lock_before.as_deref() != Some(&lock_after),
+        resolved,
+        packages_added,
+        changes,
+        transitive_changes,
+    };
     if dry_run
         && graph
             .packages
@@ -259,7 +364,7 @@ pub fn mutate_packages(
     )?;
     out.flush()?;
     if dry_run {
-        return Ok(());
+        return Ok(report);
     }
     ensure!(
         std::fs::read_to_string(&manifest_path)? == before
@@ -278,7 +383,7 @@ pub fn mutate_packages(
         }
         return Err(error);
     }
-    Ok(())
+    Ok(report)
 }
 
 fn render_manifest(doc: &DocumentMut, original: &str) -> String {
@@ -339,7 +444,7 @@ fn replace_manifest(path: &Path, text: &str) -> Result<()> {
 pub fn inspect_packages(root: &Path) -> Result<PackageGraph> {
     let source = PathSource::open(root, false)?;
     let (pins, checksums) = super::lock::command_pins(&source.root, None, false)?;
-    Ok(super::solve::resolve_prepared(
+    let graph = super::solve::resolve_prepared(
         source,
         pins,
         checksums,
@@ -347,5 +452,7 @@ pub fn inspect_packages(root: &Path) -> Result<PackageGraph> {
         false,
         HashMap::new(),
         false,
-    )?)
+    )?;
+    super::PackageImports::new(&graph)?;
+    Ok(graph)
 }

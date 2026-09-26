@@ -173,14 +173,12 @@ fn resolve_imports_in_graph(
     let routing = match packages.as_deref().map(PackageImports::new).transpose() {
         Ok(routing) => routing,
         Err(error) => {
+            let diagnostic = Diagnostic::new(Severity::Error, ErrorCode::E0401, error.to_string());
+            graph.package_import_error = Some(error);
             return ImportResolution {
                 graph,
                 item_imports,
-                diagnostics: vec![Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0401,
-                    error.to_string(),
-                )],
+                diagnostics: vec![diagnostic],
             };
         }
     };
@@ -303,6 +301,9 @@ fn resolve_import(
                     Diagnostic::new(Severity::Error, ErrorCode::E0401, error.to_string())
                         .with_label(Label::primary(span, "module not found")),
                 );
+                if graph.package_import_error.is_none() {
+                    graph.package_import_error = Some(error);
+                }
                 return None;
             }
         }

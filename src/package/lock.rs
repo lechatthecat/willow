@@ -278,11 +278,13 @@ fn resolve_source(source: PathSource, locked: bool, offline: bool) -> Result<Pac
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e).context("cannot read project.lock"),
     };
-    anyhow::ensure!(
-        !locked || previous.is_some(),
-        "lockfile_missing: {}",
-        path.display()
-    );
+    if locked && previous.is_none() {
+        return Err(
+            super::CommandError::new("lockfile_missing", path.display().to_string())
+                .with_field("path", path.to_string_lossy())
+                .into(),
+        );
+    }
     let current = previous
         .as_deref()
         .and_then(|text| toml::from_str::<Lock>(text).ok());
@@ -307,7 +309,12 @@ fn resolve_source(source: PathSource, locked: bool, offline: bool) -> Result<Pac
             | super::PackageError::CacheChecksumMismatch(_)),
         ) => return Err(error.into()),
         Err(error) if locked => {
-            anyhow::bail!("lockfile_stale: cannot validate locked graph: {error}")
+            return Err(super::CommandError::new(
+                "lockfile_stale",
+                format!("cannot validate locked graph: {error}"),
+            )
+            .with_field("path", path.to_string_lossy())
+            .into());
         }
         Err(error) => return Err(error.into()),
     };
@@ -316,7 +323,13 @@ fn resolve_source(source: PathSource, locked: bool, offline: bool) -> Result<Pac
         .as_ref()
         .is_some_and(|current| current.matches(&expected))
     {
-        anyhow::ensure!(!locked, "lockfile_stale: {}", path.display());
+        if locked {
+            return Err(
+                super::CommandError::new("lockfile_stale", path.display().to_string())
+                    .with_field("path", path.to_string_lossy())
+                    .into(),
+            );
+        }
         let text = expected.canonical_text()?;
         atomic_write(&path, text.as_bytes(), || Ok(()))?;
     }
@@ -458,3 +471,70 @@ pub(super) fn write_command_lock(path: &Path, text: &str) -> Result<()> {
 
 #[cfg(test)]
 thread_local! { static COMMAND_UNLOCK_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+/// Read the previous resolved identities without resolving or touching caches.
+pub(super) fn previous_identities(
+    text: Option<&str>,
+    root: &Path,
+) -> Result<(
+    Vec<super::PackageIdentity>,
+    std::collections::HashMap<String, super::PackageIdentity>,
+)> {
+    let Some(text) = text else {
+        return Ok(Default::default());
+    };
+    let lock: Lock = toml::from_str(text)?;
+    let identities: std::collections::HashMap<_, _> = lock
+        .packages
+        .iter()
+        .map(|p| {
+            let source = match &p.source {
+                Source::Path { path } => {
+                    let mut normalized = PathBuf::new();
+                    for c in root.join(path).components() {
+                        if c == std::path::Component::ParentDir {
+                            normalized.pop();
+                        } else {
+                            normalized.push(c);
+                        }
+                    }
+                    PackageSourceIdentity::Path { path: normalized }
+                }
+                Source::Git { url } => PackageSourceIdentity::Git { url: url.clone() },
+                Source::GitSubdirectory { url, path } => PackageSourceIdentity::GitSubdirectory {
+                    url: url.clone(),
+                    path: path.clone(),
+                },
+            };
+            (
+                p.id.as_str(),
+                super::PackageIdentity {
+                    name: p.name.clone(),
+                    version: p.version.clone(),
+                    revision: p.revision.clone(),
+                    source,
+                },
+            )
+        })
+        .collect();
+    let direct = lock
+        .packages
+        .iter()
+        .find(|p| p.id == lock.root.package)
+        .into_iter()
+        .flat_map(|p| &p.dependencies)
+        .filter_map(|d| {
+            identities
+                .get(d.package.as_str())
+                .map(|p| (d.alias.clone(), p.clone()))
+        })
+        .collect();
+    Ok((
+        identities
+            .into_iter()
+            .filter(|(id, _)| *id != lock.root.package)
+            .map(|(_, p)| p)
+            .collect(),
+        direct,
+    ))
+}

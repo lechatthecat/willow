@@ -70,6 +70,9 @@ pub struct ModuleGraph {
     #[cfg(test)]
     pub(crate) import_routes: usize,
     pub package_graph: Option<std::sync::Arc<crate::package::PackageGraph>>,
+    /// Keep the first typed routing failure alongside the full diagnostic list.
+    /// The frontend returns it as the cause of its aggregated failure.
+    pub(crate) package_import_error: Option<crate::package::PackageImportError>,
     pub entry_path: Option<PathBuf>,
     /// Explicit project mode; a legacy project may have no package graph.
     pub(crate) project_mode: bool,

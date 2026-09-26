@@ -422,3 +422,199 @@ fn add_resolves_new_transitive_constraints_without_following_locked_branches() {
     assert_eq!(versions["versioned"], "1.1.0");
     assert_eq!(versions["moving"], "1.0.0");
 }
+
+fn machine(output: Output, ok: bool) -> serde_json::Value {
+    assert_eq!(output.status.success(), ok, "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert!(!output.stdout.contains(&0x1b));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schema"], 1);
+    assert_eq!(value["ok"], ok);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("PackageId"));
+    value
+}
+
+#[test]
+fn machine_metadata_mutations_and_dry_run_preserve_files() {
+    let f = Fixture::new();
+    f.package("app", "app", "1.0.0", "");
+    f.package("leaf", "leaf", "2.0.0", "");
+    f.package(
+        "lib",
+        "lib",
+        "1.0.0",
+        "[dependencies]\nleaf={path='../leaf'}",
+    );
+    let original = f.read("app/project.toml");
+    for format in ["json", "ndjson"] {
+        let preview = machine(
+            f.cli(&[
+                "add",
+                "a",
+                "--path",
+                "../lib",
+                "--dry-run",
+                "--format",
+                format,
+            ]),
+            true,
+        );
+        assert_eq!(preview["applied"], false);
+        assert_eq!(preview["manifest_changed"], true);
+        assert_eq!(preview["lockfile_changed"], true);
+        assert_eq!(preview["changes"][0]["alias"], "a");
+        assert_eq!(preview["changes"][0]["resolved_after"]["version"], "1.0.0");
+        assert_eq!(preview["transitive_changes"][0]["after"]["name"], "leaf");
+        assert_eq!(preview["packages_added"].as_array().unwrap().len(), 2);
+        assert_eq!(f.read("app/project.toml"), original);
+        assert!(!f.0.join("app/project.lock").exists());
+        assert!(!f.0.join("cache").exists());
+    }
+    let applied = machine(f.cli(&["add", "a", "--path=../lib", "--format=json"]), true);
+    assert_eq!(applied["applied"], true);
+    let lock = f.read("app/project.lock");
+    let first = machine(f.cli(&["metadata", "--format=json"]), true);
+    assert_eq!(
+        first,
+        machine(f.cli(&["metadata", "--format=ndjson"]), true)
+    );
+    assert_eq!(first["root_package"]["name"], "app");
+    let packages = first["packages"].as_array().unwrap();
+    assert_eq!(packages.len(), 3);
+    let lib = packages.iter().find(|p| p["id"]["name"] == "lib").unwrap();
+    assert_eq!(lib["aliases"], serde_json::json!(["a"]));
+    assert_eq!(lib["direct"], true);
+    assert_eq!(lib["id"]["revision"], serde_json::Value::Null);
+    assert_eq!(lib["dependencies"][0]["package"]["name"], "leaf");
+    let why = machine(f.cli(&["deps", "why", "leaf", "--format=json"]), true);
+    assert_eq!(why["packages"].as_array().unwrap().len(), 3);
+    let tree = machine(f.cli(&["deps", "tree", "--format=ndjson"]), true);
+    assert_eq!(tree["packages"], first["packages"]);
+    let update = machine(f.cli(&["update", "--dry-run", "--format=json"]), true);
+    assert_eq!(update["changes"], serde_json::json!([]));
+    assert_eq!(update["transitive_changes"], serde_json::json!([]));
+    assert_eq!(update["lockfile_changed"], false);
+    let removal = machine(f.cli(&["remove", "a", "--dry-run", "--format=json"]), true);
+    assert_eq!(removal["changes"][0]["resolved_before"]["name"], "lib");
+    assert!(removal["changes"][0]["resolved_after"].is_null());
+    assert_eq!(removal["transitive_changes"][0]["before"]["name"], "leaf");
+    assert_eq!(f.read("app/project.lock"), lock);
+    machine(f.cli(&["remove", "a", "--format=ndjson"]), true);
+}
+
+#[test]
+fn machine_errors_cover_parse_manifest_alias_and_lock_boundaries() {
+    let f = Fixture::new();
+    f.package("app", "app", "1.0.0", "");
+    f.package("lib", "lib", "1.0.0", "");
+    for format in ["json", "ndjson"] {
+        assert_eq!(
+            machine(f.cli(&["add", "--format", format]), false)["error"]["kind"],
+            "package_command_failed"
+        );
+        assert_eq!(
+            machine(f.cli(&["fetch", "--locked", "--format", format]), false)["error"]["kind"],
+            "lockfile_missing"
+        );
+        assert_eq!(
+            machine(
+                f.cli(&["add", "bad-alias", "--path=../lib", "--format", format]),
+                false
+            )["error"]["kind"],
+            "dependency_alias_invalid"
+        );
+    }
+    machine(
+        f.cli(&["add", "lib", "--path=../lib", "--format=json"]),
+        true,
+    );
+    assert_eq!(
+        machine(
+            f.cli(&["add", "lib", "--path=../lib", "--format=json"]),
+            false
+        )["error"]["kind"],
+        "dependency_alias_conflict"
+    );
+    f.write("app/src/lib.wi", "module lib;");
+    assert_eq!(
+        machine(f.cli(&["metadata", "--format=json"]), false)["error"]["kind"],
+        "dependency_alias_conflict"
+    );
+    fs::remove_file(f.0.join("app/src/lib.wi")).unwrap();
+    f.package("lib", "lib", "2.0.0", "");
+    assert_eq!(
+        machine(f.cli(&["fetch", "--locked", "--format=json"]), false)["error"]["kind"],
+        "lockfile_stale"
+    );
+    f.write("app/project.toml", "invalid toml");
+    assert_eq!(
+        machine(f.cli(&["metadata", "--format=json"]), false)["error"]["kind"],
+        "manifest_invalid"
+    );
+    f.write(
+        "app/project.toml",
+        "[project]\nname='app'\nversion='1.0.0'\n[willow]\nmanifest-version=99",
+    );
+    assert_eq!(
+        machine(f.cli(&["metadata", "--format=json"]), false)["error"]["kind"],
+        "unsupported_manifest_version"
+    );
+}
+
+#[test]
+fn machine_git_update_reports_exact_revision_delta() {
+    let f = Fixture::new();
+    f.package("app", "app", "1.0.0", "");
+    let url = f.remote("remote", "library");
+    let added = machine(f.cli(&["add", "lib", "--git", &url, "--format=json"]), true);
+    let old_revision = added["resolved"][0]["revision"].as_str().unwrap();
+    assert_eq!(old_revision.len(), 40);
+    f.release("remote", "library", "1.1.0");
+    let updated = machine(f.cli(&["update", "lib", "--format=ndjson"]), true);
+    assert_eq!(updated["manifest_changed"], false);
+    assert_eq!(
+        updated["changes"][0]["resolved_before"]["revision"],
+        old_revision
+    );
+    assert_eq!(updated["changes"][0]["resolved_after"]["version"], "1.1.0");
+    assert_ne!(updated["resolved"][0]["revision"], old_revision);
+    assert_eq!(updated["transitive_changes"], serde_json::json!([]));
+}
+
+#[test]
+fn machine_dry_run_reports_direct_dependency_removed_from_manifest() {
+    for count in [1, 16, 64] {
+        let f = Fixture::new();
+        let aliases: Vec<_> = (0..count).map(|i| format!("a{i:04}")).collect();
+        let mut deps = String::from("[dependencies]\n");
+        for alias in &aliases {
+            deps.push_str(&format!("{alias}={{path='../lib'}}\n"));
+        }
+        f.package("app", "app", "1.0.0", &deps);
+        f.package("lib", "library", "1.0.0", "");
+        machine(f.cli(&["fetch", "--format=json"]), true);
+        f.package("app", "app", "1.0.0", "");
+        let manifest = f.read("app/project.toml");
+        let lock = f.read("app/project.lock");
+        for format in ["json", "ndjson"] {
+            let result = machine(f.cli(&["update", "--dry-run", "--format", format]), true);
+            assert_eq!(result["lockfile_changed"], true);
+            assert_eq!(result["manifest_changed"], false);
+            assert_eq!(result["applied"], false);
+            let changes = result["changes"].as_array().unwrap();
+            assert_eq!(changes.len(), count);
+            for (change, alias) in changes.iter().zip(&aliases) {
+                assert_eq!(change["alias"], *alias);
+                assert_eq!(change["resolved_before"]["name"], "library");
+                assert!(change["resolved_after"].is_null());
+            }
+            assert_eq!(result["transitive_changes"], serde_json::json!([]));
+            assert_eq!(f.read("app/project.toml"), manifest);
+            assert_eq!(f.read("app/project.lock"), lock);
+            eprintln!(
+                "removed_aliases={count} format={format} reported_changes={}",
+                changes.len()
+            );
+        }
+    }
+}
