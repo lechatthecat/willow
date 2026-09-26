@@ -37,7 +37,7 @@ Willow is more than a parser and code generator. The project currently includes:
 - **Reference, caller, impact, effect, and risk analysis**
 - **Structured source edits with validation and recovery**
 - **A warm analysis daemon**
-- **Typed-body reuse across compiler revisions**
+- **Fine-grained incremental compilation** — compiler queries track their actual semantic dependencies across revisions and use red-green validation to avoid recomputing unaffected declarations, signatures, typed bodies, effects, layouts, references, and dispatch information
 - **A versioned NDJSON protocol for tools and AI agents**
 - **Automatic `AGENTS.md` and `CLAUDE.md` generation**
 
@@ -634,44 +634,38 @@ The daemon keeps one accepted analysis revision alive and accepts JSON requests 
 
 After source changes, a successful refresh installs a new revision.
 
-The current implementation can reuse:
-
-- typed-body artifacts
-- symbol-query results
-- reference-query results
-- effect-query results
-
-across revisions when their inputs remain valid.
+The current implementation reuses fine-grained compiler query results across revisions when their semantic dependencies remain valid, including typed bodies, symbol/reference facts, effects, layouts, dispatch information, and related analysis results.
 
 ---
 
-## Incremental frontend reuse
+## Fine-grained incremental compilation
 
-Willow's `CompilerDb` supports revision-aware analysis.
+Willow's `CompilerDb` includes its own dependency-tracked incremental query engine. Willow does not use Salsa; the query engine is implemented directly in the compiler.
 
-When a source module changes, Willow computes a reverse dependency closure.
+Queries automatically record the semantic inputs and other queries they read. Across revisions, Willow validates those dependencies and uses red-green recomputation: if a dependency must be recomputed but its semantic result is unchanged, that result is backdated and the change does not propagate further.
 
-Modules outside that invalidated region can reuse typed-body artifacts from the previous accepted revision.
+Important compiler facts are tracked separately, including declarations, signatures, body syntax and typed bodies, effects, references, class/interface layouts, GC layouts, dispatch targets, and lowering-related results.
 
-Conceptually:
+For example, a body-only edit can behave like this:
 
 ```text
-previous revision
-      │
-      ├── unchanged module ──→ reuse typed bodies
-      │
-      └── changed module
-              ↓
-       invalidate consumers
-              ↓
-         type-check again
+foo() body changes
+        ↓
+body syntax / typed body recomputed
+        ↓
+signature unchanged ─────┐
+effects unchanged ───────┤
+                         ↓
+               callers remain reusable
+               unrelated bodies in the
+               same module remain reusable
 ```
 
-Changes to bodies, public signatures, types, default methods, or effects invalidate affected modules and their consumers.
+If the signature, effect capabilities, dispatch set, or layout actually changes, only queries that recorded a dependency on that fact are required to recompute.
 
-Resolver-topology or compiler-configuration changes start a cold generation.
+The incremental path is continuously checked against cold compilation in the test suite, including diagnostics, semantic snapshots, and native code for representative edits.
 
-The current invalidation granularity is primarily module-based; Willow does not claim fully fine-grained incremental type checking at every AST node.
+Resolver-topology or incompatible compiler-configuration changes may still fall back to a cold generation. The next stage of this work focuses on durability-aware validation, long-running daemon memory bounds, and further production hardening.
 
 ---
 
@@ -816,7 +810,7 @@ Some important limitations:
 - the standard library is still small
 - language syntax and runtime APIs may change
 - the public toolchain protocol is versioned, but higher-level analysis features are still evolving
-- the incremental frontend currently invalidates primarily at module granularity
+- the fine-grained incremental engine is still being hardened for durability-aware validation, long-running daemon memory bounds, and broader production workloads
 - the debugger is not yet a full interactive debugger
 - the ecosystem is very small
 - production hardening and real-world compatibility testing are still ongoing
