@@ -1,2 +1,4 @@
 # Agent golden tests compare exact bytes against LF-rendered instructions.
 /tests/fixtures/agent/**/*.md text eol=lf
+# Bootstrap golden tests compare exact bytes against LF-generated project files.
+/tests/fixtures/init/** text eol=lf
