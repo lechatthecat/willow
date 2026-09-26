@@ -5,6 +5,8 @@ use serde_json::{Value, json};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticFacts {
+    #[serde(default)]
+    pub modules: Vec<ModuleEvidence>,
     pub symbols: Vec<symbols::Symbol>,
     pub references: Vec<symbols::Reference>,
     pub expressions: Vec<Expression>,
@@ -205,6 +207,12 @@ pub(super) fn finish(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum QueryRequest {
+    Affected {
+        revision: String,
+        delta: UpdateDelta,
+        #[serde(default)]
+        tests: Vec<String>,
+    },
     Symbols {
         revision: String,
     },
@@ -233,6 +241,7 @@ pub enum QueryRequest {
 }
 /// Own one immutable revision and its indexes. Query calls do no frontend work.
 pub struct QuerySession {
+    packages: packages::PackageIndex,
     pub(crate) snapshot: Snapshot,
     functions: HashMap<String, usize>,
     symbols: HashMap<String, usize>,
@@ -392,7 +401,9 @@ impl QuerySession {
                     .as_deref()
                     .is_some_and(|op| op.starts_with("method:"))
             });
+        let packages = packages::PackageIndex::new(&snapshot);
         Ok(Self {
+            packages,
             snapshot,
             functions,
             references,
@@ -466,7 +477,8 @@ impl QuerySession {
     pub fn query(&mut self, request: QueryRequest) -> Value {
         self.queries += 1;
         let revision = match &request {
-            QueryRequest::Symbols { revision }
+            QueryRequest::Affected { revision, .. }
+            | QueryRequest::Symbols { revision }
             | QueryRequest::SymbolAt { revision, .. }
             | QueryRequest::SymbolInfo { revision, .. }
             | QueryRequest::References { revision, .. }
@@ -477,6 +489,9 @@ impl QuerySession {
             return json!({"status":"stale", "revision":self.revision()});
         }
         let data = match request {
+            QueryRequest::Affected { delta, tests, .. } => {
+                self.packages.affected(&self.snapshot, &delta, &tests)
+            }
             QueryRequest::Symbols { .. } => {
                 json!({"status":"ok","symbols":self.snapshot.semantic.symbols})
             }
@@ -552,6 +567,7 @@ impl QuerySession {
                                 let mut reference =
                                     serde_json::to_value(&self.snapshot.semantic.expressions[j])
                                         .unwrap();
+                                reference["identity"] = json!(self.snapshot.functions[i].identity);
                                 reference["certainty"] = json!(if i == root {
                                     "resolved"
                                 } else {

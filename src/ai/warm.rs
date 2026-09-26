@@ -107,7 +107,8 @@ impl WarmSession {
             QueryRequest::Effects { revision, function } => (revision, function, Kind::Effects),
             // Position queries already use the V2 logarithmic interval index;
             // retaining arbitrary byte offsets would only consume cache space.
-            QueryRequest::TypeAt { .. }
+            QueryRequest::Affected { .. }
+            | QueryRequest::TypeAt { .. }
             | QueryRequest::Symbols { .. }
             | QueryRequest::SymbolAt { .. } => return Ok(self.session.query(request)),
         };
@@ -153,8 +154,11 @@ fn inputs(
             .or(f.body_id)
             .unwrap_or_else(BodyId::fresh);
         let symbol = hash_serialized(f)?;
-        let refs =
-            hash_serialized(&(session.incomplete_references, references.get(f.id.as_str())))?;
+        let refs = hash_serialized(&(
+            session.incomplete_references,
+            &f.identity,
+            references.get(f.id.as_str()),
+        ))?;
         let effects = hash_serialized(&(
             f.runtime_effects,
             f.unknown,
@@ -206,6 +210,7 @@ mod tests {
             semantic: SemanticFacts::default(),
             functions: (0..n)
                 .map(|i| Function {
+                    identity: None,
                     body_id: Some(BodyId::fresh()),
                     body_location: None,
                     rename_calls: vec![],

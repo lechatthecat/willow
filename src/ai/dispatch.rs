@@ -99,6 +99,7 @@ pub(super) fn complete(
                     .insert((classes[class].key.clone(), method.to_string()), id.clone());
             }
             result.functions.push(Function {
+                identity: None,
                 body_id: None,
                 body_location: None,
                 rename_calls: vec![],

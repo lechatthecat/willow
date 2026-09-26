@@ -2,6 +2,8 @@
 mod dispatch;
 pub mod edit;
 mod graph;
+mod packages;
+pub use packages::{ModuleEvidence, ModuleIdentity, SymbolIdentity, UpdateDelta};
 mod semantic;
 mod storage;
 mod symbols;
@@ -46,6 +48,8 @@ pub struct Location {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Function {
+    #[serde(default)]
+    pub identity: Option<SymbolIdentity>,
     #[serde(skip)]
     pub(crate) body_id: Option<BodyId>,
     #[serde(skip)]
@@ -102,6 +106,7 @@ pub(crate) struct CapturedUnit {
     graph: CallGraph,
     semantic: semantic::Captured,
     symbols: crate::semantic::analysis_symbols::Facts,
+    symbol_owners: Vec<(Span, String)>,
     declarations: HashMap<FunctionId, Vec<(Span, Span)>>,
     identities: HashMap<FunctionId, BodyId>,
     lambda_names: HashMap<FunctionId, String>,
@@ -136,6 +141,7 @@ pub(crate) fn capture(
         graph: graph.clone(),
         semantic: semantic::Captured::default(),
         symbols: symbol_facts.clone(),
+        symbol_owners: symbols::owners(program),
         declarations: HashMap::new(),
         identities: HashMap::new(),
         lambda_names: HashMap::new(),
@@ -532,6 +538,7 @@ pub(crate) fn snapshot(
                     .cloned()
                     .unwrap_or_else(|| local.to_string());
                 Function {
+                    identity: None,
                     body_id: None,
                     body_location: None,
                     rename_calls: vec![],
@@ -779,6 +786,7 @@ pub(crate) fn snapshot(
         symbols::finish(&captured, &paths, &symbol_names, &functions);
     semantic.symbols = symbol_definitions;
     semantic.references = symbol_references;
+    packages::attach(frontend, &paths, &captured, &mut functions, &mut semantic)?;
     captured.clear();
     let mut snapshot = Snapshot {
         version: 1,

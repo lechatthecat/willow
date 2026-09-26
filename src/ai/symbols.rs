@@ -5,6 +5,8 @@ use crate::semantic::analysis_symbols::{Declaration, Facts};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Symbol {
+    #[serde(default)]
+    pub identity: Option<SymbolIdentity>,
     pub id: String,
     pub name: String,
     pub kind: String,
@@ -14,9 +16,43 @@ pub struct Symbol {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reference {
+    #[serde(default)]
+    pub identity: Option<SymbolIdentity>,
     pub target: String,
     pub location: Location,
     pub role: String,
+}
+
+/// Source owners, captured before module bodies are offloaded. Inherited/default
+/// method copies retain their declaration span and must not acquire a new owner.
+pub(super) fn owners(program: &Program) -> Vec<(Span, String)> {
+    let mut owners = Vec::new();
+    for item in &program.items {
+        match item {
+            Item::Function(f) => owners.push((f.span, f.name.clone())),
+            Item::Class(c) => {
+                owners.push((c.span, c.name.clone()));
+                for m in &c.methods {
+                    if c.span.contains(m.span) {
+                        owners.push((m.span, format!("{}::{}", c.name, m.name)));
+                    }
+                }
+                for init in &c.constructors {
+                    if c.span.contains(init.span) {
+                        owners.push((init.span, format!("{}::init@{}", c.name, init.span.start)));
+                    }
+                }
+            }
+            Item::Enum(e) => owners.push((e.span, e.name.clone())),
+            Item::Interface(i) => {
+                owners.push((i.span, i.name.clone()));
+                for m in &i.methods {
+                    owners.push((m.span, format!("{}::{}", i.name, m.name)));
+                }
+            }
+        }
+    }
+    owners
 }
 
 pub(super) fn declarations(
@@ -265,6 +301,7 @@ pub(super) fn finish(
                 None => format!("builtin:{}:{}", d.kind, d.name),
             });
         symbols.entry(id.clone()).or_insert_with(|| Symbol {
+            identity: None,
             id: id.clone(),
             name: d.name.clone(),
             kind: d.kind.clone(),
@@ -309,6 +346,7 @@ pub(super) fn finish(
                     references.insert(
                         key,
                         Reference {
+                            identity: None,
                             target,
                             location,
                             role: "variant".into(),
@@ -330,6 +368,7 @@ pub(super) fn finish(
                 references.insert(
                     key,
                     Reference {
+                        identity: None,
                         target,
                         location,
                         role: r.role.clone(),

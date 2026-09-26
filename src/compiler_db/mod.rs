@@ -104,6 +104,10 @@ impl CompilerDb {
         &self.dependencies
     }
 
+    pub fn package_graph(&self) -> Option<&crate::package::PackageGraph> {
+        self.inputs.package_graph.as_deref()
+    }
+
     pub fn bodies(&self) -> &ids::BodyIndex {
         &self.bodies
     }

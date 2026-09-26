@@ -67,6 +67,20 @@ impl Snapshot {
             "incompatible compiler snapshot"
         );
         ensure!(self.revision == self.digest()?, "corrupt snapshot digest");
+        let mut module_paths = std::collections::HashSet::new();
+        for module in &self.semantic.modules {
+            ensure!(
+                self.sources.contains_key(&module.path) && module_paths.insert(&module.path),
+                "invalid package module source"
+            );
+            ensure!(
+                module
+                    .dependencies
+                    .iter()
+                    .all(|&i| i < self.semantic.modules.len()),
+                "invalid package module edge"
+            );
+        }
         let mut ids = std::collections::HashSet::new();
         for f in &self.functions {
             ensure!(ids.insert(&f.id), "duplicate FunctionId");

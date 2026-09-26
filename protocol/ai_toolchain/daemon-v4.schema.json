@@ -99,6 +99,66 @@
                   "minimum": 0
                 }
               }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "delta"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "affected"
+                },
+                "revision": {
+                  "type": "string"
+                },
+                "tests": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Caller-supplied test FunctionIds in this snapshot."
+                },
+                "delta": {
+                  "type": "object",
+                  "required": [
+                    "schema",
+                    "ok",
+                    "kind"
+                  ],
+                  "properties": {
+                    "schema": {
+                      "const": 1
+                    },
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "kind": {
+                      "const": "package.mutation"
+                    },
+                    "packages_added": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      }
+                    },
+                    "changes": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      }
+                    },
+                    "transitive_changes": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      }
+                    }
+                  }
+                }
+              }
             }
           ]
         }

@@ -21,6 +21,7 @@ impl Default for Limits {
 }
 #[derive(Debug, Serialize)]
 pub struct ImpactNode {
+    pub identity: Option<SymbolIdentity>,
     pub id: String,
     pub level: usize,
     pub distance: usize,
@@ -30,6 +31,7 @@ pub struct ImpactNode {
 }
 #[derive(Debug, Serialize)]
 pub struct Impact {
+    pub external_dependencies: Vec<serde_json::Value>,
     pub revision: String,
     pub nodes: Vec<ImpactNode>,
     pub truncated: bool,
@@ -207,6 +209,7 @@ impl Snapshot {
                 unknown |= f.unknown;
                 if !f.synthetic {
                     nodes.push(ImpactNode {
+                        identity: f.identity.clone(),
                         id: f.id.clone(),
                         level: (distance[i] + 1).min(3),
                         distance: distance[i],
@@ -218,7 +221,9 @@ impl Snapshot {
             }
         }
         nodes.sort_by(|a, b| (a.distance, &a.id).cmp(&(b.distance, &b.id)));
+        let external_dependencies = self.external_dependencies(&index, &distance);
         Ok(Impact {
+            external_dependencies,
             revision: self.revision.clone(),
             nodes,
             truncated,
@@ -233,6 +238,7 @@ mod tests {
     use super::*;
     fn node(i: usize) -> Function {
         Function {
+            identity: None,
             body_id: None,
             body_location: None,
             rename_calls: vec![],

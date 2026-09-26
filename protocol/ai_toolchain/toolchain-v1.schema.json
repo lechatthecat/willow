@@ -145,6 +145,9 @@
           "items": {
             "type": "string"
           }
+        },
+        "identity": {
+          "$ref": "#/$defs/symbolIdentity"
         }
       }
     },
@@ -184,6 +187,9 @@
         },
         "unknown": {
           "type": "boolean"
+        },
+        "identity": {
+          "$ref": "#/$defs/symbolIdentity"
         }
       }
     },
@@ -215,6 +221,28 @@
         "edge_visits": {
           "type": "integer",
           "minimum": 0
+        },
+        "external_dependencies": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "from",
+              "target",
+              "relation"
+            ],
+            "properties": {
+              "from": {
+                "$ref": "#/$defs/symbolIdentity"
+              },
+              "target": {
+                "$ref": "#/$defs/symbolIdentity"
+              },
+              "relation": {
+                "const": "callee"
+              }
+            }
+          }
         }
       }
     },
@@ -313,6 +341,51 @@
               "type": "null"
             }
           ]
+        }
+      }
+    },
+    "symbolIdentity": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "required": [
+        "package",
+        "module",
+        "symbol"
+      ],
+      "properties": {
+        "package": {
+          "type": "object",
+          "required": [
+            "name",
+            "version",
+            "revision",
+            "source"
+          ],
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            },
+            "revision": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "type": "object"
+            }
+          }
+        },
+        "module": {
+          "type": "string"
+        },
+        "symbol": {
+          "type": "string"
         }
       }
     }

@@ -95,3 +95,42 @@ for each set bit, with a source witness or explicit missing evidence. Compiler
 facts, runtime capability bounds and external boundaries are distinguished.
 A missing witness produces `incomplete`; unknown callees produce `unknown`.
 These are capability facts, not proof of external business writes.
+
+Package-aware analysis adds `identity: {package, module, symbol}` to callable,
+source-symbol, reference and impact-node results. `package` contains `name`,
+`version`, `revision` (null for live path packages), and `source`. Logical module
+paths and package identities do not include consumer dependency aliases. Existing
+opaque IDs and source locations remain revision-scoped. Non-callable members use
+owner-qualified symbols (for example `Box::field:value` and
+`Choice::type-parameter:T`). Parameters and bindings additionally carry their
+declaration token's byte offset (`first::parameter:x@42`); this distinguishes
+shadowing, sibling scopes and lambda bindings within a named owner. These local
+identities are revision-scoped and can change when source offsets change.
+References carry the same identity as their target declaration. Single-file/legacy
+analysis without a PackageGraph reports null identities. Impact includes
+`external_dependencies` with `from`, `target`, and `relation: "callee"` for
+cross-package calls from discovered nodes (including outgoing boundary edges).
+
+Use package commands as the planning interface:
+
+1. Run `willow update --dry-run --format json` (or `willow add ... --format json`).
+2. Put its complete report object into a V2 request's `delta` field:
+   `{"kind":"affected","delta":<report>,"tests":["<test FunctionId>"]}`.
+3. Run `willow query --requests requests.json` in the project. As with other
+   query batches, requests.json is an array; omitted revision binds to this
+   invocation. The same request works through the warm daemon with its revision.
+4. Use the returned modules/symbols/tests to select checks. Review the plan before
+   applying the package mutation; the query itself never edits manifests or locks.
+
+`affected` matches full before/after package identities from direct and transitive
+changes, ignoring alias-only changes. It returns a conservative reverse import
+closure and all declarations within that closure, including type-only consumers.
+The indexed graph is limited to modules loaded from the selected entry point.
+`tests` is an explicit caller-supplied list of test FunctionIds: no naming
+convention or unloaded test discovery is assumed. Unknown test IDs produce
+`incomplete`; unmatched package identities are returned explicitly (a planned
+new revision will normally be unmatched in a pre-update snapshot). Empty change
+sets return empty results. Invalid report schema/kind/success state returns
+`invalid-delta`; stale revisions retain the existing top-level `stale` response.
+`module_visits` and `edge_visits` expose closure work per request, excluding the
+one-time session index construction and JSON output serialization.
