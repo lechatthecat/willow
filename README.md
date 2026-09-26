@@ -48,4 +48,4 @@ hello/
 
 # License
 
-Willow is available under the [MIT License](LICENSE).
+[MIT License](LICENSE)
