@@ -1841,10 +1841,21 @@ impl TypeChecker {
                     vec![FunctionId::free_from_source_name(&call.callee)]
                 }
             }
+            // A builtin method has no Willow body but a known lowering, so it
+            // resolves to its intrinsic target instead of an unknown site.
             Expr::MethodCall(call) => self
                 .expr_types
                 .get(&call.object.id())
-                .map(|ty| self.method_effect_ids(ty, &call.method))
+                .map(|ty| {
+                    let targets = self.method_effect_ids(ty, &call.method);
+                    if targets.is_empty()
+                        && let Some(resolved) =
+                            crate::semantic::intrinsics::resolve(ty, &call.method, call.args.len())
+                    {
+                        return vec![resolved.intrinsic.function_id()];
+                    }
+                    targets
+                })
                 .unwrap_or_default(),
             Expr::StaticCall(call) => vec![
                 self.static_method_effect_id(&call.class, &call.method)

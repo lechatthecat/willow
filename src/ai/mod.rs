@@ -570,6 +570,37 @@ pub(crate) fn snapshot(
             }
         }
     }
+    // Declared types whose calls have no Willow body: an implicit memberwise
+    // `init` only stores fields (the `new` site already carries the
+    // allocation), and a variant constructor boxes its payload. Indexed once
+    // so each call target is classified in O(1).
+    let mut bodyless = HashMap::<(UnitId, &str), bool>::new();
+    let mut module_aliases = HashMap::new();
+    for (&unit, program) in &programs {
+        module_aliases.insert(
+            unit,
+            crate::compiler_db::normalize::builtin_module_aliases(program),
+        );
+        for item in &program.items {
+            match item {
+                Item::Class(class) if class.constructors.is_empty() => {
+                    bodyless.insert((unit, class.name.as_str()), false);
+                }
+                Item::Enum(e) => {
+                    bodyless.insert((unit, e.name.as_str()), true);
+                }
+                _ => {}
+            }
+        }
+    }
+    let bodyless_effects = |(unit, target): &(UnitId, FunctionId)| {
+        let is_enum = *bodyless.get(&(*unit, target.owner()?))?;
+        match (is_enum, target.name()) {
+            (false, "init") => Some(RuntimeEffects::NONE),
+            (true, _) => Some(RuntimeEffects::MAY_ALLOCATE),
+            _ => None,
+        }
+    };
     let mut edges = HashMap::<(UnitId, FunctionId), BTreeSet<String>>::new();
     for (&unit, capture) in &captured {
         for (&id, locations) in &capture.declarations {
@@ -626,19 +657,19 @@ pub(crate) fn snapshot(
                 let key_target = resolve(unit, *target);
                 if let Some(node) = nodes.get(&key_target) {
                     edges.entry(key).or_default().insert(node.id.clone());
-                } else if target.owner().is_none()
-                    && target.namespace().is_none()
-                    && let Some(runtime) =
-                        crate::semantic::intrinsics::builtin_call_runtime_name(target.name())
-                    && let Some(symbol) = willow_abi::runtime_symbol(runtime)
+                } else if let Some(effects) =
+                    crate::semantic::intrinsics::builtin_target_effects(target)
                 {
-                    bits |= symbol.effects().bits();
-                } else if target.owner().is_none()
-                    && matches!(target.name(), "panic" | "recover" | "pow" | "powf")
+                    bits |= effects.bits();
+                } else if let Some(effects) = bodyless_effects(&key_target)
+                    .or_else(|| {
+                        crate::semantic::intrinsics::builtin_static_effects(
+                            target,
+                            &module_aliases[&unit],
+                        )
+                    })
                 {
-                    if target.name() == "panic" {
-                        bits |= RuntimeEffects::MAY_PANIC.bits();
-                    }
+                    bits |= effects.bits();
                 } else {
                     unknown = true;
                     unresolved.insert(format!("{}#{}", paths[&key_target.0], key_target.1));

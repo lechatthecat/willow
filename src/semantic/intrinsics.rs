@@ -42,6 +42,8 @@
 
 use crate::parser::ast::Type;
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
+use crate::semantic::ids::{FunctionId, TypeId};
+use willow_abi::RuntimeEffects;
 
 /// A builtin method, resolved to an identity the backend can match on.
 ///
@@ -266,6 +268,178 @@ impl Intrinsic {
     pub fn is_suspension_point(self) -> bool {
         matches!(self, Intrinsic::ChannelSend | Intrinsic::ChannelRecv)
     }
+
+    /// Every runtime symbol the lowering of this intrinsic can call, over all
+    /// receiver representations (a channel's element suffix, an atomic's
+    /// width). Inline fast paths are covered by their runtime fallback: an
+    /// array length reads the header inline and calls `willow_array_len` only
+    /// for a null receiver. Keep in step with `emit_flat_intrinsic_inner`.
+    pub fn runtime_symbols(self) -> &'static [&'static str] {
+        use Intrinsic::*;
+        match self {
+            I64ToString => &["willow_i64_to_string"],
+            F64ToString => &["willow_f64_to_string"],
+            BoolToString => &["willow_bool_to_string"],
+            StringToString | TaskResult => &[],
+            TaskCancel => &["willow_sched_cancel"],
+            TaskIsCancelled => &["willow_frame_is_cancelled"],
+            TokenIsCancelled => &["willow_cancellation_token_is_cancelled"],
+            TokenCancel => &["willow_cancellation_token_cancel"],
+            TokenChild => &["willow_cancellation_token_child"],
+            TokenAttach => &["willow_cancellation_token_attach"],
+            ScopeIsCancelled => &["willow_task_scope_is_cancelled"],
+            ScopeCancel => &["willow_task_scope_cancel"],
+            ScopeChild => &["willow_task_scope_child"],
+            ScopeAdd => &["willow_task_scope_add"],
+            ScopeFinish => &["willow_task_scope_finish"],
+            AtomicLoad => &["willow_atomic_i64_load", "willow_atomic_bool_load"],
+            AtomicStore => &["willow_atomic_i64_store", "willow_atomic_bool_store"],
+            AtomicSwap => &["willow_atomic_i64_swap", "willow_atomic_bool_swap"],
+            AtomicAdd => &["willow_atomic_i64_add"],
+            AtomicSub => &["willow_atomic_i64_sub"],
+            CellGet => &["willow_blocking_cell_get"],
+            CellSet => &["willow_blocking_cell_set"],
+            RwCellRead => &["willow_blocking_rw_cell_read"],
+            RwCellWrite => &["willow_blocking_rw_cell_write"],
+            ChannelSend => &[
+                "willow_channel_send_i64",
+                "willow_channel_send_bool",
+                "willow_channel_send_f64",
+                "willow_channel_send_ptr",
+            ],
+            ChannelRecv => &[
+                "willow_channel_recv_i64",
+                "willow_channel_recv_bool",
+                "willow_channel_recv_f64",
+                "willow_channel_recv_ptr",
+            ],
+            ChannelClose => &["willow_channel_close"],
+            ArrayLen | FrozenArrayLen => &["willow_array_len"],
+            ArrayPush => &["willow_array_push"],
+            ArrayPop => &["willow_array_pop"],
+            ArrayToString => &["willow_array_to_string"],
+            ArrayFreeze => &["willow_array_copy"],
+            MapInsert => &["willow_map_insert"],
+            MapGet | FrozenMapGet => &["willow_map_get"],
+            MapContains | FrozenMapContains => &["willow_map_contains"],
+            MapLen | FrozenMapLen => &["willow_map_len"],
+            MapToString => &["willow_map_to_string"],
+            MapFreeze => &["willow_map_copy"],
+        }
+    }
+
+    /// Runtime effects of one call: the union of its runtime symbols' ABI
+    /// effects, plus `MAY_SUSPEND` at a suspension point. A symbol missing from
+    /// the ABI table fails closed to every effect.
+    pub fn runtime_effects(self) -> RuntimeEffects {
+        let mut effects = if self.is_suspension_point() {
+            RuntimeEffects::MAY_SUSPEND
+        } else {
+            RuntimeEffects::NONE
+        };
+        for name in self.runtime_symbols() {
+            effects = effects.union(
+                willow_abi::runtime_symbol(name).map_or(RuntimeEffects::ALL, |s| s.effects()),
+            );
+        }
+        effects
+    }
+
+    /// The call-graph target of a resolved builtin method call. Intrinsics
+    /// have no Willow body, so this id never names a graph node; consumers
+    /// classify it with [`builtin_target_effects`] instead of treating the
+    /// call site as unresolved.
+    pub fn function_id(self) -> FunctionId {
+        FunctionId::method(TypeId::local(INTRINSIC_OWNER), format!("{self:?}"))
+    }
+
+    /// Inverse of [`Intrinsic::function_id`], by one hash lookup.
+    pub fn from_function_id(id: &FunctionId) -> Option<Self> {
+        static BY_ID: std::sync::OnceLock<std::collections::HashMap<FunctionId, Intrinsic>> =
+            std::sync::OnceLock::new();
+        if id.owner() != Some(INTRINSIC_OWNER) || id.namespace().is_some() {
+            return None;
+        }
+        BY_ID
+            .get_or_init(|| Self::ALL.iter().map(|&i| (i.function_id(), i)).collect())
+            .get(id)
+            .copied()
+    }
+}
+
+/// Owner of synthetic intrinsic call targets. `$` cannot start a source
+/// identifier, so no user type can collide with it.
+const INTRINSIC_OWNER: &str = "$intrinsic";
+
+/// Full runtime effects of a call target that has no Willow body: a builtin
+/// method ([`Intrinsic::function_id`]) or a builtin free function. `None`
+/// means the target is not a known builtin, and the caller must fail closed.
+/// A user declaration of the same name is a graph node and is looked up
+/// before this is consulted.
+pub(crate) fn builtin_target_effects(target: &FunctionId) -> Option<RuntimeEffects> {
+    if let Some(intrinsic) = Intrinsic::from_function_id(target) {
+        return Some(intrinsic.runtime_effects());
+    }
+    if target.owner().is_some() || target.namespace().is_some() {
+        return None;
+    }
+    match target.name() {
+        "panic" => Some(RuntimeEffects::MAY_PANIC),
+        // String formatting allocates the result and can panic on a failed
+        // conversion; argument evaluation is attributed at its own sites.
+        "format" => Some(RuntimeEffects::MAY_PANIC.union(RuntimeEffects::MAY_ALLOCATE)),
+        "recover" | "pow" | "powf" => Some(RuntimeEffects::NONE),
+        name => builtin_call_runtime_name(name).map(symbol_effects),
+    }
+}
+
+fn symbol_effects(name: &str) -> RuntimeEffects {
+    willow_abi::runtime_symbol(name).map_or(RuntimeEffects::ALL, |s| s.effects())
+}
+
+/// The runtime constructor a builtin `Class::method(...)` static call lowers to
+/// (`emit_lir_static_call_values_inner`). The caller rules out user classes of
+/// the same name first: a declared static method always wins.
+pub(crate) fn builtin_static_constructor(class: &str, method: &str) -> Option<&'static str> {
+    Some(match (class, method) {
+        ("Map", "new") => "willow_map_new",
+        ("Channel", "new") => "willow_channel_new",
+        ("Channel", "with_capacity") => "willow_channel_new_bounded",
+        ("CancellationToken", "new") => "willow_cancellation_token_new",
+        ("TaskScope", "new") => "willow_task_scope_new",
+        ("AtomicI64", "new") => "willow_atomic_i64_new",
+        ("AtomicBool", "new") => "willow_atomic_bool_new",
+        ("BlockingCell", "new") => "willow_blocking_cell_new",
+        ("BlockingRwCell", "new") => "willow_blocking_rw_cell_new",
+        ("Mutex", "new") => "willow_async_mutex_new",
+        ("RwLock", "new") => "willow_async_rwlock_new",
+        _ => return None,
+    })
+}
+
+/// Effects of a static call whose target has no Willow body: a builtin
+/// constructor, a builtin-enum variant, or a namespace builtin (`fs::read`).
+/// `module_aliases` maps a caller's `import std::fs as files` spellings back to
+/// the builtin namespace. `None` means the target is not a known builtin and
+/// stays unresolved.
+pub(crate) fn builtin_static_effects(
+    target: &FunctionId,
+    module_aliases: &std::collections::HashMap<String, String>,
+) -> Option<RuntimeEffects> {
+    let owner = target.owner().filter(|_| target.namespace().is_none())?;
+    let method = target.name();
+    if let Some(runtime) = builtin_static_constructor(owner, method) {
+        return Some(symbol_effects(runtime));
+    }
+    // Variant construction boxes the payload on the GC heap.
+    if matches!(
+        (owner, method),
+        ("Option", "Some" | "None") | ("Result", "Ok" | "Err")
+    ) {
+        return Some(RuntimeEffects::MAY_ALLOCATE);
+    }
+    let namespace = module_aliases.get(owner).map_or(owner, String::as_str);
+    namespace_builtin(namespace, method).map(|entry| symbol_effects(entry.runtime))
 }
 
 /// The name a receiver type resolves under, for the families this table keys on

@@ -479,18 +479,8 @@ impl EffectQueries {
 }
 
 pub(crate) fn intrinsic_effects(target: &FunctionId) -> Option<RuntimeEffects> {
-    if target.owner().is_some() || target.namespace().is_some() {
-        return None;
-    }
-    match target.name() {
-        "panic" | "format" => Some(PANIC),
-        "recover" | "pow" | "powf" => Some(RuntimeEffects::NONE),
-        name => crate::semantic::intrinsics::builtin_call_runtime_name(name).map(|name| {
-            willow_abi::runtime_symbol(name)
-                .map(|symbol| symbol.effects().intersection(PANIC))
-                .unwrap_or(PANIC)
-        }),
-    }
+    crate::semantic::intrinsics::builtin_target_effects(target)
+        .map(|effects| effects.intersection(PANIC))
 }
 fn unknown_external_capabilities(target: &FunctionId) -> EffectCapabilities {
     EffectCapabilities {
