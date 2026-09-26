@@ -5,6 +5,10 @@ use super::*;
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
         (
+            "example/incremental_dispatch_gc.wi",
+            "child\nchild\nretained\n",
+        ),
+        (
             "example/run_queue_metrics.wi",
             "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n",
         ),
