@@ -65,26 +65,26 @@ impl GcLayoutMetadata {
         object: &crate::compiler_db::layout::ObjectLayout,
         enum_infos: &TypeMap<EnumInfo>,
     ) -> Self {
-        let fields = object.fields().as_slice();
-        let gc_ref_mask = gc_ref_mask_for_layout(fields, enum_infos);
+        let fallback;
+        let trace = match object.gc_trace() {
+            Some(trace) => trace,
+            None => {
+                // Standalone layout tests and unregistered builtin layouts.
+                fallback =
+                    crate::compiler_db::layout::GcTraceLayout::from_fields(object.fields(), |ty| {
+                        Ok(is_gc_managed(ty, enum_infos))
+                    })
+                    .expect("GC classification");
+                &fallback
+            }
+        };
         let mut layout = Self::new(
             GcObjectKind::Class,
             object.size_bytes(),
             runtime_type_id,
-            gc_ref_mask,
+            trace.mask,
         );
-        if fields
-            .iter()
-            .enumerate()
-            .any(|(i, (_, ty))| i + 1 >= 64 && is_gc_managed(ty, enum_infos))
-        {
-            layout.bitmap = vec![0; (fields.len() + 1).div_ceil(64)];
-            for (i, (_, ty)) in fields.iter().enumerate() {
-                if is_gc_managed(ty, enum_infos) {
-                    layout.bitmap[(i + 1) / 64] |= 1 << ((i + 1) % 64);
-                }
-            }
-        }
+        layout.bitmap.clone_from(&trace.bitmap);
         layout
     }
 }

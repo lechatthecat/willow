@@ -25,6 +25,51 @@ struct TrackedLayout {
 }
 impl Eq for TrackedLayout {}
 
+/// Frozen tracing shape, shared by every allocation of one class.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GcTraceLayout {
+    pub(crate) mask: u64,
+    pub(crate) bitmap: Vec<u64>,
+}
+impl GcTraceLayout {
+    pub(crate) fn from_fields(
+        fields: &[(String, Type)],
+        mut managed: impl FnMut(&Type) -> Result<bool>,
+    ) -> Result<Self> {
+        let mut result = Self {
+            mask: 0,
+            bitmap: Vec::new(),
+        };
+        for (i, (_, ty)) in fields.iter().enumerate() {
+            if !managed(ty)? {
+                continue;
+            }
+            // Word zero points to a static class descriptor, never a GC object.
+            let word = i + 1;
+            if word < 64 {
+                result.mask |= 1 << word;
+            } else {
+                if result.bitmap.is_empty() {
+                    result.bitmap = vec![0; (fields.len() + 1).div_ceil(64)];
+                    result.bitmap[0] = result.mask;
+                }
+                result.bitmap[word / 64] |= 1 << (word % 64);
+            }
+        }
+        Ok(result)
+    }
+}
+
+/// One representation rule used by tracing queries and backend root/store lowering.
+pub(crate) fn is_gc_managed(ty: &Type, named: impl FnOnce(TypeId) -> bool) -> bool {
+    match ty {
+        Type::Named(name) => named(*name),
+        Type::Array(_) | Type::String | Type::Closure(_, _) => true,
+        Type::Generic(name, _) => name.name() != "Future",
+        _ => false,
+    }
+}
+
 struct LayoutProvider;
 impl super::tracked::QueryProvider for LayoutProvider {
     fn compute(
@@ -33,6 +78,21 @@ impl super::tracked::QueryProvider for LayoutProvider {
         node: &super::tracked::QueryNode,
     ) -> Result<super::tracked::QueryValue> {
         use super::tracked::{InputNode, QueryNode, QueryValue, ResultFingerprint};
+        if let QueryNode::GcLayout(id) = node {
+            let layout = table.read(self, QueryNode::ClassLayout(*id))?;
+            let layout = layout.get::<TrackedLayout>();
+            let trace = GcTraceLayout::from_fields(&layout.fields, |ty| {
+                let named = match ty {
+                    Type::Named(id) => *table.input(&InputNode::GcNamedType(*id))?.get::<bool>(),
+                    _ => false,
+                };
+                Ok(is_gc_managed(ty, |_| named))
+            })?;
+            return Ok(QueryValue::new(
+                trace,
+                ResultFingerprint::bytes(b"gc-trace-layout"),
+            ));
+        }
         if let QueryNode::InterfaceLayout(id) = node {
             return table.input(&InputNode::InterfaceDeclaration(*id));
         }
@@ -98,6 +158,7 @@ pub(crate) struct ObjectLayout {
     fields: Arc<Vec<(String, Type)>>,
     index: HashMap<String, usize>,
     word_bytes: i64,
+    gc: Option<Arc<GcTraceLayout>>,
 }
 
 impl ObjectLayout {
@@ -111,7 +172,12 @@ impl ObjectLayout {
             fields,
             index,
             word_bytes: i64::from(willow_abi::storage_word_bytes(pointer_bytes)),
+            gc: None,
         }
+    }
+
+    pub(crate) fn gc_trace(&self) -> Option<&GcTraceLayout> {
+        self.gc.as_deref()
     }
 
     pub(crate) fn fields(&self) -> &Arc<Vec<(String, Type)>> {
@@ -148,6 +214,8 @@ pub(crate) struct LayoutQueries {
     slots: QueryTable<TypeId, MethodSlots>,
     interfaces: QueryTable<TypeId, crate::semantic::symbols::InterfaceInfo<TypeId>>,
     object_layouts: QueryTable<TargetLayoutKey, ObjectLayout>,
+    gc_layouts: QueryTable<TypeId, GcTraceLayout>,
+    gc_named_types: QueryTable<TypeId, bool>,
     #[cfg(test)]
     work: std::cell::Cell<[usize; 4]>,
     #[cfg(test)]
@@ -168,6 +236,8 @@ impl Default for LayoutQueries {
             slots: QueryTable::named("class_vslots"),
             interfaces: QueryTable::named("interface_composition"),
             object_layouts: QueryTable::named("object_layout"),
+            gc_layouts: QueryTable::named("gc_trace_layout"),
+            gc_named_types: QueryTable::named("gc_named_type"),
             #[cfg(test)]
             work: Default::default(),
             #[cfg(test)]
@@ -268,8 +338,60 @@ impl LayoutQueries {
         }
         let fields = self.fields(key.ty)?;
         self.object_layouts
-            .query(key, || Ok(ObjectLayout::new(fields, key.pointer_bytes())))
+            .query(key, || {
+                let mut object = ObjectLayout::new(fields, key.pointer_bytes());
+                object.gc = self.gc_layouts.ready(&key.ty);
+                Ok(object)
+            })
             .ok()
+    }
+
+    /// Prepare tracing metadata at declaration time; emission only reads it.
+    pub(crate) fn prepare_gc_layouts(
+        &self,
+        classes: &[TypeId],
+        named: impl Fn(TypeId) -> bool,
+    ) -> Result<()> {
+        use super::tracked::{InputNode, QueryNode, QueryValue, ResultFingerprint};
+        let classify_named = |id| {
+            *self
+                .gc_named_types
+                .query(id, || Ok(named(id)))
+                .expect("frozen named representation")
+        };
+        let mut named_types = HashSet::new();
+        for &id in classes {
+            if self.gc_layouts.is_ready(&id) {
+                continue;
+            }
+            let fields = self
+                .fields(id)
+                .ok_or_else(|| anyhow::anyhow!("missing class fields {id}"))?;
+            let trace = if let Some(queries) = self.tracking.borrow().as_ref() {
+                for (_, ty) in fields.iter() {
+                    if let Type::Named(name) = ty
+                        && named_types.insert(*name)
+                    {
+                        queries.borrow_mut().capture_input(
+                            InputNode::GcNamedType(*name),
+                            QueryValue::new(
+                                classify_named(*name),
+                                ResultFingerprint::bytes(b"gc-named-type"),
+                            ),
+                        )?;
+                    }
+                }
+                queries
+                    .borrow()
+                    .read_with(&LayoutProvider, QueryNode::GcLayout(id))?
+                    .get::<GcTraceLayout>()
+                    .clone()
+            } else {
+                GcTraceLayout::from_fields(&fields, |ty| Ok(is_gc_managed(ty, classify_named)))?
+            };
+            self.gc_layouts.seed(id, trace);
+        }
+        Ok(())
     }
 
     /// Registration freezes own declarations, never provisional inherited data.
@@ -650,6 +772,105 @@ mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn gc_named_representation_scans_once_across_class_batches() {
+        for size in [8, 32, 128] {
+            let layouts = LayoutQueries::default();
+            let scans = std::cell::Cell::new(0);
+            for index in 0..size {
+                let id = TypeId::local(format!("C{index}"));
+                layouts.register_class(
+                    id,
+                    None,
+                    vec![
+                        ("a".into(), Type::Named(TypeId::local("E"))),
+                        ("b".into(), Type::Named(TypeId::local("E"))),
+                    ],
+                    vec![],
+                );
+                let completed = layouts.complete_pending_classes().unwrap();
+                layouts
+                    .prepare_gc_layouts(&completed, |_| {
+                        scans.set(scans.get() + 1);
+                        true
+                    })
+                    .unwrap();
+                assert_eq!(
+                    layouts
+                        .object_layout(TargetLayoutKey::new(id, 8))
+                        .unwrap()
+                        .gc_trace()
+                        .unwrap()
+                        .mask,
+                    6
+                );
+            }
+            assert_eq!(scans.get(), 1);
+        }
+    }
+
+    #[test]
+    fn tracked_gc_bitmap_boundaries_and_unrelated_classes_match_cold() {
+        use crate::compiler_db::incremental::SyntaxQueries;
+        use std::{cell::RefCell, rc::Rc};
+        for count in [8, 63, 64, 65, 128] {
+            let mut accepted = SyntaxQueries::default();
+            for step in 0..4 {
+                let tracking = Rc::new(RefCell::new(accepted.candidate().unwrap()));
+                let layouts = LayoutQueries::default();
+                layouts.set_tracking(Rc::clone(&tracking));
+                let id = TypeId::local("C");
+                let fields: Vec<_> = (0..count)
+                    .map(|i| {
+                        (
+                            format!("f{i}"),
+                            if step % 2 == 1 && (i == 0 || i + 1 == count) {
+                                Type::String
+                            } else {
+                                Type::I64
+                            },
+                        )
+                    })
+                    .collect();
+                layouts.register_class(id, None, fields.clone(), vec![]);
+                let unrelated = TypeId::local("Other");
+                layouts.register_class(unrelated, None, vec![("s".into(), Type::String)], vec![]);
+                let classes = layouts.complete_pending_classes().unwrap();
+                layouts.prepare_gc_layouts(&classes, |_| true).unwrap();
+                let before = tracking.borrow().stats();
+                for pointer in [4, 8] {
+                    let object = layouts
+                        .object_layout(TargetLayoutKey::new(id, pointer))
+                        .unwrap();
+                    let cold =
+                        GcTraceLayout::from_fields(&fields, |ty| Ok(matches!(ty, Type::String)))
+                            .unwrap();
+                    assert_eq!(object.gc_trace().unwrap(), &cold);
+                    assert_eq!(
+                        object.size_bytes(),
+                        (count as i64 + 1) * i64::from(willow_abi::storage_word_bytes(pointer))
+                    );
+                    if step % 2 == 1 {
+                        assert_eq!(cold.mask & 2, 2);
+                        assert_eq!(!cold.bitmap.is_empty(), count >= 64);
+                        if count >= 64 {
+                            assert_ne!(cold.bitmap[count / 64] & (1 << (count % 64)), 0);
+                        }
+                    }
+                }
+                assert_eq!(tracking.borrow().stats(), before, "frozen reads");
+                assert_eq!(
+                    tracking
+                        .borrow()
+                        .recomputations(&super::super::tracked::QueryNode::GcLayout(unrelated)),
+                    usize::from(step == 0)
+                );
+                drop(layouts);
+                accepted = Rc::try_unwrap(tracking).unwrap().into_inner();
+            }
+        }
+    }
 
     /// The builtin layouts every `LayoutQueries` starts with: `PanicInfo`'s
     /// fields and its (empty) slot table, computed once in `Default`.

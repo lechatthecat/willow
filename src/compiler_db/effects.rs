@@ -1715,7 +1715,7 @@ mod tests {
 #[derive(Default, Clone)]
 pub(crate) struct CallableIndex {
     pub(crate) callables: HashMap<FunctionId, bool>,
-    pub(crate) hierarchy: ClassHierarchy,
+    pub(crate) hierarchy: Arc<ClassHierarchy>,
 }
 
 /// Typed effect contributions and lock-held diagnostic sites for one unit/body.

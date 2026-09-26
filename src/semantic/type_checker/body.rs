@@ -302,7 +302,10 @@ impl TypeChecker {
         if self.body_query_error.is_some() {
             return;
         }
-        if let Err(error) = queries.validate_candidate(id, &self.symbols) {
+        if let Err(error) = queries
+            .prepare_dispatch(id, &self.effect_index.hierarchy)
+            .and_then(|()| queries.validate_candidate(id, &self.symbols))
+        {
             self.body_query_error = Some(error);
             return;
         }

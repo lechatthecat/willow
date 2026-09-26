@@ -6,6 +6,7 @@ pub(crate) mod captured;
 mod checked;
 pub(crate) mod declarations;
 pub(crate) mod dependencies;
+pub(crate) mod dispatch;
 pub(crate) mod effects;
 pub mod ids;
 pub(crate) mod incremental;

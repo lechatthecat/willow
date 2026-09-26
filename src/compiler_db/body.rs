@@ -95,6 +95,9 @@ pub(crate) struct BodyQueries {
     index: Rc<BodyIndex>,
     typed: QueryTable<BodyId, usize>,
     tracking: std::cell::RefCell<Option<BodyTracking>>,
+    dispatch: std::cell::RefCell<
+        HashMap<crate::module::UnitId, std::sync::Arc<crate::semantic::call_graph::ClassHierarchy>>,
+    >,
     correspondence: std::cell::RefCell<super::syntax::Correspondence>,
     module_gate: std::cell::RefCell<HashSet<crate::module::UnitId>>,
     fine_allowed_module_refused: std::cell::Cell<usize>,
@@ -112,6 +115,87 @@ pub(crate) struct BodyQueries {
 }
 
 impl BodyQueries {
+    pub(crate) fn interface_dispatch_targets(
+        &self,
+        unit: crate::module::UnitId,
+        inputs: std::collections::BTreeMap<
+            crate::semantic::ids::FunctionId,
+            Vec<crate::semantic::ids::FunctionId>,
+        >,
+    ) -> Result<
+        std::collections::BTreeMap<
+            crate::semantic::ids::FunctionId,
+            Vec<crate::semantic::ids::FunctionId>,
+        >,
+    > {
+        let tracking = self.tracking.borrow();
+        let Some(tracking) = tracking.as_ref() else {
+            return Ok(inputs);
+        };
+        tracking
+            .syntax
+            .borrow_mut()
+            .capture_interface_dispatch(unit, &inputs)?;
+        inputs
+            .into_keys()
+            .map(|id| {
+                Ok((
+                    id,
+                    tracking
+                        .syntax
+                        .borrow()
+                        .interface_dispatch_targets(unit, id)?,
+                ))
+            })
+            .collect()
+    }
+
+    pub(crate) fn prepare_dispatch(
+        &self,
+        body: BodyId,
+        hierarchy: &std::sync::Arc<crate::semantic::call_graph::ClassHierarchy>,
+    ) -> Result<()> {
+        let Some((unit, _)) = self.index.owner(body) else {
+            return Ok(());
+        };
+        if self.dispatch.borrow().contains_key(&unit) {
+            return Ok(());
+        }
+        if let Some(tracking) = self.tracking.borrow().as_ref() {
+            super::dispatch::capture(&mut tracking.syntax.borrow_mut(), unit, hierarchy)?;
+        }
+        self.dispatch.borrow_mut().insert(unit, hierarchy.clone());
+        Ok(())
+    }
+    fn dispatch_result(
+        &self,
+        unit: crate::module::UnitId,
+        class: crate::semantic::ids::TypeId,
+        method: &str,
+    ) -> Vec<crate::semantic::ids::FunctionId> {
+        if let Some(tracking) = self.tracking.borrow().as_ref() {
+            return tracking
+                .syntax
+                .borrow()
+                .dispatch_targets(unit, class, method)
+                .expect("captured dispatch declarations");
+        }
+        self.dispatch.borrow()[&unit].dispatch_targets(&class.to_string(), method)
+    }
+    pub(crate) fn dispatch_targets(
+        &self,
+        body: BodyId,
+        class: crate::semantic::ids::TypeId,
+        method: &str,
+    ) -> Vec<crate::semantic::ids::FunctionId> {
+        crate::semantic::symbols::record_read(|| SymbolRead::Dispatch(class, method.to_owned()));
+        let (unit, _) = self
+            .index
+            .owner(body)
+            .expect("registered dispatch consumer");
+        self.dispatch_result(unit, class, method)
+    }
+
     #[cfg(test)]
     pub(crate) fn reuse_from(
         &self,
@@ -297,7 +381,15 @@ impl BodyQueries {
         self.signatures
             .borrow_mut()
             .entry((unit, read.clone()))
-            .or_insert_with(|| Rc::new(symbols.symbol_value(read)))
+            .or_insert_with(|| {
+                Rc::new(match read {
+                    SymbolRead::Dispatch(class, method) => {
+                        serde_json::to_value(self.dispatch_result(unit, *class, method))
+                            .expect("dispatch serialization")
+                    }
+                    _ => symbols.symbol_value(read),
+                })
+            })
             .clone()
     }
 
@@ -315,13 +407,11 @@ impl BodyQueries {
                     && let Some((path, owner)) = tracking.owners.get(&id)
                     && let Some((unit, _)) = self.index.owner(id)
                 {
-                    tracking.syntax.borrow_mut().validate_body(
-                        unit,
-                        id,
-                        path,
-                        owner,
-                        self.tracked_reads(id, symbols),
-                    )?;
+                    let reads = self.tracked_reads(id, symbols);
+                    tracking
+                        .syntax
+                        .borrow_mut()
+                        .validate_body(unit, id, path, owner, reads)?;
                 }
                 return Ok(());
             };
@@ -342,22 +432,19 @@ impl BodyQueries {
         if let Some(tracking) = self.tracking.borrow().as_ref() {
             for (body, _) in &candidates {
                 let (unit, _) = self.index.owner(*body).expect("candidate owner");
-                tracking
-                    .syntax
-                    .borrow_mut()
-                    .capture_semantic(unit, self.tracked_reads(*body, symbols))?;
+                let reads = self.tracked_reads(*body, symbols);
+                tracking.syntax.borrow_mut().capture_semantic(unit, reads)?;
             }
             let Some((path, owner)) = tracking.owners.get(&id) else {
                 return Ok(());
             };
             let (unit, _) = self.index.owner(id).expect("candidate owner");
-            if !tracking.syntax.borrow_mut().validate_body(
-                unit,
-                id,
-                path,
-                owner,
-                self.tracked_reads(id, symbols),
-            )? {
+            let reads = self.tracked_reads(id, symbols);
+            if !tracking
+                .syntax
+                .borrow_mut()
+                .validate_body(unit, id, path, owner, reads)?
+            {
                 return Ok(());
             }
         }
@@ -490,6 +577,7 @@ impl BodyQueries {
             index,
             typed: QueryTable::named("typed_body"),
             tracking: Default::default(),
+            dispatch: Default::default(),
             correspondence: Default::default(),
             module_gate: Default::default(),
             fine_allowed_module_refused: Default::default(),

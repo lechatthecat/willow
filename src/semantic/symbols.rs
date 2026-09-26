@@ -15,6 +15,7 @@ pub(crate) enum SymbolRead {
     Interface(String),
     Module(String),
     ModuleFunction(String, String),
+    Dispatch(TypeId, String),
 }
 
 thread_local! {
@@ -53,7 +54,7 @@ impl Drop for SymbolReadCapture {
         });
     }
 }
-fn record_read(make: impl FnOnce() -> SymbolRead) {
+pub(crate) fn record_read(make: impl FnOnce() -> SymbolRead) {
     BODY_READS.with(|reads| {
         if let Some(reads) = reads.borrow_mut().last_mut() {
             reads.insert(make());
@@ -358,6 +359,7 @@ impl SymbolTable {
     /// revision/key by the body reuse scheduler, never by scanning the scope.
     pub(crate) fn symbol_value(&self, read: &SymbolRead) -> serde_json::Value {
         let value = match read {
+            SymbolRead::Dispatch(..) => unreachable!("dispatch is evaluated by BodyQueries"),
             SymbolRead::Function(name) => serde_json::to_value(self.lookup_func(name)),
             SymbolRead::Class(name) => serde_json::to_value(self.lookup_class(name)),
             SymbolRead::Enum(name) => serde_json::to_value(self.lookup_enum(name)),

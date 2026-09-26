@@ -258,7 +258,7 @@ impl TypeChecker {
     fn prepare_lock_effect_analysis(&mut self, program: &Program) {
         self.local.current_effect_callable = None;
         self.effect_index.callables.clear();
-        self.effect_index.hierarchy = self.build_lock_effect_hierarchy();
+        self.effect_index.hierarchy = std::sync::Arc::new(self.build_lock_effect_hierarchy());
         self.effect_inputs.edges.clear();
         self.resolved_calls.clear();
         self.analysis_calls.clear();
@@ -324,6 +324,46 @@ impl TypeChecker {
         }
 
         self.connect_interface_lock_effects(program);
+        // Freeze the declaration-derived interface unions before checking any
+        // body; the same query result feeds the real effect graph.
+        if let (Some(queries), Some((_, unit))) = (&self.body_queries, &self.effect_queries) {
+            let inputs = self
+                .symbols
+                .interfaces
+                .values()
+                .flat_map(|interface| {
+                    let owner = TypeId::from_source_name(&interface.name);
+                    interface
+                        .method_order
+                        .iter()
+                        .map(move |method| FunctionId::method(owner, method.as_str()))
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .map(|id| {
+                    let mut targets: Vec<_> = self
+                        .effect_inputs
+                        .edges
+                        .get(&id)
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .collect();
+                    targets.sort();
+                    (id, targets)
+                })
+                .collect();
+            match queries.interface_dispatch_targets(*unit, inputs) {
+                Ok(results) => {
+                    for (id, targets) in results {
+                        self.effect_inputs
+                            .edges
+                            .insert(id, targets.into_iter().collect());
+                    }
+                }
+                Err(error) => self.body_query_error = Some(error),
+            }
+        }
     }
 
     /// Build the shared [`ClassHierarchy`] the effect analysis dispatches
@@ -614,6 +654,9 @@ impl TypeChecker {
         let Some(info) = self.symbols.lookup_class(class) else {
             return Vec::new();
         };
+        if let (Some(queries), Some(body)) = (&self.body_queries, self.local.current_body) {
+            return queries.dispatch_targets(body, TypeId::from_source_name(&info.name), method);
+        }
         self.effect_index
             .hierarchy
             .dispatch_targets(&info.name, method)

@@ -213,46 +213,27 @@ impl ClassHierarchy {
         let Some(owners) = analysis.owners.get(method) else {
             return Vec::new();
         };
-        let mut targets = BTreeSet::new();
-        // A virtual union needs the inherited body at its static root, plus
-        // every override below that root. Inheriting descendants cannot add
-        // another target, so never resolve an ancestor chain for each one.
-        let mut current = Some(declared_class);
-        let mut ancestors = HashSet::new();
-        while let Some(class) = current {
-            if !ancestors.insert(class) {
-                break;
-            }
-            #[cfg(test)]
-            {
-                analysis.visits += 1;
-            }
-            if owners.contains(class) {
-                if self.is_known_class(class) {
-                    targets.insert(FunctionId::method(TypeId::from_source_name(class), method));
-                }
-                break;
-            }
-            current = self.base_of(class);
+        #[cfg(test)]
+        let visits = std::cell::Cell::new(0usize);
+        let targets = resolve_dispatch_targets(
+            declared_class,
+            method,
+            |class| {
+                #[cfg(test)]
+                visits.set(visits.get() + 1);
+                Ok((
+                    self.is_known_class(class),
+                    self.base_of(class).map(str::to_owned),
+                    owners.contains(class),
+                ))
+            },
+            |class| Ok(analysis.children.get(class).cloned().unwrap_or_default()),
+        )
+        .expect("in-memory dispatch inventory");
+        #[cfg(test)]
+        {
+            analysis.visits += visits.get();
         }
-        let mut pending = vec![declared_class];
-        let mut seen = HashSet::new();
-        while let Some(class) = pending.pop() {
-            if !seen.insert(class) {
-                continue;
-            }
-            #[cfg(test)]
-            {
-                analysis.visits += 1;
-            }
-            if self.is_known_class(class) && owners.contains(class) {
-                targets.insert(FunctionId::method(TypeId::from_source_name(class), method));
-            }
-            if let Some(children) = analysis.children.get(class) {
-                pending.extend(children.iter().map(String::as_str));
-            }
-        }
-        let targets: Vec<_> = targets.into_iter().collect();
         if analysis.results.len() == DISPATCH_CACHE_ENTRIES {
             let oldest = analysis
                 .order
@@ -265,11 +246,75 @@ impl ClassHierarchy {
         targets
     }
 
+    pub(crate) fn dispatch_declarations(
+        &self,
+    ) -> BTreeMap<String, crate::compiler_db::dispatch::DispatchDeclaration> {
+        let mut declarations: BTreeMap<_, _> = self
+            .bases
+            .iter()
+            .map(|(class, base)| {
+                (
+                    class.clone(),
+                    crate::compiler_db::dispatch::DispatchDeclaration {
+                        exists: true,
+                        base: base.clone(),
+                        methods: Default::default(),
+                    },
+                )
+            })
+            .collect();
+        for (class, method) in &self.declared {
+            if let Some(declaration) = declarations.get_mut(class) {
+                declaration.methods.insert(method.clone());
+            }
+        }
+        declarations
+    }
+
     /// Class names in a stable order. Used by consumers that need to enumerate
     /// dispatch candidates themselves.
     pub fn classes(&self) -> impl Iterator<Item = &str> {
         self.bases.keys().map(String::as_str)
     }
+}
+
+/// Shared dispatch algorithm for frozen and revision-tracked inventories.
+/// Only the root's ancestors and descendants can contribute a target.
+pub(crate) fn resolve_dispatch_targets(
+    root: &str,
+    method: &str,
+    mut declaration: impl FnMut(&str) -> anyhow::Result<(bool, Option<String>, bool)>,
+    mut children: impl FnMut(&str) -> anyhow::Result<Vec<String>>,
+) -> anyhow::Result<Vec<FunctionId>> {
+    let mut targets = BTreeSet::new();
+    let mut current = Some(root.to_owned());
+    let mut ancestors = HashSet::new();
+    while let Some(class) = current {
+        if !ancestors.insert(class.clone()) {
+            break;
+        }
+        let (exists, base, declares) = declaration(&class)?;
+        if declares {
+            if exists {
+                targets.insert(FunctionId::method(TypeId::from_source_name(&class), method));
+            }
+            break;
+        }
+        current = base;
+    }
+    let mut pending = vec![root.to_owned()];
+    let mut seen = HashSet::new();
+    while let Some(class) = pending.pop() {
+        if !seen.insert(class.clone()) {
+            continue;
+        }
+        let (exists, _, declares) = declaration(&class)?;
+        if exists && declares {
+            targets.insert(FunctionId::method(TypeId::from_source_name(&class), method));
+        }
+        pending.extend(children(&class)?);
+    }
+    Ok(targets.into_iter().collect())
 }
 
 /// What one body can reach.

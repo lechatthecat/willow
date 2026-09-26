@@ -545,15 +545,11 @@ const FORBIDDEN_IN_QUERIES: &[&str] = &[
 /// Removes `//` comments and every item or statement guarded by
 /// `#[cfg(test)]`, so the remaining text is the non-test code.
 fn non_test_code(source: &str) -> String {
-    let uncommented: String = source
-        .lines()
-        .map(|line| line.split("//").next().unwrap_or(""))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let bytes = uncommented.as_bytes();
+    let (uncommented, structural) = rust_scan_masks(source);
+    let bytes = structural.as_bytes();
     let mut kept = String::with_capacity(uncommented.len());
     let mut cursor = 0;
-    while let Some(offset) = uncommented[cursor..].find("#[cfg(test)]") {
+    while let Some(offset) = structural[cursor..].find("#[cfg(test)]") {
         let start = cursor + offset;
         kept.push_str(&uncommented[cursor..start]);
         let mut index = start + "#[cfg(test)]".len();
@@ -581,6 +577,109 @@ fn non_test_code(source: &str) -> String {
     }
     kept.push_str(&uncommented[cursor..]);
     kept
+}
+
+// Ignore delimiters and comment markers inside literals while retaining literal
+// bytes in the result. Otherwise a Willow fixture containing "//" or an unmatched
+// brace makes a cfg(test) module end early and reports its test-only println!.
+fn rust_scan_masks(source: &str) -> (String, String) {
+    let bytes = source.as_bytes();
+    let mut uncommented = bytes.to_vec();
+    let mut structural = bytes.to_vec();
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        let mut comment = false;
+        if bytes[i..].starts_with(b"//") {
+            comment = true;
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if bytes[i..].starts_with(b"/*") {
+            comment = true;
+            i += 2;
+            let mut depth = 1;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i..].starts_with(b"/*") {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i..].starts_with(b"*/") {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        } else if bytes[i] == b'r' {
+            let mut quote = i + 1;
+            while bytes.get(quote) == Some(&b'#') {
+                quote += 1;
+            }
+            if bytes.get(quote) != Some(&b'"') {
+                i += 1;
+                continue;
+            }
+            let hashes = quote - i - 1;
+            i = quote + 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"'
+                    && bytes
+                        .get(i + 1..i + 1 + hashes)
+                        .is_some_and(|tail| tail.iter().all(|b| *b == b'#'))
+                {
+                    i += 1 + hashes;
+                    break;
+                }
+                i += 1;
+            }
+        } else if bytes[i] == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' => i = (i + 2).min(bytes.len()),
+                    b'"' => {
+                        i += 1;
+                        break;
+                    }
+                    _ => i += 1,
+                }
+            }
+        } else if bytes[i] == b'\'' {
+            // A lifetime has no closing quote after one character. Escaped char
+            // literals may include unicode escapes, but cannot include a newline.
+            let mut end = i + 1;
+            if bytes.get(end) == Some(&b'\\') {
+                end += 2;
+                if bytes.get(end) == Some(&b'{') {
+                    while end < bytes.len() && bytes[end] != b'}' {
+                        end += 1;
+                    }
+                    end += 1;
+                } else if bytes.get(i + 2) == Some(&b'x') {
+                    end += 2;
+                }
+            } else if let Some(ch) = source.get(end..).and_then(|s| s.chars().next()) {
+                end += ch.len_utf8();
+            }
+            if bytes.get(end) != Some(&b'\'') {
+                i += 1;
+                continue;
+            }
+            i = end + 1;
+        } else {
+            i += 1;
+            continue;
+        }
+        structural[start..i].fill(b' ');
+        if comment {
+            uncommented[start..i].fill(b' ');
+        }
+    }
+    (
+        String::from_utf8(uncommented).unwrap(),
+        String::from_utf8(structural).unwrap(),
+    )
 }
 
 fn rust_files(dir: &std::path::Path, files: &mut Vec<PathBuf>) {
@@ -625,4 +724,28 @@ fn diagnostic_scanner_strips_only_test_code() {
     assert!(code.contains("live: u8"), "{code}");
     assert!(code.contains("println!(\"live\")"), "{code}");
     assert!(code.contains("fn keep"), "{code}");
+}
+
+#[test]
+fn diagnostic_scanner_handles_literals_without_hiding_production_output() {
+    for literal in [
+        r#""// prefix {""#,
+        r#""}""#,
+        r##"r#"// } #[cfg(test)]"#"##,
+        r###"br##"/* } */"##"###,
+        r#"'}'"#,
+        r#"'\\''"#,
+    ] {
+        let source = format!(
+            "#[cfg(test)] mod tests {{ fn t() {{ let s = {literal}; println!(\"test\"); }} }} fn live() {{ println!(\"production\"); }}"
+        );
+        let code = non_test_code(&source);
+        assert!(!code.contains("test"), "literal {literal}: {code}");
+        assert!(code.contains("println!(\"production\")"), "{code}");
+    }
+    let code = non_test_code(
+        "/* outer /* println! */ still comment */ fn f<'a>(x: &'a str) { println!(\"live\"); }",
+    );
+    assert_eq!(code.matches("println!").count(), 1);
+    assert!(code.contains("fn f<'a>"));
 }

@@ -1,0 +1,30 @@
+// Declaration-derived dispatch and GC metadata share frozen backend reads.
+// Expected output: child, child, retained.
+interface Named {
+    fn label(self) -> String;
+}
+
+open class Base implements Named {
+    pub text: String;
+    pub open fn label(self) -> String { return self.text; }
+}
+
+class Child extends Base {
+    pub override fn label(self) -> String { return "child"; }
+}
+
+enum Payload { Empty, Text(String) }
+class Holder { pub value: Payload; }
+
+fn through_base(value: Base) -> String { return value.label(); }
+fn through_interface(value: Named) -> String { return value.label(); }
+
+fn main() {
+    let child = new Child("base");
+    let holder = new Holder(Payload::Text("retained"));
+    gc_minor_collect();
+    gc_collect();
+    println(through_base(child));
+    println(through_interface(child));
+    println(match holder.value { Payload::Empty => "empty", Payload::Text(text) => text });
+}

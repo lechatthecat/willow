@@ -29,6 +29,8 @@ pub(crate) type TokenPairs = (TokenInventory, TokenInventory);
 #[derive(Default)]
 pub(crate) struct SyntaxQueries {
     table: TrackedQueryTable,
+    interface_dispatch: HashMap<UnitId, Vec<FunctionId>>,
+    pub(crate) dispatch_classes: HashMap<UnitId, std::collections::BTreeSet<String>>,
     captured: HashMap<PathBuf, Source>,
     advanced: bool,
     bodies: HashMap<BodyId, BodyBinding>,
@@ -53,6 +55,54 @@ impl std::fmt::Debug for SyntaxQueries {
     }
 }
 impl SyntaxQueries {
+    pub(crate) fn capture_interface_dispatch(
+        &mut self,
+        unit: UnitId,
+        inputs: &std::collections::BTreeMap<FunctionId, Vec<FunctionId>>,
+    ) -> Result<()> {
+        for old in self.interface_dispatch.remove(&unit).unwrap_or_default() {
+            if !inputs.contains_key(&old) {
+                self.capture_input(
+                    InputNode::InterfaceDispatch(unit, old),
+                    value(serde_json::json!([]))?,
+                )?;
+            }
+        }
+        self.interface_dispatch
+            .insert(unit, inputs.keys().copied().collect());
+        for (&id, targets) in inputs {
+            self.capture_input(
+                InputNode::InterfaceDispatch(unit, id),
+                value(serde_json::to_value(targets)?)?,
+            )?;
+        }
+        Ok(())
+    }
+    pub(crate) fn interface_dispatch_targets(
+        &self,
+        unit: UnitId,
+        id: FunctionId,
+    ) -> Result<Vec<FunctionId>> {
+        let result = self.table.read(
+            &self.provider(),
+            QueryNode::InterfaceDispatchTargets(unit, id),
+        )?;
+        Ok(serde_json::from_value(result.get::<Value>().clone())?)
+    }
+
+    pub(crate) fn dispatch_targets(
+        &self,
+        unit: UnitId,
+        class: crate::semantic::ids::TypeId,
+        method: &str,
+    ) -> Result<Vec<FunctionId>> {
+        let result = self.table.read(
+            &super::dispatch::DispatchProvider,
+            QueryNode::DispatchTargets(unit, class, method.to_owned()),
+        )?;
+        Ok(serde_json::from_value(result.get::<Value>().clone())?)
+    }
+
     pub(crate) fn capture_references(
         &mut self,
         uses: Vec<(super::references::SymbolUseId, Value)>,
@@ -169,6 +219,8 @@ impl SyntaxQueries {
     pub(crate) fn candidate(&self) -> Result<Self> {
         Ok(Self {
             table: self.table.candidate()?,
+            dispatch_classes: self.dispatch_classes.clone(),
+            interface_dispatch: self.interface_dispatch.clone(),
             captured: HashMap::new(),
             advanced: false,
             bodies: HashMap::new(),
@@ -214,6 +266,7 @@ impl SyntaxQueries {
     }
     fn provider(&self) -> SyntaxProvider<'_> {
         SyntaxProvider {
+            interface_dispatch: &self.interface_dispatch,
             bodies: &self.bodies,
             prepared: &self.prepared,
             effects: &self.effects,
@@ -488,6 +541,14 @@ impl SyntaxQueries {
             .get::<Value>()
             .clone())
     }
+    #[cfg(test)]
+    pub(crate) fn recomputations(&self, node: &QueryNode) -> usize {
+        self.table.recomputations(node)
+    }
+    #[cfg(test)]
+    pub(crate) fn query_dependencies(&self, node: &QueryNode) -> Vec<QueryNode> {
+        self.table.query_dependencies(node)
+    }
     pub(crate) fn stats(&self) -> TrackedStats {
         self.table.stats()
     }
@@ -595,6 +656,7 @@ struct EffectInventoryValue {
     metadata: Value,
 }
 struct SyntaxProvider<'a> {
+    interface_dispatch: &'a HashMap<UnitId, Vec<FunctionId>>,
     bodies: &'a HashMap<BodyId, BodyBinding>,
     prepared: &'a HashMap<BodyId, PreparedBody>,
     effects: &'a HashMap<UnitId, PreparedEffects>,
@@ -764,6 +826,9 @@ impl QueryProvider for SyntaxProvider<'_> {
                     return Err(super::tracked::DeferredQuery(node.clone()).into());
                 };
                 table.input(&InputNode::EffectRoots(*unit))?;
+                for &id in self.interface_dispatch.get(unit).into_iter().flatten() {
+                    table.read(self, QueryNode::InterfaceDispatchTargets(*unit, id))?;
+                }
                 let mut paths = std::collections::HashSet::new();
                 for body in &prepared.roots {
                     if self.checked_roots.contains(body) {
@@ -840,7 +905,18 @@ impl QueryProvider for SyntaxProvider<'_> {
                     ResultFingerprint::bytes(b"symbol-references"),
                 ))
             }
+            QueryNode::InterfaceDispatchTargets(unit, id) => {
+                table.input(&InputNode::InterfaceDispatch(*unit, *id))
+            }
+            QueryNode::DispatchTargets(..) => {
+                super::dispatch::DispatchProvider.compute(table, node)
+            }
             QueryNode::SemanticSignature(unit, key) => {
+                if let Ok(crate::semantic::symbols::SymbolRead::Dispatch(class, method)) =
+                    serde_json::from_str(key)
+                {
+                    return table.read(self, QueryNode::DispatchTargets(*unit, class, method));
+                }
                 table.input(&InputNode::SemanticSymbol(*unit, key.clone()))
             }
             QueryNode::VisibleScope(unit, path) => {

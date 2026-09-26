@@ -450,88 +450,90 @@ mod tests {
         }
     }
 
+    fn native_object(
+        revision: &AnalysisRevision,
+        path: &std::path::Path,
+    ) -> std::collections::BTreeMap<String, Vec<u8>> {
+        use object::{Object, ObjectSection};
+        let frontend = revision.frontend.as_ref().unwrap();
+        assert!(frontend.module_graph.files.is_empty());
+        let artifacts = frontend.module_graph.artifacts.as_ref().unwrap();
+        let program = artifacts
+            .hydrate(&frontend.program, diagnostics::FileId::ENTRY)
+            .unwrap();
+        let db = &frontend.db;
+        let checked = db.checked_unit(UnitId::ENTRY, artifacts).unwrap();
+        let options = crate::CompilerOptions::debug();
+        let mut codegen =
+            crate::backend::Codegen::new(&options, std::rc::Rc::clone(&db.layouts)).unwrap();
+        codegen.body_queries = Some(std::rc::Rc::clone(&db.typed_bodies));
+        codegen.lir_queries = Some(std::rc::Rc::clone(&db.lir));
+        codegen.effect_queries = Some((std::rc::Rc::clone(&db.effects), UnitId::ENTRY));
+        for (name, info) in &checked.symbols.enums {
+            codegen.register_enum_info(name.to_string(), info.to_semantic());
+        }
+        for (name, info) in &checked.symbols.interfaces {
+            let identity = crate::semantic::ids::TypeId::from_source_name(&info.name);
+            codegen
+                .register_interface_info(name.to_string(), identity, || info.to_semantic())
+                .unwrap();
+        }
+        let scope = db
+            .unit_scope(UnitId::ENTRY, &program, &[], &checked.symbols)
+            .unwrap();
+        let types = checked
+            .expr_types
+            .iter()
+            .map(|(id, ty)| (*id, ty.into()))
+            .collect();
+        let unit = codegen
+            .declare_program_with_types(&program, path.to_str().unwrap(), &types, scope)
+            .unwrap();
+        let mut tables = checked.tables();
+        tables.expr_types = Some(unit.normalized_expr_types());
+        db.lir
+            .lower_unit(
+                UnitId::ENTRY,
+                unit.normalized_program(),
+                db.bodies(),
+                &tables,
+            )
+            .unwrap();
+        let before = revision.syntax.borrow().stats();
+        let plan = codegen.program_body_plan(&unit);
+        codegen
+            .with_program_bodies(&unit, |backend| {
+                for target in &plan {
+                    backend.compile_body(target)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            revision.syntax.borrow().stats(),
+            before,
+            "emission adds no dependency edges"
+        );
+        let bytes = codegen.finish().unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        object
+            // Mach-O and some COFF function symbols have size zero. Compare
+            // complete executable sections so those targets cannot silently
+            // omit functions. Padding is intentionally checked too.
+            .sections()
+            .filter(|section| section.kind() == object::SectionKind::Text && section.size() != 0)
+            .enumerate()
+            .map(|(ordinal, section)| {
+                (
+                    format!("{ordinal}:{}", section.name().unwrap()),
+                    section.data().unwrap().to_vec(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn revision_native_object_matches_cold_after_body_edit() {
-        fn object(
-            revision: &AnalysisRevision,
-            path: &std::path::Path,
-        ) -> std::collections::BTreeMap<String, Vec<u8>> {
-            use object::{Object, ObjectSection};
-            let frontend = revision.frontend.as_ref().unwrap();
-            assert!(frontend.module_graph.files.is_empty());
-            let artifacts = frontend.module_graph.artifacts.as_ref().unwrap();
-            let program = artifacts
-                .hydrate(&frontend.program, diagnostics::FileId::ENTRY)
-                .unwrap();
-            let db = &frontend.db;
-            let checked = db.checked_unit(UnitId::ENTRY, artifacts).unwrap();
-            let options = crate::CompilerOptions::debug();
-            let mut codegen =
-                crate::backend::Codegen::new(&options, std::rc::Rc::clone(&db.layouts)).unwrap();
-            codegen.body_queries = Some(std::rc::Rc::clone(&db.typed_bodies));
-            codegen.lir_queries = Some(std::rc::Rc::clone(&db.lir));
-            codegen.effect_queries = Some((std::rc::Rc::clone(&db.effects), UnitId::ENTRY));
-            for (name, info) in &checked.symbols.interfaces {
-                let identity = crate::semantic::ids::TypeId::from_source_name(&info.name);
-                codegen
-                    .register_interface_info(name.to_string(), identity, || info.to_semantic())
-                    .unwrap();
-            }
-            let scope = db
-                .unit_scope(UnitId::ENTRY, &program, &[], &checked.symbols)
-                .unwrap();
-            let types = checked
-                .expr_types
-                .iter()
-                .map(|(id, ty)| (*id, ty.into()))
-                .collect();
-            let unit = codegen
-                .declare_program_with_types(&program, path.to_str().unwrap(), &types, scope)
-                .unwrap();
-            let mut tables = checked.tables();
-            tables.expr_types = Some(unit.normalized_expr_types());
-            db.lir
-                .lower_unit(
-                    UnitId::ENTRY,
-                    unit.normalized_program(),
-                    db.bodies(),
-                    &tables,
-                )
-                .unwrap();
-            let before = revision.syntax.borrow().stats();
-            let plan = codegen.program_body_plan(&unit);
-            codegen
-                .with_program_bodies(&unit, |backend| {
-                    for target in &plan {
-                        backend.compile_body(target)?;
-                    }
-                    Ok(())
-                })
-                .unwrap();
-            assert_eq!(
-                revision.syntax.borrow().stats(),
-                before,
-                "emission adds no dependency edges"
-            );
-            let bytes = codegen.finish().unwrap();
-            let object = object::File::parse(bytes.as_slice()).unwrap();
-            object
-                // Mach-O and some COFF function symbols have size zero. Compare
-                // complete executable sections so those targets cannot silently
-                // omit functions. Padding is intentionally checked too.
-                .sections()
-                .filter(|section| {
-                    section.kind() == object::SectionKind::Text && section.size() != 0
-                })
-                .enumerate()
-                .map(|(ordinal, section)| {
-                    (
-                        format!("{ordinal}:{}", section.name().unwrap()),
-                        section.data().unwrap().to_vec(),
-                    )
-                })
-                .collect()
-        }
         let f = Fixture::new();
         let mut warm = AnalysisRevision::default();
         for (iteration, source) in [
@@ -543,15 +545,235 @@ mod tests {
         ].iter().enumerate() {
             f.write("main.wi", source);
             assert!(f.compare(&mut warm));
-            let warm_object = object(&warm, &f.0.join("main.wi"));
+            let warm_object = native_object(&warm, &f.0.join("main.wi"));
             let mut cold = AnalysisRevision::default();
             assert!(f.compare(&mut cold));
-            let cold_object = object(&cold, &f.0.join("main.wi"));
+            let cold_object = native_object(&cold, &f.0.join("main.wi"));
             assert!(!warm_object.is_empty());
             assert_eq!(warm_object.keys().collect::<Vec<_>>(), cold_object.keys().collect::<Vec<_>>());
             for (name, code) in warm_object {
                 assert_eq!(code, cold_object[&name], "machine code for {name}, edit {iteration}");
             }
+        }
+    }
+
+    #[test]
+    fn revision_dispatch_override_edits_track_actual_body_consumers() {
+        use super::super::{ids::BodyOwner, tracked::QueryNode};
+        use crate::semantic::ids::{FunctionId, TypeId};
+        for unrelated in [8, 32, 128] {
+            let f = Fixture::new();
+            let mut warm = AnalysisRevision::default();
+            let others: String = (0..unrelated).map(|i| format!("class Other{i} {{ pub fn get(self) -> i64 {{ return {i}; }} }} fn other{i}(c: Other{i}) -> i64 {{ return c.get(); }}\n")).collect();
+            for (step, method) in [
+                "",
+                "pub override fn get(self) -> i64 { return 2; }",
+                "pub override fn get(self) -> i64 { return 3; }",
+                "",
+                "pub override fn get(self) -> i64 { return 4; }",
+            ]
+            .iter()
+            .enumerate()
+            {
+                f.write("main.wi", &format!("open class Base {{ pub open fn get(self) -> i64 {{ return 1; }} }} class Child extends Base {{ {method} }} fn use_base(c: Base) -> i64 {{ return c.get(); }} fn main() {{ println(use_base(new Child())); }} {others}"));
+                assert!(f.compare(&mut warm), "edit {step}");
+                let db = &warm.frontend.as_ref().unwrap().db;
+                let syntax = warm.syntax.borrow();
+                let dispatch =
+                    QueryNode::DispatchTargets(UnitId::ENTRY, TypeId::local("Base"), "get".into());
+                assert_eq!(
+                    syntax.recomputations(&dispatch),
+                    usize::from(step != 2),
+                    "dispatch edit {step}"
+                );
+                let body = db
+                    .bodies()
+                    .body(
+                        UnitId::ENTRY,
+                        BodyOwner::Function(FunctionId::free("use_base")),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    syntax.recomputations(&QueryNode::TypedBody(body)),
+                    usize::from(step != 2),
+                    "consumer edit {step}"
+                );
+                let key = serde_json::to_string(&crate::semantic::symbols::SymbolRead::Dispatch(
+                    TypeId::local("Base"),
+                    "get".into(),
+                ))
+                .unwrap();
+                let signature = QueryNode::SemanticSignature(UnitId::ENTRY, key);
+                assert!(
+                    syntax
+                        .query_dependencies(&QueryNode::TypedBody(body))
+                        .contains(&signature)
+                );
+                assert!(syntax.query_dependencies(&signature).contains(&dispatch));
+                for i in 0..unrelated {
+                    let node = QueryNode::DispatchTargets(
+                        UnitId::ENTRY,
+                        TypeId::local(format!("Other{i}")),
+                        "get".into(),
+                    );
+                    assert_eq!(syntax.recomputations(&node), usize::from(step == 0));
+                }
+                println!(
+                    "dispatch edit={step} unrelated={unrelated} target_recomputed={} consumer_recomputed={}",
+                    syntax.recomputations(&dispatch),
+                    syntax.recomputations(&QueryNode::TypedBody(body))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn revision_gc_layout_edits_match_cold_and_emission_stays_frozen() {
+        use super::super::{layout::TargetLayoutKey, tracked::QueryNode};
+        use crate::semantic::ids::TypeId;
+        let f = Fixture::new();
+        let mut warm = AnalysisRevision::default();
+        for (step, field, value, method) in [
+            (0, "i64", "1", "1"),
+            (1, "i64", "1", "2"),
+            (2, "String", "\"hello\"", "2"),
+            (3, "i64", "1", "2"),
+        ] {
+            let source = format!(
+                "interface I {{ fn get(self) -> i64; }} open class Base implements I {{ pub value: {field}; pub open fn get(self) -> i64 {{ return {method}; }} }} class Child extends Base {{}} class Unrelated {{ pub other: String; }} fn main() {{ let c = new Child({value}); println(c.get()); }}"
+            );
+            f.write("main.wi", &source);
+            assert!(f.compare(&mut warm));
+            let actual = native_object(&warm, &f.0.join("main.wi"));
+            let mut cold = AnalysisRevision::default();
+            assert!(f.compare(&mut cold));
+            let expected = native_object(&cold, &f.0.join("main.wi"));
+            assert_eq!(actual, expected, "native code edit {step}");
+            let syntax = warm.syntax.borrow();
+            for class in ["Base", "Child", "Unrelated"] {
+                let id = TypeId::local(class);
+                let object = warm
+                    .frontend
+                    .as_ref()
+                    .unwrap()
+                    .db
+                    .layouts
+                    .object_layout(TargetLayoutKey::new(id, 8))
+                    .unwrap();
+                let cold_object = cold
+                    .frontend
+                    .as_ref()
+                    .unwrap()
+                    .db
+                    .layouts
+                    .object_layout(TargetLayoutKey::new(id, 8))
+                    .unwrap();
+                assert_eq!(object.gc_trace(), cold_object.gc_trace());
+                let gc = QueryNode::GcLayout(id);
+                assert!(
+                    syntax
+                        .query_dependencies(&gc)
+                        .contains(&QueryNode::ClassLayout(id))
+                );
+                let count = usize::from(step == 0 || (step >= 2 && class != "Unrelated"));
+                assert_eq!(syntax.recomputations(&gc), count, "GC {class} edit {step}");
+                assert_eq!(syntax.recomputations(&QueryNode::ClassLayout(id)), count);
+                assert_eq!(
+                    object.gc_trace().unwrap().mask,
+                    if class == "Unrelated" || step == 2 {
+                        2
+                    } else {
+                        0
+                    }
+                );
+            }
+            assert_eq!(
+                syntax.recomputations(&QueryNode::InterfaceLayout(TypeId::local("I"))),
+                usize::from(step == 0)
+            );
+        }
+    }
+
+    #[test]
+    fn revision_interface_implementation_edits_refresh_effect_consumer() {
+        use super::super::tracked::QueryNode;
+        use crate::semantic::ids::{FunctionId, TypeId};
+        let f = Fixture::new();
+        let mut warm = AnalysisRevision::default();
+        let interface = FunctionId::method(TypeId::local("I"), "get");
+        for (step, implements, body) in [
+            (0, "", "return 1;"),
+            (1, " implements I", "return 1;"),
+            (2, " implements I", "println(3); return 2;"),
+            (3, "", "println(3); return 2;"),
+            (4, " implements I", "return 1;"),
+        ] {
+            f.write("main.wi", &format!("interface I {{ fn get(self) -> i64; }} class A implements I {{ pub fn get(self) -> i64 {{ return 0; }} }} class B{implements} {{ pub fn get(self) -> i64 {{ {body} }} }} fn use_i(c: I) -> i64 {{ return c.get(); }} fn main() {{ println(use_i(new A())); }}"));
+            assert!(f.compare(&mut warm), "interface edit {step}");
+            let syntax = warm.syntax.borrow();
+            let node = QueryNode::InterfaceDispatchTargets(UnitId::ENTRY, interface);
+            assert_eq!(syntax.recomputations(&node), usize::from(step != 2));
+            assert!(
+                syntax
+                    .query_dependencies(&QueryNode::EffectInventory(UnitId::ENTRY))
+                    .contains(&node)
+            );
+            let targets = syntax
+                .interface_dispatch_targets(UnitId::ENTRY, interface)
+                .unwrap();
+            assert_eq!(targets.len(), if implements.is_empty() { 1 } else { 2 });
+            assert_eq!(
+                targets.contains(&FunctionId::method(TypeId::local("B"), "get")),
+                !implements.is_empty()
+            );
+            // The interface's capabilities remain conservative for unknown
+            // implementations; cold snapshots above are the semantic oracle.
+            assert_eq!(
+                syntax.recomputations(&QueryNode::EffectInventory(UnitId::ENTRY)),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn revision_enum_representation_invalidates_only_gc_consumers() {
+        use super::super::{layout::TargetLayoutKey, tracked::QueryNode};
+        use crate::semantic::ids::TypeId;
+        let f = Fixture::new();
+        let mut warm = AnalysisRevision::default();
+        for (step, variants) in ["A", "A, B(i64)", "A, B(i64)", "A"].iter().enumerate() {
+            f.write("main.wi", &format!("enum E {{ {variants} }} class Holder {{ pub value: E; }} class Other {{ pub value: i64; }} fn main() {{ let h = new Holder(E::A); println(1); }}"));
+            assert!(f.compare(&mut warm));
+            let actual = native_object(&warm, &f.0.join("main.wi"));
+            let mut cold = AnalysisRevision::default();
+            assert!(f.compare(&mut cold));
+            assert_eq!(actual, native_object(&cold, &f.0.join("main.wi")));
+            let syntax = warm.syntax.borrow();
+            let id = TypeId::local("Holder");
+            assert_eq!(
+                syntax.recomputations(&QueryNode::ClassLayout(id)),
+                usize::from(step == 0)
+            );
+            assert_eq!(
+                syntax.recomputations(&QueryNode::GcLayout(id)),
+                usize::from(step != 2)
+            );
+            assert_eq!(
+                syntax.recomputations(&QueryNode::GcLayout(TypeId::local("Other"))),
+                usize::from(step == 0)
+            );
+            let object = warm
+                .frontend
+                .as_ref()
+                .unwrap()
+                .db
+                .layouts
+                .object_layout(TargetLayoutKey::new(id, 8))
+                .unwrap();
+            assert_eq!(
+                object.gc_trace().unwrap().mask,
+                if step == 1 || step == 2 { 2 } else { 0 }
+            );
         }
     }
 

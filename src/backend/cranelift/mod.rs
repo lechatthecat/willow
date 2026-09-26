@@ -1189,6 +1189,13 @@ impl Codegen {
     /// results stay in the shared queries; [`Codegen::classes`] reads them.
     fn finalize_class_layouts(&mut self) -> Result<()> {
         let completed = self.layout_queries.complete_pending_classes()?;
+        self.layout_queries.prepare_gc_layouts(&completed, |id| {
+            self.enum_infos.get(&id).is_none_or(|info| {
+                info.variants
+                    .iter()
+                    .any(|variant| !variant.payload_types.is_empty())
+            })
+        })?;
         crate::query_stats::add(crate::query_stats::Counter::ClassLayout, completed.len());
         crate::query_stats::add(crate::query_stats::Counter::ClassVslots, completed.len());
         Ok(())
@@ -2077,26 +2084,13 @@ fn param_abi_type(
     }
 }
 
+#[cfg(test)]
 fn gc_ref_mask_for_layout(layout: &[(String, Type)], enum_infos: &TypeMap<EnumInfo>) -> u64 {
-    // Object layout: word 0 = the class DESCRIPTOR address, words 1..N = fields.
-    // Bit i in the mask corresponds to word i; field[idx] lives at word (idx+1).
-    //
-    // Word 0 is never a GC reference. It used to hold the inline `type_id` and
-    // now holds a pointer to a static data symbol (willow-fm7t) — still not a
-    // heap object, so bit 0 stays clear and the collector's view of the payload
-    // is unchanged. Nothing about the field offsets or the mask moved with it.
-    let mut mask = 0u64;
-    for (idx, (_, ty)) in layout.iter().enumerate() {
-        if !is_gc_managed(ty, enum_infos) {
-            continue;
-        }
-        let word = idx + 1;
-        if word >= GC_REF_MASK_BITS {
-            continue;
-        }
-        mask |= 1u64 << word;
-    }
-    mask
+    crate::compiler_db::layout::GcTraceLayout::from_fields(layout, |ty| {
+        Ok(is_gc_managed(ty, enum_infos))
+    })
+    .expect("GC classification")
+    .mask
 }
 
 // ─── Async frame GC metadata (willow-lpn.4) ──────────────────────────────────

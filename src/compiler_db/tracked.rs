@@ -36,9 +36,13 @@ pub(crate) enum InputNode {
     Source(PathBuf),
     SemanticSymbol(UnitId, String),
     VisibleDeclarations(UnitId),
+    DispatchDeclaration(UnitId, crate::semantic::ids::TypeId),
+    DispatchChildren(UnitId, crate::semantic::ids::TypeId),
+    InterfaceDispatch(UnitId, FunctionId),
     ResolvedReference(super::references::SymbolUseId),
     ReferenceMembers(super::references::SymbolId),
     LayoutDeclaration(crate::semantic::ids::TypeId),
+    GcNamedType(crate::semantic::ids::TypeId),
     InterfaceDeclaration(crate::semantic::ids::TypeId),
     DerivedDependencies(QueryNode),
     EffectRoots(UnitId),
@@ -66,6 +70,8 @@ pub(crate) enum QueryNode {
     SyntaxSignature(PathBuf, String),
     BodySyntax(PathBuf, String),
     SemanticSignature(UnitId, String),
+    DispatchTargets(UnitId, crate::semantic::ids::TypeId, String),
+    InterfaceDispatchTargets(UnitId, FunctionId),
     Signature(UnitId, FunctionId),
     TypedBody(BodyId),
     NormalizedBody(BodyId),
@@ -82,6 +88,7 @@ pub(crate) enum QueryNode {
     References(UnitId),
     Layout(super::layout::TargetLayoutKey),
     ClassLayout(crate::semantic::ids::TypeId),
+    GcLayout(crate::semantic::ids::TypeId),
     InterfaceLayout(crate::semantic::ids::TypeId),
     LirBody(BodyId),
     LirUnit(UnitId),
@@ -223,6 +230,8 @@ pub(crate) struct TrackedQueryTable {
     states: RefCell<HashMap<QueryNode, State>>,
     stack: RefCell<Vec<EvalFrame>>,
     stats: Cell<TrackedStats>,
+    #[cfg(test)]
+    recomputations: RefCell<HashMap<QueryNode, usize>>,
     // A cycle leaves an unrecorded dependency. Poison the active evaluation,
     // even if a provider catches or reformats the error, until its root unwinds.
     cycle_error: RefCell<Option<Arc<str>>>,
@@ -301,6 +310,24 @@ impl TrackedQueryTable {
         match self.states.borrow().get(node) {
             Some(State::Ready(memo)) => memo.result.as_ref().ok().cloned(),
             _ => None,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn recomputations(&self, node: &QueryNode) -> usize {
+        self.recomputations.borrow().get(node).copied().unwrap_or(0)
+    }
+    #[cfg(test)]
+    pub(crate) fn query_dependencies(&self, node: &QueryNode) -> Vec<QueryNode> {
+        match self.states.borrow().get(node) {
+            Some(State::Ready(memo)) => memo
+                .dependencies
+                .iter()
+                .filter_map(|edge| match &edge.node {
+                    DependencyNode::Query(node) => Some(node.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
         }
     }
     pub(crate) fn stats(&self) -> TrackedStats {
@@ -529,6 +556,14 @@ impl TrackedQueryTable {
             return Err(DeferredQuery(node.clone()).into());
         }
         self.bump(|s| s.recomputed += 1);
+        #[cfg(test)]
+        {
+            *self
+                .recomputations
+                .borrow_mut()
+                .entry(node.clone())
+                .or_default() += 1;
+        }
         // Do not publish a failed memo (or a caught-error fallback) whose
         // dependency set is incomplete. Guard removes the Computing entry.
         self.check_cycle()?;
