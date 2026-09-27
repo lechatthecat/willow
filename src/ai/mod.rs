@@ -12,7 +12,7 @@ pub(crate) mod symbols;
 mod warm;
 pub use graph::{Direction, Impact, ImpactNode, Limits};
 pub use semantic::{QueryRequest, QuerySession, SemanticFacts};
-pub use storage::{Difference, FunctionChange, expand_snapshot_paths};
+pub use storage::{Difference, FunctionChange, compact_output_paths, expand_snapshot_paths};
 pub use warm::WarmSession;
 pub(crate) use warm::check_size;
 

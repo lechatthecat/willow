@@ -14,7 +14,7 @@ pub struct SemanticFacts {
     pub witnesses: BTreeMap<String, Vec<Value>>,
     pub compiler_effects: BTreeMap<String, u8>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Expression {
     pub function: String,
@@ -27,7 +27,7 @@ pub struct Expression {
     pub node: usize,
     pub occurrences: Vec<usize>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Flow {
     pub function: String,
@@ -35,7 +35,7 @@ pub struct Flow {
     pub entry: usize,
     pub complete: bool,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlowNode {
     pub location: Location,

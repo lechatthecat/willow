@@ -73,7 +73,7 @@ pub(super) fn serve<W: Write>(
             return Ok(());
         }
         anyhow::ensure!(n <= 1024 * 1024, "daemon request exceeds 1 MiB");
-        let request: Request = match serde_json::from_slice(&line) {
+        let mut request: Request = match serde_json::from_slice(&line) {
             Ok(request) => request,
             Err(error) => {
                 events.event(
@@ -84,6 +84,13 @@ pub(super) fn serve<W: Write>(
                 continue;
             }
         };
+        if let Request::Query {
+            request: QueryRequest::SymbolAt { file, .. } | QueryRequest::TypeAt { file, .. },
+            ..
+        } = &mut request
+        {
+            analysis::expand_request_path(file, &root.to_string_lossy());
+        }
         let id = match &request {
             Request::Query { id, .. }
             | Request::Refresh { id }
@@ -126,7 +133,11 @@ pub(super) fn serve<W: Write>(
                 json!({"kind":"daemon.response", "id":id, "error":format!("{error:#}"), "revision":warm.revision()})
             }
         };
-        events.event("analysis.result", "WT0010", response)?;
+        events.event(
+            "analysis.result",
+            "WT0010",
+            willow_compiler::ai::compact_output_paths(response, &root.to_string_lossy()),
+        )?;
         if shutdown {
             return Ok(());
         }

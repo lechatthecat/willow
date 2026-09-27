@@ -2,7 +2,7 @@
 use super::*;
 use crate::semantic::analysis_symbols::{Declaration, Facts};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Symbol {
     #[serde(default)]
@@ -13,7 +13,7 @@ pub struct Symbol {
     pub location: Option<Location>,
     pub ty: Option<Type>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reference {
     #[serde(default)]
@@ -344,7 +344,7 @@ pub(super) fn finish(
             declaration_key(d),
             format!(
                 "symbol:{}",
-                serde_json::to_string(&(key, *ordinal)).expect("symbol identity serializes")
+                hash_serialized(&(key, *ordinal)).expect("symbol identity serializes")
             ),
         );
         *ordinal += 1;

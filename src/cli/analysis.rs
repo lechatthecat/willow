@@ -3,7 +3,7 @@ use super::*;
 use serde_json::{Value, json};
 use willow_compiler::{
     CompilerSession,
-    ai::{Direction, Limits, Snapshot},
+    ai::{Direction, Limits, Snapshot, compact_output_paths},
     diagnostics::DiagnosticEmitter,
 };
 
@@ -17,6 +17,7 @@ pub(super) struct AnalysisCommand {
     functions: Vec<String>,
     revision: Option<String>,
     output: Option<String>,
+    base: Option<String>,
     before: Option<String>,
     after: Option<String>,
     direction: Direction,
@@ -46,6 +47,7 @@ impl AnalysisCommand {
             functions: vec![],
             revision: None,
             output: None,
+            base: None,
             before: None,
             after: None,
             direction: Direction::Callers,
@@ -66,6 +68,7 @@ impl AnalysisCommand {
                     | "--function"
                     | "--revision"
                     | "--output"
+                    | "--base"
                     | "--before"
                     | "--after"
                     | "--direction"
@@ -89,6 +92,7 @@ impl AnalysisCommand {
                     "--function" => result.functions.push(value.into()),
                     "--revision" => result.revision = Some(value.into()),
                     "--output" => result.output = Some(value.into()),
+                    "--base" => result.base = Some(value.into()),
                     "--before" => result.before = Some(value.into()),
                     "--after" => result.after = Some(value.into()),
                     "--max-nodes" => result.limits.max_nodes = value.parse()?,
@@ -173,18 +177,28 @@ impl AnalysisCommand {
             operation == "query" || result.requests.is_none(),
             "--requests requires query"
         );
+        anyhow::ensure!(
+            operation == "save" || result.base.is_none(),
+            "--base requires snapshot save"
+        );
         Ok(result)
     }
     pub(super) fn execute(self, emitter: &mut dyn DiagnosticEmitter) -> Result<Value> {
         if matches!(self.operation.as_str(), "diff" | "risk") {
-            let before = Snapshot::load(std::path::Path::new(self.before.as_ref().unwrap()))?;
-            let after = Snapshot::load(std::path::Path::new(self.after.as_ref().unwrap()))?;
+            let (before, after) = Snapshot::load_pair(
+                std::path::Path::new(self.before.as_ref().unwrap()),
+                std::path::Path::new(self.after.as_ref().unwrap()),
+            )?;
             if self.operation == "risk" {
-                return Ok(json!({"kind":"risk", "risk":after.risk(&before)?}));
+                return Ok(compact_output_paths(
+                    json!({"kind":"risk", "risk":after.risk(&before)?}),
+                    &after.workspace,
+                ));
             }
-            return Ok(
+            return Ok(compact_output_paths(
                 json!({"kind":"snapshot.diff", "difference": before.compare(&after,self.limits)?}),
-            );
+                &after.workspace,
+            ));
         }
         let (entry, root) = if let Some(source) = self.build.source {
             (source, None)
@@ -205,11 +219,15 @@ impl AnalysisCommand {
         let snapshot = CompilerSession::new(&entry, "", &self.build.options, root)
             .analysis_with_emitter(emitter)?;
         if self.operation == "query" {
+            let workspace = snapshot.workspace.clone();
             let requests: Vec<serde_json::Value> =
                 serde_json::from_slice(&std::fs::read(self.requests.as_ref().unwrap())?)?;
             let mut session = willow_compiler::ai::QuerySession::new(snapshot)?;
             let mut results = Vec::with_capacity(requests.len());
             for mut request in requests {
+                if let Some(Value::String(file)) = request.get_mut("file") {
+                    expand_request_path(file, &workspace);
+                }
                 // A missing revision binds to this invocation's immutable snapshot.
                 if request.get("revision").is_none() {
                     request
@@ -219,16 +237,28 @@ impl AnalysisCommand {
                 }
                 results.push(session.query(serde_json::from_value(request)?));
             }
-            return Ok(json!({"kind":"query", "revision":session.revision(),"results":results}));
+            return Ok(compact_output_paths(
+                json!({"kind":"query", "revision":session.revision(),"results":results}),
+                &workspace,
+            ));
         }
         if self.operation == "save" {
-            snapshot.save(std::path::Path::new(self.output.as_ref().unwrap()))?;
-            return Ok(
-                json!({"kind":"snapshot.saved", "revision":snapshot.revision,"path":self.output,"function_count":snapshot.functions.len()}),
-            );
+            let output = std::path::Path::new(self.output.as_ref().unwrap());
+            if let Some(base) = &self.base {
+                snapshot.save_delta(output, std::path::Path::new(base))?;
+            } else {
+                snapshot.save(output)?;
+            }
+            let mut result = json!({"kind":"snapshot.saved", "revision":snapshot.revision,"path":self.output,"function_count":snapshot.functions.len()});
+            if let Some(base) = self.base {
+                result["base"] = json!(base);
+                result["snapshot_encoding"] = json!("snapshot-delta-v1");
+            }
+            return Ok(result);
         }
         let mut seeds = self.functions;
-        if let Some(file) = self.file {
+        if let Some(mut file) = self.file {
+            expand_request_path(&mut file, &snapshot.workspace);
             seeds.push(
                 snapshot
                     .resolve_position(
@@ -253,7 +283,19 @@ impl AnalysisCommand {
             .iter()
             .filter(|f| ids.contains(f.id.as_str()))
             .collect();
-        Ok(json!({"kind":"impact", "impact":impact,"functions":functions}))
+        Ok(compact_output_paths(
+            json!({"kind":"impact", "impact":impact,"functions":functions}),
+            &snapshot.workspace,
+        ))
+    }
+}
+
+pub(super) fn expand_request_path(file: &mut String, workspace: &str) {
+    // Only position-query paths are paths, not symbol IDs or name filters.
+    if let Some(rest) = file.strip_prefix("${workspace}")
+        && (rest.is_empty() || rest.starts_with(['/', '\\']))
+    {
+        *file = format!("{workspace}{rest}");
     }
 }
 

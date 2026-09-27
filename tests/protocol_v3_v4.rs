@@ -178,6 +178,21 @@ fn daemon_refresh_matches_cold_and_reuses_equivalent_queries() {
         writeln!(input,"{}",json!({"id":id,"operation":"query","request":{"kind":"symbol-info","revision":before["revision"],"function":function}})).unwrap();
         let response = result(&mut output);
         assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["path_encoding"], "workspace-placeholder-v1");
+        let path = &response["result"]["result"]["symbol"]["locations"][0]["path"];
+        assert!(path.as_str().unwrap().starts_with("${workspace}"));
+        writeln!(
+            input,
+            "{}",
+            json!({"id":20+id,"operation":"query","request":{
+                "kind":"symbol-at","revision":before["revision"],"file":path,"byte":3
+            }})
+        )
+        .unwrap();
+        assert_eq!(
+            result(&mut output)["result"]["result"]["symbol"]["id"],
+            function
+        );
     }
     writeln!(input, "{}", json!({"id":2,"operation":"stats"})).unwrap();
     let stats = result(&mut output);
@@ -194,7 +209,8 @@ fn daemon_refresh_matches_cold_and_reuses_equivalent_queries() {
     let cold = f.snapshot();
     assert_eq!(refreshed["revision"], cold["revision"]);
     writeln!(input,"{}",json!({"id":4,"operation":"query","request":{"kind":"symbol-info","revision":cold["revision"],"function":function}})).unwrap();
-    let response = result(&mut output);
+    let mut response = result(&mut output);
+    willow_compiler::ai::expand_snapshot_paths(&mut response).unwrap();
     let symbol = cold["functions"]
         .as_array()
         .unwrap()

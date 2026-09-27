@@ -18,7 +18,7 @@ pub struct ModuleIdentity {
     pub package: PackageIdentity,
     pub module: String,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleEvidence {
     pub path: String,

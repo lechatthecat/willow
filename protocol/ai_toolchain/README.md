@@ -57,15 +57,48 @@ queries and edits remain later releases. Within-revision identities and
 cross-revision matching will be separate; impact distance and synthetic-node
 presentation remain V1 decisions.
 
-Saved snapshot files store the workspace path once in `workspace` and set
+Saved snapshot files and CLI query, impact, diff, risk and daemon response
+payloads store the workspace path once in `workspace` and set
 `path_encoding: "workspace-placeholder-v1"`; any other string that is a path under
 the workspace is written as `${workspace}/rest`. Loading restores the exact
-snapshot (the revision digest is computed over the expanded form). Opaque IDs,
-including symbol IDs that embed a path, are never rewritten, so IDs copied from
-the file match query results. Files without `path_encoding` load unchanged.
+snapshot (the revision digest is computed over the expanded form). Opaque IDs
+are never rewritten, so IDs copied from the file match query results. New
+declaration IDs use a SHA-256 digest of the original identity tuple, avoiding
+embedded absolute paths. Files without `path_encoding` load unchanged.
 Tools reading the file as raw JSON expand it by replacing the `${workspace}`
 prefix of every string and object key with `workspace` and dropping
 `path_encoding`; Rust callers can use `willow_compiler::ai::expand_snapshot_paths`.
+CLI position queries (including daemon requests) and `impact --file` accept the
+returned `${workspace}` paths. Library query results retain their original paths.
+If a payload already contains a literal `${workspace}` prefix, compaction is
+skipped to preserve unambiguous decoding.
+
+For repeated baselines, `willow snapshot save . --base baseline.json --output
+current.json` writes a lossless `snapshot-delta-v1` JSON document. Save the first
+full baseline without `--base`, and retain it. Subsequent deltas always reference
+that full baseline; a delta cannot be another delta's base. `snapshot diff`,
+`risk`, and the library's `Snapshot::load` restore every original fact before
+use, verify the base revision and restored digest, and require no live source
+files. `Snapshot::load_pair` shares a validated base within a comparison.
+
+Delta paths are relative to their file when both files share a filesystem root;
+move the baseline and deltas together, preserving their relative layout. A
+missing, modified, incompatible or invalid base produces an error. Each input
+file and the expanded delta snapshot are bounded to 64 MiB. Publication is
+create-only for both formats. Full snapshots remain supported and remain the
+default; their initial storage cost must be counted separately from each delta.
+
+The delta envelope contains `snapshot_encoding`, `base`, `base_revision`,
+`revision` and `changes`. A change is `set` (`path`, `value`), `remove` (`path`),
+or `splice` (`path`, `start`, `delete`, `values`). Paths contain object-key strings
+or array-index integers. Changes have nonoverlapping paths and depth at most
+128. These are storage operations, not source edits or the public edit protocol.
+Raw-JSON consumers must resolve the base and changes before interpreting facts;
+`expand_snapshot_paths` alone only expands paths in a full snapshot. There is
+no general-purpose compression or decompression step. Delta creation compares
+all records, while encoding and patch conversion serialize only changed records.
+Total load time still includes reading and validating the full base; deltas do
+not imply constant-time cold loading or a small expanded working set.
 
 The machine-readable envelope and known payloads are defined in [toolchain-v1.schema.json](toolchain-v1.schema.json). Unknown additive fields and events remain permitted.
 

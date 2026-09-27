@@ -24,6 +24,20 @@ willow edit apply --root . --transaction <transaction>
 willow edit recover --root . --transaction <transaction>
 ```
 
+For a project snapshot, use the same analysis mode when preparing edits:
+
+```sh
+willow snapshot save . --output base.json
+willow edit prepare --root . --entry src/main.wi --project --requests edits.json --changes diff
+```
+
+`--entry` is relative to `--root`. `--project` is accepted only by `prepare`;
+subsequent operations reuse the mode stored in the transaction. Omit it when
+using a snapshot saved from a source file. Revisions include the analysis mode,
+so even unchanged sources can produce a revision mismatch if the modes differ.
+For changed inputs, save a new snapshot and rebuild the request with its revision
+and function ids; do not merely replace the revision in an old request.
+
 `prepare` returns the transaction id and full before/after text for every changed
 file. With `--changes diff` (accepted by `prepare` and `preview`) each change is
 instead `{"path", "diff"}`: a unified diff with three context lines and

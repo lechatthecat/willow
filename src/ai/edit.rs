@@ -175,7 +175,13 @@ impl Workspace {
             .to_owned();
         self.file(&relative)?;
         let snapshot = self.analyze(&entry, project, emitter)?;
-        ensure!(snapshot.revision == request.revision, "stale base revision");
+        ensure!(
+            snapshot.revision == request.revision,
+            "base revision mismatch: source, configuration, or analysis mode differs; \
+             use --project for a snapshot saved from a project directory, omit --project \
+             for a snapshot saved from a source file; if inputs changed, save a new \
+             snapshot and rebuild the edit request"
+        );
         ensure!(!request.operations.is_empty(), "empty transaction");
         let mut sources = BTreeMap::new();
         let mut inputs = BTreeMap::new();
@@ -839,10 +845,22 @@ fn structured_changes(
                     _ => anyhow::bail!("unsupported declaration name"),
                 };
                 ensure!(name != *old, "rename has no effect");
-                ensure!(
-                    !identifiers.contains_key(name.as_str()),
-                    "rename destination already occurs in workspace"
-                );
+                if let Some(&(path, span)) = identifiers
+                    .get(name.as_str())
+                    .and_then(|occurrences| occurrences.first())
+                {
+                    return Err(Rejection {
+                        message: "rename destination already occurs in workspace".into(),
+                        location: RejectionLocation {
+                            path: path.into(),
+                            start: span.start,
+                            end: span.end,
+                            line: span.line,
+                            column: span.col,
+                        },
+                    }
+                    .into());
+                }
                 // Conservative closed-world rename: every same-spelled token
                 // must be a declaration or a compiler-resolved call to target.
                 // Ambiguous/shadowed/function-value references fail closed.
@@ -1553,6 +1571,41 @@ mod tests {
         assert_eq!((l.line, l.column), (2, 16));
         assert_eq!(&main[l.start..l.end], "value");
         assert!(error.to_string().ends_with("at main.wi:2:16"));
+    }
+
+    #[test]
+    fn rename_destination_collision_reports_first_occurrence() {
+        for count in [1, 16, 64] {
+            let helper = format!(
+                "// answer is only a comment\npub fn answer() -> i64 {{ return 2; }}\npub fn value() -> i64 {{ {} return 1; }}",
+                "answer();".repeat(count)
+            );
+            let error = rename_helper_value(&[
+                ("helper.wi", &helper),
+                (
+                    "main.wi",
+                    "import helper;\nfn main() { let answer = helper::value(); println(answer); }",
+                ),
+            ])
+            .err()
+            .unwrap();
+            let rejection = error.downcast_ref::<Rejection>().unwrap();
+            assert_eq!(
+                rejection.message,
+                "rename destination already occurs in workspace"
+            );
+            let location = &rejection.location;
+            let start = helper.find("fn answer").unwrap() + 3;
+            assert_eq!(
+                serde_json::to_value(location).unwrap(),
+                serde_json::json!({
+                    "path": "helper.wi", "start": start, "end": start + 6,
+                    "line": 2, "column": 8
+                })
+            );
+            assert_eq!(&helper[location.start..location.end], "answer");
+            assert!(error.to_string().ends_with("at helper.wi:2:8"));
+        }
     }
 
     #[test]

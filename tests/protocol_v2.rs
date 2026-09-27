@@ -82,6 +82,158 @@ fn risk(f: &Fixture, after: &str) -> Value {
     f.save("after.json");
     f.result(&["risk", "--before", "before.json", "--after", "after.json"])["risk"].clone()
 }
+
+#[test]
+fn query_and_impact_compact_paths_and_accept_returned_locations() {
+    let f = Fixture::new(
+        "fn value() -> i64 { let result = 1; return result; } fn main() { println(value()); }",
+    );
+    f.write("queries.json", r#"[{"kind":"symbols","name":"value"}]"#);
+    let query = f.result(&["query", "main.wi", "--requests", "queries.json"]);
+    assert_eq!(query["path_encoding"], "workspace-placeholder-v1");
+    assert_eq!(query["workspace"], f.0.to_str().unwrap());
+    f.write("all.json", r#"[{"kind":"symbols"}]"#);
+    let all = f.result(&["query", "main.wi", "--requests", "all.json"]);
+    assert!(!all["results"].to_string().contains(f.0.to_str().unwrap()));
+    let symbol = &query["results"][0]["result"]["symbols"][0];
+    let location = &symbol["location"];
+    let path = location["path"].as_str().unwrap();
+    assert!(path.starts_with("${workspace}"));
+    let byte = location["start"].as_u64().unwrap();
+    f.write(
+        "queries.json",
+        &serde_json::json!([
+            {"kind":"symbol-at","file":path,"byte":byte},
+            {"kind":"effects","function":symbol["id"]}
+        ])
+        .to_string(),
+    );
+    let next = f.result(&["query", "main.wi", "--requests", "queries.json"]);
+    assert_eq!(next["results"][0]["result"]["symbol"]["id"], symbol["id"]);
+    assert_eq!(next["results"][1]["result"]["status"], "ok");
+    let impact = f.result(&[
+        "impact",
+        "main.wi",
+        "--file",
+        path,
+        "--byte",
+        &byte.to_string(),
+    ]);
+    assert_eq!(impact["path_encoding"], "workspace-placeholder-v1");
+    assert!(
+        impact["functions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|function| {
+                function["locations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|location| {
+                        location["path"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("${workspace}")
+                    })
+            })
+    );
+    let mut expanded = impact;
+    willow_compiler::ai::expand_snapshot_paths(&mut expanded).unwrap();
+    assert!(
+        expanded["functions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|function| {
+                function["locations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|location| {
+                        location["path"].as_str().unwrap() == f.0.join("main.wi").to_str().unwrap()
+                    })
+            })
+    );
+}
+
+#[test]
+fn delta_snapshot_preserves_diff_and_risk_and_rejects_chains() {
+    let f = Fixture::new("fn value() -> i64 { return 1; } fn main() { println(value()); }");
+    f.save("base.json");
+    f.write(
+        "main.wi",
+        "fn value() -> i64 { return 2; } fn main() { println(value()); }",
+    );
+    let full = f.save("full.json");
+    let saved = f.result(&[
+        "snapshot",
+        "save",
+        "main.wi",
+        "--base",
+        "base.json",
+        "--output",
+        "delta.json",
+    ]);
+    assert_eq!(saved["revision"], full["revision"]);
+    assert_eq!(saved["snapshot_encoding"], "snapshot-delta-v1");
+    let delta: Value = serde_json::from_slice(&fs::read(f.0.join("delta.json")).unwrap()).unwrap();
+    assert_eq!(delta["base"], "base.json");
+    assert!(
+        fs::metadata(f.0.join("delta.json")).unwrap().len()
+            < fs::metadata(f.0.join("full.json")).unwrap().len()
+    );
+    // Neither the source file nor the original working directory is required
+    // by diff/risk. The delta resolves its base relative to its own location.
+    fs::remove_file(f.0.join("main.wi")).unwrap();
+    fs::create_dir(f.0.join("archive")).unwrap();
+    for file in ["base.json", "full.json", "delta.json"] {
+        fs::rename(f.0.join(file), f.0.join("archive").join(file)).unwrap();
+    }
+    for operation in ["diff", "risk"] {
+        let args = |after| {
+            if operation == "diff" {
+                vec![
+                    "snapshot",
+                    "diff",
+                    "--before",
+                    "archive/base.json",
+                    "--after",
+                    after,
+                ]
+            } else {
+                vec!["risk", "--before", "archive/base.json", "--after", after]
+            }
+        };
+        assert_eq!(
+            f.result(&args("archive/full.json")),
+            f.result(&args("archive/delta.json"))
+        );
+    }
+    f.write(
+        "main.wi",
+        "fn value() -> i64 { return 2; } fn main() { println(value()); }",
+    );
+    let failed = f.run(
+        &[
+            "snapshot",
+            "save",
+            "main.wi",
+            "--base",
+            "archive/delta.json",
+            "--output",
+            "chain.json",
+        ],
+        1,
+    );
+    assert!(
+        failed.last().unwrap()["data"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("full snapshot")
+    );
+    assert!(!f.0.join("chain.json").exists());
+}
 #[test]
 fn retry_cfg_excludes_success_break_return_dead_code_and_single_execution_iterable() {
     let f = Fixture::new("fn main() {}");
@@ -185,7 +337,8 @@ fn queries_share_revision_and_match_compiler_facts() {
         {"kind":"symbol-info","function":"absent"}
     ]);
     f.write("requests.json", &requests.to_string());
-    let r = f.result(&["query", "main.wi", "--requests", "requests.json"]);
+    let mut r = f.result(&["query", "main.wi", "--requests", "requests.json"]);
+    willow_compiler::ai::expand_snapshot_paths(&mut r).unwrap();
     assert_eq!(r["revision"], snapshot["revision"]);
     let results = &r["results"];
     assert_eq!(results[0]["result"]["symbol"], *leaf);
@@ -1096,7 +1249,17 @@ fn symbol_filters_readable_types_and_compact_snapshot_paths() {
     let snapshot: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(snapshot["path_encoding"], "workspace-placeholder-v1");
     assert_eq!(snapshot["workspace"], f.0.to_str().unwrap());
-    assert!(text.contains("${workspace}/src/shapes.wi"));
+    let compact_shapes = format!(
+        "${{workspace}}{0}src{0}shapes.wi",
+        std::path::MAIN_SEPARATOR
+    );
+    assert!(
+        snapshot["sources"]
+            .as_object()
+            .unwrap()
+            .contains_key(&compact_shapes),
+        "{text}"
+    );
     let wrap = named(&snapshot, "wrap");
     let symbol = snapshot["semantic"]["symbols"]
         .as_array()
