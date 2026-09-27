@@ -71,12 +71,18 @@ impl Stats {
                 query.frozen_reads
             )
             .unwrap();
+            if *name == "incremental" {
+                write!(line, " validations={} green_validations={} recomputations={} green_after_recompute={} changed_results={} dependency_reads={} dependency_edges={} durability_shortcuts={}",
+                    query.validations, query.green_validations, query.recomputations, query.green_after_recompute,
+                    query.changed_results, query.dependency_reads, query.dependency_edges, query.durability_shortcuts).unwrap();
+            }
         }
         line
     }
 }
 
 thread_local! {
+    static TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static LOG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static ACTIVE: RefCell<Option<Stats>> = const { RefCell::new(None) };
 }
@@ -85,6 +91,7 @@ pub(crate) struct Session {
     previous: Option<Stats>,
     emit: bool,
     previous_log: bool,
+    previous_trace: bool,
     _thread_bound: PhantomData<Rc<()>>,
 }
 
@@ -95,6 +102,9 @@ impl Session {
             true,
         );
         LOG.with(|log| log.set(std::env::var_os("WILLOW_QUERY_LOG").is_some_and(|v| v == "1")));
+        TRACE.with(|trace| {
+            trace.set(std::env::var_os("WILLOW_QUERY_TRACE").is_some_and(|v| v == "1"))
+        });
         session
     }
 
@@ -103,6 +113,7 @@ impl Session {
             previous: ACTIVE.with(|slot| slot.replace(enabled.then(Stats::default))),
             emit,
             previous_log: LOG.with(|log| log.replace(false)),
+            previous_trace: TRACE.with(|trace| trace.replace(false)),
             _thread_bound: PhantomData,
         }
     }
@@ -111,6 +122,7 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         LOG.with(|log| log.set(self.previous_log));
+        TRACE.with(|trace| trace.set(self.previous_trace));
         let finished = ACTIVE.with(|slot| slot.replace(self.previous.take()));
         if self.emit
             && let Some(stats) = finished
@@ -205,6 +217,39 @@ pub(crate) fn query_exit(
                 "exit depth={depth} {frame} compute_ns={elapsed}"
             ))
         });
+    }
+}
+
+pub(crate) fn tracked_counts(
+    before: crate::compiler_db::tracked::TrackedStats,
+    after: crate::compiler_db::tracked::TrackedStats,
+) {
+    record(|stats| {
+        let q = stats.queries.entry("incremental").or_default();
+        q.validations += after.validated - before.validated;
+        q.green_validations += after.green_validations - before.green_validations;
+        q.recomputations += after.recomputed - before.recomputed;
+        q.green_after_recompute += after.green_after_recompute - before.green_after_recompute;
+        q.changed_results += after.changed - before.changed;
+        q.dependency_reads += after.dependency_reads - before.dependency_reads;
+        q.dependency_edges += after.dependency_edges_visited - before.dependency_edges_visited;
+        q.durability_shortcuts += after.durability_shortcuts - before.durability_shortcuts;
+    });
+}
+
+pub(crate) fn tracked_event(
+    node: &crate::compiler_db::tracked::QueryNode,
+    event: &str,
+    revision: u64,
+) {
+    use std::io::Write as _;
+    if LOG.with(|log| log.get()) {
+        trace(format_args!("{event} revision={revision} {node:?}"));
+    }
+    if TRACE.with(|trace| trace.get()) {
+        let record =
+            serde_json::json!({"event": event, "revision": revision, "query": format!("{node:?}")});
+        let _ = writeln!(std::io::stderr().lock(), "{record}");
     }
 }
 

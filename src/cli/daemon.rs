@@ -97,25 +97,24 @@ pub(super) fn serve<W: Write>(
             | Request::Stats { id }
             | Request::Shutdown { id } => *id,
         };
-        let mut shutdown = matches!(&request, Request::Shutdown { .. });
+        let shutdown = matches!(&request, Request::Shutdown { .. });
         let result = match request {
             Request::Query { request, .. } => warm.query(request),
             Request::Refresh { .. } => {
-                if frontend_runs >= 32 {
-                    shutdown = true;
-                    Err(anyhow::anyhow!(
-                        "daemon frontend budget exhausted; restart required"
-                    ))
-                } else {
-                    frontend_runs += 1;
-                    analyze(&mut revision, events).and_then(|snapshot| {
-                        warm.update(snapshot)?;
-                        Ok(json!({"revision":warm.revision()}))
-                    })
-                }
+                frontend_runs = frontend_runs.saturating_add(1);
+                analyze(&mut revision, events).and_then(|snapshot| {
+                    warm.update(snapshot)?;
+                    Ok(json!({"revision":warm.revision()}))
+                })
             }
             Request::Stats { .. } | Request::Shutdown { .. } => {
                 let mut stats = warm.stats();
+                if let Some(incremental) = revision.incremental_stats.as_object() {
+                    stats
+                        .as_object_mut()
+                        .expect("daemon stats object")
+                        .extend(incremental.clone());
+                }
                 stats["frontend_runs"] = json!(frontend_runs);
                 stats["retained_artifact_bytes"] = json!(revision.retained_artifact_bytes);
                 stats["semantic_input_visits"] = json!(revision.input_visits);

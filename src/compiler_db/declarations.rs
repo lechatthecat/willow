@@ -118,7 +118,7 @@ impl DeclarationQueries {
         let Some(path) = tracking.paths.get(&unit) else {
             return Ok(());
         };
-        let canonical = super::syntax::without_spans(&serde_json::to_value(symbols)?);
+        let canonical = super::syntax::semantic(&serde_json::to_value(symbols)?);
         tracking
             .syntax
             .borrow_mut()

@@ -71,6 +71,10 @@ pub(crate) fn configuration(
         // These tables are compiled into the executable. A live revision cannot
         // outlive that executable; on-disk compatibility is a separate phase.
         (InputNode::StdlibStamp, json!(env!("CARGO_PKG_VERSION"))),
+        (
+            InputNode::RuntimeAbiRevision,
+            json!(willow_abi::OBJECT_LAYOUT_REVISION),
+        ),
         (InputNode::ManifestMode, json!(inputs.project_mode)),
     ];
     let mut graph_entries = Vec::new();

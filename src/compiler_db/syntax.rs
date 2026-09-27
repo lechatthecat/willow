@@ -18,12 +18,18 @@ pub(crate) struct Correspondence {
 
 fn span(value: &Value) -> Option<Span> {
     let object = value.as_object()?;
-    (object.len() == 5
-        && ["file_id", "start", "end", "line", "col"]
-            .iter()
-            .all(|key| object.contains_key(*key)))
-    .then(|| serde_json::from_value(value.clone()).ok())
-    .flatten()
+    if object.len() != 5 {
+        return None;
+    }
+    // This predicate runs for every wire node during canonicalization and
+    // correspondence. Read the fixed schema without cloning an object tree.
+    Some(Span {
+        file_id: crate::diagnostics::FileId(object.get("file_id")?.as_u64()?.try_into().ok()?),
+        start: object.get("start")?.as_u64()?.try_into().ok()?,
+        end: object.get("end")?.as_u64()?.try_into().ok()?,
+        line: object.get("line")?.as_u64()?.try_into().ok()?,
+        col: object.get("col")?.as_u64()?.try_into().ok()?,
+    })
 }
 
 /// The flat AST wire has named IDs and tuple-expression IDs immediately after
@@ -274,6 +280,41 @@ mod tests {
         ast::*,
         iter::{AstEvent, AstWalk},
     };
+
+    #[test]
+    fn span_probe_matches_exact_serde_schema() {
+        let base = serde_json::json!({"file_id": 7, "start": 1, "end": 9, "line": 2, "col": 3});
+        let mut cases = vec![base.clone(), Value::Null, serde_json::json!([])];
+        for field in ["file_id", "start", "end", "line", "col"] {
+            for value in [
+                Value::Null,
+                serde_json::json!(false),
+                serde_json::json!("1"),
+                serde_json::json!(-1),
+                serde_json::json!(1.0),
+                serde_json::json!(0),
+                serde_json::json!(u32::MAX),
+                serde_json::json!(u64::MAX),
+            ] {
+                let mut changed = base.clone();
+                changed[field] = value;
+                cases.push(changed);
+            }
+            let mut missing = base.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            cases.push(missing);
+        }
+        let mut extra = base;
+        extra["extra"] = Value::Null;
+        cases.push(extra);
+        for value in cases {
+            let expected = value
+                .as_object()
+                .filter(|object| object.len() == 5)
+                .and_then(|_| serde_json::from_value::<Span>(value.clone()).ok());
+            assert_eq!(span(&value), expected, "{value}");
+        }
+    }
 
     fn parse(source: &str) -> Program {
         let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();

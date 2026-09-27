@@ -1040,8 +1040,10 @@ mod intern_tests {
 // Session artifacts preserve resolution scope as well as declaration identity.
 impl<V: serde::Serialize> serde::Serialize for FunctionMap<V> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let values: Vec<_> = self.values.iter().collect();
-        let aliases: Vec<_> = self.scope.aliases.iter().collect();
+        let mut values: Vec<_> = self.values.iter().collect();
+        values.sort_unstable_by_key(|(id, _)| **id);
+        let mut aliases: Vec<_> = self.scope.aliases.iter().collect();
+        aliases.sort_unstable_by_key(|(id, _)| **id);
         serde::Serialize::serialize(
             &(values, aliases, &*self.scope.declarations.borrow()),
             serializer,

@@ -142,6 +142,47 @@ impl Write for CountedWriter<'_> {
 }
 
 impl ArtifactStore {
+    /// Copy one immutable record without decoding it. Scratch remains bounded
+    /// by the buffered I/O implementation, including for very large records.
+    pub(crate) fn copy_record(&self, source: &Self, id: usize) -> Result<usize> {
+        anyhow::ensure!(
+            !std::ptr::eq(self, source),
+            "cannot copy within the same artifact pack"
+        );
+        let &(start, length) = source
+            .entries
+            .borrow()
+            .get(id)
+            .context("missing compiler unit artifact")?;
+        let mut old = source.pack.borrow_mut();
+        let old = old.as_mut().expect("open artifact pack");
+        let mut new = self.pack.borrow_mut();
+        let new = new.as_mut().expect("open artifact pack");
+        let target_start = new.written;
+        let mut writer = CountedWriter {
+            writer: &mut new.writer,
+            written: &mut new.written,
+        };
+        let flushed = old.written - old.writer.buffer().len() as u64;
+        if start >= flushed {
+            writer.write_all(
+                &old.writer.buffer()
+                    [(start - flushed) as usize..(start + length - flushed) as usize],
+            )?;
+        } else {
+            old.writer
+                .flush()
+                .context("flush copied compiler artifacts")?;
+            old.reader.seek(SeekFrom::Start(start))?;
+            let copied = std::io::copy(&mut (&mut old.reader).take(length), &mut writer)?;
+            anyhow::ensure!(copied == length, "truncated compiler unit artifact");
+        }
+        let mut entries = self.entries.borrow_mut();
+        let target = entries.len();
+        entries.push((target_start, length));
+        Ok(target)
+    }
+
     pub(crate) fn write<T: Serialize>(&self, value: &T) -> Result<usize> {
         let mut borrowed = self.pack.borrow_mut();
         let pack = borrowed.as_mut().expect("open artifact pack");
@@ -560,6 +601,48 @@ impl Drop for UnitArtifacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn record_copy_preserves_buffered_flushed_and_large_records() {
+        for prefix in [0, WRITE_BUFFER_BYTES - 16] {
+            for length in [0, 64, WRITE_BUFFER_BYTES, WRITE_BUFFER_BYTES * 2] {
+                for flush in [false, true] {
+                    let old = UnitArtifacts::new().unwrap();
+                    let new = UnitArtifacts::new().unwrap();
+                    old.store.write(&"p".repeat(prefix)).unwrap();
+                    let value = format!("{}\"\\\n日本語", "x".repeat(length));
+                    let id = old.store.write(&value).unwrap();
+                    if flush {
+                        old.store
+                            .pack
+                            .borrow_mut()
+                            .as_mut()
+                            .unwrap()
+                            .writer
+                            .flush()
+                            .unwrap();
+                    }
+                    let before = new.store.written();
+                    let copied = new.store.copy_record(&old.store, id).unwrap();
+                    assert_eq!(
+                        new.store.written() - before,
+                        serde_json::to_vec(&value).unwrap().len() as u64
+                    );
+                    assert_eq!(new.store.read::<String>(copied).unwrap(), value);
+                    assert_eq!(old.store.read::<String>(id).unwrap(), value);
+                    // A reader seek must not move either writer's append position.
+                    let later = old.store.write(&"later").unwrap();
+                    assert_eq!(old.store.read::<String>(later).unwrap(), "later");
+                    let later = new.store.write(&"new later").unwrap();
+                    assert_eq!(new.store.read::<String>(later).unwrap(), "new later");
+                    let bytes = new.store.written();
+                    assert!(new.store.copy_record(&old.store, usize::MAX).is_err());
+                    assert!(new.store.copy_record(&new.store, copied).is_err());
+                    assert_eq!(new.store.written(), bytes);
+                }
+            }
+        }
+    }
+
     fn parse(source: &str, file: FileId) -> Program {
         let tokens = crate::lexer::Lexer::with_file_id(source, file)
             .tokenize()

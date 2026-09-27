@@ -73,6 +73,13 @@ impl<'de> serde::Deserialize<'de> for MethodSlots {
     }
 }
 
+impl crate::compiler_db::retained::Retained for MethodSlots {
+    fn heap_bytes(&self) -> usize {
+        self.names.heap_bytes()
+            + self.index.capacity() * (std::mem::size_of::<(MethodId, usize)>() + 16) * 2
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

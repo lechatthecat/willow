@@ -657,6 +657,22 @@ impl LayoutQueries {
     }
 }
 
+impl super::retained::Retained for ClassLayoutDeclaration {
+    fn heap_bytes(&self) -> usize {
+        self.fields.heap_bytes() + self.methods.heap_bytes()
+    }
+}
+impl super::retained::Retained for TrackedLayout {
+    fn heap_bytes(&self) -> usize {
+        self.fields.retained_bytes() + self.slots.retained_bytes()
+    }
+}
+impl super::retained::Retained for GcTraceLayout {
+    fn heap_bytes(&self) -> usize {
+        self.bitmap.heap_bytes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

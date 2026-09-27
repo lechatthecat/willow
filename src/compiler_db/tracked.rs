@@ -3,6 +3,7 @@
 // Query-family migration follows the engine phase. Keep the typed dispatcher
 // internal until those families have passed their purity/equality audits.
 #![allow(dead_code)]
+use super::retained::Retained;
 use crate::{module::UnitId, parser::ast::BodyId, semantic::ids::FunctionId};
 use anyhow::{Context, Result};
 use std::{
@@ -31,6 +32,15 @@ impl ResultFingerprint {
     }
 }
 
+/// Stability of a captured input, ordered from frequently edited to immutable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Durability {
+    #[default]
+    Low,
+    Medium,
+    High,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum InputNode {
     Source(PathBuf),
@@ -56,12 +66,28 @@ pub(crate) enum InputNode {
     Features,
     CompilerStamp,
     StdlibStamp,
+    RuntimeAbiRevision,
     ManifestMode,
     Entry,
 }
 
+impl InputNode {
+    fn durability(&self) -> Durability {
+        match self {
+            Self::Manifest(_) | Self::Lock(_) | Self::PackageGraph => Durability::Medium,
+            Self::CompilerStamp
+            | Self::StdlibStamp
+            | Self::RuntimeAbiRevision
+            | Self::RuntimeCapabilities => Durability::High,
+            // A filesystem path alone never proves immutability.
+            _ => Durability::Low,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum QueryNode {
+    CompilerEnvironment,
     Parse(PathBuf),
     Declarations(UnitId),
     SyntaxDeclarations(PathBuf),
@@ -113,10 +139,15 @@ pub(crate) struct QueryValue {
     value: Arc<dyn Any>,
     fingerprint: ResultFingerprint,
     equivalent: fn(&dyn Any, &dyn Any) -> bool,
+    retained_bytes: usize,
 }
 impl QueryValue {
-    pub(crate) fn new<V: Eq + 'static>(value: V, fingerprint: ResultFingerprint) -> Self {
+    pub(crate) fn new<V: Eq + Retained + 'static>(
+        value: V,
+        fingerprint: ResultFingerprint,
+    ) -> Self {
         Self {
+            retained_bytes: value.retained_bytes(),
             value: Arc::new(value),
             fingerprint,
             equivalent: |a, b| {
@@ -140,7 +171,7 @@ impl QueryValue {
 struct Input {
     value: QueryValue,
     changed_at: Revision,
-    _durability: (),
+    durability: Durability,
 }
 #[derive(Clone)]
 struct Memo {
@@ -148,6 +179,7 @@ struct Memo {
     verified_at: Revision,
     changed_at: Revision,
     dependencies: Arc<[Dependency]>,
+    durability: Durability,
 }
 #[derive(Clone)]
 enum State {
@@ -197,6 +229,10 @@ pub(crate) fn assert_frozen_read() {
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(crate) struct TrackedStats {
+    pub inputs_changed: usize,
+    pub green_validations: usize,
+    pub durability_shortcuts: usize,
+    pub dependency_reads: usize,
     pub validated: usize,
     pub recomputed: usize,
     pub green_after_recompute: usize,
@@ -226,8 +262,10 @@ struct QueryCycle(Arc<str>);
 #[derive(Default)]
 pub(crate) struct TrackedQueryTable {
     revision: Revision,
+    last_changed: [Revision; 3],
     inputs: HashMap<InputNode, Input>,
     states: RefCell<HashMap<QueryNode, State>>,
+    demanded: RefCell<HashSet<QueryNode>>,
     stack: RefCell<Vec<EvalFrame>>,
     stats: Cell<TrackedStats>,
     #[cfg(test)]
@@ -248,6 +286,7 @@ impl TrackedQueryTable {
         );
         Ok(Self {
             revision: self.revision,
+            last_changed: self.last_changed,
             inputs: self.inputs.clone(),
             states: RefCell::new(self.states.borrow().clone()),
             ..Default::default()
@@ -270,22 +309,85 @@ impl TrackedQueryTable {
 
     /// Capture each source once before evaluating its queries in a candidate.
     pub(crate) fn capture_candidate(&mut self, node: InputNode, value: QueryValue) {
+        let durability = node.durability();
+        self.capture_candidate_with_durability(node, value, durability);
+    }
+    pub(crate) fn capture_candidate_with_durability(
+        &mut self,
+        node: InputNode,
+        value: QueryValue,
+        durability: Durability,
+    ) {
         assert_frozen_read();
         assert!(self.stack.get_mut().is_empty(), "capture during evaluation");
         if self
             .inputs
             .get(&node)
-            .is_none_or(|old| !old.value.equivalent(&value))
+            .is_none_or(|old| old.durability != durability || !old.value.equivalent(&value))
         {
+            let invalidates = self
+                .inputs
+                .get(&node)
+                .map_or(durability, |old| old.durability.max(durability));
+            self.changed(invalidates, self.revision);
             self.inputs.insert(
                 node,
                 Input {
                     value,
                     changed_at: self.revision,
-                    _durability: (),
+                    durability,
                 },
             );
         }
+    }
+
+    /// Retain the transitive closure of this candidate's demands. Visiting
+    /// each live node and edge once also preserves dependencies of green memos
+    /// whose providers never ran in this revision.
+    pub(crate) fn compact(
+        &mut self,
+        mut inventory: impl FnMut(&QueryNode) -> bool,
+    ) -> (usize, usize) {
+        assert_frozen_read();
+        assert!(self.stack.get_mut().is_empty());
+        let mut live = std::mem::take(self.demanded.get_mut());
+        live.extend(
+            self.states
+                .get_mut()
+                .keys()
+                .filter(|node| inventory(node))
+                .cloned(),
+        );
+        let mut pending: Vec<_> = live.iter().cloned().collect();
+        let mut inputs = HashSet::new();
+        let states = self.states.get_mut();
+        let mut edges = 0;
+        while let Some(node) = pending.pop() {
+            if let Some(State::Ready(memo)) = states.get(&node) {
+                edges += memo.dependencies.len();
+                for dependency in memo.dependencies.iter() {
+                    match &dependency.node {
+                        DependencyNode::Input(input) => {
+                            inputs.insert(input.clone());
+                        }
+                        DependencyNode::Query(query) => {
+                            if live.insert(query.clone()) {
+                                pending.push(query.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        states.retain(|node, _| live.contains(node));
+        self.inputs.retain(|node, _| inputs.contains(node));
+        if states.capacity() > 4 * states.len().max(16) {
+            states.shrink_to_fit();
+        }
+        if self.inputs.capacity() > 4 * self.inputs.len().max(16) {
+            self.inputs.shrink_to_fit();
+        }
+        (states.len(), edges)
     }
 
     pub(crate) fn revision(&self) -> Revision {
@@ -329,6 +431,86 @@ impl TrackedQueryTable {
                 .collect(),
             _ => Vec::new(),
         }
+    }
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let states = self.states.borrow();
+        let inputs = self
+            .inputs
+            .iter()
+            .map(|(node, input)| node.heap_bytes() + input.value.retained_bytes)
+            .sum::<usize>();
+        let buckets = self.inputs.capacity() * (std::mem::size_of::<(InputNode, Input)>() + 16) * 2
+            + states.capacity() * (std::mem::size_of::<(QueryNode, State)>() + 16) * 2;
+        inputs
+            + buckets
+            + states
+                .iter()
+                .map(|(node, state)| {
+                    node.heap_bytes()
+                        + match state {
+                            State::Ready(memo) => {
+                                memo.dependencies
+                                    .iter()
+                                    .map(|edge| {
+                                        std::mem::size_of::<Dependency>()
+                                            + match &edge.node {
+                                                DependencyNode::Input(node) => node.heap_bytes(),
+                                                DependencyNode::Query(node) => node.heap_bytes(),
+                                            }
+                                    })
+                                    .sum::<usize>()
+                                    + memo
+                                        .result
+                                        .as_ref()
+                                        .map_or_else(|e| e.len(), |v| v.retained_bytes)
+                            }
+                            State::Computing { .. } => 0,
+                        }
+                })
+                .sum::<usize>()
+    }
+    #[cfg(test)]
+    pub(crate) fn retention_profile(&self) -> std::collections::BTreeMap<String, usize> {
+        let mut profile = std::collections::BTreeMap::new();
+        for (node, input) in &self.inputs {
+            let name = format!("input:{node:?}")
+                .split('(')
+                .next()
+                .unwrap()
+                .to_owned();
+            *profile.entry(name).or_default() += input.value.retained_bytes;
+        }
+        for (node, state) in self.states.borrow().iter() {
+            if let State::Ready(memo) = state {
+                let name = format!("query:{node:?}")
+                    .split('(')
+                    .next()
+                    .unwrap()
+                    .to_owned();
+                *profile.entry(name).or_default() +=
+                    memo.result.as_ref().map_or(0, |v| v.retained_bytes);
+            }
+        }
+        profile
+    }
+    pub(crate) fn verification_dump(&self) -> String {
+        let mut rows: Vec<_> = self
+            .states
+            .borrow()
+            .iter()
+            .filter_map(|(node, state)| {
+                let State::Ready(memo) = state else {
+                    return None;
+                };
+                Some(format!(
+                    "{node:?}: fingerprint={:?}, dependencies={:?}",
+                    memo.result.as_ref().map(|v| v.fingerprint),
+                    memo.dependencies
+                ))
+            })
+            .collect();
+        rows.sort();
+        rows.join("\n")
     }
     pub(crate) fn stats(&self) -> TrackedStats {
         self.stats.get()
@@ -385,20 +567,39 @@ impl TrackedQueryTable {
                 .context("revision overflow")?,
         );
         for (node, value) in changes {
+            let durability = node.durability();
+            self.changed(durability, next);
             self.inputs.insert(
                 node,
                 Input {
                     value,
                     changed_at: next,
-                    _durability: (),
+                    durability,
                 },
             );
+        }
+        if removed {
+            let removed_durability = self
+                .inputs
+                .iter()
+                .filter(|(node, _)| !unique.contains(*node))
+                .map(|(_, input)| input.durability)
+                .max()
+                .unwrap();
+            self.changed(removed_durability, next);
         }
         if replace {
             self.inputs.retain(|node, _| unique.contains(node));
         }
         self.revision = next;
         Ok(true)
+    }
+
+    fn changed(&mut self, durability: Durability, revision: Revision) {
+        for clock in &mut self.last_changed[..=durability as usize] {
+            *clock = revision;
+        }
+        self.bump(|s| s.inputs_changed += 1);
     }
 
     pub(crate) fn input(&self, node: &InputNode) -> Result<QueryValue> {
@@ -416,6 +617,7 @@ impl TrackedQueryTable {
     }
     fn record(&self, node: DependencyNode, changed_at: Revision) {
         if let Some(frame) = self.stack.borrow_mut().last_mut().filter(|f| f.recording) {
+            self.bump(|s| s.dependency_reads += 1);
             frame.dependencies.insert(Dependency {
                 node,
                 observed_changed_at: changed_at,
@@ -427,6 +629,7 @@ impl TrackedQueryTable {
         provider: &impl QueryProvider,
         node: QueryNode,
     ) -> Result<QueryValue> {
+        self.demanded.borrow_mut().insert(node.clone());
         let memo = self.validate(provider, &node)?;
         self.record(DependencyNode::Query(node), memo.changed_at);
         memo.result.map_err(|error| anyhow::anyhow!("{error}"))
@@ -521,13 +724,32 @@ impl TrackedQueryTable {
         };
         if let Some(old) = &previous {
             self.bump(|s| s.validated += 1);
+            crate::query_stats::tracked_event(node, "validate", self.revision.0);
+            let shortcut = self.last_changed[old.durability as usize] <= old.verified_at;
             let mut green = true;
-            for dependency in old.dependencies.iter() {
+            let mut durability = if shortcut {
+                old.durability
+            } else {
+                Durability::High
+            };
+            // Select an empty slice before iterating: filtering every edge would
+            // still scan the entire dependency array on a durability shortcut.
+            let dependencies = if shortcut {
+                &[][..]
+            } else {
+                &old.dependencies[..]
+            };
+            for dependency in dependencies {
                 self.bump(|s| s.dependency_edges_visited += 1);
                 let changed_at = match &dependency.node {
-                    DependencyNode::Input(input) => self.inputs.get(input).map(|v| v.changed_at),
+                    DependencyNode::Input(input) => self.inputs.get(input).map(|v| {
+                        durability = durability.min(v.durability);
+                        v.changed_at
+                    }),
                     DependencyNode::Query(query) => {
-                        Some(self.validate(provider, query)?.changed_at)
+                        let dependency = self.validate(provider, query)?;
+                        durability = durability.min(dependency.durability);
+                        Some(dependency.changed_at)
                     }
                 };
                 if changed_at != Some(dependency.observed_changed_at) {
@@ -536,8 +758,24 @@ impl TrackedQueryTable {
                 }
             }
             if green {
+                self.bump(|s| {
+                    s.green_validations += 1;
+                    s.durability_shortcuts += usize::from(shortcut);
+                });
+                crate::query_stats::tracked_event(
+                    node,
+                    if shortcut {
+                        "durability-green"
+                    } else {
+                        "green"
+                    },
+                    self.revision.0,
+                );
                 let mut memo = old.clone();
                 memo.verified_at = self.revision;
+                // Semantic backdating does not backdate durability. A child
+                // can return the same value while gaining a less stable input.
+                memo.durability = durability;
                 self.states
                     .borrow_mut()
                     .insert(node.clone(), State::Ready(memo.clone()));
@@ -545,6 +783,7 @@ impl TrackedQueryTable {
             }
         }
         self.stack.borrow_mut().last_mut().unwrap().recording = true;
+        crate::query_stats::tracked_event(node, "recompute", self.revision.0);
         let result = provider.compute(self, node);
         if let Err(error) = &result
             && error.downcast_ref::<DeferredQuery>().is_some()
@@ -584,7 +823,19 @@ impl TrackedQueryTable {
                 s.changed += 1;
             }
         });
+        let durability = dependencies
+            .iter()
+            .map(|edge| match &edge.node {
+                DependencyNode::Input(node) => self.inputs[node].durability,
+                DependencyNode::Query(node) => match &self.states.borrow()[node] {
+                    State::Ready(memo) => memo.durability,
+                    State::Computing { .. } => unreachable!("cycle checked before publication"),
+                },
+            })
+            .min()
+            .unwrap_or(Durability::High);
         let memo = Memo {
+            durability,
             changed_at: if equal {
                 previous.as_ref().unwrap().changed_at
             } else {
@@ -605,8 +856,10 @@ impl TrackedQueryTable {
         Ok(memo)
     }
     fn bump(&self, f: impl FnOnce(&mut TrackedStats)) {
-        let mut s = self.stats.get();
+        let before = self.stats.get();
+        let mut s = before;
         f(&mut s);
+        crate::query_stats::tracked_counts(before, s);
         self.stats.set(s);
     }
     fn check_cycle(&self) -> Result<()> {
@@ -630,6 +883,143 @@ impl TrackedQueryTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct InputReader(InputNode);
+    impl QueryProvider for InputReader {
+        fn compute(&self, table: &TrackedQueryTable, _: &QueryNode) -> Result<QueryValue> {
+            table.input(&self.0)
+        }
+    }
+    #[test]
+    fn durability_shortcuts_skip_edges_and_respect_intervening_revisions() {
+        for high in [
+            InputNode::CompilerStamp,
+            InputNode::StdlibStamp,
+            InputNode::RuntimeCapabilities,
+        ] {
+            let reader = InputReader(high.clone());
+            let mut table = TrackedQueryTable::default();
+            table
+                .accept(vec![(high.clone(), value(1)), (input(0), value(0))])
+                .unwrap();
+            table.read(&reader, query(0)).unwrap();
+            for n in 1..4 {
+                table.accept(vec![(input(0), value(n))]).unwrap();
+            }
+            let before = table.stats();
+            assert_eq!(*table.read(&reader, query(0)).unwrap().get::<i64>(), 1);
+            assert_eq!(
+                table.stats().dependency_edges_visited,
+                before.dependency_edges_visited
+            );
+            assert_eq!(
+                table.stats().durability_shortcuts,
+                before.durability_shortcuts + 1
+            );
+            table.accept(vec![(high, value(2))]).unwrap();
+            table.accept(vec![(input(0), value(9))]).unwrap();
+            assert_eq!(*table.read(&reader, query(0)).unwrap().get::<i64>(), 2);
+            assert_eq!(table.stats().recomputed, 2);
+        }
+    }
+    #[test]
+    fn local_paths_are_low_and_medium_changes_invalidate_medium_consumers() {
+        assert_eq!(input(0).durability(), Durability::Low);
+        for node in [
+            InputNode::Manifest("project.toml".into()),
+            InputNode::Lock("project.lock".into()),
+            InputNode::PackageGraph,
+        ] {
+            assert_eq!(node.durability(), Durability::Medium);
+            let reader = InputReader(node.clone());
+            let mut table = TrackedQueryTable::default();
+            table.accept(vec![(node.clone(), value(1))]).unwrap();
+            table.read(&reader, query(0)).unwrap();
+            table.accept(vec![(input(0), value(2))]).unwrap();
+            table.read(&reader, query(0)).unwrap();
+            assert_eq!(table.stats().dependency_edges_visited, 0);
+            table.accept(vec![(node, value(3))]).unwrap();
+            assert_eq!(*table.read(&reader, query(0)).unwrap().get::<i64>(), 3);
+        }
+    }
+    #[test]
+    fn green_parent_inherits_downgraded_dependency_durability() {
+        struct Chain(usize);
+        impl QueryProvider for Chain {
+            fn compute(&self, table: &TrackedQueryTable, node: &QueryNode) -> Result<QueryValue> {
+                let QueryNode::Parse(path) = node else {
+                    unreachable!()
+                };
+                let index: usize = path.file_stem().unwrap().to_str().unwrap().parse().unwrap();
+                if index < self.0 {
+                    table.read(self, query(index + 1))
+                } else {
+                    table.input(&input(0))
+                }
+            }
+        }
+        for depth in [1, 8, 64] {
+            for (before, after) in [
+                (Durability::High, Durability::Medium),
+                (Durability::High, Durability::Low),
+                (Durability::Medium, Durability::Low),
+            ] {
+                let chain = Chain(depth);
+                let mut table = TrackedQueryTable::default();
+                table.advance_candidate().unwrap();
+                table.capture_candidate_with_durability(input(0), value(1), before);
+                table.read(&chain, query(0)).unwrap();
+                table.advance_candidate().unwrap();
+                table.capture_candidate_with_durability(input(0), value(1), after);
+                table.read(&chain, query(0)).unwrap();
+                assert_eq!(table.stats().dependency_edges_visited, depth + 1);
+                assert_eq!(table.stats().recomputed, depth + 2);
+                table.advance_candidate().unwrap();
+                table.capture_candidate_with_durability(input(0), value(2), after);
+                assert_eq!(*table.read(&chain, query(0)).unwrap().get::<i64>(), 2);
+                assert_eq!(table.stats().dependency_edges_visited, 2 * (depth + 1));
+            }
+        }
+    }
+    #[test]
+    fn revision_compaction_bounds_deleted_queries_over_hundreds_of_edits() {
+        let mut accepted = TrackedQueryTable::default();
+        for revision in 0..400 {
+            let mut candidate = accepted.candidate().unwrap();
+            candidate
+                .accept(vec![(input(revision), value(revision as i64))])
+                .unwrap();
+            candidate
+                .read(&InputReader(input(revision)), query(revision))
+                .unwrap();
+            assert_eq!(candidate.compact(|_| false), (1, 1));
+            assert_eq!(candidate.inputs.len(), 1);
+            accepted = candidate;
+        }
+    }
+    #[test]
+    fn input_mutation_does_not_walk_ten_thousand_consumers() {
+        let reader = InputReader(input(0));
+        let mut table = TrackedQueryTable::default();
+        table.accept(vec![(input(0), value(0))]).unwrap();
+        for i in 0..10_000 {
+            table.read(&reader, query(i)).unwrap();
+        }
+        let before = table.stats();
+        table.accept(vec![(input(0), value(1))]).unwrap();
+        assert_eq!(table.stats().validated, before.validated);
+        assert_eq!(
+            table.stats().dependency_edges_visited,
+            before.dependency_edges_visited
+        );
+        assert_eq!(table.stats().recomputed, before.recomputed);
+        table.read(&reader, query(42)).unwrap();
+        assert_eq!(table.stats().recomputed, before.recomputed + 1);
+        assert_eq!(
+            table.stats().dependency_edges_visited,
+            before.dependency_edges_visited + 1
+        );
+    }
+
     struct RecoveringCycle {
         length: usize,
         catch: bool,

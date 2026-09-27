@@ -224,7 +224,7 @@ fn daemon_refresh_matches_cold_and_reuses_equivalent_queries() {
 }
 
 #[test]
-fn daemon_failed_refresh_preserves_revision_and_bounds_process_lifetime() {
+fn daemon_failed_refresh_preserves_revision_and_recovers_after_hundreds_of_edits() {
     let f = Fixture::new();
     let mut child = Command::new(env!("CARGO_BIN_EXE_willow"))
         .current_dir(&f.0)
@@ -237,20 +237,36 @@ fn daemon_failed_refresh_preserves_revision_and_bounds_process_lifetime() {
     let mut output = BufReader::new(child.stdout.take().unwrap());
     let ready = result(&mut output);
     fs::write(f.0.join("main.wi"), "fn main() { missing(); }").unwrap();
-    for id in 1..=32 {
+    for id in 1..=200 {
         writeln!(input, "{}", json!({"id":id,"operation":"refresh"})).unwrap();
         let response = result(&mut output);
         assert_eq!(response["revision"], ready["revision"]);
         assert!(response.get("error").is_some(), "{response}");
-        if id == 32 {
-            assert!(
-                response["error"]
-                    .as_str()
-                    .unwrap()
-                    .contains("restart required")
-            );
-        }
     }
+    fs::write(
+        f.0.join("main.wi"),
+        "fn value() -> i64 { return 1; } fn main() { println(value()); }",
+    )
+    .unwrap();
+    writeln!(input, "{}", json!({"id":201,"operation":"refresh"})).unwrap();
+    assert!(result(&mut output).get("error").is_none());
+    writeln!(input, "{}", json!({"id":202,"operation":"stats"})).unwrap();
+    let stats = result(&mut output)["result"].clone();
+    assert_eq!(stats["typechecks"], 0);
+    assert_eq!(stats["queries_recomputed"], 0);
+    for field in [
+        "inputs_changed",
+        "queries_validated",
+        "queries_green_after_recompute",
+        "queries_changed",
+        "dependency_edges_visited",
+        "durability_shortcuts",
+        "retained_query_bytes",
+    ] {
+        assert!(stats[field].is_u64(), "missing {field}: {stats}");
+    }
+    writeln!(input, "{}", json!({"id":203,"operation":"shutdown"})).unwrap();
+    result(&mut output);
     assert!(child.wait().unwrap().success());
 }
 

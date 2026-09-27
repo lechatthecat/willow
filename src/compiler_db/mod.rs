@@ -251,3 +251,5 @@ pub(crate) mod map_entries {
         deserializer.deserialize_seq(Entries(std::marker::PhantomData))
     }
 }
+
+pub(crate) mod retained;

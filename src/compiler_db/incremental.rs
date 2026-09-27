@@ -1,4 +1,5 @@
 //! Pure syntax queries; source capture and artifact I/O stay at the caller.
+use super::retained::Retained;
 use super::tracked::{
     InputNode, QueryNode, QueryProvider, QueryValue, ResultFingerprint, TrackedQueryTable,
     TrackedStats,
@@ -29,6 +30,7 @@ pub(crate) type TokenPairs = (TokenInventory, TokenInventory);
 #[derive(Default)]
 pub(crate) struct SyntaxQueries {
     table: TrackedQueryTable,
+    source_roots: HashMap<PathBuf, super::tracked::Durability>,
     interface_dispatch: HashMap<UnitId, Vec<FunctionId>>,
     pub(crate) dispatch_classes: HashMap<UnitId, std::collections::BTreeSet<String>>,
     captured: HashMap<PathBuf, Source>,
@@ -37,7 +39,7 @@ pub(crate) struct SyntaxQueries {
     prepared: HashMap<BodyId, PreparedBody>,
     symbols: HashMap<(UnitId, String), Rc<Value>>,
     effect_functions: HashMap<UnitId, Vec<FunctionId>>,
-    reference_wires: HashMap<super::references::SymbolUseId, Value>,
+    reference_wires: HashMap<super::references::SymbolUseId, CompactJson>,
     reference_symbols: std::collections::BTreeSet<super::references::SymbolId>,
     reference_uses: std::collections::BTreeSet<super::references::SymbolUseId>,
     effects: HashMap<UnitId, PreparedEffects>,
@@ -87,7 +89,7 @@ impl SyntaxQueries {
             &self.provider(),
             QueryNode::InterfaceDispatchTargets(unit, id),
         )?;
-        Ok(serde_json::from_value(result.get::<Value>().clone())?)
+        result.get::<CompactJson>().decode()
     }
 
     pub(crate) fn dispatch_targets(
@@ -100,7 +102,7 @@ impl SyntaxQueries {
             &super::dispatch::DispatchProvider,
             QueryNode::DispatchTargets(unit, class, method.to_owned()),
         )?;
-        Ok(serde_json::from_value(result.get::<Value>().clone())?)
+        result.get::<CompactJson>().decode()
     }
 
     pub(crate) fn capture_references(
@@ -127,7 +129,8 @@ impl SyntaxQueries {
             if let Some(object) = canonical.as_object_mut() {
                 object.remove("location");
             }
-            self.reference_wires.insert(id.clone(), reference);
+            self.reference_wires
+                .insert(id.clone(), CompactJson::new(&reference)?);
             self.capture_input(InputNode::ResolvedReference(id.clone()), value(canonical)?)?;
             self.resolved_reference(id)?;
         }
@@ -168,11 +171,10 @@ impl SyntaxQueries {
         let result = self
             .table
             .read(&self.provider(), QueryNode::ResolvedReference(id.clone()))?;
-        Ok(self
-            .reference_wires
-            .get(&id)
-            .unwrap_or_else(|| result.get::<Value>())
-            .clone())
+        match self.reference_wires.get(&id) {
+            Some(wire) => wire.decode(),
+            None => result.get::<CompactJson>().decode(),
+        }
     }
     pub(crate) fn references(&mut self, symbol: super::references::SymbolId) -> Result<Vec<Value>> {
         if self.reference_symbols.insert(symbol.clone()) {
@@ -187,11 +189,14 @@ impl SyntaxQueries {
         let result = self
             .table
             .read(&self.provider(), QueryNode::SymbolReferences(symbol))?;
-        Ok(result
-            .get::<Vec<(super::references::SymbolUseId, Value)>>()
+        result
+            .get::<Vec<(super::references::SymbolUseId, CompactJson)>>()
             .iter()
-            .map(|(id, semantic)| self.reference_wires.get(id).unwrap_or(semantic).clone())
-            .collect())
+            .map(|(id, semantic)| match self.reference_wires.get(id) {
+                Some(wire) => wire.decode(),
+                None => semantic.decode(),
+            })
+            .collect()
     }
 
     pub(crate) fn read_visible_scope(&self, unit: UnitId, path: &Path) -> Result<QueryValue> {
@@ -207,18 +212,18 @@ impl SyntaxQueries {
         declarations: Value,
     ) -> Result<Value> {
         self.capture_input(InputNode::VisibleDeclarations(unit), value(declarations)?)?;
-        Ok(self
-            .table
+        self.table
             .read(
                 &self.provider(),
                 QueryNode::VisibleScope(unit, path.to_owned()),
             )?
-            .get::<Value>()
-            .clone())
+            .get::<CompactJson>()
+            .decode()
     }
     pub(crate) fn candidate(&self) -> Result<Self> {
-        Ok(Self {
+        let mut candidate = Self {
             table: self.table.candidate()?,
+            source_roots: self.source_roots.clone(),
             dispatch_classes: self.dispatch_classes.clone(),
             interface_dispatch: self.interface_dispatch.clone(),
             captured: HashMap::new(),
@@ -235,7 +240,49 @@ impl SyntaxQueries {
             checked_roots: Default::default(),
             token_pairs: HashMap::new(),
             captured_nodes: Default::default(),
-        })
+        };
+        for (node, payload) in [
+            (
+                InputNode::CompilerStamp,
+                serde_json::json!(env!("CARGO_PKG_VERSION")),
+            ),
+            (
+                InputNode::StdlibStamp,
+                serde_json::json!(env!("CARGO_PKG_VERSION")),
+            ),
+            (
+                InputNode::RuntimeAbiRevision,
+                serde_json::json!(willow_abi::OBJECT_LAYOUT_REVISION),
+            ),
+        ] {
+            candidate.capture_input(node, value(payload)?)?;
+        }
+        Ok(candidate)
+    }
+    pub(crate) fn configure_sources(&mut self, graph: Option<&crate::package::PackageGraph>) {
+        use super::tracked::Durability;
+        use crate::package::PackageSourceIdentity;
+        self.source_roots.clear();
+        for package in graph.into_iter().flat_map(|graph| &graph.packages) {
+            let immutable = matches!(
+                package.identity.source,
+                PackageSourceIdentity::Git { .. } | PackageSourceIdentity::GitSubdirectory { .. }
+            ) && package.identity.revision.is_some()
+                && package.checksum.is_some();
+            self.source_roots.insert(
+                package.root.clone(),
+                if immutable {
+                    Durability::High
+                } else {
+                    Durability::Low
+                },
+            );
+        }
+    }
+    fn source_durability(&self, path: &Path) -> super::tracked::Durability {
+        path.ancestors()
+            .find_map(|root| self.source_roots.get(root).copied())
+            .unwrap_or_default()
     }
     pub(crate) fn capture_input(&mut self, node: InputNode, payload: QueryValue) -> Result<()> {
         if !self.captured_nodes.insert(node.clone()) {
@@ -351,7 +398,7 @@ impl SyntaxQueries {
         self.prepared.insert(
             body,
             PreparedBody {
-                result,
+                result: CompactJson::new(&result)?,
                 keys,
                 children,
             },
@@ -373,7 +420,9 @@ impl SyntaxQueries {
             ),
         )?;
         match self.table.read(&self.provider(), node) {
-            Ok(result) => Ok(Some(result.get::<DerivedValue>().wire.clone())),
+            Ok(result) => Ok(Some(serde_json::from_slice(
+                &result.get::<DerivedValue>().wire,
+            )?)),
             Err(error)
                 if error
                     .downcast_ref::<super::tracked::DeferredQuery>()
@@ -385,8 +434,9 @@ impl SyntaxQueries {
         }
     }
     pub(crate) fn refresh_derived(&self, node: QueryNode, wire: Value) -> Result<()> {
-        let canonical = super::syntax::without_spans(&wire);
-        let fingerprint = ResultFingerprint::bytes(&serde_json::to_vec(&canonical)?);
+        let canonical = serde_json::to_vec(&super::syntax::without_spans(&wire))?;
+        let fingerprint = ResultFingerprint::bytes(&canonical);
+        let wire = serde_json::to_vec(&wire)?;
         self.table.refresh_value(
             &node,
             QueryValue::new(DerivedValue { wire, canonical }, fingerprint),
@@ -405,7 +455,8 @@ impl SyntaxQueries {
                 ResultFingerprint::bytes(b"derived-dependencies-v1"),
             ),
         )?;
-        let canonical = super::syntax::without_spans(&wire);
+        let canonical = serde_json::to_vec(&super::syntax::without_spans(&wire))?;
+        let wire = serde_json::to_vec(&wire)?;
         self.derived
             .insert(node.clone(), DerivedValue { wire, canonical });
         self.table.read(&self.provider(), node)?;
@@ -485,7 +536,7 @@ impl SyntaxQueries {
                 imported,
                 inventory,
                 source_units,
-                metadata,
+                metadata: CompactJson::new(&metadata)?,
             },
         );
         self.table
@@ -513,33 +564,112 @@ impl SyntaxQueries {
             .get::<super::effects::EffectEvidence>()
             .clone())
     }
-    pub(crate) fn finish(&mut self) -> Result<()> {
-        self.table
-            .retain_sources(&self.captured.keys().cloned().collect());
-        Ok(())
+    pub(crate) fn finish(&mut self) -> Result<(usize, usize)> {
+        // Candidate metadata starts from the accepted inventories so capture
+        // can publish removals. Units not captured in this revision must not
+        // keep deleted classes/functions rooted during graph compaction.
+        let mut dispatch_units = std::collections::HashSet::new();
+        let mut interface_units = std::collections::HashSet::new();
+        let mut effect_units = std::collections::HashSet::new();
+        for input in &self.captured_nodes {
+            match input {
+                InputNode::DispatchDeclaration(unit, _) => {
+                    dispatch_units.insert(*unit);
+                }
+                InputNode::InterfaceDispatch(unit, _) => {
+                    interface_units.insert(*unit);
+                }
+                InputNode::EffectRoots(unit) => {
+                    effect_units.insert(*unit);
+                }
+                _ => {}
+            }
+        }
+        let old_lengths = (
+            self.dispatch_classes.len(),
+            self.interface_dispatch.len(),
+            self.effect_functions.len(),
+        );
+        self.dispatch_classes
+            .retain(|unit, _| dispatch_units.contains(unit));
+        self.interface_dispatch
+            .retain(|unit, _| interface_units.contains(unit));
+        self.effect_functions
+            .retain(|unit, _| effect_units.contains(unit));
+        if self.dispatch_classes.len() != old_lengths.0 {
+            self.dispatch_classes.shrink_to_fit();
+        }
+        if self.interface_dispatch.len() != old_lengths.1 {
+            self.interface_dispatch.shrink_to_fit();
+        }
+        if self.effect_functions.len() != old_lengths.2 {
+            self.effect_functions.shrink_to_fit();
+        }
+        let captured = &self.captured_nodes;
+        let bodies = &self.bodies;
+        let classes: std::collections::HashSet<_> = self
+            .dispatch_classes
+            .values()
+            .flatten()
+            .map(|name| crate::semantic::ids::TypeId::from_source_name(name))
+            .collect();
+        let interfaces: std::collections::HashSet<_> = self
+            .interface_dispatch
+            .values()
+            .flatten()
+            .filter_map(FunctionId::owner_type)
+            .collect();
+        let (nodes, edges) = self.table.compact(|node| match node {
+            QueryNode::ClassLayout(id) | QueryNode::GcLayout(id) => {
+                classes.contains(id) || captured.contains(&InputNode::LayoutDeclaration(*id))
+            }
+            QueryNode::InterfaceLayout(id) => {
+                interfaces.contains(id) || captured.contains(&InputNode::InterfaceDeclaration(*id))
+            }
+            QueryNode::TypedBody(id)
+            | QueryNode::NormalizedBody(id)
+            | QueryNode::DefiniteAssignment(id)
+            | QueryNode::AsyncBorrowReport(id)
+            | QueryNode::ResolvedReferences(id)
+            | QueryNode::DirectEffects(id)
+            | QueryNode::LirBody(id)
+            | QueryNode::AsyncFrameLayout(id) => bodies.contains_key(id),
+            _ => false,
+        });
+        anyhow::ensure!(nodes <= 1_000_000, "revision query node limit exceeded");
+        anyhow::ensure!(
+            edges <= 8_000_000,
+            "revision dependency edge limit exceeded"
+        );
+        // Providers only need these payloads while publishing a memo. Ready
+        // memos own the accepted values; a new candidate prepares fresh inputs.
+        // Drop the backing tables too, rather than retaining their capacity.
+        self.prepared = HashMap::new();
+        self.derived = HashMap::new();
+        self.effects = HashMap::new();
+        self.symbols = HashMap::new();
+        Ok((nodes, edges))
     }
     /// Owner is a declaration path, e.g. `Function:f` or `Class:C/methods:f`.
     #[cfg(test)]
     pub(crate) fn signature(&self, path: &Path, owner: &str) -> Result<Value> {
-        Ok(self
-            .table
+        self.table
             .read(
                 &self.provider(),
                 QueryNode::SyntaxSignature(path.to_owned(), owner.to_owned()),
             )?
-            .get::<Value>()
-            .clone())
+            .get::<CompactJson>()
+            .decode()
     }
     #[cfg(test)]
     pub(crate) fn body_syntax(&self, path: &Path, owner: &str) -> Result<Value> {
-        Ok(self
-            .table
+        self.table
             .read(
                 &self.provider(),
                 QueryNode::BodySyntax(path.to_owned(), owner.to_owned()),
             )?
-            .get::<Value>()
-            .clone())
+            .get::<CompactJson>()
+            .decode()
     }
     #[cfg(test)]
     pub(crate) fn recomputations(&self, node: &QueryNode) -> usize {
@@ -548,6 +678,40 @@ impl SyntaxQueries {
     #[cfg(test)]
     pub(crate) fn query_dependencies(&self, node: &QueryNode) -> Vec<QueryNode> {
         self.table.query_dependencies(node)
+    }
+    pub(crate) fn retained_query_bytes(&self) -> usize {
+        #[cfg(test)]
+        if std::env::var_os("WILLOW_RETAIN_PROFILE").is_some_and(|v| v == "1") {
+            eprintln!(
+                "retained_payloads={:?} auxiliary_prepared={} auxiliary_derived={} auxiliary_effects={} auxiliary_symbols={} table={}",
+                self.table.retention_profile(),
+                self.prepared.heap_bytes(),
+                self.derived.heap_bytes(),
+                self.effects.heap_bytes(),
+                self.symbols.heap_bytes(),
+                self.table.retained_bytes()
+            );
+        }
+        self.table.retained_bytes()
+            + self.source_roots.heap_bytes()
+            + self.interface_dispatch.heap_bytes()
+            + self.dispatch_classes.heap_bytes()
+            + self.captured.heap_bytes()
+            + self.bodies.heap_bytes()
+            + self.prepared.heap_bytes()
+            + self.symbols.heap_bytes()
+            + self.effect_functions.heap_bytes()
+            + self.reference_wires.heap_bytes()
+            + self.reference_symbols.heap_bytes()
+            + self.reference_uses.heap_bytes()
+            + self.effects.heap_bytes()
+            + self.derived.heap_bytes()
+            + self.checked_roots.heap_bytes()
+            + self.token_pairs.heap_bytes()
+            + self.captured_nodes.heap_bytes()
+    }
+    pub(crate) fn verification_dump(&self) -> String {
+        self.table.verification_dump()
     }
     pub(crate) fn stats(&self) -> TrackedStats {
         self.table.stats()
@@ -582,7 +746,8 @@ impl SyntaxQueries {
                 self.table.advance_candidate()?;
                 self.advanced = true;
             }
-            self.table.capture_candidate(node, value);
+            self.table
+                .capture_candidate_with_durability(node, value, self.source_durability(path));
             self.captured.insert(path.to_owned(), captured);
         }
         let result = self
@@ -594,25 +759,21 @@ impl SyntaxQueries {
         )?;
         self.table
             .read(&self.provider(), QueryNode::SyntaxImports(path.to_owned()))?;
-        let values = result.get::<ParsedValue>().wire.as_array().unwrap();
+        let parsed = result.get::<ParsedValue>();
         if let Some(previous) = previous {
             let old: TokenInventory =
-                serde_json::from_value(previous.get::<ParsedValue>().wire[4].clone())?;
-            let new: TokenInventory = serde_json::from_value(values[4].clone())?;
+                serde_json::from_slice(&previous.get::<ParsedValue>().tokens)?;
+            let new: TokenInventory = serde_json::from_slice(&parsed.tokens)?;
             self.token_pairs.insert(path.to_owned(), (old, new));
         }
-        Ok((
-            serde_json::from_value(values[0].clone())?,
-            serde_json::from_value(values[1].clone())?,
-            values[2].as_bool().unwrap(),
-        ))
+        Ok(serde_json::from_slice(&parsed.wire)?)
     }
 }
 
 #[derive(Clone)]
 struct DerivedValue {
-    wire: Value,
-    canonical: Value,
+    wire: Vec<u8>,
+    canonical: Vec<u8>,
 }
 impl PartialEq for DerivedValue {
     fn eq(&self, other: &Self) -> bool {
@@ -622,8 +783,13 @@ impl PartialEq for DerivedValue {
 impl Eq for DerivedValue {}
 
 struct ParsedValue {
-    wire: Value,
-    canonical: Value,
+    wire: Vec<u8>,
+    canonical: Vec<u8>,
+    tokens: Vec<u8>,
+    declarations: CompactJson,
+    imports: CompactJson,
+    // Precomputed per-owner projections keep lookups independent of file size.
+    owners: HashMap<String, (CompactJson, CompactJson)>,
 }
 impl PartialEq for ParsedValue {
     fn eq(&self, other: &Self) -> bool {
@@ -639,7 +805,7 @@ struct BodyBinding {
     owner: String,
 }
 struct PreparedBody {
-    result: Value,
+    result: CompactJson,
     keys: Vec<String>,
     children: Vec<BodyId>,
 }
@@ -648,12 +814,12 @@ struct PreparedEffects {
     imported: Vec<(UnitId, FunctionId)>,
     inventory: HashMap<FunctionId, super::effects::CapturedEffect>,
     source_units: Vec<UnitId>,
-    metadata: Value,
+    metadata: CompactJson,
 }
 #[derive(Clone, PartialEq, Eq)]
 struct EffectInventoryValue {
     functions: HashMap<FunctionId, super::effects::CapturedEffect>,
-    metadata: Value,
+    metadata: CompactJson,
 }
 struct SyntaxProvider<'a> {
     interface_dispatch: &'a HashMap<UnitId, Vec<FunctionId>>,
@@ -663,9 +829,45 @@ struct SyntaxProvider<'a> {
     derived: &'a HashMap<QueryNode, DerivedValue>,
     checked_roots: &'a std::collections::HashSet<BodyId>,
 }
-fn value(value: Value) -> Result<QueryValue> {
-    let fingerprint = ResultFingerprint::bytes(&serde_json::to_vec(&value)?);
-    Ok(QueryValue::new(value, fingerprint))
+/// Immutable canonical JSON without the per-field allocation overhead of Value.
+/// Encoding happens once; equality and fingerprints compare the same bytes.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct CompactJson {
+    bytes: std::sync::Arc<[u8]>,
+}
+impl CompactJson {
+    fn new(value: &Value) -> Result<Self> {
+        Ok(Self::from_bytes(serde_json::to_vec(value)?))
+    }
+    fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: bytes.into(),
+        }
+    }
+    fn decode<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
+        Ok(serde_json::from_slice(&self.bytes)?)
+    }
+    fn pair(a: &Self, b: &Self) -> Self {
+        let mut bytes = Vec::with_capacity(a.bytes.len() + b.bytes.len() + 3);
+        bytes.push(b'[');
+        bytes.extend_from_slice(&a.bytes);
+        bytes.push(b',');
+        bytes.extend_from_slice(&b.bytes);
+        bytes.push(b']');
+        Self::from_bytes(bytes)
+    }
+    fn into_query(self) -> QueryValue {
+        let fingerprint = ResultFingerprint::bytes(&self.bytes);
+        QueryValue::new(self, fingerprint)
+    }
+}
+impl Retained for CompactJson {
+    fn heap_bytes(&self) -> usize {
+        2 * std::mem::size_of::<usize>() + self.bytes.len()
+    }
+}
+pub(crate) fn value(value: Value) -> Result<QueryValue> {
+    Ok(CompactJson::new(&value)?.into_query())
 }
 /// Exclude executable trees before semantic canonicalization, avoiding scans of
 /// bodies in every declaration projection. Initializers remain declarations:
@@ -731,7 +933,18 @@ impl QueryProvider for SyntaxProvider<'_> {
     }
     fn compute(&self, table: &TrackedQueryTable, node: &QueryNode) -> Result<QueryValue> {
         match node {
+            QueryNode::CompilerEnvironment => {
+                let compiler = table.input(&InputNode::CompilerStamp)?;
+                let stdlib = table.input(&InputNode::StdlibStamp)?;
+                let runtime = table.input(&InputNode::RuntimeAbiRevision)?;
+                value(serde_json::json!([
+                    compiler.get::<CompactJson>().decode::<Value>()?,
+                    stdlib.get::<CompactJson>().decode::<Value>()?,
+                    runtime.get::<CompactJson>().decode::<Value>()?
+                ]))
+            }
             QueryNode::Parse(path) => {
+                table.read(self, QueryNode::CompilerEnvironment)?;
                 let input = table.input(&InputNode::Source(path.clone()))?;
                 let source = input.get::<Source>();
                 let mut inventory = Vec::new();
@@ -765,42 +978,61 @@ impl QueryProvider for SyntaxProvider<'_> {
                             true,
                         ),
                     };
-                let mut parsed = serde_json::to_value((program, diagnostics, lexer_failed))?;
+                let parsed = serde_json::to_value((program, diagnostics, lexer_failed))?;
                 let mut index = serde_json::Map::new();
                 index_declarations(&parsed[0]["items"], "", &mut index);
-                parsed.as_array_mut().unwrap().push(Value::Object(index));
-                parsed
-                    .as_array_mut()
-                    .unwrap()
-                    .push(serde_json::to_value(inventory)?);
-                let canonical = super::syntax::without_ids(&parsed);
-                let fingerprint = ResultFingerprint::bytes(&serde_json::to_vec(&canonical)?);
+                let owners = index
+                    .into_iter()
+                    .map(|(owner, projection)| {
+                        Ok((
+                            owner,
+                            (
+                                CompactJson::new(&projection["signature"])?,
+                                CompactJson::new(&projection["body"])?,
+                            ),
+                        ))
+                    })
+                    .collect::<Result<_>>()?;
+                // The owner index is derived solely from the program, so it
+                // need not be duplicated in the semantic comparison payload.
+                let canonical =
+                    serde_json::to_vec(&(super::syntax::without_ids(&parsed), &inventory))?;
+                let fingerprint = ResultFingerprint::bytes(&canonical);
                 Ok(QueryValue::new(
                     ParsedValue {
-                        wire: parsed,
+                        wire: serde_json::to_vec(&parsed)?,
                         canonical,
+                        tokens: serde_json::to_vec(&inventory)?,
+                        declarations: CompactJson::new(&declarations(parsed[0]["items"].clone()))?,
+                        imports: CompactJson::new(&super::syntax::semantic(&parsed[0]["imports"]))?,
+                        owners,
                     },
                     fingerprint,
                 ))
             }
             QueryNode::SyntaxDeclarations(path) | QueryNode::SyntaxImports(path) => {
                 let parsed = table.read(self, QueryNode::Parse(path.clone()))?;
-                let program = &parsed.get::<ParsedValue>().wire[0];
+                let parsed = parsed.get::<ParsedValue>();
                 if matches!(node, QueryNode::SyntaxImports(_)) {
-                    value(super::syntax::semantic(&program["imports"]))
+                    Ok(parsed.imports.clone().into_query())
                 } else {
-                    value(declarations(program["items"].clone()))
+                    Ok(parsed.declarations.clone().into_query())
                 }
             }
             QueryNode::SyntaxSignature(path, owner) | QueryNode::BodySyntax(path, owner) => {
                 let parsed = table.read(self, QueryNode::Parse(path.clone()))?;
-                let entry = &parsed.get::<ParsedValue>().wire[3][owner];
-                let field = if matches!(node, QueryNode::BodySyntax(_, _)) {
-                    "body"
-                } else {
-                    "signature"
-                };
-                value(entry[field].clone())
+                match parsed.get::<ParsedValue>().owners.get(owner) {
+                    Some((signature, body)) => {
+                        Ok((if matches!(node, QueryNode::BodySyntax(_, _)) {
+                            body
+                        } else {
+                            signature
+                        })
+                        .clone()
+                        .into_query())
+                    }
+                    None => value(Value::Null),
+                }
             }
             QueryNode::NormalizedBody(_)
             | QueryNode::DirectEffects(_)
@@ -817,8 +1049,7 @@ impl QueryProvider for SyntaxProvider<'_> {
                 for dependency in dependencies.get::<Vec<QueryNode>>() {
                     table.read(self, dependency.clone())?;
                 }
-                let fingerprint =
-                    ResultFingerprint::bytes(&serde_json::to_vec(&prepared.canonical)?);
+                let fingerprint = ResultFingerprint::bytes(&prepared.canonical);
                 Ok(QueryValue::new(prepared.clone(), fingerprint))
             }
             QueryNode::EffectInventory(unit) => {
@@ -896,7 +1127,7 @@ impl QueryProvider for SyntaxProvider<'_> {
                         id.clone(),
                         table
                             .read(self, QueryNode::ResolvedReference(id.clone()))?
-                            .get::<Value>()
+                            .get::<CompactJson>()
                             .clone(),
                     ));
                 }
@@ -949,16 +1180,336 @@ impl QueryProvider for SyntaxProvider<'_> {
                 for child in &prepared.children {
                     table.read(self, QueryNode::TypedBody(*child))?;
                 }
-                value(serde_json::json!([syntax.get::<Value>(), prepared.result]))
+                Ok(CompactJson::pair(syntax.get::<CompactJson>(), &prepared.result).into_query())
             }
             _ => anyhow::bail!("unsupported syntax query {node:?}"),
         }
     }
 }
 
+impl Retained for Source {
+    fn heap_bytes(&self) -> usize {
+        self.text.heap_bytes()
+    }
+}
+impl Retained for BodyBinding {
+    fn heap_bytes(&self) -> usize {
+        self.path.heap_bytes() + self.owner.heap_bytes()
+    }
+}
+impl Retained for PreparedBody {
+    fn heap_bytes(&self) -> usize {
+        self.result.heap_bytes() + self.keys.heap_bytes() + self.children.heap_bytes()
+    }
+}
+impl Retained for PreparedEffects {
+    fn heap_bytes(&self) -> usize {
+        self.roots.heap_bytes()
+            + self.imported.heap_bytes()
+            + self.inventory.heap_bytes()
+            + self.source_units.heap_bytes()
+            + self.metadata.heap_bytes()
+    }
+}
+impl Retained for ParsedValue {
+    fn heap_bytes(&self) -> usize {
+        self.wire.capacity()
+            + self.canonical.capacity()
+            + self.tokens.capacity()
+            + self.declarations.heap_bytes()
+            + self.imports.heap_bytes()
+            + self.owners.heap_bytes()
+    }
+}
+impl Retained for DerivedValue {
+    fn heap_bytes(&self) -> usize {
+        self.wire.capacity() + self.canonical.capacity()
+    }
+}
+impl Retained for EffectInventoryValue {
+    fn heap_bytes(&self) -> usize {
+        self.functions.heap_bytes() + self.metadata.heap_bytes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn finish_prunes_inventory_for_units_absent_from_candidate() {
+        let mut queries = SyntaxQueries::default();
+        queries
+            .dispatch_classes
+            .insert(UnitId::ENTRY, ["Removed".into()].into());
+        queries.interface_dispatch.insert(UnitId::ENTRY, vec![]);
+        queries.effect_functions.insert(UnitId::ENTRY, vec![]);
+        let mut candidate = queries.candidate().unwrap();
+        candidate.finish().unwrap();
+        assert!(candidate.dispatch_classes.is_empty());
+        assert!(candidate.interface_dispatch.is_empty());
+        assert!(candidate.effect_functions.is_empty());
+        assert_eq!(candidate.dispatch_classes.capacity(), 0);
+        assert_eq!(candidate.interface_dispatch.capacity(), 0);
+        assert_eq!(candidate.effect_functions.capacity(), 0);
+        // Finishing an unaccepted candidate must not mutate accepted inventory.
+        assert_eq!(queries.dispatch_classes.len(), 1);
+        assert_eq!(queries.interface_dispatch.len(), 1);
+        assert_eq!(queries.effect_functions.len(), 1);
+    }
+    #[test]
+    fn finish_releases_preparation_and_preserves_late_query_reads() {
+        let path = Path::new("main.wi");
+        let mut queries = SyntaxQueries::default().candidate().unwrap();
+        queries.parse(path, FileId::ENTRY, "fn main() {}").unwrap();
+        let body = BodyId::fresh();
+        queries.register_body(UnitId::ENTRY, body, path, "Function:main");
+        queries
+            .publish_body(
+                UnitId::ENTRY,
+                body,
+                serde_json::json!({"typed": true}),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        let node = QueryNode::NormalizedBody(body);
+        let wire = serde_json::json!({"body": [], "metadata": "retained"});
+        let dependencies = vec![QueryNode::TypedBody(body)];
+        queries
+            .publish_derived(node.clone(), wire.clone(), dependencies.clone())
+            .unwrap();
+        let before = queries.retained_query_bytes();
+        queries.finish().unwrap();
+        assert!(
+            queries.prepared.is_empty()
+                && queries.derived.is_empty()
+                && queries.effects.is_empty()
+                && queries.symbols.is_empty()
+        );
+        assert!(queries.retained_query_bytes() < before);
+        let stats = queries.stats();
+        assert_eq!(
+            queries
+                .validate_derived(node.clone(), dependencies)
+                .unwrap(),
+            Some(wire)
+        );
+        assert_eq!(queries.stats().recomputed, stats.recomputed);
+        let late = QueryNode::LirBody(body);
+        queries
+            .publish_derived(
+                late.clone(),
+                serde_json::json!(["late"]),
+                vec![node.clone()],
+            )
+            .unwrap();
+        assert_eq!(
+            queries.validate_derived(late, vec![node]).unwrap(),
+            Some(serde_json::json!(["late"]))
+        );
+    }
+    #[test]
+    fn compact_parse_preserves_artifact_deserialization_depth() {
+        let mut accepted = 0;
+        for depth in 1..80 {
+            let source = format!(
+                "fn f(x: {}i64{}) {{}}",
+                "Array<".repeat(depth),
+                ">".repeat(depth)
+            );
+            let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+            let (program, diagnostics) = crate::parser::Parser::new(tokens).parse();
+            assert!(diagnostics.is_empty());
+            let wire = serde_json::to_vec(&program).unwrap();
+            if serde_json::from_slice::<Program>(&wire).is_err() {
+                continue;
+            }
+            accepted += 1;
+            let mut queries = SyntaxQueries::default().candidate().unwrap();
+            queries
+                .parse(Path::new("nested.wi"), FileId::ENTRY, &source)
+                .unwrap_or_else(|error| panic!("depth={depth}: {error}"));
+        }
+        assert!(accepted > 10);
+    }
+    #[test]
+    fn compact_json_roundtrips_and_pairs_without_reparsing() {
+        let cases = [
+            Value::Null,
+            serde_json::json!(true),
+            serde_json::json!(1),
+            serde_json::json!(1.5),
+            serde_json::json!("quote\"\\\n日本語"),
+            serde_json::json!([1, false, null, {"nested": ["x", "y"]}]),
+            serde_json::json!({"b": 2, "a": 1}),
+        ];
+        for a in &cases {
+            let encoded = CompactJson::new(a).unwrap();
+            assert_eq!(encoded.decode::<Value>().unwrap(), *a);
+            for b in &cases {
+                let pair = CompactJson::pair(&encoded, &CompactJson::new(b).unwrap());
+                assert_eq!(pair.decode::<Value>().unwrap(), serde_json::json!([a, b]));
+                assert_eq!(
+                    pair.bytes.len(),
+                    encoded.bytes.len() + serde_json::to_vec(b).unwrap().len() + 3
+                );
+            }
+        }
+    }
+    #[test]
+    fn compact_parse_storage_and_projection_work_scale_with_owners() {
+        let mut previous = None;
+        for count in [16, 64, 256] {
+            let mut queries = SyntaxQueries::default().candidate().unwrap();
+            let source: String = (0..count)
+                .map(|i| format!("fn function_{i}() -> i64 {{ return {i}; }}\n"))
+                .collect();
+            let path = Path::new("compact.wi");
+            queries.parse(path, FileId::ENTRY, &source).unwrap();
+            let result = queries.table.peek(&QueryNode::Parse(path.into())).unwrap();
+            let parsed = result.get::<ParsedValue>();
+            assert_eq!(parsed.owners.len(), count);
+            let bytes = parsed.retained_bytes();
+            // Bounded serialized storage per generated owner, including tokens,
+            // diagnostics and the separately indexed body/signature projections.
+            assert!(bytes < 16_384 * count);
+            if let Some(old) = previous {
+                assert!(bytes < old * 5);
+            }
+            previous = Some(bytes);
+            let before = queries.stats();
+            for i in 0..count {
+                queries
+                    .body_syntax(path, &format!("Function:function_{i}"))
+                    .unwrap();
+                queries
+                    .signature(path, &format!("Function:function_{i}"))
+                    .unwrap();
+            }
+            assert_eq!(queries.stats().recomputed - before.recomputed, 2 * count);
+            assert_eq!(
+                queries.stats().dependency_reads - before.dependency_reads,
+                2 * count
+            );
+            let projection = queries
+                .table
+                .peek(&QueryNode::BodySyntax(
+                    path.into(),
+                    "Function:function_0".into(),
+                ))
+                .unwrap();
+            assert!(
+                std::sync::Arc::ptr_eq(
+                    &parsed.owners["Function:function_0"].1.bytes,
+                    &projection.get::<CompactJson>().bytes,
+                ),
+                "publishing a projection must share its encoded payload"
+            );
+            println!(
+                "compact_parse owners={count} retained_bytes={bytes} projection_reads={}",
+                2 * count
+            );
+        }
+    }
+    #[test]
+    fn retained_accounting_includes_auxiliary_payload_capacity() {
+        let mut queries = SyntaxQueries::default();
+        let empty = queries.retained_query_bytes();
+        let mut source = String::with_capacity(65_536);
+        source.push_str("fn main() {}");
+        queries.captured.insert(
+            PathBuf::from("main.wi"),
+            Source {
+                file: FileId::ENTRY,
+                text: source,
+            },
+        );
+        assert!(queries.retained_query_bytes() >= empty + 65_536);
+        let captured = queries.retained_query_bytes();
+        queries.prepared.insert(
+            BodyId::fresh(),
+            PreparedBody {
+                result: CompactJson::new(&Value::String("x".repeat(32_768))).unwrap(),
+                keys: Vec::with_capacity(128),
+                children: Vec::new(),
+            },
+        );
+        assert!(
+            queries.retained_query_bytes()
+                >= captured + 32_768 + 128 * std::mem::size_of::<String>()
+        );
+    }
+    #[test]
+    fn immutable_package_durability_requires_git_revision_and_checksum() {
+        use super::super::tracked::Durability;
+        use crate::package::{
+            PackageGraph, PackageId, PackageIdentity, PackageSourceIdentity, ResolvedPackage,
+        };
+        for git in [false, true] {
+            for revision in [false, true] {
+                for checksum in [false, true] {
+                    let root = PathBuf::from("dependencies/pkg");
+                    let package = ResolvedPackage {
+                        id: PackageId(0),
+                        root: root.clone(),
+                        dependencies: vec![],
+                        checksum: checksum.then(|| "checksum".into()),
+                        identity: PackageIdentity {
+                            name: "pkg".into(),
+                            version: "1.0.0".into(),
+                            source: if git {
+                                PackageSourceIdentity::Git {
+                                    url: "https://example.invalid/pkg".into(),
+                                }
+                            } else {
+                                PackageSourceIdentity::Path { path: root.clone() }
+                            },
+                            revision: revision.then(|| "revision".into()),
+                        },
+                    };
+                    let graph = PackageGraph {
+                        root: PackageId(0),
+                        packages: vec![package],
+                        stats: Default::default(),
+                    };
+                    let mut queries = SyntaxQueries::default();
+                    queries.configure_sources(Some(&graph));
+                    assert_eq!(
+                        queries.source_durability(&root.join("module.wi")),
+                        if git && revision && checksum {
+                            Durability::High
+                        } else {
+                            Durability::Low
+                        }
+                    );
+                    assert_eq!(
+                        queries.source_durability(Path::new("main.wi")),
+                        Durability::Low
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn compiler_environment_is_high_and_skips_edges_after_source_edit() {
+        let mut queries = SyntaxQueries::default().candidate().unwrap();
+        queries
+            .parse(
+                Path::new("main.wi"),
+                FileId::ENTRY,
+                "fn main() { println(1); }",
+            )
+            .unwrap();
+        let mut next = queries.candidate().unwrap();
+        next.parse(
+            Path::new("main.wi"),
+            FileId::ENTRY,
+            "fn main() { println(2); }",
+        )
+        .unwrap();
+        assert!(next.stats().durability_shortcuts > 0);
+        assert_eq!(next.recomputations(&QueryNode::CompilerEnvironment), 0);
+    }
     #[test]
     fn review_reference_locations_refresh_without_semantic_recomputation() {
         use super::super::references::{SymbolId, SymbolUseId};
@@ -1042,8 +1593,10 @@ mod tests {
             signature
                 .read_visible_scope(UnitId::ENTRY, path)
                 .unwrap()
-                .get::<Value>(),
-            &scope
+                .get::<CompactJson>()
+                .decode::<Value>()
+                .unwrap(),
+            scope
         );
     }
 
@@ -1135,7 +1688,7 @@ mod tests {
         assert_eq!(next.stats().recomputed, 3);
         assert_eq!(next.stats().changed, 1);
         assert_eq!(next.stats().green_after_recompute, 2);
-        assert_eq!(next.stats().dependency_edges_visited, 3);
+        assert_eq!(next.stats().dependency_edges_visited, 4);
     }
     #[test]
     fn per_owner_projections_have_linear_edge_visits() {
@@ -1166,7 +1719,7 @@ mod tests {
                 let after = next.body_syntax(path, &format!("Function:f{i}")).unwrap();
                 assert_eq!(before == after, i != 0);
             }
-            assert_eq!(next.stats().dependency_edges_visited, 3 + 2 * count);
+            assert_eq!(next.stats().dependency_edges_visited, 4 + 2 * count);
             assert_eq!(next.stats().changed, 2); // parse and edited body projection
             assert_eq!(next.stats().green_after_recompute, 1 + 2 * count);
         }
@@ -1332,9 +1885,9 @@ mod tests {
                 }
                 assert_eq!(demands, if aggregate { count } else { 1 });
                 let expected_visits = if aggregate {
-                    5 * count + 2
+                    5 * count + 3
                 } else {
-                    6 * count + 1
+                    6 * count + 2
                 };
                 assert_eq!(next.stats().dependency_edges_visited, expected_visits);
                 println!(

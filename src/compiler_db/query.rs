@@ -19,6 +19,14 @@ pub struct QueryStats {
     /// Successful [`QueryTable::ready`] reads: reuse of a completed result by
     /// a frozen reader, which records neither a call nor a hit.
     pub frozen_reads: usize,
+    pub validations: usize,
+    pub green_validations: usize,
+    pub recomputations: usize,
+    pub green_after_recompute: usize,
+    pub changed_results: usize,
+    pub dependency_reads: usize,
+    pub dependency_edges: usize,
+    pub durability_shortcuts: usize,
 }
 
 pub struct QueryTable<K, V> {
@@ -240,6 +248,7 @@ mod tests {
                 compute_ns: 0,
                 max_depth: 1,
                 frozen_reads: 0,
+                ..Default::default()
             }
         );
     }

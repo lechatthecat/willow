@@ -2,7 +2,7 @@
 //! are rebuilt; unchanged parsed syntax preserves its identities.
 use super::*;
 use crate::{CompilerSession, Frontend, ai, diagnostics, module};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 /// One accepted frontend, replaced only after analysis succeeds. Dropping this
 /// value releases its query tables and temporary artifact pack.
@@ -11,12 +11,12 @@ pub struct AnalysisRevision {
     frontend: Option<Frontend>,
     tracked: tracked::TrackedQueryTable,
     syntax: std::rc::Rc<std::cell::RefCell<incremental::SyntaxQueries>>,
+    pub incremental_stats: serde_json::Value,
     pub typechecks: usize,
     pub reused_bodies: usize,
     pub retained_artifact_bytes: u64,
     pub input_visits: usize,
     pub invalidation_visits: usize,
-    pub fine_allowed_module_refused: usize,
     pub signature_edges: usize,
     pub distinct_signatures: usize,
 }
@@ -37,6 +37,20 @@ impl AnalysisRevision {
         artifact_limit: u64,
     ) -> Result<ai::Snapshot> {
         use anyhow::Context;
+        let verify = std::env::var_os("WILLOW_INCREMENTAL_VERIFY").is_some_and(|v| v == "1");
+        let cold_session = verify.then(|| {
+            CompilerSession::new(
+                session.src,
+                session.out,
+                &session.opts,
+                session.project_root.clone(),
+            )
+        });
+        let mut observed = Vec::new();
+        let mut recording = VerificationEmitter {
+            downstream: Some(emitter),
+            observed: verify.then_some(&mut observed),
+        };
         let _query_stats = crate::query_stats::Session::enter();
         let _node_ids = crate::parser::ast::NodeIdSession::enter();
         let captured::FileInput { path, source } =
@@ -53,13 +67,21 @@ impl AnalysisRevision {
             .matches_inputs(&accepted)
             .then_some(self.frontend.as_ref())
             .flatten();
-        let syntax = std::rc::Rc::new(std::cell::RefCell::new(self.syntax.borrow().candidate()?));
+        let syntax = if previous.is_some() {
+            self.syntax.borrow().candidate()?
+        } else {
+            incremental::SyntaxQueries::default().candidate()?
+        };
+        let syntax = std::rc::Rc::new(std::cell::RefCell::new(syntax));
+        syntax
+            .borrow_mut()
+            .configure_sources(inputs.package_graph.as_deref());
         let frontend = crate::run_frontend_revision(
             &source,
             root,
             &map,
             inputs,
-            emitter,
+            &mut recording,
             previous,
             Some(std::rc::Rc::clone(&syntax)),
         )?;
@@ -76,6 +98,25 @@ impl AnalysisRevision {
         );
         let snapshot = ai::snapshot(&frontend, &path, &source, session.project_root.as_deref())?;
         ai::check_size(&snapshot)?;
+        if let Some(cold_session) = cold_session {
+            let mut cold_diagnostics = Vec::new();
+            let cold = cold_session
+                .analysis_with_emitter(&mut VerificationEmitter {
+                    downstream: None,
+                    observed: Some(&mut cold_diagnostics),
+                })
+                .with_context(|| format!(
+                    "E0800: incremental verification mismatch: warm analysis succeeded but cold analysis failed; query graph={}",
+                    syntax.borrow().verification_dump()
+                ))?;
+            let warm_value = serde_json::to_value(&snapshot)?;
+            let cold_value = serde_json::to_value(&cold)?;
+            anyhow::ensure!(
+                warm_value == cold_value && observed == cold_diagnostics,
+                "E0800: incremental verification mismatch; warm={warm_value}; cold={cold_value}; query graph={}",
+                syntax.borrow().verification_dump()
+            );
+        }
         accepted.push((
             tracked::InputNode::Source(path.clone()),
             captured::bytes(source.as_bytes().to_vec()),
@@ -93,14 +134,34 @@ impl AnalysisRevision {
                 captured::bytes(artifacts.source(module.id.file_id())?.into_bytes()),
             ));
         }
-        syntax.borrow_mut().finish()?;
+        let (nodes, edges) = syntax.borrow_mut().finish()?;
+        let retained_query_bytes = syntax.borrow().retained_query_bytes();
+        anyhow::ensure!(
+            retained_query_bytes <= 512 * 1024 * 1024,
+            "revision query bytes exceed 512 MiB: accounted {retained_query_bytes} bytes"
+        );
+        let stats = syntax.borrow().stats();
+        let incremental_stats = serde_json::json!({
+            "inputs_changed": stats.inputs_changed,
+            "queries_validated": stats.validated,
+            "queries_recomputed": stats.recomputed,
+            "queries_green_after_recompute": stats.green_after_recompute,
+            "queries_changed": stats.changed,
+            "dependency_edges_visited": stats.dependency_edges_visited,
+            "durability_shortcuts": stats.durability_shortcuts,
+            "green_validations": stats.green_validations,
+            "dependency_reads": stats.dependency_reads,
+            "retained_query_bytes": retained_query_bytes,
+            "query_nodes": nodes,
+            "dependency_edges": edges,
+        });
         self.tracked.replace_inputs(accepted)?;
+        self.incremental_stats = incremental_stats;
         self.syntax = syntax;
         self.retained_artifact_bytes = retained;
         (self.input_visits, self.invalidation_visits) = frontend.db.revision_work.get();
         self.typechecks = frontend.db.typed_bodies.typechecks();
         self.reused_bodies = frontend.db.typed_bodies.reused();
-        self.fine_allowed_module_refused = frontend.db.typed_bodies.fine_allowed_module_refused();
         self.signature_edges = frontend.db.typed_bodies.signature_edge_count();
         self.distinct_signatures = frontend.db.typed_bodies.distinct_signature_count();
         self.frontend = Some(frontend);
@@ -108,72 +169,24 @@ impl AnalysisRevision {
     }
 }
 
-/// Module-granularity invalidation. All reverse edges are visited at most once;
-/// any source change invalidates its consumers, including signature, type,
-/// default-body and effect changes. A topology change starts a cold generation
-/// because FileId is a resolver-local identity.
-pub(crate) fn reusable_units(
-    previous: &Frontend,
-    modules: &[module::ResolvedModule],
-    artifacts: &UnitArtifacts,
-    db: &CompilerDb,
-) -> HashSet<UnitId> {
-    let old_modules = &previous.module_graph.files;
-    if old_modules.len() != modules.len()
-        || old_modules
-            .iter()
-            .zip(modules)
-            .any(|(a, b)| a.id != b.id || a.path != b.path || a.symbol_module != b.symbol_module)
-    {
-        return HashSet::new();
-    }
-    let old = previous
-        .module_graph
-        .artifacts
-        .as_ref()
-        .expect("revision artifacts");
-    let mut invalid = HashSet::new();
-    let mut units = HashSet::new();
-    for unit in modules
-        .iter()
-        .map(|m| m.id)
-        .chain(std::iter::once(UnitId::ENTRY))
-    {
-        units.insert(unit);
-        let file = unit.file_id();
-        match (artifacts.parsed.get(&file), old.parsed.get(&file)) {
-            (Some((fingerprint, _)), Some((old, _))) if fingerprint == old => {}
-            _ => {
-                invalid.insert(unit);
-            }
+struct VerificationEmitter<'a> {
+    downstream: Option<&'a mut dyn diagnostics::DiagnosticEmitter>,
+    observed: Option<&'a mut Vec<serde_json::Value>>,
+}
+impl diagnostics::DiagnosticEmitter for VerificationEmitter<'_> {
+    fn emit(
+        &mut self,
+        diagnostic: &diagnostics::Diagnostic,
+        sources: &dyn diagnostics::source_map::SourceLookup,
+    ) -> std::io::Result<()> {
+        if let Some(observed) = &mut self.observed {
+            observed.push(serde_json::to_value(diagnostic)?);
         }
-    }
-    let mut reverse: HashMap<UnitId, Vec<UnitId>> = HashMap::new();
-    for (consumer, edges) in db.dependencies().edges.iter().enumerate() {
-        for &dependency in edges {
-            reverse
-                .entry(modules[dependency].id)
-                .or_default()
-                .push(modules[consumer].id);
+        if let Some(downstream) = &mut self.downstream {
+            downstream.emit(diagnostic, sources)?;
         }
+        Ok(())
     }
-    // Entry registration observes all loaded module declarations.
-    for module in modules {
-        reverse.entry(module.id).or_default().push(UnitId::ENTRY);
-    }
-    let mut visits = 0;
-    let mut pending: VecDeque<_> = invalid.iter().copied().collect();
-    while let Some(unit) = pending.pop_front() {
-        for &consumer in reverse.get(&unit).into_iter().flatten() {
-            visits += 1;
-            if invalid.insert(consumer) {
-                pending.push_back(consumer);
-            }
-        }
-    }
-    db.revision_work.set((units.len(), visits));
-    units.retain(|unit| !invalid.contains(unit));
-    units
 }
 
 /// Candidate discovery is separate from semantic validation. A retained body
@@ -183,7 +196,6 @@ pub(crate) fn candidate_bodies(
     modules: &[module::ResolvedModule],
     artifacts: &UnitArtifacts,
     db: &CompilerDb,
-    module_gate: &HashSet<UnitId>,
 ) -> HashSet<crate::parser::ast::BodyId> {
     let old = &previous.module_graph.files;
     if old.len() != modules.len()
@@ -194,11 +206,31 @@ pub(crate) fn candidate_bodies(
     {
         return HashSet::new();
     }
+    // Source identity discovers possible artifacts; only tracked query
+    // validation decides whether a discovered body is reusable. No reverse
+    // dependency walk is needed for an input mutation.
+    let old_artifacts = previous
+        .module_graph
+        .artifacts
+        .as_ref()
+        .expect("revision artifacts");
+    let unchanged_units: HashSet<_> = modules
+        .iter()
+        .map(|m| m.id)
+        .chain(std::iter::once(UnitId::ENTRY))
+        .filter(|unit| {
+            matches!(
+                (artifacts.parsed.get(&unit.file_id()), old_artifacts.parsed.get(&unit.file_id())),
+                (Some((a, _)), Some((b, _))) if a == b
+            )
+        })
+        .collect();
+    db.revision_work.set((modules.len() + 1, 0));
     let index = db.bodies();
     let mut result: HashSet<_> = index
         .entries()
         .filter_map(|(id, unit)| {
-            (module_gate.contains(&unit)
+            (unchanged_units.contains(&unit)
                 || artifacts
                     .correspondence
                     .unchanged
@@ -807,17 +839,13 @@ mod tests {
                 assert_eq!(warm.typechecks, expected);
                 assert_eq!(warm.reused_bodies, count + 3 - expected);
                 if step != 0 {
-                    // All functions share the edited unit: this measures the
-                    // typed-body family's explicit coarse-gate relaxation.
-                    assert_eq!(warm.fine_allowed_module_refused, warm.reused_bodies);
                     println!(
-                        "ai_edit_loop unrelated={count} step={step} typechecks={} reused={} signature_edges={} distinct_signatures={} edge_visits={} coarse_refused={}",
+                        "ai_edit_loop unrelated={count} step={step} typechecks={} reused={} signature_edges={} distinct_signatures={} edge_visits={}",
                         warm.typechecks,
                         warm.reused_bodies,
                         warm.signature_edges,
                         warm.distinct_signatures,
                         warm.syntax.borrow().stats().dependency_edges_visited,
-                        warm.fine_allowed_module_refused,
                     );
                 }
             }
@@ -1002,7 +1030,7 @@ mod tests {
             assert!(f.compare(&mut warm));
             assert_eq!((warm.typechecks, warm.reused_bodies), (1, n));
             assert_eq!(warm.input_visits, n + 1);
-            assert_eq!(warm.invalidation_visits, 1);
+            assert_eq!(warm.invalidation_visits, 0);
             println!(
                 "revision modules={n} rechecked={} reused={} retained_bytes={}",
                 warm.typechecks, warm.reused_bodies, warm.retained_artifact_bytes
@@ -1062,7 +1090,7 @@ mod tests {
                 assert!(f.compare(&mut warm));
                 assert_eq!((warm.typechecks, warm.reused_bodies), (1, n + 1));
                 assert_eq!(warm.input_visits, n + 2);
-                assert_eq!(warm.invalidation_visits, 2 * n - 1);
+                assert_eq!(warm.invalidation_visits, 0);
                 println!(
                     "revision shape={} modules={n} invalidation_edges={} rechecked={} reused={}",
                     if chain { "chain" } else { "fanout" },
@@ -1145,6 +1173,111 @@ mod tests {
         assert!(other.compare(&mut warm));
         assert_eq!(warm.typechecks, 1);
     }
+    #[test]
+    #[ignore = "10k-function productionization measurement; run explicitly"]
+    fn revision_ten_thousand_functions_fit_query_budget() {
+        for shape in ["fanout", "chain", "diamond"] {
+            let f = Fixture::new();
+            let mut main = String::new();
+            for module in 0..100 {
+                main.push_str(&format!("import m{module};\n"));
+                let targets: Vec<usize> = match shape {
+                    "fanout" if module < 99 => vec![99],
+                    "chain" if module < 99 => vec![module + 1],
+                    "diamond" => {
+                        let mut targets: Vec<_> = [2 * module + 1, 2 * module + 2]
+                            .into_iter()
+                            .filter(|&t| t < 100)
+                            .collect();
+                        if targets.is_empty() && module < 99 {
+                            targets.push(99);
+                        }
+                        targets
+                    }
+                    _ => vec![],
+                };
+                let mut source: String = targets
+                    .iter()
+                    .map(|target| format!("import m{target};\n"))
+                    .collect();
+                for function in 0..100 {
+                    let body = if targets.is_empty() {
+                        "1".into()
+                    } else {
+                        targets
+                            .iter()
+                            .map(|target| format!("m{target}::function_{function}()"))
+                            .collect::<Vec<_>>()
+                            .join(" + ")
+                    };
+                    source.push_str(&format!(
+                        "pub fn function_{function}() -> i64 {{ return {body}; }}\n"
+                    ));
+                }
+                f.write(&format!("m{module}.wi"), &source);
+            }
+            main.push_str("fn main() { println(m0::function_0()); }");
+            f.write("main.wi", &main);
+            let path = f.0.join("main.wi");
+            let options = crate::CompilerOptions::debug();
+            let mut revision = AnalysisRevision::default();
+            for step in 0..2 {
+                if step == 1 {
+                    let path = f.0.join("m99.wi");
+                    let source = std::fs::read_to_string(&path).unwrap().replacen(
+                        "return 1;",
+                        "return 2;",
+                        1,
+                    );
+                    std::fs::write(path, source).unwrap();
+                }
+                revision
+                    .analyze(
+                        CompilerSession::new(path.to_str().unwrap(), "", &options, None),
+                        &mut Diagnostics::default(),
+                    )
+                    .unwrap();
+                println!(
+                    "ten_thousand shape={shape} step={step} typechecks={} stats={}",
+                    revision.typechecks, revision.incremental_stats
+                );
+                assert_eq!(revision.typechecks, if step == 0 { 10_001 } else { 1 });
+            }
+        }
+    }
+    #[test]
+    fn revision_long_edit_session_keeps_graph_and_artifacts_bounded() {
+        let f = Fixture::new();
+        let mut warm = AnalysisRevision::default();
+        let mut peak_nodes = 0;
+        let mut peak_edges = 0;
+        let mut peak_artifacts = 0;
+        let mut peak_query_bytes = 0;
+        for step in 0..200 {
+            f.write("main.wi", &format!("fn renamed_{step}() -> i64 {{ return {step}; }} fn main() {{ println(renamed_{step}()); }}"));
+            assert!(f.compare(&mut warm));
+            let nodes = warm.incremental_stats["query_nodes"].as_u64().unwrap();
+            let edges = warm.incremental_stats["dependency_edges"].as_u64().unwrap();
+            peak_nodes = peak_nodes.max(nodes);
+            peak_edges = peak_edges.max(edges);
+            peak_artifacts = peak_artifacts.max(warm.retained_artifact_bytes);
+            let query_bytes = warm.incremental_stats["retained_query_bytes"]
+                .as_u64()
+                .unwrap();
+            peak_query_bytes = peak_query_bytes.max(query_bytes);
+            assert!(nodes < 100, "edit {step}: {nodes} nodes");
+            assert!(edges < 300, "edit {step}: {edges} edges");
+            assert!(warm.retained_artifact_bytes < 100_000);
+            assert!(
+                query_bytes < 2_000_000,
+                "edit {step}: {query_bytes} query bytes"
+            );
+        }
+        println!(
+            "edits=200 peak_nodes={peak_nodes} peak_edges={peak_edges} peak_artifact_bytes={peak_artifacts} peak_query_bytes={peak_query_bytes}"
+        );
+    }
+
     #[test]
     fn revision_artifact_limit_rejects_candidate_without_losing_previous() {
         let f = Fixture::new();

@@ -95,8 +95,13 @@ impl QueryProvider for DispatchProvider {
             },
         )?;
         let value = serde_json::to_value(targets)?;
-        let fingerprint = ResultFingerprint::bytes(&serde_json::to_vec(&value)?);
-        Ok(QueryValue::new(value, fingerprint))
+        super::incremental::value(value)
+    }
+}
+
+impl super::retained::Retained for DispatchDeclaration {
+    fn heap_bytes(&self) -> usize {
+        self.base.heap_bytes() + self.methods.heap_bytes()
     }
 }
 

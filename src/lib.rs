@@ -663,17 +663,9 @@ fn run_frontend_revision(
         db.typed_bodies.configure_tracking(queries, owners);
     }
     if let Some(previous) = previous {
-        let reusable =
-            compiler_db::revision::reusable_units(previous, &graph.files, &artifacts, &db);
         db.effects.reuse_from(&previous.db.effects);
-        let candidates = compiler_db::revision::candidate_bodies(
-            previous,
-            &graph.files,
-            &artifacts,
-            &db,
-            &reusable,
-        );
-        db.typed_bodies.set_module_gate(reusable);
+        let candidates =
+            compiler_db::revision::candidate_bodies(previous, &graph.files, &artifacts, &db);
         db.typed_bodies.reuse_body_candidates(
             &previous.db.typed_bodies,
             &candidates,

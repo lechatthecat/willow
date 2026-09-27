@@ -1719,3 +1719,22 @@ pub(crate) struct EffectInputs {
     pub(crate) direct_sites: Vec<LockEffectCause>,
     pub(crate) sites: Vec<LockEffectCallsite>,
 }
+
+impl super::retained::Retained for EffectCapabilities {
+    fn heap_bytes(&self) -> usize {
+        0
+    }
+}
+impl super::retained::Retained for EffectEvidence {
+    fn heap_bytes(&self) -> usize {
+        // Canonical evidence contains the same owned witness strings. Charge
+        // it twice plus the maximum B-tree storage for all runtime effect bits.
+        2 * self.canonical.heap_bytes()
+            + RuntimeEffects::BIT_COUNT as usize * (std::mem::size_of::<EffectWitness>() + 64) * 2
+    }
+}
+impl super::retained::Retained for CapturedEffect {
+    fn heap_bytes(&self) -> usize {
+        self.evidence.heap_bytes()
+    }
+}

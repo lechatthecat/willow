@@ -99,8 +99,7 @@ pub(crate) struct BodyQueries {
         HashMap<crate::module::UnitId, std::sync::Arc<crate::semantic::call_graph::ClassHierarchy>>,
     >,
     correspondence: std::cell::RefCell<super::syntax::Correspondence>,
-    module_gate: std::cell::RefCell<HashSet<crate::module::UnitId>>,
-    fine_allowed_module_refused: std::cell::Cell<usize>,
+    coordinates_changed: std::cell::Cell<bool>,
     candidates: std::cell::RefCell<HashMap<BodyId, ReuseCandidate>>,
     signatures: std::cell::RefCell<HashMap<SignatureKey, Rc<serde_json::Value>>>,
     dependencies: std::cell::RefCell<
@@ -231,12 +230,7 @@ impl BodyQueries {
         }
         Ok(())
     }
-    pub(crate) fn set_module_gate(&self, units: HashSet<crate::module::UnitId>) {
-        *self.module_gate.borrow_mut() = units;
-    }
-    pub(crate) fn fine_allowed_module_refused(&self) -> usize {
-        self.fine_allowed_module_refused.get()
-    }
+
     pub(crate) fn signature_edge_count(&self) -> usize {
         self.dependencies.borrow().values().map(Vec::len).sum()
     }
@@ -325,6 +319,8 @@ impl BodyQueries {
         correspondence: &super::syntax::Correspondence,
     ) -> Result<()> {
         self.correspondence.borrow_mut().spans = correspondence.spans.clone();
+        let coordinates_changed = correspondence.spans.iter().any(|(old, new)| old != new);
+        self.coordinates_changed.set(coordinates_changed);
         let mut copied = HashMap::new();
         for &id in bodies {
             if self.typed.is_ready(&id) {
@@ -356,8 +352,13 @@ impl BodyQueries {
             let target = match copied.entry(*record) {
                 std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    let body: TypedBody = previous.store.read(*record)?;
-                    *entry.insert(self.store.write(&correspondence.remap(&body)?)?)
+                    let target = if coordinates_changed {
+                        let body: TypedBody = previous.store.read(*record)?;
+                        self.store.write(&correspondence.remap(&body)?)?
+                    } else {
+                        self.store.copy_record(&previous.store, *record)?
+                    };
+                    *entry.insert(target)
                 }
             };
             self.dependencies.borrow_mut().insert(id, reads);
@@ -547,14 +548,6 @@ impl BodyQueries {
     fn mark_reused(&self, id: BodyId) {
         if self.seeded.borrow_mut().remove(&id) {
             self.reused.set(self.reused.get() + 1);
-            if self
-                .index
-                .owner(id)
-                .is_some_and(|(unit, _)| !self.module_gate.borrow().contains(&unit))
-            {
-                self.fine_allowed_module_refused
-                    .set(self.fine_allowed_module_refused.get() + 1);
-            }
         }
     }
     pub(crate) fn typechecks(&self) -> usize {
@@ -579,8 +572,7 @@ impl BodyQueries {
             tracking: Default::default(),
             dispatch: Default::default(),
             correspondence: Default::default(),
-            module_gate: Default::default(),
-            fine_allowed_module_refused: Default::default(),
+            coordinates_changed: Default::default(),
             candidates: Default::default(),
             signatures: Default::default(),
             dependencies: Default::default(),
@@ -617,6 +609,9 @@ impl BodyQueries {
             .validate_derived(node.clone(), deps.clone())?;
         if let Some(value) = cached {
             let result: V = serde_json::from_value(value)?;
+            if !self.coordinates_changed.get() {
+                return Ok(result);
+            }
             let result = self.correspondence.borrow().remap(&result)?;
             syntax
                 .borrow_mut()
