@@ -8,8 +8,6 @@ A statically typed, garbage-collected native programming language with its own r
 
 Willow is an experimental programming language that compiles to native code through [Cranelift](https://cranelift.dev/).
 
-It combines class-based object-oriented programming with algebraic enums, pattern matching, `Option`, `Result`, closures, and stackless `async` / `await`.
-
 ## How to start
 
 A Rust toolchain is currently required to build Willow from source.
