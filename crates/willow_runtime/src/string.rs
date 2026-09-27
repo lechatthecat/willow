@@ -25,6 +25,16 @@ fn string_payload_size(len: usize) -> Option<i64> {
     i64::try_from(size).ok()
 }
 
+/// UTF-8 byte length excluding the NUL terminator. No allocation or safepoint.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_string_len(value: *const u8) -> i64 {
+    if value.is_null() {
+        return 0;
+    }
+    // SAFETY: a non-null argument is a live WillowString payload.
+    unsafe { *(value as *const i64) }
+}
+
 /// Allocate a new WillowString from a raw UTF-8 byte slice.
 /// Invalid UTF-8 is a fatal runtime invariant violation.
 /// Returns a pointer to the payload (the `len` field at offset 0).
@@ -618,6 +628,18 @@ mod tests {
         // NUL at offset 8+2
         let nul = unsafe { *ptr.add(10) };
         assert_eq!(nul, 0);
+    }
+
+    #[test]
+    fn string_length_counts_utf8_bytes_including_embedded_nul() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        assert_eq!(willow_string_len(std::ptr::null()), 0);
+        for text in ["", "abc", "日本語", "😀", "e\u{301}", "a\0b"] {
+            let ptr = willow_string_alloc(text.as_ptr(), text.len() as i64);
+            assert!(!ptr.is_null());
+            assert_eq!(willow_string_len(ptr), text.len() as i64);
+        }
     }
 
     // Fix 1: willow_string_alloc hardening tests

@@ -724,3 +724,105 @@ fn main() {
     assert!(ok, "compilation failed: {out}");
     assert_eq!(out, "-1\n0\n1\n");
 }
+
+#[test]
+fn enum_condition_brace_boundary() {
+    let (out, ok) = compile_and_run(
+        r#"
+enum Dir { Idle, Moving }
+fn main() {
+    let d = Dir::Idle;
+    if d == Dir::Idle { println(1); }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n");
+}
+
+#[test]
+fn string_byte_length_runtime() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    println("".len());
+    println("hello".len());
+    println("日本語".len());
+    println(("a" + "bc").len());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "0\n5\n9\n3\n");
+}
+
+#[test]
+fn string_length_twenty_perspectives() {
+    let source = r#"
+class Label { pub text: String; pub fn size(self) -> i64 { return self.text.len(); } }
+fn size(s: String) -> i64 { return s.len(); }
+fn text() -> String { return "abc"; }
+fn main() {
+    println("".len());
+    println("a".len());
+    println("abc".len());
+    println("日本語".len());
+    println("😀".len());
+    println("é".len());
+    println("a\nb".len());
+    println("\t".len());
+    println("a\"b".len());
+    println(("a" + "bc").len());
+    let s = "four";
+    println(s.len());
+    println(size(s));
+    println(text().len());
+    println(new Label("abc").size());
+    println(new Label("abc").text.len());
+    println(["ab", "c"][0].len());
+    println(s.toString().len());
+    println(s.len() + 2);
+    if s.len() == 4 { println(1); }
+    let mut i = 0;
+    while i < s.len() { i = i + 1; }
+    println(i);
+}
+"#;
+    let expected = "0\n1\n3\n9\n4\n3\n3\n1\n3\n3\n4\n4\n3\n3\n3\n2\n4\n6\n1\n4\n";
+    for run in [
+        compile_and_run,
+        compile_and_run_release,
+        compile_and_run_gc_stress,
+    ] {
+        let (out, ok) = run(source);
+        assert!(ok, "{out}");
+        assert_eq!(out, expected);
+    }
+    for source in [
+        "fn main() { println(\"x\".len(1)); }",
+        "fn main() { println(1.len()); }",
+        "fn main() { let s: String = \"x\".len(); }",
+    ] {
+        assert!(compile_error_stderr(source).contains("E0201"));
+    }
+}
+
+#[test]
+fn string_length_generated_calls_scale_with_callsites() {
+    for count in [1, 8, 32] {
+        for bytes in [0, 8, 1024] {
+            let calls = "println(s.len());".repeat(count);
+            let text = "x".repeat(bytes);
+            let source = format!("fn main() {{ let s = \"{text}\"; {calls} }}");
+            let symbols = compile_and_collect_relocation_targets_all(&source, &[]);
+            assert_eq!(
+                symbols
+                    .iter()
+                    .filter(|s| s.as_str() == "willow_string_len")
+                    .count(),
+                count,
+                "callsites={count}, bytes={bytes}"
+            );
+        }
+    }
+}

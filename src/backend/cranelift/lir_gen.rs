@@ -7604,6 +7604,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         use Intrinsic::*;
         match intrinsic {
             StringToString | TaskResult => receiver,
+            StringLen => self.emit_value_runtime_call("willow_string_len", &[receiver]),
             I64ToString => self.emit_value_runtime_call("willow_i64_to_string", &[receiver]),
             F64ToString => self.emit_value_runtime_call("willow_f64_to_string", &[receiver]),
             BoolToString => self.emit_value_runtime_call("willow_bool_to_string", &[receiver]),

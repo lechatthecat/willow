@@ -62,6 +62,8 @@ pub enum Intrinsic {
     /// `String.toString()` — the identity, and the only intrinsic that emits no
     /// code at all.
     StringToString,
+    /// UTF-8 byte length, excluding the trailing NUL.
+    StringLen,
 
     /// `Task<T>::cancel()` / `JoinHandle<T>::cancel()`.
     TaskCancel,
@@ -216,6 +218,7 @@ impl Intrinsic {
         Intrinsic::F64ToString,
         Intrinsic::BoolToString,
         Intrinsic::StringToString,
+        Intrinsic::StringLen,
         Intrinsic::TaskCancel,
         Intrinsic::TaskIsCancelled,
         Intrinsic::TaskResult,
@@ -281,6 +284,7 @@ impl Intrinsic {
             F64ToString => &["willow_f64_to_string"],
             BoolToString => &["willow_bool_to_string"],
             StringToString | TaskResult => &[],
+            StringLen => &["willow_string_len"],
             TaskCancel => &["willow_sched_cancel"],
             TaskIsCancelled => &["willow_frame_is_cancelled"],
             TokenIsCancelled => &["willow_cancellation_token_is_cancelled"],
@@ -459,9 +463,10 @@ pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
     method: &str,
     arity: usize,
 ) -> Option<ResolvedMethod<N>> {
-    // Scalar `toString` (willow-fvfc). Checked first because it is the only
-    // intrinsic on a primitive receiver, and because `String` is a receiver no
-    // other family claims.
+    if matches!(recv, Type::String) && method == "len" && arity == 0 {
+        return Some(ResolvedMethod::fixed(Intrinsic::StringLen, Type::I64));
+    }
+    // Scalar `toString` conversions (willow-fvfc).
     if method == "toString" && arity == 0 {
         match recv {
             Type::I64 => return Some(ResolvedMethod::fixed(Intrinsic::I64ToString, Type::String)),
@@ -1253,7 +1258,7 @@ mod tests {
         assert_eq!(unique.len(), Intrinsic::ALL.len(), "duplicate in ALL");
         assert_eq!(
             Intrinsic::ALL.len(),
-            43,
+            44,
             "Intrinsic::ALL must list every variant; update the count when adding one"
         );
     }
@@ -1434,6 +1439,7 @@ fn f() {
     let c = r.toString();
     let d = b.toString();
     let e = s.toString();
+    let size = s.len();
 }
 "#;
 
@@ -1554,7 +1560,7 @@ async fn f() {
     /// lowers to a different runtime symbol.
     #[test]
     fn p37_scalar_to_string_agrees() {
-        assert_agrees(SCALARS, 4);
+        assert_agrees(SCALARS, 5);
     }
 
     /// Perspective 38: the whole `Array<T>` surface, plus the `FrozenArray<T>`
@@ -1724,7 +1730,7 @@ fn f() {
     fn p51_every_intrinsic_is_cross_checked() {
         let mut reached: std::collections::HashSet<Intrinsic> = std::collections::HashSet::new();
         for (src, expected) in [
-            (SCALARS, 4),
+            (SCALARS, 5),
             (ARRAYS, 6),
             (MAPS, 9),
             (ATOMICS, 8),

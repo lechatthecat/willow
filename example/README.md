@@ -142,3 +142,10 @@ infinities, retain their bits. NaN keys raise the recoverable runtime panic
 `FrozenMap` uses the same rules. Ordinary floating-point arithmetic and `==`
 keep IEEE semantics, and NaN remains valid as a map value. Map `toString()`
 sorts entries by rendered key text for deterministic output.
+
+## String length
+
+`String.len()` returns an `i64` UTF-8 byte count in constant time, excluding
+the trailing NUL: `"".len()` is 0, `"abc".len()` is 3, and `"日本語".len()`
+is 9. It does not measure Unicode characters, grapheme clusters, or terminal
+columns. See `language_gaps/main.wi` for length and imported-array examples.

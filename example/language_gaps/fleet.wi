@@ -1,0 +1,5 @@
+import car::Car;
+import std::collections::Array;
+pub fn pick(cars: Array<Car>) -> Car { return cars[0]; }
+pub fn copy(cars: Array<Car>) -> Array<Car> { return cars; }
+pub class Garage { pub cars: Array<Car>; }

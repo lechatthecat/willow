@@ -1,0 +1,14 @@
+// Imported arrays preserve identity across arguments, returns, and fields.
+import car::{Car, Dir};
+import fleet::{pick, copy, Garage};
+import std::collections::Array;
+fn main() {
+    let cars = [new Car(Dir::Idle, "Lift A")];
+    let copied: Array<Car> = copy(cars);
+    let garage = new Garage([]);
+    garage.cars = copied;
+    let c = pick(garage.cars);
+    if c.dir == Dir::Idle { println("idle"); }
+    println(c.label.len()); // UTF-8 bytes: 6
+    println("日本語".len()); // UTF-8 bytes: 9, not display columns
+}
