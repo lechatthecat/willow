@@ -154,8 +154,11 @@ pub(super) fn attach(
     let owners = OwnerIndex::new(captured.values().flat_map(|c| c.symbol_owners.iter()));
     let units_by_path: HashMap<_, _> = paths.iter().map(|(u, p)| (p.as_str(), *u)).collect();
     for symbol in &mut semantic.symbols {
+        // Method source owners include interface defaults; compiled copies may
+        // have an implementation owner or an internal `$default$` function name.
         symbol.identity = by_id
             .get(symbol.id.as_str())
+            .filter(|_| symbol.kind != "method")
             .and_then(|i| (*i).clone())
             .or_else(|| {
                 symbol.location.as_ref().and_then(|l| {

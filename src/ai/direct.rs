@@ -173,12 +173,17 @@ impl DirectSession {
             .as_str()
             .context("resolved symbol lacks identity")?
             .to_owned();
-        if !self.function_names.contains_key(&id) {
+        if !self.function_names.contains_key(&id)
+            && !matches!(
+                resolved["symbol"]["kind"].as_str(),
+                Some("field" | "static-field" | "variant" | "method")
+            )
+        {
             self.display_locations(&mut resolved, false)?;
             let symbol = &resolved["symbol"];
             let loc = &symbol["location"];
             let message = format!(
-                "unsupported rename target `{selector}` ({}): rename currently supports source functions and implementation methods only; fields, enum variants, interface contracts and local bindings are not supported. No files changed",
+                "unsupported rename target `{selector}` ({}): rename supports source functions, methods, fields and enum variants; this symbol kind is not supported. No files changed",
                 symbol["kind"].as_str().unwrap_or("symbol")
             );
             if let (Some(path), Some(start), Some(end), Some(line), Some(column)) = (
@@ -274,6 +279,16 @@ impl DirectSession {
         Ok(Some((path, byte)))
     }
     fn selector(&self, symbol: &symbols::Symbol) -> String {
+        if symbol.kind == "method"
+            && let (Some(name), Some(location)) = (&symbol.source_name, &symbol.location)
+        {
+            let module = symbol
+                .identity
+                .as_ref()
+                .map(|i| i.module.clone())
+                .unwrap_or_else(|| source_module(&location.path, self.workspace()));
+            return format!("{module}::{name}");
+        }
         if let Some(identity) = &symbol.identity {
             let name = identity
                 .symbol

@@ -1,5 +1,5 @@
 // Inspect: willow effects main --source example/semantic_cli_diagnostics.wi --all
-// Rename rejects interface contracts, fields and variants without source edits.
+// Semantic rename follows fields, variants and interface implementation families.
 interface Dispatcher { fn assign(self) -> i64; }
 class Nearest implements Dispatcher {
     pub fn assign(self) -> i64 { return 1; }
@@ -9,7 +9,12 @@ class Passenger {
     pub init(self) { self.board = 0; }
 }
 enum Dir { Idle, Up }
+fn dispatch(x: Dispatcher) -> i64 { return x.assign(); }
 fn main() {
     let dispatcher = new Nearest();
-    println(dispatcher.assign());
+    let passenger = new Passenger();
+    let direction = Dir::Idle;
+    println(dispatch(dispatcher));
+    println(passenger.board);
+    match direction { Dir::Idle => { println(0); }, Dir::Up => { println(1); } };
 }

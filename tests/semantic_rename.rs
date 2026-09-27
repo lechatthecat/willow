@@ -283,31 +283,335 @@ fn direct_rename_rejects_entry_that_disagrees_with_current_manifest() {
 }
 
 #[test]
-fn unsupported_symbol_kinds_and_interface_coverage_have_actionable_reasons() {
-    let source = "interface Dispatcher { fn assign(self) -> i64; }\nclass Nearest implements Dispatcher { pub fn assign(self) -> i64 { return 1; } }\nclass Passenger { pub board: i64; pub init(self) { self.board = 0; } }\nenum Dir { Idle, Up }\nfn main() {}\n";
-    for dry in [false, true] {
-        for (selector, reason) in [
-            ("main::Dispatcher::assign", "unsupported rename target"),
-            ("main::Passenger::board", "unsupported rename target"),
-            ("main::Dir::Idle", "unsupported rename target"),
-            (
-                "main::Nearest::assign",
-                "interface contract declarations are not covered",
-            ),
-        ] {
-            let f = Fixture::new(source);
-            let mut args = vec!["rename", selector, "renamed"];
-            if dry {
-                args.push("--dry-run");
-            }
-            let result = f.run(&args, 1);
-            assert!(
-                result["message"].as_str().unwrap().contains(reason),
-                "{result}"
-            );
-            assert_eq!(result["location"]["path"], "main.wi");
-            assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), source);
-            assert!(!f.0.join(".willow-edits/active").exists());
+fn semantic_member_rename_covers_declarations_references_and_dispatch() {
+    let cases = [
+        (
+            "field reads",
+            "class A { pub old: i64; pub init(self) { self.old = 1; } pub fn get(self) -> i64 { return self.old; } } fn main() {}",
+            "main::A::old",
+        ),
+        (
+            "field writes",
+            "class A { pub old: i64; pub init(self) { self.old = 1; } } fn main() { let a = new A(); a.old = 2; println(a.old); }",
+            "main::A::old",
+        ),
+        (
+            "field unrelated owner",
+            "class A { pub old: i64; pub init(self) { self.old = 1; } } class B { pub old: i64; pub init(self) { self.old = 2; } } fn main() { let a = new A(); let b = new B(); println(a.old + b.old); }",
+            "main::A::old",
+        ),
+        (
+            "field same-name binding",
+            "class A { pub old: i64; pub init(self) { self.old = 1; } } fn main() { let old = 2; let a = new A(); println(a.old + old); }",
+            "main::A::old",
+        ),
+        (
+            "inherited field",
+            "open class A { pub old: i64; pub init(self) { self.old = 1; } } class B extends A {} fn read(b: B) -> i64 { return b.old; } fn main() {}",
+            "main::A::old",
+        ),
+        (
+            "variant value",
+            "enum E { Old, Other } fn main() { let e = E::Old; }",
+            "main::E::Old",
+        ),
+        (
+            "variant payload",
+            "enum E { Old(i64), Other } fn main() { let e = E::Old(1); }",
+            "main::E::Old",
+        ),
+        (
+            "variant pattern",
+            "enum E { Old(i64), Other } fn main() { let e = E::Old(1); match e { E::Old(v) => { println(v); }, E::Other => {} }; }",
+            "main::E::Old",
+        ),
+        (
+            "variant bare pattern",
+            "enum E { Old(i64), Other } fn main() { let e = E::Old(1); match e { Old(v) => { println(v); }, Other => {} }; }",
+            "main::E::Old",
+        ),
+        (
+            "variant unrelated owner",
+            "enum E { Old, Other } enum F { Old, Other } fn main() { let e = E::Old; let f = F::Old; }",
+            "main::E::Old",
+        ),
+        (
+            "variant same as type",
+            "enum Old { Old, Other } fn main() { let e = Old::Old; }",
+            "main::Old::Old",
+        ),
+        (
+            "generic variant",
+            "enum E<T> { Old(T), Other } fn main() { let e = E<i64>::Old(1); }",
+            "main::E::Old",
+        ),
+        (
+            "interface contract",
+            "interface I { fn old(self) -> i64; } class A implements I { pub fn old(self) -> i64 { return 1; } } fn call(x: I) -> i64 { return x.old(); } fn main() {}",
+            "main::I::old",
+        ),
+        (
+            "implementation entry",
+            "interface I { fn old(self) -> i64; } class A implements I { pub fn old(self) -> i64 { return 1; } } fn call(x: I) -> i64 { return x.old(); } fn main() {}",
+            "main::A::old",
+        ),
+        (
+            "multiple implementations",
+            "interface I { fn old(self) -> i64; } class A implements I { pub fn old(self) -> i64 { return 1; } } class B implements I { pub fn old(self) -> i64 { return 2; } } fn call(x: I) -> i64 { return x.old(); } fn main() {}",
+            "main::A::old",
+        ),
+        (
+            "unrelated method",
+            "interface I { fn old(self) -> i64; } class A implements I { pub fn old(self) -> i64 { return 1; } } class B { pub fn old(self) -> i64 { return 2; } } fn call(x: I, y: B) -> i64 { return x.old() + y.old(); } fn main() {}",
+            "main::I::old",
+        ),
+        (
+            "generic interface",
+            "interface I<T> { fn old(self, x: T) -> T; } class A implements I<i64> { pub fn old(self, x: i64) -> i64 { return x; } } fn call(x: I<i64>) -> i64 { return x.old(1); } fn main() {}",
+            "main::I::old",
+        ),
+        (
+            "interface inheritance",
+            "interface I { fn old(self) -> i64; } interface J extends I {} class A implements J { pub fn old(self) -> i64 { return 1; } } fn call(x: J) -> i64 { return x.old(); } fn main() {}",
+            "main::I::old",
+        ),
+        (
+            "multiple contracts",
+            "interface I { fn old(self) -> i64; } interface J { fn old(self) -> i64; } class A implements I, J { pub fn old(self) -> i64 { return 1; } } fn main() {}",
+            "main::I::old",
+        ),
+        (
+            "inherited implementation",
+            "interface I { fn old(self) -> i64; } open class A { pub open fn old(self) -> i64 { return 1; } } class B extends A implements I {} fn call(x: I) -> i64 { return x.old(); } fn main() {}",
+            "main::I::old",
+        ),
+        (
+            "override family without calls",
+            "open class A { pub open fn old(self) -> i64 { return 1; } } class B extends A { pub override fn old(self) -> i64 { return 2; } } fn main() {}",
+            "main::B::old",
+        ),
+    ];
+    for (label, source, selector) in cases {
+        let f = Fixture::new(source);
+        eprintln!("rename perspective: {label}");
+        let new_name = if selector.rsplit("::").next().unwrap().starts_with('O') {
+            "Renamed"
+        } else {
+            "renamed"
+        };
+        let preview = f.run(&["rename", selector, new_name, "--dry-run"], 0);
+        assert!(
+            preview["result"]["changes"]
+                .as_array()
+                .is_some_and(|c| !c.is_empty()),
+            "{label}: {preview}"
+        );
+        assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), source);
+        assert!(!f.0.join(".willow-edits").exists());
+        let applied = f.run(&["rename", selector, new_name], 0);
+        assert_eq!(applied["result"]["validation"], "passed", "{label}");
+        let after = fs::read_to_string(f.0.join("main.wi")).unwrap();
+        assert!(after.contains(new_name), "{label}");
+        if label == "unrelated method" {
+            assert!(after.contains("y.old()"));
+        }
+        if label == "field unrelated owner" {
+            assert!(after.contains("b.old"));
+        }
+        if label == "variant unrelated owner" {
+            assert!(after.contains("F::Old"));
+        }
+        if label == "variant same as type" {
+            assert!(after.contains("Old::Renamed"));
         }
     }
+}
+
+#[test]
+fn member_rename_across_modules_and_aliases() {
+    for (main, model, selector, name) in [
+        (
+            "import model; fn main() { let a = new model::A(); println(a.old); }",
+            "pub class A { pub old: i64; pub init(self) { self.old = 1; } }",
+            "model::A::old",
+            "updated",
+        ),
+        (
+            "import model::A as Item; fn main() { let a = new Item(); println(a.old); }",
+            "pub class A { pub old: i64; pub init(self) { self.old = 1; } }",
+            "model::A::old",
+            "updated",
+        ),
+        (
+            "import model; fn main() { let x = model::E::Old; }",
+            "pub enum E { Old, Other }",
+            "model::E::Old",
+            "Updated",
+        ),
+        (
+            "import model::E as Choice; fn main() { let x = Choice::Old(1); match x { Choice::Old(v) => { println(v); }, Choice::Other => {} }; }",
+            "pub enum E { Old(i64), Other }",
+            "model::E::Old",
+            "Updated",
+        ),
+    ] {
+        let f = Fixture::new(main);
+        f.write("model.wi", model);
+        let result = f.run(&["rename", selector, name], 0);
+        assert_eq!(result["result"]["files_changed"], 2);
+        assert!(
+            fs::read_to_string(f.0.join("model.wi"))
+                .unwrap()
+                .contains(name)
+        );
+        assert!(
+            fs::read_to_string(f.0.join("main.wi"))
+                .unwrap()
+                .contains(name)
+        );
+    }
+    for selector in ["api::Search::run", "search::BestFirst::run"] {
+        let f = Fixture::new(
+            "import api; import search; fn call(x: api::Search) -> i64 { return x.run(); } fn main() { let x = new search::BestFirst(); println(call(x)); println(x.run()); }",
+        );
+        f.write("api.wi", "pub interface Search { fn run(self) -> i64; }");
+        f.write("search.wi", "import api::Search as Contract; pub class BestFirst implements Contract { pub fn run(self) -> i64 { return 1; } }");
+        let result = f.run(&["rename", selector, "execute"], 0);
+        assert_eq!(result["result"]["files_changed"], 3);
+        for path in ["main.wi", "api.wi", "search.wi"] {
+            let after = fs::read_to_string(f.0.join(path)).unwrap();
+            assert!(after.contains("execute"), "{path}: {after}");
+            assert!(!after.contains("run("), "{path}: {after}");
+        }
+    }
+}
+
+#[test]
+fn semantic_member_rename_failures_are_atomic() {
+    for (source, selector, name) in [
+        (
+            "class A { pub old: i64; pub other: i64; pub init(self) { self.old = 1; self.other = 2; } } fn main() {}",
+            "main::A::old",
+            "other",
+        ),
+        (
+            "enum E { Old, Other } fn main() { let e = E::Old; }",
+            "main::E::Old",
+            "Other",
+        ),
+        (
+            "interface I { fn old(self) -> i64; fn other(self) -> i64; } class A implements I { pub fn old(self) -> i64 { return 1; } pub fn other(self) -> i64 { return 2; } } fn main() {}",
+            "main::I::old",
+            "other",
+        ),
+        (
+            "class A { pub old: i64; pub init(self) { self.old = 1; } } fn main() {}",
+            "main::A::old",
+            "if",
+        ),
+        (
+            "enum E { Old, Other } fn main() { let e = E::Old; }",
+            "main::E::Old",
+            "lowercase",
+        ),
+    ] {
+        let f = Fixture::new(source);
+        f.run(&["rename", selector, name], 1);
+        assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), source);
+        assert!(!f.0.join(".willow-edits/active").exists());
+    }
+}
+
+#[test]
+fn static_members_and_constructor_parameter_shadowing() {
+    for (source, selector) in [
+        (
+            "class A { pub static mut old: i64 = 1; } fn main() { A::old = 2; println(A::old); }",
+            "main::A::old",
+        ),
+        (
+            "class A { pub static fn old(x: i64) -> i64 { return x; } } fn main() { println(A::old(1)); }",
+            "main::A::old",
+        ),
+        (
+            "class A { pub old: i64; pub init(self, old: i64) { self.old = old; } } fn main() { let a = new A(1); println(a.old); }",
+            "main::A::old",
+        ),
+    ] {
+        let f = Fixture::new(source);
+        f.run(&["rename", selector, "updated"], 0);
+        let after = fs::read_to_string(f.0.join("main.wi")).unwrap();
+        assert!(after.contains("updated"));
+        if source.contains("init(self, old") {
+            assert!(after.contains("self.updated = old"));
+        }
+    }
+}
+
+#[test]
+fn default_and_nested_method_renames() {
+    let cases = [
+        (
+            "default interface method",
+            "interface I { fn old(self) -> i64 { return 1; } } class A implements I {} class B implements I {} fn call(x: I) -> i64 { return x.old(); } fn main() {}",
+            "main::I::old",
+        ),
+        (
+            "nested method calls",
+            "class A { pub fn old(self) -> A { return self; } } fn call(x: A) -> A { return x.old().old(); } fn main() {}",
+            "main::A::old",
+        ),
+    ];
+    for (label, source, selector) in cases {
+        let f = Fixture::new(source);
+        eprintln!("{label}");
+        f.run(&["rename", selector, "renamed", "--dry-run"], 0);
+        f.run(&["rename", selector, "renamed"], 0);
+        assert!(
+            !fs::read_to_string(f.0.join("main.wi"))
+                .unwrap()
+                .contains("old(")
+        );
+    }
+}
+
+#[test]
+fn project_default_contract_uses_source_owner_selector() {
+    let f = Fixture::new(
+        "import api; import implementation; fn call(x: api::I) -> i64 { return x.old(); } fn main() { let a = new implementation::A(); println(call(a)); println(a.old()); }",
+    );
+    f.write("project.toml", "[willow]\nmanifest-version=1\n[project]\nname='rename_test'\nversion='0.1.0'\nentry='src/main.wi'\n");
+    f.write(
+        "api.wi",
+        "pub interface I { fn old(self) -> i64 { return 7; } }",
+    );
+    f.write(
+        "implementation.wi",
+        "import api; pub class A implements api::I {}",
+    );
+    fs::create_dir(f.0.join("src")).unwrap();
+    for file in ["main.wi", "api.wi", "implementation.wi"] {
+        fs::rename(f.0.join(file), f.0.join("src").join(file)).unwrap();
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_willow"))
+        .current_dir(&f.0)
+        .args(["rename", "api::I::old", "renamed", "--format=json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::read_to_string(f.0.join("src/api.wi"))
+            .unwrap()
+            .contains("fn renamed")
+    );
+    assert!(
+        fs::read_to_string(f.0.join("src/main.wi"))
+            .unwrap()
+            .contains("a.renamed()")
+    );
 }

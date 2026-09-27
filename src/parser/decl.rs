@@ -520,7 +520,6 @@ impl Parser {
         protected: bool,
         is_static: bool,
     ) -> Result<FieldDecl, Diagnostic> {
-        let span = self.current_span();
         // `static mut name: T = expr` — `mut` is only meaningful on a static
         // property (instance fields take their mutability from the binding).
         let is_mut = self.eat(TokenKind::Mut);
@@ -530,6 +529,7 @@ impl Parser {
                 "`mut` on a class field is only allowed on a `static` property",
             ));
         }
+        let span = self.current_span();
         let name = self.expect_ident()?;
         self.expect(TokenKind::Colon)?;
         let ty = self.parse_type()?;

@@ -788,20 +788,20 @@ fn durable_write_observed(path: &Path, bytes: &[u8], published: impl FnOnce()) -
 }
 
 #[derive(Default, Serialize, Deserialize)]
-struct EditWork {
-    tokens_indexed: usize,
-    expressions_indexed: usize,
-    references_visited: usize,
-    patches: usize,
+pub(super) struct EditWork {
+    pub(super) tokens_indexed: usize,
+    pub(super) expressions_indexed: usize,
+    pub(super) references_visited: usize,
+    pub(super) patches: usize,
     #[serde(default)]
-    declarations: usize,
-    output_bytes: usize,
+    pub(super) declarations: usize,
+    pub(super) output_bytes: usize,
 }
 #[derive(Clone)]
-struct Patch {
-    start: usize,
-    end: usize,
-    text: String,
+pub(super) struct Patch {
+    pub(super) start: usize,
+    pub(super) end: usize,
+    pub(super) text: String,
 }
 /// Reports candidate diagnostics against workspace-relative source paths, so
 /// agents never open or edit the isolated `.willow-edits/<tx>/` copy.
@@ -1000,6 +1000,25 @@ fn structured_changes(
             }
         }
     }
+    let requested_renames: std::collections::HashSet<_> = operations
+        .iter()
+        .filter_map(|op| {
+            if let Operation::Rename { function, .. } = op {
+                Some(function.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let has_member_rename = snapshot.semantic.symbols.iter().any(|symbol| {
+        requested_renames.contains(symbol.id.as_str())
+            && matches!(
+                symbol.kind.as_str(),
+                "method" | "field" | "static-field" | "variant"
+            )
+    });
+    let mut semantic_renames =
+        has_member_rename.then(|| super::rename::Index::new(snapshot, root, &identifiers));
     let mut renamed = std::collections::HashSet::new();
     for operation in operations {
         let id = match &operation {
@@ -1007,6 +1026,13 @@ fn structured_changes(
                 function
             }
         };
+        if let Operation::Rename { name, .. } = &operation
+            && let Some(index) = &mut semantic_renames
+            && index.supports(id)
+        {
+            index.plan(id, name, root, &identifiers, &mut patches, &mut work)?;
+            continue;
+        }
         let function = functions.get(id.as_str()).context("unknown function")?;
         ensure!(
             !function.synthetic && function.locations.len() == 1,

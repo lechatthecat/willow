@@ -48,6 +48,29 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn impact_prints_definition_location_once() {
+    let f = Fixture::new();
+    let value = f.json(&["impact", "order::submit"], 0);
+    let location = &value["result"]["symbol"]["location"];
+    let expected = format!(
+        "{}:{}:{}",
+        location["path"].as_str().unwrap(),
+        location["line"],
+        location["column"]
+    );
+    let output = f.run(&["impact", "order::submit"]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        text.lines().filter(|line| *line == expected).count(),
+        1,
+        "{text}"
+    );
+    assert!(text.contains("Symbol: order::submit (function)"), "{text}");
+    assert!(text.contains("Affected functions:"), "{text}");
+}
+
+#[test]
 fn direct_queries_resolve_fields_functions_and_locations() {
     let f = Fixture::new();
     for args in [

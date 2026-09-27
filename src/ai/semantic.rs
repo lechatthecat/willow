@@ -5,6 +5,9 @@ use serde_json::{Value, json};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticFacts {
+    /// Live-only declaration relationships for atomic semantic rename.
+    #[serde(skip)]
+    pub(crate) rename_links: Vec<(String, String)>,
     #[serde(default)]
     pub modules: Vec<ModuleEvidence>,
     pub symbols: Vec<symbols::Symbol>,
@@ -55,6 +58,7 @@ impl std::ops::Deref for CaptureContext<'_> {
 }
 #[derive(Default)]
 pub(super) struct Captured {
+    pub rename_relations: super::rename::Relations,
     bodies: Vec<Body>,
     pub witnesses: HashMap<FunctionId, Vec<Value>>,
     pub compiler_effects: HashMap<FunctionId, u8>,

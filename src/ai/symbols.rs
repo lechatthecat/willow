@@ -339,7 +339,9 @@ pub(super) fn finish(
     let mut identities = HashMap::new();
     let mut source_names = HashMap::new();
     for (d, owner) in declarations.into_iter().zip(owners) {
-        let (_, owner_name): (&str, &str) =
+        // JSON escapes (notably Windows path separators) cannot deserialize
+        // into borrowed str. Skip the unused path and own the decoded name.
+        let (_, owner_name): (serde::de::IgnoredAny, String) =
             serde_json::from_str(&owner).expect("compiler owner identity");
         let name = d.name.rsplit("::").next().unwrap_or(&d.name);
         let source_name = if matches!(
@@ -349,7 +351,7 @@ pub(super) fn finish(
         {
             format!("{owner_name}::{name}")
         } else if matches!(d.kind.as_str(), "method" | "constructor") && owner_name != "module" {
-            owner_name.to_owned()
+            owner_name
         } else {
             name.to_owned()
         };
@@ -468,4 +470,72 @@ pub(super) fn finish(
         symbols.into_values().collect(),
         references.into_values().collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finish_accepts_escaped_owner_paths_and_names() {
+        let paths = [
+            "/tmp/project/main.wi",
+            r"C:\Users\runneradmin\project\main.wi",
+            r"\\?\C:\Users\runneradmin\project\main.wi",
+            r"\\server\share\project\main.wi",
+            "/tmp/quoted\"project/main.wi",
+            "/tmp/tab\tnewline\n/main.wi",
+            "/tmp/日本語/main.wi",
+        ];
+        let mut ids = std::collections::HashSet::new();
+        for path in paths {
+            for owner in [
+                None,
+                Some("run"),
+                Some("Widget::run"),
+                Some("escaped\"\\\nowner"),
+            ] {
+                let span = Span::new(2, 3, 1, 3);
+                let mut facts = Facts::default();
+                facts
+                    .declarations
+                    .push(Declaration::new("x", "binding", span, Some(Type::I64)));
+                facts.reference(span, "x", facts.declarations[0].clone(), "read", false);
+                let captured = CapturedUnit {
+                    graph: CallGraph::default(),
+                    semantic: semantic::Captured::default(),
+                    symbols: facts,
+                    symbol_owners: owner
+                        .map(|name| vec![(Span::new(0, 8, 1, 1), name.into())])
+                        .unwrap_or_default(),
+                    declarations: HashMap::new(),
+                    identities: HashMap::new(),
+                    lambda_names: HashMap::new(),
+                    rename_calls: Vec::new(),
+                    direct: HashMap::new(),
+                    dispatches: HashMap::new(),
+                    dispatch_sites: HashMap::new(),
+                };
+                let captures = HashMap::from([(UnitId::ENTRY, captured)]);
+                let paths = HashMap::from([(UnitId::ENTRY, path.into())]);
+                let names =
+                    HashMap::from([(UnitId::ENTRY, HashMap::from([("x".into(), vec![(2, 3)])]))]);
+                let (symbols, references) = finish(&captures, &paths, &names, &[]);
+                assert_eq!(symbols.len(), 1);
+                assert_eq!(references.len(), 1);
+                let expected = owner.map_or_else(|| "x".to_owned(), |name| format!("{name}::x"));
+                assert_eq!(symbols[0].source_name.as_deref(), Some(expected.as_str()));
+                assert_eq!(symbols[0].location.as_ref().unwrap().path, path);
+                assert_eq!(references[0].target, symbols[0].id);
+                assert!(
+                    ids.insert(symbols[0].id.clone()),
+                    "path/owner identities collided"
+                );
+                assert_eq!(
+                    finish(&captures, &paths, &names, &[]),
+                    (symbols, references)
+                );
+            }
+        }
+    }
 }

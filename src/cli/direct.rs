@@ -315,13 +315,8 @@ fn human(value: &Value, options: &Options) -> String {
             lines.push(format!("ID: {}", selected["id"].as_str().unwrap_or("?")));
         }
     }
-    if let Some(symbol) = result.get("symbol") {
-        if let Some(ty) = symbol["type_display"].as_str() {
-            lines.push(format!("Type: {ty}"));
-        }
-        if symbol["location"].is_object() {
-            lines.push(location(&symbol["location"]));
-        }
+    if let Some(ty) = result["symbol"]["type_display"].as_str() {
+        lines.push(format!("Type: {ty}"));
     }
     if options.command == "type" {
         match result["status"].as_str() {

@@ -7,6 +7,7 @@ pub mod edit;
 mod graph;
 pub mod measurement;
 mod packages;
+mod rename;
 pub use packages::{ModuleEvidence, ModuleIdentity, SymbolIdentity, UpdateDelta};
 mod semantic;
 mod storage;
@@ -175,6 +176,7 @@ pub(crate) fn capture(
         dispatch_sites: HashMap::new(),
     };
     symbols::declarations(program, &mut result.symbols, symbols);
+    result.semantic.rename_relations = rename::relations(program, symbols);
     let mut pending = Vec::new();
     for item in &program.items {
         match item {
@@ -850,6 +852,13 @@ pub(crate) fn snapshot(
     let (symbol_definitions, symbol_references) =
         symbols::finish(&captured, &paths, &symbol_names, &functions);
     semantic.symbols = symbol_definitions;
+    semantic.rename_links = rename::links(
+        &captured,
+        &paths,
+        &symbol_names,
+        &functions,
+        &semantic.symbols,
+    );
     let ranges: Vec<_> = captured
         .values()
         .flat_map(|unit| &unit.symbol_owners)
