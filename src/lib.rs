@@ -361,17 +361,49 @@ impl<'a> CompilerSession<'a> {
         self,
         emitter: &mut dyn diagnostics::DiagnosticEmitter,
     ) -> Result<ai::Snapshot> {
+        self.analysis_with_policy(emitter, true)
+    }
+
+    /// Edit preflight must not create or rewrite project inputs, even on failure.
+    pub fn analysis_for_edit_with_emitter(
+        self,
+        emitter: &mut dyn diagnostics::DiagnosticEmitter,
+    ) -> Result<ai::Snapshot> {
+        self.analysis_with_policy(emitter, false)
+    }
+    fn analysis_with_policy(
+        self,
+        emitter: &mut dyn diagnostics::DiagnosticEmitter,
+        publish_lock: bool,
+    ) -> Result<ai::Snapshot> {
         let _query_stats = query_stats::Session::enter();
         let _node_ids = parser::ast::NodeIdSession::enter();
         let path = std::fs::canonicalize(self.src)?;
         let source = std::fs::read_to_string(&path)?;
         let root = path.parent().context("source has no parent")?;
+        let edit_context = if publish_lock {
+            None
+        } else {
+            Some(ai::edit::AnalysisInputs::capture(
+                &path,
+                self.project_root.as_deref(),
+                &self.opts,
+            )?)
+        };
         let map = diagnostics::SourceMap::new(path.to_str().context("non UTF-8 path")?, &source);
         let mut inputs = compiler_db::inputs::CompilerInputs::native(self.opts, root.to_path_buf())
-            .resolve_project(self.project_root.as_deref())?;
+            .resolve_project_analysis(self.project_root.as_deref(), publish_lock)?;
+        if let Some(context) = &edit_context {
+            context.verify_files()?;
+        }
         inputs.capture_analysis = true;
         let frontend = run_frontend_with_inputs(&source, root, &map, inputs, emitter)?;
-        ai::snapshot(&frontend, &path, &source, self.project_root.as_deref())
+        let mut snapshot = ai::snapshot(&frontend, &path, &source, self.project_root.as_deref())?;
+        if let Some(context) = &edit_context {
+            context.verify_files()?;
+        }
+        snapshot.edit_context = edit_context;
+        Ok(snapshot)
     }
 
     fn execute(self, emitter: &mut dyn diagnostics::DiagnosticEmitter, build: bool) -> Result<()> {
@@ -562,7 +594,7 @@ fn run_frontend_revision(
         inputs.project_mode,
     );
     let mut graph = resolution.graph;
-    let mut diagnostic_modules = DiagnosticModuleIndex::new(&graph);
+    let diagnostic_modules = DiagnosticModuleIndex::new(&graph);
     emit_frontend_diagnostics(
         &resolution.diagnostics,
         map,
@@ -571,10 +603,10 @@ fn run_frontend_revision(
         emitter,
     )?;
     let imports = PhaseDiagnostics::new(resolution.diagnostics);
-    if imports.error_count != 0 {
-        graph.files.clear();
-        diagnostic_modules.positions.clear();
-    }
+    // Keep resolved and recovered declarations even when another import fails.
+    // Clearing the graph makes healthy imports disappear from the type checker
+    // and manufactures cross-file cascades. All import errors remain fatal at
+    // the frontend boundary below, before code generation.
     let desugar_dependencies =
         ModuleDependencies::with_packages(&graph.files, inputs.package_graph.as_deref());
     let desugar = PhaseDiagnostics::new(

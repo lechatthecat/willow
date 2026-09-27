@@ -201,6 +201,7 @@ mod tests {
     use super::*;
     fn snapshot(n: usize, fanout: bool) -> Snapshot {
         let mut snapshot = Snapshot {
+            edit_context: None,
             version: 1,
             compiler: storage::compiler_stamp(),
             compatibility: "test".into(),

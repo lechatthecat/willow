@@ -1,0 +1,6 @@
+import order;
+
+fn main() {
+    let item = new order::Order(2);
+    println(order::submit(item.value()));
+}

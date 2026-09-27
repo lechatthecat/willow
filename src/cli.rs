@@ -6,6 +6,7 @@ use willow_compiler::{CompilerOptions, compile, emit_hir_text, emit_lir_text, pr
 mod agent;
 mod analysis;
 mod daemon;
+mod direct;
 mod edit;
 mod init;
 mod package;
@@ -176,6 +177,10 @@ impl CliCommand {
             Self::Analysis(command) => {
                 let value = command.execute(&mut willow_compiler::diagnostics::HumanEmitter)?;
                 println!("{}", serde_json::to_string_pretty(&value)?);
+                anyhow::ensure!(
+                    value.get("success") != Some(&serde_json::Value::Bool(false)),
+                    "analysis operation failed; see result reasons"
+                );
                 Ok(())
             }
             Self::Package(command) => command.execute(),
@@ -563,6 +568,13 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
         println!("{text}");
         return Ok(());
     }
+    if direct::requested(&args) {
+        let code = direct::run(&args)?;
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
     if protocol::requested(&args) {
         let code = protocol::run(args)?;
         if code != 0 {
@@ -620,7 +632,7 @@ fn help(args: &[String]) -> Option<String> {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  willow agent instructions <codex|claude> [--format human|json]\n  willow agent sync [--yes]\n  willow init [DIR] [--name NAME]\n  willow metadata [project-dir] [--format human|json|ndjson]\n  Package commands accept --format human|json|ndjson (default human).\n  willow edit prepare --root DIR --entry main.wi [--project] --requests edits.json [--changes full|diff]\n  willow edit preview --root DIR --transaction ID [--changes full|diff]\n  willow edit <validate|apply|recover> --root DIR --transaction ID\n  willow daemon <source.wi|project-dir>\n  willow snapshot save <source.wi|project-dir> --output snapshot.json [--base baseline.json]\n  willow snapshot diff --before baseline.json --after current.json\n  willow impact <source.wi|project-dir> (--file PATH --byte N | --function ID --revision REV) [--direction callers|callees] [--max-nodes N] [--max-depth N]\n  willow risk --before baseline.json --after current.json\n  willow query <source.wi|project-dir> --requests queries.json\n  willow check <source.wi|project-dir> [--format human|ndjson]\n  willow build <source.wi|project-dir> [--format human|ndjson] [--protocol-version 1]\n  willow add [alias] --git URL [--version REQ] [--dry-run] [--project-dir DIR]\n  willow add [alias] --path DIR [--dry-run] [--project-dir DIR]\n  willow add URL [--dry-run] [--project-dir DIR]\n  willow remove alias [--dry-run] [--project-dir DIR]\n  willow update [alias] [--breaking] [--dry-run] [--project-dir DIR]\n  willow deps tree [--project-dir DIR]\n  willow deps why <alias|package-name> [--project-dir DIR]\n  willow package verify [PATH] [--format human|json|ndjson]\n  willow build <source.wi|project-dir> [-o <output>] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--emit-hir] [--emit-lir] [--runtime-lib <path>]\n  willow run [source.wi|project-dir] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--runtime-lib <path>] [-- <args>...]\n  willow fetch [project-dir] [--locked|--offline|--frozen] [--format human|json|ndjson]\n  willow debug <source.wi> [--runtime-lib <path>]"
+    "Usage:\n  willow agent instructions <codex|claude> [--format human|json]\n  willow agent sync [--yes]\n  willow init [DIR] [--name NAME]\n  willow metadata [project-dir] [--format human|json|ndjson]\n  Package commands accept --format human|json|ndjson (default human).\n  willow edit prepare --root DIR --entry main.wi [--project] --requests edits.json [--changes full|diff]\n  willow edit preview --root DIR --transaction ID [--changes full|diff]\n  willow edit <validate|apply|recover> --root DIR --transaction ID\n  willow daemon <source.wi|project-dir>\n  willow snapshot init --dir DIR\n  willow snapshot clear --dir DIR [--dry-run]\n  willow snapshot save <source.wi|project-dir> --output snapshot.json [--base baseline.json] [--managed-dir DIR]\n  willow rename SELECTOR NEW_NAME [--dry-run] [--source FILE | --project-dir DIR] [--format human|json|ndjson] [--verbose]\n  willow snapshot diff --before baseline.json --after current.json\n  willow impact <source.wi|project-dir> (--file PATH --byte N | --function ID --revision REV) [--direction callers|callees] [--max-nodes N] [--max-depth N]\n  willow risk --before baseline.json --after current.json\n  willow query <source.wi|project-dir> --requests queries.json\n  willow refs SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow references SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow symbol SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow type SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow effects SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow impact SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow check <source.wi|project-dir> [--format human|ndjson]\n  willow build <source.wi|project-dir> [--format human|ndjson] [--protocol-version 1]\n  willow add [alias] --git URL [--version REQ] [--dry-run] [--project-dir DIR]\n  willow add [alias] --path DIR [--dry-run] [--project-dir DIR]\n  willow add URL [--dry-run] [--project-dir DIR]\n  willow remove alias [--dry-run] [--project-dir DIR]\n  willow update [alias] [--breaking] [--dry-run] [--project-dir DIR]\n  willow deps tree [--project-dir DIR]\n  willow deps why <alias|package-name> [--project-dir DIR]\n  willow package verify [PATH] [--format human|json|ndjson]\n  willow build <source.wi|project-dir> [-o <output>] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--emit-hir] [--emit-lir] [--runtime-lib <path>]\n  willow run [source.wi|project-dir] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--runtime-lib <path>] [-- <args>...]\n  willow fetch [project-dir] [--locked|--offline|--frozen] [--format human|json|ndjson]\n  willow debug <source.wi> [--runtime-lib <path>]"
 }
 
 fn stem(path: &str) -> String {

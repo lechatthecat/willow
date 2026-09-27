@@ -296,8 +296,17 @@ pub(super) fn run(args: Vec<String>) -> anyhow::Result<i32> {
             },
             Ok(CliCommand::Analysis(command)) => match command.execute(&mut events) {
                 Ok(value) => {
+                    let failed = value.get("success") == Some(&Value::Bool(false));
                     events.event("analysis.result", "WT0010", value)?;
-                    ("WT0000", 0, String::new())
+                    if failed {
+                        (
+                            "WT2002",
+                            1,
+                            "analysis operation failed; see result reasons".into(),
+                        )
+                    } else {
+                        ("WT0000", 0, String::new())
+                    }
                 }
                 Err(error) => (
                     if events.errors > 0 {

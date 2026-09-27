@@ -37,6 +37,20 @@ impl Agent {
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct AgentCapabilities {
     #[serde(serialize_with = "available")]
+    pub direct_refs: Option<&'static str>,
+    #[serde(serialize_with = "available")]
+    pub direct_symbol: Option<&'static str>,
+    #[serde(serialize_with = "available")]
+    pub direct_type: Option<&'static str>,
+    #[serde(serialize_with = "available")]
+    pub direct_effects: Option<&'static str>,
+    #[serde(serialize_with = "available")]
+    pub direct_impact: Option<&'static str>,
+    #[serde(serialize_with = "available")]
+    pub direct_rename: Option<&'static str>,
+    #[serde(serialize_with = "available")]
+    pub snapshot_clear: Option<&'static str>,
+    #[serde(serialize_with = "available")]
     pub machine_check: Option<&'static str>,
     #[serde(serialize_with = "available")]
     pub machine_build: Option<&'static str>,
@@ -59,7 +73,23 @@ fn available<S: Serializer>(command: &Option<&str>, serializer: S) -> Result<S::
 }
 impl AgentCapabilities {
     pub fn instruction_schema(self) -> u32 {
-        if self.snapshots.is_some() { 2 } else { 1 }
+        if [
+            self.direct_refs,
+            self.direct_symbol,
+            self.direct_type,
+            self.direct_effects,
+            self.direct_impact,
+            self.direct_rename,
+        ]
+        .iter()
+        .any(Option::is_some)
+        {
+            3
+        } else if self.snapshots.is_some() {
+            2
+        } else {
+            1
+        }
     }
 }
 
@@ -69,6 +99,42 @@ pub fn render_agent_instructions(agent: Agent, caps: AgentCapabilities) -> Strin
         caps.instruction_schema(),
         agent.name()
     );
+    if caps.instruction_schema() >= 3 {
+        text.push_str("Run commands from the project root. Prefer human output; use --format json when structured output helps. NDJSON is for low-level protocol integrations.\n\nUse compiler commands for semantic identity, references, dispatch, imports, inferred types, rename, impact and effects. Text search is useful for navigation, comments, string literals and broad exploration. Never substitute a textual match for a resolved symbol.\n\n");
+        for (label, command) in [
+            ("References", caps.direct_refs),
+            ("Symbol", caps.direct_symbol),
+            ("Type", caps.direct_type),
+            ("Effects", caps.direct_effects),
+            ("Impact", caps.direct_impact),
+            ("Rename", caps.direct_rename),
+        ] {
+            if let Some(command) = command {
+                text.push_str(&format!("- {label}: `{command}`.\n"));
+            }
+        }
+        text.push_str("Selectors are qualified names or file:line:column positions (1-based Unicode columns). If a selector is ambiguous, retry with a selector returned in the candidate list. Read coverage, total/shown/truncated and result status; unknown or incomplete is not proof of absence.\n\n");
+        if caps.direct_rename.is_some() {
+            text.push_str("For rename, add --dry-run to inspect the diff, then run the same command without --dry-run. The command resolves the symbol, prepares and validates semantic edits, and applies the transaction. On failure, do not perform text replacement; report the location and any recovery transaction shown.\n\n");
+        } else if let Some(command) = caps.structured_edits {
+            text.push_str(&format!("Direct rename is unavailable. Use the low-level structured edit protocol: `{command}`, then edit validate and edit apply for the returned transaction.\n\n"));
+        }
+        if caps.snapshots.is_some() {
+            text.push_str("Saved snapshots are optional for snapshot diff, before/after risk comparison, reproducible persisted analysis, external low-level clients and protocol debugging. Ordinary semantic queries do not require a snapshot file, request JSON, manual IDs or byte-offset calculation. Low-level query/edit/daemon protocols remain available for advanced batch integration.\n\n");
+        }
+        if caps.machine_check.is_some() {
+            text.push_str("After changes run `willow check .`.\n");
+        }
+        if caps.machine_build.is_some() {
+            text.push_str("When executable validation is needed, run `willow build .`.\n");
+        }
+        text.push_str("After source edits or branch switches, refresh a daemon before querying it. Restart it when configuration, entry point or compiler changes. Git branch names do not define analysis revisions; a clear is not a substitute for stale checks or refresh.\n");
+        if let Some(command) = caps.snapshot_clear {
+            text.push_str(&format!("Before a measurement session: shut down only its owned daemon and wait for exit; run `{command}` once on its dedicated registered snapshot directory; start a new process and create a fresh full baseline; then measure. Initialize a new empty measurement directory with `willow snapshot init --dir DIR` and save its snapshots with `--managed-dir DIR`. Never share these baselines outside the measurement set. Abort measurement if shutdown, refresh or clear fails. Do not clear between warm samples. Record initial analysis/baseline preparation time; include it in cold-start measurements and report it separately for snapshot-only IO measurements. Clear leaves OS page caches unchanged. Preserve historical/shared snapshots separately as complete independent sets.\n"));
+        }
+        text.push_str(&format!("\n{END}\n"));
+        return text;
+    }
     text.push_str(
         "Run commands from the project root. Use compiler results to validate changes.\n",
     );
@@ -195,7 +261,7 @@ mod tests {
     #[test]
     fn capability_flags_and_independent_omission() {
         let disabled = serde_json::to_value(AgentCapabilities::default()).unwrap();
-        assert_eq!(disabled.as_object().unwrap().len(), 8);
+        assert_eq!(disabled.as_object().unwrap().len(), 15);
         assert!(disabled.as_object().unwrap().values().all(|v| v == false));
         let caps = AgentCapabilities {
             references: Some("references-command"),
@@ -207,6 +273,38 @@ mod tests {
         assert!(!rendered.contains("\"kind\":\"symbols\""));
         assert!(!rendered.contains("Before semantic"));
         assert_eq!(caps.instruction_schema(), 1);
+    }
+
+    #[test]
+    fn direct_capabilities_omit_disabled_commands_and_gate_edit_fallback() {
+        for agent in [Agent::Codex, Agent::Claude] {
+            let caps = AgentCapabilities {
+                direct_refs: Some("refs-example"),
+                direct_type: Some("type-example"),
+                direct_rename: Some("rename-example"),
+                structured_edits: Some("edit-fallback-example"),
+                ..Default::default()
+            };
+            let complete = render_agent_instructions(agent, caps);
+            assert!(complete.contains("refs-example"));
+            assert!(complete.contains("type-example"));
+            assert!(complete.contains("rename-example"));
+            assert!(!complete.contains("edit-fallback-example"));
+            assert!(!complete.contains("willow snapshot clear"));
+            let partial = render_agent_instructions(
+                agent,
+                AgentCapabilities {
+                    direct_refs: None,
+                    direct_rename: None,
+                    ..caps
+                },
+            );
+            assert!(!partial.contains("refs-example"));
+            assert!(!partial.contains("rename-example"));
+            assert!(partial.contains("type-example"));
+            assert!(partial.contains("edit-fallback-example"));
+            assert_eq!(caps.instruction_schema(), 3);
+        }
     }
 
     #[test]

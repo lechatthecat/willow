@@ -1,9 +1,11 @@
 //! Opt-in, compiler-owned impact facts. No backend or runtime dependency.
 mod diff;
+pub mod direct;
 mod dispatch;
 mod display;
 pub mod edit;
 mod graph;
+pub mod measurement;
 mod packages;
 pub use packages::{ModuleEvidence, ModuleIdentity, SymbolIdentity, UpdateDelta};
 mod semantic;
@@ -77,6 +79,8 @@ pub struct Function {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
+    #[serde(skip)]
+    pub(crate) edit_context: Option<edit::AnalysisInputs>,
     pub version: u32,
     pub compiler: String,
     pub compatibility: String,
@@ -864,6 +868,7 @@ pub(crate) fn snapshot(
     packages::attach(frontend, &paths, &captured, &mut functions, &mut semantic)?;
     captured.clear();
     let mut snapshot = Snapshot {
+        edit_context: None,
         version: 1,
         compiler,
         compatibility: hash(config),

@@ -241,22 +241,32 @@ impl Lock {
 /// compiler, so lock validation does not cause a second dependency traversal.
 /// Only the selected root lock is read. A matching lock is never rewritten.
 pub fn resolve_locked_path_packages(root: &Path, locked: bool) -> Result<PackageGraph> {
-    resolve_source(PathSource::open(root, false)?, locked, false)
+    resolve_source(PathSource::open(root, false)?, locked, false, true)
 }
 
 /// Resolve and cache dependencies without invoking the compiler or runtime builder.
 pub fn fetch_packages(root: &Path, locked: bool, offline: bool) -> Result<PackageGraph> {
-    resolve_source(PathSource::open(root, false)?, locked, offline)
+    resolve_source(PathSource::open(root, false)?, locked, offline, true)
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_project_packages(
     root: &Path,
     locked: bool,
     offline: bool,
 ) -> Result<Option<PackageGraph>> {
+    resolve_project_analysis(root, locked, offline, true)
+}
+
+pub(crate) fn resolve_project_analysis(
+    root: &Path,
+    locked: bool,
+    offline: bool,
+    publish_lock: bool,
+) -> Result<Option<PackageGraph>> {
     let source = PathSource::open(root, false)?;
     let package_mode = source.manifest.willow.is_some() || !source.manifest.dependencies.is_empty();
-    let graph = resolve_source(source, locked, offline)?;
+    let graph = resolve_source(source, locked, offline, publish_lock)?;
     Ok(package_mode.then_some(graph))
 }
 
@@ -271,7 +281,12 @@ pub(super) fn update(root: &Path) -> Result<PackageGraph> {
     Ok(graph)
 }
 
-fn resolve_source(source: PathSource, locked: bool, offline: bool) -> Result<PackageGraph> {
+fn resolve_source(
+    source: PathSource,
+    locked: bool,
+    offline: bool,
+    publish_lock: bool,
+) -> Result<PackageGraph> {
     let path = source.root.join("project.lock");
     let previous = match std::fs::read_to_string(&path) {
         Ok(text) => Some(text),
@@ -330,8 +345,10 @@ fn resolve_source(source: PathSource, locked: bool, offline: bool) -> Result<Pac
                     .into(),
             );
         }
-        let text = expected.canonical_text()?;
-        atomic_write(&path, text.as_bytes(), || Ok(()))?;
+        if publish_lock {
+            let text = expected.canonical_text()?;
+            atomic_write(&path, text.as_bytes(), || Ok(()))?;
+        }
     }
     Ok(graph)
 }

@@ -474,3 +474,161 @@ fn diagnostics_without_syntax_errors_are_all_roots() {
         assert!(diagnostic["data"]["root_cause"].is_null());
     }
 }
+
+#[test]
+fn failed_imports_do_not_manufacture_cross_file_semantic_errors() {
+    // Four independent import shapes x five failure shapes. The entry uses
+    // symbols that would all disappear if the resolved graph were discarded.
+    for shape in ["module", "alias", "item", "transitive"] {
+        for failure in [
+            "syntax",
+            "nested",
+            "transitive_syntax",
+            "two_files",
+            "entry_syntax",
+        ] {
+            let import = match shape {
+                "alias" => "import market as prices;",
+                "item" => "import market::price;",
+                "transitive" => "import bridge;",
+                _ => "import market;",
+            };
+            let call = match shape {
+                "alias" => "prices::price()",
+                "item" => "price()",
+                "transitive" => "bridge::price()",
+                _ => "market::price()",
+            };
+            let extra = if failure == "entry_syntax" {
+                "fn independent() { let x = ; }"
+            } else {
+                ""
+            };
+            let f = Fixture::new(&format!(
+                "{import}\nimport healthy;\nfn main() {{ println({call} + healthy::value()); }}\n{extra}"
+            ));
+            fs::write(
+                f.0.join("healthy.wi"),
+                "pub fn value() -> i64 { return 1; }",
+            )
+            .unwrap();
+            fs::write(
+                f.0.join("bridge.wi"),
+                "import market; pub fn price() -> i64 { return market::price(); }",
+            )
+            .unwrap();
+            if failure != "transitive_syntax" {
+                fs::write(
+                    f.0.join("market.wi"),
+                    if failure == "nested" {
+                        "pub fn price() -> i64 { let y = 0; if true { y += 1; } return y; }"
+                    } else {
+                        "pub fn price() -> i64 { let y = 0; y += 1; return y; }"
+                    },
+                )
+                .unwrap();
+            }
+            if failure == "transitive_syntax" {
+                fs::write(
+                    f.0.join("market.wi"),
+                    "import leaf; pub fn price() -> i64 { return leaf::value(); }",
+                )
+                .unwrap();
+                fs::write(
+                    f.0.join("leaf.wi"),
+                    "pub fn value() -> i64 { let y = 0; y += 1; return y; }",
+                )
+                .unwrap();
+            }
+            if failure == "two_files" {
+                fs::write(
+                    f.0.join("healthy.wi"),
+                    "pub fn value() -> i64 { let x = ; return 1; }",
+                )
+                .unwrap();
+            }
+            let values = events(
+                &f.run(
+                    env!("CARGO_BIN_EXE_willow"),
+                    &["check", "main.wi", "--format=ndjson"],
+                ),
+                1,
+                "WT2001",
+            );
+            let diagnostics: Vec<_> = values
+                .iter()
+                .filter(|v| v["event"] == "diagnostic")
+                .collect();
+            assert!(!diagnostics.is_empty(), "{shape}/{failure}");
+            for diagnostic in &diagnostics {
+                let code = diagnostic["code"].as_str().unwrap();
+                assert!(
+                    code.starts_with("E005")
+                        || code.starts_with("E010")
+                        || code == "E0401"
+                        || code.starts_with("E07"),
+                    "{shape}/{failure}: unexpected semantic fallout: {diagnostic}"
+                );
+            }
+            // Independent parser errors remain roots, rather than being
+            // attributed to whichever imported file happened to fail first.
+            for path in match failure {
+                "two_files" => vec!["market.wi", "healthy.wi"],
+                "entry_syntax" => vec!["market.wi", "main.wi"],
+                "transitive_syntax" => vec!["leaf.wi"],
+                _ => vec!["market.wi"],
+            } {
+                assert!(
+                    diagnostics.iter().any(|v| {
+                        v["data"]["cascade"] == false
+                            && v["data"]["labels"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|l| l["path"].as_str().is_some_and(|p| p.ends_with(path)))
+                    }),
+                    "{shape}/{failure}: missing independent root for {path}: {diagnostics:?}"
+                );
+            }
+            assert!(!f.0.join("main.o").exists());
+        }
+    }
+}
+
+#[test]
+fn independent_cross_file_type_errors_remain_roots_with_recovered_imports() {
+    let f = Fixture::new(
+        "import market; import broken;\nfn main() { let unrelated: i64 = true; println(market::price()); }",
+    );
+    fs::write(
+        f.0.join("market.wi"),
+        "pub fn price() -> i64 { return false; }",
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("broken.wi"),
+        "pub fn recover() -> i64 { let y = 0; y += 1; return y; }",
+    )
+    .unwrap();
+    let values = events(
+        &f.run(
+            env!("CARGO_BIN_EXE_willow"),
+            &["check", "main.wi", "--format=ndjson"],
+        ),
+        1,
+        "WT2001",
+    );
+    for path in ["main.wi", "market.wi"] {
+        assert!(
+            values.iter().any(|v| {
+                v["event"] == "diagnostic"
+                    && v["code"] == "E0201"
+                    && v["data"]["cascade"] == false
+                    && v["data"]["labels"][0]["path"]
+                        .as_str()
+                        .is_some_and(|p| p.ends_with(path))
+            }),
+            "missing independent type error: {path}: {values:?}"
+        );
+    }
+}

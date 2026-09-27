@@ -13,6 +13,13 @@ use willow_compiler::project::{
 
 pub(super) fn capabilities() -> AgentCapabilities {
     AgentCapabilities {
+        direct_refs: Some("willow refs module::symbol"),
+        direct_symbol: Some("willow symbol module::symbol"),
+        direct_type: Some("willow type src/main.wi:1:1"),
+        direct_effects: Some("willow effects module::function"),
+        direct_impact: Some("willow impact module::function"),
+        direct_rename: Some("willow rename module::function new_name"),
+        snapshot_clear: Some("willow snapshot clear --dir DIR"),
         machine_check: Some(super::protocol::CHECK_COMMAND),
         machine_build: Some(super::protocol::BUILD_COMMAND),
         snapshots: Some(super::analysis::SNAPSHOT_COMMAND),
@@ -246,7 +253,16 @@ mod tests {
             machine_build: current.machine_build,
             ..Default::default()
         };
-        for (name, caps) in [("v0", v0), ("snapshot", current)] {
+        let snapshot = AgentCapabilities {
+            direct_refs: None,
+            direct_symbol: None,
+            direct_type: None,
+            direct_effects: None,
+            direct_impact: None,
+            direct_rename: None,
+            ..current
+        };
+        for (name, caps) in [("v0", v0), ("snapshot", snapshot), ("direct", current)] {
             let codex = render_agent_instructions(Agent::Codex, caps);
             let claude = render_agent_instructions(Agent::Claude, caps);
             assert_eq!(
@@ -254,10 +270,13 @@ mod tests {
                 claude.split_once("## Willow core").unwrap().1
             );
             for (agent, text) in [(Agent::Codex, codex), (Agent::Claude, claude)] {
-                let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                let mut path = Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("tests/fixtures/agent")
                     .join(name)
                     .join(agent.file());
+                if name == "direct" {
+                    path.set_extension("txt");
+                }
                 if std::env::var_os("UPDATE_AGENT_GOLDENS").is_some() {
                     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                     std::fs::write(&path, &text).unwrap();
@@ -266,7 +285,7 @@ mod tests {
                 if name == "v0" {
                     assert!(!text.contains("willow snapshot"));
                     assert!(!text.contains("willow impact"));
-                } else {
+                } else if name == "snapshot" {
                     for phrase in [
                         "Before semantic",
                         "old snapshot stale",
@@ -275,6 +294,12 @@ mod tests {
                     ] {
                         assert!(text.contains(phrase));
                     }
+                } else {
+                    assert!(text.contains("willow refs"));
+                    assert!(text.contains("willow rename"));
+                    assert!(!text.contains("Before semantic"));
+                    assert!(!text.contains("REVISION"));
+                    assert!(!text.contains("queries.json"));
                 }
             }
         }

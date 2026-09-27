@@ -9,6 +9,10 @@ pub struct Symbol {
     pub identity: Option<SymbolIdentity>,
     pub id: String,
     pub name: String,
+    /// Live compiler owner spelling for standalone direct selectors. This is
+    /// display metadata, not an additional persisted semantic fact.
+    #[serde(skip)]
+    pub source_name: Option<String>,
     pub kind: String,
     pub location: Option<Location>,
     pub ty: Option<Type>,
@@ -333,7 +337,23 @@ pub(super) fn finish(
     let owners = crate::compiler_db::references::owners(&points, &ranges);
     let mut ordinals = HashMap::<(String, String, String), usize>::new();
     let mut identities = HashMap::new();
+    let mut source_names = HashMap::new();
     for (d, owner) in declarations.into_iter().zip(owners) {
+        let (_, owner_name): (&str, &str) =
+            serde_json::from_str(&owner).expect("compiler owner identity");
+        let name = d.name.rsplit("::").next().unwrap_or(&d.name);
+        let source_name = if matches!(
+            d.kind.as_str(),
+            "field" | "static-field" | "variant" | "parameter" | "binding" | "type-parameter"
+        ) && owner_name != "module"
+        {
+            format!("{owner_name}::{name}")
+        } else if matches!(d.kind.as_str(), "method" | "constructor") && owner_name != "module" {
+            owner_name.to_owned()
+        } else {
+            name.to_owned()
+        };
+        source_names.insert(declaration_key(d), source_name);
         let key = (
             owner,
             d.kind.clone(),
@@ -370,6 +390,7 @@ pub(super) fn finish(
             identity: None,
             id: id.clone(),
             name: d.name.clone(),
+            source_name: source_names.get(&declaration_key(d)).cloned(),
             kind: d.kind.clone(),
             location,
             ty: d.ty.clone(),

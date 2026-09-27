@@ -282,6 +282,7 @@ mod tests {
                     }
                 }
                 let snapshot = Snapshot {
+                    edit_context: None,
                     semantic: Default::default(),
                     version: 1,
                     compiler: String::new(),

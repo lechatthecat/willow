@@ -575,6 +575,7 @@ mod tests {
         let mut semantic = SemanticFacts::default();
         let id = serde_json::to_string(&[&file, "Box"]).unwrap();
         semantic.symbols.push(symbols::Symbol {
+            source_name: None,
             identity: None,
             id: format!("symbol:{id}"),
             name: "Box".into(),
@@ -587,6 +588,7 @@ mod tests {
             ty: None,
         });
         Snapshot {
+            edit_context: None,
             version: 1,
             compiler: "test".into(),
             compatibility: "c".into(),

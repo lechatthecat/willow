@@ -1,5 +1,43 @@
 # Willow toolchain protocol V0 (schema version 1)
 
+## Direct semantic commands
+
+For interactive work, use `willow refs order::Order::qty`, `willow symbol
+order::Order::qty`, `willow type src/order.wi:18:12`, `willow effects
+order::submit`, `willow impact order::submit`, or `willow rename book::min
+smaller`. These commands resolve names through compiler semantics in one process;
+no saved snapshot, request file, manual identity or byte offset is required.
+`references` aliases `refs`. Project discovery searches for `project.toml`;
+use `--project-dir DIR` or `--source FILE` to select an explicit analysis scope.
+
+Selectors are qualified/unqualified semantic names or file:line:column (one-based
+Unicode scalar columns). Ambiguity returns reusable candidate selectors without
+choosing a candidate. `--kind`, `--module` and `--package` narrow selection.
+Invalid positions fail rather than being clamped. Display paths are project-relative;
+`--absolute-paths` requests absolute paths for read queries. Human output is the
+default, with coverage and truncation visible. References show at most 50 entries;
+`--all` removes the limit, `--show-id` exposes identities and `--explain` retains
+detailed evidence. `--format json` returns one `{schema,kind,status,result}`
+object; `--format ndjson` writes that same object on one line. Exit codes are
+0 for success, 1 for resolution/analysis failures and 2 for invalid arguments.
+This direct-command envelope is separate from the event-stream protocol below.
+
+Rename uses compiler-owned structured edits, checks its source/configuration
+revision, validates a candidate, and applies under the existing workspace lock.
+`--dry-run` only returns the prospective diff. Failed direct apply rolls back
+files it actually published, preserving differing concurrent edits. An OS-level
+rollback failure reports the recovery transaction. Ordinary filesystem readers
+may observe intermediate files; cross-file isolation is for cooperating clients.
+The transaction ID is hidden on success unless `--verbose` is set. Unsupported
+coverage or ambiguous names fail without a text-replacement fallback.
+
+The existing `query --requests`, `impact --function/--revision` and `edit`
+protocols remain available for batch/external integrations. Snapshots are useful
+for persisted comparisons, risk analysis and debugging, rather than a prerequisite
+for the direct commands.
+
+## Event-stream protocol
+
 `willow check main.wi --format ndjson` and `willow build main.wi -o app --format ndjson`
 emit UTF-8 NDJSON on stdout. Each line is an independent JSON object. Both accept
 project directories and existing compiler flags. `--format human` selects ordinary output.
@@ -52,10 +90,9 @@ protocol dependencies enter distributed applications.
 
 The archived prototype is not the public contract. V0 adds lifecycle/version
 rejection, stable command failures, build diagnostics, project check, and a user
-driver to the existing diagnostic/check foundation. Impact, snapshots, risk,
-queries and edits remain later releases. Within-revision identities and
-cross-revision matching will be separate; impact distance and synthetic-node
-presentation remain V1 decisions.
+driver to the existing diagnostic/check foundation. Later protocol revisions
+add impact, snapshots, risk, queries and structured edits; their contracts are
+documented below and in the linked protocol documents.
 
 Saved snapshot files and CLI query, impact, diff, risk and daemon response
 payloads store the workspace path once in `workspace` and set
@@ -104,6 +141,34 @@ The machine-readable envelope and known payloads are defined in [toolchain-v1.sc
 
 Agent instruction generation, capability flags and managed sync are documented
 in [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md).
+
+## Owned measurement snapshots
+
+`snapshot init --dir DIR` registers an absent or empty dedicated measurement
+directory. `snapshot save PROJECT --managed-dir DIR --output NAME` publishes a
+snapshot and its immutable ownership record; `--base BASE_NAME` permits a delta
+against a full snapshot owned by the same directory. Names are single filenames.
+`snapshot clear --dir DIR [--dry-run]` verifies ownership, payload hashes and the
+full/delta dependency set before deleting deltas followed by bases. Unknown files,
+symlinks, external bases, invalid records and active writers cause refusal.
+An absent directory is a successful no-op. Source, Git, build caches, edit recovery
+state and arbitrary historical snapshots are outside this directory's contract.
+
+The result records scope, success, deleted/planned payload count and bytes,
+separate ownership-record counts, refusal/skipped reasons and traversal counters.
+Deletion failure reports only successful deletions. If payload deletion succeeds
+but ownership-record deletion fails, clear fails closed on retry and requires
+inspection; it does not guess that unmatched metadata is safe to remove.
+
+Before each measurement session, stop and wait for only its owned daemon, clear
+once, then start a fresh process and create a full baseline. Abort on failure.
+Do not clear between warm samples. Count initial analysis/baseline creation in
+cold-start measurements and report it separately for isolated snapshot IO.
+Record compiler digest, source revision/dirty state, entry and configuration.
+OS page caches are unchanged. Branch names are not revision keys: ordinary source
+changes require daemon refresh, while entry/configuration/compiler changes require
+restart. Clear is not a substitute for either. Keep historical/shared snapshots
+as separate complete sets and never share a measurement baseline externally.
 
 Structured editing and the warm query process are documented in [STRUCTURED_EDITS.md](STRUCTURED_EDITS.md), including their isolation, recovery, refresh and retention boundaries.
 

@@ -173,9 +173,9 @@ fn instructions_json_and_sync_upgrade_preserve_user_bytes() {
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(value["schema_version"], 1);
     assert_eq!(value["agent"], "codex");
-    assert_eq!(value["instruction_schema"], 2);
+    assert_eq!(value["instruction_schema"], 3);
     let caps = value["capabilities"].as_object().unwrap();
-    assert_eq!(caps.len(), 8);
+    assert_eq!(caps.len(), 15);
     assert!(caps.values().all(|v| v == &serde_json::json!(true)));
     let current = value["markdown"].as_str().unwrap();
     let old = include_str!("fixtures/agent/v0/AGENTS.md");
@@ -190,7 +190,7 @@ fn instructions_json_and_sync_upgrade_preserve_user_bytes() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("1 -> 2"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("1 -> 3"));
     assert_eq!(
         fs::read_to_string(f.0.join("AGENTS.md")).unwrap(),
         format!("User prefix\r\n{current}User suffix: 日本語\r\n")
@@ -356,7 +356,7 @@ fn concurrent_readers_only_observe_complete_new_files() {
 }
 
 #[test]
-fn generated_snapshot_query_and_callers_workflow_executes_and_detects_staleness() {
+fn generated_direct_workflow_executes_without_snapshot_requests() {
     let f = Fixture::new();
     assert!(f.run(&["init", "."]).status.success());
     fs::write(
@@ -367,107 +367,42 @@ fn generated_snapshot_query_and_callers_workflow_executes_and_detects_staleness(
     let display = f.run(&["agent", "instructions", "claude"]);
     assert!(display.status.success());
     let markdown = String::from_utf8(display.stdout).unwrap();
-
-    let run = |command: &str| {
-        let args: Vec<_> = command.split_whitespace().skip(1).collect();
-        let out = f.run(&args);
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stdout)
-        );
-        let events: Vec<serde_json::Value> = String::from_utf8(out.stdout)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        for (seq, event) in events.iter().enumerate() {
-            assert_eq!(event["seq"], seq);
-            assert_eq!(event["schema_version"], 1);
-            assert_eq!(event["stream_id"], events[0]["stream_id"]);
-        }
-        assert_eq!(events[0]["event"], "request.started");
-        let terminal = events.last().unwrap();
-        assert_eq!(terminal["event"], "request.finished");
-        assert_eq!(terminal["data"]["status"], "ok");
-        assert_eq!(terminal["data"]["exit_code"], 0);
-        events
-            .iter()
-            .find(|event| event["event"] == "analysis.result")
-            .map(|event| event["data"].clone())
-            .unwrap_or(serde_json::Value::Null)
-    };
-    let commands: Vec<_> = markdown
-        .split('`')
-        .filter(|s| s.starts_with("willow "))
-        .collect();
-    let snapshot_command = *commands
-        .iter()
-        .find(|c| c.starts_with("willow snapshot "))
-        .unwrap();
-    let query_command = *commands
-        .iter()
-        .find(|c| c.starts_with("willow query "))
-        .unwrap();
-    let callers_command = *commands
-        .iter()
-        .find(|c| c.starts_with("willow impact "))
-        .unwrap();
-    let check_command = *commands
-        .iter()
-        .find(|c| c.starts_with("willow check "))
-        .unwrap();
-    let saved = run(snapshot_command);
-    let snapshot: serde_json::Value =
-        serde_json::from_slice(&fs::read(f.0.join("snapshot.json")).unwrap()).unwrap();
-    assert_eq!(saved["revision"], snapshot["revision"]);
-    let revision = saved["revision"].as_str().unwrap();
-    let functions = snapshot["functions"].as_array().unwrap();
-    let leaf = functions.iter().find(|v| v["name"] == "leaf").unwrap();
-    let main = functions.iter().find(|v| v["name"] == "main").unwrap();
-    let id = leaf["id"].as_str().unwrap();
-    let mut examples = Vec::new();
-    for block in markdown.split("```json\n").skip(1) {
-        let example = block
-            .split("```")
-            .next()
-            .unwrap()
-            .replace("REVISION", revision)
-            .replace("SYMBOL_ID", id);
-        fs::write(f.0.join("queries.json"), &example).unwrap();
-        let result = run(query_command);
-        assert_eq!(result["revision"], revision);
-        assert_eq!(result["results"][0]["result"]["status"], "ok");
-        examples.push(example);
+    for text in [
+        "willow refs",
+        "willow type",
+        "willow rename",
+        "willow effects",
+        "willow impact",
+    ] {
+        assert!(markdown.contains(text));
     }
-    assert_eq!(examples.len(), 2);
-    let impact = run(&callers_command
-        .replace("FUNCTION_ID", id)
-        .replace("REVISION", revision));
+    for text in ["Before semantic", "queries.json", "REVISION", "FUNCTION_ID"] {
+        assert!(!markdown.contains(text));
+    }
+    for args in [
+        vec!["refs", "main::leaf"],
+        vec!["type", "src/main.wi:1:4"],
+        vec!["effects", "main::leaf"],
+        vec!["impact", "main::leaf"],
+        vec!["rename", "main::leaf", "smaller", "--dry-run"],
+        vec!["rename", "main::leaf", "smaller"],
+        vec!["check", "."],
+    ] {
+        let output = f.run(&args);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(!f.0.join("snapshot.json").exists());
+    assert!(!f.0.join("queries.json").exists());
     assert!(
-        impact["impact"]["nodes"]
-            .as_array()
+        fs::read_to_string(f.0.join("src/main.wi"))
             .unwrap()
-            .iter()
-            .any(|v| v["id"] == main["id"])
+            .contains("smaller();")
     );
-
-    fs::write(
-        f.0.join("src/main.wi"),
-        "fn leaf() {} fn main() { leaf(); leaf(); }",
-    )
-    .unwrap();
-    let stale = run(query_command);
-    assert_eq!(stale["results"][0]["status"], "stale");
-    run(check_command);
-    let fresh = run(&snapshot_command.replace("snapshot.json", "fresh-snapshot.json"));
-    assert_ne!(fresh["revision"], revision);
-    fs::write(
-        f.0.join("queries.json"),
-        examples[0].replace(revision, fresh["revision"].as_str().unwrap()),
-    )
-    .unwrap();
-    assert_eq!(run(query_command)["results"][0]["result"]["status"], "ok");
 }
 
 #[test]

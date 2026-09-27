@@ -41,9 +41,13 @@ pub struct CompilerInputs {
 }
 
 impl CompilerInputs {
-    pub(crate) fn resolve_project(
+    pub(crate) fn resolve_project(self, root: Option<&std::path::Path>) -> anyhow::Result<Self> {
+        self.resolve_project_analysis(root, true)
+    }
+    pub(crate) fn resolve_project_analysis(
         mut self,
         root: Option<&std::path::Path>,
+        publish_lock: bool,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             root.is_some() || !(self.options.locked || self.options.offline),
@@ -52,10 +56,11 @@ impl CompilerInputs {
         if let Some(root) = root {
             self.project_mode = true;
             // Lock all projects, while preserving legacy compiler identities.
-            if let Some(graph) = crate::package::resolve_project_packages(
+            if let Some(graph) = crate::package::resolve_project_analysis(
                 root,
                 self.options.locked,
                 self.options.offline,
+                publish_lock,
             )? {
                 self = self.with_packages(std::sync::Arc::new(graph));
             }

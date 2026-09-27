@@ -1,0 +1,10 @@
+module order;
+
+pub class Order {
+    pub qty: i64;
+
+    pub init(self, qty: i64) { self.qty = qty; }
+    pub fn value(self) -> i64 { return self.qty; }
+}
+
+pub fn submit(n: i64) -> i64 { return n + 1; }

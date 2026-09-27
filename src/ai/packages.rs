@@ -522,6 +522,7 @@ mod tests {
                     .collect();
                 let edges: usize = modules.iter().map(|m| m.dependencies.len()).sum();
                 let snapshot = Snapshot {
+                    edit_context: None,
                     version: 1,
                     compiler: storage::compiler_stamp(),
                     compatibility: "test".into(),

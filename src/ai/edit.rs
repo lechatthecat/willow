@@ -67,6 +67,94 @@ pub struct Workspace {
     directory: PathBuf,
     _lock: File,
 }
+
+/// Live analysis inputs, deliberately absent from persisted snapshots. Structured
+/// edits need a current checked frontend, including its original configuration.
+#[derive(Debug, Clone)]
+pub(crate) struct AnalysisInputs {
+    entry: PathBuf,
+    root: PathBuf,
+    project: bool,
+    manifest_entry: Option<PathBuf>,
+    configuration: String,
+    files: BTreeMap<String, Option<String>>,
+}
+impl AnalysisInputs {
+    pub(crate) fn capture(
+        entry: &Path,
+        project: Option<&Path>,
+        options: &CompilerOptions,
+    ) -> Result<Self> {
+        let root = fs::canonicalize(project.unwrap_or(entry.parent().context("entry parent")?))?;
+        let mut files = BTreeMap::new();
+        let mut manifest_entry = None;
+        for name in ["project.toml", "project.lock"] {
+            files.insert(
+                name.into(),
+                match fs::read(root.join(name)) {
+                    Ok(bytes) => {
+                        if name == "project.toml" && project.is_some() {
+                            let manifest: crate::project::ProjectManifest =
+                                toml::from_str(std::str::from_utf8(&bytes)?)?;
+                            manifest_entry = Some(manifest.entry_point(&root));
+                        }
+                        Some(hash(bytes))
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                },
+            );
+        }
+        Ok(Self {
+            entry: entry.to_owned(),
+            root,
+            project: project.is_some(),
+            manifest_entry,
+            configuration: hash(format!("{options:?}|{}", target_lexicon::HOST)),
+            files,
+        })
+    }
+    pub(crate) fn verify_files(&self) -> Result<()> {
+        for (name, expected) in &self.files {
+            let actual = match fs::read(self.root.join(name)) {
+                Ok(bytes) => Some(hash(bytes)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            ensure!(
+                &actual == expected,
+                "stale analysis configuration: {name} changed"
+            );
+        }
+        Ok(())
+    }
+    pub(super) fn verify_manifest_entry(&self) -> Result<()> {
+        if let Some(entry) = &self.manifest_entry {
+            ensure!(
+                fs::canonicalize(entry)? == self.entry,
+                "analysis entry differs from current project manifest"
+            );
+        }
+        self.verify_files()
+    }
+    fn verify_edit(&self, entry: &Path, root: &Path, project: bool) -> Result<()> {
+        ensure!(
+            self.entry == entry
+                && self.project == project
+                && if project {
+                    self.root == root
+                } else {
+                    self.entry.starts_with(root)
+                },
+            "analysis entry/workspace/mode mismatch"
+        );
+        ensure!(
+            self.configuration == configuration(),
+            "analysis options/environment changed"
+        );
+        self.verify_files()
+    }
+}
 impl Workspace {
     pub fn open(root: &Path) -> Result<Self> {
         let root = fs::canonicalize(root)?;
@@ -98,28 +186,7 @@ impl Workspace {
         })
     }
     fn file(&self, relative: &str) -> Result<PathBuf> {
-        let path = Path::new(relative);
-        ensure!(
-            !path.as_os_str().is_empty()
-                && path
-                    .components()
-                    .all(|c| matches!(c, std::path::Component::Normal(_))),
-            "invalid workspace-relative path"
-        );
-        ensure!(
-            path.components().next().unwrap().as_os_str() != ".willow-edits",
-            "local metadata cannot be an input"
-        );
-        let full = self.root.join(path);
-        ensure!(
-            fs::canonicalize(&full)? == full,
-            "symlink input is not editable"
-        );
-        ensure!(
-            fs::metadata(&full)?.is_file(),
-            "input is not a regular file"
-        );
-        Ok(full)
+        checked_file(&self.root, relative)
     }
     fn plan_path(&self, id: &str) -> Result<PathBuf> {
         ensure!(
@@ -128,6 +195,33 @@ impl Workspace {
         );
         Ok(self.directory.join(format!("{id}.json")))
     }
+}
+
+fn checked_file(root: &Path, relative: &str) -> Result<PathBuf> {
+    let path = Path::new(relative);
+    ensure!(
+        !path.as_os_str().is_empty()
+            && path
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_))),
+        "invalid workspace-relative path"
+    );
+    ensure!(
+        path.components().next().unwrap().as_os_str() != ".willow-edits",
+        "local metadata cannot be an input"
+    );
+    let full = root.join(path);
+    ensure!(
+        fs::canonicalize(&full)? == full,
+        "symlink input is not editable"
+    );
+    ensure!(
+        fs::metadata(&full)?.is_file(),
+        "input is not a regular file"
+    );
+    Ok(full)
+}
+impl Workspace {
     fn load(&self, id: &str) -> Result<Plan> {
         let plan: Plan = serde_json::from_slice(&fs::read(self.plan_path(id)?)?)?;
         ensure!(plan.version == 1, "unsupported edit plan");
@@ -171,10 +265,33 @@ impl Workspace {
             .strip_prefix(&self.root)
             .context("entry outside workspace")?
             .to_str()
+            .context("non UTF-8 entry")?;
+        self.file(relative)?;
+        let snapshot = self.analyze(&entry, project, emitter)?;
+        self.prepare_analyzed(&entry, project, request, format, snapshot)
+    }
+    pub(super) fn prepare_analyzed(
+        &self,
+        entry: &Path,
+        project: bool,
+        request: Request,
+        format: ChangeFormat,
+        snapshot: Snapshot,
+    ) -> Result<serde_json::Value> {
+        self.ensure_recovered()?;
+        let entry = fs::canonicalize(entry)?;
+        let context = snapshot
+            .edit_context
+            .as_ref()
+            .context("edit requires live analysis inputs")?;
+        context.verify_edit(&entry, &self.root, project)?;
+        let relative = entry
+            .strip_prefix(&self.root)
+            .context("entry outside workspace")?
+            .to_str()
             .context("non UTF-8 entry")?
             .to_owned();
         self.file(&relative)?;
-        let snapshot = self.analyze(&entry, project, emitter)?;
         ensure!(
             snapshot.revision == request.revision,
             "base revision mismatch: source, configuration, or analysis mode differs; \
@@ -207,6 +324,7 @@ impl Workspace {
                 absent.push(name.into());
             }
         }
+        context.verify_files()?;
         let (changes, work) =
             structured_changes(&snapshot, &self.root, &sources, request.operations)?;
         ensure!(!changes.is_empty(), "transaction makes no changes");
@@ -257,7 +375,7 @@ impl Workspace {
             &CompilerOptions::debug(),
             project.then(|| self.root.clone()),
         )
-        .analysis_with_emitter(emitter)
+        .analysis_for_edit_with_emitter(emitter)
     }
     pub fn preview(&self, id: &str, format: ChangeFormat) -> Result<serde_json::Value> {
         self.ensure_recovered()?;
@@ -357,7 +475,7 @@ impl Workspace {
             &CompilerOptions::debug(),
             plan.project.then_some(root.clone()),
         )
-        .analysis_with_emitter(&mut CandidatePaths::new(emitter, &root))?;
+        .analysis_for_edit_with_emitter(&mut CandidatePaths::new(emitter, &root))?;
         for (path, digest) in &checked.sources {
             let relative = Path::new(path)
                 .strip_prefix(&root)
@@ -394,6 +512,78 @@ impl Workspace {
         fail_after: Option<usize>,
         emitter: &mut dyn DiagnosticEmitter,
     ) -> Result<serde_json::Value> {
+        self.apply_observed(id, fail_after, None, &mut 0, emitter)
+    }
+    pub(super) fn apply_with_rollback(
+        &self,
+        id: &str,
+        emitter: &mut dyn DiagnosticEmitter,
+    ) -> Result<serde_json::Value> {
+        self.apply_rollback_observed(id, None, emitter)
+    }
+    fn apply_rollback_observed(
+        &self,
+        id: &str,
+        observe: Option<&dyn Fn(Option<usize>) -> Result<()>>,
+        emitter: &mut dyn DiagnosticEmitter,
+    ) -> Result<serde_json::Value> {
+        let mut written = 0;
+        let result = self.apply_observed(id, None, observe, &mut written, emitter);
+        if result.is_err()
+            && (written > 0 || self.directory.join("active").exists())
+            && let Err(rollback) = self.rollback_owned(id, written)
+        {
+            return result.with_context(|| {
+                format!("rollback failed: {rollback:#}; Recovery transaction: {id}")
+            });
+        }
+        result
+    }
+    fn rollback_owned(&self, id: &str, written: usize) -> Result<()> {
+        match fs::read_to_string(self.directory.join("active")) {
+            Ok(active) => ensure!(active == id, "different active transaction"),
+            Err(error) if written > 0 && error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut plan = self.load(id)?;
+        // A failure after the success marker was removed still needs an undo
+        // journal if rollback itself is interrupted or encounters an IO error.
+        plan.state = "applying".into();
+        self.store(id, &plan)?;
+        if !self.directory.join("active").exists() {
+            durable_write(&self.directory.join("active"), id.as_bytes())?;
+        }
+        let mut failures = Vec::new();
+        for change in plan.changes.iter().take(written) {
+            let reverted = (|| -> Result<()> {
+                let path = self.file(&change.path)?;
+                let current = fs::read_to_string(&path)?;
+                // A third-party change is preserved; rollback only our exact bytes.
+                if current == change.after {
+                    durable_write(&path, change.before.as_bytes())?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = reverted {
+                failures.push(format!("{}: {error:#}", change.path));
+            }
+        }
+        ensure!(failures.is_empty(), "{}", failures.join("; "));
+        plan.state = "aborted".into();
+        self.store(id, &plan)?;
+        if self.directory.join("active").exists() {
+            self.clear_active()?;
+        }
+        Ok(())
+    }
+    fn apply_observed(
+        &self,
+        id: &str,
+        fail_after: Option<usize>,
+        observe: Option<&dyn Fn(Option<usize>) -> Result<()>>,
+        written: &mut usize,
+        emitter: &mut dyn DiagnosticEmitter,
+    ) -> Result<serde_json::Value> {
         self.ensure_recovered()?;
         let mut plan = self.load(id)?;
         ensure!(
@@ -416,6 +606,9 @@ impl Workspace {
         plan.state = "applying".into();
         self.store(id, &plan)?;
         for (i, change) in plan.changes.iter().enumerate() {
+            if let Some(hook) = observe {
+                hook(Some(i))?;
+            }
             if fail_after == Some(i) {
                 anyhow::bail!("injected interrupted write");
             }
@@ -425,7 +618,7 @@ impl Workspace {
                 "concurrent edit: {}",
                 change.path
             );
-            durable_write(&path, change.after.as_bytes())?;
+            durable_write_observed(&path, change.after.as_bytes(), || *written += 1)?;
         }
         let snapshot = self.analyze(&self.root.join(&plan.entry), plan.project, emitter)?;
         let replacements: BTreeMap<_, _> = plan
@@ -463,6 +656,9 @@ impl Workspace {
         plan.state = "applied".into();
         self.store(id, &plan)?;
         self.clear_active()?;
+        if let Some(hook) = observe {
+            hook(None)?;
+        }
         Ok(
             serde_json::json!({"kind":"edit.applied", "transaction":id, "candidate":plan.candidate, "revision":snapshot.revision}),
         )
@@ -557,6 +753,9 @@ fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 fn durable_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    durable_write_observed(path, bytes, || {})
+}
+fn durable_write_observed(path: &Path, bytes: &[u8], published: impl FnOnce()) -> Result<()> {
     let parent = path.parent().context("missing parent")?;
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let temporary = parent.join(format!(
@@ -578,6 +777,7 @@ fn durable_write(path: &Path, bytes: &[u8]) -> Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;
+        published();
         sync_directory(parent)?;
         Ok(())
     })();
@@ -593,6 +793,8 @@ struct EditWork {
     expressions_indexed: usize,
     references_visited: usize,
     patches: usize,
+    #[serde(default)]
+    declarations: usize,
     output_bytes: usize,
 }
 #[derive(Clone)]
@@ -686,6 +888,44 @@ impl std::fmt::Display for Rejection {
     }
 }
 impl std::error::Error for Rejection {}
+
+/// Preview semantic changes without creating transaction metadata or candidates.
+pub(super) fn preview_analyzed(snapshot: &Snapshot, request: Request) -> Result<serde_json::Value> {
+    ensure!(request.revision == snapshot.revision, "stale revision");
+    let root = Path::new(&snapshot.workspace);
+    let context = snapshot
+        .edit_context
+        .as_ref()
+        .context("edit requires live analysis inputs")?;
+    context.verify_edit(&context.entry, root, context.project)?;
+    ensure!(
+        !root.join(".willow-edits/active").exists(),
+        "interrupted transaction requires edit recover"
+    );
+    let mut sources = BTreeMap::new();
+    for (path, expected) in &snapshot.sources {
+        let relative = Path::new(path)
+            .strip_prefix(root)
+            .context("external source is not editable")?
+            .to_str()
+            .context("non UTF-8 path")?;
+        let source = fs::read_to_string(checked_file(root, relative)?)?;
+        ensure!(hash(&source) == *expected, "source changed during analysis");
+        sources.insert(relative.to_owned(), source);
+    }
+    let (changes, work) = structured_changes(snapshot, root, &sources, request.operations)?;
+    for (path, expected) in &snapshot.sources {
+        ensure!(
+            hash(fs::read(path)?) == *expected,
+            "source changed during preview"
+        );
+    }
+    context.verify_files()?;
+    let changes:Vec<_>=changes.iter().map(|c|serde_json::json!({"path":c.path,"diff":super::diff::unified(&c.path,&c.before,&c.after)})).collect();
+    Ok(
+        serde_json::json!({"status":"ok","changes":changes,"work":work,"dry_run":true,"revision":snapshot.revision}),
+    )
+}
 
 fn structured_changes(
     snapshot: &Snapshot,
@@ -910,7 +1150,9 @@ fn structured_changes(
                                 matches!(&t.kind, TokenKind::Ident(s) if s == old),
                                 "inconsistent dispatch declaration"
                             );
-                            allowed.entry(p.into()).or_default().insert(t.span.start);
+                            if allowed.entry(p.into()).or_default().insert(t.span.start) {
+                                work.declarations += 1;
+                            }
                         }
                     }
                     // Item imports (`import m::{f}` / `import m::f as g`) name the
@@ -1010,6 +1252,82 @@ fn structured_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn direct_apply_rolls_back_own_writes_on_late_failure_or_race() {
+        for race in [0, 1, 2, 3] {
+            let f = Fixture::new();
+            fs::write(f.0.join("helper.wi"), "pub fn other() -> i64 { return 2; }").unwrap();
+            fs::write(f.0.join("main.wi"),"import helper; fn value() -> i64 { return 1; } fn main() { println(value() + helper::other()); }").unwrap();
+            let workspace = f.workspace();
+            let mut emitter = crate::diagnostics::HumanEmitter;
+            let snapshot = workspace
+                .analyze(&f.0.join("main.wi"), false, &mut emitter)
+                .unwrap();
+            let operations = snapshot
+                .functions
+                .iter()
+                .filter(|f| matches!(f.name.as_str(), "value" | "other"))
+                .map(|f| Operation::ReplaceBody {
+                    function: f.id.clone(),
+                    body: "{ return 9; }".into(),
+                })
+                .collect();
+            let preview = workspace
+                .prepare_analyzed(
+                    &f.0.join("main.wi"),
+                    false,
+                    Request {
+                        revision: snapshot.revision.clone(),
+                        operations,
+                    },
+                    ChangeFormat::Diff,
+                    snapshot,
+                )
+                .unwrap();
+            let id = preview["transaction"].as_str().unwrap();
+            workspace.validate(id, &mut emitter).unwrap();
+            let plan = workspace.load(id).unwrap();
+            assert_eq!(plan.changes.len(), 2);
+            let second = workspace.root.join(&plan.changes[1].path);
+            let third_party = if race == 2 {
+                plan.changes[1].after.clone()
+            } else {
+                format!("{} // concurrent user edit", plan.changes[1].before)
+            };
+            let hook = |event: Option<usize>| -> Result<()> {
+                if event.is_none() && race == 3 {
+                    anyhow::bail!("injected failure after active marker removal");
+                }
+                if matches!(event, Some(1)) && race != 3 {
+                    if race != 0 {
+                        fs::write(&second, &third_party)?;
+                    } else {
+                        anyhow::bail!("injected write failure");
+                    }
+                }
+                Ok(())
+            };
+            assert!(
+                workspace
+                    .apply_rollback_observed(id, Some(&hook), &mut emitter)
+                    .is_err()
+            );
+            assert_eq!(
+                fs::read_to_string(workspace.root.join(&plan.changes[0].path)).unwrap(),
+                plan.changes[0].before
+            );
+            assert_eq!(
+                fs::read_to_string(second).unwrap(),
+                if race == 1 || race == 2 {
+                    third_party
+                } else {
+                    plan.changes[1].before.clone()
+                }
+            );
+            assert!(!workspace.directory.join("active").exists());
+            assert_eq!(workspace.load(id).unwrap().state, "aborted");
+        }
+    }
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {

@@ -581,16 +581,11 @@ fn resolve_one(
 
     if !parse_errs.is_empty() {
         errors.extend(parse_errs);
-        // Keep the partially parsed module in the graph long enough for the
-        // diagnostic reporter to resolve its FileId to the imported file.
-        // The front end clears files after an import failure, so this recovery
-        // program is never desugared, type-checked, or emitted.
-        let name = alias
-            .map(str::to_string)
-            .unwrap_or_else(|| module_access_name(path).to_string());
-        graph.add_package_file(name, key.clone(), module_path, source, program);
-        graph.end_key_visit(key);
-        return;
+        // Preserve recovered declarations AND resolve their imports. The entry
+        // parser already feeds recovery ASTs to semantic checking; imported
+        // recovery units use the same policy. Discarding all modules here
+        // manufactures unrelated unresolved-name errors in their consumers.
+        // The recorded errors still prevent backend emission.
     }
 
     // An imported file's declared module identity must match the import path
