@@ -4,6 +4,9 @@ use super::*;
 
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
+        ("example/language_gaps/main.wi", "idle\n6\n9\n"),
+        ("example/semantic_cli/src/main.wi", "3\n"),
+        ("example/semantic_cli_diagnostics.wi", "1\n0\n0\n"),
         (
             "example/else_if_chains.wi",
             "A\nB\nC\nF\nfizzbuzz\n1\n2\nfizz\n4\nbuzz\nfizz\n7\n8\nfizz\nbuzz\ndone\n",
@@ -832,6 +835,23 @@ fn test_runnable_example_catalog_is_complete() {
         actual_paths, expected_paths,
         "every runnable non-future example entrypoint should have an output assertion"
     );
+}
+
+#[test]
+fn test_recent_cli_and_language_examples() {
+    for path in [
+        "example/language_gaps/main.wi",
+        "example/semantic_cli/src/main.wi",
+        "example/semantic_cli_diagnostics.wi",
+    ] {
+        let (_, expected) = runnable_example_cases()
+            .iter()
+            .find(|(entry, _)| *entry == path)
+            .expect("example must be cataloged");
+        let (out, ok) = compile_file_and_run(path);
+        assert!(ok, "{path} failed to compile or run");
+        assert_eq!(out, *expected, "{path} output mismatch");
+    }
 }
 
 #[test]
