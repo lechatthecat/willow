@@ -1,11 +1,11 @@
+![Status](https://img.shields.io/badge/status-experimental-orange)
+![License](https://img.shields.io/badge/license-MIT-blue)
+
 # Willow
 
 This project is not production ready.
 
-> A statically typed, garbage-collected native programming language with its own runtime, package manager, incremental compiler infrastructure, and AI-oriented semantic tooling.
-
-![Status](https://img.shields.io/badge/status-experimental-orange)
-![License](https://img.shields.io/badge/license-MIT-blue)
+A statically typed, garbage-collected native programming language with its own runtime, package manager, incremental compiler infrastructure, and AI-oriented semantic tooling.
 
 Willow is an experimental programming language that compiles to native code through [Cranelift](https://cranelift.dev/).
 
