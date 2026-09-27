@@ -1,5 +1,7 @@
 # Willow
 
+This project is not production ready.
+
 > A statically typed, garbage-collected native programming language with its own runtime, package manager, incremental compiler infrastructure, and AI-oriented semantic tooling.
 
 ![Status](https://img.shields.io/badge/status-experimental-orange)
