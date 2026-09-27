@@ -56,6 +56,9 @@ impl InitCommand {
         }
         scaffold.commit();
         println!("Created Willow project");
+        println!(
+            "Git is not initialized by willow init. For a new project outside a Git repository, run `git init` in the project directory to activate .gitignore rules (including .willow-edits/). Inside an existing or parent Git repository, its ignore rules already apply; no nested repository is needed. Existing .gitignore files are preserved: ensure they include .willow-edits/."
+        );
         Ok(())
     }
 }

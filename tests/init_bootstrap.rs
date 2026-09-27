@@ -510,3 +510,62 @@ fn init_preserves_agent_symlinks_without_following_them() {
     assert_eq!(fs::read(f.0.join("target")).unwrap(), b"user");
     assert!(!f.0.join("missing").exists());
 }
+
+#[test]
+fn init_explains_git_policy_and_preserves_repository_markers() {
+    for marker in [None, Some(".git"), Some("parent")] {
+        let f = Fixture::new();
+        let root = if marker == Some("parent") {
+            f.0.join("child")
+        } else {
+            f.0.clone()
+        };
+        fs::create_dir_all(&root).unwrap();
+        if marker.is_some() {
+            let output = Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&f.0)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+        let config = marker.map(|_| fs::read(f.0.join(".git/config")).unwrap());
+        let out = f.run(&["init", root.to_str().unwrap(), "--name", "demo"]);
+        assert!(out.status.success(), "{out:?}");
+        let text = String::from_utf8(out.stdout).unwrap();
+        for expected in [
+            "git init",
+            ".willow-edits/",
+            "parent Git repository",
+            "Existing .gitignore files are preserved",
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+        if marker.is_some() {
+            assert_eq!(fs::read(f.0.join(".git/config")).unwrap(), config.unwrap());
+            let output = Command::new("git")
+                .args(["check-ignore", ".willow-edits/probe"])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+        if marker != Some(".git") {
+            assert!(!root.join(".git").exists());
+        }
+    }
+}
+
+#[test]
+fn init_works_without_git_executable() {
+    let f = Fixture::new();
+    let out = Command::new(env!("CARGO_BIN_EXE_willow"))
+        .current_dir(&f.0)
+        .env("PATH", "")
+        .args(["init", "."])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(!f.0.join(".git").exists());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("git init"));
+}

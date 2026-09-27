@@ -1,0 +1,15 @@
+// Inspect: willow effects main --source example/semantic_cli_diagnostics.wi --all
+// Rename rejects interface contracts, fields and variants without source edits.
+interface Dispatcher { fn assign(self) -> i64; }
+class Nearest implements Dispatcher {
+    pub fn assign(self) -> i64 { return 1; }
+}
+class Passenger {
+    pub board: i64;
+    pub init(self) { self.board = 0; }
+}
+enum Dir { Idle, Up }
+fn main() {
+    let dispatcher = new Nearest();
+    println(dispatcher.assign());
+}

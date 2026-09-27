@@ -52,6 +52,9 @@ semantic queries, safe renaming, and check/build validation. Existing agent file
 are left untouched. Use `willow agent sync` to review updates to Willow-managed
 sections later.
 
+Willow includes AI-oriented semantic tooling for references, types, impact analysis, and safe structured refactoring.
+AI agents can query compiler-resolved program structure directly instead of reconstructing it from text search alone.
+
 ---
 
 ## Examples

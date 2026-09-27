@@ -281,3 +281,33 @@ fn direct_rename_rejects_entry_that_disagrees_with_current_manifest() {
     .analysis_with_emitter(&mut HumanEmitter)
     .unwrap();
 }
+
+#[test]
+fn unsupported_symbol_kinds_and_interface_coverage_have_actionable_reasons() {
+    let source = "interface Dispatcher { fn assign(self) -> i64; }\nclass Nearest implements Dispatcher { pub fn assign(self) -> i64 { return 1; } }\nclass Passenger { pub board: i64; pub init(self) { self.board = 0; } }\nenum Dir { Idle, Up }\nfn main() {}\n";
+    for dry in [false, true] {
+        for (selector, reason) in [
+            ("main::Dispatcher::assign", "unsupported rename target"),
+            ("main::Passenger::board", "unsupported rename target"),
+            ("main::Dir::Idle", "unsupported rename target"),
+            (
+                "main::Nearest::assign",
+                "interface contract declarations are not covered",
+            ),
+        ] {
+            let f = Fixture::new(source);
+            let mut args = vec!["rename", selector, "renamed"];
+            if dry {
+                args.push("--dry-run");
+            }
+            let result = f.run(&args, 1);
+            assert!(
+                result["message"].as_str().unwrap().contains(reason),
+                "{result}"
+            );
+            assert_eq!(result["location"]["path"], "main.wi");
+            assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), source);
+            assert!(!f.0.join(".willow-edits/active").exists());
+        }
+    }
+}

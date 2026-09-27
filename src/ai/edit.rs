@@ -1195,8 +1195,31 @@ fn structured_changes(
                 }
                 for &(p, span) in identifiers.get(old.as_str()).into_iter().flatten() {
                     if !allowed.get(p).is_some_and(|a| a.contains(&span.start)) {
+                        let ts = &tokens[p];
+                        let index = ts.partition_point(|t| t.span.start < span.start);
+                        let reason = match index
+                            .checked_sub(1)
+                            .and_then(|i| ts.get(i))
+                            .map(|t| &t.kind)
+                        {
+                            Some(TokenKind::Fn) => {
+                                "function/method declaration outside the supported dispatch family; interface contract declarations are not covered"
+                            }
+                            Some(TokenKind::Dot) => {
+                                "member reference without a proven target in the supported dispatch family"
+                            }
+                            Some(TokenKind::ColonColon) => {
+                                "qualified reference without a proven target in the supported dispatch family"
+                            }
+                            _ => {
+                                "same-name identifier outside the proven declaration/reference set"
+                            }
+                        };
                         return Err(Rejection {
-                            message: "rename coverage incomplete or ambiguous".into(),
+                            message: format!(
+                                "rename coverage incomplete or ambiguous: `{old}` is a {reason}. Inspect this occurrence with `willow symbol {p}:{}:{}` and `willow refs`; no files changed",
+                                span.line, span.col
+                            ),
                             location: RejectionLocation {
                                 path: p.into(),
                                 start: span.start,

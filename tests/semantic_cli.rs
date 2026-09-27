@@ -333,3 +333,64 @@ fn references_distinguish_possible_virtual_dispatch() {
         "{result}"
     );
 }
+
+#[test]
+fn type_positions_explain_absent_types_and_keep_structured_status() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "fn main() {\n    let value = 1;\n    println(value);\n}\n",
+    )
+    .unwrap();
+    for selector in ["src/main.wi:1:1", "src/main.wi:2:1", "src/main.wi:2:5"] {
+        let value = f.json(&["type", selector], 1);
+        assert_eq!(value["status"], "unknown", "{value}");
+        let out = f.run(&["type", selector]);
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            text.contains("No typed expression or declaration"),
+            "{text}"
+        );
+        assert!(text.contains("Place the cursor"), "{text}");
+    }
+    for selector in ["src/main.wi:2:17", "src/main.wi:3:13"] {
+        let value = f.json(&["type", selector], 0);
+        assert_eq!(value["result"]["type_display"], "i64");
+    }
+    fs::write(f.0.join("src/main.wi"), "fn main() { let x = ; }").unwrap();
+    let value = f.json(&["type", "src/main.wi:1:1"], 1);
+    assert_eq!(value["status"], "error");
+    assert!(value["message"].is_string());
+}
+
+#[test]
+fn effects_human_decodes_masks_and_retains_source_evidence() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "fn empty() {}\nfn main() { println(1); }\n",
+    )
+    .unwrap();
+    let empty = f.run(&["effects", "main::empty"]);
+    assert!(
+        String::from_utf8(empty.stdout)
+            .unwrap()
+            .contains("Runtime effects: none")
+    );
+    for extra in [vec![], vec!["--all"], vec!["--explain"]] {
+        let mut args = vec!["effects", "main::main"];
+        args.extend(extra);
+        let out = f.run(&args);
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(text.contains("may-allocate"), "{text}");
+        assert!(text.contains("may-panic"), "{text}");
+        assert!(text.contains("src/main.wi:2:"), "{text}");
+        assert!(text.contains("Runtime evidence for main::main"), "{text}");
+        assert!(text.contains("conservative"), "{text}");
+    }
+    let out = f.run(&["effects", "main::main", "--format=json"]);
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["result"]["runtime_effects"], 63);
+    assert!(value["result"]["effect_evidence"].is_array());
+    assert!(value["result"].get("compiler_witnesses").is_none());
+}

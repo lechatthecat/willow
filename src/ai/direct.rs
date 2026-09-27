@@ -173,6 +173,35 @@ impl DirectSession {
             .as_str()
             .context("resolved symbol lacks identity")?
             .to_owned();
+        if !self.function_names.contains_key(&id) {
+            self.display_locations(&mut resolved, false)?;
+            let symbol = &resolved["symbol"];
+            let loc = &symbol["location"];
+            let message = format!(
+                "unsupported rename target `{selector}` ({}): rename currently supports source functions and implementation methods only; fields, enum variants, interface contracts and local bindings are not supported. No files changed",
+                symbol["kind"].as_str().unwrap_or("symbol")
+            );
+            if let (Some(path), Some(start), Some(end), Some(line), Some(column)) = (
+                loc["path"].as_str(),
+                loc["start"].as_u64(),
+                loc["end"].as_u64(),
+                loc["line"].as_u64(),
+                loc["column"].as_u64(),
+            ) {
+                return Err(edit::Rejection {
+                    message,
+                    location: edit::RejectionLocation {
+                        path: path.into(),
+                        start: start.try_into()?,
+                        end: end.try_into()?,
+                        line: line.try_into()?,
+                        column: column.try_into()?,
+                    },
+                }
+                .into());
+            }
+            anyhow::bail!(message);
+        }
         let request = edit::Request {
             revision: self.session.revision().to_owned(),
             operations: vec![edit::Operation::Rename {
@@ -468,6 +497,27 @@ impl DirectSession {
             result["truncated"] = json!(shown < total);
         }
         Ok(result)
+    }
+    /// Human-only labels; callers keep the query's structured IDs unchanged.
+    pub fn display_effect_targets(&self, result: &mut Value) {
+        for key in ["effect_evidence", "compiler_witnesses"] {
+            if let Some(facts) = result[key].as_array_mut() {
+                for fact in facts {
+                    if let Some(name) = fact["via_function"]
+                        .as_str()
+                        .and_then(|id| self.function_names.get(id))
+                    {
+                        fact["via_function"] = json!(name);
+                    }
+                    if let Some(name) = fact["witness"]["owner"]
+                        .as_str()
+                        .and_then(|id| self.function_names.get(id))
+                    {
+                        fact["witness"]["owner"] = json!(name);
+                    }
+                }
+            }
+        }
     }
     pub fn display_locations(&mut self, value: &mut Value, absolute: bool) -> Result<()> {
         match value {

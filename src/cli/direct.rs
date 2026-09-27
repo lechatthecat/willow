@@ -172,8 +172,11 @@ impl Options {
             );
         }
         let mut result = session.query(&self.command, &self.selector, &self.filter, self.all)?;
+        if self.command == "effects" && self.format == "human" {
+            session.display_effect_targets(&mut result);
+        }
         session.display_locations(&mut result, self.absolute)?;
-        if !self.explain {
+        if !(self.explain || self.command == "effects" && self.format == "human") {
             concise(&mut result);
         }
         Ok(
@@ -320,12 +323,17 @@ fn human(value: &Value, options: &Options) -> String {
             lines.push(location(&symbol["location"]));
         }
     }
+    if options.command == "type" {
+        match result["status"].as_str() {
+            Some("unknown") if willow_compiler::ai::direct::split_location(&options.selector).is_none() => lines.push("No symbol matches this selector and its filters. Use a qualified symbol name or file:line:column on an identifier or expression.".into()),
+            Some("unknown") => lines.push("No typed expression or declaration was found at this position (keywords and whitespace may have no type). Place the cursor on an expression or identifier, or use `willow type QUALIFIED_SYMBOL`.".into()),
+            Some("unanalyzed") => lines.push("A semantic expression or declaration was found, but its type is unavailable in this analysis. Run `willow check .` for diagnostics; try a typed expression or declaration identifier.".into()),
+            Some("ambiguous") => lines.push("Multiple semantic candidates overlap this position. Select a declaration identifier or a qualified symbol.".into()),
+            _ => {}
+        }
+    }
     if result["runtime_effects"].is_number() {
-        lines.push(format!(
-            "Runtime effects: {}; compiler effects: {}",
-            result["runtime_effects"], result["compiler_effects"]
-        ));
-        lines.push(result["meaning"].as_str().unwrap_or("").into());
+        effect_lines(result, options.all, &mut lines);
     }
     if let Some(nodes) = result["impact"]["nodes"].as_array() {
         lines.push(format!("Affected functions: {}", nodes.len()));
@@ -351,6 +359,91 @@ fn human(value: &Value, options: &Options) -> String {
         lines.push(serde_json::to_string_pretty(result).unwrap());
     }
     lines.join("\n")
+}
+
+fn effect_names(bits: &Value) -> String {
+    use willow_abi::RuntimeEffects as E;
+    let Some(bits) = bits.as_u64() else {
+        return "unavailable".into();
+    };
+    let names: Vec<_> = [
+        (E::MAY_ALLOCATE, "may-allocate"),
+        (E::MAY_BLOCK, "may-block"),
+        (E::MAY_SUSPEND, "may-suspend"),
+        (E::MAY_PREEMPT, "may-preempt"),
+        (E::NO_PREEMPT_REGION, "no-preempt-region"),
+        (E::MAY_PANIC, "may-panic"),
+    ]
+    .into_iter()
+    .filter_map(|(effect, name)| (bits & u64::from(effect.bits()) != 0).then_some(name))
+    .collect();
+    if names.is_empty() {
+        "none".into()
+    } else {
+        names.join(", ")
+    }
+}
+
+fn effect_lines(result: &Value, all: bool, lines: &mut Vec<String>) {
+    lines.push(format!(
+        "Runtime effects: {}",
+        effect_names(&result["runtime_effects"])
+    ));
+    lines.push(format!(
+        "Compiler effects: {}",
+        effect_names(&result["compiler_effects"])
+    ));
+    let target = result["selected"]["selector"]
+        .as_str()
+        .unwrap_or("selected function");
+    for (label, key) in [
+        ("Runtime evidence", "effect_evidence"),
+        (
+            "Local evidence (compiler facts and runtime capabilities)",
+            "compiler_witnesses",
+        ),
+    ] {
+        let evidence = result[key].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        lines.push(format!("{label} for {target}: {}", evidence.len()));
+        let shown = if all {
+            evidence.len()
+        } else {
+            evidence.len().min(50)
+        };
+        for fact in &evidence[..shown] {
+            let witness = &fact["witness"];
+            let mut detail = format!(
+                "  {}: {}",
+                effect_names(&fact["effect"]),
+                fact["status"]
+                    .as_str()
+                    .or_else(|| witness["kind"].as_str())
+                    .unwrap_or("unavailable")
+            );
+            for (name, value) in [
+                ("via", &fact["via_function"]),
+                ("target", &witness["target"]),
+                ("owner", &witness["owner"]),
+                ("operation", &witness["cause"]["operation"]),
+                ("reason", &witness["reason"]),
+            ] {
+                if let Some(value) = value.as_str() {
+                    detail.push_str(&format!("; {name}={value}"));
+                }
+            }
+            if witness["cause"]["location"].is_object() {
+                detail.push_str(&format!(" at {}", location(&witness["cause"]["location"])));
+            }
+            lines.push(detail);
+        }
+        if shown < evidence.len() {
+            lines.push(format!(
+                "{} omitted; use --all to show all evidence",
+                evidence.len() - shown
+            ));
+        }
+    }
+    lines.push(result["meaning"].as_str().unwrap_or("").into());
 }
 
 pub(super) fn run(args: &[String]) -> Result<i32> {
@@ -400,4 +493,52 @@ pub(super) fn run(args: &[String]) -> Result<i32> {
         println!("{}", serde_json::to_string(&value)?);
     }
     Ok(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn type_failure_kinds_have_distinct_explanations() {
+        let options = Options::parse(&["type".into(), "main.wi:1:1".into()]).unwrap();
+        for (status, reason) in [
+            ("unknown", "No typed expression"),
+            ("unanalyzed", "type is unavailable"),
+            ("ambiguous", "Multiple semantic candidates"),
+        ] {
+            let text = human(
+                &json!({"status":status,"result":{"status":status}}),
+                &options,
+            );
+            assert!(text.contains(reason), "{text}");
+        }
+    }
+    #[test]
+    fn effect_evidence_output_is_bounded_and_all_is_linear() {
+        for count in [0, 1, 16, 64, 256, 1024] {
+            let facts: Vec<_> = (0..count).map(|i| json!({"effect":1,"witness":{"kind":"runtime-capability","cause":{"operation":format!("op-{i}"),"location":{"path":"main.wi","line":i+1,"column":1}}}})).collect();
+            let value =
+                json!({"runtime_effects":1,"compiler_effects":0,"compiler_witnesses":facts});
+            for all in [false, true] {
+                let mut lines = Vec::new();
+                effect_lines(&value, all, &mut lines);
+                let shown = if all { count } else { count.min(50) };
+                assert_eq!(
+                    lines
+                        .iter()
+                        .filter(|l| l.starts_with("  may-allocate:"))
+                        .count(),
+                    shown
+                );
+                assert_eq!(
+                    lines.iter().any(|l| l.contains("omitted; use --all")),
+                    !all && count > 50
+                );
+                assert_eq!(lines.len(), 5 + shown + usize::from(!all && count > 50));
+            }
+        }
+        assert_eq!(effect_names(&json!(0)), "none");
+        assert_eq!(effect_names(&Value::Null), "unavailable");
+        assert_eq!(effect_names(&json!(63)).split(", ").count(), 6);
+    }
 }
