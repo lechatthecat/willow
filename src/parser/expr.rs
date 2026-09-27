@@ -6,7 +6,19 @@ use crate::lexer::token::TokenKind;
 #[willow_continuations::parser]
 impl Parser {
     pub(super) fn parse_expr(&mut self) -> Result<Expr, Diagnostic> {
-        self.parse_range()
+        let saved = std::mem::replace(&mut self.allow_object_literals, true);
+        let result = self.parse_range();
+        self.allow_object_literals = saved;
+        result
+    }
+
+    /// At a control-flow head, an unparenthesized `{` starts the body.
+    /// Nested expression delimiters re-enable object literals via `parse_expr`.
+    pub(super) fn parse_control_head(&mut self) -> Result<Expr, Diagnostic> {
+        let saved = std::mem::replace(&mut self.allow_object_literals, false);
+        let result = self.parse_range();
+        self.allow_object_literals = saved;
+        result
     }
 
     pub(super) fn parse_range(&mut self) -> Result<Expr, Diagnostic> {
@@ -471,7 +483,8 @@ impl Parser {
                                 method_span,
                             })))
                         }
-                    } else if super::is_type_constructor_name(&member)
+                    } else if self.allow_object_literals
+                        && super::is_type_constructor_name(&member)
                         && self.eat(TokenKind::LBrace)
                     {
                         self.parse_object_literal_fields(format!("{name}::{member}"), span)
@@ -517,7 +530,10 @@ impl Parser {
                         span,
                         id: ExprId::fresh(),
                     })))
-                } else if super::is_type_constructor_name(&name) && self.eat(TokenKind::LBrace) {
+                } else if self.allow_object_literals
+                    && super::is_type_constructor_name(&name)
+                    && self.eat(TokenKind::LBrace)
+                {
                     self.parse_object_literal_fields(name, span)
                 } else {
                     Ok(Expr::Var(name, span, ExprId::fresh()))
@@ -971,7 +987,7 @@ impl Parser {
     pub(super) fn parse_match_expr(&mut self) -> Result<Expr, Diagnostic> {
         let start = self.current_span();
         self.expect(TokenKind::Match)?;
-        let scrutinee = self.parse_expr()?;
+        let scrutinee = self.parse_control_head()?;
         self.expect(TokenKind::LBrace)?;
         let mut arms = Vec::new();
         while !matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {

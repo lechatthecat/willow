@@ -378,7 +378,7 @@ impl Parser {
         let mut else_block = loop {
             let span = self.current_span();
             self.expect(TokenKind::If)?;
-            let cond = self.parse_expr()?;
+            let cond = self.parse_control_head()?;
             let then_block = self.parse_block()?;
             rungs.push((span, cond, then_block));
             if !self.eat(TokenKind::Else) {
@@ -413,7 +413,7 @@ impl Parser {
     pub(super) fn parse_while(&mut self) -> Result<Stmt, Diagnostic> {
         let span = self.current_span();
         self.expect(TokenKind::While)?;
-        let cond = self.parse_expr()?;
+        let cond = self.parse_control_head()?;
         let body = self.parse_block()?;
         Ok(Stmt::While(WhileStmt { cond, body, span }))
     }
@@ -424,7 +424,7 @@ impl Parser {
         let name_span = self.current_span();
         let name = self.expect_ident()?;
         self.expect(TokenKind::In)?;
-        let iterable = self.parse_expr()?;
+        let iterable = self.parse_control_head()?;
         let body = self.parse_block()?;
         Ok(Stmt::For(ForStmt {
             name,

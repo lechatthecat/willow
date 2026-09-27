@@ -291,3 +291,13 @@ fn package_identity_initializers_run_once_per_package() {
         "1\n2\n11\n11\n22\n",
     );
 }
+
+#[test]
+fn package_identity_imported_class_arrays() {
+    run_case(
+        "import std::collections::Array; pub class Car { pub n: i64; } pub fn pick(cars: Array<Car>) -> i64 { return cars[0].n; } pub fn copy(cars: Array<Car>) -> Array<Car> { return cars; } pub class Garage { pub cars: Array<Car>; }",
+        "pub class Car { pub n: i64; }",
+        "import a::util::{Car, pick, copy, Garage}; import same::util::Car as SameCar; import std::collections::Array; fn main() { let cars = [new SameCar(42)]; let copied: Array<Car> = copy(cars); let garage = new Garage([]); garage.cars = copied; println(pick(garage.cars)); }",
+        "42\n",
+    );
+}

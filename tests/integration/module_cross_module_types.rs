@@ -1319,3 +1319,88 @@ pub fn run() {{
         );
     }
 }
+
+#[test]
+fn imported_array_identity_argument() {
+    assert_project(
+        &[
+            ("a.wi", "pub class Car { pub n: i64; }"),
+            (
+                "b.wi",
+                "import a::Car; import std::collections::Array; pub fn pick(xs: Array<Car>) -> i64 { return xs[0].n; }",
+            ),
+            (
+                "app.wi",
+                "import a::Car; import b::pick; fn main() { let xs = [new Car(42)]; println(pick(xs)); }",
+            ),
+        ],
+        "42\n",
+    );
+}
+
+#[test]
+fn imported_array_identity_perspectives() {
+    // Five import forms x four flows = 20 independently compiled perspectives.
+    let imports = [
+        ("import a::Car;", "Car"),
+        ("import a::Car as Vehicle;", "Vehicle"),
+        ("import a;", "a::Car"),
+        ("import a as cars;", "cars::Car"),
+        ("import a::Car; import a as cars;", "cars::Car"),
+    ];
+    for (import, car) in imports {
+        for flow in 0..4 {
+            let body = match flow {
+                0 => format!("let xs = [new {car}(42)]; println(pick(xs));"),
+                1 => format!("let xs: Array<{car}> = make(); println(xs[0].n);"),
+                2 => format!("let h = new Holder([]); h.xs = [new {car}(42)]; println(h.xs[0].n);"),
+                _ => {
+                    format!("let xs: Array<Array<{car}>> = [[new {car}(42)]]; println(nested(xs));")
+                }
+            };
+            let app = format!(
+                "{import} import b::{{pick, make, Holder, nested}}; import std::collections::Array; fn main() {{ {body} }}"
+            );
+            assert_project(
+                &[
+                    ("a.wi", "pub class Car { pub n: i64; }"),
+                    (
+                        "b.wi",
+                        "import a::Car as Vehicle; import std::collections::Array; pub fn pick(xs: Array<Vehicle>) -> i64 { return xs[0].n; } pub fn make() -> Array<Vehicle> { return [new Vehicle(42)]; } pub class Holder { pub xs: Array<Vehicle>; } pub fn nested(xs: Array<Array<Vehicle>>) -> i64 { return xs[0][0].n; }",
+                    ),
+                    ("app.wi", &app),
+                ],
+                "42\n",
+            );
+        }
+    }
+}
+
+#[test]
+fn imported_array_identity_rejects_different_declarations_and_covariance() {
+    for declaration in [
+        "pub class Car { pub n: i64; }",
+        "import a::Car as Base; pub class Car extends Base {}",
+    ] {
+        let errors = project_error(&[
+            ("a.wi", "pub open class Car { pub n: i64; }"),
+            ("other.wi", declaration),
+            (
+                "b.wi",
+                "import a::Car; import std::collections::Array; pub fn pick(xs: Array<Car>) -> i64 { return xs[0].n; }",
+            ),
+            (
+                "app.wi",
+                "import other::Car; import b::pick; fn main() { let xs = [new Car(42)]; println(pick(xs)); }",
+            ),
+        ]);
+        assert!(errors.contains("E0201"), "{errors}");
+    }
+}
+
+#[test]
+fn language_gaps_runnable_example() {
+    let (out, ok) = super::support::compile_file_and_run("example/language_gaps/main.wi");
+    assert!(ok, "{out}");
+    assert_eq!(out, "idle\n6\n9\n");
+}

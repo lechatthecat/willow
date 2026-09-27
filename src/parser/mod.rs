@@ -17,6 +17,7 @@ pub struct Parser {
     type_uses: Vec<TypeUse>,
     tokens: Vec<Token>,
     pos: usize,
+    allow_object_literals: bool,
     /// Statement-level errors recovered inside blocks (willow-qzxg): the block
     /// keeps parsing after a bad statement, so one error no longer swallows the
     /// rest of the surrounding item (which used to cascade into a false
@@ -31,6 +32,7 @@ impl Parser {
             type_uses: Vec::new(),
             tokens,
             pos: 0,
+            allow_object_literals: true,
             recovered_errors: Vec::new(),
         }
     }
@@ -109,6 +111,8 @@ impl Parser {
     }
 
     fn peek_kind(&self) -> &TokenKind {
+        #[cfg(test)]
+        PARSER_TOKEN_READS.with(|count| count.set(count.get() + 1));
         &self.tokens[self.pos].kind
     }
 
@@ -345,6 +349,80 @@ mod tests {
             Item::Function(function) => function,
             _ => panic!("expected first item to be a function"),
         }
+    }
+
+    #[test]
+    fn control_head_token_reads_scale_linearly() {
+        let mut samples = Vec::new();
+        for count in [8, 16, 32, 64] {
+            let source = format!("fn main() {{ {} }}", "if x == Dir::Idle {} ".repeat(count));
+            PARSER_TOKEN_READS.with(|v| v.set(0));
+            parse_ok(&source);
+            samples.push((count, PARSER_TOKEN_READS.with(|v| v.get())));
+        }
+        let per_head = (samples[1].1 - samples[0].1) / (samples[1].0 - samples[0].0);
+        for pair in samples.windows(2) {
+            assert_eq!(pair[1].1 - pair[0].1, per_head * (pair[1].0 - pair[0].0));
+        }
+        eprintln!("control-head token reads: {samples:?}");
+    }
+
+    #[test]
+    fn control_head_brace_perspectives() {
+        let cases = [
+            "if x == Dir::Idle {}",
+            "if x != Dir::Idle {} else {}",
+            "if Dir::Idle == x {}",
+            "if (x == Dir::Idle) {}",
+            "if x == (Dir::Idle) {}",
+            "if x == Dir::Idle && yes {}",
+            "if yes || x == Dir::Idle {}",
+            "if x == Dir::Idle {} else if x == Dir::Moving {}",
+            "while x == Dir::Idle {}",
+            "while (x != Dir::Idle) {}",
+            "if x == m::Dir::Idle {}",
+            "match Dir::Idle { Dir::Idle => 1, Dir::Moving => 2 };",
+            "for x in Values {}",
+            "if (Point { x: 1 }).x == 1 {}",
+            "if (m::Point { x: 1 }).x == 1 {}",
+            "if valid(Point { x: 1 }) {}",
+            "if valid(m::Point { x: 1 }) {}",
+            "if [Point { x: 1 }][0].x == 1 {}",
+            "if xs[index(Point { x: 1 })] {}",
+            "if x == Dir::Idle { let p = Point { x: 1 }; }",
+            "while x == Dir::Idle { if x == Dir::Idle {} }",
+            "let p = Point { x: 1 };",
+            "let p = m::Point { x: 1 };",
+            "if choose ? x == Dir::Idle : y == Dir::Moving {}",
+        ];
+        for (i, body) in cases.iter().enumerate() {
+            let errors = parse_errors(&format!("fn main() {{ {body} }}"));
+            assert!(
+                errors.is_empty(),
+                "perspective {}: {body}: {errors:?}",
+                i + 1
+            );
+        }
+        for body in [
+            "if x == {}",
+            "if x == Dir:: {}",
+            "while {}",
+            "if (Point { x: }) {}",
+            "if x == Dir::Idle",
+            "for x in {}",
+        ] {
+            assert!(
+                !parse_errors(&format!("fn main() {{ {body} }}")).is_empty(),
+                "{body}"
+            );
+        }
+        // A failed restricted parse must restore the mode for the next item.
+        let tokens = Lexer::new("fn bad() { if x == ; } fn good() { let p = Point { x: 1 }; }")
+            .tokenize()
+            .unwrap();
+        let (program, errors) = Parser::new(tokens).parse();
+        assert!(!errors.is_empty());
+        assert_eq!(program.items.len(), 2);
     }
 
     #[test]
@@ -2950,4 +3028,9 @@ class ProtectedCtor { prot init(self) {} }
             .unwrap();
         assert_eq!(depth, RUNGS);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PARSER_TOKEN_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

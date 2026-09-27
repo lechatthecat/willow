@@ -2645,6 +2645,7 @@ fn class_name_of(ty: &Type) -> Option<&str> {
 /// by the receiver type (mirrors the checker's method tables).
 fn builtin_method_type(receiver: &Type, method: &str) -> Option<Type> {
     match receiver {
+        Type::String if method == "len" => Some(Type::I64),
         Type::Array(elem) => match method {
             "len" => Some(Type::I64),
             "toString" => Some(Type::String),

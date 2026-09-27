@@ -1,0 +1,2 @@
+pub enum Dir { Idle, Moving }
+pub class Car { pub dir: Dir; pub label: String; }

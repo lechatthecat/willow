@@ -1253,7 +1253,7 @@ impl TypeChecker {
     fn types_compatible(&self, expected: &Type, actual: &Type) -> bool {
         // A diverging expression produces no value and can flow into any
         // expected type. This is directional: concrete values cannot become Never.
-        *actual == Type::Never || expected == actual
+        *actual == Type::Never || self.same_type_identity(expected, actual)
             // A Void-placeholder generic (e.g. Option<Void> from None) matches any
             // concrete instantiation of the same generic enum.
             || matches!((expected, actual),
@@ -1273,6 +1273,79 @@ impl TypeChecker {
                     .is_some_and(|(key, value)| *key == Type::Void && *value == Type::Void))
             || self.is_subtype(actual, expected)
             || self.same_interface(expected, actual)
+    }
+
+    /// Structural equality through imported declaration aliases. Containers stay
+    /// invariant: subtype conversion of an element does not convert its array.
+    /// Visit each pair once, without allocating normalized copies of the types.
+    fn same_type_identity(&self, mut expected: &Type, mut actual: &Type) -> bool {
+        let name_eq = |a: &str, b: &str| {
+            a == b
+                || match (self.symbols.lookup_class(a), self.symbols.lookup_class(b)) {
+                    (Some(a), Some(b)) => a.name == b.name,
+                    _ => false,
+                }
+                || match (
+                    self.symbols.lookup_interface(a),
+                    self.symbols.lookup_interface(b),
+                ) {
+                    (Some(a), Some(b)) => a.name == b.name,
+                    _ => false,
+                }
+                || match (self.symbols.lookup_enum(a), self.symbols.lookup_enum(b)) {
+                    (Some(a), Some(b)) => a.name == b.name,
+                    _ => false,
+                }
+        };
+        let mut pending: Vec<(&[Type], &[Type])> = Vec::new();
+        loop {
+            let (a, b) = (expected, actual);
+            #[cfg(test)]
+            TYPE_IDENTITY_VISITS.with(|visits| visits.set(visits.get() + 1));
+            match (a, b) {
+                (Type::Named(a), Type::Named(b)) if name_eq(a, b) => {}
+                (Type::Array(a), Type::Array(b)) => {
+                    expected = a;
+                    actual = b;
+                    continue;
+                }
+                (Type::Generic(a, aa), Type::Generic(b, ba))
+                    if name_eq(a, b) && aa.len() == ba.len() =>
+                {
+                    pending.push((aa, ba));
+                }
+                (Type::Fn(aa, ar), Type::Fn(ba, br))
+                | (Type::Closure(aa, ar), Type::Closure(ba, br))
+                    if aa.len() == ba.len() =>
+                {
+                    pending.push((std::slice::from_ref(ar), std::slice::from_ref(br)));
+                    pending.push((aa, ba));
+                }
+                (Type::I64, Type::I64)
+                | (Type::F64, Type::F64)
+                | (Type::Bool, Type::Bool)
+                | (Type::String, Type::String)
+                | (Type::Void, Type::Void)
+                | (Type::Never, Type::Never) => {}
+                _ => return false,
+            }
+            // Retain sibling slices instead of one work item per sibling:
+            // wide signatures use constant space, nested ones O(depth).
+            loop {
+                let Some((aa, ba)) = pending.pop() else {
+                    return true;
+                };
+                let (Some((a, ar)), Some((b, br))) = (aa.split_first(), ba.split_first()) else {
+                    continue;
+                };
+                if !ar.is_empty() {
+                    pending.push((ar, br));
+                }
+                expected = a;
+                actual = b;
+                break;
+            }
+        }
     }
 
     /// Two spellings of ONE interface: `Describable`, bound bare by an item
@@ -8045,3 +8118,47 @@ mod continuation_depth_tests {
 }
 
 mod analysis_symbols;
+
+#[cfg(test)]
+thread_local! {
+    static TYPE_IDENTITY_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod type_identity_scaling_tests {
+    use super::*;
+
+    #[test]
+    fn structural_identity_visits_each_node_once() {
+        let mut checker = TypeChecker::new();
+        let tokens = crate::lexer::Lexer::new("class Car {}").tokenize().unwrap();
+        let (program, errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(errors.is_empty());
+        checker.check_module_program(&program);
+        let info = checker.symbols.lookup_class("Car").unwrap().clone();
+        checker.symbols.define_class("Alias".into(), info);
+        for size in [8, 32, 128, 512] {
+            let mut chain = Type::Named("Car".into());
+            let mut alias_chain = Type::Named("Alias".into());
+            for _ in 0..size {
+                chain = Type::Array(Box::new(chain));
+                alias_chain = Type::Array(Box::new(alias_chain));
+            }
+            let wide = Type::Fn(vec![Type::Named("Car".into()); size], Box::new(Type::Bool));
+            let alias_wide = Type::Fn(
+                vec![Type::Named("Alias".into()); size],
+                Box::new(Type::Bool),
+            );
+            for (ty, alias, expected) in [
+                (&chain, &alias_chain, size + 1),
+                (&wide, &alias_wide, size + 2),
+            ] {
+                TYPE_IDENTITY_VISITS.with(|v| v.set(0));
+                for _ in 0..size {
+                    assert!(checker.same_type_identity(ty, alias));
+                }
+                assert_eq!(TYPE_IDENTITY_VISITS.with(|v| v.get()), expected * size);
+            }
+        }
+    }
+}

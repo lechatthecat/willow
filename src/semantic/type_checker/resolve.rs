@@ -1262,6 +1262,19 @@ impl TypeChecker {
         args: &[CallArg],
         span: Span,
     ) -> Type {
+        if *obj_ty == Type::String && method_name == "len" {
+            if !args.is_empty() {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        "`String.len()` takes no arguments",
+                    )
+                    .with_label(Label::primary(span, "unexpected arguments")),
+                );
+            }
+            return Type::I64;
+        }
         // Built-in `toString()` on primitives: `i64`/`f64`/`bool`/`String` ->
         // `String` (willow-fvfc). Class `toString()` falls through to normal
         // instance-method resolution.
