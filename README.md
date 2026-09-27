@@ -40,9 +40,17 @@ willow run
 ```text
 hello/
 ├── project.toml
+├── .gitignore
+├── AGENTS.md
+├── CLAUDE.md
 └── src/
     └── main.wi
 ```
+
+Both agent files contain the current `willow agent instructions` guidance for
+semantic queries, safe renaming, and check/build validation. Existing agent files
+are left untouched. Use `willow agent sync` to review updates to Willow-managed
+sections later.
 
 ---
 

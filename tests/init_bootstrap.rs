@@ -128,7 +128,7 @@ fn preserves_main_and_rolls_back_partial_failure() {
 }
 
 #[test]
-fn init_never_writes_agent_instruction_files() {
+fn init_generates_canonical_agent_instructions_and_preserves_existing_files() {
     let f = Fixture::new();
     let out = f.run(&["init", "."]);
     assert!(
@@ -136,8 +136,30 @@ fn init_never_writes_agent_instruction_files() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!f.0.join("AGENTS.md").exists());
-    assert!(!f.0.join("CLAUDE.md").exists());
+    for (agent, file) in [("codex", "AGENTS.md"), ("claude", "CLAUDE.md")] {
+        let instructions = f.run(&["agent", "instructions", agent]);
+        assert!(instructions.status.success());
+        assert_eq!(fs::read(f.0.join(file)).unwrap(), instructions.stdout);
+    }
+    for file in ["AGENTS.md", "CLAUDE.md"] {
+        let text = fs::read_to_string(f.0.join(file)).unwrap();
+        for guidance in [
+            "--project-dir DIR",
+            "Human-readable output is the default",
+            "not UTF-8 byte offsets",
+            "Start with the smallest query",
+            "do not run every query as a checklist",
+            "Never bypass stale checks",
+            "Do not manually search for or extract FunctionId, SymbolId, revision IDs",
+            "do not manually run prepare/validate/apply",
+            "does not require Git, commits or branches",
+        ] {
+            assert!(text.contains(guidance), "{file}: missing {guidance}");
+        }
+        assert!(text.find("- Rename:").unwrap() < text.find("- Effects:").unwrap());
+        assert!(!text.contains("Before a measurement session"));
+        assert!(!text.contains("willow snapshot clear"));
+    }
     assert!(!String::from_utf8_lossy(&out.stdout).contains("[Y/n]"));
     assert!(!String::from_utf8_lossy(&out.stdout).contains("[y/N]"));
 
@@ -239,8 +261,8 @@ fn parent_components_resolve_for_project_files() {
                 .unwrap()
                 .contains("name = \"demo\"")
         );
-        assert!(!root.join("AGENTS.md").exists());
-        assert!(!root.join("CLAUDE.md").exists());
+        assert!(root.join("AGENTS.md").is_file());
+        assert!(root.join("CLAUDE.md").is_file());
         assert!(!f.0.join("new").exists());
     }
     let f = Fixture::new();
@@ -275,7 +297,7 @@ fn parent_components_follow_existing_symlinks() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(f.0.join("actual/demo/project.toml").is_file());
-    assert!(!f.0.join("actual/demo/AGENTS.md").exists());
+    assert!(f.0.join("actual/demo/AGENTS.md").is_file());
     assert!(!f.0.join("demo").exists());
 }
 
@@ -364,9 +386,7 @@ fn generated_direct_workflow_executes_without_snapshot_requests() {
         "fn leaf() {} fn main() { leaf(); }",
     )
     .unwrap();
-    let display = f.run(&["agent", "instructions", "claude"]);
-    assert!(display.status.success());
-    let markdown = String::from_utf8(display.stdout).unwrap();
+    let markdown = fs::read_to_string(f.0.join("CLAUDE.md")).unwrap();
     for text in [
         "willow refs",
         "willow type",
@@ -435,4 +455,58 @@ fn hyphenated_directory_requires_valid_explicit_name() {
             .unwrap()
             .contains(r#"name = "my_app""#)
     );
+}
+
+#[test]
+fn init_preserves_existing_agent_bytes_and_creates_only_missing_files() {
+    for size in [0, 1024, 1024 * 1024] {
+        for existing in ["AGENTS.md", "CLAUDE.md"] {
+            let f = Fixture::new();
+            let bytes = vec![0xff; size];
+            fs::write(f.0.join(existing), &bytes).unwrap();
+            assert!(f.run(&["init", "."]).status.success());
+            assert_eq!(fs::read(f.0.join(existing)).unwrap(), bytes);
+            let other = if existing == "AGENTS.md" {
+                "CLAUDE.md"
+            } else {
+                "AGENTS.md"
+            };
+            assert!(
+                fs::read_to_string(f.0.join(other))
+                    .unwrap()
+                    .contains("<!-- BEGIN WILLOW MANAGED -->")
+            );
+            assert_eq!(fs::read_dir(&f.0).unwrap().count(), 5);
+        }
+    }
+}
+
+#[test]
+fn init_preserves_agent_directories() {
+    let f = Fixture::new();
+    fs::create_dir(f.0.join("AGENTS.md")).unwrap();
+    fs::write(f.0.join("AGENTS.md/keep"), "user").unwrap();
+    assert!(f.run(&["init", "."]).status.success());
+    assert_eq!(fs::read(f.0.join("AGENTS.md/keep")).unwrap(), b"user");
+    assert!(f.0.join("CLAUDE.md").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn init_preserves_agent_symlinks_without_following_them() {
+    let f = Fixture::new();
+    fs::write(f.0.join("target"), "user").unwrap();
+    std::os::unix::fs::symlink("target", f.0.join("AGENTS.md")).unwrap();
+    std::os::unix::fs::symlink("missing", f.0.join("CLAUDE.md")).unwrap();
+    assert!(f.run(&["init", "."]).status.success());
+    assert_eq!(
+        fs::read_link(f.0.join("AGENTS.md")).unwrap(),
+        PathBuf::from("target")
+    );
+    assert_eq!(
+        fs::read_link(f.0.join("CLAUDE.md")).unwrap(),
+        PathBuf::from("missing")
+    );
+    assert_eq!(fs::read(f.0.join("target")).unwrap(), b"user");
+    assert!(!f.0.join("missing").exists());
 }

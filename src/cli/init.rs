@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+use willow_compiler::project::agent::{Agent, render_agent_instructions};
 use willow_compiler::project::init::{Scaffold, resolve_root};
 
 #[derive(Debug)]
@@ -41,7 +42,19 @@ impl InitCommand {
     }
     pub(super) fn execute(self) -> Result<()> {
         let root = resolve_root(&self.root)?;
-        Scaffold::create(&root, self.name.as_deref())?.commit();
+        let mut scaffold = Scaffold::create(&root, self.name.as_deref())?;
+        for agent in [Agent::Codex, Agent::Claude] {
+            let path = root.join(agent.file());
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => {} // Preserve all existing entries, including dangling symlinks.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let text = render_agent_instructions(agent, super::agent::capabilities());
+                    scaffold.write_new(&path, text.as_bytes())?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        scaffold.commit();
         println!("Created Willow project");
         Ok(())
     }

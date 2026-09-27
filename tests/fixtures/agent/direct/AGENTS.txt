@@ -4,25 +4,30 @@
 
 ## Willow core
 
-Run commands from the project root. Prefer human output; use --format json when structured output helps. NDJSON is for low-level protocol integrations.
+Run commands from the project root. Direct commands discover project.toml automatically; use --project-dir DIR to select another project. Human-readable output is the default; use --format json only when structured output helps. NDJSON is for low-level protocol integrations.
 
-Use compiler commands for semantic identity, references, dispatch, imports, inferred types, rename, impact and effects. Text search is useful for navigation, comments, string literals and broad exploration. Never substitute a textual match for a resolved symbol.
+Prefer references and structured rename over text matching when symbol identity matters: same-named fields, imports and dispatch can make grep or bulk replacement misleading. Inspect inferred types with the type command without building an executable. Use text search and source reading for navigation, comments, strings and simple local investigation. Start with the smallest query that answers the question.
 
 - References: `willow refs module::symbol`.
-- Symbol: `willow symbol module::symbol`.
-- Type: `willow type src/main.wi:1:1`.
-- Effects: `willow effects module::function`.
-- Impact: `willow impact module::function`.
 - Rename: `willow rename module::function new_name`.
-Selectors are qualified names or file:line:column positions (1-based Unicode columns). If a selector is ambiguous, retry with a selector returned in the candidate list. Read coverage, total/shown/truncated and result status; unknown or incomplete is not proof of absence.
+- Inferred type: `willow type src/main.wi:1:1`.
+- Symbol details: `willow symbol module::symbol`.
 
-For rename, add --dry-run to inspect the diff, then run the same command without --dry-run. The command resolves the symbol, prepares and validates semantic edits, and applies the transaction. On failure, do not perform text replacement; report the location and any recovery transaction shown.
+Selectors are qualified names or file:line:column positions (1-based Unicode columns, not UTF-8 byte offsets). Use project-relative file paths; replace the example names and positions with actual declarations or uses. Willow resolves names to compiler identities and converts source positions internally. Do not manually search for or extract FunctionId, SymbolId, revision IDs or byte offsets for ordinary code work; these belong to the low-level compiler/protocol interface. If a selector is ambiguous, retry with a selector returned in the candidate list. Read coverage, total/shown/truncated and result status; unknown or incomplete is not proof of absence.
 
-Saved snapshots are optional for snapshot diff, before/after risk comparison, reproducible persisted analysis, external low-level clients and protocol debugging. Ordinary semantic queries do not require a snapshot file, request JSON, manual IDs or byte-offset calculation. Low-level query/edit/daemon protocols remain available for advanced batch integration.
+For rename, add --dry-run to inspect the diff, then run the same command without --dry-run. The command resolves the symbol, prepares and validates semantic edits, and applies the transaction atomically; do not manually run prepare/validate/apply or write edit request files for ordinary rename. On failure, do not perform text replacement; report the location and any recovery transaction shown.
 
 After changes run `willow check .`.
 When executable validation is needed, run `willow build .`.
-After source edits or branch switches, refresh a daemon before querying it. Restart it when configuration, entry point or compiler changes. Git branch names do not define analysis revisions; a clear is not a substitute for stale checks or refresh.
-Before a measurement session: shut down only its owned daemon and wait for exit; run `willow snapshot clear --dir DIR` once on its dedicated registered snapshot directory; start a new process and create a fresh full baseline; then measure. Initialize a new empty measurement directory with `willow snapshot init --dir DIR` and save its snapshots with `--managed-dir DIR`. Never share these baselines outside the measurement set. Abort measurement if shutdown, refresh or clear fails. Do not clear between warm samples. Record initial analysis/baseline preparation time; include it in cold-start measurements and report it separately for snapshot-only IO measurements. Clear leaves OS page caches unchanged. Preserve historical/shared snapshots separately as complete independent sets.
+
+## Optional deeper analysis
+
+Use effects or impact when the question needs transitive behavior or cross-file risk analysis, especially with heavy dispatch or a large codebase. Source reading is often enough for small local changes; do not run every query as a checklist.
+- Effects: `willow effects module::function`.
+- Impact: `willow impact module::function`.
+Saved snapshots are optional for snapshot diff, before/after risk comparison, reproducible persisted analysis, external low-level clients and protocol debugging. Ordinary semantic queries do not require a snapshot file, request JSON, manual IDs or byte-offset calculation. Snapshot diff compares two saved semantic snapshots and does not require Git, commits or branches. Low-level query/edit/daemon protocols remain available for advanced batch integration.
+
+
+Do not start a daemon or dump a full snapshot just to find a symbol ID. Use snapshot/query/edit/daemon --help only when a task needs the low-level protocol. If using it, keep the project context consistent (including --project where required), use compiler-returned IDs and UTF-8 byte offsets, and reject stale results. Refresh after source edits or branch switches; restart a daemon after configuration, entry point or compiler changes. Never bypass stale checks.
 
 <!-- END WILLOW MANAGED -->

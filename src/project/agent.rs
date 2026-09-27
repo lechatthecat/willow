@@ -100,27 +100,22 @@ pub fn render_agent_instructions(agent: Agent, caps: AgentCapabilities) -> Strin
         agent.name()
     );
     if caps.instruction_schema() >= 3 {
-        text.push_str("Run commands from the project root. Prefer human output; use --format json when structured output helps. NDJSON is for low-level protocol integrations.\n\nUse compiler commands for semantic identity, references, dispatch, imports, inferred types, rename, impact and effects. Text search is useful for navigation, comments, string literals and broad exploration. Never substitute a textual match for a resolved symbol.\n\n");
+        text.push_str("Run commands from the project root. Direct commands discover project.toml automatically; use --project-dir DIR to select another project. Human-readable output is the default; use --format json only when structured output helps. NDJSON is for low-level protocol integrations.\n\nPrefer references and structured rename over text matching when symbol identity matters: same-named fields, imports and dispatch can make grep or bulk replacement misleading. Inspect inferred types with the type command without building an executable. Use text search and source reading for navigation, comments, strings and simple local investigation. Start with the smallest query that answers the question.\n\n");
         for (label, command) in [
             ("References", caps.direct_refs),
-            ("Symbol", caps.direct_symbol),
-            ("Type", caps.direct_type),
-            ("Effects", caps.direct_effects),
-            ("Impact", caps.direct_impact),
             ("Rename", caps.direct_rename),
+            ("Inferred type", caps.direct_type),
+            ("Symbol details", caps.direct_symbol),
         ] {
             if let Some(command) = command {
                 text.push_str(&format!("- {label}: `{command}`.\n"));
             }
         }
-        text.push_str("Selectors are qualified names or file:line:column positions (1-based Unicode columns). If a selector is ambiguous, retry with a selector returned in the candidate list. Read coverage, total/shown/truncated and result status; unknown or incomplete is not proof of absence.\n\n");
+        text.push_str("\nSelectors are qualified names or file:line:column positions (1-based Unicode columns, not UTF-8 byte offsets). Use project-relative file paths; replace the example names and positions with actual declarations or uses. Willow resolves names to compiler identities and converts source positions internally. Do not manually search for or extract FunctionId, SymbolId, revision IDs or byte offsets for ordinary code work; these belong to the low-level compiler/protocol interface. If a selector is ambiguous, retry with a selector returned in the candidate list. Read coverage, total/shown/truncated and result status; unknown or incomplete is not proof of absence.\n\n");
         if caps.direct_rename.is_some() {
-            text.push_str("For rename, add --dry-run to inspect the diff, then run the same command without --dry-run. The command resolves the symbol, prepares and validates semantic edits, and applies the transaction. On failure, do not perform text replacement; report the location and any recovery transaction shown.\n\n");
+            text.push_str("For rename, add --dry-run to inspect the diff, then run the same command without --dry-run. The command resolves the symbol, prepares and validates semantic edits, and applies the transaction atomically; do not manually run prepare/validate/apply or write edit request files for ordinary rename. On failure, do not perform text replacement; report the location and any recovery transaction shown.\n\n");
         } else if let Some(command) = caps.structured_edits {
             text.push_str(&format!("Direct rename is unavailable. Use the low-level structured edit protocol: `{command}`, then edit validate and edit apply for the returned transaction.\n\n"));
-        }
-        if caps.snapshots.is_some() {
-            text.push_str("Saved snapshots are optional for snapshot diff, before/after risk comparison, reproducible persisted analysis, external low-level clients and protocol debugging. Ordinary semantic queries do not require a snapshot file, request JSON, manual IDs or byte-offset calculation. Low-level query/edit/daemon protocols remain available for advanced batch integration.\n\n");
         }
         if caps.machine_check.is_some() {
             text.push_str("After changes run `willow check .`.\n");
@@ -128,10 +123,19 @@ pub fn render_agent_instructions(agent: Agent, caps: AgentCapabilities) -> Strin
         if caps.machine_build.is_some() {
             text.push_str("When executable validation is needed, run `willow build .`.\n");
         }
-        text.push_str("After source edits or branch switches, refresh a daemon before querying it. Restart it when configuration, entry point or compiler changes. Git branch names do not define analysis revisions; a clear is not a substitute for stale checks or refresh.\n");
-        if let Some(command) = caps.snapshot_clear {
-            text.push_str(&format!("Before a measurement session: shut down only its owned daemon and wait for exit; run `{command}` once on its dedicated registered snapshot directory; start a new process and create a fresh full baseline; then measure. Initialize a new empty measurement directory with `willow snapshot init --dir DIR` and save its snapshots with `--managed-dir DIR`. Never share these baselines outside the measurement set. Abort measurement if shutdown, refresh or clear fails. Do not clear between warm samples. Record initial analysis/baseline preparation time; include it in cold-start measurements and report it separately for snapshot-only IO measurements. Clear leaves OS page caches unchanged. Preserve historical/shared snapshots separately as complete independent sets.\n"));
+        text.push_str("\n## Optional deeper analysis\n\nUse effects or impact when the question needs transitive behavior or cross-file risk analysis, especially with heavy dispatch or a large codebase. Source reading is often enough for small local changes; do not run every query as a checklist.\n");
+        for (label, command) in [
+            ("Effects", caps.direct_effects),
+            ("Impact", caps.direct_impact),
+        ] {
+            if let Some(command) = command {
+                text.push_str(&format!("- {label}: `{command}`.\n"));
+            }
         }
+        if caps.snapshots.is_some() {
+            text.push_str("Saved snapshots are optional for snapshot diff, before/after risk comparison, reproducible persisted analysis, external low-level clients and protocol debugging. Ordinary semantic queries do not require a snapshot file, request JSON, manual IDs or byte-offset calculation. Snapshot diff compares two saved semantic snapshots and does not require Git, commits or branches. Low-level query/edit/daemon protocols remain available for advanced batch integration.\n\n");
+        }
+        text.push_str("\nDo not start a daemon or dump a full snapshot just to find a symbol ID. Use snapshot/query/edit/daemon --help only when a task needs the low-level protocol. If using it, keep the project context consistent (including --project where required), use compiler-returned IDs and UTF-8 byte offsets, and reject stale results. Refresh after source edits or branch switches; restart a daemon after configuration, entry point or compiler changes. Never bypass stale checks.\n");
         text.push_str(&format!("\n{END}\n"));
         return text;
     }
