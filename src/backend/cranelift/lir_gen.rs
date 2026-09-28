@@ -11904,6 +11904,35 @@ mod tests {
         assert!(eligible_lenient(&src, "f", &["f"]));
     }
 
+    #[test]
+    fn contextual_arrays_generated_stores_scale_linearly() {
+        use crate::ir::lowered::{LirInst, LirRvalue};
+        for n in [8, 16, 32, 64] {
+            let elements = vec!["new Item(\"a\")"; n].join(",");
+            let source = format!(
+                "import std::collections::Array; {NAMED} fn f() -> Array<Named> {{ return [{elements}]; }}"
+            );
+            let (f, tables) = lir_fn_and_tables(&source, "f", &["f"]);
+            assert!(tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
+            let stores = f
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instrs)
+                .filter(|inst| {
+                    matches!(
+                        inst,
+                        LirInst::Compute {
+                            value: LirRvalue::ArrayStore { .. },
+                            ..
+                        }
+                    )
+                })
+                .count();
+            assert_eq!(stores, n);
+            eprintln!("contextual array generated stores: n={n}: {stores}");
+        }
+    }
+
     // j07. (updated by willow-0g8j.2.4) an ANNOTATED array literal takes the
     // annotation's element type — `lower.rs` retypes it, as the checker's
     // `check_array_literal_expecting` already did — so

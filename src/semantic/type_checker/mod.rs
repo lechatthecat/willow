@@ -8169,3 +8169,6 @@ mod type_identity_scaling_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod contextual_arrays_tests;

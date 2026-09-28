@@ -273,7 +273,19 @@ impl Parser {
     fn err(&self, code: ErrorCode, msg: impl Into<String>) -> Diagnostic {
         let msg = msg.into();
         let span = self.current_span();
-        Diagnostic::new(Severity::Error, code, msg.clone()).with_label(Label::primary(span, msg))
+        let mut diagnostic = Diagnostic::new(Severity::Error, code, msg.clone())
+            .with_label(Label::primary(span, msg));
+        if code == ErrorCode::E0102
+            && let Some(keyword) = self.peek_kind().keyword_name()
+        {
+            diagnostic
+                .message
+                .push_str(&format!("; '{keyword}' is a reserved keyword"));
+            diagnostic.helps.push(format!(
+                "if you intended '{keyword}' as a name, rename it to a non-keyword identifier"
+            ));
+        }
+        diagnostic
     }
 
     /// Like [`Self::err`], but labels a span the parser already has instead of
@@ -3034,3 +3046,6 @@ class ProtectedCtor { prot init(self) {} }
 thread_local! {
     static PARSER_TOKEN_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
+
+#[cfg(test)]
+mod keyword_tests;

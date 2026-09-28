@@ -786,7 +786,7 @@ impl TypeChecker {
 
         let previous_init_ctx = self.local.in_static_initializer;
         self.local.in_static_initializer = true;
-        let init_ty = self.check_expr(init);
+        let init_ty = self.check_expr_expecting(init, &declared);
         self.local.in_static_initializer = previous_init_ctx;
 
         if !self.types_compatible(&declared, &init_ty) && init_ty != Type::Void {

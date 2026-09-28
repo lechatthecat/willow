@@ -821,12 +821,8 @@ impl<'a> LowerCtx<'a> {
 /// Re-type an array literal (and any array literal nested directly inside it)
 /// to the element type its annotated slot declares.
 ///
-/// The type checker already checked every element against that type — see
-/// [`TypeChecker::check_array_literal_expecting`] — and made the literal's own
-/// type the annotation. Lowering infers it from element 0 instead, which is the
-/// same answer whenever the elements agree and a WRONG one when the annotation
-/// widened them (a base class, an interface). Only the recorded type moves; the
-/// elements are untouched, so nothing about what is stored changes.
+/// Checked literals already carry this type. This fallback preserves lowering
+/// for callers without checker tables.
 ///
 /// [`TypeChecker::check_array_literal_expecting`]: crate::semantic::type_checker::TypeChecker
 fn retype_array_literal(value: &mut HirExpr, target: &Type) {
@@ -1526,28 +1522,20 @@ fn lower_array_literal_expr(
     for element in elements {
         lowered.push(lower_expr(element, ctx)?);
     }
-    // A non-empty literal is typed by its first element, exactly as
-    // before; `retype_array_literal` then widens it to an annotated
-    // slot's element type where there is one.
-    //
-    // An empty literal has no element to infer from, so its type comes
-    // from the checker, which typed it against the slot it was written
-    // into (willow-0g8j.2.10). A literal the checker recorded nothing
-    // for — or recorded a non-array for — leaves the element type
-    // genuinely unknown, and the function falls back rather than the
-    // lowering picking one.
-    let ty = match lowered.first() {
-        Some(first) => Type::Array(Box::new(first.ty.clone())),
-        None => match ctx.tables.expr_type(&expr.id()) {
-            Some(recorded @ Type::Array(_)) => recorded,
-            _ => {
+    // The checker owns contextual typing for every literal, not only empty
+    // ones. Inferring again from element 0 loses interface storage/boxing.
+    // The first-element fallback supports callers lowering unchecked syntax.
+    let ty = match ctx.tables.expr_type(&expr.id()) {
+        Some(recorded @ Type::Array(_)) => recorded.into(),
+        _ => match lowered.first() {
+            Some(first) => Type::Array(Box::new(first.ty.clone())),
+            None => {
                 return Err(unsupported(
                     span,
                     "empty array literal with no recorded element type",
                 ));
             }
-        }
-        .into(),
+        },
     };
     Ok(HirExpr {
         kind: HirExprKind::Array { elements: lowered },

@@ -1,0 +1,10 @@
+// `open` is reserved. Use descriptive non-keyword names for members/bindings.
+class Gate {
+    pub is_open: bool;
+    pub fn open_gate(self) -> bool { return self.is_open; }
+}
+fn main() {
+    let opened = new Gate(true);
+    println(opened.open_gate()); // true
+    println(opened.is_open); // true
+}

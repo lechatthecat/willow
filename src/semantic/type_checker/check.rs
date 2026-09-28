@@ -1100,13 +1100,9 @@ impl TypeChecker {
                     self.validate_type(&annotation, s.span);
                     annotation
                 });
-                // A `let xs: Array<I> = [..]` literal is checked element-wise
-                // against `I`, so classes implementing interface `I` are accepted.
-                let inferred = match (&annotation, &s.init) {
-                    (Some(Type::Array(elem)), Expr::ArrayLiteral(elements, _lit_span, _)) => self
-                        .check_array_literal_expecting(elements, s.init.id(), Some(elem.as_ref())),
-                    (Some(ann), _) => self.check_expr_expecting(&s.init, ann),
-                    _ => self.check_expr(&s.init),
+                let inferred = match &annotation {
+                    Some(ann) => self.check_expr_expecting(&s.init, ann),
+                    None => self.check_expr(&s.init),
                 };
                 let ty = if let Some(ann) = &annotation {
                     let channel_ctor_infers_from_annotation = channel_element_type(ann).is_some()
@@ -2341,7 +2337,7 @@ impl TypeChecker {
             Expr::Lambda(l) => self.check_lambda(l),
             Expr::Match(m) => self.check_match_expr(m),
             Expr::TryPropagate(inner, span, _) => self.check_try_propagate(inner, *span),
-            Expr::ArrayLiteral(elements, _span, _) => self.check_array_literal(elements, expr.id()),
+            Expr::ArrayLiteral(elements, _span, _) => self.check_array_literal(elements),
             Expr::Index(arr, index, span, _) => self.check_index(arr, index, *span),
         }
     }

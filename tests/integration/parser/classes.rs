@@ -651,3 +651,10 @@ fn main() {
         ],
     );
 }
+
+#[test]
+fn keyword_reserved_names_example() {
+    let (out, ok) = compile_and_run(include_str!("../../../example/reserved_keyword_names.wi"));
+    assert!(ok);
+    assert_eq!(out, "true\ntrue\n");
+}

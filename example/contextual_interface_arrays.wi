@@ -1,0 +1,25 @@
+// Contextual array elements are converted to Search at each storage position.
+import std::collections::Array;
+
+interface Search { fn value(self) -> i64; }
+class A implements Search { pub fn value(self) -> i64 { return 10; } }
+class B implements Search { pub fn value(self) -> i64 { return 20; } }
+class Holder {
+    pub values: Array<Search>;
+    pub static defaults: Array<Search> = [new B(), new A()];
+}
+fn all() -> Array<Search> { return [new A(), new B()]; }
+fn sum(xs: Array<Search>) -> i64 {
+    return xs[0].value() + xs[1].value();
+}
+fn main() {
+    let xs: Array<Search> = [new A(), new B()];
+    println(sum(xs));
+    println(sum(all()));
+    println(sum([new B(), new A()]));
+    let holder = new Holder([new A(), new B()]);
+    println(sum(holder.values));
+    println(sum(Holder::defaults));
+    let nested: Array<Array<Search>> = [[new A(), new B()]];
+    println(sum(nested[0]));
+}

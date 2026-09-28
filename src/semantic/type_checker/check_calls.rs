@@ -223,13 +223,10 @@ impl TypeChecker {
     }
 
     fn check_expr_expecting_inner(&mut self, expr: &Expr, expected: &Type) -> Type {
-        // Empty arrays have no element from which to infer a type. Record
-        // their contextual type here so arguments, returns, and branches
-        // reach lowering with a concrete element representation.
-        if let (Expr::ArrayLiteral(elements, _, _), Type::Array(elem)) = (expr, expected)
-            && elements.is_empty()
-        {
-            return Type::Array(elem.clone());
+        // Every array element receives the contextual element type, including
+        // nested literals and class values stored through an interface.
+        if let (Expr::ArrayLiteral(elements, _, _), Type::Array(elem)) = (expr, expected) {
+            return self.check_array_literal_expecting(elements, Some(elem));
         }
         // Contextually-typed lambda.
         if let (Expr::Lambda(lambda), Type::Fn(..) | Type::Closure(..)) = (expr, expected) {

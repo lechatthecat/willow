@@ -494,3 +494,21 @@ fn main() {
         &["error[E0201]"],
     );
 }
+
+#[test]
+fn contextual_interface_arrays_example() {
+    let (out, ok) = compile_and_run(include_str!(
+        "../../../example/contextual_interface_arrays.wi"
+    ));
+    assert!(ok);
+    assert_eq!(out, "30\n30\n30\n30\n30\n30\n");
+}
+
+#[test]
+fn contextual_interface_arrays_example_release() {
+    let (out, ok) = compile_and_run_release(include_str!(
+        "../../../example/contextual_interface_arrays.wi"
+    ));
+    assert!(ok);
+    assert_eq!(out, "30\n30\n30\n30\n30\n30\n");
+}

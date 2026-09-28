@@ -288,6 +288,11 @@ impl Parser {
                     ));
             }
             let member_static = member_static_span.is_some();
+            // `open:` is an attempted field name, not a method modifier.
+            // Diagnose while the cursor still points at the reserved name.
+            if self.check(TokenKind::Open) && matches!(self.peek_kind_at(1), TokenKind::Colon) {
+                return Err(self.err(ErrorCode::E0102, "expected identifier"));
+            }
             let member_open = self.eat(TokenKind::Open);
             let member_override = self.eat(TokenKind::Override);
             let member_async = self.eat(TokenKind::Async);
