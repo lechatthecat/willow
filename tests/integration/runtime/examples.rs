@@ -8,6 +8,14 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/semantic_cli/src/main.wi", "3\n"),
         ("example/semantic_cli_diagnostics.wi", "1\n0\n0\n"),
         (
+            "example/contextual_interface_arrays.wi",
+            "30\n30\n30\n30\n30\n30\n",
+        ),
+        ("example/reserved_keyword_names.wi", "true\ntrue\n"),
+        ("example/semantic_contract_queries.wi", "3\n"),
+        ("example/semantic_scope/main.wi", "19\n"),
+        ("example/semantic_local_lock_queries.wi", "1\n2\n"),
+        (
             "example/else_if_chains.wi",
             "A\nB\nC\nF\nfizzbuzz\n1\n2\nfizz\n4\nbuzz\nfizz\n7\n8\nfizz\nbuzz\ndone\n",
         ),
@@ -843,6 +851,11 @@ fn test_recent_cli_and_language_examples() {
         "example/language_gaps/main.wi",
         "example/semantic_cli/src/main.wi",
         "example/semantic_cli_diagnostics.wi",
+        "example/contextual_interface_arrays.wi",
+        "example/reserved_keyword_names.wi",
+        "example/semantic_contract_queries.wi",
+        "example/semantic_scope/main.wi",
+        "example/semantic_local_lock_queries.wi",
     ] {
         let (_, expected) = runnable_example_cases()
             .iter()
