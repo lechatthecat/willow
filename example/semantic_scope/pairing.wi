@@ -1,0 +1,14 @@
+pub interface Pairing {
+    fn pairings(self) -> i64;
+}
+
+pub class Lottery implements Pairing {
+    pub fn pairings(self) -> i64 {
+        let values = [3, 1, 2];
+        let mut total = 0;
+        for value in values {
+            total = total + value;
+        }
+        return total;
+    }
+}

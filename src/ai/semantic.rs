@@ -8,6 +8,8 @@ pub struct SemanticFacts {
     /// Live-only declaration relationships for atomic semantic rename.
     #[serde(skip)]
     pub(crate) rename_links: Vec<(String, String)>,
+    #[serde(skip)]
+    pub(crate) rename_scopes: HashMap<String, Vec<(usize, usize)>>,
     #[serde(default)]
     pub modules: Vec<ModuleEvidence>,
     pub symbols: Vec<symbols::Symbol>,

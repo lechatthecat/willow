@@ -1363,6 +1363,22 @@ mod tests {
     }
 
     #[test]
+    fn revision_imported_interface_waits_match_cold_after_body_edits() {
+        let f = Fixture::new();
+        f.write(
+            "main.wi",
+            "import pairing; fn round(p: pairing::Pairing) { p.pairings(); } fn main() {}",
+        );
+        let mut warm = AnalysisRevision::default();
+        for body in ["", "self.channel.recv();", ""] {
+            f.write("pairing.wi", &format!("pub interface Pairing {{ fn pairings(self); }} pub class Lottery implements Pairing {{ pub channel: Channel<i64>; pub fn pairings(self) {{ {body} }} }}"));
+            assert!(f.compare(&mut warm));
+            assert!(f.compare(&mut warm));
+            assert_eq!(warm.typechecks, 0);
+        }
+    }
+
+    #[test]
     fn revision_effect_changes_recheck_lock_effects() {
         let f = Fixture::new();
         f.write("main.wi", "import value; import independent; async fn main() { let mutex = Mutex::new(0); let ch: Channel<i64> = Channel::new(); lock mutex as n { let v = value::get(ch); } }");

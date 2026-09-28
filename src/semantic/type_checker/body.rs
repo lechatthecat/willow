@@ -542,7 +542,7 @@ impl OrderedOutputs {
             } else if self.errors < errors
                 && let Some(diagnostic) = self.diagnostics.next()
             {
-                checker.errors.push(diagnostic);
+                checker.push(diagnostic);
                 self.errors += 1;
             } else {
                 break;

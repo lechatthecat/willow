@@ -400,17 +400,36 @@ impl EffectQueries {
             .intersection(PANIC)
     }
 
+    /// Imported dispatch uses completed capability queries; unavailable units
+    /// still fail closed. These reads participate in revision invalidation.
+    pub(crate) fn external_waiting(&self, consumer: UnitId, target: &FunctionId) -> RuntimeEffects {
+        self.lookup_external_capabilities(consumer, target, &HashMap::new())
+            .map_or(LOCK_EFFECT_WAIT, |fact| {
+                fact.runtime.intersection(LOCK_EFFECT_WAIT)
+            })
+    }
+
     fn external_capabilities(
         &self,
         consumer: UnitId,
         target: &FunctionId,
         imports: &HashMap<String, String>,
     ) -> EffectCapabilities {
+        self.lookup_external_capabilities(consumer, target, imports)
+            .unwrap_or_else(|| unknown_external_capabilities(target))
+    }
+
+    fn lookup_external_capabilities(
+        &self,
+        consumer: UnitId,
+        target: &FunctionId,
+        imports: &HashMap<String, String>,
+    ) -> Option<EffectCapabilities> {
         if let Some(effect) = intrinsic_effects(target) {
-            return EffectCapabilities {
+            return Some(EffectCapabilities {
                 runtime: effect,
                 may_io: false,
-            };
+            });
         }
         let namespace = target.namespace();
         let owner = target.owner();
@@ -435,46 +454,36 @@ impl EffectQueries {
                     FunctionId::method(TypeId::local(item), target.name()),
                 )
             } else {
-                return unknown_external_capabilities(target);
+                return None;
             }
         } else if let Some(path) = imports.get(target.name()) {
-            let Some((module, item)) = path.rsplit_once("::") else {
-                return unknown_external_capabilities(target);
-            };
+            let (module, item) = path.rsplit_once("::")?;
             (module, FunctionId::free(item))
         } else {
-            return unknown_external_capabilities(target);
+            return None;
         };
-        self.resolve_module(consumer, path).map_or_else(
-            || unknown_external_capabilities(target),
-            |unit| {
-                if !self.units.is_ready(&unit) {
-                    return EffectCapabilities {
-                        runtime: PANIC,
-                        may_io: true,
-                    };
-                }
-                self.effect_capabilities(unit, id).map_or_else(
-                    || unknown_external_capabilities(target),
-                    |fact| {
-                        if let Some(tracking) = self.tracking.borrow().upgrade() {
-                            let capabilities = tracking
-                                .borrow()
-                                .effect_capabilities(unit, id)
-                                .expect("completed effect capability query");
-                            self.imported_reads
-                                .borrow_mut()
-                                .entry(consumer)
-                                .or_default()
-                                .insert((unit, id));
-                            capabilities
-                        } else {
-                            *fact
-                        }
-                    },
-                )
-            },
-        )
+        let unit = self.resolve_module(consumer, path)?;
+        if !self.units.is_ready(&unit) {
+            return Some(EffectCapabilities {
+                runtime: PANIC.union(LOCK_EFFECT_WAIT),
+                may_io: true,
+            });
+        }
+        let fact = self.effect_capabilities(unit, id)?;
+        Some(if let Some(tracking) = self.tracking.borrow().upgrade() {
+            let capabilities = tracking
+                .borrow()
+                .effect_capabilities(unit, id)
+                .expect("completed effect capability query");
+            self.imported_reads
+                .borrow_mut()
+                .entry(consumer)
+                .or_default()
+                .insert((unit, id));
+            capabilities
+        } else {
+            *fact
+        })
     }
 }
 

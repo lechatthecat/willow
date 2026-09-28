@@ -954,10 +954,17 @@ fn structured_changes(
     }
     let mut identifiers: BTreeMap<&str, Vec<(&str, &crate::diagnostics::Span)>> = BTreeMap::new();
     let mut call_names = BTreeMap::new();
+    let mut qualifiers = std::collections::HashSet::new();
     for (path, ts) in &tokens {
         for (i, token) in ts.iter().enumerate() {
             work.tokens_indexed += 1;
             if let TokenKind::Ident(name) = &token.kind {
+                if ts
+                    .get(i + 1)
+                    .is_some_and(|t| t.kind == TokenKind::ColonColon)
+                {
+                    qualifiers.insert((path.as_str(), token.span.start, token.span.end));
+                }
                 identifiers
                     .entry(name)
                     .or_default()
@@ -1017,8 +1024,8 @@ fn structured_changes(
                 "method" | "field" | "static-field" | "variant"
             )
     });
-    let mut semantic_renames =
-        has_member_rename.then(|| super::rename::Index::new(snapshot, root, &identifiers));
+    let mut semantic_renames = has_member_rename
+        .then(|| super::rename::Index::new(snapshot, root, &identifiers, &qualifiers));
     let mut renamed = std::collections::HashSet::new();
     for operation in operations {
         let id = match &operation {
@@ -1030,7 +1037,7 @@ fn structured_changes(
             && let Some(index) = &mut semantic_renames
             && index.supports(id)
         {
-            index.plan(id, name, root, &identifiers, &mut patches, &mut work)?;
+            index.plan(id, name, root, &mut patches, &mut work)?;
             continue;
         }
         let function = functions.get(id.as_str()).context("unknown function")?;

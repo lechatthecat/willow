@@ -14,6 +14,7 @@ struct Class {
     span: Span,
     base: Option<Span>,
     methods: Vec<(String, Span, bool)>,
+    members: Vec<(String, Span)>,
     contracts: Vec<(String, Span)>,
 }
 
@@ -47,6 +48,12 @@ pub(super) fn relations(program: &Program, checked: &SymbolTable) -> Relations {
                 result.classes.push(Class {
                     span: c.span,
                     base,
+                    members: c
+                        .fields
+                        .iter()
+                        .map(|f| (f.name.clone(), f.span))
+                        .chain(c.methods.iter().map(|m| (m.name.clone(), m.span)))
+                        .collect(),
                     methods: c
                         .methods
                         .iter()
@@ -59,6 +66,17 @@ pub(super) fn relations(program: &Program, checked: &SymbolTable) -> Relations {
                 let Some(info) = checked.lookup_interface(&i.name) else {
                     continue;
                 };
+                result.classes.push(Class {
+                    span: i.span,
+                    base: None,
+                    methods: vec![],
+                    contracts: vec![],
+                    members: info
+                        .methods
+                        .iter()
+                        .map(|(name, m)| (name.clone(), m.declaration_span))
+                        .collect(),
+                });
                 for parent in &info.extends {
                     if let Some(parent) = checked.lookup_interface(parent) {
                         for method in &i.methods {
@@ -77,6 +95,17 @@ pub(super) fn relations(program: &Program, checked: &SymbolTable) -> Relations {
                     }
                 }
             }
+            Item::Enum(e) => result.classes.push(Class {
+                span: e.span,
+                base: None,
+                methods: vec![],
+                contracts: vec![],
+                members: e
+                    .variants
+                    .iter()
+                    .map(|v| (v.name.clone(), v.span))
+                    .collect(),
+            }),
             _ => {}
         }
     }
@@ -191,9 +220,74 @@ pub(super) fn links(
     links.into_iter().collect()
 }
 
+/// DFS intervals make each owner relationship comparison O(1).
+/// Siblings and unrelated classes occupy disjoint intervals. A source method
+/// can belong to several scopes (inherited contracts or injected defaults).
+pub(super) fn scopes(
+    captures: &HashMap<UnitId, CapturedUnit>,
+    paths: &HashMap<UnitId, String>,
+    names: &HashMap<UnitId, symbols::Names>,
+    symbols: &[symbols::Symbol],
+) -> HashMap<String, Vec<(usize, usize)>> {
+    let classes: Vec<_> = captures
+        .values()
+        .flat_map(|c| &c.semantic.rename_relations.classes)
+        .collect();
+    let by_span: HashMap<_, _> = classes
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.span, i))
+        .collect();
+    let by_location: HashMap<_, _> = symbols
+        .iter()
+        .filter_map(|s| {
+            s.location
+                .as_ref()
+                .map(|l| ((l.path.as_str(), l.start, l.end), s.id.as_str()))
+        })
+        .collect();
+    let mut children = vec![vec![]; classes.len()];
+    let mut pending = vec![];
+    for (i, c) in classes.iter().enumerate() {
+        if let Some(parent) = c.base.and_then(|b| by_span.get(&b)) {
+            children[*parent].push(i);
+        } else {
+            pending.push((i, false));
+        }
+    }
+    let mut clock = 0;
+    let mut starts = vec![0; classes.len()];
+    let mut result: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    let mut locations = HashMap::new();
+    while let Some((i, exit)) = pending.pop() {
+        if !exit {
+            starts[i] = clock;
+            clock += 1;
+            pending.push((i, true));
+            pending.extend(children[i].iter().map(|&c| (c, false)));
+        } else {
+            for (name, span) in &classes[i].members {
+                let id = locations.entry((*span, name.as_str())).or_insert_with(|| {
+                    symbols::select(*span, name, false, names, paths)
+                        .and_then(|l| by_location.get(&(l.path.as_str(), l.start, l.end)).copied())
+                });
+                if let Some(id) = id {
+                    result
+                        .entry((*id).to_owned())
+                        .or_default()
+                        .push((starts[i], clock));
+                }
+            }
+        }
+    }
+    result
+}
+
 type Point<'a> = (&'a str, usize, usize);
 pub(super) struct Index<'a> {
     symbols: HashMap<&'a str, &'a symbols::Symbol>,
+    scopes: &'a HashMap<String, Vec<(usize, usize)>>,
+    destinations: HashMap<&'a str, Vec<(usize, usize, &'a str)>>,
     references: HashMap<&'a str, Vec<&'a symbols::Reference>>,
     occurrences: HashMap<Point<'a>, HashSet<&'a str>>,
     links: HashMap<&'a str, Vec<&'a str>>,
@@ -204,15 +298,20 @@ pub(super) struct Index<'a> {
     indexed: usize,
     #[cfg(test)]
     edges_visited: usize,
+    #[cfg(test)]
+    collision_probes: usize,
 }
 impl<'a> Index<'a> {
     pub fn new(
         snapshot: &'a Snapshot,
         root: &Path,
         identifiers: &BTreeMap<&'a str, Vec<(&str, &'a Span)>>,
+        qualifiers: &HashSet<(&str, usize, usize)>,
     ) -> Self {
         let mut result = Self {
             symbols: HashMap::new(),
+            scopes: &snapshot.semantic.rename_scopes,
+            destinations: HashMap::new(),
             references: HashMap::new(),
             occurrences: HashMap::new(),
             links: HashMap::new(),
@@ -223,15 +322,45 @@ impl<'a> Index<'a> {
             indexed: 0,
             #[cfg(test)]
             edges_visited: 0,
+            #[cfg(test)]
+            collision_probes: 0,
         };
+        let scope_count = result
+            .scopes
+            .values()
+            .flatten()
+            .map(|s| s.0)
+            .max()
+            .map_or(0, |n| n + 1);
+        let mut by_start = vec![Vec::new(); scope_count];
         for symbol in &snapshot.semantic.symbols {
             result.symbols.insert(&symbol.id, symbol);
+            for &(start, end) in result.scopes.get(&symbol.id).into_iter().flatten() {
+                by_start[start].push((
+                    symbol.name.rsplit("::").next().unwrap(),
+                    end,
+                    symbol.id.as_str(),
+                ));
+            }
             if let Some(l) = &symbol.location {
                 result
                     .occurrences
                     .entry((&l.path, l.start, l.end))
                     .or_default()
                     .insert(&symbol.id);
+            }
+        }
+        // DFS starts are dense integer keys: bucket once rather than sorting
+        // every spelling. Prefix maxima detect overlaps with one binary search.
+        for (start, members) in by_start.into_iter().enumerate() {
+            for (name, end, id) in members {
+                let candidates = result.destinations.entry(name).or_default();
+                let (_, widest, witness) = candidates.last().copied().unwrap_or((0, 0, id));
+                candidates.push(if end > widest {
+                    (start, end, id)
+                } else {
+                    (start, widest, witness)
+                });
             }
         }
         for reference in &snapshot.semantic.references {
@@ -276,7 +405,8 @@ impl<'a> Index<'a> {
                         .source_tokens
                         .insert((absolute, span.start, span.end), (name, span));
                 }
-                if !result.unknown.contains_key(name)
+                if !qualifiers.contains(&(path, span.start, span.end))
+                    && !result.unknown.contains_key(name)
                     && paths.get(path).is_none_or(|absolute| {
                         !result
                             .occurrences
@@ -297,13 +427,11 @@ impl<'a> Index<'a> {
             )
         })
     }
-    #[allow(clippy::too_many_arguments)]
     pub fn plan(
         &mut self,
         id: &str,
         name: &str,
         root: &Path,
-        identifiers: &BTreeMap<&str, Vec<(&str, &Span)>>,
         patches: &mut BTreeMap<String, Vec<Patch>>,
         work: &mut EditWork,
     ) -> Result<()> {
@@ -317,13 +445,6 @@ impl<'a> Index<'a> {
             "rename requires an identifier"
         );
         ensure!(name != old, "rename has no effect");
-        if let Some(&(path, span)) = identifiers.get(name).and_then(|v| v.first()) {
-            return Err(reject(
-                "rename destination already occurs in workspace",
-                path,
-                span,
-            ));
-        }
         ensure!(
             !self.renamed.contains(id),
             "duplicate rename of dispatch family"
@@ -352,6 +473,40 @@ impl<'a> Index<'a> {
             family.is_disjoint(&self.renamed),
             "duplicate rename of dispatch family"
         );
+        for &(start, end) in family
+            .iter()
+            .filter_map(|id| self.scopes.get(*id))
+            .flatten()
+        {
+            let Some(candidates) = self.destinations.get(name) else {
+                continue;
+            };
+            let before = candidates.partition_point(|&(other_start, _, _)| {
+                #[cfg(test)]
+                {
+                    self.collision_probes += 1;
+                }
+                other_start < end
+            });
+            if let Some(&(_, other_end, candidate)) = before.checked_sub(1).map(|i| &candidates[i])
+                && other_end > start
+            {
+                let l = self.symbols[candidate].location.as_ref().unwrap();
+                let (_, span) = self
+                    .source_tokens
+                    .get(&(l.path.as_str(), l.start, l.end))
+                    .context("collision declaration is not an editable identifier")?;
+                let path = Path::new(&l.path)
+                    .strip_prefix(root)?
+                    .to_str()
+                    .context("non UTF-8 source path")?;
+                return Err(reject(
+                    "rename destination conflicts with a member in the same hierarchy",
+                    path,
+                    span,
+                ));
+            }
+        }
         self.renamed.extend(&family);
         let mut allowed = HashSet::new();
         for id in &family {
@@ -428,6 +583,7 @@ mod tests {
                 let classes: Vec<_> = (0..n)
                     .map(|i| Class {
                         span: span(i),
+                        members: vec![],
                         base: (i > 0).then(|| span(if shape == "chain" { i - 1 } else { 0 })),
                         methods: if i == 0 {
                             (0..n)
@@ -458,6 +614,78 @@ mod tests {
                     links.len()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn unrelated_destination_queries_do_not_multiply_full_scans() {
+        for n in [16usize, 64, 256, 1024] {
+            let root = std::env::temp_dir().join("willow-collision-index");
+            let path = root.join("main.wi").to_str().unwrap().to_owned();
+            let tokens = Lexer::new(&"old next ".repeat(n)).tokenize().unwrap();
+            let mut identifiers = BTreeMap::<&str, Vec<(&str, &Span)>>::new();
+            let mut symbols = vec![];
+            let mut scopes = HashMap::new();
+            for (i, t) in tokens.iter().enumerate().take(2 * n) {
+                let TokenKind::Ident(name) = &t.kind else {
+                    panic!()
+                };
+                identifiers
+                    .entry(name)
+                    .or_default()
+                    .push(("main.wi", &t.span));
+                let id = format!("s{i}");
+                scopes.insert(id.clone(), vec![(i, i + 1)]);
+                symbols.push(symbols::Symbol {
+                    id,
+                    identity: None,
+                    source_name: None,
+                    name: name.clone(),
+                    kind: "field".into(),
+                    ty: None,
+                    location: Some(Location {
+                        path: path.clone(),
+                        start: t.span.start,
+                        end: t.span.end,
+                    }),
+                });
+            }
+            let snapshot = Snapshot {
+                edit_context: None,
+                version: 1,
+                compiler: String::new(),
+                compatibility: String::new(),
+                workspace: root.to_str().unwrap().into(),
+                revision: String::new(),
+                functions: vec![],
+                sources: BTreeMap::from([(path, String::new())]),
+                semantic: SemanticFacts {
+                    symbols,
+                    rename_scopes: scopes,
+                    ..Default::default()
+                },
+            };
+            let mut index = Index::new(&snapshot, &root, &identifiers, &HashSet::new());
+            let mut patches = BTreeMap::new();
+            let mut work = EditWork::default();
+            for i in 0..n {
+                index
+                    .plan(
+                        &format!("s{}", 2 * i),
+                        "next",
+                        &root,
+                        &mut patches,
+                        &mut work,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(index.indexed, 2 * n);
+            assert_eq!(patches["main.wi"].len(), n);
+            assert!(index.collision_probes <= n * (n.ilog2() as usize + 2));
+            println!(
+                "destinations={n} queries={n} indexed={} collision_probes={}",
+                index.indexed, index.collision_probes
+            );
         }
     }
 
@@ -531,7 +759,7 @@ mod tests {
                 };
                 let identifiers =
                     BTreeMap::from([("old", spans.iter().map(|&s| ("main.wi", s)).collect())]);
-                let mut index = Index::new(&snapshot, &root, &identifiers);
+                let mut index = Index::new(&snapshot, &root, &identifiers, &HashSet::new());
                 let mut work = EditWork::default();
                 let mut patches = BTreeMap::new();
                 for i in 0..if shape == "disjoint" { n } else { 1 } {
@@ -540,7 +768,6 @@ mod tests {
                             &format!("s{i}"),
                             &format!("new{i}"),
                             &root,
-                            &identifiers,
                             &mut patches,
                             &mut work,
                         )
@@ -556,7 +783,7 @@ mod tests {
                 );
                 assert!(
                     index
-                        .plan("s0", "again", &root, &identifiers, &mut patches, &mut work)
+                        .plan("s0", "again", &root, &mut patches, &mut work)
                         .is_err()
                 );
                 println!(

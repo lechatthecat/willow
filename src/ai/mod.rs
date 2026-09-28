@@ -319,6 +319,11 @@ pub(crate) fn capture(
                         {
                             RuntimeEffects::ALL.bits()
                         }
+                        Expr::MethodCall(_) => calls
+                            .get(&e.id())
+                            .and_then(|target| target.as_ref())
+                            .and_then(crate::semantic::intrinsics::builtin_target_effects)
+                            .map_or(0, |effects| effects.bits()),
                         Expr::Call(c)
                             if symbols
                                 .lookup_func(&c.callee)
@@ -849,6 +854,7 @@ pub(crate) fn snapshot(
     let (symbol_definitions, symbol_references) =
         symbols::finish(&captured, &paths, &symbol_names, &functions);
     semantic.symbols = symbol_definitions;
+    semantic.rename_scopes = rename::scopes(&captured, &paths, &symbol_names, &semantic.symbols);
     semantic.rename_links = rename::links(
         &captured,
         &paths,

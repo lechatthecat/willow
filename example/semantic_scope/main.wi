@@ -1,0 +1,24 @@
+// Runnable regression: field/module name overlap and a pure imported dispatch.
+// effects main::round --source example/semantic_scope/main.wi
+// rename main::Team::elo count --dry-run --source example/semantic_scope/main.wi
+import elo::delta;
+import pairing;
+
+class Team {
+    pub elo: i64;
+}
+
+class Pair {
+    pub count: i64;
+}
+
+fn round(p: pairing::Pairing) -> i64 {
+    return p.pairings();
+}
+
+fn main() {
+    let team = new Team(10);
+    let pair = new Pair(2);
+    let p = new pairing::Lottery();
+    println(team.elo + pair.count + delta() + round(p));
+}

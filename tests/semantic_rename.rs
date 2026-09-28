@@ -615,3 +615,88 @@ fn project_default_contract_uses_source_owner_selector() {
             .contains("a.renamed()")
     );
 }
+
+#[test]
+fn member_rename_ignores_module_prefixes_and_unrelated_destinations() {
+    for (name, extra) in [
+        ("count", "class Pair { pub count: i64; }"),
+        ("goals", "fn goals() -> i64 { return 0; }"),
+        ("n", "fn unrelated() { let n = 1; println(n); }"),
+        ("value", "fn unrelated(value: i64) { println(value); }"),
+        ("Rating", "class Rating {}"),
+        ("delta", ""),
+    ] {
+        for import in ["import elo::delta;", "import elo;"] {
+            let source = format!(
+                "{import} import team; {extra} fn main() {{ let t = new team::Team(2); println(t.elo); }}"
+            );
+            let f = Fixture::new(&source);
+            f.write("elo.wi", "pub fn delta() -> i64 { return 1; }");
+            f.write("team.wi", "pub class Team { pub elo: i64; }");
+            let preview = f.run(&["rename", "team::Team::elo", name, "--dry-run"], 0);
+            assert_eq!(preview["status"], "ok");
+            assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), source);
+            f.run(&["rename", "team::Team::elo", name], 0);
+            let after = fs::read_to_string(f.0.join("main.wi")).unwrap();
+            assert!(after.contains(import), "{after}");
+            assert!(after.contains(extra), "{after}");
+            assert!(after.contains(&format!("t.{name}")), "{after}");
+        }
+    }
+}
+
+#[test]
+fn member_rename_destination_respects_hierarchy_and_dispatch_scopes() {
+    for (source, selector, reject) in [
+        (
+            "interface I { fn old(self) {} } class A implements I { pub fn next(self) {} } fn main() {}",
+            "main::I::old",
+            true,
+        ),
+        (
+            "interface I { fn next(self); } interface J extends I { fn old(self); } fn main() {}",
+            "main::J::old",
+            true,
+        ),
+        (
+            "open class A { pub old: i64; } class B extends A { pub next: i64; } fn main() {}",
+            "main::A::old",
+            true,
+        ),
+        (
+            "open class A { pub next: i64; } class B extends A { pub old: i64; } fn main() {}",
+            "main::B::old",
+            true,
+        ),
+        (
+            "open class Root {} class A extends Root { pub old: i64; } class B extends Root { pub next: i64; } fn main() {}",
+            "main::A::old",
+            false,
+        ),
+        (
+            "interface I { fn old(self); fn next(self); } class A implements I { pub fn old(self) {} pub fn next(self) {} } fn main() {}",
+            "main::I::old",
+            true,
+        ),
+        (
+            "class A { pub fn old(self) {} } class B { pub fn next(self) {} } fn main() {}",
+            "main::A::old",
+            false,
+        ),
+    ] {
+        let f = Fixture::new(source);
+        for dry in [true, false] {
+            let mut args = vec!["rename", selector, "next"];
+            if dry {
+                args.push("--dry-run");
+            }
+            let result = f.run(&args, i32::from(reject));
+            if reject {
+                assert_eq!(result["location"]["path"], "main.wi", "{result}");
+            }
+            if reject || dry {
+                assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), source);
+            }
+        }
+    }
+}

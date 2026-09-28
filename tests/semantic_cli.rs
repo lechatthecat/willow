@@ -417,3 +417,98 @@ fn effects_human_decodes_masks_and_retains_source_evidence() {
     assert!(value["result"]["effect_evidence"].is_array());
     assert!(value["result"].get("compiler_witnesses").is_none());
 }
+
+#[test]
+fn imported_interface_effects_use_completed_implementation_summaries() {
+    use willow_compiler::semantic::effects::RuntimeEffects;
+    for (body, waiting) in [
+        ("", RuntimeEffects::NONE),
+        (
+            "let values = [3, 1, 2]; for value in values { let copy = value; }",
+            RuntimeEffects::NONE,
+        ),
+        ("helper();", RuntimeEffects::NONE),
+        ("self.channel.recv();", RuntimeEffects::MAY_SUSPEND),
+        ("self.cell.get();", RuntimeEffects::MAY_BLOCK),
+    ] {
+        for import in [
+            "import pairing;",
+            "import pairing::Lottery; import pairing::Pairing;",
+        ] {
+            let f = Fixture::new();
+            fs::write(f.0.join("src/pairing.wi"), format!("pub interface Pairing {{ fn pairings(self); }} pub class Lottery implements Pairing {{ pub channel: Channel<i64>; pub cell: BlockingCell<i64>; pub fn pairings(self) {{ {body} }} }} fn helper() {{ let n = 1; }}")).unwrap();
+            let ty = if import == "import pairing;" {
+                "pairing::Pairing"
+            } else {
+                "Pairing"
+            };
+            fs::write(
+                f.0.join("src/main.wi"),
+                format!("{import} fn round(p: {ty}) {{ p.pairings(); }} fn main() {{}}"),
+            )
+            .unwrap();
+            let result = f.json(&["effects", "main::round"], 0);
+            let effects = result["result"]["runtime_effects"].as_u64().unwrap();
+            let waits = RuntimeEffects::MAY_BLOCK
+                .union(RuntimeEffects::MAY_SUSPEND)
+                .bits() as u64;
+            assert_eq!(
+                effects & waits,
+                u64::from(waiting.bits()),
+                "body={body} import={import}: {result}"
+            );
+        }
+    }
+}
+
+#[test]
+fn imported_interface_lock_checks_allow_pure_and_reject_waiting_bodies() {
+    for waiting in [false, true] {
+        let f = Fixture::new();
+        let body = if waiting {
+            "self.channel.recv();"
+        } else {
+            "let value = 1;"
+        };
+        fs::write(f.0.join("src/pairing.wi"), format!("pub interface Pairing extends Send {{ fn pairings(self); }} pub class Lottery implements Pairing {{ pub channel: Channel<i64>; pub fn pairings(self) {{ {body} }} }}")).unwrap();
+        fs::write(f.0.join("src/main.wi"), "import pairing; fn invoke(p: pairing::Pairing) { p.pairings(); } async fn main() { let m = Mutex::new(0); let ch: Channel<i64> = Channel::new(); let p = new pairing::Lottery(ch); lock m as n { invoke(p); } }").unwrap();
+        let output = f.run(&["check", "."]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), !waiting, "{stderr}");
+        assert_eq!(stderr.contains("E2604"), waiting, "{stderr}");
+    }
+}
+
+#[test]
+fn condition_diagnostics_preserve_errors_and_do_not_cascade_through_cached_bodies() {
+    for (expression, mismatch) in [
+        ("\"abc\".starts_with(\"a\")", false),
+        ("empty()", true),
+        ("(match true { _ => 1, true => 2 })", true),
+    ] {
+        for statement in [
+            format!("if {expression} {{}}"),
+            format!("while {expression} {{}}"),
+            format!("let n = {expression} ? 1 : 2;"),
+            format!("let n: i64 = {expression} ? 1 : 2;"),
+        ] {
+            let f = Fixture::new();
+            fs::write(
+                f.0.join("src/main.wi"),
+                format!("fn empty() {{}} fn main() {{ {statement} }}"),
+            )
+            .unwrap();
+            let output = f.run(&["check", "."]);
+            let text = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{statement}");
+            assert_eq!(
+                text.contains("E0203") || text.contains("E0901"),
+                mismatch,
+                "{statement}: {text}"
+            );
+            if !mismatch {
+                assert!(text.contains("E0201"), "{text}");
+            }
+        }
+    }
+}

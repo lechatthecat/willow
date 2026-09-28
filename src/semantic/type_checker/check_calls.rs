@@ -300,8 +300,9 @@ impl TypeChecker {
     /// contextual forms (unqualified enum variants, contextually-typed lambdas,
     /// nested ternaries) resolve inside the branches (willow-ok7f).
     fn check_ternary_expecting(&mut self, t: &TernaryExpr, expected: &Type) -> Type {
+        let errors_before = self.error_generation;
         let cond_ty = self.check_expr(&t.condition);
-        if cond_ty != Type::Bool {
+        if cond_ty != Type::Bool && self.error_generation == errors_before {
             self.push(
                 Diagnostic::new(
                     Severity::Error,

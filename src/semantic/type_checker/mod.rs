@@ -127,6 +127,9 @@ pub struct TypeChecker {
     local: body::BodyState,
     pub symbols: SymbolTable,
     pub errors: Vec<Diagnostic>,
+    /// Monotonic error generation, independent of body-output swaps/replay.
+    /// Condition recovery must distinguish errors from warnings in O(1).
+    error_generation: usize,
     /// Maps the ID of an UNQUALIFIED enum-variant construction (`Ok(42)` in an
     /// expected-enum position) to the enum it resolved to. The backend consults
     /// this to lower such a `Call` as a variant allocation instead of a function
@@ -293,6 +296,7 @@ impl TypeChecker {
             symbols,
             local: body::BodyState::default(),
             errors: Vec::new(),
+            error_generation: 0,
             enum_variant_resolutions: HashMap::new(),
             pattern_resolutions: HashMap::new(),
             expr_types: HashMap::new(),
@@ -1502,6 +1506,9 @@ impl TypeChecker {
     }
 
     fn push(&mut self, d: Diagnostic) {
+        if d.severity == Severity::Error {
+            self.error_generation += 1;
+        }
         self.errors.push(d);
     }
 

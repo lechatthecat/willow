@@ -396,9 +396,8 @@ impl TypeChecker {
 
     /// Connect each interface-method union node to every concrete body that
     /// may be selected by dynamic dispatch. Local implementations reuse the
-    /// ordinary method call graph. Imported implementations are deliberately
-    /// fail-closed until their effect summaries are serialized into module
-    /// metadata: treating an unavailable body as pure would re-open E2604.
+    /// ordinary method call graph. Imported implementations reuse completed
+    /// effect capability queries, falling back conservatively if unavailable.
     fn connect_interface_lock_effects(&mut self, program: &Program) {
         let local_methods = program
             .items
@@ -501,19 +500,40 @@ impl TypeChecker {
                                 .insert(implementation_id);
                         }
                         None => {
+                            use crate::semantic::effects::RuntimeEffects;
+                            let waiting = self.effect_queries.as_ref().map_or(
+                                crate::compiler_db::effects::LOCK_EFFECT_WAIT,
+                                |(queries, unit)| {
+                                    queries.external_waiting(*unit, &implementation_id)
+                                },
+                            );
+                            let suspend = waiting.intersects(RuntimeEffects::MAY_SUSPEND);
+                            let block = waiting.intersects(RuntimeEffects::MAY_BLOCK);
+                            self.effect_inputs
+                                .edges
+                                .entry(interface_id)
+                                .or_default()
+                                .insert(implementation_id);
+                            let kind = match (suspend, block) {
+                                (true, true) => LockEffectKind::SuspendOrBlock,
+                                (true, false) => LockEffectKind::Suspend,
+                                (false, true) => LockEffectKind::Block,
+                                (false, false) => continue,
+                            };
                             let span = self
                                 .symbols
                                 .lookup_class(&declaring)
                                 .and_then(|info| info.methods.get(method_name))
                                 .map_or(class.declaration_span, |method| method.declaration_span);
-                            self.effect_inputs.direct.entry(interface_id).or_insert(
-                                LockEffectCause {
+                            self.effect_inputs
+                                .direct
+                                .entry(implementation_id)
+                                .or_insert(LockEffectCause {
                                     span,
                                     operation: "interface dispatch to an imported implementation"
                                         .into(),
-                                    kind: LockEffectKind::SuspendOrBlock,
-                                },
-                            );
+                                    kind,
+                                });
                         }
                     }
                 }
@@ -1398,8 +1418,9 @@ impl TypeChecker {
                 }
             }
             Stmt::If(s) => {
+                let errors_before = self.error_generation;
                 let cond_ty = self.check_expr(&s.cond);
-                if cond_ty != Type::Bool {
+                if cond_ty != Type::Bool && self.error_generation == errors_before {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -1419,8 +1440,9 @@ impl TypeChecker {
                 }
             }
             Stmt::While(s) => {
+                let errors_before = self.error_generation;
                 let cond_ty = self.check_expr(&s.cond);
-                if cond_ty != Type::Bool {
+                if cond_ty != Type::Bool && self.error_generation == errors_before {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -2265,8 +2287,9 @@ impl TypeChecker {
                 Type::Void
             }
             Expr::Ternary(t) => {
+                let errors_before = self.error_generation;
                 let cond_ty = self.check_expr(&t.condition);
-                if cond_ty != Type::Bool {
+                if cond_ty != Type::Bool && self.error_generation == errors_before {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -3409,6 +3432,81 @@ async fn main() {
                 .iter()
                 .any(|message| message.contains("BlockingCell.get")),
             "expected the blocking operation to be named, got {labels:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod condition_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_conditions_do_not_add_type_cascades() {
+        for expression in [
+            "\"abc\".starts_with(\"a\")",
+            "missing()",
+            "new Empty().missing()",
+        ] {
+            for statement in [
+                format!("if {expression} {{}}"),
+                format!("while {expression} {{}}"),
+                format!("let n = {expression} ? 1 : 2;"),
+                format!("let n: i64 = {expression} ? 1 : 2;"),
+            ] {
+                let source = format!("class Empty {{}} fn main() {{ {statement} }}");
+                let errors = check_source(&source);
+                assert!(!errors.is_empty(), "{source}");
+                assert!(
+                    !errors
+                        .iter()
+                        .any(|d| matches!(d.code, ErrorCode::E0203 | ErrorCode::E0901)),
+                    "{source}: {errors:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validly_typed_non_bool_conditions_still_report_errors() {
+        for expression in ["1", "\"text\"", "empty()"] {
+            for statement in [
+                format!("if {expression} {{}}"),
+                format!("while {expression} {{}}"),
+                format!("let n = {expression} ? 1 : 2;"),
+                format!("let n: i64 = {expression} ? 1 : 2;"),
+            ] {
+                let source = format!("fn empty() {{}} fn main() {{ {statement} }}");
+                let errors = check_source(&source);
+                assert!(
+                    errors
+                        .iter()
+                        .any(|d| matches!(d.code, ErrorCode::E0203 | ErrorCode::E0901)),
+                    "{source}: {errors:?}"
+                );
+            }
+        }
+        for context in [
+            "if (match true { _ => 1, true => 2 }) {}",
+            "while (match true { _ => 1, true => 2 }) {}",
+            "let n = (match true { _ => 1, true => 2 }) ? 1 : 2;",
+            "let n: i64 = (match true { _ => 1, true => 2 }) ? 1 : 2;",
+        ] {
+            let errors = check_source(&format!("fn main() {{ {context} }}"));
+            assert!(
+                errors.iter().any(|d| d.code == ErrorCode::W1201),
+                "{errors:?}"
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|d| matches!(d.code, ErrorCode::E0203 | ErrorCode::E0901)),
+                "{errors:?}"
+            );
+        }
+        let errors = check_source("fn main() { missing(); if 1 {} }");
+        assert!(
+            errors.iter().any(|d| d.code == ErrorCode::E0203),
+            "{errors:?}"
         );
     }
 }

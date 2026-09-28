@@ -141,7 +141,15 @@ fn render_file_labels(
             #[cfg(test)]
             LABEL_PROBES.with(|count| count.set(count.get() + 1));
             let col = label.span.col.saturating_sub(1);
-            let len = label.span.end.saturating_sub(label.span.start).max(1);
+            // A declaration span can cover an entire method body. Only
+            // underline the portion on the displayed source line.
+            let remaining = map.line_text(line).len().saturating_sub(col);
+            let len = label
+                .span
+                .end
+                .saturating_sub(label.span.start)
+                .min(remaining)
+                .max(1);
             let character = if label.kind == LabelKind::Primary {
                 '^'
             } else {
@@ -442,5 +450,36 @@ mod tests {
             maps.get(diagnostic.labels[1].span.file_id).unwrap().path,
             "module.wi"
         );
+    }
+}
+
+#[cfg(test)]
+mod multiline_label_tests {
+    use super::*;
+    use crate::diagnostics::{ErrorCode, Label, Severity, Span};
+
+    #[test]
+    fn multiline_labels_stop_at_the_displayed_line() {
+        for n in [16, 64, 256, 1024] {
+            for newline in ["\n", "\r\n"] {
+                let source = format!(
+                    "    fn secret(self) {{{newline}{}{newline}}}",
+                    "        work();\n".repeat(n)
+                );
+                let map = SourceMap::new("private.wi", &source);
+                let d = Diagnostic::new(Severity::Error, ErrorCode::E0501, "private").with_label(
+                    Label::secondary(Span::new(4, source.len(), 1, 5), "defined here"),
+                );
+                let mut output = vec![];
+                emit_with(&d, &map, &mut output).unwrap();
+                let output = String::from_utf8(output).unwrap();
+                assert!(
+                    output.contains("----------------- defined here"),
+                    "{output}"
+                );
+                assert!(!output.contains(&"-".repeat(18)), "{output}");
+                assert!(output.len() < 180, "body_lines={n} bytes={}", output.len());
+            }
+        }
     }
 }
