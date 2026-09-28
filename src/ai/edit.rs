@@ -295,9 +295,9 @@ impl Workspace {
         ensure!(
             snapshot.revision == request.revision,
             "base revision mismatch: source, configuration, or analysis mode differs; \
-             use --project for a snapshot saved from a project directory, omit --project \
-             for a snapshot saved from a source file; if inputs changed, save a new \
-             snapshot and rebuild the edit request"
+             use --project for a query of a project directory, omit --project \
+             for a query of a source file; if inputs changed, query the current source again \
+             and rebuild the edit request"
         );
         ensure!(!request.operations.is_empty(), "empty transaction");
         let mut sources = BTreeMap::new();

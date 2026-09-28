@@ -1,9 +1,6 @@
 use super::*;
 use std::io::{Read, Write};
 
-const MAX_BYTES: u64 = 64 * 1024 * 1024;
-mod delta;
-
 pub(super) fn compiler_stamp() -> String {
     static STAMP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     STAMP.get_or_init(compute_compiler_stamp).clone()
@@ -196,109 +193,6 @@ impl Snapshot {
         );
         Ok(())
     }
-    /// Atomic create-only publication. Existing baselines are never overwritten.
-    pub fn save(&self, path: &Path) -> Result<()> {
-        self.validate()?;
-        publish(&compact_paths(self)?, path)
-    }
-
-    /// Lossless, single-level delta. Keep the full base file alongside it.
-    pub fn save_delta(&self, path: &Path, base: &Path) -> Result<()> {
-        self.validate_with_limit(Some(MAX_BYTES))?;
-        let before = load_full(base)?;
-        ensure!(
-            self.workspace == before.workspace && self.compatibility == before.compatibility,
-            "incompatible delta workspace/configuration/dependencies"
-        );
-        let value = delta::encode(&before, self, base, path)?;
-        publish(&value, path)
-    }
-
-    pub fn load(path: &Path) -> Result<Self> {
-        let value = read_value(path)?;
-        if value.get("snapshot_encoding").is_some() {
-            return delta::decode(value, path, None);
-        }
-        decode_full(value)
-    }
-
-    /// Load a comparison pair, reusing a validated full before-snapshot when it
-    /// is also the after-snapshot's base. No cache survives this operation.
-    pub fn load_pair(before: &Path, after: &Path) -> Result<(Self, Self)> {
-        let value = read_value(before)?;
-        let full = value.get("snapshot_encoding").is_none();
-        let baseline = if full {
-            decode_full(value)?
-        } else {
-            delta::decode(value, before, None)?
-        };
-        let value = read_value(after)?;
-        let next = if value.get("snapshot_encoding").is_some() {
-            delta::decode(value, after, full.then_some((before, &baseline)))?
-        } else {
-            decode_full(value)?
-        };
-        Ok((baseline, next))
-    }
-}
-
-fn publish(value: &serde_json::Value, path: &Path) -> Result<()> {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let temp = path.with_extension(format!("snapshot-{}-{sequence}.tmp", std::process::id()));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)?;
-    let result = (|| -> Result<()> {
-        {
-            let mut writer = std::io::BufWriter::new(&mut file);
-            serde_json::to_writer(&mut writer, value)?;
-            writer.flush()?;
-        }
-        ensure!(
-            file.metadata()?.len() <= MAX_BYTES,
-            "snapshot exceeds 64 MiB limit"
-        );
-        file.sync_all()?;
-        std::fs::hard_link(&temp, path).context("publish baseline (destination must not exist)")?;
-        Ok(())
-    })();
-    drop(file);
-    let _ = std::fs::remove_file(temp);
-    result
-}
-
-fn read_value(path: &Path) -> Result<serde_json::Value> {
-    let file = std::fs::File::open(path)?;
-    ensure!(
-        file.metadata()?.len() <= MAX_BYTES,
-        "snapshot exceeds 64 MiB limit"
-    );
-    let mut reader = file.take(MAX_BYTES + 1);
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_BYTES,
-        "snapshot exceeds 64 MiB limit"
-    );
-    Ok(serde_json::from_slice(&bytes)?)
-}
-
-fn load_full(path: &Path) -> Result<Snapshot> {
-    let value = read_value(path).context("read full delta base")?;
-    ensure!(
-        value.get("snapshot_encoding").is_none(),
-        "delta base must be a full snapshot; delta chains are not supported"
-    );
-    decode_full(value)
-}
-
-fn decode_full(mut value: serde_json::Value) -> Result<Snapshot> {
-    expand_snapshot_paths(&mut value)?;
-    let snapshot: Snapshot = serde_json::from_value(value)?;
-    snapshot.validate()?;
-    Ok(snapshot)
 }
 
 /// Marker for files whose workspace-rooted paths start with [`PLACEHOLDER`].
@@ -334,9 +228,10 @@ fn rewrite_strings(value: &mut serde_json::Value, f: &dyn Fn(&str) -> Option<Str
 /// Write the workspace path once: a path string that starts with it (locations,
 /// source keys, module paths, the root package source) is stored as
 /// `${workspace}/rest`. Opaque identities that embed a path are left intact so
-/// IDs copied from the file still match query results. [`expand_snapshot_paths`]
+/// IDs copied from the file still match query results. [`expand_output_paths`]
 /// restores the exact in-memory snapshot, so the revision digest is unaffected.
 /// Falls back to the plain form if any string already starts with the marker.
+#[cfg(test)]
 fn compact_paths(snapshot: &Snapshot) -> Result<serde_json::Value> {
     Ok(compact_output_paths(
         serde_json::to_value(snapshot)?,
@@ -345,7 +240,7 @@ fn compact_paths(snapshot: &Snapshot) -> Result<serde_json::Value> {
 }
 
 /// Compact serialized analysis output without changing opaque IDs. The envelope
-/// records the workspace once; `expand_snapshot_paths` restores original paths.
+/// records the workspace once; `expand_output_paths` restores original paths.
 pub fn compact_output_paths(mut value: serde_json::Value, workspace: &str) -> serde_json::Value {
     if !value.is_object() {
         return value;
@@ -378,10 +273,10 @@ pub fn compact_output_paths(mut value: serde_json::Value, workspace: &str) -> se
     value
 }
 
-/// Restore the plain JSON form of a saved snapshot file in place: expands
+/// Restore absolute paths in a compact analysis response in place: expands
 /// `${workspace}` path prefixes and drops the encoding marker. Files without the
-/// marker are left unchanged. For tools that read snapshot files as raw JSON.
-pub fn expand_snapshot_paths(value: &mut serde_json::Value) -> Result<()> {
+/// marker are left unchanged.
+pub fn expand_output_paths(value: &mut serde_json::Value) -> Result<()> {
     let Some(map) = value.as_object_mut() else {
         return Ok(());
     };
@@ -390,12 +285,12 @@ pub fn expand_snapshot_paths(value: &mut serde_json::Value) -> Result<()> {
     };
     ensure!(
         encoding == PATH_ENCODING,
-        "unsupported snapshot path encoding"
+        "unsupported analysis path encoding"
     );
     let workspace = map
         .get("workspace")
         .and_then(|w| w.as_str())
-        .context("snapshot workspace")?
+        .context("analysis workspace")?
         .to_owned();
     rewrite_strings(value, &|text| {
         text.strip_prefix(PLACEHOLDER)
@@ -543,6 +438,24 @@ fn change(old: Option<&Function>, new: Option<&Function>, kind: &str) -> Functio
     }
 }
 
+pub(crate) fn check_size(snapshot: &Snapshot) -> Result<()> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            if self.0 > 64 * 1024 * 1024 {
+                return Err(std::io::Error::other("analysis state exceeds 64 MiB"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(&mut Counter(0), snapshot)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,7 +520,7 @@ mod tests {
     fn roundtrip(snapshot: &Snapshot) -> serde_json::Value {
         let mut compact = compact_paths(snapshot).unwrap();
         let written = compact.clone();
-        expand_snapshot_paths(&mut compact).unwrap();
+        expand_output_paths(&mut compact).unwrap();
         assert_eq!(compact, serde_json::to_value(snapshot).unwrap());
         written
     }
@@ -653,12 +566,12 @@ mod tests {
         // Files written before the encoding load unchanged.
         let mut plain = serde_json::to_value(snapshot("/w", "/")).unwrap();
         let before = plain.clone();
-        expand_snapshot_paths(&mut plain).unwrap();
+        expand_output_paths(&mut plain).unwrap();
         assert_eq!(plain, before);
         // Unknown encodings are rejected rather than misread.
         let mut unknown = before.clone();
         unknown["path_encoding"] = "future".into();
-        assert!(expand_snapshot_paths(&mut unknown).is_err());
+        assert!(expand_output_paths(&mut unknown).is_err());
         let mut escaped = snapshot("/日本語/\"quoted\"", "/");
         escaped.revision = "\"\\\n日本語".into();
         assert_eq!(

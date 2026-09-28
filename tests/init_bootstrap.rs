@@ -152,7 +152,6 @@ fn init_generates_canonical_agent_instructions_and_preserves_existing_files() {
             "Never bypass stale checks",
             "Do not manually search for or extract FunctionId, SymbolId, revision IDs",
             "do not manually run prepare/validate/apply",
-            "does not require Git, commits or branches",
         ] {
             assert!(text.contains(guidance), "{file}: missing {guidance}");
         }
@@ -197,7 +196,7 @@ fn instructions_json_and_sync_upgrade_preserve_user_bytes() {
     assert_eq!(value["agent"], "codex");
     assert_eq!(value["instruction_schema"], 3);
     let caps = value["capabilities"].as_object().unwrap();
-    assert_eq!(caps.len(), 15);
+    assert_eq!(caps.len(), 13);
     assert!(caps.values().all(|v| v == &serde_json::json!(true)));
     let current = value["markdown"].as_str().unwrap();
     let old = include_str!("fixtures/agent/v0/AGENTS.md");

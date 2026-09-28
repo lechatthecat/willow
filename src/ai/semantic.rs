@@ -269,7 +269,6 @@ pub struct QuerySession {
     callees: Vec<Vec<usize>>,
     dispatch_callers: Vec<Vec<usize>>,
     indirect_references: HashMap<Type, Vec<usize>>,
-    pub(crate) incomplete_references: bool,
     pub queries: usize,
     pub position_comparisons: usize,
     pub effect_edge_visits: usize,
@@ -412,12 +411,6 @@ impl QuerySession {
             })
             .collect();
         let callees = graph.callees;
-        let incomplete_references = snapshot.functions.iter().any(|f| f.unknown)
-            || snapshot.semantic.expressions.iter().any(|e| {
-                e.operation
-                    .as_deref()
-                    .is_some_and(|op| op.starts_with("method:"))
-            });
         let packages = packages::PackageIndex::new(&snapshot);
         let names = display::TypeNames::new(&snapshot);
         Ok(Self {
@@ -433,7 +426,6 @@ impl QuerySession {
             callees,
             dispatch_callers,
             indirect_references,
-            incomplete_references,
             queries: 0,
             position_comparisons: 0,
             effect_edge_visits: 0,

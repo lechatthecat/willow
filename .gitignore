@@ -47,5 +47,3 @@ AGENTS.md
 # Public generated-instruction golden fixtures only.
 !/tests/fixtures/agent/v0/AGENTS.md
 !/tests/fixtures/agent/v0/CLAUDE.md
-!/tests/fixtures/agent/snapshot/AGENTS.md
-!/tests/fixtures/agent/snapshot/CLAUDE.md

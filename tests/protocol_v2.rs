@@ -54,11 +54,25 @@ impl Fixture {
             .unwrap()["data"]
             .clone()
     }
-    fn save(&self, name: &str) -> Value {
-        self.result(&["snapshot", "save", "main.wi", "--output", name]);
-        // Decode like consumers do: workspace placeholders expand to paths.
-        let mut value = serde_json::from_slice(&fs::read(self.0.join(name)).unwrap()).unwrap();
-        willow_compiler::ai::expand_snapshot_paths(&mut value).unwrap();
+    fn analyze(&self) -> willow_compiler::ai::Snapshot {
+        self.analyze_mode(false)
+    }
+    fn analyze_mode(&self, project: bool) -> willow_compiler::ai::Snapshot {
+        willow_compiler::CompilerSession::new(
+            self.0.join("main.wi").to_str().unwrap(),
+            "",
+            &willow_compiler::CompilerOptions::debug(),
+            project.then(|| self.0.clone()),
+        )
+        .analysis_with_emitter(&mut willow_compiler::diagnostics::HumanEmitter)
+        .unwrap()
+    }
+    fn facts(&self) -> Value {
+        let mut value = serde_json::to_value(self.analyze()).unwrap();
+        self.write("revision-query.json", "[]");
+        value["revision"] = self.result(&["query", "main.wi", "--requests", "revision-query.json"])
+            ["revision"]
+            .clone();
         value
     }
 }
@@ -77,10 +91,9 @@ fn named<'a>(s: &'a Value, name: &str) -> &'a Value {
 }
 
 fn risk(f: &Fixture, after: &str) -> Value {
-    f.save("before.json");
+    let before = f.analyze();
     f.write("main.wi", after);
-    f.save("after.json");
-    f.result(&["risk", "--before", "before.json", "--after", "after.json"])["risk"].clone()
+    serde_json::to_value(f.analyze().risk(&before).unwrap()).unwrap()
 }
 
 #[test]
@@ -139,7 +152,7 @@ fn query_and_impact_compact_paths_and_accept_returned_locations() {
             })
     );
     let mut expanded = impact;
-    willow_compiler::ai::expand_snapshot_paths(&mut expanded).unwrap();
+    willow_compiler::ai::expand_output_paths(&mut expanded).unwrap();
     assert!(
         expanded["functions"]
             .as_array()
@@ -157,83 +170,6 @@ fn query_and_impact_compact_paths_and_accept_returned_locations() {
     );
 }
 
-#[test]
-fn delta_snapshot_preserves_diff_and_risk_and_rejects_chains() {
-    let f = Fixture::new("fn value() -> i64 { return 1; } fn main() { println(value()); }");
-    f.save("base.json");
-    f.write(
-        "main.wi",
-        "fn value() -> i64 { return 2; } fn main() { println(value()); }",
-    );
-    let full = f.save("full.json");
-    let saved = f.result(&[
-        "snapshot",
-        "save",
-        "main.wi",
-        "--base",
-        "base.json",
-        "--output",
-        "delta.json",
-    ]);
-    assert_eq!(saved["revision"], full["revision"]);
-    assert_eq!(saved["snapshot_encoding"], "snapshot-delta-v1");
-    let delta: Value = serde_json::from_slice(&fs::read(f.0.join("delta.json")).unwrap()).unwrap();
-    assert_eq!(delta["base"], "base.json");
-    assert!(
-        fs::metadata(f.0.join("delta.json")).unwrap().len()
-            < fs::metadata(f.0.join("full.json")).unwrap().len()
-    );
-    // Neither the source file nor the original working directory is required
-    // by diff/risk. The delta resolves its base relative to its own location.
-    fs::remove_file(f.0.join("main.wi")).unwrap();
-    fs::create_dir(f.0.join("archive")).unwrap();
-    for file in ["base.json", "full.json", "delta.json"] {
-        fs::rename(f.0.join(file), f.0.join("archive").join(file)).unwrap();
-    }
-    for operation in ["diff", "risk"] {
-        let args = |after| {
-            if operation == "diff" {
-                vec![
-                    "snapshot",
-                    "diff",
-                    "--before",
-                    "archive/base.json",
-                    "--after",
-                    after,
-                ]
-            } else {
-                vec!["risk", "--before", "archive/base.json", "--after", after]
-            }
-        };
-        assert_eq!(
-            f.result(&args("archive/full.json")),
-            f.result(&args("archive/delta.json"))
-        );
-    }
-    f.write(
-        "main.wi",
-        "fn value() -> i64 { return 2; } fn main() { println(value()); }",
-    );
-    let failed = f.run(
-        &[
-            "snapshot",
-            "save",
-            "main.wi",
-            "--base",
-            "archive/delta.json",
-            "--output",
-            "chain.json",
-        ],
-        1,
-    );
-    assert!(
-        failed.last().unwrap()["data"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("full snapshot")
-    );
-    assert!(!f.0.join("chain.json").exists());
-}
 #[test]
 fn retry_cfg_excludes_success_break_return_dead_code_and_single_execution_iterable() {
     let f = Fixture::new("fn main() {}");
@@ -326,7 +262,7 @@ fn deferred_operations_and_indirect_calls_keep_structural_evidence() {
 fn queries_share_revision_and_match_compiler_facts() {
     let source = "fn leaf() -> i64 { return 42; } fn main() { println(leaf()); }";
     let f = Fixture::new(source);
-    let snapshot = f.save("snapshot.json");
+    let snapshot = f.facts();
     let leaf = named(&snapshot, "leaf");
     let requests = serde_json::json!([
         {"kind":"symbol-info","function":leaf["id"]},
@@ -338,7 +274,7 @@ fn queries_share_revision_and_match_compiler_facts() {
     ]);
     f.write("requests.json", &requests.to_string());
     let mut r = f.result(&["query", "main.wi", "--requests", "requests.json"]);
-    willow_compiler::ai::expand_snapshot_paths(&mut r).unwrap();
+    willow_compiler::ai::expand_output_paths(&mut r).unwrap();
     assert_eq!(r["revision"], snapshot["revision"]);
     let results = &r["results"];
     assert_eq!(results[0]["result"]["symbol"], *leaf);
@@ -413,7 +349,7 @@ fn references_use_checked_bindings_and_imported_identities() {
         "import dep; fn leaf() -> i64 { return 1; } fn main() { let leaf = |x: i64| x; println(leaf(7)); println(dep::value()); }",
     );
     f.write("dep.wi", "pub fn value() -> i64 { return 42; }");
-    let snapshot = f.save("snapshot.json");
+    let snapshot = f.facts();
     let local = named(&snapshot, "leaf");
     let imported = named(&snapshot, "value");
     f.write(
@@ -583,7 +519,7 @@ fn reference_parameter_writes_do_not_prove_side_effect_absence() {
 fn declarations_and_references_use_checker_binding_identity() {
     let source = "fn take(p: &mut i64) { p = p + 1; } fn main() { let mut x = 1; take(&x); if true { let x = 2; println(x); } println(x); }";
     let f = Fixture::new(source);
-    let s = f.save("symbols.json");
+    let s = f.facts();
     let symbols = s["semantic"]["symbols"].as_array().unwrap();
     let mut xs: Vec<_> = symbols.iter().filter(|s| s["name"] == "x").collect();
     xs.sort_by_key(|s| s["location"]["start"].as_u64().unwrap());
@@ -641,7 +577,7 @@ fn field_type_variant_and_import_references_have_source_identity() {
         }
     "#,
     );
-    let s = f.save("symbols.json");
+    let s = f.facts();
     let symbols = s["semantic"]["symbols"].as_array().unwrap();
     let refs = s["semantic"]["references"].as_array().unwrap();
     for (name, kind) in [
@@ -670,7 +606,7 @@ fn dynamic_references_are_target_specific_and_keep_possible_dispatch() {
     let f = Fixture::new(
         "open class Base { pub open fn run(self) -> i64 { return 0; } } class Child extends Base { pub override fn run(self) -> i64 { return 1; } } fn leaf() -> bool { return true; } fn invoke(x: Base) { x.run(); } fn main() { let indirect = |v: i64| v; indirect(1); invoke(new Child()); leaf(); }",
     );
-    let s = f.save("symbols.json");
+    let s = f.facts();
     let child = named(&s, "Child::run");
     let leaf = named(&s, "leaf");
     f.write(
@@ -763,7 +699,7 @@ fn effects_have_per_bit_roots_and_distinguish_unknown_evidence() {
     let f = Fixture::new(
         "fn danger(x: i64) -> i64 { return 1/x; } fn relay(x:i64)->i64 { return danger(x); } fn opaque(f: fn(i64)->i64)->i64 { return f(1); } fn main() { println(relay(1)); }",
     );
-    let s = f.save("effects.json");
+    let s = f.facts();
     f.write(
         "requests.json",
         &serde_json::json!([
@@ -842,7 +778,7 @@ fn callable_references_include_function_values_and_import_targets() {
         "import dep::leaf as imported; fn main() { let callback = imported; println(callback(1)); }",
     );
     f.write("dep.wi", "pub fn leaf(x: i64) -> i64 { return x; }");
-    let snapshot = f.save("snapshot.json");
+    let snapshot = f.facts();
     f.write(
         "requests.json",
         &serde_json::json!([
@@ -921,7 +857,7 @@ fn binding_forms_and_inherited_field_writes_keep_exact_reference_tokens() {
             select { let received = channel.recv() => { println(received); } sleep(1) => {} }
         }"#;
     let f = Fixture::new(source);
-    let s = f.save("symbols.json");
+    let s = f.facts();
     let symbols = s["semantic"]["symbols"].as_array().unwrap();
     let refs = s["semantic"]["references"].as_array().unwrap();
     for (name, count) in [
@@ -960,7 +896,7 @@ fn module_and_static_assignment_references_keep_declared_targets() {
         "dep.wi",
         "module dep; pub class Counter { pub static mut count: i64 = 0; }",
     );
-    let snapshot = f.save("snapshot.json");
+    let snapshot = f.facts();
     let symbols = snapshot["semantic"]["symbols"].as_array().unwrap();
     let references = snapshot["semantic"]["references"].as_array().unwrap();
     for (name, kind, count) in [
@@ -988,7 +924,7 @@ fn declared_types_use_normalized_import_identity() {
     let f =
         Fixture::new("import dep::Color as Shade; class Box { pub value: Shade; } fn main() {}");
     f.write("dep.wi", "module dep; pub enum Color { Red }");
-    let snapshot = f.save("snapshot.json");
+    let snapshot = f.facts();
     let field = snapshot["semantic"]["symbols"]
         .as_array()
         .unwrap()
@@ -1100,7 +1036,7 @@ fn same_named_enum_variant_uses_its_own_token() {
         "enum Foo { Foo(i64), Other } fn main() { let x = Foo::Foo(1); match x { Foo(v) => {}, Other => {} }; }",
     ] {
         let f = Fixture::new(source);
-        let s = f.save("snapshot.json");
+        let s = f.facts();
         let variant = s["semantic"]["symbols"]
             .as_array()
             .unwrap()
@@ -1132,7 +1068,7 @@ fn method_references_are_unique_and_prelude_contracts_are_not_functions() {
                   fn show(x: i64) -> String { return \"v=${x}\"; }\n\
                   fn main() { let l = new Level(3); println(l.front()); println(show(l.front())); }";
     let f = Fixture::new(source);
-    let snapshot = f.save("snapshot.json");
+    let snapshot = f.facts();
     let names: Vec<_> = snapshot["functions"]
         .as_array()
         .unwrap()
@@ -1159,7 +1095,7 @@ fn method_references_are_unique_and_prelude_contracts_are_not_functions() {
 }
 
 #[test]
-fn symbol_filters_readable_types_and_compact_snapshot_paths() {
+fn symbol_filters_readable_types_and_compact_query_paths() {
     let f = Fixture::new("");
     fs::remove_file(f.0.join("main.wi")).unwrap();
     f.write(
@@ -1242,51 +1178,29 @@ fn symbol_filters_readable_types_and_compact_snapshot_paths() {
     assert_eq!(results[7]["status"], "ok");
     assert_eq!(results[7]["type_display"], "shapes::Box");
 
-    // Saved snapshots write the workspace once; ids read from the file still
-    // resolve in queries against the live project.
-    f.result(&["snapshot", "save", ".", "--output", "snapshot.json"]);
-    let text = fs::read_to_string(f.0.join("snapshot.json")).unwrap();
-    let snapshot: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(snapshot["path_encoding"], "workspace-placeholder-v1");
-    assert_eq!(snapshot["workspace"], f.0.to_str().unwrap());
-    let compact_shapes = format!(
-        "${{workspace}}{0}src{0}shapes.wi",
-        std::path::MAIN_SEPARATOR
-    );
-    assert!(
-        snapshot["sources"]
-            .as_object()
-            .unwrap()
-            .contains_key(&compact_shapes),
-        "{text}"
-    );
-    let wrap = named(&snapshot, "wrap");
-    let symbol = snapshot["semantic"]["symbols"]
-        .as_array()
-        .unwrap()
+    // Returned identities and paths can be reused without saving analysis state.
+    let all_symbols = results[6]["symbols"].as_array().unwrap();
+    let wrap = all_symbols.iter().find(|s| s["name"] == "wrap").unwrap();
+    let symbol = all_symbols
         .iter()
         .find(|s| s["name"] == "Box" && s["kind"] == "class")
         .unwrap();
+    assert!(
+        symbol["location"]["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("${workspace}")
+    );
     let requests = serde_json::json!([
         {"kind":"symbol-info","function":wrap["id"]},
         {"kind":"symbol-info","function":symbol["id"]}
     ]);
     f.write("requests.json", &requests.to_string());
     let r = f.result(&["query", ".", "--requests", "requests.json"]);
-    assert_eq!(r["revision"], snapshot["revision"]);
     assert_eq!(r["results"][0]["result"]["symbol"]["name"], "wrap");
     assert_eq!(r["results"][1]["result"]["status"], "ok");
     assert_eq!(
         r["results"][1]["result"]["symbol"]["type_display"],
         "shapes::Box"
     );
-    // The compacted file round-trips through snapshot diff.
-    f.result(&[
-        "snapshot",
-        "diff",
-        "--before",
-        "snapshot.json",
-        "--after",
-        "snapshot.json",
-    ]);
 }

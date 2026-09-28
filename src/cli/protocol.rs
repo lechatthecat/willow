@@ -29,7 +29,7 @@ pub(super) fn requested(args: &[String]) -> bool {
     }
     matches!(
         args.first().map(String::as_str),
-        Some("impact" | "snapshot" | "risk" | "query" | "edit" | "daemon")
+        Some("impact" | "query" | "edit")
     ) || args
         .iter()
         .take_while(|arg| arg.as_str() != "--")
@@ -274,12 +274,6 @@ pub(super) fn run(args: Vec<String>) -> anyhow::Result<i32> {
             2,
             format!("unsupported protocol version {version}"),
         ),
-        Ok((args, _, _)) if args.first().is_some_and(|a| a == "daemon") => {
-            match super::daemon::serve(&args[1..], &mut events) {
-                Ok(()) => ("WT0000", 0, String::new()),
-                Err(error) => ("WT2002", 1, format!("{error:#}")),
-            }
-        }
         Ok((args, _, _)) => match CliCommand::parse(&args) {
             Err(error) => ("WT1001", 2, error.to_string()),
             Ok(CliCommand::Edit(command)) => match command.execute(&mut events) {
@@ -584,7 +578,7 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        // A new batch (e.g. a daemon refresh) starts with fresh roots.
+        // A new batch starts with fresh roots.
         assert_eq!(events[2]["code"], "E0102");
         assert_eq!(events[2]["data"]["cascade"], false);
     }

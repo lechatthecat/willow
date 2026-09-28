@@ -19,10 +19,8 @@ pub(super) fn capabilities() -> AgentCapabilities {
         direct_effects: Some("willow effects module::function"),
         direct_impact: Some("willow impact module::function"),
         direct_rename: Some("willow rename module::function new_name"),
-        snapshot_clear: Some("willow snapshot clear --dir DIR"),
         machine_check: Some(super::protocol::CHECK_COMMAND),
         machine_build: Some(super::protocol::BUILD_COMMAND),
-        snapshots: Some(super::analysis::SNAPSHOT_COMMAND),
         symbol_query: Some(super::analysis::QUERY_COMMAND),
         references: Some(super::analysis::QUERY_COMMAND),
         callers: Some(super::analysis::IMPACT_COMMAND),
@@ -218,15 +216,10 @@ mod tests {
     #[test]
     fn current_commands_are_from_protocol_and_parse() {
         let caps = capabilities();
-        assert_eq!(
-            caps.snapshots,
-            Some(super::super::analysis::SNAPSHOT_COMMAND)
-        );
         assert_eq!(caps.impact, Some(super::super::analysis::IMPACT_COMMAND));
         for command in [
             caps.machine_check,
             caps.machine_build,
-            caps.snapshots,
             caps.symbol_query,
             caps.references,
             caps.callers,
@@ -253,16 +246,7 @@ mod tests {
             machine_build: current.machine_build,
             ..Default::default()
         };
-        let snapshot = AgentCapabilities {
-            direct_refs: None,
-            direct_symbol: None,
-            direct_type: None,
-            direct_effects: None,
-            direct_impact: None,
-            direct_rename: None,
-            ..current
-        };
-        for (name, caps) in [("v0", v0), ("snapshot", snapshot), ("direct", current)] {
+        for (name, caps) in [("v0", v0), ("direct", current)] {
             let codex = render_agent_instructions(Agent::Codex, caps);
             let claude = render_agent_instructions(Agent::Claude, caps);
             assert_eq!(
@@ -285,15 +269,6 @@ mod tests {
                 if name == "v0" {
                     assert!(!text.contains("willow snapshot"));
                     assert!(!text.contains("willow impact"));
-                } else if name == "snapshot" {
-                    for phrase in [
-                        "Before semantic",
-                        "old snapshot stale",
-                        "new snapshot",
-                        "willow impact",
-                    ] {
-                        assert!(text.contains(phrase));
-                    }
                 } else {
                     assert!(text.contains("willow refs"));
                     assert!(text.contains("willow rename"));

@@ -5,19 +5,16 @@ mod dispatch;
 mod display;
 pub mod edit;
 mod graph;
-pub mod measurement;
 mod packages;
 mod rename;
 pub use packages::{ModuleEvidence, ModuleIdentity, SymbolIdentity, UpdateDelta};
 mod semantic;
 mod storage;
 pub(crate) mod symbols;
-mod warm;
 pub use graph::{Direction, Impact, ImpactNode, Limits};
 pub use semantic::{QueryRequest, QuerySession, SemanticFacts};
-pub use storage::{Difference, FunctionChange, compact_output_paths, expand_snapshot_paths};
-pub use warm::WarmSession;
-pub(crate) use warm::check_size;
+pub(crate) use storage::check_size;
+pub use storage::{Difference, FunctionChange, compact_output_paths, expand_output_paths};
 
 use crate::{
     diagnostics::Span,

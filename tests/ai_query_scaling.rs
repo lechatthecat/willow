@@ -75,36 +75,6 @@ fn increasing_graphs_and_repeated_queries_retain_no_query_history() {
             .unwrap()
             .id
             .clone();
-        if n == 16 {
-            let saved = directory.join("query-baseline.json");
-            snapshot.save(&saved).unwrap();
-            let delta = directory.join("query-delta.json");
-            snapshot.save_delta(&delta, &saved).unwrap();
-            let mut from_delta =
-                QuerySession::new(willow_compiler::ai::Snapshot::load(&delta).unwrap()).unwrap();
-            let mut from_disk =
-                QuerySession::new(willow_compiler::ai::Snapshot::load(&saved).unwrap()).unwrap();
-            let mut from_frontend = QuerySession::new(snapshot.clone()).unwrap();
-            let request = || QueryRequest::SymbolInfo {
-                revision: revision.clone(),
-                function: id.clone(),
-            };
-            assert_eq!(from_disk.query(request()), from_frontend.query(request()));
-            assert_eq!(from_delta.query(request()), from_frontend.query(request()));
-            for kind in ["references", "effects"] {
-                let request = serde_json::json!({"kind":kind,"revision":revision,"function":id});
-                assert_eq!(
-                    from_delta.query(serde_json::from_value(request.clone()).unwrap()),
-                    from_frontend.query(serde_json::from_value(request).unwrap())
-                );
-            }
-            let request = || QueryRequest::TypeAt {
-                revision: revision.clone(),
-                file: path.to_string_lossy().into_owned(),
-                byte: source.find("42").unwrap(),
-            };
-            assert_eq!(from_delta.query(request()), from_frontend.query(request()));
-        }
         let expression_count = snapshot.semantic.expressions.len();
         let snapshot_bytes = serde_json::to_vec(&snapshot).unwrap().len();
         let heap_before = LIVE.load(Ordering::Relaxed);

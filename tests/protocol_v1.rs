@@ -53,15 +53,26 @@ impl Fixture {
             .unwrap()["data"]
             .clone()
     }
-    fn save(&self, name: &str) -> Value {
-        self.result(&["snapshot", "save", "main.wi", "--output", name]);
-        // Decode like consumers do: workspace placeholders expand to paths.
-        let mut value = serde_json::from_slice(&fs::read(self.0.join(name)).unwrap()).unwrap();
-        willow_compiler::ai::expand_snapshot_paths(&mut value).unwrap();
-        value
+    fn analyze(&self) -> willow_compiler::ai::Snapshot {
+        self.analyze_mode(false)
     }
-    fn diff(&self, a: &str, b: &str) -> Value {
-        self.result(&["snapshot", "diff", "--before", a, "--after", b])["difference"].clone()
+    fn analyze_mode(&self, project: bool) -> willow_compiler::ai::Snapshot {
+        willow_compiler::CompilerSession::new(
+            self.0.join("main.wi").to_str().unwrap(),
+            "",
+            &willow_compiler::CompilerOptions::debug(),
+            project.then(|| self.0.clone()),
+        )
+        .analysis_with_emitter(&mut willow_compiler::diagnostics::HumanEmitter)
+        .unwrap()
+    }
+    fn facts(&self) -> Value {
+        let mut value = serde_json::to_value(self.analyze()).unwrap();
+        self.write("revision-query.json", "[]");
+        value["revision"] = self.result(&["query", "main.wi", "--requests", "revision-query.json"])
+            ["revision"]
+            .clone();
+        value
     }
 }
 impl Drop for Fixture {
@@ -148,7 +159,7 @@ fn modules_same_names_item_and_module_aliases() {
     assert!(names.contains(&"main"));
     assert!(names.contains(&"work"));
     assert!(names.contains(&"leaf"));
-    let snapshot = f.save("baseline.json");
+    let snapshot = f.facts();
     let work: Vec<_> = snapshot["functions"]
         .as_array()
         .unwrap()
@@ -167,23 +178,24 @@ fn modules_same_names_item_and_module_aliases() {
 }
 
 #[test]
-fn snapshot_without_git_empty_diff_effects_deleted_edges_and_rename() {
+fn in_memory_comparison_without_git_empty_diff_effects_deleted_edges_and_rename() {
     let f = Fixture::new("fn leaf() {} fn main() { leaf(); }");
-    let before = f.save("before.json");
+    let before_facts = f.facts();
+    let before = f.analyze();
     f.write(
         "main.wi",
         "// comment\nfn leaf() { }\nfn main() { leaf(); }\n",
     );
-    f.save("whitespace.json");
+    let whitespace = f.analyze();
     assert!(
-        f.diff("before.json", "whitespace.json")["changes"]
+        difference(&before, &whitespace)["changes"]
             .as_array()
             .unwrap()
             .is_empty()
     );
     f.write("main.wi", "fn leaf() { println(1); } fn main() { leaf(); }");
-    f.save("effects.json");
-    let diff = f.diff("before.json", "effects.json");
+    let effects = f.analyze();
+    let diff = difference(&before, &effects);
     assert!(
         diff["changes"]
             .as_array()
@@ -191,7 +203,7 @@ fn snapshot_without_git_empty_diff_effects_deleted_edges_and_rename() {
             .iter()
             .any(|c| c["added_effects"].as_u64().unwrap() > 0)
     );
-    let reverse = f.diff("effects.json", "before.json");
+    let reverse = difference(&effects, &before);
     assert!(
         reverse["changes"]
             .as_array()
@@ -200,8 +212,8 @@ fn snapshot_without_git_empty_diff_effects_deleted_edges_and_rename() {
             .any(|c| c["removed_effects"].as_u64().unwrap() > 0)
     );
     f.write("main.wi", "fn main() {}");
-    f.save("deleted.json");
-    let diff = f.diff("before.json", "deleted.json");
+    let deleted = f.analyze();
+    let diff = difference(&before, &deleted);
     assert!(
         diff["changes"]
             .as_array()
@@ -218,9 +230,9 @@ fn snapshot_without_git_empty_diff_effects_deleted_edges_and_rename() {
     );
     assert_eq!(diff["before_impact"]["nodes"].as_array().unwrap().len(), 2);
     f.write("main.wi", "fn renamed() {} fn main() { renamed(); }");
-    f.save("rename.json");
+    let rename = f.analyze();
     assert!(
-        f.diff("before.json", "rename.json")["changes"]
+        difference(&before, &rename)["changes"]
             .as_array()
             .unwrap()
             .iter()
@@ -231,9 +243,9 @@ fn snapshot_without_git_empty_diff_effects_deleted_edges_and_rename() {
             "impact",
             "main.wi",
             "--function",
-            named(&before, "leaf")["id"].as_str().unwrap(),
+            named(&before_facts, "leaf")["id"].as_str().unwrap(),
             "--revision",
-            before["revision"].as_str().unwrap(),
+            before_facts["revision"].as_str().unwrap(),
         ],
         1,
     );
@@ -241,97 +253,18 @@ fn snapshot_without_git_empty_diff_effects_deleted_edges_and_rename() {
 }
 
 #[test]
-fn malformed_incompatible_snapshots_and_atomic_save() {
-    let f = Fixture::new("fn main() {}");
-    let original = f.save("before.json");
-    let bytes = fs::read(f.0.join("before.json")).unwrap();
-    f.run(
-        &["snapshot", "save", "main.wi", "--output", "before.json"],
-        1,
-    );
-    assert_eq!(fs::read(f.0.join("before.json")).unwrap(), bytes);
-    let mut bad = original.clone();
-    bad["functions"][0]["runtime_effects"] =
-        (bad["functions"][0]["runtime_effects"].as_u64().unwrap() ^ 1).into();
-    f.write("corrupt.json", &bad.to_string());
-    f.run(
-        &[
-            "snapshot",
-            "diff",
-            "--before",
-            "before.json",
-            "--after",
-            "corrupt.json",
-        ],
-        1,
-    );
-    bad = original;
-    bad["compiler"] = "old compiler".into();
-    f.write("old.json", &bad.to_string());
-    f.run(
-        &[
-            "snapshot",
-            "diff",
-            "--before",
-            "before.json",
-            "--after",
-            "old.json",
-        ],
-        1,
-    );
-    f.write("truncated.json", "{");
-    f.run(
-        &[
-            "snapshot",
-            "diff",
-            "--before",
-            "before.json",
-            "--after",
-            "truncated.json",
-        ],
-        1,
-    );
-    f.result(&[
-        "snapshot",
-        "save",
-        "main.wi",
-        "--release",
-        "--output",
-        "release.json",
-    ]);
-    f.run(
-        &[
-            "snapshot",
-            "diff",
-            "--before",
-            "before.json",
-            "--after",
-            "release.json",
-        ],
-        1,
-    );
-    assert!(
-        !fs::read_dir(&f.0).unwrap().any(|p| p
-            .unwrap()
-            .path()
-            .extension()
-            .is_some_and(|e| e == "tmp"))
-    );
-}
-
-#[test]
 fn unknown_indirect_effects_and_virtual_interface_dispatch() {
     let f = Fixture::new("fn indirect(f: fn() -> i64) -> i64 { return f(); } fn main() {}");
-    let snapshot = f.save("unknown.json");
+    let snapshot = f.facts();
     assert_eq!(named(&snapshot, "indirect")["unknown"], true);
     assert_eq!(named(&snapshot, "indirect")["runtime_effects"], 63);
     f.write("main.wi", "interface I { fn run(self) -> i64; } fn caller(x: I) -> i64 { return x.run(); } fn main() {}");
-    let unknown = f.save("abstract.json");
+    let unknown = f.facts();
     assert_eq!(named(&unknown, "caller")["unknown"], true);
     assert_eq!(named(&unknown, "caller")["runtime_effects"], 63);
     let source = "interface I { fn run(self) -> i64; } class A implements I { pub fn run(self) -> i64 { return 1; } } fn call(x: I) -> i64 { return x.run(); } fn main() {}";
     f.write("main.wi", source);
-    let snapshot = f.save("interface.json");
+    let snapshot = f.facts();
     let method = snapshot["functions"]
         .as_array()
         .unwrap()
@@ -356,7 +289,7 @@ fn unknown_indirect_effects_and_virtual_interface_dispatch() {
     assert_eq!(node["level"], 2, "{result}");
     assert!(node["graph_distance"].as_u64().unwrap() >= 1);
     f.write("main.wi","open class Base { pub open fn run(self) -> i64 { return 1; } } class Child extends Base { pub override fn run(self) -> i64 { return 2; } } fn call(x: Base) -> i64 { return x.run(); } fn main() {}");
-    let snapshot = f.save("virtual.json");
+    let snapshot = f.facts();
     let callees = named(&snapshot, "call")["callees"].as_array().unwrap();
     let concrete = snapshot["functions"]
         .as_array()
@@ -375,35 +308,28 @@ fn project_configuration_and_dependency_scope_are_checked() {
         "project.toml",
         "[project]\nname = \"impact_test\"\nversion = \"0.1.0\"\nentry = \"main.wi\"\n",
     );
-    f.result(&["snapshot", "save", ".", "--output", "project-before.json"]);
+    let before = f.analyze_mode(true);
     // Files outside the resolved source closure do not change this revision.
     f.write("unrelated.wi", "fn unused() { println(1); }");
-    f.result(&["snapshot", "save", ".", "--output", "unrelated.json"]);
-    let difference = f.diff("project-before.json", "unrelated.json");
+    let unrelated = f.analyze_mode(true);
+    let difference = difference(&before, &unrelated);
     assert_eq!(difference["before_revision"], difference["after_revision"]);
     assert!(difference["changes"].as_array().unwrap().is_empty());
     f.write(
         "project.toml",
         "[project]\nname = \"impact_test\"\nversion = \"0.2.0\"\nentry = \"main.wi\"\n",
     );
-    f.result(&["snapshot", "save", ".", "--output", "project-after.json"]);
-    f.run(
-        &[
-            "snapshot",
-            "diff",
-            "--before",
-            "project-before.json",
-            "--after",
-            "project-after.json",
-        ],
-        1,
+    assert!(
+        before
+            .compare(&f.analyze_mode(true), Default::default())
+            .is_err()
     );
 }
 
 #[test]
 fn invalid_arguments_diagnostics_positions_and_live_references() {
     let f = Fixture::new("fn a() {} fn b() {} fn main() { a(); b(); }");
-    let snapshot = f.save("base.json");
+    let snapshot = f.facts();
     let a = named(&snapshot, "a")["id"].as_str().unwrap();
     let b = named(&snapshot, "b")["id"].as_str().unwrap();
     let revision = snapshot["revision"].as_str().unwrap();
@@ -422,15 +348,6 @@ fn invalid_arguments_diagnostics_positions_and_live_references() {
         vec!["impact", "main.wi"],
         vec!["impact", "main.wi", "--file", "main.wi"],
         vec!["impact", "main.wi", "--function", a],
-        vec![
-            "snapshot",
-            "diff",
-            "main.wi",
-            "--before",
-            "base.json",
-            "--after",
-            "base.json",
-        ],
         vec![
             "impact",
             "main.wi",
@@ -506,7 +423,7 @@ fn interface_dispatch_crosses_modules_and_repeated_import_spellings() {
         "impls.wi",
         "import api; pub class A implements api::I { pub fn run(self) -> i64 { return 7; } }",
     );
-    let snapshot = f.save("cross-interface.json");
+    let snapshot = f.facts();
     let method = snapshot["functions"]
         .as_array()
         .unwrap()
@@ -537,7 +454,7 @@ fn virtual_dispatch_in_dependency_reaches_subclass_defined_by_consumer() {
         "import base; class Child extends base::Base { pub override fn run(self) -> i64 { return 2; } } fn main() { base::call(new Child()); }",
     );
     f.write("base.wi","pub open class Base { pub open fn run(self) -> i64 { return 1; } } pub fn call(x: Base) -> i64 { return x.run(); }");
-    let snapshot = f.save("virtual-cross.json");
+    let snapshot = f.facts();
     let child = named(&snapshot, "Child::run");
     let result = f.result(&[
         "impact",
@@ -581,10 +498,17 @@ fn nested_expression_and_block_lambdas_own_their_source_positions() {
             "{result}"
         );
         assert!(!functions.iter().any(|f| f["name"] == "main"), "{result}");
-        f.save("first.json");
-        f.save("second.json");
-        let diff = f.diff("first.json", "second.json");
+        let first = f.analyze();
+        let second = f.analyze();
+        let diff = difference(&first, &second);
         assert_eq!(diff["before_revision"], diff["after_revision"]);
         assert!(diff["changes"].as_array().unwrap().is_empty());
     }
+}
+
+fn difference(
+    before: &willow_compiler::ai::Snapshot,
+    after: &willow_compiler::ai::Snapshot,
+) -> Value {
+    serde_json::to_value(before.compare(after, Default::default()).unwrap()).unwrap()
 }

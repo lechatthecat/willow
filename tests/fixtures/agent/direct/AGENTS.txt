@@ -25,9 +25,7 @@ When executable validation is needed, run `willow build .`.
 Use effects or impact when the question needs transitive behavior or cross-file risk analysis, especially with heavy dispatch or a large codebase. Source reading is often enough for small local changes; do not run every query as a checklist.
 - Effects: `willow effects module::function`.
 - Impact: `willow impact module::function`.
-Saved snapshots are optional for snapshot diff, before/after risk comparison, reproducible persisted analysis, external low-level clients and protocol debugging. Ordinary semantic queries do not require a snapshot file, request JSON, manual IDs or byte-offset calculation. Snapshot diff compares two saved semantic snapshots and does not require Git, commits or branches. Low-level query/edit/daemon protocols remain available for advanced batch integration.
 
-
-Do not start a daemon or dump a full snapshot just to find a symbol ID. Use snapshot/query/edit/daemon --help only when a task needs the low-level protocol. If using it, keep the project context consistent (including --project where required), use compiler-returned IDs and UTF-8 byte offsets, and reject stale results. Refresh after source edits or branch switches; restart a daemon after configuration, entry point or compiler changes. Never bypass stale checks.
+Use query/edit --help for advanced batch integrations. Keep project context consistent (including --project where required), use compiler-returned IDs and UTF-8 byte offsets, and reject stale results. Query the current source again after changes. Never bypass stale checks.
 
 <!-- END WILLOW MANAGED -->

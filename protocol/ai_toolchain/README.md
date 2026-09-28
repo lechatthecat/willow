@@ -32,9 +32,7 @@ The transaction ID is hidden on success unless `--verbose` is set. Unsupported
 coverage or ambiguous names fail without a text-replacement fallback.
 
 The existing `query --requests`, `impact --function/--revision` and `edit`
-protocols remain available for batch/external integrations. Snapshots are useful
-for persisted comparisons, risk analysis and debugging, rather than a prerequisite
-for the direct commands.
+protocols remain available for batch/external integrations.
 
 ## Event-stream protocol
 
@@ -91,102 +89,32 @@ protocol dependencies enter distributed applications.
 The archived prototype is not the public contract. V0 adds lifecycle/version
 rejection, stable command failures, build diagnostics, project check, and a user
 driver to the existing diagnostic/check foundation. Later protocol revisions
-add impact, snapshots, risk, queries and structured edits; their contracts are
+add impact, queries and structured edits; their contracts are
 documented below and in the linked protocol documents.
 
-Saved snapshot files and CLI query, impact, diff, risk and daemon response
-payloads store the workspace path once in `workspace` and set
-`path_encoding: "workspace-placeholder-v1"`; any other string that is a path under
-the workspace is written as `${workspace}/rest`. Loading restores the exact
-snapshot (the revision digest is computed over the expanded form). Opaque IDs
-are never rewritten, so IDs copied from the file match query results. New
-declaration IDs use a SHA-256 digest of the original identity tuple, avoiding
-embedded absolute paths. Files without `path_encoding` load unchanged.
-Tools reading the file as raw JSON expand it by replacing the `${workspace}`
-prefix of every string and object key with `workspace` and dropping
-`path_encoding`; Rust callers can use `willow_compiler::ai::expand_snapshot_paths`.
-CLI position queries (including daemon requests) and `impact --file` accept the
-returned `${workspace}` paths. Library query results retain their original paths.
-If a payload already contains a literal `${workspace}` prefix, compaction is
-skipped to preserve unambiguous decoding.
-
-For repeated baselines, `willow snapshot save . --base baseline.json --output
-current.json` writes a lossless `snapshot-delta-v1` JSON document. Save the first
-full baseline without `--base`, and retain it. Subsequent deltas always reference
-that full baseline; a delta cannot be another delta's base. `snapshot diff`,
-`risk`, and the library's `Snapshot::load` restore every original fact before
-use, verify the base revision and restored digest, and require no live source
-files. `Snapshot::load_pair` shares a validated base within a comparison.
-
-Delta paths are relative to their file when both files share a filesystem root;
-move the baseline and deltas together, preserving their relative layout. A
-missing, modified, incompatible or invalid base produces an error. Each input
-file and the expanded delta snapshot are bounded to 64 MiB. Publication is
-create-only for both formats. Full snapshots remain supported and remain the
-default; their initial storage cost must be counted separately from each delta.
-
-The delta envelope contains `snapshot_encoding`, `base`, `base_revision`,
-`revision` and `changes`. A change is `set` (`path`, `value`), `remove` (`path`),
-or `splice` (`path`, `start`, `delete`, `values`). Paths contain object-key strings
-or array-index integers. Changes have nonoverlapping paths and depth at most
-128. These are storage operations, not source edits or the public edit protocol.
-Raw-JSON consumers must resolve the base and changes before interpreting facts;
-`expand_snapshot_paths` alone only expands paths in a full snapshot. There is
-no general-purpose compression or decompression step. Delta creation compares
-all records, while encoding and patch conversion serialize only changed records.
-Total load time still includes reading and validating the full base; deltas do
-not imply constant-time cold loading or a small expanded working set.
+CLI query and impact payloads store the workspace path once in `workspace` and
+set `path_encoding: "workspace-placeholder-v1"`. Paths under that workspace use
+`${workspace}/rest`. Opaque IDs are never rewritten. Rust callers can use
+`willow_compiler::ai::expand_output_paths` to expand response paths. Position
+queries and `impact --file` accept the returned `${workspace}` paths. Library
+query results retain absolute paths. If a payload already contains a literal
+`${workspace}` prefix, compaction is skipped to preserve unambiguous decoding.
 
 The machine-readable envelope and known payloads are defined in [toolchain-v1.schema.json](toolchain-v1.schema.json). Unknown additive fields and events remain permitted.
 
 Agent instruction generation, capability flags and managed sync are documented
 in [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md).
 
-## Owned measurement snapshots
+## Advanced integration
 
-`snapshot init --dir DIR` registers an absent or empty dedicated measurement
-directory. `snapshot save PROJECT --managed-dir DIR --output NAME` publishes a
-snapshot and its immutable ownership record; `--base BASE_NAME` permits a delta
-against a full snapshot owned by the same directory. Names are single filenames.
-`snapshot clear --dir DIR [--dry-run]` verifies ownership, payload hashes and the
-full/delta dependency set before deleting deltas followed by bases. Unknown files,
-symlinks, external bases, invalid records and active writers cause refusal.
-An absent directory is a successful no-op. Source, Git, build caches, edit recovery
-state and arbitrary historical snapshots are outside this directory's contract.
+Structured editing is documented in [STRUCTURED_EDITS.md](STRUCTURED_EDITS.md),
+including isolation and recovery boundaries. Each query invocation analyzes the
+current source and returns its revision. Re-query after changing source or configuration.
 
-The result records scope, success, deleted/planned payload count and bytes,
-separate ownership-record counts, refusal/skipped reasons and traversal counters.
-Deletion failure reports only successful deletions. If payload deletion succeeds
-but ownership-record deletion fails, clear fails closed on retry and requires
-inspection; it does not guess that unmatched metadata is safe to remove.
-
-Before each measurement session, stop and wait for only its owned daemon, clear
-once, then start a fresh process and create a full baseline. Abort on failure.
-Do not clear between warm samples. Count initial analysis/baseline creation in
-cold-start measurements and report it separately for isolated snapshot IO.
-Record compiler digest, source revision/dirty state, entry and configuration.
-OS page caches are unchanged. Branch names are not revision keys: ordinary source
-changes require daemon refresh, while entry/configuration/compiler changes require
-restart. Clear is not a substitute for either. Keep historical/shared snapshots
-as separate complete sets and never share a measurement baseline externally.
-
-Structured editing and the warm query process are documented in [STRUCTURED_EDITS.md](STRUCTURED_EDITS.md), including their isolation, recovery, refresh and retention boundaries.
-
-Risk side-effect classification distinguishes `new_operation` (source operation
-addition) from `new_side_effect`: `not-new`, `proven-absent` for captured pure
-direct calls, `proven-operation` for explicit I/O/writes, or
-`conservative-candidate`. `proven-operation` describes an operation in the source;
-it does not prove predicate feasibility, an external business write, or retry
-intent. Binding assignments remain candidates until local versus reference
-writes are distinguished. `effect_edge_visits` counts the shared reverse-graph
-side-effect propagation. Lock bodies preserve branch and loop-exit paths.
-`new_execution` and `new_repetition` compare structural reachability and local or
-inherited repetition with the baseline. An unchanged operation can therefore
-produce a new side-effect candidate and review question. Identical operations
-are compared as multisets of total, reachable, and repeating occurrences;
-reordering equivalent operations alone does not enable a new effect.
-`baseline_edge_visits` and `baseline_call_edge_visits` expose the baseline graph
-work separately from the current revision's counters.
+The former `snapshot` commands, file-based `risk`, and `daemon` have been removed.
+There is no replacement baseline file format. Use direct semantic commands for
+current-source facts and `query --requests` for batched integrations. Existing
+saved files are left untouched; this CLI no longer loads or manages them.
 
 V2 query batches use [query-v2.schema.json](query-v2.schema.json). `symbols`
 lists compiler-resolved declarations. It accepts optional AND-combined filters
@@ -214,13 +142,6 @@ references. `type-at` includes checked declaration types and expression types.
 Successful query envelopes carry `revision` and `result`; an invalid revision
 returns top-level `status: stale` before lookup. Unknown positions/identities,
 ambiguous source positions and incomplete evidence remain distinct.
-
-Risk evaluates expression order, short-circuit constants, match/select branches,
-loop exits and defer registration/cleanup. It separates `retry_detection`
-(repetition only, timeout/fallible candidates, inherited candidates),
-`execution_reachability`, and `new_side_effect`. Structural paths do not prove
-predicate feasibility or business retry intent. V1.2 uses snapshots directly
-and does not instantiate a V2 query session.
 
 `effects` preserves compiler capability bits and supplies `effect_evidence`
 for each set bit, with a source witness or explicit missing evidence. Compiler
@@ -250,7 +171,7 @@ Use package commands as the planning interface:
    `{"kind":"affected","delta":<report>,"tests":["<test FunctionId>"]}`.
 3. Run `willow query --requests requests.json` in the project. As with other
    query batches, requests.json is an array; omitted revision binds to this
-   invocation. The same request works through the warm daemon with its revision.
+   invocation.
 4. Use the returned modules/symbols/tests to select checks. Review the plan before
    applying the package mutation; the query itself never edits manifests or locks.
 
@@ -261,7 +182,7 @@ The indexed graph is limited to modules loaded from the selected entry point.
 `tests` is an explicit caller-supplied list of test FunctionIds: no naming
 convention or unloaded test discovery is assumed. Unknown test IDs produce
 `incomplete`; unmatched package identities are returned explicitly (a planned
-new revision will normally be unmatched in a pre-update snapshot). Empty change
+new revision will normally be unmatched in a pre-update analysis revision). Empty change
 sets return empty results. Invalid report schema/kind/success state returns
 `invalid-delta`; stale revisions retain the existing top-level `stale` response.
 `module_visits` and `edge_visits` expose closure work per request, excluding the

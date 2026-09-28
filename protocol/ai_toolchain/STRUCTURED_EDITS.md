@@ -1,12 +1,14 @@
-# Structured edits and warm queries
+# Structured edits
 
-The V1 NDJSON event envelope also carries `edit.*` and `daemon.*` analysis results.
-Schemas: `edit-v3.schema.json`, `daemon-v4.schema.json`.
+The V1 NDJSON event envelope also carries `edit.*` analysis results.
+Schema: `edit-v3.schema.json`.
 
 ## Editing
 
-Start from `willow snapshot save main.wi --output base.json`. Copy the revision
-and function id into a request conforming to the edit schema, for example:
+For ordinary renames use `willow rename SELECTOR NEW_NAME`. For advanced edits,
+write `[ {"kind":"symbols","name":"value","symbol_kind":"function"} ]` to
+`queries.json`, then run `willow query main.wi --requests queries.json`.
+Copy the returned revision and callable `id` into an edit request, for example:
 
 ```json
 {"revision":"<base revision>","operations":[
@@ -24,18 +26,18 @@ willow edit apply --root . --transaction <transaction>
 willow edit recover --root . --transaction <transaction>
 ```
 
-For a project snapshot, use the same analysis mode when preparing edits:
+For a project query, use the same analysis mode when preparing edits:
 
 ```sh
-willow snapshot save . --output base.json
+willow query . --requests queries.json
 willow edit prepare --root . --entry src/main.wi --project --requests edits.json --changes diff
 ```
 
 `--entry` is relative to `--root`. `--project` is accepted only by `prepare`;
 subsequent operations reuse the mode stored in the transaction. Omit it when
-using a snapshot saved from a source file. Revisions include the analysis mode,
+querying a source file. Revisions include the analysis mode,
 so even unchanged sources can produce a revision mismatch if the modes differ.
-For changed inputs, save a new snapshot and rebuild the request with its revision
+For changed inputs, query the current source again and rebuild the request with its revision
 and function ids; do not merely replace the revision in an old request.
 
 `prepare` returns the transaction id and full before/after text for every changed
@@ -54,7 +56,7 @@ reported conflicting file explicitly before retrying recovery; no automatic
 conflict resolution is attempted.
 
 Atomic visibility is scoped to operations holding `Workspace`'s exclusive OS
-file lock, including edit operations and daemon refresh. The journal blocks
+file lock, including edit operations. The journal blocks
 those observers after an interrupted apply until recovery. Ordinary editors,
 filesystem readers and standalone builds do not take this lock: they can observe
 intermediate files. Non-cooperating writers are detected at the input checks,
@@ -81,62 +83,3 @@ fail without changing source files. A rejection tied to one occurrence adds
 `line`/`column`) to the `request.finished` event. Local candidates and journals remain under
 `.willow-edits/`; retain interrupted journals until recovery. Completed candidate
 history may be removed manually while no edit operation is active.
-
-## Warm query process
-
-```sh
-willow daemon main.wi
-```
-
-The process emits `daemon.ready` with its current revision. Send one JSON request
-per stdin line; each response echoes its numeric `id`. Query revisions are
-mandatory. Queries read the installed immutable revision; source changes become
-visible only after a successful `refresh`.
-
-```json
-{"id":1,"operation":"query","request":{"kind":"symbol-info","revision":"<revision>","function":"<function id>"}}
-{"id":2,"operation":"refresh"}
-{"id":3,"operation":"stats"}
-{"id":4,"operation":"shutdown"}
-```
-
-A refresh uses the existing CompilerDb with module-granularity revision
-invalidation. Unchanged parsed inputs keep their syntax/BodyId identities;
-unchanged modules outside the reverse dependency closure replay typed-body
-artifacts and skip body type checking. Body, public signature, type definition,
-default-method and effect changes invalidate the changed module and its
-consumers. Declarations and whole-unit effect/concurrency aggregation are rebuilt.
-A change to resolver topology or compiler inputs starts a cold generation.
-
-The BodyId-keyed analysis-query family additionally reuses symbol, references
-and effects responses. Transitive effect witnesses invalidate through old and
-new call edges. Position queries retain their logarithmic index. This does not
-cache native build artifacts or introduce another query engine. Configuration
-changes require a fresh daemon. A failed refresh leaves the previous query
-revision available. EOF or shutdown releases all state; there is no detached
-process or persistent compiler cache.
-
-The process permits at most 32 frontend attempts (including initialization
-and failed refreshes), then responds that a restart is required and exits. This
-bounds lifetime growth of the existing process-wide compiler interner; it does
-not introduce a second interner or claim that interning is already session-local.
-
-Limits: 1 MiB per request, 64 MiB serialized current snapshot, 256 cached results
-and 8 MiB serialized cached values. The accepted compiler revision retains at
-most 128 MiB of serialized artifacts in one temporary pack; each successful
-refresh copies live records into its new pack and releases the old one. Oversized individual results are returned but
-not cached. Bounds on serialized data imply proportional heap retention, not an
-8 MiB RSS guarantee. Refresh can temporarily hold the old/new snapshots and frontend
-working state, including both artifact packs. `stats` reports deterministic cache/recompute counts and
-retained serialized bytes. These limits concern retained query data; they do not
-bound peak memory needed to compile arbitrary inputs.
-
-Compiler counters in `stats` describe the last successful analysis:
-`typechecks` counts actual typed-body evaluator executions;
-`reused_typed_bodies` counts distinct imported typed records subsequently read;
-`semantic_input_visits` counts revision inputs compared;
-`semantic_invalidation_visits` counts traversed reverse edges;
-`retained_artifact_bytes` counts bytes in the current compiler pack.
-The existing `computations`/`hits` fields continue to describe response queries.
-Lambda public names use their lexical owner and source range, independent of
-process-local compiler IDs.

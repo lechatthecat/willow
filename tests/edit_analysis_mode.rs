@@ -42,20 +42,14 @@ impl Fixture {
             .unwrap()["data"]
             .clone()
     }
-    fn snapshot(&self) -> Value {
-        let _ = fs::remove_file(self.0.join("snapshot.json"));
-        self.result(&[
-            "snapshot",
-            "save",
-            "src/main.wi",
-            "--output",
-            "snapshot.json",
-        ]);
-        // Decode like consumers do: workspace placeholders expand to paths.
-        let mut value =
-            serde_json::from_slice(&fs::read(self.0.join("snapshot.json")).unwrap()).unwrap();
-        willow_compiler::ai::expand_snapshot_paths(&mut value).unwrap();
-        value
+    fn symbols(&self, source: &str) -> Value {
+        fs::write(
+            self.0.join("symbols-query.json"),
+            r#"[{"kind":"symbols","symbol_kind":"function"}]"#,
+        )
+        .unwrap();
+        let result = self.result(&["query", source, "--requests", "symbols-query.json"]);
+        json!({"revision": result["revision"], "functions": result["results"][0]["result"]["symbols"]})
     }
 }
 impl Drop for Fixture {
@@ -64,7 +58,7 @@ impl Drop for Fixture {
     }
 }
 #[test]
-fn prepare_documents_and_preserves_snapshot_analysis_mode() {
+fn prepare_documents_and_preserves_query_analysis_mode() {
     let f = Fixture::new();
     fs::write(f.0.join("project.toml"), "[willow]\nmanifest-version = 1\n[project]\nname = \"app\"\nversion = \"0.1.0\"\nentry = \"src/main.wi\"\n[dependencies]\n").unwrap();
     let help = Command::new(env!("CARGO_BIN_EXE_willow"))
@@ -75,10 +69,9 @@ fn prepare_documents_and_preserves_snapshot_analysis_mode() {
     assert!(String::from_utf8_lossy(&help.stdout).contains("[--project]"));
     for project in [false, true] {
         let snapshot = if project {
-            f.result(&["snapshot", "save", ".", "--output", "project.json"]);
-            serde_json::from_slice(&fs::read(f.0.join("project.json")).unwrap()).unwrap()
+            f.symbols(".")
         } else {
-            f.snapshot()
+            f.symbols("src/main.wi")
         };
         let function = snapshot["functions"]
             .as_array()
@@ -118,7 +111,10 @@ fn prepare_documents_and_preserves_snapshot_analysis_mode() {
         assert!(output.contains("base revision mismatch"), "{output}");
         assert!(output.contains("use --project"), "{output}");
         assert!(output.contains("omit --project"), "{output}");
-        assert!(output.contains("save a new snapshot"), "{output}");
+        assert!(
+            output.contains("query the current source again"),
+            "{output}"
+        );
         assert_eq!(fs::read(f.0.join("src/main.wi")).unwrap(), before);
         if !project {
             args.pop();

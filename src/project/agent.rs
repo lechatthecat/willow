@@ -49,13 +49,9 @@ pub struct AgentCapabilities {
     #[serde(serialize_with = "available")]
     pub direct_rename: Option<&'static str>,
     #[serde(serialize_with = "available")]
-    pub snapshot_clear: Option<&'static str>,
-    #[serde(serialize_with = "available")]
     pub machine_check: Option<&'static str>,
     #[serde(serialize_with = "available")]
     pub machine_build: Option<&'static str>,
-    #[serde(serialize_with = "available")]
-    pub snapshots: Option<&'static str>,
     #[serde(serialize_with = "available")]
     pub symbol_query: Option<&'static str>,
     #[serde(serialize_with = "available")]
@@ -85,8 +81,6 @@ impl AgentCapabilities {
         .any(Option::is_some)
         {
             3
-        } else if self.snapshots.is_some() {
-            2
         } else {
             1
         }
@@ -132,10 +126,7 @@ pub fn render_agent_instructions(agent: Agent, caps: AgentCapabilities) -> Strin
                 text.push_str(&format!("- {label}: `{command}`.\n"));
             }
         }
-        if caps.snapshots.is_some() {
-            text.push_str("Saved snapshots are optional for snapshot diff, before/after risk comparison, reproducible persisted analysis, external low-level clients and protocol debugging. Ordinary semantic queries do not require a snapshot file, request JSON, manual IDs or byte-offset calculation. Snapshot diff compares two saved semantic snapshots and does not require Git, commits or branches. Low-level query/edit/daemon protocols remain available for advanced batch integration.\n\n");
-        }
-        text.push_str("\nDo not start a daemon or dump a full snapshot just to find a symbol ID. Use snapshot/query/edit/daemon --help only when a task needs the low-level protocol. If using it, keep the project context consistent (including --project where required), use compiler-returned IDs and UTF-8 byte offsets, and reject stale results. Refresh after source edits or branch switches; restart a daemon after configuration, entry point or compiler changes. Never bypass stale checks.\n");
+        text.push_str("\nUse query/edit --help for advanced batch integrations. Keep project context consistent (including --project where required), use compiler-returned IDs and UTF-8 byte offsets, and reject stale results. Query the current source again after changes. Never bypass stale checks.\n");
         text.push_str(&format!("\n{END}\n"));
         return text;
     }
@@ -151,9 +142,6 @@ pub fn render_agent_instructions(agent: Agent, caps: AgentCapabilities) -> Strin
         text.push_str("Parse stdout as NDJSON only in toolchain machine mode; stderr is human output and must not be parsed as protocol. Require supported schema_version on every event, a single stream with contiguous seq, and request.started first and request.finished last. Missing request.finished is failure, never success. Require terminal status and exit_code to agree with the process exit status. Reject unsupported versions without guessing a fallback.\n\n");
     }
     text.push_str("Use willow add, willow remove, willow update, willow deps, willow fetch, and willow package verify for package work. Prefer --dry-run when planning add/remove/update changes. Package commands have their own output contract; do not interpret package output as the check/build NDJSON event protocol. Do not edit project.lock by hand.\n\n");
-    if let Some(snapshot) = caps.snapshots {
-        text.push_str(&format!("Before semantic or cross-file work, obtain a snapshot at the project root: `{snapshot}`. The --output destination must not exist; choose a new filename for every snapshot, including refreshes. Query compiler facts against the corresponding revision; do not infer calls, references or impact from text search alone. Text search remains useful for navigation.\n\nSource, project.toml, project.lock, or path-dependency edits make the old snapshot stale. After edits, run machine-readable check, then obtain a new snapshot before further semantic queries. Finish with check/build. On snapshot failure, explicitly describe investigation as textual and do not invent semantic results. Snapshots do not replace Git commits. Trivial comment, README or typo edits do not require snapshots.\n\n"));
-    }
     for (label, command) in [
         ("Symbols", caps.symbol_query),
         ("References", caps.references),
@@ -166,8 +154,8 @@ pub fn render_agent_instructions(agent: Agent, caps: AgentCapabilities) -> Strin
         }
     }
     if caps.symbol_query.is_some() || caps.references.is_some() {
-        text.push_str("Query request files are JSON arrays. Use compiler-returned IDs and the current revision; a stale, unknown or incomplete result is not proof of absence. The query command constructs its own immutable snapshot; bind requests to the saved revision to detect changes between commands.\n");
-        text.push_str("Replace REVISION with analysis.result.data.revision from snapshot.saved (or the current query result). Write each following JSON array to queries.json before running its command. Check each query result status as well as request.finished: a successful transport can contain stale or unknown results.\n");
+        text.push_str("Query request files are JSON arrays. Use compiler-returned IDs and the current revision; a stale, unknown or incomplete result is not proof of absence. The query command analyzes current source; bind requests to the returned revision to detect changes between commands.\n");
+        text.push_str("Replace REVISION with analysis.result.data.revision from the current query result. Write each following JSON array to queries.json before running its command. Check each query result status as well as request.finished: a successful transport can contain stale or unknown results.\n");
         text.push_str("Keep symbol lists small: replace NAME_PREFIX with a name prefix, or filter by `name`, `module` or `symbol_kind`; `total`/`truncated` report what `limit` cut. Read `type_display` for types.\n");
         for (command, request) in [
             (
@@ -202,7 +190,7 @@ pub fn render_agent_instructions(agent: Agent, caps: AgentCapabilities) -> Strin
         }
     }
     if caps.callers.is_some() || caps.impact.is_some() {
-        text.push_str("Replace FUNCTION_ID with a callable id from the saved snapshot file's functions and REVISION with that snapshot's revision. Impact constructs a fresh snapshot and checks --revision before lookup. Read coverage, truncation and unresolved-call evidence; an incomplete result is not proof of no callers.\n");
+        text.push_str("Replace FUNCTION_ID with a callable id from a symbols query and REVISION with its revision. Impact analyzes current source and checks --revision before lookup. Read coverage, truncation and unresolved-call evidence; an incomplete result is not proof of no callers.\n");
     }
     text.push_str(&format!("\n{END}\n"));
     text
@@ -265,7 +253,7 @@ mod tests {
     #[test]
     fn capability_flags_and_independent_omission() {
         let disabled = serde_json::to_value(AgentCapabilities::default()).unwrap();
-        assert_eq!(disabled.as_object().unwrap().len(), 15);
+        assert_eq!(disabled.as_object().unwrap().len(), 13);
         assert!(disabled.as_object().unwrap().values().all(|v| v == false));
         let caps = AgentCapabilities {
             references: Some("references-command"),
