@@ -115,8 +115,9 @@ impl TypeChecker {
                     arg.expr.span(),
                     format!("`{}` crosses a task boundary here", type_name(ty)),
                 ))
+                .with_note(self.marker_failure_note(ty, if marker == "Send" { Marker::Send } else { Marker::Sync }))
                 .with_help(
-                    "share it safely with `Mutex<T>`, `RwLock<T>`, `Atomic*`, a `Channel<T>`, or a frozen value",
+                    "mutable Array/Map values are never Sync: use FrozenArray/FrozenMap via .freeze(), or coordinate shared access with Mutex<T>, RwLock<T>, Atomic*, or Channel<T>",
                 ),
             );
         }
@@ -173,6 +174,7 @@ impl TypeChecker {
                 span,
                 "this async task may be scheduled on another worker",
             ))
+            .with_note(self.marker_failure_note(first_bad, Marker::Send))
             .with_help(
                 "keep task frame values Send, or wrap shared mutable state with Mutex/RwLock/Atomic/Channel/frozen data",
             ),
@@ -180,15 +182,39 @@ impl TypeChecker {
     }
 
     fn marker_holds(&self, ty: &Type, marker: Marker, visiting: &mut HashSet<String>) -> bool {
+        self.marker_holds_with_reason(ty, marker, visiting, &mut None)
+    }
+
+    fn marker_failure_note(&self, ty: &Type, marker: Marker) -> String {
+        let mut reasons = Some(Vec::new());
+        self.marker_holds_with_reason(ty, marker, &mut HashSet::new(), &mut reasons);
+        let mut reasons = reasons.unwrap();
+        reasons.reverse();
+        reasons.join(" -> ")
+    }
+
+    fn marker_holds_with_reason(
+        &self,
+        ty: &Type,
+        marker: Marker,
+        visiting: &mut HashSet<String>,
+        reasons: &mut Option<Vec<String>>,
+    ) -> bool {
+        #[cfg(test)]
+        if reasons.is_some() {
+            tests::REASON_VISITS.with(|n| n.set(n.get() + 1));
+        }
         let send = matches!(marker, Marker::Send);
-        match ty {
+        let result = match ty {
             // Primitives + immutable String are Send + Sync; void/never carry
             // no shared mutable state.
             Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Void | Type::Never => true,
 
             // A mutable array/map may be sent if its contents are Send, but it is
             // NOT Sync (concurrent push/set/insert races).
-            Type::Array(elem) => send && self.marker_holds(elem, Marker::Send, visiting),
+            Type::Array(elem) => {
+                send && self.marker_holds_with_reason(elem, Marker::Send, visiting, reasons)
+            }
             // Function/closure values capture unknown state — conservatively
             // neither Send nor Sync in the MVP.
             Type::Fn(_, _) | Type::Closure(_, _) => false,
@@ -196,46 +222,57 @@ impl TypeChecker {
             Type::Generic(name, args) => match name.as_str() {
                 // Immutable: Send iff args Send, Sync iff args Sync (the frozen
                 // collections that may be shared across tasks — willow-dgwo.7).
-                "Option" | "Result" | "FrozenArray" | "FrozenMap" => {
-                    args.iter().all(|a| self.marker_holds(a, marker, visiting))
-                }
+                "Option" | "Result" | "FrozenArray" | "FrozenMap" => args
+                    .iter()
+                    .all(|a| self.marker_holds_with_reason(a, marker, visiting, reasons)),
                 // Send if K/V Send; never Sync (mutable).
                 "Map" => {
                     send && args
                         .iter()
-                        .all(|a| self.marker_holds(a, Marker::Send, visiting))
+                        .all(|a| self.marker_holds_with_reason(a, Marker::Send, visiting, reasons))
                 }
                 // Channel<T>/Mutex<T>/BlockingCell<T>: Send + Sync iff T: Send.
                 // Each hands out the value only under exclusive access, so T
                 // never needs to be Sync.
-                "Channel" | "Mutex" | "BlockingCell" => args
-                    .first()
-                    .is_none_or(|t| self.marker_holds(t, Marker::Send, visiting)),
+                "Channel" | "Mutex" | "BlockingCell" => args.first().is_none_or(|t| {
+                    self.marker_holds_with_reason(t, Marker::Send, visiting, reasons)
+                }),
                 // RwLock<T>: Send + Sync iff T: Send + Sync (concurrent readers).
                 "RwLock" | "BlockingRwCell" => args.first().is_none_or(|t| {
-                    self.marker_holds(t, Marker::Send, visiting)
-                        && self.marker_holds(t, Marker::Sync, visiting)
+                    self.marker_holds_with_reason(t, Marker::Send, visiting, reasons)
+                        && self.marker_holds_with_reason(t, Marker::Sync, visiting, reasons)
                 }),
                 // Task/JoinHandle/Future: Send iff T: Send; a task handle is not
                 // itself Sync (share results, not the task).
                 // `TaskResult<T>` is a view of the same frame, so it carries the
                 // same markers as the task it came from (willow-qrj9).
                 "Task" | "JoinHandle" | "Future" | "TaskResult" => {
-                    send && args
-                        .first()
-                        .is_none_or(|t| self.marker_holds(t, Marker::Send, visiting))
+                    send && args.first().is_none_or(|t| {
+                        self.marker_holds_with_reason(t, Marker::Send, visiting, reasons)
+                    })
                 }
                 // Range<i64> is a scalar pair.
                 "Range" => true,
-                _ => self.named_marker_holds(name, args, marker, visiting),
+                _ => self.named_marker_holds(name, args, marker, visiting, reasons),
             },
 
             Type::Named(name) => match name.as_str() {
                 "AtomicI64" | "AtomicBool" | "TcpListener" | "TcpStream" | "CancellationToken"
                 | "TaskScope" => true,
-                _ => self.named_marker_holds(name, &[], marker, visiting),
+                _ => self.named_marker_holds(name, &[], marker, visiting, reasons),
             },
+        };
+        if !result
+            && let Some(reasons) = reasons
+            && reasons.is_empty()
+        {
+            reasons.push(format!(
+                "`{}` is not `{}`",
+                type_name(ty),
+                if send { "Send" } else { "Sync" }
+            ));
         }
+        result
     }
 
     /// Classify a named user type (class / enum / interface), substituting any
@@ -246,6 +283,7 @@ impl TypeChecker {
         args: &[Type],
         marker: Marker,
         visiting: &mut HashSet<String>,
+        reasons: &mut Option<Vec<String>>,
     ) -> bool {
         // Break recursive-type cycles optimistically: a self-reference adds no
         // new constraint beyond the other fields/payloads.
@@ -262,16 +300,19 @@ impl TypeChecker {
                 .zip(args.iter().cloned())
                 .collect();
             en.variants.iter().all(|v| {
-                v.payload_types
-                    .iter()
-                    .all(|p| self.marker_holds(&substitute(p, &subst), marker, visiting))
+                v.payload_types.iter().all(|p| {
+                    self.marker_holds_with_reason(&substitute(p, &subst), marker, visiting, reasons)
+                })
             })
         } else if let Some(class) = self.symbols.lookup_class(name) {
             // Send iff all fields Send; Sync iff all fields Sync.
-            class
-                .fields
-                .values()
-                .all(|f| self.marker_holds(&f.ty, marker, visiting))
+            class.fields.iter().all(|(name, f)| {
+                let ok = self.marker_holds_with_reason(&f.ty, marker, visiting, reasons);
+                if !ok && let Some(reasons) = reasons {
+                    reasons.push(format!("field `{name}: {}`", type_name(&f.ty)));
+                }
+                ok
+            })
         } else if self.symbols.lookup_interface(name).is_some() {
             // An interface value follows its declared contract. `extends Sync`
             // is sufficient for Send as well: a Sync interface promises safe
@@ -313,6 +354,33 @@ mod tests {
     use crate::lexer::Lexer;
     use crate::parser::Parser;
 
+    thread_local! { pub(super) static REASON_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+    #[test]
+    fn failure_reason_walk_counts_scale_with_field_chain() {
+        for size in [16, 64, 256] {
+            let mut source = String::from("class Leaf { pub bad: Array<i64>; }");
+            for i in 0..size {
+                let child = if i == 0 {
+                    "Leaf".into()
+                } else {
+                    format!("Node{}", i - 1)
+                };
+                source.push_str(&format!("class Node{i} {{ pub child: {child}; }}"));
+            }
+            let c = checker(&source);
+            REASON_VISITS.with(|n| n.set(0));
+            let note = c.marker_failure_note(&named(&format!("Node{}", size - 1)), Marker::Sync);
+            assert_eq!(note.matches("field `").count(), size + 1);
+            let visits = REASON_VISITS.with(|n| n.get());
+            assert_eq!(visits, size + 2);
+            eprintln!(
+                "marker-reason depth={size} visits={visits} fields={}",
+                size + 1
+            );
+        }
+    }
+
     /// Build a checker with `src`'s declarations registered, so user
     /// class/enum/interface types can be classified.
     fn checker(src: &str) -> TypeChecker {
@@ -329,6 +397,88 @@ mod tests {
     }
     fn generic(n: &str, args: Vec<Type>) -> Type {
         Type::Generic(n.to_string(), args)
+    }
+
+    #[test]
+    fn failure_notes_follow_nested_fields_and_wrapper_marker_rules() {
+        let c = checker(
+            "class Inner { pub inboxes: Array<Channel<i64>>; } class Outer { pub nested: Inner; } class Callback { pub action: fn() -> void; } fn main() {}",
+        );
+        let note = c.marker_failure_note(&named("Outer"), Marker::Sync);
+        assert!(
+            note.contains("field `nested: Inner` -> field `inboxes: Array<Channel<i64>>`"),
+            "{note}"
+        );
+        assert!(
+            note.ends_with("`Array<Channel<i64>>` is not `Sync`"),
+            "{note}"
+        );
+        for wrapper in ["Option", "Result", "FrozenArray", "FrozenMap", "RwLock"] {
+            let note = c.marker_failure_note(&generic(wrapper, vec![named("Outer")]), Marker::Sync);
+            assert!(note.contains("inboxes:"), "{wrapper}: {note}");
+        }
+        for wrapper in ["Mutex", "Channel"] {
+            assert!(
+                c.marker_failure_note(&generic(wrapper, vec![named("Outer")]), Marker::Sync)
+                    .is_empty()
+            );
+            let note =
+                c.marker_failure_note(&generic(wrapper, vec![named("Callback")]), Marker::Sync);
+            assert!(note.contains("field `action:"), "{note}");
+            assert!(note.ends_with("is not `Send`"), "{note}");
+        }
+        for ty in [
+            Type::I64,
+            Type::String,
+            generic("FrozenArray", vec![Type::I64]),
+        ] {
+            assert!(c.marker_failure_note(&ty, Marker::Sync).is_empty());
+        }
+    }
+
+    #[test]
+    fn resolved_async_call_forms_enforce_the_same_capture_rules() {
+        for (declaration, call) in [
+            ("async fn take(value: Payload) {}", "take(value)"),
+            (
+                "class Receiver { pub async fn take(self, value: Payload) {} }",
+                "new Receiver().take(value)",
+            ),
+            (
+                "class Receiver { pub static async fn take(value: Payload) {} }",
+                "Receiver::take(value)",
+            ),
+        ] {
+            for (field_type, rejected) in [
+                ("Array<i64>", true),
+                ("i64", false),
+                ("Mutex<Array<i64>>", false),
+            ] {
+                let source = format!(
+                    "class Payload {{ pub data: {field_type}; }} {declaration} fn invoke(value: Payload) {{ {call}; }} fn main() {{}}"
+                );
+                let tokens = Lexer::new(&source).tokenize().unwrap();
+                let (program, errors) = Parser::new(tokens).parse();
+                assert!(errors.is_empty(), "{errors:?}");
+                let mut c = TypeChecker::new();
+                c.set_enforce_send_sync(true);
+                c.check_program(&program);
+                let captures: Vec<_> = c
+                    .errors
+                    .iter()
+                    .filter(|d| d.code == ErrorCode::E2402)
+                    .collect();
+                assert_eq!(
+                    captures.len(),
+                    usize::from(rejected),
+                    "{source}: {:?}",
+                    c.errors
+                );
+                if rejected {
+                    assert!(captures[0].notes[0].contains("field `data:"));
+                }
+            }
+        }
     }
 
     // 1-4: primitives + immutable String are Send + Sync.

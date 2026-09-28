@@ -67,10 +67,11 @@ impl TypeChecker {
         self.check_call_args_against_param_infos(&param_infos, args);
     }
 
+    /// Check value sharing and record reference retention for resolved calls.
     /// Only async callees retain reference arguments after this call returns.
     /// A synchronous function may return an independent Task without borrowing
     /// its caller's storage for the lifetime of that Task.
-    pub(super) fn record_async_reference_args(
+    pub(super) fn check_async_call_captures(
         &mut self,
         params: &[ParamInfo],
         args: &[CallArg],
@@ -79,6 +80,9 @@ impl TypeChecker {
         if !is_async {
             return;
         }
+        // Every resolved async call retains its value arguments too, including
+        // module-qualified functions and instance/static methods.
+        self.check_async_capture(params, args);
         for (param, arg) in params.iter().zip(args) {
             if matches!(param.mode, ParamMode::Reference { .. })
                 && matches!(arg.mode, CallArgMode::Reference { .. })

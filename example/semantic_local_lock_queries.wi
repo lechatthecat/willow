@@ -1,0 +1,23 @@
+// willow effects transfer --source example/semantic_local_lock_queries.wi --explain
+// willow refs semantic_local_lock_queries::fees_collected::running --source example/semantic_local_lock_queries.wi
+async fn fees_collected(fees: Mutex<i64>) -> i64 {
+    let mut running = 0;
+    lock fees as collected { running = collected; }
+    return running;
+}
+async fn transfer(fees: Mutex<i64>) {
+    await sleep(0);
+    lock fees as mut collected { collected = collected + 1; }
+}
+async fn inspect(shared: RwLock<i64>) -> i64 {
+    lock write shared as mut value { value = value + 1; }
+    let mut out = 0;
+    lock read shared as value { out = value; }
+    return out;
+}
+async fn main() {
+    let fees = Mutex::new(0);
+    await transfer(fees);
+    println(await fees_collected(fees)); // 1
+    println(await inspect(RwLock::new(1))); // 2
+}

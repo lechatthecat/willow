@@ -671,6 +671,23 @@ pub(crate) fn solve_unit<N>(
             if direct.may_io {
                 may_io.insert(direct.id);
             }
+            if let Some(span) = direct.lock_span {
+                // Acquisition parks a contended task before entering the
+                // critical section. Seed it before the checker's other waits
+                // so this precise acquisition witness survives same-owner ties.
+                problem = problem.seed(
+                    direct.id,
+                    RuntimeEffects::MAY_SUSPEND,
+                    Some(EffectWitness::Lock(LockEffectWitness {
+                        owner: direct.id,
+                        cause: LockEffectCause {
+                            span,
+                            operation: "lock".into(),
+                            kind: LockEffectKind::Suspend,
+                        },
+                    })),
+                );
+            }
             if direct.panics {
                 let witness = direct.panic_span.map(|span| EffectWitness::Panic {
                     owner: direct.id,
@@ -882,6 +899,7 @@ struct DirectBodyEffects {
     body: BodyId,
     panics: bool,
     panic_span: Option<crate::diagnostics::Span>,
+    lock_span: Option<crate::diagnostics::Span>,
     has_loop: bool,
     may_io: bool,
 }
@@ -904,6 +922,7 @@ fn scan_direct_effects<N>(
         };
         let mut has_loop = false;
         let mut may_io = false;
+        let mut lock_span = None;
         let mut defer_depth = 0;
         let mut walk = AstWalk::new(AstEvent::Block(body));
         while let Some(event) = walk.next() {
@@ -921,6 +940,11 @@ fn scan_direct_effects<N>(
                 AstEvent::Stmt(stmt) => {
                     hazards.visit_stmt(stmt);
                     match stmt {
+                        Stmt::Lock(lock) if lock_span.is_none() => {
+                            // Keep an AST-native span: coordinate-only edits
+                            // remap cached evidence by exact syntax spans.
+                            lock_span = Some(lock.span);
+                        }
                         Stmt::Defer(_) => defer_depth += 1,
                         Stmt::While(_) | Stmt::For(_) if defer_depth == 0 => has_loop = true,
                         _ => {}
@@ -939,6 +963,7 @@ fn scan_direct_effects<N>(
             body: body_id,
             panics: hazards.panics,
             panic_span: hazards.panic_span,
+            lock_span,
             has_loop,
             may_io,
         });
@@ -1173,8 +1198,8 @@ pub(crate) const LOCK_EFFECT_WAIT: RuntimeEffects =
 /// owner, so diagnostics do not depend on hash iteration order.
 ///
 /// `Eq` is deliberately owner-only too, keeping `Ord` consistent with it. That
-/// is sound because `EffectInputs::direct` holds exactly one cause per owner, so
-/// two witnesses naming the same owner carry the same cause.
+/// preserves the first seeded cause per effect and owner. Acquisition seeds
+/// precede other direct waits, making their precise lock location canonical.
 #[derive(Debug, Clone)]
 pub(crate) struct LockEffectWitness {
     pub(crate) owner: FunctionId,
@@ -1263,6 +1288,131 @@ mod tests {
     }
 
     #[test]
+    fn lock_acquisition_seeds_suspend_and_preserves_its_witness() {
+        use crate::semantic::call_graph::CallSites;
+        for mode in ["", "read ", "write "] {
+            for prefix in ["", "await sleep(0); "] {
+                let source = format!(
+                    "async fn acquire() {{ {prefix}lock {mode}cell as value {{ }} }} fn relay() {{ }}"
+                );
+                let program = program(&source);
+                let acquire = FunctionId::free("acquire");
+                let relay = FunctionId::free("relay");
+                let mut graph = CallGraph::default();
+                graph.merge(
+                    relay,
+                    CallSites {
+                        targets: [acquire].into(),
+                        has_unknown: false,
+                    },
+                );
+                let direct = HashMap::from([(
+                    acquire,
+                    LockEffectCause {
+                        span: Span::dummy(),
+                        operation: "earlier wait".into(),
+                        kind: LockEffectKind::SuspendOrBlock,
+                    },
+                )]);
+                let lock_only = solve_unit(
+                    &program,
+                    &graph,
+                    &HashMap::<ExprId, Type>::new(),
+                    None,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    |_| PANIC,
+                );
+                for id in [acquire, relay] {
+                    assert!(lock_only.facts.intersects(&id, RuntimeEffects::MAY_SUSPEND));
+                    assert!(!lock_only.facts.intersects(&id, RuntimeEffects::MAY_BLOCK));
+                }
+                let effects = solve_unit(
+                    &program,
+                    &graph,
+                    &HashMap::<ExprId, Type>::new(),
+                    None,
+                    &HashMap::new(),
+                    &direct,
+                    |_| PANIC,
+                );
+                for id in [acquire, relay] {
+                    let summary = effects.facts.get(&id).unwrap();
+                    assert!(summary.contains(LOCK_EFFECT_WAIT));
+                    let cause = summary
+                        .witness(RuntimeEffects::MAY_SUSPEND)
+                        .unwrap()
+                        .lock()
+                        .unwrap();
+                    assert_eq!(cause.operation, "lock");
+                    assert_eq!(cause.span.start, source.find("lock ").unwrap());
+                    assert_eq!(
+                        summary
+                            .witness(RuntimeEffects::MAY_BLOCK)
+                            .unwrap()
+                            .lock()
+                            .unwrap()
+                            .operation,
+                        "earlier wait"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lock_scan_isolates_lambda_and_roundtrips_cached_evidence() {
+        let program = program("async fn outer() { let f = || { lock cell as value {} }; }");
+        let Item::Function(function) = &program.items[0] else {
+            panic!("function")
+        };
+        let direct = scan_direct_effects(
+            FunctionId::free("outer"),
+            function.body.id,
+            &function.body,
+            &HashMap::<ExprId, Type>::new(),
+            None,
+        );
+        assert_eq!(direct.len(), 2);
+        assert!(direct[0].lock_span.is_none());
+        assert!(direct[1].lock_span.is_some());
+        let encoded = serde_json::to_vec(&direct).unwrap();
+        let restored: Vec<DirectBodyEffects> = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored[1].lock_span, direct[1].lock_span);
+    }
+
+    #[test]
+    fn cached_lock_evidence_relocates_after_coordinate_only_edit() {
+        let before = program("async fn acquire() { lock cell as value {} }");
+        let mut after =
+            program("\n// shifted declaration\nasync fn acquire() { lock cell as value {} }");
+        let Item::Function(old) = &before.items[0] else {
+            panic!("function");
+        };
+        let cached = scan_direct_effects(
+            FunctionId::free("acquire"),
+            old.body.id,
+            &old.body,
+            &HashMap::<ExprId, Type>::new(),
+            None,
+        );
+        let mut correspondence = super::super::syntax::Correspondence::default();
+        correspondence.reconcile(&before, &mut after).unwrap();
+        let Item::Function(new) = &after.items[0] else {
+            panic!("function");
+        };
+        assert_eq!(new.body.id, old.body.id, "unchanged body is reused");
+        // BodyQueries::derived uses this same remapping for cached direct facts.
+        let relocated: Vec<DirectBodyEffects> = correspondence.remap(&cached).unwrap();
+        let Stmt::Lock(lock) = &new.body.stmts[0] else {
+            panic!("lock");
+        };
+        assert_eq!(relocated[0].lock_span, Some(lock.span));
+        assert_ne!(relocated[0].lock_span, cached[0].lock_span);
+        assert_eq!(relocated[0].lock_span.unwrap().line, 3);
+    }
+
+    #[test]
     fn combined_masks_keep_lock_helper_and_panic_contracts_distinct() {
         use crate::semantic::call_graph::CallSites;
         let program = program(
@@ -1347,7 +1497,7 @@ mod tests {
     #[test]
     fn inventory_counts_scale_with_syntax_and_edges_and_classify_shared_targets_once() {
         use crate::query_stats::{Counter, Session, count};
-        for shape in ["chain", "fanout", "repeated", "cycle"] {
+        for shape in ["chain", "fanout", "repeated", "cycle", "locks"] {
             let mut previous = None;
             for size in [16usize, 64, 256, 1024] {
                 let mut source = String::new();
@@ -1357,7 +1507,12 @@ mod tests {
                         "cycle" => format!("node_{}", (i + 1) % size),
                         _ => "external".to_string(),
                     };
-                    source.push_str(&format!("fn node_{i}() {{ {target}(); }}\n"));
+                    let lock = if shape == "locks" {
+                        "lock cell as value {}"
+                    } else {
+                        ""
+                    };
+                    source.push_str(&format!("fn node_{i}() {{ {target}(); {lock} }}\n"));
                 }
                 if shape == "fanout" || shape == "repeated" {
                     source.push_str("fn root() { ");

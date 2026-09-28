@@ -1396,6 +1396,7 @@ mod diagnostic_emission_tests {
 /// Request-local positions stay valid while desugaring/checking module bodies.
 /// Clearing the graph on import failure also clears this index.
 struct DiagnosticModuleIndex {
+    package_names: std::collections::HashMap<String, String>,
     positions: std::collections::HashMap<diagnostics::FileId, usize>,
     #[cfg(test)]
     probes: std::cell::Cell<usize>,
@@ -1404,6 +1405,26 @@ struct DiagnosticModuleIndex {
 impl DiagnosticModuleIndex {
     fn new(graph: &module::ModuleGraph) -> Self {
         Self {
+            package_names: graph
+                .package_graph
+                .as_ref()
+                .map(|packages| {
+                    packages
+                        .packages
+                        .iter()
+                        .map(|package| {
+                            (
+                                semantic::ids::package_namespace(&package.identity),
+                                if package.id == packages.root {
+                                    String::new()
+                                } else {
+                                    format!("{}::", package.identity.name)
+                                },
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             positions: graph
                 .files
                 .iter()
@@ -1486,7 +1507,10 @@ fn emit_frontend_diagnostics(
     }
     let sources = Sources { entry, imports };
     for diagnostic in diagnostics {
-        emitter.emit(diagnostic, &sources)?;
+        emitter.emit(
+            &diagnostic.with_source_names(&modules.package_names),
+            &sources,
+        )?;
     }
     Ok(())
 }

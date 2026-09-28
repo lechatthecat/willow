@@ -650,3 +650,163 @@ fn project_check_checks_unimported_sources_without_importing_names() {
         assert!(f.run(&["check", "src/main.wi"]).status.success(), "{label}");
     }
 }
+
+#[test]
+fn local_selectors_accept_unique_names_and_disambiguate_shadowing() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/main.wi"), "fn serve(arg: i64) { let mut running = arg; if true { let slot = 1; println(slot); } if false { let slot = 2; println(slot); } println(running); }\nfn customer() { let r = 1; println(r); }\nfn main() { serve(1); }\n").unwrap();
+    for command in ["symbol", "refs", "type"] {
+        for name in ["main::serve::running", "main::serve::arg"] {
+            assert_eq!(f.json(&[command, name], 0)["status"], "ok");
+        }
+    }
+    let rename = f.json(
+        &["rename", "main::serve::running", "active", "--dry-run"],
+        0,
+    );
+    assert_eq!(rename["status"], "ok");
+    let ambiguous = f.json(&["symbol", "main::serve::slot"], 1);
+    assert_eq!(ambiguous["status"], "ambiguous", "{ambiguous}");
+    let candidates = ambiguous["result"]["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2);
+    for candidate in candidates {
+        f.json(&["symbol", candidate["selector"].as_str().unwrap()], 0);
+    }
+    let unknown = f.json(&["symbol", "main::serve::runn"], 1);
+    let suggestions = unknown["result"]["suggestions"].as_array().unwrap();
+    assert_eq!(suggestions.len(), 1, "{unknown}");
+    assert!(suggestions[0].as_str().unwrap().contains("serve::running@"));
+}
+
+#[test]
+fn missing_position_symbols_explain_token_and_nearest_identifier() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "fn main() {\n    let value: i64 = 1;\n    println(value);\n}\n",
+    )
+    .unwrap();
+    for command in ["symbol", "refs", "type", "effects", "impact", "rename"] {
+        for (position, found) in [
+            ("src/main.wi:2:14", "token `:`"),
+            ("src/main.wi:2:1", "whitespace"),
+            ("src/main.wi:2:24", "end of line"),
+        ] {
+            let mut args = vec![command, position];
+            if command == "rename" {
+                args.extend(["other", "--dry-run"]);
+            }
+            let value = f.json(&args, 1);
+            assert_eq!(value["status"], "unknown", "{value}");
+            let reason = value["result"]["reason"].as_str().unwrap();
+            assert!(reason.contains(found), "{value}");
+            assert!(
+                reason.contains(if found == "end of line" {
+                    "`i64` at 2:16"
+                } else {
+                    "`value` at 2:9"
+                }),
+                "{value}"
+            );
+            let out = f.run(&args);
+            assert!(String::from_utf8(out.stdout).unwrap().contains(found));
+        }
+    }
+    for (position, reason) in [
+        ("src/missing.wi:1:1", "source file not found"),
+        ("src/main.wi:99:1", "line is out of range"),
+        ("src/main.wi:2:99", "column is out of range"),
+    ] {
+        let value = f.json(&["symbol", position], 1);
+        assert!(value.to_string().contains(reason), "{value}");
+    }
+}
+
+#[test]
+fn async_capture_diagnostic_explains_nested_field_without_package_hash() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/order.wi"), "module order;\nimport std::collections::Array;\npub class Inner { pub inboxes: Array<Channel<i64>>; }\npub class Bank { pub inner: Inner; }\npub async fn consume(bank: Bank) {}\n").unwrap();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "import order;\nfn call(bank: order::Bank) { order::consume(bank); }\nfn main() {}\n",
+    )
+    .unwrap();
+    let out = f.run(&["check"]);
+    assert!(!out.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("E2402"), "{text}");
+    assert!(!text.contains("$pkg"), "{text}");
+    for part in [
+        "order::Bank",
+        "inner:",
+        "inboxes: Array<Channel<i64>>",
+        "FrozenArray/FrozenMap",
+        "Mutex<T>",
+    ] {
+        assert!(text.contains(part), "missing {part}: {text}");
+    }
+}
+
+#[test]
+fn locks_have_suspend_compiler_evidence_after_await_and_in_callers() {
+    let f = Fixture::new();
+    for (mode, ty) in [
+        ("lock", "Mutex"),
+        ("lock read", "RwLock"),
+        ("lock write", "RwLock"),
+    ] {
+        fs::write(f.0.join("src/main.wi"), format!("async fn fees(m: {ty}<i64>) -> i64 {{\n    let mut out = 0;\n    {mode} m as value {{ out = value; }}\n    return out;\n}}\nasync fn transfer(m: {ty}<i64>) {{\n    await sleep(0);\n    {mode} m as value {{ }}\n}}\nfn relay(m: {ty}<i64>) {{ fees(m); }}\nfn main() {{}}\n")).unwrap();
+        for (name, line) in [("fees", 3), ("transfer", 8), ("relay", 3)] {
+            let value = f.json(&["effects", &format!("main::{name}"), "--explain"], 0);
+            let evidence = value["result"]["effect_evidence"].as_array().unwrap();
+            assert!(
+                evidence.iter().any(|e| e["status"] == "compiler-fact"
+                    && e["witness"]["cause"]["operation"] == "lock"
+                    && e["witness"]["cause"]["location"]["line"] == line),
+                "{mode} {name}: {value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn mismatch_diagnostics_keep_dependency_type_names_distinct() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.0.join("ledger/src")).unwrap();
+    fs::write(
+        f.0.join("ledger/project.toml"),
+        "[willow]\nmanifest-version=1\n[project]\nname='ledger'\nversion='1.0.0'\n",
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("ledger/src/order.wi"),
+        "module order; pub class Bank {} pub fn make() -> Bank { return new Bank(); }\n",
+    )
+    .unwrap();
+    let manifest = fs::read_to_string(f.0.join("project.toml")).unwrap();
+    fs::write(
+        f.0.join("project.toml"),
+        format!("{manifest}\n[dependencies]\nexternal={{path='ledger'}}\n"),
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("src/order.wi"),
+        "module order; pub class Bank {} pub fn make() -> Bank { return new Bank(); }\n",
+    )
+    .unwrap();
+    fs::write(f.0.join("src/main.wi"), "import order; import external::order as other;\nfn takes(bank: order::Bank) {}\nfn wrong() { takes(other::make()); }\nfn main() {}\n").unwrap();
+    let out = f.run(&["check"]);
+    assert!(!out.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!text.contains("$pkg"), "{text}");
+    assert!(text.contains("order::Bank"), "{text}");
+    assert!(text.contains("ledger::order::Bank"), "{text}");
+}

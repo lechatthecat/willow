@@ -332,12 +332,79 @@ impl DirectSession {
             symbol.name.clone()
         }
     }
+    fn missing_symbol_reason(&mut self, path: &str, byte: usize) -> Result<String> {
+        let source = self.source(path)?;
+        let (line, _) = source.position(byte)?;
+        let start = source.lines[line - 1];
+        let end = source.lines.get(line).copied().unwrap_or(source.text.len());
+        let line_text = source.text[start..end].trim_end_matches(['\r', '\n']);
+        let line_end = start + line_text.len();
+        let found = match source.text[byte..].chars().next() {
+            _ if byte >= line_end => "end of line".to_owned(),
+            Some(c) if c.is_whitespace() => "whitespace".to_owned(),
+            Some(c) if c.is_alphanumeric() || c == '_' => {
+                let word = |c: char| c.is_alphanumeric() || c == '_';
+                let token_start = source.text[start..byte]
+                    .char_indices()
+                    .rev()
+                    .find(|&(_, c)| !word(c))
+                    .map_or(start, |(i, c)| start + i + c.len_utf8());
+                let token_end = source.text[byte..line_end]
+                    .char_indices()
+                    .find(|&(_, c)| !word(c))
+                    .map_or(line_end, |(i, _)| byte + i);
+                format!("token `{}`", &source.text[token_start..token_end])
+            }
+            Some(c) => format!("token `{c}`"),
+            None => "end of file".to_owned(),
+        };
+        let mut reason = format!(
+            "No symbol at this position: found {found}. Place the cursor on an identifier."
+        );
+        let nearest = self
+            .snapshot()
+            .semantic
+            .symbols
+            .iter()
+            .filter_map(|s| s.location.as_ref())
+            .chain(
+                self.snapshot()
+                    .semantic
+                    .references
+                    .iter()
+                    .map(|r| &r.location),
+            )
+            .filter(|loc| loc.path == path)
+            .map(|loc| (loc.start, loc.end))
+            .filter(|&(s, e)| s >= start && e <= line_end && s < e)
+            .min_by_key(|&(s, e)| {
+                (
+                    if byte < s {
+                        s - byte
+                    } else {
+                        byte.saturating_sub(e)
+                    },
+                    s,
+                )
+            });
+        let source = self.source(path)?;
+        if let Some((near_start, near_end)) = nearest
+            && let Some(name) = source.text.get(near_start..near_end)
+        {
+            let (_, column) = source.position(near_start)?;
+            reason.push_str(&format!(
+                " Nearest symbol on this line: `{name}` at {line}:{column}."
+            ));
+        }
+        Ok(reason)
+    }
     pub fn resolve(&mut self, selector: &str, filter: &SelectorFilter) -> Result<Value> {
         let revision = self.session.revision().to_owned();
+        let mut location_reason = None;
         let located = if let Some((file, byte)) = self.location(selector)? {
             let mut result = self.session.query(QueryRequest::SymbolAt {
                 revision,
-                file,
+                file: file.clone(),
                 byte,
             })["result"]
                 .take();
@@ -353,6 +420,9 @@ impl DirectSession {
                 .filter(|s| s["kind"] != "import" || result.get("resolved_symbols").is_none())
                 .filter_map(|s| s["id"].as_str().map(str::to_owned))
                 .collect();
+            if ids.is_empty() {
+                location_reason = Some(self.missing_symbol_reason(&file, byte)?);
+            }
             Some(ids)
         } else {
             None
@@ -392,20 +462,47 @@ impl DirectSession {
             }
             let qualified = self.selector(symbol);
             let tail = selector.rsplit("::").next().unwrap_or(selector);
+            let local_name = matches!(symbol.kind.as_str(), "binding" | "parameter")
+                .then(|| qualified.rsplit_once('@'))
+                .flatten()
+                .filter(|(_, offset)| {
+                    !offset.is_empty() && offset.bytes().all(|b| b.is_ascii_digit())
+                })
+                .map(|(name, _)| name);
+            let matches_name = |name: &str| {
+                selector == name
+                    || name
+                        .strip_suffix(selector)
+                        .is_some_and(|p| p.ends_with("::"))
+            };
             if located.is_some()
-                || selector == qualified
+                || matches_name(&qualified)
+                || local_name.is_some_and(matches_name)
                 || selector == symbol.name
-                || qualified
-                    .strip_suffix(selector)
-                    .is_some_and(|p| p.ends_with("::"))
             {
                 candidates.push(json!({"id":symbol.id,"selector":qualified,"name":symbol.name,"kind":symbol.kind,"location":symbol.location,"identity":symbol.identity}));
-            } else if suggestions.len() < 5
-                && (symbol.name.starts_with(tail) || tail.starts_with(&symbol.name))
-            {
-                suggestions.push(qualified);
+            } else {
+                let name = local_name.unwrap_or(&qualified);
+                let (owner, short) = name.rsplit_once("::").unwrap_or(("", name));
+                let same_scope = selector.rsplit_once("::").is_none_or(|(scope, _)| {
+                    owner == scope || owner.strip_suffix(scope).is_some_and(|p| p.ends_with("::"))
+                });
+                let score = if short.starts_with(tail) {
+                    Some(0)
+                } else if short.chars().count() > 1 && tail.starts_with(short) {
+                    Some(1)
+                } else {
+                    None
+                };
+                if same_scope && let Some(score) = score {
+                    suggestions.push((score, qualified));
+                    suggestions.sort_unstable();
+                    suggestions.dedup();
+                    suggestions.truncate(5);
+                }
             }
         }
+        let suggestions: Vec<_> = suggestions.into_iter().map(|(_, name)| name).collect();
         let mut spellings = HashMap::new();
         for candidate in &candidates {
             *spellings
@@ -431,7 +528,17 @@ impl DirectSession {
             }
         }
         Ok(match candidates.len() {
-            0 => json!({"status":"unknown","suggestions":suggestions}),
+            0 => {
+                let mut result = json!({"status":"unknown","suggestions":suggestions});
+                if let Some(reason) = location_reason {
+                    result["reason"] = json!(reason);
+                } else if located.is_some() {
+                    result["reason"] = json!(
+                        "A symbol exists at this position, but it does not match the selected filters."
+                    );
+                }
+                result
+            }
             1 => json!({"status":"ok","symbol":candidates.remove(0)}),
             _ => json!({"status":"ambiguous","candidates":candidates}),
         })
@@ -453,12 +560,19 @@ impl DirectSession {
                     return Ok(resolved);
                 }
             }
-            return Ok(self.session.query(QueryRequest::TypeAt {
+            let mut result = self.session.query(QueryRequest::TypeAt {
                 revision,
-                file,
+                file: file.clone(),
                 byte,
             })["result"]
-                .take());
+                .take();
+            if result["status"] == "unknown" {
+                result["reason"] = json!(format!(
+                    "No typed expression or declaration at this position. {}",
+                    self.missing_symbol_reason(&file, byte)?
+                ));
+            }
+            return Ok(result);
         }
         let resolved = self.resolve(selector, filter)?;
         if resolved["status"] != "ok" {

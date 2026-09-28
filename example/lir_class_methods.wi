@@ -48,7 +48,7 @@ open class Ledger {
     // synchronous loop helper is not preemptible in task context (E0810), not
     // because the loop needs it -- which makes it a loop inside an async method
     // body, where the induction variable lives in the heap frame.
-    pub async fn add_all(self, amounts: Array<i64>) {
+    pub async fn add_all(self, amounts: FrozenArray<i64>) {
         let mut i = 0;
         while i < amounts.len() {
             self.total = self.total + amounts[i];
@@ -149,13 +149,13 @@ class Counter {
 
 async fn main() {
     let ledger = new Ledger("ops");
-    await ledger.add_all([3, 4, 5]);
+    await ledger.add_all([3, 4, 5].freeze());
     println(ledger.total);              // 12
     println(ledger.charged());          // 12 * 1
     println(ledger.describe());         // ops:12, after the deferred line
 
     let payroll = new Payroll("pay", 3);
-    await payroll.add_all([10, 20]);
+    await payroll.add_all([10, 20].freeze());
     println(payroll.total);             // 30, the inherited field
     println(payroll.charged());         // 60: the override's rate
     println(payroll.size());            // many
