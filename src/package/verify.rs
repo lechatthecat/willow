@@ -36,6 +36,13 @@ pub struct VerificationError {
     kind: String,
     reason: String,
 }
+impl std::fmt::Display for VerificationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.kind, self.reason)
+    }
+}
+impl std::error::Error for VerificationError {}
+
 impl Verification {
     pub fn human(&self) -> String {
         let mut text = String::new();
@@ -210,8 +217,14 @@ impl DiagnosticEmitter for VerificationDiagnostics {
 /// Walk each directory once, refusing symlink cycles/aliases and source escapes.
 /// BTreeMap both detects competing module spellings and stabilizes import order.
 fn discover(root: &Path) -> Result<BTreeMap<String, std::path::PathBuf>, VerificationError> {
-    let src = root.join("src");
-    let mut stack = vec![src.clone()];
+    discover_sources(root, &root.join("src"))
+}
+
+pub(crate) fn discover_sources(
+    root: &Path,
+    src: &Path,
+) -> Result<BTreeMap<String, std::path::PathBuf>, VerificationError> {
+    let mut stack = vec![src.to_path_buf()];
     let mut directories = std::collections::HashSet::new();
     let mut modules = BTreeMap::new();
     while let Some(dir) = stack.pop() {
@@ -232,7 +245,7 @@ fn discover(root: &Path) -> Result<BTreeMap<String, std::path::PathBuf>, Verific
                 continue;
             }
             let relative = path
-                .strip_prefix(&src)
+                .strip_prefix(src)
                 .expect("descendant")
                 .with_extension("");
             let mut parts: Vec<_> = relative

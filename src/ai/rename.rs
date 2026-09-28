@@ -5,6 +5,21 @@ use crate::semantic::{analysis_symbols::Declaration, symbols::SymbolTable};
 use edit::{EditWork, Patch, Rejection, RejectionLocation};
 use std::collections::HashSet;
 
+pub(super) fn validate_name(name: &str) -> Result<()> {
+    let tokens = Lexer::new(name)
+        .tokenize()
+        .map_err(|_| anyhow::anyhow!("invalid identifier"))?;
+    if tokens.len() == 2 {
+        if let Some(keyword) = tokens[0].kind.keyword_name() {
+            anyhow::bail!("rename requires an identifier; '{keyword}' is a reserved keyword");
+        }
+        if matches!(&tokens[0].kind, TokenKind::Ident(s) if s == name) {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("rename requires an identifier")
+}
+
 #[derive(Default)]
 pub(super) struct Relations {
     classes: Vec<Class>,
@@ -294,6 +309,8 @@ pub(super) struct Index<'a> {
     renamed: HashSet<&'a str>,
     unknown: HashMap<String, (String, Span)>,
     source_tokens: HashMap<Point<'a>, (&'a str, &'a Span)>,
+    local_ranges: HashMap<&'a str, Location>,
+    named_tokens: HashMap<&'a str, Vec<(&'a str, &'a Span)>>,
     #[cfg(test)]
     indexed: usize,
     #[cfg(test)]
@@ -318,6 +335,8 @@ impl<'a> Index<'a> {
             renamed: HashSet::new(),
             unknown: HashMap::new(),
             source_tokens: HashMap::new(),
+            local_ranges: HashMap::new(),
+            named_tokens: HashMap::new(),
             #[cfg(test)]
             indexed: 0,
             #[cfg(test)]
@@ -325,6 +344,32 @@ impl<'a> Index<'a> {
             #[cfg(test)]
             collision_probes: 0,
         };
+        let locals: Vec<_> = snapshot
+            .semantic
+            .symbols
+            .iter()
+            .filter(|s| matches!(s.kind.as_str(), "binding" | "parameter") && s.location.is_some())
+            .collect();
+        let ranges: Vec<_> = snapshot
+            .functions
+            .iter()
+            .flat_map(|f| f.locations.iter().map(|l| (l.clone(), f.id.clone())))
+            .collect();
+        let by_owner: HashMap<_, _> = ranges
+            .iter()
+            .map(|(l, id)| ((l.path.as_str(), id.as_str()), l))
+            .collect();
+        let points: Vec<_> = locals.iter().map(|s| s.location.clone().unwrap()).collect();
+        for (symbol, owner) in locals
+            .into_iter()
+            .zip(crate::compiler_db::references::owners(&points, &ranges))
+        {
+            let (path, id): (String, String) =
+                serde_json::from_str(&owner).expect("compiler owner");
+            if let Some(range) = by_owner.get(&(path.as_str(), id.as_str())) {
+                result.local_ranges.insert(&symbol.id, (*range).clone());
+            }
+        }
         let scope_count = result
             .scopes
             .values()
@@ -402,6 +447,11 @@ impl<'a> Index<'a> {
                 }
                 if let Some(&absolute) = paths.get(path) {
                     result
+                        .named_tokens
+                        .entry(name)
+                        .or_default()
+                        .push((absolute, span));
+                    result
                         .source_tokens
                         .insert((absolute, span.start, span.end), (name, span));
                 }
@@ -417,13 +467,24 @@ impl<'a> Index<'a> {
                 }
             }
         }
+        // edit::structured_changes supplies identifiers in BTreeMap file order,
+        // then lexer offset order; canonical editable paths share the root prefix.
+        // Preserve that order instead of sorting all tokens again.
+        debug_assert!(
+            result
+                .named_tokens
+                .values()
+                .all(|tokens| tokens
+                    .windows(2)
+                    .all(|pair| (pair[0].0, pair[0].1.start) <= (pair[1].0, pair[1].1.start)))
+        );
         result
     }
     pub fn supports(&self, id: &str) -> bool {
         self.symbols.get(id).is_some_and(|s| {
             matches!(
                 s.kind.as_str(),
-                "method" | "field" | "static-field" | "variant"
+                "method" | "field" | "static-field" | "variant" | "binding" | "parameter"
             )
         })
     }
@@ -437,19 +498,46 @@ impl<'a> Index<'a> {
     ) -> Result<()> {
         let selected = self.symbols[id];
         let old = selected.name.rsplit("::").next().unwrap();
-        let ts = Lexer::new(name)
-            .tokenize()
-            .map_err(|_| anyhow::anyhow!("invalid identifier"))?;
-        ensure!(
-            ts.len() == 2 && matches!(&ts[0].kind, TokenKind::Ident(s) if s == name),
-            "rename requires an identifier"
-        );
+        validate_name(name)?;
         ensure!(name != old, "rename has no effect");
         ensure!(
             !self.renamed.contains(id),
             "duplicate rename of dispatch family"
         );
-        if let Some((path, span)) = self.unknown.get(old) {
+        let local = matches!(selected.kind.as_str(), "binding" | "parameter");
+        if local {
+            let range = self
+                .local_ranges
+                .get(id)
+                .context("local binding has no editable function scope")?;
+            // Conservative capture prevention: any existing destination spelling
+            // in the enclosing function (including nested closures) is rejected.
+            // Indexed range lookup avoids a token scan for each local rename.
+            if let Some(tokens) = self.named_tokens.get(name) {
+                let i = tokens.partition_point(|(path, span)| {
+                    #[cfg(test)]
+                    {
+                        self.collision_probes += 1;
+                    }
+                    (*path, span.start) < (range.path.as_str(), range.start)
+                });
+                if let Some(&(path, span)) = tokens.get(i)
+                    && path == range.path
+                    && span.start < range.end
+                {
+                    let relative = Path::new(path)
+                        .strip_prefix(root)?
+                        .to_str()
+                        .context("non UTF-8 path")?;
+                    return Err(reject(
+                        "rename destination already occurs in the enclosing function; renaming could capture or shadow another binding",
+                        relative,
+                        span,
+                    ));
+                }
+            }
+        }
+        if !local && let Some((path, span)) = self.unknown.get(old) {
             return Err(reject(
                 "rename coverage incomplete: identifier has no proven semantic target",
                 path,
@@ -619,73 +707,88 @@ mod tests {
 
     #[test]
     fn unrelated_destination_queries_do_not_multiply_full_scans() {
-        for n in [16usize, 64, 256, 1024] {
-            let root = std::env::temp_dir().join("willow-collision-index");
-            let path = root.join("main.wi").to_str().unwrap().to_owned();
-            let tokens = Lexer::new(&"old next ".repeat(n)).tokenize().unwrap();
-            let mut identifiers = BTreeMap::<&str, Vec<(&str, &Span)>>::new();
-            let mut symbols = vec![];
-            let mut scopes = HashMap::new();
-            for (i, t) in tokens.iter().enumerate().take(2 * n) {
-                let TokenKind::Ident(name) = &t.kind else {
-                    panic!()
+        for kind in ["field", "binding"] {
+            for n in [16usize, 64, 256, 1024] {
+                let root = std::env::temp_dir().join("willow-collision-index");
+                let path = root.join("main.wi").to_str().unwrap().to_owned();
+                let tokens = Lexer::new(&"old next ".repeat(n)).tokenize().unwrap();
+                let mut identifiers = BTreeMap::<&str, Vec<(&str, &Span)>>::new();
+                let mut symbols = vec![];
+                let mut scopes = HashMap::new();
+                for (i, t) in tokens.iter().enumerate().take(2 * n) {
+                    let TokenKind::Ident(name) = &t.kind else {
+                        panic!()
+                    };
+                    identifiers
+                        .entry(name)
+                        .or_default()
+                        .push(("main.wi", &t.span));
+                    let id = format!("s{i}");
+                    scopes.insert(id.clone(), vec![(i, i + 1)]);
+                    symbols.push(symbols::Symbol {
+                        id,
+                        identity: None,
+                        source_name: None,
+                        name: name.clone(),
+                        kind: kind.into(),
+                        ty: None,
+                        location: Some(Location {
+                            path: path.clone(),
+                            start: t.span.start,
+                            end: t.span.end,
+                        }),
+                    });
+                }
+                let functions = if kind == "binding" {
+                    symbols.iter().map(|s| serde_json::from_value(serde_json::json!({
+                    "id":format!("fn{}", s.id), "module":"main", "name":format!("fn{}", s.id),
+                    "locations":[s.location], "synthetic":false, "fingerprint":"", "body_fingerprint":"",
+                    "callees":[], "runtime_effects":0, "unknown":false, "unresolved":[]
+                })).unwrap()).collect()
+                } else {
+                    vec![]
                 };
-                identifiers
-                    .entry(name)
-                    .or_default()
-                    .push(("main.wi", &t.span));
-                let id = format!("s{i}");
-                scopes.insert(id.clone(), vec![(i, i + 1)]);
-                symbols.push(symbols::Symbol {
-                    id,
-                    identity: None,
-                    source_name: None,
-                    name: name.clone(),
-                    kind: "field".into(),
-                    ty: None,
-                    location: Some(Location {
-                        path: path.clone(),
-                        start: t.span.start,
-                        end: t.span.end,
-                    }),
-                });
+                let snapshot = Snapshot {
+                    edit_context: None,
+                    version: 1,
+                    compiler: String::new(),
+                    compatibility: String::new(),
+                    workspace: root.to_str().unwrap().into(),
+                    revision: String::new(),
+                    functions,
+                    sources: BTreeMap::from([(path, String::new())]),
+                    semantic: SemanticFacts {
+                        symbols,
+                        rename_scopes: if kind == "field" {
+                            scopes
+                        } else {
+                            HashMap::new()
+                        },
+                        ..Default::default()
+                    },
+                };
+                let mut index = Index::new(&snapshot, &root, &identifiers, &HashSet::new());
+                let mut patches = BTreeMap::new();
+                let mut work = EditWork::default();
+                for i in 0..n {
+                    index
+                        .plan(
+                            &format!("s{}", 2 * i),
+                            "next",
+                            &root,
+                            &mut patches,
+                            &mut work,
+                        )
+                        .unwrap();
+                }
+                assert_eq!(index.indexed, 2 * n);
+                assert_eq!(patches["main.wi"].len(), n);
+                assert!(index.collision_probes <= n * (n.ilog2() as usize + 2));
+                println!(
+                    "kind={kind} destinations={n} queries={n} indexed={} collision_probes={}",
+                    index.indexed, index.collision_probes
+                );
             }
-            let snapshot = Snapshot {
-                edit_context: None,
-                version: 1,
-                compiler: String::new(),
-                compatibility: String::new(),
-                workspace: root.to_str().unwrap().into(),
-                revision: String::new(),
-                functions: vec![],
-                sources: BTreeMap::from([(path, String::new())]),
-                semantic: SemanticFacts {
-                    symbols,
-                    rename_scopes: scopes,
-                    ..Default::default()
-                },
-            };
-            let mut index = Index::new(&snapshot, &root, &identifiers, &HashSet::new());
-            let mut patches = BTreeMap::new();
-            let mut work = EditWork::default();
-            for i in 0..n {
-                index
-                    .plan(
-                        &format!("s{}", 2 * i),
-                        "next",
-                        &root,
-                        &mut patches,
-                        &mut work,
-                    )
-                    .unwrap();
-            }
-            assert_eq!(index.indexed, 2 * n);
-            assert_eq!(patches["main.wi"].len(), n);
-            assert!(index.collision_probes <= n * (n.ilog2() as usize + 2));
-            println!(
-                "destinations={n} queries={n} indexed={} collision_probes={}",
-                index.indexed, index.collision_probes
-            );
         }
     }
 

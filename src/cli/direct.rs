@@ -260,6 +260,9 @@ fn human(value: &Value, options: &Options) -> String {
     if let Some(message) = value["message"].as_str() {
         lines.push(message.into());
     }
+    if let Some(reason) = result["reason"].as_str() {
+        lines.push(reason.into());
+    }
     if let Some(candidates) = result["candidates"].as_array() {
         for candidate in candidates {
             lines.push(format!(

@@ -512,3 +512,141 @@ fn condition_diagnostics_preserve_errors_and_do_not_cascade_through_cached_bodie
         }
     }
 }
+
+#[test]
+fn contract_impact_and_effects_explain_bodyless_declarations() {
+    for (label, interface, implementation, expected) in [
+        (
+            "contract",
+            "pub interface I { fn pick(self) -> i64; }",
+            "pub class A implements api::I { pub fn pick(self) -> i64 { return 1; } }",
+            "implementation::A::pick",
+        ),
+        (
+            "default",
+            "pub interface I { fn pick(self) -> i64 { return 2; } }",
+            "pub class A implements api::I {}",
+            "api::I::pick",
+        ),
+    ] {
+        let f = Fixture::new();
+        fs::write(f.0.join("src/api.wi"), interface).unwrap();
+        fs::write(
+            f.0.join("src/implementation.wi"),
+            format!("import api; {implementation}"),
+        )
+        .unwrap();
+        fs::write(f.0.join("src/main.wi"), "import api; import implementation; fn call(x: api::I) -> i64 { return x.pick(); } fn main() { println(call(new implementation::A())); }").unwrap();
+        f.json(&["symbol", "api::I::pick"], 0);
+        f.json(&["refs", "api::I::pick"], 0);
+        let result = f.json(&["impact", "api::I::pick"], 0);
+        let names: Vec<_> = result["result"]["impact"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n["selector"].as_str())
+            .collect();
+        assert!(names.contains(&expected), "{label}: {result}");
+        assert!(names.contains(&"main::call"), "{label}: {result}");
+        if label == "contract" {
+            let result = f.json(&["effects", "api::I::pick"], 1);
+            assert!(
+                result["result"]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no executable body")
+            );
+            let output = f.run(&["effects", "api::I::pick"]);
+            assert!(String::from_utf8_lossy(&output.stdout).contains("implementing method"));
+        }
+    }
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "interface I { fn pick(self) -> i64; } fn main() {}",
+    )
+    .unwrap();
+    let result = f.json(&["impact", "main::I::pick"], 1);
+    assert!(
+        result["result"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("no analyzed implementation")
+    );
+    let result = f.json(&["impact", "main::I"], 1);
+    assert!(
+        result["result"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("function or method")
+    );
+}
+
+#[test]
+fn project_check_checks_unimported_sources_without_importing_names() {
+    for (label, path, source, success) in [
+        (
+            "return mismatch",
+            "junk.wi",
+            "fn value() -> i64 { return \"bad\"; }",
+            false,
+        ),
+        ("reserved keyword", "junk.wi", "fn open() {}", false),
+        (
+            "nested module",
+            "nested/junk.wi",
+            "fn value() -> i64 { return \"bad\"; }",
+            false,
+        ),
+        (
+            "directory module",
+            "nested/mod.wi",
+            "fn value() -> i64 { return \"bad\"; }",
+            false,
+        ),
+        (
+            "valid unused",
+            "junk.wi",
+            "fn value() -> i64 { return 1; }",
+            true,
+        ),
+        (
+            "private name collision",
+            "junk.wi",
+            "fn submit() {} fn main() {}",
+            true,
+        ),
+        (
+            "transitive dependency",
+            "junk.wi",
+            "import order; fn value() -> i64 { return order::submit(1); }",
+            true,
+        ),
+        ("missing import", "junk.wi", "import missing;", false),
+    ] {
+        let f = Fixture::new();
+        let file = f.0.join("src").join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, source).unwrap();
+        let output = f.run(&["check", "."]);
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !success {
+            let diagnostics = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                diagnostics.contains("junk.wi") || diagnostics.contains("mod.wi"),
+                "{label}: {diagnostics}"
+            );
+        }
+        // Explicit source checks keep their reachable-source semantics.
+        assert!(f.run(&["check", "src/main.wi"]).status.success(), "{label}");
+    }
+}

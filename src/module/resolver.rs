@@ -123,6 +123,7 @@ pub fn resolve_imports(entry_program: &Program, src_root: &Path) -> ImportResolu
         entry_program,
         src_root,
         ModuleGraph::new(src_root.to_path_buf()),
+        &Default::default(),
     )
 }
 
@@ -132,9 +133,18 @@ pub(crate) fn resolve_imports_spooled(
     src_root: &Path,
     artifacts: super::artifacts::UnitArtifacts,
 ) -> ImportResolution {
-    resolve_imports_spooled_entry(entry_program, src_root, artifacts, None, None, false)
+    resolve_imports_spooled_entry(
+        entry_program,
+        src_root,
+        artifacts,
+        None,
+        None,
+        false,
+        &Default::default(),
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_imports_spooled_entry(
     entry_program: &Program,
     src_root: &Path,
@@ -142,19 +152,21 @@ pub(crate) fn resolve_imports_spooled_entry(
     entry_path: Option<PathBuf>,
     package_graph: Option<std::sync::Arc<crate::package::PackageGraph>>,
     project_mode: bool,
+    check_modules: &std::collections::BTreeMap<String, PathBuf>,
 ) -> ImportResolution {
     let mut graph = ModuleGraph::new(src_root.to_path_buf());
     graph.entry_path = entry_path;
     graph.project_mode = project_mode;
     graph.package_graph = package_graph;
     graph.artifacts = Some(artifacts);
-    resolve_imports_in_graph(entry_program, src_root, graph)
+    resolve_imports_in_graph(entry_program, src_root, graph, check_modules)
 }
 
 fn resolve_imports_in_graph(
     entry_program: &Program,
     src_root: &Path,
     mut graph: ModuleGraph,
+    check_modules: &std::collections::BTreeMap<String, PathBuf>,
 ) -> ImportResolution {
     struct BoundImport {
         span: crate::diagnostics::Span,
@@ -253,6 +265,24 @@ fn resolve_imports_in_graph(
                 );
             }
         }
+    }
+
+    // Load additional roots into the same graph without importing their names
+    // into the entry scope. Shared dependencies are parsed and checked once.
+    for (name, path) in check_modules {
+        if graph.entry_path.as_ref() == Some(path) {
+            continue;
+        }
+        resolve_one(
+            &ModuleKey::new(consumer, name.clone()),
+            path.clone(),
+            None,
+            crate::diagnostics::Span::dummy(),
+            src_root,
+            routing.as_ref(),
+            &mut graph,
+            &mut errors,
+        );
     }
 
     ImportResolution {

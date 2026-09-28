@@ -70,11 +70,12 @@ impl Fixture {
                 None,
                 Some(graph),
                 true,
+                &Default::default(),
             )
         } else {
             let mut modules = ModuleGraph::new(root.clone());
             modules.package_graph = Some(graph);
-            resolve_imports_in_graph(&program, &root, modules)
+            resolve_imports_in_graph(&program, &root, modules, &Default::default())
         }
     }
 }
@@ -454,5 +455,49 @@ fn package_loader_feeds_consumer_dependency_index_and_backend_classification() {
         assert_eq!(imports.module_spellings[0].types, ["Left"]);
         assert_eq!(imports.module_spellings[1].access, "right");
         assert_eq!(imports.module_spellings[1].types, ["Right"]);
+    }
+}
+
+#[test]
+fn project_check_additional_roots_load_each_module_once() {
+    for size in [16, 64, 256] {
+        for chain in [false, true] {
+            let f = Fixture::new();
+            for i in 0..size {
+                let import = if i == 0 {
+                    String::new()
+                } else {
+                    format!("import m{};", if chain { i - 1 } else { 0 })
+                };
+                f.file(
+                    0,
+                    &format!("m{i}.wi"),
+                    &format!("{import} pub fn value() -> i64 {{ return 1; }}"),
+                );
+            }
+            let packages = f.graph(&[&[]]);
+            let root = packages.get(packages.root).unwrap().source_root();
+            let modules = crate::package::discover_sources(root.parent().unwrap(), &root).unwrap();
+            let (program, errors) =
+                Parser::new(Lexer::new("import m0; fn main() {}").tokenize().unwrap()).parse();
+            assert!(errors.is_empty());
+            let result = resolve_imports_spooled_entry(
+                &program,
+                &root,
+                super::super::artifacts::UnitArtifacts::new().unwrap(),
+                None,
+                Some(packages),
+                true,
+                &modules,
+            );
+            success(&result);
+            assert_eq!(result.graph.source_loads, size);
+            assert_eq!(result.graph.files.len(), size);
+            assert_eq!(result.graph.import_routes, size);
+            eprintln!(
+                "check roots={size} chain={chain} loads={} routes={}",
+                result.graph.source_loads, result.graph.import_routes
+            );
+        }
     }
 }

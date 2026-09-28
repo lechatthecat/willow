@@ -421,8 +421,18 @@ impl<'a> CompilerSession<'a> {
 
         let map = diagnostics::SourceMap::new(self.src, &source);
 
-        let inputs = compiler_db::inputs::CompilerInputs::native(self.opts.clone(), root.clone())
-            .resolve_project(self.project_root.as_deref())?;
+        let mut inputs =
+            compiler_db::inputs::CompilerInputs::native(self.opts.clone(), root.clone())
+                .resolve_project(self.project_root.as_deref())?;
+        if !build && let Some(project) = &self.project_root {
+            let source_root = inputs
+                .package_graph
+                .as_ref()
+                .and_then(|g| g.get(g.root))
+                .map(|p| p.source_root())
+                .unwrap_or_else(|| root.clone());
+            inputs.check_modules = package::discover_sources(project, &source_root)?;
+        }
         let frontend = run_frontend_with_inputs(&source, &root, &map, inputs, emitter)?;
         if build {
             run_backend(
@@ -592,6 +602,7 @@ fn run_frontend_revision(
         std::fs::canonicalize(&map.path).ok(),
         inputs.package_graph.clone(),
         inputs.project_mode,
+        &inputs.check_modules,
     );
     let mut graph = resolution.graph;
     let diagnostic_modules = DiagnosticModuleIndex::new(&graph);

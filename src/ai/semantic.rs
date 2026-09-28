@@ -687,7 +687,10 @@ impl QuerySession {
             }
             QueryRequest::Effects { function, .. } => match self.functions.get(&function) {
                 None => {
-                    json!({"status":if self.symbols.contains_key(&function) {"unanalyzed"} else {"unknown"}})
+                    json!({"status":if self.symbols.contains_key(&function) {"unanalyzed"} else {"unknown"},
+                        "reason":if self.symbols.get(&function).is_some_and(|&i| self.snapshot.semantic.symbols[i].kind == "method") {
+                            "This interface contract has no executable body. Query an implementing method for its effects; dispatch effects depend on the implementation."
+                        } else { "No executable body is available for this symbol in the selected source graph." }})
                 }
                 Some(&i) => {
                     let f = &self.snapshot.functions[i];

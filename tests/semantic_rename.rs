@@ -108,10 +108,10 @@ fn rename_rejections_preserve_sources_and_report_collision_location() {
 }
 
 #[test]
-fn unsupported_binding_and_validation_failure_preserve_source() {
+fn binding_capture_and_validation_failure_preserve_source() {
     for (source, selector, name) in [
         (
-            "fn main() { let local = 1; println(local); }",
+            "fn main() { let local = 1; let other = 2; println(local + other); }",
             "local",
             "other",
         ),
@@ -697,6 +697,110 @@ fn member_rename_destination_respects_hierarchy_and_dispatch_scopes() {
             if reject || dry {
                 assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), source);
             }
+        }
+    }
+}
+
+#[test]
+fn local_binding_rename_preserves_identity_and_previews() {
+    for (label, source, selector, expected) in [
+        (
+            "closure capture",
+            "fn main() { let old = 1; let f = |x: i64| { return x + old; }; println(f(2)); }",
+            "old",
+            "x + renamed",
+        ),
+        (
+            "lambda parameter",
+            "fn main() { let f = |old: i64| { return old + 1; }; println(f(2)); }",
+            "old",
+            "renamed + 1",
+        ),
+        (
+            "match binding",
+            "enum E { Some(i64), None } fn main() { let e = E::Some(1); match e { E::Some(old) => { println(old); }, E::None => {} }; }",
+            "old",
+            "println(renamed)",
+        ),
+        (
+            "simple",
+            "fn main() { let old = 1; println(old); }",
+            "old",
+            "println(renamed)",
+        ),
+        (
+            "assignment",
+            "fn main() { let mut old = 1; old = 2; println(old); }",
+            "old",
+            "renamed = 2",
+        ),
+        (
+            "parameter",
+            "fn f(old: i64) -> i64 { return old; } fn main() {}",
+            "old",
+            "return renamed",
+        ),
+        (
+            "nested use",
+            "fn main() { let old = 1; if true { println(old); } }",
+            "old",
+            "println(renamed)",
+        ),
+        (
+            "unrelated destination",
+            "fn other() { let renamed = 3; } fn main() { let old = 1; println(old); }",
+            "old",
+            "println(renamed)",
+        ),
+        (
+            "same spelling field",
+            "class A { pub old: i64; } fn main() { let old = 1; let a = new A(old); println(a.old); }",
+            "main::main::old",
+            "a.old",
+        ),
+        ("unused", "fn main() { let old = 1; }", "old", "let renamed"),
+        (
+            "string untouched",
+            "fn main() { let old = 1; println(\"old\"); println(old); }",
+            "old",
+            "\"old\"",
+        ),
+        (
+            "shadowed binding",
+            "fn main() { let old = 1; if true { let old = 2; println(old); } println(old); }",
+            "main.wi:1:17",
+            "let old = 2; println(old)",
+        ),
+    ] {
+        let f = Fixture::new(source);
+        eprintln!("local rename: {label}");
+        f.run(&["rename", selector, "renamed", "--dry-run"], 0);
+        assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), source);
+        f.run(&["rename", selector, "renamed"], 0);
+        let after = fs::read_to_string(f.0.join("main.wi")).unwrap();
+        assert!(after.contains(expected), "{label}: {after}");
+        assert!(after.contains("renamed"), "{label}: {after}");
+    }
+}
+
+#[test]
+fn rename_keywords_name_the_reserved_word_for_all_target_kinds() {
+    for (source, selector) in [
+        ("fn old() {} fn main() { old(); }", "old"),
+        ("class A { pub old: i64; } fn main() {}", "main::A::old"),
+        ("fn main() { let old = 1; println(old); }", "old"),
+    ] {
+        for keyword in ["open", "if", "class", "return", "i64"] {
+            let f = Fixture::new(source);
+            let result = f.run(&["rename", selector, keyword], 1);
+            assert!(
+                result["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("'{keyword}' is a reserved keyword")),
+                "{result}"
+            );
+            assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), source);
         }
     }
 }

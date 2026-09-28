@@ -1,0 +1,12 @@
+// Query: willow impact semantic_contract_queries::Picker::pick --source example/semantic_contract_queries.wi
+// Effects on Picker::pick explains that the declaration has no body.
+// Rename: willow rename semantic_contract_queries::main::count total --source example/semantic_contract_queries.wi --dry-run
+interface Picker { fn pick(self) -> i64; }
+class First implements Picker {
+    pub fn pick(self) -> i64 { return 3; }
+}
+fn choose(picker: Picker) -> i64 { return picker.pick(); }
+fn main() {
+    let count = choose(new First());
+    println(count);
+}

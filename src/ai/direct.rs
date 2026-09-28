@@ -111,6 +111,7 @@ pub struct DirectSession {
     pub session: QuerySession,
     sources: HashMap<String, SourceIndex>,
     function_names: HashMap<String, String>,
+    contract_bodies: std::collections::HashSet<String>,
 }
 fn source_module(path: &str, workspace: &str) -> String {
     let path = Path::new(path)
@@ -137,11 +138,33 @@ impl DirectSession {
                 (f.id.clone(), format!("{module}::{}", f.name))
             })
             .collect();
-        Ok(Self {
+        let contract_bodies = snapshot
+            .functions
+            .iter()
+            .filter(|f| {
+                f.name
+                    .rsplit("::")
+                    .next()
+                    .is_some_and(|n| n.starts_with("$default$"))
+            })
+            .map(|f| f.id.clone())
+            .collect();
+        let mut session = Self {
             session: QuerySession::new(snapshot)?,
             sources: HashMap::new(),
             function_names,
-        })
+            contract_bodies,
+        };
+        let names: Vec<_> = session
+            .snapshot()
+            .semantic
+            .symbols
+            .iter()
+            .filter(|s| s.kind == "method" && session.function_names.contains_key(&s.id))
+            .map(|s| (s.id.clone(), session.selector(s)))
+            .collect();
+        session.function_names.extend(names);
+        Ok(session)
     }
     pub fn workspace(&self) -> &str {
         &self.session.snapshot.workspace
@@ -176,14 +199,14 @@ impl DirectSession {
         if !self.function_names.contains_key(&id)
             && !matches!(
                 resolved["symbol"]["kind"].as_str(),
-                Some("field" | "static-field" | "variant" | "method")
+                Some("field" | "static-field" | "variant" | "method" | "binding" | "parameter")
             )
         {
             self.display_locations(&mut resolved, false)?;
             let symbol = &resolved["symbol"];
             let loc = &symbol["location"];
             let message = format!(
-                "unsupported rename target `{selector}` ({}): rename supports source functions, methods, fields and enum variants; this symbol kind is not supported. No files changed",
+                "unsupported rename target `{selector}` ({}): rename supports source functions, methods, fields, enum variants and local bindings; this symbol kind is not supported. No files changed",
                 symbol["kind"].as_str().unwrap_or("symbol")
             );
             if let (Some(path), Some(start), Some(end), Some(line), Some(column)) = (
@@ -446,8 +469,48 @@ impl DirectSession {
             .context("resolved symbol lacks identity")?
             .to_owned();
         if command == "impact" {
+            // Contract declarations have no executable body. Traverse the shared
+            // semantic family once to seed all implementations, including defaults.
+            let mut seeds = vec![function.clone()];
+            if !self.function_names.contains_key(&function)
+                || self.contract_bodies.contains(&function)
+            {
+                if resolved["symbol"]["kind"] != "method" {
+                    return Ok(
+                        json!({"status":"unanalyzed","reason":"Impact requires a function or method.","selected":resolved["symbol"]}),
+                    );
+                }
+                let mut links = HashMap::<&str, Vec<&str>>::new();
+                for (a, b) in &self.session.snapshot.semantic.rename_links {
+                    links.entry(a).or_default().push(b);
+                    links.entry(b).or_default().push(a);
+                }
+                let mut seen = std::collections::HashSet::new();
+                let mut pending = vec![function.as_str()];
+                seeds.clear();
+                while let Some(id) = pending.pop() {
+                    if seen.insert(id)
+                        && let Some(neighbors) = links.get(id)
+                    {
+                        pending.extend(neighbors.iter().copied());
+                    }
+                }
+                seeds.extend(
+                    self.session
+                        .snapshot
+                        .functions
+                        .iter()
+                        .filter(|f| seen.contains(f.id.as_str()))
+                        .map(|f| f.id.clone()),
+                );
+                if seeds.is_empty() {
+                    return Ok(
+                        json!({"status":"unanalyzed","reason":"This interface contract has no analyzed implementation in the selected source graph.","selected":resolved["symbol"]}),
+                    );
+                }
+            }
             let impact = self.session.snapshot.impact(
-                &[function],
+                &seeds,
                 Direction::Callers,
                 Limits::default(),
                 Some(&revision),
