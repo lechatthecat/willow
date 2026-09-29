@@ -55,7 +55,7 @@ impl Parser {
                         self.advance(); // consume (
                         let mut bindings = Vec::new();
                         while !matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
-                            bindings.push(self.expect_ident()?);
+                            bindings.push(self.parse_payload_binding()?);
                             if matches!(self.peek_kind(), TokenKind::Comma) {
                                 self.advance();
                             }
@@ -89,7 +89,7 @@ impl Parser {
                     let mut bindings = Vec::new();
                     if !matches!(self.peek_kind(), TokenKind::RParen) {
                         loop {
-                            bindings.push(self.expect_ident()?);
+                            bindings.push(self.parse_payload_binding()?);
                             if !self.eat(TokenKind::Comma)
                                 || matches!(self.peek_kind(), TokenKind::RParen)
                             {
@@ -128,5 +128,60 @@ impl Parser {
         }
     }
 
+    fn parse_payload_binding(&mut self) -> Result<String, Diagnostic> {
+        let start = self.current_span();
+        let name = self.expect_ident()?;
+        if matches!(self.peek_kind(), TokenKind::ColonColon | TokenKind::LParen) {
+            return Err(Diagnostic::new(
+                crate::diagnostics::Severity::Error,
+                ErrorCode::E0102,
+                "nested patterns are not supported; bind and match again",
+            )
+            .with_label(crate::diagnostics::Label::primary(
+                start,
+                "nested constructor pattern",
+            ))
+            .with_help("write `Result::Err(error) => { match error { E::Bad(n) => ... } }`"));
+        }
+        Ok(name)
+    }
+
     // --- helpers ---
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{lexer::Lexer, parser::Parser};
+    #[test]
+    fn nested_pattern_twenty_diagnostic_perspectives() {
+        for outer in ["Result::Err", "Err", "pkg::Result::Err", "Wrap::Value"] {
+            for inner in [
+                "E::Bad(n)",
+                "E::Bad(_)",
+                "Bad(n)",
+                "E::Empty",
+                "E::Bad(E::Bad(n))",
+            ] {
+                let source = format!(
+                    "fn f() {{ match value {{\n{outer}({inner}) => println(1),\n}} }}\nasync fn main() {{ await sleep(0); }}"
+                );
+                let (program, errors) =
+                    Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+                assert!(program.items.iter().any(|item| matches!(item, crate::parser::ast::Item::Function(f) if f.name == "main" && f.is_async)), "{outer}/{inner}: following async modifier was lost");
+                assert!(
+                    errors[0]
+                        .message
+                        .contains("nested patterns are not supported; bind and match again"),
+                    "{outer}/{inner}: {errors:?}"
+                );
+                assert_eq!(errors[0].primary_span().unwrap().line, 2);
+                assert!(
+                    errors
+                        .windows(2)
+                        .all(|pair| pair[0].primary_span().unwrap().start
+                            <= pair[1].primary_span().unwrap().start)
+                );
+            }
+        }
+    }
 }

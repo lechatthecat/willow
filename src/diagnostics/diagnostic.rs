@@ -102,19 +102,27 @@ impl Diagnostic {
 
 /// Remove only canonical package namespaces from prose, never from identities
 /// or fix replacement text. Scan once so messages with many types stay linear.
-fn source_names(text: String, packages: &std::collections::HashMap<String, String>) -> String {
+pub(crate) fn source_names(
+    text: String,
+    packages: &std::collections::HashMap<String, String>,
+) -> String {
     if !text.contains("$pkg") {
         return text;
     }
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
     for (start, _) in text.match_indices("$pkg") {
-        let end = start + 38;
+        let separator = if text.as_bytes().get(start + 36) == Some(&b'.') {
+            "."
+        } else {
+            "::"
+        };
+        let end = start + 36 + separator.len();
         if text
             .as_bytes()
             .get(start + 4..start + 36)
             .is_some_and(|hash| hash.iter().all(u8::is_ascii_hexdigit))
-            && text.as_bytes().get(start + 36..end) == Some(b"::")
+            && text.as_bytes().get(start + 36..end) == Some(separator.as_bytes())
         {
             out.push_str(&text[copied..start]);
             if let Some(prefix) = packages.get(&text[start..start + 36]) {
@@ -130,6 +138,25 @@ fn source_names(text: String, packages: &std::collections::HashMap<String, Strin
 #[cfg(test)]
 mod source_name_tests {
     use super::*;
+
+    #[test]
+    fn backend_names_hide_package_hashes() {
+        let package = "$pkg0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            source_names(
+                format!("function `{package}.graph.empty` has invalid lowered IR"),
+                &Default::default()
+            ),
+            "function `graph.empty` has invalid lowered IR"
+        );
+        assert_eq!(
+            source_names(
+                format!("{package}.graph.empty"),
+                &[(package.into(), "dep::".into())].into()
+            ),
+            "dep::graph.empty"
+        );
+    }
 
     #[test]
     fn dependency_names_remain_distinct_from_root_types() {

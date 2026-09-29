@@ -255,12 +255,11 @@ impl DirectSession {
         workspace.validate(transaction, &mut emitter)?;
         workspace.apply_with_rollback(transaction, &mut emitter)?;
         let changes = preview["changes"].as_array().map_or(0, Vec::len);
-        let references = preview["work"]["patches"]
-            .as_u64()
-            .unwrap_or(0)
-            .saturating_sub(preview["work"]["declarations"].as_u64().unwrap_or(0));
+        let edits = preview["work"]["patches"].as_u64().unwrap_or(0);
+        let declarations = preview["work"]["declarations"].as_u64().unwrap_or(0);
+        let references = edits.saturating_sub(declarations);
         Ok(
-            json!({"status":"ok","old":selector,"new":name,"files_changed":changes,"references_updated":references,"validation":"passed","transaction":transaction}),
+            json!({"status":"ok","old":selector,"new":name,"files_changed":changes,"references_updated":references,"declarations_updated":declarations,"edits":edits,"validation":"passed","transaction":transaction}),
         )
     }
     fn source(&mut self, path: &str) -> Result<&SourceIndex> {
@@ -429,6 +428,9 @@ impl DirectSession {
         };
         let mut candidates = Vec::new();
         let mut suggestions = Vec::new();
+        let tail = selector.rsplit("::").next().unwrap_or(selector);
+        let tail_chars: Vec<_> = tail.chars().collect();
+        let selector_scope = selector.rsplit_once("::").map(|(scope, _)| scope);
         for symbol in &self.session.snapshot.semantic.symbols {
             if located
                 .as_ref()
@@ -461,7 +463,6 @@ impl DirectSession {
                 continue;
             }
             let qualified = self.selector(symbol);
-            let tail = selector.rsplit("::").next().unwrap_or(selector);
             let local_name = matches!(symbol.kind.as_str(), "binding" | "parameter")
                 .then(|| qualified.rsplit_once('@'))
                 .flatten()
@@ -484,17 +485,22 @@ impl DirectSession {
             } else {
                 let name = local_name.unwrap_or(&qualified);
                 let (owner, short) = name.rsplit_once("::").unwrap_or(("", name));
-                let same_scope = selector.rsplit_once("::").is_none_or(|(scope, _)| {
+                let same_scope = selector_scope.is_none_or(|scope| {
                     owner == scope || owner.strip_suffix(scope).is_some_and(|p| p.ends_with("::"))
                 });
+                if !same_scope {
+                    continue;
+                }
                 let score = if short.starts_with(tail) {
                     Some(0)
                 } else if short.chars().count() > 1 && tail.starts_with(short) {
                     Some(1)
+                } else if short.len() > 2 && tail_chars.len() > 2 {
+                    selector_typo_distance(short, &tail_chars).map(|distance| distance + 2)
                 } else {
                     None
                 };
-                if same_scope && let Some(score) = score {
+                if let Some(score) = score {
                     suggestions.push((score, qualified));
                     suggestions.sort_unstable();
                     suggestions.dedup();
@@ -812,5 +818,105 @@ mod tests {
         );
         assert_eq!(split_location("order::Order::qty"), None);
         assert_eq!(SourceIndex::new(String::new()).byte(1, 1).unwrap(), 0);
+    }
+}
+
+/// Banded edit distance, bounded to two edits. O(a+b) work and O(1)
+/// distance-band storage, plus O(a+b) Unicode scalar storage.
+fn selector_typo_distance(a: &str, b: &[char]) -> Option<usize> {
+    let a: Vec<_> = a.chars().collect();
+    let limit = if a.len().min(b.len()) < 4 { 1 } else { 2 };
+    if a.len().abs_diff(b.len()) > limit {
+        return None;
+    }
+    // Only the diagonal band can participate in a distance <= limit.
+    let mut previous = [3usize; 5];
+    for j in 0..=limit.min(b.len()) {
+        previous[j + limit] = j;
+    }
+    for i in 1..=a.len() {
+        let mut current = [3usize; 5];
+        for j in i.saturating_sub(limit)..=b.len().min(i + limit) {
+            #[cfg(test)]
+            typo_tests::CELLS.with(|count| count.set(count.get() + 1));
+            let k = j + limit - i;
+            if j == 0 {
+                current[k] = i;
+                continue;
+            }
+            let diagonal = previous[k] + usize::from(a[i - 1] != b[j - 1]);
+            let deletion = if k + 1 < 5 { previous[k + 1] + 1 } else { 3 };
+            let insertion = if k > 0 { current[k - 1] + 1 } else { 3 };
+            current[k] = diagonal.min(deletion).min(insertion);
+        }
+        previous = current;
+    }
+    let distance = previous[b.len() + limit - a.len()];
+    (distance <= limit).then_some(distance)
+}
+
+#[cfg(test)]
+mod typo_tests {
+    use super::selector_typo_distance;
+    thread_local! { pub(super) static CELLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    #[test]
+    fn band_work_scales_linearly_with_identifier_length() {
+        for n in [16, 64, 256, 1024] {
+            let a = "a".repeat(n);
+            let mut b: Vec<_> = a.chars().collect();
+            b[n - 1] = 'b';
+            CELLS.with(|count| count.set(0));
+            assert_eq!(selector_typo_distance(&a, &b), Some(1));
+            assert_eq!(CELLS.with(|count| count.get()), 5 * n - 4);
+        }
+    }
+    #[test]
+    fn bounded_distance_matches_full_distance() {
+        fn full(a: &str, b: &str) -> usize {
+            let b: Vec<_> = b.chars().collect();
+            let mut row: Vec<_> = (0..=b.len()).collect();
+            for (i, a) in a.chars().enumerate() {
+                let mut diagonal = row[0];
+                row[0] = i + 1;
+                for (j, &b) in b.iter().enumerate() {
+                    let old = row[j + 1];
+                    row[j + 1] = (diagonal + usize::from(a != b))
+                        .min(row[j] + 1)
+                        .min(old + 1);
+                    diagonal = old;
+                }
+            }
+            row[b.len()]
+        }
+        let words = [
+            "",
+            "a",
+            "abc",
+            "slot",
+            "slto",
+            "transfer",
+            "tranfer",
+            "running",
+            "runing",
+            "関数名",
+            "関数",
+            "abcdefghijk",
+            "xabcdefghijkz",
+        ];
+        for a in words {
+            for b in words {
+                let d = full(a, b);
+                let limit = if a.chars().count().min(b.chars().count()) < 4 {
+                    1
+                } else {
+                    2
+                };
+                assert_eq!(
+                    selector_typo_distance(a, &b.chars().collect::<Vec<_>>()),
+                    (d <= limit).then_some(d),
+                    "{a}/{b}"
+                );
+            }
+        }
     }
 }

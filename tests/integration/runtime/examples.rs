@@ -4,6 +4,10 @@ use super::*;
 
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
+        (
+            "example/buildgraph_regressions.wi",
+            "1\n0\n0\n0\n0\n0\n2\nsafe\nsafe\n3\n",
+        ),
         ("example/language_gaps/main.wi", "idle\n6\n9\n"),
         ("example/semantic_cli/src/main.wi", "3\n"),
         ("example/semantic_cli_diagnostics.wi", "1\n0\n0\n"),

@@ -603,9 +603,14 @@ impl<'a> Index<'a> {
                     .location
                     .as_ref()
                     .context("rename declaration is outside editable source")?;
-                allowed.insert((l.path.as_str(), l.start, l.end));
-                work.declarations += 1;
+                if allowed.insert((l.path.as_str(), l.start, l.end)) {
+                    work.declarations += 1;
+                }
             }
+        }
+        // Count unique declaration tokens before references: copied/default
+        // methods may have several semantic identities at one source location.
+        for id in &family {
             for reference in self.references.get(id).into_iter().flatten() {
                 work.references_visited += 1;
                 let l = &reference.location;
@@ -794,11 +799,15 @@ mod tests {
 
     #[test]
     fn indexed_members_scale_with_occurrences_and_family_edges() {
-        for shape in ["chain", "fanout", "disjoint"] {
+        for shape in ["chain", "fanout", "disjoint", "shared"] {
             for n in [16, 64, 256, 1024] {
                 let root = std::env::temp_dir().join("willow-rename-index");
                 let absolute = root.join("main.wi").to_str().unwrap().to_owned();
-                let source = "old old ".repeat(n);
+                let source = if shape == "shared" {
+                    "old ".repeat(n + 1)
+                } else {
+                    "old old ".repeat(n)
+                };
                 let tokens = Lexer::new(&source).tokenize().unwrap();
                 let spans: Vec<_> = tokens
                     .iter()
@@ -815,8 +824,8 @@ mod tests {
                         ty: None,
                         location: Some(Location {
                             path: absolute.clone(),
-                            start: spans[2 * i].start,
-                            end: spans[2 * i].end,
+                            start: spans[if shape == "shared" { 0 } else { 2 * i }].start,
+                            end: spans[if shape == "shared" { 0 } else { 2 * i }].end,
                         }),
                     })
                     .collect();
@@ -827,8 +836,8 @@ mod tests {
                         role: "member".into(),
                         location: Location {
                             path: absolute.clone(),
-                            start: spans[2 * i + 1].start,
-                            end: spans[2 * i + 1].end,
+                            start: spans[if shape == "shared" { i + 1 } else { 2 * i + 1 }].start,
+                            end: spans[if shape == "shared" { i + 1 } else { 2 * i + 1 }].end,
                         },
                     })
                     .collect();
@@ -876,10 +885,13 @@ mod tests {
                         )
                         .unwrap();
                 }
-                assert_eq!(index.indexed, 2 * n);
+                assert_eq!(index.indexed, if shape == "shared" { n + 1 } else { 2 * n });
                 assert_eq!(work.references_visited, n);
-                assert_eq!(work.declarations, n);
-                assert_eq!(patches["main.wi"].len(), 2 * n);
+                assert_eq!(work.declarations, if shape == "shared" { 1 } else { n });
+                assert_eq!(
+                    patches["main.wi"].len(),
+                    if shape == "shared" { n + 1 } else { 2 * n }
+                );
                 assert_eq!(
                     index.edges_visited,
                     if shape == "disjoint" { 0 } else { 2 * (n - 1) }

@@ -132,53 +132,67 @@ impl TypeChecker {
     /// the return value, parameters, and locals live across `await` — is entirely
     /// `Send`. Consumed by the multi-worker capstone (willow-dgwo.9) to reject
     /// stealing a non-`Send` task.
-    pub(super) fn is_task_send(&self, ret: &Type, params: &[Type], locals: &[Type]) -> bool {
-        self.is_send(ret)
-            && params.iter().all(|p| self.is_send(p))
-            && locals.iter().all(|t| self.is_send(t))
-    }
-
-    /// Multi-worker capstone check (willow-dgwo.9): a scheduler task can be
-    /// stolen by another worker only if its frame is `Send`.
     pub(super) fn check_async_task_send(
         &mut self,
         span: Span,
+        body: &Block,
         ret: &Type,
         params: &[Type],
         locals: &[Type],
+        locals_offset: usize,
     ) {
-        if !self.enforce_send_sync || self.is_task_send(ret, params, locals) {
+        let bindings = std::mem::take(&mut self.local.async_local_bindings);
+        if !self.enforce_send_sync {
             return;
         }
-        let mut first_bad = ret;
-        for ty in params
+        // Classify frame slots once, retaining the offending slot for its label.
+        let mut bad_slot = None;
+        for (index, ty) in params
             .iter()
             .chain(locals.iter())
             .chain(std::iter::once(ret))
+            .enumerate()
         {
             if !self.is_send(ty) {
-                first_bad = ty;
+                bad_slot = Some((index, ty));
                 break;
             }
         }
-        self.push(
-            Diagnostic::new(
-                Severity::Error,
-                ErrorCode::E2402,
-                format!(
-                    "async task frame is not `Send`: `{}` cannot move between workers",
-                    type_name(first_bad)
-                ),
-            )
-            .with_label(Label::primary(
-                span,
-                "this async task may be scheduled on another worker",
-            ))
-            .with_note(self.marker_failure_note(first_bad, Marker::Send))
-            .with_help(
-                "keep task frame values Send, or wrap shared mutable state with Mutex/RwLock/Atomic/Channel/frozen data",
-            ),
-        );
+        let Some((index, first_bad)) = bad_slot else {
+            return;
+        };
+        let binding = if index >= params.len() && index < params.len() + locals.len() {
+            bindings.get(&(locals_offset + index - params.len()))
+        } else {
+            None
+        };
+        let mut diagnostic = Diagnostic::new(
+            Severity::Error, ErrorCode::E2402,
+            format!("async task frame is not `Send`: `{}` cannot move between workers", type_name(first_bad)),
+        ).with_label(Label::primary(
+            binding.map_or(span, |(_, span)| *span),
+            binding.map_or_else(|| "this async task may be scheduled on another worker".into(),
+                |(name, _)| format!("`{name}` is retained in this async task frame")),
+        )).with_note(self.marker_failure_note(first_bad, Marker::Send))
+          .with_help("interface values need a declared `extends Send` (or `extends Sync`) contract; keep other task frame values Send");
+        if let Some((name, binding_span)) = binding {
+            use crate::parser::iter::{AstEvent, AstWalk};
+            let mut walk = AstWalk::new(AstEvent::Block(body));
+            while let Some(event) = walk.next() {
+                match event {
+                    AstEvent::Lambda(_) => walk.skip_children(),
+                    AstEvent::Expr(Expr::Await(wait)) if wait.span.start >= binding_span.start => {
+                        diagnostic = diagnostic.with_label(Label::secondary(
+                            wait.span,
+                            format!("the frame containing `{name}` can suspend here"),
+                        ));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.push(diagnostic);
     }
 
     fn marker_holds(&self, ty: &Type, marker: Marker, visiting: &mut HashSet<String>) -> bool {
@@ -309,7 +323,20 @@ impl TypeChecker {
             class.fields.iter().all(|(name, f)| {
                 let ok = self.marker_holds_with_reason(&f.ty, marker, visiting, reasons);
                 if !ok && let Some(reasons) = reasons {
-                    reasons.push(format!("field `{name}: {}`", type_name(&f.ty)));
+                    let prefix = format!("`{}` is not `", type_name(&f.ty));
+                    if reasons.len() == 1 && reasons[0].starts_with(&prefix) {
+                        reasons[0] = format!(
+                            "field `{name}: {}` is not `{}`",
+                            type_name(&f.ty),
+                            if matches!(marker, Marker::Send) {
+                                "Send"
+                            } else {
+                                "Sync"
+                            }
+                        );
+                    } else {
+                        reasons.push(format!("field `{name}: {}`", type_name(&f.ty)));
+                    }
                 }
                 ok
             })
@@ -317,12 +344,17 @@ impl TypeChecker {
             // An interface value follows its declared contract. `extends Sync`
             // is sufficient for Send as well: a Sync interface promises safe
             // shared use, so moving the interface value between workers is okay.
-            match marker {
+            let holds = match marker {
                 Marker::Send => {
                     self.interface_extends(name, "Send") || self.interface_extends(name, "Sync")
                 }
                 Marker::Sync => self.interface_extends(name, "Sync"),
+            };
+            if !holds && let Some(reasons) = reasons {
+                reasons.push(format!("interface `{name}` does not declare `extends {}`; interface values follow their declared contract, regardless of currently known implementations",
+                    if matches!(marker, Marker::Send) { "Send` or `extends Sync" } else { "Sync" }));
             }
+            holds
         } else {
             // Unknown type: conservative.
             false
@@ -410,7 +442,7 @@ mod tests {
             "{note}"
         );
         assert!(
-            note.ends_with("`Array<Channel<i64>>` is not `Sync`"),
+            note.ends_with("field `inboxes: Array<Channel<i64>>` is not `Sync`"),
             "{note}"
         );
         for wrapper in ["Option", "Result", "FrozenArray", "FrozenMap", "RwLock"] {
@@ -564,6 +596,60 @@ mod tests {
         let t = generic("Task", vec![Type::I64]);
         assert!(c.is_send(&t));
         assert!(!c.is_sync(&t));
+    }
+
+    #[test]
+    fn buildgraph_interface_contract_twenty_perspectives() {
+        for (contract, ok) in [
+            ("", false),
+            ("extends Send", true),
+            ("extends Sync", true),
+            ("extends Moving", true),
+            ("extends Sharing", true),
+        ] {
+            for (ty, init) in [
+                ("Named", "new A()"),
+                ("Array<Named>", "[new A()]"),
+                ("Option<Named>", "Option::Some(new A())"),
+                ("Holder", "new Holder(new A())"),
+            ] {
+                let source = format!(
+                    "import std::collections::Array; enum Option<T> {{ Some(T), None }} interface Send {{}} interface Sync extends Send {{}} interface Moving extends Send {{}} interface Sharing extends Sync {{}} interface Named {contract} {{ fn label(self) -> String; }} class A implements Named {{ pub fn label(self) -> String {{ return \"a\"; }} }} class Holder {{ pub value: Named; }} async fn main() {{\nlet value: {ty} = {init};\nawait sleep(0);\nprintln(1);\n}}"
+                );
+                let (program, errors) =
+                    Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+                assert!(errors.is_empty(), "{errors:?}");
+                let mut c = TypeChecker::new();
+                c.set_enforce_send_sync(true);
+                c.check_program(&program);
+                let errors: Vec<_> = c
+                    .errors
+                    .iter()
+                    .filter(|e| e.severity == Severity::Error)
+                    .collect();
+                if ok {
+                    assert!(errors.is_empty(), "{contract}/{ty}: {errors:?}");
+                } else {
+                    let d = errors
+                        .iter()
+                        .find(|e| e.code == ErrorCode::E2402)
+                        .expect("plain interface is not Send");
+                    assert_eq!(d.primary_span().unwrap().line, 2, "{d:?}");
+                    assert!(
+                        d.labels
+                            .iter()
+                            .any(|l| l.span.line == 3 && l.message.contains("value")),
+                        "{d:?}"
+                    );
+                    assert!(
+                        d.notes
+                            .iter()
+                            .any(|n| n.contains("declared contract") && n.contains("extends Send")),
+                        "{d:?}"
+                    );
+                }
+            }
+        }
     }
 
     // 17: fieldless enums are Send + Sync.

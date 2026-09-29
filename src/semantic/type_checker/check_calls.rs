@@ -282,7 +282,22 @@ impl TypeChecker {
                 return result;
             }
         }
-        self.check_expr(expr)
+        let actual = self.check_expr(expr);
+        // Resolve only constructors whose omitted arguments are placeholders.
+        // Ordinary values and explicitly typed calls must keep their own type.
+        if let Expr::StaticCall(call) = expr
+            && call.type_args.is_empty()
+            && let Type::Generic(name, args) = &actual
+            && let Type::Generic(expected_name, expected_args) = expected
+            && name == expected_name
+            && args.len() == expected_args.len()
+            && args.iter().all(|arg| *arg == Type::Void)
+            && ((name == "Map" && call.method == "new")
+                || (name == "Channel" && matches!(call.method.as_str(), "new" | "with_capacity")))
+        {
+            return expected.clone();
+        }
+        actual
     }
 
     /// Bare enum variants are contextual prelude shorthands, not privileged

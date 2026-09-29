@@ -295,3 +295,35 @@ impl TypeChecker {
         }
     }
 }
+
+#[cfg(test)]
+mod buildgraph_tests {
+    use super::*;
+    use crate::{lexer::Lexer, parser::Parser};
+    #[test]
+    fn element_mutation_roles_scale_with_sites() {
+        for n in [16, 64, 256, 1024] {
+            let mut source = String::from("fn f() { let xs = [1]; let i = 0;");
+            source.push_str(&"xs[i] = xs[i] + 1;".repeat(n));
+            source.push('}');
+            let (program, parse) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+            assert!(parse.is_empty());
+            let mut checker = TypeChecker::new();
+            checker.capture_call_sites = true;
+            checker.check_program(&program);
+            assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+            let references = &checker.analysis_symbols.references;
+            assert_eq!(
+                references
+                    .iter()
+                    .filter(|r| r.role == "write-element")
+                    .count(),
+                n
+            );
+            assert_eq!(
+                references.iter().filter(|r| r.role == "read").count(),
+                3 * n
+            );
+        }
+    }
+}

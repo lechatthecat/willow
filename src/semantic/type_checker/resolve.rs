@@ -1620,7 +1620,24 @@ impl TypeChecker {
                     .with_label(Label::primary(span, "unexpected arguments")),
                 );
             }
-            return Type::Generic("Map".to_string(), vec![Type::Void, Type::Void]);
+            return match type_args {
+                [] => Type::Generic("Map".to_string(), vec![Type::Void, Type::Void]),
+                [key, value] => Type::Generic("Map".to_string(), vec![key.clone(), value.clone()]),
+                _ => {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!(
+                                "`Map::new` expects 2 type arguments, got {}",
+                                type_args.len()
+                            ),
+                        )
+                        .with_label(Label::primary(span, "wrong number of type arguments")),
+                    );
+                    Type::Generic("Map".to_string(), vec![Type::Void, Type::Void])
+                }
+            };
         }
 
         // Check if class_name refers to an enum — handle variant construction.

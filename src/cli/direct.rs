@@ -237,10 +237,12 @@ fn human(value: &Value, options: &Options) -> String {
                 .join("\n");
         }
         let mut output = format!(
-            "Renamed {} -> {}\n{} files changed\n{} references updated\nValidation: passed",
+            "Renamed {} -> {}\n{} files changed\n{} edits ({} declarations, {} references)\nValidation: passed",
             options.selector,
             options.new_name.as_deref().unwrap(),
             result["files_changed"],
+            result["edits"],
+            result["declarations_updated"],
             result["references_updated"]
         );
         if options.verbose {

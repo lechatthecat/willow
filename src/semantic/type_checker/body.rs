@@ -22,6 +22,9 @@ pub(super) struct BodyState {
     /// temporaries. Each occurrence has its own slot, independent of source
     /// spans; callable checking drains its slots after checking Send.
     pub(super) async_local_types: Vec<Type>,
+    /// Source bindings keyed by the same frame slot, for task-mobility labels.
+    /// Synthetic temporaries have no entry. Drained with the callable slots.
+    pub(super) async_local_bindings: HashMap<usize, (String, Span)>,
     /// The type parameters of the generic declaration whose written types are
     /// being normalized or validated (`T` inside `enum Wrap<T>` or `interface Conv<T>`).
     /// A bare `T` there names a parameter, not a missing type, so
@@ -80,6 +83,7 @@ impl Default for BodyState {
             lock_depth: 0,
             lexical_block_depth: 0,
             async_local_types: Vec::new(),
+            async_local_bindings: HashMap::new(),
             declared_type_params: Vec::new(),
             inferred_maps: HashMap::new(),
             pending_map_uses: HashSet::new(),

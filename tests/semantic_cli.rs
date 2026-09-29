@@ -218,6 +218,9 @@ fn references_are_bounded_and_agree_with_low_level_queries() {
             match value {
                 Value::Object(fields) => {
                     if let Some(Value::String(path)) = fields.get_mut("path") {
+                        // Low-level storage uses the host separator; direct CLI
+                        // locations use '/'. Compare the same logical path.
+                        *path = path.replace('\\', "/");
                         if path == "${workspace}" {
                             *path = ".".into();
                         } else if let Some(relative) = path.strip_prefix("${workspace}/") {
@@ -259,6 +262,14 @@ fn references_are_bounded_and_agree_with_low_level_queries() {
         }
         references.sort_by_key(Value::to_string);
         references
+    }
+    for path in [
+        "${workspace}/src/main.wi",
+        r"${workspace}\src\main.wi",
+        "src/main.wi",
+    ] {
+        let reference = serde_json::json!([{"location":{"path":path,"start":0,"end":1}}]);
+        assert_eq!(normalized(&reference)[0]["location"]["path"], "src/main.wi");
     }
     assert_eq!(low["status"], all["result"]["status"]);
     assert_eq!(low["coverage"], all["result"]["coverage"]);
@@ -809,4 +820,198 @@ fn mismatch_diagnostics_keep_dependency_type_names_distinct() {
     assert!(!text.contains("$pkg"), "{text}");
     assert!(text.contains("order::Bank"), "{text}");
     assert!(text.contains("ledger::order::Bank"), "{text}");
+}
+
+#[test]
+fn await_block_bounds_explain_lowering_without_blaming_locks() {
+    use willow_compiler::semantic::effects::RuntimeEffects;
+    for (mode, ty) in [
+        ("lock", "Mutex"),
+        ("lock read", "RwLock"),
+        ("lock write", "RwLock"),
+    ] {
+        for (setup, wait) in [
+            ("", "await sleep(0);"),
+            ("", "await sleep(1);"),
+            ("", "await yield();"),
+            ("let timer = sleep(0);", "await timer;"),
+        ] {
+            let f = Fixture::new();
+            fs::write(f.0.join("src/main.wi"), format!("async fn fees(m: {ty}<i64>) {{ {mode} m as value {{ }} }}\nasync fn transfer(m: {ty}<i64>) {{\n{setup}\n{wait}\n{mode} m as value {{ }}\n}}\nfn relay(m: {ty}<i64>) {{ transfer(m); }}\nfn main() {{}}\n")).unwrap();
+            for name in ["transfer", "relay"] {
+                let selector = format!("main::{name}");
+                let result = f.json(&["effects", &selector, "--explain"], 0);
+                let evidence = result["result"]["effect_evidence"].as_array().unwrap();
+                let block = evidence
+                    .iter()
+                    .find(|e| e["effect"] == RuntimeEffects::MAY_BLOCK.bits())
+                    .unwrap();
+                assert_eq!(block["status"], "conservative-bound", "{result}");
+                assert_eq!(block["witness"]["cause"]["operation"], "await", "{result}");
+                assert_eq!(block["witness"]["cause"]["location"]["line"], 4, "{result}");
+                let reason = block["witness"]["reason"].as_str().unwrap();
+                assert!(
+                    reason.contains("willow_future_await_void")
+                        && reason.contains("does not identify the selected lowering"),
+                    "{result}"
+                );
+                let output = f.run(&["effects", &selector]);
+                assert!(output.status.success());
+                let text = String::from_utf8(output.stdout).unwrap();
+                assert!(
+                    text.contains("operation=await") && text.contains(reason),
+                    "{text}"
+                );
+                assert!(!text.contains("typed-expression-lowering"), "{text}");
+            }
+            let fees = f.json(&["effects", "main::fees"], 0);
+            assert_eq!(
+                fees["result"]["runtime_effects"].as_u64().unwrap()
+                    & u64::from(RuntimeEffects::MAY_BLOCK.bits()),
+                0,
+                "{fees}"
+            );
+        }
+    }
+}
+
+#[test]
+fn buildgraph_typo_suggestions_stay_in_scope() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/main.wi"), "class Bank { pub fn transfer(self) {} } fn serve() { let running = true; let slot = 1; println(slot); } fn unrelated() { let r = 1; } fn main() {} ").unwrap();
+    for (typo, wanted) in [
+        ("main::Bank::tranfer", "transfer"),
+        ("main::serve::runing", "running"),
+        ("main::serve::slto", "slot"),
+    ] {
+        for command in ["refs", "symbol", "type"] {
+            let value = f.json(&[command, typo], 1);
+            let suggestions = value["result"]["suggestions"].as_array().unwrap();
+            assert!(
+                suggestions
+                    .iter()
+                    .any(|s| s.as_str().unwrap().contains(wanted)),
+                "{value}"
+            );
+            assert!(
+                suggestions
+                    .iter()
+                    .all(|s| !s.as_str().unwrap().contains("unrelated")),
+                "{value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn buildgraph_element_mutation_references() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "import std::collections::Array;
+class Data { pub values: Array<i64>; }
+fn f() {
+let xs = [1, 2];
+let i = 0;
+xs[i] = xs[i] + 1;
+let d = new Data(xs);
+d.values[i] = d.values[i] + 1;
+}
+fn main() {}
+",
+    )
+    .unwrap();
+    for (selector, line) in [("main::f::xs", 6), ("main::Data::values", 8)] {
+        let value = f.json(&["refs", selector], 0);
+        let refs = value["result"]["references"].as_array().unwrap();
+        assert!(
+            refs.iter()
+                .any(|r| r["location"]["line"] == line && r["role"] == "write-element"),
+            "{value}"
+        );
+        assert!(
+            refs.iter()
+                .any(|r| r["location"]["line"] == line && r["role"] != "write-element"),
+            "{value}"
+        );
+    }
+    let indices = f.json(&["refs", "main::f::i"], 0);
+    assert!(
+        indices["result"]["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["role"] == "read"),
+        "{indices}"
+    );
+}
+
+#[test]
+fn buildgraph_rename_counts_all_edits() {
+    for (source, selector, declarations, references) in [
+        (
+            "class A { pub fn unused(self) {} } fn main() {}",
+            "main::A::unused",
+            1,
+            0,
+        ),
+        (
+            "interface P { fn choose(self) -> i64; } class A implements P { pub fn choose(self) -> i64 { return 1; } } class B implements P { pub fn choose(self) -> i64 { return 2; } } class C implements P { pub fn choose(self) -> i64 { return 3; } } fn f(p: P) { println(p.choose()); } fn main() {}",
+            "main::P::choose",
+            4,
+            1,
+        ),
+    ] {
+        let f = Fixture::new();
+        fs::write(f.0.join("src/main.wi"), source).unwrap();
+        let value = f.json(&["rename", selector, "pick"], 0);
+        assert_eq!(
+            value["result"]["edits"],
+            declarations + references,
+            "{value}"
+        );
+        assert_eq!(
+            value["result"]["declarations_updated"], declarations,
+            "{value}"
+        );
+        assert_eq!(value["result"]["references_updated"], references, "{value}");
+        let after = fs::read_to_string(f.0.join("src/main.wi")).unwrap();
+        assert_eq!(
+            after.matches("pick").count(),
+            (declarations + references) as usize
+        );
+    }
+    let f = Fixture::new();
+    let output = f.run(&["rename", "order::Order::value", "get"]);
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("2 edits (1 declarations, 1 references)")
+    );
+}
+
+#[test]
+fn buildgraph_loop_evidence_has_origin_and_explanation() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "fn work(n: i64) {
+let mut i = 0;
+while i < n { i = i + 1; }
+}
+fn relay() { work(2); }
+fn main() {}
+",
+    )
+    .unwrap();
+    for name in ["main::work", "main::relay"] {
+        let value = f.json(&["effects", name, "--explain"], 0);
+        let output = f.run(&["effects", name]);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.contains("operation=synchronous-loop") && text.contains("src/main.wi:3:1"),
+            "{value}\n{text}"
+        );
+        assert!(text.contains("runtime/platform gating"), "{text}");
+        assert!(!text.contains("typed-expression-lowering"), "{text}");
+    }
 }

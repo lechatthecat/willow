@@ -1403,28 +1403,32 @@ struct DiagnosticModuleIndex {
 }
 
 impl DiagnosticModuleIndex {
+    fn package_names(graph: &module::ModuleGraph) -> std::collections::HashMap<String, String> {
+        graph
+            .package_graph
+            .as_ref()
+            .map(|packages| {
+                packages
+                    .packages
+                    .iter()
+                    .map(|package| {
+                        (
+                            semantic::ids::package_namespace(&package.identity),
+                            if package.id == packages.root {
+                                String::new()
+                            } else {
+                                format!("{}::", package.identity.name)
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn new(graph: &module::ModuleGraph) -> Self {
         Self {
-            package_names: graph
-                .package_graph
-                .as_ref()
-                .map(|packages| {
-                    packages
-                        .packages
-                        .iter()
-                        .map(|package| {
-                            (
-                                semantic::ids::package_namespace(&package.identity),
-                                if package.id == packages.root {
-                                    String::new()
-                                } else {
-                                    format!("{}::", package.identity.name)
-                                },
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
+            package_names: Self::package_names(graph),
             positions: graph
                 .files
                 .iter()
@@ -1638,6 +1642,7 @@ fn run_backend(
     } = frontend;
     let module_init_plan = ir::module_init::ModuleInitPlan::from_graph(&module_graph);
     let artifacts = module_graph.artifacts.take().expect("spooled frontend");
+    let diagnostic_packages = DiagnosticModuleIndex::package_names(&module_graph);
     let modules = module_graph.files;
     // Debug metadata is read from the same hydrated trees the declare pass
     // uses, so a debug build hydrates each unit no more often than a release
@@ -1650,6 +1655,7 @@ fn run_backend(
                 errors::CodegenError::new(errors::CodegenStage::Initialize, error),
                 map,
                 emitter,
+                &diagnostic_packages,
             )
         })?;
     codegen.body_queries = Some(std::rc::Rc::clone(&db.typed_bodies));
@@ -1711,6 +1717,7 @@ fn run_backend(
                 map,
                 emitter,
                 &artifacts,
+                &diagnostic_packages,
             )
         })?;
         let unit = artifacts.track(UnitKind::Declared, unit);
@@ -1745,6 +1752,7 @@ fn run_backend(
                 map,
                 emitter,
                 &artifacts,
+                &diagnostic_packages,
             )
         })?;
         let unit = artifacts.track(UnitKind::Declared, unit);
@@ -1785,6 +1793,7 @@ fn run_backend(
                 map,
                 emitter,
                 &artifacts,
+                &diagnostic_packages,
             )
         })?;
     }
@@ -1816,6 +1825,7 @@ fn run_backend(
             map,
             emitter,
             &artifacts,
+            &diagnostic_packages,
         )
     })?;
     drop(entry_unit);
@@ -1882,6 +1892,7 @@ fn run_backend(
                     errors::CodegenError::new(errors::CodegenStage::Metadata, error),
                     map,
                     emitter,
+                    &diagnostic_packages,
                 )
             })?;
     }
@@ -1891,6 +1902,7 @@ fn run_backend(
             errors::CodegenError::new(errors::CodegenStage::Finish, error),
             map,
             emitter,
+            &diagnostic_packages,
         )
     })?;
 
@@ -1957,14 +1969,52 @@ fn run_backend(
 }
 
 fn emit_codegen_error(
-    error: errors::CodegenError,
+    mut error: errors::CodegenError,
     map: &diagnostics::SourceMap,
     emitter: &mut dyn diagnostics::DiagnosticEmitter,
+    packages: &std::collections::HashMap<String, String>,
 ) -> anyhow::Error {
+    error.message = diagnostics::diagnostic::source_names(error.message, packages);
+    if let errors::CodegenStage::Module(name) = &mut error.stage {
+        *name = diagnostics::diagnostic::source_names(std::mem::take(name), packages);
+    }
     if let Err(error) = emitter.emit(&error.diagnostic(), map) {
         return error.into();
     }
     anyhow::Error::new(error)
+}
+
+#[cfg(test)]
+#[test]
+fn buildgraph_codegen_failure_projects_emitted_and_returned_names() {
+    struct Capture(Vec<diagnostics::Diagnostic>);
+    impl diagnostics::DiagnosticEmitter for Capture {
+        fn emit(
+            &mut self,
+            d: &diagnostics::Diagnostic,
+            _: &dyn diagnostics::source_map::SourceLookup,
+        ) -> std::io::Result<()> {
+            self.0.push(d.clone());
+            Ok(())
+        }
+    }
+    let package = "$pkg0123456789abcdef0123456789abcdef";
+    let packages = [(package.into(), "dep::".into())].into();
+    let mut emitter = Capture(Vec::new());
+    let map = diagnostics::SourceMap::new("main.wi", "");
+    let error = emit_codegen_error(
+        errors::CodegenError::new(
+            errors::CodegenStage::Module(format!("{package}::graph")),
+            format!("function `{package}.graph.empty` has invalid lowered IR"),
+        ),
+        &map,
+        &mut emitter,
+        &packages,
+    );
+    assert!(!error.to_string().contains("$pkg"), "{error}");
+    assert!(error.to_string().contains("dep::graph.empty"), "{error}");
+    assert!(!emitter.0[0].message.contains("$pkg"));
+    assert!(emitter.0[0].message.contains("dep::graph"));
 }
 
 /// Render a codegen failure, preferring the symbol conflicts the backend
@@ -1980,10 +2030,11 @@ fn report_backend_failure(
     map: &diagnostics::SourceMap,
     emitter: &mut dyn diagnostics::DiagnosticEmitter,
     artifacts: &UnitArtifacts,
+    packages: &std::collections::HashMap<String, String>,
 ) -> anyhow::Error {
     let conflicts = codegen.take_symbol_conflicts();
     if conflicts.is_empty() {
-        return emit_codegen_error(fallback, map, emitter);
+        return emit_codegen_error(fallback, map, emitter, packages);
     }
     let mut sources = diagnostics::SourceMaps::default();
     for conflict in &conflicts {

@@ -1496,7 +1496,14 @@ impl TypeChecker {
                 task_params.extend(param_types.iter().cloned());
                 task_params
             };
-            self.check_async_task_send(m.span, &return_type, &task_params, &locals);
+            self.check_async_task_send(
+                m.span,
+                &m.body,
+                &return_type,
+                &task_params,
+                &locals,
+                async_locals_before,
+            );
         }
         self.symbols.pop_scope();
         self.local.current_class = previous_class;
@@ -1568,7 +1575,14 @@ impl TypeChecker {
         self.check_all_paths_return(&f.body, &return_type, f.span, site);
         let locals = self.local.async_local_types.split_off(async_locals_before);
         if f.is_async {
-            self.check_async_task_send(f.span, &return_type, &param_types, &locals);
+            self.check_async_task_send(
+                f.span,
+                &f.body,
+                &return_type,
+                &param_types,
+                &locals,
+                async_locals_before,
+            );
         }
         self.symbols.pop_scope();
         self.local.current_effect_callable = previous_effect_callable;

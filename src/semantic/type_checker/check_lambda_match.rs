@@ -1055,7 +1055,12 @@ impl TypeChecker {
                     },
                 );
             }
-            let arm_ty = self.check_match_body(&arm.body, expected.as_ref());
+            let arm_ty = self.check_match_body(
+                &arm.body,
+                expected.as_ref().or(result_type
+                    .as_ref()
+                    .filter(|ty| matches!(ty, Type::Array(_)) && !has_array_placeholder(ty))),
+            );
             self.symbols.pop_scope();
 
             // Never arms don't constrain result type
@@ -1075,6 +1080,13 @@ impl TypeChecker {
                 _ => arm_ty,
             };
 
+            // An empty array arm contributes no element constraint, in either
+            // arm order. Keep the concrete sibling type for the whole match.
+            if let Some(existing) = &result_type
+                && array_placeholder_matches(existing, &arm_ty)
+            {
+                result_type = Some(arm_ty.clone());
+            }
             match &result_type {
                 None => result_type = Some(arm_ty),
                 Some(existing) => {
@@ -1168,7 +1180,59 @@ impl TypeChecker {
             }
         }
 
-        result_type.unwrap_or(Type::Void)
+        let result = result_type.unwrap_or(Type::Void);
+        self.resolve_empty_array_values(&m.arms, &result);
+        result
+    }
+
+    /// Repair placeholder array expression types without rechecking scopes or
+    /// duplicating diagnostics. Only value-producing branches are visited, and
+    /// only once a concrete sibling has supplied an element type.
+    fn resolve_empty_array_values(&mut self, arms: &[MatchArm], expected: &Type) {
+        if !matches!(expected, Type::Array(_)) || has_array_placeholder(expected) {
+            return;
+        }
+        let mut pending = Vec::new();
+        for arm in arms {
+            if let MatchBody::Expr(expr) = &arm.body
+                && self
+                    .expr_types
+                    .get(&expr.id())
+                    .is_some_and(|actual| array_placeholder_matches(actual, expected))
+            {
+                pending.push((expr.as_ref(), expected));
+            }
+        }
+        while let Some((expr, expected)) = pending.pop() {
+            let Some(actual) = self.expr_types.get(&expr.id()) else {
+                continue;
+            };
+            if !array_placeholder_matches(actual, expected) {
+                continue;
+            }
+            match expr {
+                Expr::ArrayLiteral(elements, _, _) => {
+                    let Type::Array(element) = expected else {
+                        continue;
+                    };
+                    pending.extend(elements.iter().map(|e| (e, element.as_ref())));
+                }
+                Expr::Match(m) => {
+                    pending.extend(m.arms.iter().filter_map(|arm| match &arm.body {
+                        MatchBody::Expr(e) => Some((e.as_ref(), expected)),
+                        _ => None,
+                    }));
+                }
+                Expr::Ternary(t) => {
+                    pending.push((&t.then_expr, expected));
+                    pending.push((&t.else_expr, expected));
+                }
+                _ => continue,
+            }
+            #[cfg(test)]
+            EMPTY_ARRAY_REFINEMENTS.with(|count| count.set(count.get() + 1));
+            self.expr_types.insert(expr.id(), expected.clone());
+        }
     }
 
     pub(super) fn check_match_body(&mut self, body: &MatchBody, expected: Option<&Type>) -> Type {
@@ -1326,6 +1390,32 @@ impl CaptureScan<'_> {
             _ => {}
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static EMPTY_ARRAY_REFINEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn array_placeholder_matches(mut actual: &Type, mut expected: &Type) -> bool {
+    while let (Type::Array(a), Type::Array(b)) = (actual, expected) {
+        if **a == Type::Void && **b != Type::Void {
+            return true;
+        }
+        actual = a;
+        expected = b;
+    }
+    false
+}
+
+fn has_array_placeholder(mut ty: &Type) -> bool {
+    while let Type::Array(element) = ty {
+        if **element == Type::Void {
+            return true;
+        }
+        ty = element;
+    }
+    false
 }
 
 #[cfg(test)]

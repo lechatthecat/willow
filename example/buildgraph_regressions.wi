@@ -1,0 +1,43 @@
+// Contextual constructors, empty match arms, explicit Send contracts, and
+// the supported two-stage form of a nested enum pattern.
+import std::collections::{Array, Map};
+
+class Registry { pub names: Map<String, i64>; pub values: Array<i64>; }
+class Explicit {
+    pub names: Map<String, i64>;
+    pub init(self, names: Map<String, i64>) { self.names = names; }
+}
+fn empty_map() -> Map<String, i64> { return Map::new(); }
+fn map_size(names: Map<String, i64>) -> i64 { return names.len(); }
+fn result(ok: bool) -> Result<Array<i64>, String> {
+    if ok { return Ok([1, 2]); }
+    return Err("empty");
+}
+interface Named extends Send { fn label(self) -> String; }
+class Name implements Named { pub fn label(self) -> String { return "safe"; } }
+enum Error { Bad(i64) }
+fn failure() -> Result<i64, Error> { return Err(Error::Bad(3)); }
+async fn main() {
+    let r = new Registry(Map::new(), []);
+    r.names.insert("one", 1);
+    println(r.names.len());
+    let explicit = new Explicit(Map::new());
+    println(explicit.names.len());
+    r.names = Map::new();
+    println(r.names.len());
+    println(map_size(Map::new()));
+    println(empty_map().len());
+    let xs = match result(false) { Result::Ok(values) => values, Result::Err(_) => [] };
+    println(xs.len());
+    let ys = match result(true) { Result::Err(_) => [], Result::Ok(values) => values };
+    println(ys.len());
+    let named: Named = new Name();
+    let names: Array<Named> = [new Name()];
+    await sleep(0);
+    println(named.label());
+    println(names[0].label());
+    match failure() {
+        Result::Ok(value) => println(value),
+        Result::Err(error) => { match error { Error::Bad(value) => println(value) } }
+    }
+}

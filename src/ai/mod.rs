@@ -270,9 +270,9 @@ pub(crate) fn capture(
                 if !summary.contains(effect) { return None; }
                 let witness = match summary.witness(effect) {
                     Some(crate::compiler_db::effects::EffectWitness::Lock(w)) => serde_json::json!({"kind":"wait", "owner_key":w.owner, "cause":w.cause}),
-                    Some(crate::compiler_db::effects::EffectWitness::Panic {owner, source}) => serde_json::json!({"kind":"panic", "owner_key":owner, "cause":{"span":Span::in_file(crate::diagnostics::FileId(source.0),source.1,source.2,0,0)}}),
+                    Some(crate::compiler_db::effects::EffectWitness::Panic {owner, source}) => serde_json::json!({"kind":"panic", "owner_key":owner, "cause":{"span":Span::in_file(crate::diagnostics::FileId(source.0),source.1,source.2,0,0), "operation":"panic-guard"}}),
                     Some(crate::compiler_db::effects::EffectWitness::External(target)) => serde_json::json!({"kind":"external-boundary","target":target.to_string()}),
-                    Some(crate::compiler_db::effects::EffectWitness::Helper(reason)) => serde_json::json!({"kind":"nonpreemptible", "reason":format!("{reason:?}")}),
+                    Some(crate::compiler_db::effects::EffectWitness::Helper { reason, owner, source }) => serde_json::json!({"kind":"nonpreemptible", "owner_key":owner, "reason":format!("{reason:?}: synchronous helper may run in a nonpreemptible region; loop safepoints are separate potential preemption points, subject to runtime/platform gating"), "cause":{"span":Span::in_file(crate::diagnostics::FileId(source.0),source.1,source.2,0,0),"operation":match reason { crate::semantic::concurrency::NonpreemptibleReason::Loop => "synchronous-loop", crate::semantic::concurrency::NonpreemptibleReason::Recursion => "synchronous-recursion" }}}),
                     None => serde_json::json!({"kind":"unavailable"}),
                 };
                 Some(serde_json::json!({"effect":effect.bits(), "witness":witness}))
@@ -335,7 +335,20 @@ pub(crate) fn capture(
                         }
                         _ => 0,
                     };
-                    Some((effects, e.span(), "typed-expression-lowering"))
+                    let operation = match e {
+                        Expr::New(_) => "object-allocation",
+                        Expr::ArrayLiteral(..) => "array-allocation",
+                        Expr::ObjectLiteral(_) => "object-literal-allocation",
+                        Expr::String(..) => "string-allocation",
+                        Expr::Await(_) => "await",
+                        Expr::Select(_) => "select",
+                        Expr::Print(..) => "print",
+                        Expr::Binary(_) => "non-scalar-addition",
+                        Expr::MethodCall(_) => "builtin-method-call",
+                        Expr::Call(_) => "builtin-call",
+                        _ => "expression",
+                    };
+                    Some((effects, e.span(), operation))
                 }
                 _ => None,
             };

@@ -1105,22 +1105,7 @@ impl TypeChecker {
                     None => self.check_expr(&s.init),
                 };
                 let ty = if let Some(ann) = &annotation {
-                    let channel_ctor_infers_from_annotation = channel_element_type(ann).is_some()
-                        && is_untyped_channel_ctor_call(&s.init);
-                    if channel_ctor_infers_from_annotation {
-                        // `Channel::new()` and `Channel::with_capacity(n)` with
-                        // no type argument are typed `Channel<void>`: the
-                        // element is not knowable from either call alone. The
-                        // annotation is what supplies it, so
-                        // record the ANNOTATION as the initializer's type
-                        // rather than leaving the placeholder behind
-                        // (willow-nk3g). Codegen reads the element type from
-                        // here to decide the channel's `is_ref` flag, and
-                        // a `Channel<String>` left as `Channel<void>` builds an
-                        // untraced buffer whose contents the collector is free
-                        // to reclaim while they are still queued.
-                        self.expr_types.insert(s.init.id(), ann.clone());
-                    } else if !self.types_compatible(ann, &inferred) {
+                    if !self.types_compatible(ann, &inferred) {
                         let code = self.type_mismatch_error_code(ann, &inferred);
                         let message = if code == ErrorCode::E0704 {
                             format!(
@@ -1179,6 +1164,9 @@ impl TypeChecker {
                 // backend can frame-back unannotated live-across-await locals
                 // (willow-lpn.5c).
                 if self.local.current_async_context {
+                    self.local
+                        .async_local_bindings
+                        .insert(self.local.async_local_types.len(), (s.name.clone(), s.span));
                     self.local.async_local_types.push(ty.clone());
                 }
                 // `_` is a wildcard: evaluate the initializer for side effects but do
@@ -1254,7 +1242,27 @@ impl TypeChecker {
                 self.check_super_init(s)
             }
             Stmt::IndexAssign(s) => {
+                let reference_start = self.analysis_symbols.references.len();
                 let arr_ty = self.check_expr(&s.array);
+                // The target expression still reads its receiver and indexes;
+                // mark only its storage path as an element mutation.
+                let mut target = &s.array;
+                while let Expr::Index(array, ..) = target {
+                    target = array;
+                }
+                for reference in &mut self.analysis_symbols.references[reference_start..] {
+                    if matches!(
+                        target,
+                        Expr::Var(..) | Expr::FieldAccess(..) | Expr::StaticField(..)
+                    ) && reference.span == target.span()
+                        && matches!(
+                            reference.target.kind.as_str(),
+                            "binding" | "parameter" | "field" | "static-field"
+                        )
+                    {
+                        reference.role = "write-element".into();
+                    }
+                }
                 let idx_ty = self.check_expr(&s.index);
                 if !matches!(idx_ty, Type::I64) {
                     self.push(

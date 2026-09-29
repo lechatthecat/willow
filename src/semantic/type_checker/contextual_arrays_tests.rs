@@ -1,4 +1,5 @@
 use super::*;
+use crate::{lexer::Lexer, parser::Parser};
 
 const PREFIX: &str = r#"
 import std::collections::Array;
@@ -185,5 +186,109 @@ fn contextual_arrays_deep_recorded_type_size() {
         }
         assert_eq!(recorded_array_nodes, depth * (depth + 1) / 2);
         eprintln!("owned array type nodes: depth={depth}: {recorded_array_nodes}");
+    }
+}
+
+#[test]
+fn buildgraph_contextual_match_twenty_perspectives() {
+    use crate::parser::iter::{AstEvent, AstWalk};
+    for scalar in ["i64", "f64", "bool", "String"] {
+        for context in ["let", "return", "argument", "constructor", "assignment"] {
+            let expr = "match true { true => [], false => [] }";
+            let body = match context {
+                "let" => format!("fn f() {{ let xs: Array<{scalar}> = {expr}; }}"),
+                "return" => format!("fn f() -> Array<{scalar}> {{ return {expr}; }}"),
+                "argument" => format!("fn g(xs: Array<{scalar}>) {{}} fn f() {{ g({expr}); }}"),
+                "constructor" => format!(
+                    "class H {{ pub xs: Array<{scalar}>; }} fn f() {{ let h = new H({expr}); }}"
+                ),
+                _ => format!("fn f() {{ let mut xs: Array<{scalar}> = []; xs = {expr}; }}"),
+            };
+            let source = format!("import std::collections::Array; {body}");
+            let (program, parse) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+            assert!(parse.is_empty(), "{parse:?}");
+            let mut checker = TypeChecker::new();
+            checker.check_program(&program);
+            assert!(
+                checker.errors.is_empty(),
+                "{context}/{scalar}: {:?}",
+                checker.errors
+            );
+            for item in &program.items {
+                if let Item::Function(f) = item {
+                    for event in AstWalk::new(AstEvent::Block(&f.body)) {
+                        if let AstEvent::Expr(e @ Expr::ArrayLiteral(..)) = event {
+                            assert_ne!(
+                                checker.expr_types[&e.id()],
+                                Type::Array(Box::new(Type::Void)),
+                                "{context}/{scalar}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn buildgraph_match_arm_work_is_linear() {
+    use super::check_collections::ARRAY_ELEMENT_CHECKS;
+    use super::check_lambda_match::EMPTY_ARRAY_REFINEMENTS;
+    for n in [16, 64, 256, 1024] {
+        let mut source =
+            String::from("import std::collections::Array; fn f(n: i64) { let xs = match n {");
+        for i in 0..n {
+            source.push_str(&format!("{i} => [],"));
+        }
+        source.push_str("_ => [1] }; }");
+        ARRAY_ELEMENT_CHECKS.with(|count| count.set(0));
+        EMPTY_ARRAY_REFINEMENTS.with(|count| count.set(0));
+        let errors = check_source(&source);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(ARRAY_ELEMENT_CHECKS.with(|count| count.get()), 1);
+        assert_eq!(EMPTY_ARRAY_REFINEMENTS.with(|count| count.get()), n);
+    }
+}
+
+#[test]
+fn buildgraph_explicit_constructor_types_are_not_overridden() {
+    for (ty, constructor) in [
+        ("Map<String, i64>", "Map<i64, i64>::new()"),
+        ("Map<String, i64>", "Map<String, String>::new()"),
+        ("Map<String, i64>", "Map<i64>::new()"),
+        ("Map<String, i64>", "Map<i64, i64, i64>::new()"),
+        ("Map<String, i64>", "Map::new(1)"),
+        ("Channel<String>", "Channel<i64>::new()"),
+        ("Channel<String>", "Channel<i64>::with_capacity(1)"),
+    ] {
+        let source = format!(
+            "import std::collections::Map; class H {{ pub value: {ty}; }} fn main() {{ let h = new H({constructor}); }}"
+        );
+        let errors = check_source(&source);
+        assert!(
+            errors.iter().any(|d| d.severity == Severity::Error),
+            "{constructor}: expected a source error"
+        );
+        assert!(
+            errors.iter().all(|d| d.code != ErrorCode::E0800),
+            "{errors:?}"
+        );
+    }
+}
+
+#[test]
+fn buildgraph_nested_empty_match_work_is_linear() {
+    use super::check_lambda_match::EMPTY_ARRAY_REFINEMENTS;
+    for n in [16, 64, 256, 1024] {
+        let source = format!(
+            "fn f() {{ let xs = match true {{ true => {}[]{} , false => [1] }}; }}",
+            "match true { true => ".repeat(n),
+            ", false => [] }".repeat(n)
+        );
+        EMPTY_ARRAY_REFINEMENTS.with(|count| count.set(0));
+        let errors = check_source(&source);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(EMPTY_ARRAY_REFINEMENTS.with(|count| count.get()), 2 * n + 1);
     }
 }

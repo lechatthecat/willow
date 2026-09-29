@@ -26,7 +26,11 @@ const NO_PREEMPT: RuntimeEffects = RuntimeEffects::NO_PREEMPT_REGION;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum EffectWitness {
     Lock(LockEffectWitness),
-    Helper(NonpreemptibleReason),
+    Helper {
+        reason: NonpreemptibleReason,
+        owner: FunctionId,
+        source: (u32, usize, usize),
+    },
     Panic {
         owner: FunctionId,
         source: (u32, usize, usize),
@@ -63,8 +67,14 @@ impl EffectEvidence {
                 Some(EffectWitness::Lock(witness)) => {
                     serde_json::json!(["lock", witness.owner, witness.cause])
                 }
-                Some(EffectWitness::Helper(reason)) => serde_json::json!([
+                Some(EffectWitness::Helper {
+                    reason,
+                    owner,
+                    source,
+                }) => serde_json::json!([
                     "helper",
+                    owner,
+                    source,
                     match reason {
                         NonpreemptibleReason::Loop => "loop",
                         NonpreemptibleReason::Recursion => "recursion",
@@ -591,6 +601,8 @@ pub(crate) fn solve_unit<N>(
         .default_transmit(PANIC.union(LOCK_EFFECT_WAIT));
     let mut own = HashSet::new();
     let mut loops = HashSet::new();
+    let mut loop_spans = HashMap::new();
+    let mut loop_body_spans = HashMap::new();
     let mut loop_bodies = HashSet::new();
     let mut copies = Vec::new();
     let mut may_io = HashSet::new();
@@ -664,7 +676,9 @@ pub(crate) fn solve_unit<N>(
         for direct in direct_bodies {
             own.insert(direct.id);
             problem = problem.body(direct.id);
-            if direct.has_loop {
+            if let Some(span) = direct.loop_span {
+                loop_spans.insert(direct.id, span);
+                loop_body_spans.insert(direct.body, span);
                 loops.insert(direct.id);
                 loop_bodies.insert(direct.body);
             }
@@ -700,6 +714,9 @@ pub(crate) fn solve_unit<N>(
     for &(id, source) in &copies {
         if loop_bodies.contains(&source) {
             loops.insert(id);
+            if let Some(&span) = loop_body_spans.get(&source) {
+                loop_spans.insert(id, span);
+            }
         }
     }
     crate::query_stats::add(crate::query_stats::Counter::EffectInventory, visits);
@@ -738,7 +755,16 @@ pub(crate) fn solve_unit<N>(
             None
         };
         if let Some(reason) = reason {
-            problem = problem.seed(id, NO_PREEMPT, Some(EffectWitness::Helper(reason)));
+            let span = loop_spans.get(&id).unwrap_or(&helpers[&id]);
+            problem = problem.seed(
+                id,
+                NO_PREEMPT,
+                Some(EffectWitness::Helper {
+                    reason,
+                    owner: id,
+                    source: (span.file_id.0, span.start, span.end),
+                }),
+            );
         }
     }
     for (&id, cause) in direct {
@@ -875,7 +901,7 @@ pub(crate) fn solve_unit<N>(
     let helpers = helpers
         .into_iter()
         .filter_map(|(id, span)| match facts.get(&id)?.witness(NO_PREEMPT)? {
-            EffectWitness::Helper(reason) => Some((
+            EffectWitness::Helper { reason, .. } => Some((
                 id,
                 NonpreemptibleHelper {
                     span,
@@ -900,7 +926,7 @@ struct DirectBodyEffects {
     panics: bool,
     panic_span: Option<crate::diagnostics::Span>,
     lock_span: Option<crate::diagnostics::Span>,
-    has_loop: bool,
+    loop_span: Option<crate::diagnostics::Span>,
     may_io: bool,
 }
 
@@ -920,7 +946,7 @@ fn scan_direct_effects<N>(
             panic_span: None,
             expr_types: types,
         };
-        let mut has_loop = false;
+        let mut loop_span = None;
         let mut may_io = false;
         let mut lock_span = None;
         let mut defer_depth = 0;
@@ -946,7 +972,9 @@ fn scan_direct_effects<N>(
                             lock_span = Some(lock.span);
                         }
                         Stmt::Defer(_) => defer_depth += 1,
-                        Stmt::While(_) | Stmt::For(_) if defer_depth == 0 => has_loop = true,
+                        Stmt::While(_) | Stmt::For(_) if defer_depth == 0 => {
+                            loop_span.get_or_insert(stmt.span());
+                        }
                         _ => {}
                     }
                 }
@@ -964,7 +992,7 @@ fn scan_direct_effects<N>(
             panics: hazards.panics,
             panic_span: hazards.panic_span,
             lock_span,
-            has_loop,
+            loop_span,
             may_io,
         });
     }
@@ -1410,6 +1438,30 @@ mod tests {
         assert_eq!(relocated[0].lock_span, Some(lock.span));
         assert_ne!(relocated[0].lock_span, cached[0].lock_span);
         assert_eq!(relocated[0].lock_span.unwrap().line, 3);
+    }
+
+    #[test]
+    fn buildgraph_cached_loop_evidence_relocates() {
+        let before = program("fn work() { while true {} }");
+        let mut after = program("\n// move loop\nfn work() { while true {} }");
+        let Item::Function(old) = &before.items[0] else {
+            panic!("function");
+        };
+        let cached = scan_direct_effects(
+            FunctionId::free("work"),
+            old.body.id,
+            &old.body,
+            &HashMap::<ExprId, Type>::new(),
+            None,
+        );
+        let mut correspondence = super::super::syntax::Correspondence::default();
+        correspondence.reconcile(&before, &mut after).unwrap();
+        let Item::Function(new) = &after.items[0] else {
+            panic!("function");
+        };
+        let relocated: Vec<DirectBodyEffects> = correspondence.remap(&cached).unwrap();
+        assert_eq!(relocated[0].loop_span, Some(new.body.stmts[0].span()));
+        assert_ne!(relocated[0].loop_span, cached[0].loop_span);
     }
 
     #[test]

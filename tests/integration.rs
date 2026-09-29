@@ -234,3 +234,6 @@ mod task_blocking;
 
 #[path = "integration/package_identity.rs"]
 mod package_identity;
+
+#[path = "integration/buildgraph_regressions.rs"]
+mod buildgraph_regressions;

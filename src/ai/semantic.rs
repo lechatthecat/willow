@@ -76,11 +76,18 @@ impl Captured {
             if bits & effect == 0 {
                 continue;
             }
-            let value = json!({"effect":effect,"witness":{"kind":"runtime-capability","certainty":"conservative-bound","cause":{"span":span,"operation":operation}}});
-            if let Some(existing) = witnesses.iter_mut().find(|w| w["effect"] == effect) {
-                if existing["witness"]["kind"] == "unavailable" {
-                    *existing = value;
-                }
+            let existing = witnesses.iter().position(|w| w["effect"] == effect);
+            if existing.is_some_and(|i| witnesses[i]["witness"]["kind"] != "unavailable") {
+                continue;
+            }
+            let mut value = json!({"effect":effect,"witness":{"kind":"runtime-capability","certainty":"conservative-bound","cause":{"span":span,"operation":operation}}});
+            if effect == RuntimeEffects::MAY_BLOCK.bits() && operation == "await" {
+                value["witness"]["reason"] = json!(
+                    "conservative await bound: stored void futures may use blocking willow_future_await_void; scheduler sleep/yield parks the task; this bound does not identify the selected lowering"
+                );
+            }
+            if let Some(i) = existing {
+                witnesses[i] = value;
             } else {
                 witnesses.push(value);
             }

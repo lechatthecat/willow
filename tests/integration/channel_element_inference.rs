@@ -512,22 +512,17 @@ fn channel_element_16_no_annotation_stays_void() {
     );
 }
 
-// 17. A constructor argument does not infer either, even though the field it
-//     fills names the element. Only the `let` form was ever accepted, and the
-//     fix records a type rather than widening what is accepted.
+// 17. Constructor fields now supply the same expected element type as let
+//     annotations (willow-jz15.28). Prove that the contextual reference flag
+//     traces a queued, dynamically allocated String during collection.
 #[test]
-fn channel_element_17_constructor_argument_stays_void() {
-    let stderr = compile_error_stderr(
-        "class Hub { pub inbox: Channel<String>; }
-async fn main() {
-    let hub = new Hub(Channel::new());
-    hub.inbox.send(\"x\");
-}
-",
-    );
-    assert!(
-        stderr.contains("Channel<void>"),
-        "expected the constructor argument to stay `Channel<void>`, got: {stderr}"
+fn channel_element_17_constructor_argument_uses_field_context() {
+    assert_channels(
+        &format!(
+            "class Hub {{ pub inbox: Channel<String>; }}\nasync fn main() {{\nlet hub = new Hub(Channel::new());\nhub.inbox.send(\"x\" + 1.toString());\n{PAD}println(hub.inbox.recv());\n}}"
+        ),
+        "x1\n",
+        &["main"],
     );
 }
 
@@ -565,23 +560,16 @@ fn channel_element_18_with_capacity_infers_from_the_annotation() {
     );
 }
 
-// 18b. The line perspective 17 draws holds for the bounded constructor as well:
-//      inference is a `let` annotation and nothing else, so `with_capacity` in a
-//      constructor argument still stays `Channel<void>` rather than picking up
-//      the field's element. Widening 18 must not have widened this.
+// 18b. The bounded constructor shares contextual element inference, including
+//      the queued reference's GC tracing, with the unbounded constructor.
 #[test]
-fn channel_element_18b_with_capacity_outside_a_let_stays_void() {
-    let stderr = compile_error_stderr(
-        "class Hub { pub inbox: Channel<String>; }
-async fn main() {
-    let hub = new Hub(Channel::with_capacity(4));
-    hub.inbox.send(\"x\");
-}
-",
-    );
-    assert!(
-        stderr.contains("Channel<void>"),
-        "expected a constructor argument to stay `Channel<void>`, got: {stderr}"
+fn channel_element_18b_with_capacity_uses_field_context() {
+    assert_channels(
+        &format!(
+            "class Hub {{ pub inbox: Channel<String>; }}\nasync fn main() {{\nlet hub = new Hub(Channel::with_capacity(4));\nhub.inbox.send(\"x\" + 1.toString());\n{PAD}println(hub.inbox.recv());\n}}"
+        ),
+        "x1\n",
+        &["main"],
     );
 }
 

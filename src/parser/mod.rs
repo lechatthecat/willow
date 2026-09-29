@@ -99,6 +99,11 @@ impl Parser {
         }
 
         errors.append(&mut self.recovered_errors);
+        errors.sort_by_key(|error| {
+            error
+                .primary_span()
+                .map(|span| (span.file_id.0, span.start))
+        });
         (
             Program {
                 type_uses: std::mem::take(&mut self.type_uses),
@@ -304,6 +309,7 @@ impl Parser {
             if matches!(
                 self.peek_kind(),
                 TokenKind::Fn
+                    | TokenKind::Async
                     | TokenKind::Class
                     | TokenKind::Interface
                     | TokenKind::Pub
