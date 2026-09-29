@@ -614,23 +614,50 @@ fn help(args: &[String]) -> Option<String> {
             .filter(|c| !c.starts_with('-')),
         _ => return None,
     };
+    if command == Some("advanced") {
+        return Some(advanced_usage());
+    }
     let lines: Vec<_> = command
         .map(|c| format!("  willow {c} "))
         .map(|prefix| {
-            usage()
+            detailed_usage()
                 .lines()
                 .filter(|line| line.starts_with(&prefix) || line.trim_end() == prefix.trim_end())
                 .collect()
         })
         .unwrap_or_default();
     Some(if lines.is_empty() {
-        usage().into()
+        usage()
     } else {
         format!("Usage:\n{}", lines.join("\n"))
     })
 }
 
-fn usage() -> &'static str {
+fn usage() -> String {
+    let lines = detailed_usage()
+        .lines()
+        .filter(|line| !is_advanced_usage(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{lines}\n  willow help advanced")
+}
+
+fn advanced_usage() -> String {
+    let lines = detailed_usage()
+        .lines()
+        .filter(|line| is_advanced_usage(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Usage (advanced protocol):\n{lines}")
+}
+
+fn is_advanced_usage(line: &str) -> bool {
+    line.starts_with("  willow edit ")
+        || line.starts_with("  willow query ")
+        || line.starts_with("  willow impact <source.wi|project-dir>")
+}
+
+fn detailed_usage() -> &'static str {
     "Usage:\n  willow agent instructions <codex|claude> [--format human|json]\n  willow agent sync [--yes]\n  willow init [DIR] [--name NAME]\n  init preserves existing Git repositories and .gitignore files; outside a repository, run git init in DIR to activate ignore rules. Parent repositories need no nested git init.\n  willow metadata [project-dir] [--format human|json|ndjson]\n  Package commands accept --format human|json|ndjson (default human).\n  willow edit prepare --root DIR --entry main.wi [--project] --requests edits.json [--changes full|diff]\n  willow edit preview --root DIR --transaction ID [--changes full|diff]\n  willow edit <validate|apply|recover> --root DIR --transaction ID\n  willow rename SELECTOR NEW_NAME [--dry-run] [--source FILE | --project-dir DIR] [--format human|json|ndjson] [--verbose]\n  willow impact <source.wi|project-dir> (--file PATH --byte N | --function ID --revision REV) [--direction callers|callees] [--max-nodes N] [--max-depth N]\n  willow query <source.wi|project-dir> --requests queries.json\n  willow refs SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow references SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow symbol SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow type SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow effects SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow impact SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths]\n  willow check <source.wi|project-dir> [--format human|ndjson]\n  willow build <source.wi|project-dir> [--format human|ndjson] [--protocol-version 1]\n  willow add [alias] --git URL [--version REQ] [--dry-run] [--project-dir DIR]\n  willow add [alias] --path DIR [--dry-run] [--project-dir DIR]\n  willow add URL [--dry-run] [--project-dir DIR]\n  willow remove alias [--dry-run] [--project-dir DIR]\n  willow update [alias] [--breaking] [--dry-run] [--project-dir DIR]\n  willow deps tree [--project-dir DIR]\n  willow deps why <alias|package-name> [--project-dir DIR]\n  willow package verify [PATH] [--format human|json|ndjson]\n  willow build <source.wi|project-dir> [-o <output>] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--emit-hir] [--emit-lir] [--runtime-lib <path>]\n  willow run [source.wi|project-dir] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--runtime-lib <path>] [-- <args>...]\n  willow fetch [project-dir] [--locked|--offline|--frozen] [--format human|json|ndjson]\n  willow debug <source.wi> [--runtime-lib <path>]"
 }
 
@@ -726,6 +753,49 @@ mod tests {
         // Arguments after `--` belong to the program being run.
         assert!(help(&args(&["run", "main.wi", "--", "--help"])).is_none());
         assert!(help(&args(&["build", "main.wi"])).is_none());
+    }
+
+    #[test]
+    fn top_level_help_keeps_protocol_commands_under_advanced() {
+        let top = help(&args(&["--help"])).unwrap();
+        assert!(top.contains("willow impact SELECTOR"));
+        assert!(top.contains("willow help advanced"));
+        for hidden in [
+            "willow impact <source.wi|project-dir>",
+            "willow query <source.wi|project-dir>",
+            "willow edit prepare",
+            "willow edit preview",
+            "willow edit <validate|apply|recover>",
+        ] {
+            assert!(!top.contains(hidden), "{hidden}: {top}");
+        }
+
+        let advanced = help(&args(&["help", "advanced"])).unwrap();
+        for visible in [
+            "willow impact <source.wi|project-dir>",
+            "willow query <source.wi|project-dir>",
+            "willow edit prepare",
+            "willow edit preview",
+            "willow edit <validate|apply|recover>",
+        ] {
+            assert!(advanced.contains(visible), "{visible}: {advanced}");
+        }
+        assert!(!advanced.contains("willow impact SELECTOR"));
+        assert!(
+            help(&args(&["impact", "--help"]))
+                .unwrap()
+                .contains("--function ID")
+        );
+        assert!(
+            help(&args(&["query", "--help"]))
+                .unwrap()
+                .contains("--requests")
+        );
+        assert!(
+            help(&args(&["edit", "--help"]))
+                .unwrap()
+                .contains("willow edit prepare")
+        );
     }
 
     #[test]
