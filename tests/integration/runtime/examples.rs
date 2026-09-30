@@ -5,6 +5,10 @@ use super::*;
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
         (
+            "example/compound_and_multiline.wi",
+            "compound assignment\nand a multi-line string\n1\n",
+        ),
+        (
             "example/buildgraph_regressions.wi",
             "1\n0\n0\n0\n0\n0\n2\nsafe\nsafe\n3\n",
         ),
@@ -847,6 +851,18 @@ fn test_runnable_example_catalog_is_complete() {
         actual_paths, expected_paths,
         "every runnable non-future example entrypoint should have an output assertion"
     );
+}
+
+#[test]
+fn test_compound_and_multiline_example() {
+    let path = "example/compound_and_multiline.wi";
+    let (_, expected) = runnable_example_cases()
+        .iter()
+        .find(|(entry, _)| *entry == path)
+        .expect("example must be cataloged");
+    let (out, ok) = compile_file_and_run(path);
+    assert!(ok, "{path} failed to compile or run");
+    assert_eq!(out, *expected, "{path} output mismatch");
 }
 
 #[test]

@@ -431,7 +431,7 @@ fn a29_nested_bare_generic_reports_only_the_inner() {
     );
 }
 
-// 30. The primary label sits on the annotated parameter.
+// 30. The primary label sits on the parameter's type annotation.
 #[test]
 fn a30_label_span_is_the_annotation() {
     let src = "fn main() {}\nfn f(o: Option) -> i64 { return 1; }";
@@ -439,7 +439,8 @@ fn a30_label_span_is_the_annotation() {
     assert_eq!(d.len(), 1, "{d:?}");
     let span = d[0].labels[0].span;
     assert_eq!(span.line, 2, "{d:?}");
-    assert_eq!(span.col, 6, "{d:?}");
+    assert_eq!(span.col, 9, "{d:?}");
+    assert_eq!(&src[span.start..span.end], "Option", "{d:?}");
 }
 
 // 31. `Result` lists both of its parameters.
