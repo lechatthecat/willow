@@ -598,6 +598,41 @@ fn test_module_qualified_call_no_alias() {
     assert_eq!(out, "30\n");
 }
 
+#[test]
+fn item_import_also_allows_qualified_call_from_same_module() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import math::{add};\nfn main() { println(math::add(10, 20)); }\n",
+            ),
+            aliasable_math(),
+        ],
+        "main.wi",
+    );
+    assert!(ok);
+    assert_eq!(out, "30\n");
+}
+
+#[test]
+fn item_import_qualified_call_with_module_class_arguments() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import book::{Book, ticks}; fn main() { let b = new Book(8); println(book::same_trade(b, b)); }",
+            ),
+            (
+                "book.wi",
+                "module book; pub class Book { pub id: i64; pub init(self, id: i64) { self.id = id; } } pub fn ticks() -> i64 { return 1; } pub fn same_trade(a: Book, b: Book) -> bool { return a.id == b.id; }",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(ok);
+    assert_eq!(out, "true\n");
+}
+
 // Accessing a module item with `.` is an error that points at `::`.
 #[test]
 fn test_module_dot_access_rejected() {

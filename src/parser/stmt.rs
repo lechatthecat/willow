@@ -450,6 +450,12 @@ impl Parser {
     pub(super) fn parse_expr_stmt(&mut self) -> Result<Stmt, Diagnostic> {
         let span = self.current_span();
         let mut expr = self.parse_expr()?;
+        if let Some(op) = compound_assignment_op(self.peek_kind()) {
+            self.advance();
+            let rhs = self.parse_expr()?;
+            self.expect(TokenKind::Semicolon)?;
+            return self.make_compound_assignment(expr, op, rhs, span);
+        }
         // `array[index] = value;` — element assignment. Detected after parsing
         // the lvalue expression because the index can be an arbitrary expression
         // (fixed lookahead cannot find the `=`).
@@ -546,4 +552,116 @@ impl Parser {
         self.expect(TokenKind::Semicolon)?;
         Ok(Stmt::Expr(ExprStmt { expr, span }))
     }
+
+    fn make_compound_assignment(
+        &self,
+        mut lhs: Expr,
+        op: BinOp,
+        rhs: Expr,
+        span: crate::diagnostics::Span,
+    ) -> Result<Stmt, Diagnostic> {
+        let binary = |left: Expr| {
+            Expr::Binary(Box::new(BinaryExpr {
+                id: ExprId::fresh(),
+                op,
+                lhs: left,
+                rhs,
+                span,
+            }))
+        };
+        let temp_var = |name: &str| Expr::Var(name.to_owned(), span, ExprId::fresh());
+        let temp_let = |name: &str, init| {
+            Stmt::Let(LetStmt {
+                name: name.to_owned(),
+                mutable: false,
+                ty: None,
+                init,
+                span,
+            })
+        };
+        let scoped = |stmts| {
+            Stmt::If(IfStmt {
+                cond: Expr::Bool(true, span, ExprId::fresh()),
+                then_block: Block {
+                    id: BodyId::fresh(),
+                    stmts,
+                    span,
+                },
+                else_block: None,
+                span,
+            })
+        };
+        match &mut lhs {
+            Expr::Var(name, _, _) => Ok(Stmt::Assign(AssignStmt {
+                value: binary(temp_var(name)),
+                name: std::mem::take(name),
+                span,
+            })),
+            Expr::FieldAccess(object, field, target_span, _) => {
+                // The receiver is captured before the read and the RHS. `self`
+                // is a stable binding; keep constructor field initialization
+                // visible to definite-assignment analysis.
+                let is_self = matches!(&**object, Expr::Var(name, _, _) if name == "self");
+                let receiver = format!("$compound_receiver_{}", span.start);
+                let read_object = temp_var(if is_self { "self" } else { &receiver });
+                let store_object = temp_var(if is_self { "self" } else { &receiver });
+                let read = Expr::FieldAccess(
+                    Box::new(read_object),
+                    field.clone(),
+                    *target_span,
+                    ExprId::fresh(),
+                );
+                let assignment = Stmt::FieldAssign(FieldAssignStmt {
+                    target_span: *target_span,
+                    object: store_object,
+                    field: std::mem::take(field),
+                    value: binary(read),
+                    span,
+                });
+                if is_self {
+                    Ok(assignment)
+                } else {
+                    Ok(scoped(vec![temp_let(&receiver, object.take()), assignment]))
+                }
+            }
+            Expr::Index(array, index, target_span, _) => {
+                let receiver = format!("$compound_array_{}", span.start);
+                let subscript = format!("$compound_index_{}", span.start);
+                let read = Expr::Index(
+                    Box::new(temp_var(&receiver)),
+                    Box::new(temp_var(&subscript)),
+                    *target_span,
+                    ExprId::fresh(),
+                );
+                let assignment = Stmt::IndexAssign(IndexAssignStmt {
+                    array: temp_var(&receiver),
+                    index: temp_var(&subscript),
+                    value: binary(read),
+                    span,
+                });
+                Ok(scoped(vec![
+                    temp_let(&receiver, array.take()),
+                    temp_let(&subscript, index.take()),
+                    assignment,
+                ]))
+            }
+            _ => Err(Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0106,
+                "invalid compound assignment target",
+            )
+            .with_label(Label::primary(span, "cannot assign to this expression"))),
+        }
+    }
+}
+
+fn compound_assignment_op(token: &TokenKind) -> Option<BinOp> {
+    Some(match token {
+        TokenKind::PlusEq => BinOp::Add,
+        TokenKind::MinusEq => BinOp::Sub,
+        TokenKind::StarEq => BinOp::Mul,
+        TokenKind::SlashEq => BinOp::Div,
+        TokenKind::PercentEq => BinOp::Rem,
+        _ => return None,
+    })
 }

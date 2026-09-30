@@ -654,6 +654,8 @@ mod closures;
 mod collection_display;
 #[path = "codegen/collection_inference.rs"]
 mod collection_inference;
+#[path = "codegen/compound_assignments.rs"]
+mod compound_assignments;
 #[path = "codegen/constructors.rs"]
 mod constructors;
 #[path = "codegen/defer.rs"]

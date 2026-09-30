@@ -1036,6 +1036,25 @@ class ProtectedCtor { prot init(self) {} }
     }
 
     #[test]
+    fn compound_index_expansion_is_constant_per_statement() {
+        for count in [1, 16, 64] {
+            let source = format!(
+                "fn main() {{ let mut a = [0]; {} }}",
+                "a[0] += 1;".repeat(count)
+            );
+            let program = parse_ok(&source);
+            let body = &first_function(&program).body;
+            assert_eq!(body.stmts.len(), count + 1);
+            for stmt in &body.stmts[1..] {
+                let Stmt::If(expansion) = stmt else {
+                    panic!("compound index must capture its place once: {stmt:?}");
+                };
+                assert_eq!(expansion.then_block.stmts.len(), 3);
+            }
+        }
+    }
+
+    #[test]
     fn parses_module_qualified_static_call() {
         let program = parse_ok("fn main() { geom::Point::new(1, 2); }");
         let function = first_function(&program);
@@ -1572,10 +1591,15 @@ class ProtectedCtor { prot init(self) {} }
             // Binary/postfix operators and punctuation cannot start an
             // expression → try-propagate.
             TokenKind::Plus
+            | TokenKind::PlusEq
+            | TokenKind::MinusEq
             | TokenKind::Star
+            | TokenKind::StarEq
             | TokenKind::StarStar
             | TokenKind::Slash
+            | TokenKind::SlashEq
             | TokenKind::Percent
+            | TokenKind::PercentEq
             | TokenKind::Eq
             | TokenKind::EqEq
             | TokenKind::BangEq
@@ -1681,11 +1705,16 @@ class ProtectedCtor { prot init(self) {} }
             TokenKind::StringLiteral("s".to_string()),
             TokenKind::Ident("x".to_string()),
             TokenKind::Plus,
+            TokenKind::PlusEq,
             TokenKind::Minus,
+            TokenKind::MinusEq,
             TokenKind::Star,
+            TokenKind::StarEq,
             TokenKind::StarStar,
             TokenKind::Slash,
+            TokenKind::SlashEq,
             TokenKind::Percent,
+            TokenKind::PercentEq,
             TokenKind::Eq,
             TokenKind::EqEq,
             TokenKind::BangEq,

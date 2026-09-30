@@ -246,7 +246,7 @@ impl TypeChecker {
     fn check_constructor_body(&mut self, ctor: &ConstructorDecl, c: &ClassDecl) {
         let param_types = self.normalize_param_types(&ctor.params);
         for (param, ty) in ctor.params.iter().zip(param_types.iter()) {
-            self.validate_type(ty, param.span);
+            self.validate_type(ty, param.type_span);
         }
         let previous_class = self.local.current_class.replace(c.name.clone());
         let previous_effect_callable = self
@@ -1414,7 +1414,7 @@ impl TypeChecker {
         let param_types = self.normalize_param_types(&m.params);
         self.validate_type(&return_type, m.span);
         for (param, ty) in m.params.iter().zip(param_types.iter()) {
-            self.validate_type(ty, param.span);
+            self.validate_type(ty, param.type_span);
         }
         if m.is_async && is_task_handle_type(&return_type) {
             self.push(
@@ -1521,7 +1521,7 @@ impl TypeChecker {
         let param_types = self.normalize_param_types(&f.params);
         self.validate_type(&return_type, f.span);
         for (param, ty) in f.params.iter().zip(param_types.iter()) {
-            self.validate_type(ty, param.span);
+            self.validate_type(ty, param.type_span);
         }
         // An async fn already returns `Task<ReturnType>`, so its declared return
         // type must be the awaited value, not a task handle — otherwise the call

@@ -836,6 +836,36 @@ mod tests {
     }
 
     #[test]
+    fn missing_collection_parameter_labels_type_not_name() {
+        for (source, code, expected) in [
+            (
+                "fn len(xs: Array<i64>) -> i64 { return 0; }",
+                ErrorCode::E2001,
+                "Array<i64>",
+            ),
+            (
+                "class C { pub init(self, xs: Array<i64>) {} }",
+                ErrorCode::E2001,
+                "Array<i64>",
+            ),
+            (
+                "class C { pub fn get(self, xs: Map<i64, i64>) {} }",
+                ErrorCode::E2002,
+                "Map<i64, i64>",
+            ),
+        ] {
+            let (checker, _, _) = compare(source);
+            let error = checker
+                .errors
+                .iter()
+                .find(|error| error.code == code)
+                .expect("missing collection import");
+            let span = error.primary_span().expect("primary type label");
+            assert_eq!(&source[span.start..span.end], expected);
+        }
+    }
+
+    #[test]
     fn typed_body_computations_scale_with_roots_and_cache_replays_keep_local_tables() {
         for count in [16, 64, 256] {
             let source: String = (0..count)

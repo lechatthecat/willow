@@ -1,5 +1,50 @@
 use super::*;
 
+#[test]
+fn map_new_in_field_assignment_uses_field_type() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std::collections::Map;
+class Registry {
+    pub values: Map<i64, i64>;
+    pub init(self) { self.values = Map::new(); }
+}
+fn main() {
+    let registry = new Registry();
+    registry.values.insert(3, 7);
+    println(registry.values.len());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "1\n");
+}
+
+#[test]
+fn analogous_constructors_in_field_assignments_use_field_types() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std::collections::Array;
+class Holder {
+    pub channel: Channel<i64>;
+    pub values: Array<i64>;
+    pub init(self) {
+        self.channel = Channel::new();
+        self.values = [];
+    }
+}
+fn main() {
+    let holder = new Holder();
+    holder.channel.send(4);
+    println(holder.channel.recv());
+    println(holder.values.len());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "4\n0\n");
+}
+
 // ── Map<K,V> type (willow-5t6) ─────────────────────────────────────────────
 // GC-managed hash map: Map::new(), .insert(k,v), .get(k) -> Option<V>,
 // .contains(k) -> bool, .len() -> i64. Keys: String (by content) or i64.

@@ -1,0 +1,19 @@
+import std::collections::{Array, Map};
+
+class Totals {
+    pub counts: Map<i64, i64>;
+
+    pub init(self) {
+        self.counts = Map::new();
+    }
+}
+
+fn main() {
+    let mut values: Array<i64> = [2];
+    values[0] += 3;
+    let totals = new Totals();
+    totals.counts.insert(1, values[0]);
+    println("compound assignment
+and a multi-line string");
+    println(totals.counts.len());
+}

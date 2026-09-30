@@ -72,13 +72,21 @@ impl<'a> Lexer<'a> {
         let kind = match b {
             b'+' => {
                 self.advance();
-                TokenKind::Plus
+                if self.peek() == Some(b'=') {
+                    self.advance();
+                    TokenKind::PlusEq
+                } else {
+                    TokenKind::Plus
+                }
             }
             b'-' => {
                 self.advance();
                 if self.peek() == Some(b'>') {
                     self.advance();
                     TokenKind::Arrow
+                } else if self.peek() == Some(b'=') {
+                    self.advance();
+                    TokenKind::MinusEq
                 } else {
                     TokenKind::Minus
                 }
@@ -86,22 +94,34 @@ impl<'a> Lexer<'a> {
             b'*' => {
                 self.advance();
                 // Maximal munch: `**` is exponentiation, so `***` is `**` then
-                // `*`. There is no `*=`, so `**=` is `**` followed by `=` and
-                // the parser rejects it — `**=` is not a V1 assignment operator.
+                // `*`. `**=` remains `**` followed by `=`.
                 if self.peek() == Some(b'*') {
                     self.advance();
                     TokenKind::StarStar
+                } else if self.peek() == Some(b'=') {
+                    self.advance();
+                    TokenKind::StarEq
                 } else {
                     TokenKind::Star
                 }
             }
             b'/' => {
                 self.advance();
-                TokenKind::Slash
+                if self.peek() == Some(b'=') {
+                    self.advance();
+                    TokenKind::SlashEq
+                } else {
+                    TokenKind::Slash
+                }
             }
             b'%' => {
                 self.advance();
-                TokenKind::Percent
+                if self.peek() == Some(b'=') {
+                    self.advance();
+                    TokenKind::PercentEq
+                } else {
+                    TokenKind::Percent
+                }
             }
             b'!' => {
                 self.advance();
@@ -270,7 +290,10 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     return Ok(TokenKind::StringLiteral(value));
                 }
-                b'\n' => return Err(self.err_unterminated_string_at(start, line, col)),
+                b'\n' => {
+                    self.advance();
+                    value.push('\n');
+                }
                 b'\\' => {
                     self.advance();
                     if self.pos >= self.bytes.len() || self.bytes[self.pos] == b'\n' {
@@ -910,6 +933,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn quoted_string_can_contain_raw_newlines_and_resume_on_next_line() {
+        let tokens = Lexer::new("\"first\nsecond\"\n42")
+            .tokenize()
+            .expect("multi-line string");
+        assert_eq!(
+            tokens[0].kind,
+            TokenKind::StringLiteral("first\nsecond".into())
+        );
+        assert_eq!(tokens[1].span.line, 3);
+        assert_eq!(tokens[1].kind, TokenKind::Integer(42));
+    }
+
+    #[test]
+    fn unclosed_multi_line_string_reports_opening_quote() {
+        let error = Lexer::new("\"first\nsecond")
+            .tokenize()
+            .expect_err("missing closing quote");
+        assert_eq!(error.diagnostics[0].code, ErrorCode::E0051);
+        assert_eq!(error.diagnostics[0].primary_span().unwrap().start, 0);
+    }
+
     // Perspective 35: there is no `**=` operator — it lexes as `**` then `=`,
     // which the parser rejects as a malformed assignment.
     #[test]
@@ -925,15 +970,14 @@ mod tests {
         );
     }
 
-    // Perspective 36: `*=` is likewise not an operator; `*` then `=`.
+    // Perspective 36: `*=` is a compound assignment token.
     #[test]
-    fn pow_12_star_equals_is_star_then_eq() {
+    fn pow_12_star_equals_is_compound_assignment() {
         assert_eq!(
             kinds("x *= 2").unwrap(),
             vec![
                 TokenKind::Ident("x".to_string()),
-                TokenKind::Star,
-                TokenKind::Eq,
+                TokenKind::StarEq,
                 TokenKind::Integer(2)
             ]
         );
