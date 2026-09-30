@@ -83,7 +83,7 @@ impl TypeChecker {
     pub(super) fn check_index(&mut self, arr: &Expr, index: &Expr, span: Span) -> Type {
         let arr_ty = self.check_expr(arr);
         let idx_ty = self.check_expr(index);
-        if !matches!(idx_ty, Type::I64) {
+        if !matches!(idx_ty, Type::I64) && !Self::is_error_type(&idx_ty) {
             self.push(
                 Diagnostic::new(
                     Severity::Error,
@@ -92,6 +92,9 @@ impl TypeChecker {
                 )
                 .with_label(Label::primary(index.span(), "index is not an `i64`")),
             );
+        }
+        if Self::is_error_type(&arr_ty) {
+            return Self::error_type();
         }
         match &arr_ty {
             Type::Array(elem) => (**elem).clone(),

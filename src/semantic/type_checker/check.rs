@@ -1424,7 +1424,10 @@ impl TypeChecker {
             Stmt::If(s) => {
                 let errors_before = self.error_generation;
                 let cond_ty = self.check_expr(&s.cond);
-                if cond_ty != Type::Bool && self.error_generation == errors_before {
+                if cond_ty != Type::Bool
+                    && !Self::is_error_type(&cond_ty)
+                    && self.error_generation == errors_before
+                {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -1446,7 +1449,10 @@ impl TypeChecker {
             Stmt::While(s) => {
                 let errors_before = self.error_generation;
                 let cond_ty = self.check_expr(&s.cond);
-                if cond_ty != Type::Bool && self.error_generation == errors_before {
+                if cond_ty != Type::Bool
+                    && !Self::is_error_type(&cond_ty)
+                    && self.error_generation == errors_before
+                {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -1467,6 +1473,7 @@ impl TypeChecker {
             Stmt::For(s) => {
                 let iterable_ty = self.check_expr(&s.iterable);
                 let elem_ty = match &iterable_ty {
+                    ty if Self::is_error_type(ty) => Self::error_type(),
                     Type::Array(elem) => (**elem).clone(),
                     Type::Generic(name, args)
                         if name == "Range" && args.as_slice() == [Type::I64] =>
@@ -1821,7 +1828,13 @@ impl TypeChecker {
     }
 
     pub(super) fn check_expr(&mut self, expr: &Expr) -> Type {
+        let generation = self.error_generation;
         let ty = self.check_expr_inner(expr);
+        let ty = if ty == Type::Void && self.error_generation != generation {
+            Self::error_type()
+        } else {
+            ty
+        };
         // What the written class turned out to name, per call site: HIR lowering
         // rewrites `Level::High` to the build-wide identity `signal::Level::High`
         // with this, because the node's type already carries that identity and
@@ -2133,6 +2146,12 @@ impl TypeChecker {
                     return Type::Void;
                 }
                 let obj_ty = self.check_expr(&m.object);
+                if Self::is_error_type(&obj_ty) {
+                    for arg in &m.args {
+                        self.check_expr(&arg.expr);
+                    }
+                    return Self::error_type();
+                }
                 self.record_builtin_lock_effect(&obj_ty, m);
                 if let Some(ret) = self.check_option_result_method_call(&obj_ty, m) {
                     return ret;
@@ -2263,7 +2282,8 @@ impl TypeChecker {
                 if !matches!(
                     &arg_ty,
                     Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never
-                ) {
+                ) && !Self::is_error_type(&arg_ty)
+                {
                     let fn_name = if *newline { "println" } else { "print" };
                     self.push(
                         Diagnostic::new(
@@ -2288,7 +2308,10 @@ impl TypeChecker {
             Expr::Ternary(t) => {
                 let errors_before = self.error_generation;
                 let cond_ty = self.check_expr(&t.condition);
-                if cond_ty != Type::Bool && self.error_generation == errors_before {
+                if cond_ty != Type::Bool
+                    && !Self::is_error_type(&cond_ty)
+                    && self.error_generation == errors_before
+                {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,

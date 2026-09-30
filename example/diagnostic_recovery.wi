@@ -1,0 +1,17 @@
+import std::collections::Array;
+
+// Arrays do not provide clone(): use an explicit element copy.
+// For a diagnostic experiment, replace copy(input) below with input.clone().
+// Inspect a typo: willow symbol Trap::Underflw --source example/diagnostic_recovery.wi
+// Inspect loop evidence: willow effects copy --source example/diagnostic_recovery.wi
+enum Trap { Underflow, Overflow }
+fn copy(input: Array<i64>) -> Array<i64> {
+    let mut output: Array<i64> = [];
+    for value in input { output.push(value); }
+    return output;
+}
+fn main() {
+    let input = [1, 2, 3];
+    let code = copy(input);
+    println(code.len());
+}

@@ -169,6 +169,8 @@ pub struct TypeChecker {
     /// cycle from its own declaration; the first one in declaration order
     /// reports it and the rest stay silent (willow-jlky).
     reported_class_cycles: HashSet<String>,
+    invalid_type_names: std::rc::Rc<std::cell::RefCell<HashSet<String>>>,
+    import_type_hints: std::rc::Rc<std::cell::OnceCell<HashMap<String, Vec<String>>>>,
     /// Collection type names referenced through fully-qualified `std` paths.
     fully_qualified_collection_types: HashSet<String>,
     /// Suppress duplicate missing-import diagnostics per type name.
@@ -305,6 +307,8 @@ impl TypeChecker {
             static_call_classes: HashMap::new(),
             lambda_captures: HashMap::new(),
             reported_class_cycles: HashSet::new(),
+            invalid_type_names: Default::default(),
+            import_type_hints: Default::default(),
             fully_qualified_collection_types: HashSet::new(),
             missing_collection_imports_reported: HashSet::new(),
             resolved_calls: HashMap::new(),
@@ -965,6 +969,55 @@ impl TypeChecker {
         }
     }
 
+    // Recovery-only nominal marker: cannot be spelled by source syntax and never
+    // reaches lowering, since its creation requires an error diagnostic.
+    fn error_type() -> Type {
+        Type::Named("\0diagnostic-error".into())
+    }
+    fn is_error_type(ty: &Type) -> bool {
+        matches!(ty, Type::Named(name) if name == "\0diagnostic-error")
+    }
+
+    fn unknown_type_help(&self, name: &str) -> String {
+        let hints = self.import_type_hints.get_or_init(|| {
+            let mut hints: HashMap<String, Vec<String>> = HashMap::new();
+            for (name, public) in self
+                .symbols
+                .classes
+                .values()
+                .map(|v| (&v.name, v.public))
+                .chain(self.symbols.enums.values().map(|v| (&v.name, v.public)))
+                .chain(
+                    self.symbols
+                        .interfaces
+                        .values()
+                        .map(|v| (&v.name, v.public)),
+                )
+            {
+                if public && let Some((_, short)) = name.rsplit_once("::") {
+                    let names = hints.entry(short.to_owned()).or_default();
+                    names.push(name.clone());
+                    names.sort_unstable();
+                    names.dedup();
+                    names.truncate(5);
+                }
+            }
+            hints
+        });
+        if let Some(names) = hints.get(name) {
+            return format!(
+                "import the type: {}",
+                names
+                    .iter()
+                    .take(5)
+                    .map(|n| format!("`import {n};`"))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            );
+        }
+        "define a class, enum, or interface with this name, or check the spelling".into()
+    }
+
     fn validate_type(&mut self, ty: &Type, span: Span) {
         match ty {
             Type::Array(element) => {
@@ -1017,6 +1070,7 @@ impl TypeChecker {
                     && self.symbols.lookup_enum(name).is_none()
                     && self.symbols.lookup_interface(name).is_none()
                 {
+                    self.invalid_type_names.borrow_mut().insert(name.clone());
                     let diag = if self.symbols.lookup_module(name).is_some() {
                         Diagnostic::new(
                             Severity::Error,
@@ -1034,7 +1088,7 @@ impl TypeChecker {
                             format!("cannot find type `{name}`"),
                         )
                         .with_label(Label::primary(span, "not a known type"))
-                        .with_help("define a class or enum with this name, or check the spelling")
+                        .with_help(self.unknown_type_help(name))
                     };
                     self.push(diag);
                 }
@@ -1085,6 +1139,7 @@ impl TypeChecker {
         } else if given > 0 && !compiler_known_generic_head(name) {
             // `Type::Named` reports its own unknown names; a generic head
             // that resolves to nothing is the same defect one spelling wider.
+            self.invalid_type_names.borrow_mut().insert(name.to_owned());
             self.push(
                 Diagnostic::new(
                     Severity::Error,
@@ -1092,9 +1147,7 @@ impl TypeChecker {
                     format!("cannot find type `{name}`"),
                 )
                 .with_label(Label::primary(span, "not a known type"))
-                .with_help(
-                    "define a class, enum, or interface with this name, or check the spelling",
-                ),
+                .with_help(self.unknown_type_help(name)),
             );
             return;
         } else {
@@ -1257,7 +1310,8 @@ impl TypeChecker {
     fn types_compatible(&self, expected: &Type, actual: &Type) -> bool {
         // A diverging expression produces no value and can flow into any
         // expected type. This is directional: concrete values cannot become Never.
-        *actual == Type::Never || self.same_type_identity(expected, actual)
+        Self::is_error_type(expected) || Self::is_error_type(actual)
+            || *actual == Type::Never || self.same_type_identity(expected, actual)
             // A Void-placeholder generic (e.g. Option<Void> from None) matches any
             // concrete instantiation of the same generic enum.
             || matches!((expected, actual),
@@ -1306,7 +1360,12 @@ impl TypeChecker {
             let (a, b) = (expected, actual);
             #[cfg(test)]
             TYPE_IDENTITY_VISITS.with(|visits| visits.set(visits.get() + 1));
+            let invalid = |ty: &Type| matches!(ty, Type::Named(n) | Type::Generic(n, _) if self.invalid_type_names.borrow().contains(n));
             match (a, b) {
+                _ if invalid(a)
+                    || invalid(b)
+                    || Self::is_error_type(a)
+                    || Self::is_error_type(b) => {}
                 (Type::Named(a), Type::Named(b)) if name_eq(a, b) => {}
                 (Type::Array(a), Type::Array(b)) => {
                     expected = a;
@@ -8172,3 +8231,6 @@ mod type_identity_scaling_tests {
 
 #[cfg(test)]
 mod contextual_arrays_tests;
+
+#[cfg(test)]
+mod diagnostic_recovery_tests;

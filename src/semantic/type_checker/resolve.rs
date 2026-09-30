@@ -1134,6 +1134,9 @@ impl TypeChecker {
         span: Span,
         check_visibility: bool,
     ) -> Type {
+        if Self::is_error_type(obj_ty) {
+            return Self::error_type();
+        }
         // `Range<i64>` exposes its bounds as read-only `.start` / `.end` (i64).
         if is_i64_range_type(obj_ty) {
             if field_name == "start" || field_name == "end" {

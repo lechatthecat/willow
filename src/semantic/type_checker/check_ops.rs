@@ -103,6 +103,9 @@ impl TypeChecker {
     }
 
     fn finish_binary(&mut self, b: &BinaryExpr, lty: Type, rty: Type) -> Type {
+        if Self::is_error_type(&lty) || Self::is_error_type(&rty) {
+            return Self::error_type();
+        }
         match &b.op {
             // `**` is deliberately narrower than the other arithmetic operators:
             // only `i64 ** i64 -> i64` and `f64 ** f64 -> f64` are defined
@@ -335,6 +338,9 @@ impl TypeChecker {
     }
 
     fn finish_unary(&mut self, u: &UnaryExpr, ty: Type) -> Type {
+        if Self::is_error_type(&ty) {
+            return Self::error_type();
+        }
         match &u.op {
             UnaryOp::Neg => {
                 if ty != Type::I64 && ty != Type::F64 {

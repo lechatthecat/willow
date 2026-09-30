@@ -1015,3 +1015,69 @@ fn main() {}
         assert!(!text.contains("typed-expression-lowering"), "{text}");
     }
 }
+
+#[test]
+fn diagnostic_selector_regressions() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/main.wi"), "enum Trap { Underflow, Overflow } fn apply() { let modified = true; println(modified); } fn main() {} ").unwrap();
+    for (selector, wanted) in [
+        ("Trap::Underflw", "Underflow"),
+        ("main::apply::changed", "modified"),
+    ] {
+        for command in ["refs", "symbol", "type", "effects", "impact"] {
+            let value = f.json(&[command, selector], 1);
+            assert!(
+                value["result"]["suggestions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.as_str().unwrap().contains(wanted)),
+                "{value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn diagnostic_missing_import_hints_and_recovery() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/vm.wi"),
+        "module vm; pub enum Trap { Underflow } pub fn trap() -> Trap { return Trap::Underflow; }",
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "import vm; fn run() -> Result<i64, Trap> { return Err(vm::trap()); } fn main() {} ",
+    )
+    .unwrap();
+    let output = f.run(&["check", "."]);
+    assert!(!output.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("import vm::Trap;"), "{text}");
+    assert!(!text.contains("expected `Result"), "{text}");
+}
+
+#[test]
+fn diagnostic_import_hints_cover_public_type_kinds() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/vm.wi"), "module vm; pub class Machine {} pub interface Device { fn run(self); } enum Secret { Hidden }").unwrap();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "import vm; fn run(a: Machine, b: Device, c: Secret) {} fn main() {} ",
+    )
+    .unwrap();
+    let output = f.run(&["check", "."]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("import vm::Machine;"), "{text}");
+    assert!(text.contains("import vm::Device;"), "{text}");
+    assert!(!text.contains("import vm::Secret;"), "{text}");
+}

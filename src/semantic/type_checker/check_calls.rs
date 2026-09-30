@@ -982,6 +982,9 @@ impl TypeChecker {
         }
         for (i, arg) in args.iter().enumerate() {
             let ty = self.check_expr(&arg.expr);
+            if Self::is_error_type(&ty) {
+                continue;
+            }
             match placeholders.get(i) {
                 Some(crate::interpolate::Segment::F64(_)) => {
                     if ty != Type::F64 {

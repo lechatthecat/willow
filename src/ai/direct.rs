@@ -315,7 +315,7 @@ impl DirectSession {
             let name = identity
                 .symbol
                 .split("::")
-                .map(|s| s.strip_prefix(&format!("{}:", symbol.kind)).unwrap_or(s))
+                .map(|s| s.split_once(':').map_or(s, |(_, name)| name))
                 .collect::<Vec<_>>()
                 .join("::");
             format!("{}::{name}", identity.module)
@@ -428,6 +428,7 @@ impl DirectSession {
         };
         let mut candidates = Vec::new();
         let mut suggestions = Vec::new();
+        let mut scope_fallback = Vec::new();
         let tail = selector.rsplit("::").next().unwrap_or(selector);
         let tail_chars: Vec<_> = tail.chars().collect();
         let selector_scope = selector.rsplit_once("::").map(|(scope, _)| scope);
@@ -500,6 +501,12 @@ impl DirectSession {
                 } else {
                     None
                 };
+                if selector_scope.is_some() {
+                    scope_fallback.push(qualified.clone());
+                    scope_fallback.sort_unstable();
+                    scope_fallback.dedup();
+                    scope_fallback.truncate(5);
+                }
                 if let Some(score) = score {
                     suggestions.push((score, qualified));
                     suggestions.sort_unstable();
@@ -508,7 +515,11 @@ impl DirectSession {
                 }
             }
         }
-        let suggestions: Vec<_> = suggestions.into_iter().map(|(_, name)| name).collect();
+        let suggestions: Vec<_> = if suggestions.is_empty() {
+            scope_fallback
+        } else {
+            suggestions.into_iter().map(|(_, name)| name).collect()
+        };
         let mut spellings = HashMap::new();
         for candidate in &candidates {
             *spellings

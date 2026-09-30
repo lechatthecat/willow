@@ -4,6 +4,7 @@ use super::*;
 
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
+        ("example/diagnostic_recovery.wi", "3\n"),
         (
             "example/compound_and_multiline.wi",
             "compound assignment\nand a multi-line string\n1\n",
@@ -1083,4 +1084,11 @@ fn test_release_example_build_runs() {
     let (out, ok) = compile_file_and_run_with_args("example/functions.wi", &["--release"]);
     assert!(ok, "release compilation failed");
     assert_eq!(out, "25\ntrue\n");
+}
+
+#[test]
+fn test_diagnostic_recovery_example() {
+    let (out, ok) = compile_file_and_run("example/diagnostic_recovery.wi");
+    assert!(ok);
+    assert_eq!(out, "3\n");
 }

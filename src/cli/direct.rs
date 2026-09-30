@@ -371,7 +371,7 @@ fn effect_names(bits: &Value) -> String {
         (E::MAY_BLOCK, "may-block"),
         (E::MAY_SUSPEND, "may-suspend"),
         (E::MAY_PREEMPT, "may-preempt"),
-        (E::NO_PREEMPT_REGION, "no-preempt-region"),
+        (E::NO_PREEMPT_REGION, "may-run-without-preemption"),
         (E::MAY_PANIC, "may-panic"),
     ]
     .into_iter()
@@ -393,6 +393,13 @@ fn effect_lines(result: &Value, all: bool, lines: &mut Vec<String>) {
         "Compiler effects: {}",
         effect_names(&result["compiler_effects"])
     ));
+    if ["runtime_effects", "compiler_effects"].iter().any(|key| {
+        result[key].as_u64().is_some_and(|bits| {
+            bits & u64::from(willow_abi::RuntimeEffects::NO_PREEMPT_REGION.bits()) != 0
+        })
+    }) {
+        lines.push("Preemption evidence is conservative (for example, a loop or recursion); it does not mean the entire function disables preemption.".into());
+    }
     let target = result["selected"]["selector"]
         .as_str()
         .unwrap_or("selected function");
@@ -537,6 +544,19 @@ mod tests {
                 assert_eq!(lines.len(), 5 + shown + usize::from(!all && count > 50));
             }
         }
+        let bits = willow_abi::RuntimeEffects::NO_PREEMPT_REGION.bits();
+        assert_eq!(effect_names(&json!(bits)), "may-run-without-preemption");
+        let mut lines = Vec::new();
+        effect_lines(
+            &json!({"runtime_effects":bits,"compiler_effects":0}),
+            false,
+            &mut lines,
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("does not mean the entire function"))
+        );
         assert_eq!(effect_names(&json!(0)), "none");
         assert_eq!(effect_names(&Value::Null), "unavailable");
         assert_eq!(effect_names(&json!(63)).split(", ").count(), 6);
