@@ -361,20 +361,30 @@ impl<'a> CompilerSession<'a> {
         self,
         emitter: &mut dyn diagnostics::DiagnosticEmitter,
     ) -> Result<ai::Snapshot> {
-        self.analysis_with_policy(emitter, true)
+        self.analysis_with_policy(emitter, true, false, false)
     }
 
-    /// Edit preflight must not create or rewrite project inputs, even on failure.
+    /// Edit preflight covers all project sources and must not rewrite project inputs.
     pub fn analysis_for_edit_with_emitter(
         self,
         emitter: &mut dyn diagnostics::DiagnosticEmitter,
     ) -> Result<ai::Snapshot> {
-        self.analysis_with_policy(emitter, false)
+        self.analysis_with_policy(emitter, false, true, false)
     }
+    /// Analyze all project sources without importing additional roots into the entry scope.
+    pub fn overview_with_emitter(
+        self,
+        emitter: &mut dyn diagnostics::DiagnosticEmitter,
+    ) -> Result<ai::Snapshot> {
+        self.analysis_with_policy(emitter, true, true, true)
+    }
+
     fn analysis_with_policy(
         self,
         emitter: &mut dyn diagnostics::DiagnosticEmitter,
         publish_lock: bool,
+        discover: bool,
+        overview_aliases: bool,
     ) -> Result<ai::Snapshot> {
         let _query_stats = query_stats::Session::enter();
         let _node_ids = parser::ast::NodeIdSession::enter();
@@ -395,6 +405,19 @@ impl<'a> CompilerSession<'a> {
             .resolve_project_analysis(self.project_root.as_deref(), publish_lock)?;
         if let Some(context) = &edit_context {
             context.verify_files()?;
+        }
+        if discover && let Some(project) = &self.project_root {
+            let source_root = inputs
+                .package_graph
+                .as_ref()
+                .and_then(|g| g.get(g.root))
+                .map(|p| p.source_root())
+                .unwrap_or_else(|| root.to_path_buf());
+            inputs.check_modules = if overview_aliases {
+                package::discover_sources_for_overview(project, &source_root)?
+            } else {
+                package::discover_sources(project, &source_root)?
+            };
         }
         inputs.capture_analysis = true;
         let frontend = run_frontend_with_inputs(&source, root, &map, inputs, emitter)?;

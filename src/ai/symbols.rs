@@ -375,7 +375,9 @@ pub(super) fn finish(
     let mut register = |d: &Declaration| {
         let location = select(d.span, &d.name, false, names, paths);
         let raw_path = paths.get(&crate::module::ModuleId(d.span.file_id.0));
-        let function = if matches!(d.kind.as_str(), "function" | "method" | "constructor") {
+        // Constructor overloads share a lowered dispatch function but remain distinct
+        // source declarations. Keep their compiler owner/ordinal identities.
+        let function = if matches!(d.kind.as_str(), "function" | "method") {
             raw_path
                 .and_then(|p| callable.get(&(p.as_str(), d.span.start, d.span.end)))
                 .copied()

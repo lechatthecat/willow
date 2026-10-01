@@ -37,6 +37,8 @@ impl Agent {
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct AgentCapabilities {
     #[serde(serialize_with = "available")]
+    pub direct_overview: Option<&'static str>,
+    #[serde(serialize_with = "available")]
     pub direct_refs: Option<&'static str>,
     #[serde(serialize_with = "available")]
     pub direct_symbol: Option<&'static str>,
@@ -69,6 +71,9 @@ fn available<S: Serializer>(command: &Option<&str>, serializer: S) -> Result<S::
 }
 impl AgentCapabilities {
     pub fn instruction_schema(self) -> u32 {
+        if self.direct_overview.is_some() {
+            return 4;
+        }
         if [
             self.direct_refs,
             self.direct_symbol,
@@ -95,6 +100,9 @@ pub fn render_agent_instructions(agent: Agent, caps: AgentCapabilities) -> Strin
     );
     if caps.instruction_schema() >= 3 {
         text.push_str("Run commands from the project root. Direct commands discover project.toml automatically; use --project-dir DIR to select another project. Human-readable output is the default; use --format json only when structured output helps. NDJSON is for low-level protocol integrations.\n\nPrefer references and structured rename over text matching when symbol identity matters: same-named fields, imports and dispatch can make grep or bulk replacement misleading. Inspect inferred types with the type command without building an executable. Use text search and source reading for navigation, comments, strings and simple local investigation. Start with the smallest query that answers the question.\n\n");
+        if let Some(command) = caps.direct_overview {
+            text.push_str(&format!("For an unfamiliar file or project, use `{command}` before reading whole files. Overview shows structure and reusable selectors; it omits bodies, references and effects. Pass its selectors to symbol, refs, type, effects or impact for details. If truncated, narrow the path before using --all. When the target symbol is already known, query it directly; overview is optional.\n\n"));
+        }
         for (label, command) in [
             ("References", caps.direct_refs),
             ("Rename", caps.direct_rename),
@@ -253,7 +261,7 @@ mod tests {
     #[test]
     fn capability_flags_and_independent_omission() {
         let disabled = serde_json::to_value(AgentCapabilities::default()).unwrap();
-        assert_eq!(disabled.as_object().unwrap().len(), 13);
+        assert_eq!(disabled.as_object().unwrap().len(), 14);
         assert!(disabled.as_object().unwrap().values().all(|v| v == false));
         let caps = AgentCapabilities {
             references: Some("references-command"),

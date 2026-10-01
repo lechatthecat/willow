@@ -152,7 +152,7 @@ impl Options {
             compiler
                 .analysis_for_edit_with_emitter(&mut willow_compiler::diagnostics::HumanEmitter)?
         } else {
-            compiler.analysis_with_emitter(&mut willow_compiler::diagnostics::HumanEmitter)?
+            compiler.overview_with_emitter(&mut willow_compiler::diagnostics::HumanEmitter)?
         };
         let mut session = DirectSession::new(snapshot)?;
         if self.command == "rename" {

@@ -267,7 +267,7 @@ pub enum QueryRequest {
 /// Own one immutable revision and its indexes. Query calls do no frontend work.
 pub struct QuerySession {
     packages: packages::PackageIndex,
-    names: display::TypeNames,
+    pub(super) names: display::TypeNames,
     pub(crate) snapshot: Snapshot,
     functions: HashMap<String, usize>,
     symbols: HashMap<String, usize>,

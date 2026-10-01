@@ -111,6 +111,7 @@ pub struct DirectSession {
     pub session: QuerySession,
     sources: HashMap<String, SourceIndex>,
     function_names: HashMap<String, String>,
+    constructor_bodies: HashMap<String, String>,
     contract_bodies: std::collections::HashSet<String>,
 }
 fn source_module(path: &str, workspace: &str) -> String {
@@ -126,33 +127,47 @@ fn source_module(path: &str, workspace: &str) -> String {
 }
 impl DirectSession {
     pub fn new(snapshot: Snapshot) -> Result<Self> {
-        let function_names = snapshot
-            .functions
+        // Constructor overloads have distinct declaration IDs, while the
+        // compiler analyzes their bodies under one class `init` callable ID.
+        let mut callable_by_owner = HashMap::new();
+        let mut function_names = HashMap::new();
+        let mut contract_bodies = std::collections::HashSet::new();
+        for f in &snapshot.functions {
+            if f.name.ends_with("::init") {
+                callable_by_owner.insert((f.module.as_str(), f.name.as_str()), f.id.as_str());
+            }
+            let module = f
+                .identity
+                .as_ref()
+                .map(|i| i.module.clone())
+                .unwrap_or_else(|| source_module(&f.module, &snapshot.workspace));
+            function_names.insert(f.id.clone(), format!("{module}::{}", f.name));
+            if f.name
+                .rsplit("::")
+                .next()
+                .is_some_and(|n| n.starts_with("$default$"))
+            {
+                contract_bodies.insert(f.id.clone());
+            }
+        }
+        let constructor_bodies = snapshot
+            .semantic
+            .symbols
             .iter()
-            .map(|f| {
-                let module = f
-                    .identity
-                    .as_ref()
-                    .map(|i| i.module.clone())
-                    .unwrap_or_else(|| source_module(&f.module, &snapshot.workspace));
-                (f.id.clone(), format!("{module}::{}", f.name))
+            .filter(|s| s.kind == "constructor")
+            .filter_map(|s| {
+                let owner = s.source_name.as_deref()?.rsplit_once('#')?.0;
+                let path = s.location.as_ref()?.path.as_str();
+                callable_by_owner
+                    .get(&(path, owner))
+                    .map(|id| (s.id.clone(), (*id).to_owned()))
             })
-            .collect();
-        let contract_bodies = snapshot
-            .functions
-            .iter()
-            .filter(|f| {
-                f.name
-                    .rsplit("::")
-                    .next()
-                    .is_some_and(|n| n.starts_with("$default$"))
-            })
-            .map(|f| f.id.clone())
             .collect();
         let mut session = Self {
             session: QuerySession::new(snapshot)?,
             sources: HashMap::new(),
             function_names,
+            constructor_bodies,
             contract_bodies,
         };
         let names: Vec<_> = session
@@ -300,7 +315,7 @@ impl DirectSession {
         let byte = self.source(&path)?.byte(line, column)?;
         Ok(Some((path, byte)))
     }
-    fn selector(&self, symbol: &symbols::Symbol) -> String {
+    pub(super) fn selector(&self, symbol: &symbols::Symbol) -> String {
         if symbol.kind == "method"
             && let (Some(name), Some(location)) = (&symbol.source_name, &symbol.location)
         {
@@ -595,10 +610,18 @@ impl DirectSession {
         if resolved["status"] != "ok" {
             return Ok(resolved);
         }
-        let function = resolved["symbol"]["id"]
+        let declaration = resolved["symbol"]["id"]
             .as_str()
-            .context("resolved symbol lacks identity")?
-            .to_owned();
+            .context("resolved symbol lacks identity")?;
+        let function = if matches!(command, "effects" | "impact") {
+            self.constructor_bodies
+                .get(declaration)
+                .map(String::as_str)
+                .unwrap_or(declaration)
+        } else {
+            declaration
+        }
+        .to_owned();
         if command == "impact" {
             // Contract declarations have no executable body. Traverse the shared
             // semantic family once to seed all implementations, including defaults.

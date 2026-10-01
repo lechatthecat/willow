@@ -13,6 +13,7 @@ use willow_compiler::project::{
 
 pub(super) fn capabilities() -> AgentCapabilities {
     AgentCapabilities {
+        direct_overview: Some("willow overview ."),
         direct_refs: Some("willow refs module::symbol"),
         direct_symbol: Some("willow symbol module::symbol"),
         direct_type: Some("willow type src/main.wi:1:1"),

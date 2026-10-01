@@ -1,5 +1,5 @@
 <!-- BEGIN WILLOW MANAGED -->
-<!-- willow-instruction-schema: 3 -->
+<!-- willow-instruction-schema: 4 -->
 # Willow instructions for codex
 
 ## Willow core
@@ -7,6 +7,8 @@
 Run commands from the project root. Direct commands discover project.toml automatically; use --project-dir DIR to select another project. Human-readable output is the default; use --format json only when structured output helps. NDJSON is for low-level protocol integrations.
 
 Prefer references and structured rename over text matching when symbol identity matters: same-named fields, imports and dispatch can make grep or bulk replacement misleading. Inspect inferred types with the type command without building an executable. Use text search and source reading for navigation, comments, strings and simple local investigation. Start with the smallest query that answers the question.
+
+For an unfamiliar file or project, use `willow overview .` before reading whole files. Overview shows structure and reusable selectors; it omits bodies, references and effects. Pass its selectors to symbol, refs, type, effects or impact for details. If truncated, narrow the path before using --all. When the target symbol is already known, query it directly; overview is optional.
 
 - References: `willow refs module::symbol`.
 - Rename: `willow rename module::function new_name`.

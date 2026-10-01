@@ -29,8 +29,8 @@ mod tests;
 mod git_tests;
 
 mod verify;
-pub(crate) use verify::discover_sources;
 pub use verify::{Verification, verify_package};
+pub(crate) use verify::{discover_sources, discover_sources_for_overview};
 
 mod commands;
 pub use commands::{

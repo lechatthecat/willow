@@ -1,0 +1,17 @@
+// Try: willow overview example/overview.wi --depth 1
+interface Described {
+    fn describe(self) -> String;
+}
+class Counter implements Described {
+    pub value: i64;
+    pub init(self, value: i64) { self.value = value; }
+    pub fn describe(self) -> String { return "counter"; }
+    pub fn increment(self) { self.value = self.value + 1; }
+}
+enum Direction { Up, Down }
+fn main() {
+    let counter = new Counter(1);
+    counter.increment();
+    println(counter.describe());
+    println(counter.value);
+}

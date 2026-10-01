@@ -5,6 +5,7 @@ mod dispatch;
 mod display;
 pub mod edit;
 mod graph;
+pub mod overview;
 mod packages;
 mod rename;
 pub use packages::{ModuleEvidence, ModuleIdentity, SymbolIdentity, UpdateDelta};

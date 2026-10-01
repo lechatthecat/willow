@@ -194,9 +194,9 @@ fn instructions_json_and_sync_upgrade_preserve_user_bytes() {
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(value["schema_version"], 1);
     assert_eq!(value["agent"], "codex");
-    assert_eq!(value["instruction_schema"], 3);
+    assert_eq!(value["instruction_schema"], 4);
     let caps = value["capabilities"].as_object().unwrap();
-    assert_eq!(caps.len(), 13);
+    assert_eq!(caps.len(), 14);
     assert!(caps.values().all(|v| v == &serde_json::json!(true)));
     let current = value["markdown"].as_str().unwrap();
     let old = include_str!("fixtures/agent/v0/AGENTS.md");
@@ -211,7 +211,7 @@ fn instructions_json_and_sync_upgrade_preserve_user_bytes() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("1 -> 3"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("1 -> 4"));
     assert_eq!(
         fs::read_to_string(f.0.join("AGENTS.md")).unwrap(),
         format!("User prefix\r\n{current}User suffix: 日本語\r\n")

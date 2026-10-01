@@ -224,15 +224,40 @@ pub(crate) fn discover_sources(
     root: &Path,
     src: &Path,
 ) -> Result<BTreeMap<String, std::path::PathBuf>, VerificationError> {
+    discover_sources_with_aliases(root, src, false)
+}
+
+/// Overview is read-only: one canonical source is reported once even when a
+/// directory or file also has an in-tree symlink name.
+pub(crate) fn discover_sources_for_overview(
+    root: &Path,
+    src: &Path,
+) -> Result<BTreeMap<String, std::path::PathBuf>, VerificationError> {
+    discover_sources_with_aliases(root, src, true)
+}
+
+fn discover_sources_with_aliases(
+    root: &Path,
+    src: &Path,
+    deduplicate_aliases: bool,
+) -> Result<BTreeMap<String, std::path::PathBuf>, VerificationError> {
     let mut stack = vec![src.to_path_buf()];
     let mut directories = std::collections::HashSet::new();
     let mut modules = BTreeMap::new();
     while let Some(dir) = stack.pop() {
         let canonical = contained_path(root, &dir).map_err(package_error)?;
-        if !directories.insert(canonical) {
+        if !directories.insert(canonical.clone()) {
+            if deduplicate_aliases {
+                continue;
+            }
             return Err(failure("source_layout_invalid", "directory cycle or alias"));
         }
-        for entry in std::fs::read_dir(&dir).map_err(|e| failure("source_layout_invalid", e))? {
+        let scan_dir = if deduplicate_aliases {
+            &canonical
+        } else {
+            &dir
+        };
+        for entry in std::fs::read_dir(scan_dir).map_err(|e| failure("source_layout_invalid", e))? {
             let path = entry
                 .map_err(|e| failure("source_layout_invalid", e))?
                 .path();
@@ -244,9 +269,14 @@ pub(crate) fn discover_sources(
             if path.extension().is_none_or(|ext| ext != "wi") {
                 continue;
             }
-            let relative = path
+            let logical_path = if deduplicate_aliases {
+                &canonical
+            } else {
+                &path
+            };
+            let relative = logical_path
                 .strip_prefix(src)
-                .expect("descendant")
+                .map_err(|_| failure("source_layout_invalid", "source outside source root"))?
                 .with_extension("");
             let mut parts: Vec<_> = relative
                 .iter()
@@ -274,7 +304,9 @@ pub(crate) fn discover_sources(
             {
                 return Err(failure("source_layout_invalid", &logical));
             }
-            if modules.insert(logical.clone(), canonical).is_some() {
+            if let Some(previous) = modules.insert(logical.clone(), canonical.clone())
+                && (!deduplicate_aliases || previous != canonical)
+            {
                 return Err(failure(
                     "source_layout_invalid",
                     format!("ambiguous module {logical}"),
