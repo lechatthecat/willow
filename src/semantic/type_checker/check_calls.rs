@@ -486,7 +486,7 @@ impl TypeChecker {
     /// local spelling (`Level`, or `Rank` under an alias) and to its identity
     /// (`signal::Level`); the identity is what the enum tables are keyed by, so
     /// that is what a call site records (willow-0g8j.3).
-    fn static_call_enum_key(&self, class: &str) -> Option<String> {
+    pub(super) fn static_call_enum_key(&self, class: &str) -> Option<String> {
         if let Some(info) = self.symbols.lookup_enum(class) {
             return Some(info.name.clone());
         }
@@ -1148,11 +1148,10 @@ mod ternary_expecting_tests {
 
     // 14
     #[test]
-    fn t14_no_expected_context_still_errors() {
-        // Without an expected type there is nothing to resolve the variants
-        // against; this pins the current (rejecting) behavior.
+    fn t14_prelude_variants_infer_without_expected_context() {
+        // Prelude constructors infer complementary payload constraints.
         let e = errs("fn f(c: bool) { let x = c ? Ok(1) : Err(\"e\"); }");
-        assert!(!e.is_empty());
+        assert!(e.is_empty(), "{e:?}");
     }
 
     // 15

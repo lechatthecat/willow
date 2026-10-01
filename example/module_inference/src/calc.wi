@@ -1,0 +1,8 @@
+pub fn free(n: i64) -> i64 {
+    let f = |x: i64| x + 1;
+    return f(n);
+}
+pub fn capture(n: i64) -> i64 {
+    let f = |x: i64| x + n;
+    return f(1);
+}

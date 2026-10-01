@@ -2110,6 +2110,25 @@ impl TypeChecker {
                     return function_call_return_type(&info);
                 }
 
+                // Prelude constructors can infer their payload without an outer
+                // annotation, just like the qualified Result::Ok/Err forms.
+                let inferred_enum = match c.callee.as_str() {
+                    "Ok" | "Err" => Some("Result"),
+                    _ => None,
+                };
+                if let Some(name) = inferred_enum
+                    && self.prelude_variant_name_is_unshadowed(&c.callee)
+                    && self
+                        .symbols
+                        .lookup_enum(name)
+                        .is_some_and(|info| info.name == name)
+                {
+                    let ty =
+                        self.resolve_static_call(name, &[], &c.callee, &c.args, c.span, c.span);
+                    self.enum_variant_resolutions.insert(c.id, name.to_string());
+                    return ty;
+                }
+
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
@@ -2330,6 +2349,7 @@ impl TypeChecker {
                 let then_ty = self.check_expr(&t.then_expr);
                 let else_ty = self.check_expr(&t.else_expr);
                 if let Some(unified_ty) = self.unify_ternary_types(&then_ty, &else_ty) {
+                    self.resolve_generic_values([&t.then_expr, &t.else_expr], &unified_ty);
                     self.validate_type(&unified_ty, t.span);
                     unified_ty
                 } else {

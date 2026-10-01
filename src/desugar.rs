@@ -61,8 +61,7 @@ impl DesugarPass {
             .iter()
             .map(|module| resolve(&module.program))
             .collect();
-        let iface_index =
-            build_module_iface_index_with_imports(modules, &module_imports, package_aware);
+        let iface_index = build_module_iface_index_with_imports(modules, &module_imports);
         let default_index = build_module_default_methods(modules, &iface_index);
         let class_shape_index = build_module_class_shapes_with_imports(
             modules,
@@ -499,16 +498,13 @@ fn iface_inherited_default_conflicts<'a>(
 fn build_module_iface_index_with_imports(
     modules: &[module::ResolvedModule],
     imports: &[Vec<parser::ast::ImportDecl>],
-    package_aware: bool,
 ) -> IfaceIndex {
     use parser::ast::Item;
     let mut index = IfaceIndex::new();
     for (m, imports) in modules.iter().zip(imports) {
-        let import_names = if package_aware {
-            import_name_index(imports)
-        } else {
-            Default::default()
-        };
+        // A source-local super-interface alias must not escape into a
+        // consumer's implements list, including standalone multi-file builds.
+        let import_names = import_name_index(imports);
         // Local interface names declared by this module (to detect same-module
         // supers that need qualifying).
         let local: std::collections::HashSet<&str> = m

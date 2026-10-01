@@ -297,6 +297,9 @@ pub struct ClassDecl {
     /// their type arguments (willow-1js.1). Consumed by the conformance checker.
     #[allow(dead_code)]
     pub implements: Vec<Type>,
+    /// Original source prefix; desugaring appends inherited contracts. Only
+    /// the source entries require import visibility at this declaration site.
+    pub source_implements_len: usize,
     pub fields: Vec<FieldDecl>,
     pub methods: Vec<MethodDecl>,
     /// `init(self, ...)` constructors (willow-scq2). MVP allows at most one.

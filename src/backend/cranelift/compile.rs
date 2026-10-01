@@ -209,6 +209,7 @@ macro_rules! lir_type_ctx {
     ($me:expr, $return_type:expr) => {
         super::lir_gen::LirTypeCtx {
             known_fn: &|n| $me.func_ids.contains_key(n),
+            known_fn_id: &|id| $me.func_ids.get_id(id).is_some(),
             classes: &$me.classes(),
             is_interface: &|n| $me.classes().is_interface(n),
             iface_identity: &|n| $me.classes().interface(n).map(|i| i.name.clone()),

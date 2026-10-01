@@ -413,6 +413,9 @@ impl LirEnumDef {
 pub(super) struct LirTypeCtx<'x> {
     /// Whether a symbol name is a declared/linkable function.
     pub known_fn: &'x dyn Fn(&str) -> bool,
+    /// Resolved IR identities must never round-trip through display strings:
+    /// display omits package identity, while emitted symbols retain it.
+    pub known_fn_id: &'x dyn Fn(&FunctionId) -> bool,
     /// Field layouts, base edges and runtime `type_id`s per class NAME. A
     /// direct type import (`import zoo::Animal;`) aliases the imported class
     /// under its unqualified name, so both spellings answer with the canonical
@@ -1225,7 +1228,7 @@ impl LirTypeCtx<'_> {
     /// parameter has no spelling in a `fn(...)` type, so the call site could not
     /// reproduce it), and the whole signature is inside the subset.
     fn fn_value_of(&self, mangled: &FunctionId) -> Option<Type> {
-        if !(self.known_fn)(&mangled.to_string()) {
+        if !(self.known_fn_id)(mangled) {
             return None;
         }
         if self
@@ -1951,7 +1954,7 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                         result,
                     } = value
                     {
-                        if !(ctx.known_fn)(&callee.to_string()) {
+                        if !(ctx.known_fn_id)(callee) {
                             return Some(format!(
                                 "the call to `{callee}` at line {} has no declared function",
                                 span.line
@@ -8430,7 +8433,7 @@ fn flat_rvalue_supported(
     match value {
         V::ReferenceDebug { argument, .. } => matches!(argument, crate::ir::lowered::LirOperand::Reference { place, .. } if flat_reference_place_supported(place, locals, ctx)),
         V::StartTask { callee, params, output, .. } => ctx.cooperative_leaves.contains(&ctx.fn_types.scope().resolve(callee))
-            && (ctx.known_fn)(&callee.to_string())
+            && (ctx.known_fn_id)(callee)
             && ctx.supported_type(output) && params.iter().all(|ty| ctx.supported_type(ty))
             && ctx.fn_types.get_id(callee).is_some_and(|signature| matches!(signature, Type::Fn(declared, result) if declared.len() == params.len() && declared.iter().zip(params).all(|(expected, actual)| ctx.same_repr(expected, actual)) && builtin_types::unary_arg(result, B::Task).is_some_and(|payload| ctx.same_repr(payload, output))))
             && ctx.func_param_modes.get_id(callee).is_none_or(|modes| modes.iter().all(|mode| matches!(mode, ParamMode::Value))),
@@ -9281,6 +9284,7 @@ mod tests {
         fn with_ctx<R>(&self, body: impl FnOnce(&LirTypeCtx<'_>) -> R) -> R {
             body(&LirTypeCtx {
                 known_fn: &|n| self.known.contains(n),
+                known_fn_id: &|id| self.known.contains(&id.to_string()),
                 classes: self,
                 is_interface: &|n| self.interfaces.contains(&n.to_string()),
                 iface_identity: &|n| self.interfaces.contains(&n.to_string()).then_some(*n),

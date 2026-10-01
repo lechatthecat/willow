@@ -237,3 +237,6 @@ mod package_identity;
 
 #[path = "integration/buildgraph_regressions.rs"]
 mod buildgraph_regressions;
+
+#[path = "integration/module_inference_regressions.rs"]
+mod module_inference_regressions;

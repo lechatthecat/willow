@@ -771,6 +771,17 @@ impl TestProject {
         Self { root, bin_path }
     }
 
+    pub(super) fn package_command(&self, command: &str) -> std::process::Output {
+        let mut cli = Command::new(env!("CARGO_BIN_EXE_willow"));
+        cli.current_dir(&self.root)
+            .arg(command)
+            .env("WILLOW_LIR_LOG", "1");
+        if command == "build" {
+            cli.args(["-o", path_str(&self.bin_path)]);
+        }
+        cli.output().expect("failed to run package compiler")
+    }
+
     pub(super) fn compile(&self, entry: &str) -> std::process::Output {
         let src_path = self.root.join(entry);
         Command::new(env!("CARGO_BIN_EXE_willow"))

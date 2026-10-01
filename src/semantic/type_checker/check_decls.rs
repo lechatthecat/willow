@@ -853,8 +853,19 @@ impl TypeChecker {
     /// inherited methods) must satisfy every required method signature exactly.
     pub(super) fn check_class_implements(&mut self, c: &ClassDecl) {
         let mut seen: HashSet<String> = HashSet::new();
-        for iface_ty in &c.implements {
-            self.check_source_type_access(iface_ty, c.span);
+        for (index, written) in c.implements.iter().enumerate() {
+            if index < c.source_implements_len {
+                self.check_source_type_access(written, c.span);
+            }
+            // Reuse registration's normalized identity, including enum type
+            // arguments and transitive contracts appended by desugaring.
+            let iface_ty = self
+                .symbols
+                .lookup_class(&c.name)
+                .expect("class registered before conformance")
+                .implements[index]
+                .clone();
+            let iface_ty = &iface_ty;
             // Split the implemented interface into its name and type arguments:
             // `Animal` -> ("Animal", []), `From<Err>` -> ("From", [Err]).
             let (iface_name, type_args): (String, Vec<Type>) = match iface_ty {

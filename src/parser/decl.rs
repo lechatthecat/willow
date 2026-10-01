@@ -326,6 +326,7 @@ impl Parser {
             public,
             is_open,
             base_class,
+            source_implements_len: implements.len(),
             implements,
             fields,
             methods,

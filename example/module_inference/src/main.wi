@@ -1,0 +1,18 @@
+// Run from example/module_inference with `willow run` to exercise package IDs.
+import calc;
+import expr::Expr;
+import source::Source;
+
+class Answer implements Source<Expr> {
+    pub fn get(self) -> Expr { return Expr::Value(42); }
+}
+
+async fn main() {
+    println(calc::free(41));
+    println(calc::capture(41));
+    let source: Source<Expr> = new Answer();
+    await yield();
+    let value = match source.get() { Value(n) => n };
+    let answer = match true { true => Ok(value), false => Err("unavailable") };
+    println(match answer { Ok(n) => n, Err(e) => 0 });
+}

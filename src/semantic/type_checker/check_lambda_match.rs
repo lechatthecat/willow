@@ -669,6 +669,35 @@ impl TypeChecker {
         // never this one by accident.
         let expected = self.local.match_expected.take();
         let scrutinee_ty = self.check_expr(&m.scrutinee);
+        if Self::is_error_type(&scrutinee_ty) {
+            // The failed scrutinee cannot constrain patterns. Keep checking arm
+            // bodies for independent errors with poisoned payload bindings.
+            for arm in &m.arms {
+                self.symbols.push_scope();
+                let names: &[String] = match &arm.pattern {
+                    Pattern::Binding { name, .. } => std::slice::from_ref(name),
+                    Pattern::ClassDowncast { binding, .. } => std::slice::from_ref(binding),
+                    Pattern::EnumVariantTuple { bindings, .. } => bindings,
+                    _ => &[],
+                };
+                for name in names {
+                    if name != "_" {
+                        self.define_var(
+                            name.to_string(),
+                            VarInfo {
+                                ty: Self::error_type(),
+                                mutable: false,
+                                is_param: false,
+                                declaration_span: arm.span,
+                            },
+                        );
+                    }
+                }
+                self.check_match_body(&arm.body, expected.as_ref());
+                self.symbols.pop_scope();
+            }
+            return Self::error_type();
+        }
 
         if m.arms.is_empty() {
             self.push(
@@ -1068,16 +1097,16 @@ impl TypeChecker {
                 continue;
             }
 
-            // When the new arm type is a partial-generic (e.g. `Option<void>` from `None`),
-            // keep the richer type already recorded rather than replacing it.
-            let arm_ty = match (&result_type, &arm_ty) {
-                (Some(existing), arm) if self.generic_partially_matches(existing, arm) => {
-                    existing.clone()
-                }
-                (Some(existing), arm) if self.generic_partially_matches(arm, existing) => {
-                    arm.clone()
-                }
-                _ => arm_ty,
+            // Each arm contributes constraints, including complementary
+            // Result<T, void> and Result<void, E> constructors.
+            let arm_ty = if let Some(merged) = result_type
+                .as_ref()
+                .and_then(|existing| self.merge_inferred_enum_types(existing, &arm_ty))
+            {
+                result_type = Some(merged.clone());
+                merged
+            } else {
+                arm_ty
             };
 
             // An empty array arm contributes no element constraint, in either
@@ -1182,7 +1211,54 @@ impl TypeChecker {
 
         let result = result_type.unwrap_or(Type::Void);
         self.resolve_empty_array_values(&m.arms, &result);
+        self.resolve_generic_values(
+            m.arms.iter().filter_map(|arm| match &arm.body {
+                MatchBody::Expr(expr) => Some(expr.as_ref()),
+                _ => None,
+            }),
+            &result,
+        );
         result
+    }
+
+    /// Complete inferred enum constructors after sibling arms supplied the
+    /// missing type arguments. Reuse checked payloads; never recheck an arm.
+    pub(super) fn resolve_generic_values<'a>(
+        &mut self,
+        values: impl IntoIterator<Item = &'a Expr>,
+        expected: &'a Type,
+    ) {
+        if !matches!(expected, Type::Generic(..)) {
+            return;
+        }
+        let mut pending: Vec<(&Expr, &Type)> =
+            values.into_iter().map(|expr| (expr, expected)).collect();
+        while let Some((expr, expected)) = pending.pop() {
+            #[cfg(test)]
+            GENERIC_VALUE_VISITS.with(|count| count.set(count.get() + 1));
+            let Some(actual) = self.expr_types.get(&expr.id()) else {
+                continue;
+            };
+            if actual == expected || !self.generic_partially_matches(expected, actual) {
+                continue;
+            }
+            match expr {
+                Expr::Call(_) if self.enum_variant_resolutions.contains_key(&expr.id()) => {}
+                Expr::StaticCall(call)
+                    if call.type_args.is_empty()
+                        && self.static_call_enum_key(&call.class).is_some() => {}
+                Expr::Match(m) => pending.extend(m.arms.iter().filter_map(|arm| match &arm.body {
+                    MatchBody::Expr(expr) => Some((expr.as_ref(), expected)),
+                    _ => None,
+                })),
+                Expr::Ternary(t) => {
+                    pending.push((&t.then_expr, expected));
+                    pending.push((&t.else_expr, expected));
+                }
+                _ => continue,
+            }
+            self.expr_types.insert(expr.id(), expected.clone());
+        }
     }
 
     /// Repair placeholder array expression types without rechecking scopes or
@@ -1394,6 +1470,7 @@ impl CaptureScan<'_> {
 
 #[cfg(test)]
 thread_local! {
+    static GENERIC_VALUE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static EMPTY_ARRAY_REFINEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -1967,5 +2044,44 @@ mod lambda_capture_tests {
     #[test]
     fn c41_a_capture_free_lambda_reports_no_slots() {
         ok("fn main() { let f = |x: i64| x; println(f(1)); }");
+    }
+}
+
+#[cfg(test)]
+mod inferred_enum_scaling_tests {
+    use super::*;
+
+    #[test]
+    fn inferred_enum_refinement_visits_are_linear() {
+        for count in [8, 32, 128] {
+            for deep in [false, true] {
+                let value = if deep {
+                    let mut value = "Ok(42)".to_string();
+                    for _ in 0..count {
+                        value = format!("(match true {{ true => {value}, false => Ok(1) }})");
+                    }
+                    format!("match true {{ true => {value}, false => Err(\"bad\") }}")
+                } else {
+                    let arms = (0..count)
+                        .map(|i| format!("{i} => Ok({i}),"))
+                        .collect::<String>();
+                    format!("match 0 {{ {arms} _ => Err(\"bad\") }}")
+                };
+                let source = format!(
+                    "fn main() {{ let r = {value}; println(match r {{ Ok(n) => n, Err(e) => e.len() }}); }}"
+                );
+                let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+                let (program, errors) = crate::parser::Parser::new(tokens).parse();
+                assert!(errors.is_empty(), "{errors:?}");
+                let mut checker = TypeChecker::new();
+                crate::register_prelude(&mut checker).unwrap();
+                GENERIC_VALUE_VISITS.with(|c| c.set(0));
+                checker.check_program(&program);
+                assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+                let visits = GENERIC_VALUE_VISITS.with(|c| c.get());
+                assert_eq!(visits, if deep { 4 * count + 2 } else { count + 1 });
+                eprintln!("generic refinement deep={deep} n={count} visits={visits}");
+            }
+        }
     }
 }

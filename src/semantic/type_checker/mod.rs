@@ -663,7 +663,17 @@ impl TypeChecker {
             implements: class
                 .implements
                 .iter()
-                .map(|iface| qualify_type_for_module(iface, module_prefix))
+                .enumerate()
+                .map(|(index, iface)| {
+                    if index < class.source_implements_len {
+                        self.normalize_decl_type(iface, class.span, module_prefix)
+                    } else {
+                        // Inherited contracts already name declarations in the
+                        // dependency closure, not source imports of this file.
+                        qualify_type_for_module(iface, module_prefix)
+                            .map_names(|name| self.canonical_type_name(name))
+                    }
+                })
                 .collect(),
             declaration_span: class.span,
             fields,
@@ -962,11 +972,36 @@ impl TypeChecker {
             return Some(then_ty.clone());
         }
 
+        if let Some(merged) = self.merge_inferred_enum_types(then_ty, else_ty) {
+            return Some(merged);
+        }
         match (then_ty, else_ty) {
             _ if self.types_compatible(then_ty, else_ty) => Some(then_ty.clone()),
             _ if self.types_compatible(else_ty, then_ty) => Some(else_ty.clone()),
             _ => None,
         }
+    }
+
+    fn merge_inferred_enum_types(&self, left: &Type, right: &Type) -> Option<Type> {
+        if !self.generic_partially_matches(left, right) {
+            return None;
+        }
+        let (Type::Generic(name, args), Type::Generic(_, other)) = (left, right) else {
+            return None;
+        };
+        Some(Type::Generic(
+            name.clone(),
+            args.iter()
+                .zip(other)
+                .map(|(a, b)| {
+                    if *a == Type::Void {
+                        b.clone()
+                    } else {
+                        a.clone()
+                    }
+                })
+                .collect(),
+        ))
     }
 
     // Recovery-only nominal marker: cannot be spelled by source syntax and never

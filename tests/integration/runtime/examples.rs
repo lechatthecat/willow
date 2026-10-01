@@ -4,6 +4,7 @@ use super::*;
 
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
+        ("example/module_inference/src/main.wi", "42\n42\n42\n"),
         ("example/diagnostic_recovery.wi", "3\n"),
         (
             "example/compound_and_multiline.wi",

@@ -844,28 +844,20 @@ impl TypeChecker {
                     let local = import.alias.as_deref().unwrap_or(module);
                     self.imported_names
                         .insert(local.to_string(), Some(import.span));
-                    if import.alias.is_none() {
-                        self.imported_std_modules.insert(
-                            local.to_string(),
-                            ImportedStdModule {
-                                module: (*module).to_string(),
-                                span: import.span,
-                            },
-                        );
-                    } else if matches!(*module, "env" | "fs" | "net" | "parallel") {
-                        // `import std::fs as files;` — make the builtin
-                        // module's functions resolvable under the alias and
-                        // record the mapping for codegen dispatch
-                        // (willow-2s3 review fix).
+                    if import.alias.is_some()
+                        && matches!(*module, "env" | "fs" | "net" | "parallel")
+                    {
                         self.register_schema_module_as(module, local);
-                        self.imported_std_modules.insert(
-                            local.to_string(),
-                            ImportedStdModule {
-                                module: (*module).to_string(),
-                                span: import.span,
-                            },
-                        );
                     }
+                    // Type-bearing modules need their alias too: res::Result
+                    // must resolve identically with and without expected type.
+                    self.imported_std_modules.insert(
+                        local.to_string(),
+                        ImportedStdModule {
+                            module: (*module).to_string(),
+                            span: import.span,
+                        },
+                    );
                 }
                 _ => {}
             }
@@ -1049,14 +1041,9 @@ impl TypeChecker {
                 methods,
                 method_order: method_order.into(),
                 type_params: decl.type_params.clone(),
-                extends: decl
-                    .extends
-                    .iter()
-                    .map(|s| match module_path {
-                        Some(m) if !s.contains("::") => format!("{m}::{s}"),
-                        _ => s.clone(),
-                    })
-                    .collect(),
+                // Imported bounds were already qualified in register_module_impl.
+                // In particular, compiler markers Send/Sync remain global.
+                extends: decl.extends.clone(),
                 declaration_span: decl.span,
                 module_path: module_path.map(|s| s.to_string()),
             },
