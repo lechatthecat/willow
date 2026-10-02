@@ -37,6 +37,174 @@ const LIR_LOG: &[(&str, &str)] = &[("WILLOW_LIR_LOG", "1")];
 const ALLOC_STRESS: &[(&str, &str)] = &[("WILLOW_GC_STRESS", "alloc")];
 const MINOR_STRESS: &[(&str, &str)] = &[("WILLOW_GC_STRESS", "minor")];
 
+#[test]
+fn imported_class_lambda_signature() {
+    assert_project_output(
+        &[
+            ("pt.wi", "module pt; pub class Pt { pub x: i64; }"),
+            (
+                "main.wi",
+                "import pt::Pt; fn main() { let f = |q: Pt| q.x; println(f(new Pt(3))); }",
+            ),
+        ],
+        "main.wi",
+        "3\n",
+    );
+}
+
+// Eight callable shapes × four import spellings × two body locations explicitly
+// cover 64 perspectives. Every program must execute, not merely pass checking.
+#[test]
+fn imported_class_lambda_signature_matrix() {
+    let cases = [
+        ("parameter", "let f = |q: T| q.x; println(f(new T(3)));"),
+        (
+            "inferred_parameter",
+            "let f: fn(T) -> i64 = |q| q.x; println(f(new T(3)));",
+        ),
+        (
+            "result",
+            "let f: fn(i64) -> T = |n| new T(n); println(f(3).x);",
+        ),
+        (
+            "identity",
+            "let f: fn(T) -> T = |q| q; println(f(new T(3)).x);",
+        ),
+        (
+            "capturing_parameter",
+            "let n = 1; let f: closure(T) -> i64 = |q| q.x + n; println(f(new T(2)));",
+        ),
+        (
+            "capturing_result",
+            "let q = new T(3); let f: closure() -> T = || q; println(f().x);",
+        ),
+        (
+            "explicit_block_result",
+            "let f = |n: i64| -> T { return new T(n); }; println(f(3).x);",
+        ),
+        (
+            "nested_callable_parameter",
+            "let f = |g: fn(T) -> T, q: T| g(q); println(f(|p: T| p, new T(3)).x);",
+        ),
+    ];
+    for (import, ty) in [
+        ("import pt::Pt;", "Pt"),
+        ("import pt::Pt as Point;", "Point"),
+        ("import pt;", "pt::Pt"),
+        ("import pt as geom;", "geom::Pt"),
+    ] {
+        for (shape, body) in cases {
+            let body = body.replace('T', ty);
+            for in_module in [false, true] {
+                let entry;
+                let worker;
+                let mut files = vec![("pt.wi", "module pt; pub class Pt { pub x: i64; }")];
+                if in_module {
+                    worker = format!("module worker; {import} pub fn run() {{ {body} }}");
+                    entry = "import worker; fn main() { worker::run(); }".to_string();
+                    files.push(("worker.wi", &worker));
+                } else {
+                    entry = format!("{import} fn main() {{ {body} }}");
+                }
+                files.push(("main.wi", &entry));
+                let (out, ok) = compile_temp_project_and_run(&files, "main.wi");
+                assert!(ok, "{shape}, {import}, module={in_module}: {out}");
+                assert_eq!(out, "3\n", "{shape}, {import}, module={in_module}");
+            }
+        }
+    }
+}
+
+#[test]
+fn imported_class_lambda_example_debug_release_and_gc() {
+    let files = &[
+        (
+            "point.wi",
+            include_str!("../../example/imported_class_lambdas/point.wi"),
+        ),
+        (
+            "ops.wi",
+            include_str!("../../example/imported_class_lambdas/ops.wi"),
+        ),
+        (
+            "main.wi",
+            include_str!("../../example/imported_class_lambdas/main.wi"),
+        ),
+    ];
+    let (out, ok) = compile_file_and_run("example/imported_class_lambdas/main.wi");
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n7\n");
+    for env in [ALLOC_STRESS, MINOR_STRESS] {
+        let (out, ok) = compile_temp_project_with_env_and_run_under(files, "main.wi", &PLAIN, env);
+        assert!(ok, "{env:?}: {out}");
+        assert_eq!(out, "42\n7\n");
+    }
+    let project = TestProject::new("imported_class_lambda_release", files);
+    let build = project.compile_release("main.wi");
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = project.run();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "42\n7\n");
+}
+
+#[test]
+fn imported_class_lambda_aliases_stay_unit_local() {
+    assert_project_output(
+        &[
+            ("left.wi", "module left; pub class Point { pub x: i64; }"),
+            (
+                "right.wi",
+                "module right; pub class Point { pub pad: i64; pub x: i64; }",
+            ),
+            (
+                "one.wi",
+                "module one; import left::Point; pub fn run() -> i64 { let f: fn(Point) -> Point = |p| p; return f(new Point(3)).x; }",
+            ),
+            (
+                "two.wi",
+                "module two; import right::Point; pub fn run() -> i64 { let f: fn(Point) -> Point = |p| p; return f(new Point(90, 7)).x; }",
+            ),
+            (
+                "main.wi",
+                "import one; import two; class Point { pub x: i64; } fn main() { let f = |p: Point| p.x; println(one::run()); println(two::run()); println(f(new Point(11))); }",
+            ),
+        ],
+        "main.wi",
+        "3\n7\n11\n",
+    );
+}
+
+#[test]
+fn imported_class_lambda_generated_body_counts() {
+    for count in [1, 8, 32] {
+        let mut entry = "import pt::Pt; fn main() {".to_string();
+        for i in 0..count {
+            entry.push_str(&format!(
+                "let f{i}: fn(Pt) -> Pt = |p| p; println(f{i}(new Pt({i})).x);"
+            ));
+        }
+        entry.push('}');
+        let (ok, log) = compile_temp_project_with_env_stderr(
+            &[
+                ("pt.wi", "module pt; pub class Pt { pub x: i64; }"),
+                ("main.wi", &entry),
+            ],
+            "main.wi",
+            LIR_LOG,
+        );
+        assert!(ok, "{log}");
+        assert_eq!(log.matches("[lir] compiling `$lambda.").count(), count);
+    }
+}
+
 #[track_caller]
 fn assert_project_output(files: &[(&str, &str)], entry: &str, expected: &str) {
     let (out, ok) = compile_temp_project_with_env_and_run(files, entry, &PLAIN[..]);

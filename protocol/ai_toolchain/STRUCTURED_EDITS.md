@@ -73,10 +73,12 @@ The initial edit surface uses debug/default compiler options and workspace-local
 regular, non-symlink source files. `--project` selects project mode. External
 source dependencies are rejected rather than validated against a different tree.
 Rename covers proven declarations, resolved direct/qualified calls, item imports
-(`import m::{f}`, `import m::f as g`; the alias and its uses are kept) and
-captured class dispatch families. It rejects an already-used destination identifier,
-ambiguous or uncovered occurrences (including unsupported aliases, function
-values and interface contracts), and overlapping edits. Body replacement must
+(`import m::{f}`, `import m::f as g`; the alias and its uses are kept), local
+bindings and parameters, fields, enum variants, and captured interface/class
+dispatch families. Selecting a contract or implementation method renames its
+connected dispatch family while preserving unrelated same-name symbols. It
+rejects destination collisions, ambiguous or uncovered occurrences, unsupported
+targets, and overlapping edits. Body replacement must
 be exactly one block and uses the compiler's source range. Unsupported cases
 fail without changing source files. A rejection tied to one occurrence adds
 `location` (`path` workspace-relative, zero-based byte `start`/`end`, one-based

@@ -272,3 +272,6 @@ mod task_send;
 mod task_status;
 #[path = "concurrency/task_traces.rs"]
 mod task_traces;
+
+#[path = "concurrency/interface_contracts.rs"]
+mod interface_contracts;

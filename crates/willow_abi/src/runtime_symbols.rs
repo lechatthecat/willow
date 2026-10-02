@@ -121,6 +121,13 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     // --- string ---
     PANIC_ALLOC; "willow_string_concat" => ([Ptr, Ptr] -> Some(Ptr));
     NONE; "willow_string_len" => ([Ptr] -> Some(I64));
+    PANIC_ALLOC; "willow_string_substring" => ([Ptr, I64, I64] -> Some(Ptr));
+    PANIC_ALLOC; "willow_string_repeat" => ([Ptr, I64] -> Some(Ptr));
+    ALLOC; "willow_string_split" => ([Ptr, Ptr] -> Some(Ptr));
+    ALLOC; "willow_string_trim" => ([Ptr] -> Some(Ptr));
+    NONE; "willow_string_contains" => ([Ptr, Ptr] -> Some(I64));
+    NONE; "willow_string_find" => ([Ptr, Ptr] -> Some(I64));
+    NONE; "willow_string_starts_with" => ([Ptr, Ptr] -> Some(I64));
     NONE; "willow_string_eq" => ([Ptr, Ptr] -> Some(I64));
     ALLOC; "willow_string_alloc" => ([Ptr, I64] -> Some(Ptr));
     ALLOC; "willow_string_literal_slot" => ([Ptr, Ptr, I64] -> Some(Ptr));

@@ -214,6 +214,7 @@ impl TypeChecker {
         if self.class_extends_cycle(&c.name).is_none() {
             self.check_constructor_inheritance_rules(c);
             self.check_class_implements(c);
+            self.check_class_marker_contract(c);
         }
         for field in &c.fields {
             let ty = self.normalize_type(&field.ty, field.span);

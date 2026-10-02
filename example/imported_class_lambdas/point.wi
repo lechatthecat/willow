@@ -1,0 +1,5 @@
+module point;
+
+pub class Point {
+    pub x: i64;
+}

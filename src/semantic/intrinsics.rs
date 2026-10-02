@@ -64,6 +64,13 @@ pub enum Intrinsic {
     StringToString,
     /// UTF-8 byte length, excluding the trailing NUL.
     StringLen,
+    StringSubstring,
+    StringSplit,
+    StringContains,
+    StringFind,
+    StringTrim,
+    StringRepeat,
+    StringStartsWith,
 
     /// `Task<T>::cancel()` / `JoinHandle<T>::cancel()`.
     TaskCancel,
@@ -219,6 +226,13 @@ impl Intrinsic {
         Intrinsic::BoolToString,
         Intrinsic::StringToString,
         Intrinsic::StringLen,
+        Intrinsic::StringSubstring,
+        Intrinsic::StringSplit,
+        Intrinsic::StringContains,
+        Intrinsic::StringFind,
+        Intrinsic::StringTrim,
+        Intrinsic::StringRepeat,
+        Intrinsic::StringStartsWith,
         Intrinsic::TaskCancel,
         Intrinsic::TaskIsCancelled,
         Intrinsic::TaskResult,
@@ -285,6 +299,14 @@ impl Intrinsic {
             BoolToString => &["willow_bool_to_string"],
             StringToString | TaskResult => &[],
             StringLen => &["willow_string_len"],
+            StringSubstring => &["willow_string_substring"],
+            StringSplit => &["willow_string_split"],
+            StringContains => &["willow_string_contains"],
+            StringFind => &["willow_string_find"],
+            StringTrim => &["willow_string_trim"],
+            StringRepeat => &["willow_string_repeat"],
+            StringStartsWith => &["willow_string_starts_with"],
+
             TaskCancel => &["willow_sched_cancel"],
             TaskIsCancelled => &["willow_frame_is_cancelled"],
             TokenIsCancelled => &["willow_cancellation_token_is_cancelled"],
@@ -463,8 +485,21 @@ pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
     method: &str,
     arity: usize,
 ) -> Option<ResolvedMethod<N>> {
-    if matches!(recv, Type::String) && method == "len" && arity == 0 {
-        return Some(ResolvedMethod::fixed(Intrinsic::StringLen, Type::I64));
+    if matches!(recv, Type::String) {
+        let entry = match (method, arity) {
+            ("len", 0) => Some((Intrinsic::StringLen, Type::I64)),
+            ("substring" | "slice", 2) => Some((Intrinsic::StringSubstring, Type::String)),
+            ("split", 1) => Some((Intrinsic::StringSplit, Type::Array(Box::new(Type::String)))),
+            ("contains", 1) => Some((Intrinsic::StringContains, Type::Bool)),
+            ("find", 1) => Some((Intrinsic::StringFind, Type::I64)),
+            ("trim", 0) => Some((Intrinsic::StringTrim, Type::String)),
+            ("repeat", 1) => Some((Intrinsic::StringRepeat, Type::String)),
+            ("starts_with", 1) => Some((Intrinsic::StringStartsWith, Type::Bool)),
+            _ => None,
+        };
+        if let Some((intrinsic, ty)) = entry {
+            return Some(ResolvedMethod::fixed(intrinsic, ty));
+        }
     }
     // Scalar `toString` conversions (willow-fvfc).
     if method == "toString" && arity == 0 {
@@ -661,6 +696,40 @@ pub fn resolve_intrinsic<N: builtin_types::TypeName + Clone + From<&'static str>
 mod tests {
     use super::*;
     type Type = crate::parser::ast::Type<String>;
+
+    #[test]
+    fn string_methods_types_arities_and_effects() {
+        for (method, arity, result, allocates, panics) in [
+            ("len", 0, Type::I64, false, false),
+            ("substring", 2, Type::String, true, true),
+            ("slice", 2, Type::String, true, true),
+            ("split", 1, Type::Array(Box::new(Type::String)), true, false),
+            ("contains", 1, Type::Bool, false, false),
+            ("find", 1, Type::I64, false, false),
+            ("trim", 0, Type::String, true, false),
+            ("repeat", 1, Type::String, true, true),
+            ("starts_with", 1, Type::Bool, false, false),
+            ("toString", 0, Type::String, false, false),
+        ] {
+            let resolved = resolve(&Type::String, method, arity).unwrap();
+            assert_eq!(resolved.return_type(|_| None), result);
+            let effects = resolved.intrinsic.runtime_effects();
+            assert_eq!(
+                effects.contains(RuntimeEffects::MAY_ALLOCATE),
+                allocates,
+                "{method}"
+            );
+            assert_eq!(
+                effects.contains(RuntimeEffects::MAY_PANIC),
+                panics,
+                "{method}"
+            );
+            assert!(resolve(&Type::String, method, arity + 1).is_none());
+            if arity > 0 {
+                assert!(resolve(&Type::String, method, arity - 1).is_none());
+            }
+        }
+    }
 
     fn array(elem: Type) -> Type {
         Type::Array(Box::new(elem))
@@ -1204,6 +1273,13 @@ mod tests {
             named("TaskScope"),
         ];
         let methods = [
+            "substring",
+            "slice",
+            "split",
+            "find",
+            "trim",
+            "repeat",
+            "starts_with",
             "toString",
             "len",
             "push",
@@ -1258,7 +1334,7 @@ mod tests {
         assert_eq!(unique.len(), Intrinsic::ALL.len(), "duplicate in ALL");
         assert_eq!(
             Intrinsic::ALL.len(),
-            44,
+            51,
             "Intrinsic::ALL must list every variant; update the count when adding one"
         );
     }

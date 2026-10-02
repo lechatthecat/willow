@@ -1,0 +1,40 @@
+// Immediate await still requires Sync reference arguments. Use a frozen
+// snapshot for reads, or put shared mutable state behind a Mutex.
+import std::collections::Array;
+import std::collections::Map;
+
+class Sheet {
+    pub cells: Map<i64, i64>;
+}
+
+async fn array_count(values: FrozenArray<i64>) -> i64 {
+    return values.len();
+}
+
+async fn map_count(cells: FrozenMap<i64, i64>) -> i64 {
+    return cells.len();
+}
+
+async fn add_cell(sheet: Mutex<Sheet>) -> i64 {
+    lock sheet as data {
+        data.cells.insert(3, 30);
+        return data.cells.len();
+    }
+}
+
+async fn main() {
+    let values: Array<i64> = [10, 20, 30];
+    println(await array_count(values.freeze()));
+
+    let cells: Map<i64, i64> = Map::new();
+    cells.insert(1, 10);
+    cells.insert(2, 20);
+    let snapshot = cells.freeze();
+    println(await map_count(snapshot));
+
+    // After sharing, access the mutable Sheet only through the Mutex.
+    let shared = Mutex::new(new Sheet(cells));
+    println(await add_cell(shared));
+    // The frozen map is a separate snapshot of the original entries.
+    println(await map_count(snapshot));
+}

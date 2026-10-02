@@ -105,6 +105,32 @@ fn collection_handles_are_pointers_and_payload_words_remain_i64() {
     let _: extern "C" fn(*mut u8, i64, i64, i64) -> *mut u8 = map::willow_map_get;
 }
 
+#[test]
+fn string_methods_abi_signatures() {
+    let _: extern "C" fn(*mut u8, i64, i64) -> *mut u8 = string::willow_string_substring;
+    assert_schema("willow_string_substring", &[Ptr, I64, I64], Some(Ptr));
+    let _: extern "C" fn(*mut u8, i64) -> *mut u8 = string::willow_string_repeat;
+    assert_schema("willow_string_repeat", &[Ptr, I64], Some(Ptr));
+    let _: extern "C" fn(*mut u8, *const u8) -> *mut u8 = string::willow_string_split;
+    assert_schema("willow_string_split", &[Ptr, Ptr], Some(Ptr));
+    let _: extern "C" fn(*mut u8) -> *mut u8 = string::willow_string_trim;
+    assert_schema("willow_string_trim", &[Ptr], Some(Ptr));
+    for (name, function) in [
+        (
+            "willow_string_contains",
+            string::willow_string_contains as extern "C" fn(*const u8, *const u8) -> i64,
+        ),
+        ("willow_string_find", string::willow_string_find),
+        (
+            "willow_string_starts_with",
+            string::willow_string_starts_with,
+        ),
+    ] {
+        let _: extern "C" fn(*const u8, *const u8) -> i64 = function;
+        assert_schema(name, &[Ptr, Ptr], Some(I64));
+    }
+}
+
 // --- semantic kinds: generic payload `Word` vs fixed-width `I64` ---
 //
 // Every payload-carrying row is stated twice: the Rust `extern "C"` type,

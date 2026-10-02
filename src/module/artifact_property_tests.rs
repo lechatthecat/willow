@@ -106,7 +106,31 @@ fn generated_multifile_roundtrips_have_exact_linear_record_counts() {
             }
             assert_eq!(artifacts.blocks.len(), files * owners * 4);
             assert_eq!(artifacts.initializers.len(), files * owners);
-            assert_eq!(artifacts.entries.borrow().len(), files * (5 * owners + 1));
+            let records = files * (5 * owners + 1);
+            assert_eq!(artifacts.entries.borrow().len(), records);
+            // Growing either dimension must still use one append-only file,
+            // with exactly one indexed byte range per immutable record.
+            let mut end = 0;
+            for &(offset, length) in artifacts.entries.borrow().iter() {
+                assert_eq!(offset, end);
+                assert!(length > 0);
+                end += length;
+            }
+            assert_eq!(artifacts.written(), end);
+            {
+                let mut packed = artifacts.pack.borrow_mut();
+                let pack = packed.as_mut().unwrap();
+                pack.writer.flush().unwrap();
+                assert_eq!(pack.reader.metadata().unwrap().len(), end);
+            }
+            let paths: Vec<_> = std::fs::read_dir(&artifacts.directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(paths, [std::ffi::OsString::from("artifacts.pack")]);
+            eprintln!(
+                "artifact-pack files={files} owners={owners} records={records} bytes={end} pack_files=1"
+            );
             // Reverse order detects accidental dependence on the most recently
             // parsed program or sequential artifact reads.
             for (file, source, summary, expected) in summaries.iter().rev() {

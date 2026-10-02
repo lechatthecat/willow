@@ -1,0 +1,9 @@
+module ops;
+
+import point::Point as Sample;
+
+pub fn shifted(n: i64) -> Sample {
+    let shift = 2;
+    let make: closure(i64) -> Sample = |x| new Sample(x + shift);
+    return make(n);
+}

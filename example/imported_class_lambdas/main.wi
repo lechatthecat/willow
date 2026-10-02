@@ -1,0 +1,13 @@
+// Imported class types in both entry and module lambda signatures.
+import point::Point;
+import ops;
+
+fn main() {
+    let read = |p: Point| p.x;
+    let copy: fn(Point) -> Point = |p| new Point(p.x);
+    println(read(copy(ops::shifted(40))));
+
+    let origin = new Point(7);
+    let saved: closure() -> Point = || origin;
+    println(read(saved()));
+}

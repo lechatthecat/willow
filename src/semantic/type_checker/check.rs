@@ -102,6 +102,8 @@ impl TypeChecker {
     }
 
     fn check_program_items(&mut self, program: &Program) {
+        self.marker_contracts.clear();
+        self.marker_contract_proven.clear();
         self.register_std_imports(&program.imports);
         // Looping sync helpers indexed by `Class::method`, so a call through a
         // typed non-`self` receiver (`obj.heavy()`) in a task context is flagged

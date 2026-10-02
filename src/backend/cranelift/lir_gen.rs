@@ -7608,6 +7608,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         match intrinsic {
             StringToString | TaskResult => receiver,
             StringLen => self.emit_value_runtime_call("willow_string_len", &[receiver]),
+            StringSubstring => self
+                .emit_value_runtime_call("willow_string_substring", &[receiver, args[0], args[1]]),
+            StringSplit => {
+                self.emit_value_runtime_call("willow_string_split", &[receiver, args[0]])
+            }
+            StringFind => self.emit_value_runtime_call("willow_string_find", &[receiver, args[0]]),
+            StringRepeat => {
+                self.emit_value_runtime_call("willow_string_repeat", &[receiver, args[0]])
+            }
+            StringTrim => self.emit_value_runtime_call("willow_string_trim", &[receiver]),
+            StringContains | StringStartsWith => {
+                let symbol = if intrinsic == StringContains {
+                    "willow_string_contains"
+                } else {
+                    "willow_string_starts_with"
+                };
+                let value = self.emit_value_runtime_call(symbol, &[receiver, args[0]]);
+                self.builder.ins().ireduce(types::I8, value)
+            }
+
             I64ToString => self.emit_value_runtime_call("willow_i64_to_string", &[receiver]),
             F64ToString => self.emit_value_runtime_call("willow_f64_to_string", &[receiver]),
             BoolToString => self.emit_value_runtime_call("willow_bool_to_string", &[receiver]),

@@ -211,6 +211,7 @@ error_codes! {
     E2403, // channel item type must be Send (it crosses task/worker boundaries)
     E2404, // interface value crossing a task boundary is not Send
     E2405, // interface value crossing a task boundary is not Sync
+    E2406, // implementing class violates an inherited Send/Sync interface contract
     // Standard library import warnings W20xx
     W2002, // duplicate import
     // Staged language features that parse and type-check but have no code

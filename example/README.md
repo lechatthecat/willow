@@ -143,12 +143,32 @@ infinities, retain their bits. NaN keys raise the recoverable runtime panic
 keep IEEE semantics, and NaN remains valid as a map value. Map `toString()`
 sorts entries by rendered key text for deterministic output.
 
-## String length
+## String methods
 
 `String.len()` returns an `i64` UTF-8 byte count in constant time, excluding
 the trailing NUL: `"".len()` is 0, `"abc".len()` is 3, and `"日本語".len()`
 is 9. It does not measure Unicode characters, grapheme clusters, or terminal
 columns. See `language_gaps/main.wi` for length and imported-array examples.
+
+[String methods](string_methods.wi) demonstrates the remaining core API:
+
+| Method | Result and semantics |
+| --- | --- |
+| `substring(start: i64, end: i64)` / `slice(start: i64, end: i64)` | New `String` containing the byte range `[start, end)`. Both positions must be UTF-8 boundaries, with `0 <= start <= end <= len()`. Invalid ranges raise a recoverable panic. |
+| `find(needle: String)` | `i64` byte offset of the first exact match, or `-1`. An empty needle returns `0`. |
+| `contains(needle: String)` | `bool` indicating an exact substring match. An empty needle always matches. |
+| `starts_with(prefix: String)` | `bool` indicating an exact prefix match. An empty prefix always matches. |
+| `split(separator: String)` | `Array<String>` of non-overlapping literal matches; preserves leading, trailing, and adjacent empty fields. Empty separator splits at Unicode scalar boundaries, including leading/trailing empty fields: `"é".split("")` gives `["", "é", ""]`, and `"".split("")` gives `["", ""]`. |
+| `trim()` | New `String` with Unicode whitespace removed from both ends. Interior whitespace is preserved. |
+| `repeat(count: i64)` | New `String` repeated `count` times; zero produces `""`. Negative counts and size overflow raise recoverable panics. |
+| `toString()` | The original `String`, unchanged. |
+
+Matching is case-sensitive and performs no Unicode normalization. Embedded NUL
+bytes are ordinary string content. Slicing copies bytes and does not retain the
+original allocation. `"日本語".find("本")` returns `3`, and
+`"日本語".slice(3, 6)` returns `"本"`. Slicing at byte `1` panics because it
+would split a UTF-8 character. `split` returns a normal mutable array; an explicit
+`Array<String>` type annotation requires `import std::collections::Array;`.
 
 ### Default floating-point display
 

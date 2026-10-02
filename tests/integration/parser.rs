@@ -10,3 +10,6 @@ mod classes;
 mod control_flow;
 #[path = "parser/expressions.rs"]
 mod expressions;
+
+#[path = "parser/string_methods.rs"]
+mod string_methods;

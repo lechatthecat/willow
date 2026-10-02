@@ -1,0 +1,16 @@
+// String positions and len() use UTF-8 bytes. End positions are exclusive.
+fn main() {
+    let text = "  日本語,Willow,,  ".trim();
+    println(text.len());
+    println(text.substring(0, 6));
+    println(text.slice(6, 9));
+    println(text.find("Willow"));
+    println(text.contains("日本"));
+    println(text.starts_with("日本語"));
+    let fields = text.split(",");
+    println(fields.len());
+    println(fields[1].repeat(2));
+    println(fields[2].len());
+    println(fields[3].len());
+    println(text.toString());
+}

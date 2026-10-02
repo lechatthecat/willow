@@ -106,6 +106,10 @@ pub struct ResolutionContext {
 }
 
 pub struct TypeChecker {
+    // Declaration-epoch caches: cleared before registering each program.
+    marker_contracts: HashMap<String, Option<send_sync::Marker>>,
+    marker_contract_proven: HashSet<(Type, send_sync::Marker)>,
+
     resolution: std::rc::Rc<ResolutionContext>,
     body_queries: Option<std::rc::Rc<crate::compiler_db::body::BodyQueries>>,
     body_query_error: Option<anyhow::Error>,
@@ -286,6 +290,8 @@ impl TypeChecker {
 
     fn empty(resolution: std::rc::Rc<ResolutionContext>, symbols: SymbolTable) -> Self {
         Self {
+            marker_contracts: HashMap::new(),
+            marker_contract_proven: HashSet::new(),
             resolution,
             body_queries: None,
             body_query_error: None,

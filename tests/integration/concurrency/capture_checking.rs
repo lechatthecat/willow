@@ -6,6 +6,8 @@ fn test_dgwo4_nonsync_gc_arg_rejected_under_check() {
     assert!(!ok, "non-Sync Array arg should be rejected");
     assert!(stderr.contains("error[E2402]"), "{stderr}");
     assert!(stderr.contains("not `Sync`"), "{stderr}");
+    assert!(stderr.contains("immediately awaited"), "{stderr}");
+    assert!(stderr.contains("exclusive access"), "{stderr}");
 }
 
 #[test]
@@ -16,6 +18,7 @@ fn test_dgwo4_low_worker_override_still_rejects_nonsync_arg() {
         "single-worker scheduling must preserve Send/Sync checks"
     );
     assert!(stderr.contains("error[E2402]"), "{stderr}");
+    assert!(stderr.contains("immediately awaited"), "{stderr}");
 }
 
 #[test]
@@ -38,6 +41,50 @@ async fn main() { let m: Map<String, i64> = Map::new(); println(await use_m(m));
     );
     assert!(!ok);
     assert!(stderr.contains("error[E2402]"), "{stderr}");
+    assert!(stderr.contains("immediately awaited"), "{stderr}");
+    assert!(
+        stderr.contains("FrozenMap") && stderr.contains("Mutex<Map"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn test_immediate_await_fresh_array_still_requires_sync() {
+    let (ok, stderr) = compile_with_data_race_check(
+        "import std::collections::Array; async fn take(xs: Array<i64>) {} async fn main() { await take([1, 2]); }",
+    );
+    assert!(!ok, "{stderr}");
+    for text in [
+        "error[E2402]",
+        "immediately awaited",
+        "exclusive access",
+        "FrozenArray",
+        "Mutex<Array",
+    ] {
+        assert!(stderr.contains(text), "{stderr}");
+    }
+}
+
+#[test]
+fn test_immediate_await_sheet_reports_field_and_remedies() {
+    let (ok, stderr) = compile_with_data_race_check(
+        r#"
+import std::collections::Map;
+class Sheet { pub cells: Map<i64, i64>; }
+async fn evaluate(sheet: Sheet) -> i64 { return sheet.cells.len(); }
+async fn main() { let sheet = new Sheet(Map<i64, i64>::new()); println(await evaluate(sheet)); }
+"#,
+    );
+    assert!(!ok, "{stderr}");
+    for text in [
+        "error[E2402]",
+        "field `cells:",
+        "immediately awaited",
+        "FrozenMap",
+        "Mutex<Map",
+    ] {
+        assert!(stderr.contains(text), "{stderr}");
+    }
 }
 
 #[test]

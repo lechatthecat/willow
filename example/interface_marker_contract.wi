@@ -1,0 +1,31 @@
+// Implementations must uphold their interface's inherited Send/Sync contract.
+import std::collections::Array;
+
+interface Holder extends Send {
+    fn sum(self) -> i64;
+}
+class Item { pub value: i64; }
+class Bag implements Holder {
+    pub items: Array<Item>;
+    pub fn sum(self) -> i64 {
+        let mut total: i64 = 0;
+        for item in self.items { total += item.value; }
+        return total;
+    }
+}
+interface Snapshot extends Sync {
+    fn count(self) -> i64;
+}
+class FrozenBag implements Snapshot {
+    pub items: FrozenArray<i64>;
+    pub fn count(self) -> i64 { return self.items.len(); }
+}
+async fn count(snapshot: Snapshot) -> i64 { return snapshot.count(); }
+async fn main() {
+    let bag: Holder = new Bag([new Item(1), new Item(2)]);
+    await sleep(1);
+    println(bag.sum());
+    let items: Array<i64> = [10, 20];
+    let snapshot: Snapshot = new FrozenBag(items.freeze());
+    println(await count(snapshot));
+}

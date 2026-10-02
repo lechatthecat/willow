@@ -31,6 +31,8 @@ use crate::semantic::symbols::ParamInfo;
 
 use super::*;
 
+const ASYNC_CAPTURE_SHARING_NOTE: &str = "async calls share reference arguments with another task, even when immediately awaited; suspending the caller does not prove exclusive access to the referenced value";
+
 /// Value (non-GC, by-copy) types: scalars and the unit-like types. Everything
 /// else (String, Array, Map, classes, enums, Channel, Mutex, Task, …) is a
 /// heap/GC reference that is shared when passed to a task.
@@ -45,12 +47,12 @@ fn is_value_type(ty: &Type) -> bool {
 impl TypeChecker {
     /// True if a value of `ty` may be transferred across worker/task boundaries.
     pub(super) fn is_send(&self, ty: &Type) -> bool {
-        self.marker_holds(ty, Marker::Send, &mut HashSet::new())
+        self.marker_holds(ty, Marker::Send, &mut MarkerWalk::default())
     }
 
     /// True if a value of `ty` may be shared concurrently by multiple tasks.
     pub(super) fn is_sync(&self, ty: &Type) -> bool {
-        self.marker_holds(ty, Marker::Sync, &mut HashSet::new())
+        self.marker_holds(ty, Marker::Sync, &mut MarkerWalk::default())
     }
 
     /// Check the arguments passed to an async fn call: each value is captured
@@ -95,6 +97,7 @@ impl TypeChecker {
                         arg.expr.span(),
                         "interface value crosses a task boundary here",
                     ))
+                    .with_note(ASYNC_CAPTURE_SHARING_NOTE)
                     .with_help(format!(
                         "declare `interface {} extends Sync` if every implementation is Sync",
                         type_name(ty)
@@ -124,6 +127,7 @@ impl TypeChecker {
                     format!("`{}` crosses a task boundary here", type_name(ty)),
                 ))
                 .with_note(note)
+                .with_note(ASYNC_CAPTURE_SHARING_NOTE)
                 .with_help(help),
             );
         }
@@ -219,7 +223,99 @@ impl TypeChecker {
         self.push(diagnostic);
     }
 
-    fn marker_holds(&self, ty: &Type, marker: Marker, visiting: &mut HashSet<String>) -> bool {
+    /// Check the strongest inherited interface contract once per class. Traverse
+    /// interface diamonds once rather than classifying fields per interface.
+    pub(super) fn check_class_marker_contract(&mut self, c: &ClassDecl) {
+        let required = self.inherited_marker_contract(&c.name, &mut HashSet::new());
+        let Some(marker) = required else {
+            return;
+        };
+        let mut reasons = Some(MarkerFailure::default());
+        let mut walk = MarkerWalk::default();
+        if self.marker_holds_with_reason(
+            &Type::Named(c.name.clone()),
+            marker,
+            &mut walk,
+            &mut reasons,
+        ) {
+            self.marker_contract_proven.extend(walk.proven);
+            return;
+        }
+        // Without a recursive back-edge, completed positive subgraphs are
+        // independently proven even when a later field rejects the root.
+        if !walk.saw_cycle {
+            self.marker_contract_proven.extend(walk.proven);
+        }
+        let mut failure = reasons.unwrap();
+        failure.notes.reverse();
+        let name = if matches!(marker, Marker::Send) {
+            "Send"
+        } else {
+            "Sync"
+        };
+        self.push(Diagnostic::new(Severity::Error, ErrorCode::E2406,
+            format!("class `{}` does not satisfy its implemented interface's `{name}` contract", c.name))
+            .with_label(Label::primary(failure.field_span.unwrap_or(c.span),
+                format!("this field prevents `{}` from being `{name}`", c.name)))
+            .with_label(Label::secondary(c.span, format!("`{name}` is required by an implemented interface")))
+            .with_note(failure.notes.join(" -> "))
+            .with_help(failure.help.unwrap_or("all instance fields, including inherited fields, must satisfy the interface's marker contract")));
+    }
+
+    fn inherited_marker_contract(
+        &mut self,
+        name: &str,
+        active: &mut HashSet<String>,
+    ) -> Option<Marker> {
+        if let Some(&cached) = self.marker_contracts.get(name) {
+            return cached;
+        }
+        let builtin = match name {
+            "Sync" => Some(Marker::Sync),
+            "Send" => Some(Marker::Send),
+            _ => None,
+        };
+        if builtin.is_some() {
+            return builtin;
+        }
+        // Invalid inheritance cycles have their own diagnostics.
+        if !active.insert(name.to_string()) {
+            return None;
+        }
+        let parents: Vec<String> = if let Some(class) = self.symbols.lookup_class(name) {
+            class
+                .base_class
+                .iter()
+                .cloned()
+                .chain(class.implements.iter().filter_map(|ty| match ty {
+                    Type::Named(n) | Type::Generic(n, _) if n != "Send" && n != "Sync" => {
+                        Some(n.clone())
+                    }
+                    _ => None,
+                }))
+                .collect()
+        } else if let Some(interface) = self.symbols.lookup_interface(name) {
+            interface.extends.clone()
+        } else {
+            Vec::new()
+        };
+        let mut required = None;
+        for parent in parents {
+            match self.inherited_marker_contract(&parent, active) {
+                Some(Marker::Sync) => {
+                    required = Some(Marker::Sync);
+                    break;
+                }
+                Some(Marker::Send) => required = Some(Marker::Send),
+                None => {}
+            }
+        }
+        active.remove(name);
+        self.marker_contracts.insert(name.to_string(), required);
+        required
+    }
+
+    fn marker_holds(&self, ty: &Type, marker: Marker, visiting: &mut MarkerWalk) -> bool {
         self.marker_holds_with_reason(ty, marker, visiting, &mut None)
     }
 
@@ -230,7 +326,7 @@ impl TypeChecker {
 
     fn marker_failure(&self, ty: &Type, marker: Marker) -> (String, &'static str) {
         let mut reasons = Some(MarkerFailure::default());
-        self.marker_holds_with_reason(ty, marker, &mut HashSet::new(), &mut reasons);
+        self.marker_holds_with_reason(ty, marker, &mut MarkerWalk::default(), &mut reasons);
         let mut failure = reasons.unwrap();
         failure.notes.reverse();
         (failure.notes.join(" -> "), failure.help.unwrap_or(
@@ -241,7 +337,7 @@ impl TypeChecker {
         &self,
         ty: &Type,
         marker: Marker,
-        visiting: &mut HashSet<String>,
+        visiting: &mut MarkerWalk,
         reasons: &mut Option<MarkerFailure>,
     ) -> bool {
         if Self::is_error_type(ty)
@@ -255,6 +351,10 @@ impl TypeChecker {
         #[cfg(test)]
         if reasons.is_some() {
             tests::REASON_VISITS.with(|n| n.set(n.get() + 1));
+        }
+        let key = (ty.clone(), marker);
+        if visiting.proven.contains(&key) || self.marker_contract_proven.contains(&key) {
+            return true;
         }
         let send = matches!(marker, Marker::Send);
         let result = match ty {
@@ -355,6 +455,9 @@ impl TypeChecker {
                 if send { "Send" } else { "Sync" }
             ));
         }
+        if result {
+            visiting.proven.insert(key);
+        }
         result
     }
 
@@ -365,12 +468,13 @@ impl TypeChecker {
         name: &str,
         args: &[Type],
         marker: Marker,
-        visiting: &mut HashSet<String>,
+        visiting: &mut MarkerWalk,
         reasons: &mut Option<MarkerFailure>,
     ) -> bool {
         // Break recursive-type cycles optimistically: a self-reference adds no
         // new constraint beyond the other fields/payloads.
-        if !visiting.insert(name.to_string()) {
+        if !visiting.active.insert((name.to_string(), marker)) {
+            visiting.saw_cycle = true;
             return true;
         }
         let result = if let Some(en) = self.symbols.lookup_enum(name) {
@@ -389,28 +493,34 @@ impl TypeChecker {
             })
         } else if let Some(class) = self.symbols.lookup_class(name) {
             // Send iff all fields Send; Sync iff all fields Sync.
-            class.fields.iter().all(|(name, f)| {
-                let ok = self.marker_holds_with_reason(&f.ty, marker, visiting, reasons);
-                if !ok && let Some(reasons) = reasons {
-                    let prefix = format!("`{}` is not `", type_name(&f.ty));
-                    if reasons.notes.len() == 1 && reasons.notes[0].starts_with(&prefix) {
-                        reasons.notes[0] = format!(
-                            "field `{name}: {}` is not `{}`",
-                            type_name(&f.ty),
-                            if matches!(marker, Marker::Send) {
-                                "Send"
-                            } else {
-                                "Sync"
-                            }
-                        );
-                    } else {
-                        reasons
-                            .notes
-                            .push(format!("field `{name}: {}`", type_name(&f.ty)));
+            let base_ok = class.base_class.as_ref().is_none_or(|base| {
+                self.marker_holds_with_reason(&Type::Named(base.clone()), marker, visiting, reasons)
+            });
+            base_ok
+                && class.instance_field_order.iter().all(|(name, _)| {
+                    let f = &class.fields[name];
+                    let ok = self.marker_holds_with_reason(&f.ty, marker, visiting, reasons);
+                    if !ok && let Some(reasons) = reasons {
+                        reasons.field_span.get_or_insert(f.declaration_span);
+                        let prefix = format!("`{}` is not `", type_name(&f.ty));
+                        if reasons.notes.len() == 1 && reasons.notes[0].starts_with(&prefix) {
+                            reasons.notes[0] = format!(
+                                "field `{name}: {}` is not `{}`",
+                                type_name(&f.ty),
+                                if matches!(marker, Marker::Send) {
+                                    "Send"
+                                } else {
+                                    "Sync"
+                                }
+                            );
+                        } else {
+                            reasons
+                                .notes
+                                .push(format!("field `{name}: {}`", type_name(&f.ty)));
+                        }
                     }
-                }
-                ok
-            })
+                    ok
+                })
         } else if self.symbols.lookup_interface(name).is_some() {
             // An interface value follows its declared contract. `extends Sync`
             // is sufficient for Send as well: a Sync interface promises safe
@@ -430,19 +540,28 @@ impl TypeChecker {
             // Unknown type: conservative.
             false
         };
-        visiting.remove(name);
+        visiting.active.remove(&(name.to_string(), marker));
         result
     }
 }
 
 #[derive(Default)]
 struct MarkerFailure {
+    field_span: Option<Span>,
     notes: Vec<String>,
     help: Option<&'static str>,
 }
 
-#[derive(Clone, Copy)]
-enum Marker {
+#[derive(Default)]
+struct MarkerWalk {
+    saw_cycle: bool,
+    active: HashSet<(String, Marker)>,
+    // Scoped to one root query: a false result short-circuits the entire walk.
+    proven: HashSet<(Type, Marker)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum Marker {
     Send,
     Sync,
 }
@@ -653,6 +772,100 @@ mod tests {
                 );
                 if rejected {
                     assert!(captures[0].notes[0].contains("field `data:"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn immediate_await_explanation_scales_per_failing_argument() {
+        for calls in [16, 64, 256] {
+            let body = "await take(value);".repeat(calls);
+            let source = format!(
+                "import std::collections::Array; async fn take(value: Array<i64>) {{}} async fn invoke(value: Array<i64>) {{ {body} }} fn main() {{}}"
+            );
+            let (program, errors) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+            assert!(errors.is_empty(), "{errors:?}");
+            let mut c = TypeChecker::new();
+            c.set_enforce_send_sync(true);
+            REASON_VISITS.with(|n| n.set(0));
+            c.check_program(&program);
+            assert_eq!(c.errors.len(), calls, "{:?}", c.errors);
+            let notes = c
+                .errors
+                .iter()
+                .flat_map(|d| &d.notes)
+                .filter(|n| n.as_str() == ASYNC_CAPTURE_SHARING_NOTE)
+                .count();
+            let visits = REASON_VISITS.with(|n| n.get());
+            assert_eq!(notes, calls);
+            assert_eq!(visits, calls);
+            eprintln!("immediate-await calls={calls} notes={notes} reason_visits={visits}");
+        }
+    }
+
+    #[test]
+    fn immediately_awaited_captures_explain_sharing_and_preserve_remedies() {
+        // 3 call forms x 8 types x 3 wait styles = 72 explicit perspectives.
+        for form in 0..3 {
+            for (ty, code, help) in [
+                ("Array<i64>", Some(ErrorCode::E2402), "FrozenArray"),
+                ("Map<i64, i64>", Some(ErrorCode::E2402), "FrozenMap"),
+                ("Sheet", Some(ErrorCode::E2402), "Mutex<Map"),
+                ("Moving", Some(ErrorCode::E2405), "extends Sync"),
+                ("FrozenArray<i64>", None, ""),
+                ("FrozenMap<i64, i64>", None, ""),
+                ("Mutex<Sheet>", None, ""),
+                ("i64", None, ""),
+            ] {
+                for wait in ["direct", "parenthesized", "later"] {
+                    let (declaration, call) = match form {
+                        0 => (format!("async fn take(value: {ty}) {{}}"), "take(value)"),
+                        1 => (
+                            format!(
+                                "class Receiver {{ pub async fn take(self, value: {ty}) {{}} }}"
+                            ),
+                            "new Receiver().take(value)",
+                        ),
+                        _ => (
+                            format!(
+                                "class Receiver {{ pub static async fn take(value: {ty}) {{}} }}"
+                            ),
+                            "Receiver::take(value)",
+                        ),
+                    };
+                    let body = match wait {
+                        "direct" => format!("await {call};"),
+                        "parenthesized" => format!("await ({call});"),
+                        _ => format!("let task = {call}; await task;"),
+                    };
+                    let source = format!(
+                        "import std::collections::Array; import std::collections::Map; interface Send {{}} class Sheet {{ pub cells: Map<i64, i64>; }} interface Moving extends Send {{}} {declaration} async fn invoke(value: {ty}) {{ {body} }} fn main() {{}}"
+                    );
+                    let (program, errors) =
+                        Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+                    assert!(errors.is_empty(), "{errors:?}");
+                    let mut c = TypeChecker::new();
+                    c.set_enforce_send_sync(true);
+                    c.check_program(&program);
+                    assert_eq!(
+                        c.errors.len(),
+                        usize::from(code.is_some()),
+                        "{source}: {:?}",
+                        c.errors
+                    );
+                    if let Some(code) = code {
+                        let d = &c.errors[0];
+                        assert_eq!(d.code, code, "{d:?}");
+                        let span = d.primary_span().unwrap();
+                        assert_eq!(&source[span.start..span.end], "value");
+                        assert!(
+                            d.notes.iter().any(|n| n.contains("immediately awaited")
+                                && n.contains("exclusive access")),
+                            "{d:?}"
+                        );
+                        assert!(d.helps.iter().any(|h| h.contains(help)), "{d:?}");
+                    }
                 }
             }
         }
@@ -946,3 +1159,7 @@ mod tests {
         assert!(!c.is_send(&f) && !c.is_sync(&f));
     }
 }
+
+#[cfg(test)]
+#[path = "interface_marker_tests.rs"]
+mod interface_marker_tests;

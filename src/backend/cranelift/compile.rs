@@ -1133,7 +1133,11 @@ impl Codegen {
         l: &LambdaExpr,
         expr_types: &HashMap<ExprId, Type>,
     ) -> Result<()> {
-        let lambda_type = Self::lambda_value_type(l, expr_types);
+        // LIR normalizes imported type spellings to their declaration identities.
+        // Keep the lifted signature in that same form while this unit's aliases
+        // are installed; later units may reuse those aliases for other classes.
+        let lambda_type =
+            Self::lambda_value_type(l, expr_types).map(|ty| self.canonical_declared_type(ty));
         let (param_types, ast_ret) = match &lambda_type {
             Some(Type::Fn(params, ret) | Type::Closure(params, ret)) => {
                 (params.clone(), *ret.clone())
@@ -1204,9 +1208,12 @@ impl Codegen {
     }
 
     /// The checker's callable type for a lambda expression, if it recorded one.
-    fn lambda_value_type(l: &LambdaExpr, expr_types: &HashMap<ExprId, Type>) -> Option<Type> {
+    fn lambda_value_type<'a>(
+        l: &LambdaExpr,
+        expr_types: &'a HashMap<ExprId, Type>,
+    ) -> Option<&'a Type> {
         match expr_types.get(&l.id) {
-            Some(ty @ (Type::Fn(..) | Type::Closure(..))) => Some(ty.clone()),
+            Some(ty @ (Type::Fn(..) | Type::Closure(..))) => Some(ty),
             _ => None,
         }
     }

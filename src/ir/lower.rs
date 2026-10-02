@@ -2173,7 +2173,15 @@ fn lower_lambda_expr(l: &LambdaExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diag
     // block-bodied lambdas, the inferred return type.
     let inferred = match ctx.tables.lambda_fn_type(&l.id) {
         Some(Type::Fn(params, ret) | Type::Closure(params, ret)) => {
-            Some((params.clone(), (**ret).clone()))
+            // Inferred types need the same import normalization as explicit
+            // annotations before they become bindings in the lifted body.
+            Some((
+                params
+                    .iter()
+                    .map(|ty| ctx.normalize(ty))
+                    .collect::<Vec<_>>(),
+                ctx.normalize(ret),
+            ))
         }
         _ => None,
     };

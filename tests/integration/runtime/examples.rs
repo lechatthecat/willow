@@ -4,6 +4,11 @@ use super::*;
 
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
+        (
+            "example/string_methods.wi",
+            "18\n日本\n語\n10\ntrue\ntrue\n4\nWillowWillow\n0\n0\n日本語,Willow,,\n",
+        ),
+        ("example/interface_marker_contract.wi", "3\n2\n"),
         ("example/module_inference/src/main.wi", "42\n42\n42\n"),
         ("example/diagnostic_recovery.wi", "3\n"),
         ("example/parse_cascade_recovery.wi", "7\n"),
@@ -18,6 +23,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "shared cleanup\nouter cleanup\nasync cleanup\ndone\n",
         ),
         ("example/async_capture_diagnostics.wi", "3\n42\n"),
+        ("example/immediate_await_capture.wi", "3\n2\n3\n2\n"),
         (
             "example/compound_and_multiline.wi",
             "compound assignment\nand a multi-line string\n1\n",
@@ -207,6 +213,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/iterative_operator_validation.wi",
             "16\n20\ntrue\n19\n",
         ),
+        ("example/imported_class_lambdas/main.wi", "42\n7\n"),
         ("example/import_demo/main.wi", "30\n42\n42\n99\n3\n42\n"),
         ("example/item_import_demo/main.wi", "7\n25\n"),
         ("example/interfaces.wi", "woof\n4\ntweet\n2\nwoof\ntweet\n"),
@@ -1118,6 +1125,16 @@ fn test_async_capture_diagnostics_example() {
 }
 
 #[test]
+fn test_immediate_await_capture_example() {
+    let source = fs::read_to_string("example/immediate_await_capture.wi").unwrap();
+    for workers in ["1", "4"] {
+        let (out, ok) = compile_and_run_with_env(&source, &[("WILLOW_WORKERS", workers)]);
+        assert!(ok, "workers={workers}: {out}");
+        assert_eq!(out, "3\n2\n3\n2\n", "workers={workers}");
+    }
+}
+
+#[test]
 fn test_integral_float_display_examples() {
     for &(path, expected) in runnable_example_cases() {
         if matches!(
@@ -1159,4 +1176,11 @@ fn test_parse_cascade_recovery_example() {
     let (output, ok) = compile_file_and_run("example/parse_cascade_recovery.wi");
     assert!(ok);
     assert_eq!(output, "7\n");
+}
+
+#[test]
+fn test_interface_marker_contract_example() {
+    let (out, ok) = compile_file_and_run("example/interface_marker_contract.wi");
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n2\n");
 }

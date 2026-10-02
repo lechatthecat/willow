@@ -10,6 +10,9 @@
 // String literals are allocated once and kept alive permanently via
 // willow_gc_add_runtime_root so that gc_collect() never frees them.
 
+mod methods;
+pub use methods::*;
+
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, Ordering};
 

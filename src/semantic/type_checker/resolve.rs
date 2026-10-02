@@ -1253,18 +1253,21 @@ impl TypeChecker {
         args: &[CallArg],
         span: Span,
     ) -> Type {
-        if *obj_ty == Type::String && method_name == "len" {
-            if !args.is_empty() {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        "`String.len()` takes no arguments",
-                    )
-                    .with_label(Label::primary(span, "unexpected arguments")),
-                );
+        if *obj_ty == Type::String {
+            let params: Option<&[Type]> = match method_name {
+                "len" | "trim" => Some(&[]),
+                "substring" | "slice" => Some(&[Type::I64, Type::I64]),
+                "repeat" => Some(&[Type::I64]),
+                "split" | "contains" | "find" | "starts_with" => Some(&[Type::String]),
+                _ => None,
+            };
+            if let Some(params) = params {
+                self.check_call_argument_count(method_name, params.len(), args.len(), span);
+                self.check_value_call_args(params, args);
+                return crate::semantic::intrinsics::resolve(obj_ty, method_name, params.len())
+                    .expect("String method signature has an intrinsic")
+                    .return_type(|_| None);
             }
-            return Type::I64;
         }
         // Built-in `toString()` on primitives: `i64`/`f64`/`bool`/`String` ->
         // `String` (willow-fvfc). Class `toString()` falls through to normal
