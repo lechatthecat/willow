@@ -73,6 +73,9 @@ pub struct ModuleGraph {
     /// Keep the first typed routing failure alongside the full diagnostic list.
     /// The frontend returns it as the cause of its aggregated failure.
     pub(crate) package_import_error: Option<crate::package::PackageImportError>,
+    /// At least one loaded module has lexer/parser errors. Recovery ASTs remain
+    /// available for import discovery, but are not valid semantic inputs.
+    pub(crate) has_syntax_errors: bool,
     pub entry_path: Option<PathBuf>,
     /// Explicit project mode; a legacy project may have no package graph.
     pub(crate) project_mode: bool,

@@ -6,6 +6,18 @@ use crate::lexer::token::TokenKind;
 #[willow_continuations::parser]
 impl Parser {
     pub(super) fn parse_expr(&mut self) -> Result<Expr, Diagnostic> {
+        // Keep this wrapper direct: an extra continuation per expression would
+        // allocate two more boxes for every ordinary expression.
+        let saved = std::mem::replace(&mut self.allow_object_literals, true);
+        let result = self.parse_range();
+        self.allow_object_literals = saved;
+        let expr = result?;
+        self.reject_as_cast()?;
+        Ok(expr)
+    }
+
+    /// A lock target ends at its binding `as`; nested expressions still reject casts.
+    pub(super) fn parse_expr_before_as(&mut self) -> Result<Expr, Diagnostic> {
         let saved = std::mem::replace(&mut self.allow_object_literals, true);
         let result = self.parse_range();
         self.allow_object_literals = saved;
@@ -18,7 +30,18 @@ impl Parser {
         let saved = std::mem::replace(&mut self.allow_object_literals, false);
         let result = self.parse_range();
         self.allow_object_literals = saved;
-        result
+        let expr = result?;
+        self.reject_as_cast()?;
+        Ok(expr)
+    }
+
+    fn reject_as_cast(&self) -> Result<(), Diagnostic> {
+        if matches!(self.peek_kind(), TokenKind::As) {
+            return Err(self
+                .err_at(ErrorCode::E0102, "`as` casts are not supported", self.current_span())
+                .with_help("for a numeric constant, write an f64 literal such as `5.0`; runtime i64/f64 conversion is not yet available"));
+        }
+        Ok(())
     }
 
     pub(super) fn parse_range(&mut self) -> Result<Expr, Diagnostic> {
@@ -66,6 +89,7 @@ impl Parser {
                 match frames.pop() {
                     None => return Ok(value),
                     Some(Frame::Then { condition, span }) => {
+                        self.reject_as_cast()?;
                         if !self.eat(TokenKind::Colon) {
                             return Err(self
                                 .err(ErrorCode::E0903, "expected `:` in ternary expression")
@@ -334,6 +358,15 @@ impl Parser {
                 let index = self.parse_expr()?;
                 self.expect(TokenKind::RBracket)?;
                 lhs = Expr::Index(Box::new(lhs), Box::new(index), span, ExprId::fresh());
+            } else if matches!(self.peek_kind(), TokenKind::LParen)
+                && matches!(
+                    lhs,
+                    Expr::Call(_) | Expr::MethodCall(_) | Expr::StaticCall(_)
+                )
+            {
+                return Err(self
+                    .err(ErrorCode::E0102, "calling a call result is not supported")
+                    .with_help("bind the result first: `let f = pick(0); f(5)`"));
             } else {
                 break;
             }

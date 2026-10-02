@@ -3,3 +3,5 @@
 /tests/fixtures/agent/**/*.txt text eol=lf
 # Bootstrap golden tests compare exact bytes against LF-generated project files.
 /tests/fixtures/init/** text eol=lf
+# Raw newlines in example string literals are part of their asserted output.
+/example/**/*.wi text eol=lf

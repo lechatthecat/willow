@@ -148,16 +148,57 @@ impl TypeChecker {
         span: Span,
         declaration: Span,
         ty: Type,
-        last: bool,
+        role: &str,
     ) {
         if self.capture_call_sites {
             self.analysis_symbols.reference(
                 span,
                 name,
                 Declaration::new(name, kind, declaration, Some(ty)),
-                "member",
-                last,
+                role,
+                true,
             );
+        }
+    }
+    /// Classify only references produced while checking this storage expression.
+    /// Compound lowering captures the source place in a reserved temporary: its
+    /// initializer supplies both the source read and the element-write evidence.
+    pub(super) fn record_element_write(
+        &mut self,
+        expression: &Expr,
+        start: usize,
+        keep_read: bool,
+    ) {
+        if !self.capture_call_sites {
+            return;
+        }
+        let mut target = expression;
+        while let Expr::Index(array, ..) = target {
+            target = array;
+        }
+        if !matches!(
+            target,
+            Expr::Var(..) | Expr::FieldAccess(..) | Expr::StaticField(..)
+        ) {
+            return;
+        }
+        let end = self.analysis_symbols.references.len();
+        for index in start..end {
+            let reference = &mut self.analysis_symbols.references[index];
+            if reference.span == target.span()
+                && matches!(
+                    reference.target.kind.as_str(),
+                    "binding" | "parameter" | "field" | "static-field"
+                )
+            {
+                if keep_read {
+                    let mut write = reference.clone();
+                    write.role = "write-element".into();
+                    self.analysis_symbols.references.push(write);
+                } else {
+                    reference.role = "write-element".into();
+                }
+            }
         }
     }
     pub(super) fn record_method_use(
@@ -300,6 +341,43 @@ impl TypeChecker {
 mod buildgraph_tests {
     use super::*;
     use crate::{lexer::Lexer, parser::Parser};
+    #[test]
+    fn compound_element_roles_scale_with_sites_and_index_depth() {
+        for n in [16, 64, 256, 1024] {
+            for depth in [1, 4, 16] {
+                let mut source = format!(
+                    "fn f() {{ let xs = {}1{}; let i = 0;",
+                    "[".repeat(depth),
+                    "]".repeat(depth)
+                );
+                source.push_str(&format!("xs{} += 1;", "[i]".repeat(depth)).repeat(n));
+                source.push('}');
+                let (program, parse) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+                assert!(parse.is_empty());
+                let mut checker = TypeChecker::new();
+                checker.capture_call_sites = true;
+                checker.check_program(&program);
+                assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+                let references = &checker.analysis_symbols.references;
+                for (name, role, count) in [
+                    ("xs", "read", n),
+                    ("xs", "write-element", n),
+                    ("i", "read", n * depth),
+                ] {
+                    assert_eq!(
+                        references
+                            .iter()
+                            .filter(|r| r.written == name && r.role == role)
+                            .count(),
+                        count,
+                        "n={n}, depth={depth}, {name}/{role}"
+                    );
+                }
+                // Four synthetic temporary references per lowered assignment.
+                assert_eq!(references.len(), n * (depth + 6));
+            }
+        }
+    }
     #[test]
     fn element_mutation_roles_scale_with_sites() {
         for n in [16, 64, 256, 1024] {

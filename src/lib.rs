@@ -637,6 +637,15 @@ fn run_frontend_revision(
         emitter,
     )?;
     let imports = PhaseDiagnostics::new(resolution.diagnostics);
+    // Partial syntax is useful to editors and import discovery, but omitted
+    // declarations/statements are not a sound input to semantic diagnostics.
+    // Finish collecting syntax errors across imports before stopping here.
+    if parse.error_count > 0 || graph.has_syntax_errors {
+        anyhow::bail!(
+            "aborting due to {} error(s)",
+            parse.error_count + imports.error_count
+        );
+    }
     // Keep resolved and recovered declarations even when another import fails.
     // Clearing the graph makes healthy imports disappear from the type checker
     // and manufactures cross-file cascades. All import errors remain fatal at

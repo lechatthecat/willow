@@ -374,3 +374,76 @@ fn imported_container_members_are_source_owned_and_paths_are_canonical() {
         "model::Thing::get"
     );
 }
+
+#[test]
+fn typo_suggestions_correct_each_qualified_segment() {
+    let f = Fixture::new(true);
+    f.source("src/sub/eval.wi", "pub class Recursive { pub fn cell(self) -> i64 { return 1; } pub fn cells(self) -> i64 { return 2; } } ");
+    for typo in [
+        "su::eval::Recursive::cell",
+        "sub::evl::Recursive::cell",
+        "sub::eval::Recursiv::cell",
+        "sub::eval::Recursive::cel",
+        "eval::Recursiv::cell",
+        "Recursiv::cell",
+    ] {
+        let v = f.json(&["refs", typo], 1);
+        assert_eq!(v["status"], "unknown", "{v}");
+        assert_eq!(
+            v["result"]["suggestions"][0], "sub::eval::Recursive::cell",
+            "{typo}: {v}"
+        );
+    }
+}
+
+#[test]
+fn overview_preserves_async_and_generic_declaration_details() {
+    let f = Fixture::new(false);
+    f.source("src/main.wi", "interface Source<T, U> { fn get(self) -> T; } enum Pair<T, U> { Left(T), Right(U) } async fn editor() {} class Worker { pub async fn run(self) -> i64 { return 1; } } fn main() {} ");
+    let v = f.json(&["overview", "src/main.wi"], 0);
+    let symbols = v["files"][0]["symbols"].as_array().unwrap();
+    assert_eq!(symbols[0]["type_params"], serde_json::json!(["T", "U"]));
+    assert_eq!(symbols[1]["type_params"], serde_json::json!(["T", "U"]));
+    assert_eq!(symbols[2]["is_async"], true);
+    assert_eq!(symbols[3]["members"][0]["is_async"], true);
+    assert!(symbols[4].get("is_async").is_none());
+    let out = f.run(&["overview", "src/main.wi"]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    for expected in [
+        "interface Source<T, U>",
+        "enum Pair<T, U>",
+        "async function editor",
+        "async method run",
+    ] {
+        assert!(text.contains(expected), "{text}");
+    }
+}
+
+#[test]
+fn imported_declaration_details_survive_depth_formats_and_round_trip() {
+    let f = Fixture::new(true);
+    f.source("src/model.wi", "pub interface Source<T> { fn get(self) -> T; } pub enum Item<T> { Value(T) } pub async fn load() -> i64 { return 7; } ");
+    f.source("src/main.wi", "import model; fn main() {} ");
+    for format in ["json", "ndjson"] {
+        let out = f.run(&[
+            "overview",
+            "src/model.wi",
+            "--depth",
+            "0",
+            "--format",
+            format,
+        ]);
+        assert!(out.status.success());
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let symbols = v["files"][0]["symbols"].as_array().unwrap();
+        assert_eq!(symbols[0]["type_params"], serde_json::json!(["T"]));
+        assert_eq!(symbols[1]["type_params"], serde_json::json!(["T"]));
+        assert_eq!(symbols[2]["is_async"], true);
+        assert!(symbols[0].get("members").is_none());
+        for symbol in symbols {
+            let selector = symbol["selector"].as_str().unwrap();
+            assert!(!selector.contains('<'));
+            assert_eq!(f.json(&["symbol", selector], 0)["status"], "ok");
+        }
+    }
+}

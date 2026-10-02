@@ -10,6 +10,18 @@ impl Parser {
         self.expect(TokenKind::LBrace)?;
         let mut stmts = Vec::new();
         while !self.check(TokenKind::RBrace) && !self.at_eof() {
+            if matches!(
+                self.peek_kind(),
+                TokenKind::Fn | TokenKind::Pub | TokenKind::Class | TokenKind::Async
+            ) {
+                return Err(self
+                    .err_at(
+                        ErrorCode::E0103,
+                        "expected `}` to close block",
+                        self.current_span(),
+                    )
+                    .with_label(Label::secondary(start, "block opened here")));
+            }
             match self.parse_stmt() {
                 Ok(stmt) => stmts.push(stmt),
                 Err(e) => {
@@ -22,7 +34,8 @@ impl Parser {
             }
         }
         let end = self.current_span();
-        self.expect(TokenKind::RBrace)?;
+        self.expect(TokenKind::RBrace)
+            .map_err(|error| error.with_label(Label::secondary(start, "block opened here")))?;
         Ok(Block {
             id: crate::parser::ast::BodyId::fresh(),
             stmts,
@@ -194,7 +207,7 @@ impl Parser {
             _ => LockMode::Mutex,
         };
 
-        let target = self.parse_expr()?;
+        let target = self.parse_expr_before_as()?;
         self.expect(TokenKind::As)?;
 
         let mut_span = self.current_span();

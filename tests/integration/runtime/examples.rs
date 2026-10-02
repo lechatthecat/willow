@@ -6,6 +6,18 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
         ("example/module_inference/src/main.wi", "42\n42\n42\n"),
         ("example/diagnostic_recovery.wi", "3\n"),
+        ("example/parse_cascade_recovery.wi", "7\n"),
+        ("example/call_result_binding.wi", "5\n5.5\n"),
+        ("example/reference_roles.wi", "1\n9\n6\n"),
+        ("example/overview.wi", "counter\n2\n"),
+        ("example/assignment_target_types.wi", "10\n10\n12\n9\n"),
+        ("example/effect_explanations.wi", "4\n2\n"),
+        ("example/void_tasks_frozen_iteration.wi", "2\n60\n"),
+        (
+            "example/shared_cancellation_cleanup.wi",
+            "shared cleanup\nouter cleanup\nasync cleanup\ndone\n",
+        ),
+        ("example/async_capture_diagnostics.wi", "3\n42\n"),
         (
             "example/compound_and_multiline.wi",
             "compound assignment\nand a multi-line string\n1\n",
@@ -93,7 +105,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/constructor_lambdas.wi", "8\n402\n"),
         (
             "example/map_float_keys.wi",
-            "true\n1\n20\n20\n{0.0: 20}\ntrue\nfalse\nNaN cannot be used as a Map key\n1\n",
+            "true\n1\n20\n20\n{0: 20}\ntrue\nfalse\nNaN cannot be used as a Map key\n1\n",
         ),
         ("example/constructor_visibility.wi", "pub\n42\n7\n"),
         ("example/constructors.wi", "John\n20\n7\n"),
@@ -108,6 +120,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/fib.wi", "6765\n"),
         ("example/fib_bench.wi", "6765\n"),
         ("example/f64_parse.wi", "3.5\ntrue\nNaN\nparse failed\n"),
+        (
+            "example/f64_integral_display.wi",
+            "0\n0\n0\n0\ntrue\n-0\n-0\n-0\n-0\ntrue\n2\n2\n2\n2\ntrue\n-2\n-2\n-2\n-2\ntrue\n1\n1\n1\n1\ntrue\n1.25\n1.25\n1.25\n1.25\ntrue\n-Infinity\n",
+        ),
         ("example/floats.wi", "4\ntrue\n-4\n"),
         ("example/fn_values.wi", "20\n25\n30\n107\n104\n"),
         ("example/lambda_shadowing.wi", "101\n201\n102\n"),
@@ -133,7 +149,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/gc_mutator_registration.wi", "ledger\n288\n"),
         (
             "example/enum_match.wi",
-            "north\nwest\n78.53975\n12\n0.0\nzero\nnonzero\nyes\nno\n",
+            "north\nwest\n78.53975\n12\n0\nzero\nnonzero\nyes\nno\n",
         ),
         ("example/generic_enum_empty/main.wi", "1\n2\n"),
         ("example/unqualified_enum_pair.wi", "42\n"),
@@ -537,7 +553,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         (
             "example/lir_closures.wi",
-            "8\n15\n5\n18\n9\narea=12\n11.25\n0.0\n1\n42\n42\n25\n14\n63\n20\n",
+            "8\n15\n5\n18\n9\narea=12\n11.25\n0\n1\n42\n42\n25\n14\n63\n20\n",
         ),
         (
             "example/lir_interface_boxing.wi",
@@ -1092,4 +1108,55 @@ fn test_diagnostic_recovery_example() {
     let (out, ok) = compile_file_and_run("example/diagnostic_recovery.wi");
     assert!(ok);
     assert_eq!(out, "3\n");
+}
+
+#[test]
+fn test_async_capture_diagnostics_example() {
+    let (out, ok) = compile_file_and_run("example/async_capture_diagnostics.wi");
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n42\n");
+}
+
+#[test]
+fn test_integral_float_display_examples() {
+    for &(path, expected) in runnable_example_cases() {
+        if matches!(
+            path,
+            "example/f64_integral_display.wi"
+                | "example/map_float_keys.wi"
+                | "example/enum_match.wi"
+                | "example/lir_closures.wi"
+        ) {
+            let (out, ok) = compile_file_and_run(path);
+            assert!(ok, "{path}: {out}");
+            assert_eq!(out, expected, "{path}");
+        }
+    }
+}
+
+#[test]
+fn test_repaired_example_catalog_entries() {
+    for &(path, expected) in runnable_example_cases() {
+        if matches!(
+            path,
+            "example/reference_roles.wi"
+                | "example/overview.wi"
+                | "example/async_capture_diagnostics.wi"
+                | "example/assignment_target_types.wi"
+                | "example/effect_explanations.wi"
+                | "example/void_tasks_frozen_iteration.wi"
+                | "example/shared_cancellation_cleanup.wi"
+        ) {
+            let (out, ok) = compile_file_and_run(path);
+            assert!(ok, "{path}: {out}");
+            assert_eq!(out, expected, "{path}");
+        }
+    }
+}
+
+#[test]
+fn test_parse_cascade_recovery_example() {
+    let (output, ok) = compile_file_and_run("example/parse_cascade_recovery.wi");
+    assert!(ok);
+    assert_eq!(output, "7\n");
 }

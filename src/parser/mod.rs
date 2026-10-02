@@ -370,6 +370,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_cascade_recovery_token_reads_scale_linearly() {
+        let mut samples = Vec::new();
+        for count in [16, 64, 256] {
+            let source = format!(
+                "fn main() {{ let x = ; {} }}",
+                "println(absent);".repeat(count)
+            );
+            PARSER_TOKEN_READS.with(|v| v.set(0));
+            assert_eq!(parse_errors(&source).len(), 1);
+            samples.push((count, PARSER_TOKEN_READS.with(|v| v.get())));
+        }
+        let slope = (samples[1].1 - samples[0].1) / 48;
+        assert_eq!(samples[1].1 - samples[0].1, slope * 48);
+        assert_eq!(samples[2].1 - samples[1].1, slope * 192);
+        eprintln!("parse recovery token reads: {samples:?}");
+    }
+
+    #[test]
     fn control_head_token_reads_scale_linearly() {
         let mut samples = Vec::new();
         for count in [8, 16, 32, 64] {
@@ -3084,3 +3102,6 @@ thread_local! {
 
 #[cfg(test)]
 mod keyword_tests;
+
+#[cfg(test)]
+mod unsupported_postfix_tests;

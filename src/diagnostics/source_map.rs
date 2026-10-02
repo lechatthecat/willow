@@ -10,6 +10,11 @@ use super::FileId;
 /// Read-only source lookup shared by human and structured diagnostics.
 pub trait SourceLookup {
     fn get(&self, file_id: FileId) -> Option<&SourceMap>;
+
+    /// Display spelling only; source identity and debug paths remain unchanged.
+    fn display_path(&self, file_id: FileId) -> Option<&str> {
+        self.get(file_id).map(|source| source.path.as_str())
+    }
 }
 
 impl SourceLookup for SourceMap {

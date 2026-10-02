@@ -13,10 +13,70 @@ pub struct Symbol {
     /// display metadata, not an additional persisted semantic fact.
     #[serde(skip)]
     pub source_name: Option<String>,
+    #[serde(skip)]
+    pub details: DeclarationDetails,
     pub kind: String,
     pub location: Option<Location>,
     pub ty: Option<Type>,
 }
+/// Live declaration presentation metadata, captured before bodies are offloaded.
+/// It does not alter persisted symbol facts or selector identities.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeclarationDetails {
+    pub is_async: bool,
+    pub type_params: Vec<String>,
+}
+
+pub(super) fn details(program: &Program) -> HashMap<Span, DeclarationDetails> {
+    let mut result = HashMap::new();
+    for item in &program.items {
+        match item {
+            Item::Function(f) if f.is_async => {
+                result.insert(
+                    f.span,
+                    DeclarationDetails {
+                        is_async: true,
+                        ..Default::default()
+                    },
+                );
+            }
+            Item::Class(c) => {
+                for m in &c.methods {
+                    if m.is_async && c.span.contains(m.span) {
+                        result.insert(
+                            m.span,
+                            DeclarationDetails {
+                                is_async: true,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }
+            }
+            Item::Interface(i) if !i.type_params.is_empty() => {
+                result.insert(
+                    i.span,
+                    DeclarationDetails {
+                        type_params: i.type_params.clone(),
+                        ..Default::default()
+                    },
+                );
+            }
+            Item::Enum(e) if !e.type_params.is_empty() => {
+                result.insert(
+                    e.span,
+                    DeclarationDetails {
+                        type_params: e.type_params.clone(),
+                        ..Default::default()
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+    result
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reference {
@@ -396,6 +456,20 @@ pub(super) fn finish(
             name: d.name.clone(),
             source_name: source_names.get(&declaration_key(d)).cloned(),
             kind: d.kind.clone(),
+            // Type-parameter declarations share their container span. Do not
+            // clone the whole generic parameter list onto each parameter.
+            details: if matches!(
+                d.kind.as_str(),
+                "function" | "method" | "interface" | "enum"
+            ) {
+                captures
+                    .get(&crate::module::ModuleId(d.span.file_id.0))
+                    .and_then(|unit| unit.symbol_details.get(&d.span))
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                DeclarationDetails::default()
+            },
             location,
             ty: d.ty.clone(),
         });
@@ -479,6 +553,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn generic_metadata_is_stored_once_per_container_not_per_parameter() {
+        for n in [1, 16, 256] {
+            let span = Span::new(0, n * 8 + 8, 1, 1);
+            let params: Vec<_> = (0..n).map(|i| format!("T{i}")).collect();
+            let mut facts = Facts::default();
+            facts
+                .declarations
+                .push(Declaration::new("Source", "interface", span, None));
+            for param in &params {
+                facts
+                    .declarations
+                    .push(Declaration::new(param, "type-parameter", span, None));
+            }
+            let captured = CapturedUnit {
+                graph: CallGraph::default(),
+                semantic: semantic::Captured::default(),
+                symbols: facts,
+                symbol_owners: vec![(span, "Source".into())],
+                symbol_details: HashMap::from([(
+                    span,
+                    DeclarationDetails {
+                        is_async: false,
+                        type_params: params.clone(),
+                    },
+                )]),
+                declarations: HashMap::new(),
+                identities: HashMap::new(),
+                lambda_names: HashMap::new(),
+                rename_calls: Vec::new(),
+                direct: HashMap::new(),
+                dispatches: HashMap::new(),
+                dispatch_sites: HashMap::new(),
+            };
+            let names = std::iter::once(("Source".into(), vec![(0, 6)]))
+                .chain(
+                    params
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| (p.clone(), vec![(8 + i * 8, 8 + i * 8 + p.len())])),
+                )
+                .collect();
+            let (symbols, _) = finish(
+                &HashMap::from([(UnitId::ENTRY, captured)]),
+                &HashMap::from([(UnitId::ENTRY, "/tmp/generic.wi".into())]),
+                &HashMap::from([(UnitId::ENTRY, names)]),
+                &[],
+            );
+            assert_eq!(symbols.len(), n + 1);
+            assert_eq!(
+                symbols
+                    .iter()
+                    .map(|s| s.details.type_params.len())
+                    .sum::<usize>(),
+                n
+            );
+            assert_eq!(
+                symbols
+                    .iter()
+                    .find(|s| s.kind == "interface")
+                    .unwrap()
+                    .details
+                    .type_params,
+                params
+            );
+            println!("generic_parameters={n} stored_parameter_names={n}");
+        }
+    }
+
+    #[test]
     fn finish_accepts_escaped_owner_paths_and_names() {
         let paths = [
             "/tmp/project/main.wi",
@@ -510,6 +653,7 @@ mod tests {
                     symbol_owners: owner
                         .map(|name| vec![(Span::new(0, 8, 1, 1), name.into())])
                         .unwrap_or_default(),
+                    symbol_details: HashMap::new(),
                     declarations: HashMap::new(),
                     identities: HashMap::new(),
                     lambda_names: HashMap::new(),

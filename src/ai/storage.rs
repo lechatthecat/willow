@@ -489,6 +489,7 @@ mod tests {
         let id = serde_json::to_string(&[&file, "Box"]).unwrap();
         semantic.symbols.push(symbols::Symbol {
             source_name: None,
+            details: Default::default(),
             identity: None,
             id: format!("symbol:{id}"),
             name: "Box".into(),

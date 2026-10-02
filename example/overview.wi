@@ -1,4 +1,8 @@
 // Try: willow overview example/overview.wi --depth 1
+interface Source<T> {
+    fn get(self) -> T;
+}
+async fn background() -> i64 { return 1; }
 interface Described {
     fn describe(self) -> String;
 }

@@ -322,8 +322,18 @@ impl Body {
                     };
                     let node = self.node(stmt.span(), vec![next], false);
                     if let Some(op) = operation {
+                        // A plain index store has no target Expr node in the AST.
+                        // Its source span is the `[` token; retain the checked
+                        // element type just as an index read does.
+                        let ty = match stmt {
+                            Stmt::IndexAssign(s) => match types.get(&s.array.id()) {
+                                Some(Type::Array(element)) => Some((**element).clone()),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
                         self.expressions
-                            .push((stmt.span(), None, None, Some(op.into()), node));
+                            .push((stmt.span(), ty, None, Some(op.into()), node));
                     }
                     self.sequence(jobs, Self::children(AstEvent::Stmt(stmt)), node, exits)
                 }

@@ -438,7 +438,7 @@ fn cascaded_diagnostics_follow_their_roots_and_name_them() {
             .any(|d| d.0 == "E0201" && d.1.ends_with("util.wi") && d.2 == 2 && !d.3),
         "{summary:?}"
     );
-    // Parse recovery noise and the `void` result of the unresolved call cascade.
+    // Parse recovery noise cascades; an unresolved call must not manufacture a type mismatch.
     assert!(
         summary
             .iter()
@@ -446,9 +446,9 @@ fn cascaded_diagnostics_follow_their_roots_and_name_them() {
         "{summary:?}"
     );
     assert!(
-        summary
+        !summary
             .iter()
-            .any(|d| d.0 == "E0201" && d.1.ends_with("util.wi") && d.2 == 1 && d.3),
+            .any(|d| d.0 == "E0201" && d.1.ends_with("util.wi") && d.2 == 1),
         "{summary:?}"
     );
 }
@@ -521,9 +521,9 @@ fn failed_imports_do_not_manufacture_cross_file_semantic_errors() {
                 fs::write(
                     f.0.join("market.wi"),
                     if failure == "nested" {
-                        "pub fn price() -> i64 { let y = 0; if true { y += 1; } return y; }"
+                        "pub fn price() -> i64 { let y = 0; if true { let broken = ; } return y; }"
                     } else {
-                        "pub fn price() -> i64 { let y = 0; y += 1; return y; }"
+                        "pub fn price() -> i64 { let broken = ; return 0; }"
                     },
                 )
                 .unwrap();
@@ -536,7 +536,7 @@ fn failed_imports_do_not_manufacture_cross_file_semantic_errors() {
                 .unwrap();
                 fs::write(
                     f.0.join("leaf.wi"),
-                    "pub fn value() -> i64 { let y = 0; y += 1; return y; }",
+                    "pub fn value() -> i64 { let broken = ; return 0; }",
                 )
                 .unwrap();
             }
@@ -607,7 +607,7 @@ fn independent_cross_file_type_errors_remain_roots_with_recovered_imports() {
     .unwrap();
     fs::write(
         f.0.join("broken.wi"),
-        "pub fn recover() -> i64 { let y = 0; y += 1; return y; }",
+        "pub fn recover() -> i64 { let broken = ; return 0; }",
     )
     .unwrap();
     let values = events(

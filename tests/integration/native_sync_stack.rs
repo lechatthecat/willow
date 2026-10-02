@@ -2,6 +2,25 @@ use super::support::*;
 use std::time::Duration;
 
 #[test]
+fn shared_sync_cancellation_nested_gc_captures_and_call_edges() {
+    for workers in ["1", "4"] {
+        for budget in ["1", "32"] {
+            let (out, ok) = compile_and_run_with_runtime_env(
+                include_str!("../../example/shared_cancellation_cleanup.wi"),
+                &[
+                    ("WILLOW_WORKERS", workers),
+                    ("WILLOW_TASK_BUDGET", budget),
+                    ("WILLOW_GC_STRESS", "alloc,scheduler"),
+                ],
+                Duration::from_secs(20),
+            );
+            assert!(ok, "workers={workers} budget={budget}: {out}");
+            assert_eq!(out, "shared cleanup\nouter cleanup\nasync cleanup\ndone\n");
+        }
+    }
+}
+
+#[test]
 fn native_sync_stack_recursive_helpers_return_exact_results() {
     let (out, ok) = compile_and_run_with_runtime_env(
         r#"

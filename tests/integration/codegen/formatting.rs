@@ -175,3 +175,15 @@ fn interp_20_many_pieces_under_gc_stress() {
     assert!(ok, "{out}");
     assert_eq!(out, "1 true 2.5 s 3 false\n");
 }
+
+#[test]
+fn integral_f64_display_all_public_paths() {
+    let source = include_str!("../../../example/f64_integral_display.wi");
+    let expected = "0\n0\n0\n0\ntrue\n-0\n-0\n-0\n-0\ntrue\n2\n2\n2\n2\ntrue\n-2\n-2\n-2\n-2\ntrue\n1\n1\n1\n1\ntrue\n1.25\n1.25\n1.25\n1.25\ntrue\n-Infinity\n";
+    let (out, ok) = compile_and_run(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, expected);
+    let (out, ok) = compile_and_run_gc_stress(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, expected);
+}

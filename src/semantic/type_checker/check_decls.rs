@@ -1499,14 +1499,17 @@ impl TypeChecker {
         );
         let locals = self.local.async_local_types.split_off(async_locals_before);
         if m.is_async {
-            let task_params = if m.is_static {
-                param_types.clone()
-            } else {
-                let mut task_params = Vec::with_capacity(param_types.len() + 1);
-                task_params.push(Type::Named(class_name.to_string()));
-                task_params.extend(param_types.iter().cloned());
-                task_params
-            };
+            let receiver = Type::Named(class_name.to_string());
+            let mut task_params = Vec::with_capacity(param_types.len() + usize::from(!m.is_static));
+            if !m.is_static {
+                task_params.push((&receiver, m.span));
+            }
+            task_params.extend(
+                param_types
+                    .iter()
+                    .zip(&m.params)
+                    .map(|(ty, p)| (ty, p.span)),
+            );
             self.check_async_task_send(
                 m.span,
                 &m.body,
@@ -1590,7 +1593,11 @@ impl TypeChecker {
                 f.span,
                 &f.body,
                 &return_type,
-                &param_types,
+                &param_types
+                    .iter()
+                    .zip(&f.params)
+                    .map(|(ty, p)| (ty, p.span))
+                    .collect::<Vec<_>>(),
                 &locals,
                 async_locals_before,
             );

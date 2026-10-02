@@ -811,9 +811,9 @@ fn main() {}
 }
 
 #[test]
-fn test_parse_errors_and_type_errors_both_reported() {
+fn test_parse_errors_precede_semantic_checks() {
     // One function has a parse error (missing RHS); another has a type error.
-    // The pipeline should continue past the parse error and report both.
+    // Semantic checks wait for complete syntax to avoid misleading cascades.
     let stderr = compile_error_stderr(
         r#"
 fn bad_parse() -> i64 {
@@ -829,8 +829,8 @@ fn main() {}
     );
     let error_count = stderr.matches("error[").count();
     assert!(
-        error_count >= 2,
-        "expected parse error and type error both reported, got {error_count}:\n{stderr}"
+        error_count == 1,
+        "expected only the parse error, got {error_count}:\n{stderr}"
     );
 }
 

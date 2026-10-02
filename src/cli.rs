@@ -692,7 +692,18 @@ fn execute_compiler(
     emitter: &mut dyn willow_compiler::diagnostics::DiagnosticEmitter,
     build: bool,
 ) -> Result<()> {
-    let session = willow_compiler::CompilerSession::new(src, out, options, root);
+    let session = willow_compiler::CompilerSession::new(src, out, options, root.clone());
+    let mut project_emitter;
+    let emitter: &mut dyn willow_compiler::diagnostics::DiagnosticEmitter =
+        if let Some(root) = root.as_deref() {
+            project_emitter = willow_compiler::diagnostics::ProjectEmitter {
+                root,
+                inner: &mut *emitter,
+            };
+            &mut project_emitter
+        } else {
+            &mut *emitter
+        };
     if build {
         session.run_with_emitter(emitter)
     } else {

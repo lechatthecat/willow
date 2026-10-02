@@ -24,6 +24,10 @@ pub struct Entry {
     pub name: String,
     pub kind: String,
     pub selector: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_async: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub type_params: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub type_display: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -349,6 +353,8 @@ fn entry(session: &DirectSession, symbol: &Symbol) -> Entry {
             .into(),
         kind: symbol.kind.clone(),
         selector: session.selector(symbol),
+        is_async: symbol.details.is_async,
+        type_params: symbol.details.type_params.clone(),
         type_display: symbol.ty.as_ref().map(|ty| {
             session
                 .session
@@ -360,7 +366,15 @@ fn entry(session: &DirectSession, symbol: &Symbol) -> Entry {
     }
 }
 fn human_entry(out: &mut impl Write, s: &Entry, indent: &str) -> io::Result<()> {
-    write!(out, "{indent}{} {} [{}]", s.kind, s.name, s.selector)?;
+    write!(out, "{indent}")?;
+    if s.is_async {
+        write!(out, "async ")?;
+    }
+    write!(out, "{} {}", s.kind, s.name)?;
+    if !s.type_params.is_empty() {
+        write!(out, "<{}>", s.type_params.join(", "))?;
+    }
+    write!(out, " [{}]", s.selector)?;
     if let Some(ty) = &s.type_display {
         write!(out, ": {ty}")?;
     }
@@ -450,6 +464,7 @@ mod tests {
                 id: format!("symbol:{i}"),
                 name: format!("f{i}"),
                 source_name: Some(format!("f{i}")),
+                details: Default::default(),
                 kind: "function".into(),
                 location: Some(Location {
                     path: root
@@ -656,6 +671,7 @@ mod path_tests {
                 id: "unicode".into(),
                 name: "計算".into(),
                 source_name: Some("計算".into()),
+                details: Default::default(),
                 kind: "function".into(),
                 location: Some(crate::ai::Location {
                     path: path.into(),

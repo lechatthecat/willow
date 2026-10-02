@@ -1,0 +1,20 @@
+// Mutable collections are Send but not Sync. Protect them with a Mutex;
+// RwLock readers share the payload, so RwLock needs Send + Sync contents.
+import std::collections::Array;
+
+async fn count(values: Mutex<Array<i64>>) -> i64 {
+    lock values as data {
+        return data.len();
+    }
+}
+
+async fn read(value: RwLock<i64>) -> i64 {
+    lock read value as data {
+        return data;
+    }
+}
+
+async fn main() {
+    println(await count(Mutex::new([10, 20, 30])));
+    println(await read(RwLock::new(42)));
+}

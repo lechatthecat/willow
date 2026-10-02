@@ -1,0 +1,20 @@
+// Default integral f64 display omits .0, including signed zero.
+fn show(value: f64) {
+    println(value);
+    println(value.toString());
+    println(format("{}", value));
+    let text = f64::to_string(value);
+    println(text);
+    println(f64::parse(text).unwrap() == value);
+}
+
+fn main() {
+    show(0.0);
+    show(-2.0 * 0.0);
+    show(2.0);
+    show(-2.0);
+    show(0.5 + 0.5);
+    show(1.25);
+    // Equality alone cannot check the sign of zero.
+    println(1.0 / f64::parse((-0.0).toString()).unwrap());
+}

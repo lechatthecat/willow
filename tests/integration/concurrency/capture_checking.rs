@@ -19,10 +19,10 @@ fn test_dgwo4_low_worker_override_still_rejects_nonsync_arg() {
 }
 
 #[test]
-fn test_dgwo4_e2402_help_mentions_safe_wrappers() {
+fn test_dgwo4_e2402_help_names_array_remedies() {
     let (_ok, stderr) = compile_with_data_race_check(NONSYNC_ARG_SRC);
     assert!(
-        stderr.contains("Mutex") && stderr.contains("Channel"),
+        stderr.contains("Mutex<Array<T>>") && stderr.contains("FrozenArray"),
         "{stderr}"
     );
 }

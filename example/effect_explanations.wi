@@ -1,0 +1,20 @@
+// Effects queries retain conservative bounds for unresolved function values.
+// `willow effects` explains these bounds; length reads do not allocate.
+import std::collections::{Array, Map};
+fn apply(f: fn(i64) -> i64, value: i64) -> i64 { return f(value); }
+fn relay(f: fn(i64) -> i64, value: i64) -> i64 { return apply(f, value); }
+async fn worker(value: i64) -> i64 { return relay(increment, value); }
+fn increment(value: i64) -> i64 { return value + 1; }
+fn array_len(xs: Array<i64>) -> i64 { return xs.len(); }
+fn frozen_len(xs: FrozenArray<i64>) -> i64 { return xs.len(); }
+fn map_len(xs: Map<i64, i64>) -> i64 { return xs.len(); }
+fn frozen_map_len(xs: FrozenMap<i64, i64>) -> i64 { return xs.len(); }
+fn string_len(s: String) -> i64 { return s.len(); }
+open class Base { pub open fn value(self) -> i64 { return 1; } }
+class Child extends Base { pub override fn value(self) -> i64 { return 2; } }
+fn dispatch(x: Base) -> i64 { return x.value(); }
+fn main() {
+    let xs = [1, 2, 3];
+    println(relay(increment, frozen_len(xs.freeze())));
+    println(dispatch(new Child()));
+}

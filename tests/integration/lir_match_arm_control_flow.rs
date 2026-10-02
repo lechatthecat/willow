@@ -580,7 +580,7 @@ fn arm_flow_20_an_f64_arm_with_a_guard() {
          \x20   println(clamp(Reading::Value(2.5)));\n\
          \x20   println(clamp(Reading::Missing));\n\
          }\n",
-        "10\n2.5\n0.0\n",
+        "10\n2.5\n0\n",
         &["clamp", "main"],
     );
 }

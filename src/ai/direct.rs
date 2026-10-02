@@ -444,8 +444,10 @@ impl DirectSession {
         let mut candidates = Vec::new();
         let mut suggestions = Vec::new();
         let mut scope_fallback = Vec::new();
-        let tail = selector.rsplit("::").next().unwrap_or(selector);
-        let tail_chars: Vec<_> = tail.chars().collect();
+        let segments: Vec<_> = selector
+            .split("::")
+            .map(|s| (s, s.chars().collect::<Vec<_>>()))
+            .collect();
         let selector_scope = selector.rsplit_once("::").map(|(scope, _)| scope);
         for symbol in &self.session.snapshot.semantic.symbols {
             if located
@@ -500,23 +502,12 @@ impl DirectSession {
                 candidates.push(json!({"id":symbol.id,"selector":qualified,"name":symbol.name,"kind":symbol.kind,"location":symbol.location,"identity":symbol.identity}));
             } else {
                 let name = local_name.unwrap_or(&qualified);
-                let (owner, short) = name.rsplit_once("::").unwrap_or(("", name));
+                let (owner, _) = name.rsplit_once("::").unwrap_or(("", name));
                 let same_scope = selector_scope.is_none_or(|scope| {
                     owner == scope || owner.strip_suffix(scope).is_some_and(|p| p.ends_with("::"))
                 });
-                if !same_scope {
-                    continue;
-                }
-                let score = if short.starts_with(tail) {
-                    Some(0)
-                } else if short.chars().count() > 1 && tail.starts_with(short) {
-                    Some(1)
-                } else if short.len() > 2 && tail_chars.len() > 2 {
-                    selector_typo_distance(short, &tail_chars).map(|distance| distance + 2)
-                } else {
-                    None
-                };
-                if selector_scope.is_some() {
+                let score = selector_suggestion_score(name, &segments);
+                if same_scope && selector_scope.is_some() {
                     scope_fallback.push(qualified.clone());
                     scope_fallback.sort_unstable();
                     scope_fallback.dedup();
@@ -561,7 +552,7 @@ impl DirectSession {
         }
         Ok(match candidates.len() {
             0 => {
-                let mut result = json!({"status":"unknown","suggestions":suggestions});
+                let mut result = json!({"status":"unknown","reason":"No symbol matches this selector and its filters.","suggestions":suggestions});
                 if let Some(reason) = location_reason {
                     result["reason"] = json!(reason);
                 } else if located.is_some() {
@@ -855,6 +846,29 @@ mod tests {
     }
 }
 
+/// Compare aligned path segments from the leaf, permitting the same omitted
+/// module prefix as exact resolution. Each segment is visited at most once.
+fn selector_suggestion_score(name: &str, segments: &[(&str, Vec<char>)]) -> Option<usize> {
+    let mut names = name.rsplit("::");
+    let mut score = 0;
+    for (wanted, chars) in segments.iter().rev() {
+        #[cfg(test)]
+        typo_tests::SEGMENTS.with(|count| count.set(count.get() + 1));
+        let actual = names.next()?;
+        if actual == *wanted {
+            continue;
+        }
+        score += if !wanted.is_empty() && actual.starts_with(wanted) {
+            1
+        } else if actual.chars().count() > 1 && wanted.starts_with(actual) {
+            2
+        } else {
+            selector_typo_distance(actual, chars)? + 2
+        };
+    }
+    Some(score)
+}
+
 /// Banded edit distance, bounded to two edits. O(a+b) work and O(1)
 /// distance-band storage, plus O(a+b) Unicode scalar storage.
 fn selector_typo_distance(a: &str, b: &[char]) -> Option<usize> {
@@ -891,8 +905,65 @@ fn selector_typo_distance(a: &str, b: &[char]) -> Option<usize> {
 
 #[cfg(test)]
 mod typo_tests {
-    use super::selector_typo_distance;
+    use super::{selector_suggestion_score, selector_typo_distance};
+    thread_local! { pub(super) static SEGMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
     thread_local! { pub(super) static CELLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    fn score(name: &str, selector: &str) -> Option<usize> {
+        selector_suggestion_score(
+            name,
+            &selector
+                .split("::")
+                .map(|s| (s, s.chars().collect()))
+                .collect::<Vec<_>>(),
+        )
+    }
+    #[test]
+    fn segment_scores_cover_edits_suffixes_and_ranking() {
+        for (name, selector, expected) in [
+            ("eval::Recursive::cell", "eval::Recursive::cell", Some(0)),
+            ("eval::Recursive::cell", "Recursive::cell", Some(0)),
+            ("eval::Recursive::cell", "cell", Some(0)),
+            ("eval::Recursive::cell", "evl::Recursive::cell", Some(3)),
+            ("eval::Recursive::cell", "eval::Recursiv::cell", Some(1)),
+            ("eval::Recursive::cell", "eval::Recursive::cel", Some(1)),
+            ("eval::Recursive::cell", "eval::Recursive::celll", Some(2)),
+            ("eval::Recursive::cell", "eval::Recursive::clle", Some(4)),
+            ("eval::Recursive::cell", "evl::Recursiv::cell", Some(4)),
+            ("eval::Recursive::cell", "different::Recursive::cell", None),
+            ("Recursive::cell", "eval::Recursive::cel", None),
+            ("eval::Recursive::cell", "eval::cell", None),
+            ("eval::Recursive::cell", "eval::Recursive::unrelated", None),
+            ("a::B::c", "a::C::c", Some(3)),
+            ("日本語::計算式", "日本::計算式", Some(1)),
+            ("日本語::計算式", "日本語::計算値", Some(3)),
+        ] {
+            assert_eq!(score(name, selector), expected, "{name}/{selector}");
+        }
+        assert!(
+            score("eval::Recursive::cell", "eval::Recursiv::cell")
+                < score("eval::Recursive::cells", "eval::Recursiv::cell")
+        );
+    }
+    #[test]
+    fn segment_work_scales_with_candidates_and_depth_without_suffix_rescans() {
+        for depth in [1, 4, 16, 64] {
+            let selector = vec!["Recursive"; depth].join("::");
+            let name = format!("{}x", selector);
+            let parts: Vec<_> = selector
+                .split("::")
+                .map(|s| (s, s.chars().collect()))
+                .collect();
+            for candidates in [1, 8, 64] {
+                SEGMENTS.with(|count| count.set(0));
+                for _ in 0..candidates {
+                    assert_eq!(selector_suggestion_score(&name, &parts), Some(1));
+                }
+                let visits = SEGMENTS.with(|count| count.get());
+                assert_eq!(visits, candidates * depth);
+                println!("candidates={candidates} depth={depth} segment_visits={visits}");
+            }
+        }
+    }
     #[test]
     fn band_work_scales_linearly_with_identifier_length() {
         for n in [16, 64, 256, 1024] {
@@ -901,7 +972,9 @@ mod typo_tests {
             b[n - 1] = 'b';
             CELLS.with(|count| count.set(0));
             assert_eq!(selector_typo_distance(&a, &b), Some(1));
-            assert_eq!(CELLS.with(|count| count.get()), 5 * n - 4);
+            let cells = CELLS.with(|count| count.get());
+            assert_eq!(cells, 5 * n - 4);
+            println!("identifier_scalars={n} distance_cells={cells}");
         }
     }
     #[test]

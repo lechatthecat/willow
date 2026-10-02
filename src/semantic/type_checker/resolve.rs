@@ -1120,6 +1120,7 @@ impl TypeChecker {
         field_name: &str,
         span: Span,
         check_visibility: bool,
+        role: &str,
     ) -> Type {
         if Self::is_error_type(obj_ty) {
             return Self::error_type();
@@ -1204,7 +1205,7 @@ impl TypeChecker {
                     span,
                     fi.declaration_span,
                     fi.ty.clone(),
-                    true,
+                    role,
                 );
                 if check_visibility && !fi.public {
                     if fi.protected {
@@ -2416,7 +2417,7 @@ impl TypeChecker {
                     span,
                     info.declaration_span,
                     info.ty.clone(),
-                    true,
+                    "read",
                 );
                 // Visibility: non-public static props are reachable only from
                 // inside the class (private) or subclasses (protected).

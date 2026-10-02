@@ -7,6 +7,9 @@ const RESULT_OK_TAG: i64 = 0;
 const RESULT_ERR_TAG: i64 = 1;
 const PARSE_FLOAT_INVALID_TAG: i64 = 0;
 
+/// Default f64 display omits `.0` for every integral value, including signed
+/// zeros (`0` and `-0`). Parsing preserves the sign bit. Explicit precision
+/// formatting uses its own rules.
 pub fn format_f64_shortest(value: f64) -> String {
     if value.is_nan() {
         return "NaN".to_string();
@@ -17,22 +20,12 @@ pub fn format_f64_shortest(value: f64) -> String {
     if value == f64::NEG_INFINITY {
         return "-Infinity".to_string();
     }
-    // Signed zeros keep an explicit fractional part so `0.0` and `-0.0` are
-    // visually floats and distinguishable (requirements_float_printing.md).
-    if value == 0.0 {
-        return if value.is_sign_negative() {
-            "-0.0".to_string()
-        } else {
-            "0.0".to_string()
-        };
-    }
-
     let mut buffer = ryu::Buffer::new();
     let text = buffer.format_finite(value).to_string();
 
     // ryu uses scientific notation for some values (e.g. 1e-3 for 0.001).
     // Prefer fixed notation when it also round-trips and is not longer.
-    let text = if text.contains('e') || text.contains('E') {
+    let mut text = if text.contains('e') || text.contains('E') {
         let fixed = format!("{value}");
         if fixed.parse::<f64>().ok() == Some(value) && !fixed.contains('e') && !fixed.contains('E')
         {
@@ -46,10 +39,9 @@ pub fn format_f64_shortest(value: f64) -> String {
 
     // Strip trailing ".0" (e.g. "12.0" → "12") for integer-valued floats.
     if text.ends_with(".0") {
-        text[..text.len() - 2].to_string()
-    } else {
-        text
+        text.truncate(text.len() - 2);
     }
+    text
 }
 
 pub fn format_f64_17g(value: f64) -> String {
@@ -181,6 +173,48 @@ mod tests {
 
     fn ws_text(ptr: *mut u8) -> String {
         unsafe { willow_string_as_str(ptr) }.to_string()
+    }
+
+    #[test]
+    fn integral_display_roundtrips_including_signed_zero() {
+        // 22 boundary perspectives, including adjacent representable values.
+        let values = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            2.0,
+            -2.0,
+            10.0,
+            -10.0,
+            0.5 + 0.5,
+            -2.0 * 0.0,
+            0.5,
+            -0.5,
+            0.1 + 0.2,
+            f64::from_bits(1),
+            -f64::from_bits(1),
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            f64::MIN,
+            9007199254740991.0,
+            9007199254740992.0,
+            f64::from_bits(1.0f64.to_bits() - 1),
+            f64::from_bits(1.0f64.to_bits() + 1),
+        ];
+        for value in values {
+            let text = format_f64_shortest(value);
+            assert_eq!(
+                text.parse::<f64>().unwrap().to_bits(),
+                value.to_bits(),
+                "{text}"
+            );
+            if value.fract() == 0.0 {
+                assert!(!text.contains('.'), "integral value {value:?}: {text}");
+            }
+        }
+        assert_eq!(format_f64_shortest(0.0), "0");
+        assert_eq!(format_f64_shortest(-0.0), "-0");
     }
 
     #[test]

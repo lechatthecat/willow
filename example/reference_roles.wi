@@ -1,0 +1,27 @@
+import std::collections::Array;
+
+class Counter {
+    pub count: i64;
+    pub values: Array<i64>;
+
+    pub init(self) {
+        self.count = 0;
+        self.values = [10];
+    }
+
+    pub fn bump(self) {
+        self.count += 1;
+        self.values[0] -= 2;
+    }
+}
+
+fn main() {
+    let counter = new Counter();
+    counter.bump();
+    counter.values[0] += counter.count;
+    let values = [3];
+    values[0] *= 2;
+    println(counter.count);
+    println(counter.values[0]);
+    println(values[0]);
+}

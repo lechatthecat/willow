@@ -806,7 +806,7 @@ impl TypeChecker {
             }
             Expr::FieldAccess(obj, field_name, span, _) => {
                 let obj_ty = self.check_expr(obj);
-                let field_ty = self.resolve_field(&obj_ty, field_name, *span, true);
+                let field_ty = self.resolve_field(&obj_ty, field_name, *span, true, "read");
                 if matches!(field_ty, Type::Void) {
                     return None;
                 }

@@ -27,6 +27,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_flush_defers_from(&mut self, depth: usize) {
         let frames: Vec<Vec<super::DeferEntry>> = self.defer_stack[depth..].to_vec();
         let unavailable_before = self.unavailable_defer_ids.clone();
+        let cancel_context_before = self.sync_cancel_defer_context;
         // Each registration is emitted under the bindings it captured, so the
         // flush rewrites `vars`. Whatever comes after it — the `return` whose
         // value was bound AFTER the registration, the rest of an enclosing
@@ -63,6 +64,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // nested unwind sees the registration as unavailable and cannot
                 // execute it a second time.
                 self.unavailable_defer_ids.insert(entry.id);
+                self.sync_cancel_defer_context = self.defer_stack.fresh_identity();
                 self.vars = entry.vars_at_registration.clone();
                 // Rebind the hidden frame operands: coop loop bodies restore
                 // `vars`, wiping the names between registration and a
@@ -118,6 +120,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_lock_release_at_depth(lock_depth);
         }
         self.unavailable_defer_ids = unavailable_before;
+        self.sync_cancel_defer_context = cancel_context_before;
         self.vars = vars_before;
     }
 
@@ -378,12 +381,61 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if self.emitting_sync_cancel_cleanup {
             return;
         }
+        // Poll-shaped entries can resume in the middle of a cleanup, so only
+        // ordinary synchronous functions share this terminal path.
+        let key = (self.async_frame.is_none()
+            && self.coop_frame.is_none()
+            && self.panic_return_block.is_some())
+        .then(|| SyncCancelCleanupKey {
+            defers: self.defer_stack.identity,
+            consumed: self.sync_cancel_defer_context,
+            // A lexical cleanup block identifies its entire enclosing chain.
+            panic_target: self.panic_scopes.last().map(|scope| scope.cleanup),
+            roots: self.gc_root_count,
+            panic_depth: self.panic_defer_codegen_depth,
+            recover_depth: self.recover_eligible_depth,
+            call_depth: self.callstack_frame_depth,
+            reference_depth: self.lir_reference_scopes.len(),
+            native_active: self.sync_native_active.is_some(),
+        });
+        let resume = self.builder.create_block();
+        let active_arg = self.sync_native_active.map(Into::into);
+        let args = active_arg.as_slice();
+        if let Some(unwind) = key
+            .as_ref()
+            .and_then(|key| self.sync_cancel_cleanups.get(key))
+        {
+            self.builder
+                .ins()
+                .brif(cancelled, *unwind, args, resume, &[]);
+            self.builder.switch_to_block(resume);
+            self.builder.seal_block(resume);
+            return;
+        }
         let unwind = self.builder.create_block();
         self.builder.set_cold_block(unwind);
-        let resume = self.builder.create_block();
-        self.builder.ins().brif(cancelled, unwind, &[], resume, &[]);
+        let active_before = self.sync_native_active;
+        if key.is_some() {
+            if let Some(active) = active_before {
+                self.builder
+                    .append_block_param(unwind, self.builder.func.dfg.value_type(active));
+            }
+            self.builder
+                .ins()
+                .brif(cancelled, unwind, args, resume, &[]);
+        } else {
+            self.builder.ins().brif(cancelled, unwind, &[], resume, &[]);
+        }
         self.builder.switch_to_block(unwind);
-        self.builder.seal_block(unwind);
+        if let Some(key) = key {
+            // Seal with the function, after every equivalent edge is emitted.
+            self.sync_cancel_cleanups.insert(key, unwind);
+            if active_before.is_some() {
+                self.sync_native_active = Some(self.builder.block_params(unwind)[0]);
+            }
+        } else {
+            self.builder.seal_block(unwind);
+        }
         let roots_before = self.gc_root_count;
         let defer_depth_before = self.panic_defer_codegen_depth;
         let eligible_depth_before = self.recover_eligible_depth;
@@ -438,6 +490,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.callstack_frame_depth = callstack_depth_before;
         self.lir_call_frames = prepared_frames_before;
         self.lir_reference_scopes = reference_scopes_before;
+        self.sync_native_active = active_before;
         self.builder.switch_to_block(resume);
         self.builder.seal_block(resume);
         self.terminated = false;

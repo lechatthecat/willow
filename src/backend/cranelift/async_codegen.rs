@@ -1117,11 +1117,12 @@ impl Codegen {
         {
             let mut fg = FuncGen {
                 builder: &mut builder,
-                defer_stack: Vec::new(),
+                defer_stack: DeferStack::default(),
                 defer_counter: 0,
                 sync_defer_flags: HashMap::new(),
                 panic_scopes: Vec::new(),
                 unavailable_defer_ids: HashSet::new(),
+                sync_cancel_defer_context: 0,
                 panic_defer_codegen_depth: 0,
                 recover_eligible_depth: 0,
                 panic_recovery_targets: HashSet::new(),
@@ -1129,6 +1130,7 @@ impl Codegen {
                 panic_function_root_depth: Some(poll_root_depth),
                 panic_depth_snapshot: None,
                 emitting_sync_cancel_cleanup: false,
+                sync_cancel_cleanups: HashMap::new(),
                 sync_native_active: None,
                 lir_cleanup_exit: None,
                 callstack_frame_depth: 0,
@@ -1329,11 +1331,12 @@ impl Codegen {
         {
             let mut fg = FuncGen {
                 builder: &mut builder,
-                defer_stack: Vec::new(),
+                defer_stack: DeferStack::default(),
                 defer_counter: 0,
                 sync_defer_flags: HashMap::new(),
                 panic_scopes: Vec::new(),
                 unavailable_defer_ids: HashSet::new(),
+                sync_cancel_defer_context: 0,
                 panic_defer_codegen_depth: 0,
                 recover_eligible_depth: 0,
                 panic_recovery_targets: HashSet::new(),
@@ -1341,6 +1344,7 @@ impl Codegen {
                 panic_function_root_depth: None,
                 panic_depth_snapshot: None,
                 emitting_sync_cancel_cleanup: false,
+                sync_cancel_cleanups: HashMap::new(),
                 sync_native_active: None,
                 lir_cleanup_exit: None,
                 callstack_frame_depth: 0,

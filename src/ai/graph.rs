@@ -28,6 +28,7 @@ pub struct ImpactNode {
     pub graph_distance: usize,
     pub runtime_effects: u8,
     pub unknown: bool,
+    pub reason: Option<&'static str>,
 }
 #[derive(Debug, Serialize)]
 pub struct Impact {
@@ -36,6 +37,7 @@ pub struct Impact {
     pub nodes: Vec<ImpactNode>,
     pub truncated: bool,
     pub unknown: bool,
+    pub reason: Option<&'static str>,
     pub edge_visits: usize,
 }
 
@@ -216,6 +218,7 @@ impl Snapshot {
                         graph_distance: graph_distance[i],
                         runtime_effects: f.runtime_effects,
                         unknown: f.unknown,
+                        reason: f.unknown_reason(),
                     });
                 }
             }
@@ -228,6 +231,11 @@ impl Snapshot {
             nodes,
             truncated,
             unknown,
+            reason: unknown.then_some(if matches!(direction, Direction::Callers) {
+                "Indirect or unresolved calls in the source graph may reach the selected functions; caller coverage is conservative without a points-to proof."
+            } else {
+                "A reachable callee or dynamic dispatch candidate has an incomplete effect summary; callee coverage and runtime capabilities are conservative."
+            }),
             edge_visits,
         })
     }
@@ -281,6 +289,11 @@ mod tests {
                         f.synthetic = true;
                     }
                 }
+                functions[0].unknown = true;
+                functions[0]
+                    .unresolved
+                    .push("indirect-or-unresolved".into());
+                propagate(&mut functions);
                 let snapshot = Snapshot {
                     edit_context: None,
                     semantic: Default::default(),
@@ -311,6 +324,37 @@ mod tests {
                 let expected = if shape == "cycle" { n } else { n - 1 };
                 assert_eq!(result.edge_visits, expected, "{shape} {n}");
                 assert!(!result.truncated);
+                assert!(result.unknown && result.reason.is_some());
+                assert!(result.nodes.iter().all(|f| f.unknown && f.reason.is_some()));
+                let mut snapshot = snapshot;
+                snapshot.compiler = storage::compiler_stamp();
+                snapshot.revision = snapshot.digest().unwrap();
+                let revision = snapshot.revision.clone();
+                let mut session = QuerySession::new(snapshot).unwrap();
+                // Traverse in the other direction too. Reasons share the
+                // existing effects BFS, including cycles and synthetic nodes.
+                let root = if shape == "fanout" || shape == "duplicate_calls" {
+                    1
+                } else {
+                    n - 1
+                };
+                for _ in 0..3 {
+                    let before = session.effect_edge_visits;
+                    let value = session.query(QueryRequest::Effects {
+                        revision: revision.clone(),
+                        function: format!("f{root}"),
+                    });
+                    assert_eq!(value["result"]["status"], "unknown");
+                    assert!(value["result"]["reason"].is_string());
+                    assert_eq!(
+                        session.effect_edge_visits - before,
+                        if shape == "fanout" || shape == "duplicate_calls" {
+                            1
+                        } else {
+                            expected
+                        }
+                    );
+                }
                 assert_eq!(
                     result.nodes.len(),
                     if shape == "synthetic" {

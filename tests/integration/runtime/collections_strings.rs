@@ -6,7 +6,7 @@ fn test_map_float_key_semantics_example() {
     assert!(ok, "compilation failed");
     assert_eq!(
         out,
-        "true\n1\n20\n20\n{0.0: 20}\ntrue\nfalse\nNaN cannot be used as a Map key\n1\n"
+        "true\n1\n20\n20\n{0: 20}\ntrue\nfalse\nNaN cannot be used as a Map key\n1\n"
     );
 }
 

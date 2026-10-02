@@ -1,0 +1,12 @@
+// A call result must be bound before it can be called again.
+fn pick(offset: i64) -> closure(i64) -> i64 {
+    return |value: i64| value + offset;
+}
+
+fn main() {
+    // Instead of pick(0)(5):
+    let f = pick(0);
+    println(f(5));
+    // Numeric constants use a float literal, rather than `5 as f64`.
+    println(5.0 + 0.5);
+}

@@ -155,8 +155,8 @@ fn main() {
     assert!(ok, "special matrix failed: {out}");
     assert_eq!(
         out,
-        "1\n1\n1\n1\ntrue\n-0.0\n0.0\n-Infinity\n0.0\nInfinity\n-Infinity\n\
-         Infinity\nInfinity\n0.0\n-Infinity\nInfinity\n"
+        "1\n1\n1\n1\ntrue\n-0\n0\n-Infinity\n0\nInfinity\n-Infinity\n\
+         Infinity\nInfinity\n0\n-Infinity\nInfinity\n"
     );
 }
 

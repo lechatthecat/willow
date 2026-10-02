@@ -28,6 +28,7 @@ use crate::{
         call_graph::CallGraph,
         effects::RuntimeEffects,
         ids::{FunctionId, TypeId},
+        intrinsics::Intrinsic,
     },
 };
 use anyhow::{Context, Result, ensure};
@@ -75,6 +76,20 @@ pub struct Function {
     pub unresolved: Vec<String>,
 }
 
+impl Function {
+    /// Explanation uses existing graph facts, without copying transitive cause
+    /// sets into every caller (which would grow quadratically on long chains).
+    pub(crate) fn unknown_reason(&self) -> Option<&'static str> {
+        self.unknown.then_some(if !self.unresolved.is_empty() {
+            "Indirect or unresolved call targets have no complete effect summary; all runtime capabilities are conservatively retained."
+        } else if self.synthetic {
+            "Dynamic dispatch has no complete implementation summary; all runtime capabilities are conservatively retained."
+        } else {
+            "A reachable callee or dynamic dispatch candidate has an incomplete effect summary; its conservative runtime capabilities are retained."
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
@@ -115,6 +130,7 @@ pub(crate) struct CapturedUnit {
     semantic: semantic::Captured,
     symbols: crate::semantic::analysis_symbols::Facts,
     symbol_owners: Vec<(Span, String)>,
+    symbol_details: HashMap<Span, symbols::DeclarationDetails>,
     declarations: HashMap<FunctionId, Vec<(Span, Span)>>,
     identities: HashMap<FunctionId, BodyId>,
     lambda_names: HashMap<FunctionId, String>,
@@ -165,6 +181,7 @@ pub(crate) fn capture(
         semantic: semantic::Captured::default(),
         symbols: symbol_facts.clone(),
         symbol_owners: symbols::owners(program),
+        symbol_details: symbols::details(program),
         declarations: HashMap::new(),
         identities: HashMap::new(),
         lambda_names: HashMap::new(),
@@ -345,6 +362,20 @@ pub(crate) fn capture(
                         Expr::Select(_) => "select",
                         Expr::Print(..) => "print",
                         Expr::Binary(_) => "non-scalar-addition",
+                        Expr::MethodCall(_)
+                            if calls
+                                .get(&e.id())
+                                .and_then(|target| target.as_ref())
+                                .and_then(Intrinsic::from_function_id)
+                                .is_some_and(|intrinsic| {
+                                    matches!(
+                                        intrinsic,
+                                        Intrinsic::ArrayLen | Intrinsic::FrozenArrayLen
+                                    )
+                                }) =>
+                        {
+                            "array-length-null-panic"
+                        }
                         Expr::MethodCall(_) => "builtin-method-call",
                         Expr::Call(_) => "builtin-call",
                         _ => "expression",

@@ -149,3 +149,15 @@ sorts entries by rendered key text for deterministic output.
 the trailing NUL: `"".len()` is 0, `"abc".len()` is 3, and `"日本語".len()`
 is 9. It does not measure Unicode characters, grapheme clusters, or terminal
 columns. See `language_gaps/main.wi` for length and imported-array examples.
+
+### Default floating-point display
+
+`println(value)`, `value.toString()`, `format("{}", value)`, and
+`f64::to_string(value)` omit the fractional suffix for integral `f64` values:
+`2.0` displays as `2`, `0.0` as `0`, and negative zero as `-0`.
+`f64::parse` round-trips these strings, preserving negative zero's sign.
+Fractional values retain their round-tripping decimal representation;
+`NaN`, `Infinity`, and `-Infinity` keep those spellings. Explicit precision
+placeholders such as `{:.6f}` retain their requested decimal places.
+Collections use the same default formatting for floating-point elements.
+See [f64_integral_display.wi](f64_integral_display.wi) for all four entry points.

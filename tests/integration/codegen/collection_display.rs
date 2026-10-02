@@ -69,7 +69,7 @@ fn tostr_07_f64_specials_inside() {
         "import std::collections::Array;\nfn main() { let inf = 1.0 / 0.0; let nan = 0.0 / 0.0; let xs: Array<f64> = [inf, 0.0 - inf, nan, 0.0]; println(xs.toString()); }",
     );
     assert!(ok, "{out}");
-    assert_eq!(out, "[Infinity, -Infinity, NaN, 0.0]\n");
+    assert_eq!(out, "[Infinity, -Infinity, NaN, 0]\n");
 }
 
 #[test]

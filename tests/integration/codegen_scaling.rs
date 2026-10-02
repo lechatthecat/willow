@@ -610,3 +610,97 @@ fn scaling_23_call_instructions_are_counted_apart_from_table_slots() {
     assert_eq!(text, 0);
     assert_eq!(data, 2 * 17);
 }
+
+// willow-ssl7.30: runtime-call cancellation edges share a terminal flush.
+fn cancellation_sites(defers: usize, sites: usize, branches: bool) -> String {
+    let mut source =
+        String::from("import std::collections::Array;\nfn work(xs: Array<i64>, i: i64) -> i64 {\n");
+    for index in 0..defers {
+        source.push_str(&format!("defer println({index});\n"));
+    }
+    for index in 0..sites {
+        if branches {
+            source.push_str(&format!(
+                "if i == {index} {{ xs[i] = xs[i] + xs.len(); }}\n"
+            ));
+        } else {
+            source.push_str("xs[i] = xs[i] + xs.len();\n");
+        }
+    }
+    source.push_str("return xs[i]; }\nfn main() { println(work([1], 0)); }\n");
+    source
+}
+
+#[test]
+fn scaling_24_sync_cancellation_actions_do_not_multiply_by_call_sites() {
+    for release in [false, true] {
+        for branches in [false, true] {
+            for defers in [1, 4, 16] {
+                let mut baseline = None;
+                for sites in [1, 4, 16, 64] {
+                    let relocations = compile_and_collect_relocations_by_section(
+                        &cancellation_sites(defers, sites, branches),
+                        &PLAIN,
+                        release,
+                    );
+                    let actions = relocations
+                        .iter()
+                        .filter(|(section, name)| section == "text" && name == "willow_println_i64")
+                        .count();
+                    let expected = *baseline.get_or_insert(actions);
+                    assert_eq!(
+                        actions, expected,
+                        "release={release} branches={branches} defers={defers} sites={sites}"
+                    );
+                    assert!(actions <= 6 * defers + 1, "duplicated cleanup: {actions}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn scaling_25_shared_cancellation_preserves_normal_lifo_and_values() {
+    for defers in [0, 1, 4, 16] {
+        for branches in [false, true] {
+            let (out, ok) = compile_and_run_gc_stress(&cancellation_sites(defers, 16, branches));
+            assert!(ok, "{out}");
+            let mut expected = (0..defers)
+                .rev()
+                .map(|i| format!("{i}\n"))
+                .collect::<String>();
+            expected.push_str(if branches { "2\n" } else { "17\n" });
+            assert_eq!(out, expected);
+        }
+    }
+}
+
+#[test]
+fn scaling_26_cancellation_inside_defer_shares_only_unconsumed_actions() {
+    for release in [false, true] {
+        let mut baseline = None;
+        for sites in [1, 4, 16, 64] {
+            let body = "xs[i] = xs[i] + xs.len();\n".repeat(sites);
+            let source = format!(
+                "import std::collections::Array;\n\
+                 fn work(xs: Array<i64>, i: i64) -> i64 {{\n\
+                 defer println(1); defer println(2); defer println(3);\n\
+                 defer {{ {body} }} return xs[i]; }}\n\
+                 fn main() {{ println(work([1], 0)); }}"
+            );
+            let relocations = compile_and_collect_relocations_by_section(&source, &PLAIN, release);
+            let actions = relocations
+                .iter()
+                .filter(|(section, name)| section == "text" && name == "willow_println_i64")
+                .count();
+            assert_eq!(
+                actions,
+                *baseline.get_or_insert(actions),
+                "sites={sites} release={release}"
+            );
+            let (out, ok) = compile_and_run_gc_stress(&source);
+            assert!(ok, "{out}");
+            assert_eq!(out, "3\n2\n1\n1\n");
+        }
+    }
+}

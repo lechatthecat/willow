@@ -355,6 +355,9 @@ fn human(value: &Value, options: &Options) -> String {
             result["impact"]["unknown"]
         ));
     }
+    if let Some(reason) = result["impact"]["reason"].as_str() {
+        lines.push(reason.into());
+    }
     if options.explain {
         lines.push(serde_json::to_string_pretty(result).unwrap());
     }
@@ -432,7 +435,7 @@ fn effect_lines(result: &Value, all: bool, lines: &mut Vec<String>) {
                 ("target", &witness["target"]),
                 ("owner", &witness["owner"]),
                 ("operation", &witness["cause"]["operation"]),
-                ("reason", &witness["reason"]),
+                ("reason", fact.get("reason").unwrap_or(&witness["reason"])),
             ] {
                 if let Some(value) = value.as_str() {
                     detail.push_str(&format!("; {name}={value}"));

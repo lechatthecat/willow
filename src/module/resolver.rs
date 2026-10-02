@@ -538,6 +538,7 @@ fn resolve_one(
                 let tokens = match Lexer::with_file_id(&source, module_id.file_id()).tokenize() {
                     Ok(t) => t,
                     Err(errs) => {
+                        graph.has_syntax_errors = true;
                         errors.extend(errs);
                         // Keep the imported file addressable by lexer diagnostic FileIds,
                         // just as parse-error recovery below does.
@@ -610,12 +611,10 @@ fn resolve_one(
     }
 
     if !parse_errs.is_empty() {
+        graph.has_syntax_errors = true;
         errors.extend(parse_errs);
-        // Preserve recovered declarations AND resolve their imports. The entry
-        // parser already feeds recovery ASTs to semantic checking; imported
-        // recovery units use the same policy. Discarding all modules here
-        // manufactures unrelated unresolved-name errors in their consumers.
-        // The recorded errors still prevent backend emission.
+        // Keep import discovery and source locations available. The frontend
+        // stops before semantic checking when any loaded syntax is incomplete.
     }
 
     // An imported file's declared module identity must match the import path

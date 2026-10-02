@@ -1,0 +1,31 @@
+// A cancelled synchronous helper unwinds nested defers once, in LIFO order.
+import std::collections::Array;
+
+fn work(ready: Channel<i64>) {
+    let values: Array<i64> = [1];
+    let label = "shared" + " cleanup";
+    defer println("outer cleanup");
+    if true {
+        defer println(label);
+        ready.send(1);
+        while true {
+            values[0] = values[0] + values.len();
+            values[0] = values[0] + values.len();
+            values[0] = values[0] + values.len();
+        }
+    }
+}
+
+async fn worker(ready: Channel<i64>) {
+    defer println("async cleanup");
+    work(ready);
+}
+
+async fn main() {
+    let ready = Channel<i64>::new();
+    let task = worker(ready);
+    ready.recv();
+    task.cancel();
+    await task.result();
+    println("done");
+}

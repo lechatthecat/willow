@@ -755,8 +755,8 @@ fn async_capture_diagnostic_explains_nested_field_without_package_hash() {
         "order::Bank",
         "inner:",
         "inboxes: Array<Channel<i64>>",
-        "FrozenArray/FrozenMap",
-        "Mutex<T>",
+        "FrozenArray via .freeze()",
+        "Mutex<Array<T>> when the elements are Send",
     ] {
         assert!(text.contains(part), "missing {part}: {text}");
     }
@@ -1080,4 +1080,272 @@ fn diagnostic_import_hints_cover_public_type_kinds() {
     assert!(text.contains("import vm::Machine;"), "{text}");
     assert!(text.contains("import vm::Device;"), "{text}");
     assert!(!text.contains("import vm::Secret;"), "{text}");
+}
+
+#[test]
+fn buildgraph_storage_reference_roles() {
+    for (statement, selector, expected) in [
+        ("println(d.n);", "main::Data::n", vec!["read"]),
+        ("d.n = 2;", "main::Data::n", vec!["write"]),
+        ("d.n += 2;", "main::Data::n", vec!["read", "write"]),
+        ("d.n -= 2;", "main::Data::n", vec!["read", "write"]),
+        ("d.n *= 2;", "main::Data::n", vec!["read", "write"]),
+        ("d.n /= 2;", "main::Data::n", vec!["read", "write"]),
+        ("d.n %= 2;", "main::Data::n", vec!["read", "write"]),
+        ("xs[i] = 2;", "main::f::xs", vec!["write-element"]),
+        ("xs[i] += 2;", "main::f::xs", vec!["read", "write-element"]),
+        ("xs[i] -= 2;", "main::f::xs", vec!["read", "write-element"]),
+        ("xs[i] *= 2;", "main::f::xs", vec!["read", "write-element"]),
+        ("xs[i] /= 2;", "main::f::xs", vec!["read", "write-element"]),
+        ("xs[i] %= 2;", "main::f::xs", vec!["read", "write-element"]),
+        (
+            "d.values[i] = 2;",
+            "main::Data::values",
+            vec!["write-element"],
+        ),
+        (
+            "d.values[i] += 2;",
+            "main::Data::values",
+            vec!["read", "write-element"],
+        ),
+        (
+            "d.values[i] -= 2;",
+            "main::Data::values",
+            vec!["read", "write-element"],
+        ),
+        ("d.values[i] += 2;", "main::f::d", vec!["read"]),
+        ("d.values[i] += 2;", "main::f::i", vec!["read"]),
+        (
+            "xs[i] += xs[i];",
+            "main::f::xs",
+            vec!["read", "read", "write-element"],
+        ),
+        (
+            "grid[i][i] += 2;",
+            "main::f::grid",
+            vec!["read", "write-element"],
+        ),
+        ("grid[i][i] += 2;", "main::f::i", vec!["read", "read"]),
+        ("d.n = d.n + 1;", "main::Data::n", vec!["read", "write"]),
+    ] {
+        let f = Fixture::new();
+        fs::write(f.0.join("src/main.wi"), format!(
+            "import std::collections::Array;\nclass Data {{ pub n: i64; pub values: Array<i64>; }}\nfn f() {{\nlet xs = [8]; let grid = [[8]]; let i = 0; let d = new Data(8, xs);\n{statement}\n}}\nfn main() {{ f(); }}\n"
+        )).unwrap();
+        let value = f.json(&["refs", selector], 0);
+        let mut roles: Vec<_> = value["result"]["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["location"]["line"] == 5)
+            .map(|r| r["role"].as_str().unwrap())
+            .collect();
+        roles.sort_unstable();
+        assert_eq!(roles, expected, "{statement}: {value}");
+    }
+}
+
+#[test]
+fn buildgraph_self_and_static_field_roles() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/main.wi"), "class Counter {\n pub n: i64;\n pub static mut total: i64 = 0;\n pub init(self) { self.n = 1; }\n pub fn bump(self) {\n self.n += 2;\n Counter::total = self.n;\n println(Counter::total);\n }\n}\nfn main() { let c = new Counter(); c.bump(); }\n").unwrap();
+    for (selector, line, expected) in [
+        ("main::Counter::n", 4, vec!["write"]),
+        ("main::Counter::n", 6, vec!["read", "write"]),
+        ("main::Counter::n", 7, vec!["read"]),
+        ("main::Counter::total", 7, vec!["write"]),
+        ("main::Counter::total", 8, vec!["read"]),
+    ] {
+        let value = f.json(&["refs", selector], 0);
+        let mut roles: Vec<_> = value["result"]["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["location"]["line"] == line)
+            .map(|r| r["role"].as_str().unwrap())
+            .collect();
+        roles.sort_unstable();
+        assert_eq!(roles, expected, "{value}");
+    }
+}
+
+#[test]
+fn buildgraph_compound_roles_do_not_duplicate_rename_edits() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/main.wi"), "class Counter { pub n: i64; pub init(self) { self.n = 0; } pub fn bump(self) { self.n += 1; } } fn main() { let c = new Counter(); c.bump(); println(c.n); let xs = [1]; xs[0] += 2; println(xs[0]); }").unwrap();
+    for (selector, destination, edits) in [
+        ("main::Counter::n", "count", 4),
+        ("main::main::xs", "values", 3),
+    ] {
+        let value = f.json(&["rename", selector, destination], 0);
+        assert_eq!(value["result"]["edits"], edits, "{value}");
+    }
+}
+
+#[test]
+fn assignment_target_types() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "class Counter {
+ pub n: i64;
+ pub init(self) { self.n = 8; }
+ pub fn bump(self) {
+ self.n += 2;
+ self.n = 3;
+ }
+}
+fn main() {
+ let mut n = 8; let xs = [8]; let i = 0; let c = new Counter();
+ n += 2;
+ n = 3;
+ xs[i] += 2;
+ xs[i] = 3;
+ c.n += 2;
+ c.n = 3;
+}
+",
+    )
+    .unwrap();
+    for (line, column) in [
+        (11, 2),
+        (12, 2),
+        (5, 7),
+        (6, 7),
+        (13, 4),
+        (14, 4),
+        (15, 4),
+        (16, 4),
+    ] {
+        let selector = format!("src/main.wi:{line}:{column}");
+        let value = f.json(&["type", &selector], 0);
+        assert_eq!(
+            value["result"]["type_display"], "i64",
+            "{selector}: {value}"
+        );
+    }
+}
+
+#[test]
+fn unknown_effects_and_impact_explain_conservative_capabilities() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        include_str!("../example/effect_explanations.wi"),
+    )
+    .unwrap();
+    for name in ["apply", "relay", "worker"] {
+        let selector = format!("main::{name}");
+        let value = f.json(&["effects", &selector, "--explain"], 1);
+        let result = &value["result"];
+        assert_eq!(result["status"], "unknown", "{value}");
+        assert!(
+            result["reason"].as_str().unwrap().contains("conservative"),
+            "{value}"
+        );
+        let missing: Vec<_> = result["effect_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["status"] == "missing-witness")
+            .collect();
+        assert!(!missing.is_empty(), "{value}");
+        for fact in missing {
+            let reason = fact["reason"].as_str().unwrap();
+            assert!(
+                reason.contains("unresolved") && reason.contains("synchronous"),
+                "{value}"
+            );
+        }
+        assert!(
+            result["witness"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(
+                    |w| w["unresolved"].as_array().is_some_and(|u| !u.is_empty())
+                        && w["reason"].as_str().is_some()
+                ),
+            "{value}"
+        );
+        let output = f.run(&["effects", &selector]);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains(result["reason"].as_str().unwrap()), "{text}");
+        assert!(
+            text.contains("This does not prove that this function suspends or blocks"),
+            "{text}"
+        );
+    }
+    for name in ["apply", "increment"] {
+        let selector = format!("main::{name}");
+        let value = f.json(&["impact", &selector], 0);
+        assert_eq!(value["result"]["impact"]["unknown"], true, "{value}");
+        let reason = value["result"]["impact"]["reason"].as_str().unwrap();
+        assert!(reason.contains("points-to proof"), "{value}");
+        let output = f.run(&["impact", &selector]);
+        assert!(String::from_utf8(output.stdout).unwrap().contains(reason));
+        for node in value["result"]["impact"]["nodes"].as_array().unwrap() {
+            if node["unknown"] == true {
+                assert!(node["reason"].is_string(), "{node}");
+            }
+        }
+    }
+    for command in ["effects", "impact"] {
+        let value = f.json(&[command, "main::absent"], 1);
+        assert!(value["result"]["reason"].is_string(), "{value}");
+    }
+}
+
+#[test]
+fn length_queries_attribute_only_panic_allocation_and_resolved_dispatch_stays_known() {
+    use willow_compiler::semantic::effects::RuntimeEffects as E;
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        include_str!("../example/effect_explanations.wi"),
+    )
+    .unwrap();
+    for name in [
+        "array_len",
+        "frozen_len",
+        "map_len",
+        "frozen_map_len",
+        "string_len",
+        "increment",
+        "dispatch",
+    ] {
+        let value = f.json(&["effects", &format!("main::{name}"), "--explain"], 0);
+        let result = &value["result"];
+        assert_eq!(result["status"], "ok", "{name}: {value}");
+        assert!(result["reason"].is_null(), "{value}");
+        if ["array_len", "frozen_len"].contains(&name) {
+            let allocation = result["effect_evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["effect"] == E::MAY_ALLOCATE.bits())
+                .unwrap();
+            assert_eq!(
+                allocation["witness"]["cause"]["operation"], "panic-payload-allocation",
+                "{value}"
+            );
+            let reason = allocation["witness"]["reason"].as_str().unwrap();
+            assert!(
+                reason.contains("without allocating") && reason.contains("null receiver"),
+                "{value}"
+            );
+            let output = f.run(&["effects", &format!("main::{name}")]);
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                text.contains(reason) && text.contains("panic-payload-allocation"),
+                "{text}"
+            );
+        } else {
+            assert_eq!(
+                result["runtime_effects"].as_u64().unwrap() & u64::from(E::MAY_ALLOCATE.bits()),
+                0,
+                "{value}"
+            );
+        }
+    }
 }

@@ -1096,14 +1096,25 @@ impl TypeChecker {
                 // malformed one (`let x: Option = ...`) is reported ahead of
                 // the mismatches it goes on to cause (willow-rlq9).
                 let annotation = s.ty.as_ref().map(|ty| {
+                    let errors_before = self.error_generation;
                     let annotation = self.normalize_type(ty, s.span);
                     self.validate_type(&annotation, s.span);
-                    annotation
+                    if self.error_generation == errors_before {
+                        annotation
+                    } else {
+                        // Retain the binding without letting its rejected type
+                        // cause errors in the initializer or subsequent uses.
+                        Self::error_type()
+                    }
                 });
+                let reference_start = self.analysis_symbols.references.len();
                 let inferred = match &annotation {
                     Some(ann) => self.check_expr_expecting(&s.init, ann),
                     None => self.check_expr(&s.init),
                 };
+                if s.name.starts_with("$compound_array_") {
+                    self.record_element_write(&s.init, reference_start, true);
+                }
                 let ty = if let Some(ann) = &annotation {
                     if !self.types_compatible(ann, &inferred) {
                         let code = self.type_mismatch_error_code(ann, &inferred);
@@ -1197,7 +1208,7 @@ impl TypeChecker {
             }
             Stmt::FieldAssign(s) => {
                 let obj_ty = self.check_expr(&s.object);
-                let field_ty = self.resolve_field(&obj_ty, &s.field, s.target_span, true);
+                let field_ty = self.resolve_field(&obj_ty, &s.field, s.target_span, true, "write");
                 let val_ty = if field_ty == Type::Void {
                     self.check_expr(&s.value)
                 } else {
@@ -1244,25 +1255,7 @@ impl TypeChecker {
             Stmt::IndexAssign(s) => {
                 let reference_start = self.analysis_symbols.references.len();
                 let arr_ty = self.check_expr(&s.array);
-                // The target expression still reads its receiver and indexes;
-                // mark only its storage path as an element mutation.
-                let mut target = &s.array;
-                while let Expr::Index(array, ..) = target {
-                    target = array;
-                }
-                for reference in &mut self.analysis_symbols.references[reference_start..] {
-                    if matches!(
-                        target,
-                        Expr::Var(..) | Expr::FieldAccess(..) | Expr::StaticField(..)
-                    ) && reference.span == target.span()
-                        && matches!(
-                            reference.target.kind.as_str(),
-                            "binding" | "parameter" | "field" | "static-field"
-                        )
-                    {
-                        reference.role = "write-element".into();
-                    }
-                }
+                self.record_element_write(&s.array, reference_start, false);
                 let idx_ty = self.check_expr(&s.index);
                 if !matches!(idx_ty, Type::I64) {
                     self.push(
@@ -1482,6 +1475,17 @@ impl TypeChecker {
                     }
                     Type::Void => Type::Void,
                     other => {
+                        let help = match builtin_types::resolve(other).map(|ty| ty.id) {
+                            Some(B::FrozenArray) => {
+                                "use an index loop: `for i in 0..values.len() { let item = values[i]; ... }`"
+                            }
+                            Some(B::FrozenMap) => {
+                                "`FrozenMap` has no iterator; keep keys in an array and use an index loop: `for i in 0..keys.len() { let value = values.get(keys[i]); ... }`"
+                            }
+                            _ => {
+                                "use `for item in array { ... }` with `Array<T>` or `for n in start..end { ... }`"
+                            }
+                        };
                         self.push(
                             Diagnostic::new(
                                 Severity::Error,
@@ -1492,11 +1496,9 @@ impl TypeChecker {
                                 s.iterable.span(),
                                 "for-in requires an array or i64 range",
                             ))
-                            .with_help(
-                                "use `for item in array { ... }` with `Array<T>` or `for n in start..end { ... }`",
-                            ),
+                            .with_help(help),
                         );
-                        Type::Void
+                        Self::error_type()
                     }
                 };
 
@@ -2141,7 +2143,7 @@ impl TypeChecker {
             }
             Expr::FieldAccess(obj, field_name, span, _) => {
                 let obj_ty = self.check_expr(obj);
-                self.resolve_field(&obj_ty, field_name, *span, true)
+                self.resolve_field(&obj_ty, field_name, *span, true, "read")
             }
             Expr::MethodCall(m) => {
                 // `.` is instance member access; module items use `::`. Using
@@ -2226,6 +2228,7 @@ impl TypeChecker {
             Expr::ObjectLiteral(o) => self.check_object_literal(o),
             Expr::Await(a) => {
                 self.record_direct_lock_effect(a.span, "await", LockEffectKind::Suspend);
+                let errors_before = self.error_generation;
                 let awaited_ty = self.check_expr(&a.expr);
                 if !self.local.current_async_context {
                     self.push(
@@ -2241,6 +2244,9 @@ impl TypeChecker {
                         .with_help("make the enclosing function `async`"),
                     );
                     return Type::Void;
+                }
+                if Self::is_error_type(&awaited_ty) || self.error_generation != errors_before {
+                    return Self::error_type();
                 }
                 // `Task<T>`/`JoinHandle<T>` yield `T`; `Future<T>` yields `T`;
                 // `await task.result()` (willow-qrj9) is the same wait, same

@@ -405,7 +405,7 @@ impl TypeChecker {
             target_span,
             info.declaration_span,
             info.ty.clone(),
-            true,
+            "write",
         );
         let val_ty = self.check_expr_expecting(&s.value, &info.ty);
         if !info.is_mut {

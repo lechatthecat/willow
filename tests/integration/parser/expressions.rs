@@ -211,4 +211,9 @@ fn main() {
     assert_eq!(out.trim(), "-42");
 }
 
-// ── Compile error cases ───────────────────────────────────────────────────────
+#[test]
+fn test_call_result_binding_example() {
+    let (out, ok) = compile_and_run(include_str!("../../../example/call_result_binding.wi"));
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "5\n5.5\n");
+}

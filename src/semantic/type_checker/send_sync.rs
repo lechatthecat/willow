@@ -102,6 +102,14 @@ impl TypeChecker {
                 );
                 continue;
             }
+            let (note, help) = self.marker_failure(
+                ty,
+                if marker == "Send" {
+                    Marker::Send
+                } else {
+                    Marker::Sync
+                },
+            );
             self.push(
                 Diagnostic::new(
                     Severity::Error,
@@ -115,10 +123,8 @@ impl TypeChecker {
                     arg.expr.span(),
                     format!("`{}` crosses a task boundary here", type_name(ty)),
                 ))
-                .with_note(self.marker_failure_note(ty, if marker == "Send" { Marker::Send } else { Marker::Sync }))
-                .with_help(
-                    "mutable Array/Map values are never Sync: use FrozenArray/FrozenMap via .freeze(), or coordinate shared access with Mutex<T>, RwLock<T>, Atomic*, or Channel<T>",
-                ),
+                .with_note(note)
+                .with_help(help),
             );
         }
     }
@@ -137,11 +143,17 @@ impl TypeChecker {
         span: Span,
         body: &Block,
         ret: &Type,
-        params: &[Type],
+        params: &[(&Type, Span)],
         locals: &[Type],
         locals_offset: usize,
     ) {
         let bindings = std::mem::take(&mut self.local.async_local_bindings);
+        // Declaration spans include the body; fallback diagnostics belong on
+        // the signature. Parameter/local labels keep their more precise spans.
+        let span = Span {
+            end: body.span.start,
+            ..span
+        };
         if !self.enforce_send_sync {
             return;
         }
@@ -149,6 +161,7 @@ impl TypeChecker {
         let mut bad_slot = None;
         for (index, ty) in params
             .iter()
+            .map(|(ty, _)| *ty)
             .chain(locals.iter())
             .chain(std::iter::once(ret))
             .enumerate()
@@ -166,15 +179,26 @@ impl TypeChecker {
         } else {
             None
         };
+        let (note, help) = self.marker_failure(first_bad, Marker::Send);
+        let mut primary_span = params.get(index).map_or(span, |(_, span)| *span);
+        primary_span.end = primary_span.end.min(body.span.start);
         let mut diagnostic = Diagnostic::new(
-            Severity::Error, ErrorCode::E2402,
-            format!("async task frame is not `Send`: `{}` cannot move between workers", type_name(first_bad)),
-        ).with_label(Label::primary(
-            binding.map_or(span, |(_, span)| *span),
-            binding.map_or_else(|| "this async task may be scheduled on another worker".into(),
-                |(name, _)| format!("`{name}` is retained in this async task frame")),
-        )).with_note(self.marker_failure_note(first_bad, Marker::Send))
-          .with_help("interface values need a declared `extends Send` (or `extends Sync`) contract; keep other task frame values Send");
+            Severity::Error,
+            ErrorCode::E2402,
+            format!(
+                "async task frame is not `Send`: `{}` cannot move between workers",
+                type_name(first_bad)
+            ),
+        )
+        .with_label(Label::primary(
+            binding.map_or(primary_span, |(_, span)| *span),
+            binding.map_or_else(
+                || "this async task may be scheduled on another worker".into(),
+                |(name, _)| format!("`{name}` is retained in this async task frame"),
+            ),
+        ))
+        .with_note(note)
+        .with_help(help);
         if let Some((name, binding_span)) = binding {
             use crate::parser::iter::{AstEvent, AstWalk};
             let mut walk = AstWalk::new(AstEvent::Block(body));
@@ -199,12 +223,18 @@ impl TypeChecker {
         self.marker_holds_with_reason(ty, marker, visiting, &mut None)
     }
 
+    #[cfg(test)]
     fn marker_failure_note(&self, ty: &Type, marker: Marker) -> String {
-        let mut reasons = Some(Vec::new());
+        self.marker_failure(ty, marker).0
+    }
+
+    fn marker_failure(&self, ty: &Type, marker: Marker) -> (String, &'static str) {
+        let mut reasons = Some(MarkerFailure::default());
         self.marker_holds_with_reason(ty, marker, &mut HashSet::new(), &mut reasons);
-        let mut reasons = reasons.unwrap();
-        reasons.reverse();
-        reasons.join(" -> ")
+        let mut failure = reasons.unwrap();
+        failure.notes.reverse();
+        (failure.notes.join(" -> "), failure.help.unwrap_or(
+            "ensure the failing value satisfies the required Send/Sync contract before crossing a task boundary"))
     }
 
     fn marker_holds_with_reason(
@@ -212,8 +242,16 @@ impl TypeChecker {
         ty: &Type,
         marker: Marker,
         visiting: &mut HashSet<String>,
-        reasons: &mut Option<Vec<String>>,
+        reasons: &mut Option<MarkerFailure>,
     ) -> bool {
+        if Self::is_error_type(ty)
+            || matches!(ty, Type::Named(name) | Type::Generic(name, _)
+                if self.invalid_type_names.borrow().contains(name))
+        {
+            // The root type error is already reported. Recovery types must not
+            // manufacture a second concurrency error.
+            return true;
+        }
         #[cfg(test)]
         if reasons.is_some() {
             tests::REASON_VISITS.with(|n| n.set(n.get() + 1));
@@ -276,11 +314,42 @@ impl TypeChecker {
                 _ => self.named_marker_holds(name, &[], marker, visiting, reasons),
             },
         };
+        if !result && let Some(failure) = reasons {
+            // Reuse the reason traversal: select advice at the failing leaf,
+            // with reader-sharing wrappers explaining their stronger contract.
+            let help = match ty {
+                Type::Generic(name, _) if matches!(name.as_str(), "RwLock" | "BlockingRwCell") => {
+                    Some(
+                        "RwLock<T> and BlockingRwCell<T> require T: Send + Sync because readers share it; use Mutex<T> when T is Send, or freeze mutable data so it is Sync",
+                    )
+                }
+                Type::Array(_) if !send => Some(
+                    "mutable Array values are never Sync; use FrozenArray via .freeze(), or Mutex<Array<T>> when the elements are Send",
+                ),
+                Type::Generic(name, _) if name == "Map" && !send => Some(
+                    "mutable Map values are never Sync; use FrozenMap via .freeze(), or Mutex<Map<K, V>> when keys and values are Send",
+                ),
+                Type::Named(name) if self.symbols.lookup_interface(name).is_some() => {
+                    Some(if send {
+                        "interface values need a declared `extends Send` (or `extends Sync`) contract if every implementation satisfies it"
+                    } else {
+                        "interface values need a declared `extends Sync` contract if every implementation satisfies it"
+                    })
+                }
+                Type::Fn(_, _) | Type::Closure(_, _) => Some(
+                    "function and closure values have unknown captures; pass Send/Sync data instead of retaining the callable across a task boundary",
+                ),
+                _ => None,
+            };
+            if help.is_some() {
+                failure.help = help;
+            }
+        }
         if !result
             && let Some(reasons) = reasons
-            && reasons.is_empty()
+            && reasons.notes.is_empty()
         {
-            reasons.push(format!(
+            reasons.notes.push(format!(
                 "`{}` is not `{}`",
                 type_name(ty),
                 if send { "Send" } else { "Sync" }
@@ -297,7 +366,7 @@ impl TypeChecker {
         args: &[Type],
         marker: Marker,
         visiting: &mut HashSet<String>,
-        reasons: &mut Option<Vec<String>>,
+        reasons: &mut Option<MarkerFailure>,
     ) -> bool {
         // Break recursive-type cycles optimistically: a self-reference adds no
         // new constraint beyond the other fields/payloads.
@@ -324,8 +393,8 @@ impl TypeChecker {
                 let ok = self.marker_holds_with_reason(&f.ty, marker, visiting, reasons);
                 if !ok && let Some(reasons) = reasons {
                     let prefix = format!("`{}` is not `", type_name(&f.ty));
-                    if reasons.len() == 1 && reasons[0].starts_with(&prefix) {
-                        reasons[0] = format!(
+                    if reasons.notes.len() == 1 && reasons.notes[0].starts_with(&prefix) {
+                        reasons.notes[0] = format!(
                             "field `{name}: {}` is not `{}`",
                             type_name(&f.ty),
                             if matches!(marker, Marker::Send) {
@@ -335,7 +404,9 @@ impl TypeChecker {
                             }
                         );
                     } else {
-                        reasons.push(format!("field `{name}: {}`", type_name(&f.ty)));
+                        reasons
+                            .notes
+                            .push(format!("field `{name}: {}`", type_name(&f.ty)));
                     }
                 }
                 ok
@@ -351,7 +422,7 @@ impl TypeChecker {
                 Marker::Sync => self.interface_extends(name, "Sync"),
             };
             if !holds && let Some(reasons) = reasons {
-                reasons.push(format!("interface `{name}` does not declare `extends {}`; interface values follow their declared contract, regardless of currently known implementations",
+                reasons.notes.push(format!("interface `{name}` does not declare `extends {}`; interface values follow their declared contract, regardless of currently known implementations",
                     if matches!(marker, Marker::Send) { "Send` or `extends Sync" } else { "Sync" }));
             }
             holds
@@ -362,6 +433,12 @@ impl TypeChecker {
         visiting.remove(name);
         result
     }
+}
+
+#[derive(Default)]
+struct MarkerFailure {
+    notes: Vec<String>,
+    help: Option<&'static str>,
 }
 
 #[derive(Clone, Copy)]
@@ -410,6 +487,74 @@ mod tests {
                 "marker-reason depth={size} visits={visits} fields={}",
                 size + 1
             );
+        }
+    }
+
+    #[test]
+    fn failure_help_reuses_reason_walk_for_fanout_and_repeated_calls() {
+        let c = checker("fn main() {}");
+        for size in [16, 64, 256] {
+            let mut args = vec![Type::I64; size];
+            args.push(Type::Array(Box::new(Type::I64)));
+            let ty = generic("Result", args);
+            REASON_VISITS.with(|n| n.set(0));
+            for _ in 0..4 {
+                let (note, help) = c.marker_failure(&ty, Marker::Sync);
+                assert!(note.contains("Array<i64>"));
+                assert!(help.contains("FrozenArray"));
+            }
+            let visits = REASON_VISITS.with(|n| n.get());
+            assert_eq!(visits, 4 * (size + 2));
+            eprintln!("marker-help fanout={size} repetitions=4 visits={visits}");
+        }
+    }
+
+    #[test]
+    fn error_types_do_not_create_marker_failures() {
+        let mut c = checker("fn main() {}");
+        c.invalid_type_names.borrow_mut().insert("Missing".into());
+        for ty in [
+            TypeChecker::error_type(),
+            named("Missing"),
+            generic("Missing", vec![Type::I64]),
+        ] {
+            for wrapper in ["Option", "Result", "Mutex", "Channel", "FrozenArray"] {
+                let wrapped = generic(wrapper, vec![ty.clone()]);
+                assert!(c.is_send(&wrapped), "{wrapped:?}");
+                assert!(c.is_sync(&wrapped), "{wrapped:?}");
+            }
+        }
+        // Genuine constraints survive alongside an erroneous field.
+        assert!(!c.is_sync(&Type::Array(Box::new(named("Missing")))));
+        c.validate_type(&named("Unresolved"), Span::dummy());
+        assert!(c.errors.iter().any(|d| d.code == ErrorCode::E0350));
+        assert!(c.is_send(&named("Unresolved")));
+        // Merely unknown names are still conservative until diagnosed.
+        assert!(!c.is_send(&named("Unchecked")));
+    }
+
+    #[test]
+    fn task_frame_fallback_labels_only_signatures() {
+        for source in [
+            "fn inc(x: i64) -> i64 { return x; } async fn bad() -> fn(i64) -> i64 { return inc; } fn main() {}",
+            "class Bad { f: fn(i64) -> i64; pub async fn run(self) { println(1); } } fn main() {}",
+        ] {
+            let (program, errors) = Parser::new(Lexer::new(source).tokenize().unwrap()).parse();
+            assert!(errors.is_empty(), "{errors:?}");
+            let mut c = TypeChecker::new();
+            c.set_enforce_send_sync(true);
+            c.check_program(&program);
+            let diagnostic = c
+                .errors
+                .iter()
+                .find(|d| d.code == ErrorCode::E2402)
+                .expect("real non-Send frame");
+            let span = diagnostic.primary_span().unwrap();
+            assert!(
+                !source[span.start..span.end].contains('{'),
+                "{diagnostic:?}"
+            );
+            assert!(span.end > span.start);
         }
     }
 
@@ -508,6 +653,91 @@ mod tests {
                 );
                 if rejected {
                     assert!(captures[0].notes[0].contains("field `data:"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn async_diagnostic_help_and_parameter_spans_twenty_four_perspectives() {
+        for form in 0..3 {
+            for (ty, frame_error, call_code, help) in [
+                (
+                    "RwLock<Sheet>",
+                    true,
+                    Some(ErrorCode::E2402),
+                    "readers share it",
+                ),
+                ("Array<i64>", false, Some(ErrorCode::E2402), "FrozenArray"),
+                ("Map<i64, i64>", false, Some(ErrorCode::E2402), "FrozenMap"),
+                ("Plain", true, Some(ErrorCode::E2404), "interface"),
+                ("Moving", false, Some(ErrorCode::E2405), "interface"),
+                ("Mutex<Sheet>", false, None, ""),
+                ("RwLock<i64>", false, None, ""),
+                ("Wrapped", true, Some(ErrorCode::E2402), "readers share it"),
+            ] {
+                let signature = format!("ok: i64, bad: {ty}");
+                let (declaration, call) = match form {
+                    0 => (format!("async fn take({signature}) {{}}"), "take(0, value)"),
+                    1 => (
+                        format!("class Receiver {{ pub async fn take(self, {signature}) {{}} }}"),
+                        "new Receiver().take(0, value)",
+                    ),
+                    _ => (
+                        format!("class Receiver {{ pub static async fn take({signature}) {{}} }}"),
+                        "Receiver::take(0, value)",
+                    ),
+                };
+                let source = format!(
+                    "class Sheet {{ pub cells: Map<i64, i64>; }} class Wrapped {{ pub inner: RwLock<Sheet>; }} interface Plain {{}} interface Moving extends Send {{}} {declaration} fn invoke(value: {ty}) {{ {call}; }} fn main() {{}}"
+                );
+                let (program, parse_errors) =
+                    Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+                assert!(parse_errors.is_empty(), "{parse_errors:?}");
+                let mut c = TypeChecker::new();
+                c.set_enforce_send_sync(true);
+                c.check_program(&program);
+                let diagnostics: Vec<_> = c
+                    .errors
+                    .iter()
+                    .filter(|d| {
+                        matches!(
+                            d.code,
+                            ErrorCode::E2402 | ErrorCode::E2404 | ErrorCode::E2405
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    diagnostics.len(),
+                    usize::from(frame_error) + usize::from(call_code.is_some()),
+                    "form={form} {ty}: {:?}",
+                    c.errors
+                );
+                if frame_error {
+                    let d = diagnostics
+                        .iter()
+                        .find(|d| d.message.starts_with("async task frame"))
+                        .unwrap();
+                    let span = d.primary_span().unwrap();
+                    assert_eq!(&source[span.start..span.end], "bad", "{d:?}");
+                    assert!(d.helps.iter().any(|h| h.contains(help)), "{d:?}");
+                }
+                if let Some(code) = call_code {
+                    let d = diagnostics
+                        .iter()
+                        .find(|d| !d.message.starts_with("async task frame"))
+                        .unwrap();
+                    assert_eq!(d.code, code, "{d:?}");
+                    assert_eq!(
+                        &source[d.primary_span().unwrap().start..d.primary_span().unwrap().end],
+                        "value"
+                    );
+                    assert!(d.helps.iter().any(|h| h.contains(help)), "{d:?}");
+                }
+                if !matches!(ty, "Plain" | "Moving") {
+                    for d in diagnostics {
+                        assert!(!d.helps.iter().any(|h| h.contains("interface")), "{d:?}");
+                    }
                 }
             }
         }

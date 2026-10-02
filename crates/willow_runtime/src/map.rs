@@ -756,7 +756,7 @@ mod tests {
             );
         }
         assert_eq!(opt_payload(willow_map_get(copy, i64::MIN, 0, 0)), 11);
-        assert!(!unsafe { willow_string_as_str(willow_map_to_string(copy)) }.contains("-0.0:"));
+        assert!(!unsafe { willow_string_as_str(willow_map_to_string(copy)) }.contains("-0:"));
         willow_pop_roots(2);
     }
 

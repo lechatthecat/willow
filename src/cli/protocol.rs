@@ -175,7 +175,7 @@ impl<W: Write> DiagnosticEmitter for EventWriter<W> {
             .map(|label| {
                 json!({
                     "span": label.span, "kind": label.kind, "message": label.message,
-                    "path": sources.get(label.span.file_id).map(|source| &source.path)
+                    "path": sources.display_path(label.span.file_id)
                 })
             })
             .collect();
@@ -185,7 +185,7 @@ impl<W: Write> DiagnosticEmitter for EventWriter<W> {
             .map(|fix| {
                 json!({
                     "span": fix.span, "replacement": fix.replacement, "message": fix.message,
-                    "path": sources.get(fix.span.file_id).map(|source| &source.path)
+                    "path": sources.display_path(fix.span.file_id)
                 })
             })
             .collect();
@@ -382,6 +382,28 @@ mod tests {
             self.lookups.set(self.lookups.get() + 1);
             (id == self.source.file_id).then_some(&self.source)
         }
+    }
+
+    #[test]
+    fn project_diagnostics_rebase_labels_and_fix_paths() {
+        use willow_compiler::diagnostics::ProjectEmitter;
+        let root = std::env::temp_dir().join("willow-project-fix-paths");
+        let source = SourceMap::new(root.join("main.wi").to_str().unwrap(), "x");
+        let span = Span::new(0, 1, 1, 1);
+        let diagnostic = Diagnostic::new(Severity::Error, ErrorCode::E0001, "bad")
+            .with_label(Label::primary(span, "bad"))
+            .with_fix(FixSuggestion::new(span, "y", "fix"));
+        let mut writer = EventWriter::new(Vec::new());
+        ProjectEmitter {
+            root: &root,
+            inner: &mut writer,
+        }
+        .emit(&diagnostic, &source)
+        .unwrap();
+        writer.flush_diagnostics().unwrap();
+        let event: Value = serde_json::from_slice(&writer.writer).unwrap();
+        assert_eq!(event["data"]["labels"][0]["path"], "main.wi");
+        assert_eq!(event["data"]["fix_suggestions"][0]["path"], "main.wi");
     }
 
     #[test]

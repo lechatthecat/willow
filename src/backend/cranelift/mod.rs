@@ -1266,6 +1266,83 @@ pub(super) struct DeferEntry {
     recovery_capable: bool,
 }
 
+/// Snapshots retain their identity; new registrations and scopes get fresh
+/// identities from a function-local sequence shared by snapshots. Removing a
+/// scope restores its prefix identity. Cleanup lookups need not walk or hash
+/// all registrations at every runtime-call edge.
+#[derive(Clone, Default)]
+struct DeferStack {
+    frames: Vec<Vec<DeferEntry>>,
+    identity: usize,
+    /// Each prefix keeps its identity when an inner scope is removed.
+    prefixes: Vec<usize>,
+    sequence: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl std::ops::Deref for DeferStack {
+    type Target = [Vec<DeferEntry>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.frames
+    }
+}
+
+impl DeferStack {
+    fn fresh_identity(&self) -> usize {
+        let identity = self
+            .sequence
+            .get()
+            .checked_add(1)
+            .expect("defer identity overflow");
+        self.sequence.set(identity);
+        identity
+    }
+
+    fn changed(&mut self) {
+        self.identity = self.fresh_identity();
+    }
+
+    fn push(&mut self, frame: Vec<DeferEntry>) {
+        self.changed();
+        self.prefixes.push(self.identity);
+        self.frames.push(frame);
+    }
+
+    fn pop(&mut self) -> Option<Vec<DeferEntry>> {
+        self.prefixes.pop();
+        self.identity = self.prefixes.last().copied().unwrap_or(0);
+        self.frames.pop()
+    }
+
+    fn truncate(&mut self, depth: usize) {
+        self.prefixes.truncate(depth);
+        self.identity = self.prefixes.last().copied().unwrap_or(0);
+        self.frames.truncate(depth);
+    }
+
+    fn last_mut(&mut self) -> Option<&mut Vec<DeferEntry>> {
+        if self.frames.is_empty() {
+            return None;
+        }
+        self.changed();
+        *self.prefixes.last_mut().expect("defer prefix") = self.identity;
+        self.frames.last_mut()
+    }
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct SyncCancelCleanupKey {
+    defers: usize,
+    consumed: usize,
+    panic_target: Option<cranelift_codegen::ir::Block>,
+    roots: usize,
+    panic_depth: usize,
+    recover_depth: usize,
+    call_depth: usize,
+    reference_depth: usize,
+    native_active: bool,
+}
+
 #[derive(Clone)]
 pub(super) struct PanicScope {
     /// Preparations live before this lexical scope must be replayed on recovery.
@@ -1360,7 +1437,7 @@ struct FuncGen<'a, 'b> {
     /// statements whose operands were already evaluated into hidden locals,
     /// plus (async only) the frame offset of the registration FLAG consumed
     /// before cleanup begins (willow-s9ej.1).
-    defer_stack: Vec<Vec<DeferEntry>>,
+    defer_stack: DeferStack,
     defer_counter: usize,
     /// Pre-zeroed registration flags for synchronous defer sites in the
     /// lexical block currently being emitted, keyed by source span.
@@ -1371,6 +1448,8 @@ struct FuncGen<'a, 'b> {
     /// Defer registrations already consumed on the cleanup path currently
     /// being emitted. A nested panic must not execute them again.
     unavailable_defer_ids: HashSet<usize>,
+    /// Identity of the consumed-registration set during normal defer replay.
+    sync_cancel_defer_context: usize,
     /// Number of compiler-generated panic-defer entries surrounding the code
     /// currently being emitted. A nested panic abandons each before raising
     /// its own panic record.
@@ -1392,6 +1471,7 @@ struct FuncGen<'a, 'b> {
     /// is restricted to this block before any intervening call instruction.
     panic_depth_snapshot: Option<(cranelift_codegen::ir::Block, cranelift_codegen::ir::Value)>,
     emitting_sync_cancel_cleanup: bool,
+    sync_cancel_cleanups: HashMap<SyncCancelCleanupKey, cranelift_codegen::ir::Block>,
     /// Invocation-constant native activity known to dominate the current LIR block.
     sync_native_active: Option<cranelift_codegen::ir::Value>,
     lir_cleanup_exit: Option<(cranelift_codegen::ir::Block, usize, bool)>,
@@ -2426,6 +2506,28 @@ mod symbol_namespace_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cancellation_defer_snapshots_do_not_alias_divergent_mutations() {
+        let mut original = DeferStack::default();
+        original.push(Vec::new());
+        let mut left = original.clone();
+        let mut right = original.clone();
+        assert_eq!(left.identity, right.identity);
+        left.last_mut().unwrap().clear();
+        right.push(Vec::new());
+        assert_ne!(left.identity, right.identity);
+        assert_ne!(left.identity, original.identity);
+        assert_ne!(right.identity, original.identity);
+        let snapshot = right.clone();
+        right.pop();
+        assert_eq!(right.identity, original.identity);
+        left.truncate(0);
+        assert_ne!(right.identity, snapshot.identity);
+        assert_ne!(left.identity, right.identity);
+        assert_eq!(original.len(), 1);
+        assert_eq!(snapshot.len(), 2);
+    }
+
     #[test]
     fn class_layouts_complete_subclass_first_declarations_from_frozen_queries() {
         let source = "

@@ -16,7 +16,7 @@ pub fn emit(diag: &Diagnostic, map: &SourceMap) {
 fn emit_single(diag: &Diagnostic, map: &SourceMap, writer: &mut dyn Write) -> io::Result<()> {
     emit_header(diag, writer)?;
     if let Some(labels) = group_labels(&diag.labels).get(&map.file_id) {
-        render_file_labels(map, labels, writer)?;
+        render_file_labels(map, &map.path, labels, writer)?;
     }
     render_footer(
         diag,
@@ -50,7 +50,12 @@ pub fn emit_with(
         if !labels.lines.is_empty()
             && let Some(map) = maps.get(file_id)
         {
-            render_file_labels(map, &labels, writer)?;
+            render_file_labels(
+                map,
+                maps.display_path(file_id).unwrap_or(&map.path),
+                &labels,
+                writer,
+            )?;
         }
     }
     render_footer(diag, |file_id| maps.get(file_id), writer)
@@ -101,6 +106,7 @@ thread_local! {
 
 fn render_file_labels(
     map: &SourceMap,
+    path: &str,
     labels: &FileLabels<'_>,
     writer: &mut dyn Write,
 ) -> io::Result<()> {
@@ -113,7 +119,7 @@ fn render_file_labels(
     writeln!(
         writer,
         " {marker} {}:{}:{}",
-        map.path, location.span.line, location.span.col
+        path, location.span.line, location.span.col
     )?;
 
     let mut lines: Vec<_> = labels.lines.iter().collect();

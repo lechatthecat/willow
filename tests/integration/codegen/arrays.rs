@@ -1,5 +1,15 @@
 use super::*;
 
+#[test]
+fn void_tasks_frozen_iteration_example() {
+    let source = include_str!("../../../example/void_tasks_frozen_iteration.wi");
+    for run in [compile_and_run, compile_and_run_release] {
+        let (out, ok) = run(source);
+        assert!(ok);
+        assert_eq!(out, "2\n60\n");
+    }
+}
+
 // ── Array<T> type (willow-xqm) ─────────────────────────────────────────────
 // GC-managed arrays: literals, indexing (read/write), `.len()`, bounds checks.
 // Element types cover scalars (i64/bool/f64) and GC references (String/object).

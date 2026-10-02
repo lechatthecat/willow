@@ -1,0 +1,22 @@
+// Query `count`, `value`, and `[` on the assignment lines with `willow type`.
+class Counter {
+    pub value: i64;
+    pub init(self) { self.value = 8; }
+    pub fn bump(self) { self.value += 2; }
+}
+fn main() {
+    let mut count = 8;
+    let values = [8];
+    let counter = new Counter();
+    count += 2;
+    values[0] += 2;
+    counter.value += 2;
+    counter.bump();
+    println(count);
+    println(values[0]);
+    println(counter.value);
+    count = 3;
+    values[0] = 3;
+    counter.value = 3;
+    println(count + values[0] + counter.value);
+}

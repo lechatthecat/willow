@@ -1,0 +1,12 @@
+// Diagnostic experiment: remove the closing `)` from the if condition.
+// The compiler reports syntax errors before checking the incomplete program.
+// Remove the final `}` to see the opening brace identified as a related label.
+class Box { pub value: i64; }
+fn positive(box: Box) -> i64 {
+    if (box.value > 0) { return box.value; }
+    return 0;
+}
+async fn main() {
+    let box = new Box(7);
+    println(positive(box));
+}

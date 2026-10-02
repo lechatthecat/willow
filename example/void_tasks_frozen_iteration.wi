@@ -1,0 +1,21 @@
+// `()` and `void` name the same no-result type, including in Task<()>.
+// FrozenArray uses a range/index loop; direct for-in reports this alternative.
+import std::collections::Array;
+
+async fn work() -> () {}
+
+async fn main() {
+    let tasks: Array<Task<()>> = [];
+    tasks.push(work());
+    tasks.push(work());
+    for task in tasks {
+        await task;
+    }
+    let values = [10, 20, 30].freeze();
+    let mut total = 0;
+    for i in 0..values.len() {
+        total += values[i];
+    }
+    println(tasks.len()); // 2
+    println(total); // 60
+}

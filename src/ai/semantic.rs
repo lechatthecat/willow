@@ -86,6 +86,14 @@ impl Captured {
                     "conservative await bound: stored void futures may use blocking willow_future_await_void; scheduler sleep/yield parks the task; this bound does not identify the selected lowering"
                 );
             }
+            if operation == "array-length-null-panic" {
+                value["witness"]["reason"] = json!(
+                    "Normal Array.len()/FrozenArray.len() reads the length without allocating. Only a null receiver reaches willow_array_len's panic path, which may allocate the panic payload; receiver non-nullness is not proven by this summary."
+                );
+                if effect == RuntimeEffects::MAY_ALLOCATE.bits() {
+                    value["witness"]["cause"]["operation"] = json!("panic-payload-allocation");
+                }
+            }
             if let Some(i) = existing {
                 witnesses[i] = value;
             } else {
@@ -273,6 +281,7 @@ pub struct QuerySession {
     symbols: HashMap<String, usize>,
     symbol_references: HashMap<String, Vec<usize>>,
     symbol_positions: HashMap<String, Vec<(usize, usize, String)>>,
+    write_positions: HashMap<String, Vec<(usize, usize)>>,
     references: HashMap<String, Vec<usize>>,
     positions: HashMap<String, Vec<(usize, usize, Option<usize>)>>,
     callees: Vec<Vec<usize>>,
@@ -358,7 +367,15 @@ impl QuerySession {
                 ));
             }
         }
+        let mut write_positions: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
         for (i, r) in snapshot.semantic.references.iter().enumerate() {
+            if matches!(r.role.as_str(), "write" | "write-element") {
+                let l = &r.location;
+                write_positions
+                    .entry(l.path.clone())
+                    .or_default()
+                    .push((l.start, l.end));
+            }
             symbol_references
                 .entry(r.target.clone())
                 .or_default()
@@ -393,6 +410,10 @@ impl QuerySession {
         }
         for positions in symbol_positions.values_mut() {
             positions.sort();
+            positions.dedup();
+        }
+        for positions in write_positions.values_mut() {
+            positions.sort_unstable();
             positions.dedup();
         }
         let mut indirect_references: HashMap<Type, Vec<usize>> = HashMap::new();
@@ -431,6 +452,7 @@ impl QuerySession {
             symbols,
             symbol_references,
             symbol_positions,
+            write_positions,
             positions,
             callees,
             dispatch_callers,
@@ -558,6 +580,17 @@ impl QuerySession {
                         .to_string_lossy()
                         .into_owned()
                 };
+                // Resolved source write tokens are authoritative: compound lowering
+                // can put several synthetic expressions on the same token span.
+                if let Some(writes) = self.write_positions.get(&file) {
+                    let p = writes.partition_point(|s| {
+                        self.position_comparisons += 1;
+                        s.0 <= byte
+                    });
+                    if p.checked_sub(1).is_some_and(|i| byte < writes[i].1) {
+                        return json!({"revision":self.revision(),"result":self.declared_type_at(&file,byte)});
+                    }
+                }
                 let Some(ids) = self.positions.get(&file) else {
                     return json!({"revision":self.revision(),"result":self.declared_type_at(&file,byte)});
                 };
@@ -703,7 +736,9 @@ impl QuerySession {
                     let f = &self.snapshot.functions[i];
                     let mut seen = std::collections::HashSet::from([i]);
                     let mut queue = std::collections::VecDeque::from([i]);
-                    let mut witness = vec![json!({"function":f.id,"via":null})];
+                    let mut witness = vec![
+                        json!({"function":f.id,"via":null,"reason":f.unknown_reason(),"unresolved":f.unresolved}),
+                    ];
                     let mut evidence = BTreeMap::new();
                     while let Some(j) = queue.pop_front() {
                         if let Some(facts) = self
@@ -732,7 +767,7 @@ impl QuerySession {
                             self.effect_edge_visits += 1;
                             if seen.insert(k) {
                                 queue.push_back(k);
-                                witness.push(json!({"function":self.snapshot.functions[k].id,"via":self.snapshot.functions[j].id,"runtime_effects":self.snapshot.functions[k].runtime_effects}));
+                                witness.push(json!({"function":self.snapshot.functions[k].id,"via":self.snapshot.functions[j].id,"runtime_effects":self.snapshot.functions[k].runtime_effects,"reason":self.snapshot.functions[k].unknown_reason(),"unresolved":self.snapshot.functions[k].unresolved}));
                             }
                         }
                     }
@@ -744,11 +779,16 @@ impl QuerySession {
                         }
                         evidence.entry(effect as u64).or_insert_with(|| {
                             missing = true;
-                            json!({"effect":effect,"status":"missing-witness"})
+                            json!({"effect":effect,"status":"missing-witness", "reason":
+                                if f.unknown {
+                                    "Retained as a conservative capability of an unresolved call or dispatch candidate; no operation witness is available. This does not prove that this function suspends or blocks, including when its declaration is synchronous."
+                                } else {
+                                    "Retained from the compiler/runtime capability summary, but no operation witness is available. This is an upper bound, not proof that this function performs the effect."
+                                }})
                         });
                     }
                     json!({"status":if f.unknown{"unknown"}else if missing{"incomplete"}else{"ok"},
-                        "runtime_effects":f.runtime_effects,"compiler_effects":self.snapshot.semantic.compiler_effects.get(&f.id),"effect_evidence":evidence.into_values().collect::<Vec<_>>(),
+                        "reason":f.unknown_reason(), "runtime_effects":f.runtime_effects,"compiler_effects":self.snapshot.semantic.compiler_effects.get(&f.id),"effect_evidence":evidence.into_values().collect::<Vec<_>>(),
                         "witness":witness, "compiler_witnesses":self.snapshot.semantic.witnesses.get(&f.id),
                         "meaning":"compiler facts and conservative runtime capability bounds; external business effects and predicate feasibility are not implied"})
                 }
@@ -1191,7 +1231,10 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|e| e["status"] == "missing-witness")
+                .all(|e| e["status"] == "missing-witness"
+                    && e["reason"]
+                        .as_str()
+                        .is_some_and(|r| r.contains("upper bound")))
         );
         let result = session.query(QueryRequest::Effects {
             revision,

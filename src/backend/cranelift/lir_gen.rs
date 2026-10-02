@@ -115,7 +115,7 @@ struct LirDeferScopeFrame {
 #[derive(Clone, Default)]
 struct LirDeferState {
     scopes: Vec<LirDeferScopeFrame>,
-    entries: Vec<Vec<super::DeferEntry>>,
+    entries: super::DeferStack,
     panic_scopes: Vec<super::PanicScope>,
     flags: HashMap<Span, cranelift_codegen::ir::StackSlot>,
 }
