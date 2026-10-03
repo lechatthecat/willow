@@ -11,7 +11,8 @@
 //! of the ABI lives in exactly one place.
 
 use cranelift_codegen::ir::{AbiParam, Type, types};
-pub use willow_abi::{AbiTy, RUNTIME_SYMBOLS, RuntimeEffects, RuntimeSymbol, runtime_symbol};
+pub use willow_abi::{AbiTy, RuntimeEffects, RuntimeSymbol, runtime_symbol};
+pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = willow_abi::RUNTIME_ABI.symbols;
 
 /// Lower a target-independent ABI representation to Cranelift.
 fn clif_abi_ty(ty: AbiTy, ptr_ty: Type) -> Type {

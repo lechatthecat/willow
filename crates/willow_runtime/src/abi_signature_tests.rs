@@ -17,7 +17,8 @@ use std::collections::BTreeSet;
 use std::ffi::c_void;
 
 use willow_abi::AbiTy::{self, F64, I8, I32, I64, Ptr, Word};
-use willow_abi::{RUNTIME_SYMBOLS, runtime_symbol};
+use willow_abi::runtime_symbol;
+const RUNTIME_SYMBOLS: &[willow_abi::RuntimeSymbol] = willow_abi::RUNTIME_ABI.symbols;
 
 use crate::{
     array, async_frame, async_mutex, async_rwlock, channel, future, gc, lock, map, parallel,
@@ -369,15 +370,19 @@ fn interface_dispatch_layout_matches_native_pointer_aggregate() {
     }
     let pointer_bytes = std::mem::size_of::<*const c_void>() as u32;
     assert_eq!(
-        willow_abi::dispatch_layout::interface_bytes(pointer_bytes) as usize,
+        willow_abi::schema::SharedLayout::InterfaceBox.size(pointer_bytes) as usize,
         std::mem::size_of::<InterfaceBox>()
     );
     assert_eq!(
-        willow_abi::dispatch_layout::OBJECT_OFFSET as usize,
+        willow_abi::schema::SharedLayout::InterfaceBox
+            .field_offset(0, pointer_bytes)
+            .unwrap() as usize,
         std::mem::offset_of!(InterfaceBox, object)
     );
     assert_eq!(
-        willow_abi::dispatch_layout::vtable_offset(pointer_bytes) as usize,
+        willow_abi::schema::SharedLayout::InterfaceBox
+            .field_offset(1, pointer_bytes)
+            .unwrap() as usize,
         std::mem::offset_of!(InterfaceBox, vtable)
     );
 }

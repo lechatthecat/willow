@@ -6,6 +6,8 @@
 //! keeps cross-compilation independent of the host Rust process layout.
 
 pub mod runtime_type_ids;
+pub mod schema;
+pub use schema::RUNTIME_ABI;
 // Keep the existing descriptor-type import path available to ABI consumers.
 pub use runtime_type_ids::GC_BITMAP_TYPE_ID;
 

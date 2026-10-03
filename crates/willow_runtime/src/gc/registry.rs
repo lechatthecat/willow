@@ -101,15 +101,22 @@ pub type DropFn = unsafe fn(payload: *mut u8);
 /// registration mutex, and two registry calls in every module.
 #[derive(Clone, Copy)]
 pub struct NativeGcType {
-    pub type_id: u32,
-    pub trace: Option<TraceFn>,
-    pub drop_fn: Option<DropFn>,
-    pub concurrent_trace: Option<ConcurrentTraceFn>,
-    pub concurrent_slice: Option<ConcurrentTraceSliceFn>,
+    type_id: u32,
+    trace: Option<TraceFn>,
+    drop_fn: Option<DropFn>,
+    concurrent_trace: Option<ConcurrentTraceFn>,
+    concurrent_slice: Option<ConcurrentTraceSliceFn>,
 }
 
 impl NativeGcType {
     pub const fn new(type_id: u32, trace: Option<TraceFn>, drop_fn: Option<DropFn>) -> Self {
+        let Some(contract) = willow_abi::runtime_type_ids::runtime_type(type_id) else {
+            panic!("native GC type is absent from the ABI schema");
+        };
+        assert!(
+            contract.accepts_native_hooks(trace.is_some(), drop_fn.is_some()),
+            "native GC hooks disagree with the ABI schema"
+        );
         Self {
             type_id,
             trace,

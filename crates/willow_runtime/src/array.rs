@@ -483,6 +483,19 @@ mod tests {
             assert_eq!(buf_slot(buffer, 0).byte_offset_from(buffer), 8);
             assert_eq!(*buf_slot(buffer, 3), 42);
             assert_eq!(HANDLE_MASK, 1 << H_BUF);
+            use willow_abi::schema::SharedLayout;
+            assert_eq!(SharedLayout::ArrayHandle.size(8), 32);
+            for (field, value) in [4, handle_word(array, H_CAP), 0, buffer as i64]
+                .into_iter()
+                .enumerate()
+            {
+                let offset = SharedLayout::ArrayHandle.field_offset(field, 8).unwrap();
+                assert_eq!(*array.add(offset as usize).cast::<i64>(), value);
+            }
+            assert_eq!(
+                SharedLayout::ArrayBufferHeader.size(8),
+                buf_slot(buffer, 0).byte_offset_from(buffer) as u32
+            );
         }
     }
 

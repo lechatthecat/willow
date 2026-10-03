@@ -819,6 +819,18 @@ mod tests {
 
     #[test]
     fn frame_fs15_header_offsets_match_the_compiler_constants() {
+        let layout = willow_abi::schema::SharedLayout::AsyncFrameHeader;
+        assert_eq!(layout.size(8) as usize, ASYNC_FRAME_HEADER_BYTES);
+        for (field, offset) in [
+            ASYNC_FRAME_STATE_OFFSET,
+            ASYNC_FRAME_SLOT_COUNT_OFFSET,
+            ASYNC_FRAME_STATUS_OFFSET,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(layout.field_offset(field, 8).unwrap() as usize, offset);
+        }
         assert_eq!(ASYNC_FRAME_HEADER_WORDS, 3);
         assert_eq!(ASYNC_FRAME_HEADER_BYTES, 24);
         assert_eq!(ASYNC_FRAME_STATE_OFFSET, 0);

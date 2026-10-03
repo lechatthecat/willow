@@ -978,6 +978,83 @@ fn test_gc_generated_header_and_tlab_abi_layout() {
 }
 
 #[test]
+fn unified_schema_pins_native_gc_layouts() {
+    use willow_abi::GcLayoutDescriptor;
+    use willow_abi::schema::SharedLayout;
+    let width = std::mem::size_of::<usize>() as u32;
+    let cases: &[(SharedLayout, usize, &[usize])] = &[
+        (
+            SharedLayout::GcHeader,
+            std::mem::size_of::<GcHeader>(),
+            &[
+                std::mem::offset_of!(GcHeader, marked),
+                std::mem::offset_of!(GcHeader, allocated),
+                std::mem::offset_of!(GcHeader, generation),
+                std::mem::offset_of!(GcHeader, age),
+                std::mem::offset_of!(GcHeader, descriptor_owned),
+                std::mem::offset_of!(GcHeader, remembered),
+                std::mem::offset_of!(GcHeader, descriptor),
+            ],
+        ),
+        (
+            SharedLayout::GcDescriptor,
+            std::mem::size_of::<GcLayoutDescriptor>(),
+            &[
+                std::mem::offset_of!(GcLayoutDescriptor, type_id),
+                std::mem::offset_of!(GcLayoutDescriptor, layout_id),
+                std::mem::offset_of!(GcLayoutDescriptor, gc_ref_mask),
+                std::mem::offset_of!(GcLayoutDescriptor, size),
+            ],
+        ),
+        (
+            SharedLayout::Tlab,
+            std::mem::size_of::<GcTlabState>(),
+            &[
+                std::mem::offset_of!(GcTlabState, cursor),
+                std::mem::offset_of!(GcTlabState, limit),
+                std::mem::offset_of!(GcTlabState, start_bits),
+            ],
+        ),
+    ];
+    for &(layout, size, offsets) in cases {
+        assert!(willow_abi::RUNTIME_ABI.layouts.contains(&layout));
+        assert_eq!(layout.size(width) as usize, size);
+        assert_eq!(layout.fields().len(), offsets.len());
+        for (field, &offset) in offsets.iter().enumerate() {
+            assert_eq!(layout.field_offset(field, width), Some(offset as u32));
+        }
+    }
+}
+
+#[test]
+fn native_gc_schema_rejects_unknown_ids_and_incorrect_hooks() {
+    use willow_abi::runtime_type_ids::*;
+    unsafe fn trace(_: *mut u8, _: &mut Vec<*mut *mut u8>) {}
+    unsafe fn finalize(_: *mut u8) {}
+    for id in [
+        NO_TYPE_ID,
+        GENERATED_TYPE_ID_MIN,
+        GENERATED_TYPE_ID_MAX,
+        u32::MAX,
+        GC_BITMAP_TYPE_ID,
+    ] {
+        assert!(std::panic::catch_unwind(|| NativeGcType::new(id, None, None)).is_err());
+    }
+    for row in willow_abi::RUNTIME_ABI.types {
+        for trace in [None, Some(trace as TraceFn)] {
+            for drop_fn in [None, Some(finalize as DropFn)] {
+                let result =
+                    std::panic::catch_unwind(|| NativeGcType::new(row.type_id, trace, drop_fn));
+                assert_eq!(
+                    result.is_ok(),
+                    row.accepts_native_hooks(trace.is_some(), drop_fn.is_some())
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn test_gc_tlab_large_object_uses_old_region_slow_path() {
     let _guard = gc_test_guard();
     reset_gc();
