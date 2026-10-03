@@ -42,8 +42,8 @@ pub(super) fn resolve_vtable_id(
 }
 
 impl<'a, 'b> FuncGen<'a, 'b> {
-    /// Push a GC root for a pointer value. Creates a stack slot to hold the pointer so
-    /// the GC can find and mark the object via `willow_push_root`.
+    /// Spill a GC pointer or an inline interface pair, rooting only word zero.
+    /// Scalar ADT pairs must not be passed here: their first word is a tag.
     ///
     /// The slot is returned so a caller that roots a temporary across a call
     /// which may collect can reload the pointer from the root afterwards.
@@ -51,14 +51,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         val: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::StackSlot {
-        assert_ne!(
-            self.builder.func.dfg.value_type(val),
-            cranelift_codegen::ir::types::I128,
-            "scalar pair must never be registered as a GC pointer"
-        );
+        let spill_bytes = self.builder.func.dfg.value_type(val).bytes();
         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
-            reference_type(self.module.target_config()).bytes(),
+            spill_bytes,
             0,
         ));
         self.stack_store(val, slot);
@@ -86,9 +82,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().call(pop_ref, &[n_val]);
     }
 
-    /// Box a concrete class instance into an interface value: a 16-byte GC object
-    /// `[object (GC ref) | vtable (raw)]` allocated with `gc_ref_mask = 0b01`.
-    /// Returns the box pointer (spec §8.1 / §9.2).
+    /// Form an inline `[object (GC ref) | vtable (raw)]` interface value.
+    /// The pair requires no wrapper allocation; only its object word is traced.
     pub(super) fn emit_interface_box(
         &mut self,
         object: cranelift_codegen::ir::Value,
@@ -97,53 +92,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let vtable_id =
             resolve_vtable_id(self.vtable_ids, &self.classes, class_name, interface_name);
-        let Some(vtable_id) = vtable_id else {
-            // No vtable registered (e.g. unknown interface already diagnosed):
-            // fall back to the raw object so codegen stays total.
-            return object;
-        };
-
-        // Root the object across the box allocation (the alloc may collect).
-        let object_root = self.emit_push_root(object);
-        let box_ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
-            GcObjectKind::InterfaceBox,
-            willow_abi::dispatch_layout::interface_bytes(
-                reference_type(self.module.target_config()).bytes(),
-            ) as i64,
-            0,
-            willow_abi::dispatch_layout::INTERFACE_GC_REF_MASK,
-        ));
-
-        // word 0: concrete object pointer (GC-traced). Reload the root because
-        // the allocation may have moved the concrete object.
-        let object = self.stack_load(reference_type(self.module.target_config()), object_root);
-        self.emit_gc_heap_store_classified(
-            box_ptr,
-            0,
-            object,
-            true,
-            GcStoreDestination::InterfaceObject,
-        );
-
-        // word 1: vtable address (a static data symbol; not a GC reference).
-        let gv = self
-            .module
-            .declare_data_in_func(vtable_id, self.builder.func);
         let ptr_ty = reference_type(self.module.target_config());
-        let vtable_ptr = self.builder.ins().symbol_value(ptr_ty, gv);
-        self.emit_gc_heap_store_classified(
-            box_ptr,
-            willow_abi::dispatch_layout::vtable_offset(
-                reference_type(self.module.target_config()).bytes(),
-            ) as i32,
-            vtable_ptr,
-            false,
-            GcStoreDestination::InterfaceObject,
-        );
-
-        self.emit_pop_roots_n(1);
-        self.gc_root_count -= 1;
-        box_ptr
+        let vtable_ptr = if let Some(vtable_id) = vtable_id {
+            let gv = self
+                .module
+                .declare_data_in_func(vtable_id, self.builder.func);
+            self.builder.ins().symbol_value(ptr_ty, gv)
+        } else {
+            // The missing implementation has already been diagnosed. Preserve
+            // the pair representation even on this recovery path.
+            self.builder.ins().iconst(ptr_ty, 0)
+        };
+        self.builder.ins().iconcat(object, vtable_ptr)
     }
 }
 

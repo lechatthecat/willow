@@ -36,19 +36,23 @@ impl GcTraceLayout {
         fields: &[(String, Type)],
         mut managed: impl FnMut(&Type) -> Result<bool>,
     ) -> Result<Self> {
+        Self::from_field_slots(fields, |ty| Ok(field_slot_kind(ty, managed(ty)?, false)))
+    }
+
+    pub(crate) fn from_field_slots(
+        fields: &[(String, Type)],
+        mut slot: impl FnMut(&Type) -> Result<willow_abi::SlotKind>,
+    ) -> Result<Self> {
         let mut result = Self {
             mask: 0,
             bitmap: Vec::new(),
         };
-        let words = 1 + fields
-            .iter()
-            .map(|(_, ty)| 1 + usize::from(crate::semantic::builtin_types::is_scalar_pair(ty)))
-            .sum::<usize>();
         let mut next_word = 1;
         for (_, ty) in fields.iter() {
+            let slot = slot(ty)?;
             let word = next_word;
-            next_word += 1 + usize::from(crate::semantic::builtin_types::is_scalar_pair(ty));
-            if !managed(ty)? {
+            next_word += slot.word_count() as usize;
+            if !slot.traces_first_word() {
                 continue;
             }
             // Word zero points to a static class descriptor, never a GC object.
@@ -56,13 +60,36 @@ impl GcTraceLayout {
                 result.mask |= 1 << word;
             } else {
                 if result.bitmap.is_empty() {
-                    result.bitmap = vec![0; words.div_ceil(64)];
-                    result.bitmap[0] = result.mask;
+                    result.bitmap.push(result.mask);
                 }
+                result.bitmap.resize(word / 64 + 1, 0);
                 result.bitmap[word / 64] |= 1 << (word % 64);
             }
         }
+        if !result.bitmap.is_empty() {
+            result.bitmap.resize(next_word.div_ceil(64), 0);
+        }
         Ok(result)
+    }
+}
+
+fn field_slot_kind(ty: &Type, managed: bool, interface: bool) -> willow_abi::SlotKind {
+    use willow_abi::SlotKind;
+    if interface {
+        SlotKind::InterfacePair
+    } else if crate::semantic::builtin_types::is_scalar_pair(ty) {
+        SlotKind::ScalarPair
+    } else if managed {
+        SlotKind::GcRef
+    } else {
+        SlotKind::Word
+    }
+}
+
+fn field_type_id(ty: &Type) -> Option<TypeId> {
+    match ty {
+        Type::Named(id) | Type::Generic(id, _) => Some(*id),
+        _ => None,
     }
 }
 
@@ -90,12 +117,18 @@ impl super::tracked::QueryProvider for LayoutProvider {
         if let QueryNode::GcLayout(id) = node {
             let layout = table.read(self, QueryNode::ClassLayout(*id))?;
             let layout = layout.get::<TrackedLayout>();
-            let trace = GcTraceLayout::from_fields(&layout.fields, |ty| {
-                let named = match ty {
-                    Type::Named(id) => *table.input(&InputNode::GcNamedType(*id))?.get::<bool>(),
-                    _ => false,
+            let trace = GcTraceLayout::from_field_slots(&layout.fields, |ty| {
+                let (managed, interface) = match field_type_id(ty) {
+                    Some(id) => *table
+                        .input(&InputNode::GcNamedType(id))?
+                        .get::<(bool, bool)>(),
+                    None => (false, false),
                 };
-                Ok(is_gc_managed(ty, |_| named))
+                Ok(field_slot_kind(
+                    ty,
+                    is_gc_managed(ty, |_| managed),
+                    interface,
+                ))
             })?;
             return Ok(QueryValue::new(
                 trace,
@@ -173,7 +206,18 @@ pub(crate) struct ObjectLayout {
 }
 
 impl ObjectLayout {
+    #[cfg(test)]
     pub(crate) fn new(fields: Arc<Vec<(String, Type)>>, pointer_bytes: u32) -> Self {
+        Self::with_field_slots(fields, pointer_bytes, |ty| {
+            field_slot_kind(ty, false, false)
+        })
+    }
+
+    pub(crate) fn with_field_slots(
+        fields: Arc<Vec<(String, Type)>>,
+        pointer_bytes: u32,
+        mut slot: impl FnMut(&Type) -> willow_abi::SlotKind,
+    ) -> Self {
         let index = fields
             .iter()
             .enumerate()
@@ -184,7 +228,7 @@ impl ObjectLayout {
             .iter()
             .map(|(_, ty)| {
                 let offset = words;
-                words += 1 + usize::from(crate::semantic::builtin_types::is_scalar_pair(ty));
+                words += slot(ty).word_count() as usize;
                 offset
             })
             .collect();
@@ -237,7 +281,7 @@ pub(crate) struct LayoutQueries {
     interfaces: QueryTable<TypeId, crate::semantic::symbols::InterfaceInfo<TypeId>>,
     object_layouts: QueryTable<TargetLayoutKey, ObjectLayout>,
     gc_layouts: QueryTable<TypeId, GcTraceLayout>,
-    gc_named_types: QueryTable<TypeId, bool>,
+    gc_named_types: QueryTable<TypeId, (bool, bool)>,
     #[cfg(test)]
     work: std::cell::Cell<[usize; 4]>,
     #[cfg(test)]
@@ -361,7 +405,11 @@ impl LayoutQueries {
         let fields = self.fields(key.ty)?;
         self.object_layouts
             .query(key, || {
-                let mut object = ObjectLayout::new(fields, key.pointer_bytes());
+                let mut object =
+                    ObjectLayout::with_field_slots(fields, key.pointer_bytes(), |ty| {
+                        let interface = field_type_id(ty).is_some_and(|id| self.has_interface(id));
+                        field_slot_kind(ty, false, interface)
+                    });
                 object.gc = self.gc_layouts.ready(&key.ty);
                 Ok(object)
             })
@@ -378,7 +426,7 @@ impl LayoutQueries {
         let classify_named = |id| {
             *self
                 .gc_named_types
-                .query(id, || Ok(named(id)))
+                .query(id, || Ok((named(id), self.has_interface(id))))
                 .expect("frozen named representation")
         };
         let mut named_types = HashSet::new();
@@ -391,13 +439,13 @@ impl LayoutQueries {
                 .ok_or_else(|| anyhow::anyhow!("missing class fields {id}"))?;
             let trace = if let Some(queries) = self.tracking.borrow().as_ref() {
                 for (_, ty) in fields.iter() {
-                    if let Type::Named(name) = ty
-                        && named_types.insert(*name)
+                    if let Some(name) = field_type_id(ty)
+                        && named_types.insert(name)
                     {
                         queries.borrow_mut().capture_input(
-                            InputNode::GcNamedType(*name),
+                            InputNode::GcNamedType(name),
                             QueryValue::new(
-                                classify_named(*name),
+                                classify_named(name),
                                 ResultFingerprint::bytes(b"gc-named-type"),
                             ),
                         )?;
@@ -409,7 +457,16 @@ impl LayoutQueries {
                     .get::<GcTraceLayout>()
                     .clone()
             } else {
-                GcTraceLayout::from_fields(&fields, |ty| Ok(is_gc_managed(ty, classify_named)))?
+                GcTraceLayout::from_field_slots(&fields, |ty| {
+                    let (managed, interface) = field_type_id(ty)
+                        .map(classify_named)
+                        .unwrap_or((false, false));
+                    Ok(field_slot_kind(
+                        ty,
+                        is_gc_managed(ty, |_| managed),
+                        interface,
+                    ))
+                })?
             };
             self.gc_layouts.seed(id, trace);
         }
@@ -697,6 +754,113 @@ impl super::retained::Retained for GcTraceLayout {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn interface_class_fields_share_physical_offsets_and_tracing() {
+        use crate::compiler_db::incremental::SyntaxQueries;
+        use std::rc::Rc;
+        for tracked in [false, true] {
+            let mut accepted = SyntaxQueries::default();
+            for interface in [false, true, false] {
+                let queries = LayoutQueries::default();
+                let tracking = Rc::new(RefCell::new(accepted.candidate().unwrap()));
+                if tracked {
+                    queries.set_tracking(Rc::clone(&tracking));
+                }
+                let named = TypeId::local("LayoutInterface");
+                if interface {
+                    queries.interfaces.seed(
+                        named,
+                        crate::semantic::symbols::InterfaceInfo {
+                            name: named,
+                            public: false,
+                            methods: HashMap::new(),
+                            method_order: MethodSlots::default(),
+                            type_params: Vec::new(),
+                            extends: Vec::new(),
+                            declaration_span: crate::diagnostics::Span::dummy(),
+                            module_path: None,
+                        },
+                    );
+                }
+                let owner = TypeId::local("LayoutOwner");
+                let fields = vec![
+                    ("plain".into(), Type::Named(named)),
+                    ("generic".into(), Type::Generic(named, vec![Type::I64])),
+                    (
+                        "future".into(),
+                        Type::Generic(TypeId::local("Future"), vec![Type::I64]),
+                    ),
+                    (
+                        "scalar".into(),
+                        Type::Generic(TypeId::local("Option"), vec![Type::I64]),
+                    ),
+                    ("string".into(), Type::String),
+                ];
+                queries.register_class(owner, None, fields, vec![]);
+                let completed = queries.complete_pending_classes().unwrap();
+                // Fieldless named enum remains untraced; generic builtin rules survive.
+                queries.prepare_gc_layouts(&completed, |_| false).unwrap();
+                let layout = queries
+                    .object_layout(TargetLayoutKey::new(owner, 8))
+                    .unwrap();
+                let offsets = if interface {
+                    [1, 3, 5, 6, 8]
+                } else {
+                    [1, 2, 3, 4, 6]
+                };
+                for (index, word) in offsets.into_iter().enumerate() {
+                    assert_eq!(layout.field_offset(index), word * 8);
+                }
+                assert_eq!(layout.size_bytes(), if interface { 72 } else { 56 });
+                assert_eq!(
+                    layout.gc_trace().unwrap().mask,
+                    if interface {
+                        (1 << 1) | (1 << 3) | (1 << 8)
+                    } else {
+                        (1 << 2) | (1 << 6)
+                    }
+                );
+                assert!(Arc::ptr_eq(
+                    &layout,
+                    &queries
+                        .object_layout(TargetLayoutKey::new(owner, 8))
+                        .unwrap()
+                ));
+                drop(queries);
+                accepted = Rc::try_unwrap(tracking).unwrap().into_inner();
+            }
+        }
+    }
+
+    #[test]
+    fn interface_field_trace_construction_classifies_each_field_once() {
+        for count in [1, 32, 64, 256] {
+            let fields: Vec<_> = (0..count).map(|i| (format!("f{i}"), Type::I64)).collect();
+            let mut visits = 0;
+            let trace = GcTraceLayout::from_field_slots(&fields, |_| {
+                visits += 1;
+                Ok(willow_abi::SlotKind::InterfacePair)
+            })
+            .unwrap();
+            assert_eq!(visits, count);
+            for index in 0..count {
+                let word = 1 + 2 * index;
+                let mask = if word < 64 {
+                    trace.mask
+                } else {
+                    trace.bitmap[word / 64]
+                };
+                assert_ne!(mask & (1 << (word % 64)), 0);
+                if word % 64 < 63 {
+                    assert_eq!(mask & (1 << ((word + 1) % 64)), 0);
+                }
+            }
+            if count >= 64 {
+                assert_eq!(trace.bitmap.len(), (1 + 2 * count).div_ceil(64));
+            }
+        }
+    }
+
     #[test]
     fn tracked_interface_layout_ignores_bodies_and_positions_but_tracks_signatures() {
         use crate::compiler_db::incremental::SyntaxQueries;

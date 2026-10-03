@@ -1334,7 +1334,16 @@ impl TypeChecker {
         };
         // Interface-typed receiver: only the interface's declared methods are
         // callable, and the call dispatches through the interface vtable.
-        if let Some(iface) = self.symbols.lookup_interface(&class_name).cloned() {
+        if let Some(mut iface) = self.symbols.lookup_interface(&class_name).cloned() {
+            // Dispatch returns the concrete object for `-> Self`; the backend
+            // rebuilds the receiver's interface pair. Only specialize the
+            // selected return, without traversing every interface signature or
+            // broadening the rules for concrete `Self` parameters.
+            if let Some(method) = iface.methods.get_mut(method_name)
+                && method.return_type == Type::Named("Self".into())
+            {
+                method.return_type = obj_ty.clone();
+            }
             return self.resolve_interface_method(&iface, method_name, args, span);
         }
         if self.symbols.lookup_class(&class_name).is_none() {

@@ -254,3 +254,6 @@ mod static_mut_policy;
 
 #[path = "integration/scalar_adt_pairs.rs"]
 mod scalar_adt_pairs;
+
+#[path = "integration/interface_pairs.rs"]
+mod interface_pairs;

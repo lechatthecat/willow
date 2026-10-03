@@ -3583,3 +3583,78 @@ fn test_gc_typeinfo_unrooted_parent_child_both_collected() {
     );
     reset_gc();
 }
+
+#[test]
+fn enum_variant_mixed_pair_words_preserve_offsets_and_gc_edges() {
+    use willow_abi::SlotKind::{GcRef, InterfacePair, ScalarPair, Word};
+    let _guard = gc_test_guard();
+    reset_gc();
+    for count in [1, 4, 8] {
+        let mut slots = Vec::new();
+        let mut words = Vec::new();
+        let mut expected_refs = Vec::new();
+        // Keep child root addresses stable while assembling increasing inputs.
+        let mut children = vec![std::ptr::null_mut(); count * 2];
+        for (index, child) in children.iter_mut().enumerate() {
+            *child = willow_alloc(8);
+            unsafe { child.cast::<i64>().write(100 + index as i64) };
+            willow_push_root(child);
+        }
+        for index in 0..count {
+            slots.extend([ScalarPair, InterfacePair, Word, GcRef]);
+            words.extend([
+                i64::MIN,
+                i64::MAX,
+                children[index * 2] as i64,
+                1234,
+                -99,
+                children[index * 2 + 1] as i64,
+            ]);
+            expected_refs.extend([3 + index * 6, 6 + index * 6]);
+        }
+        willow_pop_roots(children.len() as i32);
+        let layout = willow_abi::EnumVariantLayout::new(7, &slots);
+        let depth = willow_root_depth();
+        set_gc_stress_for_test(Some("alloc"));
+        let mut variant = willow_alloc_enum_variant(0, layout, &words);
+        set_gc_stress_for_test(None);
+        assert_eq!(willow_root_depth(), depth);
+        assert!(!variant.is_null());
+        willow_push_root(&mut variant);
+        willow_gc_collect();
+        let object = HeapObject::from_raw(payload_to_header(variant)).unwrap();
+        let metadata = object.trace_metadata();
+        assert_eq!(metadata.payload_size, (1 + count * 6) * 8);
+        assert_eq!(
+            metadata.gc_ref_mask,
+            expected_refs
+                .iter()
+                .fold(0u64, |mask, bit| mask | (1 << bit))
+        );
+        let traced = object_reference_slots(object, &HashMap::new());
+        assert_eq!(traced.len(), count * 2);
+        for (slot, expected_word) in traced.iter().zip(&expected_refs) {
+            assert_eq!(*slot as usize - variant as usize, expected_word * 8);
+        }
+        unsafe {
+            assert_eq!(variant.cast::<i64>().read(), 7);
+            for index in 0..count {
+                let payload = variant.cast::<i64>().add(1 + index * 6);
+                assert_eq!(payload.read(), i64::MIN);
+                assert_eq!(payload.add(1).read(), i64::MAX);
+                assert_eq!(
+                    (payload.add(2).read() as *const i64).read(),
+                    100 + (index * 2) as i64
+                );
+                assert_eq!(payload.add(3).read(), 1234);
+                assert_eq!(payload.add(4).read(), -99);
+                assert_eq!(
+                    (payload.add(5).read() as *const i64).read(),
+                    101 + (index * 2) as i64
+                );
+            }
+        }
+        willow_pop_roots(1);
+    }
+    reset_gc();
+}

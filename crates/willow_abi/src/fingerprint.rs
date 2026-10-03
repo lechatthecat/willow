@@ -18,6 +18,8 @@ const CONTRACT_CONSTANTS: &[u64] = &[
     GC_REF_MASK_BITS as u64,
     EnumVariantLayout::TAG_WORDS as u64,
     storage_word_bytes(8) as u64,
+    SlotKind::InterfacePair.word_count() as u64,
+    SlotKind::InterfacePair.traces_first_word() as u64,
     array_layout::WORD_BYTES as u64,
     array_layout::HANDLE_MASK,
     dispatch_layout::CLASS_ID_BYTES as u64,

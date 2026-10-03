@@ -60,7 +60,7 @@ use crate::semantic::type_checker::types::type_name;
 
 use super::emit_interface::{collection_elem_kind, is_self_or_descendant};
 use super::gc_codegen::{GcLayoutMetadata, GcObjectKind, GcStoreDestination};
-use super::option_repr::{OptionRepr, is_scalar_pair, option_repr};
+use super::option_repr::{OptionRepr, is_scalar_pair};
 use super::symbols::{class_method_symbol_name, class_name_for_object_type, module_item_symbol};
 use super::type_helpers::{
     builtin_call_runtime_name, clif_type, is_gc_managed, reference_type,
@@ -5550,7 +5550,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         let runtime =
                             format!("willow_channel_recv_{}", channel_runtime_suffix(elem_ty));
                         let value = self.emit_value_runtime_call(&runtime, &[channel]);
-                        let value = if is_scalar_pair(elem_ty) {
+                        let value = if self.is_inline_pair(elem_ty) {
                             self.emit_from_storage_word(value, elem_ty)
                         } else {
                             value
@@ -5573,7 +5573,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             channel_runtime_suffix(elem_ty)
                         );
                         let before = self.gc_root_count;
-                        let value = if is_scalar_pair(elem_ty) {
+                        let value = if self.is_inline_pair(elem_ty) {
                             self.emit_push_root(channel);
                             let word = self.emit_to_storage_word(value, elem_ty);
                             self.emit_push_root(word);
@@ -5703,7 +5703,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let channel_value = self.load_lir_local(function, *channel);
                 let runtime = format!("willow_channel_recv_{}", channel_runtime_suffix(result_ty));
                 let value = self.emit_value_runtime_call(&runtime, &[channel_value]);
-                let value = if is_scalar_pair(result_ty) {
+                let value = if self.is_inline_pair(result_ty) {
                     self.emit_from_storage_word(value, result_ty)
                 } else {
                     value
@@ -5862,11 +5862,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let ptr_ty = reference_type(self.module.target_config());
         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
-            8,
+            self.clif_type(ty).bytes().max(8),
             0,
         ));
         let zero = *null.get_or_insert_with(|| self.builder.ins().iconst(ptr_ty, 0));
         self.stack_store(zero, slot);
+        if self.is_interface_pair(ty) {
+            self.builder.ins().stack_store(ptr_ty, zero, slot, 8);
+        }
         self.emit_push_root_slot(slot);
         self.track_coop_binding_root(slot);
         self.vars.insert(
@@ -6002,7 +6005,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // Give an address-taken local its definitive slot at function
                 // entry so no `&` use inserts path-local promotion, and so the
                 // one slot is the same one whichever block writes it first.
-                let clif = clif_type(reference_type(self.module.target_config()), &local.ty);
+                let clif = self.clif_type(&local.ty);
                 let zero = if clif == types::F64 {
                     self.builder.ins().f64const(0.0)
                 } else {
@@ -6016,7 +6019,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // write — a `match` whose arms all diverge, a merge reached from a
             // branch that never assigned — still has a reaching definition,
             // including a match merge whose other arm diverges.
-            let clif = clif_type(reference_type(self.module.target_config()), &local.ty);
+            let clif = self.clif_type(&local.ty);
             let var = self.builder.declare_var(clif);
             let zero = match clif {
                 types::F64 => self.builder.ins().f64const(0.0),
@@ -6771,11 +6774,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 } else {
                     // Unreachable fall-through in a value function (the checker
                     // guarantees returns); satisfy the signature with a zero.
-                    let zero =
-                        match clif_type(reference_type(self.module.target_config()), return_type) {
-                            types::F64 => self.builder.ins().f64const(0.0),
-                            ty => self.emit_zero(ty),
-                        };
+                    let zero = match self.clif_type(return_type) {
+                        types::F64 => self.builder.ins().f64const(0.0),
+                        ty => self.emit_zero(ty),
+                    };
                     self.builder.ins().return_(&[zero]);
                 }
             }
@@ -6810,8 +6812,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // The `Option` pointer niche carries no tag word: `Some` is any
                 // non-null payload and `None` is null (willow-0g8j.2.1).
                 if builtin_types::is(scrutinee_ty, B::Option)
-                    && option_repr(scrutinee_ty, self.enum_infos)
-                        == Some(OptionRepr::NullableGcPointer)
+                    && self.option_repr(scrutinee_ty) == Some(OptionRepr::NullableGcPointer)
                 {
                     let cc = if tag == 0 {
                         IntCC::NotEqual
@@ -6842,12 +6843,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         "compiler invariant violated: checked downcast pattern class `{class_name}` has no type id"
                     )
                 });
-                let obj = self.builder.ins().load(
-                    reference_type(self.module.target_config()),
-                    MemFlagsData::new(),
-                    scrutinee,
-                    0i32,
-                );
+                let (obj, _) = self.builder.ins().isplit(scrutinee);
                 let actual = self.emit_load_runtime_type_id(obj);
                 let expected = self.builder.ins().iconst(types::I64, type_id);
                 self.builder.ins().icmp(IntCC::Equal, actual, expected)
@@ -6880,15 +6876,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 );
                 normalize_void_payloads(&mut payload_types);
                 let niche = builtin_types::is(scrutinee_ty, B::Option)
-                    && option_repr(scrutinee_ty, self.enum_infos)
-                        == Some(OptionRepr::NullableGcPointer);
+                    && self.option_repr(scrutinee_ty) == Some(OptionRepr::NullableGcPointer);
                 let mut out = Vec::with_capacity(payload_types.len());
                 let mut payload_word = 1;
                 for (i, ((name, _), payload_ty)) in
                     bindings.iter().zip(payload_types.iter()).enumerate()
                 {
-                    let clif_ty =
-                        clif_type(reference_type(self.module.target_config()), payload_ty);
+                    let clif_ty = self.clif_type(payload_ty);
                     // In the niche the scrutinee IS the payload — there is no
                     // heap object to load word 1 from.
                     let raw = if niche && i == 0 {
@@ -6899,7 +6893,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         } else {
                             let offset = payload_word * 8;
                             self.builder.ins().load(
-                                if is_scalar_pair(payload_ty) {
+                                if clif_ty == types::I128 {
                                     types::I128
                                 } else {
                                     types::I64
@@ -6919,7 +6913,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     } else {
                         raw
                     };
-                    payload_word += 1 + i32::from(is_scalar_pair(payload_ty));
+                    payload_word += 1 + i32::from(self.is_inline_pair(payload_ty));
                     out.push((name.clone(), payload_ty.clone(), val));
                 }
                 out
@@ -6932,12 +6926,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 binding_ty,
                 ..
             } => {
-                let obj = self.builder.ins().load(
-                    reference_type(self.module.target_config()),
-                    MemFlagsData::new(),
-                    scrutinee,
-                    0i32,
-                );
+                let (obj, _) = self.builder.ins().isplit(scrutinee);
                 vec![(binding.clone(), binding_ty.clone(), obj)]
             }
             crate::ir::lowered::LirPattern::Wildcard
@@ -7301,7 +7290,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .iter()
                     .map(|capture| {
                         let ty = capture.ty(&function.locals).expect("capture type");
-                        super::type_helpers::value_slot_kind(&ty, self.enum_infos)
+                        self.value_slot_kind(&ty)
                     })
                     .collect();
                 let env = self.emit_gc_alloc(GcLayoutMetadata::aggregate(
@@ -7331,7 +7320,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         &ty,
                         GcStoreDestination::ObjectField,
                     );
-                    capture_word += 1 + i32::from(is_scalar_pair(&ty));
+                    capture_word += 1 + i32::from(self.is_inline_pair(&ty));
                 }
                 env
             }
@@ -7434,14 +7423,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         .params
                         .push(AbiParam::new(reference_type(self.module.target_config())));
                 }
-                signature.params.extend(params.iter().map(|ty| {
-                    AbiParam::new(clif_type(reference_type(self.module.target_config()), ty))
-                }));
+                signature
+                    .params
+                    .extend(params.iter().map(|ty| AbiParam::new(self.clif_type(ty))));
                 if *result != Type::Void {
-                    signature.returns.push(AbiParam::new(clif_type(
-                        reference_type(self.module.target_config()),
-                        result,
-                    )));
+                    signature
+                        .returns
+                        .push(AbiParam::new(self.clif_type(result)));
                 }
                 let signature = self.builder.import_signature(signature);
                 let pushed = self.emit_callstack_push(&name.to_string(), span);
@@ -7809,7 +7797,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let mut values = vec![receiver];
                 if let Some(&value) = args.first() {
                     let word = self.emit_to_storage_word(value, element);
-                    if is_scalar_pair(element) {
+                    if self.is_inline_pair(element) {
                         self.emit_push_root(word);
                     }
                     values.push(word);
@@ -7846,12 +7834,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     if is_gc_managed(element, self.enum_infos) {
                         self.emit_push_root(value);
                     }
-                    let value = if is_scalar_pair(element) {
+                    let value = if self.is_inline_pair(element) {
                         self.emit_to_storage_word(value, element)
                     } else {
                         value
                     };
-                    if is_scalar_pair(element) {
+                    if self.is_inline_pair(element) {
                         self.emit_push_root(value);
                     }
                     values.push(value);
@@ -7859,7 +7847,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let value = self
                     .emit_runtime_call_with_cleanup(&symbol, &values, |_| {})
                     .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0));
-                if intrinsic == ChannelRecv && is_scalar_pair(element) {
+                if intrinsic == ChannelRecv && self.is_inline_pair(element) {
                     self.emit_from_storage_word(value, element)
                 } else {
                     value
@@ -7873,10 +7861,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.emit_push_root(value);
                 }
                 let word = self.emit_to_storage_word(value, &element);
-                if is_scalar_pair(&element) {
+                if self.is_inline_pair(&element) {
                     self.emit_push_root(word);
                 }
-                let runtime = if is_scalar_pair(&element) {
+                let runtime = if self.is_inline_pair(&element) {
                     "willow_array_push_scalar_pairs"
                 } else {
                     "willow_array_push"
@@ -7886,7 +7874,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             ArrayPop => {
                 let element = array_element_type(receiver_ty);
-                if is_scalar_pair(&element) {
+                if self.is_inline_pair(&element) {
                     let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
                         16,
@@ -7911,7 +7899,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_value_runtime_call("willow_array_to_string", &[receiver, kind])
             }
             ArrayFreeze => {
-                let runtime = if is_scalar_pair(&array_element_type(receiver_ty)) {
+                let runtime = if self.is_inline_pair(&array_element_type(receiver_ty)) {
                     "willow_array_copy_scalar_pairs"
                 } else {
                     "willow_array_copy"
@@ -7943,7 +7931,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             self.emit_push_root(value);
                         }
                         let word = self.emit_to_storage_word(value, value_ty);
-                        if is_scalar_pair(value_ty) {
+                        if self.is_inline_pair(value_ty) {
                             self.emit_push_root(word);
                         }
                         let value_ref = self.map_is_ref_flag(value_ty);
@@ -8257,7 +8245,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .copied()
                 .unwrap_or_else(|| {
                     self.builder.ins().iconst(
-                        clif_type(reference_type(self.module.target_config()), ret_ty),
+                        self.classes
+                            .clif_type(reference_type(self.module.target_config()), ret_ty),
                         0,
                     )
                 });
@@ -8299,7 +8288,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .copied()
             .unwrap_or_else(|| {
                 self.builder.ins().iconst(
-                    clif_type(reference_type(self.module.target_config()), ret_ty),
+                    self.classes
+                        .clif_type(reference_type(self.module.target_config()), ret_ty),
                     0,
                 )
             });
@@ -8356,10 +8346,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .map(|ty| crate::semantic::symbols::substitute_type(ty, &parameters))
                     .collect();
                 normalize_void_payloads(&mut payloads);
-                let kinds: Vec<_> = payloads
-                    .iter()
-                    .map(|ty| super::type_helpers::value_slot_kind(ty, self.enum_infos))
-                    .collect();
+                let kinds: Vec<_> = payloads.iter().map(|ty| self.value_slot_kind(ty)).collect();
                 let wire = willow_abi::EnumVariantLayout::new(variant.tag as u32, &kinds);
                 let mut offset = wire.payload_byte_offset(bytes) as i32;
                 let fields = payloads
@@ -8410,7 +8397,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let tag = self.builder.ins().iconst(types::I64, tag);
             return self.emit_pair(tag, payload);
         }
-        if option_repr(enum_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
+        if self.option_repr(enum_ty) == Some(OptionRepr::NullableGcPointer) {
             return if tag == 0 {
                 args[0]
             } else {
@@ -8554,7 +8541,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let payload = self.builder.ins().iconst(types::I64, 0);
             return self.emit_pair(tag, payload);
         }
-        if option_repr(enum_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
+        if self.option_repr(enum_ty) == Some(OptionRepr::NullableGcPointer) {
             return self
                 .builder
                 .ins()
@@ -8601,8 +8588,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         let (target, offset) = &layout.fields[index];
         let value = self.coerce_to_target(value, source_ty, target);
-        let result = if option_repr(enum_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer)
-        {
+        let result = if self.option_repr(enum_ty) == Some(OptionRepr::NullableGcPointer) {
             assert_eq!(index, 0);
             value
         } else {

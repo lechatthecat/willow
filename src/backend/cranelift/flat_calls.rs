@@ -16,19 +16,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         push_frame: bool,
     ) -> Value {
         let interface = matches!(receiver_ty, Type::Named(name) | Type::Generic(name, _) if self.classes.is_interface(name));
-        if interface {
-            self.emit_interface_dispatch_nil_check(receiver, span, method);
+        let interface_parts = interface.then(|| self.builder.ins().isplit(receiver));
+        if let Some((_, vtable)) = interface_parts {
+            self.emit_interface_dispatch_nil_check(vtable, span, method);
         }
         if push_frame {
             self.emit_callstack_push(method, span);
         }
-        if interface {
-            let object = self.builder.ins().load(
-                reference_type(self.module.target_config()),
-                MemFlagsData::new(),
-                receiver,
-                0,
-            );
+        if let Some((object, _)) = interface_parts {
             self.emit_interface_dispatch_nil_check(object, span, method);
         }
         receiver
@@ -135,15 +130,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 for (idx, pt) in params.iter().flat_map(|p| p.iter()).enumerate() {
                     let abi = match modes.as_ref().and_then(|all| all.get(idx)) {
                         Some(ParamMode::Reference { .. }) => ptr_ty,
-                        _ => clif_type(reference_type(self.module.target_config()), pt),
+                        _ => self.clif_type(pt),
                     };
                     sig.params.push(AbiParam::new(abi));
                 }
                 if ret_type != Type::Void {
-                    sig.returns.push(AbiParam::new(clif_type(
-                        reference_type(self.module.target_config()),
-                        &ret_type,
-                    )));
+                    sig.returns.push(AbiParam::new(self.clif_type(&ret_type)));
                 }
                 let sig_ref = self.builder.import_signature(sig);
                 self.builder.ins().call_indirect(sig_ref, fnptr, &call_args)
@@ -156,7 +148,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .copied()
             .unwrap_or_else(|| {
                 self.builder.ins().iconst(
-                    clif_type(reference_type(self.module.target_config()), ret_ty),
+                    self.classes
+                        .clif_type(reference_type(self.module.target_config()), ret_ty),
                     0,
                 )
             });
@@ -173,14 +166,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// `iface.method(args)` on an interface-typed receiver: an indirect call
-    /// through the receiver box's vtable (willow-0g8j.6).
+    /// through the receiver pair's vtable (willow-0g8j.6).
     ///
-    /// The box is `[object | vtable]`, so the concrete class is not known
-    /// statically and there is nothing to inline: load the object and the
-    /// vtable, load the slot's function pointer, and call it with the object as
+    /// The pair is `[object | vtable]`, so the concrete class is not known
+    /// statically: extract the object and vtable, load the slot's function
+    /// pointer, and call it with the object as
     /// the hidden receiver. Eligibility proved the interface declares the method
     /// and so fixed its slot; the argument types come from the interface's
-    /// declaration, which is what a class argument gets boxed against.
+    /// declaration, which determines each class argument’s interface pair.
     ///
     /// Root the concrete object directly across dispatch so a moving minor
     /// collection cannot invalidate the hidden receiver SSA value.
@@ -232,35 +225,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let ret_type =
             crate::semantic::symbols::substitute_type(&sig_info.return_type, &substitutions);
 
-        let box_ptr = receiver;
+        let (obj, vtable) = self.builder.ins().isplit(receiver);
         if !receiver_prepared {
-            self.emit_interface_dispatch_nil_check(box_ptr, span, method);
+            self.emit_interface_dispatch_nil_check(vtable, span, method);
         }
         // Install the method frame before validating the concrete object so a
-        // invalid boxed receiver retains the method context in its diagnostic.
+        // invalid receiver retains the method context in its diagnostic.
         let pushed = if frame_prepared {
             self.flat_method_frame_enabled(method)
         } else {
             self.emit_callstack_push(method, span)
         };
-        let obj = self.builder.ins().load(
-            reference_type(self.module.target_config()),
-            MemFlagsData::new(),
-            box_ptr,
-            0i32,
-        );
-
         if !receiver_prepared {
             self.emit_interface_dispatch_nil_check(obj, span, method);
         }
-        let vtable = self.builder.ins().load(
-            reference_type(self.module.target_config()),
-            MemFlagsData::new(),
-            box_ptr,
-            willow_abi::dispatch_layout::vtable_offset(
-                reference_type(self.module.target_config()).bytes(),
-            ) as i32,
-        );
         let fnptr = self.builder.ins().load(
             reference_type(self.module.target_config()),
             MemFlagsData::new(),
@@ -272,7 +250,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         );
 
         let slots = self.interface_slot_summary(info.name, method);
-        // Pin the hidden receiver even when the interface box is held only by
+        // Pin the hidden receiver even when the interface pair is held only by
         // an async frame's interior slot. Nothing between this load and the
         // callee's entry is a safepoint, so a call whose every target roots
         // `self` itself before its first safepoint needs no second root
@@ -296,15 +274,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         for (idx, pt) in param_types.iter().enumerate() {
             let abi = match param_modes.get(idx) {
                 Some(ParamMode::Reference { .. }) => ptr_ty,
-                _ => clif_type(reference_type(self.module.target_config()), pt),
+                _ => self.clif_type(pt),
             };
             sig.params.push(AbiParam::new(abi));
         }
         if ret_type != Type::Void {
-            sig.returns.push(AbiParam::new(clif_type(
-                reference_type(self.module.target_config()),
-                &ret_type,
-            )));
+            sig.returns.push(AbiParam::new(self.clif_type(&ret_type)));
         }
         let sig_ref = self.builder.import_signature(sig);
 
@@ -318,8 +293,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             None
         };
-        let result_ty = (ret_type != Type::Void)
-            .then(|| clif_type(reference_type(self.module.target_config()), &ret_type));
+        let result_ty = (ret_type != Type::Void).then(|| self.clif_type(&ret_type));
         let merge = self.builder.create_block();
         if let Some(ty) = result_ty {
             self.builder.append_block_param(merge, ty);
@@ -382,7 +356,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_pop_roots_n(arg_roots + receiver_roots);
         self.gc_root_count -= arg_roots + receiver_roots;
         self.emit_post_willow_call_panic_check(panic_depth);
-        // `-> Self` yields a bare object of the receiver's own class. Re-box it
+        // `-> Self` yields a bare object of the receiver's own class. Pair it
         // only after the panic edge has rejected the neutral placeholder.
         if matches!(&ret_type, Type::Named(n) if n == &TypeId::local("Self")) {
             result = self.emit_box_with_vtable(result, vtable);

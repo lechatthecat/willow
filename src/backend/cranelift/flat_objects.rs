@@ -55,11 +55,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let word = self.emit_to_storage_word(value, element_ty);
             return self.emit_array_access(array, Some(index), Some(word));
         }
-        if super::option_repr::is_scalar_pair(element_ty) {
+        if self.is_inline_pair(element_ty) {
             let array = self.emit_lir_operand(function, array);
             let index = self.emit_lir_operand(function, index);
+            let source_ty = Self::flat_operand_type(function, value);
             let value = self.emit_lir_operand(function, value);
-            self.emit_push_root(array);
+            let value = self.coerce_to_target(value, &source_ty, element_ty);
+            let array_root = self.emit_push_root(array);
             let existing = self.emit_value_runtime_call("willow_array_get", &[array, index]);
             let update = self.builder.create_block();
             let initialize = self.builder.create_block();
@@ -70,13 +72,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.switch_to_block(update);
             self.builder.seal_block(update);
             // Preserve the element storage identity for outstanding references.
-            self.builder
-                .ins()
-                .store(MemFlagsData::new(), value, existing, 0);
+            self.emit_gc_heap_store(
+                existing,
+                0,
+                value,
+                element_ty,
+                GcStoreDestination::InterfaceObject,
+            );
             self.builder.ins().jump(done, &[]);
             self.builder.switch_to_block(initialize);
             self.builder.seal_block(initialize);
             let boxed = self.emit_to_storage_word(value, element_ty);
+            let array = self.stack_load(reference_type(self.module.target_config()), array_root);
             self.emit_word_array_store(array, index, boxed);
             self.builder.ins().jump(done, &[]);
             self.builder.switch_to_block(done);
@@ -90,8 +97,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // A frame-backed local is only an interior edge of the rooted frame.
         // Only an interface-boxing coercion allocates, so only it needs the
         // loaded owner pinned.
-        let boxes = self.coercion_boxes(&source_ty, element_ty)
-            || super::option_repr::is_scalar_pair(element_ty);
+        let boxes = self.coercion_boxes(&source_ty, element_ty) || self.is_inline_pair(element_ty);
         if boxes {
             self.emit_push_root(array);
         }
@@ -474,7 +480,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let layout = self.lir_class_layout(object_ty);
         let (offset, field_ty) = layout.field(field).expect("checked field");
         self.builder.ins().load(
-            clif_type(reference_type(self.module.target_config()), field_ty),
+            self.classes
+                .clif_type(reference_type(self.module.target_config()), field_ty),
             MemFlagsData::new(),
             object,
             offset as i32,
@@ -527,7 +534,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .declare_data_in_func(info.data_id, self.builder.func);
         let address = self.builder.ins().symbol_value(ptr_ty, global);
         self.builder.ins().load(
-            clif_type(reference_type(self.module.target_config()), &info.ty),
+            self.classes
+                .clif_type(reference_type(self.module.target_config()), &info.ty),
             MemFlagsData::new(),
             address,
             0,

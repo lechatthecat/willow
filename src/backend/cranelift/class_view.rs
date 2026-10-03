@@ -41,6 +41,18 @@ impl<'a> ClassView<'a> {
         Self { scope, layouts }
     }
 
+    pub(super) fn clif_type(
+        &self,
+        pointer: cranelift_codegen::ir::Type,
+        ty: &Type,
+    ) -> cranelift_codegen::ir::Type {
+        if matches!(ty, Type::Named(n) | Type::Generic(n, _) if self.is_interface(n)) {
+            cranelift_codegen::ir::types::I128
+        } else {
+            super::type_helpers::clif_type(pointer, ty)
+        }
+    }
+
     /// The declaration identity `name` refers to in this unit.
     pub(super) fn resolve<Q: TypeLookup + ?Sized>(&self, name: &Q) -> TypeId {
         self.scope.resolve(&name.type_id())

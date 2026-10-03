@@ -171,6 +171,7 @@ pub(crate) fn analyze(blocks: &[SourceBlock], locals: &[LirLocal]) -> LirAsyncFr
                 occupants.iter().position(|members| {
                     members.iter().all(|other| {
                         !pinned.contains(&other.id)
+                            && reusable_scalar(other)
                             && other.ty == local.ty
                             && regions[local.id.0 as usize]
                                 .is_disjoint(&regions[other.id.0 as usize])
@@ -589,6 +590,23 @@ mod coalescing_tests {
             );
             assert_eq!(layout(&separated).0, layout(&separated).0);
         }
+    }
+
+    #[test]
+    fn scalar_cannot_reuse_an_opaque_gc_owner_slot() {
+        let source = "async fn f() { if true { let a = 1; await sleep(0); print(a); } await sleep(0); if true { let b = 2; await sleep(0); print(b); } }";
+        let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
+        let (ast, errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(errors.is_empty());
+        let (hir, errors) = crate::ir::lower::lower_program(&ast);
+        assert!(errors.is_empty());
+        let mut program = super::super::lower_source_program(&hir);
+        let mut f = program.functions.remove(0);
+        let a = f.locals.iter().position(|local| local.name == "a").unwrap();
+        let b = f.locals.iter().position(|local| local.name == "b").unwrap();
+        f.locals[a].storage_kind = super::super::LirStorageKind::GcOwner;
+        let layout = analyze(&f.blocks, &f.locals);
+        assert_ne!(layout.slot(f.locals[a].id), layout.slot(f.locals[b].id));
     }
 
     #[test]

@@ -1,0 +1,28 @@
+import std::collections::Array;
+
+interface Value extends Sync {
+    fn get(self) -> i64;
+}
+
+class Number implements Value {
+    pub n: i64;
+    pub fn get(self) -> i64 { return self.n; }
+}
+
+fn same(value: Value) -> Value { return value; }
+
+async fn later(value: Value) -> Value {
+    await sleep(0);
+    return value;
+}
+
+async fn main() {
+    let first: Value = new Number(7);
+    let second: Value = new Number(11);
+    println(same(first).get());
+    println((await later(second)).get());
+    let values: Array<Value> = [first, second];
+    gc_collect();
+    println(values[0].get());
+    println(values[1].get());
+}

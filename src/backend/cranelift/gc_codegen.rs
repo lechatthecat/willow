@@ -73,7 +73,7 @@ impl GcLayoutMetadata {
         let mut bitmap = Vec::new();
         let mut word = header_words as usize;
         for slot in slots {
-            if *slot == willow_abi::SlotKind::GcRef {
+            if slot.traces_first_word() {
                 if word < 64 {
                     mask |= 1 << word;
                 } else {
@@ -217,6 +217,22 @@ pub(super) fn emit_gc_heap_store_raw(
     flags: MemFlagsData,
 ) {
     if let Some(barrier) = barrier {
+        if builder.func.dfg.value_type(value) == types::I128 {
+            // A traced inline pair contains an object followed by an untraced
+            // vtable. The barrier ABI and atomic publication concern word zero.
+            let (object, vtable) = builder.ins().isplit(value);
+            emit_gc_heap_store_raw(
+                builder,
+                Some(barrier),
+                owner,
+                offset,
+                object,
+                destination,
+                flags,
+            );
+            builder.ins().store(flags, vtable, owner, offset + 8);
+            return;
+        }
         let destination = builder.ins().iconst(types::I64, destination as i64);
         let slot = if offset == 0 {
             owner
@@ -458,16 +474,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         value_ty: &Type,
         destination: GcStoreDestination,
     ) {
-        if super::option_repr::is_scalar_pair(value_ty)
+        if self.is_inline_pair(value_ty)
             && destination == GcStoreDestination::AsyncFrameSlot
             && self.coop_result_offset == Some(offset)
         {
             // The runtime task-id word remains at data slot 1. Pair results
             // reserve data slot 2 for their payload, leaving this shared ABI intact.
-            let (tag, payload) = self.builder.ins().isplit(value);
-            self.builder
-                .ins()
-                .store(MemFlagsData::new(), tag, owner, offset);
+            let (first, payload) = self.builder.ins().isplit(value);
+            self.emit_gc_heap_store_classified(
+                owner,
+                offset,
+                first,
+                self.is_interface_pair(value_ty),
+                destination,
+            );
             let payload_offset = super::async_frame_slot_offset(
                 2,
                 reference_type(self.module.target_config()).bytes(),
@@ -482,7 +502,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// Variant for values whose source-level type has already been erased to a
-    /// raw word (runtime payloads and dynamic interface boxes).
+    /// raw word or a traced inline interface pair (runtime payloads).
     pub(super) fn emit_gc_heap_store_classified(
         &mut self,
         owner: Value,
@@ -564,6 +584,76 @@ mod tests {
             cranelift_codegen::verify_function(&ctx.func, codegen.output.module.isa()).unwrap();
             println!(
                 "reference_stores={stores} old_loads={stores} barrier_calls={stores} atomic_stores={stores}"
+            );
+        }
+    }
+
+    #[test]
+    fn interface_pair_stores_trace_only_object_word_in_linear_code() {
+        use cranelift_codegen::ir::Opcode;
+        for stores in [1, 16, 256] {
+            let mut codegen_build = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+            let mut codegen = codegen_build.declaration_context();
+            codegen.declare_runtime().unwrap();
+            let mut ctx = codegen.output.module.make_context();
+            let mut signature = codegen.output.module.make_signature();
+            signature
+                .params
+                .extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+            ctx.func.signature = signature;
+            let mut fn_ctx = FunctionBuilderContext::new();
+            let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_ctx);
+            let entry = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            builder.seal_block(entry);
+            let owner = builder.block_params(entry)[0];
+            let object = builder.block_params(entry)[1];
+            let vtable = builder.ins().iconst(types::I64, 1234);
+            let value = builder.ins().iconcat(object, vtable);
+            let barrier_id = codegen.func_id("willow_gc_write_barrier");
+            let barrier = codegen
+                .output
+                .module
+                .declare_func_in_func(barrier_id, builder.func);
+            for i in 0..stores {
+                emit_gc_heap_store_raw(
+                    &mut builder,
+                    Some(barrier),
+                    owner,
+                    i * 16,
+                    value,
+                    GcStoreDestination::ObjectField,
+                    MemFlagsData::new(),
+                );
+            }
+            builder.ins().return_(&[]);
+            builder.finalize(codegen.output.module.target_config());
+            let effects: Vec<_> = ctx
+                .func
+                .layout
+                .block_insts(entry)
+                .map(|i| ctx.func.dfg.insts[i].opcode())
+                .filter(|op| {
+                    matches!(
+                        op,
+                        Opcode::AtomicLoad | Opcode::Call | Opcode::AtomicStore | Opcode::Store
+                    )
+                })
+                .collect();
+            assert_eq!(
+                effects,
+                [
+                    Opcode::AtomicLoad,
+                    Opcode::Call,
+                    Opcode::AtomicStore,
+                    Opcode::Store
+                ]
+                .repeat(stores as usize)
+            );
+            cranelift_codegen::verify_function(&ctx.func, codegen.output.module.isa()).unwrap();
+            println!(
+                "interface_pair_stores={stores} old_loads={stores} barrier_calls={stores} atomic_stores={stores} vtable_stores={stores}"
             );
         }
     }
@@ -819,6 +909,32 @@ mod tests {
         assert_eq!(layout.payload_size, 257 * 8);
         assert_eq!(layout.gc_ref_mask, 0);
         assert!(layout.bitmap.is_empty());
+    }
+
+    #[test]
+    fn interface_pair_aggregate_traces_objects_across_bitmap_boundaries() {
+        use willow_abi::SlotKind::{GcRef, InterfacePair, ScalarPair, Word};
+        for count in [1, 16, 30, 31, 32, 63, 64, 128] {
+            let mut slots = vec![Word, ScalarPair];
+            slots.extend(std::iter::repeat_n(InterfacePair, count));
+            slots.push(GcRef);
+            let words = 5 + 2 * count;
+            for kind in [GcObjectKind::Closure, GcObjectKind::Enum] {
+                let layout = GcLayoutMetadata::aggregate(kind, 1, &slots, 8);
+                assert_eq!(layout.payload_size, (words * 8) as i64);
+                let traced: Vec<_> = (0..words)
+                    .filter(|bit| {
+                        if layout.bitmap.is_empty() {
+                            *bit < 64 && layout.gc_ref_mask & (1 << bit) != 0
+                        } else {
+                            layout.bitmap[bit / 64] & (1 << (bit % 64)) != 0
+                        }
+                    })
+                    .collect();
+                assert_eq!(traced, (0..=count).map(|i| 4 + 2 * i).collect::<Vec<_>>());
+                assert_eq!(layout.bitmap.is_empty(), 4 + 2 * count < 64);
+            }
+        }
     }
 
     #[test]

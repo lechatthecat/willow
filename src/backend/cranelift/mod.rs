@@ -642,6 +642,31 @@ impl UnitCodegenContext<'_> {
         ClassView::new(&self.type_scope, &self.layout_queries)
     }
 
+    fn is_interface_pair<N: type_index::TypeLookup>(
+        &self,
+        ty: &crate::parser::ast::Type<N>,
+    ) -> bool {
+        matches!(ty, crate::parser::ast::Type::Named(n) | crate::parser::ast::Type::Generic(n, _) if self.classes().is_interface(n))
+    }
+
+    fn is_inline_pair<N: builtin_types::TypeName + type_index::TypeLookup>(
+        &self,
+        ty: &crate::parser::ast::Type<N>,
+    ) -> bool {
+        option_repr::is_scalar_pair(ty) || self.is_interface_pair(ty)
+    }
+
+    fn clif_type<N: builtin_types::TypeName + type_index::TypeLookup>(
+        &self,
+        ty: &crate::parser::ast::Type<N>,
+    ) -> cranelift_codegen::ir::Type {
+        if self.is_interface_pair(ty) {
+            types::I128
+        } else {
+            clif_type(reference_type(self.output.module.target_config()), ty)
+        }
+    }
+
     /// The lowered IR for one emission target.
     ///
     /// On the session path the caller supplies the body's own identity, so no
@@ -1654,14 +1679,43 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .get(name)
             .unwrap_or_else(|| panic!("backend: undeclared runtime symbol `{name}`"))
     }
+    fn is_interface_pair(&self, ty: &Type) -> bool {
+        matches!(ty, Type::Named(n) | Type::Generic(n, _) if self.classes.is_interface(n))
+    }
+
+    fn is_inline_pair(&self, ty: &Type) -> bool {
+        option_repr::is_scalar_pair(ty) || self.is_interface_pair(ty)
+    }
+
+    fn clif_type(&self, ty: &Type) -> cranelift_codegen::ir::Type {
+        if self.is_interface_pair(ty) {
+            types::I128
+        } else {
+            clif_type(reference_type(self.module.target_config()), ty)
+        }
+    }
+
+    fn value_slot_kind(&self, ty: &Type) -> willow_abi::SlotKind {
+        if self.is_interface_pair(ty) {
+            willow_abi::SlotKind::InterfacePair
+        } else {
+            type_helpers::value_slot_kind(ty, self.enum_infos)
+        }
+    }
+
+    fn option_repr(&self, ty: &Type) -> Option<option_repr::OptionRepr> {
+        if option_repr::option_inner(ty).is_some_and(|inner| self.is_interface_pair(inner)) {
+            Some(option_repr::OptionRepr::BoxedTaggedEnum)
+        } else {
+            option_repr::option_repr(ty, self.enum_infos)
+        }
+    }
+
     /// Bind a by-value parameter as a plain SSA variable. GC-managed values
     /// bound this way are NOT rooted; only a body that can never reach a
     /// safepoint may bind them so (willow-8hq4.14).
     fn bind_unrooted_param(&mut self, name: &str, ty: &Type, val: cranelift_codegen::ir::Value) {
-        let var = self.builder.declare_var(clif_type(
-            type_helpers::reference_type(self.module.target_config()),
-            ty,
-        ));
+        let var = self.builder.declare_var(self.clif_type(ty));
         self.builder.def_var(var, val);
         self.vars
             .insert(name.to_string(), VarStorage::Value { var });
@@ -1680,7 +1734,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // GC can find and trace them during any allocation in the body.
                 let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
-                    reference_type(self.module.target_config()).bytes(),
+                    self.clif_type(ty).bytes(),
                     0,
                 ));
                 self.stack_store(val, slot);
@@ -1751,9 +1805,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> VarStorage {
         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
-            clif_type(reference_type(self.module.target_config()), ty)
-                .bytes()
-                .max(8),
+            self.clif_type(ty).bytes().max(8),
             0,
         ));
         self.stack_store(val, slot);
@@ -1766,20 +1818,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn load_var(&mut self, storage: &VarStorage) -> cranelift_codegen::ir::Value {
         match storage {
             VarStorage::Value { var, .. } => self.builder.use_var(*var),
-            VarStorage::Stack { slot, ty } => self.stack_load(
-                clif_type(
-                    type_helpers::reference_type(self.module.target_config()),
-                    ty,
-                ),
-                *slot,
-            ),
+            VarStorage::Stack { slot, ty } => self.stack_load(self.clif_type(ty), *slot),
             VarStorage::ReferencePtr { var, ty } => {
                 let ptr = self.builder.use_var(*var);
                 self.builder.ins().load(
-                    clif_type(
-                        type_helpers::reference_type(self.module.target_config()),
-                        ty,
-                    ),
+                    self.classes
+                        .clif_type(reference_type(self.module.target_config()), ty),
                     MemFlagsData::new(),
                     ptr,
                     0,
@@ -1790,10 +1834,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .async_frame
                     .expect("frame-backed var requires an allocated async frame");
                 self.builder.ins().load(
-                    clif_type(
-                        type_helpers::reference_type(self.module.target_config()),
-                        ty,
-                    ),
+                    self.classes
+                        .clif_type(reference_type(self.module.target_config()), ty),
                     MemFlagsData::new(),
                     base,
                     *offset,
@@ -2122,9 +2164,13 @@ fn channel_runtime_suffix(ty: &Type) -> &'static str {
 fn param_abi_type(
     param: &Param,
     pointer_type: cranelift_codegen::ir::Type,
+    classes: ClassView<'_>,
 ) -> cranelift_codegen::ir::Type {
     match &param.mode {
         ParamMode::Reference { .. } => pointer_type,
+        ParamMode::Value if matches!(&param.ty, crate::parser::ast::Type::Named(n) | crate::parser::ast::Type::Generic(n, _) if classes.is_interface(n)) => {
+            types::I128
+        }
         ParamMode::Value => clif_type(pointer_type, &param.ty),
     }
 }

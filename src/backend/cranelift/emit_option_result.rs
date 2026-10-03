@@ -10,7 +10,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         value: cranelift_codegen::ir::Value,
         payload_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        if super::option_repr::is_scalar_pair(payload_ty) {
+        if self.is_inline_pair(payload_ty) {
             self.builder
                 .ins()
                 .load(types::I128, MemFlagsData::new(), value, 8i32)
@@ -25,7 +25,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         inner_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         let option_ty = Type::Generic("Option".to_string().into(), vec![inner_ty.clone()]);
-        if option_repr(&option_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
+        if self.option_repr(&option_ty) == Some(OptionRepr::NullableGcPointer) {
             return self.builder.ins().icmp_imm_u(IntCC::NotEqual, ptr, 0);
         }
         let tag = self.emit_load_enum_tag(ptr);
@@ -39,8 +39,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         inner_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         let option_ty = Type::Generic("Option".to_string().into(), vec![inner_ty.clone()]);
-        let raw = if option_repr(&option_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer)
-        {
+        let raw = if self.option_repr(&option_ty) == Some(OptionRepr::NullableGcPointer) {
             ptr
         } else {
             self.emit_enum_payload_bits(ptr, inner_ty)
@@ -78,10 +77,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         inner_ty: &Type,
         default_val: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
-        let result_var = self.builder.declare_var(clif_type(
-            reference_type(self.module.target_config()),
-            inner_ty,
-        ));
+        let result_var = self.builder.declare_var(self.clif_type(inner_ty));
         let is_some = self.emit_option_is_some(ptr, inner_ty);
         let some_block = self.builder.create_block();
         let none_block = self.builder.create_block();
@@ -132,7 +128,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
         self.terminated = false;
-        let clif_ty = clif_type(reference_type(self.module.target_config()), payload_ty);
+        let clif_ty = self.clif_type(payload_ty);
         let raw = self.emit_enum_payload_bits(ptr, payload_ty);
         if clif_ty == types::F64 {
             self.builder
@@ -153,7 +149,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         success_tag: i64,
         default_val: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
-        let clif_ty = clif_type(reference_type(self.module.target_config()), payload_ty);
+        let clif_ty = self.clif_type(payload_ty);
         let result_var = self.builder.declare_var(clif_ty);
         let tag = self.emit_load_enum_tag(ptr);
         let expected = self.builder.ins().iconst(types::I64, success_tag);
@@ -202,17 +198,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Type::Fn(param_types, ret_type) = f_ty {
             let mut sig = self.module.make_signature();
             for pt in param_types {
-                sig.params.push(AbiParam::new(clif_type(
-                    reference_type(self.module.target_config()),
-                    pt,
-                )));
+                sig.params.push(AbiParam::new(self.clif_type(pt)));
             }
             let has_return = **ret_type != Type::Void;
             if has_return {
-                sig.returns.push(AbiParam::new(clif_type(
-                    reference_type(self.module.target_config()),
-                    ret_type,
-                )));
+                sig.returns.push(AbiParam::new(self.clif_type(ret_type)));
             }
             let sig_ref = self.builder.import_signature(sig);
             let panic_depth = self.emit_pre_willow_call_panic_depth();
@@ -242,9 +232,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let ptr_type = reference_type(self.module.target_config());
         let output_ty = Type::Generic("Option".to_string().into(), vec![ret_ty.clone()]);
-        let result_var = self.builder.declare_var(clif_type(ptr_type, &output_ty));
+        let result_var = self.builder.declare_var(self.clif_type(&output_ty));
         let is_some = self.emit_option_is_some(ptr, inner_ty);
 
         let some_block = self.builder.create_block();
@@ -281,12 +270,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let ptr_type = reference_type(self.module.target_config());
         let output_ty = match f_ty {
             Type::Fn(_, ret) => (**ret).clone(),
             _ => unreachable!("combinator callback must be a function"),
         };
-        let result_var = self.builder.declare_var(clif_type(ptr_type, &output_ty));
+        let result_var = self.builder.declare_var(self.clif_type(&output_ty));
         let is_some = self.emit_option_is_some(ptr, inner_ty);
         let output_inner = match f_ty {
             Type::Fn(_, ret) => option_inner(ret).cloned().unwrap_or(Type::Void),
@@ -326,9 +314,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let ptr_type = reference_type(self.module.target_config());
         let output_ty = Type::Generic("Option".to_string().into(), vec![inner_ty.clone()]);
-        let result_var = self.builder.declare_var(clif_type(ptr_type, &output_ty));
+        let result_var = self.builder.declare_var(self.clif_type(&output_ty));
         let is_some = self.emit_option_is_some(ptr, inner_ty);
 
         let some_block = self.builder.create_block();
@@ -364,12 +351,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let ptr_type = reference_type(self.module.target_config());
         let output_ty = Type::Generic(
             "Result".to_string().into(),
             vec![ret_ty.clone(), err_ty.clone()],
         );
-        let result_var = self.builder.declare_var(clif_type(ptr_type, &output_ty));
+        let result_var = self.builder.declare_var(self.clif_type(&output_ty));
         let tag = self.emit_load_enum_tag(ptr);
         let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
@@ -413,12 +399,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let ptr_type = reference_type(self.module.target_config());
         let output_ty = Type::Generic(
             "Result".to_string().into(),
             vec![ok_ty.clone(), ret_ty.clone()],
         );
-        let result_var = self.builder.declare_var(clif_type(ptr_type, &output_ty));
+        let result_var = self.builder.declare_var(self.clif_type(&output_ty));
         let tag = self.emit_load_enum_tag(ptr);
         let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
@@ -461,12 +446,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let ptr_type = reference_type(self.module.target_config());
         let output_ty = match f_ty {
             Type::Fn(_, ret) => (**ret).clone(),
             _ => unreachable!("combinator callback must be a function"),
         };
-        let result_var = self.builder.declare_var(clif_type(ptr_type, &output_ty));
+        let result_var = self.builder.declare_var(self.clif_type(&output_ty));
         let tag = self.emit_load_enum_tag(ptr);
         let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
@@ -488,8 +472,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(err_block);
         self.builder.seal_block(err_block);
-        let unchanged = if self.builder.func.dfg.value_type(ptr) == clif_type(ptr_type, &output_ty)
-        {
+        let unchanged = if self.builder.func.dfg.value_type(ptr) == self.clif_type(&output_ty) {
             ptr
         } else {
             let raw = self.emit_enum_payload_bits(ptr, err_ty);
@@ -513,12 +496,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        let ptr_type = reference_type(self.module.target_config());
         let output_ty = match f_ty {
             Type::Fn(_, ret) => (**ret).clone(),
             _ => unreachable!("combinator callback must be a function"),
         };
-        let result_var = self.builder.declare_var(clif_type(ptr_type, &output_ty));
+        let result_var = self.builder.declare_var(self.clif_type(&output_ty));
         let tag = self.emit_load_enum_tag(ptr);
         let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
@@ -532,8 +514,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
-        let unchanged = if self.builder.func.dfg.value_type(ptr) == clif_type(ptr_type, &output_ty)
-        {
+        let unchanged = if self.builder.func.dfg.value_type(ptr) == self.clif_type(&output_ty) {
             ptr
         } else {
             let raw = self.emit_enum_payload_bits(ptr, ok_ty);
@@ -581,13 +562,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         payload_val: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
         let payload_is_gc = is_gc_managed(payload_ty, self.enum_infos);
-        let slots = [if super::option_repr::is_scalar_pair(payload_ty) {
-            willow_abi::SlotKind::ScalarPair
-        } else if payload_is_gc {
-            willow_abi::SlotKind::GcRef
-        } else {
-            willow_abi::SlotKind::Word
-        }];
+        let slots = [self.value_slot_kind(payload_ty)];
         let layout = willow_abi::EnumVariantLayout::new(tag as u32, &slots);
         let pointer_bytes = reference_type(self.module.target_config()).bytes();
         // Root the payload across the enum allocation: a GC-managed payload is a
@@ -603,7 +578,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             layout.gc_ref_mask(),
         ));
         let payload_val = payload_root.map_or(payload_val, |slot| {
-            self.stack_load(reference_type(self.module.target_config()), slot)
+            self.stack_load(self.clif_type(payload_ty), slot)
         });
         let tag_val = self.builder.ins().iconst(types::I64, tag);
         self.builder
@@ -639,7 +614,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         payload_val: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
         let option_ty = Type::Generic("Option".to_string().into(), vec![payload_ty.clone()]);
-        if option_repr(&option_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
+        if self.option_repr(&option_ty) == Some(OptionRepr::NullableGcPointer) {
             payload_val
         } else if super::option_repr::is_scalar_pair(&option_ty) {
             let payload = self.coerce_to_i64(payload_val, payload_ty);
@@ -656,7 +631,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         payload_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         let option_ty = Type::Generic("Option".to_string().into(), vec![payload_ty.clone()]);
-        if option_repr(&option_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
+        if self.option_repr(&option_ty) == Some(OptionRepr::NullableGcPointer) {
             self.builder
                 .ins()
                 .iconst(reference_type(self.module.target_config()), 0)

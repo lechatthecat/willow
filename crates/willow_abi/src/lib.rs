@@ -397,6 +397,8 @@ pub enum SlotKind {
     Word,
     /// Inline tag and scalar payload, occupying two non-reference words.
     ScalarPair,
+    /// Inline object reference and native vtable address; only the object is traced.
+    InterfacePair,
     /// GC-managed Willow reference. It contributes a bit to the GC mask.
     GcRef,
     /// Native address or function pointer. It is never traced as a Willow ref.
@@ -406,9 +408,13 @@ pub enum SlotKind {
 impl SlotKind {
     pub const fn word_count(self) -> u32 {
         match self {
-            Self::ScalarPair => 2,
+            Self::ScalarPair | Self::InterfacePair => 2,
             Self::Word | Self::GcRef | Self::NativePtr => 1,
         }
+    }
+
+    pub const fn traces_first_word(self) -> bool {
+        matches!(self, Self::GcRef | Self::InterfacePair)
     }
 }
 
@@ -449,7 +455,7 @@ impl<'a> WordLayout<'a> {
         let mut index = 0usize;
         let mut word = first_payload_word as usize;
         while index < self.slots.len() {
-            if matches!(self.slots[index], SlotKind::GcRef) {
+            if self.slots[index].traces_first_word() {
                 assert!(word < GC_REF_MASK_BITS, "layout exceeds inline GC mask");
                 mask |= 1u64 << word;
             }
@@ -601,6 +607,68 @@ mod tests {
     #[should_panic(expected = "layout exceeds inline GC mask")]
     fn scalar_pair_masks_reject_reference_past_bit_63() {
         WordLayout::new(&[SlotKind::ScalarPair, SlotKind::GcRef]).gc_ref_mask(62);
+    }
+
+    #[test]
+    fn interface_pair_slots_trace_only_objects_and_preserve_mixed_offsets() {
+        const SLOTS: &[SlotKind] = &[
+            SlotKind::Word,
+            SlotKind::InterfacePair,
+            SlotKind::ScalarPair,
+            SlotKind::GcRef,
+            SlotKind::InterfacePair,
+            SlotKind::NativePtr,
+        ];
+        let layout = WordLayout::new(SLOTS);
+        for (index, offset) in [0, 1, 3, 5, 6, 8, 9].into_iter().enumerate() {
+            assert_eq!(layout.word_offset(index), offset);
+        }
+        assert_eq!(layout.word_count(), 9);
+        assert_eq!(layout.gc_ref_mask(0), (1 << 1) | (1 << 5) | (1 << 6));
+        assert_eq!(SlotKind::InterfacePair.word_count(), 2);
+        assert!(SlotKind::InterfacePair.traces_first_word());
+        assert!(SlotKind::GcRef.traces_first_word());
+        for scalar in [SlotKind::Word, SlotKind::ScalarPair, SlotKind::NativePtr] {
+            assert!(!scalar.traces_first_word());
+        }
+        for pointer_bytes in [4, 8] {
+            assert_eq!(layout.byte_size(pointer_bytes), 72);
+            let variant = EnumVariantLayout::new(7, SLOTS);
+            assert_eq!(variant.payload_bytes(pointer_bytes), 80);
+            assert_eq!(variant.gc_ref_mask(), layout.gc_ref_mask(0) << 1);
+            let frame = NativeFrameLayout::new(SLOTS);
+            assert_eq!(frame.slot_count(), 9);
+            assert_eq!(frame.data_gc_ref_mask(), layout.gc_ref_mask(0));
+            assert_eq!(
+                frame.gc_ref_mask(),
+                layout.gc_ref_mask(async_frame::HEADER_WORDS)
+            );
+            assert_eq!(
+                frame.payload_bytes(pointer_bytes),
+                async_frame::header_bytes(pointer_bytes) + 72
+            );
+        }
+    }
+
+    #[test]
+    fn interface_pair_masks_allow_untraced_vtable_beyond_bit_63() {
+        let pair = WordLayout::new(&[SlotKind::InterfacePair]);
+        assert_eq!(pair.gc_ref_mask(62), 1u64 << 62);
+        assert_eq!(pair.gc_ref_mask(63), 1u64 << 63);
+        let mixed = WordLayout::new(&[SlotKind::ScalarPair, SlotKind::InterfacePair]);
+        assert_eq!(mixed.gc_ref_mask(61), 1u64 << 63);
+    }
+
+    #[test]
+    #[should_panic(expected = "layout exceeds inline GC mask")]
+    fn interface_pair_masks_reject_object_past_bit_63() {
+        WordLayout::new(&[SlotKind::InterfacePair]).gc_ref_mask(64);
+    }
+
+    #[test]
+    #[should_panic(expected = "layout exceeds inline GC mask")]
+    fn interface_pair_masks_reject_later_reference_past_bit_63() {
+        WordLayout::new(&[SlotKind::InterfacePair, SlotKind::GcRef]).gc_ref_mask(62);
     }
 
     #[test]

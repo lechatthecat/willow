@@ -59,6 +59,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         value: cranelift_codegen::ir::Value,
         ty: &Type,
     ) -> cranelift_codegen::ir::Value {
+        if self.is_interface_pair(ty) {
+            let root = self.emit_push_root(value);
+            let ptr =
+                self.emit_gc_alloc(GcLayoutMetadata::new(GcObjectKind::InterfaceBox, 16, 0, 1));
+            let value = self.stack_load(types::I128, root);
+            self.emit_gc_heap_store(ptr, 0, value, ty, GcStoreDestination::InterfaceObject);
+            self.emit_pop_roots_n(1);
+            self.gc_root_count -= 1;
+            return ptr;
+        }
         if super::option_repr::is_scalar_pair(ty) {
             let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(GcObjectKind::Enum, 16, 0, 0));
             self.builder.ins().store(MemFlagsData::new(), value, ptr, 0);
@@ -73,7 +83,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         value: cranelift_codegen::ir::Value,
         ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        if super::option_repr::is_scalar_pair(ty) {
+        if self.is_inline_pair(ty) {
             self.builder
                 .ins()
                 .load(types::I128, MemFlagsData::new(), value, 0)
@@ -125,11 +135,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .params
                 .push(cranelift_codegen::ir::AbiParam::new(pointer));
             if ret_type != Type::Void {
-                signature
-                    .returns
-                    .push(cranelift_codegen::ir::AbiParam::new(clif_type(
-                        pointer, &ret_type,
-                    )));
+                signature.returns.push(cranelift_codegen::ir::AbiParam::new(
+                    self.clif_type(&ret_type),
+                ));
             }
             let signature = self.builder.import_signature(signature);
             self.builder

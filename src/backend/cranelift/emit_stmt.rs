@@ -225,12 +225,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(commit_b);
         self.builder.seal_block(commit_b);
         let value = self.builder.ins().load(
-            clif_type(reference_type(self.module.target_config()), value_ty),
+            self.classes
+                .clif_type(reference_type(self.module.target_config()), value_ty),
             MemFlagsData::new(),
             frame,
             value_offset,
         );
         let word = self.emit_to_storage_word(value, value_ty);
+        // Pair boxing can move the handle reachable through the frame.
+        let handle = self.builder.ins().load(
+            reference_type(self.module.target_config()),
+            MemFlagsData::new(),
+            frame,
+            handle_offset,
+        );
+
         // Runtime commit captures the protected old value under its ownership
         // check and performs the fused SATB/generational barrier.
         let commit = match mode {
@@ -249,6 +258,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             LockMode::Mutex => "willow_async_mutex_release",
             LockMode::Read | LockMode::Write => "willow_async_rwlock_release",
         };
+        let handle = self.builder.ins().load(
+            reference_type(self.module.target_config()),
+            MemFlagsData::new(),
+            frame,
+            handle_offset,
+        );
         self.emit_value_runtime_call(release, &[handle, token]);
 
         // Native pointer use is over. Mark the acquisition inactive before
@@ -278,7 +293,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             &handle_ty,
             GcStoreDestination::AsyncFrameSlot,
         );
-        let zero_value = match clif_type(reference_type(self.module.target_config()), value_ty) {
+        let zero_value = match self.clif_type(value_ty) {
             types::F64 => self.builder.ins().f64const(0.0),
             ty => self.emit_zero(ty),
         };
@@ -999,7 +1014,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if *return_ty == Type::Void || force_void {
             self.builder.ins().return_(&[]);
         } else {
-            let zero = match clif_type(reference_type(self.module.target_config()), return_ty) {
+            let zero = match self.clif_type(return_ty) {
                 types::F64 => self.builder.ins().f64const(0.0),
                 ty => self.emit_zero(ty),
             };

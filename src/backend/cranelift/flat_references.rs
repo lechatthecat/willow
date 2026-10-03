@@ -50,7 +50,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 place: LirPlace::ArrayElement { element, .. },
                 ..
             } = argument
-                && super::option_repr::is_scalar_pair(element)
+                && self.is_inline_pair(element)
             {
                 self.emit_push_root(value);
             }
@@ -131,7 +131,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let offset = self.builder.ins().imul_imm_s(index, 8);
                 let base = self.builder.ins().iadd_imm_s(owner, 8);
                 let address = self.builder.ins().iadd(base, offset);
-                if super::option_repr::is_scalar_pair(element) {
+                if self.is_inline_pair(element) {
                     // Pop clears the pair's bits, not this pointer; no-growth
                     // push overwrites the same box. Capturing buffer + index
                     // therefore preserves identity throughout argument evaluation.

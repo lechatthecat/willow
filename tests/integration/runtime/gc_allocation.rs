@@ -254,18 +254,22 @@ class Dog implements Animal {
     pub n: i64;
     pub fn value(self) -> i64 { return self.n; }
 }
+class Zoo {
+    pub animal: Animal;
+}
 class Node {
     pub n: i64;
 }
 fn main() {
-    let animal: Animal = new Dog(17);
+    let zoo = new Zoo(new Dog(17));
     let option = Option::Some(new Node(25));
     let moved = gc_moved_objects();
     gc_minor_collect();
-    println(animal.value());
+    println(zoo.animal.value());
     println(option.unwrap().n);
-    // Option<Node> is the Node pointer itself (willow-glaj.3), so this graph
-    // contains one fewer movable enum wrapper than the old tagged layout.
+    // The interface object is an interior edge of Zoo; its vtable is static.
+    // Direct interface locals now root the object itself and pin it, so use
+    // heap storage to exercise evacuation and rewriting of the object word.
     println(gc_moved_objects() >= moved + 1);
 }
 "#;

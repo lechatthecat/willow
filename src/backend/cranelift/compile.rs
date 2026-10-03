@@ -1039,15 +1039,9 @@ impl UnitCodegenContext<'_> {
             )));
         }
         for ty in &param_types {
-            sig.params.push(AbiParam::new(clif_type(
-                reference_type(self.output.module.target_config()),
-                ty,
-            )));
+            sig.params.push(AbiParam::new(self.clif_type(ty)));
         }
-        sig.returns.push(AbiParam::new(clif_type(
-            reference_type(self.output.module.target_config()),
-            &ast_ret,
-        )));
+        sig.returns.push(AbiParam::new(self.clif_type(&ast_ret)));
         let id = self
             .output
             .module
@@ -1280,7 +1274,7 @@ impl UnitCodegenContext<'_> {
         if symbol_name != USER_MAIN_SYMBOL {
             for param in &f.params {
                 sig.params
-                    .push(AbiParam::new(param_abi_type(param, ptr_ty)));
+                    .push(AbiParam::new(param_abi_type(param, ptr_ty, self.classes())));
             }
         }
         let call_return_type = self.canonical_enum_type(&function_call_return_type(f));
@@ -1289,10 +1283,8 @@ impl UnitCodegenContext<'_> {
         // sync with compile_function_named.
         let force_void_main = symbol_name == USER_MAIN_SYMBOL && main_result_err_type(f).is_some();
         if call_return_type != Type::Void && !force_void_main {
-            sig.returns.push(AbiParam::new(clif_type(
-                reference_type(self.output.module.target_config()),
-                &call_return_type,
-            )));
+            sig.returns
+                .push(AbiParam::new(self.clif_type(&call_return_type)));
         }
         let linkage = if export {
             Linkage::Export
@@ -1350,7 +1342,7 @@ impl UnitCodegenContext<'_> {
         if !is_main {
             for param in &f.params {
                 sig.params
-                    .push(AbiParam::new(param_abi_type(param, ptr_ty)));
+                    .push(AbiParam::new(param_abi_type(param, ptr_ty, self.classes())));
             }
         }
         // Stage 5 function-body cutover (willow-0g8j.3): every checked function
@@ -1414,10 +1406,8 @@ impl UnitCodegenContext<'_> {
         // mains (incl. async, whose body returns a Future) keep their signature.
         let force_void_main = main_result_err_ty.is_some();
         if call_return_type != Type::Void && !force_void_main {
-            sig.returns.push(AbiParam::new(clif_type(
-                reference_type(self.output.module.target_config()),
-                &call_return_type,
-            )));
+            sig.returns
+                .push(AbiParam::new(self.clif_type(&call_return_type)));
         }
 
         let mut ctx = self.output.module.make_context();
@@ -1569,7 +1559,8 @@ impl UnitCodegenContext<'_> {
             let mut capture_word = 1;
             for capture in &lir_fn.captures {
                 let val = fg.builder.ins().load(
-                    clif_type(reference_type(fg.module.target_config()), &capture.ty),
+                    fg.classes
+                        .clif_type(reference_type(fg.module.target_config()), &capture.ty),
                     MemFlagsData::trusted(),
                     env,
                     capture_word
@@ -1577,7 +1568,7 @@ impl UnitCodegenContext<'_> {
                             reference_type(fg.module.target_config()).bytes(),
                         ) as i32,
                 );
-                capture_word += 1 + i32::from(super::option_repr::is_scalar_pair(&capture.ty));
+                capture_word += 1 + i32::from(fg.is_inline_pair(&capture.ty));
                 fg.bind_param(&capture.name, &capture.ty, &ParamMode::Value, val);
             }
         }
@@ -1598,11 +1589,10 @@ impl UnitCodegenContext<'_> {
                 // return (e.g. a statement-position match, willow-zvkv); this
                 // fall-through is then unreachable but must still satisfy the
                 // signature.
-                let zero =
-                    match clif_type(reference_type(fg.module.target_config()), &call_return_type) {
-                        types::F64 => fg.builder.ins().f64const(0.0),
-                        ty => fg.emit_zero(ty),
-                    };
+                let zero = match fg.clif_type(&call_return_type) {
+                    types::F64 => fg.builder.ins().f64const(0.0),
+                    ty => fg.emit_zero(ty),
+                };
                 fg.builder.ins().return_(&[zero]);
             } else {
                 fg.builder.ins().return_(&[]);
@@ -1648,14 +1638,13 @@ impl UnitCodegenContext<'_> {
                 self.output.module.target_config(),
             ))); // self pointer
             for p in &m.params {
-                sig.params.push(AbiParam::new(param_abi_type(p, ptr_ty)));
+                sig.params
+                    .push(AbiParam::new(param_abi_type(p, ptr_ty, self.classes())));
             }
             let call_return_type = method_call_return_type(m);
             if call_return_type != Type::Void {
-                sig.returns.push(AbiParam::new(clif_type(
-                    reference_type(self.output.module.target_config()),
-                    &call_return_type,
-                )));
+                sig.returns
+                    .push(AbiParam::new(self.clif_type(&call_return_type)));
             }
             let id = self
                 .output
@@ -1724,8 +1713,7 @@ impl UnitCodegenContext<'_> {
                 reference_type(self.output.module.target_config()).bytes(),
             );
             data.define_zeroinit(
-                storage_bytes as usize
-                    * (1 + usize::from(super::option_repr::is_scalar_pair(&field.ty))),
+                storage_bytes as usize * (1 + usize::from(self.is_inline_pair(&field.ty))),
             );
             data.set_align(storage_bytes as u64);
             self.output.module.define_data(data_id, &data)?;
@@ -2405,14 +2393,13 @@ impl UnitCodegenContext<'_> {
             self.output.module.target_config(),
         ))); // self pointer
         for p in &m.params {
-            sig.params.push(AbiParam::new(param_abi_type(p, ptr_ty)));
+            sig.params
+                .push(AbiParam::new(param_abi_type(p, ptr_ty, self.classes())));
         }
         let call_return_type = method_call_return_type(m);
         if call_return_type != Type::Void {
-            sig.returns.push(AbiParam::new(clif_type(
-                reference_type(self.output.module.target_config()),
-                &call_return_type,
-            )));
+            sig.returns
+                .push(AbiParam::new(self.clif_type(&call_return_type)));
         }
 
         let mut ctx = self.output.module.make_context();
@@ -2572,11 +2559,10 @@ impl UnitCodegenContext<'_> {
                 // Unreachable fall-through after a body that ends with an
                 // all-returning statement match (willow-zvkv): satisfy the
                 // signature with a typed zero.
-                let zero =
-                    match clif_type(reference_type(fg.module.target_config()), &call_return_type) {
-                        types::F64 => fg.builder.ins().f64const(0.0),
-                        ty => fg.emit_zero(ty),
-                    };
+                let zero = match fg.clif_type(&call_return_type) {
+                    types::F64 => fg.builder.ins().f64const(0.0),
+                    ty => fg.emit_zero(ty),
+                };
                 fg.builder.ins().return_(&[zero]);
             } else {
                 fg.builder.ins().return_(&[]);

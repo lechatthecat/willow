@@ -121,9 +121,9 @@ impl UnitCodegenContext<'_> {
         // each logical reserved slot so parameter placement stays linear.
         let mut reserved_indices = Vec::with_capacity(reserved.len());
         let logical_reserved = std::mem::take(&mut reserved);
-        let split_result = logical_reserved.first().is_some_and(|slot| {
-            slot.name == "__result" && super::option_repr::is_scalar_pair(&slot.ty)
-        });
+        let split_result = logical_reserved
+            .first()
+            .is_some_and(|slot| slot.name == "__result" && self.is_inline_pair(&slot.ty));
         let has_task_id = logical_reserved
             .get(1)
             .is_some_and(|slot| slot.name == "__task_id");
@@ -133,11 +133,12 @@ impl UnitCodegenContext<'_> {
                 reserved.push(AsyncFrameSlot::scalar_padding());
             }
             reserved_indices.push(reserved.len());
-            let pair = super::option_repr::is_scalar_pair(&slot.ty);
+            let pair = slot.storage_kind != crate::ir::lowered::LirStorageKind::GcOwner
+                && self.is_inline_pair(&slot.ty);
             reserved.push(slot);
             if split_result && index == 0 {
                 // Slot one is fixed by the task ABI. Main has no task-id slot,
-                // so reserve it explicitly when its scalar result needs slot two.
+                // so reserve it explicitly when its pair result needs slot two.
                 continue;
             }
             if split_result && has_task_id && index == 1 {
@@ -193,7 +194,8 @@ impl UnitCodegenContext<'_> {
         };
         let mut pair_representatives = std::collections::HashSet::new();
         for (local, slot) in &lir.async_frame.locals {
-            if super::option_repr::is_scalar_pair(&lir.locals[local.0 as usize].ty) {
+            let local = &lir.locals[local.0 as usize];
+            if !local.is_gc_owner() && self.is_inline_pair(&local.ty) {
                 pair_representatives.insert(lir.async_frame.slots[slot.index]);
             }
         }
@@ -216,7 +218,7 @@ impl UnitCodegenContext<'_> {
                 name: local.name.clone(),
                 ty: local.ty.clone(),
             });
-            if super::option_repr::is_scalar_pair(&local.ty)
+            if (!local.is_gc_owner() && self.is_inline_pair(&local.ty))
                 || pair_representatives.contains(local_id)
             {
                 reserved.push(AsyncFrameSlot::scalar_padding());
@@ -255,7 +257,7 @@ impl UnitCodegenContext<'_> {
                             name: local.name.clone(),
                             ty: local.ty.clone(),
                         });
-                        if super::option_repr::is_scalar_pair(&local.ty) {
+                        if !local.is_gc_owner() && self.is_inline_pair(&local.ty) {
                             reserved.push(AsyncFrameSlot::scalar_padding());
                         }
                         offset
@@ -269,7 +271,7 @@ impl UnitCodegenContext<'_> {
                 operation: crate::ir::lowered::SuspendOp::ChannelSend { value, elem_ty, .. },
                 ..
             } = &block.terminator
-                && super::option_repr::is_scalar_pair(elem_ty)
+                && self.is_inline_pair(elem_ty)
             {
                 send_offsets.entry(*value).or_insert_with(|| {
                     let offset = async_frame_slot_offset(
@@ -399,7 +401,7 @@ impl UnitCodegenContext<'_> {
                 mask,
                 bitmap: layout.gc_payload_bitmap.clone(),
                 first_param_slot: if main_result_err_ty.as_ref().is_some_and(|err| {
-                    super::option_repr::is_scalar_pair(&Type::Generic(
+                    self.is_inline_pair(&Type::Generic(
                         "Result".into(),
                         vec![Type::Void, err.clone()],
                     ))
@@ -524,10 +526,7 @@ impl UnitCodegenContext<'_> {
         let mut ctx = self.output.module.make_context();
         let mut sig = self.output.module.make_signature();
         for p in &f.params {
-            sig.params.push(AbiParam::new(clif_type(
-                reference_type(self.output.module.target_config()),
-                &p.ty,
-            )));
+            sig.params.push(AbiParam::new(self.clif_type(&p.ty)));
         }
         sig.returns.push(AbiParam::new(reference_type(
             self.output.module.target_config(),
@@ -786,7 +785,8 @@ impl UnitCodegenContext<'_> {
             self.output.module.target_config(),
         ))); // self/dummy method ABI slot
         for p in &m.params {
-            sig.params.push(AbiParam::new(param_abi_type(p, ptr_ty)));
+            sig.params
+                .push(AbiParam::new(param_abi_type(p, ptr_ty, self.classes())));
         }
         sig.returns.push(AbiParam::new(reference_type(
             self.output.module.target_config(),
@@ -1048,7 +1048,7 @@ impl UnitCodegenContext<'_> {
 
         if let Some((result_offset, err_ty)) = frame_layout.main_result {
             let result_ty = Type::Generic("Result".into(), vec![Type::Void, err_ty.clone()]);
-            let result = if super::option_repr::is_scalar_pair(&result_ty) {
+            let result = if self.is_inline_pair(&result_ty) {
                 let tag =
                     builder
                         .ins()
@@ -2315,7 +2315,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         result_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         let pointer_bytes = reference_type(self.module.target_config()).bytes();
-        if super::option_repr::is_scalar_pair(result_ty) {
+        if self.is_inline_pair(result_ty) {
             let tag = self.builder.ins().load(
                 types::I64,
                 MemFlagsData::new(),
@@ -2330,8 +2330,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             );
             self.emit_pair(tag, payload)
         } else {
+            let clif_ty = self.clif_type(result_ty);
             self.builder.ins().load(
-                clif_type(reference_type(self.module.target_config()), result_ty),
+                clif_ty,
                 MemFlagsData::new(),
                 task_frame,
                 async_frame_slot_offset(FRAME_SLOT_RESULT, pointer_bytes),

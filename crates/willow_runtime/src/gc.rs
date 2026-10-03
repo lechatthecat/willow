@@ -120,7 +120,7 @@ pub fn willow_alloc_with_layout(
 /// later stores. This avoids the subtle stale-copy bug caused by rooting a
 /// caller variable while passing its pre-collection pointer value by value.
 /// The helper also owns tag/offset/mask interpretation and applies the barrier
-/// for every slot described as [`willow_abi::SlotKind::GcRef`].
+/// for the first word of every slot whose layout marks it as traced.
 pub(crate) fn willow_alloc_enum_variant(
     type_id: u32,
     layout: willow_abi::EnumVariantLayout<'_>,
@@ -133,14 +133,16 @@ pub(crate) fn willow_alloc_enum_variant(
     );
     let mut words = payload_words.to_vec();
     let mut rooted = 0usize;
-    for (index, kind) in layout.payload.slots.iter().enumerate() {
-        if matches!(kind, willow_abi::SlotKind::GcRef) {
+    let mut offset = 0;
+    for kind in layout.payload.slots {
+        if kind.traces_first_word() {
             // SAFETY: `words` is not resized while the root is registered and
             // each i64 word is one pointer-sized Willow slot on supported
             // targets.
-            willow_push_root(unsafe { words.as_mut_ptr().add(index).cast::<*mut u8>() });
+            willow_push_root(unsafe { words.as_mut_ptr().add(offset).cast::<*mut u8>() });
             rooted += 1;
         }
+        offset += kind.word_count() as usize;
     }
 
     let pointer_bytes = std::mem::size_of::<usize>() as u32;
@@ -159,20 +161,25 @@ pub(crate) fn willow_alloc_enum_variant(
     // described by `layout`; all writes are within that initialized payload.
     unsafe {
         *value.cast::<i64>() = i64::from(layout.tag);
-        for (index, (&word, kind)) in words.iter().zip(layout.payload.slots.iter()).enumerate() {
-            if matches!(kind, willow_abi::SlotKind::GcRef) {
-                willow_gc_write_barrier(
-                    value,
-                    std::ptr::null_mut(),
-                    word as *mut u8,
-                    GcStoreDestination::EnumPayload as i64,
-                );
+        let mut offset = 0;
+        for kind in layout.payload.slots {
+            let count = kind.word_count() as usize;
+            for index in 0..count {
+                let word = words[offset + index];
+                let destination = value.cast::<i64>().add(1 + offset + index);
+                if index == 0 && kind.traces_first_word() {
+                    willow_gc_write_barrier(
+                        value,
+                        std::ptr::null_mut(),
+                        word as *mut u8,
+                        GcStoreDestination::EnumPayload as i64,
+                    );
+                    store_gc_reference(destination.cast(), word as *mut u8);
+                } else {
+                    destination.write(word);
+                }
             }
-            if matches!(kind, willow_abi::SlotKind::GcRef) {
-                store_gc_reference(value.cast::<i64>().add(1 + index).cast(), word as *mut u8);
-            } else {
-                *value.cast::<i64>().add(1 + index) = word;
-            }
+            offset += count;
         }
     }
     value

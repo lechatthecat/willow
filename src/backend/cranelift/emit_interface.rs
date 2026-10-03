@@ -227,9 +227,9 @@ pub(super) struct VirtualCallPlan {
 
 impl<'a, 'b> FuncGen<'a, 'b> {
     /// Defense-in-depth check for the two raw pointers used by interface
-    /// dispatch: the outer box and its concrete-object word. Safe Willow code
-    /// cannot construct either invalid value, but checking this ABI boundary
-    /// keeps a corrupt/test-only box from becoming an unchecked native load.
+    /// dispatch: the vtable and concrete object. Safe Willow code cannot
+    /// construct either invalid value, but checking this ABI boundary keeps
+    /// a corrupt/test-only pair from becoming an unchecked native load.
     pub(super) fn emit_interface_dispatch_nil_check(
         &mut self,
         ptr: cranelift_codegen::ir::Value,
@@ -267,66 +267,24 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.seal_block(ok_block);
     }
 
-    /// Box a concrete object with an already-loaded vtable pointer (no vtable-id
-    /// lookup). Used to re-box a `Self`-returning interface method result with the
-    /// receiver's vtable (willow-1js.5). Layout matches `emit_interface_box`.
+    /// Pair a concrete object with an already-loaded static vtable pointer.
+    /// `Self` results retain the receiver's vtable without allocating a box.
     pub(super) fn emit_box_with_vtable(
         &mut self,
         object: cranelift_codegen::ir::Value,
         vtable_ptr: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
-        let object_root = self.emit_push_root(object);
-        let box_ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
-            GcObjectKind::InterfaceBox,
-            willow_abi::dispatch_layout::interface_bytes(
-                reference_type(self.module.target_config()).bytes(),
-            ) as i64,
-            0,
-            willow_abi::dispatch_layout::INTERFACE_GC_REF_MASK,
-        ));
-        let object = self.stack_load(reference_type(self.module.target_config()), object_root);
-        self.emit_gc_heap_store_classified(
-            box_ptr,
-            0,
-            object,
-            true,
-            GcStoreDestination::InterfaceObject,
-        );
-        self.emit_gc_heap_store_classified(
-            box_ptr,
-            willow_abi::dispatch_layout::vtable_offset(
-                reference_type(self.module.target_config()).bytes(),
-            ) as i32,
-            vtable_ptr,
-            false,
-            GcStoreDestination::InterfaceObject,
-        );
-        self.emit_pop_roots_n(1);
-        self.gc_root_count -= 1;
-        box_ptr
+        self.builder.ins().iconcat(object, vtable_ptr)
     }
 
     /// Widen by loading a path of shared static supertable pointers, then
-    /// rebox the unchanged object. Static table pointers need no GC roots.
+    /// pairing the unchanged object. Static table pointers need no GC roots.
     pub(super) fn emit_interface_rewiden(
         &mut self,
-        box_ptr: cranelift_codegen::ir::Value,
+        value: cranelift_codegen::ir::Value,
         path: &[usize],
     ) -> cranelift_codegen::ir::Value {
-        let object = self.builder.ins().load(
-            reference_type(self.module.target_config()),
-            MemFlagsData::new(),
-            box_ptr,
-            0i32,
-        );
-        let vtable = self.builder.ins().load(
-            reference_type(self.module.target_config()),
-            MemFlagsData::new(),
-            box_ptr,
-            willow_abi::dispatch_layout::vtable_offset(
-                reference_type(self.module.target_config()).bytes(),
-            ) as i32,
-        );
+        let (object, vtable) = self.builder.ins().isplit(value);
         let mut target_vtable = vtable;
         for &slot in path {
             target_vtable = self.builder.ins().load(
