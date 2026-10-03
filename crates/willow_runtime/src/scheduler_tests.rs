@@ -5534,3 +5534,11 @@ fn vjaf_11_reset_drops_queued_retired_frames() {
     willow_gc_collect();
     assert_eq!(willow_gc_allocated_bytes(), 0);
 }
+
+#[test]
+fn static_mut_policy_uses_effective_worker_count() {
+    for workers in [1, 2, 8, 128, usize::MAX] {
+        assert!(static_mut_workers_allowed(false, workers));
+        assert_eq!(static_mut_workers_allowed(true, workers), workers == 1);
+    }
+}

@@ -761,6 +761,17 @@ impl TypeChecker {
             if !field.is_static {
                 continue;
             }
+            if field.is_mut {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Warning,
+                        ErrorCode::W2407,
+                        "static mut restricts task execution to a single worker",
+                    )
+                    .with_label(Label::primary(field.span, "unsynchronized shared storage"))
+                    .with_help("set WILLOW_WORKERS=1 when running tasks, or use an immutable static Atomic/Mutex value; read-modify-write across await is not atomic"),
+                );
+            }
             let Some(init) = &field.initializer else {
                 continue;
             };

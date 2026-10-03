@@ -3257,6 +3257,18 @@ struct PersistentWorkers {
     senders: Vec<std::sync::mpsc::Sender<WorkerDrive>>,
 }
 
+// Set once by the build-wide static initializer before any user code runs.
+static SINGLE_WORKER_STATICS: AtomicBool = AtomicBool::new(false);
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sched_require_single_worker_statics() {
+    SINGLE_WORKER_STATICS.store(true, Ordering::Release);
+}
+
+fn static_mut_workers_allowed(has_static_mut: bool, workers: usize) -> bool {
+    !has_static_mut || workers <= 1
+}
+
 static PERSISTENT_WORKERS: std::sync::LazyLock<Mutex<PersistentWorkers>> =
     std::sync::LazyLock::new(|| Mutex::new(PersistentWorkers::default()));
 
@@ -3291,6 +3303,11 @@ fn willow_sched_run_parallel(
         all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     ))]
     let workers = workers.max(crate::native_stack::required_workers());
+    if !static_mut_workers_allowed(SINGLE_WORKER_STATICS.load(Ordering::Acquire), workers) {
+        crate::panic_context::fatal_invariant(
+            "static mut requires single-worker execution; set WILLOW_WORKERS=1 or use immutable static Atomic/Mutex values",
+        );
+    }
     while pool.senders.len() < workers {
         let worker = pool.senders.len();
         let (sender, receiver) = std::sync::mpsc::channel::<WorkerDrive>();

@@ -345,6 +345,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     // cooperative spawn/poll/wake calls.
     ALLOC; "willow_async_frame_alloc" => ([I64, I64] -> Some(Ptr));
     NO_PREEMPT; "willow_sched_spawn" => ([Ptr, Ptr] -> Some(I64));
+    NO_PREEMPT; "willow_sched_require_single_worker_statics" => ([] -> None);
     NONE; "willow_sched_run" => ([] -> Some(I64));
     NONE; "willow_sched_run_until" => ([I64] -> Some(I64));
     NONE; "willow_sched_run_until_deadline" => ([I64] -> Some(I64));

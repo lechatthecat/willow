@@ -572,7 +572,7 @@ fn main() {
 // poll ABI, so its deferred island had the same gap.
 #[test]
 fn lir_static_body_19_an_async_functions_defer() {
-    assert_project_output(
+    let (out, ok) = compile_with_env_and_run_under(
         &with_registry(
             "async fn work(n: i64) -> i64 {
     defer {
@@ -586,8 +586,11 @@ async fn main() {
     println(Registry::count);
 }",
         ),
-        "8\n4\n",
+        &PLAIN,
+        &[("WILLOW_WORKERS", "1")],
     );
+    assert!(ok, "{out}");
+    assert_eq!(out, "8\n4\n");
 }
 
 // 20. A collection at every allocation, with the stored value itself freshly

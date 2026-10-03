@@ -60,7 +60,8 @@
 //!  36 user functions cannot collide with generated module initializers
 
 use super::support::{
-    TestProject, compile_temp_project_and_run, compile_temp_project_with_env_stderr,
+    TestProject, compile_temp_project_and_run, compile_temp_project_with_env_and_run_under,
+    compile_temp_project_with_env_stderr,
 };
 
 /// The module most perspectives import: one counter, reached from a free
@@ -1045,7 +1046,7 @@ fn main() {
 //     emitted through the coroutine path.
 #[test]
 fn msp_31_an_async_module_function_writes_it() {
-    assert_project(
+    let (out, ok) = compile_temp_project_with_env_and_run_under(
         &[
             (
                 "c.wi",
@@ -1070,8 +1071,12 @@ async fn main() {
 ",
             ),
         ],
-        "3\n3\n",
+        "main.wi",
+        &[],
+        &[("WILLOW_WORKERS", "1")],
     );
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n3\n");
 }
 
 // 32. A write through an item-imported class name, read back through a second

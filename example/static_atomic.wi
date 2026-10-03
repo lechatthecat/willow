@@ -1,0 +1,14 @@
+// Shared mutation without replacing the static slot works with any worker count.
+class Counter {
+    pub static value: AtomicI64 = AtomicI64::new(0);
+}
+async fn bump() {
+    Counter::value.add(1);
+}
+async fn main() {
+    let a = bump();
+    let b = bump();
+    await a;
+    await b;
+    println(Counter::value.load()); // 2
+}

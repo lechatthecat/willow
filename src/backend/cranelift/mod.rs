@@ -305,6 +305,7 @@ struct StaticStorageInfo {
 /// One static-property initializer to replay in `__willow_static_init`.
 #[derive(Clone)]
 struct StaticInitItem {
+    is_mut: bool,
     class_key: String,
     field: String,
     initializer: FunctionDecl,

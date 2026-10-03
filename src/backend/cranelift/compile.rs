@@ -1860,6 +1860,7 @@ impl Codegen {
                 .or_default()
                 .items
                 .push(StaticInitItem {
+                    is_mut: field.is_mut,
                     class_key: class_key.to_string(),
                     field: field.name.clone(),
                     id: self
@@ -2005,6 +2006,13 @@ impl Codegen {
             address_taken: HashSet::new(),
         };
 
+        // Register before ANY initializer can drive tasks, including initializers
+        // in other modules that precede the mutable property's own initializer.
+        if items.iter().any(|item| item.is_mut) {
+            let id = fg.func_id("willow_sched_require_single_worker_statics");
+            let callee = fg.module.declare_func_in_func(id, fg.builder.func);
+            fg.builder.ins().call(callee, &[]);
+        }
         let ptr_ty = reference_type(fg.module.target_config());
         for item in items {
             // The expression body has already been resolved in its own unit.

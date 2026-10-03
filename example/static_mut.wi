@@ -3,7 +3,8 @@
 // `static mut name: T = expr;` is shared, class-level state that CAN be
 // reassigned with `ClassName::name = value`. A plain `static` (no `mut`) is
 // immutable and rejects assignment. Static mutable state is shared across all
-// calls — use it deliberately.
+// calls. Task execution requires WILLOW_WORKERS=1; multiple workers are rejected.
+// Updates across await are not atomic. See static_atomic.wi for shared counters.
 
 class Counter {
     pub static mut total: i64 = 0;
