@@ -8,8 +8,11 @@ pub(crate) fn telemetry_heap_snapshot() -> (
     use crate::gc_telemetry::{GcCountersV1, GcHeapV1};
     let mut state = runtime().heap.lock().unwrap_or_else(|p| p.into_inner());
     sync_tlab_accounting(&mut state);
+    let external = external_bytes() as u64;
     let old_reserved = state.old_reserved_bytes as u64;
-    let reserved = old_reserved.saturating_add(state.tlab_reserved_bytes as u64);
+    let reserved = old_reserved
+        .saturating_add(state.tlab_reserved_bytes as u64)
+        .saturating_add(external);
     (
         GcCountersV1 {
             allocation_count: state.total_allocs,
@@ -26,7 +29,7 @@ pub(crate) fn telemetry_heap_snapshot() -> (
             barrier_hits: state.write_barrier_hits,
         },
         GcHeapV1 {
-            occupied_bytes: state.allocated_bytes as u64,
+            occupied_bytes: (state.allocated_bytes as u64).saturating_add(external),
             young_occupied_bytes: state.young_allocated_bytes as u64,
             reserved_bytes: reserved,
             committed_bytes: reserved,

@@ -3,10 +3,11 @@
 mod abi;
 pub use abi::*;
 
+use crate::native_memory::Mutex;
 use crate::task::{ChannelOwnershipToken, ChannelRole};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
-use std::sync::{Condvar, Mutex};
+use std::sync::Condvar;
 
 use crate::trace::{GcTrace, GcVisitor};
 
@@ -53,6 +54,23 @@ struct WillowChannelState {
     recv_claims: HashMap<u64, u64>,
     send_handoffs: HashMap<u64, u64>,
     next_generation: u64,
+    native_tables: [usize; 2],
+}
+
+impl crate::native_memory::Footprint for WillowChannelState {
+    fn native_bytes(&mut self) -> usize {
+        self.values.capacity() * size_of::<WillowChannelValue>()
+            + self.waiters.native_bytes()
+            + self.send_waiters.native_bytes()
+            + crate::native_memory::retain_capacity(
+                &mut self.native_tables[0],
+                crate::native_memory::hash_bytes::<u64, u64>(self.recv_claims.capacity()),
+            )
+            + crate::native_memory::retain_capacity(
+                &mut self.native_tables[1],
+                crate::native_memory::hash_bytes::<u64, u64>(self.send_handoffs.capacity()),
+            )
+    }
 }
 
 pub struct WillowAbiChannel {
@@ -81,7 +99,7 @@ impl WillowAbiChannel {
     fn new(is_ref: bool) -> Self {
         Self {
             inner: Box::new(ChannelCore {
-                state: Mutex::new(WillowChannelState::default()),
+                state: Mutex::with_base(WillowChannelState::default(), size_of::<ChannelCore>()),
                 not_empty: Condvar::new(),
                 is_ref,
             }),

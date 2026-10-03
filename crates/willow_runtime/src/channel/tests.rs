@@ -1583,3 +1583,96 @@ fn cancellation_tokens_follow_native_core_when_gc_wrappers_move() {
     crate::scheduler::reset_global_scheduler_for_test();
     crate::gc::reset_internal_for_test();
 }
+
+#[test]
+fn native_channel_storage_counts_boxes_buffers_waiters_and_handoffs() {
+    let _guard = crate::gc::runtime_test_guard();
+    crate::gc::willow_gc_init();
+    let baseline = crate::gc_telemetry::external_bytes();
+    for count in [1, 32, 1024] {
+        let channel = WillowAbiChannel::new(false);
+        let boxed = crate::gc_telemetry::external_bytes();
+        assert_eq!(boxed - baseline, size_of::<ChannelCore>() as u64);
+        {
+            let mut state = channel.state.lock().unwrap();
+            for task in 0..count {
+                state.values.push_back(WillowChannelValue::default());
+                state.waiters.register(task);
+                state.send_waiters.register(task);
+                state.recv_claims.insert(task, task);
+                state.send_handoffs.insert(task, task);
+            }
+        }
+        let grown = crate::gc_telemetry::external_bytes();
+        assert!(grown > boxed + count * size_of::<WillowChannelValue>() as u64);
+        {
+            let mut state = channel.state.lock().unwrap();
+            state.values.clear();
+            state.waiters.drain_all();
+            state.send_waiters.drain_all();
+            state.recv_claims.clear();
+            state.send_handoffs.clear();
+        }
+        assert_eq!(
+            crate::gc_telemetry::external_bytes(),
+            grown,
+            "clear retains buffers"
+        );
+        drop(channel);
+        assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
+        println!(
+            "native channel entries={count} charged_bytes={}",
+            grown - baseline
+        );
+    }
+}
+
+#[test]
+fn native_channel_gc_finalizer_and_reset_release_storage() {
+    let _guard = crate::gc::runtime_test_guard();
+    crate::gc::willow_gc_init();
+    let baseline = crate::gc_telemetry::external_bytes();
+    for reset in [false, true] {
+        let channel = willow_channel_new(0);
+        for value in 0..128 {
+            willow_channel_send_i64(channel, value);
+        }
+        assert!(crate::gc_telemetry::external_bytes() > baseline);
+        if reset {
+            crate::gc::willow_gc_init();
+        } else {
+            crate::gc::willow_gc_collect();
+        }
+        assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
+    }
+}
+
+#[test]
+fn native_table_tombstones_do_not_hide_growth_in_another_buffer() {
+    let _guard = crate::gc::runtime_test_guard();
+    crate::gc::willow_gc_init();
+    let baseline = crate::gc_telemetry::external_bytes();
+    let channel = WillowAbiChannel::new(false);
+    {
+        let mut state = channel.state.lock().unwrap();
+        for task in 0..1024 {
+            state.recv_claims.insert(task, task);
+        }
+    }
+    let before = crate::gc_telemetry::external_bytes();
+    {
+        let mut state = channel.state.lock().unwrap();
+        for task in 0..1024 {
+            state.recv_claims.remove(&task);
+        }
+        for _ in 0..1024 {
+            state.values.push_back(WillowChannelValue::default());
+        }
+    }
+    assert_eq!(
+        crate::gc_telemetry::external_bytes(),
+        before + 1024 * size_of::<WillowChannelValue>() as u64
+    );
+    drop(channel);
+    assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
+}

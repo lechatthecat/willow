@@ -14,10 +14,8 @@ fn assert_consistent(s: &WillowGcStatsV1) {
     assert!(s.heap.young_occupied_bytes <= s.heap.occupied_bytes);
     assert!(s.heap.occupied_bytes <= s.heap.committed_bytes);
     assert!(s.heap.committed_bytes <= s.heap.reserved_bytes);
-    assert_eq!(
-        s.heap.reserved_bytes,
-        s.heap.old_reserved_bytes + s.heap.nursery_reserved_bytes
-    );
+    // Native capacity is independently sampled; it may change after this snapshot.
+    assert!(s.heap.reserved_bytes >= s.heap.old_reserved_bytes + s.heap.nursery_reserved_bytes);
     let elapsed = s.last_cycle.end_ns.saturating_sub(s.last_cycle.start_ns);
     assert!(s.last_cycle.mark_ns <= elapsed);
     assert!(s.last_cycle.pause_ns <= elapsed);

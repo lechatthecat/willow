@@ -38,6 +38,7 @@ pub struct WaitQueue<T> {
     order: VecDeque<WaitEntry<T>>,
     members: HashMap<T, u64>,
     next_ticket: u64,
+    native_table_bytes: usize,
 }
 
 impl<T> Default for WaitQueue<T> {
@@ -46,7 +47,18 @@ impl<T> Default for WaitQueue<T> {
             order: VecDeque::new(),
             members: HashMap::new(),
             next_ticket: 0,
+            native_table_bytes: 0,
         }
+    }
+}
+
+impl<T> WaitQueue<T> {
+    pub(crate) fn native_bytes(&mut self) -> usize {
+        self.order.capacity() * size_of::<WaitEntry<T>>()
+            + crate::native_memory::retain_capacity(
+                &mut self.native_table_bytes,
+                crate::native_memory::hash_bytes::<T, u64>(self.members.capacity()),
+            )
     }
 }
 

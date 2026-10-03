@@ -88,7 +88,9 @@ pub fn survivor_snapshot() -> GcSurvivorStats {
     crate::gc::survivor_snapshot()
 }
 
-/// GC-owned storage, excluding Rust container buffers and allocator overhead.
+/// Managed storage plus retained native object storage (excluding allocator overhead).
+/// Hash table capacity uses a conservative estimate; `external_bytes()`
+/// exposes the native subset without changing the stable V1 snapshot layout.
 /// The current allocator commits every reservation, so committed == reserved.
 /// occupied includes unreachable objects until collection, NOT measured liveness.
 #[repr(C)]
@@ -658,3 +660,9 @@ pub(crate) fn reset_for_test() {
 #[cfg(test)]
 #[path = "gc_telemetry_tests.rs"]
 mod tests;
+
+/// Retained native owner capacity. Hash tables use conservative high-water
+/// estimates; this independently sampled gauge preserves the V1 C ABI layout.
+pub fn external_bytes() -> u64 {
+    crate::gc::external_bytes() as u64
+}

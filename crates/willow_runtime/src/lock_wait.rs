@@ -32,6 +32,8 @@
 //!    outlived its state (ABA / lifetime-invariant violation) and aborts rather
 //!    than corrupting an unrelated lock.
 
+use crate::native_memory::Mutex as StdMutex;
+use crate::native_memory::MutexGuard;
 use crate::scheduler::{
     install_lock_wait_link, promote_lock_wait_link, revoke_terminal_lock_handoff,
     take_lock_wait_link, wake_lock_waiter,
@@ -41,8 +43,6 @@ use crate::task_state::WakeOutcome;
 use crate::wait_queue::WaitQueue;
 use std::collections::HashMap;
 use std::ptr::NonNull;
-use std::sync::Mutex as StdMutex;
-use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Process-wide identity of one native lock state. Stable across GC relocation
@@ -179,6 +179,7 @@ struct LockStateInner {
     /// Next token this lock will issue. Per-lock, so registration allocates it
     /// under a lock the caller already holds.
     next_token: RegistrationToken,
+    native_tables: [usize; 3],
     /// FIFO admission order. `WaitQueue` gives O(1) membership and removal with
     /// tombstone compaction, so a cancellation does not scan the queue
     /// (willow-ezs.2).
@@ -197,12 +198,37 @@ struct LockStateInner {
     readers: HashMap<RuntimeTaskId, RegistrationToken>,
 }
 
+impl crate::native_memory::Footprint for LockStateInner {
+    fn native_bytes(&mut self) -> usize {
+        self.waiters.native_bytes()
+            + crate::native_memory::retain_capacity(
+                &mut self.native_tables[0],
+                crate::native_memory::hash_bytes::<RuntimeTaskId, RegistrationToken>(
+                    self.tokens.capacity(),
+                ),
+            )
+            + crate::native_memory::retain_capacity(
+                &mut self.native_tables[1],
+                crate::native_memory::hash_bytes::<RuntimeTaskId, LockAccess>(
+                    self.waiter_modes.capacity(),
+                ),
+            )
+            + crate::native_memory::retain_capacity(
+                &mut self.native_tables[2],
+                crate::native_memory::hash_bytes::<RuntimeTaskId, RegistrationToken>(
+                    self.readers.capacity(),
+                ),
+            )
+    }
+}
+
 impl Default for LockStateInner {
     fn default() -> Self {
         Self {
             // `0` is never a live token, so a zeroed frame slot cannot pass an
             // identity check.
             next_token: 1,
+            native_tables: [0; 3],
             waiters: WaitQueue::default(),
             tokens: HashMap::new(),
             waiter_modes: HashMap::new(),
@@ -283,7 +309,7 @@ impl AsyncLockState {
         Box::new(Self {
             lock_id: next_lock_id(),
             kind,
-            inner: StdMutex::new(LockStateInner::default()),
+            inner: StdMutex::with_base(LockStateInner::default(), size_of::<Self>()),
         })
     }
 
@@ -2032,5 +2058,62 @@ mod tests {
     fn owns_wait_links(task: RuntimeTaskId) -> bool {
         with_global_for_test(|sched| sched.with_task_for_test(task, |task| task.owns_wait_links()))
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod native_accounting_tests {
+    use super::*;
+    #[test]
+    fn boxed_lock_waiters_tokens_modes_readers_release_on_drop() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::willow_gc_init();
+        let baseline = crate::gc_telemetry::external_bytes();
+        for count in [1, 32, 1024] {
+            let lock = AsyncLockState::new_rwlock();
+            assert_eq!(
+                crate::gc_telemetry::external_bytes() - baseline,
+                size_of::<AsyncLockState>() as u64
+            );
+            {
+                let mut inner = lock.inner();
+                for task in 1..=count {
+                    inner.waiters.register(task);
+                    inner.tokens.insert(task, task);
+                    inner.waiter_modes.insert(task, LockAccess::Read);
+                    inner.readers.insert(task, task);
+                }
+            }
+            let grown = crate::gc_telemetry::external_bytes();
+            assert!(grown > baseline + size_of::<AsyncLockState>() as u64);
+            {
+                let mut inner = lock.inner();
+                inner.waiters.drain_all();
+                inner.tokens.clear();
+                inner.waiter_modes.clear();
+                inner.readers.clear();
+            }
+            assert_eq!(crate::gc_telemetry::external_bytes(), grown);
+            drop(lock);
+            assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
+            println!(
+                "native lock entries={count} charged_bytes={}",
+                grown - baseline
+            );
+        }
+        let mutex = crate::async_mutex::AsyncMutex::new(0, false);
+        let rwlock = crate::async_rwlock::AsyncRwLock::new(0, false);
+        assert_eq!(
+            crate::gc_telemetry::external_bytes() - baseline,
+            (2 * size_of::<AsyncLockState>()) as u64
+        );
+        // Native test owners can outlive a GC reset; their charge must persist.
+        crate::gc::willow_gc_init();
+        assert_eq!(
+            crate::gc_telemetry::external_bytes() - baseline,
+            (2 * size_of::<AsyncLockState>()) as u64
+        );
+        drop((mutex, rwlock));
+        assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
     }
 }

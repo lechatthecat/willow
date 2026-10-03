@@ -263,8 +263,10 @@ struct GcState {
     allocated_bytes: usize,
     /// Trigger a collection when allocated_bytes exceeds this threshold.
     threshold_bytes: usize,
-    /// Hard cap on GC-owned region reservations; native container storage is excluded.
+    /// Hard cap on managed reservations plus retained native owner storage.
     memory_limit_bytes: Option<usize>,
+    /// Reservation pressure fires once above 75%, rearming at/below 50%.
+    hard_pressure_triggered: bool,
     soft_memory: memory_control::Controller,
     last_major_live_bytes: u64,
     last_major_mark_work: u64,
@@ -320,11 +322,71 @@ fn gc_memory_limit_from_env() -> Option<usize> {
     )
 }
 
+// Native owners can outlive a test/reset epoch. Never zero this counter at reset:
+// each owner releases its own charge, including non-GC lock state.
+static EXTERNAL_BYTES: AtomicUsize = AtomicUsize::new(0);
+static EXTERNAL_ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn external_bytes() -> usize {
+    EXTERNAL_BYTES.load(Ordering::Relaxed)
+}
+
+pub(crate) fn charge_external(bytes: usize) {
+    // Serialize increases with region reservations. Releases need no heap lock,
+    // so finalizers also work during reset and stop-the-world collection.
+    let state = runtime().heap.lock().unwrap();
+    if !can_reserve(&state, bytes) {
+        allocation_failure(&state);
+    }
+    let previous_external = EXTERNAL_BYTES
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(bytes)
+        })
+        .unwrap_or_else(|_| {
+            crate::failure::resource_exhausted(format_args!("native byte accounting overflow"))
+        });
+    let _ =
+        EXTERNAL_ALLOCATED_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(bytes as u64))
+        });
+    let previous_footprint = state
+        .old_reserved_bytes
+        .saturating_add(state.tlab_reserved_bytes)
+        .saturating_add(previous_external);
+    // Native-only mutations must not request a whole-heap cycle for every key
+    // after crossing the hard-pressure watermark. The cap still applies to
+    // every increase; soft limits use their existing progress/relief policy.
+    let hard_crossing = state.memory_limit_bytes.is_some_and(|limit| {
+        let trigger = (limit / 4).saturating_mul(3).max(1);
+        previous_footprint < trigger && previous_footprint.saturating_add(bytes) >= trigger
+    });
+    let previous_occupied = state.allocated_bytes.saturating_add(previous_external) as u64;
+    let paced_crossing = state.pacer.enabled()
+        && previous_occupied < state.pacer_trigger
+        && previous_occupied.saturating_add(bytes as u64) >= state.pacer_trigger;
+    let pressure = state.concurrent_cycle.is_none()
+        && state.sweeping.is_none()
+        && (hard_crossing
+            || paced_crossing
+            || state.soft_memory.decide(memory_inputs(&state)).collect);
+    drop(state);
+    if pressure {
+        // Request only; never collect or park while a native guard is held.
+        // Unregistered compatibility callers collect on their next GC allocation.
+        coordinator::request();
+    }
+}
+
+pub(crate) fn release_external(bytes: usize) {
+    EXTERNAL_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+}
+
 fn can_reserve(state: &GcState, additional: usize) -> bool {
     state.memory_limit_bytes.is_none_or(|limit| {
         state
             .old_reserved_bytes
             .checked_add(state.tlab_reserved_bytes)
+            .and_then(|total| total.checked_add(external_bytes()))
             .and_then(|total| total.checked_add(additional))
             .is_some_and(|total| total <= limit)
     })
@@ -391,7 +453,7 @@ fn collect_for_budget() {
 fn allocation_failure(state: &GcState) -> *mut u8 {
     if let Some(limit) = state.memory_limit_bytes {
         crate::failure::resource_exhausted(format_args!(
-            "GC memory limit exceeded ({limit} bytes of managed region reservations)"
+            "GC memory limit exceeded ({limit} bytes of managed and native reservations)"
         ));
     }
     crate::failure::resource_exhausted(format_args!("managed allocation failed"))
@@ -415,7 +477,9 @@ fn major_trigger(state: &GcState) -> usize {
 
 fn pacer_inputs(state: &GcState) -> pacer::Inputs {
     pacer::Inputs {
-        live: state.last_major_live_bytes,
+        live: state
+            .last_major_live_bytes
+            .saturating_add(external_bytes() as u64),
         previous_goal: state.threshold_bytes as u64,
         expected_work: state.last_major_mark_work.max(state.last_major_live_bytes),
         allocation_per_second: 0,
@@ -427,15 +491,26 @@ fn pacer_inputs(state: &GcState) -> pacer::Inputs {
     }
 }
 
+// Policy samplers share one cumulative domain. Reclamation reduces occupancy,
+// but must not remove native allocation history from a rate sample.
+fn policy_allocated_total(state: &GcState) -> u64 {
+    state
+        .total_allocated_bytes
+        .saturating_add(EXTERNAL_ALLOCATED_BYTES.load(Ordering::Relaxed))
+}
+
 fn memory_inputs(state: &GcState) -> memory_control::Inputs {
     memory_control::Inputs {
         unlimited_goal: state.threshold_bytes as u64,
-        live: state.last_major_live_bytes,
-        occupied: state.allocated_bytes as u64,
+        live: state
+            .last_major_live_bytes
+            .saturating_add(external_bytes() as u64),
+        occupied: state.allocated_bytes.saturating_add(external_bytes()) as u64,
         committed: state
             .old_reserved_bytes
-            .saturating_add(state.tlab_reserved_bytes) as u64,
-        allocated_total: state.total_allocated_bytes,
+            .saturating_add(state.tlab_reserved_bytes)
+            .saturating_add(external_bytes()) as u64,
+        allocated_total: policy_allocated_total(state),
         // Our process provider reports RSS, not a compatible commit scope.
         non_heap_commit: None,
     }
@@ -460,6 +535,7 @@ impl Default for GcState {
             allocated_bytes: 0,
             threshold_bytes: 1024 * 1024,
             memory_limit_bytes,
+            hard_pressure_triggered: false,
             soft_memory: memory_control::Controller::from_env(),
             last_major_live_bytes: 0,
             last_major_mark_work: 0,
@@ -620,6 +696,29 @@ fn initialize_object_at(
     )
 }
 
+/// Reservation occupancy can remain high even when few objects are live. A
+/// level-triggered check would repeatedly scan the same rooted region. Keep a
+/// pressure latch across cycles; normal occupancy/pacer triggers and reservation
+/// admission still operate independently while the latch is set.
+fn hard_reservation_pressure(state: &mut GcState) -> bool {
+    let Some(limit) = state.memory_limit_bytes else {
+        state.hard_pressure_triggered = false;
+        return false;
+    };
+    let reserved = state
+        .old_reserved_bytes
+        .saturating_add(state.tlab_reserved_bytes)
+        .saturating_add(external_bytes());
+    if reserved <= limit / 2 {
+        state.hard_pressure_triggered = false;
+    }
+    if reserved >= (limit / 4).saturating_mul(3).max(1) && !state.hard_pressure_triggered {
+        state.hard_pressure_triggered = true;
+        return true;
+    }
+    false
+}
+
 fn allocation_should_collect() -> bool {
     let stress = gc_stress_enabled("alloc");
     let mut state = runtime().heap.lock().unwrap();
@@ -627,24 +726,24 @@ fn allocation_should_collect() -> bool {
         return false;
     }
     sync_tlab_bytes(&mut state);
-    if state.pacer.sample_due(state.total_allocated_bytes) {
-        let bytes = state.total_allocated_bytes;
+    let bytes = policy_allocated_total(&state);
+    if state.pacer.sample_due(bytes) {
         state
             .pacer
             .allocation(crate::gc_telemetry::timestamp_ns(), bytes);
         // Sampling may advance the trigger, but cannot move the current goal.
-        let decision = state.pacer.decision(pacer_inputs(&state));
+        let input = pacer_inputs(&state);
+        let decision = state.pacer.decision(input);
         state.pacer_trigger = (state.threshold_bytes as u64)
             .saturating_sub(decision.runway)
-            .max(state.last_major_live_bytes.saturating_add(256 * 1024))
+            .max(input.live.saturating_add(256 * 1024))
             .min(state.threshold_bytes as u64);
     }
-    let hard_pressure = state
-        .memory_limit_bytes
-        .is_some_and(|limit| state.allocated_bytes >= (limit / 4).saturating_mul(3).max(1));
-    let memory = state.soft_memory.decide(memory_inputs(&state));
+    let hard_pressure = hard_reservation_pressure(&mut state);
+    let memory_input = memory_inputs(&state);
+    let memory = state.soft_memory.decide(memory_input);
     let paced = state.pacer.enabled()
-        && state.allocated_bytes as u64 >= state.pacer_trigger
+        && memory_input.occupied >= state.pacer_trigger
         && memory.reason != memory_control::Reason::Relief;
     stress || hard_pressure || paced || memory.collect
 }
@@ -1306,6 +1405,7 @@ fn collect_internal() {
     // independently. Payload tracing is gated until the activation round ends;
     // late TLAB starts are retried after the root-publication round.
     let started = std::time::Instant::now();
+    let external_before = external_bytes() as u64;
     let Some((heap_before, marking)) = root_handshake::begin() else {
         runtime()
             .skipped_foreign_owner_collections
@@ -1436,7 +1536,11 @@ fn collect_internal() {
         sync_tlab_bytes(&mut state);
         let after = state.allocated_bytes as u64;
         let previous_goal = state.threshold_bytes as u64;
-        state.threshold_bytes = state.allocated_bytes.saturating_mul(2).max(1024 * 1024);
+        state.threshold_bytes = state
+            .allocated_bytes
+            .saturating_add(external_bytes())
+            .saturating_mul(2)
+            .max(1024 * 1024);
         state.last_major_live_bytes = after;
         state.last_major_mark_work = work
             .marked_bytes
@@ -1450,7 +1554,7 @@ fn collect_internal() {
                 .saturating_add(work.descriptor_bytes),
             cpu,
         );
-        let bytes = state.total_allocated_bytes;
+        let bytes = policy_allocated_total(&state);
         state
             .pacer
             .allocation(crate::gc_telemetry::timestamp_ns(), bytes);
@@ -1462,8 +1566,14 @@ fn collect_internal() {
             state.threshold_bytes = decision.goal.min(usize::MAX as u64) as usize;
             state.pacer_trigger = decision.trigger;
         }
+        // A completed full cycle services any high reservation pressure. If
+        // reclamation crossed the low watermark, rearm before new allocations
+        // can reserve a region again (even within the same allocation call).
+        hard_reservation_pressure(&mut state);
         let memory_input = memory_inputs(&state);
-        state.soft_memory.completed(heap_before, memory_input);
+        state
+            .soft_memory
+            .completed(heap_before.saturating_add(external_before), memory_input);
         if gc_log {
             let decision = state.soft_memory.decide(memory_input);
             eprintln!(
@@ -1673,6 +1783,7 @@ fn reset_internal() {
     state.allocated_bytes = 0;
     state.threshold_bytes = 1024 * 1024;
     state.memory_limit_bytes = gc_memory_limit_from_env();
+    state.hard_pressure_triggered = false;
     state.soft_memory = memory_control::Controller::from_env();
     state.last_major_live_bytes = 0;
     state.last_major_mark_work = 0;
@@ -1684,6 +1795,7 @@ fn reset_internal() {
     state.nursery_threshold_bytes = state.nursery_policy.initial(state.memory_limit_bytes);
     state.total_allocs = 0;
     state.total_allocated_bytes = 0;
+    EXTERNAL_ALLOCATED_BYTES.store(0, Ordering::Relaxed);
     state.released_bytes = 0;
     crate::gc_telemetry::reset_for_test();
     state.total_frees = 0;
@@ -1846,3 +1958,6 @@ mod concurrent_tests;
 
 #[cfg(test)]
 mod failure_policy_tests;
+
+#[cfg(test)]
+mod native_memory_tests;

@@ -16,11 +16,11 @@
 use crate::gc::{
     GcObjectKind, GcStoreDestination, willow_alloc_with_layout, willow_gc_write_barrier,
 };
+use crate::native_memory::{Mutex, MutexGuard};
 use crate::string::willow_string_as_str;
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::{Mutex, MutexGuard};
 
 use willow_abi::runtime_type_ids::MAP_TYPE_ID;
 
@@ -53,6 +53,15 @@ struct MapData {
     /// Major cycles are serialized. Appends after the first slice are covered
     /// by insertion barriers and must not extend this epoch's finite scan.
     scan_limit: usize,
+    key_bytes: usize,
+}
+
+impl crate::native_memory::Footprint for MapData {
+    fn native_bytes(&mut self) -> usize {
+        crate::native_memory::hash_bytes::<MapKey, usize>(self.entries.capacity())
+            + self.values.capacity() * size_of::<i64>()
+            + self.key_bytes
+    }
 }
 
 impl MapData {
@@ -247,6 +256,7 @@ pub extern "C" fn willow_map_new(key_kind: i64, value_kind: i64, value_is_ref: i
             entries: HashMap::new(),
             values: Vec::new(),
             scan_limit: 0,
+            key_bytes: 0,
         }));
     }
     map
@@ -274,10 +284,26 @@ pub extern "C" fn willow_map_insert(
         raise_nan_key();
         return;
     };
+    // Borrowed lookup avoids allocating a duplicate string on replacement.
+    if let Some(&index) = data.entries.get(&key as &dyn KeyView) {
+        if data.layout.value_is_ref {
+            willow_gc_write_barrier(
+                map,
+                data.values[index] as *mut u8,
+                val_word as *mut u8,
+                GcStoreDestination::MapValue as i64,
+            );
+        }
+        data.values[index] = val_word;
+        return;
+    }
     let owned_key = match key {
         KeyRef::Word(word) => MapKey::Word(word),
         KeyRef::Str(text) => MapKey::Str(text.to_owned()),
     };
+    if let MapKey::Str(text) = &owned_key {
+        data.key_bytes += text.capacity();
+    }
     let is_ref = data.layout.value_is_ref;
     let MapData {
         entries, values, ..
@@ -386,7 +412,11 @@ pub extern "C" fn willow_map_copy(map: *mut u8) -> *mut u8 {
         dst.values.push(v);
     }
     for (key, &index) in &src.entries {
-        dst.entries.insert(key.clone(), index);
+        let key = key.clone();
+        if let MapKey::Str(text) = &key {
+            dst.key_bytes += text.capacity();
+        }
+        dst.entries.insert(key, index);
     }
     copy
 }
@@ -1088,5 +1118,77 @@ mod tests {
             "get bytes went {short_bytes} -> {long_bytes} from key length {short_len} to {long_len}"
         );
         willow_pop_roots(1);
+    }
+}
+
+#[cfg(test)]
+mod native_accounting_tests {
+    use super::*;
+    use crate::gc::*;
+
+    #[test]
+    fn string_keys_growth_updates_copy_telemetry_and_finalizers() {
+        let _guard = runtime_test_guard();
+        for count in [1, 32, 1024] {
+            willow_gc_init();
+            let baseline = crate::gc_telemetry::external_bytes();
+            let mut map = willow_map_new(3, 0, 0);
+            willow_push_root(&mut map);
+            assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
+            let before = crate::gc_telemetry::snapshot();
+            let mut key_bytes = 0;
+            for index in 0..count {
+                let text = format!("{index:08}-{}", "x".repeat(256));
+                key_bytes += text.len() as u64;
+                let mut key = crate::string::willow_string_from_str(&text);
+                willow_push_root(&mut key);
+                willow_map_insert(map, key as i64, 1, index, 0);
+                let charged = crate::gc_telemetry::external_bytes();
+                willow_map_insert(map, key as i64, 1, index + 1, 0);
+                assert_eq!(
+                    crate::gc_telemetry::external_bytes(),
+                    charged,
+                    "replacement grew native storage"
+                );
+                willow_pop_root();
+            }
+            let bytes = crate::gc_telemetry::external_bytes() - baseline;
+            assert!(bytes >= key_bytes);
+            let stats = crate::gc_telemetry::snapshot();
+            assert!(stats.heap.reserved_bytes >= before.heap.reserved_bytes + bytes);
+            assert_eq!(
+                stats.heap.reserved_bytes,
+                stats.heap.old_reserved_bytes
+                    + stats.heap.nursery_reserved_bytes
+                    + baseline
+                    + bytes
+            );
+            willow_gc_collect();
+            assert_eq!(crate::gc_telemetry::external_bytes(), baseline + bytes);
+            let mut copy = willow_map_copy(map);
+            willow_push_root(&mut copy);
+            assert!(crate::gc_telemetry::external_bytes() >= baseline + bytes + key_bytes);
+            assert_eq!(willow_map_len(copy), count);
+            willow_pop_roots(2);
+            willow_gc_collect();
+            assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
+            println!(
+                "native map entries={count} owned_key_bytes={key_bytes} charged_bytes={bytes}"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_releases_native_map_storage() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let baseline = crate::gc_telemetry::external_bytes();
+        let map = willow_map_new(0, 0, 0);
+        for key in 0..128 {
+            willow_map_insert(map, key, 0, key, 0);
+        }
+        assert!(crate::gc_telemetry::external_bytes() > baseline);
+        willow_gc_init();
+        assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
     }
 }

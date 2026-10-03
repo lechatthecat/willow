@@ -189,3 +189,5 @@ mod tests {
         assert_eq!(unsafe { string::willow_string_as_str(arg0) }, "one");
     }
 }
+
+mod native_memory;
