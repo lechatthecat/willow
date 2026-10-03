@@ -323,24 +323,46 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// Preserve the native call chain when a synchronous helper exhausts its
     /// task budget. Ordinary synchronous loops only load the live GC gate;
     /// they enter the runtime when a collector actually requests a stop.
+    /// Inside a task native stack, `poll_counter` is the stack's inline
+    /// countdown: each safepoint decrements it and the runtime is entered only
+    /// when the batch the runtime granted is used up (willow-jz15.40).
     pub(super) fn emit_sync_safepoint(
         &mut self,
-        native_active: cranelift_codegen::ir::Value,
+        poll_counter: cranelift_codegen::ir::Value,
         gc_stop_flag: cranelift_codegen::ir::Value,
     ) {
         // Atomic loads cannot be hoisted out of the source loop. The GC flag
-        // may change concurrently even though native activity is invocation-
-        // constant (nested scheduler drives restore the enclosing context).
+        // may change concurrently even though the counter address is
+        // invocation-constant (nested scheduler drives restore the enclosing
+        // context).
         let stop = self
             .builder
             .ins()
             .atomic_load(types::I8, MemFlagsData::trusted(), gc_stop_flag);
-        let stop = self.builder.ins().uextend(types::I32, stop);
-        let required = self.builder.ins().bor(native_active, stop);
         let slow = self.builder.create_block();
         self.builder.set_cold_block(slow);
+        let counted = self.builder.create_block();
+        let countdown = self.builder.create_block();
         let resume = self.builder.create_block();
-        self.builder.ins().brif(required, slow, &[], resume, &[]);
+        self.builder.ins().brif(stop, slow, &[], counted, &[]);
+        self.builder.switch_to_block(counted);
+        self.builder.seal_block(counted);
+        // Null outside task stacks: synchronous main/thread code never counts.
+        self.builder
+            .ins()
+            .brif(poll_counter, countdown, &[], resume, &[]);
+        self.builder.switch_to_block(countdown);
+        self.builder.seal_block(countdown);
+        // Only this thread's generated code and runtime touch the countdown.
+        let flags = MemFlagsData::trusted();
+        let left = self.builder.ins().load(types::I32, flags, poll_counter, 0);
+        let left = self.builder.ins().iadd_imm_s(left, -1);
+        self.builder.ins().store(flags, left, poll_counter, 0);
+        let expired = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::SignedLessThanOrEqual, left, 0);
+        self.builder.ins().brif(expired, slow, &[], resume, &[]);
         self.builder.switch_to_block(slow);
         self.builder.seal_block(slow);
         let cancelled = self.emit_value_runtime_call("willow_sync_safepoint", &[]);

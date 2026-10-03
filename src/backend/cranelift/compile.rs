@@ -1590,6 +1590,8 @@ impl Codegen {
             class_descriptor_ids: &self.class_descriptor_ids,
             dispatch_cache: &self.dispatch_cache,
             vtable_ids: &self.vtable_ids,
+            interface_slot_targets: &self.interface_slot_targets,
+            interface_slot_summaries: &self.interface_slot_summaries,
             coop_frame: None,
             coop_suspend_points: None,
             coop_result_offset: None,
@@ -1610,7 +1612,13 @@ impl Codegen {
             source_file: &self.source_file,
             address_taken: super::lir_address_taken_locals(&lir_fn),
         };
-        if panic_return_block.is_some() && super::root_effect::may_push_gc_roots(&lir_fn) {
+        // A safepoint-free leaf neither roots its GC parameters nor reaches
+        // the panic-return block (willow-8hq4.14).
+        let unrooted = !is_main && super::root_effect::is_safepoint_free_leaf(&lir_fn);
+        if panic_return_block.is_some()
+            && !unrooted
+            && super::root_effect::may_push_gc_roots(&lir_fn)
+        {
             fg.panic_function_root_depth =
                 Some(fg.emit_value_runtime_call("willow_root_depth", &[]));
         }
@@ -1647,12 +1655,12 @@ impl Codegen {
                     );
                     continue;
                 }
-                fg.bind_param(
-                    &param.name,
-                    &crate::semantic::ids::SemanticType::from(&param.ty),
-                    &param.mode,
-                    val,
-                );
+                let ty = crate::semantic::ids::SemanticType::from(&param.ty);
+                if unrooted && matches!(param.mode, ParamMode::Value) {
+                    fg.bind_unrooted_param(&param.name, &ty, val);
+                    continue;
+                }
+                fg.bind_param(&param.name, &ty, &param.mode, val);
             }
         }
 
@@ -1729,10 +1737,12 @@ impl Codegen {
         }
         for m in &all_methods {
             let mangled = self.class_method_symbol(&c.name, &m.name);
-            self.func_ids.scope().declare(
-                &mangled,
-                FunctionId::method(TypeId::from_source_name(&c.name), &m.name),
-            );
+            let id = FunctionId::method(TypeId::from_source_name(&c.name), &m.name);
+            self.func_ids.scope().declare(&mangled, id);
+            if m.is_async {
+                self.async_methods
+                    .insert(self.func_ids.scope().lookup_id(&mangled));
+            }
             self.claim_symbol(&mangled, format!("method `{}::{}`", c.name, m.name), m.span)?;
             let mut sig = self.module.make_signature();
             let ptr_ty = reference_type(self.module.target_config());
@@ -1990,6 +2000,8 @@ impl Codegen {
             class_descriptor_ids: &self.class_descriptor_ids,
             dispatch_cache: &self.dispatch_cache,
             vtable_ids: &self.vtable_ids,
+            interface_slot_targets: &self.interface_slot_targets,
+            interface_slot_summaries: &self.interface_slot_summaries,
             coop_frame: None,
             coop_suspend_points: None,
             coop_result_offset: None,
@@ -2178,9 +2190,10 @@ impl Codegen {
         // Filled BY NAME, which is what lets one method occupy several slots
         // (a diamond's shared grandparent) without the copies disagreeing.
         for (slot, method_name) in slots.iter().enumerate() {
-            let Some(func_id) = self.resolve_class_method_func_id(class_name, method_name) else {
-                continue;
-            };
+            let symbol = self.resolve_class_method_symbol(class_name, method_name);
+            let func_id = symbol
+                .as_deref()
+                .and_then(|symbol| self.func_ids.get(symbol).copied());
             // An `open`/`override` method must not be nailed to the body THIS
             // class would inherit: the box may have been built from a
             // base-typed expression whose object is really a subclass, and the
@@ -2199,6 +2212,26 @@ impl Codegen {
                 .classes()
                 .slots(class_name)
                 .and_then(|slots| slots.slot_of(method_name));
+            // A thunk's runtime target is any override below this class, so
+            // the slot summary records it as unknown (willow-8hq4.14).
+            let target = match (&symbol, func_id, vslot) {
+                (Some(symbol), Some(_), None) => {
+                    let id = self.func_ids.scope().lookup_id(symbol);
+                    Some(super::SlotTarget {
+                        id,
+                        roots_receiver: !self.async_methods.contains(&id),
+                    })
+                }
+                _ => None,
+            };
+            self.interface_slot_summaries.get_mut().clear();
+            self.interface_slot_targets
+                .entry((iface.name, method_name.to_string()))
+                .or_default()
+                .push(target);
+            let Some(func_id) = func_id else {
+                continue;
+            };
             let entry = match vslot {
                 Some(vslot) => {
                     self.declare_vtable_thunk(class_name, method_name, vslot, func_id, span)?
@@ -2527,6 +2560,8 @@ impl Codegen {
             class_descriptor_ids: &self.class_descriptor_ids,
             dispatch_cache: &self.dispatch_cache,
             vtable_ids: &self.vtable_ids,
+            interface_slot_targets: &self.interface_slot_targets,
+            interface_slot_summaries: &self.interface_slot_summaries,
             coop_frame: None,
             coop_suspend_points: None,
             coop_result_offset: None,
@@ -2546,8 +2581,11 @@ impl Codegen {
             source_file: &self.source_file,
             address_taken: super::lir_address_taken_locals(&lir_fn),
         };
-        // Instance methods always bind a rooted `self`, even for scalar bodies.
+        // Instance methods bind a rooted `self`, even for scalar bodies, unless
+        // the body can never reach a safepoint (willow-8hq4.14).
+        let unrooted = super::root_effect::is_safepoint_free_leaf(&lir_fn);
         if panic_return_block.is_some()
+            && !unrooted
             && (!m.is_static || super::root_effect::may_push_gc_roots(&lir_fn))
         {
             fg.panic_function_root_depth =
@@ -2564,7 +2602,10 @@ impl Codegen {
         // The receiver is a GC-managed class object; it must be stored in a
         // stack slot and rooted so that allocations inside the method body
         // cannot cause the receiver to be collected.
-        if !m.is_static {
+        if !m.is_static && unrooted {
+            let self_val = fg.builder.block_params(entry_block)[0];
+            fg.bind_unrooted_param("self", &Type::Named(c.name.clone().into()), self_val);
+        } else if !m.is_static {
             let self_val = fg.builder.block_params(entry_block)[0];
             let self_slot = fg.builder.create_sized_stack_slot(StackSlotData::new(
                 StackSlotKind::ExplicitSlot,
@@ -2591,12 +2632,12 @@ impl Codegen {
         // Bind remaining method params
         for (i, p) in m.params.iter().enumerate() {
             let val = fg.builder.block_params(entry_block)[i + 1];
-            fg.bind_param(
-                &p.name,
-                &crate::semantic::ids::SemanticType::from(&p.ty),
-                &p.mode,
-                val,
-            );
+            let ty = crate::semantic::ids::SemanticType::from(&p.ty);
+            if unrooted && matches!(p.mode, ParamMode::Value) {
+                fg.bind_unrooted_param(&p.name, &ty, val);
+                continue;
+            }
+            fg.bind_param(&p.name, &ty, &p.mode, val);
         }
 
         if std::env::var("WILLOW_LIR_LOG").is_ok() {

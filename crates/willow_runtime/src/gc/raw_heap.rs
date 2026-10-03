@@ -1,4 +1,5 @@
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use super::{GC_STORAGE_WORD_BYTES, GcHeader};
 
@@ -74,6 +75,7 @@ impl Object {
             header.allocated = true;
             header.generation = generation;
             header.age = 0;
+            header.remembered = 0;
             header.descriptor = super::layouts::acquire(willow_abi::GcLayoutDescriptor {
                 type_id: u64::from(type_id),
                 layout_id,
@@ -169,6 +171,7 @@ impl Object {
                 header.allocated = false;
             }
             header.marked = false;
+            header.remembered = 0;
         }
     }
 
@@ -204,11 +207,34 @@ impl Object {
         unsafe { (*self.as_ptr()).generation }
     }
 
+    pub(super) fn remembered(self) -> bool {
+        // SAFETY: `Object` refers to a live heap allocation; generated code
+        // reads this byte concurrently, so access it atomically.
+        unsafe {
+            AtomicU8::from_ptr(&raw mut (*self.as_ptr()).remembered).load(Ordering::Relaxed) != 0
+        }
+    }
+
+    /// Mirror remembered-set membership for the inline barrier filter. The
+    /// heap lock (or a stop) orders this with the set update; stops order it
+    /// with generated readers.
+    pub(super) fn set_remembered(self, remembered: bool) {
+        // SAFETY: as in `remembered`.
+        unsafe {
+            AtomicU8::from_ptr(&raw mut (*self.as_ptr()).remembered)
+                .store(u8::from(remembered), Ordering::Relaxed);
+        }
+    }
+
     pub(super) fn set_generation(self, generation: u8) {
         // SAFETY: collection has exclusive access while mutators are stopped.
         unsafe {
             (*self.as_ptr()).generation = generation;
             (*self.as_ptr()).age = 0;
+            // Generated TLAB headers leave this byte unwritten. A young
+            // object is never remembered, so an in-place promotion starts
+            // unremembered rather than inheriting stale chunk contents.
+            (*self.as_ptr()).remembered = 0;
         }
     }
 }

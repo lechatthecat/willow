@@ -76,8 +76,8 @@ pub use willow_abi::{GcObjectKind, GcStoreDestination};
 const GC_STORAGE_WORD_BYTES: usize =
     willow_abi::storage_word_bytes(std::mem::size_of::<usize>() as u32) as usize;
 
-const GC_GENERATION_YOUNG: u8 = 0;
-const GC_GENERATION_OLD: u8 = 1;
+const GC_GENERATION_YOUNG: u8 = willow_abi::gc_header::GENERATION_YOUNG;
+const GC_GENERATION_OLD: u8 = willow_abi::gc_header::GENERATION_OLD;
 const GC_CARD_SIZE: usize = 512;
 const GC_OLD_REGION_SIZE: usize = 256 * 1024;
 const GC_LARGE_OBJECT_THRESHOLD: usize = GC_OLD_REGION_SIZE / 2;
@@ -191,6 +191,11 @@ pub struct GcHeader {
     pub age: u8,
     /// Runtime-interned descriptors are reference counted; generated ones are static.
     pub descriptor_owned: bool,
+    /// Nonzero exactly while this payload is in `GcState::remembered_set`.
+    /// Generated reference-array stores read it to skip a redundant barrier
+    /// call (willow-8hq4.15); only the runtime writes it, under the heap lock
+    /// or with mutators stopped.
+    pub remembered: u8,
     /// Live: immutable descriptor address. Reclaimed: original allocation size,
     /// so retained TLAB holes remain walkable without retaining dead metadata.
     pub descriptor: usize,

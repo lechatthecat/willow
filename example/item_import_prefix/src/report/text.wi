@@ -1,0 +1,8 @@
+// Only `Op` is imported by item, yet the module prefix stays callable.
+import ops::Op;
+
+pub class Filter {
+    pub op: Op;
+    pub init(self, op: Op) { self.op = op; }
+    pub fn describe(self) -> String { return "x " + ops::op_text(self.op) + " y"; }
+}

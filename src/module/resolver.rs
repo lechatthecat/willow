@@ -15,6 +15,9 @@ use crate::parser::{Parser, ast::Program};
 pub struct ItemImport {
     /// Local name introduced into scope (the alias, or the item name).
     pub local: String,
+    /// The module prefix as this file wrote it (`a` in `import a::Op;`), which
+    /// the file may still use for qualified calls such as `a::twice()`.
+    pub access: String,
     /// Package-local module path; combine with `package` for identity.
     pub canonical_module: String,
     /// Owning package; aliases never participate in this identity.
@@ -96,6 +99,7 @@ pub(crate) fn classify_unit_imports_with<'a>(
         {
             out.items.push(ItemImport {
                 local: import.alias.clone().unwrap_or_else(|| item.to_string()),
+                access: parent.to_string(),
                 canonical_module: dependency.canonical_path.clone(),
                 package: dependency.package,
                 item: item.to_string(),
@@ -396,6 +400,10 @@ fn resolve_import(
     if let (Some(item), Some(sink)) = (item, item_sink) {
         sink.push(ItemImport {
             local: alias.unwrap_or(&item).to_string(),
+            access: path
+                .rsplit_once("::")
+                .map_or(path, |(parent, _)| parent)
+                .to_string(),
             canonical_module: key.path.0.clone(),
             package: key.package,
             item,

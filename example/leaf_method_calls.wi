@@ -1,0 +1,33 @@
+// Leaf methods (no panic, allocation, call or loop) skip the receiver root,
+// the safepoint poll and the caller's panic bracket, and so does an
+// interface call whose every implementer is such a leaf (willow-8hq4.14).
+// Expected output: 385, 1210, 7
+import std::collections::Array;
+interface Shape { fn area(self) -> i64; }
+class Square implements Shape {
+    pub side: i64;
+    pub fn area(self) -> i64 { return self.side * self.side; }
+}
+class Strip implements Shape {
+    pub len: i64;
+    pub fn area(self) -> i64 { return self.len / 2; }
+}
+fn main() {
+    let mut squares: Array<Square> = [];
+    let mut shapes: Array<Shape> = [];
+    let mut i = 1;
+    while i <= 10 {
+        squares.push(new Square(i));
+        shapes.push(new Square(i));
+        shapes.push(new Strip(i * 30));
+        i = i + 1;
+    }
+    let mut direct = 0;
+    for s in squares { direct = direct + s.area(); }
+    println(direct);
+    gc_collect();
+    let mut dynamic = 0;
+    for s in shapes { dynamic = dynamic + s.area(); }
+    println(dynamic);
+    println(new Strip(15).area());
+}

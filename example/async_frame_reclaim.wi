@@ -1,0 +1,88 @@
+// Finished task frames are reclaimed while a long-running `async main` is
+// still running (willow-vjaf). Each phase finishes thousands of tasks; after
+// a collection the live heap stays near zero instead of growing with every
+// task the program ever completed.
+
+async fn make(i: i64) -> i64 {
+    return i;
+}
+
+async fn label(i: i64) -> String {
+    return format("v{}", i);
+}
+
+async fn parked() -> i64 {
+    await sleep(100000);
+    return 0;
+}
+
+async fn relay(ch: Channel<i64>, i: i64) {
+    ch.send(i);
+}
+
+fn bounded() -> bool {
+    gc_collect();
+    return gc_allocated_bytes() < 200000;
+}
+
+async fn main() {
+    let rounds = 20000;
+
+    // Awaited tasks with scalar results.
+    let mut sum = 0;
+    let mut i = 0;
+    while i < rounds {
+        sum = sum + await make(i);
+        i = i + 1;
+    }
+    println(sum);
+    println(bounded());
+
+    // Awaited tasks with heap results.
+    let mut chars = 0;
+    i = 0;
+    while i < rounds {
+        chars = chars + (await label(i)).len();
+        i = i + 1;
+    }
+    println(chars);
+    println(bounded());
+
+    // Fire-and-forget tasks nobody awaits.
+    i = 0;
+    while i < rounds {
+        make(i);
+        if i % 1000 == 0 {
+            await yield();
+        }
+        i = i + 1;
+    }
+    await sleep(10);
+    println(bounded());
+
+    // Cancelled tasks.
+    i = 0;
+    while i < rounds / 10 {
+        let t = parked();
+        t.cancel();
+        i = i + 1;
+    }
+    await sleep(10);
+    println(bounded());
+
+    // Tasks finished through a TaskScope and tasks talking over channels.
+    let mut via = 0;
+    i = 0;
+    while i < rounds / 10 {
+        let scope = TaskScope::new();
+        let t = scope.add(make(i));
+        await scope.finish();
+        let ch = Channel<i64>::new();
+        let r = relay(ch, 1);
+        via = via + await t + ch.recv();
+        await r;
+        i = i + 1;
+    }
+    println(via);
+    println(bounded());
+}

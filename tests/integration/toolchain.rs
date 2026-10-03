@@ -444,8 +444,11 @@ fn assert_staticlib_exports_backend_symbols(runtime_lib: &Path) {
             }
         }
     }
+    // Data symbols the backend reads inline are imported outside the
+    // function table and must be exported by the same staticlib.
     let missing: Vec<_> = backend_runtime_symbols()
         .into_iter()
+        .chain([willow_abi::GC_MARK_PHASE_SYMBOL.to_string()])
         .filter(|name| !symbols.contains(name))
         .collect();
     assert!(

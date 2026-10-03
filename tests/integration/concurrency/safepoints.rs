@@ -191,3 +191,35 @@ fn psp_10_cancel_preempted_busy_task() {
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");
 }
+
+#[test]
+fn psp_11_sync_helper_countdown_preempts_and_cancels() {
+    // willow-jz15.40: loops in synchronous helpers on a task native stack
+    // count safepoints inline and enter the runtime once per granted batch.
+    // Budget 1 (a grant per safepoint) and the default budget must both keep
+    // a single worker fair, and a sync spinner must still observe cancel.
+    let source = "fn spin(done: AtomicBool) -> i64 { let mut n = 0; while !done.load() { n = n + 1; } return n; }\n\
+        async fn spinner(done: AtomicBool) -> i64 { return spin(done); }\n\
+        async fn delayed(done: AtomicBool) -> i64 { await sleep(5); println(42); done.store(true); return 0; }\n\
+        async fn main() {\n\
+            let done = AtomicBool::new(false);\n\
+            let a = spinner(done); let b = spinner(done); let c = spinner(done);\n\
+            await delayed(done);\n\
+            await a; await b; await c;\n\
+            let never = AtomicBool::new(false);\n\
+            let t = spinner(never);\n\
+            await sleep(5);\n\
+            t.cancel();\n\
+            await sleep(20);\n\
+            println(t.is_cancelled());\n\
+        }";
+    for budget in ["1", "1024"] {
+        let (out, ok) = compile_and_run_with_runtime_env(
+            source,
+            &[("WILLOW_WORKERS", "1"), ("WILLOW_TASK_BUDGET", budget)],
+            std::time::Duration::from_secs(25),
+        );
+        assert!(ok, "budget {budget}: {out}");
+        assert_eq!(out, "42\ntrue\n", "budget {budget}");
+    }
+}

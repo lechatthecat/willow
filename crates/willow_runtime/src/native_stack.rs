@@ -120,6 +120,12 @@ pub(crate) struct NativeStack {
     suspended: bool,
     cancelled: bool,
     cleanup_depth: u32,
+    /// Countdown that generated synchronous safepoints decrement inline; they
+    /// enter `willow_sync_safepoint` only when it reaches zero. Generated code
+    /// reaches it through the stable pointer from `willow_sync_poll_counter`.
+    poll_countdown: i32,
+    /// Safepoints granted by the last `willow_sync_safepoint` refill.
+    poll_granted: i32,
     entry_panic_depth: i32,
     root_depth: usize,
     parked_roots: Option<u64>,
@@ -149,6 +155,8 @@ impl NativeStack {
             stack.frame = frame;
             stack.cancelled = false;
             stack.cleanup_depth = 0;
+            stack.poll_countdown = 0;
+            stack.poll_granted = 0;
             stack.entry_panic_depth = crate::panic_context::willow_panic_depth();
             stack.trace = RuntimeStackTrace::default();
             stack.reference_context = Default::default();
@@ -205,6 +213,8 @@ impl NativeStack {
             suspended: false,
             cancelled: false,
             cleanup_depth: 0,
+            poll_countdown: 0,
+            poll_granted: 0,
             entry_panic_depth: crate::panic_context::willow_panic_depth(),
             root_depth: 0,
             parked_roots: None,
@@ -333,6 +343,42 @@ pub(crate) fn suspend_with_result(result: i32) -> bool {
 /// Whether the current invocation owns a scheduler-managed native stack.
 pub(crate) fn is_active() -> bool {
     CURRENT.with(|current| !current.get().is_null())
+}
+
+/// Address of the active stack's inline safepoint countdown, or null outside
+/// task stacks. The `NativeStack` allocation is stable while generated frames
+/// run on it, so the pointer is invocation-constant for the caller.
+pub(crate) fn poll_counter() -> *mut i32 {
+    let stack = CURRENT.with(Cell::get);
+    if stack.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { std::ptr::addr_of_mut!((*stack).poll_countdown) }
+}
+
+/// Safepoints executed since the last refill, including the current one. A
+/// generated caller arrives with the countdown at zero (the whole grant); a
+/// direct runtime caller leaves it untouched and accounts for one safepoint.
+pub(crate) fn poll_consumed() -> u64 {
+    let stack = CURRENT.with(Cell::get);
+    if stack.is_null() {
+        return 1;
+    }
+    unsafe {
+        let consumed = i64::from((*stack).poll_granted) - i64::from((*stack).poll_countdown);
+        consumed.max(1) as u64
+    }
+}
+
+/// Grant the next batch of inline safepoints to the active stack.
+pub(crate) fn poll_refill(grant: i32) {
+    let stack = CURRENT.with(Cell::get);
+    if !stack.is_null() {
+        unsafe {
+            (*stack).poll_granted = grant;
+            (*stack).poll_countdown = grant;
+        }
+    }
 }
 
 /// Sticky task cancellation, suppressed while generated defer cleanup executes.
@@ -743,6 +789,125 @@ mod tests {
         }
         assert_eq!(yields, 100);
         assert_eq!(output, 5151);
+    }
+
+    /// Models generated synchronous safepoints (willow-jz15.40): decrement
+    /// the inline countdown, enter the runtime only once it runs out.
+    struct CountedLoop {
+        safepoints: u64,
+        runtime_calls: u64,
+        resumes: u64,
+        trips: Vec<u64>,
+    }
+
+    unsafe extern "C" fn counted_poll(frame: *mut c_void) -> i32 {
+        let state = frame.cast::<CountedLoop>();
+        let counter = crate::preempt::willow_sync_poll_counter();
+        assert!(!counter.is_null());
+        unsafe {
+            for index in 1..=(*state).safepoints {
+                *counter -= 1;
+                if *counter <= 0 {
+                    (*state).runtime_calls += 1;
+                    let before = (*state).resumes;
+                    assert_eq!(willow_sync_safepoint(), 0);
+                    if (*state).resumes != before {
+                        (*state).trips.push(index);
+                    }
+                }
+            }
+        }
+        RUNTIME_POLL_READY
+    }
+
+    fn run_counted(budget: u64, safepoints: u64) -> CountedLoop {
+        let mut state = CountedLoop {
+            safepoints,
+            runtime_calls: 0,
+            resumes: 0,
+            trips: Vec::new(),
+        };
+        let config = PreemptConfig::from_env_values(Some(&budget.to_string()), Some("100000"));
+        let mut stack = NativeStack::new(counted_poll, std::ptr::from_mut(&mut state).cast());
+        loop {
+            begin_quantum(config, std::ptr::null());
+            let result = unsafe { NativeStack::resume(&mut *stack) };
+            willow_preempt_end();
+            if result == RUNTIME_POLL_READY {
+                break;
+            }
+            assert_eq!(result, RUNTIME_POLL_PREEMPTED);
+            state.resumes += 1;
+        }
+        state
+    }
+
+    #[test]
+    fn inline_countdown_bounds_runtime_calls_and_keeps_budget_trip_points() {
+        use crate::preempt::SYNC_POLL_STRIDE;
+        let _guard = crate::gc::runtime_test_guard();
+        for (budget, safepoints) in [(1000, 10_000), (1000, 100_000), (1, 50), (64, 640)] {
+            let state = run_counted(budget, safepoints);
+            // Unbatched checks trip at exactly every `budget`-th safepoint.
+            let expected: Vec<u64> = (1..=safepoints / budget).map(|k| k * budget).collect();
+            assert_eq!(state.trips, expected, "budget {budget}");
+            assert_eq!(state.resumes, safepoints / budget);
+            // The first call charges one safepoint, then each quantum is
+            // covered by grants of at most SYNC_POLL_STRIDE safepoints.
+            let quanta = safepoints / budget;
+            let per_quantum = budget.div_ceil(SYNC_POLL_STRIDE);
+            let first = 1 + (budget - 1).div_ceil(SYNC_POLL_STRIDE);
+            assert_eq!(
+                state.runtime_calls,
+                first + (quanta - 1) * per_quantum,
+                "budget {budget}, safepoints {safepoints}"
+            );
+            assert!(state.runtime_calls <= safepoints / SYNC_POLL_STRIDE + 2 * quanta);
+        }
+    }
+
+    unsafe extern "C" fn timed_poll(frame: *mut c_void) -> i32 {
+        let state = frame.cast::<CountedLoop>();
+        let counter = crate::preempt::willow_sync_poll_counter();
+        unsafe {
+            while (*state).resumes == 0 {
+                (*state).safepoints += 1;
+                std::thread::sleep(std::time::Duration::from_micros(20));
+                *counter -= 1;
+                if *counter <= 0 {
+                    (*state).runtime_calls += 1;
+                    assert_eq!(willow_sync_safepoint(), 0);
+                }
+            }
+        }
+        RUNTIME_POLL_READY
+    }
+
+    #[test]
+    fn inline_countdown_still_honors_the_time_quantum() {
+        use crate::preempt::SYNC_POLL_STRIDE;
+        let _guard = crate::gc::runtime_test_guard();
+        let mut state = CountedLoop {
+            safepoints: 0,
+            runtime_calls: 0,
+            resumes: 0,
+            trips: Vec::new(),
+        };
+        let mut stack = NativeStack::new(timed_poll, std::ptr::from_mut(&mut state).cast());
+        // A budget that cannot trip: only the 1ms time quantum preempts.
+        let config = PreemptConfig::from_env_values(Some("1000000000000"), Some("1"));
+        begin_quantum(config, std::ptr::null());
+        let result = unsafe { NativeStack::resume(&mut *stack) };
+        willow_preempt_end();
+        assert_eq!(result, RUNTIME_POLL_PREEMPTED);
+        state.resumes += 1;
+        begin_quantum(config, std::ptr::null());
+        assert_eq!(
+            unsafe { NativeStack::resume(&mut *stack) },
+            RUNTIME_POLL_READY
+        );
+        willow_preempt_end();
+        assert!(state.runtime_calls <= state.safepoints.div_ceil(SYNC_POLL_STRIDE) + 1);
     }
 
     fn set_reference(name: &str) {

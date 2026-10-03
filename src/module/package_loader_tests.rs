@@ -459,6 +459,42 @@ fn package_loader_feeds_consumer_dependency_index_and_backend_classification() {
 }
 
 #[test]
+fn item_imports_bind_one_module_spelling_per_written_prefix() {
+    // willow-jz15.43: a project module is registered under its package-qualified
+    // name, so the prefix an item import writes needs one spelling, however
+    // many items the unit imports from it.
+    for count in [1, 8, 64] {
+        let f = Fixture::new();
+        let module: String = (0..count)
+            .map(|i| format!("pub class C{i} {{}}\n"))
+            .collect();
+        f.file(0, "util.wi", &module);
+        let source: String = (0..count)
+            .map(|i| format!("import util::C{i};\n"))
+            .collect();
+        let graph = f.graph(&[&[]]);
+        let result = f.resolve(&source, graph.clone(), false);
+        success(&result);
+        let modules = &result.graph.files;
+        let index = crate::compiler_db::dependencies::ModuleDependencies::with_packages(
+            modules,
+            Some(&graph),
+        );
+        let (entry, errors) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
+        assert!(errors.is_empty());
+        let imports = crate::backend_unit_imports(&entry, modules, &index);
+        assert_eq!(imports.item_imports.len(), count);
+        assert_eq!(imports.module_spellings.len(), 1);
+        let spelling = &imports.module_spellings[0];
+        assert_eq!(spelling.access, "util");
+        assert_ne!(spelling.graph_name, "util");
+        assert_eq!(spelling.types.len(), count);
+        // Item imports keep the module's bare names unbound (willow-vtlr).
+        assert!(!imports.visible_modules.contains("util"));
+    }
+}
+
+#[test]
 fn project_check_additional_roots_load_each_module_once() {
     for size in [16, 64, 256] {
         for chain in [false, true] {

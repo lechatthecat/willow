@@ -1,0 +1,30 @@
+// The module that DECLARES the payload types. Nothing here mentions an enum:
+// the classes and the interface are wrapped in enum variants by `scene`.
+module shapes;
+
+pub interface Area {
+    fn area(self) -> i64;
+}
+
+pub open class Rect implements Area {
+    pub w: i64;
+    pub h: i64;
+
+    pub open fn area(self) -> i64 {
+        return self.w * self.h;
+    }
+}
+
+pub class Square extends Rect {
+    pub override fn area(self) -> i64 {
+        return self.w * self.w;
+    }
+}
+
+pub class Label {
+    pub text: String;
+
+    pub fn shout(self) -> String {
+        return self.text + "!";
+    }
+}

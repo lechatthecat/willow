@@ -10,6 +10,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         ("example/interface_marker_contract.wi", "3\n2\n"),
         ("example/module_inference/src/main.wi", "42\n42\n42\n"),
+        ("example/item_import_prefix/src/main.wi", "42\nx != y\n==\n"),
         ("example/diagnostic_recovery.wi", "3\n"),
         ("example/parse_cascade_recovery.wi", "7\n"),
         ("example/call_result_binding.wi", "5\n5.5\n"),
@@ -18,6 +19,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/assignment_target_types.wi", "10\n10\n12\n9\n"),
         ("example/effect_explanations.wi", "4\n2\n"),
         ("example/void_tasks_frozen_iteration.wi", "2\n60\n"),
+        (
+            "example/async_frame_reclaim.wi",
+            "199990000\ntrue\n108890\ntrue\ntrue\ntrue\n2001000\ntrue\n",
+        ),
         (
             "example/shared_cancellation_cleanup.wi",
             "shared cleanup\nouter cleanup\nasync cleanup\ndone\n",
@@ -64,6 +69,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         (
             "example/array_push_growth.wi",
             "true\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+        ),
+        (
+            "example/array_reference_store.wi",
+            "33\n200\n2101\nleft-right\n36\n9\n5\n8\n42\n12\n79990\ncaught\n",
         ),
         ("example/arrays.wi", "4\n10\n40\n100\n99\n2\nbob\ntrue\n"),
         ("example/async_sleep.wi", "42\n"),
@@ -354,6 +363,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         (
             "example/imported_enum_match/main.wi",
             "1\n42\n200\n8\nink\n2\n20\n",
+        ),
+        (
+            "example/imported_enum_payload/main.wi",
+            "3\n14\n25\n2\n3\nhi!\n25\nhi\nhi!\n42\n25\n",
         ),
         (
             "example/module_enum_tables/main.wi",

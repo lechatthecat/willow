@@ -1135,13 +1135,17 @@ impl<N> HazardVisitor<'_, N> {
             Expr::Binary(expr) => {
                 // Reuse checked expression types; unknown additions remain
                 // conservative for direct backend users without artifacts.
-                let concat = expr.op == BinOp::Add
-                    && !matches!(self.expr_types.get(&expr.id), Some(Type::I64 | Type::F64));
-                if concat || matches!(expr.op, BinOp::Div | BinOp::Rem | BinOp::Pow) {
+                let ty = self.expr_types.get(&expr.id);
+                let concat = expr.op == BinOp::Add && !matches!(ty, Some(Type::I64 | Type::F64));
+                // Only integer division keeps a zero/overflow guard, and a
+                // literal divisor other than 0 and -1 can trip neither.
+                let guarded_division = matches!(expr.op, BinOp::Div | BinOp::Rem)
+                    && !matches!(ty, Some(Type::F64))
+                    && !matches!(expr.rhs, Expr::Integer(divisor, ..) if divisor != 0 && divisor != -1);
+                if concat || guarded_division || expr.op == BinOp::Pow {
                     self.mark_direct(expression.span());
                 }
             }
-            Expr::FieldAccess(..) => self.mark_direct(expression.span()),
             // Strict await can turn cancellation into a language panic.
             // TaskResult awaits are intentionally not distinguished here:
             // retaining a check is conservative.
@@ -1152,8 +1156,11 @@ impl<N> HazardVisitor<'_, N> {
             // Bounds guard.
             Expr::Index(..) => self.mark_direct(expression.span()),
             // Every call form is an edge in the shared graph, classified by
-            // `classify_edge` rather than here.
-            Expr::Call(_)
+            // `classify_edge` rather than here. A field access lowers to a
+            // plain load of a checked layout offset with no language-level
+            // guard (willow-8hq4.14); its receiver is visited on its own.
+            Expr::FieldAccess(..)
+            | Expr::Call(_)
             | Expr::MethodCall(_)
             | Expr::StaticCall(_)
             | Expr::New(_)

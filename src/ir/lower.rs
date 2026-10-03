@@ -171,6 +171,51 @@ impl<'a> CheckerTables<'a> {
         }
     }
 
+    /// The identity this checker gave the enum written `name` here.
+    fn enum_identity(&self, name: &str) -> Option<&str> {
+        self.enums?
+            .get(&crate::semantic::ids::TypeId::from_source_name(name))
+            .map(|info| info.name.as_str())
+    }
+
+    /// The identities of the enums `program` itself declares.
+    pub fn declared_enum_identities(&self, program: &Program) -> HashSet<String> {
+        program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Enum(e) => self.enum_identity(&e.name).map(str::to_owned),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `info` as the back-end's build-wide enum table must hold it: every
+    /// payload spelled by its identity. The checker keeps a declaring unit's
+    /// payloads in that unit's own spelling — `Box2` under `import bx::Bx as
+    /// Box2;`, `Shape` for an item-imported interface — which no other unit
+    /// can resolve, so an importer that met the enum through this metadata
+    /// turned every function taking it down (willow-jz15.38). Only an enum in
+    /// `declared` (see [`Self::declared_enum_identities`]) is rewritten: an
+    /// imported one is already canonical, and this unit's spellings say
+    /// nothing about another module's names.
+    pub fn codegen_enum_info(
+        &self,
+        info: &symbols::EnumInfo,
+        declared: &HashSet<String>,
+    ) -> symbols::EnumInfo<crate::semantic::ids::TypeId> {
+        if !declared.contains(&info.name) {
+            return info.to_semantic();
+        }
+        let mut canonical = info.clone();
+        for variant in &mut canonical.variants {
+            for ty in &mut variant.payload_types {
+                *ty = self.normalize_declared(ty, &info.type_params);
+            }
+        }
+        canonical.to_semantic()
+    }
+
     /// A lambda's full inferred callable type, from the checker's expression
     /// table — including the parameter types a call site supplied, which the
     /// AST cannot spell. Either callable form answers: which one it is says
@@ -351,8 +396,27 @@ pub fn lower_program_with(
             }
             // After the prelude's own, so a program enum of the same name
             // shadows it — the order `register_prelude` gives the checker.
+            //
+            // Payload types are canonicalized like field and parameter types:
+            // a payload class imported from another module (`Leaf(Bx)` after
+            // `import bx::Bx;`) must bind as `bx::Bx`, the type every member
+            // access on the binding resolves against. The checker keeps this
+            // unit's spelling, so its entry under the enum's identity — the
+            // name a module's own scrutinee carries — is replaced as well
+            // (willow-jz15.38). Imported enums are already canonical.
             Item::Enum(e) => {
-                enums.map.insert(e.name.clone(), enum_info(e));
+                let mut info = enum_info(e);
+                for payload in info.variants.values_mut() {
+                    for ty in payload {
+                        *ty = tables.normalize_declared(ty, &e.type_params);
+                    }
+                }
+                if let Some(identity) = tables.enum_identity(&e.name)
+                    && identity != e.name
+                {
+                    enums.map.insert(identity.to_owned(), info.clone());
+                }
+                enums.map.insert(e.name.clone(), info);
             }
             _ => {}
         }

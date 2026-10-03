@@ -334,3 +334,170 @@ fn inferred_result_rejects_conflicting_payloads_and_shadowed_values() {
     );
     assert!(errors.contains("cannot call value `Ok`"), "{errors}");
 }
+
+/// Module-qualified calls through a prefix the file only item-imported, in a
+/// real `project.toml` layout where modules carry package identities
+/// (willow-jz15.43). `willow check` and `willow build` must agree.
+#[test]
+fn project_item_import_keeps_module_prefix_callable() {
+    const A: &str = "pub enum Op { Eq, Ne }\npub fn twice(n: i64) -> i64 { return n * 2; }\n\
+pub fn name() -> String { return \"a\"; }\nfn secret() -> i64 { return 1; }\n\
+pub class Box { pub v: i64; pub init(self, v: i64) { self.v = v; } \
+pub fn get(self) -> i64 { return self.v; } pub static fn make() -> Box { return new Box(21); } }\n\
+pub fn unbox(b: Box) -> i64 { return b.get() * 2; }\n";
+    const NESTED: &str = "pub enum Kind { K }\npub fn deep(n: i64) -> i64 { return n + 1; }\n";
+    let main = |imports: &str, body: &str| format!("{imports}\nfn main() {{\n{body}\n}}\n");
+    // (perspective, extra files, main source, expected stdout)
+    type Case = (
+        &'static str,
+        Vec<(&'static str, &'static str)>,
+        String,
+        &'static str,
+    );
+    let cases: Vec<Case> = vec![
+        ("1 single enum item", vec![], main("import a::Op;", "println(a::twice(21));"), "42\n"),
+        ("2 braced item", vec![], main("import a::{Op};", "println(a::twice(21));"), "42\n"),
+        ("3 braced fn and enum", vec![], main("import a::{Op, twice};", "println(a::twice(20) + twice(1));"), "42\n"),
+        ("4 aliased item", vec![], main("import a::twice as tw;", "println(a::twice(tw(3)) + 30);"), "42\n"),
+        ("5 class item", vec![], main("import a::Box;", "println(a::twice(new Box(21).get()));"), "42\n"),
+        ("6 string result", vec![], main("import a::Op;", "println(a::name());"), "a\n"),
+        ("7 module class argument", vec![], main("import a::Box;", "println(a::unbox(new Box(21)));"), "42\n"),
+        ("8 qualified static method", vec![], main("import a::Op;", "println(a::Box::make().get() * 2);"), "42\n"),
+        ("9 qualified variant", vec![], main("import a::Op;", "let o = a::Op::Ne;\nprintln(o == Op::Ne);"), "true\n"),
+        ("10 qualified new", vec![], main("import a::Op;", "println(new a::Box(42).get());"), "42\n"),
+        ("11 lambda body", vec![], main("import a::Op;", "let f = |x: i64| a::twice(x);\nprintln(f(21));"), "42\n"),
+        ("12 module import too", vec![], main("import a;\nimport a::Op;", "println(a::twice(21));"), "42\n"),
+        (
+            "13 entry method",
+            vec![],
+            "import a::Op;\nclass C { pub fn d(self) -> i64 { return a::twice(21); } }\nfn main() { println(new C().d()); }\n".into(),
+            "42\n",
+        ),
+        (
+            "14 async main",
+            vec![],
+            "import a::Op;\nasync fn main() { await yield(); println(a::twice(21)); }\n".into(),
+            "42\n",
+        ),
+        (
+            "15 module unit function",
+            vec![("src/c.wi", "import a::Op;\npub fn go() -> i64 { return a::twice(20); }\n")],
+            main("import c::go;", "println(c::go() + go() - 38);"),
+            "42\n",
+        ),
+        (
+            "16 module unit method",
+            vec![("src/c.wi", "import a::Op;\npub class F { pub fn d(self) -> i64 { return a::twice(21); } }\n")],
+            main("import c::F;", "println(new F().d());"),
+            "42\n",
+        ),
+        (
+            "17 module aliased by another file",
+            vec![("src/c.wi", "import a as z;\npub fn go() -> i64 { return z::twice(1); }\n")],
+            main("import c::go;\nimport a::Op;", "println(a::twice(go()) + 38);"),
+            "42\n",
+        ),
+        (
+            "18 nested module",
+            vec![("src/x/y.wi", NESTED)],
+            main("import x::y::Kind;", "println(x::y::deep(41));"),
+            "42\n",
+        ),
+        (
+            "19 two item-imported modules",
+            vec![("src/x/y.wi", NESTED)],
+            main("import a::Op;\nimport x::y::Kind;", "println(a::twice(x::y::deep(20)));"),
+            "42\n",
+        ),
+    ];
+    for (perspective, extra, main_source, expected) in cases {
+        let mut files = vec![
+            ("project.toml", MANIFEST),
+            ("src/main.wi", main_source.as_str()),
+            ("src/a.wi", A),
+        ];
+        files.extend(extra);
+        let project = TestProject::new("item_prefix", &files);
+        let check = project.package_command("check");
+        assert!(
+            check.status.success(),
+            "{perspective}: {}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+        let build = project.package_command("build");
+        assert!(
+            build.status.success(),
+            "{perspective}: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let output = project.run();
+        assert!(
+            output.status.success(),
+            "{perspective}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected,
+            "{perspective}"
+        );
+    }
+    // Rejections stay ordinary diagnostics in both commands, never E0800:
+    // 20 private item, 21 missing item, 22 the module's bare names stay unbound.
+    for (perspective, body, needle) in [
+        ("20 private", "println(a::secret());", "secret"),
+        ("21 missing", "println(a::nope());", "nope"),
+        ("22 bare name", "println(twice(21));", "twice"),
+    ] {
+        let project = TestProject::new(
+            "item_prefix_reject",
+            &[
+                ("project.toml", MANIFEST),
+                ("src/main.wi", &main("import a::Op;", body)),
+                ("src/a.wi", A),
+            ],
+        );
+        for command in ["check", "build"] {
+            let output = project.package_command(command);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success(),
+                "{perspective} {command}: {stderr}"
+            );
+            assert!(
+                stderr.contains(needle) && !stderr.contains("E0800"),
+                "{perspective} {command}: {stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn runnable_item_import_prefix_example() {
+    let project = TestProject::new(
+        "item_import_prefix_example",
+        &[
+            (
+                "project.toml",
+                include_str!("../../example/item_import_prefix/project.toml"),
+            ),
+            (
+                "src/main.wi",
+                include_str!("../../example/item_import_prefix/src/main.wi"),
+            ),
+            (
+                "src/ops.wi",
+                include_str!("../../example/item_import_prefix/src/ops.wi"),
+            ),
+            (
+                "src/report/text.wi",
+                include_str!("../../example/item_import_prefix/src/report/text.wi"),
+            ),
+        ],
+    );
+    assert_success(&project.package_command("check"));
+    assert_success(&project.package_command("build"));
+    let output = project.run();
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\nx != y\n==\n");
+}

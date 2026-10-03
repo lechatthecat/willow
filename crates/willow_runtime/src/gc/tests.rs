@@ -320,7 +320,7 @@ fn multi_mutator_stw_keeps_other_thread_roots_alive_through_generated_gate() {
         let b = willow_alloc_object(0, 8);
         let mut b_slot = b;
         willow_push_root(&mut b_slot as *mut *mut u8);
-        assert_eq!(crate::preempt::willow_sync_native_active(), 0);
+        assert!(crate::preempt::willow_sync_poll_counter().is_null());
         let stop = willow_gc_stop_flag();
         assert_eq!(stop, willow_gc_stop_flag());
         r2.store(true, Ordering::SeqCst);
@@ -921,6 +921,7 @@ fn compact_static_header_reclamation_keeps_hole_size() {
         generation: GC_GENERATION_YOUNG,
         age: 0,
         descriptor_owned: false,
+        remembered: 0,
         descriptor: &DESCRIPTOR as *const _ as usize,
     };
     let object = HeapObject::from_raw(&mut header).unwrap();
@@ -957,6 +958,14 @@ fn test_gc_generated_header_and_tlab_abi_layout() {
     assert_eq!(std::mem::offset_of!(GcHeader, generation), 2);
     assert_eq!(std::mem::offset_of!(GcHeader, age), 3);
     assert_eq!(std::mem::offset_of!(GcHeader, descriptor_owned), 4);
+    assert_eq!(
+        std::mem::offset_of!(GcHeader, remembered),
+        willow_abi::gc_header::REMEMBERED_OFFSET as usize
+    );
+    assert_eq!(
+        std::mem::offset_of!(GcHeader, generation),
+        willow_abi::gc_header::GENERATION_OFFSET as usize
+    );
     assert_eq!(std::mem::offset_of!(GcHeader, descriptor), 8);
     assert_eq!(GC_TLAB_STATE_SIZE, 24);
     assert_eq!(GC_TLAB_STATE_SIZE as u32, willow_abi::tlab::STATE_SIZE);

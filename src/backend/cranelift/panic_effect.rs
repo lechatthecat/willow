@@ -19,7 +19,7 @@ use crate::compiler_db::effects::EffectQueries;
 use crate::module::UnitId;
 use crate::parser::ast::*;
 use crate::semantic::effects::RuntimeEffects;
-use crate::semantic::ids::{FunctionId, FunctionMap};
+use crate::semantic::ids::{FunctionId, FunctionMap, TypeId};
 
 use super::symbols::{
     class_member_symbol, class_method_symbol_name, module_item_symbol, module_symbol_prefix,
@@ -272,6 +272,7 @@ impl Codegen {
         let mut ordered = effects.into_iter().collect::<Vec<_>>();
         ordered.sort_by(|left, right| left.0.cmp(&right.0));
         *self.dispatch_cache.get_mut() = Default::default();
+        self.interface_slot_summaries.get_mut().clear();
         let log = std::env::var_os("WILLOW_PANIC_EFFECTS_LOG").is_some();
         for (name, may_panic) in ordered {
             if log {
@@ -289,6 +290,65 @@ impl Codegen {
 impl FuncGen<'_, '_> {
     pub(super) fn user_function_may_panic(&self, name: &str) -> bool {
         !optimization_enabled() || self.function_may_panic.get(name).copied().unwrap_or(true)
+    }
+
+    /// What every function an `interface` vtable slot for `method` can hold
+    /// guarantees. Every vtable of the build is declared before any body is
+    /// lowered, so the slot targets are complete here; a re-dispatching thunk
+    /// or an unresolved slot keeps the conservative answer (willow-8hq4.14).
+    pub(super) fn interface_slot_summary(
+        &self,
+        interface: TypeId,
+        method: &str,
+    ) -> super::emit_interface::InterfaceSlotSummary {
+        let key = (interface, method.to_string());
+        if let Some(&cached) = self.interface_slot_summaries.borrow().get(&key) {
+            return cached;
+        }
+        let mut summary = super::emit_interface::InterfaceSlotSummary {
+            direct_targets: [None; 4],
+            may_panic: !optimization_enabled(),
+            needs_receiver_root: false,
+        };
+        let mut target_count = 0;
+        match self.interface_slot_targets.get(&key) {
+            None => {
+                summary.may_panic = true;
+                summary.needs_receiver_root = true;
+            }
+            Some(targets) => {
+                for target in targets {
+                    let Some(target) = target else {
+                        summary.may_panic = true;
+                        summary.needs_receiver_root = true;
+                        summary.direct_targets = [None; 4];
+                        break;
+                    };
+                    summary.may_panic |= self
+                        .function_may_panic
+                        .get_id(&target.id)
+                        .copied()
+                        .unwrap_or(true);
+                    summary.needs_receiver_root |= !target.roots_receiver;
+                    if target_count <= summary.direct_targets.len()
+                        && let Some(&fid) = self.func_ids.get_id(&target.id)
+                        && !summary.direct_targets.contains(&Some(fid))
+                    {
+                        if target_count < summary.direct_targets.len() {
+                            summary.direct_targets[target_count] = Some(fid);
+                        }
+                        target_count += 1;
+                    }
+                }
+            }
+        }
+        if target_count > summary.direct_targets.len() {
+            summary.direct_targets = [None; 4];
+        }
+        self.interface_slot_summaries
+            .borrow_mut()
+            .insert(key, summary);
+        summary
     }
 
     /// Snapshot panic depth only for a direct call whose callee was not proven

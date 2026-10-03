@@ -439,3 +439,73 @@ fn young_source_accepts_only_exact_pre_cycle_young_payloads() {
     drop(state);
     reset_internal();
 }
+
+#[test]
+fn remembered_header_flag_mirrors_remembered_set_membership() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    reset_internal();
+    let remembered = |payload: *mut u8| unsafe { (*payload_to_header(payload)).remembered };
+    let mut tls = tlab_state_for_test();
+    let child = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
+    let other_old = willow_alloc_typed(8, 0);
+    let owner = willow_alloc_typed(8, 1);
+    assert_eq!(remembered(owner), 0, "fresh old objects start unremembered");
+    // An old-to-old edge does not remember the owner.
+    willow_gc_write_barrier(
+        owner,
+        std::ptr::null_mut(),
+        other_old,
+        GcStoreDestination::ObjectField as i64,
+    );
+    assert_eq!(remembered(owner), 0);
+    assert_eq!(willow_gc_remembered_set_size(), 0);
+    // An old-to-young edge sets the flag together with the set entry.
+    willow_gc_write_barrier(
+        owner,
+        other_old,
+        child,
+        GcStoreDestination::ObjectField as i64,
+    );
+    unsafe { *owner.cast::<*mut u8>() = child };
+    assert_eq!(remembered(owner), 1);
+    assert_eq!(willow_gc_remembered_set_size(), 1);
+    // A repeated store keeps one entry and the flag.
+    willow_gc_write_barrier(owner, child, child, GcStoreDestination::ObjectField as i64);
+    assert_eq!(willow_gc_remembered_set_size(), 1);
+    // The survivor copy is still young: the collector re-remembers the owner.
+    collect(vec![]);
+    assert_eq!(remembered(owner), 1);
+    assert_eq!(willow_gc_remembered_set_size(), 1);
+    // Tenuring the child removes the entry and clears the flag.
+    collect(vec![]);
+    assert_eq!(
+        unsafe { (*payload_to_header(*owner.cast::<*mut u8>())).generation },
+        GC_GENERATION_OLD
+    );
+    assert_eq!(remembered(owner), 0);
+    assert_eq!(willow_gc_remembered_set_size(), 0);
+    reset_internal();
+}
+
+#[test]
+fn in_place_promotion_clears_stale_remembered_byte() {
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    reset_internal();
+    let mut tls = tlab_state_for_test();
+    let pinned = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
+    // Generated TLAB allocation does not write the remembered byte, so a
+    // recycled chunk can leave a stale nonzero value in a young header.
+    unsafe { (*payload_to_header(pinned)).remembered = 1 };
+    // A direct root is promoted in place; the verifier in `collect` checks
+    // that the old object's flag matches remembered-set membership.
+    collect(vec![pinned]);
+    assert_eq!(
+        unsafe { (*payload_to_header(pinned)).generation },
+        GC_GENERATION_OLD
+    );
+    assert_eq!(unsafe { (*payload_to_header(pinned)).remembered }, 0);
+    assert_eq!(willow_gc_remembered_set_size(), 0);
+    reset_internal();
+}

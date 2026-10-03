@@ -53,18 +53,176 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return self.emit_array_access(array, Some(index), Some(word));
         }
         let array = self.emit_lir_operand(function, array);
-        // A frame-backed local is only an interior edge of the rooted frame.
-        // Pin its loaded SSA value across allocating interface coercions.
-        self.emit_push_root(array);
-        let index = self.emit_lir_operand(function, index);
         let source_ty = Self::flat_operand_type(function, value);
+        // A frame-backed local is only an interior edge of the rooted frame.
+        // Only an interface-boxing coercion allocates, so only it needs the
+        // loaded owner pinned.
+        let boxes = self.coercion_boxes(&source_ty, element_ty);
+        if boxes {
+            self.emit_push_root(array);
+        }
+        let index = self.emit_lir_operand(function, index);
         let value = self.emit_lir_operand(function, value);
         let value = self.coerce_to_target(value, &source_ty, element_ty);
         let value = self.coerce_to_i64(value, element_ty);
-        self.emit_void_runtime_call("willow_array_set", &[array, index, value]);
-        self.emit_pop_roots_n(1);
-        self.gc_root_count -= 1;
+        self.emit_word_array_store(array, index, value);
+        if boxes {
+            self.emit_pop_roots_n(1);
+            self.gc_root_count -= 1;
+        }
         self.builder.ins().iconst(types::I64, 0)
+    }
+
+    /// Inline bounds-checked store of a non-scalar element word
+    /// (willow-8hq4.15). Like `willow_array_set`, the buffer's `H_IS_REF`
+    /// word selects the barrier. A reference store skips the fused barrier
+    /// call when it is a no-op: no SATB epoch is active and the word is null,
+    /// the buffer is not old, or the buffer is already remembered (a header
+    /// flag the runtime keeps equal to remembered-set membership). Otherwise
+    /// it captures the old element, calls `willow_gc_write_barrier`, and
+    /// publishes atomically. Invalid accesses take the panicking runtime
+    /// store. Nothing between the phase load and the store reaches a
+    /// safepoint, matching the runtime barrier/store pair.
+    fn emit_word_array_store(&mut self, array: Value, index: Value, word: Value) {
+        use willow_abi::{array_layout as layout, gc_header};
+        let ptr_ty = reference_type(self.module.target_config());
+        let inspect = self.builder.create_block();
+        let access = self.builder.create_block();
+        let plain = self.builder.create_block();
+        let barrier = self.builder.create_block();
+        self.builder.set_cold_block(barrier);
+        let slow = self.builder.create_block();
+        self.builder.set_cold_block(slow);
+        let done = self.builder.create_block();
+
+        let null = self.builder.ins().icmp_imm_s(IntCC::Equal, array, 0);
+        self.builder.ins().brif(null, slow, &[], inspect, &[]);
+        self.builder.switch_to_block(inspect);
+        self.builder.seal_block(inspect);
+        let len = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            array,
+            layout::handle_offset(layout::H_LEN),
+        );
+        let in_bounds = self.builder.ins().icmp(IntCC::UnsignedLessThan, index, len);
+        let nonnegative = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, len, 0);
+        let valid = self.builder.ins().band(in_bounds, nonnegative);
+        self.builder.ins().brif(valid, access, &[], slow, &[]);
+
+        self.builder.switch_to_block(access);
+        self.builder.seal_block(access);
+        let buffer = self.builder.ins().load(
+            ptr_ty,
+            MemFlagsData::new(),
+            array,
+            layout::handle_offset(layout::H_BUF),
+        );
+        let offset = self
+            .builder
+            .ins()
+            .imul_imm_s(index, i64::from(layout::WORD_BYTES));
+        let offset = if ptr_ty == types::I64 {
+            offset
+        } else {
+            self.builder.ins().ireduce(ptr_ty, offset)
+        };
+        let slot = self.builder.ins().iadd(buffer, offset);
+        let slot = self.builder.ins().iadd_imm_s(
+            slot,
+            i64::from(layout::BUFFER_HEADER_WORDS as i32 * layout::WORD_BYTES),
+        );
+        let is_ref = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            array,
+            layout::handle_offset(layout::H_IS_REF),
+        );
+        let is_ref = self.builder.ins().icmp_imm_s(IntCC::NotEqual, is_ref, 0);
+        let phase_data = self
+            .module
+            .declare_data(
+                willow_abi::GC_MARK_PHASE_SYMBOL,
+                cranelift_module::Linkage::Import,
+                false,
+                false,
+            )
+            .expect("GC mark phase symbol");
+        let phase_global = self
+            .module
+            .declare_data_in_func(phase_data, self.builder.func);
+        let phase_addr = self.builder.ins().symbol_value(ptr_ty, phase_global);
+        let phase = self
+            .builder
+            .ins()
+            .atomic_load(types::I8, MemFlagsData::trusted(), phase_addr);
+        let marking = self.builder.ins().icmp_imm_s(IntCC::NotEqual, phase, 0);
+        let header = -(gc_header::size(ptr_ty.bytes()) as i32);
+        let generation = self.builder.ins().load(
+            types::I8,
+            MemFlagsData::trusted(),
+            buffer,
+            header + gc_header::GENERATION_OFFSET as i32,
+        );
+        let remembered = self.builder.ins().load(
+            types::I8,
+            MemFlagsData::trusted(),
+            buffer,
+            header + gc_header::REMEMBERED_OFFSET as i32,
+        );
+        let old = self.builder.ins().icmp_imm_s(
+            IntCC::Equal,
+            generation,
+            i64::from(gc_header::GENERATION_OLD),
+        );
+        let unremembered = self.builder.ins().icmp_imm_s(IntCC::Equal, remembered, 0);
+        let nonnull = self.builder.ins().icmp_imm_s(IntCC::NotEqual, word, 0);
+        let new_edge = self.builder.ins().band(old, unremembered);
+        let new_edge = self.builder.ins().band(new_edge, nonnull);
+        let needs_barrier = self.builder.ins().bor(marking, new_edge);
+        let needs_barrier = self.builder.ins().band(is_ref, needs_barrier);
+        self.builder
+            .ins()
+            .brif(needs_barrier, barrier, &[], plain, &[]);
+
+        self.builder.switch_to_block(plain);
+        self.builder.seal_block(plain);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), word, slot, 0);
+        self.builder.ins().jump(done, &[]);
+
+        self.builder.switch_to_block(barrier);
+        self.builder.seal_block(barrier);
+        let previous = self
+            .builder
+            .ins()
+            .atomic_load(types::I64, MemFlagsData::trusted(), slot);
+        let destination = self
+            .builder
+            .ins()
+            .iconst(types::I64, GcStoreDestination::ArrayElement as i64);
+        let barrier_id = self.func_id("willow_gc_write_barrier");
+        let barrier_ref = self
+            .module
+            .declare_func_in_func(barrier_id, self.builder.func);
+        self.builder
+            .ins()
+            .call(barrier_ref, &[buffer, previous, word, destination]);
+        self.builder
+            .ins()
+            .atomic_store(MemFlagsData::trusted(), word, slot);
+        self.builder.ins().jump(done, &[]);
+
+        self.builder.switch_to_block(slow);
+        self.builder.seal_block(slow);
+        self.emit_void_runtime_call("willow_array_set", &[array, index, word]);
+        self.builder.ins().jump(done, &[]);
+        self.builder.switch_to_block(done);
+        self.builder.seal_block(done);
     }
 
     pub(super) fn emit_flat_index(

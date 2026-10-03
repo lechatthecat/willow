@@ -66,6 +66,17 @@ pub(crate) struct CheckedDeclarations {
 }
 
 impl CheckedDeclarations {
+    /// The declaration-level subset of [`CheckedUnit::tables`]: enough to
+    /// normalize a declared type, nothing body-level.
+    pub fn tables(&self) -> CheckerTables<'_> {
+        CheckerTables {
+            symbols: Some(&self.symbols),
+            enums: Some(&self.symbols.enums),
+            normalized_types: Some(&self.normalized_types),
+            ..CheckerTables::default()
+        }
+    }
+
     pub fn into_unit(self) -> CheckedUnit {
         CheckedUnit {
             bodies: Vec::new(),

@@ -271,9 +271,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             ) as i32,
         );
 
+        let slots = self.interface_slot_summary(info.name, method);
         // Pin the hidden receiver even when the interface box is held only by
-        // an async frame's interior slot.
-        self.emit_push_root(obj);
+        // an async frame's interior slot. Nothing between this load and the
+        // callee's entry is a safepoint, so a call whose every target roots
+        // `self` itself before its first safepoint needs no second root
+        // (willow-8hq4.14).
+        let receiver_roots = usize::from(slots.needs_receiver_root);
+        if slots.needs_receiver_root {
+            self.emit_push_root(obj);
+        }
         // The callee is named by its bare method name, and no parameter debug
         // is recorded for it.
         let has_reference_args = param_modes
@@ -303,12 +310,63 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         let mut call_args = vec![obj];
         call_args.extend(arg_vals);
-        // Interface dispatch is indirect; one implementation body being safe
-        // cannot prove the runtime-selected target safe.
-        let panic_depth = self.emit_pre_willow_call_panic_depth();
+        // Interface dispatch is indirect, so only a proof covering every
+        // function any vtable slot for this method holds may skip the panic
+        // bracket (willow-8hq4.14).
+        let panic_depth = if slots.may_panic {
+            self.emit_pre_willow_call_panic_depth()
+        } else {
+            None
+        };
+        let result_ty = (ret_type != Type::Void)
+            .then(|| clif_type(reference_type(self.module.target_config()), &ret_type));
+        let merge = self.builder.create_block();
+        if let Some(ty) = result_ty {
+            self.builder.append_block_param(merge, ty);
+        }
+        // Promote a small polymorphic set without multiplying argument evaluation,
+        // roots, panic handling or cleanup. Each guard compares the actual slot
+        // address; unknown slots and ABI mismatches always retain the fallback.
+        let direct_targets = if self.build_mode == BuildMode::Release {
+            slots.direct_targets
+        } else {
+            [None; 4]
+        };
+        for fid in direct_targets.into_iter().flatten() {
+            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+            // Only promote calls with exactly the same lowered ABI.
+            let target_sig = self.builder.func.dfg.ext_funcs[fref].signature;
+            if self.builder.func.dfg.signatures[target_sig]
+                != self.builder.func.dfg.signatures[sig_ref]
+            {
+                continue;
+            }
+            let addr = self.builder.ins().func_addr(ptr_ty, fref);
+            let matches = self.builder.ins().icmp(
+                cranelift_codegen::ir::condcodes::IntCC::Equal,
+                fnptr,
+                addr,
+            );
+            let direct = self.builder.create_block();
+            let next = self.builder.create_block();
+            self.builder.ins().brif(matches, direct, &[], next, &[]);
+            self.builder.switch_to_block(direct);
+            self.builder.seal_block(direct);
+            let call = self.builder.ins().call(fref, &call_args);
+            let values = self.builder.inst_results(call).to_vec();
+            let values = values.iter().copied().map(Into::into).collect::<Vec<_>>();
+            self.builder.ins().jump(merge, &values);
+            self.builder.switch_to_block(next);
+            self.builder.seal_block(next);
+        }
         let call = self.builder.ins().call_indirect(sig_ref, fnptr, &call_args);
-        let mut result = if ret_type != Type::Void {
-            self.builder.inst_results(call)[0]
+        let values = self.builder.inst_results(call).to_vec();
+        let values = values.iter().copied().map(Into::into).collect::<Vec<_>>();
+        self.builder.ins().jump(merge, &values);
+        self.builder.switch_to_block(merge);
+        self.builder.seal_block(merge);
+        let mut result = if result_ty.is_some() {
+            self.builder.block_params(merge)[0]
         } else {
             self.builder.ins().iconst(types::I64, 0)
         };
@@ -321,8 +379,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if has_reference_args {
             self.emit_flat_reference_call_end();
         }
-        self.emit_pop_roots_n(arg_roots + 1);
-        self.gc_root_count -= arg_roots + 1;
+        self.emit_pop_roots_n(arg_roots + receiver_roots);
+        self.gc_root_count -= arg_roots + receiver_roots;
         self.emit_post_willow_call_panic_check(panic_depth);
         // `-> Self` yields a bare object of the receiver's own class. Re-box it
         // only after the panic edge has rejected the neutral placeholder.

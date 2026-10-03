@@ -1247,7 +1247,7 @@ fn async_chain_inspection_handles_depth_fanout_tombstones_and_cycles() {
 #[test]
 fn cooperative_poll_runs_without_an_active_native_stack() {
     unsafe extern "C" fn poll(_: *mut c_void) -> i32 {
-        assert_eq!(crate::preempt::willow_sync_native_active(), 0);
+        assert!(crate::preempt::willow_sync_poll_counter().is_null());
         RUNTIME_POLL_READY
     }
     let _guard = runtime_test_guard();
@@ -1270,7 +1270,7 @@ fn cooperative_boundary_returns_callback_result_and_releases_stack() {
     unsafe extern "C" fn poll(_: *mut c_void) -> i32 {
         assert_eq!(willow_task_stack_enter(helper, std::ptr::null_mut()), 42);
         willow_task_stack_leave();
-        assert_eq!(crate::preempt::willow_sync_native_active(), 0);
+        assert!(crate::preempt::willow_sync_poll_counter().is_null());
         RUNTIME_POLL_READY
     }
     let _guard = runtime_test_guard();
@@ -1323,7 +1323,7 @@ fn cooperative_boundary_resumes_helper_without_restarting_it() {
 fn cooperative_cancel_bounded_cleanup_avoids_native_stack() {
     static CALLED: AtomicUsize = AtomicUsize::new(0);
     unsafe extern "C" fn cleanup(_: *mut c_void) {
-        assert_eq!(crate::preempt::willow_sync_native_active(), 0);
+        assert!(crate::preempt::willow_sync_poll_counter().is_null());
         CALLED.fetch_add(1, Ordering::SeqCst);
     }
     let _guard = runtime_test_guard();
@@ -1353,7 +1353,7 @@ fn cooperative_cancel_bounded_cleanup_avoids_native_stack() {
 fn cooperative_cancel_unbounded_cleanup_retains_native_stack() {
     static CALLED: AtomicUsize = AtomicUsize::new(0);
     unsafe extern "C" fn cleanup(_: *mut c_void) {
-        assert_eq!(crate::preempt::willow_sync_native_active(), 1);
+        assert!(!crate::preempt::willow_sync_poll_counter().is_null());
         CALLED.fetch_add(1, Ordering::SeqCst);
     }
     let _guard = runtime_test_guard();
@@ -5168,4 +5168,369 @@ fn sched_drive_nested_unwind_restores_poll_and_outer_task() {
     assert_eq!(current_task_id(), None);
     assert_eq!(willow_sched_run(), 1);
     reset_internal_for_test();
+}
+
+// ── Terminal frame roots end with their grace period (willow-vjaf) ────────
+//
+// Terminal frames used to stay runtime roots until the OUTERMOST drive
+// returned, so a long-running async main retained every frame it ever
+// finished. Perspectives (the remaining ones live in `frame_reclaim.rs` and
+// tests/integration/concurrency/frame_reclaim.rs):
+//
+//  1. a long single-worker drive keeps at most one release batch of retired
+//     frames rooted, independent of how many tasks finished
+//  2. the same with the multi-worker pool
+//  3. released frames are actually reclaimed by the collector mid-drive
+//  4. a poll paused in a nested drive holds back every frame retired inside it
+//  5. those frames are released once the paused poll ends, before the
+//     outermost drive does
+//  6. a frame reached through a handle survives release and keeps its result
+//     (await of an already-completed task)
+//  7. cancelled tasks' frames are retired and released like completed ones
+//  8. release pops only the retired prefix below the bound, in order
+//  9. the release flag is raised at the batch threshold, and the threshold
+//     doubles over the frames a blocked scan had to keep
+// 10. the outermost drive end releases a sub-threshold remainder
+// 11. the test reset drops queued retired frames
+
+const VJAF_LONG_DRIVE_TASKS: i64 = 2_000;
+static VJAF_MAX_FRAME_ROOTS: TestAtomicU64 = TestAtomicU64::new(0);
+
+fn vjaf_note_frame_roots() {
+    VJAF_MAX_FRAME_ROOTS.fetch_max(willow_sched_frame_root_count(), TestOrdering::SeqCst);
+}
+
+/// Long-running driver: each poll starts one ready child and yields, until
+/// `VJAF_LONG_DRIVE_TASKS` children were started.
+unsafe extern "C" fn poll_spawn_child_then_yield(frame: *mut c_void) -> i32 {
+    let started = unsafe { &mut *((frame as *mut u8).add(async_frame_slot_offset(0)) as *mut i64) };
+    vjaf_note_frame_roots();
+    if *started == VJAF_LONG_DRIVE_TASKS {
+        return RUNTIME_POLL_READY;
+    }
+    *started += 1;
+    let child = willow_async_frame_alloc(0, 0);
+    willow_sched_spawn(poll_ready_now, child);
+    RUNTIME_POLL_YIELD
+}
+
+fn run_long_drive() -> u64 {
+    VJAF_MAX_FRAME_ROOTS.store(0, TestOrdering::SeqCst);
+    let driver = willow_async_frame_alloc(1, 0);
+    willow_sched_spawn(poll_spawn_child_then_yield, driver);
+    assert_eq!(
+        willow_sched_run(),
+        VJAF_LONG_DRIVE_TASKS + 1,
+        "every child and the driver complete"
+    );
+    VJAF_MAX_FRAME_ROOTS.load(TestOrdering::SeqCst)
+}
+
+#[test]
+fn vjaf_01_long_single_worker_drive_keeps_one_release_batch() {
+    let _guard = runtime_test_guard();
+    let _single = single_worker_for_test();
+    reset_stress_fixture();
+    let peak = run_long_drive();
+    // Driver + at most one queued child + one batch awaiting its scan.
+    assert!(
+        peak <= FRAME_RELEASE_MIN_BATCH as u64 + 2,
+        "peak {peak} frame roots for {VJAF_LONG_DRIVE_TASKS} finished tasks"
+    );
+    assert_global_metadata_reaped("long single-worker drive");
+    willow_gc_collect();
+    assert_eq!(willow_gc_allocated_bytes(), 0);
+    reset_stress_fixture();
+}
+
+#[test]
+fn vjaf_02_long_parallel_drive_stays_bounded() {
+    let _guard = runtime_test_guard();
+    reset_stress_fixture();
+    let peak = run_long_drive();
+    // Concurrent polls can each hold back what finishes during them, and the
+    // doubling threshold allows twice that; still far below the task count.
+    assert!(
+        peak < VJAF_LONG_DRIVE_TASKS as u64 / 4,
+        "peak {peak} frame roots for {VJAF_LONG_DRIVE_TASKS} finished tasks"
+    );
+    assert_global_metadata_reaped("long parallel drive");
+    willow_gc_collect();
+    assert_eq!(willow_gc_allocated_bytes(), 0);
+    reset_stress_fixture();
+}
+
+static VJAF_MAX_LIVE_BYTES: TestAtomicU64 = TestAtomicU64::new(0);
+
+/// Like `poll_spawn_child_then_yield`, but collects every 100 children and
+/// records the live heap, so released frames must actually be freed.
+unsafe extern "C" fn poll_spawn_child_collect_then_yield(frame: *mut c_void) -> i32 {
+    let started = unsafe { &mut *((frame as *mut u8).add(async_frame_slot_offset(0)) as *mut i64) };
+    if *started % 100 == 0 {
+        willow_gc_collect();
+        VJAF_MAX_LIVE_BYTES.fetch_max(willow_gc_allocated_bytes() as u64, TestOrdering::SeqCst);
+    }
+    if *started == VJAF_LONG_DRIVE_TASKS {
+        return RUNTIME_POLL_READY;
+    }
+    *started += 1;
+    let child = willow_async_frame_alloc(0, 0);
+    willow_sched_spawn(poll_ready_now, child);
+    RUNTIME_POLL_YIELD
+}
+
+#[test]
+fn vjaf_03_released_frames_are_collected_during_the_drive() {
+    let _guard = runtime_test_guard();
+    let _single = single_worker_for_test();
+    reset_stress_fixture();
+    VJAF_MAX_LIVE_BYTES.store(0, TestOrdering::SeqCst);
+    let driver = willow_async_frame_alloc(1, 0);
+    willow_sched_spawn(poll_spawn_child_collect_then_yield, driver);
+    willow_sched_run();
+    let frame_bytes = {
+        willow_gc_collect();
+        let before = willow_gc_allocated_bytes();
+        let frame = willow_async_frame_alloc(0, 0);
+        let after = willow_gc_allocated_bytes();
+        assert!(!frame.is_null());
+        (after - before) as u64
+    };
+    let peak = VJAF_MAX_LIVE_BYTES.load(TestOrdering::SeqCst);
+    assert!(
+        peak <= frame_bytes * (FRAME_RELEASE_MIN_BATCH as u64 + 4),
+        "peak live heap {peak} B with {frame_bytes} B frames"
+    );
+    reset_stress_fixture();
+    willow_gc_collect();
+    assert_eq!(willow_gc_allocated_bytes(), 0);
+}
+
+const VJAF_NESTED_CHILDREN: u64 = 3 * FRAME_RELEASE_MIN_BATCH as u64;
+static VJAF_NESTED_HELD: TestAtomicU64 = TestAtomicU64::new(0);
+static VJAF_ROOTS_AFTER_OUTER: TestAtomicU64 = TestAtomicU64::new(u64::MAX);
+
+/// Starts many ready children, drives them to completion in a nested drive,
+/// and records how many frame roots are still held while this poll runs.
+unsafe extern "C" fn poll_nested_children(_frame: *mut c_void) -> i32 {
+    let mut last = 0;
+    for _ in 0..VJAF_NESTED_CHILDREN {
+        last = willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(0, 0));
+    }
+    willow_sched_run_until(last);
+    // Drive any child the target overtook as well.
+    willow_sched_run();
+    VJAF_NESTED_HELD.store(willow_sched_frame_root_count(), TestOrdering::SeqCst);
+    RUNTIME_POLL_READY
+}
+
+/// Runs after the nested-drive task finished: by now its unit is over, and
+/// enough retirements happened for the scan to run at least once.
+unsafe extern "C" fn poll_observe_after_outer(frame: *mut c_void) -> i32 {
+    let polls = unsafe { &mut *((frame as *mut u8).add(async_frame_slot_offset(0)) as *mut i64) };
+    *polls += 1;
+    if *polls < 2 * FRAME_RELEASE_MIN_BATCH as i64 {
+        // Keep finishing fresh tasks so the release threshold is reached.
+        willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(0, 0));
+        return RUNTIME_POLL_YIELD;
+    }
+    VJAF_ROOTS_AFTER_OUTER.store(willow_sched_frame_root_count(), TestOrdering::SeqCst);
+    RUNTIME_POLL_READY
+}
+
+#[test]
+fn vjaf_04_nested_drive_holds_frames_until_the_paused_poll_ends() {
+    let _guard = runtime_test_guard();
+    let _single = single_worker_for_test();
+    reset_stress_fixture();
+    VJAF_NESTED_HELD.store(0, TestOrdering::SeqCst);
+    VJAF_ROOTS_AFTER_OUTER.store(u64::MAX, TestOrdering::SeqCst);
+    let outer = willow_sched_spawn(poll_nested_children, willow_async_frame_alloc(0, 0));
+    willow_sched_run_until(outer);
+    let observer = willow_async_frame_alloc(1, 0);
+    willow_sched_spawn(poll_observe_after_outer, observer);
+    willow_sched_run();
+    let held = VJAF_NESTED_HELD.load(TestOrdering::SeqCst);
+    assert_eq!(
+        held,
+        VJAF_NESTED_CHILDREN + 1,
+        "perspective 4: the paused outer poll holds back every child frame"
+    );
+    let after = VJAF_ROOTS_AFTER_OUTER.load(TestOrdering::SeqCst);
+    assert!(
+        after <= FRAME_RELEASE_MIN_BATCH as u64 + 2,
+        "perspective 5: {after} roots once the outer poll ended"
+    );
+    assert_global_metadata_reaped("nested drive release");
+    reset_stress_fixture();
+}
+
+const VJAF_RESULT: i64 = 4242;
+
+unsafe extern "C" fn poll_write_result(frame: *mut c_void) -> i32 {
+    unsafe { *((frame as *mut u8).add(async_frame_slot_offset(0)) as *mut i64) = VJAF_RESULT };
+    RUNTIME_POLL_READY
+}
+
+#[test]
+fn vjaf_06_handle_keeps_released_frame_and_result_alive() {
+    let _guard = runtime_test_guard();
+    reset_stress_fixture();
+    // The holder's slot 0 is a GC reference, like an awaiter's `Task` slot.
+    let holder = willow_async_frame_alloc(1, 0b1) as *mut u8;
+    crate::gc::willow_gc_add_runtime_root(holder);
+    let child = willow_async_frame_alloc(1, 0);
+    unsafe {
+        crate::gc::willow_gc_write_barrier(
+            holder,
+            std::ptr::null_mut(),
+            child as *mut u8,
+            willow_abi::GcStoreDestination::AsyncFrameSlot as i64,
+        );
+        *(holder.add(async_frame_slot_offset(0)) as *mut *mut c_void) = child;
+    }
+    willow_sched_spawn(poll_write_result, child);
+    assert_eq!(willow_sched_run(), 1);
+    assert_eq!(
+        willow_sched_frame_root_count(),
+        0,
+        "the runtime root is gone"
+    );
+    willow_gc_collect();
+    crate::gc::willow_gc_minor_collect();
+    let child = unsafe { *(holder.add(async_frame_slot_offset(0)) as *const *mut c_void) };
+    assert!(crate::async_frame::frame_is_terminal(child));
+    let result = unsafe { *((child as *mut u8).add(async_frame_slot_offset(0)) as *const i64) };
+    assert_eq!(result, VJAF_RESULT, "the awaiter still reads the result");
+    crate::gc::willow_gc_remove_runtime_root(holder);
+    willow_gc_collect();
+    assert_eq!(willow_gc_allocated_bytes(), 0);
+    reset_stress_fixture();
+}
+
+static VJAF_CANCEL_CLEANUPS: TestAtomicU64 = TestAtomicU64::new(0);
+
+unsafe extern "C" fn vjaf_count_cancel(_frame: *mut c_void) {
+    VJAF_CANCEL_CLEANUPS.fetch_add(1, TestOrdering::SeqCst);
+}
+
+#[test]
+fn vjaf_07_cancelled_frames_are_released_too() {
+    let _guard = runtime_test_guard();
+    let _single = single_worker_for_test();
+    reset_stress_fixture();
+    VJAF_CANCEL_CLEANUPS.store(0, TestOrdering::SeqCst);
+    let count = 2 * FRAME_RELEASE_MIN_BATCH as u64;
+    let ids: Vec<u64> = (0..count)
+        .map(|_| {
+            let id = willow_sched_spawn(poll_ready_on_second, willow_async_frame_alloc(0, 0));
+            willow_sched_set_cancel_fn(id, vjaf_count_cancel);
+            id
+        })
+        .collect();
+    // First polls park every task.
+    willow_sched_run();
+    assert_eq!(willow_sched_frame_root_count(), count);
+    for id in ids {
+        willow_sched_cancel(id);
+    }
+    willow_sched_run();
+    assert_eq!(VJAF_CANCEL_CLEANUPS.load(TestOrdering::SeqCst), count);
+    assert_global_metadata_reaped("cancelled frames");
+    willow_gc_collect();
+    assert_eq!(willow_gc_allocated_bytes(), 0);
+    reset_stress_fixture();
+}
+
+/// Retire `count` real (unrooted, uncollected) frames through a standalone
+/// scheduler; completion publishes the terminal status into the frame.
+fn vjaf_retire(s: &mut RuntimeScheduler, count: usize) -> Vec<usize> {
+    (0..count)
+        .map(|_| {
+            let frame = willow_async_frame_alloc(0, 0);
+            let id = s.spawn_task(poll_ready_now, frame);
+            assert_eq!(s.claim_ready_for_worker(0), Some(id));
+            s.complete(id);
+            s.clear_running();
+            frame as usize
+        })
+        .collect()
+}
+
+#[test]
+fn vjaf_08_release_pops_only_the_prefix_below_the_bound() {
+    let _guard = runtime_test_guard();
+    reset_stress_fixture();
+    let mut s = RuntimeScheduler::with_worker_count(1);
+    let frames = vjaf_retire(&mut s, 3);
+    let tags: Vec<u64> = s.pending_frame_unroots.iter().map(|r| r.tag).collect();
+    assert!(tags.windows(2).all(|pair| pair[0] < pair[1]));
+    assert_eq!(s.frame_roots, 3);
+    assert_eq!(s.take_quiescent_frame_unroots(tags[0]), Vec::<usize>::new());
+    assert_eq!(s.take_quiescent_frame_unroots(tags[1]), frames[..1]);
+    assert_eq!(s.frame_roots, 2);
+    assert_eq!(s.take_quiescent_frame_unroots(u64::MAX), frames[1..]);
+    assert_eq!(s.frame_roots, 0);
+    drop(s);
+    reset_stress_fixture();
+}
+
+#[test]
+fn vjaf_09_release_threshold_doubles_over_kept_frames() {
+    let _guard = runtime_test_guard();
+    reset_stress_fixture();
+    let mut s = RuntimeScheduler::with_worker_count(1);
+    FRAME_RELEASE_DUE.store(false, Ordering::SeqCst);
+    vjaf_retire(&mut s, FRAME_RELEASE_MIN_BATCH - 1);
+    assert!(!FRAME_RELEASE_DUE.load(Ordering::SeqCst), "below the batch");
+    vjaf_retire(&mut s, 1);
+    assert!(
+        FRAME_RELEASE_DUE.swap(false, Ordering::SeqCst),
+        "at the batch"
+    );
+    // A scan blocked by a unit keeps everything: the next scan waits for
+    // twice as many pending frames.
+    let first_tag = s.pending_frame_unroots[0].tag;
+    assert!(s.take_quiescent_frame_unroots(first_tag).is_empty());
+    assert_eq!(s.frame_release_scan_at, 2 * FRAME_RELEASE_MIN_BATCH);
+    vjaf_retire(&mut s, FRAME_RELEASE_MIN_BATCH - 1);
+    assert!(!FRAME_RELEASE_DUE.load(Ordering::SeqCst));
+    vjaf_retire(&mut s, 1);
+    assert!(FRAME_RELEASE_DUE.swap(false, Ordering::SeqCst));
+    assert_eq!(
+        s.take_quiescent_frame_unroots(u64::MAX).len(),
+        2 * FRAME_RELEASE_MIN_BATCH
+    );
+    assert_eq!(s.frame_release_scan_at, FRAME_RELEASE_MIN_BATCH);
+    drop(s);
+    reset_stress_fixture();
+}
+
+#[test]
+fn vjaf_10_outermost_drive_end_releases_a_partial_batch() {
+    let _guard = runtime_test_guard();
+    reset_stress_fixture();
+    for _ in 0..3 {
+        willow_sched_spawn(poll_ready_now, willow_async_frame_alloc(0, 0));
+    }
+    assert_eq!(willow_sched_run(), 3);
+    assert_global_metadata_reaped("partial batch");
+    reset_stress_fixture();
+}
+
+#[test]
+fn vjaf_11_reset_drops_queued_retired_frames() {
+    let _guard = runtime_test_guard();
+    reset_stress_fixture();
+    let frame = willow_async_frame_alloc(0, 0);
+    let id = willow_sched_spawn(poll_ready_now, frame);
+    with_global_for_test(|sched| {
+        assert_eq!(sched.claim_ready_for_worker(0), Some(id));
+        sched.complete(id);
+        sched.clear_running();
+        assert_eq!(sched.pending_frame_unroots.len(), 1);
+    });
+    reset_stress_fixture();
+    willow_gc_collect();
+    assert_eq!(willow_gc_allocated_bytes(), 0);
 }

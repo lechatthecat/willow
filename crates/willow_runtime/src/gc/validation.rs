@@ -24,6 +24,11 @@ pub(super) fn verify_remembered_set(
     }
     for object in old_objects {
         let owner = object.payload().as_ptr() as usize;
+        if object.remembered() != state.remembered_set.contains(&owner) {
+            return Err(format!(
+                "old object 0x{owner:x} remembered flag disagrees with the remembered set"
+            ));
+        }
         for slot in object_reference_slots(object, trace_registry) {
             if slot.is_null() {
                 continue;

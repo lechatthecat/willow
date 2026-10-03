@@ -1,0 +1,10 @@
+// Module-qualified calls through prefixes this file only item-imported, in a
+// project.toml build where modules carry package identities (willow-jz15.43).
+import ops::Op;
+import report::text::Filter;
+
+fn main() {
+    println(ops::twice(21));
+    println(new Filter(Op::Ne).describe());
+    println(ops::op_text(ops::Op::Eq));
+}

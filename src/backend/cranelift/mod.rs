@@ -22,6 +22,19 @@ mod module_index;
 use module_index::ModuleSymbols;
 mod type_index;
 use type_index::{TypeMap, TypeScope, VtableMap};
+
+/// `(canonical interface, method)` -> every function a vtable slot for that
+/// method can hold; see `Codegen::interface_slot_targets`.
+type InterfaceSlotTargets = HashMap<(TypeId, String), Vec<Option<SlotTarget>>>;
+
+/// One direct method body an interface vtable slot points at.
+#[derive(Clone, Copy, Debug)]
+struct SlotTarget {
+    id: FunctionId,
+    /// A synchronous method roots `self` on entry before its first safepoint,
+    /// or never reaches one; an async constructor allocates its frame first.
+    roots_receiver: bool,
+}
 mod ast_passes;
 mod async_codegen;
 mod class_view;
@@ -182,6 +195,15 @@ pub struct Codegen {
     /// point at, so one thunk is emitted however many interfaces a class
     /// implements the method for (willow-tygf).
     vtable_thunk_ids: HashMap<(String, String), FuncId>,
+    /// Every function that can occupy an interface method's vtable slot,
+    /// build-wide: one entry per `(class, interface)` vtable, `None` for a
+    /// re-dispatching thunk or an unresolved slot (willow-8hq4.14).
+    interface_slot_targets: InterfaceSlotTargets,
+    // Canonical identities make this independent of per-unit alias scopes.
+    interface_slot_summaries:
+        std::cell::RefCell<HashMap<(TypeId, String), emit_interface::InterfaceSlotSummary>>,
+    /// Declaration identities of `async` methods, build-wide.
+    async_methods: HashSet<FunctionId>,
     /// Global storage for each `static [mut] name: T = expr` property: the
     /// registered (module-qualified) class name, then the field (willow-qsqf).
     /// Each slot holds 8 bytes (i64/ptr/f64/bool).
@@ -434,6 +456,9 @@ impl Codegen {
             lir_lambdas: HashMap::new(),
             vtable_ids: VtableMap::with_scope(type_scope.clone()),
             vtable_thunk_ids: HashMap::new(),
+            interface_slot_targets: HashMap::new(),
+            interface_slot_summaries: Default::default(),
+            async_methods: HashSet::new(),
             static_storage: TypeMap::with_scope(type_scope.clone()),
             module_init_plan: ModuleInitPlan::default(),
             unit_static_inits: HashMap::new(),
@@ -1204,6 +1229,11 @@ impl Codegen {
     /// Find the func_id for `class_name::method_name`, searching the class and
     /// then its ancestors (an inherited method satisfies the interface).
     fn resolve_class_method_func_id(&self, class_name: &str, method_name: &str) -> Option<FuncId> {
+        let mangled = self.resolve_class_method_symbol(class_name, method_name)?;
+        self.func_ids.get(&mangled).copied()
+    }
+
+    fn resolve_class_method_symbol(&self, class_name: &str, method_name: &str) -> Option<String> {
         let defining =
             self.dispatch_cache
                 .borrow_mut()
@@ -1218,8 +1248,11 @@ impl Codegen {
                     };
                     (defines, parent)
                 })?;
-        let mangled = class_method_symbol_name(&self.known_modules, &defining, method_name);
-        self.func_ids.get(&mangled).copied()
+        Some(class_method_symbol_name(
+            &self.known_modules,
+            &defining,
+            method_name,
+        ))
     }
 
     pub fn embed_runtime_metadata(&mut self, metadata: &str) -> Result<()> {
@@ -1472,7 +1505,8 @@ struct FuncGen<'a, 'b> {
     panic_depth_snapshot: Option<(cranelift_codegen::ir::Block, cranelift_codegen::ir::Value)>,
     emitting_sync_cancel_cleanup: bool,
     sync_cancel_cleanups: HashMap<SyncCancelCleanupKey, cranelift_codegen::ir::Block>,
-    /// Invocation-constant native activity known to dominate the current LIR block.
+    /// Invocation-constant native-stack safepoint countdown pointer (null outside
+    /// task stacks) known to dominate the current LIR block.
     sync_native_active: Option<cranelift_codegen::ir::Value>,
     lir_cleanup_exit: Option<(cranelift_codegen::ir::Block, usize, bool)>,
     /// Debug call-chain frames installed by this generated function and not
@@ -1532,6 +1566,9 @@ struct FuncGen<'a, 'b> {
     dispatch_cache: &'a std::cell::RefCell<emit_interface::DispatchCache>,
     /// Static `(class, interface)` vtable data objects for class→interface boxing.
     vtable_ids: &'a VtableMap<DataId>,
+    interface_slot_targets: &'a InterfaceSlotTargets,
+    interface_slot_summaries:
+        &'a std::cell::RefCell<HashMap<(TypeId, String), emit_interface::InterfaceSlotSummary>>,
     /// When emitting a cooperative poll fn: the async frame pointer, so a
     /// `return` inside nested statement control flow (e.g. a statement-position
     /// match arm, willow-zvkv) stores the result and returns the Ready status
@@ -1696,6 +1733,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .get(name)
             .unwrap_or_else(|| panic!("backend: undeclared runtime symbol `{name}`"))
     }
+    /// Bind a by-value parameter as a plain SSA variable. GC-managed values
+    /// bound this way are NOT rooted; only a body that can never reach a
+    /// safepoint may bind them so (willow-8hq4.14).
+    fn bind_unrooted_param(&mut self, name: &str, ty: &Type, val: cranelift_codegen::ir::Value) {
+        let var = self.builder.declare_var(clif_type(
+            type_helpers::reference_type(self.module.target_config()),
+            ty,
+        ));
+        self.builder.def_var(var, val);
+        self.vars
+            .insert(name.to_string(), VarStorage::Value { var });
+    }
+
     fn bind_param(
         &mut self,
         name: &str,
@@ -1734,15 +1784,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let storage = self.create_local_stack_slot(ty, val);
                 self.vars.insert(name.to_string(), storage);
             }
-            ParamMode::Value => {
-                let var = self.builder.declare_var(clif_type(
-                    type_helpers::reference_type(self.module.target_config()),
-                    ty,
-                ));
-                self.builder.def_var(var, val);
-                self.vars
-                    .insert(name.to_string(), VarStorage::Value { var });
-            }
+            ParamMode::Value => self.bind_unrooted_param(name, ty, val),
             ParamMode::Reference { .. } => {
                 let ptr_ty = reference_type(self.module.target_config());
                 let var = self.builder.declare_var(ptr_ty);

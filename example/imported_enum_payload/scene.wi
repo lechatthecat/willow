@@ -1,0 +1,52 @@
+// A module whose enum carries classes and an interface declared in ANOTHER
+// module, under each name an import can give them: a direct item import
+// (`Rect`), an aliased one (`Caption`), an item-imported interface (`Area`),
+// and the module-qualified `shapes::Label`. Its own functions bind those
+// payloads in `match` and read fields and call methods on them
+// (willow-jz15.38).
+module scene;
+
+import shapes;
+import shapes::Rect;
+import shapes::Area;
+import shapes::Label as Caption;
+
+pub enum Node {
+    Box(Rect),
+    Titled(Rect, Caption),
+    Any(Area),
+    Note(shapes::Label),
+    Maybe(Option<Rect>),
+    Empty,
+}
+
+pub fn width(n: Node) -> i64 {
+    return match n {
+        Node::Box(r) => r.w,
+        Node::Titled(r, _) => r.w,
+        Node::Any(a) => a.area(),
+        Node::Note(l) => l.text.len(),
+        Node::Maybe(m) => match m {
+            Some(r) => r.w,
+            None => -1,
+        },
+        Node::Empty => 0,
+    };
+}
+
+pub fn area(n: Node) -> i64 {
+    return match n {
+        Node::Box(r) => r.area(),
+        Node::Titled(r, c) => r.area() + c.text.len(),
+        Node::Any(a) => a.area(),
+        _ => 0,
+    };
+}
+
+pub fn caption(n: Node) -> String {
+    return match n {
+        Node::Titled(_, c) => c.shout(),
+        Node::Note(l) => l.shout(),
+        _ => "-",
+    };
+}

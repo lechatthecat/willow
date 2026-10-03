@@ -1,0 +1,120 @@
+// Reference-element array stores (willow-8hq4.15).
+//
+// `xs[i] = value` on an array of references compiles to an inline bounds
+// check, a header-flag write-barrier filter and a plain store. Only stores
+// that may create an unremembered old-to-young edge, or that run while a
+// marking epoch is active, call the runtime barrier. Runtime array buffers
+// are old-generation objects, so these stores exercise the generational
+// remembered set across minor collections.
+import std::collections::Array;
+
+interface Shape { fn area() -> i64; }
+class Square implements Shape {
+    pub side: i64;
+    pub fn area() -> i64 { return self.side * self.side; }
+}
+class Node { pub value: i64; }
+enum Slot { Empty, Full(Node) }
+
+fn fill(xs: Array<Node>, value: Node) {
+    let mut i = 0;
+    while i < xs.len() {
+        xs[i] = value;
+        i = i + 1;
+    }
+}
+
+fn sum(xs: Array<Node>) -> i64 {
+    let mut total = 0;
+    let mut i = 0;
+    while i < xs.len() {
+        total = total + xs[i].value;
+        i = i + 1;
+    }
+    return total;
+}
+
+fn main() {
+    // Young values stored into an old buffer must survive a minor collection.
+    let nodes: Array<Node> = [new Node(0), new Node(0), new Node(0)];
+    gc_minor_collect();
+    let mut i = 0;
+    while i < nodes.len() {
+        nodes[i] = new Node(i * 10 + 1);
+        i = i + 1;
+    }
+    gc_minor_collect();
+    println(sum(nodes));
+
+    // Repeated stores into an already remembered slot.
+    nodes[1] = new Node(100);
+    nodes[1] = new Node(200);
+    gc_minor_collect();
+    println(nodes[1].value);
+
+    // Old-to-old stores and element swaps.
+    let tmp = nodes[0];
+    nodes[0] = nodes[2];
+    nodes[2] = tmp;
+    println(nodes[0].value * 100 + nodes[2].value);
+
+    // Strings, interface boxing, enum payloads, options and nested arrays.
+    let words: Array<String> = ["a", "b"];
+    words[0] = "left";
+    words[1] = words[0] + "-right";
+    gc_collect();
+    println(words[1]);
+    let shapes: Array<Shape> = [new Square(1)];
+    shapes[0] = new Square(6);
+    gc_minor_collect();
+    println(shapes[0].area());
+    let slots: Array<Slot> = [Slot::Empty, Slot::Empty];
+    slots[1] = Slot::Full(new Node(9));
+    gc_minor_collect();
+    match slots[1] {
+        Slot::Full(n) => println(n.value),
+        Slot::Empty => println("empty"),
+    }
+    let maybe: Array<Option<Node>> = [Option::None];
+    maybe[0] = Option::Some(new Node(5));
+    gc_minor_collect();
+    match maybe[0] {
+        Some(n) => println(n.value),
+        None => println("none"),
+    }
+    let grid: Array<Array<i64>> = [[1], [2]];
+    grid[0] = [7, 8];
+    gc_minor_collect();
+    println(grid[0][1]);
+
+    // Closures, and one value shared by every slot.
+    let factor = 3;
+    let fs: Array<closure(i64) -> i64> = [|x: i64| x];
+    fs[0] = |x: i64| x * factor;
+    gc_minor_collect();
+    let triple = fs[0];
+    println(triple(14));
+    fill(nodes, new Node(4));
+    gc_minor_collect();
+    println(sum(nodes));
+
+    // Many allocating stores into a small ring buffer.
+    let ring: Array<Node> = [new Node(0), new Node(0), new Node(0), new Node(0)];
+    let mut n = 0;
+    while n < 20000 {
+        ring[n % 4] = new Node(n);
+        n = n + 1;
+    }
+    gc_minor_collect();
+    println(sum(ring));
+
+    // Out-of-bounds stores still panic and can be recovered.
+    if true {
+        defer match recover() {
+            Some(_) => println("caught"),
+            None => println("missing"),
+        }
+        nodes[3] = new Node(1);
+        println("unreachable");
+    }
+}

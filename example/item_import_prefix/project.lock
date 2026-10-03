@@ -1,0 +1,14 @@
+lock-version = 1
+
+[root]
+package = "path:."
+
+[[package]]
+id = "path:."
+name = "item-import-prefix-example"
+version = "0.1.0"
+dependencies = []
+
+[package.source]
+kind = "path"
+path = "."

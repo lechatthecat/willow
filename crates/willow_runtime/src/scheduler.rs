@@ -16,6 +16,22 @@ use crate::task::{
 use crate::task_state::{BoundaryOutcome, CancelOutcome, ClaimOutcome, TaskLifecycle, WakeOutcome};
 use crate::timer_queue::{TimerQueue, TimerWake};
 
+/// A terminal task's frame awaiting the end of its grace period (willow-vjaf).
+#[derive(Debug, Clone, Copy)]
+struct RetiredFrame {
+    frame: usize,
+    tag: u64,
+}
+
+/// Retired frames below this count are never scanned for early release; the
+/// outermost drive end still releases them.
+const FRAME_RELEASE_MIN_BATCH: usize = 64;
+
+/// Raised under the scheduler mutex when the retired-frame queue reaches its
+/// scan threshold, read without it so the run loop's per-iteration check
+/// costs one atomic load.
+static FRAME_RELEASE_DUE: AtomicBool = AtomicBool::new(false);
+
 /// Lock-free half of terminal task cleanup. The task record is already gone
 /// when this runs, so channel addresses and the exact lock reverse link must be
 /// captured before removal (willow-ezs.1.4, willow-38w.1.6).
@@ -943,12 +959,19 @@ pub struct RuntimeScheduler {
     /// per-iteration drain skips `GLOBAL_SCHEDULER` when nothing is pending
     /// (willow-8hq4.19).
     terminal_cleanups_pending: Arc<AtomicBool>,
-    /// Frame runtime roots retired by terminal tasks. The heavy task record is
-    /// removed immediately, but these roots remain until the outermost
-    /// scheduler drive has quiesced every worker.
-    pending_frame_unroots: Vec<usize>,
+    /// Frame runtime roots retired by terminal tasks, in retirement order with
+    /// their [`crate::frame_reclaim`] tags. The heavy task record is removed
+    /// immediately, but each root remains until every execution unit that
+    /// began before its retirement has ended (willow-vjaf).
+    pending_frame_unroots: VecDeque<RetiredFrame>,
+    /// Pending length at which a retirement requests the next release scan.
+    /// Doubling over the frames a scan had to keep amortizes the O(threads)
+    /// scan to O(1) per retirement while bounding retained frames by
+    /// `max(FRAME_RELEASE_MIN_BATCH, 2 x frames retired under a still-running
+    /// unit)`.
+    frame_release_scan_at: usize,
     /// Total frame roots currently owned by the scheduler: active task frames
-    /// plus terminal frames waiting at the outermost unroot boundary.
+    /// plus terminal frames still inside their grace period.
     frame_roots: usize,
     /// Wake-deadlines, behind their own lock rather than this scheduler's
     /// metadata mutex (willow-9ha4). The run loop promotes expired timers once
@@ -993,7 +1016,8 @@ impl RuntimeScheduler {
             timers,
             pending_terminal_cleanups: Vec::new(),
             terminal_cleanups_pending,
-            pending_frame_unroots: Vec::new(),
+            pending_frame_unroots: VecDeque::new(),
+            frame_release_scan_at: FRAME_RELEASE_MIN_BATCH,
             frame_roots: 0,
         }
     }
@@ -1248,7 +1272,13 @@ impl RuntimeScheduler {
 
         if task.frame_rooted && !task.frame.is_null() {
             task.frame_rooted = false;
-            self.pending_frame_unroots.push(task.frame as usize);
+            self.pending_frame_unroots.push_back(RetiredFrame {
+                frame: task.frame as usize,
+                tag: crate::frame_reclaim::retire_tag(),
+            });
+            if self.pending_frame_unroots.len() >= self.frame_release_scan_at {
+                FRAME_RELEASE_DUE.store(true, Ordering::Release);
+            }
         }
         // A bookkeeping-only placeholder cannot register with netpoll, and an
         // empty channel list means it has no external cleanup at all. Avoid
@@ -1265,8 +1295,8 @@ impl RuntimeScheduler {
 
         // `RuntimeTask::roots` and all diagnostic/wait metadata are active-task
         // ownership. They may be dropped now that the poll has returned and
-        // terminal status is published. The result frame has its independent
-        // runtime root until the outermost post-quiescence boundary.
+        // terminal status is published. The result frame keeps its independent
+        // runtime root until its grace period ends.
         drop(task);
         true
     }
@@ -1316,12 +1346,23 @@ impl RuntimeScheduler {
         std::mem::take(&mut self.pending_terminal_cleanups)
     }
 
-    fn take_pending_frame_unroots(&mut self) -> Vec<usize> {
-        let frames = std::mem::take(&mut self.pending_frame_unroots);
+    /// Take the retired frames whose tag is below `bound` (see
+    /// [`crate::frame_reclaim::release_bound`]). Tags are monotonic in queue
+    /// order, so this pops a prefix: O(frames released + 1).
+    fn take_quiescent_frame_unroots(&mut self, bound: u64) -> Vec<usize> {
+        let mut frames = Vec::new();
+        while let Some(retired) = self.pending_frame_unroots.front()
+            && retired.tag < bound
+        {
+            frames.push(retired.frame);
+            self.pending_frame_unroots.pop_front();
+        }
         self.frame_roots = self
             .frame_roots
             .checked_sub(frames.len())
             .expect("scheduler frame-root counter underflow");
+        self.frame_release_scan_at =
+            FRAME_RELEASE_MIN_BATCH.max(self.pending_frame_unroots.len() * 2);
         frames
     }
 
@@ -2094,6 +2135,9 @@ fn spawn_global_task_initialized_inner(
     initialize: impl FnOnce(RuntimeTaskId),
     cooperative_poll: bool,
 ) -> u64 {
+    // The caller holds `frame` unrooted once the task is published and may
+    // finish on another worker (willow-vjaf).
+    let _unit = crate::frame_reclaim::ExecutionUnit::enter();
     // Reserve under the metadata lock, then initialize entirely outside it.
     // The frame is rooted before the callback because native initialization may
     // allocate or explicitly collect. A panic leaves an id gap but the guard
@@ -2983,10 +3027,10 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instan
     // so purge them promptly after each drive, including nested drives.
     drain_terminal_cleanups();
     if outermost {
-        // The parallel pool has joined and nested polls have resumed or
-        // quiesced. It is now safe to remove every terminal frame runtime root
-        // retired during this outer drive.
-        release_pending_frame_roots();
+        // The parallel pool has joined, so its workers' units have ended.
+        // Release everything no other thread's unit still covers, including
+        // the sub-threshold remainder the run loop never scans for.
+        release_quiescent_frame_roots(true);
     }
     drop(drive);
     completed
@@ -3028,8 +3072,20 @@ fn drain_terminal_cleanups() {
     }
 }
 
-fn release_pending_frame_roots() {
-    let frames = with_global(|sched| sched.take_pending_frame_unroots());
+/// Unroot the retired frames whose grace period has ended (willow-vjaf).
+/// Unless `force`d, runs only once a retirement raised [`FRAME_RELEASE_DUE`],
+/// so the run loop's empty case takes no lock. The caller must not be inside
+/// an [`crate::frame_reclaim::ExecutionUnit`] of its own, or that unit's epoch
+/// holds back every frame retired during it.
+fn release_quiescent_frame_roots(force: bool) {
+    // Load before swapping: the common case must not write the shared line.
+    let due = FRAME_RELEASE_DUE.load(Ordering::Acquire)
+        && FRAME_RELEASE_DUE.swap(false, Ordering::AcqRel);
+    if !due && !force {
+        return;
+    }
+    let bound = crate::frame_reclaim::release_bound();
+    let frames = with_global(|sched| sched.take_quiescent_frame_unroots(bound));
     for frame in frames {
         crate::gc::willow_gc_remove_runtime_root(frame as *mut u8);
     }
@@ -3888,6 +3944,9 @@ fn scheduler_run_loop(
         // external registrations outside the scheduler lock before selecting
         // more work.
         drain_terminal_cleanups();
+        // Outside any unit of this worker, so its own last poll no longer
+        // holds back the frames retired during it.
+        release_quiescent_frame_roots(false);
         for _ in 0..woken_timers {
             crate::gc::stress_collect("scheduler");
         }
@@ -3940,6 +3999,10 @@ fn scheduler_run_loop(
         if fatal_panic_pending() {
             park_until_fatal_abort();
         }
+        // Poll, cleanup and their post-poll boundaries form one unit: frames
+        // retired while it runs keep their roots until it ends (willow-vjaf).
+        // Idle waits stay outside it so a parked worker never delays release.
+        let _unit = crate::frame_reclaim::ExecutionUnit::enter();
         // A task the claim moved to Cancelling: run its cleanup entry WITHOUT
         // the scheduler lock (poll-like), then finalize as Cancelled
         // (willow-vynv.3). The frame stays rooted until finalization.
@@ -4251,7 +4314,10 @@ pub fn reset_global_scheduler_for_test() {
     // slot reservations too (task ids restart and would alias them).
     crate::blocking::reset_slot_waiters_for_test();
     let frames = with_global(|sched| {
-        let mut frames = std::mem::take(&mut sched.pending_frame_unroots);
+        let mut frames: Vec<usize> = std::mem::take(&mut sched.pending_frame_unroots)
+            .into_iter()
+            .map(|retired| retired.frame)
+            .collect();
         frames.extend(sched.tasks.drain().into_iter().filter_map(|mut task| {
             if task.frame_rooted && !task.frame.is_null() {
                 task.frame_rooted = false;

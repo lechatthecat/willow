@@ -230,6 +230,8 @@ mod channel_suspension;
 mod channel_waiters;
 #[path = "concurrency/completion_diagnostics.rs"]
 mod completion_diagnostics;
+#[path = "concurrency/frame_reclaim.rs"]
+mod frame_reclaim;
 #[path = "concurrency/frozen_collections.rs"]
 mod frozen_collections;
 #[path = "concurrency/function_spawn.rs"]

@@ -271,6 +271,13 @@ impl Drop for NoPreemptGuard {
 /// also set so the scheduler/diagnostics can see the task was preempted.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_preempt_check() -> i32 {
+    charge_safepoints(1)
+}
+
+/// [`willow_preempt_check`] for `count` safepoints executed since the last
+/// check. The budget trips at the same safepoint count as `count` single
+/// checks would; the time quantum and flag are sampled once per batch.
+fn charge_safepoints(count: u64) -> i32 {
     QUANTUM.with(|q| {
         if q.no_preempt_depth.get() > 0 {
             return 0;
@@ -290,7 +297,7 @@ pub extern "C" fn willow_preempt_check() -> i32 {
         if budget == 0 {
             return 0;
         }
-        let remaining = budget - 1;
+        let remaining = budget.saturating_sub(count);
         q.budget.set(remaining);
         if remaining == 0 {
             if let Some(flag) = flag {
@@ -313,9 +320,42 @@ pub extern "C" fn willow_preempt_check() -> i32 {
     })
 }
 
-/// Invocation-constant activity bit for generated synchronous safepoint guards.
+/// Maximum inline safepoints generated synchronous code runs between runtime
+/// checks. It bounds how stale the time quantum, preemption flag, and
+/// cancellation state can be while the per-safepoint cost stays one counter
+/// decrement (willow-jz15.40).
+pub const SYNC_POLL_STRIDE: u64 = 64;
+
+/// The next inline safepoint grant: never past the remaining budget, so the
+/// budget still trips at the exact safepoint it would without batching.
+#[cfg(any(
+    all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
+))]
+fn sync_poll_grant() -> i32 {
+    QUANTUM.with(|q| {
+        let budget = q.budget.get();
+        if budget == 0 || q.no_preempt_depth.get() > 0 {
+            SYNC_POLL_STRIDE as i32
+        } else {
+            budget.min(SYNC_POLL_STRIDE) as i32
+        }
+    })
+}
+
+/// Invocation-constant inline safepoint countdown for generated synchronous
+/// code, or null outside a scheduler-managed native stack. Generated loops
+/// decrement it and call [`willow_sync_safepoint`] only when it reaches zero.
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_sync_native_active() -> i32 {
+pub extern "C" fn willow_sync_poll_counter() -> *mut i32 {
     #[cfg(any(
         all(
             target_os = "linux",
@@ -329,7 +369,7 @@ pub extern "C" fn willow_sync_native_active() -> i32 {
         all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     ))]
     {
-        i32::from(crate::native_stack::is_active())
+        crate::native_stack::poll_counter()
     }
     #[cfg(not(any(
         all(
@@ -343,11 +383,12 @@ pub extern "C" fn willow_sync_native_active() -> i32 {
         ),
         all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
     )))]
-    0
+    std::ptr::null_mut()
 }
 
 /// Native-stack counterpart of the async poll safepoint. Cancellation returns
 /// through compiler-generated cleanup edges; yielding preserves the call chain.
+/// Charges every safepoint consumed from the inline countdown, then refills it.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sync_safepoint() -> i32 {
     #[cfg(any(
@@ -364,12 +405,16 @@ pub extern "C" fn willow_sync_safepoint() -> i32 {
     ))]
     {
         if crate::native_stack::cancelled() != 0 {
+            // Unwinding skips the charge; cleanup code restarts a full grant.
+            crate::native_stack::poll_refill(sync_poll_grant());
             return 1;
         }
         crate::gc::willow_gc_safepoint();
-        if willow_preempt_check() != 0 {
+        if charge_safepoints(crate::native_stack::poll_consumed()) != 0 {
             crate::native_stack::suspend();
         }
+        // Refill after any suspension so the grant reflects the new quantum.
+        crate::native_stack::poll_refill(sync_poll_grant());
         crate::native_stack::cancelled()
     }
     #[cfg(not(any(

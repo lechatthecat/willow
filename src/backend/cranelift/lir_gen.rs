@@ -5034,18 +5034,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let outer_frame_depth = self.callstack_frame_depth;
         let entry = self.builder.current_block().expect("entry block active");
         let mut poll_blocks = lir_sync_poll_blocks(f);
-        let deferred_poll = coop.is_none() && lir_defer_entry_poll(f, &mut poll_blocks);
+        // A bounded body that cannot reach a safepoint needs no poll at all;
+        // the caller's polls already bound the work around it (willow-8hq4.14).
+        let unpolled = coop.is_none() && super::root_effect::is_safepoint_free_leaf(f);
+        if unpolled {
+            poll_blocks.fill(false);
+        }
+        let deferred_poll =
+            coop.is_none() && !unpolled && lir_defer_entry_poll(f, &mut poll_blocks);
         // SSA carries the delayed activity lookup through later joins and
         // inlined recursive bodies. The zero entry value is used only on the
         // bounded return path; every path containing calls crosses a poll.
         let deferred_active = deferred_poll.then(|| {
-            let var = self.builder.declare_var(types::I32);
-            let zero = self.builder.ins().iconst(types::I32, 0);
+            let ptr_ty = reference_type(self.module.target_config());
+            let var = self.builder.declare_var(ptr_ty);
+            let zero = self.builder.ins().iconst(ptr_ty, 0);
             self.builder.def_var(var, zero);
             var
         });
-        let sync_poll = (coop.is_none() && !deferred_poll).then(|| {
-            let active = self.emit_value_runtime_call("willow_sync_native_active", &[]);
+        let sync_poll = (coop.is_none() && !deferred_poll && !unpolled).then(|| {
+            let active = self.emit_value_runtime_call("willow_sync_poll_counter", &[]);
             let stop = self.emit_value_runtime_call("willow_gc_stop_flag", &[]);
             (active, stop)
         });
@@ -5171,7 +5179,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 ledger: &mut ledger,
             };
             let block_poll = if deferred_poll && poll_blocks[i] {
-                let active = self.emit_value_runtime_call("willow_sync_native_active", &[]);
+                let active = self.emit_value_runtime_call("willow_sync_poll_counter", &[]);
                 let stop = self.emit_value_runtime_call("willow_gc_stop_flag", &[]);
                 self.builder
                     .def_var(deferred_active.expect("delayed poll activity"), active);
@@ -7367,6 +7375,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 rhs,
                 operand_ty,
             } => {
+                // A literal divisor other than 0 and -1 can trip neither the
+                // zero nor the overflow guard (willow-8hq4.14).
+                let unguarded_divisor = matches!(rhs, crate::ir::lowered::LirOperand::Int(divisor) if *divisor != 0 && *divisor != -1);
                 let lhs = self.emit_lir_operand(function, lhs);
                 let rhs = self.emit_lir_operand(function, rhs);
                 if *operand_ty == Type::String {
@@ -7394,7 +7405,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     };
                 }
                 let float = *operand_ty == Type::F64;
-                if !float && matches!(op, BinOp::Div | BinOp::Rem) {
+                if !float && !unguarded_divisor && matches!(op, BinOp::Div | BinOp::Rem) {
                     self.emit_int_div_guard(lhs, rhs, matches!(op, BinOp::Rem), span);
                 }
                 if matches!(op, BinOp::Pow) {

@@ -25,6 +25,16 @@ pub(super) fn tlab_payload_generation(state: &GcState, address: usize) -> Option
     None
 }
 
+/// Record an old owner with a young child: its card, its remembered-set
+/// entry, and the header flag the inline barrier filter reads. Returns
+/// whether the entry is new.
+pub(super) fn remember_owner(state: &mut GcState, owner_payload: usize) -> bool {
+    state.dirty_cards.insert(owner_payload / GC_CARD_SIZE);
+    let payload = GcPayload::from_raw(owner_payload as *mut u8).expect("non-null owner");
+    HeapObject::from_payload(payload).set_remembered(true);
+    state.remembered_set.insert(owner_payload)
+}
+
 pub(super) fn barrier_owner_payload(
     state: &GcState,
     owner_or_slot: *mut u8,
@@ -54,6 +64,11 @@ pub(super) fn barrier_owner_payload(
 // Acquire observes the epoch published before phase=1. Initial root handshakes
 // run with SATB active; stopped remark flushes every producer before phase=0.
 // 0 = inactive, 1 = concurrent mark, 2 = stopped remark.
+// Exported as `willow_abi::GC_MARK_PHASE_SYMBOL`: inline reference-array
+// stores skip the barrier call only while it is 0. Phase changes are crossed
+// by mutator handshakes/stops, and the inline load/store pair contains no
+// safepoint, exactly like a call to `willow_gc_write_barrier` and its store.
+#[unsafe(export_name = "willow_gc_mark_phase")]
 pub(super) static GC_MARK_PHASE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 pub(super) fn record_satb_locked(state: &mut GcState, old: *mut u8) {
@@ -154,11 +169,9 @@ pub extern "C" fn willow_gc_write_barrier(
     if tlab_payload_generation(&state, value as usize) != Some(GC_GENERATION_YOUNG) {
         return;
     }
-    if let Some(owner_payload) = barrier_owner_payload(&state, owner, destination_kind) {
-        state.dirty_cards.insert(owner_payload / GC_CARD_SIZE);
-        let inserted = state.remembered_set.insert(owner_payload);
-        if inserted {
-            state.write_barrier_hits = state.write_barrier_hits.saturating_add(1);
-        }
+    if let Some(owner_payload) = barrier_owner_payload(&state, owner, destination_kind)
+        && remember_owner(&mut state, owner_payload)
+    {
+        state.write_barrier_hits = state.write_barrier_hits.saturating_add(1);
     }
 }

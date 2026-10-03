@@ -1,0 +1,59 @@
+// Binding a match payload whose type is a class or interface from a module
+// other than the enum's own (willow-jz15.38). Before the fix, `scene` and the
+// entry both type-checked but the build stopped with an internal compiler
+// error, because the payload was typed by the declaring file's local spelling
+// (`Rect`, `Caption`, `Area`) rather than its identity (`shapes::Rect`, ...).
+import scene;
+import shapes;
+import shapes::Rect;
+
+// The entry declares an enum over an imported class too.
+enum Slot {
+    Filled(Rect),
+    Free,
+}
+
+fn slot_area(s: Slot) -> i64 {
+    return match s {
+        Slot::Filled(r) => r.area() + r.h,
+        Slot::Free => 0,
+    };
+}
+
+// ... and matches the module's enum, whose payload names mean nothing here.
+fn describe(n: scene::Node) -> String {
+    return match n {
+        scene::Node::Box(_) => "box",
+        scene::Node::Titled(_, c) => c.text,
+        scene::Node::Any(_) => "any",
+        scene::Node::Note(l) => l.shout(),
+        scene::Node::Maybe(_) => "maybe",
+        scene::Node::Empty => "empty",
+    };
+}
+
+fn measure(n: scene::Node) -> i64 {
+    return match n {
+        scene::Node::Box(r) => r.w,
+        scene::Node::Titled(r, c) => r.h * 10 + c.text.len(),
+        scene::Node::Any(a) => a.area(),
+        _ => 0,
+    };
+}
+
+fn main() {
+    let r = new Rect(3, 4);
+    let sq = new shapes::Square(5, 0);
+    let hello = new shapes::Label("hi");
+    println(scene::width(scene::Node::Box(r)));                  // 3
+    println(scene::area(scene::Node::Titled(r, hello)));          // 14
+    println(scene::area(scene::Node::Any(sq)));                   // 25
+    println(scene::width(scene::Node::Note(hello)));              // 2
+    println(scene::width(scene::Node::Maybe(Some(r))));           // 3
+    println(scene::caption(scene::Node::Titled(r, hello)));       // hi!
+    println(slot_area(Slot::Filled(sq)));                         // 25
+    println(describe(scene::Node::Titled(r, hello)));             // hi
+    println(describe(scene::Node::Note(hello)));                  // hi!
+    println(measure(scene::Node::Titled(r, hello)));              // 42
+    println(measure(scene::Node::Any(sq)));                       // 25
+}

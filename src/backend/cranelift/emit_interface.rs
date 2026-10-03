@@ -76,6 +76,21 @@ pub(super) struct DispatchCache {
     fallback: HashMap<String, (DispatchSummary, Option<String>)>,
 }
 
+/// What every function an interface method's vtable slots can hold has in
+/// common (willow-8hq4.14).
+#[derive(Clone, Copy)]
+pub(super) struct InterfaceSlotSummary {
+    /// At most four guarded direct calls per site bound both code growth and
+    /// runtime comparisons, independently of the number of implementers.
+    /// Excess polymorphism keeps indirect dispatch rather than selecting an
+    /// arbitrary subset without profile evidence.
+    pub(super) direct_targets: [Option<FuncId>; 4],
+    pub(super) may_panic: bool,
+    /// Whether the call site must root the receiver because some target does
+    /// not root it before its first safepoint.
+    pub(super) needs_receiver_root: bool,
+}
+
 /// The questions code generation needs form a constant-size summary, not a
 /// set of every target. Combining child summaries avoids quadratic storage and
 /// traversal when calls use every receiver in a deep override chain.

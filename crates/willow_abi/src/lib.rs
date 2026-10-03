@@ -295,12 +295,23 @@ pub mod gc_header {
     pub const GENERATION_OFFSET: u32 = 2;
     pub const AGE_OFFSET: u32 = 3;
     pub const OWNED_OFFSET: u32 = 4;
+    /// Nonzero while the object is in the runtime remembered set.
+    pub const REMEMBERED_OFFSET: u32 = 5;
     pub const DESCRIPTOR_OFFSET: u32 = 8;
+
+    /// Values of the byte at [`GENERATION_OFFSET`].
+    pub const GENERATION_YOUNG: u8 = 0;
+    pub const GENERATION_OLD: u8 = 1;
 
     pub const fn size(pointer_bytes: u32) -> u32 {
         DESCRIPTOR_OFFSET + pointer_bytes
     }
 }
+
+/// Runtime data symbol read by inline write-barrier fast paths: one byte,
+/// 0 while no SATB marking epoch is active (otherwise 1 = concurrent mark,
+/// 2 = stopped remark). Generated code reads it with acquire ordering.
+pub const GC_MARK_PHASE_SYMBOL: &str = "willow_gc_mark_phase";
 
 /// Pointer-only interface boxes and dispatch tables. Scalar class identifiers
 /// keep their fixed i64 representation even when table entries are narrower.

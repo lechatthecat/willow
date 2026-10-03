@@ -326,8 +326,7 @@ impl<'a> MinorCollector<'a> {
             }
         }
         if has_young_child {
-            self.state.remembered_set.insert(address);
-            self.state.dirty_cards.insert(address / super::GC_CARD_SIZE);
+            super::barrier::remember_owner(self.state, address);
         }
     }
 
@@ -346,6 +345,10 @@ impl<'a> MinorCollector<'a> {
             self.pin_root(root);
         }
         for owner in remembered {
+            // The set was taken; `scan_object` re-remembers owners that keep
+            // a young child after this collection.
+            HeapObject::from_payload(GcPayload::from_raw(owner as *mut u8).unwrap())
+                .set_remembered(false);
             self.pin_root(owner as *mut u8);
         }
         while let Some(object) = self.worklist.pop() {

@@ -1,0 +1,7 @@
+pub enum Op { Eq, Ne }
+
+pub fn twice(n: i64) -> i64 { return n * 2; }
+
+pub fn op_text(op: Op) -> String {
+    return match op { Eq => "==", Ne => "!=" };
+}

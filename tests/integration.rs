@@ -43,6 +43,8 @@ mod gc_enum_payload_roots;
 mod gc_mutator_registration;
 #[path = "integration/imported_enum_match.rs"]
 mod imported_enum_match;
+#[path = "integration/imported_enum_payload.rs"]
+mod imported_enum_payload;
 #[path = "integration/interface_box_dynamic_dispatch.rs"]
 mod interface_box_dynamic_dispatch;
 #[path = "integration/interface_default_inheritance.rs"]
@@ -51,6 +53,8 @@ mod interface_default_inheritance;
 mod interface_super_coercion;
 #[path = "integration/lambda_shadowing.rs"]
 mod lambda_shadowing;
+#[path = "integration/leaf_method_calls.rs"]
+mod leaf_method_calls;
 #[path = "integration/lir_async.rs"]
 mod lir_async;
 #[path = "integration/lir_atomics.rs"]
@@ -223,6 +227,8 @@ mod constructor_flow;
 
 #[path = "integration/array_fast_paths.rs"]
 mod array_fast_paths;
+#[path = "integration/array_reference_store.rs"]
+mod array_reference_store;
 #[path = "integration/never_values.rs"]
 mod never_values;
 

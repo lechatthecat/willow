@@ -1570,35 +1570,18 @@ fn backend_unit_imports(
     let mut visible_modules = std::collections::HashSet::new();
     let mut module_spellings = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for binding in &classified.modules {
-        if !seen.insert((binding.unit, &binding.access)) {
-            continue;
-        }
-        let dependency = &modules[dependencies
-            .index_for_unit(binding.unit)
-            .expect("resolved module")];
+    // Visibility alone was not enough: the tables are keyed by ONE of the two
+    // spellings, so the other has to be bound to it for this unit's phase
+    // (willow-kd1v). The types worth binding are the ones the module itself
+    // declares, which is why this is built here rather than in the back end —
+    // only the driver holds the imported module's program.
+    let mut bind_spelling = |access: &str, dependency: &module::ResolvedModule| {
         let graph_name = dependency.registration_name();
-        // Both spellings: this file writes `access`, while the back end's
-        // module tables are keyed by the name the graph registered, which is
-        // the first importer's alias when that was another file.
-        visible_modules.insert(binding.access.clone());
-        visible_modules.insert(graph_name.to_string());
-        // Visibility alone was not enough: the tables are keyed by ONE of the
-        // two spellings, so the other has to be bound to it for this unit's
-        // phase (willow-kd1v). The types worth binding are the ones the module
-        // itself declares, which is why this is built here rather than in the
-        // back end — only the driver holds the imported module's program.
-        if binding.access == graph_name {
-            continue;
+        if access == graph_name {
+            return;
         }
-        let Some(dependency) = dependencies
-            .index_for_unit(binding.unit)
-            .map(|index| &modules[index])
-        else {
-            continue;
-        };
         module_spellings.push(backend::cranelift::ModuleSpelling {
-            access: binding.access.clone(),
+            access: access.to_string(),
             graph_name: graph_name.to_string(),
             canonical_path: dependency.identity_path().to_string(),
             types: dependency
@@ -1613,19 +1596,50 @@ fn backend_unit_imports(
                 })
                 .collect(),
         });
+    };
+    for binding in &classified.modules {
+        if !seen.insert((binding.unit, binding.access.as_str())) {
+            continue;
+        }
+        let dependency = &modules[dependencies
+            .index_for_unit(binding.unit)
+            .expect("resolved module")];
+        // Both spellings: this file writes `access`, while the back end's
+        // module tables are keyed by the name the graph registered, which is
+        // the first importer's alias when that was another file.
+        visible_modules.insert(binding.access.clone());
+        visible_modules.insert(dependency.registration_name().to_string());
+        bind_spelling(&binding.access, dependency);
+    }
+    // An item import keeps its module prefix writable for qualified calls
+    // (`import a::Op;` then `a::twice()`, willow-jz15.2). In project mode the
+    // module is registered under its package-qualified name, so that prefix
+    // needs the same binding (willow-jz15.43). It is NOT made visible: the
+    // module's bare names stay unbound in this file (willow-vtlr).
+    let item_modules: Vec<usize> = classified
+        .items
+        .iter()
+        .map(|item| {
+            dependencies
+                .index_for_module(item.package, &item.canonical_module)
+                .expect("resolved item module")
+        })
+        .collect();
+    for (item, &index) in classified.items.iter().zip(&item_modules) {
+        let dependency = &modules[index];
+        if seen.insert((dependency.id, item.access.as_str())) {
+            bind_spelling(&item.access, dependency);
+        }
     }
     backend::cranelift::UnitImports {
         visible_modules,
         item_imports: classified
             .items
             .iter()
-            .map(|item| backend::cranelift::ItemBinding {
+            .zip(item_modules)
+            .map(|(item, index)| backend::cranelift::ItemBinding {
                 local: item.local.clone(),
-                module: modules[dependencies
-                    .index_for_module(item.package, &item.canonical_module)
-                    .expect("resolved item module")]
-                .identity_path()
-                .to_string(),
+                module: modules[index].identity_path().to_string(),
                 item: item.item.clone(),
             })
             .collect(),
@@ -1696,8 +1710,10 @@ fn run_backend(
     // Shared declaration metadata comes from the checked entry artifact.
     {
         let checked = db.unit_declarations(module::UnitId::ENTRY, &artifacts)?;
+        let tables = checked.tables();
+        let declared = tables.declared_enum_identities(&program);
         for (name, info) in &checked.symbols.enums {
-            codegen.register_enum_info(name.to_string(), info.to_semantic());
+            codegen.register_enum_info(name.to_string(), tables.codegen_enum_info(info, &declared));
         }
         for (name, info) in &checked.symbols.interfaces {
             let identity = semantic::ids::TypeId::from_source_name(&info.name);
@@ -1724,8 +1740,11 @@ fn run_backend(
             );
         }
         let checker = db.checked_unit(module.id, &artifacts)?;
+        let tables = checker.tables();
+        let declared = tables.declared_enum_identities(&module.program);
         for info in checker.symbols.enums.values() {
-            codegen.register_enum_info(info.name.clone(), info.to_semantic());
+            codegen
+                .register_enum_info(info.name.clone(), tables.codegen_enum_info(info, &declared));
         }
         let expr_types = checker
             .expr_types
