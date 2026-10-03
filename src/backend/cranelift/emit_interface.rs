@@ -853,7 +853,7 @@ mod tests {
 
     #[test]
     fn defining_cache_follows_frozen_bases_and_function_alias_changes() {
-        fn declare(cg: &mut Codegen, source: &str) {
+        fn declare(cg: &mut UnitCodegenContext<'_>, source: &str) {
             let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
             let (program, errors) = crate::parser::Parser::new(tokens).parse();
             assert!(errors.is_empty());
@@ -864,7 +864,8 @@ mod tests {
                 }
             }
         }
-        let mut cg = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+        let mut backend = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+        let mut cg = backend.declaration_context();
         declare(
             &mut cg,
             "open class A { pub fn value(self) -> i64 { return 1; } } open class X { pub fn value(self) -> i64 { return 2; } } class B extends A {}",
@@ -1123,31 +1124,30 @@ fn main() {}
 
         let mut codegen =
             Codegen::for_tests(&CompilerOptions::debug()).expect("codegen should initialize");
-        for (name, info) in &checker.symbols.enums {
-            codegen.register_enum_info(name.to_string(), info.to_semantic());
+        for info in checker.symbols.enums.values() {
+            codegen.register_enum_info(info.to_semantic());
         }
-        for (name, info) in &checker.symbols.interfaces {
+        for info in checker.symbols.interfaces.values() {
             codegen
-                .register_interface_info(
-                    name.to_string(),
-                    TypeId::from_source_name(&info.name),
-                    || info.to_semantic(),
-                )
+                .register_interface_info(TypeId::from_source_name(&info.name), || {
+                    info.to_semantic()
+                })
                 .unwrap();
         }
-        codegen.register_expr_types(
-            checker
-                .expr_types
-                .iter()
-                .map(|(id, ty)| (*id, ty.into()))
-                .collect(),
-        );
+        let expr_types = checker
+            .expr_types
+            .iter()
+            .map(|(id, ty)| (*id, ty.into()))
+            .collect();
         let tables = crate::ir::lower::CheckerTables::from_checker(&checker);
         let (hir, gaps) = crate::ir::lower::lower_program_with(&program, &tables);
         assert!(gaps.is_empty(), "fixture lowering gaps: {gaps:?}");
-        codegen.register_lir_functions(crate::ir::lowered::lower_program(&hir));
+        let input = StandaloneUnitInput {
+            expr_types,
+            lir: Some(crate::ir::lowered::lower_program(&hir)),
+        };
         codegen
-            .compile_program(&program, "interface_invalid_box_fixture.wi")
+            .compile_program(&program, "interface_invalid_box_fixture.wi", input)
             .expect("fixture should compile");
         codegen.finish().expect("fixture object should finish")
     }

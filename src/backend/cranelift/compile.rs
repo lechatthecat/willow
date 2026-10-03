@@ -1,6 +1,6 @@
 //! Top-level compilation and symbol-declaration methods for the Cranelift
-//! backend (`compile_*` / `declare_*`, extracted from `mod.rs`). `compile_module`
-//! / `compile_program` stay `pub` (the entry points); the rest are `pub(super)`.
+//! backend. The build coordinator constructs a fresh context for each unit;
+//! the methods here operate only within that context.
 
 use crate::diagnostics::Span;
 use anyhow::Result;
@@ -40,7 +40,7 @@ fn closure_env_param(lambda_type: Option<&Type>, span: Span) -> Option<Param> {
 /// needs, paired with the semantic identity its lowered IR is stored under.
 ///
 /// Built by [`Codegen::module_body_plan`] / [`Codegen::program_body_plan`] and
-/// emitted one at a time by [`Codegen::compile_body`], so no whole-unit IR map
+/// emitted one at a time by [`UnitCodegenContext::compile_body`], so no whole-unit IR map
 /// or name re-keying sits between a unit's lowering and its emission
 /// (willow-afb5.18).
 pub struct UnitBody<'a> {
@@ -99,8 +99,8 @@ impl BodyTarget<'_> {
 }
 
 /// A compilation unit whose symbols are declared but whose bodies are not yet
-/// lowered — carrying the per-unit state [`Codegen::declare_module`] derived so
-/// [`Codegen::compile_module_bodies`] can reinstall it later.
+/// lowered — carrying the per-unit inputs [`Codegen::declare_module`] derived so
+/// [`Codegen::with_module_bodies`] can construct a fresh context later.
 ///
 /// Declaration and body lowering are separate driver phases (willow-4zt8):
 /// EVERY unit — each imported module plus the entry program — is declared
@@ -132,18 +132,14 @@ pub struct DeclaredModule {
     source_file: String,
     builtin_module_aliases: HashMap<String, String>,
     /// The module access names this unit's own `import`s name, plus the module
-    /// itself (willow-vtlr). Like `builtin_module_aliases`, a later unit's
-    /// declaration phase overwrites the backend's copy, so each unit carries
-    /// its own to reinstall before its bodies are lowered.
+    /// itself (willow-vtlr), carried into this unit's fresh emission context.
     visible_modules: HashSet<String>,
     /// This module's own single-item imports (willow-28h8). They bind a LOCAL
     /// name to another module's symbol, and two units can bind the same local
     /// name to different modules, so they are rebound before these bodies.
     item_imports: Vec<ItemBinding>,
     /// The module prefixes this unit writes that the tables are not keyed by
-    /// (willow-kd1v), reinstalled before these bodies for the same reason the
-    /// item imports are: another unit's phase runs in between and restores
-    /// them.
+    /// (willow-kd1v), resolved only in this unit's emission context.
     module_spellings: Vec<ModuleSpelling>,
     enum_aliases: Vec<(String, EnumInfo)>,
 }
@@ -310,353 +306,9 @@ macro_rules! lir_type_ctx {
     };
 }
 
-impl Codegen {
-    /// Compile an imported module. Functions are given the mangled name
-    /// `{canonical_module_path}__{fn}` with `::` normalized to `__`.
-    /// Must be called before `compile_program` so the entry module can call them.
-    ///
-    /// Declares and compiles in one call. A multi-unit driver should instead
-    /// call [`Codegen::declare_module`] for every unit first and only then
-    /// [`Codegen::compile_module_bodies`] (willow-4zt8).
-    pub fn compile_module(
-        &mut self,
-        mod_name: &str,
-        canonical_path: &str,
-        program: &Program,
-        source_file: &str,
-    ) -> Result<()> {
-        let unit = self.declare_module(mod_name, canonical_path, program, source_file)?;
-        self.compile_module_bodies(&unit)
-    }
-
-    /// Declare every symbol an imported module contributes — class layouts,
-    /// methods, static storage, function signatures, vtables and descriptors —
-    /// without lowering a single body.
-    pub fn declare_module(
-        &mut self,
-        mod_name: &str,
-        canonical_path: &str,
-        program: &Program,
-        source_file: &str,
-    ) -> Result<DeclaredModule> {
-        let types = std::mem::take(&mut self.expr_types);
-        // The standalone entry point has no resolver classification; the
-        // driver passes one through `*_with_types` instead.
-        let scope = crate::compiler_db::scope::UnitScope::default();
-        let result = self.declare_module_with_types(
-            mod_name,
-            canonical_path,
-            program,
-            source_file,
-            &types,
-            scope,
-        );
-        self.expr_types = types;
-        result
-    }
-
-    pub(crate) fn declare_module_with_types(
-        &mut self,
-        mod_name: &str,
-        canonical_path: &str,
-        program: &Program,
-        source_file: &str,
-        expr_types: &HashMap<ExprId, Type>,
-        scope: crate::compiler_db::scope::UnitScope,
-    ) -> Result<DeclaredModule> {
-        let init_unit = self.module_init_plan.ensure_module(canonical_path);
-        // Recorded from the RAW program, because the normalization on the next
-        // line is what erases the aliases from it (willow-nswv).
-        self.builtin_module_aliases = builtin_module_aliases(program);
-        // The imports the resolver classified for THIS file. A module sees what
-        // it imports, plus itself: its own classes are keyed
-        // `{mod_name}::{Class}` by the tables below (willow-vtlr).
-        let crate::compiler_db::scope::UnitScope {
-            imports: unit_imports,
-            enum_aliases,
-        } = scope;
-        self.visible_modules = unit_imports.visible_modules;
-        self.visible_modules.insert(mod_name.to_string());
-        // The item half is not bound here: the modules this one imports are
-        // declared, but a direct TYPE import aliases whole compiled tables and
-        // doing that per module changes what the classes declared after it are
-        // compiled against. Only the function half is rebound, before this
-        // unit's bodies (willow-28h8).
-        let item_imports = unit_imports.item_imports;
-        let module_spellings = unit_imports.module_spellings;
-        // The one type table that does have to answer under this unit's own
-        // spelling while its declarations are made: `declare_vtables_for_classes`
-        // below resolves each `implements` name in `interface_infos`, and an
-        // interface this unit IMPORTED (`import proto::Describable;`) is keyed
-        // there by its canonical `proto::Describable` alone. The lookup missed,
-        // the vtable was silently skipped, and every later boxing site fell back
-        // to the raw object (willow-0g8j.3). Installed under a snapshot and taken
-        // back out below, so nothing declared after this unit sees it.
-        self.with_unit_resolution(self.resolution_context(), |this| {
-            this.bind_unit_enum_aliases(&enum_aliases);
-            this.alias_item_import_types(&item_imports);
-            let normalized_program = match &this.body_queries {
-                Some(queries) => queries.normalized_program(program)?,
-                None => normalize_std_collection_program(program),
-            };
-            let program = &normalized_program;
-            this.source_file = source_file.to_string();
-            let module_prefix = module_symbol_prefix(canonical_path);
-            let InitUnitId::Module(module_id) = init_unit else {
-                unreachable!("module declaration has a module identity");
-            };
-            this.known_modules
-                .register(module_id, canonical_path, mod_name);
-            // ...and the module prefixes THIS unit writes for modules the graph
-            // registered under some other spelling (willow-kd1v). Every module this
-            // one imports is already declared — dependencies are declared before
-            // their dependents — so the tables the aliases point at exist.
-            this.alias_unit_module_spellings(&module_spellings);
-            this.declare_runtime()?;
-            this.declare_string_literals(program)?;
-            // The source path backs `PanicInfo.file` for every panic, so it is a
-            // release-mode literal too: V1 records message AND source location
-            // (willow-s9ej.7).
-            this.declare_string_literal(source_file)?;
-            if this.build_mode == BuildMode::Debug {
-                for name in collect_nil_check_names(program) {
-                    this.declare_string_literal(&name)?;
-                }
-                this.declare_reference_debug_strings(program)?;
-            }
-
-            // INTERFACE names declared in this module, so a module-local (possibly
-            // generic) interface named in an `implements` / signature by its bare name
-            // is qualified to `module::Iface` (qualify_module_type alone does not
-            // qualify a generic head name).
-            let local_type_names: std::collections::HashSet<String> = program
-                .items
-                .iter()
-                .filter_map(|item| match item {
-                    Item::Interface(i) => Some(i.name.clone()),
-                    _ => None,
-                })
-                .collect();
-            // ENUM names declared in this module, qualified by the module's
-            // CANONICAL path rather than the name this unit reaches it by: an enum
-            // has one identity build-wide, and the type checker qualifies module
-            // signatures the same way, so what the walker reads off a cross-module
-            // call has to be the same name (willow-itcw).
-            let local_enum_names: std::collections::HashSet<String> = program
-                .items
-                .iter()
-                .filter_map(|item| match item {
-                    Item::Enum(e) => Some(e.name.clone()),
-                    _ => None,
-                })
-                .collect();
-
-            // CLASS names declared in this module, used to qualify a module-local
-            // `extends Base` so the subclass's class_base / layout / inherited-method
-            // resolution all key off `module::Base` (willow-2egr).
-            let local_class_names: std::collections::HashSet<String> = program
-                .items
-                .iter()
-                .filter_map(|item| match item {
-                    Item::Class(c) => Some(c.name.clone()),
-                    _ => None,
-                })
-                .collect();
-
-            // Function signatures must qualify module-local classes too. Otherwise
-            // `one::make() -> Point` and `two::make() -> Point` collapse to the same
-            // bare type even though their layouts have different identities. A
-            // directly imported short name still compares equal through the shared
-            // class type id (willow-0g8j.3).
-            let mut local_signature_type_names = local_type_names.clone();
-            local_signature_type_names.extend(local_class_names.iter().cloned());
-
-            // Every type a module class mentions is qualified the same way this
-            // unit's FUNCTION signatures are (below): module-local classes and
-            // interfaces under the unit's own spelling, module-local enums under the
-            // build-wide canonical path. A name that is neither -- a type the module
-            // itself imported (`import proto::Grade;`), or a builtin -- is left
-            // exactly as written, so it still resolves to the one table that answers
-            // to it. Prefixing wholesale renamed such a type into `lib::Grade`, which
-            // nothing declares (willow-sxcp).
-            // ...and a name that is neither is resolved through the aliases this
-            // unit's own item imports installed above, so what leaves the module is
-            // the identity the build's tables answer to (`Sized` -> `proto::Sized`).
-            // A bare class name a later unit can still find by scanning modules
-            // (`resolve_class_key`), but an interface has no such scan: left bare in
-            // an exported signature, it made every box site in a consumer that did
-            // not itself import the interface fall out of the walker's subset.
-            let qualify_class_type = |ty: &crate::parser::ast::Type| -> crate::parser::ast::Type {
-                let ty = qualify_module_local_type(ty, mod_name, &local_signature_type_names);
-                let ty = qualify_module_local_type(&ty, canonical_path, &local_enum_names);
-                this.canonical_declared_type(&ty).to_source()
-            };
-            let module_classes: Vec<(String, ClassDecl)> = program
-                .items
-                .iter()
-                .filter_map(|item| {
-                    let Item::Class(c) = item else {
-                        return None;
-                    };
-                    let local_name = c.name.clone();
-                    // A module-local `implements` name (generic included --
-                    // `implements Box<i64>` -> `boxmod2::Box<i64>`) is qualified so
-                    // its vtable is declared and keyed by the same name the entry
-                    // boxes against (willow-1js.5), while an interface this module
-                    // merely IMPORTED keeps the spelling it was written with:
-                    // renaming `import proto::Describable;` into `impls::Describable`
-                    // made the vtable lookup below silently find no interface, so the
-                    // class got NO vtable and every later box site fell back to the
-                    // raw object (willow-0g8j.3).
-                    let mut qualified = qualify_module_class_decl(c, mod_name, &qualify_class_type);
-                    // Qualify a module-local base class so `name()` yields the
-                    // module-qualified base (TypePath::name() returns only the last
-                    // segment, so the qualified name must live in a single Local
-                    // string) (willow-2egr).
-                    let module_local_base = match &qualified.base_class {
-                        Some(TypePath::Local(name)) if local_class_names.contains(name) => {
-                            Some(name.clone())
-                        }
-                        _ => None,
-                    };
-                    if let Some(base) = module_local_base {
-                        qualified.base_class = Some(TypePath::Local(format!("{mod_name}::{base}")));
-                    }
-                    Some((local_name, qualified))
-                })
-                .collect();
-
-            // Register imported module class layouts and methods under their
-            // module-qualified names so entry code can call `geom::Point::new(...)`.
-            //
-            // Registration only records each class's OWN fields and virtual
-            // methods; the inherited ones are prepended afterwards by
-            // `finalize_class_layouts`, which evaluates the `extends` chain
-            // root-down. A cross-module hierarchy can arrive subclass-first too,
-            // and no declaration order may change a layout (willow-59gx). The
-            // same evaluation settles each class's virtual slot ORDER, which the
-            // vtables below need: an `open` method's vtable slot holds a thunk
-            // that dispatches through virtual slot N of the receiver's
-            // descriptor (willow-tygf).
-            for (_, c) in &module_classes {
-                this.register_class_layout(c)?;
-            }
-            this.finalize_class_layouts()?;
-            for (_, c) in &module_classes {
-                this.declare_class_methods(c)?;
-                // Static-property storage for imported modules (replayed by
-                // `__willow_static_init`, compiled in the entry's compile_program).
-                this.declare_static_storage_for_class(&c.name, c, init_unit)?;
-            }
-
-            // Forward-declare all functions in this module. The declaration records
-            // the SIGNATURE-qualified type metadata (fn_types / param debug); the body
-            // is compiled later from the original `f` under local-name aliases.
-            for item in &program.items {
-                match item {
-                    Item::Function(f) => {
-                        let mangled = module_item_symbol(&module_prefix, &f.name);
-                        let qualified =
-                            qualify_module_fn_signature(f, mod_name, &local_signature_type_names);
-                        let mut qualified = qualify_module_fn_signature(
-                            &qualified,
-                            canonical_path,
-                            &local_enum_names,
-                        );
-                        // Same translation the classes above get: a type this module
-                        // reached through its own item import is exported under the
-                        // identity the tables hold, not the bare local spelling
-                        // (willow-sxcp).
-                        for param in &mut qualified.params {
-                            param.ty = (this.canonical_declared_type(&param.ty)).to_source();
-                        }
-                        qualified.return_type =
-                            (this.canonical_declared_type(&qualified.return_type)).to_source();
-                        this.func_ids.scope().declare(
-                            &mangled,
-                            FunctionId::free(&f.name).in_namespace(canonical_path),
-                        );
-                        this.declare_function_named(&mangled, &qualified)?;
-                    }
-                    Item::Enum(_) | Item::Class(_) | Item::Interface(_) => {}
-                }
-            }
-
-            // Emit (class, interface) vtables for module classes that implement an
-            // interface (their methods are declared above; implements paths were
-            // module-qualified by `qualify_module_class_decl`).
-            let qualified_classes: Vec<ClassDecl> =
-                module_classes.iter().map(|(_, c)| c.clone()).collect();
-            // Every ancestor of a class in this unit is already registered —
-            // dependencies are declared before their dependents — so its slot
-            // order was final when the layouts were completed above.
-            this.declare_vtables_for_classes(&qualified_classes)?;
-
-            // Emit one descriptor per module class: word 0 of every object of that
-            // class, holding its `type_id` and its virtual method slots
-            // (willow-fm7t). Must follow the method declarations above, since every
-            // slot is filled by function address.
-            this.declare_class_descriptors_for(&qualified_classes)?;
-
-            // Collect and declare this module's lambdas, exactly as
-            // `declare_program` does for the entry file (willow-9yhi). Lifting a
-            // lambda is a DECLARATION-phase job: `lambda_names` is what both
-            // emitters read to find the lifted symbol for a lambda expression, so
-            // without this pass a module body's lambda reaches codegen with no name
-            // at all. The symbols carry the module prefix because the collector
-            // restarts its numbering for every unit it is given.
-            let lambdas: Vec<(String, LambdaExpr)> = collect_lambdas_in_program(program)
-                .into_iter()
-                .enumerate()
-                .map(|(index, (_, lambda))| (module_lambda_symbol(&module_prefix, index), lambda))
-                .collect();
-            for (index, (name, lambda)) in lambdas.iter().enumerate() {
-                this.func_ids.scope().declare(
-                    name,
-                    FunctionId::free(lambda_symbol(index)).in_namespace(canonical_path),
-                );
-                this.declare_lambda(name, lambda, expr_types)?;
-                this.lambda_names
-                    .insert(lambda.id, this.func_ids.scope().lookup_id(name));
-            }
-
-            // Analyze under canonical backend names before installing the module's
-            // temporary local aliases. Imported/unknown callees remain conservative
-            // unless an earlier module already published an explicit summary.
-            let lambda_bodies = this.unit_lambda_bodies(program, &lambdas)?;
-            this.bind_lambda_body_names(&lambda_bodies, &lambdas);
-            this.analyze_and_register_panic_effects(
-                program,
-                super::panic_effect::UnitNaming {
-                    module_prefix: Some(&module_prefix),
-                },
-                &lambdas,
-                &lambda_bodies,
-                expr_types,
-            )?;
-
-            Ok(DeclaredModule {
-                init_unit,
-                mod_name: mod_name.to_string(),
-                program: normalized_program,
-                normalized_expr_types: expr_types
-                    .iter()
-                    .map(|(id, ty)| (*id, ty.to_source()))
-                    .collect(),
-                module_prefix,
-                module_classes,
-                lambdas,
-                lambda_bodies,
-                source_file: source_file.to_string(),
-                builtin_module_aliases: std::mem::take(&mut this.builtin_module_aliases),
-                visible_modules: std::mem::take(&mut this.visible_modules),
-                item_imports,
-                module_spellings,
-                enum_aliases,
-            })
-        })
-    }
-
+/// Planning does not allocate alias contexts or touch mutable emission state.
+pub(super) struct BodyPlanner(pub bool);
+impl BodyPlanner {
     /// The ordered emission targets of a module's body phase, each paired with
     /// the semantic body its lowered IR is stored under (willow-afb5.18).
     ///
@@ -752,6 +404,321 @@ impl Codegen {
         }
     }
 
+    /// The body identity emission keys off, or `None` when this backend has no
+    /// session body index (the standalone path).
+    fn semantic_body(
+        &self,
+        body: crate::parser::ast::BodyId,
+    ) -> Option<crate::parser::ast::BodyId> {
+        self.0.then_some(body)
+    }
+}
+
+impl UnitCodegenContext<'_> {
+    pub fn module_body_plan<'a>(&self, unit: &'a DeclaredModule) -> Vec<UnitBody<'a>> {
+        BodyPlanner(self.body_queries.is_some()).module_body_plan(unit)
+    }
+    pub fn program_body_plan<'a>(&self, unit: &'a DeclaredProgram) -> Vec<UnitBody<'a>> {
+        BodyPlanner(self.body_queries.is_some()).program_body_plan(unit)
+    }
+
+    pub(crate) fn declare_module_with_types(
+        mut self,
+        mod_name: &str,
+        canonical_path: &str,
+        program: &Program,
+        source_file: &str,
+        expr_types: &HashMap<ExprId, Type>,
+        scope: crate::compiler_db::scope::UnitScope,
+    ) -> Result<DeclaredModule> {
+        let init_unit = self.module_init_plan.ensure_module(canonical_path);
+        // Recorded from the RAW program, because the normalization on the next
+        // line is what erases the aliases from it (willow-nswv).
+        self.builtin_module_aliases = builtin_module_aliases(program);
+        // The imports the resolver classified for THIS file. A module sees what
+        // it imports, plus itself: its own classes are keyed
+        // `{mod_name}::{Class}` by the tables below (willow-vtlr).
+        let crate::compiler_db::scope::UnitScope {
+            imports: unit_imports,
+            enum_aliases,
+        } = scope;
+        self.visible_modules = unit_imports.visible_modules;
+        self.visible_modules.insert(mod_name.to_string());
+        // The item half is not bound here: the modules this one imports are
+        // declared, but a direct TYPE import aliases whole compiled tables and
+        // doing that per module changes what the classes declared after it are
+        // compiled against. Only the function half is rebound, before this
+        // unit's bodies (willow-28h8).
+        let item_imports = unit_imports.item_imports;
+        let module_spellings = unit_imports.module_spellings;
+        // The one type table that does have to answer under this unit's own
+        // spelling while its declarations are made: `declare_vtables_for_classes`
+        // below resolves each `implements` name in `interface_infos`, and an
+        // interface this unit IMPORTED (`import proto::Describable;`) is keyed
+        // there by its canonical `proto::Describable` alone. The lookup missed,
+        // the vtable was silently skipped, and every later boxing site fell back
+        // to the raw object (willow-0g8j.3). Bound only in this declaration context, so
+        // nothing declared after this unit sees it.
+        self.bind_unit_enum_aliases(&enum_aliases);
+        self.alias_item_import_types(&item_imports);
+        let normalized_program = match &self.body_queries {
+            Some(queries) => queries.normalized_program(program)?,
+            None => normalize_std_collection_program(program),
+        };
+        let program = &normalized_program;
+        self.source_file = source_file.to_string();
+        let module_prefix = module_symbol_prefix(canonical_path);
+        let InitUnitId::Module(module_id) = init_unit else {
+            unreachable!("module declaration has a module identity");
+        };
+        self.known_modules
+            .register(module_id, canonical_path, mod_name);
+        // ...and the module prefixes THIS unit writes for modules the graph
+        // registered under some other spelling (willow-kd1v). Every module this
+        // one imports is already declared — dependencies are declared before
+        // their dependents — so the tables the aliases point at exist.
+        self.alias_unit_module_spellings(&module_spellings);
+        self.declare_runtime()?;
+        self.declare_string_literals(program)?;
+        // The source path backs `PanicInfo.file` for every panic, so it is a
+        // release-mode literal too: V1 records message AND source location
+        // (willow-s9ej.7).
+        self.declare_string_literal(source_file)?;
+        if self.build_mode == BuildMode::Debug {
+            for name in collect_nil_check_names(program) {
+                self.declare_string_literal(&name)?;
+            }
+            self.declare_reference_debug_strings(program)?;
+        }
+
+        // INTERFACE names declared in this module, so a module-local (possibly
+        // generic) interface named in an `implements` / signature by its bare name
+        // is qualified to `module::Iface` (qualify_module_type alone does not
+        // qualify a generic head name).
+        let local_type_names: std::collections::HashSet<String> = program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Interface(i) => Some(i.name.clone()),
+                _ => None,
+            })
+            .collect();
+        // ENUM names declared in this module, qualified by the module's
+        // CANONICAL path rather than the name this unit reaches it by: an enum
+        // has one identity build-wide, and the type checker qualifies module
+        // signatures the same way, so what the walker reads off a cross-module
+        // call has to be the same name (willow-itcw).
+        let local_enum_names: std::collections::HashSet<String> = program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Enum(e) => Some(e.name.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // CLASS names declared in this module, used to qualify a module-local
+        // `extends Base` so the subclass's class_base / layout / inherited-method
+        // resolution all key off `module::Base` (willow-2egr).
+        let local_class_names: std::collections::HashSet<String> = program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Class(c) => Some(c.name.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // Function signatures must qualify module-local classes too. Otherwise
+        // `one::make() -> Point` and `two::make() -> Point` collapse to the same
+        // bare type even though their layouts have different identities. A
+        // directly imported short name still compares equal through the shared
+        // class type id (willow-0g8j.3).
+        let mut local_signature_type_names = local_type_names.clone();
+        local_signature_type_names.extend(local_class_names.iter().cloned());
+
+        // Every type a module class mentions is qualified the same way this
+        // unit's FUNCTION signatures are (below): module-local classes and
+        // interfaces under the unit's own spelling, module-local enums under the
+        // build-wide canonical path. A name that is neither -- a type the module
+        // itself imported (`import proto::Grade;`), or a builtin -- is left
+        // exactly as written, so it still resolves to the one table that answers
+        // to it. Prefixing wholesale renamed such a type into `lib::Grade`, which
+        // nothing declares (willow-sxcp).
+        // ...and a name that is neither is resolved through the aliases this
+        // unit's own item imports installed above, so what leaves the module is
+        // the identity the build's tables answer to (`Sized` -> `proto::Sized`).
+        // A bare class name a later unit can still find by scanning modules
+        // (`resolve_class_key`), but an interface has no such scan: left bare in
+        // an exported signature, it made every box site in a consumer that did
+        // not itself import the interface fall out of the walker's subset.
+        let qualify_class_type = |ty: &crate::parser::ast::Type| -> crate::parser::ast::Type {
+            let ty = qualify_module_local_type(ty, mod_name, &local_signature_type_names);
+            let ty = qualify_module_local_type(&ty, canonical_path, &local_enum_names);
+            self.canonical_declared_type(&ty).to_source()
+        };
+        let module_classes: Vec<(String, ClassDecl)> = program
+            .items
+            .iter()
+            .filter_map(|item| {
+                let Item::Class(c) = item else {
+                    return None;
+                };
+                let local_name = c.name.clone();
+                // A module-local `implements` name (generic included --
+                // `implements Box<i64>` -> `boxmod2::Box<i64>`) is qualified so
+                // its vtable is declared and keyed by the same name the entry
+                // boxes against (willow-1js.5), while an interface this module
+                // merely IMPORTED keeps the spelling it was written with:
+                // renaming `import proto::Describable;` into `impls::Describable`
+                // made the vtable lookup below silently find no interface, so the
+                // class got NO vtable and every later box site fell back to the
+                // raw object (willow-0g8j.3).
+                let mut qualified = qualify_module_class_decl(c, mod_name, &qualify_class_type);
+                // Qualify a module-local base class so `name()` yields the
+                // module-qualified base (TypePath::name() returns only the last
+                // segment, so the qualified name must live in a single Local
+                // string) (willow-2egr).
+                let module_local_base = match &qualified.base_class {
+                    Some(TypePath::Local(name)) if local_class_names.contains(name) => {
+                        Some(name.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(base) = module_local_base {
+                    qualified.base_class = Some(TypePath::Local(format!("{mod_name}::{base}")));
+                }
+                Some((local_name, qualified))
+            })
+            .collect();
+
+        // Register imported module class layouts and methods under their
+        // module-qualified names so entry code can call `geom::Point::new(...)`.
+        //
+        // Registration only records each class's OWN fields and virtual
+        // methods; the inherited ones are prepended afterwards by
+        // `finalize_class_layouts`, which evaluates the `extends` chain
+        // root-down. A cross-module hierarchy can arrive subclass-first too,
+        // and no declaration order may change a layout (willow-59gx). The
+        // same evaluation settles each class's virtual slot ORDER, which the
+        // vtables below need: an `open` method's vtable slot holds a thunk
+        // that dispatches through virtual slot N of the receiver's
+        // descriptor (willow-tygf).
+        for (_, c) in &module_classes {
+            self.register_class_layout(c)?;
+        }
+        self.finalize_class_layouts()?;
+        for (_, c) in &module_classes {
+            self.declare_class_methods(c)?;
+            // Static-property storage for imported modules (replayed by
+            // `__willow_static_init`, compiled in the entry's compile_program).
+            self.declare_static_storage_for_class(&c.name, c, init_unit)?;
+        }
+
+        // Forward-declare all functions in this module. The declaration records
+        // the SIGNATURE-qualified type metadata (fn_types / param debug); the body
+        // is compiled later from the original `f` under local-name aliases.
+        for item in &program.items {
+            match item {
+                Item::Function(f) => {
+                    let mangled = module_item_symbol(&module_prefix, &f.name);
+                    let qualified =
+                        qualify_module_fn_signature(f, mod_name, &local_signature_type_names);
+                    let mut qualified =
+                        qualify_module_fn_signature(&qualified, canonical_path, &local_enum_names);
+                    // Same translation the classes above get: a type this module
+                    // reached through its own item import is exported under the
+                    // identity the tables hold, not the bare local spelling
+                    // (willow-sxcp).
+                    for param in &mut qualified.params {
+                        param.ty = (self.canonical_declared_type(&param.ty)).to_source();
+                    }
+                    qualified.return_type =
+                        (self.canonical_declared_type(&qualified.return_type)).to_source();
+                    self.func_ids.scope().declare(
+                        &mangled,
+                        FunctionId::free(&f.name).in_namespace(canonical_path),
+                    );
+                    self.declare_function_named(&mangled, &qualified)?;
+                }
+                Item::Enum(_) | Item::Class(_) | Item::Interface(_) => {}
+            }
+        }
+
+        // Emit (class, interface) vtables for module classes that implement an
+        // interface (their methods are declared above; implements paths were
+        // module-qualified by `qualify_module_class_decl`).
+        let qualified_classes: Vec<ClassDecl> =
+            module_classes.iter().map(|(_, c)| c.clone()).collect();
+        // Every ancestor of a class in this unit is already registered —
+        // dependencies are declared before their dependents — so its slot
+        // order was final when the layouts were completed above.
+        self.declare_vtables_for_classes(&qualified_classes)?;
+
+        // Emit one descriptor per module class: word 0 of every object of that
+        // class, holding its `type_id` and its virtual method slots
+        // (willow-fm7t). Must follow the method declarations above, since every
+        // slot is filled by function address.
+        self.declare_class_descriptors_for(&qualified_classes)?;
+
+        // Collect and declare this module's lambdas, exactly as
+        // `declare_program` does for the entry file (willow-9yhi). Lifting a
+        // lambda is a DECLARATION-phase job: `lambda_names` is what both
+        // emitters read to find the lifted symbol for a lambda expression, so
+        // without this pass a module body's lambda reaches codegen with no name
+        // at all. The symbols carry the module prefix because the collector
+        // restarts its numbering for every unit it is given.
+        let lambdas: Vec<(String, LambdaExpr)> = collect_lambdas_in_program(program)
+            .into_iter()
+            .enumerate()
+            .map(|(index, (_, lambda))| (module_lambda_symbol(&module_prefix, index), lambda))
+            .collect();
+        for (index, (name, lambda)) in lambdas.iter().enumerate() {
+            self.func_ids.scope().declare(
+                name,
+                FunctionId::free(lambda_symbol(index)).in_namespace(canonical_path),
+            );
+            self.declare_lambda(name, lambda, expr_types)?;
+            self.lambda_names
+                .insert(lambda.id, self.func_ids.scope().lookup_id(name));
+        }
+
+        // Analyze under canonical backend names before installing the module's
+        // temporary local aliases. Imported/unknown callees remain conservative
+        // unless an earlier module already published an explicit summary.
+        let lambda_bodies = self.unit_lambda_bodies(program, &lambdas)?;
+        self.bind_lambda_body_names(&lambda_bodies, &lambdas);
+        self.analyze_and_register_panic_effects(
+            program,
+            super::panic_effect::UnitNaming {
+                module_prefix: Some(&module_prefix),
+            },
+            &lambdas,
+            &lambda_bodies,
+            expr_types,
+        )?;
+
+        Ok(DeclaredModule {
+            init_unit,
+            mod_name: mod_name.to_string(),
+            program: normalized_program,
+            normalized_expr_types: expr_types
+                .iter()
+                .map(|(id, ty)| (*id, ty.to_source()))
+                .collect(),
+            module_prefix,
+            module_classes,
+            lambdas,
+            lambda_bodies,
+            source_file: source_file.to_string(),
+            builtin_module_aliases: self.builtin_module_aliases,
+            visible_modules: self.visible_modules,
+            item_imports,
+            module_spellings,
+            enum_aliases,
+        })
+    }
+
     /// The semantic body of a static property's initializer expression.
     ///
     /// Unlike a function or method, the emitter compiles a synthesized shell
@@ -775,15 +742,6 @@ impl Codegen {
             )
             .ok_or_else(|| anyhow::anyhow!("static initializer has no body identity"))?;
         Ok(Some(body))
-    }
-
-    /// The body identity emission keys off, or `None` when this backend has no
-    /// session body index (the standalone path).
-    fn semantic_body(
-        &self,
-        body: crate::parser::ast::BodyId,
-    ) -> Option<crate::parser::ast::BodyId> {
-        self.body_queries.as_ref().map(|_| body)
     }
 
     /// Emit one body of the unit whose alias scope is installed.
@@ -815,108 +773,62 @@ impl Codegen {
         }
     }
 
-    /// Install a module's body-phase view of the build — its aliases, imports
-    /// and source path — run `emit` under it, then compile that unit's static
-    /// initializers and restore the previous view.
-    ///
-    /// The declaration phase of a LATER unit has overwritten all three of the
-    /// installed tables, so this module's own view has to be reinstalled before
-    /// its bodies are lowered (willow-4zt8). An item import binds a LOCAL name
-    /// globally, so the last unit to bind it owns it; this module's bodies have
-    /// to call the module IT imported (willow-28h8).
-    pub fn with_module_bodies(
+    /// Populate this fresh context from the declared module, emit its bodies,
+    /// and compile its static initializers. The coordinator drops the context
+    /// on every exit; no previous unit state exists here to restore.
+    pub(super) fn emit_module(
         &mut self,
         unit: &DeclaredModule,
         emit: impl FnOnce(&mut Self) -> Result<()>,
     ) -> Result<()> {
+        for (name, lambda) in &unit.lambdas {
+            self.lambda_names
+                .insert(lambda.id, self.func_ids.scope().lookup_id(name));
+        }
         self.builtin_module_aliases = unit.builtin_module_aliases.clone();
         self.visible_modules = unit.visible_modules.clone();
         self.source_file = unit.source_file.clone();
         let program = &unit.program;
 
-        let result = self.with_unit_resolution(self.resolution_context(), |this| {
-            this.bind_unit_enum_aliases(&unit.enum_aliases);
-            this.rebind_item_import_functions(&unit.item_imports);
-            // Bind the types this unit imported by single-item import under the
-            // local names it spells them by (willow-0g8j.3), then the module's own
-            // enums/interfaces under their unqualified names so the module body
-            // resolves its own types internally (willow-64gs.1). Own declarations
-            // are installed second, so they win.
-            this.alias_item_import_types(&unit.item_imports);
-            // Before the unit's own names, so a module reached under two spellings
-            // still loses to a type this module declares itself (willow-kd1v).
-            this.alias_unit_module_spellings(&unit.module_spellings);
-            this.alias_module_local_types(program, &unit.mod_name);
-            for item in &program.items {
-                if let Item::Function(f) = item {
-                    let mangled = module_item_symbol(&unit.module_prefix, &f.name);
-                    this.alias_function_symbol(&f.name, &mangled);
-                }
+        self.bind_unit_enum_aliases(&unit.enum_aliases);
+        self.rebind_item_import_functions(&unit.item_imports);
+        // Bind the types this unit imported by single-item import under the
+        // local names it spells them by (willow-0g8j.3), then the module's own
+        // enums/interfaces under their unqualified names so the module body
+        // resolves its own types internally (willow-64gs.1). Own declarations
+        // are installed second, so they win.
+        self.alias_item_import_types(&unit.item_imports);
+        // Before the unit's own names, so a module reached under two spellings
+        // still loses to a type this module declares itself (willow-kd1v).
+        self.alias_unit_module_spellings(&unit.module_spellings);
+        self.alias_module_local_types(program, &unit.mod_name);
+        for item in &program.items {
+            if let Item::Function(f) = item {
+                let mangled = module_item_symbol(&unit.module_prefix, &f.name);
+                self.alias_function_symbol(&f.name, &mangled);
             }
-            for (local_name, qualified) in &unit.module_classes {
-                this.alias_class_symbol(local_name, &qualified.name);
-                if !qualified.constructors.is_empty() {
-                    let local = class_member_symbol(local_name, "init");
-                    let canonical = this.class_method_symbol(&qualified.name, "init");
-                    this.alias_function_symbol(&local, &canonical);
-                }
-                for method in &qualified.methods {
-                    let local_mangled = class_member_symbol(local_name, &method.name);
-                    let qualified_mangled = this.class_method_symbol(&qualified.name, &method.name);
-                    this.alias_function_symbol(&local_mangled, &qualified_mangled);
-                }
+        }
+        for (local_name, qualified) in &unit.module_classes {
+            self.alias_class_symbol(local_name, &qualified.name);
+            if !qualified.constructors.is_empty() {
+                let local = class_member_symbol(local_name, "init");
+                let canonical = self.class_method_symbol(&qualified.name, "init");
+                self.alias_function_symbol(&local, &canonical);
             }
-
-            (|| -> Result<()> {
-                emit(this)?;
-                // Inside the alias scope, for the reason the bodies are.
-                this.compile_unit_static_init(unit)
-            })()
-        });
-        self.release_unit_transients();
-        result
-    }
-
-    /// Lower the bodies of a module already passed through
-    /// [`Codegen::declare_module`], under that module's temporary unqualified
-    /// aliases. The session driver iterates
-    /// [`Codegen::module_body_plan`] instead, one body at a time.
-    pub fn compile_module_bodies(&mut self, unit: &DeclaredModule) -> Result<()> {
-        let plan = self.module_body_plan(unit);
-        self.with_module_bodies(unit, |this| {
-            for target in &plan {
-                this.compile_body(target)?;
+            for method in &qualified.methods {
+                let local_mangled = class_member_symbol(local_name, &method.name);
+                let qualified_mangled = self.class_method_symbol(&qualified.name, &method.name);
+                self.alias_function_symbol(&local_mangled, &qualified_mangled);
             }
-            Ok(())
-        })
-    }
+        }
 
-    /// Declare and compile the entry program in one call. A multi-unit driver
-    /// should instead run [`Codegen::declare_program`] alongside every module's
-    /// [`Codegen::declare_module`] and only then lower any body (willow-4zt8).
-    pub fn compile_program(&mut self, program: &Program, source_file: &str) -> Result<()> {
-        let unit = self.declare_program(program, source_file)?;
-        self.compile_program_bodies(&unit)
-    }
-
-    /// Declare every symbol the entry program contributes, without lowering a
-    /// single body.
-    pub fn declare_program(
-        &mut self,
-        program: &Program,
-        source_file: &str,
-    ) -> Result<DeclaredProgram> {
-        let types = std::mem::take(&mut self.expr_types);
-        // The standalone entry point has no resolver classification; the
-        // driver passes one through `*_with_types` instead.
-        let scope = crate::compiler_db::scope::UnitScope::default();
-        let result = self.declare_program_with_types(program, source_file, &types, scope);
-        self.expr_types = types;
-        result
+        emit(self)?;
+        // Inside the alias scope, for the reason the bodies are.
+        self.compile_unit_static_init(unit)
     }
 
     pub(crate) fn declare_program_with_types(
-        &mut self,
+        mut self,
         program: &Program,
         source_file: &str,
         expr_types: &HashMap<ExprId, Type>,
@@ -941,175 +853,142 @@ impl Codegen {
             self.register_item_import(&item.local, &item.module, &item.item);
         }
         // The entry's own spellings for modules another file registered under a
-        // different name (willow-kd1v). Snapshotted and taken back out below:
-        // every module's BODY phase runs between this declaration and the
-        // entry's own, and those units spell the same modules their own way.
-        self.with_unit_resolution(self.resolution_context(), |this| {
-            this.bind_unit_enum_aliases(&enum_aliases);
-            this.alias_unit_module_spellings(&module_spellings);
-            let normalized_program = match &this.body_queries {
-                Some(queries) => queries.normalized_program(program)?,
-                None => normalize_std_collection_program(program),
-            };
-            let program = &normalized_program;
-            this.source_file = source_file.to_string();
-            this.declare_runtime()?;
-            this.declare_string_literals(program)?;
-            // The source path backs `PanicInfo.file` for every panic, so it is a
-            // release-mode literal too: V1 records message AND source location
-            // (willow-s9ej.7).
-            this.declare_string_literal(source_file)?;
-            if this.build_mode == BuildMode::Debug {
-                for name in collect_nil_check_names(program) {
-                    this.declare_string_literal(&name)?;
-                }
-                this.declare_reference_debug_strings(program)?;
+        // different name (willow-kd1v). These bindings belong only to this
+        // context; each later body context resolves its own spellings.
+        self.bind_unit_enum_aliases(&enum_aliases);
+        self.alias_unit_module_spellings(&module_spellings);
+        let normalized_program = match &self.body_queries {
+            Some(queries) => queries.normalized_program(program)?,
+            None => normalize_std_collection_program(program),
+        };
+        let program = &normalized_program;
+        self.source_file = source_file.to_string();
+        self.declare_runtime()?;
+        self.declare_string_literals(program)?;
+        // The source path backs `PanicInfo.file` for every panic, so it is a
+        // release-mode literal too: V1 records message AND source location
+        // (willow-s9ej.7).
+        self.declare_string_literal(source_file)?;
+        if self.build_mode == BuildMode::Debug {
+            for name in collect_nil_check_names(program) {
+                self.declare_string_literal(&name)?;
             }
+            self.declare_reference_debug_strings(program)?;
+        }
 
-            // Pass 1: record every class's OWN fields, base and type_id. No
-            // inherited field is resolved here, because a subclass may be declared
-            // before its base and reading a base mid-walk sees whatever has been
-            // registered so far (willow-59gx).
-            for item in &program.items {
-                if let Item::Class(c) = item {
-                    this.register_class_layout(c)?;
-                }
+        // Pass 1: record every class's OWN fields, base and type_id. No
+        // inherited field is resolved here, because a subclass may be declared
+        // before its base and reading a base mid-walk sees whatever has been
+        // registered so far (willow-59gx).
+        for item in &program.items {
+            if let Item::Class(c) = item {
+                self.register_class_layout(c)?;
             }
-            // Pass 2: prepend inherited fields by evaluating each `extends` chain
-            // root-down, which makes the result independent of declaration order.
-            // The same pass settles every class's virtual slot ORDER, which the
-            // vtables below need: an `open` method's vtable slot holds a thunk
-            // that dispatches through virtual slot N of the receiver's
-            // descriptor (willow-tygf).
-            this.finalize_class_layouts()?;
-            // Pass 3: forward-declare methods and static storage, now that every
-            // layout is final -- a constructor's parameter order IS the layout.
-            for item in &program.items {
-                match item {
-                    Item::Class(c) => {
-                        this.declare_class_methods(c)?;
-                        this.declare_static_storage_for_class(&c.name, c, InitUnitId::Entry)?;
-                    }
-                    Item::Enum(_) => {} // enum infos are registered via register_enum_info before compile
-                    _ => {}
+        }
+        // Pass 2: prepend inherited fields by evaluating each `extends` chain
+        // root-down, which makes the result independent of declaration order.
+        // The same pass settles every class's virtual slot ORDER, which the
+        // vtables below need: an `open` method's vtable slot holds a thunk
+        // that dispatches through virtual slot N of the receiver's
+        // descriptor (willow-tygf).
+        self.finalize_class_layouts()?;
+        // Pass 3: forward-declare methods and static storage, now that every
+        // layout is final -- a constructor's parameter order IS the layout.
+        for item in &program.items {
+            match item {
+                Item::Class(c) => {
+                    self.declare_class_methods(c)?;
+                    self.declare_static_storage_for_class(&c.name, c, InitUnitId::Entry)?;
                 }
+                Item::Enum(_) => {} // enum infos are registered via register_enum_info before compile
+                _ => {}
             }
+        }
 
-            // Forward-declare all user functions first
-            for item in &program.items {
-                match item {
-                    Item::Function(f) => this.declare_user_function(f)?,
-                    Item::Class(_) | Item::Enum(_) | Item::Interface(_) => {}
-                }
+        // Forward-declare all user functions first
+        for item in &program.items {
+            match item {
+                Item::Function(f) => self.declare_user_function(f)?,
+                Item::Class(_) | Item::Enum(_) | Item::Interface(_) => {}
             }
+        }
 
-            // Emit one static vtable per (class, implemented-interface) pair. All
-            // class method symbols are declared by now, so the vtable can reference
-            // them by function address.
-            this.declare_interface_vtables(program)?;
+        // Emit one static vtable per (class, implemented-interface) pair. All
+        // class method symbols are declared by now, so the vtable can reference
+        // them by function address.
+        self.declare_interface_vtables(program)?;
 
-            // Emit one descriptor per class (willow-fm7t). Unlike interface
-            // vtables this covers EVERY class, since word 0 of every object points
-            // at its descriptor whether or not the class implements an interface.
-            this.declare_class_descriptors(program)?;
+        // Emit one descriptor per class (willow-fm7t). Unlike interface
+        // vtables this covers EVERY class, since word 0 of every object points
+        // at its descriptor whether or not the class implements an interface.
+        self.declare_class_descriptors(program)?;
 
-            // Collect and declare all lambdas (they may call user functions already declared above).
-            let lambdas = collect_lambdas_in_program(program);
-            for (name, lambda) in &lambdas {
-                this.declare_lambda(name, lambda, expr_types)?;
-                this.lambda_names
-                    .insert(lambda.id, this.func_ids.scope().lookup_id(name));
-                // The lowered body was lifted under a span-derived placeholder
-                // because only this loop knows the symbol (willow-0g8j.2.2). Moving
-                // it into `lir_functions` under that symbol is what lets a lambda be
-                // compiled by the walker like any other function.
-                if let Some(mut lf) = this.lir_lambdas.remove(&lambda.id) {
-                    lf.name = this.func_ids.scope().lookup_id(name);
-                    this.lir_functions.insert(lf.name, lf);
-                }
-            }
+        // Collect and declare all lambdas (they may call user functions already declared above).
+        let lambdas = collect_lambdas_in_program(program);
+        for (name, lambda) in &lambdas {
+            self.declare_lambda(name, lambda, expr_types)?;
+            self.lambda_names
+                .insert(lambda.id, self.func_ids.scope().lookup_id(name));
+        }
 
-            let lambda_bodies = this.unit_lambda_bodies(program, &lambdas)?;
-            this.bind_lambda_body_names(&lambda_bodies, &lambdas);
-            this.analyze_and_register_panic_effects(
-                program,
-                super::panic_effect::UnitNaming {
-                    module_prefix: None,
-                },
-                &lambdas,
-                &lambda_bodies,
-                expr_types,
-            )?;
+        let lambda_bodies = self.unit_lambda_bodies(program, &lambdas)?;
+        self.bind_lambda_body_names(&lambda_bodies, &lambdas);
+        self.analyze_and_register_panic_effects(
+            program,
+            super::panic_effect::UnitNaming {
+                module_prefix: None,
+            },
+            &lambdas,
+            &lambda_bodies,
+            expr_types,
+        )?;
 
-            // Always declare `__willow_static_init` (willow-qsqf §13.5). The runtime
-            // calls it after `gc_init` and before `willow_user_main`; it checks the ABI
-            // even when the program has no static properties. Declaring it unconditionally
-            // keeps the runtime call path uniform regardless of the `main` lowering.
-            this.declare_static_init()?;
+        // Always declare `__willow_static_init` (willow-qsqf §13.5). The runtime
+        // calls it after `gc_init` and before `willow_user_main`; it checks the ABI
+        // even when the program has no static properties. Declaring it unconditionally
+        // keeps the runtime call path uniform regardless of the `main` lowering.
+        self.declare_static_init()?;
 
-            Ok(DeclaredProgram {
-                program: normalized_program,
-                normalized_expr_types: expr_types
-                    .iter()
-                    .map(|(id, ty)| (*id, ty.to_source()))
-                    .collect(),
-                lambdas,
-                lambda_bodies,
-                source_file: source_file.to_string(),
-                builtin_module_aliases: std::mem::take(&mut this.builtin_module_aliases),
-                visible_modules: std::mem::take(&mut this.visible_modules),
-                item_imports,
-                module_spellings,
-                enum_aliases,
-            })
+        Ok(DeclaredProgram {
+            program: normalized_program,
+            normalized_expr_types: expr_types
+                .iter()
+                .map(|(id, ty)| (*id, ty.to_source()))
+                .collect(),
+            lambdas,
+            lambda_bodies,
+            source_file: source_file.to_string(),
+            builtin_module_aliases: self.builtin_module_aliases,
+            visible_modules: self.visible_modules,
+            item_imports,
+            module_spellings,
+            enum_aliases,
         })
     }
 
-    /// Install the entry program's body-phase view of the build, run `emit`
-    /// under it, then compile `__willow_static_init` and restore the previous
-    /// view.
-    ///
-    /// A module's body phase runs between the two entry phases and installs its
-    /// own view of both (willow-4zt8), including the entry's own module
-    /// spellings, which the last module body phase took back out (willow-kd1v).
-    pub fn with_program_bodies(
+    /// Populate the fresh entry context and emit its bodies and static init.
+    pub(super) fn emit_program(
         &mut self,
         unit: &DeclaredProgram,
         emit: impl FnOnce(&mut Self) -> Result<()>,
     ) -> Result<()> {
+        for (name, lambda) in &unit.lambdas {
+            self.lambda_names
+                .insert(lambda.id, self.func_ids.scope().lookup_id(name));
+        }
         self.builtin_module_aliases = unit.builtin_module_aliases.clone();
         self.visible_modules = unit.visible_modules.clone();
         self.source_file = unit.source_file.clone();
-        let result = self.with_unit_resolution(self.resolution_context(), |this| {
-            this.bind_unit_enum_aliases(&unit.enum_aliases);
-            this.rebind_item_import_functions(&unit.item_imports);
-            // Declarations no longer leak their unit aliases into later body
-            // phases. Install this entry unit's type imports explicitly too.
-            this.alias_item_import_types(&unit.item_imports);
-            this.alias_unit_module_spellings(&unit.module_spellings);
+        self.bind_unit_enum_aliases(&unit.enum_aliases);
+        self.rebind_item_import_functions(&unit.item_imports);
+        // Declarations no longer leak their unit aliases into later body
+        // phases. Install this entry unit's type imports explicitly too.
+        self.alias_item_import_types(&unit.item_imports);
+        self.alias_unit_module_spellings(&unit.module_spellings);
 
-            (|| -> Result<()> {
-                emit(this)?;
-                // Compile the static-init function body after all symbols are defined.
-                this.compile_static_init()
-            })()
-        });
-        self.release_unit_transients();
-        result
-    }
-
-    /// Lower the bodies of an entry program already passed through
-    /// [`Codegen::declare_program`], plus every lambda and the static
-    /// initializer. The session driver iterates
-    /// [`Codegen::program_body_plan`] instead, one body at a time.
-    pub fn compile_program_bodies(&mut self, unit: &DeclaredProgram) -> Result<()> {
-        let plan = self.program_body_plan(unit);
-        self.with_program_bodies(unit, |this| {
-            for target in &plan {
-                this.compile_body(target)?;
-            }
-            Ok(())
-        })
+        emit(self)?;
+        // Compile the static-init function body after all symbols are defined.
+        self.compile_static_init()
     }
 
     /// Declare the `__willow_static_init` symbol (no params, no returns). Exported
@@ -1118,8 +997,9 @@ impl Codegen {
         if self.func_ids.contains_key(STATIC_INIT_SYMBOL) {
             return Ok(());
         }
-        let sig = self.module.make_signature();
+        let sig = self.output.module.make_signature();
         let id = self
+            .output
             .module
             .declare_function(STATIC_INIT_SYMBOL, Linkage::Export, &sig)?;
         self.func_ids.insert(STATIC_INIT_SYMBOL, id);
@@ -1152,22 +1032,26 @@ impl Codegen {
         // signature and in every per-parameter table, so the index a caller
         // counts from and the index the body binds from stay the same one.
         let env_param = closure_env_param(lambda_type.as_ref(), l.span);
-        let mut sig = self.module.make_signature();
+        let mut sig = self.output.module.make_signature();
         if env_param.is_some() {
-            sig.params
-                .push(AbiParam::new(reference_type(self.module.target_config())));
+            sig.params.push(AbiParam::new(reference_type(
+                self.output.module.target_config(),
+            )));
         }
         for ty in &param_types {
             sig.params.push(AbiParam::new(clif_type(
-                reference_type(self.module.target_config()),
+                reference_type(self.output.module.target_config()),
                 ty,
             )));
         }
         sig.returns.push(AbiParam::new(clif_type(
-            reference_type(self.module.target_config()),
+            reference_type(self.output.module.target_config()),
             &ast_ret,
         )));
-        let id = self.module.declare_function(name, Linkage::Local, &sig)?;
+        let id = self
+            .output
+            .module
+            .declare_function(name, Linkage::Local, &sig)?;
         self.func_ids.insert(name, id);
         self.func_return_types.insert(name, ast_ret.clone());
         self.func_param_modes.insert(
@@ -1288,23 +1172,24 @@ impl Codegen {
     }
 
     pub(super) fn declare_runtime(&mut self) -> Result<()> {
-        if self.runtime_declared {
+        if self.output.runtime_declared {
             return Ok(());
         }
 
         // The runtime ABI surface is declared from a single source of truth in
         // `willow_abi::runtime_symbols`. Adding or changing a runtime symbol
         // means editing `RUNTIME_SYMBOLS`, not this loop.
-        let ptr_ty = reference_type(self.module.target_config());
+        let ptr_ty = reference_type(self.output.module.target_config());
         for symbol in abi::RUNTIME_SYMBOLS {
-            let mut sig = self.module.make_signature();
+            let mut sig = self.output.module.make_signature();
             abi::fill_signature(symbol, &mut sig, ptr_ty);
             let id = self
+                .output
                 .module
                 .declare_function(symbol.name, Linkage::Import, &sig)?;
             self.func_ids.insert(symbol.name, id);
         }
-        self.runtime_declared = true;
+        self.output.runtime_declared = true;
         Ok(())
     }
 
@@ -1333,31 +1218,35 @@ impl Codegen {
     }
 
     pub(super) fn declare_string_literal(&mut self, value: &str) -> Result<()> {
-        if self.string_literals.contains_key(value) {
+        if self.output.string_literals.contains_key(value) {
             return Ok(());
         }
 
-        let name = format!("__willow_str_{}", self.string_counter);
-        self.string_counter += 1;
+        let name = format!("__willow_str_{}", self.output.string_counter);
+        self.output.string_counter += 1;
         let data_id = self
+            .output
             .module
             .declare_data(&name, Linkage::Local, false, false)?;
         let mut data = DataDescription::new();
         let mut bytes = value.as_bytes().to_vec();
         bytes.push(0);
         data.define(bytes.into_boxed_slice());
-        self.module.define_data(data_id, &data)?;
+        self.output.module.define_data(data_id, &data)?;
         // Writable, pointer-aligned, zero-initialized atomic slot. Its address is
         // process-lifetime storage; runtime reset clears initialized slots.
-        let slot =
-            self.module
-                .declare_data(&format!("{name}_slot"), Linkage::Local, true, false)?;
+        let slot = self.output.module.declare_data(
+            &format!("{name}_slot"),
+            Linkage::Local,
+            true,
+            false,
+        )?;
         let mut slot_data = DataDescription::new();
-        let pointer_bytes = self.module.target_config().pointer_bytes();
+        let pointer_bytes = self.output.module.target_config().pointer_bytes();
         slot_data.define_zeroinit(pointer_bytes as usize);
         slot_data.set_align(pointer_bytes as u64);
-        self.module.define_data(slot, &slot_data)?;
-        self.string_literals.insert(
+        self.output.module.define_data(slot, &slot_data)?;
+        self.output.string_literals.insert(
             value.to_string(),
             StringLiteralData {
                 bytes: data_id,
@@ -1384,8 +1273,8 @@ impl Codegen {
         export: bool,
     ) -> Result<()> {
         *self.dispatch_cache.get_mut() = Default::default();
-        let mut sig = self.module.make_signature();
-        let ptr_ty = reference_type(self.module.target_config());
+        let mut sig = self.output.module.make_signature();
+        let ptr_ty = reference_type(self.output.module.target_config());
         // `willow_user_main` is parameterless even when `fn main(args:
         // Array<String>)` is declared (see compile_function_named).
         if symbol_name != USER_MAIN_SYMBOL {
@@ -1401,7 +1290,7 @@ impl Codegen {
         let force_void_main = symbol_name == USER_MAIN_SYMBOL && main_result_err_type(f).is_some();
         if call_return_type != Type::Void && !force_void_main {
             sig.returns.push(AbiParam::new(clif_type(
-                reference_type(self.module.target_config()),
+                reference_type(self.output.module.target_config()),
                 &call_return_type,
             )));
         }
@@ -1411,7 +1300,10 @@ impl Codegen {
             Linkage::Local
         };
         self.claim_symbol(symbol_name, format!("function `{}`", f.name), f.span)?;
-        let id = self.module.declare_function(symbol_name, linkage, &sig)?;
+        let id = self
+            .output
+            .module
+            .declare_function(symbol_name, linkage, &sig)?;
         self.func_ids.insert(lookup_name, id);
         // Task constructors are global declarations. Unit aliases resolve to
         // these canonical identities, including calls within another module.
@@ -1453,8 +1345,8 @@ impl Codegen {
         // `name` here is the lookup name (`main`), so map it to the symbol.
         let is_main = user_function_symbol(name) == USER_MAIN_SYMBOL;
 
-        let mut sig = self.module.make_signature();
-        let ptr_ty = reference_type(self.module.target_config());
+        let mut sig = self.output.module.make_signature();
+        let ptr_ty = reference_type(self.output.module.target_config());
         if !is_main {
             for param in &f.params {
                 sig.params
@@ -1523,12 +1415,12 @@ impl Codegen {
         let force_void_main = main_result_err_ty.is_some();
         if call_return_type != Type::Void && !force_void_main {
             sig.returns.push(AbiParam::new(clif_type(
-                reference_type(self.module.target_config()),
+                reference_type(self.output.module.target_config()),
                 &call_return_type,
             )));
         }
 
-        let mut ctx = self.module.make_context();
+        let mut ctx = self.output.module.make_context();
         ctx.func.signature = sig;
         ctx.func.name = UserFuncName::user(0, func_id.as_u32());
 
@@ -1569,10 +1461,10 @@ impl Codegen {
             lock_scopes: Vec::new(),
             collected_lock_sites: Vec::new(),
             collected_cleanup_order: 0,
-            module: &mut self.module,
-            gc_tlab_state: self.gc_tlab_state,
-            gc_bitmap_descriptors: &mut self.gc_bitmap_descriptors,
-            gc_layout_descriptors: &mut self.gc_layout_descriptors,
+            module: &mut self.output.module,
+            gc_tlab_state: self.output.gc_tlab_state,
+            gc_bitmap_descriptors: &mut self.output.gc_bitmap_descriptors,
+            gc_layout_descriptors: &mut self.output.gc_layout_descriptors,
             func_ids: &self.func_ids,
             func_return_types: &self.func_return_types,
             fn_types: &self.fn_types,
@@ -1583,7 +1475,7 @@ impl Codegen {
             visible_modules: &self.visible_modules,
             builtin_module_aliases: &self.builtin_module_aliases,
             lambda_names: &self.lambda_names,
-            string_literals: &self.string_literals,
+            string_literals: &self.output.string_literals,
             classes: ClassView::new(&self.type_scope, &self.layout_queries),
             static_storage: &self.static_storage,
             enum_infos: &self.enum_infos,
@@ -1591,7 +1483,7 @@ impl Codegen {
             dispatch_cache: &self.dispatch_cache,
             vtable_ids: &self.vtable_ids,
             interface_slot_targets: &self.interface_slot_targets,
-            interface_slot_summaries: &self.interface_slot_summaries,
+            interface_slot_summaries: &self.output.interface_slot_summaries,
             coop_frame: None,
             coop_suspend_points: None,
             coop_result_offset: None,
@@ -1714,8 +1606,9 @@ impl Codegen {
         fg.emit_panic_return(&call_return_type, force_void_main);
         fg.builder.seal_all_blocks();
 
-        builder.finalize(self.module.target_config());
-        self.module
+        builder.finalize(self.output.module.target_config());
+        self.output
+            .module
             .define_function(func_id, &mut ctx)
             .map_err(|e| {
                 if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
@@ -1723,7 +1616,7 @@ impl Codegen {
                 }
                 e
             })?;
-        self.module.clear_context(&mut ctx);
+        self.output.module.clear_context(&mut ctx);
         Ok(())
     }
 
@@ -1744,24 +1637,30 @@ impl Codegen {
                     .insert(self.func_ids.scope().lookup_id(&mangled));
             }
             self.claim_symbol(&mangled, format!("method `{}::{}`", c.name, m.name), m.span)?;
-            let mut sig = self.module.make_signature();
-            let ptr_ty = reference_type(self.module.target_config());
-            sig.params
-                .push(AbiParam::new(reference_type(self.module.target_config()))); // self pointer
+            let mut sig = self.output.module.make_signature();
+            let ptr_ty = reference_type(self.output.module.target_config());
+            sig.params.push(AbiParam::new(reference_type(
+                self.output.module.target_config(),
+            ))); // self pointer
             for p in &m.params {
                 sig.params.push(AbiParam::new(param_abi_type(p, ptr_ty)));
             }
             let call_return_type = method_call_return_type(m);
             if call_return_type != Type::Void {
                 sig.returns.push(AbiParam::new(clif_type(
-                    reference_type(self.module.target_config()),
+                    reference_type(self.output.module.target_config()),
                     &call_return_type,
                 )));
             }
             let id = self
+                .output
                 .module
                 .declare_function(&mangled, Linkage::Local, &sig)?;
             self.func_ids.insert(mangled.clone(), id);
+            self.method_functions
+                .entry(TypeId::from_source_name(&c.name))
+                .or_default()
+                .insert(self.func_ids.scope().lookup_id(&mangled));
             self.func_return_types
                 .insert(mangled.clone(), call_return_type.clone());
             self.func_param_modes.insert(
@@ -1808,6 +1707,7 @@ impl Codegen {
                 field.span,
             )?;
             let data_id = self
+                .output
                 .module
                 .declare_data(&sym, Linkage::Local, true, false)?;
             let mut data = DataDescription::new();
@@ -1815,11 +1715,12 @@ impl Codegen {
             // static init sees a safe (null) slot (willow-qsqf §12.3). The slot
             // holds a pointer and is registered as a GC root, so it must be
             // 8-aligned — the collector dereferences the root slot.
-            let storage_bytes =
-                willow_abi::storage_word_bytes(reference_type(self.module.target_config()).bytes());
+            let storage_bytes = willow_abi::storage_word_bytes(
+                reference_type(self.output.module.target_config()).bytes(),
+            );
             data.define_zeroinit(storage_bytes as usize);
             data.set_align(storage_bytes as u64);
-            self.module.define_data(data_id, &data)?;
+            self.output.module.define_data(data_id, &data)?;
             self.static_storage
                 .entry(class_key.to_string())
                 .or_insert(HashMap::new())
@@ -1855,7 +1756,8 @@ impl Codegen {
             self.func_ids.scope().declare(&initializer_name, identity);
             self.func_ids.scope().declare(&symbol, identity);
             self.declare_function_symbol(&initializer_name, &symbol, &initializer, false)?;
-            self.unit_static_inits
+            self.output
+                .unit_static_inits
                 .entry(owner)
                 .or_default()
                 .items
@@ -1882,11 +1784,12 @@ impl Codegen {
     }
 
     fn compile_static_expressions(&mut self, unit: InitUnitId) -> Result<()> {
-        let items = std::mem::take(&mut self.unit_static_inits.entry(unit).or_default().items);
+        let items =
+            std::mem::take(&mut self.output.unit_static_inits.entry(unit).or_default().items);
         for item in &items {
             self.compile_function_named(&item.initializer.name, &item.initializer, item.body)?;
         }
-        self.unit_static_inits.entry(unit).or_default().items = items;
+        self.output.unit_static_inits.entry(unit).or_default().items = items;
         Ok(())
     }
 
@@ -1894,14 +1797,12 @@ impl Codegen {
         self.compile_static_expressions(InitUnitId::Entry)?;
         let mut items = Vec::new();
         for unit in self.module_init_plan.order() {
-            if let Some(node) = self.unit_static_inits.remove(unit) {
+            if let Some(node) = self.output.unit_static_inits.remove(unit) {
                 items.extend(node.items);
             }
         }
-        let queried_order = self
-            .effect_queries
-            .as_ref()
-            .and_then(|(queries, _)| queries.static_initializers.order());
+        // The dependency plan is build-wide, not the last unit's effect input.
+        let queried_order = self.static_init_order.clone();
         if let Some(order) = queried_order {
             let mut indexed: HashMap<_, _> = items
                 .into_iter()
@@ -1925,8 +1826,8 @@ impl Codegen {
     }
 
     fn emit_static_init_body(&mut self, func_id: FuncId, items: &[StaticInitItem]) -> Result<()> {
-        let sig = self.module.make_signature();
-        let mut ctx = self.module.make_context();
+        let sig = self.output.module.make_signature();
+        let mut ctx = self.output.module.make_context();
         ctx.func.signature = sig;
         ctx.func.name = UserFuncName::user(0, func_id.as_u32());
 
@@ -1940,6 +1841,7 @@ impl Codegen {
         // Before any generated initializer or user main touches runtime objects.
         // One check per executable, independent of module/function/exit count.
         let check = self
+            .output
             .module
             .declare_func_in_func(self.func_ids["willow_runtime_check_abi"], builder.func);
         let expected = builder
@@ -1973,10 +1875,10 @@ impl Codegen {
             lock_scopes: Vec::new(),
             collected_lock_sites: Vec::new(),
             collected_cleanup_order: 0,
-            module: &mut self.module,
-            gc_tlab_state: self.gc_tlab_state,
-            gc_bitmap_descriptors: &mut self.gc_bitmap_descriptors,
-            gc_layout_descriptors: &mut self.gc_layout_descriptors,
+            module: &mut self.output.module,
+            gc_tlab_state: self.output.gc_tlab_state,
+            gc_bitmap_descriptors: &mut self.output.gc_bitmap_descriptors,
+            gc_layout_descriptors: &mut self.output.gc_layout_descriptors,
             func_ids: &self.func_ids,
             func_return_types: &self.func_return_types,
             fn_types: &self.fn_types,
@@ -1987,7 +1889,7 @@ impl Codegen {
             visible_modules: &self.visible_modules,
             builtin_module_aliases: &self.builtin_module_aliases,
             lambda_names: &self.lambda_names,
-            string_literals: &self.string_literals,
+            string_literals: &self.output.string_literals,
             classes: ClassView::new(&self.type_scope, &self.layout_queries),
             static_storage: &self.static_storage,
             enum_infos: &self.enum_infos,
@@ -1995,7 +1897,7 @@ impl Codegen {
             dispatch_cache: &self.dispatch_cache,
             vtable_ids: &self.vtable_ids,
             interface_slot_targets: &self.interface_slot_targets,
-            interface_slot_summaries: &self.interface_slot_summaries,
+            interface_slot_summaries: &self.output.interface_slot_summaries,
             coop_frame: None,
             coop_suspend_points: None,
             coop_result_offset: None,
@@ -2056,8 +1958,9 @@ impl Codegen {
             }
         }
         fg.builder.ins().return_(&[]);
-        builder.finalize(self.module.target_config());
-        self.module
+        builder.finalize(self.output.module.target_config());
+        self.output
+            .module
             .define_function(func_id, &mut ctx)
             .map_err(|e| {
                 if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
@@ -2065,7 +1968,7 @@ impl Codegen {
                 }
                 e
             })?;
-        self.module.clear_context(&mut ctx);
+        self.output.module.clear_context(&mut ctx);
         Ok(())
     }
 
@@ -2143,6 +2046,7 @@ impl Codegen {
                 span,
             )?;
             let id = self
+                .output
                 .module
                 .declare_data(&symbol, Linkage::Local, false, false)?;
             self.vtable_ids.insert(key, id);
@@ -2173,7 +2077,7 @@ impl Codegen {
         let mut data = DataDescription::new();
         // Explicit zeroed bytes (not `define_zeroinit`, which is BSS and cannot
         // carry the function-address relocations written below).
-        let pointer_bytes = reference_type(self.module.target_config()).bytes();
+        let pointer_bytes = reference_type(self.output.module.target_config()).bytes();
         data.set_align(pointer_bytes as u64);
         data.define(
             vec![
@@ -2220,7 +2124,7 @@ impl Codegen {
                 }
                 _ => None,
             };
-            self.interface_slot_summaries.get_mut().clear();
+            self.output.interface_slot_summaries.get_mut().clear();
             self.interface_slot_targets
                 .entry((iface.name, method_name.to_string()))
                 .or_default()
@@ -2234,7 +2138,7 @@ impl Codegen {
                 }
                 None => func_id,
             };
-            let func_ref = self.module.declare_func_in_data(entry, &mut data);
+            let func_ref = self.output.module.declare_func_in_data(entry, &mut data);
             data.write_function_addr(
                 willow_abi::dispatch_layout::table_slot_offset(slot as u32, pointer_bytes),
                 func_ref,
@@ -2247,7 +2151,7 @@ impl Codegen {
                 .map(|info| info.name)
                 .unwrap_or(*sup);
             if let Some(&target) = self.vtable_ids.get(&(key.0, canonical)) {
-                let reference = self.module.declare_data_in_data(target, &mut data);
+                let reference = self.output.module.declare_data_in_data(target, &mut data);
                 data.write_data_addr(
                     willow_abi::dispatch_layout::table_slot_offset(
                         (method_words + index) as u32,
@@ -2258,7 +2162,7 @@ impl Codegen {
                 );
             }
         }
-        self.module.define_data(data_id, &data)?;
+        self.output.module.define_data(data_id, &data)?;
         Ok(())
     }
 
@@ -2291,6 +2195,7 @@ impl Codegen {
         // one authority on the thunk's own: an `override` must match the method
         // it replaces, so every class the receiver can be agrees with it.
         let sig = self
+            .output
             .module
             .declarations()
             .get_function_decl(target)
@@ -2311,10 +2216,11 @@ impl Codegen {
             span,
         )?;
         let func_id = self
+            .output
             .module
             .declare_function(&symbol, Linkage::Local, &sig)?;
 
-        let mut ctx = self.module.make_context();
+        let mut ctx = self.output.module.make_context();
         ctx.func.signature = sig.clone();
         ctx.func.name = UserFuncName::user(0, func_id.as_u32());
         let mut fn_ctx = FunctionBuilderContext::new();
@@ -2325,7 +2231,7 @@ impl Codegen {
         builder.seal_block(entry);
 
         let params: Vec<cranelift_codegen::ir::Value> = builder.block_params(entry).to_vec();
-        let ptr_ty = reference_type(self.module.target_config());
+        let ptr_ty = reference_type(self.output.module.target_config());
         // Parameter 0 is the receiver for every instance method, which is what
         // a vtable slot is only ever reached through.
         let self_ptr = params[0];
@@ -2341,9 +2247,9 @@ impl Codegen {
         let call = builder.ins().call_indirect(sig_ref, callee, &params);
         let results = builder.inst_results(call).to_vec();
         builder.ins().return_(&results);
-        builder.finalize(self.module.target_config());
-        self.module.define_function(func_id, &mut ctx)?;
-        self.module.clear_context(&mut ctx);
+        builder.finalize(self.output.module.target_config());
+        self.output.module.define_function(func_id, &mut ctx)?;
+        self.output.module.clear_context(&mut ctx);
 
         self.vtable_thunk_ids.insert(key, func_id);
         Ok(func_id)
@@ -2399,13 +2305,14 @@ impl Codegen {
         // hands out, so it is claimed like the rest (willow-uqzx, item 8).
         self.claim_symbol(&symbol, format!("class `{class_name}`"), span)?;
         let data_id = self
+            .output
             .module
             .declare_data(&symbol, Linkage::Local, false, false)?;
         let mut data = DataDescription::new();
         // Explicit zeroed bytes (not `define_zeroinit`, which is BSS and cannot
         // carry the function-address relocations written below) — the same
         // constraint `declare_one_vtable` works under.
-        let pointer_bytes = reference_type(self.module.target_config()).bytes();
+        let pointer_bytes = reference_type(self.output.module.target_config()).bytes();
         data.set_align(willow_abi::dispatch_layout::CLASS_ID_BYTES as u64);
         let mut bytes = vec![
             0u8;
@@ -2415,7 +2322,7 @@ impl Codegen {
         // The type_id is a plain constant, not a relocation, so it is written
         // into the bytes directly — in the TARGET's byte order, which is what
         // the generated `load` will read it back in.
-        let type_id_bytes = match self.module.isa().endianness() {
+        let type_id_bytes = match self.output.module.isa().endianness() {
             cranelift_codegen::ir::Endianness::Little => type_id.to_le_bytes(),
             cranelift_codegen::ir::Endianness::Big => type_id.to_be_bytes(),
         };
@@ -2425,14 +2332,14 @@ impl Codegen {
             // Resolves to an ancestor's body when this class did not redeclare
             // the method, which is exactly what an inherited slot must hold.
             if let Some(func_id) = self.resolve_class_method_func_id(class_name, method_name) {
-                let func_ref = self.module.declare_func_in_data(func_id, &mut data);
+                let func_ref = self.output.module.declare_func_in_data(func_id, &mut data);
                 data.write_function_addr(
                     willow_abi::dispatch_layout::class_slot_offset(slot as u32, pointer_bytes),
                     func_ref,
                 );
             }
         }
-        self.module.define_data(data_id, &data)?;
+        self.output.module.define_data(data_id, &data)?;
         self.class_descriptor_ids
             .insert(class_name.to_string(), data_id);
         Ok(())
@@ -2481,22 +2388,23 @@ impl Codegen {
         }
         let func_id = self.func_ids[&mangled];
 
-        let mut sig = self.module.make_signature();
-        let ptr_ty = reference_type(self.module.target_config());
-        sig.params
-            .push(AbiParam::new(reference_type(self.module.target_config()))); // self pointer
+        let mut sig = self.output.module.make_signature();
+        let ptr_ty = reference_type(self.output.module.target_config());
+        sig.params.push(AbiParam::new(reference_type(
+            self.output.module.target_config(),
+        ))); // self pointer
         for p in &m.params {
             sig.params.push(AbiParam::new(param_abi_type(p, ptr_ty)));
         }
         let call_return_type = method_call_return_type(m);
         if call_return_type != Type::Void {
             sig.returns.push(AbiParam::new(clif_type(
-                reference_type(self.module.target_config()),
+                reference_type(self.output.module.target_config()),
                 &call_return_type,
             )));
         }
 
-        let mut ctx = self.module.make_context();
+        let mut ctx = self.output.module.make_context();
         ctx.func.signature = sig;
         ctx.func.name = UserFuncName::user(0, func_id.as_u32());
 
@@ -2535,10 +2443,10 @@ impl Codegen {
             lock_scopes: Vec::new(),
             collected_lock_sites: Vec::new(),
             collected_cleanup_order: 0,
-            module: &mut self.module,
-            gc_tlab_state: self.gc_tlab_state,
-            gc_bitmap_descriptors: &mut self.gc_bitmap_descriptors,
-            gc_layout_descriptors: &mut self.gc_layout_descriptors,
+            module: &mut self.output.module,
+            gc_tlab_state: self.output.gc_tlab_state,
+            gc_bitmap_descriptors: &mut self.output.gc_bitmap_descriptors,
+            gc_layout_descriptors: &mut self.output.gc_layout_descriptors,
             func_ids: &self.func_ids,
             func_return_types: &self.func_return_types,
             fn_types: &self.fn_types,
@@ -2549,7 +2457,7 @@ impl Codegen {
             visible_modules: &self.visible_modules,
             builtin_module_aliases: &self.builtin_module_aliases,
             lambda_names: &self.lambda_names,
-            string_literals: &self.string_literals,
+            string_literals: &self.output.string_literals,
             classes: ClassView::new(&self.type_scope, &self.layout_queries),
             static_storage: &self.static_storage,
             enum_infos: &self.enum_infos,
@@ -2557,7 +2465,7 @@ impl Codegen {
             dispatch_cache: &self.dispatch_cache,
             vtable_ids: &self.vtable_ids,
             interface_slot_targets: &self.interface_slot_targets,
-            interface_slot_summaries: &self.interface_slot_summaries,
+            interface_slot_summaries: &self.output.interface_slot_summaries,
             coop_frame: None,
             coop_suspend_points: None,
             coop_result_offset: None,
@@ -2663,8 +2571,9 @@ impl Codegen {
         fg.emit_panic_return(&call_return_type, false);
         fg.builder.seal_all_blocks();
 
-        builder.finalize(self.module.target_config());
-        self.module
+        builder.finalize(self.output.module.target_config());
+        self.output
+            .module
             .define_function(func_id, &mut ctx)
             .map_err(|e| {
                 if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
@@ -2672,7 +2581,7 @@ impl Codegen {
                 }
                 e
             })?;
-        self.module.clear_context(&mut ctx);
+        self.output.module.clear_context(&mut ctx);
         Ok(())
     }
 }

@@ -1,5 +1,6 @@
 //! Module aliases bind semantic identities; linker spelling belongs to definitions.
 
+use super::borrowed::Storage;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -17,18 +18,45 @@ struct ModuleDefinition {
 pub(super) struct ModuleResolutionContext(Rc<HashMap<String, ModuleId>>);
 
 #[derive(Default, Clone, Debug)]
-pub(super) struct ModuleSymbols {
+pub(super) struct ModuleSymbols<'a> {
     context: ModuleResolutionContext,
-    bindings: HashMap<String, ModuleId>,
-    definitions: HashMap<ModuleId, ModuleDefinition>,
-    canonical: HashMap<String, ModuleId>,
+    bindings: Storage<'a, HashMap<String, ModuleId>>,
+    definitions: Storage<'a, HashMap<ModuleId, ModuleDefinition>>,
+    canonical: Storage<'a, HashMap<String, ModuleId>>,
 }
 
-impl ModuleSymbols {
+impl ModuleSymbols<'_> {
+    #[cfg(test)]
+    pub(super) fn storage_identities(&self) -> [usize; 3] {
+        [
+            std::ptr::from_ref(&*self.bindings) as usize,
+            std::ptr::from_ref(&*self.definitions) as usize,
+            std::ptr::from_ref(&*self.canonical) as usize,
+        ]
+    }
+    pub(super) fn borrowed(&self) -> ModuleSymbols<'_> {
+        ModuleSymbols {
+            context: self.context.clone(),
+            bindings: Storage::Shared(&self.bindings),
+            definitions: Storage::Shared(&self.definitions),
+            canonical: Storage::Shared(&self.canonical),
+        }
+    }
+    pub(super) fn borrowed_mut(&mut self) -> ModuleSymbols<'_> {
+        ModuleSymbols {
+            context: self.context.clone(),
+            bindings: Storage::Mutable(&mut self.bindings),
+            definitions: Storage::Mutable(&mut self.definitions),
+            canonical: Storage::Mutable(&mut self.canonical),
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn resolution_context(&self) -> ModuleResolutionContext {
         self.context.clone()
     }
 
+    #[cfg(test)]
     pub(super) fn set_resolution_context(&mut self, context: ModuleResolutionContext) {
         self.context = context;
     }
@@ -143,14 +171,14 @@ impl ModuleSymbols {
 }
 
 #[cfg(test)]
-impl<const N: usize> From<[(String, String); N]> for ModuleSymbols {
+impl<const N: usize> From<[(String, String); N]> for ModuleSymbols<'_> {
     fn from(bindings: [(String, String); N]) -> Self {
         bindings.into_iter().collect()
     }
 }
 
 #[cfg(test)]
-impl FromIterator<(String, String)> for ModuleSymbols {
+impl FromIterator<(String, String)> for ModuleSymbols<'_> {
     fn from_iter<T: IntoIterator<Item = (String, String)>>(iter: T) -> Self {
         let mut symbols = Self::default();
         for (access, prefix) in iter {

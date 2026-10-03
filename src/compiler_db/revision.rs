@@ -676,28 +676,34 @@ mod tests {
         let options = crate::CompilerOptions::debug();
         let mut codegen =
             crate::backend::Codegen::new(&options, std::rc::Rc::clone(&db.layouts)).unwrap();
-        codegen.body_queries = Some(std::rc::Rc::clone(&db.typed_bodies));
-        codegen.lir_queries = Some(std::rc::Rc::clone(&db.lir));
-        codegen.effect_queries = Some((std::rc::Rc::clone(&db.effects), UnitId::ENTRY));
-        for (name, info) in &checked.symbols.enums {
-            codegen.register_enum_info(name.to_string(), info.to_semantic());
+        codegen.configure_queries(
+            std::rc::Rc::clone(&db.typed_bodies),
+            std::rc::Rc::clone(&db.lir),
+            db.effects.static_initializers.order(),
+        );
+        for info in checked.symbols.enums.values() {
+            codegen.register_enum_info(info.to_semantic());
         }
-        for (name, info) in &checked.symbols.interfaces {
+        for info in checked.symbols.interfaces.values() {
             let identity = crate::semantic::ids::TypeId::from_source_name(&info.name);
             codegen
-                .register_interface_info(name.to_string(), identity, || info.to_semantic())
+                .register_interface_info(identity, || info.to_semantic())
                 .unwrap();
         }
         let scope = db
             .unit_scope(UnitId::ENTRY, &program, &[], &checked.symbols)
             .unwrap();
-        let types = checked
-            .expr_types
-            .iter()
-            .map(|(id, ty)| (*id, ty.into()))
-            .collect();
         let unit = codegen
-            .declare_program_with_types(&program, path.to_str().unwrap(), &types, scope)
+            .declare_program(
+                &program,
+                path.to_str().unwrap(),
+                crate::backend::cranelift::CheckedUnitInput {
+                    checked: &checked,
+                    scope,
+                    effects: std::rc::Rc::clone(&db.effects),
+                    unit: UnitId::ENTRY,
+                },
+            )
             .unwrap();
         let mut tables = checked.tables();
         tables.expr_types = Some(unit.normalized_expr_types());
@@ -712,7 +718,7 @@ mod tests {
         let before = revision.syntax.borrow().stats();
         let plan = codegen.program_body_plan(&unit);
         codegen
-            .with_program_bodies(&unit, |backend| {
+            .with_program_bodies(&unit, &checked, |backend| {
                 for target in &plan {
                     backend.compile_body(target)?;
                 }

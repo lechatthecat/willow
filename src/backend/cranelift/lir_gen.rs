@@ -25,6 +25,7 @@
 //! cleanup graphs are replayed with their captured locals and fresh region state.
 
 use super::class_view::ClassTables;
+use super::function_index::FunctionMap;
 use super::{FlatReferenceDebug, ModuleSymbols};
 use crate::semantic::ids::SemanticType as Type;
 use std::borrow::Cow;
@@ -50,7 +51,7 @@ use crate::ir::typed_ast::{
 };
 use crate::parser::ast::{BinOp, ExprId, ParamMode, UnaryOp};
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
-use crate::semantic::ids::{FunctionId, FunctionMap, TypeId};
+use crate::semantic::ids::{FunctionId, TypeId};
 #[cfg(test)]
 use crate::semantic::intrinsics;
 use crate::semantic::intrinsics::Intrinsic;
@@ -462,9 +463,9 @@ pub(super) struct LirTypeCtx<'x> {
     /// here iff the emitter will find its data slot. `None` when there is no
     /// such property.
     pub static_field: &'x dyn Fn(&str, &str) -> Option<Type>,
-    pub fn_types: &'x FunctionMap<Type>,
-    pub func_param_modes: &'x FunctionMap<Vec<ParamMode>>,
-    pub known_modules: &'x ModuleSymbols,
+    pub fn_types: &'x FunctionMap<'x, Type>,
+    pub func_param_modes: &'x FunctionMap<'x, Vec<ParamMode>>,
+    pub known_modules: &'x ModuleSymbols<'x>,
     /// The module access names the file being vetted imports (willow-vtlr).
     /// `known_modules` is every module the build declared, so a bare class name
     /// is looked for in THESE first: an unrelated module that happens to
@@ -9010,10 +9011,10 @@ mod tests {
 
     struct TestTables {
         known: HashSet<String>,
-        class_layouts: TypeMap<std::sync::Arc<Vec<(String, Type)>>>,
+        class_layouts: TypeMap<'static, std::sync::Arc<Vec<(String, Type)>>>,
         static_fields: HashMap<(String, String), Type>,
-        class_base: TypeMap<TypeId>,
-        class_type_ids: TypeMap<i64>,
+        class_base: TypeMap<'static, TypeId>,
+        class_type_ids: TypeMap<'static, i64>,
         interfaces: HashSet<String>,
         iface_type_params: HashMap<String, Vec<String>>,
         /// Direct super-interfaces, in declaration order. The real backend
@@ -9033,9 +9034,9 @@ mod tests {
         /// Declared enums, with the same tag rule `register_enum` uses:
         /// declaration order, starting at zero.
         enums: HashMap<String, LirEnumDef>,
-        fn_types: FunctionMap<Type>,
-        param_modes: FunctionMap<Vec<ParamMode>>,
-        known_modules: ModuleSymbols,
+        fn_types: FunctionMap<'static, Type>,
+        param_modes: FunctionMap<'static, Vec<ParamMode>>,
+        known_modules: ModuleSymbols<'static>,
         /// The module access names the unit under test imports (willow-vtlr).
         /// `TestTables::build` leaves it empty because the plain test programs
         /// declare no modules; a test that populates `known_modules` says here
@@ -11193,8 +11194,8 @@ mod tests {
     /// the runtime type id of each (a negative id in the fixture means the
     /// class has none).
     struct ResolveTables {
-        layouts: TypeMap<std::sync::Arc<Vec<(String, Type)>>>,
-        ids: TypeMap<i64>,
+        layouts: TypeMap<'static, std::sync::Arc<Vec<(String, Type)>>>,
+        ids: TypeMap<'static, i64>,
     }
 
     impl ClassTables for ResolveTables {
@@ -11224,7 +11225,7 @@ mod tests {
         ResolveTables { layouts, ids }
     }
 
-    fn modules(names: &[&str]) -> ModuleSymbols {
+    fn modules(names: &[&str]) -> ModuleSymbols<'static> {
         names
             .iter()
             .map(|n| ((*n).to_string(), format!("{n}.")))

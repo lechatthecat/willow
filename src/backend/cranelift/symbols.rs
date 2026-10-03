@@ -361,7 +361,7 @@ mod mangling_tests {
     /// them would have been ambiguous under the old `__` scheme.
     const NASTY: &[&str] = &["a", "b", "a_b", "a__b", "__", "a__b__c", "_", "b__c"];
 
-    fn modules(pairs: &[(&str, &str)]) -> ModuleSymbols {
+    fn modules(pairs: &[(&str, &str)]) -> ModuleSymbols<'static> {
         pairs
             .iter()
             .map(|(access, prefix)| (access.to_string(), prefix.to_string()))

@@ -139,3 +139,27 @@ fn normalized_unit_provenance_preserves_lambdas_before_await_and_builtin_aliases
         }
     }
 }
+
+#[test]
+fn codegen_context_keeps_aliases_enums_statics_and_late_callbacks_unit_local() {
+    for release in [false, true] {
+        let project = Project::new();
+        for file in ["main.wi", "first.wi", "second.wi", "left.wi", "right.wi"] {
+            std::fs::copy(
+                format!("example/codegen_unit_context/{file}"),
+                project.0.join(file),
+            )
+            .unwrap();
+        }
+        let output = project.build(release);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "release={release}: {stderr}");
+        assert!(
+            stderr.contains("peak_ast=1 peak_checker=1 peak_declared=1 peak_lir=1"),
+            "{stderr}"
+        );
+        let output = Command::new(project.0.join("app")).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n");
+    }
+}

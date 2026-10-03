@@ -1,0 +1,14 @@
+import left::value;
+import std::collections::Array as Values;
+
+enum State { Ready, Waiting }
+
+pub fn run() -> i64 {
+    let state = State::Ready;
+    let values: Values<i64> = [value()];
+    let identity = |x: i64| x;
+    return match state {
+        Ready => identity(values[0]),
+        Waiting => 0,
+    };
+}

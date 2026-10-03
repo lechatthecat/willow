@@ -15,16 +15,17 @@
 use super::ModuleSymbols;
 use std::collections::HashMap;
 
+use super::function_index::FunctionMap;
 use crate::compiler_db::effects::EffectQueries;
 use crate::module::UnitId;
 use crate::parser::ast::*;
 use crate::semantic::effects::RuntimeEffects;
-use crate::semantic::ids::{FunctionId, FunctionMap, TypeId};
+use crate::semantic::ids::{FunctionId, TypeId};
 
 use super::symbols::{
     class_member_symbol, class_method_symbol_name, module_item_symbol, module_symbol_prefix,
 };
-use super::{Codegen, FuncGen};
+use super::{FuncGen, UnitCodegenContext};
 
 /// The only effect this analysis reads out of the shared lattice.
 const PANIC: RuntimeEffects = RuntimeEffects::MAY_PANIC;
@@ -196,7 +197,7 @@ fn optimization_enabled() -> bool {
         .unwrap_or(true)
 }
 
-impl Codegen {
+impl UnitCodegenContext<'_> {
     pub(super) fn analyze_and_register_panic_effects(
         &mut self,
         program: &Program,
@@ -272,7 +273,7 @@ impl Codegen {
         let mut ordered = effects.into_iter().collect::<Vec<_>>();
         ordered.sort_by(|left, right| left.0.cmp(&right.0));
         *self.dispatch_cache.get_mut() = Default::default();
-        self.interface_slot_summaries.get_mut().clear();
+        self.output.interface_slot_summaries.get_mut().clear();
         let log = std::env::var_os("WILLOW_PANIC_EFFECTS_LOG").is_some();
         for (name, may_panic) in ordered {
             if log {
@@ -387,8 +388,8 @@ fn method_key(
 }
 
 struct AnalysisContext<'a> {
-    known: &'a FunctionMap<bool>,
-    known_modules: &'a ModuleSymbols,
+    known: &'a FunctionMap<'a, bool>,
+    known_modules: &'a ModuleSymbols<'a>,
     free_keys: &'a HashMap<String, String>,
     method_keys: &'a HashMap<(String, String), String>,
 }

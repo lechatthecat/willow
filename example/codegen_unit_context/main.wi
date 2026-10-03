@@ -1,0 +1,9 @@
+// Each worker binds `value` and `State` differently. Expected output: 42.
+import first;
+import second;
+
+async fn main() {
+    let left = first::run();
+    await yield();
+    println(left + second::run());
+}

@@ -35,7 +35,7 @@ use cranelift_codegen::ir::{
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{FuncId, Linkage, Module};
 
-use super::{Codegen, FuncGen, ParamMode, Type};
+use super::{FuncGen, ParamMode, Type, UnitCodegenContext};
 
 pub(super) const LOG2_F64_SYMBOL: &str = "__willow_internal_log2_f64_v1";
 pub(super) const EXP2_F64_SYMBOL: &str = "__willow_internal_exp2_f64_v1";
@@ -101,7 +101,7 @@ fn clear_low_word(builder: &mut FunctionBuilder<'_>, value: Value) -> Value {
     from_i64_bits(builder, high)
 }
 
-impl Codegen {
+impl UnitCodegenContext<'_> {
     /// Declare and define the three private numerical helpers exactly once for
     /// this object, then expose the pow helper under the legacy builtin names so
     /// direct calls and function-value capture share `**` semantics.
@@ -110,32 +110,35 @@ impl Codegen {
             return Ok(());
         }
 
-        let mut log_sig = self.module.make_signature();
+        let mut log_sig = self.output.module.make_signature();
         log_sig.params.push(AbiParam::new(types::F64));
         // Keep the compensated high/low pair in one ABI return value.  The
         // Windows x64 ABI does not support two scalar floating-point returns,
         // and Cranelift rejects such a signature before lowering any Willow
         // program (even one that never calls pow).
         log_sig.returns.push(AbiParam::new(types::F64X2));
-        let log_id = self
-            .module
-            .declare_function(LOG2_F64_SYMBOL, Linkage::Local, &log_sig)?;
+        let log_id =
+            self.output
+                .module
+                .declare_function(LOG2_F64_SYMBOL, Linkage::Local, &log_sig)?;
 
-        let mut exp_sig = self.module.make_signature();
+        let mut exp_sig = self.output.module.make_signature();
         exp_sig.params.push(AbiParam::new(types::F64));
         exp_sig.params.push(AbiParam::new(types::F64));
         exp_sig.returns.push(AbiParam::new(types::F64));
-        let exp_id = self
-            .module
-            .declare_function(EXP2_F64_SYMBOL, Linkage::Local, &exp_sig)?;
+        let exp_id =
+            self.output
+                .module
+                .declare_function(EXP2_F64_SYMBOL, Linkage::Local, &exp_sig)?;
 
-        let mut pow_sig = self.module.make_signature();
+        let mut pow_sig = self.output.module.make_signature();
         pow_sig.params.push(AbiParam::new(types::F64));
         pow_sig.params.push(AbiParam::new(types::F64));
         pow_sig.returns.push(AbiParam::new(types::F64));
-        let pow_id = self
-            .module
-            .declare_function(POW_F64_SYMBOL, Linkage::Local, &pow_sig)?;
+        let pow_id =
+            self.output
+                .module
+                .declare_function(POW_F64_SYMBOL, Linkage::Local, &pow_sig)?;
 
         self.define_log2_f64(log_id, log_sig)?;
         self.define_exp2_f64(exp_id, exp_sig)?;
@@ -158,7 +161,7 @@ impl Codegen {
         func_id: FuncId,
         sig: cranelift_codegen::ir::Signature,
     ) -> Result<()> {
-        let mut ctx = self.module.make_context();
+        let mut ctx = self.output.module.make_context();
         ctx.func.signature = sig;
         ctx.func.name = UserFuncName::user(0, func_id.as_u32());
         let mut fn_ctx = FunctionBuilderContext::new();
@@ -402,10 +405,10 @@ impl Codegen {
             b.ins().return_(&[pair]);
 
             b.seal_all_blocks();
-            b.finalize(self.module.target_config());
+            b.finalize(self.output.module.target_config());
         }
-        self.module.define_function(func_id, &mut ctx)?;
-        self.module.clear_context(&mut ctx);
+        self.output.module.define_function(func_id, &mut ctx)?;
+        self.output.module.clear_context(&mut ctx);
         Ok(())
     }
 
@@ -414,7 +417,7 @@ impl Codegen {
         func_id: FuncId,
         sig: cranelift_codegen::ir::Signature,
     ) -> Result<()> {
-        let mut ctx = self.module.make_context();
+        let mut ctx = self.output.module.make_context();
         ctx.func.signature = sig;
         ctx.func.name = UserFuncName::user(0, func_id.as_u32());
         let mut fn_ctx = FunctionBuilderContext::new();
@@ -577,10 +580,10 @@ impl Codegen {
             b.ins().return_(&[scaled]);
 
             b.seal_all_blocks();
-            b.finalize(self.module.target_config());
+            b.finalize(self.output.module.target_config());
         }
-        self.module.define_function(func_id, &mut ctx)?;
-        self.module.clear_context(&mut ctx);
+        self.output.module.define_function(func_id, &mut ctx)?;
+        self.output.module.clear_context(&mut ctx);
         Ok(())
     }
 
@@ -591,11 +594,17 @@ impl Codegen {
         log_id: FuncId,
         exp_id: FuncId,
     ) -> Result<()> {
-        let mut ctx = self.module.make_context();
+        let mut ctx = self.output.module.make_context();
         ctx.func.signature = sig;
         ctx.func.name = UserFuncName::user(0, func_id.as_u32());
-        let log_ref = self.module.declare_func_in_func(log_id, &mut ctx.func);
-        let exp_ref = self.module.declare_func_in_func(exp_id, &mut ctx.func);
+        let log_ref = self
+            .output
+            .module
+            .declare_func_in_func(log_id, &mut ctx.func);
+        let exp_ref = self
+            .output
+            .module
+            .declare_func_in_func(exp_id, &mut ctx.func);
         let mut fn_ctx = FunctionBuilderContext::new();
         {
             let mut b = FunctionBuilder::new(&mut ctx.func, &mut fn_ctx);
@@ -877,10 +886,10 @@ impl Codegen {
             b.ins().return_(&[answer]);
 
             b.seal_all_blocks();
-            b.finalize(self.module.target_config());
+            b.finalize(self.output.module.target_config());
         }
-        self.module.define_function(func_id, &mut ctx)?;
-        self.module.clear_context(&mut ctx);
+        self.output.module.define_function(func_id, &mut ctx)?;
+        self.output.module.clear_context(&mut ctx);
         Ok(())
     }
 }
@@ -956,8 +965,8 @@ impl FuncGen<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::CompilerOptions;
+    use crate::backend::Codegen;
     use cranelift_codegen::settings::{self, Configurable};
     use cranelift_object::{ObjectBuilder, ObjectModule};
 
@@ -994,10 +1003,13 @@ mod tests {
                     .unwrap(),
                 );
                 let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
-                codegen.module = module;
-                codegen.func_ids = Default::default();
-                codegen.declare_native_pow_f64().unwrap();
-                codegen.module.finish().emit().unwrap();
+                codegen.output.module = module;
+                codegen.db.func_ids = Default::default();
+                codegen
+                    .declaration_context()
+                    .declare_native_pow_f64()
+                    .unwrap();
+                codegen.output.module.finish().emit().unwrap();
             }
         }
     }

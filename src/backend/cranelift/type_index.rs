@@ -1,4 +1,5 @@
 //! Canonical type metadata with immutable unit-local alias snapshots.
+use super::borrowed::Storage;
 use crate::semantic::ids::TypeId;
 use std::{collections::HashMap, hash::Hash, ops::Index, rc::Rc};
 
@@ -10,17 +11,34 @@ pub enum TypeBinding {
     Canonical(TypeId),
 }
 
+type UnitTypeBindings = Rc<std::cell::RefCell<HashMap<TypeId, Option<TypeBinding>>>>;
+
+/// Persistent snapshots are used by standalone table fixtures. A codegen unit
+/// adds one private mutable overlay shared by its table views, so binding A
+/// names performs A hash-table writes instead of cloning A growing snapshots.
 #[derive(Clone, Debug, Default)]
-pub struct TypeScope(Rc<HashMap<TypeId, TypeBinding>>);
+pub struct TypeScope {
+    base: Rc<HashMap<TypeId, TypeBinding>>,
+    unit: Option<UnitTypeBindings>,
+}
 impl TypeScope {
+    pub(super) fn fork_unit(&self) -> Self {
+        assert!(self.unit.is_none(), "fork from canonical scope only");
+        Self {
+            base: Rc::clone(&self.base),
+            unit: Some(Rc::default()),
+        }
+    }
     pub fn resolve(&self, id: &TypeId) -> TypeId {
-        let bindings = &self.0;
+        let unit = self.unit.as_ref().map(|unit| unit.borrow());
         let mut current = *id;
-        // At most one visit per binding before reaching a terminal or a cycle.
-        // Cyclic aliases have no declaration identity: preserve the original
-        // spelling, allowing normal missing-type handling instead of looping.
-        for _ in 0..=bindings.len() {
-            match bindings.get(&current) {
+        for _ in 0..=self.base.len() + unit.as_ref().map_or(0, |unit| unit.len()) {
+            let binding = unit.as_ref().and_then(|unit| unit.get(&current));
+            let binding = match binding {
+                Some(value) => value.as_ref(),
+                None => self.base.get(&current),
+            };
+            match binding {
                 Some(TypeBinding::Alias(next)) => current = *next,
                 Some(TypeBinding::Canonical(target)) => return *target,
                 None => return current,
@@ -28,31 +46,43 @@ impl TypeScope {
         }
         *id
     }
+    fn insert(&mut self, id: TypeId, binding: TypeBinding) -> Option<TypeBinding> {
+        if let Some(unit) = &self.unit {
+            let mut unit = unit.borrow_mut();
+            let previous = unit
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| self.base.get(&id).cloned());
+            unit.insert(id, Some(binding));
+            previous
+        } else {
+            Rc::make_mut(&mut self.base).insert(id, binding)
+        }
+    }
     pub fn bind(&mut self, alias: &str, target: &str) -> Option<TypeBinding> {
-        Rc::make_mut(&mut self.0).insert(
+        self.insert(
             TypeId::from_source_name(alias),
             TypeBinding::Alias(TypeId::from_source_name(target)),
         )
     }
     pub fn bind_canonical(&mut self, alias: &str, canonical: &str) -> Option<TypeBinding> {
-        Rc::make_mut(&mut self.0).insert(
+        self.insert(
             TypeId::from_source_name(alias),
             TypeBinding::Canonical(TypeId::from_source_name(canonical)),
         )
     }
     pub fn restore(&mut self, alias: &str, previous: Option<TypeBinding>) {
         let id = TypeId::from_source_name(alias);
-        match previous {
-            Some(previous) => {
-                Rc::make_mut(&mut self.0).insert(id, previous);
+        if let Some(previous) = previous {
+            self.insert(id, previous);
+        } else if let Some(unit) = &self.unit {
+            if self.base.contains_key(&id) {
+                unit.borrow_mut().insert(id, None);
+            } else {
+                unit.borrow_mut().remove(&id);
             }
-            None => {
-                // Most declarations have no alias; preserve shared snapshots
-                // without copying the bindings for this no-op.
-                if self.0.contains_key(&id) {
-                    Rc::make_mut(&mut self.0).remove(&id);
-                }
-            }
+        } else if self.base.contains_key(&id) {
+            Rc::make_mut(&mut self.base).remove(&id);
         }
     }
 }
@@ -83,26 +113,42 @@ impl TypeKey for (TypeId, TypeId) {
 }
 
 #[derive(Clone, Debug)]
-pub struct ScopedTypeMap<K: TypeKey, V> {
-    values: HashMap<K::Id, V>,
+pub struct ScopedTypeMap<'a, K: TypeKey, V> {
+    values: Storage<'a, HashMap<K::Id, V>>,
     scope: TypeScope,
 }
-pub type TypeMap<V> = ScopedTypeMap<TypeId, V>;
-pub type VtableMap<V> = ScopedTypeMap<(TypeId, TypeId), V>;
-impl<K: TypeKey, V> Default for ScopedTypeMap<K, V> {
+pub type TypeMap<'a, V> = ScopedTypeMap<'a, TypeId, V>;
+pub type VtableMap<'a, V> = ScopedTypeMap<'a, (TypeId, TypeId), V>;
+impl<K: TypeKey, V> Default for ScopedTypeMap<'_, K, V> {
     fn default() -> Self {
         Self::new()
     }
 }
-impl<K: TypeKey, V> ScopedTypeMap<K, V> {
+impl<K: TypeKey, V> ScopedTypeMap<'_, K, V> {
     pub fn new() -> Self {
         Self::with_scope(TypeScope::default())
     }
     pub fn with_scope(scope: TypeScope) -> Self {
         Self {
-            values: HashMap::new(),
+            values: Storage::default(),
             scope,
         }
+    }
+    pub(super) fn borrowed(&self) -> ScopedTypeMap<'_, K, V> {
+        ScopedTypeMap {
+            values: Storage::Shared(&self.values),
+            scope: self.scope.clone(),
+        }
+    }
+    pub(super) fn borrowed_mut(&mut self) -> ScopedTypeMap<'_, K, V> {
+        ScopedTypeMap {
+            values: Storage::Mutable(&mut self.values),
+            scope: self.scope.clone(),
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn storage_identity(&self) -> usize {
+        std::ptr::from_ref(&*self.values) as usize
     }
     /// Attach an immutable resolution snapshot for this compile unit.
     pub fn set_scope(&mut self, scope: TypeScope) {
@@ -156,7 +202,7 @@ impl TypeLookup for TypeId {
     }
 }
 
-impl<V> TypeMap<V> {
+impl<V> TypeMap<'_, V> {
     pub fn get_id(&self, id: &TypeId) -> Option<&V> {
         self.values.get(&self.scope.resolve(id))
     }
@@ -201,7 +247,7 @@ impl<V> TypeMap<V> {
         }
     }
 }
-impl<V> VtableMap<V> {
+impl<V> VtableMap<'_, V> {
     pub fn get(&self, key: &(TypeId, TypeId)) -> Option<&V> {
         self.values.get(&key.lookup(&self.scope))
     }
@@ -217,25 +263,25 @@ impl<'a, V> TypeEntry<'a, V> {
         self.entry.or_insert(value)
     }
 }
-impl<V> Index<&str> for TypeMap<V> {
+impl<V> Index<&str> for TypeMap<'_, V> {
     type Output = V;
     fn index(&self, key: &str) -> &V {
         self.get(key).expect("registered canonical type")
     }
 }
-impl<V> Index<&String> for TypeMap<V> {
+impl<V> Index<&String> for TypeMap<'_, V> {
     type Output = V;
     fn index(&self, key: &String) -> &V {
         &self[key.as_str()]
     }
 }
-impl<V> Index<&(TypeId, TypeId)> for VtableMap<V> {
+impl<V> Index<&(TypeId, TypeId)> for VtableMap<'_, V> {
     type Output = V;
     fn index(&self, key: &(TypeId, TypeId)) -> &V {
         self.get(key).expect("registered canonical vtable")
     }
 }
-impl<K: TypeKey, Q: Into<K>, V> FromIterator<(Q, V)> for ScopedTypeMap<K, V> {
+impl<K: TypeKey, Q: Into<K>, V> FromIterator<(Q, V)> for ScopedTypeMap<'_, K, V> {
     fn from_iter<T: IntoIterator<Item = (Q, V)>>(iter: T) -> Self {
         let mut map = Self::new();
         for (k, v) in iter {
@@ -245,7 +291,7 @@ impl<K: TypeKey, Q: Into<K>, V> FromIterator<(Q, V)> for ScopedTypeMap<K, V> {
     }
 }
 
-impl<K: TypeKey, Q: Into<K>, V, const N: usize> From<[(Q, V); N]> for ScopedTypeMap<K, V> {
+impl<K: TypeKey, Q: Into<K>, V, const N: usize> From<[(Q, V); N]> for ScopedTypeMap<'_, K, V> {
     fn from(items: [(Q, V); N]) -> Self {
         items.into_iter().collect()
     }
@@ -255,7 +301,7 @@ impl<K: TypeKey, Q: Into<K>, V, const N: usize> From<[(Q, V); N]> for ScopedType
 mod tests {
     use super::*;
 
-    fn map_pair() -> (TypeScope, TypeMap<i64>) {
+    fn map_pair() -> (TypeScope, TypeMap<'static, i64>) {
         let scope = TypeScope::default();
         let mut map = TypeMap::with_scope(scope.clone());
         map.insert("pal::Color".to_string(), 7);

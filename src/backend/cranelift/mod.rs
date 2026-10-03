@@ -13,11 +13,18 @@ use crate::backend::abi;
 use crate::ir::module_init::{InitUnitId, ModuleInitPlan};
 use crate::parser::ast::*;
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
-use crate::semantic::ids::{FunctionId, FunctionMap, SemanticType as Type, TypeId};
+use crate::semantic::ids::{FunctionId, SemanticType as Type, TypeId};
 type EnumInfo = crate::semantic::symbols::EnumInfo<TypeId>;
 type InterfaceInfo = crate::semantic::symbols::InterfaceInfo<TypeId>;
 use crate::{BuildMode, CompilerOptions};
 
+mod borrowed;
+use borrowed::Storage;
+mod function_index;
+use function_index::FunctionMap;
+mod context;
+pub(crate) use context::CheckedUnitInput;
+pub use context::StandaloneUnitInput;
 mod module_index;
 use module_index::ModuleSymbols;
 mod type_index;
@@ -26,6 +33,10 @@ use type_index::{TypeMap, TypeScope, VtableMap};
 /// `(canonical interface, method)` -> every function a vtable slot for that
 /// method can hold; see `Codegen::interface_slot_targets`.
 type InterfaceSlotTargets = HashMap<(TypeId, String), Vec<Option<SlotTarget>>>;
+#[cfg(test)]
+thread_local! {
+    static METHOD_ALIAS_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// One direct method body an interface vtable slot points at.
 #[derive(Clone, Copy, Debug)]
@@ -98,140 +109,106 @@ struct ParamDebug {
     mode: ParamMode,
 }
 
-/// Immutable name-resolution views for one compilation unit. Declaration
-/// metadata remains in the build-wide indexes; switching units only switches
-/// these snapshots, never rewrites another unit's aliases.
-#[derive(Clone)]
-struct UnitResolutionContext {
-    types: TypeScope,
-    functions: crate::semantic::ids::FunctionScope,
-    modules: module_index::ModuleResolutionContext,
-}
-
 #[derive(Clone, Copy)]
 struct StringLiteralData {
     bytes: DataId,
     slot: DataId,
 }
 
-pub struct Codegen {
-    type_scope: TypeScope,
-    module: ObjectModule,
-    func_ids: FunctionMap<FuncId>,
-    func_return_types: FunctionMap<Type>,
-    /// Full `Type::Fn(params, ret)` for each declared function — used to type function values.
-    fn_types: FunctionMap<Type>,
-    /// Parameter passing modes for declared Willow functions, keyed like `func_ids`.
-    func_param_modes: FunctionMap<Vec<ParamMode>>,
-    /// Source-level parameter names/types/modes for debug reference-call hooks.
-    func_param_debug: FunctionMap<Vec<ParamDebug>>,
-    /// Conservative recoverable-panic summaries keyed by backend lookup name.
-    /// Missing entries are `MAY_PANIC`; only an explicit `false` may remove a
-    /// generated depth check or panic-return path (willow-s9ej.8).
-    function_may_panic: FunctionMap<bool>,
-    /// Access names resolve to ModuleId; definitions own canonical paths and
-    /// linker spelling independently of unit-local alias bindings.
-    known_modules: ModuleSymbols,
-    /// The module access names the file currently being compiled can actually
-    /// see, i.e. the ones its own `import`s name (willow-vtlr). `known_modules`
-    /// is the whole build, so an unrelated module declaring a class of the same
-    /// bare name used to make that name ambiguous and cost the body its
-    /// eligibility; resolution consults these first. Installed per unit exactly
-    /// like `builtin_module_aliases`.
-    visible_modules: HashSet<String>,
-    /// Local alias -> canonical builtin schema module (`import std::fs as
-    /// files;` records `files -> fs`), for the file currently being compiled.
-    /// Declaration normalization folds these aliases into its program; LIR
-    /// lowering reads the raw
-    /// frontend program and canonicalizes here (willow-nswv).
-    builtin_module_aliases: HashMap<String, String>,
-    /// Maps each lambda's source span to its generated private function name.
-    lambda_names: HashMap<ExprId, FunctionId>,
+/// Canonical declarations, mutated only during the declaration phase.
+/// Body contexts hold shared borrows of this database.
+pub struct BuildCodegenDb {
+    static_init_order: Option<std::sync::Arc<[crate::compiler_db::ids::StaticId]>>,
+    func_ids: FunctionMap<'static, FuncId>,
+    func_return_types: FunctionMap<'static, Type>,
+    fn_types: FunctionMap<'static, Type>,
+    func_param_modes: FunctionMap<'static, Vec<ParamMode>>,
+    func_param_debug: FunctionMap<'static, Vec<ParamDebug>>,
+    function_may_panic: FunctionMap<'static, bool>,
+    known_modules: ModuleSymbols<'static>,
+    method_functions: HashMap<TypeId, HashSet<FunctionId>>,
     lambda_body_names: HashMap<crate::parser::ast::BodyId, FunctionId>,
-    /// Source names of async fns lowered as cooperative tasks (constructor +
-    /// poll fn). Calling one schedules the task and returns its frame.
     cooperative_leaves: std::collections::HashSet<FunctionId>,
+    body_queries: Option<std::rc::Rc<crate::compiler_db::body::BodyQueries>>,
+    layout_queries: std::rc::Rc<crate::compiler_db::layout::LayoutQueries>,
+    build_mode: BuildMode,
+    enum_infos: TypeMap<'static, EnumInfo>,
+    class_descriptor_ids: TypeMap<'static, DataId>,
+    lir_queries: Option<std::rc::Rc<crate::compiler_db::lir::LirQueries>>,
+    vtable_ids: VtableMap<'static, DataId>,
+    vtable_thunk_ids: HashMap<(String, String), FuncId>,
+    interface_slot_targets: InterfaceSlotTargets,
+    async_methods: HashSet<FunctionId>,
+    static_storage: TypeMap<'static, HashMap<String, StaticStorageInfo>>,
+    module_init_plan: ModuleInitPlan,
+}
+
+/// Mutable object output, independent of unit resolution and frozen metadata.
+struct EmissionState {
+    module: ObjectModule,
     string_literals: HashMap<String, StringLiteralData>,
     string_counter: usize,
     runtime_declared: bool,
-    /// Compiler-owned body transformations shared across declaration/lowering.
-    pub(crate) body_queries: Option<std::rc::Rc<crate::compiler_db::body::BodyQueries>>,
-    pub(crate) effect_queries: Option<(
-        std::rc::Rc<crate::compiler_db::effects::EffectQueries>,
-        crate::module::UnitId,
-    )>,
-    /// Frozen canonical class layout/base/slot/runtime-id and interface
-    /// composition queries. The driver shares one table across every unit; a
-    /// standalone backend owns its own. Read through [`Codegen::classes`],
-    /// which resolves the unit's aliases.
-    pub(crate) layout_queries: std::rc::Rc<crate::compiler_db::layout::LayoutQueries>,
-    /// Build mode for source locations, call stacks, and debug instrumentation.
-    build_mode: BuildMode,
-    /// Source file path of the current compilation unit, used in diagnostics.
-    source_file: String,
-    /// Enum info for enum variant construction in generated code.
-    enum_infos: TypeMap<EnumInfo>,
-    dispatch_cache: std::cell::RefCell<emit_interface::DispatchCache>,
-    /// Maps each class name to its descriptor data symbol — word 0 of every
-    /// object of that class (willow-fm7t). Offset 0 of the descriptor is the
-    /// class's `type_id`; the virtual method slots follow it in the class's
-    /// frozen slot order (willow-fm7t; `LayoutQueries::slots`).
-    class_descriptor_ids: TypeMap<DataId>,
-    /// Current declaration unit's checked expression types, used to establish
-    /// lambda signatures. Body emission reads the declared callable signatures.
-    expr_types: HashMap<ExprId, Type>,
-    /// Current unit's lowered bodies, consumed individually during emission.
-    lir_functions: HashMap<FunctionId, crate::ir::lowered::LirFunction>,
-    pub(crate) lir_queries: Option<std::rc::Rc<crate::compiler_db::lir::LirQueries>>,
-    /// Lifted lambda bodies in lowered IR, keyed by the lambda expression's
-    /// ID (willow-0g8j.2.2). The LIR cannot know the `$lambda.N` symbol, so
-    /// `compile_program` moves these into `lir_functions` once it has assigned
-    /// the names.
-    lir_lambdas: HashMap<ExprId, crate::ir::lowered::LirFunction>,
-    /// Static vtable data object per `(class, interface)` pair, used to box a
-    /// concrete class value into an interface value (willow-xds).
-    vtable_ids: VtableMap<DataId>,
-    /// The virtual-dispatch thunk each `(class, method)` pair's vtable slots
-    /// point at, so one thunk is emitted however many interfaces a class
-    /// implements the method for (willow-tygf).
-    vtable_thunk_ids: HashMap<(String, String), FuncId>,
-    /// Every function that can occupy an interface method's vtable slot,
-    /// build-wide: one entry per `(class, interface)` vtable, `None` for a
-    /// re-dispatching thunk or an unresolved slot (willow-8hq4.14).
-    interface_slot_targets: InterfaceSlotTargets,
-    // Canonical identities make this independent of per-unit alias scopes.
     interface_slot_summaries:
         std::cell::RefCell<HashMap<(TypeId, String), emit_interface::InterfaceSlotSummary>>,
-    /// Declaration identities of `async` methods, build-wide.
-    async_methods: HashSet<FunctionId>,
-    /// Global storage for each `static [mut] name: T = expr` property: the
-    /// registered (module-qualified) class name, then the field (willow-qsqf).
-    /// Each slot holds 8 bytes (i64/ptr/f64/bool).
-    ///
-    /// Keyed by CLASS through the shared type scope, like every other class
-    /// table, so a module body that spells its own class bare -- `Counter`,
-    /// aliased to `counting::Counter` for the length of the unit -- reaches the
-    /// same storage the declaration made. A plain map missed, and the read fell
-    /// through to a zero while the store went nowhere (willow-6xgo). The field
-    /// name is NOT a type and stays an ordinary map key.
-    static_storage: TypeMap<HashMap<String, StaticStorageInfo>>,
-    /// Resolver-owned execution order, independent of body emission order.
-    module_init_plan: ModuleInitPlan,
-    /// Each unit owns its expressions until the global dependency plan is emitted.
     unit_static_inits: HashMap<InitUnitId, UnitStaticInit>,
-    /// Zero-initialized per-thread cursor/limit and allocation counters used by
-    /// the inlined GC bump-allocation fast path.
     gc_tlab_state: DataId,
     gc_bitmap_descriptors: HashMap<Vec<u64>, (DataId, u64)>,
     gc_layout_descriptors: HashMap<willow_abi::GcLayoutDescriptor, DataId>,
     async_frame_size_warnings: Vec<AsyncFrameSizeWarning>,
-    /// Which source item owns each linker symbol the backend has handed out
-    /// (willow-uqzx, catalog item 8). Symbol names are built by flattening `::`
-    /// to `__`, which is not injective: `foo::bar` and a declaration literally
-    /// named `foo__bar` produce the same string. Recording the owner turns that
-    /// into a diagnostic instead of a duplicate-definition ICE.
     symbol_owners: HashMap<String, SymbolOwner>,
     symbol_conflicts: Vec<SymbolConflict>,
+}
+
+/// Build coordinator: no current-unit aliases, source paths, or LIR live here.
+pub struct Codegen {
+    db: BuildCodegenDb,
+    output: EmissionState,
+    generated_func_ids: HashMap<FunctionId, FuncId>,
+    frozen: bool,
+}
+
+/// A fresh declaration/emission scope. All local state dies with this context,
+/// including on errors and unwinding; canonical metadata is never copied.
+pub struct UnitCodegenContext<'a> {
+    static_init_order: Option<std::sync::Arc<[crate::compiler_db::ids::StaticId]>>,
+    checked: Option<&'a crate::compiler_db::CheckedUnit>,
+    declarations_open: bool,
+    output: &'a mut EmissionState,
+    type_scope: TypeScope,
+    func_ids: FunctionMap<'a, FuncId>,
+    func_return_types: FunctionMap<'a, Type>,
+    fn_types: FunctionMap<'a, Type>,
+    func_param_modes: FunctionMap<'a, Vec<ParamMode>>,
+    func_param_debug: FunctionMap<'a, Vec<ParamDebug>>,
+    function_may_panic: FunctionMap<'a, bool>,
+    known_modules: ModuleSymbols<'a>,
+    method_functions: Storage<'a, HashMap<TypeId, HashSet<FunctionId>>>,
+    lambda_body_names: Storage<'a, HashMap<crate::parser::ast::BodyId, FunctionId>>,
+    cooperative_leaves: Storage<'a, std::collections::HashSet<FunctionId>>,
+    body_queries: Option<std::rc::Rc<crate::compiler_db::body::BodyQueries>>,
+    layout_queries: std::rc::Rc<crate::compiler_db::layout::LayoutQueries>,
+    build_mode: BuildMode,
+    enum_infos: TypeMap<'a, EnumInfo>,
+    class_descriptor_ids: TypeMap<'a, DataId>,
+    lir_queries: Option<std::rc::Rc<crate::compiler_db::lir::LirQueries>>,
+    vtable_ids: VtableMap<'a, DataId>,
+    vtable_thunk_ids: Storage<'a, HashMap<(String, String), FuncId>>,
+    interface_slot_targets: Storage<'a, InterfaceSlotTargets>,
+    async_methods: Storage<'a, HashSet<FunctionId>>,
+    static_storage: TypeMap<'a, HashMap<String, StaticStorageInfo>>,
+    module_init_plan: Storage<'a, ModuleInitPlan>,
+    visible_modules: HashSet<String>,
+    builtin_module_aliases: HashMap<String, String>,
+    lambda_names: HashMap<ExprId, FunctionId>,
+    effect_queries: Option<(
+        std::rc::Rc<crate::compiler_db::effects::EffectQueries>,
+        crate::module::UnitId,
+    )>,
+    source_file: String,
+    dispatch_cache: std::cell::RefCell<emit_interface::DispatchCache>,
+    lir_functions: HashMap<FunctionId, crate::ir::lowered::LirFunction>,
+    lir_lambdas: HashMap<ExprId, crate::ir::lowered::LirFunction>,
 }
 
 /// Whether `symbol` belongs to the runtime or to the compiler rather than to
@@ -333,26 +310,7 @@ impl Codegen {
 impl Codegen {
     /// Supply the resolver's initialization nodes before declaring units.
     pub fn set_module_init_plan(&mut self, plan: ModuleInitPlan) {
-        self.module_init_plan = plan;
-    }
-
-    /// Look up a declared runtime/user function id by symbol name, with a clear
-    /// panic if it was never declared (e.g. a backend symbol missing from
-    /// `abi.rs`) instead of an opaque index-out-of-bounds.
-    fn func_id(&self, name: &str) -> FuncId {
-        if crate::backend::abi::runtime_symbol(name).is_some_and(|symbol| {
-            symbol
-                .effects()
-                .contains(crate::backend::abi::RuntimeEffects::MAY_PANIC)
-        }) {
-            panic!(
-                "backend: MAY_PANIC runtime symbol `{name}` cannot be emitted from a raw Codegen call"
-            );
-        }
-        *self
-            .func_ids
-            .get(name)
-            .unwrap_or_else(|| panic!("backend: undeclared runtime symbol `{name}`"))
+        self.db.module_init_plan = plan;
     }
     /// Builds a backend that reads class/interface facts from the session's
     /// `layouts` tables; it never allocates tables of its own.
@@ -426,54 +384,105 @@ impl Codegen {
         let type_scope = TypeScope::default();
         let function_scope = crate::semantic::ids::FunctionScope::default();
         let mut codegen = Self {
-            type_scope: type_scope.clone(),
-            module,
-            func_ids: FunctionMap::with_scope(function_scope.clone()),
-            func_return_types: FunctionMap::with_scope(function_scope.clone()),
-            fn_types: FunctionMap::with_scope(function_scope.clone()),
-            func_param_modes: FunctionMap::with_scope(function_scope.clone()),
-            func_param_debug: FunctionMap::with_scope(function_scope.clone()),
-            function_may_panic: FunctionMap::with_scope(function_scope.clone()),
-            known_modules: ModuleSymbols::default(),
-            visible_modules: HashSet::new(),
-            builtin_module_aliases: HashMap::new(),
-            lambda_names: HashMap::new(),
-            lambda_body_names: HashMap::new(),
-            cooperative_leaves: std::collections::HashSet::new(),
-            string_literals: HashMap::new(),
-            string_counter: 0,
-            runtime_declared: false,
-            layout_queries: layouts,
-            effect_queries: None,
-            body_queries: None,
-            build_mode: opts.target.build_mode,
-            source_file: String::new(),
-            enum_infos: TypeMap::with_scope(type_scope.clone()),
-            dispatch_cache: Default::default(),
-            class_descriptor_ids: TypeMap::with_scope(type_scope.clone()),
-            expr_types: HashMap::new(),
-            lir_functions: HashMap::new(),
-            lir_queries: None,
-            lir_lambdas: HashMap::new(),
-            vtable_ids: VtableMap::with_scope(type_scope.clone()),
-            vtable_thunk_ids: HashMap::new(),
-            interface_slot_targets: HashMap::new(),
-            interface_slot_summaries: Default::default(),
-            async_methods: HashSet::new(),
-            static_storage: TypeMap::with_scope(type_scope.clone()),
-            module_init_plan: ModuleInitPlan::default(),
-            unit_static_inits: HashMap::new(),
-            gc_tlab_state,
-            gc_bitmap_descriptors: HashMap::new(),
-            gc_layout_descriptors: HashMap::new(),
-            async_frame_size_warnings: Vec::new(),
-            symbol_owners: HashMap::new(),
-            symbol_conflicts: Vec::new(),
+            db: BuildCodegenDb {
+                static_init_order: None,
+                func_ids: FunctionMap::with_scope(function_scope.clone()),
+                func_return_types: FunctionMap::with_scope(function_scope.clone()),
+                fn_types: FunctionMap::with_scope(function_scope.clone()),
+                func_param_modes: FunctionMap::with_scope(function_scope.clone()),
+                func_param_debug: FunctionMap::with_scope(function_scope.clone()),
+                function_may_panic: FunctionMap::with_scope(function_scope.clone()),
+                known_modules: ModuleSymbols::default(),
+                method_functions: HashMap::new(),
+                lambda_body_names: HashMap::new(),
+                cooperative_leaves: std::collections::HashSet::new(),
+                body_queries: None,
+                layout_queries: layouts,
+                build_mode: opts.target.build_mode,
+                enum_infos: TypeMap::with_scope(type_scope.clone()),
+                class_descriptor_ids: TypeMap::with_scope(type_scope.clone()),
+                lir_queries: None,
+                vtable_ids: VtableMap::with_scope(type_scope.clone()),
+                vtable_thunk_ids: HashMap::new(),
+                interface_slot_targets: HashMap::new(),
+                async_methods: HashSet::new(),
+                static_storage: TypeMap::with_scope(type_scope.clone()),
+                module_init_plan: ModuleInitPlan::default(),
+            },
+            output: EmissionState {
+                module,
+                string_literals: HashMap::new(),
+                string_counter: 0,
+                runtime_declared: false,
+                interface_slot_summaries: Default::default(),
+                unit_static_inits: HashMap::new(),
+                gc_tlab_state,
+                gc_bitmap_descriptors: HashMap::new(),
+                gc_layout_descriptors: HashMap::new(),
+                async_frame_size_warnings: Vec::new(),
+                symbol_owners: HashMap::new(),
+                symbol_conflicts: Vec::new(),
+            },
+            generated_func_ids: HashMap::new(),
+            frozen: false,
         };
         // Define the private, self-contained floating exponentiation helpers
         // once per output object. They are local symbols and import no libm.
-        codegen.declare_native_pow_f64()?;
+        codegen.declaration_context().declare_native_pow_f64()?;
         Ok(codegen)
+    }
+
+    pub fn take_async_frame_size_warnings(&mut self) -> Vec<AsyncFrameSizeWarning> {
+        std::mem::take(&mut self.output.async_frame_size_warnings)
+    }
+
+    /// Symbol conflicts recorded so far. The driver renders these instead of the
+    /// generic codegen error, because they are user errors with a source
+    /// location, not internal compiler failures.
+    pub fn take_symbol_conflicts(&mut self) -> Vec<SymbolConflict> {
+        std::mem::take(&mut self.output.symbol_conflicts)
+    }
+
+    pub fn embed_runtime_metadata(&mut self, metadata: &str) -> Result<()> {
+        let data_id = self.output.module.declare_data(
+            "willow_runtime_metadata_v1",
+            Linkage::Export,
+            false,
+            false,
+        )?;
+        let mut data = DataDescription::new();
+        let mut bytes = b"willow_runtime_metadata_v1\n".to_vec();
+        bytes.extend_from_slice(metadata.as_bytes());
+        bytes.push(0);
+        data.define(bytes.into_boxed_slice());
+        self.output.module.define_data(data_id, &data)?;
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<Vec<u8>> {
+        let obj = self.output.module.finish();
+        Ok(obj.emit()?)
+    }
+}
+
+impl UnitCodegenContext<'_> {
+    /// Look up a declared runtime/user function id by symbol name, with a clear
+    /// panic if it was never declared (e.g. a backend symbol missing from
+    /// `abi.rs`) instead of an opaque index-out-of-bounds.
+    fn func_id(&self, name: &str) -> FuncId {
+        if crate::backend::abi::runtime_symbol(name).is_some_and(|symbol| {
+            symbol
+                .effects()
+                .contains(crate::backend::abi::RuntimeEffects::MAY_PANIC)
+        }) {
+            panic!(
+                "backend: MAY_PANIC runtime symbol `{name}` cannot be emitted from a raw Codegen call"
+            );
+        }
+        *self
+            .func_ids
+            .get(name)
+            .unwrap_or_else(|| panic!("backend: undeclared runtime symbol `{name}`"))
     }
 
     fn record_async_frame_size_warning(
@@ -484,27 +493,18 @@ impl Codegen {
     ) {
         let size_bytes = willow_abi::async_frame::data_slot_offset(
             layout.slot_count() as u32,
-            reference_type(self.module.target_config()).bytes(),
+            reference_type(self.output.module.target_config()).bytes(),
         ) as usize;
         if size_bytes >= ASYNC_FRAME_LARGE_WARNING_BYTES {
-            self.async_frame_size_warnings.push(AsyncFrameSizeWarning {
-                source_file: self.source_file.clone(),
-                function_name: function_name.to_string(),
-                span,
-                size_bytes,
-            });
+            self.output
+                .async_frame_size_warnings
+                .push(AsyncFrameSizeWarning {
+                    source_file: self.source_file.clone(),
+                    function_name: function_name.to_string(),
+                    span,
+                    size_bytes,
+                });
         }
-    }
-
-    pub fn take_async_frame_size_warnings(&mut self) -> Vec<AsyncFrameSizeWarning> {
-        std::mem::take(&mut self.async_frame_size_warnings)
-    }
-
-    /// Symbol conflicts recorded so far. The driver renders these instead of the
-    /// generic codegen error, because they are user errors with a source
-    /// location, not internal compiler failures.
-    pub fn take_symbol_conflicts(&mut self) -> Vec<SymbolConflict> {
-        std::mem::take(&mut self.symbol_conflicts)
     }
 
     /// Record `symbol` as belonging to `item`, or fail if it is already spoken
@@ -535,14 +535,15 @@ impl Codegen {
         let kind = if is_reserved_symbol(symbol) {
             Some(SymbolConflictKind::Reserved)
         } else {
-            self.symbol_owners
+            self.output
+                .symbol_owners
                 .get(symbol)
                 .cloned()
                 .map(|previous| SymbolConflictKind::Duplicate { previous })
         };
 
         if let Some(kind) = kind {
-            self.symbol_conflicts.push(SymbolConflict {
+            self.output.symbol_conflicts.push(SymbolConflict {
                 symbol: symbol.to_string(),
                 kind,
                 owner,
@@ -554,7 +555,7 @@ impl Codegen {
             anyhow::bail!("symbol conflict on `{symbol}`");
         }
 
-        self.symbol_owners.insert(symbol.to_string(), owner);
+        self.output.symbol_owners.insert(symbol.to_string(), owner);
         Ok(())
     }
 
@@ -614,36 +615,14 @@ impl Codegen {
         self.install_type_scope(scope);
     }
 
-    /// Register enum info so the backend can lower enum variant construction.
-    pub fn register_enum_info(&mut self, name: String, info: EnumInfo) {
-        let identity = info.name;
-        self.restore_type_alias(&identity.to_string(), None);
-        self.enum_infos.insert(identity, info);
-        if TypeId::from_source_name(&name) != identity {
-            self.bind_canonical_type_alias(&name, &identity.to_string());
-        }
-    }
-
-    /// Install a unit's bare enum names for the length of that unit's own
-    /// compilation, handing back what they displaced (willow-nm0g).
-    ///
-    /// The enum table is one flat namespace for the whole build, but a bare
-    /// name is only unambiguous inside the unit that wrote it: one module's
-    /// `enum Point` must not answer for another unit's `class Point` (the enum
-    /// table is consulted first, so a live object would read as a tag and go
-    /// untraced), and two modules that each declare `enum Kind` must each see
-    /// their own. So the names go in around the unit and come back out again.
-    ///
-    /// An interface of the same name comes OUT for that span. The interface
-    /// table is flat in the same way, and it is consulted first: with another
-    /// unit's `interface Point` standing, the declaring module's own
-    /// `Point::Near` reads as an interface and is refused. The alias is this
-    /// unit's answer for the name, so nothing else may answer for it here.
+    /// Bind only this unit's enum spellings. Enum/class/interface collisions
+    /// resolve through the unit overlay; canonical metadata is never aliased.
     fn bind_unit_enum_aliases(&mut self, aliases: &[(String, EnumInfo)]) {
         let mut scope = self.type_scope.clone();
         for (name, info) in aliases {
             // The unit checker supplies identity; metadata remains build-wide.
             if self.enum_infos.get_canonical(&info.name).is_none() {
+                self.assert_declaring();
                 self.enum_infos.insert(info.name, info.clone());
             }
             scope.bind_canonical(name, &info.name.to_string());
@@ -651,48 +630,10 @@ impl Codegen {
         self.install_type_scope(scope);
     }
 
-    /// Register interface metadata for vtable generation and method dispatch:
-    /// the session's composition of `identity` (computed once, on first
-    /// registration) plus this unit's spelling `name` of it.
-    pub fn register_interface_info(
-        &mut self,
-        name: String,
-        identity: TypeId,
-        info: impl FnOnce() -> InterfaceInfo,
-    ) -> Result<()> {
-        self.layout_queries.interface_composition(identity, info)?;
-        self.restore_type_alias(&identity.to_string(), None);
-        if TypeId::from_source_name(&name) != identity {
-            self.bind_canonical_type_alias(&name, &identity.to_string());
-        }
-        Ok(())
-    }
-
     /// This unit's alias-resolving view of the frozen class and interface
     /// layouts.
     fn classes(&self) -> ClassView<'_> {
         ClassView::new(&self.type_scope, &self.layout_queries)
-    }
-
-    /// Register resolved async-fn local types (willow-lpn.5c) for frame-backing
-    /// unannotated live-across-await locals.
-    pub fn register_expr_types(&mut self, types: HashMap<ExprId, Type>) {
-        self.expr_types = types;
-    }
-
-    /// Drop the per-unit state a body phase built up, once that unit's last
-    /// body has been emitted.
-    ///
-    /// On the session path `lir_functions`/`lir_lambdas` are empty — every body
-    /// is read from the artifact store one at a time — and this clears only the
-    /// declaration-phase `expr_types`. The standalone path
-    /// ([`Codegen::register_lir_functions`]) holds a whole unit's IR in memory,
-    /// and leaving it resident would keep every compiled unit's bodies alive
-    /// for the length of the build.
-    fn release_unit_transients(&mut self) {
-        self.lir_functions.clear();
-        self.lir_lambdas.clear();
-        self.expr_types.clear();
     }
 
     /// The lowered IR for one emission target.
@@ -768,7 +709,14 @@ impl Codegen {
     }
 
     pub fn register_lir_functions(&mut self, lir: crate::ir::lowered::LirProgram) {
-        self.lir_functions = lir.functions.into_iter().map(|f| (f.name, f)).collect();
+        self.lir_functions = lir
+            .functions
+            .into_iter()
+            .map(|mut function| {
+                function.name = self.func_ids.scope().resolve(&function.name);
+                (function.name, function)
+            })
+            .collect();
         for lambda in lir.lambdas {
             if let Some(name) = self.lambda_names.get(&lambda.id) {
                 let mut function = lambda.function;
@@ -812,8 +760,8 @@ impl Codegen {
     /// `signal::Level`, `Grade` under `import signal::Level as Grade;`,
     /// `sales::Amount` for a class the graph registered as `market::Amount`
     /// — and those spellings live only for that unit's own phase
-    /// ([`Codegen::bind_unit_enum_aliases`],
-    /// [`Codegen::alias_unit_module_spellings`]). The tables outlive it, are
+    /// ([`UnitCodegenContext::bind_unit_enum_aliases`],
+    /// [`UnitCodegenContext::alias_unit_module_spellings`]). The tables outlive it, are
     /// rebuilt by every LATER unit's declaration phase, and are compared
     /// against HIR types the checker already normalized, so recording the
     /// written spelling leaves the two halves unable to agree that `Grade` and
@@ -931,10 +879,13 @@ impl Codegen {
             return Vec::new();
         }
         let owner = TypeId::from_source_name(&qualified);
-        self.func_ids
-            .ids()
-            .filter(|id| id.namespace() == owner.namespace() && id.owner() == Some(owner.name()))
+        self.method_functions
+            .get(&owner)
+            .into_iter()
+            .flatten()
             .map(|id| {
+                #[cfg(test)]
+                METHOD_ALIAS_VISITS.with(|count| count.set(count.get() + 1));
                 (
                     class_member_symbol(local, id.name().as_ref()),
                     self.class_method_symbol(&qualified, id.name().as_ref()),
@@ -943,7 +894,7 @@ impl Codegen {
             .collect()
     }
 
-    /// The function half of [`Codegen::register_item_import`]: bind `local` to
+    /// The function half of [`UnitCodegenContext::register_item_import`]: bind `local` to
     /// the mangled symbol of `module`'s `item`, with the signature tables that
     /// travel with it. Returns whether such a function exists.
     fn bind_item_import_function(&mut self, local: &str, module: &str, item: &str) -> bool {
@@ -1053,35 +1004,6 @@ impl Codegen {
             || self.classes().is_interface(name)
     }
 
-    fn resolution_context(&self) -> UnitResolutionContext {
-        UnitResolutionContext {
-            types: self.type_scope.clone(),
-            functions: self.func_ids.scope().clone(),
-            modules: self.known_modules.resolution_context(),
-        }
-    }
-
-    fn install_resolution_context(&mut self, context: UnitResolutionContext) {
-        self.install_type_scope(context.types);
-        self.install_function_scope(context.functions);
-        self.known_modules.set_resolution_context(context.modules);
-    }
-
-    fn with_unit_resolution<R>(
-        &mut self,
-        context: UnitResolutionContext,
-        body: impl FnOnce(&mut Self) -> R,
-    ) -> R {
-        let previous = self.resolution_context();
-        self.install_resolution_context(context);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(self)));
-        self.install_resolution_context(previous);
-        match result {
-            Ok(value) => value,
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
-    }
-
     /// While compiling a module body, bind the types this unit IMPORTED by
     /// single-item import under the local names it spells them by
     /// (`import proto::Describable;` -> `Describable`), for the length of this
@@ -1101,9 +1023,9 @@ impl Codegen {
     /// Classes need no such alias: [`resolve_class_key`] already resolves a
     /// bare class name against every module's tables. Enums have their own, per
     /// unit and from that unit's own checker
-    /// ([`Codegen::bind_unit_enum_aliases`]).
+    /// ([`UnitCodegenContext::bind_unit_enum_aliases`]).
     ///
-    /// Installed BEFORE [`Codegen::alias_module_local_types`] so a module's own
+    /// Installed BEFORE [`UnitCodegenContext::alias_module_local_types`] so a module's own
     /// declaration still wins over anything it imported under the same name.
     fn alias_item_import_types(&mut self, items: &[compile::ItemBinding]) {
         for item in items {
@@ -1162,6 +1084,7 @@ impl Codegen {
     // ── Class helpers ─────────────────────────────────────────────────────────
 
     fn register_class_layout(&mut self, c: &ClassDecl) -> Result<()> {
+        self.assert_declaring();
         *self.dispatch_cache.get_mut() = Default::default();
         self.restore_type_alias(&c.name, None);
         let own: Vec<(String, Type)> = c
@@ -1212,8 +1135,9 @@ impl Codegen {
     /// inherited fields keep their order and type when a child redeclares a
     /// name, and an override keeps its inherited slot index. Work is bounded
     /// by the newly registered declarations plus the layouts they copy. The
-    /// results stay in the shared queries; [`Codegen::classes`] reads them.
+    /// results stay in the shared queries; [`UnitCodegenContext::classes`] reads them.
     fn finalize_class_layouts(&mut self) -> Result<()> {
+        self.assert_declaring();
         let completed = self.layout_queries.complete_pending_classes()?;
         self.layout_queries.prepare_gc_layouts(&completed, |id| {
             self.enum_infos.get(&id).is_none_or(|info| {
@@ -1254,27 +1178,6 @@ impl Codegen {
             &defining,
             method_name,
         ))
-    }
-
-    pub fn embed_runtime_metadata(&mut self, metadata: &str) -> Result<()> {
-        let data_id = self.module.declare_data(
-            "willow_runtime_metadata_v1",
-            Linkage::Export,
-            false,
-            false,
-        )?;
-        let mut data = DataDescription::new();
-        let mut bytes = b"willow_runtime_metadata_v1\n".to_vec();
-        bytes.extend_from_slice(metadata.as_bytes());
-        bytes.push(0);
-        data.define(bytes.into_boxed_slice());
-        self.module.define_data(data_id, &data)?;
-        Ok(())
-    }
-
-    pub fn finish(self) -> Result<Vec<u8>> {
-        let obj = self.module.finish();
-        Ok(obj.emit()?)
     }
 }
 
@@ -1536,13 +1439,13 @@ struct FuncGen<'a, 'b> {
     /// `collected_lock_sites`, so the cancel entry can merge them back into one
     /// reverse-lexical cleanup order (willow-38w.1.4 review).
     collected_cleanup_order: usize,
-    func_ids: &'a FunctionMap<FuncId>,
-    func_return_types: &'a FunctionMap<Type>,
-    fn_types: &'a FunctionMap<Type>,
-    func_param_modes: &'a FunctionMap<Vec<ParamMode>>,
-    func_param_debug: &'a FunctionMap<Vec<ParamDebug>>,
-    function_may_panic: &'a FunctionMap<bool>,
-    known_modules: &'a ModuleSymbols,
+    func_ids: &'a FunctionMap<'a, FuncId>,
+    func_return_types: &'a FunctionMap<'a, Type>,
+    fn_types: &'a FunctionMap<'a, Type>,
+    func_param_modes: &'a FunctionMap<'a, Vec<ParamMode>>,
+    func_param_debug: &'a FunctionMap<'a, Vec<ParamDebug>>,
+    function_may_panic: &'a FunctionMap<'a, bool>,
+    known_modules: &'a ModuleSymbols<'a>,
     /// The module access names the file being compiled imports (willow-vtlr).
     /// Read only to resolve a bare module class name, and read there because
     /// eligibility resolves it from the same set.
@@ -1558,15 +1461,15 @@ struct FuncGen<'a, 'b> {
     /// inline in the object: word 0 points at the class DESCRIPTOR, which
     /// holds the id at its own offset 0.
     classes: ClassView<'a>,
-    static_storage: &'a TypeMap<HashMap<String, StaticStorageInfo>>,
-    enum_infos: &'a TypeMap<EnumInfo>,
+    static_storage: &'a TypeMap<'a, HashMap<String, StaticStorageInfo>>,
+    enum_infos: &'a TypeMap<'a, EnumInfo>,
     /// Maps class name → its descriptor data symbol, the value stored in word 0
     /// of every object of that class (willow-fm7t).
-    class_descriptor_ids: &'a TypeMap<DataId>,
+    class_descriptor_ids: &'a TypeMap<'a, DataId>,
     /// Shared across functions until scoped metadata changes.
     dispatch_cache: &'a std::cell::RefCell<emit_interface::DispatchCache>,
     /// Static `(class, interface)` vtable data objects for class→interface boxing.
-    vtable_ids: &'a VtableMap<DataId>,
+    vtable_ids: &'a VtableMap<'a, DataId>,
     interface_slot_targets: &'a InterfaceSlotTargets,
     interface_slot_summaries:
         &'a std::cell::RefCell<HashMap<(TypeId, String), emit_interface::InterfaceSlotSummary>>,
@@ -2581,7 +2484,8 @@ mod tests {
         let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
         let (program, errors) = crate::parser::Parser::new(tokens).parse();
         assert!(errors.is_empty(), "{errors:?}");
-        let mut session = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+        let mut session_build = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+        let mut session = session_build.declaration_context();
         for item in &program.items {
             let Item::Class(class) = item else {
                 panic!("expected class")
@@ -2594,20 +2498,23 @@ mod tests {
             assert!(session.layout_queries.slots(id).is_none());
         }
         session.finalize_class_layouts().unwrap();
-        fn fields(session: &Codegen, name: &str) -> std::sync::Arc<Vec<(String, Type)>> {
+        fn fields(
+            session: &UnitCodegenContext<'_>,
+            name: &str,
+        ) -> std::sync::Arc<Vec<(String, Type)>> {
             session
                 .layout_queries
                 .fields(TypeId::from_source_name(name))
                 .unwrap()
         }
-        fn names(session: &Codegen, name: &str) -> Vec<String> {
+        fn names(session: &UnitCodegenContext<'_>, name: &str) -> Vec<String> {
             fields(session, name)
                 .iter()
                 .map(|(field, _)| field.clone())
                 .collect()
         }
         fn slots(
-            session: &Codegen,
+            session: &UnitCodegenContext<'_>,
             name: &str,
         ) -> std::sync::Arc<crate::semantic::method_slots::MethodSlots> {
             session
@@ -2615,7 +2522,7 @@ mod tests {
                 .slots(TypeId::from_source_name(name))
                 .unwrap()
         }
-        fn runtime_id(session: &Codegen, name: &str) -> Option<i64> {
+        fn runtime_id(session: &UnitCodegenContext<'_>, name: &str) -> Option<i64> {
             session
                 .layout_queries
                 .runtime_id(TypeId::from_source_name(name))
@@ -2670,8 +2577,9 @@ mod tests {
             panic!("expected class")
         };
         let queries = std::rc::Rc::new(crate::compiler_db::layout::LayoutQueries::default());
-        let mut codegen =
+        let mut codegen_build =
             Codegen::new(&CompilerOptions::debug(), std::rc::Rc::clone(&queries)).unwrap();
+        let mut codegen = codegen_build.declaration_context();
         codegen.bind_canonical_type_alias("Alias", "Root");
         // The parent need not be registered for its identity to be final.
         codegen.register_class_layout(child).unwrap();
@@ -2705,15 +2613,17 @@ mod tests {
         let (program, errors) = crate::parser::Parser::new(tokens).parse();
         assert!(errors.is_empty(), "{errors:?}");
         let queries = std::rc::Rc::new(crate::compiler_db::layout::LayoutQueries::default());
-        let mut first =
+        let mut first_build =
             Codegen::new(&CompilerOptions::debug(), std::rc::Rc::clone(&queries)).unwrap();
+        let mut first = first_build.declaration_context();
         for item in &program.items {
             let Item::Class(class) = item else {
                 panic!("expected class")
             };
             first.register_class_layout(class).unwrap();
         }
-        let mut second = Codegen::new(&CompilerOptions::debug(), queries).unwrap();
+        let mut second_build = Codegen::new(&CompilerOptions::debug(), queries).unwrap();
+        let mut second = second_build.declaration_context();
         for item in program.items.iter().rev() {
             let Item::Class(class) = item else {
                 panic!("expected class")
@@ -2736,7 +2646,8 @@ mod tests {
             let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
             let (program, errors) = crate::parser::Parser::new(tokens).parse();
             assert!(errors.is_empty(), "{errors:?}");
-            let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+            let mut codegen_build = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+            let mut codegen = codegen_build.declaration_context();
             for (i, item) in program.items.iter().enumerate() {
                 let Item::Class(class) = item else {
                     panic!("expected class")
@@ -2758,8 +2669,9 @@ mod tests {
 
     #[test]
     fn production_stack_probes_use_inline_four_kib_pages() {
-        let codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
-        let flags = codegen.module.isa().flags();
+        let mut codegen_build = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+        let codegen = codegen_build.declaration_context();
+        let flags = codegen.output.module.isa().flags();
         assert!(flags.enable_probestack());
         assert_eq!(
             flags.probestack_strategy(),
@@ -2772,7 +2684,8 @@ mod tests {
     fn closure_type_canonicalization_perspectives() {
         use super::*;
 
-        let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+        let mut codegen_build = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+        let mut codegen = codegen_build.declaration_context();
         codegen.enum_infos.insert(
             "origin::Choice",
             EnumInfo {
@@ -2938,7 +2851,8 @@ mod tests {
                 .collect();
             // Dependencies are declared before dependents, one unit each: the
             // pass for unit i visits declaration i alone and copies its parent.
-            let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+            let mut codegen_build = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+            let mut codegen = codegen_build.declaration_context();
             for (i, class) in classes.iter().enumerate() {
                 codegen.register_class_layout(class).unwrap();
                 codegen.finalize_class_layouts().unwrap();
@@ -2952,7 +2866,8 @@ mod tests {
             }
             // One unit declaring the whole chain subclass-first: one pass, one
             // visit per declaration, same layouts.
-            let mut reversed = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+            let mut reversed_build = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+            let mut reversed = reversed_build.declaration_context();
             for class in classes.iter().rev() {
                 reversed.register_class_layout(class).unwrap();
             }
@@ -2975,89 +2890,6 @@ mod tests {
                         assert_eq!(slots.slot_of(&format!("m{j}")), Some(j));
                     }
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn unit_resolution_context_restores_all_views_on_every_exit() {
-        use crate::semantic::ids::TypeId;
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-
-        // 4 binding shapes x 5 exits = 20 restoration perspectives. Check all
-        // three tables on every path, including repeated and nested shadowing.
-        for binding_shape in 0..4 {
-            for exit in 0..5 {
-                let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
-                let function = FunctionId::free_from_source_name("local");
-                let original = FunctionId::free_from_source_name("original");
-                if binding_shape != 0 {
-                    codegen.bind_function_alias(function, original);
-                    codegen.bind_type_alias("Local", "Original");
-                    codegen
-                        .known_modules
-                        .insert("local".into(), "original".into());
-                }
-                let before_function = codegen.func_ids.scope().resolve(&function);
-                let before_type = codegen
-                    .type_scope
-                    .resolve(&TypeId::from_source_name("Local"));
-                let before_module = codegen.known_modules.linker_prefix("local").cloned();
-                let result = catch_unwind(AssertUnwindSafe(|| {
-                    codegen.with_unit_resolution(
-                        codegen.resolution_context(),
-                        |this| -> anyhow::Result<()> {
-                            let repetitions = if binding_shape == 2 { 3 } else { 1 };
-                            for i in 0..repetitions {
-                                let target = format!("temporary{i}");
-                                this.bind_function_alias(
-                                    function,
-                                    FunctionId::free_from_source_name(&target),
-                                );
-                                this.bind_type_alias("Local", &target);
-                                let id = crate::module::ModuleId(10 + i);
-                                this.known_modules.register(id, &target, &target);
-                                this.known_modules.bind("local".into(), id);
-                            }
-                            if binding_shape == 3 {
-                                this.with_unit_resolution(this.resolution_context(), |inner| {
-                                    let id = crate::module::ModuleId(100);
-                                    inner.known_modules.register(id, "inner", "inner");
-                                    inner.known_modules.bind("local".into(), id);
-                                });
-                                assert_eq!(
-                                    this.known_modules.linker_prefix("local").unwrap(),
-                                    "temporary0"
-                                );
-                            }
-                            match exit {
-                                0 => Ok(()),
-                                1 => Err(anyhow::anyhow!("explicit error")),
-                                2 => {
-                                    Err(anyhow::anyhow!("propagated error"))?;
-                                    Ok(())
-                                }
-                                3 => panic!("scope unwind regression"),
-                                _ => Ok(()),
-                            }
-                        },
-                    )
-                }));
-                assert_eq!(result.is_err(), exit == 3);
-                if let Ok(result) = result {
-                    assert_eq!(result.is_err(), exit == 1 || exit == 2);
-                }
-                assert_eq!(codegen.func_ids.scope().resolve(&function), before_function);
-                assert_eq!(
-                    codegen
-                        .type_scope
-                        .resolve(&TypeId::from_source_name("Local")),
-                    before_type
-                );
-                assert_eq!(
-                    codegen.known_modules.linker_prefix("local").cloned(),
-                    before_module
-                );
             }
         }
     }
@@ -3220,7 +3052,7 @@ mod tests {
     }
 
     /// Helper: an EnumInfo registry with one enum of the given (name, payload) variants.
-    fn enum_infos_with(name: &str, variants: &[(&str, Vec<Type>)]) -> TypeMap<EnumInfo> {
+    fn enum_infos_with(name: &str, variants: &[(&str, Vec<Type>)]) -> TypeMap<'static, EnumInfo> {
         let mut map = TypeMap::new();
         map.insert(
             name.to_string(),

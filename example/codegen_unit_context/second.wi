@@ -1,0 +1,13 @@
+import right::value;
+
+class State {
+    pub static seed: i64 = value();
+    pub number: i64;
+    pub init(self, number: i64) { self.number = number; }
+    pub fn read(self) -> i64 { return self.number; }
+}
+
+pub fn run() -> i64 {
+    let state = new State(State::seed);
+    return state.read();
+}

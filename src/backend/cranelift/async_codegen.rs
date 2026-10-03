@@ -74,7 +74,7 @@ const MUTEX_STATUS_PHASE_POLL: i64 = willow_abi::LockStatusPhase::Poll as i64;
 /// Poll-function return codes (`fn(frame) -> i32`).
 const RUNTIME_POLL_PENDING: i64 = willow_abi::RuntimePollResult::Pending as i64;
 
-impl Codegen {
+impl UnitCodegenContext<'_> {
     fn emit_async_frame_alloc(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
@@ -86,11 +86,11 @@ impl Codegen {
             let alloc = self.func_id("willow_gc_alloc_bitmap");
             let payload_size = willow_abi::async_frame::data_slot_offset(
                 slot_count as u32,
-                reference_type(self.module.target_config()).bytes(),
+                reference_type(self.output.module.target_config()).bytes(),
             ) as i64;
             return super::gc_codegen::emit_bitmap_alloc(
-                &mut self.module,
-                &mut self.gc_bitmap_descriptors,
+                &mut self.output.module,
+                &mut self.output.gc_bitmap_descriptors,
                 builder,
                 alloc,
                 0,
@@ -99,7 +99,7 @@ impl Codegen {
             );
         }
         let alloc = self.func_id("willow_async_frame_alloc");
-        let alloc = self.module.declare_func_in_func(alloc, builder.func);
+        let alloc = self.output.module.declare_func_in_func(alloc, builder.func);
         let count = builder.ins().iconst(types::I64, slot_count);
         let mask = builder.ins().iconst(types::I64, mask);
         let call = builder.ins().call(alloc, &[count, mask]);
@@ -126,7 +126,7 @@ impl Codegen {
                 local.id,
                 async_frame_slot_offset(
                     first_parameter_slot + index,
-                    reference_type(self.module.target_config()).bytes(),
+                    reference_type(self.output.module.target_config()).bytes(),
                 ),
             );
         }
@@ -163,7 +163,10 @@ impl Codegen {
             let index = reserved.len();
             offsets.insert(
                 local.id,
-                async_frame_slot_offset(index, reference_type(self.module.target_config()).bytes()),
+                async_frame_slot_offset(
+                    index,
+                    reference_type(self.output.module.target_config()).bytes(),
+                ),
             );
             reserved.push(AsyncFrameSlot {
                 storage_kind: local.storage_kind,
@@ -197,7 +200,7 @@ impl Codegen {
                         let local = &lir.locals[id.0 as usize];
                         let offset = async_frame_slot_offset(
                             reserved.len(),
-                            reference_type(self.module.target_config()).bytes(),
+                            reference_type(self.output.module.target_config()).bytes(),
                         );
                         reserved.push(AsyncFrameSlot {
                             storage_kind: local.storage_kind,
@@ -226,7 +229,10 @@ impl Codegen {
             let index = reserved.len();
             defer_offsets.insert(
                 id,
-                async_frame_slot_offset(index, reference_type(self.module.target_config()).bytes()),
+                async_frame_slot_offset(
+                    index,
+                    reference_type(self.output.module.target_config()).bytes(),
+                ),
             );
             reserved.push(AsyncFrameSlot {
                 storage_kind: crate::ir::lowered::LirStorageKind::Value,
@@ -254,14 +260,15 @@ impl Codegen {
     ) -> Result<()> {
         // Declare the poll fn `fn(frame: i64) -> i32`.
         let poll_symbol = poll_symbol(USER_MAIN_SYMBOL);
-        let mut poll_sig = self.module.make_signature();
-        poll_sig
-            .params
-            .push(AbiParam::new(reference_type(self.module.target_config())));
+        let mut poll_sig = self.output.module.make_signature();
+        poll_sig.params.push(AbiParam::new(reference_type(
+            self.output.module.target_config(),
+        )));
         poll_sig.returns.push(AbiParam::new(types::I32));
-        let poll_fid = self
-            .module
-            .declare_function(&poll_symbol, Linkage::Local, &poll_sig)?;
+        let poll_fid =
+            self.output
+                .module
+                .declare_function(&poll_symbol, Linkage::Local, &poll_sig)?;
         self.func_ids.insert(poll_symbol.clone(), poll_fid);
 
         // A Result-returning main publishes its value in slot 0 for the driver
@@ -278,7 +285,7 @@ impl Codegen {
             });
             async_frame_slot_offset(
                 FRAME_SLOT_RESULT,
-                reference_type(self.module.target_config()).bytes(),
+                reference_type(self.output.module.target_config()).bytes(),
             )
         });
         let first_param_slot = slots.len();
@@ -306,7 +313,7 @@ impl Codegen {
                     p.name.clone(),
                     async_frame_slot_offset(
                         first_param_slot + i,
-                        reference_type(self.module.target_config()).bytes(),
+                        reference_type(self.output.module.target_config()).bytes(),
                     ),
                     p.ty.clone().into(),
                 )
@@ -355,24 +362,26 @@ impl Codegen {
         lir: LirFunction,
     ) -> Result<()> {
         let poll_symbol = coop_poll_symbol(name);
-        let mut poll_sig = self.module.make_signature();
-        poll_sig
-            .params
-            .push(AbiParam::new(reference_type(self.module.target_config())));
+        let mut poll_sig = self.output.module.make_signature();
+        poll_sig.params.push(AbiParam::new(reference_type(
+            self.output.module.target_config(),
+        )));
         poll_sig.returns.push(AbiParam::new(types::I32));
-        let poll_fid = self
-            .module
-            .declare_function(&poll_symbol, Linkage::Local, &poll_sig)?;
+        let poll_fid =
+            self.output
+                .module
+                .declare_function(&poll_symbol, Linkage::Local, &poll_sig)?;
         self.func_ids.insert(poll_symbol.clone(), poll_fid);
         // Cancellation cleanup entry (willow-vynv.3), defined after the poll
         // fn (it needs the defer sites collected while emitting the body).
         let cancel_symbol = coop_cancel_symbol(name);
-        let mut cancel_sig = self.module.make_signature();
-        cancel_sig
-            .params
-            .push(AbiParam::new(reference_type(self.module.target_config())));
+        let mut cancel_sig = self.output.module.make_signature();
+        cancel_sig.params.push(AbiParam::new(reference_type(
+            self.output.module.target_config(),
+        )));
         let cancel_fid =
-            self.module
+            self.output
+                .module
                 .declare_function(&cancel_symbol, Linkage::Local, &cancel_sig)?;
 
         // Frame layout: slot 0 = RESULT (return type), slot 1 = TASK_ID (the
@@ -409,11 +418,11 @@ impl Codegen {
         let mask = layout.gc_slot_mask as i64;
         let result_offset = async_frame_slot_offset(
             FRAME_SLOT_RESULT,
-            reference_type(self.module.target_config()).bytes(),
+            reference_type(self.output.module.target_config()).bytes(),
         );
         let task_id_offset = async_frame_slot_offset(
             FRAME_SLOT_TASK_ID,
-            reference_type(self.module.target_config()).bytes(),
+            reference_type(self.output.module.target_config()).bytes(),
         );
         let param_bindings: Vec<(String, i32, Type)> = f
             .params
@@ -424,7 +433,7 @@ impl Codegen {
                     p.name.clone(),
                     async_frame_slot_offset(
                         2 + i,
-                        reference_type(self.module.target_config()).bytes(),
+                        reference_type(self.output.module.target_config()).bytes(),
                     ),
                     p.ty.clone().into(),
                 )
@@ -434,16 +443,17 @@ impl Codegen {
         // Constructor = the fn's public symbol: alloc frame, store args into the
         // param slots, spawn the poll task, return the frame ptr (the Task).
         let ctor_fid = self.func_ids[name];
-        let mut ctx = self.module.make_context();
-        let mut sig = self.module.make_signature();
+        let mut ctx = self.output.module.make_context();
+        let mut sig = self.output.module.make_signature();
         for p in &f.params {
             sig.params.push(AbiParam::new(clif_type(
-                reference_type(self.module.target_config()),
+                reference_type(self.output.module.target_config()),
                 &p.ty,
             )));
         }
-        sig.returns
-            .push(AbiParam::new(reference_type(self.module.target_config())));
+        sig.returns.push(AbiParam::new(reference_type(
+            self.output.module.target_config(),
+        )));
         ctx.func.signature = sig;
         ctx.func.name = UserFuncName::user(0, ctor_fid.as_u32());
         let mut fn_ctx = FunctionBuilderContext::new();
@@ -453,7 +463,10 @@ impl Codegen {
         builder.switch_to_block(entry);
         builder.seal_block(entry);
         let barrier_fid = self.func_id("willow_gc_write_barrier");
-        let barrier_ref = self.module.declare_func_in_func(barrier_fid, builder.func);
+        let barrier_ref = self
+            .output
+            .module
+            .declare_func_in_func(barrier_fid, builder.func);
         let frame =
             self.emit_async_frame_alloc(&mut builder, slot_count, mask, &layout.gc_payload_bitmap);
         // Store args into their param slots (slots 2..) before spawning (no
@@ -461,8 +474,10 @@ impl Codegen {
         // safe).
         for (i, p) in f.params.iter().enumerate() {
             let arg = builder.block_params(entry)[i];
-            let off =
-                async_frame_slot_offset(2 + i, reference_type(self.module.target_config()).bytes());
+            let off = async_frame_slot_offset(
+                2 + i,
+                reference_type(self.output.module.target_config()).bytes(),
+            );
             emit_gc_heap_store_raw(
                 &mut builder,
                 is_gc_managed(
@@ -477,12 +492,18 @@ impl Codegen {
                 MemFlagsData::trusted(),
             );
         }
-        let poll_ref = self.module.declare_func_in_func(poll_fid, builder.func);
+        let poll_ref = self
+            .output
+            .module
+            .declare_func_in_func(poll_fid, builder.func);
         let poll_addr = builder
             .ins()
-            .func_addr(reference_type(self.module.target_config()), poll_ref);
+            .func_addr(reference_type(self.output.module.target_config()), poll_ref);
         let spawn_fid = self.func_id("willow_sched_spawn_cooperative");
-        let spawn_ref = self.module.declare_func_in_func(spawn_fid, builder.func);
+        let spawn_ref = self
+            .output
+            .module
+            .declare_func_in_func(spawn_fid, builder.func);
         // Record the scheduler task id in slot 1 (TASK_ID) so an awaiter can
         // willow_sched_await it.
         let spawn_call = builder.ins().call(spawn_ref, &[poll_addr, frame]);
@@ -505,22 +526,30 @@ impl Codegen {
             })
         {
             // Attach the cancellation cleanup entry (willow-vynv.3).
-            let cancel_ref = self.module.declare_func_in_func(cancel_fid, builder.func);
-            let cancel_addr = builder
-                .ins()
-                .func_addr(reference_type(self.module.target_config()), cancel_ref);
+            let cancel_ref = self
+                .output
+                .module
+                .declare_func_in_func(cancel_fid, builder.func);
+            let cancel_addr = builder.ins().func_addr(
+                reference_type(self.output.module.target_config()),
+                cancel_ref,
+            );
             let native_cleanup = lir.blocks.iter().flat_map(|block| &block.instrs).any(|inst|
                 matches!(inst, LirInst::Defer { body, .. } if super::lir_gen::cleanup_needs_task_stack(&body.function)));
             let needs_stack = builder.ins().iconst(types::I32, i64::from(native_cleanup));
             let set_fid = self.func_id("willow_sched_set_cancel_fn_cooperative");
-            let set_ref = self.module.declare_func_in_func(set_fid, builder.func);
+            let set_ref = self
+                .output
+                .module
+                .declare_func_in_func(set_fid, builder.func);
             builder
                 .ins()
                 .call(set_ref, &[task_id, cancel_addr, needs_stack]);
         }
         builder.ins().return_(&[frame]);
-        builder.finalize(self.module.target_config());
-        self.module
+        builder.finalize(self.output.module.target_config());
+        self.output
+            .module
             .define_function(ctor_fid, &mut ctx)
             .map_err(|e| {
                 if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
@@ -528,7 +557,7 @@ impl Codegen {
                 }
                 e
             })?;
-        self.module.clear_context(&mut ctx);
+        self.output.module.clear_context(&mut ctx);
 
         // Poll fn = the state machine; params are bound from their frame slots
         // and locals are frame-backed via `offsets`.
@@ -562,23 +591,25 @@ impl Codegen {
         lir: LirFunction,
     ) -> Result<()> {
         let poll_symbol = coop_poll_symbol(mangled);
-        let mut poll_sig = self.module.make_signature();
-        poll_sig
-            .params
-            .push(AbiParam::new(reference_type(self.module.target_config())));
+        let mut poll_sig = self.output.module.make_signature();
+        poll_sig.params.push(AbiParam::new(reference_type(
+            self.output.module.target_config(),
+        )));
         poll_sig.returns.push(AbiParam::new(types::I32));
-        let poll_fid = self
-            .module
-            .declare_function(&poll_symbol, Linkage::Local, &poll_sig)?;
+        let poll_fid =
+            self.output
+                .module
+                .declare_function(&poll_symbol, Linkage::Local, &poll_sig)?;
         self.func_ids.insert(poll_symbol.clone(), poll_fid);
         // Cancellation cleanup entry (willow-vynv.3).
         let cancel_symbol = coop_cancel_symbol(mangled);
-        let mut cancel_sig = self.module.make_signature();
-        cancel_sig
-            .params
-            .push(AbiParam::new(reference_type(self.module.target_config())));
+        let mut cancel_sig = self.output.module.make_signature();
+        cancel_sig.params.push(AbiParam::new(reference_type(
+            self.output.module.target_config(),
+        )));
         let cancel_fid =
-            self.module
+            self.output
+                .module
                 .declare_function(&cancel_symbol, Linkage::Local, &cancel_sig)?;
 
         let mut slots = vec![
@@ -600,7 +631,7 @@ impl Codegen {
         } else {
             let offset = async_frame_slot_offset(
                 slots.len(),
-                reference_type(self.module.target_config()).bytes(),
+                reference_type(self.output.module.target_config()).bytes(),
             );
             slots.push(AsyncFrameSlot {
                 storage_kind: crate::ir::lowered::LirStorageKind::Value,
@@ -639,11 +670,11 @@ impl Codegen {
         let mask = layout.gc_slot_mask as i64;
         let result_offset = async_frame_slot_offset(
             FRAME_SLOT_RESULT,
-            reference_type(self.module.target_config()).bytes(),
+            reference_type(self.output.module.target_config()).bytes(),
         );
         let task_id_offset = async_frame_slot_offset(
             FRAME_SLOT_TASK_ID,
-            reference_type(self.module.target_config()).bytes(),
+            reference_type(self.output.module.target_config()).bytes(),
         );
 
         let mut param_bindings: Vec<(String, i32, Type)> = Vec::new();
@@ -659,23 +690,25 @@ impl Codegen {
                 p.name.clone(),
                 async_frame_slot_offset(
                     first_param_slot + i,
-                    reference_type(self.module.target_config()).bytes(),
+                    reference_type(self.output.module.target_config()).bytes(),
                 ),
                 p.ty.clone().into(),
             )
         }));
 
         let ctor_fid = self.func_ids[mangled];
-        let mut ctx = self.module.make_context();
-        let mut sig = self.module.make_signature();
-        let ptr_ty = reference_type(self.module.target_config());
-        sig.params
-            .push(AbiParam::new(reference_type(self.module.target_config()))); // self/dummy method ABI slot
+        let mut ctx = self.output.module.make_context();
+        let mut sig = self.output.module.make_signature();
+        let ptr_ty = reference_type(self.output.module.target_config());
+        sig.params.push(AbiParam::new(reference_type(
+            self.output.module.target_config(),
+        ))); // self/dummy method ABI slot
         for p in &m.params {
             sig.params.push(AbiParam::new(param_abi_type(p, ptr_ty)));
         }
-        sig.returns
-            .push(AbiParam::new(reference_type(self.module.target_config())));
+        sig.returns.push(AbiParam::new(reference_type(
+            self.output.module.target_config(),
+        )));
         ctx.func.signature = sig;
         ctx.func.name = UserFuncName::user(0, ctor_fid.as_u32());
         let mut fn_ctx = FunctionBuilderContext::new();
@@ -686,7 +719,10 @@ impl Codegen {
         builder.seal_block(entry);
 
         let barrier_fid = self.func_id("willow_gc_write_barrier");
-        let barrier_ref = self.module.declare_func_in_func(barrier_fid, builder.func);
+        let barrier_ref = self
+            .output
+            .module
+            .declare_func_in_func(barrier_fid, builder.func);
         let frame =
             self.emit_async_frame_alloc(&mut builder, slot_count, mask, &layout.gc_payload_bitmap);
 
@@ -706,7 +742,7 @@ impl Codegen {
             let arg = builder.block_params(entry)[i + 1];
             let off = async_frame_slot_offset(
                 first_param_slot + i,
-                reference_type(self.module.target_config()).bytes(),
+                reference_type(self.output.module.target_config()).bytes(),
             );
             emit_gc_heap_store_raw(
                 &mut builder,
@@ -723,12 +759,18 @@ impl Codegen {
             );
         }
 
-        let poll_ref = self.module.declare_func_in_func(poll_fid, builder.func);
+        let poll_ref = self
+            .output
+            .module
+            .declare_func_in_func(poll_fid, builder.func);
         let poll_addr = builder
             .ins()
-            .func_addr(reference_type(self.module.target_config()), poll_ref);
+            .func_addr(reference_type(self.output.module.target_config()), poll_ref);
         let spawn_fid = self.func_id("willow_sched_spawn_cooperative");
-        let spawn_ref = self.module.declare_func_in_func(spawn_fid, builder.func);
+        let spawn_ref = self
+            .output
+            .module
+            .declare_func_in_func(spawn_fid, builder.func);
         let spawn_call = builder.ins().call(spawn_ref, &[poll_addr, frame]);
         let task_id = builder.inst_results(spawn_call)[0];
         builder
@@ -749,22 +791,30 @@ impl Codegen {
             })
         {
             // Attach the cancellation cleanup entry (willow-vynv.3).
-            let cancel_ref = self.module.declare_func_in_func(cancel_fid, builder.func);
-            let cancel_addr = builder
-                .ins()
-                .func_addr(reference_type(self.module.target_config()), cancel_ref);
+            let cancel_ref = self
+                .output
+                .module
+                .declare_func_in_func(cancel_fid, builder.func);
+            let cancel_addr = builder.ins().func_addr(
+                reference_type(self.output.module.target_config()),
+                cancel_ref,
+            );
             let native_cleanup = lir.blocks.iter().flat_map(|block| &block.instrs).any(|inst|
                 matches!(inst, LirInst::Defer { body, .. } if super::lir_gen::cleanup_needs_task_stack(&body.function)));
             let needs_stack = builder.ins().iconst(types::I32, i64::from(native_cleanup));
             let set_fid = self.func_id("willow_sched_set_cancel_fn_cooperative");
-            let set_ref = self.module.declare_func_in_func(set_fid, builder.func);
+            let set_ref = self
+                .output
+                .module
+                .declare_func_in_func(set_fid, builder.func);
             builder
                 .ins()
                 .call(set_ref, &[task_id, cancel_addr, needs_stack]);
         }
         builder.ins().return_(&[frame]);
-        builder.finalize(self.module.target_config());
-        self.module
+        builder.finalize(self.output.module.target_config());
+        self.output
+            .module
             .define_function(ctor_fid, &mut ctx)
             .map_err(|e| {
                 if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
@@ -772,7 +822,7 @@ impl Codegen {
                 }
                 e
             })?;
-        self.module.clear_context(&mut ctx);
+        self.output.module.clear_context(&mut ctx);
 
         let poll_decl = FunctionDecl {
             name: format!("{class_name}::{}", m.name),
@@ -816,8 +866,8 @@ impl Codegen {
         frame_layout: CoopMainDriverFrame,
     ) -> Result<()> {
         let func_id = self.func_ids[name];
-        let sig = self.module.make_signature(); // void, no params
-        let mut ctx = self.module.make_context();
+        let sig = self.output.module.make_signature(); // void, no params
+        let mut ctx = self.output.module.make_context();
         ctx.func.signature = sig;
         ctx.func.name = UserFuncName::user(0, func_id.as_u32());
         let mut fn_ctx = FunctionBuilderContext::new();
@@ -827,7 +877,10 @@ impl Codegen {
         builder.seal_block(entry);
 
         let barrier_fid = self.func_id("willow_gc_write_barrier");
-        let barrier_ref = self.module.declare_func_in_func(barrier_fid, builder.func);
+        let barrier_ref = self
+            .output
+            .module
+            .declare_func_in_func(barrier_fid, builder.func);
         let frame = self.emit_async_frame_alloc(
             &mut builder,
             frame_layout.slot_count,
@@ -844,19 +897,28 @@ impl Codegen {
                 8,
                 0,
             ));
-            builder
-                .ins()
-                .stack_store(reference_type(self.module.target_config()), frame, slot, 0);
-            let ptr_ty = reference_type(self.module.target_config());
+            builder.ins().stack_store(
+                reference_type(self.output.module.target_config()),
+                frame,
+                slot,
+                0,
+            );
+            let ptr_ty = reference_type(self.output.module.target_config());
             let addr = builder.ins().stack_addr(ptr_ty, slot, 0);
             let push_fid = self.func_id("willow_push_root");
-            let push_ref = self.module.declare_func_in_func(push_fid, builder.func);
+            let push_ref = self
+                .output
+                .module
+                .declare_func_in_func(push_fid, builder.func);
             builder.ins().call(push_ref, &[addr]);
         }
 
         if let Some(param) = params.first() {
             let arr_id = self.func_id("willow_runtime_args_array");
-            let arr_ref = self.module.declare_func_in_func(arr_id, builder.func);
+            let arr_ref = self
+                .output
+                .module
+                .declare_func_in_func(arr_id, builder.func);
             let arr_call = builder.ins().call(arr_ref, &[]);
             let arr = builder.inst_results(arr_call)[0];
             emit_gc_heap_store_raw(
@@ -865,7 +927,7 @@ impl Codegen {
                 frame,
                 async_frame_slot_offset(
                     frame_layout.first_param_slot,
-                    reference_type(self.module.target_config()).bytes(),
+                    reference_type(self.output.module.target_config()).bytes(),
                 ),
                 arr,
                 GcStoreDestination::AsyncFrameSlot,
@@ -876,12 +938,18 @@ impl Codegen {
 
         // willow_sched_spawn(poll_addr, frame) -> main's task id.
         let poll_fid = self.func_ids[poll_symbol];
-        let poll_ref = self.module.declare_func_in_func(poll_fid, builder.func);
+        let poll_ref = self
+            .output
+            .module
+            .declare_func_in_func(poll_fid, builder.func);
         let poll_addr = builder
             .ins()
-            .func_addr(reference_type(self.module.target_config()), poll_ref);
+            .func_addr(reference_type(self.output.module.target_config()), poll_ref);
         let spawn_fid = self.func_id("willow_sched_spawn_cooperative");
-        let spawn_ref = self.module.declare_func_in_func(spawn_fid, builder.func);
+        let spawn_ref = self
+            .output
+            .module
+            .declare_func_in_func(spawn_fid, builder.func);
         let spawn_call = builder.ins().call(spawn_ref, &[poll_addr, frame]);
         let main_task_id = builder.inst_results(spawn_call)[0];
 
@@ -891,24 +959,30 @@ impl Codegen {
         // background task). Programs that need a result await their tasks before main
         // returns, so nothing is left to run anyway.
         let run_fid = self.func_id("willow_sched_run_until");
-        let run_ref = self.module.declare_func_in_func(run_fid, builder.func);
+        let run_ref = self
+            .output
+            .module
+            .declare_func_in_func(run_fid, builder.func);
         builder.ins().call(run_ref, &[main_task_id]);
 
         if let Some((result_offset, err_ty)) = frame_layout.main_result {
             let result = builder.ins().load(
-                reference_type(self.module.target_config()),
+                reference_type(self.output.module.target_config()),
                 MemFlagsData::trusted(),
                 frame,
                 result_offset,
             );
             let pop_fid = self.func_id("willow_pop_roots");
-            let pop_ref = self.module.declare_func_in_func(pop_fid, builder.func);
+            let pop_ref = self
+                .output
+                .module
+                .declare_func_in_func(pop_fid, builder.func);
             let one = builder.ins().iconst(types::I32, 1);
             builder.ins().call(pop_ref, &[one]);
             let fail_id = self.func_id("willow_main_fail");
             super::emit_match::emit_main_result_exit_raw(
                 &mut builder,
-                &mut self.module,
+                &mut self.output.module,
                 fail_id,
                 result,
                 err_ty == Type::String,
@@ -916,8 +990,9 @@ impl Codegen {
         } else {
             builder.ins().return_(&[]);
         }
-        builder.finalize(self.module.target_config());
-        self.module
+        builder.finalize(self.output.module.target_config());
+        self.output
+            .module
             .define_function(func_id, &mut ctx)
             .map_err(|e| {
                 if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
@@ -925,7 +1000,7 @@ impl Codegen {
                 }
                 e
             })?;
-        self.module.clear_context(&mut ctx);
+        self.output.module.clear_context(&mut ctx);
         Ok(())
     }
 
@@ -953,12 +1028,12 @@ impl Codegen {
                     {
                         let symbol =
                             super::lir_gen::task_boundary_symbol(body.lir, block.id.0, index);
-                        let mut signature = self.module.make_signature();
-                        signature
-                            .params
-                            .push(AbiParam::new(reference_type(self.module.target_config())));
+                        let mut signature = self.output.module.make_signature();
+                        signature.params.push(AbiParam::new(reference_type(
+                            self.output.module.target_config(),
+                        )));
                         signature.returns.push(AbiParam::new(types::I32));
-                        let id = self.module.declare_function(
+                        let id = self.output.module.declare_function(
                             &symbol,
                             cranelift_module::Linkage::Local,
                             &signature,
@@ -1025,12 +1100,12 @@ impl Codegen {
                             flag_offset,
                             recovery,
                         );
-                        let mut signature = self.module.make_signature();
-                        signature
-                            .params
-                            .push(AbiParam::new(reference_type(self.module.target_config())));
+                        let mut signature = self.output.module.make_signature();
+                        signature.params.push(AbiParam::new(reference_type(
+                            self.output.module.target_config(),
+                        )));
                         signature.returns.push(AbiParam::new(types::I32));
-                        let id = self.module.declare_function(
+                        let id = self.output.module.declare_function(
                             &symbol,
                             cranelift_module::Linkage::Local,
                             &signature,
@@ -1064,11 +1139,12 @@ impl Codegen {
         } else {
             None
         };
-        let mut sig = self.module.make_signature();
-        sig.params
-            .push(AbiParam::new(reference_type(self.module.target_config())));
+        let mut sig = self.output.module.make_signature();
+        sig.params.push(AbiParam::new(reference_type(
+            self.output.module.target_config(),
+        )));
         sig.returns.push(AbiParam::new(types::I32));
-        let mut ctx = self.module.make_context();
+        let mut ctx = self.output.module.make_context();
         ctx.func.signature = sig;
         ctx.func.name = UserFuncName::user(0, func_id.as_u32());
         let mut fn_ctx = FunctionBuilderContext::new();
@@ -1077,19 +1153,23 @@ impl Codegen {
         builder.append_block_params_for_function_params(entry);
         builder.switch_to_block(entry);
         let frame = builder.block_params(entry)[0];
-        let ptr_ty = reference_type(self.module.target_config());
+        let ptr_ty = reference_type(self.output.module.target_config());
         // Tag the running task with this async fn's name on every poll entry (so
         // resumes re-tag too), before dispatch (willow-9lw).
         if let Some(name) = &tag_name
-            && let Some(&data_id) = self.string_literals.get(name)
+            && let Some(&data_id) = self.output.string_literals.get(name)
         {
             let gv = self
+                .output
                 .module
                 .declare_data_in_func(data_id.bytes, builder.func);
             let name_ptr = builder.ins().symbol_value(ptr_ty, gv);
             let name_len = builder.ins().iconst(types::I64, name.len() as i64);
             let tag_id = self.func_id("willow_sched_tag_current_task");
-            let tag_ref = self.module.declare_func_in_func(tag_id, builder.func);
+            let tag_ref = self
+                .output
+                .module
+                .declare_func_in_func(tag_id, builder.func);
             builder.ins().call(tag_ref, &[name_ptr, name_len]);
         }
         // This value is defined in the poll entry and therefore dominates both
@@ -1098,6 +1178,7 @@ impl Codegen {
         // body would not dominate resume edges that jump past that capture.
         let root_depth_id = self.func_id("willow_root_depth");
         let root_depth_ref = self
+            .output
             .module
             .declare_func_in_func(root_depth_id, builder.func);
         let root_depth_call = builder.ins().call(root_depth_ref, &[]);
@@ -1141,10 +1222,10 @@ impl Codegen {
                 lock_scopes: Vec::new(),
                 collected_lock_sites: Vec::new(),
                 collected_cleanup_order: 0,
-                module: &mut self.module,
-                gc_tlab_state: self.gc_tlab_state,
-                gc_bitmap_descriptors: &mut self.gc_bitmap_descriptors,
-                gc_layout_descriptors: &mut self.gc_layout_descriptors,
+                module: &mut self.output.module,
+                gc_tlab_state: self.output.gc_tlab_state,
+                gc_bitmap_descriptors: &mut self.output.gc_bitmap_descriptors,
+                gc_layout_descriptors: &mut self.output.gc_layout_descriptors,
                 func_ids: &self.func_ids,
                 func_return_types: &self.func_return_types,
                 fn_types: &self.fn_types,
@@ -1155,7 +1236,7 @@ impl Codegen {
                 visible_modules: &self.visible_modules,
                 builtin_module_aliases: &self.builtin_module_aliases,
                 lambda_names: &self.lambda_names,
-                string_literals: &self.string_literals,
+                string_literals: &self.output.string_literals,
                 classes: ClassView::new(&self.type_scope, &self.layout_queries),
                 static_storage: &self.static_storage,
                 enum_infos: &self.enum_infos,
@@ -1163,7 +1244,7 @@ impl Codegen {
                 dispatch_cache: &self.dispatch_cache,
                 vtable_ids: &self.vtable_ids,
                 interface_slot_targets: &self.interface_slot_targets,
-                interface_slot_summaries: &self.interface_slot_summaries,
+                interface_slot_summaries: &self.output.interface_slot_summaries,
                 coop_frame: None,
                 coop_suspend_points: None,
                 coop_result_offset: None,
@@ -1250,25 +1331,32 @@ impl Codegen {
             builder.ins().brif(is_k, restore, &[], next, &[]);
             builder.switch_to_block(restore);
             let push_id = self.func_id("willow_push_root");
-            let push_ref = self.module.declare_func_in_func(push_id, builder.func);
-            let ptr_ty = reference_type(self.module.target_config());
+            let push_ref = self
+                .output
+                .module
+                .declare_func_in_func(push_id, builder.func);
+            let ptr_ty = reference_type(self.output.module.target_config());
             for slot in &suspend.roots {
                 let addr = builder.ins().stack_addr(ptr_ty, *slot, 0);
                 builder.ins().call(push_ref, &[addr]);
             }
             for (method, span) in &suspend.call_frames {
                 let name_data = *self
+                    .output
                     .string_literals
                     .get(method)
                     .expect("prepared method name registered");
                 let file_data = *self
+                    .output
                     .string_literals
                     .get(self.source_file.as_str())
                     .expect("prepared source file registered");
                 let name_global = self
+                    .output
                     .module
                     .declare_data_in_func(name_data.bytes, builder.func);
                 let file_global = self
+                    .output
                     .module
                     .declare_data_in_func(file_data.bytes, builder.func);
                 let name = builder.ins().symbol_value(ptr_ty, name_global);
@@ -1280,7 +1368,7 @@ impl Codegen {
                 let line = builder.ins().iconst(types::I32, span.line as i64);
                 let col = builder.ins().iconst(types::I32, span.col as i64);
                 let push = self.func_id("willow_callstack_push");
-                let push = self.module.declare_func_in_func(push, builder.func);
+                let push = self.output.module.declare_func_in_func(push, builder.func);
                 builder
                     .ins()
                     .call(push, &[name, name_len, file, file_len, line, col]);
@@ -1293,8 +1381,9 @@ impl Codegen {
         builder.ins().jump(body_start, &[]);
         builder.seal_all_blocks();
 
-        builder.finalize(self.module.target_config());
-        self.module
+        builder.finalize(self.output.module.target_config());
+        self.output
+            .module
             .define_function(func_id, &mut ctx)
             .map_err(|e| {
                 if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
@@ -1302,7 +1391,7 @@ impl Codegen {
                 }
                 e
             })?;
-        self.module.clear_context(&mut ctx);
+        self.output.module.clear_context(&mut ctx);
         Ok((defer_sites, lock_sites))
     }
 
@@ -1318,10 +1407,11 @@ impl Codegen {
         sites: &[AsyncDeferSite],
         lock_sites: &[AsyncLockSite],
     ) -> Result<()> {
-        let mut sig = self.module.make_signature();
-        sig.params
-            .push(AbiParam::new(reference_type(self.module.target_config())));
-        let mut ctx = self.module.make_context();
+        let mut sig = self.output.module.make_signature();
+        sig.params.push(AbiParam::new(reference_type(
+            self.output.module.target_config(),
+        )));
+        let mut ctx = self.output.module.make_context();
         ctx.func.signature = sig;
         ctx.func.name = UserFuncName::user(0, cancel_fid.as_u32());
         let mut fn_ctx = FunctionBuilderContext::new();
@@ -1357,10 +1447,10 @@ impl Codegen {
                 lock_scopes: Vec::new(),
                 collected_lock_sites: Vec::new(),
                 collected_cleanup_order: 0,
-                module: &mut self.module,
-                gc_tlab_state: self.gc_tlab_state,
-                gc_bitmap_descriptors: &mut self.gc_bitmap_descriptors,
-                gc_layout_descriptors: &mut self.gc_layout_descriptors,
+                module: &mut self.output.module,
+                gc_tlab_state: self.output.gc_tlab_state,
+                gc_bitmap_descriptors: &mut self.output.gc_bitmap_descriptors,
+                gc_layout_descriptors: &mut self.output.gc_layout_descriptors,
                 func_ids: &self.func_ids,
                 func_return_types: &self.func_return_types,
                 fn_types: &self.fn_types,
@@ -1371,7 +1461,7 @@ impl Codegen {
                 visible_modules: &self.visible_modules,
                 builtin_module_aliases: &self.builtin_module_aliases,
                 lambda_names: &self.lambda_names,
-                string_literals: &self.string_literals,
+                string_literals: &self.output.string_literals,
                 classes: ClassView::new(&self.type_scope, &self.layout_queries),
                 static_storage: &self.static_storage,
                 enum_infos: &self.enum_infos,
@@ -1379,7 +1469,7 @@ impl Codegen {
                 dispatch_cache: &self.dispatch_cache,
                 vtable_ids: &self.vtable_ids,
                 interface_slot_targets: &self.interface_slot_targets,
-                interface_slot_summaries: &self.interface_slot_summaries,
+                interface_slot_summaries: &self.output.interface_slot_summaries,
                 coop_frame: None,
                 coop_suspend_points: None,
                 coop_result_offset: None,
@@ -1492,8 +1582,9 @@ impl Codegen {
             fg.builder.ins().return_(&[]);
         }
         builder.seal_all_blocks();
-        builder.finalize(self.module.target_config());
-        self.module
+        builder.finalize(self.output.module.target_config());
+        self.output
+            .module
             .define_function(cancel_fid, &mut ctx)
             .map_err(|e| {
                 if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
@@ -1501,7 +1592,7 @@ impl Codegen {
                 }
                 e
             })?;
-        self.module.clear_context(&mut ctx);
+        self.output.module.clear_context(&mut ctx);
         Ok(())
     }
 }
@@ -2298,7 +2389,8 @@ mod task_boundary_callback_tests {
         let (hir, errors) = crate::ir::lower::lower_program_with(&program, &tables);
         assert!(errors.is_empty(), "{errors:?}");
         let lir = crate::ir::lowered::lower_program(&hir).functions.remove(0);
-        let codegen = Codegen::for_tests(&crate::CompilerOptions::debug()).unwrap();
+        let mut backend = Codegen::for_tests(&crate::CompilerOptions::debug()).unwrap();
+        let codegen = backend.declaration_context();
         let (layout, offsets, _) = codegen.lir_async_layout(&lir, Vec::new(), 0).unwrap();
         (lir, layout, offsets)
     }
@@ -2377,10 +2469,13 @@ mod task_boundary_callback_tests {
         let (hir, diagnostics) = crate::ir::lower::lower_program_with(&program, &tables);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let mut codegen = Codegen::for_tests(&crate::CompilerOptions::debug()).unwrap();
-        codegen.register_lir_functions(crate::ir::lowered::lower_program(&hir));
+        let input = StandaloneUnitInput {
+            expr_types: Default::default(),
+            lir: Some(crate::ir::lowered::lower_program(&hir)),
+        };
         CALLBACK_WORK.with(|work| work.set((0, 0, 0, 0)));
         codegen
-            .compile_program(&program, "callback-scaling.wi")
+            .compile_program(&program, "callback-scaling.wi", input)
             .unwrap();
         CALLBACK_WORK.with(|work| work.get())
     }

@@ -772,18 +772,66 @@ pub struct ResolvedSymbolRef {
     pub symbol: SymbolId,
 }
 
+type CodegenUnitAliases = std::rc::Rc<std::cell::RefCell<HashMap<FunctionId, Option<FunctionId>>>>;
+
 /// One unit's local spellings resolve to canonical function identities.
 /// Clones retain immutable alias snapshots while sharing build-wide declarations.
 #[derive(Debug, Clone, Default)]
 pub struct FunctionScope {
     aliases: std::rc::Rc<HashMap<FunctionId, FunctionId>>,
+    /// Backend unit views share a private overlay; ordinary clones remain snapshots.
+    unit_aliases: Option<CodegenUnitAliases>,
+    frozen_declarations: bool,
     /// Backend spellings are labels for IDs, never input to an ID parser.
     declarations: std::rc::Rc<std::cell::RefCell<HashMap<String, FunctionId>>>,
 }
 
 impl FunctionScope {
+    pub(crate) fn fork_codegen_unit(&self, frozen_declarations: bool) -> Self {
+        assert!(self.unit_aliases.is_none());
+        Self {
+            aliases: std::rc::Rc::clone(&self.aliases),
+            declarations: std::rc::Rc::clone(&self.declarations),
+            unit_aliases: Some(Default::default()),
+            frozen_declarations,
+        }
+    }
+    fn alias(&self, id: &FunctionId) -> Option<FunctionId> {
+        if let Some(unit) = &self.unit_aliases
+            && let Some(value) = unit.borrow().get(id)
+        {
+            return *value;
+        }
+        self.aliases.get(id).copied()
+    }
+
+    fn snapshot_aliases(&self) -> std::rc::Rc<HashMap<FunctionId, FunctionId>> {
+        let mut aliases = std::rc::Rc::clone(&self.aliases);
+        if let Some(unit) = &self.unit_aliases {
+            let unit = unit.borrow();
+            if !unit.is_empty() {
+                let aliases = std::rc::Rc::make_mut(&mut aliases);
+                for (key, value) in unit.iter() {
+                    match value {
+                        Some(value) => {
+                            aliases.insert(*key, *value);
+                        }
+                        None => {
+                            aliases.remove(key);
+                        }
+                    }
+                }
+            }
+        }
+        aliases
+    }
+
     /// Associate an emitted/lookup spelling with its declaration identity.
     pub fn declare(&self, spelling: &str, id: FunctionId) {
+        assert!(
+            !self.frozen_declarations,
+            "attempt to change frozen function declarations"
+        );
         let mut declarations = self.declarations.borrow_mut();
         if id.module().is_none() {
             declarations.insert(id.to_string(), id);
@@ -793,7 +841,7 @@ impl FunctionScope {
     pub fn lookup_id(&self, spelling: &str) -> FunctionId {
         self.resolve(&FunctionId::free(spelling))
     }
-    fn declaration_id(&self, spelling: &str) -> FunctionId {
+    pub(crate) fn declaration_id(&self, spelling: &str) -> FunctionId {
         self.declarations
             .borrow()
             .get(spelling)
@@ -801,7 +849,7 @@ impl FunctionScope {
             .unwrap_or_else(|| FunctionId::free(spelling))
     }
     pub fn resolve(&self, id: &FunctionId) -> FunctionId {
-        self.aliases.get(id).copied().unwrap_or_else(|| {
+        self.alias(id).unwrap_or_else(|| {
             if id.module().is_some() {
                 return *id;
             }
@@ -815,10 +863,28 @@ impl FunctionScope {
 
     pub fn bind(&mut self, alias: FunctionId, canonical: FunctionId) -> Option<FunctionId> {
         let canonical = self.resolve(&canonical);
-        std::rc::Rc::make_mut(&mut self.aliases).insert(alias, canonical)
+        if let Some(unit) = &self.unit_aliases {
+            let previous = self.alias(&alias);
+            unit.borrow_mut().insert(alias, Some(canonical));
+            previous
+        } else {
+            std::rc::Rc::make_mut(&mut self.aliases).insert(alias, canonical)
+        }
     }
 
     pub fn restore(&mut self, alias: FunctionId, previous: Option<FunctionId>) {
+        if let Some(unit) = &self.unit_aliases {
+            let mut unit = unit.borrow_mut();
+            if previous.is_some() || self.aliases.contains_key(&alias) {
+                unit.insert(alias, previous);
+            } else {
+                unit.remove(&alias);
+            }
+            return;
+        }
+        if previous.is_none() && !self.aliases.contains_key(&alias) {
+            return;
+        }
         let aliases = std::rc::Rc::make_mut(&mut self.aliases);
         match previous {
             Some(id) => {
@@ -851,7 +917,7 @@ impl<V> Default for FunctionMap<V> {
 impl<V: PartialEq> PartialEq for FunctionMap<V> {
     fn eq(&self, other: &Self) -> bool {
         self.values == other.values
-            && *self.scope.aliases == *other.scope.aliases
+            && *self.scope.snapshot_aliases() == *other.scope.snapshot_aliases()
             && *self.scope.declarations.borrow() == *other.scope.declarations.borrow()
     }
 }
@@ -863,7 +929,9 @@ impl<V: Clone> FunctionMap<V> {
         Self {
             values: self.values.clone(),
             scope: FunctionScope {
-                aliases: std::rc::Rc::clone(&self.scope.aliases),
+                unit_aliases: None,
+                frozen_declarations: false,
+                aliases: self.scope.snapshot_aliases(),
                 declarations: std::rc::Rc::new(std::cell::RefCell::new(
                     self.scope.declarations.borrow().clone(),
                 )),
@@ -1218,7 +1286,8 @@ impl<V: serde::Serialize> serde::Serialize for FunctionMap<V> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut values: Vec<_> = self.values.iter().collect();
         values.sort_unstable_by_key(|(id, _)| **id);
-        let mut aliases: Vec<_> = self.scope.aliases.iter().collect();
+        let alias_snapshot = self.scope.snapshot_aliases();
+        let mut aliases: Vec<_> = alias_snapshot.iter().collect();
         aliases.sort_unstable_by_key(|(id, _)| **id);
         serde::Serialize::serialize(
             &(values, aliases, &*self.scope.declarations.borrow()),
@@ -1237,6 +1306,8 @@ impl<'de, V: serde::Deserialize<'de>> serde::Deserialize<'de> for FunctionMap<V>
         Ok(Self {
             values: values.into_iter().collect(),
             scope: FunctionScope {
+                unit_aliases: None,
+                frozen_declarations: false,
                 aliases: std::rc::Rc::new(aliases.into_iter().collect()),
                 declarations: std::rc::Rc::new(std::cell::RefCell::new(declarations)),
             },
@@ -1372,3 +1443,29 @@ mod package_symbol_tests {
 #[cfg(test)]
 #[path = "ids_session_tests.rs"]
 mod session_tests;
+
+#[cfg(test)]
+mod codegen_scope_tests {
+    use super::*;
+    #[test]
+    fn unit_overlay_roundtrip_and_detached_clone_keep_bindings() {
+        let mut table = FunctionMap::default();
+        table.insert("A", 1);
+        table.insert("B", 2);
+        let mut base = table.scope().clone();
+        base.bind(FunctionId::free("local"), FunctionId::free("A"));
+        let mut unit = base.fork_codegen_unit(true);
+        unit.bind(FunctionId::free("local"), FunctionId::free("B"));
+        table.set_scope(unit.clone());
+        let detached = table.detached_clone();
+        let decoded: FunctionMap<i32> =
+            serde_json::from_str(&serde_json::to_string(&table).unwrap()).unwrap();
+        assert_eq!(table, detached);
+        assert_eq!(table, decoded);
+        unit.restore(FunctionId::free("local"), None);
+        assert_eq!(table.get("local"), None);
+        assert_eq!(detached.get("local"), Some(&2));
+        assert_eq!(decoded.get("local"), Some(&2));
+        assert_eq!(base.lookup_id("local"), FunctionId::free("A"));
+    }
+}

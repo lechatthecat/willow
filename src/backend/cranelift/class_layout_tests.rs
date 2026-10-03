@@ -16,20 +16,23 @@ fn classes(source: &str) -> Vec<ClassDecl> {
 }
 
 /// The frozen layout under `name`'s DECLARATION identity, aliases ignored.
-fn fields(codegen: &Codegen, name: &str) -> Option<std::sync::Arc<Vec<(String, Type)>>> {
+fn fields(
+    codegen: &UnitCodegenContext<'_>,
+    name: &str,
+) -> Option<std::sync::Arc<Vec<(String, Type)>>> {
     codegen
         .layout_queries
         .fields(TypeId::from_source_name(name))
 }
 
-fn slots(codegen: &Codegen, name: &str) -> std::sync::Arc<MethodSlots> {
+fn slots(codegen: &UnitCodegenContext<'_>, name: &str) -> std::sync::Arc<MethodSlots> {
     codegen
         .layout_queries
         .slots(TypeId::from_source_name(name))
         .unwrap()
 }
 
-fn field_names(codegen: &Codegen, name: &str) -> Vec<String> {
+fn field_names(codegen: &UnitCodegenContext<'_>, name: &str) -> Vec<String> {
     fields(codegen, name)
         .unwrap()
         .iter()
@@ -67,7 +70,8 @@ fn field_layout_counts_are_output_sensitive_in_both_declaration_orders() {
             }
             let declarations = classes(&source);
             for reverse in [false, true] {
-                let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+                let mut codegen_build = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+                let mut codegen = codegen_build.declaration_context();
                 for index in 0..size {
                     let i = if reverse { size - 1 - index } else { index };
                     codegen.register_class_layout(&declarations[i]).unwrap();
@@ -128,7 +132,8 @@ fn field_layouts_preserve_inherited_types_and_order_under_redeclaration() {
     let declarations = classes(
         "open class A { pub a: i64; pub open fn a(self) {} } open class B extends A { pub a: bool; pub b: bool; pub override fn a(self) {} pub open fn b(self) {} } class C extends B { pub c: i64; pub override fn b(self) {} }",
     );
-    let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+    let mut codegen_build = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+    let mut codegen = codegen_build.declaration_context();
     for class in declarations.iter().rev() {
         codegen.register_class_layout(class).unwrap();
     }
@@ -156,7 +161,8 @@ fn field_layouts_preserve_inherited_types_and_order_under_redeclaration() {
 
 #[test]
 fn field_layouts_keep_canonical_identity_under_aliases_and_reject_cycles() {
-    let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+    let mut codegen_build = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+    let mut codegen = codegen_build.declaration_context();
     for class in classes(
         "open class A { pub a: i64; } class B extends A { pub b: bool; } class Other { pub other: String; }",
     ) {
@@ -171,7 +177,8 @@ fn field_layouts_keep_canonical_identity_under_aliases_and_reject_cycles() {
     );
     // A cyclic `extends` is a checker error; a backend driven directly with
     // one gets a diagnosed failure instead of a partial layout.
-    let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+    let mut codegen_build = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+    let mut codegen = codegen_build.declaration_context();
     for class in classes(
         "open class A extends B { pub a: i64; } open class B extends A { pub b: bool; } class C extends A { pub c: String; }",
     ) {
@@ -187,7 +194,8 @@ fn field_layouts_keep_canonical_identity_under_aliases_and_reject_cycles() {
 
 #[test]
 fn field_layouts_do_not_inherit_unregistered_builtin_layouts() {
-    let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+    let mut codegen_build = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+    let mut codegen = codegen_build.declaration_context();
     for class in classes("class C extends PanicInfo { pub own: i64; }") {
         codegen.register_class_layout(&class).unwrap();
     }

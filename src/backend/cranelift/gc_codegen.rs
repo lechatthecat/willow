@@ -460,10 +460,11 @@ mod tests {
     fn satb_codegen_loads_old_before_each_reference_store_in_linear_code() {
         use cranelift_codegen::ir::Opcode;
         for stores in [1, 16, 256] {
-            let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+            let mut codegen_build = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+            let mut codegen = codegen_build.declaration_context();
             codegen.declare_runtime().unwrap();
-            let mut ctx = codegen.module.make_context();
-            let mut signature = codegen.module.make_signature();
+            let mut ctx = codegen.output.module.make_context();
+            let mut signature = codegen.output.module.make_signature();
             signature
                 .params
                 .extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
@@ -478,6 +479,7 @@ mod tests {
             let value = builder.block_params(entry)[1];
             let barrier_id = codegen.func_id("willow_gc_write_barrier");
             let barrier = codegen
+                .output
                 .module
                 .declare_func_in_func(barrier_id, builder.func);
             for i in 0..stores {
@@ -492,7 +494,7 @@ mod tests {
                 );
             }
             builder.ins().return_(&[]);
-            builder.finalize(codegen.module.target_config());
+            builder.finalize(codegen.output.module.target_config());
             let effects: Vec<_> = ctx
                 .func
                 .layout
@@ -504,7 +506,7 @@ mod tests {
                 effects,
                 [Opcode::AtomicLoad, Opcode::Call, Opcode::AtomicStore].repeat(stores as usize)
             );
-            cranelift_codegen::verify_function(&ctx.func, codegen.module.isa()).unwrap();
+            cranelift_codegen::verify_function(&ctx.func, codegen.output.module.isa()).unwrap();
             println!(
                 "reference_stores={stores} old_loads={stores} barrier_calls={stores} atomic_stores={stores}"
             );
@@ -514,24 +516,43 @@ mod tests {
     #[test]
     fn compact_descriptors_scale_with_shapes_not_sites() {
         for sites in [1, 16, 256, 4096] {
-            let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
-            let before = codegen.module.declarations().get_data_objects().count();
+            let mut codegen_build = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+            let codegen = codegen_build.declaration_context();
+            let before = codegen
+                .output
+                .module
+                .declarations()
+                .get_data_objects()
+                .count();
             let key = willow_abi::GcLayoutDescriptor {
                 type_id: 2,
                 layout_id: 7,
                 gc_ref_mask: 1,
                 size: 24,
             };
-            let first =
-                layout_descriptor(&mut codegen.module, &mut codegen.gc_layout_descriptors, key);
+            let first = layout_descriptor(
+                &mut codegen.output.module,
+                &mut codegen.output.gc_layout_descriptors,
+                key,
+            );
             for _ in 1..sites {
                 assert_eq!(
-                    layout_descriptor(&mut codegen.module, &mut codegen.gc_layout_descriptors, key),
+                    layout_descriptor(
+                        &mut codegen.output.module,
+                        &mut codegen.output.gc_layout_descriptors,
+                        key
+                    ),
                     first
                 );
             }
             assert_eq!(
-                codegen.module.declarations().get_data_objects().count() - before,
+                codegen
+                    .output
+                    .module
+                    .declarations()
+                    .get_data_objects()
+                    .count()
+                    - before,
                 1
             );
             for other in [
@@ -544,14 +565,14 @@ mod tests {
             ] {
                 assert_ne!(
                     layout_descriptor(
-                        &mut codegen.module,
-                        &mut codegen.gc_layout_descriptors,
+                        &mut codegen.output.module,
+                        &mut codegen.output.gc_layout_descriptors,
                         other
                     ),
                     first
                 );
             }
-            assert_eq!(codegen.gc_layout_descriptors.len(), 4);
+            assert_eq!(codegen.output.gc_layout_descriptors.len(), 4);
             println!(
                 "sites={sites} repeated_shape_records=1 distinct_shape_records=4 descriptor_bytes=128"
             );
@@ -562,44 +583,62 @@ mod tests {
     fn bitmap_descriptors_scale_with_unique_contents_not_sites() {
         for words in [2, 8, 64] {
             for sites in [1, 16, 256] {
-                let mut codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
-                let before = codegen.module.declarations().get_data_objects().count();
+                let mut codegen_build = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+                let codegen = codegen_build.declaration_context();
+                let before = codegen
+                    .output
+                    .module
+                    .declarations()
+                    .get_data_objects()
+                    .count();
                 let mut bitmap = vec![0; words];
                 bitmap[words - 1] = 1;
                 let first = bitmap_descriptor(
-                    &mut codegen.module,
-                    &mut codegen.gc_bitmap_descriptors,
+                    &mut codegen.output.module,
+                    &mut codegen.output.gc_bitmap_descriptors,
                     &bitmap,
                 );
                 for _ in 1..sites {
                     assert_eq!(
                         bitmap_descriptor(
-                            &mut codegen.module,
-                            &mut codegen.gc_bitmap_descriptors,
+                            &mut codegen.output.module,
+                            &mut codegen.output.gc_bitmap_descriptors,
                             &bitmap,
                         ),
                         first,
                     );
                 }
                 assert_eq!(
-                    codegen.module.declarations().get_data_objects().count() - before,
+                    codegen
+                        .output
+                        .module
+                        .declarations()
+                        .get_data_objects()
+                        .count()
+                        - before,
                     1
                 );
                 // The low mask and bitmap length are identical; only a high
                 // reference bit differs. A layout-fingerprint key would collide.
                 bitmap[words - 1] = 2;
                 let other = bitmap_descriptor(
-                    &mut codegen.module,
-                    &mut codegen.gc_bitmap_descriptors,
+                    &mut codegen.output.module,
+                    &mut codegen.output.gc_bitmap_descriptors,
                     &bitmap,
                 );
                 assert_ne!(first.0, other.0);
                 assert_ne!(first.1, other.1);
                 assert_eq!(
-                    codegen.module.declarations().get_data_objects().count() - before,
+                    codegen
+                        .output
+                        .module
+                        .declarations()
+                        .get_data_objects()
+                        .count()
+                        - before,
                     2
                 );
-                assert_eq!(codegen.gc_bitmap_descriptors.len(), 2);
+                assert_eq!(codegen.output.gc_bitmap_descriptors.len(), 2);
             }
         }
     }
@@ -608,8 +647,9 @@ mod tests {
     fn tlab_start_publication_codegen_has_constant_work_per_site() {
         use cranelift_codegen::ir::Opcode;
         for sites in [1, 16, 256] {
-            let codegen = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
-            let mut ctx = codegen.module.make_context();
+            let mut codegen_build = Codegen::for_tests(&CompilerOptions::debug()).unwrap();
+            let codegen = codegen_build.declaration_context();
+            let mut ctx = codegen.output.module.make_context();
             ctx.func
                 .signature
                 .params
@@ -625,7 +665,7 @@ mod tests {
                 emit_tlab_start_publication(&mut builder, params[0], params[1], params[2], 8);
             }
             builder.ins().return_(&[]);
-            builder.finalize(codegen.module.target_config());
+            builder.finalize(codegen.output.module.target_config());
             let instructions: Vec<_> = ctx
                 .func
                 .layout
@@ -645,7 +685,7 @@ mod tests {
             assert_eq!(count(Opcode::Load), 2 * sites);
             assert_eq!(count(Opcode::Store), sites);
             assert_eq!(instructions.len(), 18 * sites + 1);
-            cranelift_codegen::verify_function(&ctx.func, codegen.module.isa()).unwrap();
+            cranelift_codegen::verify_function(&ctx.func, codegen.output.module.isa()).unwrap();
             println!(
                 "tlab_sites={sites} publication_instructions={} atomics=0",
                 instructions.len() - 1

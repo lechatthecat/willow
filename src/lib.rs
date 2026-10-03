@@ -1722,20 +1722,23 @@ fn run_backend(
                 &diagnostic_packages,
             )
         })?;
-    codegen.body_queries = Some(std::rc::Rc::clone(&db.typed_bodies));
-    codegen.lir_queries = Some(std::rc::Rc::clone(&db.lir));
+    codegen.configure_queries(
+        std::rc::Rc::clone(&db.typed_bodies),
+        std::rc::Rc::clone(&db.lir),
+        db.effects.static_initializers.order(),
+    );
     codegen.set_module_init_plan(module_init_plan);
     // Shared declaration metadata comes from the checked entry artifact.
     {
         let checked = db.unit_declarations(module::UnitId::ENTRY, &artifacts)?;
         let tables = checked.tables();
         let declared = tables.declared_enum_identities(&program);
-        for (name, info) in &checked.symbols.enums {
-            codegen.register_enum_info(name.to_string(), tables.codegen_enum_info(info, &declared));
+        for info in checked.symbols.enums.values() {
+            codegen.register_enum_info(tables.codegen_enum_info(info, &declared));
         }
-        for (name, info) in &checked.symbols.interfaces {
+        for info in checked.symbols.interfaces.values() {
             let identity = semantic::ids::TypeId::from_source_name(&info.name);
-            codegen.register_interface_info(name.to_string(), identity, || info.to_semantic())?;
+            codegen.register_interface_info(identity, || info.to_semantic())?;
         }
     }
     // Declare every unit before emitting any body: later overrides must be
@@ -1761,23 +1764,20 @@ fn run_backend(
         let tables = checker.tables();
         let declared = tables.declared_enum_identities(&module.program);
         for info in checker.symbols.enums.values() {
-            codegen
-                .register_enum_info(info.name.clone(), tables.codegen_enum_info(info, &declared));
+            codegen.register_enum_info(tables.codegen_enum_info(info, &declared));
         }
-        let expr_types = checker
-            .expr_types
-            .iter()
-            .map(|(id, ty)| (*id, ty.into()))
-            .collect();
         let scope = db.unit_scope(module.id, &body, &modules, &checker.symbols)?;
-        codegen.effect_queries = Some((std::rc::Rc::clone(&db.effects), module.id));
-        let declared = codegen.declare_module_with_types(
+        let declared = codegen.declare_module(
             module.registration_name(),
             module.identity_path(),
             &body,
             &module.path.to_string_lossy(),
-            &expr_types,
-            scope,
+            backend::cranelift::CheckedUnitInput {
+                checked: &checker,
+                scope,
+                effects: std::rc::Rc::clone(&db.effects),
+                unit: module.id,
+            },
         );
         let unit = declared.map_err(|error| {
             report_backend_failure(
@@ -1807,13 +1807,16 @@ fn run_backend(
         }
         let checked = db.checked_unit(module::UnitId::ENTRY, &artifacts)?;
         let scope = db.unit_scope(module::UnitId::ENTRY, &body, &modules, &checked.symbols)?;
-        let expr_types = checked
-            .expr_types
-            .iter()
-            .map(|(id, ty)| (*id, ty.into()))
-            .collect();
-        codegen.effect_queries = Some((std::rc::Rc::clone(&db.effects), module::UnitId::ENTRY));
-        let declared = codegen.declare_program_with_types(&body, src, &expr_types, scope);
+        let declared = codegen.declare_program(
+            &body,
+            src,
+            backend::cranelift::CheckedUnitInput {
+                checked: &checked,
+                scope,
+                effects: std::rc::Rc::clone(&db.effects),
+                unit: module::UnitId::ENTRY,
+            },
+        );
         let unit = declared.map_err(|error| {
             report_backend_failure(
                 &mut codegen,
@@ -1831,8 +1834,8 @@ fn run_backend(
         let unit: backend::cranelift::DeclaredModule = artifacts.read(artifact)?;
         let unit = artifacts.track(UnitKind::Declared, unit);
         let _lir = artifacts.live(UnitKind::Lir);
+        let checker = db.checked_unit(module.id, &artifacts)?;
         {
-            let checker = db.checked_unit(module.id, &artifacts)?;
             // ANF declarations may hoist a lambda before an await and create
             // fresh temporary IDs. Preserve source resolutions/captures, but
             // lower the exact declared tree with its extended payload types.
@@ -1849,7 +1852,7 @@ fn run_backend(
         // semantic body whose lowered IR the artifact store holds, so no
         // whole-unit IR is materialized here (willow-afb5.18).
         let plan = codegen.module_body_plan(&unit);
-        let compiled = codegen.with_module_bodies(&unit, |backend| {
+        let compiled = codegen.with_module_bodies(&unit, &checker, |backend| {
             for target in &plan {
                 backend.compile_body(target)?;
             }
@@ -1869,8 +1872,8 @@ fn run_backend(
     let entry_unit: backend::cranelift::DeclaredProgram = artifacts.read(entry_artifact)?;
     let entry_unit = artifacts.track(UnitKind::Declared, entry_unit);
     let _entry_lir = artifacts.live(UnitKind::Lir);
+    let checked = db.checked_unit(module::UnitId::ENTRY, &artifacts)?;
     {
-        let checked = db.checked_unit(module::UnitId::ENTRY, &artifacts)?;
         let mut tables = checked.tables();
         tables.expr_types = Some(entry_unit.normalized_expr_types());
         log_hir_gaps(&db.lir.lower_unit(
@@ -1881,7 +1884,7 @@ fn run_backend(
         )?);
     }
     let plan = codegen.program_body_plan(&entry_unit);
-    let compiled = codegen.with_program_bodies(&entry_unit, |backend| {
+    let compiled = codegen.with_program_bodies(&entry_unit, &checked, |backend| {
         for target in &plan {
             backend.compile_body(target)?;
         }
@@ -1897,6 +1900,7 @@ fn run_backend(
             &diagnostic_packages,
         )
     })?;
+    drop(checked);
     drop(entry_unit);
 
     let warnings = codegen.take_async_frame_size_warnings();
