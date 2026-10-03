@@ -56,7 +56,7 @@ fn package_identity_checked_declarations_and_bodies_preserve_origins() {
                     assert_eq!(unit, module.id);
                     assert_eq!(id.module(), Some(origin));
                     assert_eq!(id, FunctionId::free("value").in_module(origin));
-                    functions.insert(origin.package().name.clone(), id);
+                    functions.insert(origin.package().name, id);
                 }
                 if let parser::ast::Item::Class(class) = item {
                     let (_, BodyOwner::Function(id)) = frontend

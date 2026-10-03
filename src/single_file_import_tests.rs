@@ -421,6 +421,7 @@ fn package_entry_binding_work_scales_with_imports_not_module_product() {
                 id: module::ModuleId(i as u32 + 1),
                 package: PackageId(1),
                 symbol_module: None,
+                symbol_namespace: None,
                 name: format!("m{i}"),
                 canonical_path: format!("m{i}"),
                 path: format!("m{i}.wi").into(),

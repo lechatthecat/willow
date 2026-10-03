@@ -145,16 +145,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Some(owner) = callee.owner_type() {
             interface = self.classes.is_interface(&owner);
             if interface {
-                user_callee = callee.name().to_owned();
-            } else if callee.name() == "init" {
+                user_callee = callee.name().to_string();
+            } else if callee.name().as_ref() == "init" {
                 // Constructors are statically selected, including super.init;
                 // they have no virtual slot even when descendants define init.
                 symbol = class_method_symbol_name(self.known_modules, &owner.to_string(), "init");
                 user_callee = symbol.clone();
             } else {
-                let plan = self.plan_virtual_call(&owner.to_string(), callee.name());
+                let plan = self.plan_virtual_call(&owner.to_string(), callee.name().as_ref());
                 symbol = plan.mangled.clone();
-                user_callee = if callee.name() == "init" {
+                user_callee = if callee.name().as_ref() == "init" {
                     symbol.clone()
                 } else {
                     format!("{}::{}", plan.static_class, callee.name())
@@ -174,7 +174,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .owner_type()
                 .and_then(|owner| self.classes.interface(&owner))
                 .and_then(|info| {
-                    let method = info.methods.get(callee.name())?;
+                    let method = info.methods.get(callee.name().as_ref())?;
                     Some(method.param_infos.get(index)?.mode.clone())
                 })
         } else {

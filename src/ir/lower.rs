@@ -448,6 +448,7 @@ pub fn lower_program_with(
                 for field in c.fields.iter().filter(|field| field.is_static) {
                     if let Some(init) = &field.initializer {
                         let mut ctx = LowerCtx::new(&fn_returns, &classes, &enums, tables);
+                        ctx.current_class = Some(c.name.clone());
                         match lower_expr(init, &mut ctx) {
                             Ok(mut value) => {
                                 let return_type = ctx.normalize(&field.ty);
@@ -1127,7 +1128,7 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
                 Type::Array(inner) => (**inner).clone(),
                 // An i64 range yields i64 elements.
                 Type::Generic(name, args)
-                    if name.name() == "Range" && args.first() == Some(&Type::I64) =>
+                    if name.name().as_ref() == "Range" && args.first() == Some(&Type::I64) =>
                 {
                     Type::I64
                 }
@@ -1899,10 +1900,11 @@ fn lower_object_literal_expr(
 #[inline(never)]
 fn lower_static_field_expr(s: &StaticFieldExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
     // `Enum::Variant` (fieldless) parses like a static property read.
-    let class = if s.class == "Self" {
-        ctx.current_class.as_deref().unwrap_or(&s.class)
+    let resolved = ctx.tables.static_call_class(&s.id, &s.class);
+    let class = if resolved == "Self" {
+        ctx.current_class.as_deref().unwrap_or(&resolved)
     } else {
-        &s.class
+        &resolved
     };
     let variant_ty = enum_variant_value_type(ctx.enums, class, &s.field, true);
     let ty = variant_ty
@@ -1915,7 +1917,7 @@ fn lower_static_field_expr(s: &StaticFieldExpr, ctx: &mut LowerCtx) -> Result<Hi
         .ok_or_else(|| unsupported(s.span, "static property not found"))?;
     Ok(HirExpr {
         kind: HirExprKind::StaticField {
-            class: s.class.clone().into(),
+            class: class.into(),
             field: s.field.clone(),
         },
         ty: ty.into(),
@@ -3030,7 +3032,7 @@ fn lower_resolution(
                         .get_id(id)
                         .expect("declared module function");
                     (
-                        id.name().to_owned(),
+                        id.name().to_string(),
                         checked_signature(
                             &function.params,
                             &function.param_infos,
@@ -3230,7 +3232,7 @@ mod tests {
             .unwrap()
             .methods
             .iter()
-            .find(|method| method.name.unqualified_name() == "read")
+            .find(|method| method.name.unqualified_name().as_deref().unwrap_or("") == "read")
             .unwrap();
         let HirStmt::Return {
             value: Some(value), ..
@@ -3712,7 +3714,7 @@ mod tests {
         let (hir, diags) = lower_src("fn f(a: i64, b: bool) -> i64 { return a; }");
         assert!(diags.is_empty(), "{diags:?}");
         let f = &hir.functions[0];
-        assert_eq!(f.name.name(), "f");
+        assert_eq!(f.name.name().as_ref(), "f");
         assert_eq!(f.params.len(), 2);
         assert_eq!(f.params[0].ty, Type::I64);
         assert_eq!(f.params[1].ty, Type::Bool);
@@ -3888,7 +3890,7 @@ mod tests {
         assert_eq!(class.name, crate::semantic::ids::TypeId::local("Box"));
         assert_eq!(class.methods.len(), 1);
         let m = &class.methods[0];
-        assert_eq!(m.name.name(), "get");
+        assert_eq!(m.name.name().as_ref(), "get");
         assert_eq!(m.params[0].name, "self");
         assert_eq!(m.params[0].ty, Type::Named("Box".into()));
     }
@@ -4147,7 +4149,7 @@ mod tests {
             .find(|c| c.name == crate::semantic::ids::TypeId::local("B"))
             .unwrap();
         let init = &b.methods[0];
-        assert_eq!(init.name.name(), "init");
+        assert_eq!(init.name.name().as_ref(), "init");
         assert_eq!(init.params[0].name, "self");
         assert!(
             init.body

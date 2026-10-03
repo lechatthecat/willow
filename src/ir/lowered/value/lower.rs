@@ -162,6 +162,7 @@ fn format_segments(args: &[HirExpr]) -> Option<Vec<crate::interpolate::Segment>>
 
 fn builtin_call(callee: &FunctionId, args: &[HirExpr], result: &Type, is_async: bool) -> bool {
     let name = callee.unqualified_name();
+    let name = name.as_deref().unwrap_or("");
     if !callee.is_free_named(name) {
         return false;
     }
@@ -260,7 +261,7 @@ fn argument_types(
 ) -> Option<Vec<Type>> {
     match &node.kind {
         HirExprKind::Call { callee, .. } => {
-            if let Some(local) = names.get(callee.unqualified_name()) {
+            if let Some(local) = names.get(callee.unqualified_name().as_deref().unwrap_or("")) {
                 match &locals[local.0 as usize].ty {
                     Type::Fn(params, _) | Type::Closure(params, _) => Some(params.clone()),
                     _ => None,
@@ -294,7 +295,7 @@ fn argument_types(
             }
             if method == "new"
                 && matches!(
-                    class.name(),
+                    class.name().as_ref(),
                     "Mutex" | "RwLock" | "BlockingCell" | "BlockingRwCell"
                 )
                 && let Type::Generic(_, params) = &node.ty
@@ -344,7 +345,7 @@ fn scalar(
         HirExprKind::Print { value, .. } => matches!(value.ty, Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never),
         HirExprKind::MethodCall { object, method, args } => crate::semantic::intrinsics::resolve(&object.ty, method, args.len()).is_some_and(|resolved|
             !(is_async && resolved.intrinsic.is_suspension_point()) && resolved.return_type(|i| args.get(i).map(|arg| arg.ty.clone())) == node.ty) || enum_method(&object.ty, method) || instance_method(&object.ty, method, args, callables),
-        HirExprKind::Call { callee, args } => if let Some(local) = names.get(callee.unqualified_name()) {
+        HirExprKind::Call { callee, args } => if let Some(local) = names.get(callee.unqualified_name().as_deref().unwrap_or("")) {
             matches!(&locals[local.0 as usize].ty, Type::Fn(params, result) | Type::Closure(params, result) if !args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. })) && **result == node.ty && params.len() == args.len() && params.iter().zip(args).all(|(ty, arg)| argument_coercible(ty, arg, &callables.resolution)))
         } else { callables.get(callee).is_some_and(|(params, result)| *result == node.ty
                 && params.len() == args.len() && params.iter().zip(args).all(|(param, arg)| argument_coercible(param, arg, &callables.resolution)))
@@ -781,7 +782,7 @@ fn lower(
                 match &node.kind {
                     HirExprKind::Await { inner }
                         if !is_async
-                            && matches!(&inner.kind, HirExprKind::Call { callee, .. } if (callee.is_free_named("sleep") || callee.is_free_named("yield")) && !names.contains_key(callee.unqualified_name()) && !callables.contains_key(callee)) =>
+                            && matches!(&inner.kind, HirExprKind::Call { callee, .. } if (callee.is_free_named("sleep") || callee.is_free_named("yield")) && !names.contains_key(callee.unqualified_name().as_deref().unwrap_or("")) && !callables.contains_key(callee)) =>
                     {
                         let HirExprKind::Call { args, .. } = &inner.kind else {
                             unreachable!()
@@ -953,7 +954,10 @@ fn lower(
                     _ => {}
                 }
                 if let HirExprKind::Call { callee, args } = &node.kind {
-                    if let Some(source) = names.get(callee.unqualified_name()).copied() {
+                    if let Some(source) = names
+                        .get(callee.unqualified_name().as_deref().unwrap_or(""))
+                        .copied()
+                    {
                         let ty = locals[source.0 as usize].ty.clone();
                         let snapshot = emit(
                             LirRvalue::Use(LirOperand::Local(source)),
@@ -1488,10 +1492,14 @@ pub(in crate::ir::lowered) fn lower_calls(
         resolution: resolution.clone(),
     };
     for (name, signature) in &resolution.functions {
-        if name.is_free_named(name.unqualified_name())
-            && (matches!(name.unqualified_name(), "panic" | "recover" | "format")
-                || crate::semantic::intrinsics::builtin_call_runtime_name(name.unqualified_name())
-                    .is_some())
+        if name.is_free_named(name.unqualified_name().as_deref().unwrap_or(""))
+            && (matches!(
+                name.unqualified_name().as_deref().unwrap_or(""),
+                "panic" | "recover" | "format"
+            ) || crate::semantic::intrinsics::builtin_call_runtime_name(
+                name.unqualified_name().as_deref().unwrap_or(""),
+            )
+            .is_some())
         {
             continue;
         }

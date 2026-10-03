@@ -1,5 +1,5 @@
 //! AST analysis helpers for the type checker (extracted from `mod.rs`):
-//! control-flow "always returns" checks, sub-expression walking, and
+//! control-flow "always returns" checks, reference places, and
 //! constructor super-init collection. Re-exported from `mod.rs`.
 
 use crate::diagnostics::Span;
@@ -25,79 +25,6 @@ fn walk_constructor_statements(block: &Block, mut visit: impl FnMut(&Stmt)) {
             AstEvent::Expr(_) | AstEvent::Stmt(Stmt::Defer(_)) => walk.skip_children(),
             AstEvent::Stmt(stmt) => visit(stmt),
             _ => {}
-        }
-    }
-}
-
-/// Apply `f` to each direct sub-expression of `expr` (one level deep). Used by
-/// the static-initializer forward-reference scan (willow-qsqf §10.4).
-pub(crate) fn walk_subexprs<'a>(expr: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
-    match expr {
-        Expr::Integer(..)
-        | Expr::Float(..)
-        | Expr::Bool(..)
-        | Expr::String(..)
-        | Expr::Var(..)
-        | Expr::Select(_)
-        | Expr::StaticField(_) => {}
-        Expr::Binary(b) => {
-            f(&b.lhs);
-            f(&b.rhs);
-        }
-        Expr::Unary(u) => f(&u.expr),
-        Expr::Call(c) => {
-            for a in &c.args {
-                f(&a.expr);
-            }
-        }
-        Expr::FieldAccess(o, _, _, _) => f(o),
-        Expr::MethodCall(m) => {
-            f(&m.object);
-            for a in &m.args {
-                f(&a.expr);
-            }
-        }
-        Expr::StaticCall(s) => {
-            for a in &s.args {
-                f(&a.expr);
-            }
-        }
-        Expr::New(n) => {
-            for a in &n.args {
-                f(&a.expr);
-            }
-        }
-        Expr::ObjectLiteral(o) => {
-            for fld in &o.fields {
-                f(&fld.value);
-            }
-        }
-        Expr::Await(a) => f(&a.expr),
-        Expr::Print(e, _, _, _) => f(e),
-        Expr::Ternary(t) => {
-            f(&t.condition);
-            f(&t.then_expr);
-            f(&t.else_expr);
-        }
-        Expr::Range(r) => {
-            f(&r.start);
-            f(&r.end);
-        }
-        Expr::Lambda(l) => {
-            if let LambdaBody::Expr(e) = &l.body {
-                f(e);
-            }
-        }
-        Expr::Match(m) => f(&m.scrutinee),
-        Expr::TryPropagate(e, _, _) => f(e),
-        Expr::ArrayLiteral(els, _, _) => {
-            for e in els {
-                f(e);
-            }
-        }
-        Expr::Index(a, i, _, _) => {
-            f(a);
-            f(i);
         }
     }
 }

@@ -1607,6 +1607,7 @@ fn main() {}
         module::ResolvedModule {
             package: crate::package::PackageId(0),
             symbol_module: None,
+            symbol_namespace: None,
             id: crate::module::ModuleId(0),
             name: name.to_string(),
             canonical_path: name.to_string(),

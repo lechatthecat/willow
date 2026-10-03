@@ -1,0 +1,59 @@
+// Supported: direct/helper dependencies initialize before their consumers.
+// Runtime callbacks must be started after startup, as main demonstrates below.
+import std::collections::Array;
+import std::parallel as par;
+
+class Answer {
+    pub static value: i64 = compute();
+}
+fn compute() -> i64 {
+    return Inputs::base + Inputs::offset;
+}
+class Inputs {
+    pub static offset: i64 = 2;
+    pub static base: i64 = 40;
+}
+fn add_offset(value: i64) -> i64 {
+    return value + Inputs::offset;
+}
+async fn main() {
+    let values: Array<i64> = [Answer::value - Inputs::offset];
+    let mapped = await par::map(values.freeze(), add_offset);
+    println(mapped[0]); // 42: callback work begins after static initialization.
+}
+
+// Negative examples are standalone snippets; the integration suite checks them.
+/* example: cycle
+class A { pub static x: i64 = B::y; }
+class B { pub static y: i64 = A::x; }
+fn main() {}
+*/
+
+/* example: callback
+import std::collections::Array;
+import std::parallel as par;
+fn mapper(v: i64) -> i64 { return v + A::x; }
+fn start() -> i64 {
+    let values: Array<i64> = [1];
+    let task = par::map(values.freeze(), mapper);
+    return 42;
+}
+class A { pub static x: i64 = start(); }
+fn main() {}
+*/
+
+/* example: function-value
+fn seed() -> i64 { return 42; }
+fn call(f: fn() -> i64) -> i64 { return f(); }
+class A { pub static x: i64 = call(seed); }
+fn main() {}
+*/
+
+/* example: injected-default
+interface Seed { fn seed(self) -> i64 { return 42; } }
+class C implements Seed {}
+class A { pub static x: i64 = new C().seed(); }
+fn main() {}
+*/
+// Unsupported snippets get E0838 with a reason, not a claim of a proven cycle.
+// Use a direct helper/explicit method, or do this work after startup in main.

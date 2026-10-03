@@ -137,13 +137,13 @@ mod tests {
     impl IfaceShapes for Table {
         fn canonical(&self, iface: &super::super::TypeId) -> super::super::TypeId {
             self.aliases
-                .get(iface.name())
+                .get(iface.name().as_ref())
                 .map(super::super::TypeId::local)
                 .unwrap_or(*iface)
         }
         fn supers(&self, iface: &super::super::TypeId) -> Vec<super::super::TypeId> {
             self.rows
-                .get(self.canonical(iface).name())
+                .get(self.canonical(iface).name().as_ref())
                 .map(|(s, _)| s.iter().map(super::super::TypeId::local).collect())
                 .unwrap_or_default()
         }
@@ -155,7 +155,7 @@ mod tests {
         }
         fn methods(&self, iface: &super::super::TypeId) -> Vec<String> {
             self.rows
-                .get(self.canonical(iface).name())
+                .get(self.canonical(iface).name().as_ref())
                 .map(|(_, m)| m.iter().map(|n| n.to_string()).collect())
                 .unwrap_or_default()
         }
@@ -169,7 +169,7 @@ mod tests {
                 *iface
             }
             fn supers(&self, iface: &super::super::TypeId) -> Vec<super::super::TypeId> {
-                if iface.name() == "Child" {
+                if iface.name().as_ref() == "Child" {
                     vec![super::super::TypeId::local("Base")]
                 } else {
                     Vec::new()

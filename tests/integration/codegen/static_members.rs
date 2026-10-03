@@ -415,7 +415,7 @@ fn main() {
 // 11. missing initializer is rejected (E0830)
 // 12. initializer type mismatch is rejected (E0301)
 // 13. `self` in a static initializer is rejected (E0837)
-// 14. forward reference to a later static is rejected (E0838)
+// 14. forward reference to a later static follows dependency order
 // 15. instance field accessed via `::` is rejected (E0835)
 // 16. reading an unknown static property is rejected
 // 17. assigning to an immutable static is rejected (compile error)
@@ -604,17 +604,13 @@ fn main() {}
 }
 
 #[test]
-fn test_static_prop_14_forward_reference_rejected() {
-    assert_compile_error_contains(
-        r#"
-class C {
-    static b: i64 = C::a + 1;
-    static a: i64 = 1;
-}
-fn main() {}
-"#,
-        &["error[E0838]", "used before it is initialized"],
+fn test_static_prop_14_forward_reference_ordered() {
+    let (out, ok) = compile_and_run(
+        "class C { pub static b: i64 = C::a + 1; pub static a: i64 = 1; }
+fn main() { println(C::b); }",
     );
+    assert!(ok);
+    assert_eq!(out, "2\n");
 }
 
 #[test]

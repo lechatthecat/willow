@@ -624,6 +624,8 @@ mod tests {
         graph.merge(
             id(caller),
             CallSites {
+                unsupported_initialization: Default::default(),
+                virtual_calls: Default::default(),
                 targets: targets.iter().map(|name| id(name)).collect(),
                 has_unknown: false,
             },
@@ -634,6 +636,8 @@ mod tests {
         graph.merge(
             id(caller),
             CallSites {
+                unsupported_initialization: Default::default(),
+                virtual_calls: Default::default(),
                 targets: BTreeSet::new(),
                 has_unknown: true,
             },

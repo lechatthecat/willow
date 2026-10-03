@@ -18,6 +18,7 @@ pub mod query;
 pub(crate) mod references;
 pub mod revision;
 pub mod scope;
+pub(crate) mod static_init;
 pub(crate) mod syntax;
 pub(crate) mod tracked;
 pub use checked::CheckedUnit;
@@ -39,6 +40,7 @@ struct CheckedUnitRecord {
 }
 
 pub struct CompilerDb {
+    _symbols: crate::semantic::ids::SymbolInterner,
     inputs: inputs::CompilerInputs,
     scopes: scope::ScopeQueries,
     pub(crate) declarations: std::rc::Rc<declarations::DeclarationQueries>,
@@ -54,6 +56,9 @@ pub struct CompilerDb {
 }
 
 impl CompilerDb {
+    pub(crate) fn enter_symbols(&self) -> crate::semantic::ids::SymbolInternerGuard {
+        self._symbols.enter()
+    }
     pub(crate) fn with_dependencies(
         inputs: inputs::CompilerInputs,
         modules: &[crate::module::ResolvedModule],
@@ -63,6 +68,7 @@ impl CompilerDb {
     ) -> Self {
         let dependencies = std::rc::Rc::new(dependencies);
         Self {
+            _symbols: crate::semantic::ids::SymbolInterner::current(),
             references: Default::default(),
             scopes: scope::ScopeQueries::new(std::rc::Rc::clone(&store)),
             declarations: std::rc::Rc::new(declarations::DeclarationQueries::new(
@@ -172,6 +178,7 @@ impl CompilerDb {
         unit: UnitId,
         artifacts: &UnitArtifacts,
     ) -> Result<LiveUnit<CheckedUnit>> {
+        let _symbols = self.enter_symbols();
         let record = self.checked_record(unit)?;
         let declarations = self.unit_declarations(unit, artifacts)?;
         let mut unit = declarations.into_unit();

@@ -82,6 +82,7 @@ pub(crate) struct UnitArtifacts {
 /// shells; the final owner closes the file and removes its private directory.
 #[derive(Debug)]
 pub(crate) struct ArtifactStore {
+    symbols: crate::semantic::ids::SymbolInterner,
     directory: PathBuf,
     pack: RefCell<Option<ArtifactPack>>,
     entries: RefCell<Vec<(u64, u64)>>,
@@ -205,6 +206,7 @@ impl ArtifactStore {
     }
 
     pub(crate) fn read<T: DeserializeOwned>(&self, id: usize) -> Result<T> {
+        let _symbols = self.symbols.enter();
         let &(start, length) = self
             .entries
             .borrow()
@@ -322,6 +324,7 @@ impl UnitArtifacts {
                     // Own the directory before opening its pack, so an open
                     // failure follows the same cleanup path as every later error.
                     let mut store = ArtifactStore {
+                        symbols: crate::semantic::ids::SymbolInterner::current(),
                         pack: RefCell::new(None),
                         directory,
                         entries: RefCell::default(),
@@ -846,6 +849,7 @@ mod tests {
         let mut modules = vec![crate::module::ResolvedModule {
             package: crate::package::PackageId(0),
             symbol_module: None,
+            symbol_namespace: None,
             id: crate::module::ModuleId(0),
             name: "base".into(),
             canonical_path: "base".into(),

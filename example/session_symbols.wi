@@ -1,0 +1,14 @@
+// Exercise class, method, free-function and builtin identities through codegen.
+// Expected output: 42
+class Reading {
+    pub value: i64;
+    pub fn doubled(self) -> i64 { return self.value * 2; }
+}
+
+fn describe(reading: Reading) -> String {
+    return reading.doubled().toString();
+}
+
+fn main() {
+    println(describe(new Reading(21)));
+}

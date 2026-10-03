@@ -1862,6 +1862,10 @@ impl Codegen {
                 .push(StaticInitItem {
                     class_key: class_key.to_string(),
                     field: field.name.clone(),
+                    id: self
+                        .body_queries
+                        .as_ref()
+                        .and_then(|queries| queries.index().static_id(init.id())),
                     initializer,
                     body: static_body,
                     ty: field.ty.clone().into(),
@@ -1870,77 +1874,56 @@ impl Codegen {
         Ok(())
     }
 
-    /// Compile `__willow_static_init`: evaluate every static-property initializer
-    /// in declaration order, store it into global storage, and register
-    /// GC-managed slots as permanent roots (willow-qsqf §11/§12). Called once at
-    /// the start of `willow_user_main`.
-    pub(super) fn compile_static_init(&mut self) -> Result<()> {
-        let calls: Vec<FuncId> = self
-            .module_init_plan
-            .order()
-            .iter()
-            .filter(|unit| **unit != InitUnitId::Entry)
-            .filter_map(|unit| {
-                self.unit_static_inits
-                    .get(unit)
-                    .and_then(|node| node.function)
-            })
-            .collect();
-        let items = std::mem::take(
-            &mut self
-                .unit_static_inits
-                .entry(InitUnitId::Entry)
-                .or_default()
-                .items,
-        );
-        let func_id = self.func_ids[STATIC_INIT_SYMBOL];
-        self.emit_static_init_body(func_id, &calls, &items)
+    /// Compile each expression under its declaring unit's aliases. The shared
+    /// dispatcher calls these bodies and stores their results in dependency order.
+    pub(super) fn compile_unit_static_init(&mut self, unit: &DeclaredModule) -> Result<()> {
+        self.compile_static_expressions(unit.init_unit)
     }
 
-    /// Compile one module's static-property initializers into a private
-    /// function of its own, called from `__willow_static_init` (willow-6xgo).
-    ///
-    /// Emitted from the module's BODY phase, so the expressions are compiled
-    /// under the same aliases the module's functions are: a bare `Slot` is this
-    /// module's `h::Slot`, a bare `seed()` its mangled symbol, and
-    /// `Holder::base` its own storage. Compiled in the entry's phase instead,
-    /// every one of those names resolved to nothing and the property silently
-    /// took a zero.
-    pub(super) fn compile_unit_static_init(&mut self, unit: &DeclaredModule) -> Result<()> {
-        let items = std::mem::take(
-            &mut self
-                .unit_static_inits
-                .entry(unit.init_unit)
-                .or_default()
-                .items,
-        );
-        if items.is_empty() {
-            return Ok(());
+    fn compile_static_expressions(&mut self, unit: InitUnitId) -> Result<()> {
+        let items = std::mem::take(&mut self.unit_static_inits.entry(unit).or_default().items);
+        for item in &items {
+            self.compile_function_named(&item.initializer.name, &item.initializer, item.body)?;
         }
-        let symbol = module_static_init_symbol(&unit.module_prefix);
-        let sig = self.module.make_signature();
-        let func_id = self
-            .module
-            .declare_function(&symbol, Linkage::Local, &sig)?;
-        self.emit_static_init_body(func_id, &[], &items)?;
-        self.unit_static_inits
-            .entry(unit.init_unit)
-            .or_default()
-            .function = Some(func_id);
+        self.unit_static_inits.entry(unit).or_default().items = items;
         Ok(())
     }
 
-    /// The shared body of every static-initializer function: call `calls` in
-    /// order, then store each item's value into its slot.
-    fn emit_static_init_body(
-        &mut self,
-        func_id: FuncId,
-        calls: &[FuncId],
-        items: &[StaticInitItem],
-    ) -> Result<()> {
-        for item in items {
-            self.compile_function_named(&item.initializer.name, &item.initializer, item.body)?;
+    pub(super) fn compile_static_init(&mut self) -> Result<()> {
+        self.compile_static_expressions(InitUnitId::Entry)?;
+        let mut items = Vec::new();
+        for unit in self.module_init_plan.order() {
+            if let Some(node) = self.unit_static_inits.remove(unit) {
+                items.extend(node.items);
+            }
         }
+        let queried_order = self
+            .effect_queries
+            .as_ref()
+            .and_then(|(queries, _)| queries.static_initializers.order());
+        if let Some(order) = queried_order {
+            let mut indexed: HashMap<_, _> = items
+                .into_iter()
+                .map(|item| (item.id.expect("checked initializer identity"), item))
+                .collect();
+            items = order
+                .iter()
+                .map(|id| {
+                    indexed
+                        .remove(id)
+                        .expect("planned initializer was declared")
+                })
+                .collect();
+            anyhow::ensure!(
+                indexed.is_empty(),
+                "static initialization plan omitted a declaration"
+            );
+        }
+        let func_id = self.func_ids[STATIC_INIT_SYMBOL];
+        self.emit_static_init_body(func_id, &items)
+    }
+
+    fn emit_static_init_body(&mut self, func_id: FuncId, items: &[StaticInitItem]) -> Result<()> {
         let sig = self.module.make_signature();
         let mut ctx = self.module.make_context();
         ctx.func.signature = sig;
@@ -2023,13 +2006,8 @@ impl Codegen {
         };
 
         let ptr_ty = reference_type(fg.module.target_config());
-        for callee in calls {
-            let callee_ref = fg.module.declare_func_in_func(*callee, fg.builder.func);
-            fg.builder.ins().call(callee_ref, &[]);
-        }
         for item in items {
-            // Initializers reference other statics by explicit class name
-            // (`C::a`); `Self::` is not resolved here in the MVP.
+            // The expression body has already been resolved in its own unit.
             fg.fault_site_span = Some(item.initializer.span);
             let callee = fg.func_ids[&item.initializer.name];
             let callee = fg.module.declare_func_in_func(callee, fg.builder.func);

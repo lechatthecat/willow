@@ -1,16 +1,17 @@
 //! Interned identities for compiler symbols.
 //!
-//! IDs are process-local 32-bit handles. The process symbol table owns names;
-//! source/artifact boundaries serialize the structured names, never handles.
-//! Interned names live for the process so IDs remain valid across independent
-//! compiler sessions, builtin caches, and threads. Repeated compilations of the
-//! same names reuse storage; distinct names extend the process symbol table.
+//! IDs contain an owner and an index. Each compiler session owns reclaimable
+//! storage; artifacts serialize names rather than handles. Context-free adapters
+//! resolve through the owning session and return shared, owned strings.
 
 use crate::module::ModuleId;
+use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Index;
-use std::sync::{LazyLock, RwLock};
+use std::rc::{Rc, Weak};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Persistent declaration origin; dependency aliases and session-local package
 /// indices are deliberately absent. Intern once per module, then reuse its handle.
@@ -21,7 +22,7 @@ struct SymbolModuleName {
     package: crate::package::PackageIdentity,
     path: crate::module::ModulePath,
     #[serde(skip)]
-    namespace: String,
+    namespace: Arc<str>,
 }
 
 /// `$pkg<hash>` prefix of every type name declared by `package`. Stable
@@ -35,10 +36,9 @@ pub fn package_namespace(package: &crate::package::PackageIdentity) -> String {
     format!("$pkg{hash:032x}")
 }
 
-/// Process-local module handle used by compact symbol IDs. Artifacts serialize
-/// the underlying package identity and logical path, never the numeric handle.
+/// Session-owned module identity. Artifacts store package/path, never this handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SymbolModule(u32);
+pub struct SymbolModule(Handle);
 
 impl SymbolModule {
     pub fn new(package: crate::package::PackageIdentity, path: crate::module::ModulePath) -> Self {
@@ -46,57 +46,59 @@ impl SymbolModule {
         let name = SymbolModuleName {
             package,
             path,
-            namespace,
+            namespace: namespace.into(),
         };
-        if let Some(id) = SYMBOLS
-            .read()
-            .expect("symbol table poisoned")
-            .module_ids
-            .get(&name)
-        {
-            return *id;
-        }
-        let mut table = SYMBOLS.write().expect("symbol table poisoned");
-        if let Some(id) = table.module_ids.get(&name) {
-            return *id;
-        }
-        let id = Self(u32::try_from(table.modules.len()).expect("symbol module table exhausted"));
-        let stored = Box::leak(Box::new(name));
-        if let Some(previous) = table.module_names.insert(&stored.namespace, id) {
-            assert_eq!(
-                table.modules[previous.0 as usize], stored,
-                "package symbol hash collision"
-            );
-        }
-        table.modules.push(stored);
-        table.module_ids.insert(stored, id);
-        id
+        SymbolInterner::current().with_table_mut(|table| {
+            #[cfg(test)]
+            {
+                table.requests += 1;
+            }
+            if let Some(id) = table.module_ids.get(&name) {
+                return *id;
+            }
+            let name = Arc::new(name);
+            let id = Self(table.handle(table.modules.len()));
+            if let Some(previous) = table.module_names.get(name.namespace.as_ref()) {
+                assert_eq!(
+                    table.modules[previous.0.index as usize], name,
+                    "package symbol hash collision"
+                );
+            }
+            table.module_names.insert(Arc::clone(&name.namespace), id);
+            table.modules.push(Arc::clone(&name));
+            table.module_ids.insert(name, id);
+            id
+        })
     }
-    fn spelling(self) -> &'static SymbolModuleName {
-        SYMBOLS.read().expect("symbol table poisoned").modules[self.0 as usize]
+    fn spelling(self) -> Arc<SymbolModuleName> {
+        self.0
+            .with_table(|table| Arc::clone(&table.modules[self.0.index as usize]))
     }
-    /// Unspellable compiler adapter used by existing string-based type tables.
-    pub fn namespace(self) -> &'static str {
-        &self.spelling().namespace
+    pub fn namespace(self) -> Arc<str> {
+        self.0
+            .with_table(|table| Arc::clone(&table.modules[self.0.index as usize].namespace))
     }
     fn for_namespace(namespace: &str) -> Option<Self> {
-        SYMBOLS
-            .read()
-            .expect("symbol table poisoned")
+        SymbolInterner::current()
+            .inner
+            .table
+            .borrow()
             .module_names
             .get(namespace)
             .copied()
     }
-    pub fn package(self) -> &'static crate::package::PackageIdentity {
-        &self.spelling().package
+    pub fn package(self) -> crate::package::PackageIdentity {
+        self.spelling().package.clone()
     }
-    pub fn path(self) -> &'static crate::module::ModulePath {
-        &self.spelling().path
+    pub fn path(self) -> crate::module::ModulePath {
+        self.spelling().path.clone()
     }
 }
 impl Ord for SymbolModule {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.spelling().cmp(other.spelling())
+        self.spelling()
+            .cmp(&other.spelling())
+            .then_with(|| self.0.cmp(&other.0))
     }
 }
 impl PartialOrd for SymbolModule {
@@ -106,7 +108,7 @@ impl PartialOrd for SymbolModule {
 }
 impl serde::Serialize for SymbolModule {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serde::Serialize::serialize(self.spelling(), serializer)
+        serde::Serialize::serialize(&*self.spelling(), serializer)
     }
 }
 impl<'de> serde::Deserialize<'de> for SymbolModule {
@@ -116,37 +118,196 @@ impl<'de> serde::Deserialize<'de> for SymbolModule {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename = "TypeId")]
 struct TypeName {
     #[serde(skip_serializing_if = "Option::is_none")]
     module: Option<SymbolModule>,
-    namespace: Option<&'static str>,
-    name: &'static str,
+    namespace: Option<Arc<str>>,
+    name: Arc<str>,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename = "FunctionId")]
 struct FunctionName {
     #[serde(skip_serializing_if = "Option::is_none")]
     module: Option<SymbolModule>,
-    namespace: Option<&'static str>,
-    owner: Option<&'static str>,
-    name: &'static str,
+    namespace: Option<Arc<str>>,
+    owner: Option<Arc<str>>,
+    name: Arc<str>,
 }
 #[derive(Default)]
 struct SymbolTable {
-    modules: Vec<&'static SymbolModuleName>,
-    module_ids: HashMap<&'static SymbolModuleName, SymbolModule>,
-    module_names: HashMap<&'static str, SymbolModule>,
-    strings: HashSet<&'static str>,
+    #[cfg(test)]
+    requests: usize,
+    owner: u32,
+    modules: Vec<Arc<SymbolModuleName>>,
+    module_ids: HashMap<Arc<SymbolModuleName>, SymbolModule>,
+    module_names: HashMap<Arc<str>, SymbolModule>,
+    strings: HashSet<Arc<str>>,
     types: Vec<TypeName>,
     type_ids: HashMap<TypeName, TypeId>,
     functions: Vec<FunctionName>,
     function_ids: HashMap<FunctionName, FunctionId>,
 }
-static SYMBOLS: LazyLock<RwLock<SymbolTable>> =
-    LazyLock::new(|| RwLock::new(SymbolTable::default()));
+/// An index is meaningful only in its owner. Owner IDs are never reused.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct Handle {
+    owner: u32,
+    index: u32,
+}
+impl fmt::Debug for Handle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.owner, self.index)
+    }
+}
+impl Handle {
+    fn owner(self) -> SymbolInterner {
+        let inner = OWNERS
+            .with(|owners| owners.borrow().get(&self.owner).and_then(Weak::upgrade))
+            .expect("symbol owner was dropped or belongs to another thread");
+        SymbolInterner { inner }
+    }
+    fn with_table<R>(self, f: impl FnOnce(&SymbolTable) -> R) -> R {
+        f(&self.owner().inner.table.borrow())
+    }
+}
+struct InternerOwner {
+    id: u32,
+    table: RefCell<SymbolTable>,
+}
+impl Drop for InternerOwner {
+    fn drop(&mut self) {
+        let _ = OWNERS.try_with(|owners| {
+            owners.borrow_mut().remove(&self.id);
+        });
+    }
+}
+thread_local! {
+    static OWNERS: RefCell<HashMap<u32, Weak<InternerOwner>>> = RefCell::new(HashMap::new());
+    static ACTIVE: RefCell<Vec<SymbolInterner>> = const { RefCell::new(Vec::new()) };
+    // Standalone unit tests exercise compiler phases without a driver. Their
+    // arena is reclaimed with each test thread, never used by production code.
+    #[cfg(test)]
+    static TEST_SYMBOLS: SymbolInterner = SymbolInterner::new();
+}
+static NEXT_OWNER: AtomicU32 = AtomicU32::new(1);
+
+/// Owns all names for a compilation (or retained incremental analysis).
+/// This owner is thread-confined, like CompilerDb. Independent threads use
+/// independent owners; no interning or resolution acquires a global lock.
+#[derive(Clone)]
+pub struct SymbolInterner {
+    inner: Rc<InternerOwner>,
+}
+impl fmt::Debug for SymbolInterner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SymbolInterner")
+            .field("owner", &self.inner.id)
+            .finish()
+    }
+}
+impl Default for SymbolInterner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl SymbolInterner {
+    pub fn new() -> Self {
+        let id = NEXT_OWNER
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .expect("symbol owner IDs exhausted");
+        let inner = Rc::new(InternerOwner {
+            id,
+            table: RefCell::new(SymbolTable {
+                owner: id,
+                ..Default::default()
+            }),
+        });
+        OWNERS.with(|owners| {
+            owners.borrow_mut().insert(id, Rc::downgrade(&inner));
+        });
+        Self { inner }
+    }
+    /// Select the destination of constructor and serde adapters for this scope.
+    /// The guard restores the enclosing owner even when unwinding.
+    pub fn enter(&self) -> SymbolInternerGuard {
+        ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            let depth = active.len();
+            active.push(self.clone());
+            SymbolInternerGuard {
+                depth,
+                _thread: std::marker::PhantomData,
+            }
+        })
+    }
+    pub(crate) fn current() -> Self {
+        let current = ACTIVE.with(|active| active.borrow().last().cloned());
+        if let Some(current) = current {
+            return current;
+        }
+        #[cfg(test)]
+        {
+            TEST_SYMBOLS.with(Clone::clone)
+        }
+        #[cfg(not(test))]
+        {
+            panic!("symbol construction requires SymbolInterner::enter or CompilerSession")
+        }
+    }
+    fn with_table_mut<R>(&self, f: impl FnOnce(&mut SymbolTable) -> R) -> R {
+        f(&mut self.inner.table.borrow_mut())
+    }
+    /// Intern a source type spelling explicitly in this owner.
+    pub fn intern_type(&self, name: &str) -> TypeId {
+        let _scope = self.enter();
+        TypeId::from_source_name(name)
+    }
+    /// Intern a source free-function spelling explicitly in this owner.
+    pub fn intern_function(&self, name: &str) -> FunctionId {
+        let _scope = self.enter();
+        FunctionId::free_from_source_name(name)
+    }
+    /// Borrow a type name without cloning or allocating. Reject foreign IDs.
+    pub fn type_name(&self, id: TypeId) -> Ref<'_, str> {
+        assert_eq!(id.0.owner, self.inner.id, "foreign symbol owner");
+        Ref::map(self.inner.table.borrow(), |table| {
+            table.types[id.0.index as usize].name.as_ref()
+        })
+    }
+    /// Borrow a function name without cloning or allocating. Reject foreign IDs.
+    pub fn function_name(&self, id: FunctionId) -> Ref<'_, str> {
+        assert_eq!(id.0.owner, self.inner.id, "foreign symbol owner");
+        Ref::map(self.inner.table.borrow(), |table| {
+            table.functions[id.0.index as usize].name.as_ref()
+        })
+    }
+}
+#[must_use]
+pub struct SymbolInternerGuard {
+    depth: usize,
+    _thread: std::marker::PhantomData<Rc<()>>,
+}
+impl Drop for SymbolInternerGuard {
+    fn drop(&mut self) {
+        ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            assert_eq!(
+                active.len(),
+                self.depth + 1,
+                "symbol scopes must be dropped in reverse order"
+            );
+            active.pop();
+        });
+    }
+}
 impl SymbolTable {
+    fn handle(&self, index: usize) -> Handle {
+        Handle {
+            owner: self.owner,
+            index: u32::try_from(index).expect("symbol table exhausted"),
+        }
+    }
     fn find_type(
         &self,
         module: Option<SymbolModule>,
@@ -154,14 +315,14 @@ impl SymbolTable {
         name: &str,
     ) -> Option<TypeId> {
         let namespace = match namespace {
-            Some(n) => Some(*self.strings.get(n)?),
+            Some(n) => Some(Arc::clone(self.strings.get(n)?)),
             None => None,
         };
         self.type_ids
             .get(&TypeName {
                 module,
                 namespace,
-                name: self.strings.get(name)?,
+                name: Arc::clone(self.strings.get(name)?),
             })
             .copied()
     }
@@ -173,11 +334,11 @@ impl SymbolTable {
         name: &str,
     ) -> Option<FunctionId> {
         let namespace = match namespace {
-            Some(n) => Some(*self.strings.get(n)?),
+            Some(n) => Some(Arc::clone(self.strings.get(n)?)),
             None => None,
         };
         let owner = match owner {
-            Some(n) => Some(*self.strings.get(n)?),
+            Some(n) => Some(Arc::clone(self.strings.get(n)?)),
             None => None,
         };
         self.function_ids
@@ -185,17 +346,17 @@ impl SymbolTable {
                 module,
                 namespace,
                 owner,
-                name: self.strings.get(name)?,
+                name: Arc::clone(self.strings.get(name)?),
             })
             .copied()
     }
 
-    fn string(&mut self, name: &str) -> &'static str {
+    fn string(&mut self, name: &str) -> Arc<str> {
         if let Some(value) = self.strings.get(name) {
-            return value;
+            return Arc::clone(value);
         }
-        let value = Box::leak(name.to_owned().into_boxed_str());
-        self.strings.insert(value);
+        let value: Arc<str> = Arc::from(name);
+        self.strings.insert(Arc::clone(&value));
         value
     }
     fn type_id(
@@ -212,8 +373,8 @@ impl SymbolTable {
         if let Some(id) = self.type_ids.get(&key) {
             return *id;
         }
-        let id = TypeId(u32::try_from(self.types.len()).expect("type symbol table exhausted"));
-        self.types.push(key);
+        let id = TypeId(self.handle(self.types.len()));
+        self.types.push(key.clone());
         self.type_ids.insert(key, id);
         id
     }
@@ -233,10 +394,8 @@ impl SymbolTable {
         if let Some(id) = self.function_ids.get(&key) {
             return *id;
         }
-        let id = FunctionId(
-            u32::try_from(self.functions.len()).expect("function symbol table exhausted"),
-        );
-        self.functions.push(key);
+        let id = FunctionId(self.handle(self.functions.len()));
+        self.functions.push(key.clone());
         self.function_ids.insert(key, id);
         id
     }
@@ -244,7 +403,7 @@ impl SymbolTable {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub struct TypeId(u32);
+pub struct TypeId(Handle);
 impl TypeId {
     fn intern(namespace: Option<&str>, name: &str) -> Self {
         match namespace.and_then(SymbolModule::for_namespace) {
@@ -253,20 +412,22 @@ impl TypeId {
         }
     }
     fn intern_in(module: Option<SymbolModule>, namespace: Option<&str>, name: &str) -> Self {
-        if let Some(id) = SYMBOLS
-            .read()
-            .expect("symbol table poisoned")
-            .find_type(module, namespace, name)
-        {
-            return id;
-        }
-        SYMBOLS
-            .write()
-            .expect("symbol table poisoned")
-            .type_id(module, namespace, name)
+        SymbolInterner::current().with_table_mut(|table| {
+            #[cfg(test)]
+            {
+                table.requests += 1;
+            }
+            if let Some(module) = module {
+                assert_eq!(module.0.owner, table.owner, "foreign module owner");
+            }
+            table
+                .find_type(module, namespace, name)
+                .unwrap_or_else(|| table.type_id(module, namespace, name))
+        })
     }
     fn spelling(&self) -> TypeName {
-        SYMBOLS.read().expect("symbol table poisoned").types[self.0 as usize]
+        self.0
+            .with_table(|table| table.types[self.0.index as usize].clone())
     }
     pub fn local(name: impl AsRef<str>) -> Self {
         Self::intern(None, name.as_ref())
@@ -280,24 +441,27 @@ impl TypeId {
     /// Legacy spelling qualification. Resolved declarations retain their identity;
     /// consumer aliases belong in the scope, not in the canonical symbol.
     pub fn in_namespace(self, namespace: impl AsRef<str>) -> Self {
+        let _symbols = self.0.owner().enter();
         if self.module().is_some() {
             return self;
         }
-        Self::intern(Some(namespace.as_ref()), self.name())
+        Self::intern(Some(namespace.as_ref()), &self.name())
     }
     /// Attach the declaring module, discarding any consumer-local namespace.
     pub fn in_module(self, module: SymbolModule) -> Self {
-        Self::intern_in(Some(module), None, self.name())
+        let _symbols = self.0.owner().enter();
+        Self::intern_in(Some(module), None, &self.name())
     }
     pub fn module(&self) -> Option<SymbolModule> {
         self.spelling().module
     }
-    pub fn namespace(&self) -> Option<&str> {
+    pub fn namespace(&self) -> Option<Arc<str>> {
         let name = self.spelling();
         name.module.map(SymbolModule::namespace).or(name.namespace)
     }
-    pub fn name(&self) -> &str {
-        self.spelling().name
+    pub fn name(&self) -> Arc<str> {
+        self.0
+            .with_table(|table| Arc::clone(&table.types[self.0.index as usize].name))
     }
 }
 impl From<String> for TypeId {
@@ -321,7 +485,7 @@ impl fmt::Display for TypeId {
         if let Some(namespace) = self.namespace() {
             write!(f, "{namespace}::")?;
         }
-        f.write_str(spelling.name)
+        f.write_str(&spelling.name)
     }
 }
 impl fmt::Debug for TypeId {
@@ -329,7 +493,7 @@ impl fmt::Debug for TypeId {
         let spelling = self.spelling();
         let mut debug = f.debug_struct("TypeId");
         if let Some(module) = spelling.module {
-            debug.field("module", module.spelling());
+            debug.field("module", &*module.spelling());
         }
         debug
             .field("namespace", &spelling.namespace)
@@ -341,7 +505,9 @@ impl fmt::Debug for TypeId {
 // deterministic diagnostics and artifacts across concurrent compilations.
 impl Ord for TypeId {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.spelling().cmp(&other.spelling())
+        self.spelling()
+            .cmp(&other.spelling())
+            .then_with(|| self.0.cmp(&other.0))
     }
 }
 impl PartialOrd for TypeId {
@@ -374,7 +540,7 @@ impl<'de> serde::Deserialize<'de> for TypeId {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub struct FunctionId(u32);
+pub struct FunctionId(Handle);
 impl FunctionId {
     fn intern(namespace: Option<&str>, owner: Option<&str>, name: &str) -> Self {
         match namespace.and_then(SymbolModule::for_namespace) {
@@ -388,20 +554,22 @@ impl FunctionId {
         owner: Option<&str>,
         name: &str,
     ) -> Self {
-        if let Some(id) = SYMBOLS
-            .read()
-            .expect("symbol table poisoned")
-            .find_function(module, namespace, owner, name)
-        {
-            return id;
-        }
-        SYMBOLS
-            .write()
-            .expect("symbol table poisoned")
-            .function_id(module, namespace, owner, name)
+        SymbolInterner::current().with_table_mut(|table| {
+            #[cfg(test)]
+            {
+                table.requests += 1;
+            }
+            if let Some(module) = module {
+                assert_eq!(module.0.owner, table.owner, "foreign module owner");
+            }
+            table
+                .find_function(module, namespace, owner, name)
+                .unwrap_or_else(|| table.function_id(module, namespace, owner, name))
+        })
     }
     fn spelling(&self) -> FunctionName {
-        SYMBOLS.read().expect("symbol table poisoned").functions[self.0 as usize]
+        self.0
+            .with_table(|table| table.functions[self.0.index as usize].clone())
     }
     pub fn free(name: impl AsRef<str>) -> Self {
         Self::intern(None, None, name.as_ref())
@@ -413,11 +581,12 @@ impl FunctionId {
         }
     }
     pub fn method(owner: TypeId, name: impl AsRef<str>) -> Self {
+        let _symbols = owner.0.owner().enter();
         let owner = owner.spelling();
         Self::intern_in(
             owner.module,
-            owner.namespace,
-            Some(owner.name),
+            owner.namespace.as_deref(),
+            Some(&owner.name),
             name.as_ref(),
         )
     }
@@ -431,55 +600,60 @@ impl FunctionId {
     /// Legacy spelling qualification. Resolved declarations retain their identity;
     /// consumer aliases belong in the scope, not in the canonical symbol.
     pub fn in_namespace(self, namespace: impl AsRef<str>) -> Self {
+        let _symbols = self.0.owner().enter();
         if self.module().is_some() {
             return self;
         }
         let name = self.spelling();
-        Self::intern(Some(namespace.as_ref()), name.owner, name.name)
+        Self::intern(Some(namespace.as_ref()), name.owner.as_deref(), &name.name)
     }
     /// Attach the declaring module, discarding any consumer-local namespace.
     pub fn in_module(self, module: SymbolModule) -> Self {
+        let _symbols = self.0.owner().enter();
         let name = self.spelling();
-        Self::intern_in(Some(module), None, name.owner, name.name)
+        Self::intern_in(Some(module), None, name.owner.as_deref(), &name.name)
     }
     pub fn module(&self) -> Option<SymbolModule> {
         self.spelling().module
     }
-    pub fn namespace(&self) -> Option<&str> {
+    pub fn namespace(&self) -> Option<Arc<str>> {
         let name = self.spelling();
         name.module.map(SymbolModule::namespace).or(name.namespace)
     }
-    pub fn owner(&self) -> Option<&str> {
-        self.spelling().owner
+    pub fn owner(&self) -> Option<Arc<str>> {
+        self.0
+            .with_table(|table| table.functions[self.0.index as usize].owner.clone())
     }
-    pub fn name(&self) -> &str {
-        self.spelling().name
+    pub fn name(&self) -> Arc<str> {
+        self.0
+            .with_table(|table| Arc::clone(&table.functions[self.0.index as usize].name))
     }
-    pub fn unqualified_name(&self) -> &str {
-        let name = self.spelling();
-        if name.module.is_none() && name.namespace.is_none() && name.owner.is_none() {
-            name.name
-        } else {
-            ""
-        }
+    pub fn unqualified_name(&self) -> Option<Arc<str>> {
+        self.0.with_table(|table| {
+            let name = &table.functions[self.0.index as usize];
+            (name.module.is_none() && name.namespace.is_none() && name.owner.is_none())
+                .then(|| Arc::clone(&name.name))
+        })
     }
     pub fn owner_type(&self) -> Option<TypeId> {
+        let _symbols = self.0.owner().enter();
         let name = self.spelling();
         name.owner
-            .map(|owner| TypeId::intern_in(name.module, name.namespace, owner))
+            .map(|owner| TypeId::intern_in(name.module, name.namespace.as_deref(), &owner))
     }
     pub fn is_free_named(&self, expected: &str) -> bool {
         let name = self.spelling();
         name.module.is_none()
             && name.namespace.is_none()
             && name.owner.is_none()
-            && name.name == expected
+            && name.name.as_ref() == expected
     }
     pub fn is_method_of(&self, expected: &str) -> bool {
         let name = self.spelling();
-        name.module.is_none() && name.namespace.is_none() && name.owner == Some(expected)
+        name.module.is_none() && name.namespace.is_none() && name.owner.as_deref() == Some(expected)
     }
     pub fn remap_imported_item(&self, item: &str, local: &str) -> Option<Self> {
+        let _symbols = self.0.owner().enter();
         if self.is_free_named(item) {
             Some(Self::free(local))
         } else if self.is_method_of(item) {
@@ -489,7 +663,7 @@ impl FunctionId {
         }
     }
     pub fn resolve_self_owner(self, owner: &TypeId) -> Self {
-        if matches!(self.owner(), Some("Self" | "self")) {
+        if matches!(self.owner().as_deref(), Some("Self" | "self")) {
             Self::method(*owner, self.name())
         } else {
             self
@@ -520,7 +694,7 @@ impl fmt::Display for FunctionId {
         if let Some(owner) = name.owner {
             write!(f, "{owner}::")?;
         }
-        f.write_str(name.name)
+        f.write_str(&name.name)
     }
 }
 impl fmt::Debug for FunctionId {
@@ -528,7 +702,7 @@ impl fmt::Debug for FunctionId {
         let name = self.spelling();
         let mut debug = f.debug_struct("FunctionId");
         if let Some(module) = name.module {
-            debug.field("module", module.spelling());
+            debug.field("module", &*module.spelling());
         }
         debug
             .field("namespace", &name.namespace)
@@ -539,7 +713,9 @@ impl fmt::Debug for FunctionId {
 }
 impl Ord for FunctionId {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.spelling().cmp(&other.spelling())
+        self.spelling()
+            .cmp(&other.spelling())
+            .then_with(|| self.0.cmp(&other.0))
     }
 }
 impl PartialOrd for FunctionId {
@@ -779,9 +955,9 @@ mod tests {
     #[test]
     fn method_identity_keeps_namespace_owner_and_name_separate() {
         let id = FunctionId::method(TypeId::from_source_name("net::Client"), "connect");
-        assert_eq!(id.namespace(), Some("net"));
-        assert_eq!(id.owner(), Some("Client"));
-        assert_eq!(id.name(), "connect");
+        assert_eq!(id.namespace().as_deref(), Some("net"));
+        assert_eq!(id.owner().as_deref(), Some("Client"));
+        assert_eq!(id.name().as_ref(), "connect");
         assert_eq!(id.to_string(), "net::Client::connect");
     }
 
@@ -978,7 +1154,7 @@ mod backend_identity_tests {
                 signatures.set_scope(scope.clone());
                 effects.set_scope(scope.clone());
                 assert_eq!(signatures.get_id(&alias), None);
-                assert_eq!(id.namespace(), namespace);
+                assert_eq!(id.namespace().as_deref(), namespace);
                 assert_eq!(id.owner().is_some(), matches!(kind, 1 | 2));
             }
         }
@@ -990,9 +1166,9 @@ mod intern_tests {
     use super::*;
 
     #[test]
-    fn handles_are_four_bytes_and_preserve_structural_identity() {
-        assert_eq!(std::mem::size_of::<TypeId>(), 4);
-        assert_eq!(std::mem::size_of::<FunctionId>(), 4);
+    fn handles_are_eight_bytes_and_preserve_structural_identity() {
+        assert_eq!(std::mem::size_of::<TypeId>(), 8);
+        assert_eq!(std::mem::size_of::<FunctionId>(), 8);
         let ty = TypeId::from_source_name("ns::Owner");
         assert_eq!(ty, TypeId::local("Owner").in_namespace("ns"));
         let method = FunctionId::method(ty, "call");
@@ -1017,7 +1193,7 @@ mod intern_tests {
     }
 
     #[test]
-    fn concurrent_sessions_reuse_the_same_handles() {
+    fn concurrent_sessions_have_independent_handles() {
         let threads: Vec<_> = (0..8)
             .map(|_| {
                 std::thread::spawn(|| {
@@ -1033,7 +1209,7 @@ mod intern_tests {
             .into_iter()
             .map(|thread| thread.join().unwrap())
             .collect();
-        assert!(values.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(values.windows(2).all(|pair| pair[0] != pair[1]));
     }
 }
 
@@ -1128,8 +1304,8 @@ mod package_symbol_tests {
             assert!(!json.contains("alias"));
             assert!(json.contains("package-0"));
         }
-        assert_eq!(std::mem::size_of::<TypeId>(), 4);
-        assert_eq!(std::mem::size_of::<FunctionId>(), 4);
+        assert_eq!(std::mem::size_of::<TypeId>(), 8);
+        assert_eq!(std::mem::size_of::<FunctionId>(), 8);
     }
 
     #[test]
@@ -1192,3 +1368,7 @@ mod package_symbol_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ids_session_tests.rs"]
+mod session_tests;

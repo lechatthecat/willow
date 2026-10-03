@@ -90,6 +90,7 @@ mod tests {
                     graph.files.push(ResolvedModule {
                         package: crate::package::PackageId(0),
                         symbol_module: None,
+                        symbol_namespace: None,
                         id: ModuleId(id),
                         name: format!("alias_{position}"),
                         canonical_path: format!("pkg::unit_{position}"),

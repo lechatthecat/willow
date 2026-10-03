@@ -9,6 +9,8 @@ use super::module_graph::ModuleId;
 pub struct SourceFile {
     pub id: ModuleId,
     pub package: crate::package::PackageId,
+    /// Owned namespace adapter, sharing the module interner allocation.
+    pub symbol_namespace: Option<std::sync::Arc<str>>,
     pub symbol_module: Option<crate::semantic::ids::SymbolModule>,
     /// Name used to access the module from the entry file (possibly an alias).
     pub name: String,
@@ -21,13 +23,13 @@ pub struct SourceFile {
 
 impl SourceFile {
     pub fn identity_path(&self) -> &str {
-        self.symbol_module
-            .map_or(&self.canonical_path, |origin| origin.namespace())
+        self.symbol_namespace
+            .as_deref()
+            .unwrap_or(&self.canonical_path)
     }
 
     pub fn registration_name(&self) -> &str {
-        self.symbol_module
-            .map_or(&self.name, |origin| origin.namespace())
+        self.symbol_namespace.as_deref().unwrap_or(&self.name)
     }
 
     pub fn module_key(&self) -> super::ModuleKey {

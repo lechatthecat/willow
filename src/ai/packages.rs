@@ -96,8 +96,8 @@ pub(super) fn attach(
         semantic.modules.push(ModuleEvidence {
             path: paths[&file.id].clone(),
             identity: ModuleIdentity {
-                package: origin.package().clone(),
-                module: origin.path().0.clone(),
+                package: origin.package(),
+                module: origin.path().0,
             },
             dependencies: vec![],
         });

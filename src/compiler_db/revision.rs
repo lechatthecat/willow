@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 /// value releases its query tables and temporary artifact pack.
 #[derive(Default)]
 pub struct AnalysisRevision {
+    symbols: crate::semantic::ids::SymbolInterner,
     frontend: Option<Frontend>,
     tracked: tracked::TrackedQueryTable,
     syntax: std::rc::Rc<std::cell::RefCell<incremental::SyntaxQueries>>,
@@ -37,6 +38,7 @@ impl AnalysisRevision {
         artifact_limit: u64,
     ) -> Result<ai::Snapshot> {
         use anyhow::Context;
+        let _symbols = self.symbols.enter();
         let verify = std::env::var_os("WILLOW_INCREMENTAL_VERIFY").is_some_and(|v| v == "1");
         let cold_session = verify.then(|| {
             CompilerSession::new(
@@ -330,14 +332,50 @@ mod tests {
             std::fs::write(self.0.join(file), source).unwrap();
         }
         fn compare(&self, warm: &mut AnalysisRevision) -> bool {
-            let path = self.0.join("main.wi");
+            self.compare_impl(warm, false)
+        }
+        fn compare_impl(&self, warm: &mut AnalysisRevision, require_cycle: bool) -> bool {
+            self.compare_diagnostic(warm, require_cycle, None)
+        }
+        fn compare_diagnostic(
+            &self,
+            warm: &mut AnalysisRevision,
+            require_cycle: bool,
+            unsupported: Option<&str>,
+        ) -> bool {
+            let path = self.0.join(if self.0.join("project.toml").exists() {
+                "src/main.wi"
+            } else {
+                "main.wi"
+            });
             let options = crate::CompilerOptions::debug();
-            let session = || CompilerSession::new(path.to_str().unwrap(), "", &options, None);
+            let project = self.0.join("project.toml").exists().then(|| self.0.clone());
+            let session =
+                || CompilerSession::new(path.to_str().unwrap(), "", &options, project.clone());
             let mut a = Diagnostics::default();
             let mut b = Diagnostics::default();
             let incremental = warm.analyze(session(), &mut a);
             let cold = session().analysis_with_emitter(&mut b);
             assert_eq!(a.0, b.0);
+            if let Some(reason) = unsupported {
+                let text = serde_json::to_string(&a.0).unwrap();
+                for part in [
+                    "E0838",
+                    "unsupported static initialization",
+                    reason,
+                    "directly resolved helper",
+                    "after startup in main",
+                ] {
+                    assert!(text.contains(part), "missing {part}: {text}");
+                }
+                assert!(!text.contains("static initialization cycle:"), "{text}");
+            }
+            if require_cycle {
+                let text = serde_json::to_string(&a.0).unwrap();
+                for part in ["E0838", "static initialization cycle:", "A::x", "seed"] {
+                    assert!(text.contains(part), "missing {part}: {text}");
+                }
+            }
             match (incremental, cold) {
                 (Ok(a), Ok(b)) => {
                     let a = serde_json::to_value(a).unwrap();
@@ -396,6 +434,145 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn revision_static_dependency_reads_survive_reuse_and_invalidate_cycles() {
+        let fixture = Fixture::new();
+        let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
+        let source = |read: &str| {
+            format!(
+                "fn seed() -> i64 {{ return {read}; }} class A {{ pub static x: i64 = seed(); }} class B {{ pub static y: i64 = 42; }} fn main() {{ println(A::x); }}"
+            )
+        };
+        fixture.write("main.wi", &source("B::y"));
+        assert!(fixture.compare(&mut warm));
+        assert!(fixture.compare(&mut warm));
+        fixture.write("main.wi", &source("A::x"));
+        assert!(!fixture.compare(&mut warm));
+        fixture.write("main.wi", &source("B::y"));
+        assert!(fixture.compare(&mut warm));
+    }
+
+    #[test]
+    fn revision_static_build_dispatch_reuses_imported_helpers() {
+        for (lib, imports, declaration) in [
+            (
+                "pub open class Base { pub open fn seed() -> i64 { return 0; } } pub fn read(v: Base) -> i64 { return v.seed(); }",
+                "import lib;",
+                "class C extends lib::Base { pub override fn seed() -> i64 { return READ; } }",
+            ),
+            (
+                "pub open class Base { pub open fn seed() -> i64 { return 0; } } pub fn read(v: Base) -> i64 { return v.seed(); }",
+                "import lib as l;",
+                "open class Middle extends l::Base {} class C extends Middle { pub override fn seed() -> i64 { return READ; } }",
+            ),
+            (
+                "pub open class Base { pub open fn seed() -> i64 { return 0; } } pub fn read(v: Base) -> i64 { return v.seed(); }",
+                "import lib::Base as Parent;",
+                "class C extends Parent { pub override fn seed() -> i64 { return READ; } }",
+            ),
+            (
+                "pub interface I { fn seed() -> i64; } pub fn read(v: I) -> i64 { return v.seed(); }",
+                "import lib::I as Contract;",
+                "class C implements Contract { pub fn seed() -> i64 { return READ; } }",
+            ),
+            (
+                "pub interface I { fn seed() -> i64; } pub interface J extends I {} pub fn read(v: J) -> i64 { return v.seed(); }",
+                "import lib as l;",
+                "class C implements l::J { pub fn seed() -> i64 { return READ; } }",
+            ),
+        ] {
+            let fixture = Fixture::new();
+            let mut warm = AnalysisRevision::default();
+            let _symbols = warm.symbols.enter();
+            fixture.write("lib.wi", lib);
+            let reader = if imports.contains("as l;") {
+                "l::read"
+            } else {
+                "lib::read"
+            };
+            for read in ["B::y", "B::y", "A::x", "A::x", "B::y"] {
+                let declaration = declaration.replace("READ", read);
+                fixture.write("main.wi", &format!("{imports} {declaration} class A {{ pub static x: i64 = {reader}(new C()); }} class B {{ pub static y: i64 = 42; }} fn main() {{}}"));
+                assert_eq!(
+                    fixture.compare_impl(&mut warm, read == "A::x"),
+                    read == "B::y"
+                );
+            }
+            // Removing the consumer must discard its dispatch edges as well.
+            fixture.write(
+                "main.wi",
+                &format!("{imports} class A {{ pub static x: i64 = 42; }} fn main() {{}}"),
+            );
+            assert!(fixture.compare(&mut warm));
+        }
+    }
+
+    #[test]
+    fn revision_static_package_dispatch_invalidates_cycles() {
+        let fixture = Fixture::new();
+        std::fs::create_dir_all(fixture.0.join("dep/src")).unwrap();
+        std::fs::create_dir_all(fixture.0.join("src")).unwrap();
+        fixture.write("project.toml", "[project]\nname='app'\nversion='1.0.0'\n[willow]\nmanifest-version=1\n[dependencies]\ndep={path='dep'}\n");
+        fixture.write(
+            "dep/project.toml",
+            "[project]\nname='library'\nversion='1.0.0'\n[willow]\nmanifest-version=1\n",
+        );
+        for (lib, declaration) in [
+            (
+                "pub open class Base { pub open fn seed() -> i64 { return 0; } } pub fn read(v: Base) -> i64 { return v.seed(); }",
+                "class C extends l::Base { pub override fn seed() -> i64 { return READ; } }",
+            ),
+            (
+                "pub interface I { fn seed() -> i64; } pub fn read(v: I) -> i64 { return v.seed(); }",
+                "class C implements l::I { pub fn seed() -> i64 { return READ; } }",
+            ),
+        ] {
+            let mut warm = AnalysisRevision::default();
+            let _symbols = warm.symbols.enter();
+            fixture.write("dep/src/util.wi", lib);
+            for read in ["B::y", "B::y", "A::x", "B::y"] {
+                let declaration = declaration.replace("READ", read);
+                fixture.write("src/main.wi", &format!("import dep::util as l; {declaration} class A {{ pub static x: i64 = l::read(new C()); }} class B {{ pub static y: i64 = 42; }} fn main() {{}}"));
+                assert_eq!(
+                    fixture.compare_impl(&mut warm, read == "A::x"),
+                    read == "B::y"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn revision_static_unsupported_reasons_survive_cached_helpers() {
+        for (lib, reason) in [
+            (
+                "import std::collections::Array; import std::parallel as par; class B { pub static y: i64 = 42; } fn mapper(v: i64) -> i64 { return v + B::y; } pub fn start() -> i64 { let values: Array<i64> = [1]; let task = par::map(values.freeze(), mapper); return 42; }",
+                "runtime callback API",
+            ),
+            (
+                "interface Seed { fn seed(self) -> i64 { return 42; } } class C implements Seed {} pub fn start() -> i64 { return new C().seed(); }",
+                "injected interface default method",
+            ),
+            (
+                "fn seed() -> i64 { return 42; } fn call(f: fn() -> i64) -> i64 { return f(); } pub fn start() -> i64 { return call(seed); }",
+                "indirect call through a function value",
+            ),
+        ] {
+            let fixture = Fixture::new();
+            let mut warm = AnalysisRevision::default();
+            let _symbols = warm.symbols.enter();
+            fixture.write("lib.wi", lib);
+            for initializer in ["42", "l::start()", "l::start()", "42"] {
+                fixture.write("main.wi", &format!("import lib as l; class A {{ pub static x: i64 = {initializer}; }} fn main() {{}}"));
+                let unsupported = (initializer != "42").then_some(reason);
+                assert_eq!(
+                    fixture.compare_diagnostic(&mut warm, false, unsupported),
+                    unsupported.is_none()
+                );
+            }
+        }
+    }
+
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
@@ -487,6 +664,7 @@ mod tests {
         path: &std::path::Path,
     ) -> std::collections::BTreeMap<String, Vec<u8>> {
         use object::{Object, ObjectSection};
+        let _symbols = revision.symbols.enter();
         let frontend = revision.frontend.as_ref().unwrap();
         assert!(frontend.module_graph.files.is_empty());
         let artifacts = frontend.module_graph.artifacts.as_ref().unwrap();
@@ -568,6 +746,7 @@ mod tests {
     fn revision_native_object_matches_cold_after_body_edit() {
         let f = Fixture::new();
         let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
         for (iteration, source) in [
             "fn get() -> i64 { return 1; } fn untouched() -> i64 { return 7; } fn main() { println(get()); }",
             "fn get() -> i64 { return 2; } fn untouched() -> i64 { return 7; } fn main() { println(get()); }",
@@ -596,6 +775,7 @@ mod tests {
         for unrelated in [8, 32, 128] {
             let f = Fixture::new();
             let mut warm = AnalysisRevision::default();
+            let _symbols = warm.symbols.enter();
             let others: String = (0..unrelated).map(|i| format!("class Other{i} {{ pub fn get(self) -> i64 {{ return {i}; }} }} fn other{i}(c: Other{i}) -> i64 {{ return c.get(); }}\n")).collect();
             for (step, method) in [
                 "",
@@ -665,6 +845,7 @@ mod tests {
         use crate::semantic::ids::TypeId;
         let f = Fixture::new();
         let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
         for (step, field, value, method) in [
             (0, "i64", "1", "1"),
             (1, "i64", "1", "2"),
@@ -698,7 +879,7 @@ mod tests {
                     .unwrap()
                     .db
                     .layouts
-                    .object_layout(TargetLayoutKey::new(id, 8))
+                    .object_layout(TargetLayoutKey::new(cold.symbols.intern_type(class), 8))
                     .unwrap();
                 assert_eq!(object.gc_trace(), cold_object.gc_trace());
                 let gc = QueryNode::GcLayout(id);
@@ -732,6 +913,7 @@ mod tests {
         use crate::semantic::ids::{FunctionId, TypeId};
         let f = Fixture::new();
         let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
         let interface = FunctionId::method(TypeId::local("I"), "get");
         for (step, implements, body) in [
             (0, "", "return 1;"),
@@ -773,6 +955,7 @@ mod tests {
         use crate::semantic::ids::TypeId;
         let f = Fixture::new();
         let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
         for (step, variants) in ["A", "A, B(i64)", "A, B(i64)", "A"].iter().enumerate() {
             f.write("main.wi", &format!("enum E {{ {variants} }} class Holder {{ pub value: E; }} class Other {{ pub value: i64; }} fn main() {{ let h = new Holder(E::A); println(1); }}"));
             assert!(f.compare(&mut warm));
@@ -817,6 +1000,7 @@ mod tests {
                 .map(|i| format!("fn other_{i}() -> i64 {{ return {i}; }}\n"))
                 .collect::<String>();
             let mut warm = AnalysisRevision::default();
+            let _symbols = warm.symbols.enter();
             for (step, target) in [
                 "fn target() -> i64 { return 1; }",
                 "fn target() -> i64 { return 2; }",
@@ -864,6 +1048,7 @@ mod tests {
             "pub fn get() -> i64 { return 1; } pub fn unrelated() -> i64 { return 7; }",
         );
         let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
         assert!(f.compare(&mut warm));
         assert_eq!(warm.typechecks, 3);
         f.write(
@@ -884,6 +1069,7 @@ mod tests {
         );
         f.write("value.wi", "pub fn get() -> i64 { let f = |x: i64| x + 1; return f(1); } pub fn untouched() -> i64 { return 7; }");
         let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
         assert!(f.compare(&mut warm));
         let count = warm.typechecks;
         f.write("value.wi", "\n// moved\npub fn get() -> i64 {\n let f = |x: i64| x + 1;\n return f(1);\n }\n pub fn untouched() -> i64 { return 7; }\n");
@@ -914,6 +1100,7 @@ mod tests {
         f.write("value.wi", "pub fn get() -> i64 { return 1; }");
         f.write("independent.wi", "pub fn run() { let f = |x: i64| { let g = |y: i64| y + x; return g(1); }; println(f(1)); }");
         let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
         assert!(f.compare(&mut warm));
         let initial = warm.typechecks;
         assert!(initial >= 6, "{initial}");
@@ -943,6 +1130,7 @@ mod tests {
         );
         f.write("independent.wi", "pub fn run() {}");
         let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
         for source in [
             "pub fn get() -> i64 { return 1; }",
             "pub fn get() -> String { return \"value\"; }",
@@ -988,6 +1176,7 @@ mod tests {
             fn main() { let c = new C(1); println(new A().value() + new B().value() + c.get() + C::value); }
         "#);
         let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
         assert!(f.compare(&mut warm));
         let old = std::rc::Rc::downgrade(
             &warm
@@ -1022,6 +1211,7 @@ mod tests {
             entry.push_str("fn main() { println(m0::value()); }");
             f.write("main.wi", &entry);
             let mut warm = AnalysisRevision::default();
+            let _symbols = warm.symbols.enter();
             assert!(f.compare(&mut warm));
             assert_eq!(warm.typechecks, n + 1);
             assert!(f.compare(&mut warm));
@@ -1052,6 +1242,7 @@ mod tests {
         f.write("independent.wi", "pub fn untouched() {}");
         f.write("proto.wi", "pub interface Value { fn value(self) -> i64 { let f = |x: i64| { let g = |y: i64| y + 1; return g(x); }; return f(1); } }");
         let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
         assert!(f.compare(&mut warm));
         assert!(f.compare(&mut warm));
         assert_eq!(warm.typechecks, 0);
@@ -1085,6 +1276,7 @@ mod tests {
                 entry.push_str("fn main() {}");
                 f.write("main.wi", &entry);
                 let mut warm = AnalysisRevision::default();
+                let _symbols = warm.symbols.enter();
                 assert!(f.compare(&mut warm));
                 f.write("m0.wi", "pub fn value() -> i64 { return 2; }");
                 assert!(f.compare(&mut warm));
@@ -1107,6 +1299,7 @@ mod tests {
         let f = Fixture::new();
         f.write("main.wi", "fn main() {}");
         let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
         assert!(f.compare(&mut warm));
         let accepted_revision = warm.tracked.revision();
         for invalid in ["fn main() { missing(); }", "fn main( {", "fn main() { ` }"] {
@@ -1143,6 +1336,7 @@ mod tests {
         let path = f.0.join("main.wi");
         let options = crate::CompilerOptions::debug();
         let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
         let mut compare = |project: Option<std::path::PathBuf>| {
             let session =
                 || CompilerSession::new(path.to_str().unwrap(), "", &options, project.clone());
@@ -1249,6 +1443,7 @@ mod tests {
     fn revision_long_edit_session_keeps_graph_and_artifacts_bounded() {
         let f = Fixture::new();
         let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
         let mut peak_nodes = 0;
         let mut peak_edges = 0;
         let mut peak_artifacts = 0;
@@ -1283,6 +1478,7 @@ mod tests {
         let f = Fixture::new();
         f.write("main.wi", "fn main() {}");
         let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
         assert!(f.compare(&mut warm));
         let old = std::rc::Rc::downgrade(
             &warm
@@ -1331,6 +1527,7 @@ mod tests {
             );
             f.write("value.wi", "pub fn get() -> i64 { return 1; }");
             let mut warm = AnalysisRevision::default();
+            let _symbols = warm.symbols.enter();
             assert!(f.compare(&mut warm));
             f.write("value.wi", "pub fn get() -> i64 { return 2; }");
             assert!(f.compare(&mut warm));
@@ -1351,6 +1548,7 @@ mod tests {
                 &format!("fn f(x: i64) -> i64 {{ {body} }} fn main() {{ println(f(1)); }}"),
             );
             let mut warm = AnalysisRevision::default();
+            let _symbols = warm.symbols.enter();
             assert!(f.compare(&mut warm));
             assert!(f.compare(&mut warm));
             assert_eq!((warm.typechecks, warm.reused_bodies), (0, depth + 2));
@@ -1370,6 +1568,7 @@ mod tests {
             "import pairing; fn round(p: pairing::Pairing) { p.pairings(); } fn main() {}",
         );
         let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
         for body in ["", "self.channel.recv();", ""] {
             f.write("pairing.wi", &format!("pub interface Pairing {{ fn pairings(self); }} pub class Lottery implements Pairing {{ pub channel: Channel<i64>; pub fn pairings(self) {{ {body} }} }}"));
             assert!(f.compare(&mut warm));
@@ -1388,6 +1587,7 @@ mod tests {
             "pub fn get(ch: Channel<i64>) -> i64 { return 1; }",
         );
         let mut warm = AnalysisRevision::default();
+        let _symbols = warm.symbols.enter();
         assert!(f.compare(&mut warm));
         assert!(f.compare(&mut warm));
         assert_eq!(warm.typechecks, 0);

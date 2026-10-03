@@ -381,14 +381,14 @@ impl Intrinsic {
 
     /// Inverse of [`Intrinsic::function_id`], by one hash lookup.
     pub fn from_function_id(id: &FunctionId) -> Option<Self> {
-        static BY_ID: std::sync::OnceLock<std::collections::HashMap<FunctionId, Intrinsic>> =
+        static BY_NAME: std::sync::OnceLock<std::collections::HashMap<String, Intrinsic>> =
             std::sync::OnceLock::new();
-        if id.owner() != Some(INTRINSIC_OWNER) || id.namespace().is_some() {
+        if id.owner().as_deref() != Some(INTRINSIC_OWNER) || id.namespace().is_some() {
             return None;
         }
-        BY_ID
-            .get_or_init(|| Self::ALL.iter().map(|&i| (i.function_id(), i)).collect())
-            .get(id)
+        BY_NAME
+            .get_or_init(|| Self::ALL.iter().map(|&i| (format!("{i:?}"), i)).collect())
+            .get(id.name().as_ref())
             .copied()
     }
 }
@@ -409,7 +409,7 @@ pub(crate) fn builtin_target_effects(target: &FunctionId) -> Option<RuntimeEffec
     if target.owner().is_some() || target.namespace().is_some() {
         return None;
     }
-    match target.name() {
+    match target.name().as_ref() {
         "panic" => Some(RuntimeEffects::MAY_PANIC),
         // String formatting allocates the result and can panic on a failed
         // conversion; argument evaluation is attributed at its own sites.
@@ -453,7 +453,9 @@ pub(crate) fn builtin_static_effects(
     module_aliases: &std::collections::HashMap<String, String>,
 ) -> Option<RuntimeEffects> {
     let owner = target.owner().filter(|_| target.namespace().is_none())?;
+    let owner = owner.as_ref();
     let method = target.name();
+    let method = method.as_ref();
     if let Some(runtime) = builtin_static_constructor(owner, method) {
         return Some(symbol_effects(runtime));
     }
@@ -1505,6 +1507,18 @@ mod checker_agreement_tests {
         format!("{ty:?}")
     }
 
+    const STRINGS: &str = r#"
+fn f(s: String) {
+    let part = s.substring(0, 1);
+    let pieces = s.split(",");
+    let contains = s.contains("a");
+    let found = s.find("a");
+    let trimmed = s.trim();
+    let repeated = s.repeat(2);
+    let starts = s.starts_with("a");
+}
+"#;
+
     const SCALARS: &str = r#"
 fn f() {
     let n = 42;
@@ -1807,6 +1821,7 @@ fn f() {
         let mut reached: std::collections::HashSet<Intrinsic> = std::collections::HashSet::new();
         for (src, expected) in [
             (SCALARS, 5),
+            (STRINGS, 7),
             (ARRAYS, 6),
             (MAPS, 9),
             (ATOMICS, 8),

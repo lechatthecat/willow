@@ -458,6 +458,16 @@ impl TypeChecker {
             return;
         };
 
+        if let Some(caller) = self.local.current_effect_callable {
+            self.resolved_calls
+                .entry(caller)
+                .or_default()
+                .targets
+                .insert(FunctionId::method(
+                    TypeId::from_source_name(&base.name),
+                    "init",
+                ));
+        }
         let param_infos: Vec<ParamInfo> = match base.constructor.clone() {
             Some(ci) => {
                 self.record_method_use("init", "constructor", s.span, ci.declaration_span, &s.args);
@@ -745,10 +755,8 @@ impl TypeChecker {
 
     /// Type-check `static [mut] name: T = expr` initializers (willow-qsqf §10).
     /// Each initializer must be assignable to the declared type, cannot use
-    /// `self`, and may only reference earlier static properties of the same class
-    /// (no forward references / cycles in MVP).
+    /// `self`. The build-wide dependency plan orders reads and rejects cycles.
     pub(super) fn check_static_property_initializers(&mut self, c: &ClassDecl) {
-        let mut initialized: HashSet<String> = HashSet::new();
         for field in &c.fields {
             if !field.is_static {
                 continue;
@@ -762,33 +770,27 @@ impl TypeChecker {
                 .and_then(|queries| queries.initializer(init.id()));
             if let Some(id) = id {
                 self.query_body(id, |checker| {
-                    checker.check_static_initializer(field, init, c, &initialized)
+                    checker.check_static_initializer(field, init, c)
                 });
             } else {
-                self.check_static_initializer(field, init, c, &initialized);
+                self.check_static_initializer(field, init, c);
             }
-            initialized.insert(field.name.clone());
         }
     }
 
-    fn check_static_initializer(
-        &mut self,
-        field: &FieldDecl,
-        init: &Expr,
-        c: &ClassDecl,
-        initialized: &HashSet<String>,
-    ) {
+    fn check_static_initializer(&mut self, field: &FieldDecl, init: &Expr, c: &ClassDecl) {
         let previous_class = self.local.current_class.replace(c.name.clone());
         let declared = self.normalize_type(&field.ty, field.span);
 
-        // Reject forward references to not-yet-initialized statics of THIS
-        // class (`C::later` used before `later` is declared).
-        self.check_static_forward_references(init, &c.name, initialized);
+        let previous_callable = self.local.current_effect_callable.replace(
+            crate::compiler_db::static_init::initializer_id(&c.name, &field.name),
+        );
 
         let previous_init_ctx = self.local.in_static_initializer;
         self.local.in_static_initializer = true;
         let init_ty = self.check_expr_expecting(init, &declared);
         self.local.in_static_initializer = previous_init_ctx;
+        self.local.current_effect_callable = previous_callable;
 
         if !self.types_compatible(&declared, &init_ty) && init_ty != Type::Void {
             self.push(
@@ -807,46 +809,6 @@ impl TypeChecker {
             );
         }
         self.local.current_class = previous_class;
-    }
-
-    /// Walk an initializer expression and reject `C::prop` references to static
-    /// properties of the same class `C` that are not yet initialized
-    /// (willow-qsqf §10.4 → E0838).
-    pub(super) fn check_static_forward_references(
-        &mut self,
-        expr: &Expr,
-        class_name: &str,
-        initialized: &HashSet<String>,
-    ) {
-        if let Expr::StaticField(s) = expr {
-            // `Self::x` or `ClassName::x` referring to this class.
-            let refers_self = s.class == "Self" || s.class == class_name;
-            if refers_self
-                && !initialized.contains(&s.field)
-                && self
-                    .symbols
-                    .lookup_class(class_name)
-                    .is_some_and(|c| c.static_props.contains_key(&s.field))
-            {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0838,
-                        format!(
-                            "static property `{}::{}` is used before it is initialized",
-                            class_name, s.field
-                        ),
-                    )
-                    .with_label(Label::primary(s.span, "used before initialization"))
-                    .with_help("declare it earlier, or reorder the static properties"),
-                );
-            }
-        }
-        let mut children = Vec::new();
-        walk_subexprs(expr, &mut |sub| children.push(sub));
-        for child in children {
-            self.check_static_forward_references(child, class_name, initialized);
-        }
     }
 
     /// Validate a class's `implements` clause: each named interface must exist

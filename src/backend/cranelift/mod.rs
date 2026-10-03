@@ -217,7 +217,7 @@ pub struct Codegen {
     static_storage: TypeMap<HashMap<String, StaticStorageInfo>>,
     /// Resolver-owned execution order, independent of body emission order.
     module_init_plan: ModuleInitPlan,
-    /// Each unit owns its declaration-ordered initializers and emitted function.
+    /// Each unit owns its expressions until the global dependency plan is emitted.
     unit_static_inits: HashMap<InitUnitId, UnitStaticInit>,
     /// Zero-initialized per-thread cursor/limit and allocation counters used by
     /// the inlined GC bump-allocation fast path.
@@ -308,6 +308,7 @@ struct StaticInitItem {
     class_key: String,
     field: String,
     initializer: FunctionDecl,
+    id: Option<crate::compiler_db::ids::StaticId>,
     /// The initializer expression's own semantic body, so its lowered IR is
     /// read by identity like every other emission target. `None` on the
     /// standalone path, which has no body index.
@@ -318,7 +319,6 @@ struct StaticInitItem {
 #[derive(Default)]
 struct UnitStaticInit {
     items: Vec<StaticInitItem>,
-    function: Option<FuncId>,
 }
 
 #[cfg(test)]
@@ -935,8 +935,8 @@ impl Codegen {
             .filter(|id| id.namespace() == owner.namespace() && id.owner() == Some(owner.name()))
             .map(|id| {
                 (
-                    class_member_symbol(local, id.name()),
-                    self.class_method_symbol(&qualified, id.name()),
+                    class_member_symbol(local, id.name().as_ref()),
+                    self.class_method_symbol(&qualified, id.name().as_ref()),
                 )
             })
             .collect()

@@ -87,11 +87,6 @@ pub(crate) fn module_item_symbol(module_prefix: &str, item: &str) -> String {
     symbol_path(&[module_prefix, item])
 }
 
-/// A module's generated initializer cannot share a name with a source item.
-pub(crate) fn module_static_init_symbol(module_prefix: &str) -> String {
-    with_role(module_prefix, "static_init")
-}
-
 /// `{class_symbol}.{method}` — a class method whose class is already a symbol
 /// path. Use [`class_method_symbol_name`] when the class is a `::`-qualified
 /// Willow name that may need module-prefix resolution.

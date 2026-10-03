@@ -180,6 +180,7 @@ pub struct TypeChecker {
     /// Suppress duplicate missing-import diagnostics per type name.
     missing_collection_imports_reported: HashSet<String>,
     resolved_calls: HashMap<FunctionId, crate::semantic::call_graph::CallSites>,
+    static_reads: HashMap<FunctionId, HashSet<FunctionId>>,
     analysis_calls: HashMap<ExprId, Option<FunctionId>>,
     analysis_symbols: crate::semantic::analysis_symbols::Facts,
     capture_call_sites: bool,
@@ -318,6 +319,7 @@ impl TypeChecker {
             fully_qualified_collection_types: HashSet::new(),
             missing_collection_imports_reported: HashSet::new(),
             resolved_calls: HashMap::new(),
+            static_reads: HashMap::new(),
             analysis_calls: HashMap::new(),
             analysis_symbols: Default::default(),
             capture_call_sites: false,

@@ -138,6 +138,7 @@ pub(super) struct BodyOutputs {
     lambda_captures: HashMap<ExprId, Vec<LambdaCapture>>,
     lock_edges: HashMap<FunctionId, HashSet<FunctionId>>,
     resolved_calls: HashMap<FunctionId, crate::semantic::call_graph::CallSites>,
+    static_reads: HashMap<FunctionId, HashSet<FunctionId>>,
     analysis_calls: HashMap<ExprId, Option<FunctionId>>,
     analysis_symbols: crate::semantic::analysis_symbols::Facts,
     task_method_calls: Vec<crate::compiler_db::effects::TaskMethodCall>,
@@ -166,6 +167,8 @@ pub(crate) struct TypedBody {
     lock_edges: HashMap<FunctionId, HashSet<FunctionId>>,
     #[serde(with = "crate::compiler_db::map_entries")]
     resolved_calls: HashMap<FunctionId, crate::semantic::call_graph::CallSites>,
+    #[serde(with = "crate::compiler_db::map_entries")]
+    static_reads: HashMap<FunctionId, HashSet<FunctionId>>,
     analysis_calls: HashMap<ExprId, Option<FunctionId>>,
     analysis_symbols: crate::semantic::analysis_symbols::Facts,
     task_method_calls: Vec<crate::compiler_db::effects::TaskMethodCall>,
@@ -200,6 +203,7 @@ impl TypedBody {
             lambda_captures: outputs.lambda_captures,
             lock_edges: outputs.lock_edges,
             resolved_calls: outputs.resolved_calls,
+            static_reads: outputs.static_reads,
             analysis_calls: outputs.analysis_calls,
             analysis_symbols: outputs.analysis_symbols,
             task_method_calls: outputs.task_method_calls,
@@ -347,9 +351,16 @@ impl TypeChecker {
         body: TypedBody,
         queries: &crate::compiler_db::body::BodyQueries,
     ) -> anyhow::Result<()> {
+        for (caller, reads) in body.static_reads {
+            self.static_reads.entry(caller).or_default().extend(reads);
+        }
         for (caller, sites) in body.resolved_calls {
             let current = self.resolved_calls.entry(caller).or_default();
             current.targets.extend(sites.targets);
+            current.virtual_calls.extend(sites.virtual_calls);
+            current
+                .unsupported_initialization
+                .extend(sites.unsupported_initialization);
             current.has_unknown |= sites.has_unknown;
         }
         self.expr_types.extend(body.expr_types);
@@ -425,6 +436,7 @@ impl TypeChecker {
         swap(&mut self.lambda_captures, &mut outputs.lambda_captures);
         swap(&mut self.effect_inputs.edges, &mut outputs.lock_edges);
         swap(&mut self.resolved_calls, &mut outputs.resolved_calls);
+        swap(&mut self.static_reads, &mut outputs.static_reads);
         swap(&mut self.analysis_calls, &mut outputs.analysis_calls);
         swap(&mut self.analysis_symbols, &mut outputs.analysis_symbols);
         swap(&mut self.task_method_calls, &mut outputs.task_method_calls);

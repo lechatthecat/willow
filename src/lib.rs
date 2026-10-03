@@ -317,6 +317,7 @@ struct Frontend {
 /// back-end (codegen → link → artifacts). Splitting the phases keeps the
 /// driver testable and lets future front-ends (LSP, test harness) reuse them.
 pub struct CompilerSession<'a> {
+    symbols: semantic::ids::SymbolInterner,
     src: &'a str,
     out: &'a str,
     opts: CompilerOptions,
@@ -331,6 +332,7 @@ impl<'a> CompilerSession<'a> {
         project_root: Option<PathBuf>,
     ) -> Self {
         Self {
+            symbols: semantic::ids::SymbolInterner::new(),
             src,
             out,
             opts: opts.clone().resolve_environment(),
@@ -386,6 +388,7 @@ impl<'a> CompilerSession<'a> {
         discover: bool,
         overview_aliases: bool,
     ) -> Result<ai::Snapshot> {
+        let _symbols = self.symbols.enter();
         let _query_stats = query_stats::Session::enter();
         let _node_ids = parser::ast::NodeIdSession::enter();
         let path = std::fs::canonicalize(self.src)?;
@@ -430,6 +433,7 @@ impl<'a> CompilerSession<'a> {
     }
 
     fn execute(self, emitter: &mut dyn diagnostics::DiagnosticEmitter, build: bool) -> Result<()> {
+        let _symbols = self.symbols.enter();
         let _query_stats = query_stats::Session::enter();
         let _node_ids = parser::ast::NodeIdSession::enter();
         let src_path = PathBuf::from(self.src);
@@ -802,6 +806,17 @@ fn run_frontend_revision(
         .chain(std::iter::once(module::UnitId::ENTRY))
     {
         let diagnostics = db.unit_diagnostics(file)?;
+        error_count += diagnostic_error_count(&diagnostics);
+        emit_frontend_diagnostics(&diagnostics, map, &graph, &diagnostic_modules, emitter)?;
+    }
+    if error_count == 0 {
+        let order: Vec<_> = graph
+            .files
+            .iter()
+            .map(|m| m.id)
+            .chain(std::iter::once(module::UnitId::ENTRY))
+            .collect();
+        let diagnostics = db.effects.static_initializers.solve(&order, &db.effects);
         error_count += diagnostic_error_count(&diagnostics);
         emit_frontend_diagnostics(&diagnostics, map, &graph, &diagnostic_modules, emitter)?;
     }
@@ -1305,6 +1320,7 @@ mod diagnostic_emission_tests {
                 graph.files.push(module::ResolvedModule {
                     package: crate::package::PackageId(0),
                     symbol_module: None,
+                    symbol_namespace: None,
                     id: module::ModuleId(i + 1),
                     name: format!("m{i}"),
                     canonical_path: format!("m{i}"),
@@ -1383,6 +1399,7 @@ mod diagnostic_emission_tests {
         graph.files.push(module::ResolvedModule {
             package: crate::package::PackageId(0),
             symbol_module: None,
+            symbol_namespace: None,
             id: module::ModuleId(17),
             name: "helper".into(),
             canonical_path: "helper".into(),
@@ -1681,6 +1698,7 @@ fn run_backend(
 
     // The entry file's item imports are not carried here: the back end gets
     // them from `backend_unit_imports` below, the same way every module's are.
+    let _symbols = frontend.db.enter_symbols();
     let Frontend {
         program,
         mut module_graph,
@@ -2176,6 +2194,8 @@ pub fn check_file(
 /// covers the constructs implemented so far (willow-mb5) and lists the rest as
 /// trailing comments rather than failing.
 pub fn emit_hir_text(src: &str) -> Result<String> {
+    let symbols = semantic::ids::SymbolInterner::new();
+    let _symbols = symbols.enter();
     let _query_stats = query_stats::Session::enter();
     let _node_ids = parser::ast::NodeIdSession::enter();
     let src_path = PathBuf::from(src);
@@ -2215,6 +2235,8 @@ pub fn emit_hir_text(src: &str) -> Result<String> {
 /// `--emit-lir` build flag). Runs the normal front-end, lowers to typed HIR,
 /// then makes control flow explicit as blocks.
 pub fn emit_lir_text(src: &str) -> Result<String> {
+    let symbols = semantic::ids::SymbolInterner::new();
+    let _symbols = symbols.enter();
     let _query_stats = query_stats::Session::enter();
     let _node_ids = parser::ast::NodeIdSession::enter();
     let src_path = PathBuf::from(src);
@@ -2330,6 +2352,7 @@ mod frontend_phase_tests {
                         module::ResolvedModule {
                             package: crate::package::PackageId(0),
                             symbol_module: None,
+                            symbol_namespace: None,
                             id: module::ModuleId(id as u32),
                             name: format!("m{id}"),
                             canonical_path: format!("m{id}"),
@@ -2388,6 +2411,7 @@ mod frontend_phase_tests {
             .map(|(id, source)| module::ResolvedModule {
                 package: crate::package::PackageId(0),
                 symbol_module: None,
+                symbol_namespace: None,
                 id: module::ModuleId(id as u32),
                 name: format!("m{id}"),
                 canonical_path: format!("m{id}"),
@@ -2480,6 +2504,7 @@ mod frontend_phase_tests {
         let modules = [module::ResolvedModule {
             package: crate::package::PackageId(0),
             symbol_module: None,
+            symbol_namespace: None,
             id: module::ModuleId(0),
             name: "another_units_alias".into(),
             canonical_path: "worker".into(),

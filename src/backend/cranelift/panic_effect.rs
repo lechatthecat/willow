@@ -425,9 +425,9 @@ fn backend_symbol(id: &FunctionId, context: &AnalysisContext<'_>) -> String {
         return key.clone();
     }
     if let Some(prefix) = context.known_modules.linker_prefix(&class) {
-        return module_item_symbol(prefix, id.name());
+        return module_item_symbol(prefix, id.name().as_ref());
     }
-    class_method_symbol_name(context.known_modules, &class, id.name())
+    class_method_symbol_name(context.known_modules, &class, id.name().as_ref())
 }
 
 /// The effects of a call target this unit does not own a body for.
@@ -447,7 +447,9 @@ fn external_effects(target: &FunctionId, context: &AnalysisContext<'_>) -> Runti
         Some(true) => PANIC,
         // `new C(...)` where no `init` is known is the implicit memberwise
         // constructor, which only allocates and stores fields.
-        None if target.owner().is_some() && target.name() == "init" => RuntimeEffects::NONE,
+        None if target.owner().is_some() && target.name().as_ref() == "init" => {
+            RuntimeEffects::NONE
+        }
         None => PANIC,
     }
 }

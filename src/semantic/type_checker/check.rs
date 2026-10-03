@@ -263,6 +263,7 @@ impl TypeChecker {
         self.effect_index.hierarchy = std::sync::Arc::new(self.build_lock_effect_hierarchy());
         self.effect_inputs.edges.clear();
         self.resolved_calls.clear();
+        self.static_reads.clear();
         self.analysis_calls.clear();
         self.effect_inputs.direct.clear();
         self.effect_inputs.direct_sites.clear();
@@ -725,6 +726,8 @@ impl TypeChecker {
                         graph.merge(
                             FunctionId::method(TypeId::local(&class.name), &method.name),
                             CallSites {
+                                unsupported_initialization: [crate::semantic::call_graph::UnsupportedInitialization::InjectedDefault].into(),
+                                virtual_calls: Default::default(),
                                 targets: Default::default(),
                                 has_unknown: true,
                             },
@@ -738,6 +741,8 @@ impl TypeChecker {
             graph.merge(
                 *id,
                 CallSites {
+                    unsupported_initialization: Default::default(),
+                    virtual_calls: Default::default(),
                     targets: targets.iter().copied().collect(),
                     has_unknown: false,
                 },
@@ -764,6 +769,31 @@ impl TypeChecker {
                 )
             })
             .collect::<HashMap<_, _>>();
+        if let Some((queries, unit)) = &self.effect_queries {
+            queries.static_initializers.record(
+                *unit,
+                program,
+                &graph,
+                &self.static_reads,
+                &imports,
+                self.body_queries.as_ref().map(|queries| queries.index()),
+            );
+        }
+        if self.effect_queries.is_none() && self.errors.is_empty() {
+            let queries = crate::compiler_db::effects::EffectQueries::default();
+            let unit = crate::module::UnitId::ENTRY;
+            queries.static_initializers.record(
+                unit,
+                program,
+                &graph,
+                &self.static_reads,
+                &imports,
+                None,
+            );
+            for diagnostic in queries.static_initializers.solve(&[unit], &queries) {
+                self.push(diagnostic);
+            }
+        }
         let compute = || {
             crate::compiler_db::effects::solve_unit(
                 program,
@@ -1248,12 +1278,7 @@ impl TypeChecker {
                 }
             }
             Stmt::StaticFieldAssign(s) => self.check_static_field_assign(s),
-            Stmt::SuperInit(s) => {
-                if let Some(caller) = self.local.current_effect_callable {
-                    self.resolved_calls.entry(caller).or_default().has_unknown = true;
-                }
-                self.check_super_init(s)
-            }
+            Stmt::SuperInit(s) => self.check_super_init(s),
             Stmt::IndexAssign(s) => {
                 let reference_start = self.analysis_symbols.references.len();
                 let arr_ty = self.check_expr(&s.array);
@@ -1915,7 +1940,11 @@ impl TypeChecker {
                     }),
             ],
             Expr::New(call) => vec![FunctionId::method(
-                TypeId::from_source_name(&call.class_name),
+                TypeId::from_source_name(
+                    &self
+                        .resolve_static_call_class_quiet(&call.class_name)
+                        .unwrap_or_else(|| call.class_name.clone()),
+                ),
                 "init",
             )],
             _ => return,
@@ -1935,7 +1964,55 @@ impl TypeChecker {
         let Some(caller) = self.local.current_effect_callable else {
             return;
         };
+        // Preserve the typed receiver for build-wide dispatch. Direct static
+        // calls and constructors deliberately do not enter this set.
+        let virtual_call = if let Expr::MethodCall(call) = expr {
+            self.expr_types.get(&call.object.id()).and_then(|ty| {
+                let (Type::Named(name) | Type::Generic(name, _)) = ty else {
+                    return None;
+                };
+                let owner = self
+                    .symbols
+                    .lookup_interface(name)
+                    .map(|info| &info.name)
+                    .or_else(|| self.symbols.lookup_class(name).map(|info| &info.name))?;
+                Some(FunctionId::method(
+                    TypeId::from_source_name(owner),
+                    &call.method,
+                ))
+            })
+        } else {
+            None
+        };
+        use crate::semantic::call_graph::UnsupportedInitialization;
+        let unsupported = if let Expr::StaticCall(call) = expr {
+            let class = self
+                .static_call_classes
+                .get(&call.id)
+                .map(String::as_str)
+                .unwrap_or(&call.class);
+            self.imported_std_modules
+                .get(class)
+                .filter(|module| {
+                    // Inspect the borrowed schema, without rebuilding builtin
+                    // parameter types at every call site.
+                    matches!(crate::stdlib_schema::item(&module.module, &call.method).map(|item| &item.kind),
+                        Some(crate::stdlib_schema::StdItemKind::Function { params, .. })
+                        if params.iter().any(|ty| matches!(ty, crate::stdlib_schema::StdType::Fn(_, _))))
+                })
+                .map(|_| UnsupportedInitialization::RuntimeCallback)
+        } else if targets.is_empty() {
+            Some(if matches!(expr, Expr::Call(_)) {
+                UnsupportedInitialization::IndirectCall
+            } else {
+                UnsupportedInitialization::UnresolvedCall
+            })
+        } else {
+            None
+        };
         let sites = self.resolved_calls.entry(caller).or_default();
+        sites.unsupported_initialization.extend(unsupported);
+        sites.virtual_calls.extend(virtual_call);
         sites.has_unknown |= targets.is_empty();
         sites.targets.extend(targets);
     }

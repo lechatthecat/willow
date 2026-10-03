@@ -249,19 +249,21 @@ impl ModuleGraph {
         }
         let id = self.reserve_key(key.clone());
         self.resolved.insert(key.clone());
+        let symbol_module = self.package_graph.as_ref().map(|graph| {
+            crate::semantic::ids::SymbolModule::new(
+                graph
+                    .get(key.package)
+                    .expect("resolved package")
+                    .identity
+                    .clone(),
+                key.path.clone(),
+            )
+        });
         self.files.push(SourceFile {
             id,
             package: key.package,
-            symbol_module: self.package_graph.as_ref().map(|graph| {
-                crate::semantic::ids::SymbolModule::new(
-                    graph
-                        .get(key.package)
-                        .expect("resolved package")
-                        .identity
-                        .clone(),
-                    key.path.clone(),
-                )
-            }),
+            symbol_namespace: symbol_module.map(|module| module.namespace()),
+            symbol_module,
             name,
             canonical_path: key.path.0,
             path,

@@ -2414,6 +2414,11 @@ impl TypeChecker {
         };
         match self.lookup_static_prop_in_hierarchy(&resolved, field) {
             Some((owner, info)) => {
+                if let Some(caller) = self.local.current_effect_callable {
+                    self.static_reads.entry(caller).or_default().insert(
+                        crate::compiler_db::static_init::initializer_id(&owner, field),
+                    );
+                }
                 self.record_member_use(
                     field,
                     "static-field",

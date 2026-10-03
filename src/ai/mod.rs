@@ -169,7 +169,7 @@ pub(crate) fn capture(
             && !id.name().starts_with("$default$")
             && id
                 .owner()
-                .is_some_and(|owner| symbols.lookup_interface(owner).is_some())
+                .is_some_and(|owner| symbols.lookup_interface(owner.as_ref()).is_some())
             && sites.targets.is_empty()
             && !sites.has_unknown;
         if !contract {
@@ -577,14 +577,14 @@ pub(crate) fn snapshot(
     };
     let resolve = |unit: UnitId, id: FunctionId| -> (UnitId, FunctionId) {
         if let Some(ns) = id.namespace() {
-            if let Some(target) = namespaces.get(ns) {
+            if let Some(target) = namespaces.get(ns.as_ref()) {
                 return (*target, local_id(id));
             }
-            if let Some((target, _)) = aliases[&unit].get(ns) {
+            if let Some((target, _)) = aliases[&unit].get(ns.as_ref()) {
                 return (*target, local_id(id));
             }
         } else if let Some(owner) = id.owner() {
-            if let Some((target, item)) = aliases[&unit].get(owner) {
+            if let Some((target, item)) = aliases[&unit].get(owner.as_ref()) {
                 return (
                     *target,
                     item.as_ref().map_or_else(
@@ -594,7 +594,7 @@ pub(crate) fn snapshot(
                 );
             }
         } else if !captured[&unit].declarations.contains_key(&id)
-            && let Some((target, Some(item))) = aliases[&unit].get(id.name())
+            && let Some((target, Some(item))) = aliases[&unit].get(id.name().as_ref())
         {
             return (*target, FunctionId::free(item));
         }
@@ -679,8 +679,8 @@ pub(crate) fn snapshot(
         }
     }
     let bodyless_effects = |(unit, target): &(UnitId, FunctionId)| {
-        let is_enum = *bodyless.get(&(*unit, target.owner()?))?;
-        match (is_enum, target.name()) {
+        let is_enum = *bodyless.get(&(*unit, target.owner()?.as_ref()))?;
+        match (is_enum, target.name().as_ref()) {
             (false, "init") => Some(RuntimeEffects::NONE),
             (true, _) => Some(RuntimeEffects::MAY_ALLOCATE),
             _ => None,
@@ -785,7 +785,7 @@ pub(crate) fn snapshot(
                         unit,
                         FunctionId::method(TypeId::from_source_name(&spelling), "$dispatch"),
                     );
-                    class_key(unit, id.owner().unwrap())
+                    class_key(unit, id.owner().unwrap().as_ref())
                 });
                 let methods = class
                     .methods
@@ -817,7 +817,7 @@ pub(crate) fn snapshot(
                 let (owner, target) = resolve(unit, target);
                 dispatches
                     .entry((
-                        class_key(owner, target.owner().unwrap()),
+                        class_key(owner, target.owner().unwrap().as_ref()),
                         target.name().to_string(),
                     ))
                     .or_default()
@@ -845,7 +845,7 @@ pub(crate) fn snapshot(
         for (&span, &target) in &capture.dispatch_sites {
             let (owner, target) = resolve(unit, target);
             if let Some(id) = dispatch.queries.get(&(
-                class_key(owner, target.owner().unwrap()),
+                class_key(owner, target.owner().unwrap().as_ref()),
                 target.name().to_string(),
             )) && let Some(path) = paths.get(&crate::module::ModuleId(span.file_id.0))
             {

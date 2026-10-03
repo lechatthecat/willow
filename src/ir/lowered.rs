@@ -1129,7 +1129,7 @@ fn expr_suspends_here(expr: &HirExpr) -> bool {
     match &expr.kind {
         HirExprKind::Await { inner }
             if builtin_types::unary_arg(&inner.ty, B::Future).is_some()
-                && !matches!(&inner.kind, HirExprKind::Call { callee, .. } if matches!(callee.name(), "sleep" | "yield")) =>
+                && !matches!(&inner.kind, HirExprKind::Call { callee, .. } if matches!(callee.name().as_ref(), "sleep" | "yield")) =>
         {
             false
         }
@@ -1656,7 +1656,7 @@ impl Builder {
             }
             HirExprKind::Await { inner } => {
                 if let HirExprKind::Call { callee, args } = &inner.kind {
-                    match (callee.name(), args.as_slice()) {
+                    match (callee.name().as_ref(), args.as_slice()) {
                         ("sleep", [millis]) if value.ty == Type::Void => {
                             let millis = self.lower_operand_before_suspend(millis)?;
                             let name = self.synthetic_name("sleep_millis");
@@ -2188,7 +2188,7 @@ impl Builder {
                     if !place && control_flow.contains(&std::ptr::from_ref(expr)) {
                         match &expr.kind {
                             HirExprKind::Call { callee, args }
-                                if !self.local_by_name.contains_key(callee.unqualified_name())
+                                if !self.local_by_name.contains_key(callee.unqualified_name().as_deref().unwrap_or(""))
                                     && self.resolution.functions.get(callee).is_some_and(
                                         |signature| {
                                             !signature.is_async
@@ -2308,9 +2308,9 @@ impl Builder {
                                 continue;
                             }
                             HirExprKind::Call { callee, args }
-                                if self.local_by_name.contains_key(callee.unqualified_name()) =>
+                                if self.local_by_name.contains_key(callee.unqualified_name().as_deref().unwrap_or("")) =>
                             {
-                                let source = self.local_by_name[callee.unqualified_name()];
+                                let source = self.local_by_name[callee.unqualified_name().as_deref().unwrap_or("")];
                                 let ty = self.locals[source.0 as usize].ty.clone();
                                 if let Type::Fn(params, result) | Type::Closure(params, result) =
                                     &ty
@@ -4524,7 +4524,7 @@ impl Builder {
             // position from running twice.
             (_, Type::Generic(g, args))
                 if g.namespace().is_none()
-                    && g.name() == "Range"
+                    && g.name().as_ref() == "Range"
                     && args.first() == Some(&Type::I64) =>
             {
                 let range_name = format!("__for{n}_range");

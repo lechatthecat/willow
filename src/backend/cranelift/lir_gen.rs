@@ -739,7 +739,7 @@ impl LirTypeCtx<'_> {
                     // unlike the atomic cells and the cancellation handles: the
                     // prelude does not own these two names, so anything the
                     // program declares under them answers first.
-                    || matches!(name.name(), "TcpListener" | "TcpStream")
+                    || matches!(name.name().as_ref(), "TcpListener" | "TcpStream")
             }
             // A `Range<i64>` value (willow-0g8j.2.10): two `i64` words, no
             // element type to vet and no other instantiation to admit.
@@ -1099,7 +1099,7 @@ impl LirTypeCtx<'_> {
                 && bare.name() == qualified.name()
                 && qualified
                     .namespace()
-                    .is_some_and(|namespace| self.known_modules.contains_key(namespace))
+                    .is_some_and(|namespace| self.known_modules.contains_key(namespace.as_ref()))
         };
         if !is_qualified_form(a, b) && !is_qualified_form(b, a) {
             return false;
@@ -2264,7 +2264,7 @@ fn lir_suspends_here(expr: &HirExpr) -> bool {
     match &expr.kind {
         HirExprKind::Await { inner }
             if builtin_types::unary_arg(&inner.ty, B::Future).is_some()
-                && !matches!(&inner.kind, HirExprKind::Call { callee, .. } if matches!(callee.unqualified_name(), "sleep" | "yield")) =>
+                && !matches!(&inner.kind, HirExprKind::Call { callee, .. } if matches!(callee.unqualified_name().as_deref().unwrap_or(""), "sleep" | "yield")) =>
         {
             false
         }
@@ -2434,7 +2434,10 @@ fn lir_builtin_await(expr: &HirExpr) -> Option<LirAwaitSite<'_>> {
     {
         return None;
     }
-    match (callee.unqualified_name(), args.as_slice()) {
+    match (
+        callee.unqualified_name().as_deref().unwrap_or(""),
+        args.as_slice(),
+    ) {
         ("sleep", [millis]) if millis.ty == Type::I64 => Some(LirAwaitSite::Sleep(millis)),
         ("yield", []) => Some(LirAwaitSite::Yield),
         _ => None,
@@ -2929,7 +2932,7 @@ fn supported_panic<'e>(
     // builtin, and it wins here exactly as it does in `supported_expr`.
     if !callee.is_free_named("panic")
         || e.ty != Type::Never
-        || names.contains_key(callee.unqualified_name())
+        || names.contains_key(callee.unqualified_name().as_deref().unwrap_or(""))
     {
         return false;
     }
@@ -3166,7 +3169,7 @@ fn scheduler_lock(ty: &Type) -> Option<(&'static str, &Type)> {
     let [protected] = args.as_slice() else {
         return None;
     };
-    match name.name() {
+    match name.name().as_ref() {
         "Mutex" => Some(("willow_async_mutex", protected)),
         "RwLock" => Some(("willow_async_rwlock", protected)),
         _ => None,
@@ -4118,7 +4121,7 @@ fn supported_expr_node<'n>(
             // local fn-typed binding shadows a free function (willow-bv9.1).
             // The local wins here because this must resolve to what the type checker
             // checked the call against.
-            if let Some(local) = names.get(callee.unqualified_name()) {
+            if let Some(local) = names.get(callee.unqualified_name().as_deref().unwrap_or("")) {
                 // Either callable value: a `closure` is called through the code
                 // pointer in its word 0, with the object itself as the hidden
                 // leading argument, so the only difference from a `fn` is in
@@ -4137,9 +4140,15 @@ fn supported_expr_node<'n>(
                         .all(|(p, a)| ctx.supported_type(p) && ctx.storable(p, &a.ty))
                     && args.iter().all(child_supported);
             }
-            if matches!(callee.unqualified_name(), "sleep" | "yield") {
+            if matches!(
+                callee.unqualified_name().as_deref().unwrap_or(""),
+                "sleep" | "yield"
+            ) {
                 return builtin_types::unary_arg(&e.ty, B::Future) == Some(&Type::Void)
-                    && match (callee.unqualified_name(), args.as_slice()) {
+                    && match (
+                        callee.unqualified_name().as_deref().unwrap_or(""),
+                        args.as_slice(),
+                    ) {
                         ("sleep", [millis]) => millis.ty == Type::I64 && child_supported(millis),
                         ("yield", []) => true,
                         _ => false,
@@ -4164,7 +4173,9 @@ fn supported_expr_node<'n>(
             // statistic counters. Same shape — a zero-argument runtime call
             // with no AST-only metadata — but they return the counter
             // (willow-0g8j.3.1).
-            if runtime_stat_builtin_runtime_name(callee.unqualified_name()).is_some() {
+            if runtime_stat_builtin_runtime_name(callee.unqualified_name().as_deref().unwrap_or(""))
+                .is_some()
+            {
                 return args.is_empty() && e.ty == Type::I64;
             }
             if callee.is_free_named("recover") {
@@ -4175,9 +4186,14 @@ fn supported_expr_node<'n>(
             }
             // These compiler-known control-flow operations require lexical
             // panic-scope handling through the dedicated paths above (willow-s9ej.3).
-            !matches!(callee.unqualified_name(), "panic" | "recover")
-                && ctx.callable(callee.unqualified_name(), args, false)
-                && args.iter().all(child_supported)
+            !matches!(
+                callee.unqualified_name().as_deref().unwrap_or(""),
+                "panic" | "recover"
+            ) && ctx.callable(
+                callee.unqualified_name().as_deref().unwrap_or(""),
+                args,
+                false,
+            ) && args.iter().all(child_supported)
         }
         HirExprKind::Print { value, newline: _ } => {
             (scalar(&value.ty) || value.ty == Type::String) && child_supported(value)
@@ -7966,7 +7982,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         callee: &crate::semantic::ids::FunctionId,
         args: &[cranelift_codegen::ir::Value],
     ) -> cranelift_codegen::ir::Value {
-        let runtime = builtin_call_runtime_name(callee.unqualified_name())
+        let runtime = builtin_call_runtime_name(callee.unqualified_name().as_deref().unwrap_or(""))
             .expect("resolved builtin function");
         self.emit_runtime_call_with_cleanup(runtime, args, |_| {})
             .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
@@ -8512,7 +8528,7 @@ fn flat_rvalue_supported(
             if callee.is_free_named("yield") { return params.is_empty() && void_future; }
             if !params.is_empty() { return false; }
             if callee.is_free_named("gc_collect") || callee.is_free_named("gc_minor_collect") { *result == Type::Void }
-            else { callee.is_free_named(callee.unqualified_name()) && runtime_stat_builtin_runtime_name(callee.unqualified_name()).is_some() && *result == Type::I64 }
+            else { callee.is_free_named(callee.unqualified_name().as_deref().unwrap_or("")) && runtime_stat_builtin_runtime_name(callee.unqualified_name().as_deref().unwrap_or("")).is_some() && *result == Type::I64 }
         }
         V::FormatScalar { ty, format, .. } => matches!(ty, Type::I64 | Type::F64 | Type::Bool | Type::String) && (format.is_none() || *ty == Type::F64),
         V::Panic { message } => ty(message) == Some(Type::String),

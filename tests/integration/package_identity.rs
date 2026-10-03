@@ -301,3 +301,70 @@ fn package_identity_imported_class_arrays() {
         "42\n",
     );
 }
+
+#[test]
+fn package_identity_static_dependency_helpers() {
+    run_case(
+        "module util; fn seed() -> i64 { return Value::base; } pub class Value { pub static n: i64 = seed(); pub static base: i64 = 11; pub static fn read() -> i64 { return Value::n; } }",
+        "module util; fn seed() -> i64 { return Value::base; } pub class Value { pub static n: i64 = seed(); pub static base: i64 = 22; pub static fn read() -> i64 { return Value::n; } }",
+        "import a::util::Value as First; import b::util::Value as Second; class Value { pub static n: i64 = First::read() + Second::read(); } fn main() { println(Value::n); }",
+        "33\n",
+    );
+}
+
+fn static_dispatch_package(lib: &str, declaration: &str) {
+    for read in ["B::y", "A::x"] {
+        let other = declaration
+            .replace("READ", "A::x")
+            .replace("l::", "other::")
+            .replace("class C ", "class Other ");
+        let declaration = declaration.replace("READ", read);
+        let entry = format!(
+            "import a::util as l; import b::util as other; {other} {declaration} class A {{ pub static x: i64 = l::read(new C()); }} class B {{ pub static y: i64 = 42; }} fn main() {{ println(A::x); }}"
+        );
+        let project = TestProject::new(
+            "static_dispatch_package",
+            &[
+                ("project.toml", ROOT),
+                ("a/project.toml", A),
+                ("b/project.toml", B),
+                ("a/src/util.wi", lib),
+                ("b/src/util.wi", lib),
+                ("src/main.wi", &entry),
+            ],
+        );
+        let build = project.compile(".");
+        let error = String::from_utf8_lossy(&build.stderr);
+        if read == "A::x" {
+            assert!(!build.status.success(), "{error}");
+            for part in ["E0838", "static initialization cycle:", "A::x", "seed"] {
+                assert!(error.contains(part), "{error}");
+            }
+        } else {
+            assert!(build.status.success(), "{error}");
+            let run = project.run();
+            assert!(
+                run.status.success(),
+                "{}",
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&run.stdout), "42\n");
+        }
+    }
+}
+
+#[test]
+fn package_identity_static_cross_module_virtual_dispatch() {
+    static_dispatch_package(
+        "pub open class Base { pub open fn seed() -> i64 { return 0; } } pub fn read(v: Base) -> i64 { return v.seed(); }",
+        "class C extends l::Base { pub override fn seed() -> i64 { return READ; } }",
+    );
+}
+
+#[test]
+fn package_identity_static_cross_module_interface_dispatch() {
+    static_dispatch_package(
+        "pub interface I { fn seed() -> i64; } pub fn read(v: I) -> i64 { return v.seed(); }",
+        "class C implements l::I { pub fn seed() -> i64 { return READ; } }",
+    );
+}

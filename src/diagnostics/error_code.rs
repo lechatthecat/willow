@@ -120,7 +120,7 @@ error_codes! {
     E0835, // instance member accessed through a type
     E0836, // static interface members are not supported
     E0837, // `self` not available in static property initializer
-    E0838, // static property used before it is initialized
+    E0838, // cyclic or unresolved static initialization dependency
     E0839, // static member hides inherited static member
     // Constructors / `new` / `init` E084x (willow-scq2)
     E0840, // constructor `init` must not declare a return type

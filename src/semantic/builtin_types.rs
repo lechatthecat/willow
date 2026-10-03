@@ -8,19 +8,19 @@
 use crate::parser::ast::Type;
 
 pub trait TypeName {
-    fn builtin_name(&self) -> &str;
+    fn builtin_name(&self) -> Option<impl AsRef<str>>;
 }
 impl TypeName for String {
-    fn builtin_name(&self) -> &str {
-        self
+    fn builtin_name(&self) -> Option<impl AsRef<str>> {
+        Some(self.as_str())
     }
 }
 impl TypeName for crate::semantic::ids::TypeId {
-    fn builtin_name(&self) -> &str {
+    fn builtin_name(&self) -> Option<impl AsRef<str>> {
         if self.namespace().is_none() {
-            self.name()
+            Some(self.name())
         } else {
-            ""
+            None
         }
     }
 }
@@ -130,11 +130,11 @@ pub fn resolve<N: TypeName>(ty: &Type<N>) -> Option<BuiltinTypeRef<'_, N>> {
             args: std::slice::from_ref(element.as_ref()),
         }),
         Type::Generic(name, args) => Some(BuiltinTypeRef {
-            id: BuiltinTypeId::from_name(name.builtin_name())?,
+            id: BuiltinTypeId::from_name(name.builtin_name()?.as_ref())?,
             args,
         }),
         Type::Named(name) => Some(BuiltinTypeRef {
-            id: BuiltinTypeId::from_name(name.builtin_name())?,
+            id: BuiltinTypeId::from_name(name.builtin_name()?.as_ref())?,
             args: &[],
         }),
         _ => None,

@@ -107,6 +107,7 @@ pub(crate) struct UnitEffects {
 }
 
 pub(crate) struct EffectQueries {
+    pub(crate) static_initializers: super::static_init::StaticInitQueries,
     solutions: std::cell::RefCell<
         HashMap<UnitId, Arc<crate::semantic::effects::EffectSolution<EffectWitness>>>,
     >,
@@ -134,6 +135,7 @@ pub(crate) struct EffectQueries {
 impl Default for EffectQueries {
     fn default() -> Self {
         Self {
+            static_initializers: Default::default(),
             solutions: Default::default(),
             io_solutions: Default::default(),
             scanned: Default::default(),
@@ -429,6 +431,47 @@ impl EffectQueries {
             .unwrap_or_else(|| unknown_external_capabilities(target))
     }
 
+    pub(crate) fn external_target(
+        &self,
+        consumer: UnitId,
+        target: &FunctionId,
+        imports: &HashMap<String, String>,
+    ) -> Option<(UnitId, FunctionId)> {
+        let namespace = target.namespace();
+        let owner = target.owner();
+        let (path, id) = if let Some(namespace) = namespace.as_deref() {
+            (
+                imports
+                    .get(namespace)
+                    .map(String::as_str)
+                    .unwrap_or(namespace),
+                match owner {
+                    Some(owner) => FunctionId::method(TypeId::local(owner), target.name()),
+                    None => FunctionId::free(target.name()),
+                },
+            )
+        } else if let Some(owner) = owner.as_deref() {
+            let path = imports.get(owner).map(String::as_str).unwrap_or(owner);
+            if self.resolve_module(consumer, path).is_some() {
+                (path, FunctionId::free(target.name()))
+            } else if let Some((module, item)) = path.rsplit_once("::") {
+                (
+                    module,
+                    FunctionId::method(TypeId::local(item), target.name()),
+                )
+            } else {
+                return None;
+            }
+        } else if let Some(path) = imports.get(target.name().as_ref()) {
+            let (module, item) = path.rsplit_once("::")?;
+            (module, FunctionId::free(item))
+        } else {
+            return None;
+        };
+        let unit = self.resolve_module(consumer, path)?;
+        Some((unit, id))
+    }
+
     fn lookup_external_capabilities(
         &self,
         consumer: UnitId,
@@ -441,38 +484,7 @@ impl EffectQueries {
                 may_io: false,
             });
         }
-        let namespace = target.namespace();
-        let owner = target.owner();
-        let (path, id) = if let Some(namespace) = namespace {
-            (
-                imports
-                    .get(namespace)
-                    .map(String::as_str)
-                    .unwrap_or(namespace),
-                match owner {
-                    Some(owner) => FunctionId::method(TypeId::local(owner), target.name()),
-                    None => FunctionId::free(target.name()),
-                },
-            )
-        } else if let Some(owner) = owner {
-            let path = imports.get(owner).map(String::as_str).unwrap_or(owner);
-            if self.resolve_module(consumer, path).is_some() {
-                (path, FunctionId::free(target.name()))
-            } else if let Some((module, item)) = path.rsplit_once("::") {
-                (
-                    module,
-                    FunctionId::method(TypeId::local(item), target.name()),
-                )
-            } else {
-                return None;
-            }
-        } else if let Some(path) = imports.get(target.name()) {
-            let (module, item) = path.rsplit_once("::")?;
-            (module, FunctionId::free(item))
-        } else {
-            return None;
-        };
-        let unit = self.resolve_module(consumer, path)?;
+        let (unit, id) = self.external_target(consumer, target, imports)?;
         if !self.units.is_ready(&unit) {
             return Some(EffectCapabilities {
                 runtime: PANIC.union(LOCK_EFFECT_WAIT),
@@ -509,7 +521,7 @@ fn unknown_external_capabilities(target: &FunctionId) -> EffectCapabilities {
 }
 
 fn default_external(target: &FunctionId) -> RuntimeEffects {
-    if target.owner().is_some() && target.name() == "init" {
+    if target.owner().is_some() && target.name().as_ref() == "init" {
         RuntimeEffects::NONE
     } else {
         PANIC
@@ -740,6 +752,8 @@ pub(crate) fn solve_unit<N>(
         helper_graph.merge(
             id,
             crate::semantic::call_graph::CallSites {
+                unsupported_initialization: Default::default(),
+                virtual_calls: Default::default(),
                 targets,
                 has_unknown: false,
             },
@@ -797,6 +811,8 @@ pub(crate) fn solve_unit<N>(
                 io_graph.to_mut().merge(
                     id,
                     crate::semantic::call_graph::CallSites {
+                        unsupported_initialization: Default::default(),
+                        virtual_calls: Default::default(),
                         targets: std::iter::once(source).collect(),
                         has_unknown: false,
                     },
@@ -1337,6 +1353,8 @@ mod tests {
                 graph.merge(
                     relay,
                     CallSites {
+                        unsupported_initialization: Default::default(),
+                        virtual_calls: Default::default(),
                         targets: [acquire].into(),
                         has_unknown: false,
                     },
@@ -1498,6 +1516,8 @@ mod tests {
             graph.merge(
                 caller,
                 CallSites {
+                    unsupported_initialization: Default::default(),
+                    virtual_calls: Default::default(),
                     targets: [target].into(),
                     has_unknown: false,
                 },

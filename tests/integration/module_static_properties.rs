@@ -17,9 +17,9 @@
 //! The table is now keyed by class through the shared type scope, like every
 //! other class table, so a unit's aliases (its own bare names, its item
 //! imports, its module spellings) reach the declaration's slot. And each module
-//! compiles its own initializers into a private function during its BODY phase,
-//! under its own aliases; `__willow_static_init` calls those in declaration
-//! order before replaying the entry program's items.
+//! compiles its initializer expressions during its BODY phase under its own
+//! aliases. `__willow_static_init` calls and stores the results in build-wide
+//! dependency order (willow-9tls.32), retaining source order when independent.
 //!
 //! 36 perspectives:
 //!   1 a module function bumps its own class's static

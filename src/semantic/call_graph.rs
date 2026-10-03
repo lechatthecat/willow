@@ -317,11 +317,37 @@ pub(crate) fn resolve_dispatch_targets(
     Ok(targets.into_iter().collect())
 }
 
+/// Reasons static initialization cannot prove a body's dependencies.
+/// Kept separate from panic/effect unknowns: runtime callback effects already
+/// have their own summaries, but their Willow callback reads are not bounded here.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum UnsupportedInitialization {
+    IndirectCall,
+    InjectedDefault,
+    RuntimeCallback,
+    UnresolvedCall,
+}
+impl UnsupportedInitialization {
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            Self::IndirectCall => "an indirect call through a function value",
+            Self::InjectedDefault => "an injected interface default method",
+            Self::RuntimeCallback => "a runtime callback API (parallel::map)",
+            Self::UnresolvedCall => "an unresolved callable",
+        }
+    }
+}
+
 /// What one body can reach.
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CallSites {
-    /// Statically resolved targets, including the full virtual-dispatch union.
+    /// Statically resolved targets, including the unit-local virtual-dispatch union.
     pub targets: BTreeSet<FunctionId>,
+    /// Receiver type and method before unit-local virtual expansion.
+    pub virtual_calls: BTreeSet<FunctionId>,
+    pub unsupported_initialization: BTreeSet<UnsupportedInitialization>,
     /// At least one call site in this body has no static target. Fail-closed:
     /// consumers must treat the body as reaching something they cannot see.
     pub has_unknown: bool,
@@ -340,6 +366,9 @@ impl CallGraph {
     pub fn merge(&mut self, id: FunctionId, sites: CallSites) {
         let node = self.nodes.entry(id).or_default();
         node.targets.extend(sites.targets);
+        node.virtual_calls.extend(sites.virtual_calls);
+        node.unsupported_initialization
+            .extend(sites.unsupported_initialization);
         node.has_unknown |= sites.has_unknown;
     }
 
@@ -379,7 +408,7 @@ mod tests {
     //! `init`, 15 a module-qualified free call keeps its namespace, 16 a
     //! module-qualified static call keeps its namespace, 17 a lambda body is not
     //! merged into its definer, 18 an interface-typed receiver is unknown, 19 a
-    //! receiver with no inferable class is unknown, 20 `super.init` is unknown,
+    //! receiver with no inferable class is unknown, 20 `super.init` resolves its base constructor,
     //! 21 multiple constructors union into one node, 22 nested expression slots
     //! are all reached, 23 a static method is not a virtual dispatch target, 24 a
     //! cyclic hierarchy terminates, 25 an unrelated class is not a dispatch
@@ -740,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn p20_super_init_is_unknown() {
+    fn p20_super_init_resolves_base_constructor() {
         let source = "open class Base { init(self) {} }\n\
                       class Derived extends Base { init(self) { super.init(); } }\n\
                       fn main() {}";
@@ -748,7 +777,11 @@ mod tests {
         let node = graph
             .get(&FunctionId::method(TypeId::local("Derived"), "init"))
             .expect("node");
-        assert!(node.has_unknown);
+        assert!(!node.has_unknown);
+        assert_eq!(
+            node.targets,
+            [FunctionId::method(TypeId::local("Base"), "init")].into()
+        );
     }
 
     #[test]
@@ -759,6 +792,8 @@ mod tests {
         graph.merge(
             id,
             CallSites {
+                unsupported_initialization: Default::default(),
+                virtual_calls: Default::default(),
                 targets: [FunctionId::free("first")].into_iter().collect(),
                 has_unknown: false,
             },
@@ -766,6 +801,8 @@ mod tests {
         graph.merge(
             id,
             CallSites {
+                unsupported_initialization: Default::default(),
+                virtual_calls: Default::default(),
                 targets: [FunctionId::free("second")].into_iter().collect(),
                 has_unknown: true,
             },

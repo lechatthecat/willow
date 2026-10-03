@@ -54,13 +54,23 @@ fn canonical_typed_body(body: &TypedBody) -> Result<serde_json::Value> {
     let mut value = super::syntax::semantic(&serde_json::to_value(body)?);
     // These fields use sequence encoding because their map keys are structured.
     // Canonicalize only unordered collections, preserving diagnostic/source order.
-    for name in ["lock_edges", "resolved_calls"] {
+    for name in ["lock_edges", "resolved_calls", "static_reads"] {
         if let Some(entries) = value
             .get_mut(name)
             .and_then(serde_json::Value::as_array_mut)
         {
             for entry in entries {
-                let targets = if name == "lock_edges" {
+                if name == "resolved_calls"
+                    && let Some(calls) = entry
+                        .get_mut(1)
+                        .and_then(|calls| calls.get_mut("virtual_calls"))
+                        .and_then(serde_json::Value::as_array_mut)
+                {
+                    calls.sort_by_cached_key(|value| {
+                        serde_json::to_vec(value).expect("canonical key")
+                    });
+                }
+                let targets = if name != "resolved_calls" {
                     entry.get_mut(1)
                 } else {
                     entry.get_mut(1).and_then(|calls| calls.get_mut("targets"))
@@ -463,17 +473,17 @@ impl BodyQueries {
         };
         let owner_read = match owner {
             BodyOwner::Function(function) => Some(match function.owner_type() {
-                Some(owner) => SymbolRead::Class(owner.name().to_owned()),
-                None => SymbolRead::Function(function.name().to_owned()),
+                Some(owner) => SymbolRead::Class(owner.name().to_string()),
+                None => SymbolRead::Function(function.name().to_string()),
             }),
             BodyOwner::InterfaceDefault(function) => function
                 .owner_type()
-                .map(|owner| SymbolRead::Interface(owner.name().to_owned())),
+                .map(|owner| SymbolRead::Interface(owner.name().to_string())),
             BodyOwner::Constructor { owner, .. } => {
-                Some(SymbolRead::Class(owner.name().to_owned()))
+                Some(SymbolRead::Class(owner.name().to_string()))
             }
             BodyOwner::StaticInitializer(field) => {
-                Some(SymbolRead::Class(field.owner.name().to_owned()))
+                Some(SymbolRead::Class(field.owner.name().to_string()))
             }
             BodyOwner::Lambda { .. } => None,
         };
@@ -661,7 +671,7 @@ impl BodyQueries {
         };
         let mut reads = crate::semantic::symbols::SymbolReadCapture::current();
         if let super::ids::BodyOwner::Constructor { owner, .. } = owner_id {
-            let key = SymbolRead::Class(owner.name().to_owned());
+            let key = SymbolRead::Class(owner.name().to_string());
             if !reads.contains(&key) {
                 reads.push(key);
             }

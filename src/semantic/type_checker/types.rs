@@ -126,7 +126,7 @@ pub(crate) fn range_type() -> Type {
 }
 
 pub(crate) fn is_i64_range_type<N: TypeName>(ty: &Type<N>) -> bool {
-    matches!(ty, Type::Generic(name, args) if name.builtin_name() == "Range" && matches!(args.as_slice(), [Type::I64]))
+    matches!(ty, Type::Generic(name, args) if name.builtin_name().is_some_and(|n| n.as_ref() == "Range") && matches!(args.as_slice(), [Type::I64]))
 }
 
 pub(crate) fn function_call_return_type(info: &FuncInfo) -> Type {

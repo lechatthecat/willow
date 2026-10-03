@@ -477,7 +477,21 @@ impl SyntaxQueries {
             .table
             .read(&self.provider(), QueryNode::EffectInventory(unit))
         {
-            Ok(_) => Ok(true),
+            Ok(inventory) => {
+                // A green inventory can outlive per-function inputs pruned at
+                // finish when nobody queried that function. A new caller in
+                // this revision must still be able to ask for its effects.
+                for (&function, effect) in &inventory.get::<EffectInventoryValue>().functions {
+                    self.capture_input(
+                        InputNode::ComputedEffect(unit, function),
+                        QueryValue::new(
+                            Some(effect.clone()),
+                            ResultFingerprint::bytes(b"computed-effect"),
+                        ),
+                    )?;
+                }
+                Ok(true)
+            }
             Err(error)
                 if error
                     .downcast_ref::<super::tracked::DeferredQuery>()
