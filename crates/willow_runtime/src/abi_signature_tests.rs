@@ -422,3 +422,63 @@ fn survivor_counter_abi() {
     let _: extern "C" fn() -> i64 = gc::willow_gc_survivor_space_live;
     assert_schema("willow_gc_survivor_space_live", &[], Some(I64));
 }
+
+#[test]
+fn abi_handshake_signatures_are_scalar_and_effect_free() {
+    let _: extern "C" fn() -> u64 = crate::willow_runtime_abi_hash;
+    let _: extern "C" fn(u64) = crate::willow_runtime_check_abi;
+    assert_schema("willow_runtime_abi_hash", &[], Some(I64));
+    assert_schema("willow_runtime_check_abi", &[I64], None);
+    for name in ["willow_runtime_abi_hash", "willow_runtime_check_abi"] {
+        assert!(runtime_symbol(name).unwrap().effects.is_empty());
+    }
+}
+
+#[test]
+fn abi_handshake_matching_hash_returns_without_runtime_initialization() {
+    assert_eq!(
+        crate::willow_runtime_abi_hash(),
+        willow_abi::fingerprint::ABI_HASH_64
+    );
+    crate::willow_runtime_check_abi(willow_abi::fingerprint::ABI_HASH_64);
+}
+
+#[test]
+fn abi_handshake_mismatch_exits_with_diagnostic() {
+    const CHILD: &str = "WILLOW_ABI_MISMATCH_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        crate::willow_runtime_check_abi(willow_abi::fingerprint::ABI_HASH_64 ^ 1);
+        panic!("mismatched ABI returned");
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "abi_signature_tests::abi_handshake_mismatch_exits_with_diagnostic",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("Willow compiler/runtime ABI mismatch"),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!(
+            "compiler={:016x}",
+            willow_abi::fingerprint::ABI_HASH_64 ^ 1
+        )),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!(
+            "runtime={:016x}",
+            willow_abi::fingerprint::ABI_HASH_64
+        )),
+        "{error}"
+    );
+    assert!(error.contains("rebuild the program and runtime"), "{error}");
+    assert!(!error.contains("mismatched ABI returned"));
+}

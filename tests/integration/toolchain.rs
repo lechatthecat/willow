@@ -1302,3 +1302,51 @@ async fn main() {
     let _ = fs::remove_file(object_path(&binary));
     remove_output_artifacts(&binary);
 }
+
+#[test]
+fn abi_handshake_has_one_call_for_increasing_function_counts() {
+    for count in [1, 8, 32] {
+        let mut source = String::new();
+        for i in 0..count {
+            source.push_str(&format!(
+                "fn f{i}(x: i64) -> i64 {{ if x > 0 {{ return x; }} return 0; }}\n"
+            ));
+        }
+        source.push_str("fn main() { println(f0(42)); }");
+        let targets = compile_and_collect_relocation_targets_all(&source, &[]);
+        assert_eq!(
+            targets
+                .iter()
+                .filter(|name| *name == "willow_runtime_check_abi")
+                .count(),
+            1,
+            "{count} functions"
+        );
+    }
+}
+
+#[test]
+fn abi_handshake_covers_empty_async_and_static_entry_paths() {
+    for source in [
+        "fn main() {}",
+        "async fn main() { println(42); }",
+        "class C { pub static x: i64 = 42; } fn main() { println(C::x); }",
+    ] {
+        let targets = compile_and_collect_relocation_targets_all(source, &[]);
+        assert_eq!(
+            targets
+                .iter()
+                .filter(|name| *name == "willow_runtime_check_abi")
+                .count(),
+            1
+        );
+        assert!(compile_and_run(source).1);
+    }
+}
+
+#[test]
+fn abi_handshake_example_runs() {
+    let (output, ok) = compile_file_and_run("example/abi_handshake.wi");
+    assert!(ok, "{output}");
+    assert_eq!(output, "42\n");
+}

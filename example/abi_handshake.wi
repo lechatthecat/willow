@@ -1,0 +1,8 @@
+// The generated startup guard checks the runtime ABI before this initializer
+// or main executes. Rebuild the runtime and program together after ABI changes.
+class Config {
+    pub static answer: i64 = 42;
+}
+fn main() {
+    println(Config::answer);
+}

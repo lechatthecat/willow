@@ -97,6 +97,9 @@ macro_rules! runtime_abi_schema {
 /// This is the generated-code-facing ABI surface; runtime-only symbols are
 /// called from within the runtime and are not emitted by the backend.
 pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
+    // Bootstrap calls must remain scalar-only and usable before Willow GC setup.
+    NONE; "willow_runtime_abi_hash" => ([] -> Some(I64));
+    NONE; "willow_runtime_check_abi" => ([I64] -> None);
     // --- print ---
     // Stdout locking, writing and flushing can block the current OS thread.
     // Native formatting allocations do not enter the Willow GC, and I/O

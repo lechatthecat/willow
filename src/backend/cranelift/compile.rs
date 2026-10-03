@@ -1042,8 +1042,8 @@ impl Codegen {
             )?;
 
             // Always declare `__willow_static_init` (willow-qsqf §13.5). The runtime
-            // calls it after `gc_init` and before `willow_user_main`; it is a no-op
-            // when the program has no static properties. Declaring it unconditionally
+            // calls it after `gc_init` and before `willow_user_main`; it checks the ABI
+            // even when the program has no static properties. Declaring it unconditionally
             // keeps the runtime call path uniform regardless of the `main` lowering.
             this.declare_static_init()?;
 
@@ -1936,6 +1936,16 @@ impl Codegen {
         builder.append_block_params_for_function_params(entry);
         builder.switch_to_block(entry);
         builder.seal_block(entry);
+
+        // Before any generated initializer or user main touches runtime objects.
+        // One check per executable, independent of module/function/exit count.
+        let check = self
+            .module
+            .declare_func_in_func(self.func_ids["willow_runtime_check_abi"], builder.func);
+        let expected = builder
+            .ins()
+            .iconst(types::I64, willow_abi::fingerprint::ABI_HASH_64 as i64);
+        builder.ins().call(check, &[expected]);
 
         let mut fg = FuncGen {
             builder: &mut builder,
