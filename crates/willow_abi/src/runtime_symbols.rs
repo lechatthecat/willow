@@ -213,6 +213,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     PANIC_ALLOC; "willow_array_reference_owner" => ([Ptr, I64] -> Some(Ptr));
     // --- maps (std::collections::Map) ---
     ALLOC; "willow_map_new" => ([I64, I64, I64] -> Some(Ptr));
+    ALLOC; "willow_map_new_local" => ([I64, I64, I64] -> Some(Ptr));
     ALLOC; "willow_map_copy" => ([Ptr] -> Some(Ptr));
     // (map, key_word, key_is_ref, val_word, val_is_ref): each generic payload
     // word is followed by its own is-reference flag (willow-9tls.7).

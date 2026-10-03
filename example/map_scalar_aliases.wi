@@ -1,0 +1,54 @@
+// Independent mutexes do not make aliases to one map independent storage.
+import std::collections::Map;
+
+async fn fill(wrapper: Mutex<Map<i64, i64>>, base: i64) {
+    let mut i = 0;
+    while i < 4096 {
+        lock wrapper as values {
+            values.insert(base + i, (base + i) * 3 + 1);
+            values.contains(base + i);
+            values.get(base + i);
+            values.len();
+        }
+        i = i + 1;
+    }
+}
+
+async fn exercise(retain_original: bool) {
+    let values: Map<i64, i64> = Map::new();
+    let left = Mutex::new(values);
+    let right = Mutex::new(values);
+    let first = fill(left, 0);
+    let second = fill(right, 4096);
+    let mut expected = 8192;
+    if retain_original {
+        let mut i = 8192;
+        while i < 12288 {
+            values.insert(i, i * 3 + 1);
+            if i % 256 == 0 {
+                // Copy and display must synchronize with other aliases too.
+                let snapshot = values.freeze();
+                if snapshot.get(i).unwrap() != i * 3 + 1 { println("bad copy"); }
+                values.toString();
+            }
+            i = i + 1;
+        }
+        expected = 12288;
+    }
+    await first;
+    await second;
+    let mut valid = values.len() == expected;
+    let mut key = 0;
+    while key < expected {
+        let found = match values.get(key) { Some(value) => value, None => -1 };
+        if found != key * 3 + 1 { valid = false; }
+        key = key + 1;
+    }
+    println(values.len());
+    println(valid);
+}
+
+async fn main() {
+    await exercise(false); // two mutexes wrapping the same map
+    await exercise(true);  // plus concurrent use of the retained original alias
+}

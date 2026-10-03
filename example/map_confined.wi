@@ -1,0 +1,36 @@
+// These synchronous functions keep every mutable map alias inside the call.
+import std::collections::Map;
+
+fn integers(count: i64) -> i64 {
+    let values: Map<i64, i64> = Map::new();
+    let alias = values;
+    let mut i = 0;
+    while i < count {
+        alias.insert(i, i * 2);
+        i = i + 1;
+    }
+    let snapshot = values.freeze();
+    alias.insert(0, 99);
+    println(values.contains(count)); // false
+    println(values.len()); // 128
+    return snapshot.get(0).unwrap() + values.get(0).unwrap(); // 99
+}
+
+fn floats() -> f64 {
+    let values: Map<f64, f64> = Map::new();
+    values.insert(-0.0, 1.5);
+    values.insert(0.0, 2.5);
+    return values.get(-0.0).unwrap();
+}
+
+fn flags() -> bool {
+    let values: Map<bool, bool> = Map::new();
+    values.insert(false, true);
+    return values.get(false).unwrap();
+}
+
+fn main() {
+    println(integers(128));
+    println(floats());
+    println(flags());
+}

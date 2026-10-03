@@ -1,6 +1,50 @@
 use super::*;
 
 #[test]
+fn test_map_confined_scalar_example() {
+    let source = include_str!("../../../example/map_confined.wi");
+    for run in [
+        compile_and_run,
+        compile_and_run_release,
+        compile_and_run_gc_stress_all,
+    ] {
+        let (out, ok) = run(source);
+        assert!(ok, "{out}");
+        assert_eq!(out, "false\n128\n99\n2.5\ntrue\n");
+    }
+}
+
+#[test]
+fn test_map_scalar_aliases_through_distinct_mutexes_and_original() {
+    let source = include_str!("../../../example/map_scalar_aliases.wi");
+    for workers in ["1", "4"] {
+        let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_WORKERS", workers)]);
+        assert!(ok, "workers={workers}: {out}");
+        assert_eq!(out, "8192\ntrue\n12288\ntrue\n", "workers={workers}");
+    }
+    let (out, ok) = compile_and_run_gc_stress_all(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, "8192\ntrue\n12288\ntrue\n");
+}
+
+#[test]
+fn test_map_scalar_storage_example() {
+    let source = include_str!("../../../example/map_scalar_storage.wi");
+    for run in [
+        compile_and_run,
+        compile_and_run_release,
+        compile_and_run_gc_stress_all,
+    ] {
+        let (out, ok) = run(source);
+        assert!(ok, "{out}");
+        assert_eq!(
+            out,
+            "-9\n42\n0\n-1\n2\n{0: 0, 7: 42}\ntrue\nfalse\n1\n-2.5\n"
+        );
+    }
+}
+
+#[test]
 fn test_map_float_key_semantics_example() {
     let (out, ok) = compile_and_run(include_str!("../../../example/map_float_keys.wi"));
     assert!(ok, "compilation failed");

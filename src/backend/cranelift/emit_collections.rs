@@ -66,6 +66,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.enum_infos,
             )),
         );
-        self.emit_value_runtime_call("willow_map_new", &[key_kind, value_kind, value_is_ref])
+        let constructor = if self.lir_confined_maps {
+            "willow_map_new_local"
+        } else {
+            "willow_map_new"
+        };
+        self.emit_value_runtime_call(constructor, &[key_kind, value_kind, value_is_ref])
     }
 }

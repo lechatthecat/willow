@@ -1,6 +1,7 @@
 //! GC-managed hash map `Map<K, V>`.
 //!
-//! The map stores a `Mutex<MapData>` directly in its non-moving GC payload.
+//! Scalar word maps store a compact, atomically guarded table in their non-moving
+//! payload. Other maps store a `Mutex<MapData>` for concurrent GC tracing.
 //! Two GC hooks keep it correct:
 //!
 //! * a trace function reports reference-typed *values* so they stay alive while
@@ -19,8 +20,11 @@ use crate::gc::{
 use crate::native_memory::{Mutex, MutexGuard};
 use crate::string::willow_string_as_str;
 use std::borrow::Borrow;
+use std::cell::{RefCell, RefMut, UnsafeCell};
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use willow_abi::runtime_type_ids::MAP_TYPE_ID;
 
@@ -41,6 +45,216 @@ struct MapLayout {
     key_kind: i64,
     value_kind: i64,
     value_is_ref: bool,
+}
+
+/// Scalar maps have no GC edges. Their storage nevertheless needs exclusion:
+/// multiple language Mutex values may wrap the same Map, and original aliases
+/// remain valid. The immutable layout/discriminant can be read concurrently.
+struct MapStorage {
+    layout: MapLayout,
+    state: MapState,
+}
+
+enum MapState {
+    Words(ScalarStorage),
+    Traced(Mutex<MapData>),
+}
+
+/// Local storage is selected only by the compiler's whole-function confinement
+/// proof. RefCell checks local alias borrows without atomics or mutual exclusion.
+/// This enum is deliberately NOT Sync; only the shared variant is synchronized.
+enum ScalarStorage {
+    Local(RefCell<WordMap>),
+    Shared(WordStorage),
+}
+impl ScalarStorage {
+    fn access(&self) -> ScalarGuard<'_> {
+        match self {
+            Self::Local(data) => {
+                let no_preempt = crate::preempt::NoPreemptGuard::enter();
+                ScalarGuard::Local(data.borrow_mut(), no_preempt)
+            }
+            Self::Shared(data) => ScalarGuard::Shared(data.lock()),
+        }
+    }
+}
+enum ScalarGuard<'a> {
+    Local(RefMut<'a, WordMap>, crate::preempt::NoPreemptGuard),
+    Shared(WordGuard<'a>),
+}
+impl Deref for ScalarGuard<'_> {
+    type Target = WordMap;
+    fn deref(&self) -> &WordMap {
+        match self {
+            Self::Local(data, _) => data,
+            Self::Shared(data) => data,
+        }
+    }
+}
+impl DerefMut for ScalarGuard<'_> {
+    fn deref_mut(&mut self) -> &mut WordMap {
+        match self {
+            Self::Local(data, _) => data,
+            Self::Shared(data) => data,
+        }
+    }
+}
+
+/// One atomic access gate per shared map, independent of language-level locks.
+/// Uncontended accesses use one acquire CAS and one release swap, without an
+/// OS mutex or allocation. Contenders park on a condition variable. No GC allocation, safepoint, or user code is allowed
+/// while guarded; task preemption is disabled before acquiring the gate.
+#[derive(Default)]
+struct WordStorage {
+    // 0 = free, 1 = held without known waiters, 2 = held with possible waiters.
+    state: AtomicU8,
+    waiters: std::sync::Mutex<()>,
+    wake: std::sync::Condvar,
+    data: UnsafeCell<WordMap>,
+}
+
+// SAFETY: only WordGuard exposes data; its acquire/release gate serializes all
+// reads and writes, including lookup, display and copy. GC skips scalar data.
+unsafe impl Sync for WordStorage {}
+
+impl WordStorage {
+    fn lock(&self) -> WordGuard<'_> {
+        #[cfg(test)]
+        WORD_SHARED_ACQUIRES.with(|count| count.set(count.get() + 1));
+        let no_preempt = crate::preempt::NoPreemptGuard::enter();
+        if self
+            .state
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            self.wait();
+        }
+        WordGuard {
+            storage: self,
+            _no_preempt: no_preempt,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    #[cold]
+    fn wait(&self) {
+        let mut waiter = self.waiters.lock().unwrap();
+        // Keep state=2 when acquiring via this path, so release wakes another
+        // sleeper even if a fresh fast-path caller barged between wakeups.
+        while self.state.swap(2, Ordering::Acquire) != 0 {
+            waiter = self.wake.wait(waiter).unwrap();
+        }
+    }
+
+    #[cold]
+    fn wake_one(&self) {
+        // Pair with the waiter's state check and atomic unlock-and-wait. This
+        // prevents a release notification from racing ahead of the wait.
+        let _waiter = self.waiters.lock().unwrap();
+        self.wake.notify_one();
+    }
+}
+
+struct WordGuard<'a> {
+    storage: &'a WordStorage,
+    _no_preempt: crate::preempt::NoPreemptGuard,
+    // The preemption depth belongs to the acquiring OS thread.
+    _not_send: std::marker::PhantomData<*mut ()>,
+}
+impl Deref for WordGuard<'_> {
+    type Target = WordMap;
+    fn deref(&self) -> &WordMap {
+        unsafe { &*self.storage.data.get() }
+    }
+}
+impl DerefMut for WordGuard<'_> {
+    fn deref_mut(&mut self) -> &mut WordMap {
+        unsafe { &mut *self.storage.data.get() }
+    }
+}
+impl Drop for WordGuard<'_> {
+    fn drop(&mut self) {
+        // Release storage before the NoPreemptGuard field reenables preemption.
+        if self.storage.state.swap(0, Ordering::Release) == 2 {
+            self.storage.wake_one();
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static WORD_HASH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static WORD_SHARED_ACQUIRES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Fixed, non-cryptographic integer mixer. Both the bucket index and SwissTable
+/// fingerprint see mixed bits, including for consecutive/strided integer keys.
+#[derive(Default)]
+struct WordHasher(u64);
+impl Hasher for WordHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write_u64(&mut self, word: u64) {
+        #[cfg(test)]
+        WORD_HASH_CALLS.with(|calls| calls.set(calls.get() + 1));
+        let mut x = word;
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        self.0 = x ^ (x >> 31);
+    }
+    fn write_i64(&mut self, word: i64) {
+        self.write_u64(word as u64);
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        // Only i64 keys use this builder; keep the trait's byte entry point
+        // deterministic as well without any dynamically dispatched key view.
+        for &byte in bytes {
+            self.write_u64(self.0 ^ u64::from(byte));
+        }
+    }
+}
+
+#[derive(Default)]
+struct WordMap {
+    entries: HashMap<i64, i64, BuildHasherDefault<WordHasher>>,
+    charged: usize,
+}
+impl WordMap {
+    fn reconcile(&mut self) {
+        let bytes = crate::native_memory::hash_bytes::<i64, i64>(self.entries.capacity());
+        if bytes > self.charged {
+            crate::gc::charge_external(bytes - self.charged);
+            self.charged = bytes;
+        }
+    }
+}
+impl Drop for WordMap {
+    fn drop(&mut self) {
+        // Release the native storage before releasing its retained-byte charge.
+        drop(std::mem::take(&mut self.entries));
+        crate::gc::release_external(self.charged);
+    }
+}
+
+/// The immutable discriminant/layout may be read by GC concurrently. Access to
+/// Words contents is restricted to mutators holding the storage access gate. No GC allocation/safepoint may occur while contents are borrowed.
+unsafe fn storage<'a>(map: *mut u8) -> &'a MapStorage {
+    unsafe { &*map.cast::<MapStorage>() }
+}
+
+fn word_key(word: i64, kind: i64) -> Option<i64> {
+    if kind != 1 {
+        return Some(word);
+    }
+    // Classify bits without floating-point arithmetic, preserving subnormals
+    // and rejecting both quiet and signaling NaNs. Both zeros become +0.0.
+    let magnitude = (word as u64) & 0x7fff_ffff_ffff_ffff;
+    if magnitude > 0x7ff0_0000_0000_0000 {
+        None
+    } else {
+        Some(if magnitude == 0 { 0 } else { word })
+    }
 }
 
 struct MapData {
@@ -128,21 +342,12 @@ impl<'a> Borrow<dyn KeyView + 'a> for MapKey {
 /// for the returned borrow's lifetime. Do not allocate in the GC while borrowed.
 /// Returns None for NaN; callers must release the map lock before raising.
 unsafe fn key_from_word<'a>(word: i64, key_kind: i64) -> Option<KeyRef<'a>> {
-    match key_kind {
-        3 => Some(KeyRef::Str(unsafe {
+    if key_kind == 3 {
+        Some(KeyRef::Str(unsafe {
             willow_string_as_str(word as *const u8)
-        })),
-        1 => {
-            // Classify bits without floating-point arithmetic, preserving
-            // subnormals and rejecting both quiet and signaling NaNs.
-            let magnitude = (word as u64) & 0x7fff_ffff_ffff_ffff;
-            if magnitude > 0x7ff0_0000_0000_0000 {
-                None
-            } else {
-                Some(KeyRef::Word(if magnitude == 0 { 0 } else { word }))
-            }
-        }
-        _ => Some(KeyRef::Word(word)),
+        }))
+    } else {
+        word_key(word, key_kind).map(KeyRef::Word)
     }
 }
 
@@ -153,13 +358,19 @@ fn raise_nan_key() {
 /// Lock the inline `MapData` at a map payload pointer.
 ///
 /// # Safety
-/// `map` must be a non-null map payload produced by [`willow_map_new`].
+/// `map` must be a non-null, non-scalar map payload produced by [`willow_map_new`].
 unsafe fn map_data<'a>(map: *mut u8) -> MutexGuard<'a, MapData> {
-    unsafe { &*map.cast::<Mutex<MapData>>() }.lock().unwrap()
+    match &unsafe { storage(map) }.state {
+        MapState::Traced(data) => data.lock().unwrap(),
+        MapState::Words(_) => unreachable!("scalar maps have no traced storage"),
+    }
 }
 
 /// Trace hook: report reference-typed values as GC children.
 unsafe fn trace_map(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
+    if matches!(unsafe { storage(payload) }.state, MapState::Words(_)) {
+        return;
+    }
     let mut data = unsafe { map_data(payload) };
     if data.layout.value_is_ref {
         for value in &mut data.values {
@@ -169,6 +380,9 @@ unsafe fn trace_map(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
 }
 
 unsafe fn snapshot_map(payload: *mut u8, children: &mut Vec<*mut u8>) {
+    if matches!(unsafe { storage(payload) }.state, MapState::Words(_)) {
+        return;
+    }
     let data = unsafe { map_data(payload) };
     if data.layout.value_is_ref {
         children.extend(data.values.iter().map(|value| *value as *mut u8));
@@ -182,7 +396,10 @@ unsafe fn snapshot_map_slice(
     children: &mut Vec<*mut u8>,
 ) -> crate::gc::TraceSliceProgress {
     use crate::gc::TraceSliceProgress;
-    let mut data = match unsafe { &*payload.cast::<Mutex<MapData>>() }.try_lock() {
+    let MapState::Traced(mutex) = &unsafe { storage(payload) }.state else {
+        return TraceSliceProgress::Done;
+    };
+    let mut data = match mutex.try_lock() {
         Ok(data) => data,
         Err(std::sync::TryLockError::WouldBlock) => return TraceSliceProgress::Retry,
         Err(std::sync::TryLockError::Poisoned(_)) => panic!("map trace found poisoned storage"),
@@ -208,7 +425,7 @@ unsafe fn snapshot_map_slice(
 
 /// Finalizer hook: release the hash table and owned keys when the map is swept.
 unsafe fn drop_map(payload: *mut u8) {
-    unsafe { std::ptr::drop_in_place(payload.cast::<Mutex<MapData>>()) };
+    unsafe { std::ptr::drop_in_place(payload.cast::<MapStorage>()) };
 }
 
 /// Register the map trace and finalizer. Called on every `willow_map_new`
@@ -232,33 +449,64 @@ fn ensure_registered() {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_map_new(key_kind: i64, value_kind: i64, value_is_ref: i64) -> *mut u8 {
+    map_new(key_kind, value_kind, value_is_ref, false)
+}
+
+/// Compiler-only constructor for a map proven not to escape its synchronous
+/// function.
+///
+/// # Safety
+/// All aliases must remain in that invocation; never share this map
+/// across threads, return it, capture it, or store it in another object.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub unsafe extern "C" fn willow_map_new_local(
+    key_kind: i64,
+    value_kind: i64,
+    value_is_ref: i64,
+) -> *mut u8 {
+    map_new(key_kind, value_kind, value_is_ref, true)
+}
+
+fn map_new(key_kind: i64, value_kind: i64, value_is_ref: i64, confined: bool) -> *mut u8 {
     // Old-generation payloads never move and provide header alignment, which
     // must also satisfy the inline mutex on every supported target.
-    const { assert!(align_of::<Mutex<MapData>>() <= align_of::<crate::gc::GcHeader>()) };
+    const { assert!(align_of::<MapStorage>() <= align_of::<crate::gc::GcHeader>()) };
     ensure_registered();
     let map = willow_alloc_with_layout(
         GcObjectKind::Map,
         MAP_TYPE_ID,
-        size_of::<Mutex<MapData>>() as i64,
+        size_of::<MapStorage>() as i64,
         0,
     );
     if map.is_null() {
         return std::ptr::null_mut();
     }
-    // No GC allocation occurs between reserving the payload and initializing it.
-    unsafe {
-        map.cast::<Mutex<MapData>>().write(Mutex::new(MapData {
-            layout: MapLayout {
-                key_kind,
-                value_kind,
-                value_is_ref: value_is_ref != 0,
-            },
+    let layout = MapLayout {
+        key_kind,
+        value_kind,
+        value_is_ref: value_is_ref != 0,
+    };
+    let state = if key_kind != 3 && !layout.value_is_ref {
+        MapState::Words(if confined {
+            ScalarStorage::Local(RefCell::new(WordMap::default()))
+        } else {
+            ScalarStorage::Shared(WordStorage::default())
+        })
+    } else {
+        MapState::Traced(Mutex::new(MapData {
+            layout,
             entries: HashMap::new(),
             values: Vec::new(),
             scan_limit: 0,
             key_bytes: 0,
-        }));
+        }))
+    };
+    // No GC allocation occurs between reserving the payload and initializing it.
+    unsafe {
+        map.cast::<MapStorage>().write(MapStorage { layout, state });
     }
+
     map
 }
 
@@ -274,6 +522,19 @@ pub extern "C" fn willow_map_insert(
     val_is_ref: i64,
 ) {
     if map.is_null() {
+        return;
+    }
+    let storage = unsafe { storage(map) };
+    if let MapState::Words(words) = &storage.state {
+        debug_assert_eq!(key_is_ref, 0);
+        debug_assert_eq!(val_is_ref, 0);
+        let Some(key) = word_key(key_word, storage.layout.key_kind) else {
+            raise_nan_key();
+            return;
+        };
+        let mut words = words.access();
+        words.entries.insert(key, val_word);
+        words.reconcile();
         return;
     }
     let mut data = unsafe { map_data(map) };
@@ -351,6 +612,21 @@ pub extern "C" fn willow_map_get(
             alloc_none()
         };
     }
+    let storage = unsafe { storage(map) };
+    if let MapState::Words(words) = &storage.state {
+        debug_assert_eq!(key_is_ref, 0);
+        let Some(key) = word_key(key_word, storage.layout.key_kind) else {
+            raise_nan_key();
+            return std::ptr::null_mut();
+        };
+        let value = words.access().entries.get(&key).copied();
+        return match value {
+            Some(value) if use_niche != 0 => value as *mut u8,
+            Some(value) => alloc_some(value, false),
+            None if use_niche != 0 => std::ptr::null_mut(),
+            None => alloc_none(),
+        };
+    }
     let data = unsafe { map_data(map) };
     debug_assert_eq!(data.layout.key_kind == 3, key_is_ref != 0);
     let Some(key) = (unsafe { key_from_word(key_word, data.layout.key_kind) }) else {
@@ -386,6 +662,21 @@ pub extern "C" fn willow_map_get_into(
     if map.is_null() {
         return 1;
     }
+    let storage = unsafe { storage(map) };
+    if let MapState::Words(words) = &storage.state {
+        debug_assert_eq!(key_is_ref, 0);
+        let Some(key) = word_key(key_word, storage.layout.key_kind) else {
+            raise_nan_key();
+            return 1;
+        };
+        return match words.access().entries.get(&key) {
+            Some(&value) => {
+                unsafe { out_payload.write(value) };
+                0
+            }
+            None => 1,
+        };
+    }
     let data = unsafe { map_data(map) };
     debug_assert_eq!(data.layout.key_kind == 3, key_is_ref != 0);
     let Some(key) = (unsafe { key_from_word(key_word, data.layout.key_kind) }) else {
@@ -413,7 +704,7 @@ pub extern "C" fn willow_map_copy(map: *mut u8) -> *mut u8 {
     if map.is_null() {
         return willow_map_new(0, 0, 0);
     }
-    let layout = unsafe { map_data(map) }.layout;
+    let layout = unsafe { storage(map) }.layout;
     // Allocate the destination BEFORE reading any value word out of the source
     // (willow-9tls.8). `willow_map_new` can collect, and a moving minor
     // collection evacuates young values reachable only through the rooted
@@ -430,6 +721,16 @@ pub extern "C" fn willow_map_copy(map: *mut u8) -> *mut u8 {
     );
     if copy.is_null() {
         return std::ptr::null_mut();
+    }
+    if let MapState::Words(source) = &unsafe { storage(map) }.state {
+        let MapState::Words(destination) = &unsafe { storage(copy) }.state else {
+            unreachable!()
+        };
+        let entries = source.access().entries.clone();
+        let mut dst = destination.access();
+        dst.entries = entries;
+        dst.reconcile();
+        return copy;
     }
     let src = unsafe { map_data(map) };
     let mut dst = unsafe { map_data(copy) };
@@ -463,7 +764,10 @@ pub extern "C" fn willow_map_len(map: *mut u8) -> i64 {
     if map.is_null() {
         return 0;
     }
-    unsafe { map_data(map) }.entries.len() as i64
+    match &unsafe { storage(map) }.state {
+        MapState::Words(words) => words.access().entries.len() as i64,
+        MapState::Traced(_) => unsafe { map_data(map) }.entries.len() as i64,
+    }
 }
 
 /// Whether `key` is present (1) or not (0).
@@ -472,6 +776,15 @@ pub extern "C" fn willow_map_len(map: *mut u8) -> i64 {
 pub extern "C" fn willow_map_contains(map: *mut u8, key_word: i64, key_is_ref: i64) -> i64 {
     if map.is_null() {
         return 0;
+    }
+    let storage = unsafe { storage(map) };
+    if let MapState::Words(words) = &storage.state {
+        debug_assert_eq!(key_is_ref, 0);
+        let Some(key) = word_key(key_word, storage.layout.key_kind) else {
+            raise_nan_key();
+            return 0;
+        };
+        return i64::from(words.access().entries.contains_key(&key));
     }
     let data = unsafe { map_data(map) };
     debug_assert_eq!(data.layout.key_kind == 3, key_is_ref != 0);
@@ -515,11 +828,18 @@ pub extern "C" fn willow_map_to_string(map: *mut u8) -> *mut u8 {
     let (key_kind, val_kind) = if map.is_null() {
         (0, 0)
     } else {
-        let layout = unsafe { map_data(map) }.layout;
+        let layout = unsafe { storage(map) }.layout;
         (layout.key_kind, layout.value_kind)
     };
     let mut entries: Vec<(String, i64)> = if map.is_null() {
         Vec::new()
+    } else if let MapState::Words(words) = &unsafe { storage(map) }.state {
+        words
+            .access()
+            .entries
+            .iter()
+            .map(|(&key, &value)| (crate::array::element_word_to_string(key, key_kind), value))
+            .collect()
     } else {
         let data = unsafe { map_data(map) };
         data.entries
@@ -550,6 +870,256 @@ pub extern "C" fn willow_map_to_string(map: *mut u8) -> *mut u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confined_scalar_accesses_never_acquire_mutual_exclusion() {
+        let _guard = crate::gc::runtime_test_guard();
+        for count in [16, 128, 1024, 8192] {
+            crate::gc::willow_gc_init();
+            let mut map = unsafe { willow_map_new_local(0, 0, 0) };
+            crate::gc::willow_push_root(&mut map);
+            assert!(matches!(
+                &unsafe { storage(map) }.state,
+                MapState::Words(ScalarStorage::Local(_))
+            ));
+            WORD_SHARED_ACQUIRES.with(|count| count.set(0));
+            for key in 0..count {
+                willow_map_insert(map, key, 0, !key, 0);
+                let mut payload = 0;
+                assert_eq!(willow_map_get_into(map, key, 0, &mut payload), 0);
+                assert_eq!(payload, !key);
+                assert_eq!(willow_map_get_into(map, key + count, 0, &mut payload), 1);
+                assert_eq!(willow_map_contains(map, key, 0), 1);
+                assert_eq!(willow_map_len(map), key + 1);
+            }
+            assert_eq!(WORD_SHARED_ACQUIRES.with(|count| count.get()), 0);
+            eprintln!(
+                "confined operations={} mutual_exclusion_acquisitions=0",
+                count * 5
+            );
+            let mut copy = willow_map_copy(map);
+            crate::gc::willow_push_root(&mut copy);
+            assert!(matches!(
+                &unsafe { storage(copy) }.state,
+                MapState::Words(ScalarStorage::Shared(_))
+            ));
+            assert_eq!(willow_map_len(copy), count);
+            crate::gc::willow_pop_roots(2);
+            crate::gc::willow_gc_collect();
+        }
+    }
+
+    #[test]
+    fn scalar_storage_uncontended_access_does_not_take_the_parking_mutex() {
+        let storage = WordStorage::default();
+        // Holding the slow-path mutex must not prevent fast acquire/release.
+        // There are no contenders, so neither path should touch this mutex.
+        let _parking = storage.waiters.lock().unwrap();
+        for _ in 0..32 {
+            let access = storage.lock();
+            assert!(access.entries.is_empty());
+            assert_eq!(storage.state.load(Ordering::Relaxed), 1);
+            drop(access);
+            assert_eq!(storage.state.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn scalar_storage_gate_serializes_retained_aliases_and_releases_on_unwind() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::willow_gc_init();
+        let storage = WordStorage::default();
+        storage.lock().entries.insert(0, 0);
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let storage = &storage;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..1024 {
+                        let mut data = storage.lock();
+                        let previous = data.entries[&0];
+                        // Widen overlap: without the shared storage gate these
+                        // distinct aliases would race in the read/modify/write.
+                        std::thread::yield_now();
+                        data.entries.insert(0, previous + 1);
+                    }
+                });
+            }
+        });
+        assert_eq!(storage.lock().entries[&0], 4096);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _access = storage.lock();
+                panic!("release the storage gate on unwind");
+            }))
+            .is_err()
+        );
+        assert_eq!(storage.state.load(Ordering::Relaxed), 0);
+        assert_eq!(storage.lock().entries[&0], 4096);
+    }
+
+    #[test]
+    fn scalar_map_aliases_share_one_gate_across_all_accessors() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::willow_gc_init();
+        let mut map = willow_map_new(0, 0, 0);
+        crate::gc::willow_push_root(&mut map);
+        let address = map as usize;
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for writer in 0..4 {
+                let start = &start;
+                scope.spawn(move || {
+                    // Raw aliases model independent wrappers and an original
+                    // map alias. No external lock protects these operations.
+                    let map = address as *mut u8;
+                    start.wait();
+                    for i in 0..4096 {
+                        let key = writer * 4096 + i;
+                        willow_map_insert(map, key, 0, !key, 0);
+                        let mut value = 0;
+                        assert_eq!(willow_map_get_into(map, key, 0, &mut value), 0);
+                        assert_eq!(value, !key);
+                        assert_eq!(willow_map_contains(map, key, 0), 1);
+                        assert!(willow_map_len(map) > i);
+                    }
+                });
+            }
+        });
+        assert_eq!(willow_map_len(map), 16384);
+        for key in 0..16384 {
+            let mut value = 0;
+            assert_eq!(willow_map_get_into(map, key, 0, &mut value), 0);
+            assert_eq!(value, !key);
+        }
+        crate::gc::willow_pop_root();
+        crate::gc::willow_gc_collect();
+    }
+
+    #[test]
+    fn scalar_map_hash_work_and_lookup_allocations_scale_linearly() {
+        use crate::scheduler::scaling_measurements::counting_allocator as counter;
+        let _guard = crate::gc::runtime_test_guard();
+        for count in [16_i64, 128, 1024, 8192] {
+            for stride in [1_i64, 2654435761, 1 << 32, -1] {
+                crate::gc::willow_gc_init();
+                let baseline = crate::gc_telemetry::external_bytes();
+                let mut map = willow_map_new(0, 0, 0);
+                crate::gc::willow_push_root(&mut map);
+                WORD_HASH_CALLS.with(|calls| calls.set(0));
+                for i in 0..count {
+                    willow_map_insert(map, i.wrapping_mul(stride), 0, i, 0);
+                }
+                let insert_hashes = WORD_HASH_CALLS.with(|calls| calls.get());
+                // Geometric table growth rehashes old keys, but total hashes
+                // remain linear; this bound includes every growth in the loop.
+                assert!(insert_hashes <= 4 * count as usize);
+                let allocated = counter::thread_allocations();
+                let gc_bytes = crate::gc::willow_gc_allocated_bytes();
+                let retained = crate::gc_telemetry::external_bytes();
+                WORD_HASH_CALLS.with(|calls| calls.set(0));
+                for i in 0..count {
+                    let key = i.wrapping_mul(stride);
+                    let mut payload = -1;
+                    assert_eq!(willow_map_get_into(map, key, 0, &mut payload), 0);
+                    assert_eq!(payload, i);
+                    assert_eq!(willow_map_contains(map, key, 0), 1);
+                    assert_eq!(
+                        willow_map_get_into(map, (i + count).wrapping_mul(stride), 0, &mut payload),
+                        1
+                    );
+                    assert_eq!(payload, 0);
+                    willow_map_insert(map, key, 0, !i, 0);
+                }
+                assert_eq!(
+                    WORD_HASH_CALLS.with(|calls| calls.get()),
+                    4 * count as usize
+                );
+                assert_eq!(counter::thread_allocations(), allocated);
+                assert_eq!(crate::gc::willow_gc_allocated_bytes(), gc_bytes);
+                assert_eq!(crate::gc_telemetry::external_bytes(), retained);
+                assert_eq!(willow_map_len(map), count);
+                eprintln!(
+                    "scalar count={count} stride={stride} insert_hashes={insert_hashes} lookup_update_hashes={} allocations=0",
+                    4 * count
+                );
+                crate::gc::willow_pop_root();
+                crate::gc::willow_gc_collect();
+                assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_gc_hooks_do_not_borrow_mutating_storage() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::willow_gc_init();
+        let mut map = willow_map_new(0, 0, 0);
+        crate::gc::willow_push_root(&mut map);
+        let address = map as usize;
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let map = address as *mut u8;
+                let mut slots = Vec::new();
+                let mut children = Vec::new();
+                for _ in 0..8192 {
+                    // Exercise all hooks while the mutator may resize its table.
+                    unsafe {
+                        trace_map(map, &mut slots);
+                        snapshot_map(map, &mut children);
+                        assert!(matches!(
+                            snapshot_map_slice(map, 0, 1, &mut children),
+                            crate::gc::TraceSliceProgress::Done
+                        ));
+                    }
+                }
+                assert!(slots.is_empty());
+                assert!(children.is_empty());
+            });
+            for key in 0..8192 {
+                willow_map_insert(map, key, 0, key, 0);
+            }
+        });
+        crate::gc::willow_pop_root();
+        crate::gc::willow_gc_collect();
+    }
+
+    #[test]
+    fn scalar_frozen_copy_supports_parallel_reads_and_independent_updates() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::willow_gc_init();
+        let baseline = crate::gc_telemetry::external_bytes();
+        let mut map = willow_map_new(0, 0, 0);
+        crate::gc::willow_push_root(&mut map);
+        for key in 0..1024 {
+            willow_map_insert(map, key, 0, !key, 0);
+        }
+        let mut copy = willow_map_copy(map);
+        crate::gc::willow_push_root(&mut copy);
+        willow_map_insert(map, 0, 0, 42, 0);
+        let address = copy as usize;
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(move || {
+                    let map = address as *mut u8;
+                    for key in 0..1024 {
+                        let mut payload = 0;
+                        assert_eq!(willow_map_get_into(map, key, 0, &mut payload), 0);
+                        assert_eq!(payload, !key);
+                    }
+                });
+            }
+        });
+        crate::gc::willow_gc_collect();
+        let mut payload = 0;
+        assert_eq!(willow_map_get_into(copy, 0, 0, &mut payload), 0);
+        assert_eq!(payload, -1);
+        crate::gc::willow_pop_roots(2);
+        crate::gc::willow_gc_collect();
+        assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
+    }
 
     #[test]
     fn concurrent_slice_retries_a_busy_map_without_waiting_or_partial_children() {
@@ -608,10 +1178,10 @@ mod tests {
             for slot in &mut maps {
                 *slot = willow_map_new(3, 3, 1);
                 assert!(!slot.is_null());
-                assert!((*slot as usize).is_multiple_of(align_of::<Mutex<MapData>>()));
+                assert!((*slot as usize).is_multiple_of(align_of::<MapStorage>()));
                 willow_push_root(slot);
             }
-            let payload_bytes = size_of::<Mutex<MapData>>();
+            let payload_bytes = size_of::<MapStorage>();
             assert_eq!(
                 willow_gc_allocated_bytes() as usize,
                 count * (GC_HEADER_SIZE + payload_bytes)
@@ -758,7 +1328,7 @@ mod tests {
         let copy = willow_map_copy(map);
         let text = willow_map_to_string(copy);
         assert_eq!(unsafe { willow_string_as_str(text) }, "{1.5: true}");
-        let layout = unsafe { map_data(copy) }.layout;
+        let layout = unsafe { storage(copy) }.layout;
         assert_eq!(
             (layout.key_kind, layout.value_kind, layout.value_is_ref),
             (1, 2, false)

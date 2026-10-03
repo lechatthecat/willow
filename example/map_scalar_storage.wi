@@ -1,0 +1,32 @@
+// Scalar maps use compact storage; freeze creates an independent snapshot.
+import std::collections::Map;
+
+async fn read_snapshot(values: FrozenMap<i64, i64>) -> i64 {
+    return values.get(7).unwrap();
+}
+
+async fn main() {
+    let values: Map<i64, i64> = Map::new();
+    values.insert(7, -9);
+    values.insert(0, 0);
+    let snapshot = values.freeze();
+    values.insert(7, 42);
+    println(await read_snapshot(snapshot)); // -9
+    println(values.get(7).unwrap()); // 42
+    println(values.get(0).unwrap()); // 0
+    println(match values.get(99) { Some(value) => value, None => -1 }); // -1
+    println(values.len()); // 2
+    println(values.toString()); // {0: 0, 7: 42}
+
+    let flags: Map<bool, bool> = Map::new();
+    flags.insert(false, true);
+    flags.insert(true, false);
+    println(flags.freeze().get(false).unwrap()); // true
+    println(flags.get(true).unwrap()); // false
+
+    let floats: Map<f64, f64> = Map::new();
+    floats.insert(-0.0, 1.5);
+    floats.insert(0.0, -2.5);
+    println(floats.len()); // 1
+    println(floats.freeze().get(-0.0).unwrap()); // -2.5
+}

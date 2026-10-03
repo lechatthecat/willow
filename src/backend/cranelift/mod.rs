@@ -68,6 +68,7 @@ mod flat_objects;
 mod flat_references;
 mod gc_codegen;
 mod lir_gen;
+mod local_maps;
 mod option_repr;
 mod panic_effect;
 mod root_effect;
@@ -1504,6 +1505,7 @@ struct FuncGen<'a, 'b> {
     /// LIR-owned async frame slots. This is the identity map used by the LIR
     /// poll emitter; source spans remain available only for diagnostics.
     lir_frame_offsets: HashMap<crate::ir::lowered::LirLocalId, i32>,
+    lir_confined_maps: bool,
     lir_defer_offsets: HashMap<crate::ir::lowered::LirDeferId, i32>,
     lir_send_offsets: HashMap<crate::ir::lowered::LirLocalId, i32>,
     /// When compiling `fn main() -> Result<void, E>`: the error payload type `E`.
