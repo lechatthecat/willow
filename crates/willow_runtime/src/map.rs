@@ -369,6 +369,41 @@ pub extern "C" fn willow_map_get(
     }
 }
 
+/// Look up a word without allocating an Option wrapper. Returns the Option tag
+/// (zero for Some, one for None) and writes its payload to caller-owned storage.
+///
+/// `out_payload` must be valid, aligned writable storage for one `i64` for the
+/// duration of this call. Missing keys and rejected NaN keys leave it zeroed.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_map_get_into(
+    map: *mut u8,
+    key_word: i64,
+    key_is_ref: i64,
+    out_payload: *mut i64,
+) -> i64 {
+    unsafe { out_payload.write(0) };
+    if map.is_null() {
+        return 1;
+    }
+    let data = unsafe { map_data(map) };
+    debug_assert_eq!(data.layout.key_kind == 3, key_is_ref != 0);
+    let Some(key) = (unsafe { key_from_word(key_word, data.layout.key_kind) }) else {
+        drop(data);
+        raise_nan_key();
+        return 1;
+    };
+    let value = data.get(&key);
+    drop(data);
+    match value {
+        Some(value) => {
+            unsafe { out_payload.write(value) };
+            0
+        }
+        None => 1,
+    }
+}
+
 /// Allocate an independent copy of `map` (same entries + value ref-ness). Backs
 /// `Map<K,V>::freeze()` -> `FrozenMap<K,V>` (willow-dgwo.10): the copy shares no
 /// `MapData` with the original, so it is safe to treat as immutable / Sync.
@@ -617,6 +652,41 @@ mod tests {
     }
 
     #[test]
+    fn map_get_into_preserves_payload_bits_without_allocating_wrappers() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        for kind in [0, 1, 2] {
+            let mut map = willow_map_new(0, kind, 0);
+            willow_push_root(&mut map);
+            let words = [0, 1, -1, i64::MIN, i64::MAX, f64::NAN.to_bits() as i64];
+            for (key, word) in words.iter().enumerate() {
+                willow_map_insert(map, key as i64, 0, *word, 0);
+            }
+            let bytes = crate::gc::willow_gc_allocated_bytes();
+            for count in [1, 16, 128] {
+                for _ in 0..count {
+                    for (key, word) in words.iter().enumerate() {
+                        let mut payload = 123;
+                        assert_eq!(willow_map_get_into(map, key as i64, 0, &mut payload), 0);
+                        assert_eq!(payload, *word);
+                    }
+                    let mut payload = 123;
+                    assert_eq!(willow_map_get_into(map, 999, 0, &mut payload), 1);
+                    assert_eq!(payload, 0);
+                }
+                assert_eq!(crate::gc::willow_gc_allocated_bytes(), bytes);
+            }
+            willow_pop_roots(1);
+        }
+        let mut payload = 123;
+        assert_eq!(
+            willow_map_get_into(std::ptr::null_mut(), 0, 0, &mut payload),
+            1
+        );
+        assert_eq!(payload, 0);
+    }
+
+    #[test]
     fn map_unit_03_insert_overwrites() {
         let _guard = runtime_test_guard();
         willow_gc_init();
@@ -812,11 +882,16 @@ mod tests {
             0x7fff_ffff_ffff_ffff,
         ] {
             for sign in [0, 1u64 << 63] {
-                for operation in 0..4 {
+                for operation in 0..5 {
                     let word = (bits | sign) as i64;
                     match operation {
                         0 => willow_map_insert(map, word, 0, 99, 0),
                         1 => assert_eq!(willow_map_contains(map, word, 0), 0),
+                        4 => {
+                            let mut payload = 123;
+                            assert_eq!(willow_map_get_into(map, word, 0, &mut payload), 1);
+                            assert_eq!(payload, 0);
+                        }
                         _ => assert!(willow_map_get(map, word, 0, operation - 2).is_null()),
                     }
                     assert_eq!(willow_panic_depth(), 1);

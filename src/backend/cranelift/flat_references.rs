@@ -42,10 +42,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let mut values = Vec::with_capacity(args.len());
         for argument in args {
             let value = self.emit_lir_operand(function, argument);
-            // A callee can pop this element through another handle alias, then
-            // assign through the still-valid reference. The buffer trace only
-            // covers its live prefix, so root this borrowed slot for the call.
-            // Its owner was pinned above, keeping the slot address stable.
+            // Pair buffers retain each initialized box as stable slot storage,
+            // including across pop/reuse while later arguments execute. The
+            // captured owner keeps it traced until this point. Pin the box for
+            // the call as well, keeping its raw scalar address stable.
+            if let LirOperand::Reference {
+                place: LirPlace::ArrayElement { element, .. },
+                ..
+            } = argument
+                && super::option_repr::is_scalar_pair(element)
+            {
+                self.emit_push_root(value);
+            }
             if let LirOperand::Reference {
                 place: LirPlace::ArrayElement { element, .. },
                 ..
@@ -112,12 +120,30 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let owner = self.load_lir_local(function, *object);
                 self.builder.ins().iadd_imm_s(owner, offset)
             }
-            LirPlace::ArrayElement { owner, index, .. } => {
+            LirPlace::ArrayElement {
+                owner,
+                index,
+                element,
+                ..
+            } => {
                 let owner = self.load_lir_local(function, *owner);
                 let index = self.load_lir_local(function, *index);
                 let offset = self.builder.ins().imul_imm_s(index, 8);
                 let base = self.builder.ins().iadd_imm_s(owner, 8);
-                self.builder.ins().iadd(base, offset)
+                let address = self.builder.ins().iadd(base, offset);
+                if super::option_repr::is_scalar_pair(element) {
+                    // Pop clears the pair's bits, not this pointer; no-growth
+                    // push overwrites the same box. Capturing buffer + index
+                    // therefore preserves identity throughout argument evaluation.
+                    self.builder.ins().load(
+                        reference_type(self.module.target_config()),
+                        MemFlagsData::new(),
+                        address,
+                        0,
+                    )
+                } else {
+                    address
+                }
             }
         }
     }

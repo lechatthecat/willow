@@ -7,7 +7,7 @@
 use crate::schema::RuntimeAbiSchema;
 use crate::*;
 
-pub const CONTRACT_REVISION: u64 = 1;
+pub const CONTRACT_REVISION: u64 = 2;
 
 /// All currently supported executable targets use 64-bit pointers.
 pub const ABI_HASH_64: u64 = abi_hash(&RUNTIME_ABI, 8, CONTRACT_CONSTANTS);

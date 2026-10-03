@@ -4,6 +4,21 @@ use cranelift_module::Module;
 use super::*;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
+    /// Read an enum payload at its full representation width.
+    pub(super) fn emit_enum_payload_bits(
+        &mut self,
+        value: cranelift_codegen::ir::Value,
+        payload_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        if super::option_repr::is_scalar_pair(payload_ty) {
+            self.builder
+                .ins()
+                .load(types::I128, MemFlagsData::new(), value, 8i32)
+        } else {
+            self.emit_enum_payload_word(value)
+        }
+    }
+
     pub(super) fn emit_option_is_some(
         &mut self,
         ptr: cranelift_codegen::ir::Value,
@@ -13,10 +28,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if option_repr(&option_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
             return self.builder.ins().icmp_imm_u(IntCC::NotEqual, ptr, 0);
         }
-        let tag = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
+        let tag = self.emit_load_enum_tag(ptr);
         let some = self.builder.ins().iconst(types::I64, 0);
         self.builder.ins().icmp(IntCC::Equal, tag, some)
     }
@@ -31,9 +43,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         {
             ptr
         } else {
-            self.builder
-                .ins()
-                .load(types::I64, MemFlagsData::new(), ptr, 8i32)
+            self.emit_enum_payload_bits(ptr, inner_ty)
         };
         self.coerce_i64_to(raw, inner_ty)
     }
@@ -105,10 +115,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         msg: cranelift_codegen::ir::Value,
         span: Option<crate::diagnostics::Span>,
     ) -> cranelift_codegen::ir::Value {
-        let tag = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
+        let tag = self.emit_load_enum_tag(ptr);
         let expected = self.builder.ins().iconst(types::I64, success_tag);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, expected);
 
@@ -126,10 +133,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.seal_block(ok_block);
         self.terminated = false;
         let clif_ty = clif_type(reference_type(self.module.target_config()), payload_ty);
-        let raw = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
+        let raw = self.emit_enum_payload_bits(ptr, payload_ty);
         if clif_ty == types::F64 {
             self.builder
                 .ins()
@@ -151,10 +155,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let clif_ty = clif_type(reference_type(self.module.target_config()), payload_ty);
         let result_var = self.builder.declare_var(clif_ty);
-        let tag = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
+        let tag = self.emit_load_enum_tag(ptr);
         let expected = self.builder.ins().iconst(types::I64, success_tag);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, expected);
 
@@ -168,10 +169,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
-        let raw = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
+        let raw = self.emit_enum_payload_bits(ptr, payload_ty);
         let payload = if clif_ty == types::F64 {
             self.builder
                 .ins()
@@ -245,7 +243,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         let ptr_type = reference_type(self.module.target_config());
-        let result_var = self.builder.declare_var(ptr_type);
+        let output_ty = Type::Generic("Option".to_string().into(), vec![ret_ty.clone()]);
+        let result_var = self.builder.declare_var(clif_type(ptr_type, &output_ty));
         let is_some = self.emit_option_is_some(ptr, inner_ty);
 
         let some_block = self.builder.create_block();
@@ -283,7 +282,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         let ptr_type = reference_type(self.module.target_config());
-        let result_var = self.builder.declare_var(ptr_type);
+        let output_ty = match f_ty {
+            Type::Fn(_, ret) => (**ret).clone(),
+            _ => unreachable!("combinator callback must be a function"),
+        };
+        let result_var = self.builder.declare_var(clif_type(ptr_type, &output_ty));
         let is_some = self.emit_option_is_some(ptr, inner_ty);
         let output_inner = match f_ty {
             Type::Fn(_, ret) => option_inner(ret).cloned().unwrap_or(Type::Void),
@@ -324,7 +327,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         let ptr_type = reference_type(self.module.target_config());
-        let result_var = self.builder.declare_var(ptr_type);
+        let output_ty = Type::Generic("Option".to_string().into(), vec![inner_ty.clone()]);
+        let result_var = self.builder.declare_var(clif_type(ptr_type, &output_ty));
         let is_some = self.emit_option_is_some(ptr, inner_ty);
 
         let some_block = self.builder.create_block();
@@ -361,11 +365,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         let ptr_type = reference_type(self.module.target_config());
-        let result_var = self.builder.declare_var(ptr_type);
-        let tag = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
+        let output_ty = Type::Generic(
+            "Result".to_string().into(),
+            vec![ret_ty.clone(), err_ty.clone()],
+        );
+        let result_var = self.builder.declare_var(clif_type(ptr_type, &output_ty));
+        let tag = self.emit_load_enum_tag(ptr);
         let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
 
@@ -378,23 +383,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
-        let raw = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
+        let raw = self.emit_enum_payload_bits(ptr, ok_ty);
         let payload = self.coerce_i64_to(raw, ok_ty);
         let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
-        let new_ok = self.emit_alloc_enum_variant(0, ret_ty, result);
+        let new_ok = self.emit_alloc_result_variant(&output_ty, 0, ret_ty, result);
         self.builder.def_var(result_var, new_ok);
         self.builder.ins().jump(merge, &[]);
 
         self.builder.switch_to_block(err_block);
         self.builder.seal_block(err_block);
-        let err_raw = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
-        let new_err = self.emit_alloc_enum_variant_raw(1, err_ty, err_raw);
+        let err_raw = self.emit_enum_payload_bits(ptr, err_ty);
+        let payload = self.coerce_i64_to(err_raw, err_ty);
+        let new_err = self.emit_alloc_result_variant(&output_ty, 1, err_ty, payload);
         self.builder.def_var(result_var, new_err);
         self.builder.ins().jump(merge, &[]);
 
@@ -414,11 +414,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         let ptr_type = reference_type(self.module.target_config());
-        let result_var = self.builder.declare_var(ptr_type);
-        let tag = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
+        let output_ty = Type::Generic(
+            "Result".to_string().into(),
+            vec![ok_ty.clone(), ret_ty.clone()],
+        );
+        let result_var = self.builder.declare_var(clif_type(ptr_type, &output_ty));
+        let tag = self.emit_load_enum_tag(ptr);
         let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
 
@@ -431,23 +432,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
-        let ok_raw = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
-        let new_ok = self.emit_alloc_enum_variant_raw(0, ok_ty, ok_raw);
+        let ok_raw = self.emit_enum_payload_bits(ptr, ok_ty);
+        let payload = self.coerce_i64_to(ok_raw, ok_ty);
+        let new_ok = self.emit_alloc_result_variant(&output_ty, 0, ok_ty, payload);
         self.builder.def_var(result_var, new_ok);
         self.builder.ins().jump(merge, &[]);
 
         self.builder.switch_to_block(err_block);
         self.builder.seal_block(err_block);
-        let raw = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
+        let raw = self.emit_enum_payload_bits(ptr, err_ty);
         let payload = self.coerce_i64_to(raw, err_ty);
         let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
-        let new_err = self.emit_alloc_enum_variant(1, ret_ty, result);
+        let new_err = self.emit_alloc_result_variant(&output_ty, 1, ret_ty, result);
         self.builder.def_var(result_var, new_err);
         self.builder.ins().jump(merge, &[]);
 
@@ -461,15 +457,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         ptr: cranelift_codegen::ir::Value,
         ok_ty: &Type,
+        err_ty: &Type,
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         let ptr_type = reference_type(self.module.target_config());
-        let result_var = self.builder.declare_var(ptr_type);
-        let tag = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
+        let output_ty = match f_ty {
+            Type::Fn(_, ret) => (**ret).clone(),
+            _ => unreachable!("combinator callback must be a function"),
+        };
+        let result_var = self.builder.declare_var(clif_type(ptr_type, &output_ty));
+        let tag = self.emit_load_enum_tag(ptr);
         let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
 
@@ -482,10 +480,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
-        let raw = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
+        let raw = self.emit_enum_payload_bits(ptr, ok_ty);
         let payload = self.coerce_i64_to(raw, ok_ty);
         let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
         self.builder.def_var(result_var, result);
@@ -493,7 +488,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(err_block);
         self.builder.seal_block(err_block);
-        self.builder.def_var(result_var, ptr);
+        let unchanged = if self.builder.func.dfg.value_type(ptr) == clif_type(ptr_type, &output_ty)
+        {
+            ptr
+        } else {
+            let raw = self.emit_enum_payload_bits(ptr, err_ty);
+            let payload = self.coerce_i64_to(raw, err_ty);
+            self.emit_alloc_result_variant(&output_ty, 1, err_ty, payload)
+        };
+        self.builder.def_var(result_var, unchanged);
         self.builder.ins().jump(merge, &[]);
 
         self.builder.switch_to_block(merge);
@@ -505,16 +508,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_result_or_else(
         &mut self,
         ptr: cranelift_codegen::ir::Value,
+        ok_ty: &Type,
         err_ty: &Type,
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         let ptr_type = reference_type(self.module.target_config());
-        let result_var = self.builder.declare_var(ptr_type);
-        let tag = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
+        let output_ty = match f_ty {
+            Type::Fn(_, ret) => (**ret).clone(),
+            _ => unreachable!("combinator callback must be a function"),
+        };
+        let result_var = self.builder.declare_var(clif_type(ptr_type, &output_ty));
+        let tag = self.emit_load_enum_tag(ptr);
         let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
 
@@ -527,15 +532,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
-        self.builder.def_var(result_var, ptr);
+        let unchanged = if self.builder.func.dfg.value_type(ptr) == clif_type(ptr_type, &output_ty)
+        {
+            ptr
+        } else {
+            let raw = self.emit_enum_payload_bits(ptr, ok_ty);
+            let payload = self.coerce_i64_to(raw, ok_ty);
+            self.emit_alloc_result_variant(&output_ty, 0, ok_ty, payload)
+        };
+        self.builder.def_var(result_var, unchanged);
         self.builder.ins().jump(merge, &[]);
 
         self.builder.switch_to_block(err_block);
         self.builder.seal_block(err_block);
-        let raw = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
+        let raw = self.emit_enum_payload_bits(ptr, err_ty);
         let payload = self.coerce_i64_to(raw, err_ty);
         let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
         self.builder.def_var(result_var, result);
@@ -546,6 +556,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.use_var(result_var)
     }
 
+    /// Construct a scalar tagged pair, falling back to the boxed runtime layout.
+    pub(super) fn emit_alloc_result_variant(
+        &mut self,
+        result_ty: &Type,
+        tag: i64,
+        payload_ty: &Type,
+        payload: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        if super::option_repr::is_scalar_pair(result_ty) {
+            let payload = self.coerce_to_i64(payload, payload_ty);
+            let tag = self.builder.ins().iconst(types::I64, tag);
+            self.emit_pair(tag, payload)
+        } else {
+            self.emit_alloc_enum_variant(tag, payload_ty, payload)
+        }
+    }
+
     /// Allocate a new 2-word enum (tag + payload) where payload is a typed value.
     pub(super) fn emit_alloc_enum_variant(
         &mut self,
@@ -554,7 +581,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         payload_val: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
         let payload_is_gc = is_gc_managed(payload_ty, self.enum_infos);
-        let slots = [if payload_is_gc {
+        let slots = [if super::option_repr::is_scalar_pair(payload_ty) {
+            willow_abi::SlotKind::ScalarPair
+        } else if payload_is_gc {
             willow_abi::SlotKind::GcRef
         } else {
             willow_abi::SlotKind::Word
@@ -603,51 +632,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ptr
     }
 
-    /// Allocate a new 2-word enum (tag + payload) where payload is already an i64 raw word.
-    pub(super) fn emit_alloc_enum_variant_raw(
-        &mut self,
-        tag: i64,
-        payload_ty: &Type,
-        payload_raw: cranelift_codegen::ir::Value,
-    ) -> cranelift_codegen::ir::Value {
-        let payload_is_gc = is_gc_managed(payload_ty, self.enum_infos);
-        let slots = [if payload_is_gc {
-            willow_abi::SlotKind::GcRef
-        } else {
-            willow_abi::SlotKind::Word
-        }];
-        let layout = willow_abi::EnumVariantLayout::new(tag as u32, &slots);
-        let pointer_bytes = reference_type(self.module.target_config()).bytes();
-        // See `emit_alloc_enum_variant`: root a GC-managed payload across the
-        // allocation so a collection cannot free it before it is stored.
-        let payload_root = payload_is_gc.then(|| self.emit_push_root(payload_raw));
-        let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
-            GcObjectKind::Enum,
-            i64::from(layout.payload_bytes(pointer_bytes)),
-            0,
-            layout.gc_ref_mask(),
-        ));
-        let payload_raw = payload_root.map_or(payload_raw, |slot| {
-            self.stack_load(reference_type(self.module.target_config()), slot)
-        });
-        let tag_val = self.builder.ins().iconst(types::I64, tag);
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), tag_val, ptr, 0i32);
-        self.emit_gc_heap_store(
-            ptr,
-            layout.payload_byte_offset(pointer_bytes) as i32,
-            payload_raw,
-            payload_ty,
-            GcStoreDestination::EnumPayload,
-        );
-        if payload_is_gc {
-            self.emit_pop_roots_n(1);
-            self.gc_root_count -= 1;
-        }
-        ptr
-    }
-
     /// Construct `Some(payload)` using the central representation decision.
     pub(super) fn emit_alloc_option_some(
         &mut self,
@@ -657,6 +641,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let option_ty = Type::Generic("Option".to_string().into(), vec![payload_ty.clone()]);
         if option_repr(&option_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
             payload_val
+        } else if super::option_repr::is_scalar_pair(&option_ty) {
+            let payload = self.coerce_to_i64(payload_val, payload_ty);
+            let tag = self.builder.ins().iconst(types::I64, 0);
+            self.emit_pair(tag, payload)
         } else {
             self.emit_alloc_enum_variant(0, payload_ty, payload_val)
         }
@@ -672,6 +660,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder
                 .ins()
                 .iconst(reference_type(self.module.target_config()), 0)
+        } else if super::option_repr::is_scalar_pair(&option_ty) {
+            let tag = self.builder.ins().iconst(types::I64, 1);
+            let payload = self.builder.ins().iconst(types::I64, 0);
+            self.emit_pair(tag, payload)
         } else {
             self.emit_alloc_boxed_none()
         }

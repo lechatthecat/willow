@@ -199,11 +199,14 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     // --- arrays (std::collections::Array) ---
     PANIC_ALLOC; "willow_array_new" => ([I64, I64] -> Some(Ptr));
     PANIC_ALLOC; "willow_array_copy" => ([Ptr] -> Some(Ptr));
+    PANIC_ALLOC; "willow_array_copy_scalar_pairs" => ([Ptr] -> Some(Ptr));
     PANIC_ALLOC; "willow_array_len" => ([Ptr] -> Some(I64));
     PANIC_ALLOC; "willow_array_get" => ([Ptr, I64] -> Some(Word));
     PANIC_ALLOC; "willow_array_set" => ([Ptr, I64, Word] -> None);
     PANIC_ALLOC; "willow_array_push" => ([Ptr, Word] -> None);
+    PANIC_ALLOC; "willow_array_push_scalar_pairs" => ([Ptr, Word] -> None);
     PANIC_ALLOC; "willow_array_pop" => ([Ptr] -> Some(Word));
+    PANIC_ALLOC; "willow_array_pop_scalar_pair_into" => ([Ptr, Ptr] -> None);
     PANIC_ALLOC; "willow_array_to_string" => ([Ptr, I64] -> Some(Ptr));
     ALLOC; "willow_map_to_string" => ([Ptr] -> Some(Ptr));
     PANIC_ALLOC; "willow_array_element_addr" => ([Ptr, I64] -> Some(Ptr));
@@ -215,6 +218,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     // word is followed by its own is-reference flag (willow-9tls.7).
     PANIC_ALLOC; "willow_map_insert" => ([Ptr, Word, I64, Word, I64] -> None);
     PANIC_ALLOC; "willow_map_get" => ([Ptr, Word, I64, I64] -> Some(Ptr));
+    PANIC_ALLOC; "willow_map_get_into" => ([Ptr, Word, I64, Ptr] -> Some(I64));
     NONE; "willow_map_len" => ([Ptr] -> Some(I64));
     PANIC_ALLOC; "willow_map_contains" => ([Ptr, Word, I64] -> Some(I64));
     // --- timer ---

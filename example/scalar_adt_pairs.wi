@@ -1,0 +1,29 @@
+import std::collections::Map;
+
+fn increment(value: Option<i64>) -> Option<i64> {
+    let number = value?;
+    return Some(number + 1);
+}
+
+fn result(value: i64) -> Result<i64, bool> {
+    return Ok(value);
+}
+
+async fn later() -> Option<i64> {
+    let value: Option<i64> = Some(45);
+    await sleep(0);
+    return value;
+}
+
+async fn main() {
+    println(increment(Some(41)).unwrap());
+    println(increment(None).is_none());
+    println(result(43).unwrap());
+    let failure: Result<i64, bool> = Err(true);
+    println(failure.unwrap_err());
+    let mut values: Map<i64, i64> = Map::new();
+    values.insert(1, 44);
+    println(values.get(1).unwrap());
+    let awaited = await later();
+    println(awaited.unwrap());
+}

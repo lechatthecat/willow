@@ -38,6 +38,7 @@ struct CoopPollBody<'a> {
     lir: &'a LirFunction,
     result_offset: Option<i32>,
     lir_defer_offsets: HashMap<LirDeferId, i32>,
+    lir_send_offsets: HashMap<LirLocalId, i32>,
     cleanup: Option<(&'a LirFunction, bool)>,
     boundary: Option<(
         LirLocalId,
@@ -60,6 +61,7 @@ type LirAsyncLayoutPlan = (
     AsyncFrameLayout,
     HashMap<LirLocalId, i32>,
     HashMap<LirDeferId, i32>,
+    HashMap<LirLocalId, i32>,
 );
 const MUTEX_STATUS_RECURSIVE: i64 = willow_abi::LockAcquireStatus::Recursive as i64;
 /// This acquisition's generation is dead; the caller must acquire again.
@@ -115,6 +117,40 @@ impl UnitCodegenContext<'_> {
         mut reserved: Vec<AsyncFrameSlot>,
         first_parameter_slot: usize,
     ) -> Result<LirAsyncLayoutPlan> {
+        // Metadata records physical words. Expand once, retaining an index for
+        // each logical reserved slot so parameter placement stays linear.
+        let mut reserved_indices = Vec::with_capacity(reserved.len());
+        let logical_reserved = std::mem::take(&mut reserved);
+        let split_result = logical_reserved.first().is_some_and(|slot| {
+            slot.name == "__result" && super::option_repr::is_scalar_pair(&slot.ty)
+        });
+        let has_task_id = logical_reserved
+            .get(1)
+            .is_some_and(|slot| slot.name == "__task_id");
+        for (index, slot) in logical_reserved.into_iter().enumerate() {
+            if split_result && !has_task_id && index == 1 {
+                reserved.push(AsyncFrameSlot::scalar_padding());
+                reserved.push(AsyncFrameSlot::scalar_padding());
+            }
+            reserved_indices.push(reserved.len());
+            let pair = super::option_repr::is_scalar_pair(&slot.ty);
+            reserved.push(slot);
+            if split_result && index == 0 {
+                // Slot one is fixed by the task ABI. Main has no task-id slot,
+                // so reserve it explicitly when its scalar result needs slot two.
+                continue;
+            }
+            if split_result && has_task_id && index == 1 {
+                reserved.push(AsyncFrameSlot::scalar_padding());
+            }
+            if pair {
+                reserved.push(AsyncFrameSlot::scalar_padding());
+            }
+        }
+        if split_result && reserved.len() == 1 {
+            reserved.push(AsyncFrameSlot::scalar_padding());
+            reserved.push(AsyncFrameSlot::scalar_padding());
+        }
         let mut offsets = HashMap::new();
         for (index, local) in lir
             .locals
@@ -125,7 +161,7 @@ impl UnitCodegenContext<'_> {
             offsets.insert(
                 local.id,
                 async_frame_slot_offset(
-                    first_parameter_slot + index,
+                    reserved_indices[first_parameter_slot + index],
                     reference_type(self.output.module.target_config()).bytes(),
                 ),
             );
@@ -155,6 +191,12 @@ impl UnitCodegenContext<'_> {
         } else {
             lir.async_frame.slots.clone()
         };
+        let mut pair_representatives = std::collections::HashSet::new();
+        for (local, slot) in &lir.async_frame.locals {
+            if super::option_repr::is_scalar_pair(&lir.locals[local.0 as usize].ty) {
+                pair_representatives.insert(lir.async_frame.slots[slot.index]);
+            }
+        }
         for local_id in &selected {
             let local = &lir.locals[local_id.0 as usize];
             if local.parameter {
@@ -174,6 +216,11 @@ impl UnitCodegenContext<'_> {
                 name: local.name.clone(),
                 ty: local.ty.clone(),
             });
+            if super::option_repr::is_scalar_pair(&local.ty)
+                || pair_representatives.contains(local_id)
+            {
+                reserved.push(AsyncFrameSlot::scalar_padding());
+            }
         }
         if !frame_all {
             // Every logical occupant uses its representative's physical slot.
@@ -208,9 +255,35 @@ impl UnitCodegenContext<'_> {
                             name: local.name.clone(),
                             ty: local.ty.clone(),
                         });
+                        if super::option_repr::is_scalar_pair(&local.ty) {
+                            reserved.push(AsyncFrameSlot::scalar_padding());
+                        }
                         offset
                     });
                 }
+            }
+        }
+        let mut send_offsets = HashMap::new();
+        for block in &lir.blocks {
+            if let crate::ir::lowered::Terminator::Suspend {
+                operation: crate::ir::lowered::SuspendOp::ChannelSend { value, elem_ty, .. },
+                ..
+            } = &block.terminator
+                && super::option_repr::is_scalar_pair(elem_ty)
+            {
+                send_offsets.entry(*value).or_insert_with(|| {
+                    let offset = async_frame_slot_offset(
+                        reserved.len(),
+                        reference_type(self.output.module.target_config()).bytes(),
+                    );
+                    reserved.push(AsyncFrameSlot {
+                        storage_kind: crate::ir::lowered::LirStorageKind::GcOwner,
+                        source_span: None,
+                        name: format!("__send_box_{}", value.0),
+                        ty: Type::I64,
+                    });
+                    offset
+                });
             }
         }
         let mut defer_sites: Vec<_> = lir
@@ -242,7 +315,7 @@ impl UnitCodegenContext<'_> {
             });
         }
         let layout = AsyncFrameLayout::try_new(reserved, &self.enum_infos)?;
-        Ok((layout, offsets, defer_offsets))
+        Ok((layout, offsets, defer_offsets, send_offsets))
     }
 
     /// Cooperative-async lowering (willow-lpn.5.3 / willow-h2vf):
@@ -299,8 +372,14 @@ impl UnitCodegenContext<'_> {
             name: p.name.clone(),
             ty: p.ty.clone().into(),
         }));
-        let (layout, lir_offsets, lir_defer_offsets) =
+        let (layout, lir_offsets, lir_defer_offsets, lir_send_offsets) =
             self.lir_async_layout(&lir, slots, first_param_slot)?;
+        let parameter_offsets: Vec<_> = lir
+            .locals
+            .iter()
+            .filter(|local| local.parameter)
+            .map(|local| lir_offsets[&local.id])
+            .collect();
         self.record_async_frame_size_warning(&f.name, f.span, &layout);
         let slot_count = layout.slot_count() as i64;
         let mask = layout.gc_slot_mask as i64;
@@ -308,16 +387,7 @@ impl UnitCodegenContext<'_> {
             .params
             .iter()
             .enumerate()
-            .map(|(i, p)| {
-                (
-                    p.name.clone(),
-                    async_frame_slot_offset(
-                        first_param_slot + i,
-                        reference_type(self.output.module.target_config()).bytes(),
-                    ),
-                    p.ty.clone().into(),
-                )
-            })
+            .map(|(i, p)| (p.name.clone(), parameter_offsets[i], p.ty.clone().into()))
             .collect();
 
         self.compile_coop_main_driver(
@@ -328,7 +398,16 @@ impl UnitCodegenContext<'_> {
                 slot_count,
                 mask,
                 bitmap: layout.gc_payload_bitmap.clone(),
-                first_param_slot,
+                first_param_slot: if main_result_err_ty.as_ref().is_some_and(|err| {
+                    super::option_repr::is_scalar_pair(&Type::Generic(
+                        "Result".into(),
+                        vec![Type::Void, err.clone()],
+                    ))
+                }) {
+                    3
+                } else {
+                    first_param_slot
+                },
                 main_result: result_offset.zip(main_result_err_ty.clone()),
             },
         )?;
@@ -345,6 +424,7 @@ impl UnitCodegenContext<'_> {
                 lir: &lir,
                 result_offset,
                 lir_defer_offsets,
+                lir_send_offsets,
             },
         )?;
         Ok(())
@@ -412,7 +492,14 @@ impl UnitCodegenContext<'_> {
         }
         // Locals after the params: frame-backed so they survive the task's own
         // suspensions, keyed by LirLocalId.
-        let (layout, lir_offsets, lir_defer_offsets) = self.lir_async_layout(&lir, slots, 2)?;
+        let (layout, lir_offsets, lir_defer_offsets, lir_send_offsets) =
+            self.lir_async_layout(&lir, slots, 2)?;
+        let parameter_offsets: Vec<_> = lir
+            .locals
+            .iter()
+            .filter(|local| local.parameter)
+            .map(|local| lir_offsets[&local.id])
+            .collect();
         self.record_async_frame_size_warning(&f.name, f.span, &layout);
         let slot_count = layout.slot_count() as i64;
         let mask = layout.gc_slot_mask as i64;
@@ -428,16 +515,7 @@ impl UnitCodegenContext<'_> {
             .params
             .iter()
             .enumerate()
-            .map(|(i, p)| {
-                (
-                    p.name.clone(),
-                    async_frame_slot_offset(
-                        2 + i,
-                        reference_type(self.output.module.target_config()).bytes(),
-                    ),
-                    p.ty.clone().into(),
-                )
-            })
+            .map(|(i, p)| (p.name.clone(), parameter_offsets[i], p.ty.clone().into()))
             .collect();
 
         // Constructor = the fn's public symbol: alloc frame, store args into the
@@ -474,16 +552,14 @@ impl UnitCodegenContext<'_> {
         // safe).
         for (i, p) in f.params.iter().enumerate() {
             let arg = builder.block_params(entry)[i];
-            let off = async_frame_slot_offset(
-                2 + i,
-                reference_type(self.output.module.target_config()).bytes(),
-            );
+            let off = parameter_offsets[i];
             emit_gc_heap_store_raw(
                 &mut builder,
-                is_gc_managed(
-                    &crate::semantic::ids::SemanticType::from(&p.ty),
-                    &self.enum_infos,
-                )
+                (!super::option_repr::is_scalar_pair(&p.ty)
+                    && is_gc_managed(
+                        &crate::semantic::ids::SemanticType::from(&p.ty),
+                        &self.enum_infos,
+                    ))
                 .then_some(barrier_ref),
                 frame,
                 off,
@@ -574,6 +650,7 @@ impl UnitCodegenContext<'_> {
                 lir: &lir,
                 result_offset: Some(result_offset),
                 lir_defer_offsets,
+                lir_send_offsets,
             },
         )?;
         self.compile_async_cancel_fn(cancel_fid, &sites, &lock_sites)?;
@@ -663,8 +740,14 @@ impl UnitCodegenContext<'_> {
         } else {
             first_param_slot - 1
         };
-        let (layout, lir_offsets, lir_defer_offsets) =
+        let (layout, lir_offsets, lir_defer_offsets, lir_send_offsets) =
             self.lir_async_layout(&lir, slots, lir_first_param_slot)?;
+        let parameter_offsets: Vec<_> = lir
+            .locals
+            .iter()
+            .filter(|local| local.parameter)
+            .map(|local| lir_offsets[&local.id])
+            .collect();
         self.record_async_frame_size_warning(&format!("{class_name}::{}", m.name), m.span, &layout);
         let slot_count = layout.slot_count() as i64;
         let mask = layout.gc_slot_mask as i64;
@@ -677,6 +760,8 @@ impl UnitCodegenContext<'_> {
             reference_type(self.output.module.target_config()).bytes(),
         );
 
+        let self_offset = self_offset.map(|_| parameter_offsets[0]);
+        let param_base = usize::from(!m.is_static);
         let mut param_bindings: Vec<(String, i32, Type)> = Vec::new();
         if let Some(offset) = self_offset {
             param_bindings.push((
@@ -688,10 +773,7 @@ impl UnitCodegenContext<'_> {
         param_bindings.extend(m.params.iter().enumerate().map(|(i, p)| {
             (
                 p.name.clone(),
-                async_frame_slot_offset(
-                    first_param_slot + i,
-                    reference_type(self.output.module.target_config()).bytes(),
-                ),
+                parameter_offsets[param_base + i],
                 p.ty.clone().into(),
             )
         }));
@@ -740,16 +822,14 @@ impl UnitCodegenContext<'_> {
         }
         for (i, p) in m.params.iter().enumerate() {
             let arg = builder.block_params(entry)[i + 1];
-            let off = async_frame_slot_offset(
-                first_param_slot + i,
-                reference_type(self.output.module.target_config()).bytes(),
-            );
+            let off = parameter_offsets[param_base + i];
             emit_gc_heap_store_raw(
                 &mut builder,
-                is_gc_managed(
-                    &crate::semantic::ids::SemanticType::from(&p.ty),
-                    &self.enum_infos,
-                )
+                (!super::option_repr::is_scalar_pair(&p.ty)
+                    && is_gc_managed(
+                        &crate::semantic::ids::SemanticType::from(&p.ty),
+                        &self.enum_infos,
+                    ))
                 .then_some(barrier_ref),
                 frame,
                 off,
@@ -850,6 +930,7 @@ impl UnitCodegenContext<'_> {
                 lir: &lir,
                 result_offset: Some(result_offset),
                 lir_defer_offsets,
+                lir_send_offsets,
             },
         )?;
         self.compile_async_cancel_fn(cancel_fid, &sites, &lock_sites)?;
@@ -966,12 +1047,30 @@ impl UnitCodegenContext<'_> {
         builder.ins().call(run_ref, &[main_task_id]);
 
         if let Some((result_offset, err_ty)) = frame_layout.main_result {
-            let result = builder.ins().load(
-                reference_type(self.output.module.target_config()),
-                MemFlagsData::trusted(),
-                frame,
-                result_offset,
-            );
+            let result_ty = Type::Generic("Result".into(), vec![Type::Void, err_ty.clone()]);
+            let result = if super::option_repr::is_scalar_pair(&result_ty) {
+                let tag =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlagsData::trusted(), frame, result_offset);
+                let payload = builder.ins().load(
+                    types::I64,
+                    MemFlagsData::trusted(),
+                    frame,
+                    async_frame_slot_offset(
+                        2,
+                        reference_type(self.output.module.target_config()).bytes(),
+                    ),
+                );
+                builder.ins().iconcat(tag, payload)
+            } else {
+                builder.ins().load(
+                    reference_type(self.output.module.target_config()),
+                    MemFlagsData::trusted(),
+                    frame,
+                    result_offset,
+                )
+            };
             let pop_fid = self.func_id("willow_pop_roots");
             let pop_ref = self
                 .output
@@ -1067,6 +1166,7 @@ impl UnitCodegenContext<'_> {
                                 lir: body.lir,
                                 result_offset: None,
                                 lir_defer_offsets: HashMap::new(),
+                                lir_send_offsets: HashMap::new(),
                                 boundary: Some((*local, value, *span)),
                                 cleanup: None,
                             },
@@ -1122,6 +1222,7 @@ impl UnitCodegenContext<'_> {
                                 lir: body.lir,
                                 result_offset: None,
                                 lir_defer_offsets: HashMap::new(),
+                                lir_send_offsets: HashMap::new(),
                                 boundary: None,
                                 cleanup: Some((&action.function, recovery)),
                             },
@@ -1255,12 +1356,14 @@ impl UnitCodegenContext<'_> {
                 async_frame_offsets: offsets,
                 lir_frame_offsets: lir_offsets,
                 lir_defer_offsets: body.lir_defer_offsets.clone(),
+                lir_send_offsets: body.lir_send_offsets.clone(),
                 main_result_err_ty: None,
                 vars: HashMap::new(),
                 current_class: body.current_class,
                 is_async: false,
                 terminated: false,
                 gc_root_count: 0,
+                enum_payload_layouts: &mut self.output.enum_payload_layouts,
                 coop_shadow_roots: Some(CoopShadowRoots::default()),
                 build_mode: self.build_mode,
                 source_file: &self.source_file,
@@ -1477,12 +1580,14 @@ impl UnitCodegenContext<'_> {
                 async_frame_offsets: HashMap::new(),
                 lir_frame_offsets: HashMap::new(),
                 lir_defer_offsets: HashMap::new(),
+                lir_send_offsets: HashMap::new(),
                 main_result_err_ty: None,
                 vars: HashMap::new(),
                 current_class: None,
                 is_async: false,
                 terminated: false,
                 gc_root_count: 0,
+                enum_payload_layouts: &mut self.output.enum_payload_layouts,
                 coop_shadow_roots: None,
                 build_mode: self.build_mode,
                 source_file: &self.source_file,
@@ -2175,7 +2280,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .ins()
             .load(types::I64, MemFlagsData::new(), frame, token_offset);
         let word = self.emit_value_runtime_call(load_fn, &[handle, token]);
-        let value = self.coerce_i64_to(word, value_ty);
+        let value = self.emit_from_storage_word(word, value_ty);
         self.emit_gc_heap_store(
             frame,
             value_offset,
@@ -2202,6 +2307,36 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ///
     /// A panicked task is handled by the runtime's own panic policy in both
     /// cases, so it needs no branch here.
+    fn load_task_result(
+        &mut self,
+        task_frame: cranelift_codegen::ir::Value,
+        result_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let pointer_bytes = reference_type(self.module.target_config()).bytes();
+        if super::option_repr::is_scalar_pair(result_ty) {
+            let tag = self.builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                task_frame,
+                async_frame_slot_offset(0, pointer_bytes),
+            );
+            let payload = self.builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                task_frame,
+                async_frame_slot_offset(2, pointer_bytes),
+            );
+            self.emit_pair(tag, payload)
+        } else {
+            self.builder.ins().load(
+                clif_type(reference_type(self.module.target_config()), result_ty),
+                MemFlagsData::new(),
+                task_frame,
+                async_frame_slot_offset(FRAME_SLOT_RESULT, pointer_bytes),
+            )
+        }
+    }
+
     pub(super) fn emit_task_terminal_value(
         &mut self,
         task_frame: cranelift_codegen::ir::Value,
@@ -2214,15 +2349,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if *result_ty == Type::Void {
                 return None;
             }
-            return Some(self.builder.ins().load(
-                clif_type(reference_type(self.module.target_config()), result_ty),
-                MemFlagsData::new(),
-                task_frame,
-                async_frame_slot_offset(
-                    FRAME_SLOT_RESULT,
-                    reference_type(self.module.target_config()).bytes(),
-                ),
-            ));
+            return Some(self.load_task_result(task_frame, result_ty));
         }
         Some(self.emit_task_result_value(task_frame, result_ty))
     }
@@ -2281,15 +2408,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let raw = if *result_ty == Type::Void {
             self.builder.ins().iconst(types::I64, 0)
         } else {
-            self.builder.ins().load(
-                clif_type(reference_type(self.module.target_config()), result_ty),
-                MemFlagsData::new(),
-                task_frame,
-                async_frame_slot_offset(
-                    FRAME_SLOT_RESULT,
-                    reference_type(self.module.target_config()).bytes(),
-                ),
-            )
+            self.load_task_result(task_frame, result_ty)
         };
         let ok = self.emit_alloc_enum_variant(0, &payload_ty, raw);
         self.builder.ins().jump(merge_b, &[ok.into()]);
@@ -2391,8 +2510,72 @@ mod task_boundary_callback_tests {
         let lir = crate::ir::lowered::lower_program(&hir).functions.remove(0);
         let mut backend = Codegen::for_tests(&crate::CompilerOptions::debug()).unwrap();
         let codegen = backend.declaration_context();
-        let (layout, offsets, _) = codegen.lir_async_layout(&lir, Vec::new(), 0).unwrap();
+        let (layout, offsets, _, _) = codegen.lir_async_layout(&lir, Vec::new(), 0).unwrap();
         (lir, layout, offsets)
+    }
+
+    #[test]
+    fn scalar_pair_send_scratch_grows_once_per_send_site() {
+        for count in [1, 16, 128] {
+            let mut source =
+                String::from("async fn main() { let ch = Channel<Option<i64>>::new();");
+            for _ in 0..count {
+                source.push_str(" ch.send(Option::Some(7));");
+            }
+            source.push('}');
+            let (lir, _, _) = print_frame_layout(&source);
+            let mut backend = Codegen::for_tests(&crate::CompilerOptions::debug()).unwrap();
+            let codegen = backend.declaration_context();
+            let (layout, _, _, scratch) = codegen.lir_async_layout(&lir, Vec::new(), 0).unwrap();
+            assert_eq!(scratch.len(), count);
+            assert_eq!(
+                layout
+                    .slots
+                    .iter()
+                    .filter(|slot| slot.name.starts_with("__send_box_"))
+                    .count(),
+                count
+            );
+            for offset in scratch.values() {
+                let word = (*offset as usize / 8) - ASYNC_FRAME_HEADER_WORDS;
+                assert!(layout.slot_is_gc_ref(word));
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_pair_frame_words_preserve_task_id_and_reference_masks() {
+        let (lir, _, _) = print_frame_layout("async fn main() {}");
+        let mut backend = Codegen::for_tests(&crate::CompilerOptions::debug()).unwrap();
+        let codegen = backend.declaration_context();
+        let slot = |name: &str, ty: Type| AsyncFrameSlot {
+            storage_kind: crate::ir::lowered::LirStorageKind::Value,
+            source_span: None,
+            name: name.to_string(),
+            ty,
+        };
+        let pair = Type::Generic("Option".into(), vec![Type::I64]);
+        for count in [1, 16, 128] {
+            let mut reserved = vec![slot("__result", pair.clone()), slot("__task_id", Type::I64)];
+            for _ in 0..count {
+                reserved.push(slot("pair", pair.clone()));
+                reserved.push(slot("reference", Type::String));
+            }
+            let (layout, _, _, _) = codegen.lir_async_layout(&lir, reserved, 2).unwrap();
+            assert_eq!(layout.slot_count(), 3 + count * 3);
+            assert_eq!(layout.slots[1].name, "__task_id");
+            for word in 0..layout.slot_count() {
+                assert_eq!(
+                    layout.slot_is_gc_ref(word),
+                    word >= 5 && (word - 5) % 3 == 0
+                );
+            }
+        }
+        let (layout, _, _, _) = codegen
+            .lir_async_layout(&lir, vec![slot("__result", pair)], 1)
+            .unwrap();
+        assert_eq!(layout.slot_count(), 3);
+        assert_eq!(layout.gc_slot_mask, 0);
     }
 
     #[test]

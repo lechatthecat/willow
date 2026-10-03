@@ -87,6 +87,7 @@ const USER_MAIN_SYMBOL: &str = "willow_user_main";
 /// (willow-qsqf §13.5).
 const STATIC_INIT_SYMBOL: &str = "__willow_static_init";
 const GC_REF_MASK_BITS: usize = 64;
+#[cfg(test)]
 const OBJECT_FIELD_MASK_CAPACITY: usize = GC_REF_MASK_BITS - 1;
 const ASYNC_FRAME_HEADER_WORDS: usize = willow_abi::async_frame::HEADER_WORDS as usize;
 const ASYNC_FRAME_GC_SLOT_CAPACITY: usize = GC_REF_MASK_BITS - ASYNC_FRAME_HEADER_WORDS;
@@ -145,6 +146,7 @@ pub struct BuildCodegenDb {
 
 /// Mutable object output, independent of unit resolution and frozen metadata.
 struct EmissionState {
+    enum_payload_layouts: HashMap<Type, HashMap<String, std::sync::Arc<EnumPayloadLayout>>>,
     module: ObjectModule,
     string_literals: HashMap<String, StringLiteralData>,
     string_counter: usize,
@@ -320,6 +322,8 @@ impl Codegen {
     ) -> Result<Self> {
         let isa_builder = cranelift_native::builder().map_err(|e| anyhow::anyhow!("{}", e))?;
         let mut flag_builder = settings::builder();
+        // Scalar ADTs are I128 SSA values, lowered to two integer ABI words.
+        flag_builder.set("enable_llvm_abi_extensions", "true")?;
         // Keep function cache-line placement stable across runtime-only link
         // changes, including async entry points and internal math helpers.
         // The shared ISA setting reaches every ObjectModule definition and
@@ -410,6 +414,7 @@ impl Codegen {
                 module_init_plan: ModuleInitPlan::default(),
             },
             output: EmissionState {
+                enum_payload_layouts: HashMap::new(),
                 module,
                 string_literals: HashMap::new(),
                 string_counter: 0,
@@ -1364,7 +1369,16 @@ pub(super) struct AsyncDeferSite {
     order: usize,
 }
 
+/// Instantiated physical payload layout, reused by every store of a variant.
+struct EnumPayloadLayout {
+    tag: i64,
+    is_heap: bool,
+    fields: Vec<(Type, i32)>,
+    gc_layout: GcLayoutMetadata,
+}
+
 struct FuncGen<'a, 'b> {
+    enum_payload_layouts: &'a mut HashMap<Type, HashMap<String, std::sync::Arc<EnumPayloadLayout>>>,
     builder: &'a mut FunctionBuilder<'b>,
     module: &'a mut ObjectModule,
     gc_tlab_state: DataId,
@@ -1491,6 +1505,7 @@ struct FuncGen<'a, 'b> {
     /// poll emitter; source spans remain available only for diagnostics.
     lir_frame_offsets: HashMap<crate::ir::lowered::LirLocalId, i32>,
     lir_defer_offsets: HashMap<crate::ir::lowered::LirDeferId, i32>,
+    lir_send_offsets: HashMap<crate::ir::lowered::LirLocalId, i32>,
     /// When compiling `fn main() -> Result<void, E>`: the error payload type `E`.
     /// Each return inspects the Result and exits accordingly (willow-exg).
     main_result_err_ty: Option<Type>,
@@ -1734,7 +1749,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> VarStorage {
         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
-            8,
+            clif_type(reference_type(self.module.target_config()), ty)
+                .bytes()
+                .max(8),
             0,
         ));
         self.stack_store(val, slot);
@@ -2160,6 +2177,17 @@ pub struct AsyncFrameLayout {
 }
 
 #[allow(dead_code)] // Consumed by willow-lpn.5 (async frame emission + state machine).
+impl AsyncFrameSlot {
+    fn scalar_padding() -> Self {
+        Self {
+            storage_kind: crate::ir::lowered::LirStorageKind::Value,
+            source_span: None,
+            name: "__scalar_padding".to_string(),
+            ty: Type::I64,
+        }
+    }
+}
+
 impl AsyncFrameLayout {
     /// Build a layout from ordered slots, computing the GC reference mask.
     ///
@@ -2181,7 +2209,7 @@ impl AsyncFrameLayout {
             vec![0u64; (slots.len() + ASYNC_FRAME_HEADER_WORDS).div_ceil(64)];
         for (k, slot) in slots.iter().enumerate() {
             if slot.storage_kind == crate::ir::lowered::LirStorageKind::GcOwner
-                || is_gc_managed(&slot.ty, enum_infos)
+                || (!option_repr::is_scalar_pair(&slot.ty) && is_gc_managed(&slot.ty, enum_infos))
             {
                 let word = k + ASYNC_FRAME_HEADER_WORDS;
                 gc_payload_bitmap[word / 64] |= 1 << (word % 64);
@@ -2193,7 +2221,8 @@ impl AsyncFrameLayout {
             .enumerate()
             .fold(0u64, |mask, (k, slot)| {
                 if slot.storage_kind == crate::ir::lowered::LirStorageKind::GcOwner
-                    || is_gc_managed(&slot.ty, enum_infos)
+                    || (!option_repr::is_scalar_pair(&slot.ty)
+                        && is_gc_managed(&slot.ty, enum_infos))
                 {
                     mask | (1u64 << k)
                 } else {
@@ -3146,9 +3175,9 @@ mod tests {
 
     // 11. Option<i64> needs a tagged enum allocation and is therefore traced.
     #[test]
-    fn async_frame_11_optional_primitive_slot_traced() {
+    fn async_frame_11_optional_primitive_slot_untraced() {
         let ty = Type::Generic("Option".to_string().into(), vec![Type::I64]);
-        assert_eq!(frame_layout(&[("maybe", ty)]).gc_slot_mask, 0b1);
+        assert_eq!(frame_layout(&[("maybe", ty)]).gc_slot_mask, 0);
     }
 
     // 12. Nested Option preserves both absence levels in a boxed outer value.
@@ -3181,9 +3210,9 @@ mod tests {
 
     // 14. Option<i64> (a generic enum carrying payload) is a heap object → traced.
     #[test]
-    fn async_frame_14_option_generic_enum_traced() {
+    fn async_frame_14_option_generic_enum_untraced() {
         let ty = Type::Generic("Option".to_string().into(), vec![Type::I64]);
-        assert_eq!(frame_layout(&[("o", ty)]).gc_slot_mask, 0b1);
+        assert_eq!(frame_layout(&[("o", ty)]).gc_slot_mask, 0);
     }
 
     // 15. Result<String,i64> is a heap object → traced.

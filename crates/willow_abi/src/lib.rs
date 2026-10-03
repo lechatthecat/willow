@@ -30,7 +30,8 @@ pub const fn storage_word_bytes(pointer_bytes: u32) -> u32 {
 }
 
 /// Array payloads use fixed 64-bit slots, including on narrow-pointer targets.
-/// Buffer word zero publishes the logical length, not the allocation capacity.
+/// Buffer word zero publishes the traced prefix: logical length for ordinary
+/// arrays, initialized high-water mark for stable scalar-pair slot storage.
 pub mod array_layout {
     pub const WORD_BYTES: i32 = 8;
     pub const H_LEN: usize = 0;
@@ -389,15 +390,26 @@ pub mod async_frame {
     }
 }
 
-/// Representation of one mixed storage word in a runtime-owned aggregate.
+/// Representation of one logical slot in a runtime-owned aggregate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SlotKind {
     /// Scalar, tag, task id, or other non-reference Willow word.
     Word,
+    /// Inline tag and scalar payload, occupying two non-reference words.
+    ScalarPair,
     /// GC-managed Willow reference. It contributes a bit to the GC mask.
     GcRef,
     /// Native address or function pointer. It is never traced as a Willow ref.
     NativePtr,
+}
+
+impl SlotKind {
+    pub const fn word_count(self) -> u32 {
+        match self {
+            Self::ScalarPair => 2,
+            Self::Word | Self::GcRef | Self::NativePtr => 1,
+        }
+    }
 }
 
 /// A target-independent payload descriptor.
@@ -412,7 +424,20 @@ impl<'a> WordLayout<'a> {
     }
 
     pub const fn word_count(self) -> u32 {
-        self.slots.len() as u32
+        self.word_offset(self.slots.len())
+    }
+
+    /// Physical word offset of a logical slot; the end index yields total size.
+    /// This prefix scan is linear in `logical_index`.
+    pub const fn word_offset(self, logical_index: usize) -> u32 {
+        assert!(logical_index <= self.slots.len(), "invalid logical slot");
+        let mut index = 0;
+        let mut words = 0;
+        while index < logical_index {
+            words += self.slots[index].word_count();
+            index += 1;
+        }
+        words
     }
 
     pub const fn byte_size(self, pointer_bytes: u32) -> u32 {
@@ -422,12 +447,13 @@ impl<'a> WordLayout<'a> {
     pub const fn gc_ref_mask(self, first_payload_word: u32) -> u64 {
         let mut mask = 0u64;
         let mut index = 0usize;
+        let mut word = first_payload_word as usize;
         while index < self.slots.len() {
             if matches!(self.slots[index], SlotKind::GcRef) {
-                let bit = first_payload_word as usize + index;
-                assert!(bit < GC_REF_MASK_BITS, "layout exceeds inline GC mask");
-                mask |= 1u64 << bit;
+                assert!(word < GC_REF_MASK_BITS, "layout exceeds inline GC mask");
+                mask |= 1u64 << word;
             }
+            word += self.slots[index].word_count() as usize;
             index += 1;
         }
         mask
@@ -536,6 +562,45 @@ mod tests {
         }
         assert_eq!(dispatch_layout::OBJECT_OFFSET, 0);
         assert_eq!(dispatch_layout::INTERFACE_GC_REF_MASK, 1);
+    }
+
+    #[test]
+    fn scalar_pair_slots_shift_later_references_and_sizes() {
+        const LAYOUT: WordLayout<'_> = WordLayout::new(&[
+            SlotKind::GcRef,
+            SlotKind::ScalarPair,
+            SlotKind::GcRef,
+            SlotKind::ScalarPair,
+        ]);
+        assert_eq!(SlotKind::ScalarPair.word_count(), 2);
+        assert_eq!(LAYOUT.word_count(), 6);
+        for (index, offset) in [0, 1, 3, 4, 6].into_iter().enumerate() {
+            assert_eq!(LAYOUT.word_offset(index), offset);
+        }
+        assert_eq!(LAYOUT.gc_ref_mask(0), 0b1001);
+        assert_eq!(LAYOUT.gc_ref_mask(1), 0b10010);
+        for pointer_bytes in [4, 8] {
+            assert_eq!(LAYOUT.byte_size(pointer_bytes), 48);
+            assert_eq!(
+                EnumVariantLayout::new(0, LAYOUT.slots).payload_bytes(pointer_bytes),
+                56
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_pair_masks_use_physical_boundary_bits() {
+        let before = WordLayout::new(&[SlotKind::ScalarPair, SlotKind::GcRef]);
+        assert_eq!(before.gc_ref_mask(60), 1u64 << 62);
+        assert_eq!(before.gc_ref_mask(61), 1u64 << 63);
+        let after = WordLayout::new(&[SlotKind::GcRef, SlotKind::ScalarPair]);
+        assert_eq!(after.gc_ref_mask(63), 1u64 << 63);
+    }
+
+    #[test]
+    #[should_panic(expected = "layout exceeds inline GC mask")]
+    fn scalar_pair_masks_reject_reference_past_bit_63() {
+        WordLayout::new(&[SlotKind::ScalarPair, SlotKind::GcRef]).gc_ref_mask(62);
     }
 
     #[test]

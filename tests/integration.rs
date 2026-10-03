@@ -251,3 +251,6 @@ mod module_inference_regressions;
 
 #[path = "integration/static_mut_policy.rs"]
 mod static_mut_policy;
+
+#[path = "integration/scalar_adt_pairs.rs"]
+mod scalar_adt_pairs;

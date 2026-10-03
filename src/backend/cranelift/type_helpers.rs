@@ -26,6 +26,9 @@ pub(crate) fn clif_type<N: builtin_types::TypeName>(
     reference_type: cranelift_codegen::ir::Type,
     ty: &crate::parser::ast::Type<N>,
 ) -> cranelift_codegen::ir::Type {
+    if super::option_repr::is_scalar_pair(ty) {
+        return types::I128;
+    }
     match ty {
         crate::parser::ast::Type::I64 => types::I64,
         crate::parser::ast::Type::F64 => types::F64,
@@ -110,7 +113,14 @@ pub(crate) fn channel_element_type(ty: &Type) -> Option<Type> {
 /// hold are kept alive by the runtime instead. All other generics
 /// (`Task`/`JoinHandle` async frames, `Range`, `Map`, user generics) are real
 /// GC heap objects.
+pub(crate) fn storage_is_gc_managed(ty: &Type, enum_infos: &TypeMap<EnumInfo>) -> bool {
+    super::option_repr::is_scalar_pair(ty) || is_gc_managed(ty, enum_infos)
+}
+
 pub(crate) fn is_gc_managed(ty: &Type, enum_infos: &TypeMap<EnumInfo>) -> bool {
+    if super::option_repr::is_scalar_pair(ty) {
+        return false;
+    }
     crate::compiler_db::layout::is_gc_managed(ty, |name| {
         // Fieldless enums are immediate tags; payload enums and classes are heap objects.
         enum_infos.get(&name).is_none_or(|info| {
@@ -126,6 +136,16 @@ pub(crate) use crate::semantic::intrinsics::{
     builtin_call_runtime_name, runtime_stat_builtin_runtime_name,
 };
 
+pub(crate) fn value_slot_kind(ty: &Type, enum_infos: &TypeMap<EnumInfo>) -> willow_abi::SlotKind {
+    if super::option_repr::is_scalar_pair(ty) {
+        willow_abi::SlotKind::ScalarPair
+    } else if is_gc_managed(ty, enum_infos) {
+        willow_abi::SlotKind::GcRef
+    } else {
+        willow_abi::SlotKind::Word
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,7 +157,6 @@ mod tests {
             Type::Never,
             Type::Array(Box::new(Type::I64)),
             Type::Named("Point".to_string().into()),
-            Type::Generic("Option".to_string().into(), vec![Type::I64]),
             Type::Generic("Task".to_string().into(), vec![Type::I64]),
             Type::Generic("JoinHandle".to_string().into(), vec![Type::I64]),
             Type::Generic("TaskResult".to_string().into(), vec![Type::I64]),
@@ -149,6 +168,13 @@ mod tests {
             for ty in &references {
                 assert_eq!(clif_type(pointer, ty), pointer, "{ty:?}");
             }
+            assert_eq!(
+                clif_type(
+                    pointer,
+                    &Type::Generic("Option".to_string().into(), vec![Type::I64])
+                ),
+                types::I128
+            );
             for (ty, expected) in [
                 (Type::I64, types::I64),
                 (Type::F64, types::F64),

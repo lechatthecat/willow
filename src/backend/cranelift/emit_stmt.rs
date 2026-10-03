@@ -230,7 +230,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             frame,
             value_offset,
         );
-        let word = self.coerce_to_i64(value, value_ty);
+        let word = self.emit_to_storage_word(value, value_ty);
         // Runtime commit captures the protected old value under its ownership
         // check and performs the fused SATB/generational barrier.
         let commit = match mode {
@@ -280,7 +280,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         );
         let zero_value = match clif_type(reference_type(self.module.target_config()), value_ty) {
             types::F64 => self.builder.ins().f64const(0.0),
-            ty => self.builder.ins().iconst(ty, 0),
+            ty => self.emit_zero(ty),
         };
         self.emit_gc_heap_store(
             frame,
@@ -1001,7 +1001,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             let zero = match clif_type(reference_type(self.module.target_config()), return_ty) {
                 types::F64 => self.builder.ins().f64const(0.0),
-                ty => self.builder.ins().iconst(ty, 0),
+                ty => self.emit_zero(ty),
             };
             self.builder.ins().return_(&[zero]);
         }

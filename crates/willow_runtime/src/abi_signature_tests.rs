@@ -97,6 +97,10 @@ fn collection_handles_are_pointers_and_payload_words_remain_i64() {
     let _: extern "C" fn(*const u8) -> i64 = string::willow_string_len;
     assert_schema("willow_string_len", &[Ptr], Some(I64));
     let _: extern "C" fn(i64, i64) -> *mut u8 = array::willow_array_new;
+    let _: extern "C" fn(*mut u8) -> *mut u8 = array::willow_array_copy_scalar_pairs;
+    let _: extern "C" fn(*mut u8, *mut i64) = array::willow_array_pop_scalar_pair_into;
+    assert_schema("willow_array_pop_scalar_pair_into", &[Ptr, Ptr], None);
+    assert_schema("willow_array_copy_scalar_pairs", &[Ptr], Some(Ptr));
     let _: extern "C" fn(*mut u8) -> i64 = array::willow_array_len;
     let _: extern "C" fn(*mut u8, i64) -> i64 = array::willow_array_get;
     let _: extern "C" fn(*mut u8, i64, i64) = array::willow_array_set;
@@ -104,6 +108,7 @@ fn collection_handles_are_pointers_and_payload_words_remain_i64() {
     let _: extern "C" fn(i64, i64, i64) -> *mut u8 = map::willow_map_new;
     let _: extern "C" fn(*mut u8, i64, i64, i64, i64) = map::willow_map_insert;
     let _: extern "C" fn(*mut u8, i64, i64, i64) -> *mut u8 = map::willow_map_get;
+    let _: extern "C" fn(*mut u8, i64, i64, *mut i64) -> i64 = map::willow_map_get_into;
 }
 
 #[test]
@@ -147,6 +152,7 @@ const WORD_PINS: &[(&str, &[AbiTy], Option<AbiTy>)] = &[
     ("willow_array_get", &[Ptr, I64], Some(Word)),
     ("willow_array_set", &[Ptr, I64, Word], None),
     ("willow_array_push", &[Ptr, Word], None),
+    ("willow_array_push_scalar_pairs", &[Ptr, Word], None),
     ("willow_array_pop", &[Ptr], Some(Word)),
     // (map, key_word, key_is_ref, val_word, val_is_ref): the flag for a word
     // follows that word. The old schema `[Ptr, Word, Word, I64, I64]` only
@@ -154,6 +160,7 @@ const WORD_PINS: &[(&str, &[AbiTy], Option<AbiTy>)] = &[
     ("willow_map_insert", &[Ptr, Word, I64, Word, I64], None),
     // (map, key_word, key_is_ref, use_niche) and (map, key_word, key_is_ref).
     ("willow_map_get", &[Ptr, Word, I64, I64], Some(Ptr)),
+    ("willow_map_get_into", &[Ptr, Word, I64, Ptr], Some(I64)),
     ("willow_map_contains", &[Ptr, Word, I64], Some(I64)),
     // Cells: new(value_word, is_ref); get/read(handle) -> word;
     // set/write(handle, word).
@@ -178,9 +185,11 @@ fn word_carrying_rows_keep_i64_payload_types_in_rust() {
     let _: extern "C" fn(*mut u8, i64) -> i64 = array::willow_array_get;
     let _: extern "C" fn(*mut u8, i64, i64) = array::willow_array_set;
     let _: extern "C" fn(*mut u8, i64) = array::willow_array_push;
+    let _: extern "C" fn(*mut u8, i64) = array::willow_array_push_scalar_pairs;
     let _: extern "C" fn(*mut u8) -> i64 = array::willow_array_pop;
     let _: extern "C" fn(*mut u8, i64, i64, i64, i64) = map::willow_map_insert;
     let _: extern "C" fn(*mut u8, i64, i64, i64) -> *mut u8 = map::willow_map_get;
+    let _: extern "C" fn(*mut u8, i64, i64, *mut i64) -> i64 = map::willow_map_get_into;
     let _: extern "C" fn(*mut u8, i64, i64) -> i64 = map::willow_map_contains;
     let _: extern "C" fn(i64, i64) -> *mut c_void = lock::willow_blocking_cell_new;
     let _: extern "C" fn(*mut c_void) -> i64 = lock::willow_blocking_cell_get;

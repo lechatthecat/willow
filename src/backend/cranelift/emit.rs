@@ -51,6 +51,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         val: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::StackSlot {
+        assert_ne!(
+            self.builder.func.dfg.value_type(val),
+            cranelift_codegen::ir::types::I128,
+            "scalar pair must never be registered as a GC pointer"
+        );
         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
             reference_type(self.module.target_config()).bytes(),

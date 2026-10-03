@@ -1491,6 +1491,7 @@ impl UnitCodegenContext<'_> {
             async_frame_offsets: HashMap::new(),
             lir_frame_offsets: HashMap::new(),
             lir_defer_offsets: HashMap::new(),
+            lir_send_offsets: HashMap::new(),
             main_result_err_ty,
             vars: HashMap::new(),
             current_class: None,
@@ -1499,6 +1500,7 @@ impl UnitCodegenContext<'_> {
             is_async: false,
             terminated: false,
             gc_root_count: 0,
+            enum_payload_layouts: &mut self.output.enum_payload_layouts,
             coop_shadow_roots: None,
             build_mode: self.build_mode,
             source_file: &self.source_file,
@@ -1563,16 +1565,18 @@ impl UnitCodegenContext<'_> {
         if !lir_fn.captures.is_empty() {
             let env = fg.vars[CLOSURE_ENV_PARAM].clone();
             let env = fg.load_var(&env);
-            for (i, capture) in lir_fn.captures.iter().enumerate() {
+            let mut capture_word = 1;
+            for capture in &lir_fn.captures {
                 let val = fg.builder.ins().load(
                     clif_type(reference_type(fg.module.target_config()), &capture.ty),
                     MemFlagsData::trusted(),
                     env,
-                    (i as i32 + 1)
+                    capture_word
                         * willow_abi::storage_word_bytes(
                             reference_type(fg.module.target_config()).bytes(),
                         ) as i32,
                 );
+                capture_word += 1 + i32::from(super::option_repr::is_scalar_pair(&capture.ty));
                 fg.bind_param(&capture.name, &capture.ty, &ParamMode::Value, val);
             }
         }
@@ -1596,7 +1600,7 @@ impl UnitCodegenContext<'_> {
                 let zero =
                     match clif_type(reference_type(fg.module.target_config()), &call_return_type) {
                         types::F64 => fg.builder.ins().f64const(0.0),
-                        ty => fg.builder.ins().iconst(ty, 0),
+                        ty => fg.emit_zero(ty),
                     };
                 fg.builder.ins().return_(&[zero]);
             } else {
@@ -1718,7 +1722,10 @@ impl UnitCodegenContext<'_> {
             let storage_bytes = willow_abi::storage_word_bytes(
                 reference_type(self.output.module.target_config()).bytes(),
             );
-            data.define_zeroinit(storage_bytes as usize);
+            data.define_zeroinit(
+                storage_bytes as usize
+                    * (1 + usize::from(super::option_repr::is_scalar_pair(&field.ty))),
+            );
             data.set_align(storage_bytes as u64);
             self.output.module.define_data(data_id, &data)?;
             self.static_storage
@@ -1905,12 +1912,14 @@ impl UnitCodegenContext<'_> {
             async_frame_offsets: HashMap::new(),
             lir_frame_offsets: HashMap::new(),
             lir_defer_offsets: HashMap::new(),
+            lir_send_offsets: HashMap::new(),
             main_result_err_ty: None,
             vars: HashMap::new(),
             current_class: None,
             is_async: false,
             terminated: false,
             gc_root_count: 0,
+            enum_payload_layouts: &mut self.output.enum_payload_layouts,
             coop_shadow_roots: None,
             build_mode: self.build_mode,
             source_file: &self.source_file,
@@ -2473,6 +2482,7 @@ impl UnitCodegenContext<'_> {
             async_frame_offsets: HashMap::new(),
             lir_frame_offsets: HashMap::new(),
             lir_defer_offsets: HashMap::new(),
+            lir_send_offsets: HashMap::new(),
             main_result_err_ty: None,
             vars: HashMap::new(),
             current_class: Some(c.name.as_str()),
@@ -2480,6 +2490,7 @@ impl UnitCodegenContext<'_> {
             is_async: false,
             terminated: false,
             gc_root_count: 0,
+            enum_payload_layouts: &mut self.output.enum_payload_layouts,
             coop_shadow_roots: None,
             build_mode: self.build_mode,
             source_file: &self.source_file,
@@ -2561,7 +2572,7 @@ impl UnitCodegenContext<'_> {
                 let zero =
                     match clif_type(reference_type(fg.module.target_config()), &call_return_type) {
                         types::F64 => fg.builder.ins().f64const(0.0),
-                        ty => fg.builder.ins().iconst(ty, 0),
+                        ty => fg.emit_zero(ty),
                     };
                 fg.builder.ins().return_(&[zero]);
             } else {

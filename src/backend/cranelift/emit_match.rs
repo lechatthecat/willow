@@ -12,9 +12,13 @@ pub(super) fn emit_main_result_exit_raw(
     result_ptr: cranelift_codegen::ir::Value,
     err_is_string: bool,
 ) {
-    let tag = builder
-        .ins()
-        .load(types::I64, MemFlagsData::new(), result_ptr, 0i32);
+    let tag = if builder.func.dfg.value_type(result_ptr) == types::I128 {
+        builder.ins().ireduce(types::I64, result_ptr)
+    } else {
+        builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), result_ptr, 0i32)
+    };
     let err_tag = builder.ins().iconst(types::I64, 1); // Err = tag 1
     let is_err = builder.ins().icmp(IntCC::Equal, tag, err_tag);
     let err_block = builder.create_block();
@@ -48,6 +52,50 @@ pub(super) fn emit_main_result_exit_raw(
 }
 
 impl<'a, 'b> FuncGen<'a, 'b> {
+    /// Bridge a value into a runtime collection's erased one-word storage ABI.
+    /// Callers root owners before this potentially allocating conversion.
+    pub(super) fn emit_to_storage_word(
+        &mut self,
+        value: cranelift_codegen::ir::Value,
+        ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        if super::option_repr::is_scalar_pair(ty) {
+            let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(GcObjectKind::Enum, 16, 0, 0));
+            self.builder.ins().store(MemFlagsData::new(), value, ptr, 0);
+            ptr
+        } else {
+            self.coerce_to_i64(value, ty)
+        }
+    }
+
+    pub(super) fn emit_from_storage_word(
+        &mut self,
+        value: cranelift_codegen::ir::Value,
+        ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        if super::option_repr::is_scalar_pair(ty) {
+            self.builder
+                .ins()
+                .load(types::I128, MemFlagsData::new(), value, 0)
+        } else {
+            self.coerce_i64_to(value, ty)
+        }
+    }
+
+    pub(super) fn emit_zero(
+        &mut self,
+        ty: cranelift_codegen::ir::Type,
+    ) -> cranelift_codegen::ir::Value {
+        if ty == types::I128 {
+            let zero = self.builder.ins().iconst(types::I64, 0);
+            self.builder.ins().iconcat(zero, zero)
+        } else if ty == types::F64 {
+            self.builder.ins().f64const(0.0)
+        } else {
+            self.builder.ins().iconst(ty, 0)
+        }
+    }
+
     /// Convert error `e1_payload` (static class `e1_name`, implementing
     /// `Into<E2>`) to `E2` by calling `into`, dispatching VIRTUALLY on the
     /// payload's runtime type so a subclass override is honored (willow-bpk6).
@@ -118,8 +166,33 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         ptr: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
+        if self.builder.func.dfg.value_type(ptr) == types::I128 {
+            return self.builder.ins().ireduce(types::I64, ptr);
+        }
         self.builder
             .ins()
             .load(types::I64, MemFlagsData::new(), ptr, 0i32)
+    }
+
+    pub(super) fn emit_enum_payload_word(
+        &mut self,
+        value: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        if self.builder.func.dfg.value_type(value) == types::I128 {
+            let (_, payload) = self.builder.ins().isplit(value);
+            payload
+        } else {
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), value, 8)
+        }
+    }
+
+    pub(super) fn emit_pair(
+        &mut self,
+        tag: cranelift_codegen::ir::Value,
+        payload: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        self.builder.ins().iconcat(tag, payload)
     }
 }

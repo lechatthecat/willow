@@ -60,6 +60,42 @@ impl GcLayoutMetadata {
         }
     }
 
+    /// Mixed-width fields following non-reference header words. Use the same
+    /// bitmap allocation path as wide classes when references exceed bit 63.
+    pub(super) fn aggregate(
+        kind: GcObjectKind,
+        header_words: u32,
+        slots: &[willow_abi::SlotKind],
+        pointer_bytes: u32,
+    ) -> Self {
+        let words = header_words + willow_abi::WordLayout::new(slots).word_count();
+        let mut mask = 0u64;
+        let mut bitmap = Vec::new();
+        let mut word = header_words as usize;
+        for slot in slots {
+            if *slot == willow_abi::SlotKind::GcRef {
+                if word < 64 {
+                    mask |= 1 << word;
+                } else {
+                    if bitmap.is_empty() {
+                        bitmap = vec![0; (words as usize).div_ceil(64)];
+                        bitmap[0] = mask;
+                    }
+                    bitmap[word / 64] |= 1 << (word % 64);
+                }
+            }
+            word += slot.word_count() as usize;
+        }
+        let mut layout = Self::new(
+            kind,
+            i64::from(words) * i64::from(willow_abi::storage_word_bytes(pointer_bytes)),
+            0,
+            mask,
+        );
+        layout.bitmap = bitmap;
+        layout
+    }
+
     pub(super) fn class(
         runtime_type_id: i64,
         object: &crate::compiler_db::layout::ObjectLayout,
@@ -422,6 +458,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         value_ty: &Type,
         destination: GcStoreDestination,
     ) {
+        if super::option_repr::is_scalar_pair(value_ty)
+            && destination == GcStoreDestination::AsyncFrameSlot
+            && self.coop_result_offset == Some(offset)
+        {
+            // The runtime task-id word remains at data slot 1. Pair results
+            // reserve data slot 2 for their payload, leaving this shared ABI intact.
+            let (tag, payload) = self.builder.ins().isplit(value);
+            self.builder
+                .ins()
+                .store(MemFlagsData::new(), tag, owner, offset);
+            let payload_offset = super::async_frame_slot_offset(
+                2,
+                reference_type(self.module.target_config()).bytes(),
+            );
+            self.builder
+                .ins()
+                .store(MemFlagsData::new(), payload, owner, payload_offset);
+            return;
+        }
         let is_reference = is_gc_managed(value_ty, self.enum_infos);
         self.emit_gc_heap_store_classified(owner, offset, value, is_reference, destination);
     }
@@ -719,6 +774,51 @@ mod tests {
         assert_eq!(willow_abi::tlab::start_bits_offset(8), 16);
         assert_eq!(willow_abi::tlab::CHUNK_SIZE, 32768);
         assert_eq!(willow_abi::tlab::MARK_GRANULE_BYTES, 8);
+    }
+
+    #[test]
+    fn scalar_pair_aggregate_trace_boundaries_and_linear_storage() {
+        use willow_abi::SlotKind::{GcRef, ScalarPair, Word};
+        for count in [1, 16, 30, 31, 32, 63, 64, 128] {
+            for prefix_ref in [false, true] {
+                let mut slots = Vec::new();
+                if prefix_ref {
+                    slots.push(GcRef);
+                }
+                slots.extend(std::iter::repeat_n(ScalarPair, count));
+                slots.push(GcRef);
+                slots.push(Word);
+                let high_word = 1 + usize::from(prefix_ref) + 2 * count;
+                for kind in [GcObjectKind::Closure, GcObjectKind::Enum] {
+                    let layout = GcLayoutMetadata::aggregate(kind, 1, &slots, 8);
+                    let words = high_word + 2;
+                    assert_eq!(layout.payload_size, (words * 8) as i64);
+                    let traced: Vec<_> = if layout.bitmap.is_empty() {
+                        (0..64)
+                            .filter(|bit| layout.gc_ref_mask & (1 << bit) != 0)
+                            .collect()
+                    } else {
+                        assert_eq!(layout.bitmap.len(), words.div_ceil(64));
+                        (0..words)
+                            .filter(|bit| layout.bitmap[bit / 64] & (1 << (bit % 64)) != 0)
+                            .collect()
+                    };
+                    let expected = if prefix_ref {
+                        vec![1, high_word]
+                    } else {
+                        vec![high_word]
+                    };
+                    assert_eq!(traced, expected);
+                    assert_eq!(layout.bitmap.is_empty(), high_word < 64);
+                }
+            }
+        }
+        // Widening non-reference storage alone never needs bitmap tracing.
+        let slots = vec![ScalarPair; 128];
+        let layout = GcLayoutMetadata::aggregate(GcObjectKind::Closure, 1, &slots, 8);
+        assert_eq!(layout.payload_size, 257 * 8);
+        assert_eq!(layout.gc_ref_mask, 0);
+        assert!(layout.bitmap.is_empty());
     }
 
     #[test]

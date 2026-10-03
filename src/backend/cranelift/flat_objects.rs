@@ -29,7 +29,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let len = self.builder.ins().iconst(types::I64, len as i64);
         let refs = self.builder.ins().iconst(
             types::I64,
-            i64::from(is_gc_managed(element_ty, self.enum_infos)),
+            i64::from(super::type_helpers::storage_is_gc_managed(
+                element_ty,
+                self.enum_infos,
+            )),
         );
         self.emit_value_runtime_call("willow_array_new", &[len, refs])
     }
@@ -49,22 +52,53 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let array = self.emit_lir_operand(function, array);
             let index = self.emit_lir_operand(function, index);
             let value = self.emit_lir_operand(function, value);
-            let word = self.coerce_to_i64(value, element_ty);
+            let word = self.emit_to_storage_word(value, element_ty);
             return self.emit_array_access(array, Some(index), Some(word));
+        }
+        if super::option_repr::is_scalar_pair(element_ty) {
+            let array = self.emit_lir_operand(function, array);
+            let index = self.emit_lir_operand(function, index);
+            let value = self.emit_lir_operand(function, value);
+            self.emit_push_root(array);
+            let existing = self.emit_value_runtime_call("willow_array_get", &[array, index]);
+            let update = self.builder.create_block();
+            let initialize = self.builder.create_block();
+            let done = self.builder.create_block();
+            self.builder
+                .ins()
+                .brif(existing, update, &[], initialize, &[]);
+            self.builder.switch_to_block(update);
+            self.builder.seal_block(update);
+            // Preserve the element storage identity for outstanding references.
+            self.builder
+                .ins()
+                .store(MemFlagsData::new(), value, existing, 0);
+            self.builder.ins().jump(done, &[]);
+            self.builder.switch_to_block(initialize);
+            self.builder.seal_block(initialize);
+            let boxed = self.emit_to_storage_word(value, element_ty);
+            self.emit_word_array_store(array, index, boxed);
+            self.builder.ins().jump(done, &[]);
+            self.builder.switch_to_block(done);
+            self.builder.seal_block(done);
+            self.emit_pop_roots_n(1);
+            self.gc_root_count -= 1;
+            return self.builder.ins().iconst(types::I64, 0);
         }
         let array = self.emit_lir_operand(function, array);
         let source_ty = Self::flat_operand_type(function, value);
         // A frame-backed local is only an interior edge of the rooted frame.
         // Only an interface-boxing coercion allocates, so only it needs the
         // loaded owner pinned.
-        let boxes = self.coercion_boxes(&source_ty, element_ty);
+        let boxes = self.coercion_boxes(&source_ty, element_ty)
+            || super::option_repr::is_scalar_pair(element_ty);
         if boxes {
             self.emit_push_root(array);
         }
         let index = self.emit_lir_operand(function, index);
         let value = self.emit_lir_operand(function, value);
         let value = self.coerce_to_target(value, &source_ty, element_ty);
-        let value = self.coerce_to_i64(value, element_ty);
+        let value = self.emit_to_storage_word(value, element_ty);
         self.emit_word_array_store(array, index, value);
         if boxes {
             self.emit_pop_roots_n(1);
@@ -235,7 +269,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let array = self.emit_lir_operand(function, array);
         let index = self.emit_lir_operand(function, index);
         let value = self.emit_array_access(array, Some(index), None);
-        self.coerce_i64_to(value, element_ty)
+        self.emit_from_storage_word(value, element_ty)
     }
 
     /// Inline nonallocating access; retain ABI panic propagation on cold failures.

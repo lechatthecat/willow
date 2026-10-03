@@ -40,17 +40,23 @@ impl GcTraceLayout {
             mask: 0,
             bitmap: Vec::new(),
         };
-        for (i, (_, ty)) in fields.iter().enumerate() {
+        let words = 1 + fields
+            .iter()
+            .map(|(_, ty)| 1 + usize::from(crate::semantic::builtin_types::is_scalar_pair(ty)))
+            .sum::<usize>();
+        let mut next_word = 1;
+        for (_, ty) in fields.iter() {
+            let word = next_word;
+            next_word += 1 + usize::from(crate::semantic::builtin_types::is_scalar_pair(ty));
             if !managed(ty)? {
                 continue;
             }
             // Word zero points to a static class descriptor, never a GC object.
-            let word = i + 1;
             if word < 64 {
                 result.mask |= 1 << word;
             } else {
                 if result.bitmap.is_empty() {
-                    result.bitmap = vec![0; (fields.len() + 1).div_ceil(64)];
+                    result.bitmap = vec![0; words.div_ceil(64)];
                     result.bitmap[0] = result.mask;
                 }
                 result.bitmap[word / 64] |= 1 << (word % 64);
@@ -62,6 +68,9 @@ impl GcTraceLayout {
 
 /// One representation rule used by tracing queries and backend root/store lowering.
 pub(crate) fn is_gc_managed(ty: &Type, named: impl FnOnce(TypeId) -> bool) -> bool {
+    if crate::semantic::builtin_types::is_scalar_pair(ty) {
+        return false;
+    }
     match ty {
         Type::Named(name) => named(*name),
         Type::Array(_) | Type::String | Type::Closure(_, _) => true,
@@ -158,6 +167,8 @@ pub(crate) struct ObjectLayout {
     fields: Arc<Vec<(String, Type)>>,
     index: HashMap<String, usize>,
     word_bytes: i64,
+    offsets: Vec<usize>,
+    words: usize,
     gc: Option<Arc<GcTraceLayout>>,
 }
 
@@ -168,9 +179,20 @@ impl ObjectLayout {
             .enumerate()
             .map(|(index, (name, _))| (name.clone(), index))
             .collect();
+        let mut words = 1;
+        let offsets = fields
+            .iter()
+            .map(|(_, ty)| {
+                let offset = words;
+                words += 1 + usize::from(crate::semantic::builtin_types::is_scalar_pair(ty));
+                offset
+            })
+            .collect();
         Self {
             fields,
             index,
+            offsets,
+            words,
             word_bytes: i64::from(willow_abi::storage_word_bytes(pointer_bytes)),
             gc: None,
         }
@@ -186,7 +208,7 @@ impl ObjectLayout {
 
     /// Byte offset of field `index` from the object base.
     pub(crate) fn field_offset(&self, index: usize) -> i64 {
-        (index as i64 + 1) * self.word_bytes
+        self.offsets[index] as i64 * self.word_bytes
     }
 
     /// `(offset, declared type)` of the field named `name`.
@@ -198,7 +220,7 @@ impl ObjectLayout {
     /// Bytes of the object payload: the descriptor word plus one storage word
     /// per field.
     pub(crate) fn size_bytes(&self) -> i64 {
-        (self.fields.len() as i64 + 1) * self.word_bytes
+        self.words as i64 * self.word_bytes
     }
 }
 

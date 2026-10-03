@@ -6,15 +6,17 @@
 //!
 //! ```text
 //!   handle payload:  [ len(i64), cap(i64), is_ref(i64), buffer ]   (gc_ref_mask = 0b1000)
-//!   buffer payload:  [ len(atomic i64), elem0, elem1, ... elem_{cap-1} ]
+//!   buffer payload:  [ traced_prefix(atomic i64), elem0, elem1, ... elem_{cap-1} ]
 //! ```
 //!
 //! Each element occupies one 64-bit word. Scalars are stored directly (`bool`
 //! zero-extended, `f64` bit-cast); reference elements store the GC pointer.
 //! The handle traces `buffer` through `gc_ref_mask`; a reference buffer uses a
-//! dedicated `type_id` + trace function that scans only its logical length.
-//! Capacity is kept in the handle; new spare slots are zeroed and pop clears
-//! removed slots. Generated calls root any independently borrowed reference slots.
+//! dedicated `type_id` + trace function that scans its published prefix.
+//! Ordinary arrays trace their logical length and clear removed slots. Pair
+//! arrays retain untraced scalar boxes as stable slot storage, even after pop;
+//! their traced prefix is the initialized high-water mark, bounded by capacity.
+//! Capacity is kept in the handle. Generated code roots captured buffer owners.
 //!
 //! Index access is bounds-checked against `len`; out-of-range aborts.
 //!
@@ -36,20 +38,20 @@ use willow_abi::array_layout::{
 };
 const WORD: i64 = WORD_BYTES as i64;
 
-/// Read the published live prefix; the buffer remains independently traceable
+/// Read the published tracing prefix; the buffer remains independently traceable
 /// when a captured element reference keeps it alive after handle growth.
 unsafe fn buffer_len(buffer: *mut u8) -> i64 {
     unsafe { AtomicI64::from_ptr(buffer.cast()).load(Ordering::Acquire) }
 }
 
-/// Publish length after initializing newly live slots or clearing popped slots.
+/// Publish the traced prefix after initializing slots or clearing ordinary slots.
 /// The concurrent marker may observe an older prefix; insertion barriers retain
 /// every newly stored reference even when its slot is outside that snapshot.
 unsafe fn set_buffer_len(buffer: *mut u8, len: i64) {
     unsafe { AtomicI64::from_ptr(buffer.cast()).store(len, Ordering::Release) };
 }
 
-/// Trace only the live element slots (word 0 is the published length).
+/// Trace the published prefix (logical length, or initialized pair storage).
 ///
 /// # Safety
 /// `payload` must point at a buffer allocated by [`alloc_buffer`].
@@ -245,6 +247,54 @@ pub extern "C" fn willow_array_copy(mut arr: *mut u8) -> *mut u8 {
     copy
 }
 
+/// Freeze an array whose element words point to untraced `[tag, payload]`
+/// scalar-pair boxes. Copy the boxes too: mutable element references must not
+/// change the frozen snapshot. Both arrays remain rooted across every allocation.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_array_copy_scalar_pairs(mut arr: *mut u8) -> *mut u8 {
+    if arr.is_null() {
+        raise_with("cannot freeze a null array");
+        return std::ptr::null_mut();
+    }
+    let len = willow_array_len(arr);
+    willow_push_root(&mut arr);
+    let mut copy = willow_array_new(len, 1);
+    if copy.is_null() {
+        willow_pop_roots(1);
+        return copy;
+    }
+    willow_push_root(&mut copy);
+    for index in 0..len {
+        if willow_array_get(arr, index) == 0 {
+            continue;
+        }
+        let pair = unsafe { copy_scalar_pair(willow_array_get(arr, index) as *const i64) };
+        if pair.is_null() {
+            willow_pop_roots(2);
+            return std::ptr::null_mut();
+        }
+        willow_array_set(copy, index, pair as i64);
+    }
+    willow_pop_roots(2);
+    copy
+}
+
+/// Copy scalar bits before allocating: the source box can move during the
+/// allocation, but neither copied word is a reference needing relocation.
+/// The caller must publish or root the returned box before another safepoint.
+unsafe fn copy_scalar_pair(source: *const i64) -> *mut u8 {
+    let (tag, payload) = unsafe { (source.read(), source.add(1).read()) };
+    let pair = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0);
+    if !pair.is_null() {
+        unsafe {
+            (pair as *mut i64).write(tag);
+            (pair as *mut i64).add(1).write(payload);
+        }
+    }
+    pair
+}
+
 /// Number of elements in `arr`.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
@@ -309,7 +359,20 @@ pub extern "C" fn willow_array_reference_owner(arr: *mut u8, index: i64) -> *mut
 /// Append `value`, growing the buffer (doubling, min 4) when full.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
-pub extern "C" fn willow_array_push(mut arr: *mut u8, mut value: i64) {
+pub extern "C" fn willow_array_push(arr: *mut u8, value: i64) {
+    array_push(arr, value, false);
+}
+
+/// Pair boxes are mutable element storage, not shared referents. A captured
+/// element reference belongs to the old buffer, so growth copies each pair's
+/// bits into independent storage in the new buffer.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_array_push_scalar_pairs(arr: *mut u8, value: i64) {
+    array_push(arr, value, true);
+}
+
+fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool) {
     if arr.is_null() {
         raise_with("cannot push to a null array");
         return;
@@ -332,21 +395,46 @@ pub extern "C" fn willow_array_push(mut arr: *mut u8, mut value: i64) {
         if root_val {
             willow_push_root(&mut val as *mut *mut u8);
         }
-        let new_buf = alloc_buffer(new_cap, is_ref);
+        let mut new_buf = alloc_buffer(new_cap, is_ref);
         if new_buf.is_null() {
             willow_pop_roots(1 + i32::from(root_val));
             return;
+        }
+        if copy_pairs {
+            willow_push_root(&mut new_buf);
+            for index in 0..len {
+                // Reload through the rooted handle on every iteration: cloning
+                // can move both buffers and all still-live boxes.
+                let source = unsafe { *buf_slot(handle_buffer(arr), index) };
+                let pair = if source == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    let pair = unsafe { copy_scalar_pair(source as *const i64) };
+                    if pair.is_null() {
+                        willow_pop_roots(2 + i32::from(root_val));
+                        return;
+                    }
+                    pair
+                };
+                unsafe {
+                    store_buffer_slot(new_buf, index, pair as i64, true);
+                    // Keep each initialized pair visible to GC during the next
+                    // allocation, while leaving the old buffer unchanged.
+                    set_buffer_len(new_buf, index + 1);
+                }
+            }
+            willow_pop_roots(1);
         }
         if root_val {
             value = val as i64;
         }
         unsafe {
             let old_buf = handle_buffer(arr);
-            if is_ref {
+            if is_ref && !copy_pairs {
                 for i in 0..len {
                     store_buffer_slot(new_buf, i, *buf_slot(old_buf, i), true);
                 }
-            } else if len != 0 {
+            } else if !is_ref && len != 0 {
                 // Separate live allocations; copy only initialized scalar slots.
                 // Empty arrays may have a null old buffer.
                 std::ptr::copy_nonoverlapping(
@@ -372,8 +460,27 @@ pub extern "C" fn willow_array_push(mut arr: *mut u8, mut value: i64) {
     }
     unsafe {
         let buffer = handle_buffer(arr);
-        store_buffer_slot(buffer, len, value, is_ref);
-        set_buffer_len(buffer, len + 1);
+        let existing = if copy_pairs {
+            *buf_slot(buffer, len)
+        } else {
+            0
+        };
+        if existing != 0 {
+            // A popped pair retains its buffer slot identity. Updating the
+            // scalar words also updates any outstanding element reference.
+            let source = value as *const i64;
+            let target = existing as *mut i64;
+            target.write(source.read());
+            target.add(1).write(source.add(1).read());
+        } else {
+            store_buffer_slot(buffer, len, value, is_ref);
+        }
+        let traced = if copy_pairs {
+            buffer_len(buffer).max(len + 1)
+        } else {
+            len + 1
+        };
+        set_buffer_len(buffer, traced);
         set_handle_word(arr, H_LEN, len + 1);
     }
 }
@@ -402,6 +509,38 @@ pub extern "C" fn willow_array_pop(arr: *mut u8) -> i64 {
         set_buffer_len(buffer, last);
         set_handle_word(arr, H_LEN, last);
         value
+    }
+}
+
+/// Pop scalar bits into caller-owned storage without returning an alias to
+/// mutable element storage. The box stays in its buffer slot and remains traced
+/// until that buffer dies, so references captured before later arguments (or
+/// already held by a callee) survive removal and observe a subsequent push.
+/// `out` must be aligned writable storage for two i64 words during this call.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_array_pop_scalar_pair_into(arr: *mut u8, out: *mut i64) {
+    unsafe {
+        out.write(0);
+        out.add(1).write(0);
+    }
+    if arr.is_null() {
+        raise_with("cannot pop from a null array");
+        return;
+    }
+    let len = unsafe { handle_word(arr, H_LEN) };
+    if len == 0 {
+        raise_with("cannot pop from an empty array");
+        return;
+    }
+    unsafe {
+        let pair = *buf_slot(handle_buffer(arr), len - 1) as *mut i64;
+        out.write(pair.read());
+        out.add(1).write(pair.add(1).read());
+        // Match ordinary slot clearing, while retaining the slot's allocation.
+        pair.write(0);
+        pair.add(1).write(0);
+        set_handle_word(arr, H_LEN, len - 1);
     }
 }
 
@@ -817,6 +956,214 @@ mod tests {
             );
         }
         willow_pop_roots(1);
+    }
+
+    #[test]
+    fn scalar_pair_freeze_copies_boxes_and_survives_gc_stress() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let mut arr = willow_array_new(4, 1);
+        willow_push_root(&mut arr);
+        let words = [(0, 0), (1, i64::MIN), (0, f64::NAN.to_bits() as i64)];
+        for (index, &(tag, payload)) in words.iter().enumerate() {
+            let pair = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0);
+            unsafe {
+                (pair as *mut i64).write(tag);
+                (pair as *mut i64).add(1).write(payload);
+            }
+            willow_array_set(arr, index as i64, pair as i64);
+        }
+        let depth = crate::gc::willow_root_depth();
+        crate::gc::set_gc_stress_for_test(Some("alloc"));
+        let mut copy = willow_array_copy_scalar_pairs(arr);
+        crate::gc::set_gc_stress_for_test(None);
+        assert_eq!(crate::gc::willow_root_depth(), depth);
+        willow_push_root(&mut copy);
+        willow_gc_collect();
+        assert_eq!(willow_array_get(copy, 3), 0);
+        for (index, &(tag, payload)) in words.iter().enumerate() {
+            let source = willow_array_get(arr, index as i64) as *mut i64;
+            let frozen = willow_array_get(copy, index as i64) as *const i64;
+            assert_ne!(source as *const i64, frozen);
+            unsafe {
+                source.write(99);
+                source.add(1).write(123);
+                assert_eq!(frozen.read(), tag);
+                assert_eq!(frozen.add(1).read(), payload);
+            }
+        }
+        willow_pop_roots(2);
+    }
+
+    #[test]
+    fn scalar_pair_growth_copies_each_element_once_and_preserves_old_buffer() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        for count in [1, 16, 128] {
+            let mut arr = willow_array_new(count, 1);
+            willow_push_root(&mut arr);
+            for index in 0..count {
+                let pair = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0);
+                unsafe {
+                    pair.cast::<i64>().write(index % 2);
+                    pair.cast::<i64>().add(1).write(i64::MIN + index);
+                }
+                willow_array_set(arr, index, pair as i64);
+            }
+            let mut old_buffer = unsafe { handle_buffer(arr) };
+            willow_push_root(&mut old_buffer);
+            let pushed = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0);
+            unsafe { pushed.cast::<i64>().add(1).write(777) };
+            let depth = crate::gc::willow_root_depth();
+            let before = crate::gc::telemetry_heap_snapshot().0.allocation_count;
+            crate::gc::set_gc_stress_for_test(Some("alloc"));
+            willow_array_push_scalar_pairs(arr, pushed as i64);
+            crate::gc::set_gc_stress_for_test(None);
+            let allocations = crate::gc::telemetry_heap_snapshot().0.allocation_count - before;
+            // One new buffer and exactly one box per live copied element.
+            assert_eq!(allocations, count as u64 + 1);
+            eprintln!("pair-growth count={count} allocations={allocations}");
+            assert_eq!(crate::gc::willow_root_depth(), depth);
+            willow_gc_collect();
+            assert_eq!(willow_array_len(arr), count + 1);
+            assert_eq!(unsafe { buffer_len(old_buffer) }, count);
+            let mut unique = std::collections::HashSet::new();
+            for index in 0..count {
+                let old_pair = unsafe { *buf_slot(old_buffer, index) } as *mut i64;
+                let new_pair = willow_array_get(arr, index) as *const i64;
+                assert_ne!(old_pair as *const i64, new_pair);
+                assert!(unique.insert(new_pair));
+                unsafe {
+                    assert_eq!(new_pair.read(), index % 2);
+                    assert_eq!(new_pair.add(1).read(), i64::MIN + index);
+                    old_pair.add(1).write(123);
+                    assert_eq!(new_pair.add(1).read(), i64::MIN + index);
+                }
+            }
+            assert_eq!(unique.len(), count as usize);
+            assert_eq!(
+                unsafe { (willow_array_get(arr, count) as *const i64).add(1).read() },
+                777
+            );
+            willow_pop_roots(2);
+        }
+    }
+
+    #[test]
+    fn scalar_pair_pop_reuse_preserves_storage_and_tracing() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        for count in [1, 16, 128] {
+            let mut arr = willow_array_new(count, 1);
+            willow_push_root(&mut arr);
+            for index in 0..count {
+                let pair = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0);
+                unsafe {
+                    pair.cast::<i64>().write(index % 2);
+                    pair.cast::<i64>().add(1).write(i64::MIN + index);
+                }
+                willow_array_set(arr, index, pair as i64);
+            }
+            let mut owner = unsafe { handle_buffer(arr) };
+            willow_push_root(&mut owner);
+            let depth = crate::gc::willow_root_depth();
+            let before = crate::gc::telemetry_heap_snapshot().0.allocation_count;
+            for index in (0..count).rev() {
+                let mut out = [-1; 2];
+                willow_array_pop_scalar_pair_into(arr, out.as_mut_ptr());
+                assert_eq!(out, [index % 2, i64::MIN + index]);
+                let pair = unsafe { *buf_slot(owner, index) } as *const i64;
+                assert!(!pair.is_null());
+                assert_eq!(unsafe { [pair.read(), pair.add(1).read()] }, [0, 0]);
+            }
+            assert_eq!(
+                crate::gc::telemetry_heap_snapshot().0.allocation_count,
+                before
+            );
+            assert_eq!(willow_array_len(arr), 0);
+            assert_eq!(unsafe { buffer_len(owner) }, count);
+            let mut slots = Vec::new();
+            unsafe { trace_array_ref(owner, &mut slots) };
+            assert_eq!(slots.len(), count as usize);
+            willow_gc_collect();
+            crate::gc::set_gc_stress_for_test(Some("alloc"));
+            for index in 0..count {
+                let incoming = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0);
+                unsafe { incoming.cast::<i64>().add(1).write(index + 99) };
+                // Read the old identity only after allocation, which may move it.
+                let old_pair = unsafe { *buf_slot(owner, index) } as *mut i64;
+                let before = crate::gc::telemetry_heap_snapshot().0.allocation_count;
+                willow_array_push_scalar_pairs(arr, incoming as i64);
+                assert_eq!(
+                    crate::gc::telemetry_heap_snapshot().0.allocation_count,
+                    before
+                );
+                assert_eq!(willow_array_get(arr, index), old_pair as i64);
+                unsafe {
+                    assert_eq!(old_pair.add(1).read(), index + 99);
+                    old_pair.add(1).write(777);
+                }
+                assert_eq!(
+                    unsafe { (willow_array_get(arr, index) as *const i64).add(1).read() },
+                    777
+                );
+                assert_eq!(unsafe { buffer_len(owner) }, count);
+            }
+            crate::gc::set_gc_stress_for_test(None);
+            assert_eq!(crate::gc::willow_root_depth(), depth);
+            eprintln!(
+                "pair-pop-reuse count={count} retained-slots={} pop-allocations=0 reuse-runtime-allocations=0",
+                slots.len()
+            );
+            willow_pop_roots(2);
+        }
+    }
+
+    #[test]
+    fn scalar_pair_pop_errors_initialize_output_without_losing_roots() {
+        use crate::panic_context::*;
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let previous = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(905))));
+        let depth = crate::gc::willow_root_depth();
+        let empty = willow_array_new(0, 1);
+        for (arr, message) in [
+            (empty, "cannot pop from an empty array"),
+            (std::ptr::null_mut(), "cannot pop from a null array"),
+        ] {
+            let mut out = [-1; 2];
+            willow_array_pop_scalar_pair_into(arr, out.as_mut_ptr());
+            assert_eq!(out, [0, 0]);
+            assert_eq!(crate::gc::willow_root_depth(), depth);
+            assert_eq!(willow_panic_depth(), 1);
+            willow_panic_enter_defer();
+            let info = willow_panic_recover();
+            willow_panic_leave_defer();
+            assert_eq!(unsafe { panic_info_message(info) }, message);
+            willow_panic_release_recovered(info);
+        }
+        replace_current_context(previous);
+    }
+
+    #[test]
+    fn scalar_pair_freeze_null_preserves_root_depth_and_raises() {
+        use crate::panic_context::*;
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let previous = replace_current_context(Some(std::sync::Arc::new(PanicContext::new(904))));
+        let depth = crate::gc::willow_root_depth();
+        assert!(willow_array_copy_scalar_pairs(std::ptr::null_mut()).is_null());
+        assert_eq!(crate::gc::willow_root_depth(), depth);
+        assert_eq!(willow_panic_depth(), 1);
+        willow_panic_enter_defer();
+        let info = willow_panic_recover();
+        willow_panic_leave_defer();
+        assert_eq!(
+            unsafe { panic_info_message(info) },
+            "cannot freeze a null array"
+        );
+        willow_panic_release_recovered(info);
+        replace_current_context(previous);
     }
 
     #[test]
