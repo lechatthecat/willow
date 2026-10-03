@@ -352,13 +352,13 @@ unsafe fn record_then_panic_drop(payload: *mut u8) {
 }
 
 #[test]
-fn panicking_drop_does_not_poison_heap_or_retry_dead_storage() {
-    let _guard = global_gc_guard();
-    for shape in ["old", "large", "tlab_major", "tlab_minor"] {
+fn panicking_drop_terminates_every_storage_kind() {
+    use super::failure_policy_tests::{GC_FATAL_CASE, assert_fatal_child};
+    if let Ok(shape) = std::env::var(GC_FATAL_CASE) {
         reset_gc();
         willow_register_drop(CONTRACT_TYPE_ID as u32, record_then_panic_drop);
         let mut tls = new_tlab_state();
-        let mut allocate = || match shape {
+        let mut allocate = || match shape.as_str() {
             "large" => {
                 willow_alloc_object(CONTRACT_TYPE_ID, (GC_LARGE_OBJECT_THRESHOLD + 8) as i64)
             }
@@ -368,55 +368,51 @@ fn panicking_drop_does_not_poison_heap_or_retry_dead_storage() {
             _ => willow_alloc_object(CONTRACT_TYPE_ID, 8),
         };
         let dead = allocate();
-        let healthy_dead = allocate();
+        let _healthy_dead = allocate();
         let mut survivor = allocate();
         unsafe { *(dead as *mut u64) = 1 };
         willow_push_root(&mut survivor);
-        let before = crate::gc_telemetry::workers::snapshot().drop_hook_panics;
         if shape == "tlab_minor" {
             willow_gc_minor_collect();
         } else {
             willow_gc_collect();
         }
-        assert_eq!(
-            crate::gc_telemetry::workers::snapshot().drop_hook_panics,
-            before + 1,
-            "{shape}"
-        );
-        assert_eq!(drops_of(dead), 1, "{shape}");
-        assert_eq!(drops_of(healthy_dead), 1, "{shape}");
-        assert_eq!(drops_of(survivor), 0, "{shape}");
-        assert!(!runtime().heap.is_poisoned());
-        willow_gc_collect();
-        assert_eq!(drops_of(dead), 1, "{shape}: retried failed destructor");
-        assert_eq!(drops_of(healthy_dead), 1, "{shape}");
-        willow_pop_root();
-        willow_gc_collect();
-        assert_eq!(drops_of(survivor), 1, "{shape}");
-        assert_eq!(willow_gc_allocated_bytes(), 0);
-        assert!(!willow_alloc(8).is_null());
+        eprintln!("GC_PANIC_RETURNED");
+        return;
     }
-    reset_gc();
+    for shape in ["old", "large", "tlab_major", "tlab_minor"] {
+        let stderr = assert_fatal_child(
+            "gc::contract_viewpoint_tests::panicking_drop_terminates_every_storage_kind",
+            shape,
+            "runtime fatal: Rust panic in GC native destructor",
+        );
+        assert!(stderr.contains("injected native drop failure"));
+    }
 }
 
 #[test]
-fn panicking_panic_payload_cannot_escape_drop_hook_isolation() {
-    struct BadPayload;
-    impl Drop for BadPayload {
-        fn drop(&mut self) {
-            panic!("panic payload destructor");
+fn panicking_payload_is_not_dropped_after_native_hook_panic() {
+    use super::failure_policy_tests::{GC_FATAL_CASE, assert_fatal_child};
+    if std::env::var_os(GC_FATAL_CASE).is_some() {
+        struct BadPayload;
+        impl Drop for BadPayload {
+            fn drop(&mut self) {
+                panic!("GC_PAYLOAD_DROP_RAN");
+            }
         }
+        unsafe fn hook(_: *mut u8) {
+            std::panic::panic_any(BadPayload);
+        }
+        unsafe { run_drop_hook(hook, std::ptr::null_mut()) };
+        eprintln!("GC_PANIC_RETURNED");
+        return;
     }
-    unsafe fn hook(_: *mut u8) {
-        std::panic::panic_any(BadPayload);
-    }
-    let _guard = global_gc_guard();
-    let before = crate::gc_telemetry::workers::snapshot().drop_hook_panics;
-    unsafe { run_drop_hook(hook, std::ptr::null_mut()) };
-    assert_eq!(
-        crate::gc_telemetry::workers::snapshot().drop_hook_panics,
-        before + 1
+    let stderr = assert_fatal_child(
+        "gc::contract_viewpoint_tests::panicking_payload_is_not_dropped_after_native_hook_panic",
+        "payload",
+        "runtime fatal: Rust panic in GC native destructor",
     );
+    assert!(!stderr.contains("GC_PAYLOAD_DROP_RAN"));
 }
 
 static DROP_WITHOUT_HEAP_LOCK: std::sync::atomic::AtomicBool =

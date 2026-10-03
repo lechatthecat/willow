@@ -83,6 +83,7 @@ impl GcTrace for RuntimeSleepFuture {
 /// Use willow_future_is_ready_void to poll, willow_future_await_void to block.
 /// The caller owns the handle and must release it with willow_future_release_void.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_runtime_sleep(ms: i64) -> *mut std::ffi::c_void {
     future::void_future_into_raw_pub(future::WillowFutureVoid::sleep_after_millis(ms))
 }
@@ -91,6 +92,7 @@ pub extern "C" fn willow_runtime_sleep(ms: i64) -> *mut std::ffi::c_void {
 /// scheduler-aware yield path is `await yield()`, lowered to `willow_sched_yield`.
 /// The caller owns the handle and must release it with willow_future_release_void.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_runtime_yield() -> *mut std::ffi::c_void {
     future::void_future_into_raw_pub(future::WillowFutureVoid::ready())
 }

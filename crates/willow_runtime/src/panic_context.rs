@@ -217,8 +217,7 @@ fn require_current_context() -> Arc<PanicContext> {
 }
 
 pub(crate) fn fatal_invariant(message: &str) -> ! {
-    eprintln!("runtime fatal: {message}");
-    std::process::abort();
+    crate::failure::fatal_invariant(message)
 }
 
 fn alloc_string_or_empty(input: *const u8, fallback: &str) -> *mut u8 {
@@ -302,6 +301,7 @@ fn current_fault_site() -> (String, i64, i64) {
 /// length, copied onto the Rust heap so the fault site never allocates on the
 /// GC heap. Debug builds only; release builds never call this.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_fault_site_set(file: *const u8, file_len: i64, line: i64, column: i64) {
     let file = if file.is_null() || file_len <= 0 {
         String::new()
@@ -315,6 +315,7 @@ pub extern "C" fn willow_fault_site_set(file: *const u8, file_len: i64, line: i6
 /// Drop the published fault site (used by tests and by contexts that leave
 /// generated code, so a later fault cannot inherit an unrelated location).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_fault_site_clear() {
     FAULT_SITE.with(|site| *site.borrow_mut() = (String::new(), 0, 0));
 }
@@ -337,6 +338,7 @@ pub(crate) fn panic_unwind_cleanup_active() -> bool {
 /// Unlike the legacy `willow_panic` entry, this returns to compiler-generated
 /// propagation code and never invokes host unwinding.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_panic_raise(message: *const u8, file: *const u8, line: i64, column: i64) {
     let context = require_current_context();
     let info = alloc_panic_info(message, file, line, column);
@@ -344,6 +346,7 @@ pub extern "C" fn willow_panic_raise(message: *const u8, file: *const u8, line: 
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_panic_active() -> i32 {
     CURRENT_CONTEXT.with(|slot| {
         slot.borrow()
@@ -356,6 +359,7 @@ pub extern "C" fn willow_panic_active() -> i32 {
 /// Generated calls compare before/after depth so an already-active outer panic
 /// does not make a harmless helper look like it raised a nested panic.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_panic_depth() -> i32 {
     CURRENT_CONTEXT.with(|slot| {
         slot.borrow()
@@ -365,11 +369,13 @@ pub extern "C" fn willow_panic_depth() -> i32 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_panic_enter_defer() {
     require_current_context().enter_defer();
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_panic_leave_defer() {
     require_current_context().leave_defer();
 }
@@ -379,11 +385,13 @@ pub extern "C" fn willow_panic_leave_defer() {
 /// [`willow_panic_release_recovered`] acknowledges transfer to GC-visible
 /// generated storage.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_panic_recover() -> *mut u8 {
     require_current_context().recover()
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_panic_release_recovered(info: *mut u8) {
     if !require_current_context().release_recovered(info) {
         fatal_invariant("released PanicInfo without a matching recover transfer");
@@ -393,6 +401,7 @@ pub extern "C" fn willow_panic_release_recovered(info: *mut u8) {
 /// Finish an unhandled language panic. Compiler/runtime corruption must call a
 /// separate fatal ABI and therefore never reaches this recoverable path.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_panic_finish_unhandled() -> ! {
     let async_chain = crate::scheduler::async_chain_text();
     finish_unhandled_with_async_chain(&async_chain)

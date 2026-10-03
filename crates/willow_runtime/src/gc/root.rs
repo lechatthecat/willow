@@ -3,6 +3,7 @@ use super::*;
 /// Register a root slot.  `slot` must point to a stack location that holds
 /// a GC-managed pointer.  The slot must remain valid until the matching pop.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_push_root(slot: *mut *mut u8) {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     claim_root_stack_owner();
@@ -15,6 +16,7 @@ pub extern "C" fn willow_push_root(slot: *mut *mut u8) {
 
 /// Unregister the most recently pushed root slot.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_pop_root() {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     ROOT_STACK.with(|rs| {
@@ -27,6 +29,7 @@ pub extern "C" fn willow_pop_root() {
 
 /// Unregister `count` root slots from the top of the root stack.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_pop_roots(count: i32) {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     ROOT_STACK.with(|rs| {
@@ -44,6 +47,7 @@ pub extern "C" fn willow_pop_roots(count: i32) {
 /// unwind edge, where the number of roots pushed before the panic is otherwise
 /// path-dependent (willow-s9ej.3).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_root_depth() -> i32 {
     i32::try_from(ROOT_DEPTH.get()).unwrap_or_else(|_| {
         eprintln!("runtime fatal: generated-code root depth overflow");
@@ -132,6 +136,7 @@ pub(crate) unsafe fn discard_parked_roots(token: u64) {
 /// Keep a GC-managed object alive through a runtime-owned structure such as a
 /// scheduler task, future frame, task handle, or wait queue.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
     if object.is_null() {
         return;
@@ -152,6 +157,7 @@ pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
 /// Remove a persistent runtime root when the owning runtime structure no
 /// longer needs to retain the object.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_remove_runtime_root(object: *mut u8) {
     if object.is_null() {
         return;

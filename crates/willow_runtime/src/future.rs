@@ -90,6 +90,7 @@ macro_rules! release_abi {
         /// consumes it; using or releasing it again is invalid. A null handle
         /// is a fatal invariant violation. Pointer payloads are not freed.
         #[unsafe(no_mangle)]
+        #[willow_runtime_macros::ffi_boundary]
         pub unsafe extern "C" fn $name(raw: *mut c_void) {
             unsafe { release_raw::<$ty>(raw) };
         }
@@ -218,47 +219,56 @@ unsafe fn void_future_from_raw<'a>(raw: *mut c_void) -> &'a WillowFutureVoid {
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_ready_void() -> *mut c_void {
     void_future_into_raw(WillowFutureVoid::ready())
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_pending_void() -> *mut c_void {
     void_future_into_raw(WillowFutureVoid::pending())
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_is_ready_void(raw: *mut c_void) -> u8 {
     u8::from(unsafe { void_future_from_raw(raw) }.is_ready())
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_ready_i64(value: i64) -> *mut c_void {
     into_raw(ready_future(value))
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_ready_bool(value: u8) -> *mut c_void {
     into_raw(ready_future(if value == 0 { 0_u8 } else { 1_u8 }))
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_ready_f64(value: f64) -> *mut c_void {
     into_raw(ready_future(value))
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_ready_ptr(value: *mut c_void) -> *mut c_void {
     into_raw(ready_future(value))
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_await_void(raw: *mut c_void) -> u8 {
     unsafe { void_future_from_raw(raw) }.block_until_ready();
     0
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_is_ready_i64(raw: *mut c_void) -> u8 {
     match unsafe { future_from_raw::<i64>(raw) }.poll() {
         Poll::Ready(_) => 1,
@@ -267,6 +277,7 @@ pub extern "C" fn willow_future_is_ready_i64(raw: *mut c_void) -> u8 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_await_i64(raw: *mut c_void) -> i64 {
     match unsafe { future_from_raw::<i64>(raw) }.poll() {
         Poll::Ready(value) => value,
@@ -275,11 +286,13 @@ pub extern "C" fn willow_future_await_i64(raw: *mut c_void) -> i64 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_pending_i64() -> *mut c_void {
     into_raw(RuntimeFuture::<i64>::pending())
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_is_ready_bool(raw: *mut c_void) -> u8 {
     match unsafe { future_from_raw::<u8>(raw) }.poll() {
         Poll::Ready(_) => 1,
@@ -288,6 +301,7 @@ pub extern "C" fn willow_future_is_ready_bool(raw: *mut c_void) -> u8 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_await_bool(raw: *mut c_void) -> u8 {
     match unsafe { future_from_raw::<u8>(raw) }.poll() {
         Poll::Ready(value) => {
@@ -302,11 +316,13 @@ pub extern "C" fn willow_future_await_bool(raw: *mut c_void) -> u8 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_pending_bool() -> *mut c_void {
     into_raw(RuntimeFuture::<u8>::pending())
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_is_ready_f64(raw: *mut c_void) -> u8 {
     match unsafe { future_from_raw::<f64>(raw) }.poll() {
         Poll::Ready(_) => 1,
@@ -315,6 +331,7 @@ pub extern "C" fn willow_future_is_ready_f64(raw: *mut c_void) -> u8 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_await_f64(raw: *mut c_void) -> f64 {
     match unsafe { future_from_raw::<f64>(raw) }.poll() {
         Poll::Ready(value) => value,
@@ -323,11 +340,13 @@ pub extern "C" fn willow_future_await_f64(raw: *mut c_void) -> f64 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_pending_f64() -> *mut c_void {
     into_raw(RuntimeFuture::<f64>::pending())
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_is_ready_ptr(raw: *mut c_void) -> u8 {
     match unsafe { future_from_raw::<*mut c_void>(raw) }.poll() {
         Poll::Ready(_) => 1,
@@ -336,6 +355,7 @@ pub extern "C" fn willow_future_is_ready_ptr(raw: *mut c_void) -> u8 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_await_ptr(raw: *mut c_void) -> *mut c_void {
     match unsafe { future_from_raw::<*mut c_void>(raw) }.poll() {
         Poll::Ready(value) => value,
@@ -344,6 +364,7 @@ pub extern "C" fn willow_future_await_ptr(raw: *mut c_void) -> *mut c_void {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_pending_ptr() -> *mut c_void {
     into_raw(RuntimeFuture::<*mut c_void>::pending())
 }
@@ -351,6 +372,7 @@ pub extern "C" fn willow_future_pending_ptr() -> *mut c_void {
 /// Complete a pending i64 future with a value (called by executor when async fn finishes).
 /// Returns 1 on success. A null handle is a fatal runtime invariant violation.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_future_complete_i64(raw: *mut c_void, value: i64) -> u8 {
     unsafe { future_from_raw_mut::<i64>(raw) }.complete(value);
     1

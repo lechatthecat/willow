@@ -103,6 +103,26 @@ fn env_count(name: &str) -> Option<usize> {
         .filter(|count| *count > 0)
 }
 
+// A caller-side FFI catch cannot observe a detached thread's panic. Cover
+// initialization, dequeue/wakeup, job execution and accounting on this thread.
+fn blocking_worker_entry(initialize: fn()) {
+    crate::failure::ffi_boundary("blocking worker", || {
+        initialize();
+        loop {
+            let (work, freed_slot_for) = BLOCKING_POOL.dequeue();
+            // Waking takes scheduler locks and can trigger GC: keep it inside
+            // the fatal boundary, but outside the pool lock.
+            if let Some(task_id) = freed_slot_for {
+                crate::scheduler::willow_sched_wake(task_id);
+            }
+            ACTIVE_JOBS.fetch_add(1, Ordering::AcqRel);
+            work();
+            ACTIVE_JOBS.fetch_sub(1, Ordering::AcqRel);
+            COMPLETED_JOBS.fetch_add(1, Ordering::AcqRel);
+        }
+    });
+}
+
 impl BlockingPool {
     fn new() -> Self {
         let threads = env_count("WILLOW_BLOCKING_THREADS").unwrap_or(DEFAULT_BLOCKING_THREADS);
@@ -120,22 +140,12 @@ impl BlockingPool {
         for index in 0..threads {
             std::thread::Builder::new()
                 .name(format!("willow-blocking-{index}"))
-                .spawn(move || {
-                    crate::stack_overflow::protect_current_thread();
-                    loop {
-                        let (work, freed_slot_for) = BLOCKING_POOL.dequeue();
-                        // Wake outside the pool lock: waking takes scheduler
-                        // locks and may hit a GC stress collection.
-                        if let Some(task_id) = freed_slot_for {
-                            crate::scheduler::willow_sched_wake(task_id);
-                        }
-                        ACTIVE_JOBS.fetch_add(1, Ordering::AcqRel);
-                        work();
-                        ACTIVE_JOBS.fetch_sub(1, Ordering::AcqRel);
-                        COMPLETED_JOBS.fetch_add(1, Ordering::AcqRel);
-                    }
-                })
-                .expect("failed to start Willow blocking worker");
+                .spawn(|| blocking_worker_entry(crate::stack_overflow::protect_current_thread))
+                .unwrap_or_else(|_| {
+                    crate::failure::resource_exhausted(format_args!(
+                        "cannot start Willow blocking worker"
+                    ))
+                });
         }
         pool
     }
@@ -331,12 +341,14 @@ pub(crate) fn reset_slot_waiters_for_test() {
 
 /// Jobs currently running on pool threads.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_blocking_active_jobs() -> i64 {
     ACTIVE_JOBS.load(Ordering::Acquire) as i64
 }
 
 /// Jobs that have finished running on pool threads (monotonic).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_blocking_completed_jobs() -> i64 {
     COMPLETED_JOBS.load(Ordering::Acquire) as i64
 }
@@ -344,6 +356,7 @@ pub extern "C" fn willow_blocking_completed_jobs() -> i64 {
 /// Jobs admitted to the bounded queue but not yet started (depth gauge,
 /// `0..=willow_blocking_queue_capacity()`).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_blocking_queued_jobs() -> i64 {
     QUEUED_JOBS.load(Ordering::Acquire) as i64
 }
@@ -351,12 +364,14 @@ pub extern "C" fn willow_blocking_queued_jobs() -> i64 {
 /// Tasks parked because no queue slot was available when they submitted
 /// (gauge).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_blocking_slot_waiters() -> i64 {
     SLOT_WAITERS.load(Ordering::Acquire) as i64
 }
 
 /// Bounded queue capacity (`WILLOW_BLOCKING_QUEUE`).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_blocking_queue_capacity() -> i64 {
     BLOCKING_POOL.capacity as i64
 }
@@ -814,3 +829,7 @@ mod tests {
         reset_global_scheduler_for_test();
     }
 }
+
+#[cfg(test)]
+#[path = "blocking_failure_tests.rs"]
+mod failure_tests;

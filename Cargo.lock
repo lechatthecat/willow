@@ -762,6 +762,15 @@ dependencies = [
  "ryu",
  "socket2",
  "willow_abi",
+ "willow_runtime_macros",
+]
+
+[[package]]
+name = "willow_runtime_macros"
+version = "0.1.0"
+dependencies = [
+ "quote",
+ "syn",
 ]
 
 [[package]]

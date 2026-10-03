@@ -76,6 +76,7 @@ pub fn print_current_reference_call_context() {
 /// One scope covers the whole call, so multiple reference arguments still
 /// select the last argument while a nested call can restore its parent.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_debug_reference_call_scope_push() {
     REFERENCE_CALL_STATE.with(|state| {
         let mut state = state.borrow_mut();
@@ -85,6 +86,7 @@ pub extern "C" fn willow_debug_reference_call_scope_push() {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_debug_reference_call(
     file: *const u8,
     line: i32,
@@ -112,6 +114,7 @@ pub extern "C" fn willow_debug_reference_call(
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_debug_reference_call_clear() {
     clear_current_reference_call();
 }

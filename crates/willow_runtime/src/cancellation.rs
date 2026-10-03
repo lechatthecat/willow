@@ -610,11 +610,13 @@ fn task_id(frame: *mut u8) -> u64 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_cancellation_token_new() -> *mut u8 {
     alloc_token(Arc::new(CancellationCore::default()))
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_cancellation_token_child(parent: *mut u8) -> *mut u8 {
     let Some(parent) = (unsafe { token(parent) }) else {
         return std::ptr::null_mut();
@@ -623,6 +625,7 @@ pub extern "C" fn willow_cancellation_token_child(parent: *mut u8) -> *mut u8 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_cancellation_token_attach(
     token_handle: *mut u8,
     task_frame: *mut u8,
@@ -634,6 +637,7 @@ pub extern "C" fn willow_cancellation_token_attach(
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_cancellation_token_cancel(token_handle: *mut u8) {
     if let Some(token) = unsafe { token(token_handle) } {
         token.core.cancel();
@@ -641,6 +645,7 @@ pub extern "C" fn willow_cancellation_token_cancel(token_handle: *mut u8) {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_cancellation_token_is_cancelled(token_handle: *mut u8) -> i64 {
     unsafe { token(token_handle) }
         .is_some_and(|token| token.core.cancelled.load(Ordering::Acquire))
@@ -648,11 +653,13 @@ pub extern "C" fn willow_cancellation_token_is_cancelled(token_handle: *mut u8) 
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_task_scope_new() -> *mut u8 {
     alloc_scope(Arc::new(ScopeCore::default()))
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_task_scope_child(parent: *mut u8) -> *mut u8 {
     let Some(parent) = (unsafe { scope(parent) }) else {
         return std::ptr::null_mut();
@@ -661,6 +668,7 @@ pub extern "C" fn willow_task_scope_child(parent: *mut u8) -> *mut u8 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_task_scope_add(scope_handle: *mut u8, task_frame: *mut u8) -> *mut u8 {
     if let Some(scope) = unsafe { scope(scope_handle) } {
         scope.core.add(task_id(task_frame), task_frame);
@@ -669,6 +677,7 @@ pub extern "C" fn willow_task_scope_add(scope_handle: *mut u8, task_frame: *mut 
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_task_scope_cancel(scope_handle: *mut u8) {
     if let Some(scope) = unsafe { scope(scope_handle) } {
         scope.core.cancel();
@@ -676,6 +685,7 @@ pub extern "C" fn willow_task_scope_cancel(scope_handle: *mut u8) {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_task_scope_is_cancelled(scope_handle: *mut u8) -> i64 {
     unsafe { scope(scope_handle) }
         .is_some_and(|scope| scope.core.cancelled.load(Ordering::Acquire))
@@ -812,6 +822,7 @@ unsafe fn finish_scope_task(frame: *mut c_void, result: *mut u8) -> i32 {
     crate::task::RUNTIME_POLL_READY
 }
 
+#[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn poll_scope_finish(frame: *mut c_void) -> i32 {
     let Some(state) = (unsafe { finish_state(frame) }) else {
         return crate::task::RUNTIME_POLL_READY;
@@ -834,6 +845,7 @@ unsafe extern "C" fn poll_scope_finish(frame: *mut c_void) -> i32 {
     unsafe { finish_scope_task(frame, result) }
 }
 
+#[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn cancel_scope_finish(frame: *mut c_void) {
     unsafe {
         let raw =
@@ -845,6 +857,7 @@ unsafe extern "C" fn cancel_scope_finish(frame: *mut c_void) {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_task_scope_finish(scope_handle: *mut u8) -> *mut c_void {
     let Some(scope) = (unsafe { scope(scope_handle) }) else {
         return std::ptr::null_mut();

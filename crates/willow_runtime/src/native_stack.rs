@@ -171,6 +171,7 @@ impl NativeStack {
     }
 
     pub(crate) fn acquire_cleanup(cancel: RuntimeCancelFn, frame: *mut c_void) -> Box<Self> {
+        #[willow_runtime_macros::ffi_boundary]
         unsafe extern "C" fn unused_poll(_: *mut c_void) -> i32 {
             unreachable!()
         }
@@ -190,8 +191,9 @@ impl NativeStack {
     pub(crate) fn new(poll: RuntimePollFn, frame: *mut c_void) -> Box<Self> {
         // Windows stacks inherit the current thread's overflow guarantee.
         crate::stack_overflow::protect_current_thread();
-        let storage = corosensei::stack::DefaultStack::new(8 * 1024 * 1024)
-            .expect("cannot allocate task native stack");
+        let storage = corosensei::stack::DefaultStack::new(8 * 1024 * 1024).unwrap_or_else(|_| {
+            crate::failure::resource_exhausted(format_args!("cannot allocate task native stack"))
+        });
         #[cfg(unix)]
         let guard = {
             let lower = storage.limit().get();

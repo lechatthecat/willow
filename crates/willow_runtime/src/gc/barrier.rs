@@ -134,6 +134,7 @@ pub(super) fn flush_satb_all_locked(state: &mut GcState) {
 /// edges. The caller must capture `old_value` before overwriting, including
 /// removals/null stores. Only proven-null initialization passes null as old.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_write_barrier(
     owner: *mut u8,
     old_value: *mut u8,

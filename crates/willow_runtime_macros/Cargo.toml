@@ -1,0 +1,15 @@
+[package]
+name = "willow_runtime_macros"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+
+[dev-dependencies]
+syn = { version = "2", features = ["full", "visit"] }

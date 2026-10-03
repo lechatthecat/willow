@@ -154,6 +154,7 @@ macro_rules! run_queue_metrics {
 
         $($(
             #[unsafe(no_mangle)]
+            #[willow_runtime_macros::ffi_boundary]
             pub extern "C" fn $getter() -> i64 {
                 crate::scheduler::read_run_queue_metric(|metrics| {
                     metrics.$field.load(Ordering::Relaxed)
@@ -177,6 +178,7 @@ run_queue_metrics! {
 
 /// Global publishes use only the shared bank, so this read stays O(1).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_global_pushes() -> i64 {
     crate::scheduler::run_queue_global_pushes() as i64
 }
@@ -341,6 +343,7 @@ pub(crate) fn record(kind: RuntimeEventKind, worker: Option<usize>, task_id: u64
 /// callbacks already using the prior context. A callback must not itself call
 /// this registration function.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_runtime_set_event_hook_v1(
     hook: Option<RuntimeEventHookV1>,
     context: *mut c_void,
@@ -377,6 +380,7 @@ pub extern "C" fn willow_runtime_set_event_hook_v1(
 /// Write a versioned cumulative runtime snapshot. Returns 0 on success and -1
 /// for a null output pointer.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_runtime_metrics_snapshot_v1(out: *mut WillowRuntimeMetricsV1) -> i32 {
     let Some(out) = (unsafe { out.as_mut() }) else {
         return -1;

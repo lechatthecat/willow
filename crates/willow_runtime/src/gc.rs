@@ -390,12 +390,11 @@ fn collect_for_budget() {
 
 fn allocation_failure(state: &GcState) -> *mut u8 {
     if let Some(limit) = state.memory_limit_bytes {
-        eprintln!(
-            "runtime fatal: GC memory limit exceeded ({limit} bytes of managed region reservations)"
-        );
-        std::process::exit(1);
+        crate::failure::resource_exhausted(format_args!(
+            "GC memory limit exceeded ({limit} bytes of managed region reservations)"
+        ));
     }
-    std::ptr::null_mut()
+    crate::failure::resource_exhausted(format_args!("managed allocation failed"))
 }
 
 fn major_trigger(state: &GcState) -> usize {
@@ -665,6 +664,7 @@ fn allocation_should_minor_collect() -> bool {
 /// previous limit. Collection is considered at the next allocation slow path;
 /// this setter never parks mutators or changes the legacy hard reservation cap.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_set_memory_limit(bytes: u64) -> u64 {
     runtime().heap.lock().unwrap().soft_memory.set_limit(bytes)
 }
@@ -678,6 +678,7 @@ pub extern "C" fn willow_gc_set_memory_limit(bytes: u64) -> u64 {
 /// `runtime_test_guard()` while doing so because the Rust test harness runs
 /// tests in parallel in one process.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_init() {
     reset_internal();
 }
@@ -688,16 +689,19 @@ pub extern "C" fn willow_gc_init() {
 ///
 /// This function may trigger a collection if the heap threshold is exceeded.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_alloc_object(type_id: i64, payload_size: i64) -> *mut u8 {
     allocate_object(0, type_id as u32, payload_size, 0)
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_alloc_typed(payload_size: i64, gc_ref_mask: u64) -> *mut u8 {
     allocate_object(0, 0, payload_size, gc_ref_mask)
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_alloc(payload_size: i64) -> *mut u8 {
     willow_alloc_typed(payload_size, 0)
 }
@@ -712,6 +716,7 @@ pub extern "C" fn willow_alloc(payload_size: i64) -> *mut u8 {
 /// objects have been reclaimed. Payload and bitmap sizes must agree.
 /// `layout_id` is the address-independent fingerprint computed by the compiler.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_alloc_bitmap(
     layout_id: i64,
     payload_size: i64,
@@ -733,6 +738,7 @@ pub extern "C" fn willow_gc_alloc_bitmap(
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_alloc_layout(
     layout_id: u64,
     type_id: i64,
@@ -749,6 +755,7 @@ pub extern "C" fn willow_gc_alloc_layout(
 /// initialize the first object, and return its payload. Large and stress-mode
 /// allocations stay on the old/large-region path.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_alloc_slow(
     tlab_state: *mut GcTlabState,
     layout_id: u64,
@@ -757,13 +764,13 @@ pub extern "C" fn willow_gc_alloc_slow(
     gc_ref_mask: u64,
 ) -> *mut u8 {
     if tlab_state.is_null() || payload_size < 0 {
-        return std::ptr::null_mut();
+        crate::failure::fatal_invariant("invalid TLAB allocation arguments");
     }
     let Some(total_size) = (GC_HEADER_SIZE)
         .checked_add(payload_size as usize)
         .and_then(|size| size.checked_next_multiple_of(std::mem::align_of::<GcHeader>()))
     else {
-        return std::ptr::null_mut();
+        crate::failure::resource_exhausted(format_args!("TLAB allocation size overflow"));
     };
     let state_address = tlab_state as usize;
     let stress = gc_stress_enabled("alloc");
@@ -813,7 +820,7 @@ pub extern "C" fn willow_gc_alloc_slow(
     let Some(header) =
         initialize_object_at(base, total_size, type_id as u32, layout_id, gc_ref_mask)
     else {
-        return std::ptr::null_mut();
+        crate::failure::fatal_invariant("fresh TLAB could not initialize a validated object");
     };
     state.tlab_chunks.last_mut().unwrap().mark_bitmap.mark(0);
     // SAFETY: the generated TLS block is aligned and remains alive for this
@@ -928,7 +935,7 @@ fn find_tlab_chunk(state: &GcState, address: usize) -> Option<&BumpChunk> {
 
 fn allocate_object(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8 {
     if payload_size < 0 {
-        return std::ptr::null_mut();
+        crate::failure::fatal_invariant("negative managed allocation size");
     }
     assist_concurrent_mark((payload_size as u64).saturating_add(GC_HEADER_SIZE as u64));
     if allocation_should_collect() {
@@ -1028,7 +1035,7 @@ fn allocate_old_region_object_locked(
 
 fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8 {
     if payload_size < 0 {
-        return std::ptr::null_mut();
+        crate::failure::fatal_invariant("negative managed allocation size");
     }
     let payload_size = payload_size as usize;
     let mut state = runtime().heap.lock().unwrap();
@@ -1089,6 +1096,7 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
 /// the function, or wrap the allocation in a smaller scope if block-scoped
 /// roots are supported) before calling `gc_collect()`.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_collect() {
     collect_internal();
 }
@@ -1098,6 +1106,7 @@ pub extern "C" fn willow_gc_collect() {
 /// allocation. Heap-only survivors copy to young survivor storage at age 1,
 /// then to non-moving old storage at age 2; their reference slots are updated.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_minor_collect() {
     minor_collect_internal();
 }
@@ -1834,3 +1843,6 @@ mod tests;
 #[cfg(test)]
 #[path = "gc_concurrent_tests.rs"]
 mod concurrent_tests;
+
+#[cfg(test)]
+mod failure_policy_tests;

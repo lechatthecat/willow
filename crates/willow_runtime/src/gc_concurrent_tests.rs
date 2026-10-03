@@ -748,7 +748,7 @@ fn budget_exhaustion_reports_error_before_callers_can_dereference_null() {
         );
         assert!(
             String::from_utf8_lossy(&result.stderr)
-                .contains("runtime fatal: GC memory limit exceeded")
+                .contains("runtime resource exhausted: GC memory limit exceeded")
         );
     }
 }
@@ -1015,42 +1015,35 @@ fn dedicated_marker_pool_reuses_threads_and_quiesces_before_reclamation() {
 }
 
 #[test]
-fn concurrent_trace_failure_falls_back_and_retains_the_full_graph() {
-    let _guard = runtime_test_guard();
-    reset_internal_for_test();
-    willow_register_type(0xFA72, trace_slot);
-    runtime()
-        .concurrent_trace_registry
-        .lock()
-        .unwrap()
-        .insert(0xFA72, failing_concurrent_trace);
-    let mut parent = willow_alloc_object(0xFA72, 8);
-    let child = willow_alloc_typed(8, 1);
-    let leaf = willow_alloc(8);
-    unsafe {
-        store_gc_reference(parent.cast(), child);
-        store_gc_reference(child.cast(), leaf);
+fn concurrent_trace_panic_terminates_collection() {
+    use super::failure_policy_tests::{GC_FATAL_CASE, assert_fatal_child};
+    if std::env::var_os(GC_FATAL_CASE).is_some() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        willow_register_type(0xFA72, trace_slot);
+        runtime()
+            .concurrent_trace_registry
+            .lock()
+            .unwrap()
+            .insert(0xFA72, failing_concurrent_trace);
+        let mut parent = willow_alloc_object(0xFA72, 8);
+        let child = willow_alloc_typed(8, 1);
+        let leaf = willow_alloc(8);
+        unsafe {
+            store_gc_reference(parent.cast(), child);
+            store_gc_reference(child.cast(), leaf);
+        }
+        willow_push_root(&mut parent);
+        willow_gc_collect();
+        eprintln!("GC_PANIC_RETURNED");
+        return;
     }
-    willow_push_root(&mut parent);
-    let fallbacks = crate::gc_telemetry::workers::snapshot().fallback_cycles;
-    let panics = crate::gc_telemetry::workers::snapshot().marker_panics;
-    willow_gc_collect();
-    assert_eq!(willow_gc_allocated_bytes(), 3 * (GC_HEADER_SIZE + 8) as i64);
-    assert_eq!(
-        crate::gc_telemetry::workers::snapshot().fallback_cycles,
-        fallbacks + 1
+    let stderr = assert_fatal_child(
+        "gc::concurrent_tests::concurrent_trace_panic_terminates_collection",
+        "collection",
+        "runtime fatal: Rust panic in GC marker",
     );
-    assert_eq!(
-        crate::gc_telemetry::workers::snapshot().marker_panics,
-        panics + 1
-    );
-    assert_eq!(registered_mutator_count(), 0);
-    willow_pop_roots(1);
-    willow_gc_collect();
-    assert_eq!(willow_gc_allocated_bytes(), 0);
-    shutdown_mark_workers();
-    assert!(MARK_WORKERS.lock().unwrap().is_none());
-    reset_internal_for_test();
+    assert!(stderr.contains("injected concurrent trace failure"));
 }
 
 #[test]
@@ -1112,47 +1105,53 @@ fn marker_unregister_without_tlab_does_not_scan_mutator_allocation_records() {
 }
 
 #[test]
-fn background_marker_panic_retires_consumer_and_pool_accepts_next_epoch() {
-    let _guard = runtime_test_guard();
-    reset_internal_for_test();
-    for workers in [1, 5] {
-        let pool = mark_workers::Pool::new(workers).unwrap();
+fn marker_panics_terminate_worker_collector_and_assist() {
+    use super::failure_policy_tests::{GC_FATAL_CASE, assert_fatal_child};
+    if let Ok(case) = std::env::var(GC_FATAL_CASE) {
+        reset_internal_for_test();
         let object = willow_alloc(8) as usize;
-        for fail in [true, false] {
-            let trace = if fail {
-                failing_concurrent_trace
-            } else {
-                record_marker_thread
-            };
-            let cycle = Arc::new(ConcurrentCycle::new(
-                [(
-                    object,
-                    raw_heap::TraceMetadata {
-                        type_id: 0xFA73,
-                        layout_id: 0,
-                        gc_ref_mask: 0,
-                        payload_size: 8,
-                    },
-                )],
-                HashSet::new(),
-                HashMap::from([(0xFA73, trace as ConcurrentTraceFn)]),
-                1,
-            ));
-            cycle.enqueue(object as *mut u8);
-            let before = crate::gc_telemetry::workers::snapshot().marker_panics;
-            pool.run(&cycle, 0);
-            assert_eq!(cycle.worker_failed.load(Ordering::Acquire), fail);
-            assert_eq!(
-                crate::gc_telemetry::workers::snapshot().marker_panics,
-                before + u64::from(fail)
-            );
-            assert_eq!(cycle.queue.snapshot().registered_workers, 0);
-            assert_eq!(registered_mutator_count(), 0);
-            assert_eq!(cycle.queue.end_epoch(), 0);
+        let cycle = Arc::new(ConcurrentCycle::new(
+            [(
+                object,
+                raw_heap::TraceMetadata {
+                    type_id: 0xFA73,
+                    layout_id: 0,
+                    gc_ref_mask: 0,
+                    payload_size: 8,
+                },
+            )],
+            HashSet::new(),
+            HashMap::from([(0xFA73, failing_concurrent_trace as ConcurrentTraceFn)]),
+            1,
+        ));
+        cycle.enqueue(object as *mut u8);
+        match case.as_str() {
+            "worker1" | "worker5" => {
+                let pool = mark_workers::Pool::new(if case == "worker1" { 1 } else { 5 }).unwrap();
+                pool.run(&cycle, 0);
+            }
+            "collector" => mark_workers::Pool::new(0).unwrap().run(&cycle, 1),
+            "assist" => {
+                cycle.drain_checked(1);
+            }
+            _ => panic!("invalid child case"),
         }
-        drop(pool);
+        eprintln!("GC_PANIC_RETURNED");
+        return;
     }
-    reset_internal_for_test();
+    for (case, context) in [
+        ("worker1", "worker"),
+        ("worker5", "worker"),
+        ("collector", "collector"),
+        ("assist", "assist"),
+    ] {
+        let stderr = assert_fatal_child(
+            "gc::concurrent_tests::marker_panics_terminate_worker_collector_and_assist",
+            case,
+            &format!("runtime fatal: Rust panic in GC marker {context}"),
+        );
+        assert!(stderr.contains("injected concurrent trace failure"));
+    }
 }
 
 static SWEEP_MUTATOR_READY: AtomicBool = AtomicBool::new(false);

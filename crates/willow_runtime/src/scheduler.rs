@@ -2104,6 +2104,7 @@ pub(crate) fn current_worker() -> usize {
 /// the GC so it (and the values it references) survives collection while the
 /// task is pending. Returns the task id.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_spawn(poll: RuntimePollFn, frame: *mut c_void) -> u64 {
     spawn_global_task_initialized(poll, frame, None, |_| {})
 }
@@ -2124,6 +2125,7 @@ pub(crate) fn spawn_global_task_initialized(
 
 /// Spawn a generated poll whose synchronous calls enter a stack lazily.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_spawn_cooperative(poll: RuntimePollFn, frame: *mut c_void) -> i64 {
     spawn_global_task_initialized_inner(poll, frame, None, |_| {}, true) as i64
 }
@@ -2189,6 +2191,7 @@ impl Drop for PendingSpawnRoot {
 
 /// Wake a parked task, re-queueing it as ready.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_wake(id: u64) {
     let _ = try_wake_parked_task(id);
 }
@@ -2199,6 +2202,7 @@ pub extern "C" fn willow_sched_wake(id: u64) {
 /// For nonzero `len`, `ids` must reference `len` initialized, aligned u64 values
 /// readable for this call; their storage must remain valid across GC safepoints.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub unsafe extern "C" fn willow_sched_wake_many(ids: *const u64, len: usize) {
     if len == 0 {
         return;
@@ -2251,6 +2255,7 @@ pub(crate) fn wake_channel_owner(id: u64) -> bool {
 /// re-queued so the cancellation is observed promptly; the task is finalized
 /// (state Cancelled, never polled again) at the next scheduler claim.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_cancel(id: u64) {
     let id = id as RuntimeTaskId;
     let tasks = global_task_table();
@@ -2286,6 +2291,7 @@ pub extern "C" fn willow_sched_cancel(id: u64) {
 /// WillowString; copied out of the GC heap). Shown in panic/debug traces
 /// (willow-0a6k.7).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_set_spawn_site(id: u64, file: *const u8, line: i64) {
     let file = unsafe { crate::string::willow_string_as_str(file) }.to_string();
     let id = id as RuntimeTaskId;
@@ -2484,6 +2490,7 @@ pub(crate) fn wake_lock_waiter(task_id: RuntimeTaskId) -> WakeOutcome {
 
 /// True (1) if `id` was cancel-requested or already finalized as Cancelled.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_is_cancelled(id: u64) -> i64 {
     let id = id as RuntimeTaskId;
     global_task_table()
@@ -2544,6 +2551,7 @@ fn report_poll_failure(id: u64, invalid_result: Option<i32>, async_chain: &str) 
 /// Attach the compiler-generated cancellation cleanup entry to a task
 /// (willow-vynv.3). Called by the async-fn constructor right after spawn.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_set_cancel_fn(id: u64, cancel: RuntimeCancelFn) {
     let id = id as RuntimeTaskId;
     global_task_table().with_mut(id, |task| {
@@ -2553,6 +2561,7 @@ pub extern "C" fn willow_sched_set_cancel_fn(id: u64, cancel: RuntimeCancelFn) {
 
 /// Attach cooperative cleanup with its compiler-proven native stack requirement.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_set_cancel_fn_cooperative(
     id: u64,
     cancel: RuntimeCancelFn,
@@ -2565,6 +2574,7 @@ pub extern "C" fn willow_sched_set_cancel_fn_cooperative(
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_current_task() -> u64 {
     current_task_id().unwrap_or(0)
 }
@@ -2573,6 +2583,7 @@ pub extern "C" fn willow_sched_current_task() -> u64 {
 /// plus length). Emitted at the top of each async poll fn so a panic can render
 /// the async chain (willow-9lw). No-op when no task is running.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_tag_current_task(name: *const u8, name_len: i64) {
     if name.is_null() || name_len <= 0 {
         return;
@@ -2636,6 +2647,7 @@ pub fn async_chain_text() -> String {
 
 /// Requested worker count from `WILLOW_WORKERS`, or available parallelism.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_requested_workers() -> u64 {
     runtime_worker_config().requested_workers() as u64
 }
@@ -2643,6 +2655,7 @@ pub extern "C" fn willow_sched_requested_workers() -> u64 {
 /// Worker count the current runtime will run. Any positive `WILLOW_WORKERS`
 /// value is honored; invalid values use available parallelism (fallback: one).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_active_workers() -> u64 {
     runtime_worker_config().active_workers() as u64
 }
@@ -2650,21 +2663,25 @@ pub extern "C" fn willow_sched_active_workers() -> u64 {
 /// Deterministic scheduler ownership counters for diagnostics and plateau
 /// tests (willow-ezs.1.5). They intentionally do not claim to measure RSS.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_heavy_task_count() -> u64 {
     with_global(|sched| sched.metadata_snapshot().heavy_tasks as u64)
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_queue_entry_count() -> u64 {
     with_global(|sched| sched.metadata_snapshot().queue_entries as u64)
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_pending_cleanup_count() -> u64 {
     with_global(|sched| sched.metadata_snapshot().pending_cleanups as u64)
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_frame_root_count() -> u64 {
     with_global(|sched| sched.metadata_snapshot().frame_roots as u64)
 }
@@ -2673,6 +2690,7 @@ pub extern "C" fn willow_sched_frame_root_count() -> u64 {
 /// returns Pending, the timer-aware run loop wakes it once `millis` elapse.
 /// Called by a cooperative poll fn that is awaiting a sleep (willow-lpn.5.3).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_sleep(millis: i64) {
     set_global_wake_after_millis(millis);
     crate::gc::stress_collect("await");
@@ -2681,6 +2699,7 @@ pub extern "C" fn willow_sched_sleep(millis: i64) {
 /// Cooperatively yield the currently-running task. The compiler emits this from
 /// `await yield()` immediately before returning Pending from the poll fn.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_yield() {
     if let Some(id) = current_task_id() {
         global_task_table().with_mut(id, |task| task.yield_requested = true);
@@ -2693,6 +2712,7 @@ pub extern "C" fn willow_sched_yield() {
 /// registers the currently-running task as a waiter and returns 0 — the caller
 /// then returns Pending and is woken when `awaitee` completes (willow-lpn.5.3).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_await(awaitee: u64) -> i32 {
     let tasks = global_task_table();
     let ready = match current_task_id() {
@@ -2716,6 +2736,7 @@ pub extern "C" fn willow_sched_await(awaitee: u64) -> i32 {
 /// `frame` null falls back to the id-only path so a synthetic/placeholder task
 /// still behaves.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_frame_await(frame: *mut c_void, awaitee: u64) -> i32 {
     if frame.is_null() {
         return willow_sched_await(awaitee);
@@ -2730,6 +2751,7 @@ pub extern "C" fn willow_frame_await(frame: *mut c_void, awaitee: u64) -> i32 {
 /// Frame-backed post-await check (willow-ezs.1.3): the cancelled test is a
 /// header load, and the id is carried only for the diagnostic message.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_frame_await_check(frame: *mut c_void, id: u64) {
     if frame.is_null() {
         sched_await_check(id);
@@ -2755,6 +2777,7 @@ pub extern "C" fn willow_frame_await_check(frame: *mut c_void, id: u64) {
 /// the deadline is fixed once at select entry and re-checked on every
 /// (re-)probe (willow-soro).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_monotonic_millis() -> i64 {
     static START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
     START.elapsed().as_millis() as i64
@@ -2764,6 +2787,7 @@ pub extern "C" fn willow_monotonic_millis() -> i64 {
 /// timeout wait when nothing else can progress; willow-soro). No-op if the
 /// deadline already passed.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sleep_until_monotonic(deadline_ms: i64) {
     let now = willow_monotonic_millis();
     if deadline_ms > now {
@@ -2775,6 +2799,7 @@ pub extern "C" fn willow_sleep_until_monotonic(deadline_ms: i64) {
 /// that registered on a task-completion case must unregister when another
 /// case wins, exactly like channel waiters (willow-soro).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_unregister_task_waiter(awaitee: u64) {
     let Some(current) = current_task_id() else {
         return;
@@ -2795,6 +2820,7 @@ pub extern "C" fn willow_sched_unregister_task_waiter(awaitee: u64) {
 /// — whose answer is stored in the frame the handle already points at and so
 /// survives reaping.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_task_state(id: u64) -> i32 {
     match global_task_table().with(id, |task| task.state.lifecycle()) {
         Some(TaskLifecycle::Ready) => 0,
@@ -2823,6 +2849,7 @@ thread_local! {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_run() -> i64 {
     sched_run_with_mutator(None, None)
 }
@@ -2832,6 +2859,7 @@ pub extern "C" fn willow_sched_run() -> i64 {
 /// handle (willow-bsqy). Reuses the mutator-registration wrapper so GC
 /// coordination is identical to `willow_sched_run`.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_run_until(target: u64) -> i64 {
     let target = target as RuntimeTaskId;
     let mut completed = sched_run_with_mutator(Some(target), None);
@@ -2863,6 +2891,7 @@ pub extern "C" fn willow_sched_run_until(target: u64) -> i64 {
 /// left to do — the caller then decides whether to wait out the deadline.
 /// Returns the number of tasks completed.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_run_until_deadline(deadline_ms: i64) -> i64 {
     let remaining = (deadline_ms - willow_monotonic_millis()).max(0) as u64;
     let deadline = Instant::now() + Duration::from_millis(remaining);
@@ -2915,6 +2944,7 @@ pub(crate) fn wait_for_any_wake_briefly() {
 /// spinning — the same policy sync channel `recv`/`send` use for a blocking
 /// operation with no counterpart (willow-atth).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_select_idle_wait() {
     if scheduler_has_wake_source() {
         wait_for_any_wake_briefly();
@@ -3261,6 +3291,7 @@ struct PersistentWorkers {
 static SINGLE_WORKER_STATICS: AtomicBool = AtomicBool::new(false);
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_require_single_worker_statics() {
     SINGLE_WORKER_STATICS.store(true, Ordering::Release);
 }
@@ -3314,7 +3345,11 @@ fn willow_sched_run_parallel(
         std::thread::Builder::new()
             .name(format!("willow-worker-{worker}"))
             .spawn(move || persistent_worker_loop(worker, receiver))
-            .expect("cannot start persistent scheduler worker");
+            .unwrap_or_else(|_| {
+                crate::failure::resource_exhausted(format_args!(
+                    "cannot start persistent scheduler worker"
+                ))
+            });
         pool.senders.push(sender);
     }
     let state = Arc::new(ParallelRunState::default());
@@ -3526,6 +3561,7 @@ fn task_requires_cancel_poll(task: &RuntimeTask) -> bool {
 
 /// Run the async frame cleanup after native synchronous callers have unwound.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sync_poll_cancel_cleanup() {
     let Some(id) = current_task_id() else {
         return;
@@ -4375,6 +4411,7 @@ fn replace_global_scheduler_for_test(worker_count: usize) {
 
 /// Enter or resume a task-owned synchronous helper callback.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_task_stack_enter(callback: RuntimePollFn, frame: *mut c_void) -> i32 {
     #[cfg(any(
         all(
@@ -4429,6 +4466,7 @@ pub extern "C" fn willow_task_stack_enter(callback: RuntimePollFn, frame: *mut c
 
 /// Release a completed helper stack after generated result/cleanup handling.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_task_stack_leave() {
     #[cfg(any(
         all(

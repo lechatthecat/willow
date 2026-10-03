@@ -7,7 +7,6 @@ struct State {
     pending: bool,
     running: bool,
     shutdown: bool,
-    failed: bool,
 }
 
 struct Coordinator {
@@ -50,7 +49,7 @@ pub(super) fn request() -> bool {
     let coordinator = coordinator.as_ref().unwrap();
     let (lock, cv) = &*coordinator.shared;
     let mut state = lock.lock().unwrap();
-    if state.failed || state.shutdown {
+    if state.shutdown {
         return false;
     }
     if !state.running {
@@ -61,6 +60,10 @@ pub(super) fn request() -> bool {
 }
 
 fn run(shared: Arc<(Mutex<State>, Condvar)>) {
+    crate::failure::ffi_boundary("GC coordinator", || run_loop(shared));
+}
+
+fn run_loop(shared: Arc<(Mutex<State>, Condvar)>) {
     let (lock, cv) = &*shared;
     loop {
         let mut state = lock.lock().unwrap();
@@ -74,19 +77,15 @@ fn run(shared: Arc<(Mutex<State>, Condvar)>) {
         state.running = true;
         drop(state);
         willow_gc_register_mutator();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(collect_internal));
-        willow_gc_unregister_mutator();
-        let failed = result.is_err();
-        if let Err(payload) = result {
-            discard_callback_panic(payload);
+        #[cfg(test)]
+        if PANIC_BEFORE_COLLECTION.load(Ordering::Relaxed) {
+            panic!("injected coordinator collection panic");
         }
+        collect_internal();
+        willow_gc_unregister_mutator();
         let mut state = lock.lock().unwrap();
         state.running = false;
-        state.failed |= failed;
         cv.notify_all();
-        if failed {
-            return;
-        }
     }
 }
 
@@ -111,6 +110,10 @@ pub(super) fn shutdown() {
 }
 
 #[cfg(test)]
+static PANIC_BEFORE_COLLECTION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
 mod tests {
     use super::*;
     static ENTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -127,6 +130,26 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn coordinator_panic_terminates_instead_of_disabling_collection() {
+        use super::super::failure_policy_tests::{GC_FATAL_CASE, assert_fatal_child};
+        if std::env::var_os(GC_FATAL_CASE).is_some() {
+            reset_internal_for_test();
+            willow_gc_register_mutator();
+            PANIC_BEFORE_COLLECTION.store(true, Ordering::Relaxed);
+            assert!(request());
+            loop {
+                std::thread::park();
+            }
+        }
+        let stderr = assert_fatal_child(
+            "gc::coordinator::tests::coordinator_panic_terminates_instead_of_disabling_collection",
+            "coordinator",
+            "runtime fatal: Rust panic in GC coordinator",
+        );
+        assert!(stderr.contains("injected coordinator collection panic"));
     }
 
     #[test]

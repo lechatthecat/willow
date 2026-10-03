@@ -26,6 +26,7 @@ unsafe fn as_bool(ptr: *mut c_void) -> &'static AtomicBool {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_atomic_i64_new(init: i64) -> *mut c_void {
     atomic_i64_new_with_allocator(init, willow_alloc_with_layout)
 }
@@ -45,34 +46,40 @@ fn atomic_i64_new_with_allocator(
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_atomic_i64_load(ptr: *mut c_void) -> i64 {
     unsafe { as_i64(ptr).load(SeqCst) }
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_atomic_i64_store(ptr: *mut c_void, value: i64) {
     unsafe { as_i64(ptr).store(value, SeqCst) }
 }
 
 /// Atomically add `value`, returning the PREVIOUS value (fetch_add).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_atomic_i64_add(ptr: *mut c_void, value: i64) -> i64 {
     unsafe { as_i64(ptr).fetch_add(value, SeqCst) }
 }
 
 /// Atomically subtract `value`, returning the PREVIOUS value (fetch_sub).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_atomic_i64_sub(ptr: *mut c_void, value: i64) -> i64 {
     unsafe { as_i64(ptr).fetch_sub(value, SeqCst) }
 }
 
 /// Atomically replace the value, returning the PREVIOUS value (swap).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_atomic_i64_swap(ptr: *mut c_void, value: i64) -> i64 {
     unsafe { as_i64(ptr).swap(value, SeqCst) }
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_atomic_bool_new(init: u8) -> *mut c_void {
     atomic_bool_new_with_allocator(init, willow_alloc_with_layout)
 }
@@ -90,17 +97,20 @@ fn atomic_bool_new_with_allocator(
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_atomic_bool_load(ptr: *mut c_void) -> u8 {
     unsafe { as_bool(ptr).load(SeqCst) as u8 }
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_atomic_bool_store(ptr: *mut c_void, value: u8) {
     unsafe { as_bool(ptr).store(value != 0, SeqCst) }
 }
 
 /// Atomically replace the value, returning the PREVIOUS value (swap).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_atomic_bool_swap(ptr: *mut c_void, value: u8) -> u8 {
     unsafe { as_bool(ptr).swap(value != 0, SeqCst) as u8 }
 }

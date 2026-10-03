@@ -1,7 +1,7 @@
 //! Dedicated reusable marker threads. Idle threads hold no heap references and
 //! are unregistered; active jobs register, publish work before safepoints, and
 //! unregister before acknowledging completion. Reclamation must wait for that
-//! acknowledgement, including on a trace-hook unwind.
+//! acknowledgement. Unexpected panics terminate the process.
 use super::*;
 use crate::gc_telemetry::workers::{Failure, JobMeasurement, record_failure};
 use std::thread::JoinHandle;
@@ -80,7 +80,7 @@ impl Pool {
     }
 
     /// The caller owns collection serialization and cannot request remark until
-    /// this returns. Even a collector-side unwind waits for all epoch readers.
+    /// this returns. Unexpected collector-side panics terminate immediately.
     pub(super) fn run(&self, cycle: &Arc<ConcurrentCycle>, budget: usize) {
         let (lock, cv) = &*self.shared;
         {
@@ -100,18 +100,13 @@ impl Pool {
             state.remaining = self.threads.len();
             cv.notify_all();
         }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cycle.drain(budget)));
+        crate::failure::ffi_boundary("GC marker collector", || cycle.drain(budget));
         let mut state = lock.lock().unwrap();
         while state.remaining != 0 {
             state = cv.wait(state).unwrap();
         }
         state.job = None;
         drop(state);
-        if let Err(payload) = result {
-            record_failure(Failure::MarkerPanic);
-            cycle.worker_failed.store(true, Ordering::Release);
-            discard_callback_panic(payload);
-        }
     }
 }
 
@@ -142,6 +137,10 @@ impl Drop for Pool {
 }
 
 fn worker_main(shared: Arc<(Mutex<State>, Condvar)>) {
+    crate::failure::ffi_boundary("GC marker worker", || worker_loop(shared));
+}
+
+fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>) {
     let (lock, cv) = &*shared;
     let mut generation = 0;
     let mut children = Vec::new();
@@ -159,7 +158,7 @@ fn worker_main(shared: Arc<(Mutex<State>, Condvar)>) {
         drop(state);
         let measurement = JobMeasurement::begin();
         willow_gc_register_mutator();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        {
             // Retry and sliced objects can republish work indefinitely. Spend
             // a shared finite budget, leaving all remaining publications for
             // closure. Neither an empty sample nor budget exhaustion ends the
@@ -178,11 +177,6 @@ fn worker_main(shared: Arc<(Mutex<State>, Condvar)>) {
                     break;
                 }
             }
-        }));
-        if let Err(payload) = result {
-            record_failure(Failure::MarkerPanic);
-            cycle.worker_failed.store(true, Ordering::Release);
-            discard_callback_panic(payload);
         }
         children.clear();
         willow_gc_unregister_mutator();

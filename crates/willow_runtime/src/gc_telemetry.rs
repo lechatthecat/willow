@@ -372,6 +372,7 @@ pub fn snapshot() -> WillowGcStatsV1 {
 /// provide aligned, writable storage for a full WillowGcStatsV1. Future layouts
 /// use a new symbol; V1 never grows. RSS is best-effort and outside GC locks.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_stats_snapshot_v1(out: *mut WillowGcStatsV1) -> i32 {
     if out.is_null() {
         return -1;
@@ -395,6 +396,7 @@ fn snapshot_with_resident() -> WillowGcStatsV1 {
 
 /// Required output bytes, or -1 for an unsupported version.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_stats_size(version: i64) -> i64 {
     match version {
         1 => std::mem::size_of::<WillowGcStatsV1>() as i64,
@@ -407,6 +409,7 @@ pub extern "C" fn willow_gc_stats_size(version: i64) -> i64 {
 /// version or null output. Errors never write. On success the caller supplies
 /// writable storage for the required size; alignment is not required.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_stats_snapshot(version: i64, out: *mut u8, out_len: i64) -> i64 {
     let size = willow_gc_stats_size(version);
     if size < 0 {

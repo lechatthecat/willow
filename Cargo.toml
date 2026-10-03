@@ -8,7 +8,7 @@ autobenches = false
 autobins = false
 
 [workspace]
-members = [".", "crates/willow_abi", "crates/willow_runtime", "crates/willow_continuations"]
+members = [".", "crates/willow_abi", "crates/willow_runtime", "crates/willow_continuations", "crates/willow_runtime_macros"]
 default-members = [".", "crates/willow_abi", "crates/willow_runtime", "crates/willow_continuations"]
 resolver = "3"
 

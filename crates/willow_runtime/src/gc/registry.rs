@@ -216,28 +216,13 @@ pub(super) fn lookup_drop(type_id: u32) -> Option<DropFn> {
     drop_registry().lock().unwrap().get(&type_id).copied()
 }
 
-/// Dead storage must be reclaimed exactly once even when a native destructor
-/// unwinds. Retrying a partially executed destructor can double-free its native
-/// resources. Hooks must remain leaf operations: no GC access or safepoints.
+/// Hooks must remain leaf operations: no GC access or safepoints. A partially
+/// executed destructor cannot safely be retried or ignored; terminate on panic.
 pub(super) unsafe fn run_drop_hook(drop_fn: DropFn, payload: *mut u8) {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::failure::ffi_boundary("GC native destructor", || {
         // SAFETY: caller owns a dead, still-allocated payload for this hook.
         unsafe { drop_fn(payload) };
-    }));
-    if let Err(panic_payload) = result {
-        crate::gc_telemetry::workers::record_failure(
-            crate::gc_telemetry::workers::Failure::DropPanic,
-        );
-        discard_callback_panic(panic_payload);
-    }
-}
-
-pub(super) fn discard_callback_panic(payload: Box<dyn std::any::Any + Send>) {
-    // A panic-payload destructor must not escape a recovered native callback.
-    if let Err(secondary) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
-    {
-        std::mem::forget(secondary);
-    }
+    });
 }
 
 /// Current hook-registry generation. This changes only when existing

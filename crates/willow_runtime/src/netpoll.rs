@@ -1122,6 +1122,7 @@ fn wait_platform_events(epoll_fd: i32, timeout: Option<Duration>) -> Vec<ReadyEv
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_netpoll_init() -> i32 {
     with_global(|poll| poll.init())
 }
@@ -1129,6 +1130,7 @@ pub extern "C" fn willow_netpoll_init() -> i32 {
 /// Register the current cooperative task for fd readiness. `interest` is a
 /// bitmask: 1 readable, 2 writable, 3 both. Returns 0 on success.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_netpoll_register(fd: i64, interest: i32) -> i32 {
     let interest_bits = interest;
     let Some(interest) = IoInterest::from_bits(interest) else {
@@ -1150,6 +1152,7 @@ pub extern "C" fn willow_netpoll_register(fd: i64, interest: i32) -> i32 {
 
 /// Replace the current task's registration for `fd`.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_netpoll_reregister(fd: i64, interest: i32) -> i32 {
     let interest_bits = interest;
     let Some(interest) = IoInterest::from_bits(interest) else {
@@ -1170,6 +1173,7 @@ pub extern "C" fn willow_netpoll_reregister(fd: i64, interest: i32) -> i32 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_netpoll_deregister(fd: i64) -> i32 {
     with_global(|poll| poll.deregister_fd(fd))
 }
@@ -1177,6 +1181,7 @@ pub extern "C" fn willow_netpoll_deregister(fd: i64) -> i32 {
 /// Wait for readiness and wake matching parked tasks. `timeout_ms < 0` waits
 /// indefinitely; `0` polls; positive values bound the wait.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_netpoll_wait(timeout_ms: i64) -> i64 {
     let timeout = if timeout_ms < 0 {
         None
@@ -1190,6 +1195,7 @@ pub extern "C" fn willow_netpoll_wait(timeout_ms: i64) -> i64 {
 /// poller. The actual scheduler wake happens on the scheduler thread during
 /// `willow_netpoll_wait` / idle scheduler polling.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_netpoll_wake(token: i64) -> i64 {
     if !valid_native_handle(token) {
         return -1;

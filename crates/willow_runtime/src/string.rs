@@ -30,6 +30,7 @@ fn string_payload_size(len: usize) -> Option<i64> {
 
 /// UTF-8 byte length excluding the NUL terminator. No allocation or safepoint.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_string_len(value: *const u8) -> i64 {
     if value.is_null() {
         return 0;
@@ -41,7 +42,10 @@ pub extern "C" fn willow_string_len(value: *const u8) -> i64 {
 /// Allocate a new WillowString from a raw UTF-8 byte slice.
 /// Invalid UTF-8 is a fatal runtime invariant violation.
 /// Returns a pointer to the payload (the `len` field at offset 0).
+/// Negative/unrepresentable lengths and a null byte pointer with positive
+/// length are rejected with null. Managed storage exhaustion terminates.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_string_alloc(bytes: *const u8, len: i64) -> *mut u8 {
     if len < 0 {
         return std::ptr::null_mut();
@@ -102,6 +106,7 @@ pub(crate) fn clear_string_literal_slots() {
 /// bytes and length. Different literals (including prefixes) need distinct slots.
 /// Heap reset must be quiescent; it clears every initialized slot before reuse.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_string_literal_slot(
     slot: *const AtomicPtr<u8>,
     bytes: *const u8,
@@ -158,6 +163,7 @@ unsafe fn ws_as_bytes(s: *const u8) -> (*const u8, usize) {
 /// compare bytes, not pointers. Null-safe: two nils are equal, nil never
 /// equals a real string (this also gives `s == nil` the right meaning).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_string_eq(lhs: *const u8, rhs: *const u8) -> i64 {
     if lhs == rhs {
         return 1;
@@ -172,6 +178,7 @@ pub extern "C" fn willow_string_eq(lhs: *const u8, rhs: *const u8) -> i64 {
 
 /// Concatenate two WillowStrings and return a new GC-managed WillowString.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_string_concat(lhs: *const u8, rhs: *const u8) -> *mut u8 {
     let (_, lhs_len) = unsafe { ws_as_bytes(lhs) };
     let (_, rhs_len) = unsafe { ws_as_bytes(rhs) };

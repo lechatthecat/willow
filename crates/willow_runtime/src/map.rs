@@ -221,6 +221,7 @@ fn ensure_registered() {
 /// Allocate an empty map with inline state. `gc_ref_mask` is zero because
 /// reference values are traced through `trace_map`, not the native state words.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_map_new(key_kind: i64, value_kind: i64, value_is_ref: i64) -> *mut u8 {
     // Old-generation payloads never move and provide header alignment, which
     // must also satisfy the inline mutex on every supported target.
@@ -254,6 +255,7 @@ pub extern "C" fn willow_map_new(key_kind: i64, value_kind: i64, value_is_ref: i
 /// Insert or update `key -> value`. `key_is_ref`/`val_is_ref` describe whether
 /// the words are WillowString/GC pointers.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_map_insert(
     map: *mut u8,
     key_word: i64,
@@ -309,6 +311,7 @@ pub extern "C" fn willow_map_insert(
 /// itself for `Some`, or zero for `None`. Other payloads use the boxed tagged
 /// enum layout below.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_map_get(
     map: *mut u8,
     key_word: i64,
@@ -344,6 +347,7 @@ pub extern "C" fn willow_map_get(
 /// `Map<K,V>::freeze()` -> `FrozenMap<K,V>` (willow-dgwo.10): the copy shares no
 /// `MapData` with the original, so it is safe to treat as immutable / Sync.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_map_copy(map: *mut u8) -> *mut u8 {
     if map.is_null() {
         return willow_map_new(0, 0, 0);
@@ -389,6 +393,7 @@ pub extern "C" fn willow_map_copy(map: *mut u8) -> *mut u8 {
 
 /// Number of entries.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_map_len(map: *mut u8) -> i64 {
     if map.is_null() {
         return 0;
@@ -398,6 +403,7 @@ pub extern "C" fn willow_map_len(map: *mut u8) -> i64 {
 
 /// Whether `key` is present (1) or not (0).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_map_contains(map: *mut u8, key_word: i64, key_is_ref: i64) -> i64 {
     if map.is_null() {
         return 0;
@@ -439,6 +445,7 @@ fn alloc_none() -> *mut u8 {
 /// `bool` that share its representation, so `Map<f64, V>` prints `1.5` and not
 /// the bit pattern. Returns a newly allocated WillowString.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_map_to_string(map: *mut u8) -> *mut u8 {
     let (key_kind, val_kind) = if map.is_null() {
         (0, 0)

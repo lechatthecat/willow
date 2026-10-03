@@ -187,6 +187,7 @@ fn alloc_cell_payload(type_id: u32, payload_size: usize, value: &mut i64, is_ref
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_blocking_cell_new(value: i64, is_ref: i64) -> *mut c_void {
     let is_ref = is_ref != 0;
     let mut value = value;
@@ -219,12 +220,14 @@ pub extern "C" fn willow_blocking_cell_new(value: i64, is_ref: i64) -> *mut c_vo
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_blocking_cell_get(raw: *mut c_void) -> i64 {
     let m = unsafe { &*(raw as *const WillowBlockingCell) };
     *m.value.lock().expect("mutex poisoned")
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_blocking_cell_set(raw: *mut c_void, value: i64) {
     let m = unsafe { &*(raw as *const WillowBlockingCell) };
     let mut slot = m.value.lock().expect("mutex poisoned");
@@ -242,6 +245,7 @@ pub extern "C" fn willow_blocking_cell_set(raw: *mut c_void, value: i64) {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_blocking_rw_cell_new(value: i64, is_ref: i64) -> *mut c_void {
     let is_ref = is_ref != 0;
     let mut value = value;
@@ -272,12 +276,14 @@ pub extern "C" fn willow_blocking_rw_cell_new(value: i64, is_ref: i64) -> *mut c
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_blocking_rw_cell_read(raw: *mut c_void) -> i64 {
     let r = unsafe { &*(raw as *const WillowBlockingRwCell) };
     *r.value.read().expect("rwlock poisoned")
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_blocking_rw_cell_write(raw: *mut c_void, value: i64) {
     let r = unsafe { &*(raw as *const WillowBlockingRwCell) };
     let mut slot = r.value.write().expect("rwlock poisoned");

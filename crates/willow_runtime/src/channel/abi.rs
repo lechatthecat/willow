@@ -3,6 +3,7 @@
 use super::*;
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_new(is_ref: i64) -> *mut c_void {
     ensure_channel_registered();
     let is_ref = is_ref != 0;
@@ -28,6 +29,7 @@ pub extern "C" fn willow_channel_new(is_ref: i64) -> *mut c_void {
 /// channel closes. Capacity must be positive; rendezvous (capacity 0) is
 /// explicitly unsupported in v1.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_new_bounded(is_ref: i64, capacity: i64) -> *mut c_void {
     if capacity <= 0 {
         channel_raise_with(
@@ -47,21 +49,25 @@ pub extern "C" fn willow_channel_new_bounded(is_ref: i64, capacity: i64) -> *mut
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_try_send_i64(raw: *mut c_void, value: i64) -> i32 {
     channel_try_send_value(raw, WillowChannelValue { i64_value: value })
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_try_send_bool(raw: *mut c_void, value: u8) -> i32 {
     channel_try_send_value(raw, WillowChannelValue { bool_value: value })
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_try_send_f64(raw: *mut c_void, value: f64) -> i32 {
     channel_try_send_value(raw, WillowChannelValue { f64_value: value })
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_try_send_ptr(raw: *mut c_void, value: *mut c_void) -> i32 {
     channel_try_send_value(raw, WillowChannelValue { ptr_value: value })
 }
@@ -70,6 +76,7 @@ pub extern "C" fn willow_channel_try_send_ptr(raw: *mut c_void, value: *mut c_vo
 /// (or closed/unbounded); 0 after registering the running task as a send
 /// waiter on a FULL bounded channel.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_send_ready(raw: *mut c_void) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
@@ -101,6 +108,7 @@ pub extern "C" fn willow_channel_send_ready(raw: *mut c_void) -> i32 {
 /// after registering the currently-running task as a waiter — the caller's poll
 /// fn then returns Pending and is woken by a later `send`/`close`.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
@@ -167,6 +175,7 @@ pub extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
 /// from all of them so a later send/close does not spuriously wake the
 /// already-resumed task.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_unregister_waiter(raw: *mut c_void) {
     willow_channel_select_cleanup(raw, std::ptr::null_mut(), -1);
 }
@@ -174,6 +183,7 @@ pub extern "C" fn willow_channel_unregister_waiter(raw: *mut c_void) {
 /// Called once per distinct runtime channel by select, before committing its
 /// winning operation. Direction: 0 recv, 1 send, -1 non-channel winner.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_select_cleanup(
     raw: *mut c_void,
     winner: *mut c_void,
@@ -208,46 +218,55 @@ pub extern "C" fn willow_channel_select_cleanup(
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_send_i64(raw: *mut c_void, value: i64) {
     willow_channel_send_value(raw, WillowChannelValue { i64_value: value });
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_send_bool(raw: *mut c_void, value: u8) {
     willow_channel_send_value(raw, WillowChannelValue { bool_value: value });
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_send_f64(raw: *mut c_void, value: f64) {
     willow_channel_send_value(raw, WillowChannelValue { f64_value: value });
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_send_ptr(raw: *mut c_void, value: *mut c_void) {
     willow_channel_send_value(raw, WillowChannelValue { ptr_value: value });
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_recv_i64(raw: *mut c_void) -> i64 {
     unsafe { willow_channel_recv_value(raw).i64_value }
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_recv_bool(raw: *mut c_void) -> u8 {
     unsafe { willow_channel_recv_value(raw).bool_value }
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_recv_f64(raw: *mut c_void) -> f64 {
     unsafe { willow_channel_recv_value(raw).f64_value }
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_recv_ptr(raw: *mut c_void) -> *mut c_void {
     unsafe { willow_channel_recv_value(raw).ptr_value }
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_close(raw: *mut c_void) {
     let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
         return;
@@ -290,6 +309,7 @@ pub extern "C" fn willow_channel_close(raw: *mut c_void) {
 /// (willow-0a6k.6). Selection order is pseudo-randomized to avoid SYSTEMATIC
 /// source-order starvation; this is not a bounded-fairness guarantee.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_select_rotation() -> i64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static ROTATION: AtomicU64 = AtomicU64::new(0);

@@ -369,20 +369,7 @@ impl ConcurrentCycle {
         limit: usize,
         deadline: Option<std::time::Instant>,
     ) -> u64 {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.drain_until(limit, deadline)
-        }));
-        match result {
-            Ok(work) => work,
-            Err(payload) => {
-                crate::gc_telemetry::workers::record_failure(
-                    crate::gc_telemetry::workers::Failure::MarkerPanic,
-                );
-                self.worker_failed.store(true, Ordering::Release);
-                discard_callback_panic(payload);
-                0
-            }
-        }
+        crate::failure::ffi_boundary("GC marker assist", || self.drain_until(limit, deadline))
     }
 
     pub(super) fn drain(&self, limit: usize) -> u64 {

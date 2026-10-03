@@ -1,4 +1,33 @@
-// Runtime functions linked with Cranelift-generated object files.
+//! Runtime functions linked with Cranelift-generated object files.
+//!
+//! # Failure policy
+//!
+//! RecoverableLanguageFault: set the current language panic context and return
+//! the ABI sentinel. Generated code performs cleanup/recover dispatch. Never
+//! implement a language fault by Rust unwinding.
+//! Expected ABI validation rejections and I/O errors keep their documented
+//! return values; these are not unexpected Rust panics. Unhandled language
+//! faults and legacy fatal panic entry points retain their terminal behavior.
+//!
+//! ResourceExhausted: terminate, never return an allocation-failure null to
+//! generated code. Managed allocation failures exit with status 1, including
+//! configured memory limits. Infallible Rust container allocations use Rust's
+//! allocation-error abort. Neither path is recoverable or allocates PanicInfo.
+//!
+//! FatalInvariant: abort with a diagnostic. Unexpected Rust panics inside
+//! runtime-owned C entry points are caught before the C boundary and classified
+//! here. No recovery is attempted after partially mutating runtime state.
+//!
+//! Null remains valid where the individual ABI defines an optional value,
+//! validation rejection, or language-fault sentinel, never managed storage
+//! exhaustion. An invalid required pointer is an invariant
+//! violation. Raw-pointer ABI calls retain their valid-pointer preconditions;
+//! this policy is not a validator for arbitrary foreign pointers.
+//!
+//! Every ordinary C function uses `ffi_boundary`, including callbacks. Native
+//! signal/exception handlers instead obey their audited no-panic discipline:
+//! unwinding, allocation and Rust stderr locks are not signal-safe.
+
 #![allow(dead_code)]
 // The `extern "C"` ABI exports take raw pointers from Cranelift-generated code
 // and dereference them; they are the unsafe FFI boundary by design, so
@@ -23,6 +52,7 @@ pub mod atomic;
 pub mod blocking;
 pub mod cancellation;
 pub mod channel;
+pub(crate) mod failure;
 pub(crate) mod frame_reclaim;
 pub mod fs;
 pub mod future;
@@ -89,6 +119,7 @@ unsafe extern "C" fn __willow_static_init() {}
 
 /// Stable compiler/runtime contract fingerprint (all supported targets are 64-bit).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_runtime_abi_hash() -> u64 {
     willow_abi::fingerprint::ABI_HASH_64
 }
@@ -96,6 +127,7 @@ pub extern "C" fn willow_runtime_abi_hash() -> u64 {
 /// Bootstrap ABI: keep this scalar signature stable across schema revisions.
 /// A mismatch is fatal before any generated static initializer or main runs.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_runtime_check_abi(expected: u64) {
     let actual = willow_runtime_abi_hash();
     if expected != actual {
@@ -107,6 +139,7 @@ pub extern "C" fn willow_runtime_check_abi(expected: u64) {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn runtime_start(argc: i32, argv: *mut *mut c_char) {
     stack_overflow::protect_current_thread();
     args::willow_runtime_store_args(argc, argv);
@@ -126,6 +159,7 @@ pub extern "C" fn runtime_start(argc: i32, argv: *mut *mut c_char) {
 
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn main(argc: i32, argv: *mut *mut c_char) -> i32 {
     runtime_start(argc, argv);
     0

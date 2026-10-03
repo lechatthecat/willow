@@ -128,12 +128,14 @@ unsafe fn flag_ref<'a>(flag: *const c_void) -> Option<&'a AtomicBool> {
 
 /// Safepoint budget per quantum from `WILLOW_TASK_BUDGET` (or the default).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_preempt_task_budget() -> u64 {
     runtime_preempt_config().task_budget()
 }
 
 /// Time quantum in milliseconds from `WILLOW_TIME_QUANTUM_MS` (or the default).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_preempt_time_quantum_ms() -> u64 {
     runtime_preempt_config().time_quantum_ms()
 }
@@ -143,12 +145,14 @@ pub extern "C" fn willow_preempt_time_quantum_ms() -> u64 {
 /// Allocate a fresh per-task preemption flag (initially clear). Owned by the
 /// caller; release with [`willow_preempt_flag_free`].
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_preempt_flag_new() -> *mut c_void {
     Box::into_raw(Box::new(AtomicBool::new(false))) as *mut c_void
 }
 
 /// Free a flag from [`willow_preempt_flag_new`]. `null` is ignored.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_preempt_flag_free(flag: *mut c_void) {
     if !flag.is_null() {
         // Safety: `flag` came from `willow_preempt_flag_new` and is freed once.
@@ -160,6 +164,7 @@ pub extern "C" fn willow_preempt_flag_free(flag: *mut c_void) {
 /// release ordering so a safepoint observing it (acquire) sees a happens-before
 /// edge. Safe to call from any thread (scheduler, GC, cancellation).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_preempt_request(flag: *const c_void) {
     if let Some(flag) = unsafe { flag_ref(flag) } {
         flag.store(true, Ordering::Release);
@@ -168,6 +173,7 @@ pub extern "C" fn willow_preempt_request(flag: *const c_void) {
 
 /// Clear/acknowledge a preemption request on `flag` (spec §9 step 1).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_preempt_clear(flag: *const c_void) {
     if let Some(flag) = unsafe { flag_ref(flag) } {
         flag.store(false, Ordering::Release);
@@ -176,6 +182,7 @@ pub extern "C" fn willow_preempt_clear(flag: *const c_void) {
 
 /// Query whether `flag` currently has a pending preemption request (acquire).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_preempt_requested(flag: *const c_void) -> i32 {
     match unsafe { flag_ref(flag) } {
         Some(flag) if flag.load(Ordering::Acquire) => 1,
@@ -190,6 +197,7 @@ pub extern "C" fn willow_preempt_requested(flag: *const c_void) -> i32 {
 /// clear any stale request (the previous preemption was already honored by the
 /// requeue). `flag` may be `null` for budget/time-only quanta.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_preempt_begin(flag: *const c_void) {
     begin_quantum(runtime_preempt_config(), flag);
 }
@@ -213,6 +221,7 @@ pub(crate) fn begin_quantum(config: PreemptConfig, flag: *const c_void) {
 /// End the current quantum after a poll returns: unbind the flag and zero the
 /// budget so a stray safepoint outside a poll never reports "preempt".
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_preempt_end() {
     QUANTUM.with(|q| {
         q.flag.set(std::ptr::null());
@@ -225,6 +234,7 @@ pub extern "C" fn willow_preempt_end() {
 /// Enter a no-preempt region (§22): nestable; while open, `willow_preempt_check`
 /// reports no-preempt regardless of flag/budget/time.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_preempt_enter_no_preempt() {
     QUANTUM.with(|q| {
         q.no_preempt_depth
@@ -234,6 +244,7 @@ pub extern "C" fn willow_preempt_enter_no_preempt() {
 
 /// Leave a no-preempt region (§22).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_preempt_leave_no_preempt() {
     QUANTUM.with(|q| {
         q.no_preempt_depth
@@ -270,6 +281,7 @@ impl Drop for NoPreemptGuard {
 /// region (§22) overrides all three. When budget/time trip, the bound flag is
 /// also set so the scheduler/diagnostics can see the task was preempted.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_preempt_check() -> i32 {
     charge_safepoints(1)
 }
@@ -355,6 +367,7 @@ fn sync_poll_grant() -> i32 {
 /// code, or null outside a scheduler-managed native stack. Generated loops
 /// decrement it and call [`willow_sync_safepoint`] only when it reaches zero.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sync_poll_counter() -> *mut i32 {
     #[cfg(any(
         all(
@@ -390,6 +403,7 @@ pub extern "C" fn willow_sync_poll_counter() -> *mut i32 {
 /// through compiler-generated cleanup edges; yielding preserves the call chain.
 /// Charges every safepoint consumed from the inline countdown, then refills it.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sync_safepoint() -> i32 {
     #[cfg(any(
         all(
@@ -436,6 +450,7 @@ pub extern "C" fn willow_sync_safepoint() -> i32 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sync_cancelled() -> i32 {
     #[cfg(any(
         all(
@@ -470,6 +485,7 @@ pub extern "C" fn willow_sync_cancelled() -> i32 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sync_cleanup_enter() {
     #[cfg(any(
         all(
@@ -487,6 +503,7 @@ pub extern "C" fn willow_sync_cleanup_enter() {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sync_cleanup_leave() {
     #[cfg(any(
         all(

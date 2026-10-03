@@ -46,6 +46,7 @@ pub(crate) fn survivor_snapshot() -> crate::gc_telemetry::GcSurvivorStats {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_survivor_copies() -> i64 {
     runtime()
         .heap
@@ -56,11 +57,13 @@ pub extern "C" fn willow_gc_survivor_copies() -> i64 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_survivor_bytes() -> i64 {
     runtime().heap.lock().unwrap().survivor_stats.survivor_bytes as i64
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_tenured_objects() -> i64 {
     runtime()
         .heap
@@ -71,11 +74,13 @@ pub extern "C" fn willow_gc_tenured_objects() -> i64 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_tenured_bytes() -> i64 {
     runtime().heap.lock().unwrap().survivor_stats.tenured_bytes as i64
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_pinned_promotions() -> i64 {
     runtime()
         .heap
@@ -86,16 +91,19 @@ pub extern "C" fn willow_gc_pinned_promotions() -> i64 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_survivor_space_reserved() -> i64 {
     survivor_snapshot().survivor_space_reserved as i64
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_survivor_space_live() -> i64 {
     survivor_snapshot().survivor_space_live as i64
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_allocated_bytes() -> i64 {
     let mut state = runtime().heap.lock().unwrap();
     sync_tlab_bytes(&mut state);
@@ -103,6 +111,7 @@ pub extern "C" fn willow_gc_allocated_bytes() -> i64 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_tlab_fast_allocations() -> i64 {
     let mut state = runtime().heap.lock().unwrap();
     sync_tlab_accounting(&mut state);
@@ -110,56 +119,67 @@ pub extern "C" fn willow_gc_tlab_fast_allocations() -> i64 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_tlab_slow_allocations() -> i64 {
     runtime().heap.lock().unwrap().tlab_slow_allocations as i64
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_tlab_refills() -> i64 {
     runtime().heap.lock().unwrap().tlab_refills as i64
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_tlab_large_allocations() -> i64 {
     runtime().heap.lock().unwrap().tlab_large_allocations as i64
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_tlab_reserved_bytes() -> i64 {
     runtime().heap.lock().unwrap().tlab_reserved_bytes as i64
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_minor_collections() -> i64 {
     runtime().heap.lock().unwrap().minor_collections as i64
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_promoted_objects() -> i64 {
     runtime().heap.lock().unwrap().promoted_objects as i64
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_moved_objects() -> i64 {
     runtime().heap.lock().unwrap().moved_objects as i64
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_remembered_set_size() -> i64 {
     runtime().heap.lock().unwrap().remembered_set.len() as i64
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_dirty_card_count() -> i64 {
     runtime().heap.lock().unwrap().dirty_cards.len() as i64
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_write_barrier_hits() -> i64 {
     runtime().heap.lock().unwrap().write_barrier_hits as i64
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_old_region_count() -> i64 {
     let state = runtime().heap.lock().unwrap();
     let pinned = state
@@ -171,6 +191,7 @@ pub extern "C" fn willow_gc_old_region_count() -> i64 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_old_region_reserved_bytes() -> i64 {
     let state = runtime().heap.lock().unwrap();
     let regular: usize = state.old_regions.iter().map(|region| region.capacity).sum();
@@ -184,6 +205,7 @@ pub extern "C" fn willow_gc_old_region_reserved_bytes() -> i64 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_old_region_live_bytes() -> i64 {
     let state = runtime().heap.lock().unwrap();
     let regular: usize = state
@@ -201,6 +223,7 @@ pub extern "C" fn willow_gc_old_region_live_bytes() -> i64 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_old_region_fragmentation_bytes() -> i64 {
     let state = runtime().heap.lock().unwrap();
     let regular: usize = state
@@ -218,6 +241,7 @@ pub extern "C" fn willow_gc_old_region_fragmentation_bytes() -> i64 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_large_object_region_count() -> i64 {
     runtime()
         .heap
@@ -230,6 +254,7 @@ pub extern "C" fn willow_gc_large_object_region_count() -> i64 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_pinned_region_count() -> i64 {
     runtime()
         .heap
@@ -242,21 +267,25 @@ pub extern "C" fn willow_gc_pinned_region_count() -> i64 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_old_region_allocations() -> i64 {
     runtime().heap.lock().unwrap().old_region_allocations as i64
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_old_region_reuses() -> i64 {
     runtime().heap.lock().unwrap().old_region_reuses as i64
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_old_regions_released() -> i64 {
     runtime().heap.lock().unwrap().old_regions_released as i64
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_major_collections() -> i64 {
     runtime().heap.lock().unwrap().major_collections as i64
 }
@@ -265,6 +294,7 @@ pub extern "C" fn willow_gc_major_collections() -> i64 {
 /// (willow-6fv.2). Lets a GC-stress test assert it is actually collecting rather
 /// than silently skipping most of the time.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_skipped_collections() -> i64 {
     runtime()
         .skipped_foreign_owner_collections

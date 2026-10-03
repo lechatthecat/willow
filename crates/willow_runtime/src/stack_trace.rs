@@ -71,6 +71,7 @@ unsafe fn raw_str(ptr: *const u8, len: i64) -> String {
 /// (NOT WillowStrings) with explicit lengths, copied onto the Rust heap so the
 /// debug call stack does not allocate on the Willow GC heap (willow-992h).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_callstack_push(
     function: *const u8,
     function_len: i64,
@@ -93,6 +94,7 @@ pub extern "C" fn willow_callstack_push(
 
 /// Pop the most recent call frame (matched with a successful return).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_callstack_pop() {
     CALL_STACK.with(|s| {
         s.borrow_mut().pop();

@@ -284,6 +284,7 @@ fn access_from_abi(mode: i32) -> Option<LockAccess> {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_rwlock_new(value: i64, is_ref: i64) -> *mut c_void {
     ensure_async_rwlock_registered();
     let payload = crate::gc::willow_alloc_with_layout(
@@ -310,6 +311,7 @@ pub extern "C" fn willow_async_rwlock_new(value: i64, is_ref: i64) -> *mut c_voi
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_rwlock_acquire(
     raw: *mut c_void,
     mode: i32,
@@ -343,6 +345,7 @@ pub extern "C" fn willow_async_rwlock_acquire(
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_rwlock_poll(raw: *mut c_void, token: i64) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     let (Some(lock), Some(task)) = (unsafe { rwlock_from_raw(raw) }, current_task()) else {
@@ -356,6 +359,7 @@ pub extern "C" fn willow_async_rwlock_poll(raw: *mut c_void, token: i64) -> i32 
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_rwlock_load(raw: *mut c_void, token: i64) -> i64 {
     let (Some(lock), Some(task)) = (unsafe { rwlock_from_raw(raw) }, current_task()) else {
         return 0;
@@ -364,6 +368,7 @@ pub extern "C" fn willow_async_rwlock_load(raw: *mut c_void, token: i64) -> i64 
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_rwlock_commit(raw: *mut c_void, token: i64, value: i64) -> i32 {
     let (Some(lock), Some(task)) = (unsafe { rwlock_from_raw(raw) }, current_task()) else {
         return 0;
@@ -372,6 +377,7 @@ pub extern "C" fn willow_async_rwlock_commit(raw: *mut c_void, token: i64, value
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_rwlock_release(raw: *mut c_void, token: i64) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     let (Some(lock), Some(task)) = (unsafe { rwlock_from_raw(raw) }, current_task()) else {
@@ -384,6 +390,7 @@ pub extern "C" fn willow_async_rwlock_release(raw: *mut c_void, token: i64) -> i
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_rwlock_cancel() -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     let Some(task) = current_task() else {
@@ -393,6 +400,7 @@ pub extern "C" fn willow_async_rwlock_cancel() -> i32 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_rwlock_recursive_panic(file: *const u8, line: i32, col: i32) {
     crate::panic_context::raise_language_message_at(
         "recursive or upgrade/downgrade acquisition on non-reentrant RwLock",
@@ -403,6 +411,7 @@ pub extern "C" fn willow_async_rwlock_recursive_panic(file: *const u8, line: i32
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_rwlock_invalid_status(status: i32, phase: i32) -> ! {
     let phase = match phase {
         RWLOCK_STATUS_PHASE_ACQUIRE => "acquire",

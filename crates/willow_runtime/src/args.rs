@@ -35,6 +35,7 @@ static ARGS: Mutex<RuntimeArgs> = Mutex::new(RuntimeArgs {
 });
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_runtime_store_args(argc: i32, argv: *mut *mut c_char) {
     let mut args = ARGS.lock().expect("runtime args mutex poisoned");
     args.argc = argc;
@@ -49,6 +50,7 @@ pub extern "C" fn willow_runtime_store_args(argc: i32, argv: *mut *mut c_char) {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_runtime_args_len() -> i64 {
     ARGS.lock().expect("runtime args mutex poisoned").user_argc as i64
 }
@@ -56,6 +58,7 @@ pub extern "C" fn willow_runtime_args_len() -> i64 {
 /// Returns the nullable-pointer-niche representation of `Option<String>`:
 /// a GC-managed WillowString for an in-range user argument, or zero for None.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_runtime_arg(index: i64) -> *mut u8 {
     let s = {
         let args = ARGS.lock().expect("runtime args mutex poisoned");
@@ -79,6 +82,7 @@ pub extern "C" fn willow_runtime_arg(index: i64) -> *mut u8 {
 /// program name). Used for `env::args()` and to bind a `fn main(args:
 /// Array<String>)` parameter.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_runtime_args_array() -> *mut u8 {
     let (user_argc, user_argv) = {
         let args = ARGS.lock().expect("runtime args mutex poisoned");
@@ -113,6 +117,7 @@ pub extern "C" fn willow_runtime_args_array() -> *mut u8 {
 
 /// Returns a GC-managed WillowString for the program name (argv[0]).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_runtime_program_name() -> *mut u8 {
     let s = {
         let args = ARGS.lock().expect("runtime args mutex poisoned");

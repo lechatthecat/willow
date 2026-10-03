@@ -40,37 +40,44 @@ fn write_stdout_direct(text: &str) -> io::Result<()> {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_print_i64(value: i64) {
     write_stdout(value.to_string());
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_println_i64(value: i64) {
     write_stdout(format!("{value}\n"));
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_print_bool(value: u8) {
     write_stdout(bool_text(value));
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_println_bool(value: u8) {
     write_stdout(format!("{}\n", bool_text(value)));
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_print_f64(value: f64) {
     write_stdout(format_f64_shortest(value));
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_println_f64(value: f64) {
     write_stdout(format!("{}\n", format_f64_shortest(value)));
 }
 
 /// Print a WillowString (GC-managed heap object: len at offset 0, bytes at offset 8).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_print_string(value: *const u8) {
     let s = unsafe { willow_string_as_str(value) };
     write_stdout(s);
@@ -78,6 +85,7 @@ pub extern "C" fn willow_print_string(value: *const u8) {
 
 /// Print a WillowString followed by a newline.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_println_string(value: *const u8) {
     let s = unsafe { willow_string_as_str(value) };
     write_stdout(format!("{s}\n"));

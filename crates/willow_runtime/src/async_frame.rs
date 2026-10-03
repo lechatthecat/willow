@@ -166,6 +166,7 @@ pub fn frame_request_cancel(frame: *mut c_void) {
 /// Raw status word of a task frame — the compiler emits this wherever it has
 /// the awaitee's frame pointer (willow-ezs.1.3).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_frame_status(frame: *mut c_void) -> i64 {
     frame_status(frame)
 }
@@ -173,6 +174,7 @@ pub extern "C" fn willow_frame_status(frame: *mut c_void) -> i64 {
 /// `Task::is_cancelled()`: 1 once cancellation was requested OR the task has
 /// already finished as Cancelled.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_frame_is_cancelled(frame: *mut c_void) -> i64 {
     let status = frame_status(frame);
     let requested = status & WILLOW_FRAME_STATUS_CANCEL_REQUESTED != 0;
@@ -199,6 +201,7 @@ pub const fn async_frame_slot_offset(n: usize) -> usize {
 /// The returned pointer is the GC payload pointer (past the GcHeader).
 /// All bytes are zero-initialized by the allocator.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_frame_alloc(slot_count: i64, gc_slot_mask: u64) -> *mut c_void {
     let slots = slot_count.max(0) as usize;
     let payload_bytes = async_frame_slot_offset(slots);

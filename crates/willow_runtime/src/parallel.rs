@@ -96,6 +96,7 @@ fn chunk_ranges(len: i64, workers: usize) -> Vec<(i64, i64)> {
         .collect()
 }
 
+#[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn poll_chunk(frame: *mut c_void) -> i32 {
     let frame_view = unsafe { chunk_frame(frame) };
     let input = frame_view.load_gc(CHUNK_INPUT_SLOT);
@@ -149,6 +150,7 @@ unsafe fn drop_chunk_state(frame: *mut c_void) {
     }
 }
 
+#[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn cancel_chunk(frame: *mut c_void) {
     unsafe { drop_chunk_state(frame) };
 }
@@ -176,6 +178,7 @@ fn spawn_chunk(input: *mut u8, output: *mut u8, mapper: I64Mapper, start: i64, e
     )
 }
 
+#[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn poll_coordinator(frame: *mut c_void) -> i32 {
     let frame_view = unsafe { coordinator_frame(frame) };
     let state_ptr = frame_view.load_native::<CoordinatorState>(COORD_STATE_SLOT);
@@ -213,6 +216,7 @@ unsafe extern "C" fn poll_coordinator(frame: *mut c_void) -> i32 {
     crate::task::RUNTIME_POLL_READY
 }
 
+#[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn cancel_coordinator(frame: *mut c_void) {
     unsafe {
         let raw = coordinator_frame(frame).take_native::<CoordinatorState>(COORD_STATE_SLOT);
@@ -232,6 +236,7 @@ unsafe extern "C" fn cancel_coordinator(frame: *mut c_void) {
 /// is a plain non-capturing function pointer; captured lambdas are rejected by
 /// the compiler before this ABI is reached.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_parallel_map_i64(
     input: *mut u8,
     mapper: Option<I64Mapper>,

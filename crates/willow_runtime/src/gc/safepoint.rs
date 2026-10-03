@@ -48,6 +48,7 @@ pub(super) fn multi_mutator_active() -> bool {
 /// can allocate or hold GC references on worker threads must register so a
 /// stop-the-world collection scans its roots.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_register_mutator() {
     let (lock, _) = &runtime().coord;
     {
@@ -67,6 +68,7 @@ pub extern "C" fn willow_gc_register_mutator() {
 /// Unregister the current thread as a GC mutator. Must be called before the
 /// thread stops allocating/holding GC references (e.g. at worker shutdown).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_unregister_mutator() {
     assist::reset();
     flush_satb_current(true);
@@ -199,6 +201,7 @@ pub(super) fn wait_for_mutators<'a>(
 /// Generated code must reload this flag at every poll, with acquire ordering or
 /// stronger; caching the flag value would prevent a collector from stopping it.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_stop_flag() -> *const u8 {
     runtime().poll_requested.as_ptr().cast::<u8>()
 }
@@ -209,6 +212,7 @@ pub extern "C" fn willow_gc_stop_flag() -> *const u8 {
 /// it. The scheduler polls this between task polls; future compiler-inserted
 /// safepoints can add loop-backedge coverage.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_safepoint() {
     flush_satb_current(false);
     // Hot-path: a single relaxed atomic load. No collection pending → return

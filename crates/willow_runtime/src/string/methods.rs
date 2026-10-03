@@ -48,6 +48,7 @@ fn copy_range(mut value: *mut u8, start: usize, end: usize) -> *mut u8 {
 
 /// Copy [start, end); invalid ranges/boundaries raise a recoverable language panic.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_string_substring(value: *mut u8, start: i64, end: i64) -> *mut u8 {
     let s = unsafe { text(value) };
     if start < 0
@@ -63,6 +64,7 @@ pub extern "C" fn willow_string_substring(value: *mut u8, start: i64, end: i64) 
 
 /// First byte offset, or -1 when absent. Empty needles match at zero.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_string_find(value: *const u8, needle: *const u8) -> i64 {
     unsafe {
         text(value)
@@ -72,17 +74,20 @@ pub extern "C" fn willow_string_find(value: *const u8, needle: *const u8) -> i64
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_string_contains(value: *const u8, needle: *const u8) -> i64 {
     i64::from(willow_string_find(value, needle) >= 0)
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_string_starts_with(value: *const u8, prefix: *const u8) -> i64 {
     unsafe { i64::from(text(value).starts_with(text(prefix))) }
 }
 
 /// Remove Unicode White_Space from both ends; interior whitespace is preserved.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_string_trim(value: *mut u8) -> *mut u8 {
     let s = unsafe { text(value) };
     let trimmed = s.trim();
@@ -92,6 +97,7 @@ pub extern "C" fn willow_string_trim(value: *mut u8) -> *mut u8 {
 
 /// Repeat whole strings; negative counts or payload-size overflow raise a panic.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_string_repeat(mut value: *mut u8, count: i64) -> *mut u8 {
     if count < 0 {
         return fail("String.repeat requires a nonnegative count");
@@ -129,6 +135,7 @@ pub extern "C" fn willow_string_repeat(mut value: *mut u8, count: i64) -> *mut u
 /// Literal, non-overlapping separator. Preserve empty fields. An empty separator
 /// yields leading/trailing empty fields with Unicode scalar values between them.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_string_split(mut value: *mut u8, separator: *const u8) -> *mut u8 {
     // One search pass. Only integer ranges survive GC; the separator is no
     // longer needed after this pass. No per-field rescanning or array growth.

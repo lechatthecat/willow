@@ -1,0 +1,37 @@
+// Language faults remain recoverable across the runtime's Rust panic guards.
+// Expected stdout: explicit recovered / bounds recovered / async recovered / done
+import std::collections::Array;
+
+fn sync_faults() {
+    if true {
+        defer match recover() {
+            Some(_) => println("explicit recovered"),
+            None => println("ERROR: explicit panic missing"),
+        }
+        panic("language fault");
+        println("ERROR: panic returned");
+    }
+    let values: Array<i64> = [1, 2];
+    if true {
+        defer match recover() {
+            Some(_) => println("bounds recovered"),
+            None => println("ERROR: bounds fault missing"),
+        }
+        println(values[4]);
+        println("ERROR: bounds fault returned");
+    }
+}
+
+async fn main() {
+    sync_faults();
+    if true {
+        defer match recover() {
+            Some(_) => println("async recovered"),
+            None => println("ERROR: async panic missing"),
+        }
+        await sleep(1);
+        panic("fault after suspension");
+        println("ERROR: async panic returned");
+    }
+    println("done");
+}

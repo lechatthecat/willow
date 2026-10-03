@@ -171,6 +171,7 @@ unsafe fn handle_buffer(arr: *mut u8) -> *mut u8 {
 /// Allocate an array of `len` elements (all zero). `elem_is_ref` marks
 /// GC-managed element types. Returns the handle, or aborts on a negative length.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
     if len < 0 {
         raise_with(&format!(
@@ -220,6 +221,7 @@ pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
 /// safe to treat as immutable. Shallow per the element word (ref elements share
 /// their — Sync — referents).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_array_copy(mut arr: *mut u8) -> *mut u8 {
     if arr.is_null() {
         raise_with("cannot freeze a null array");
@@ -245,6 +247,7 @@ pub extern "C" fn willow_array_copy(mut arr: *mut u8) -> *mut u8 {
 
 /// Number of elements in `arr`.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_array_len(arr: *mut u8) -> i64 {
     if arr.is_null() {
         raise_with("cannot take the length of a null array");
@@ -256,6 +259,7 @@ pub extern "C" fn willow_array_len(arr: *mut u8) -> i64 {
 /// Read the raw 64-bit word at `index`. Callers interpret the bits according to
 /// the element type (`i64` directly, `bool`/`f64` via the generated cast).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_array_get(arr: *mut u8, index: i64) -> i64 {
     if !check_bounds(arr, index) {
         return 0;
@@ -265,6 +269,7 @@ pub extern "C" fn willow_array_get(arr: *mut u8, index: i64) -> i64 {
 
 /// Write the raw 64-bit `value` word at `index`.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_array_set(arr: *mut u8, index: i64, value: i64) {
     if !check_bounds(arr, index) {
         return;
@@ -280,6 +285,7 @@ pub extern "C" fn willow_array_set(arr: *mut u8, index: i64, value: i64) {
 /// returned address points into the current buffer; a `push` that grows the
 /// array reallocates the buffer and invalidates any address taken earlier.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_array_element_addr(arr: *mut u8, index: i64) -> *mut u8 {
     if !check_bounds(arr, index) {
         return std::ptr::null_mut();
@@ -292,6 +298,7 @@ pub extern "C" fn willow_array_element_addr(arr: *mut u8, index: i64) -> *mut u8
 /// Generated code roots the returned base and keeps the original index, then
 /// recomputes the interior address after any moving collection or suspension.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_array_reference_owner(arr: *mut u8, index: i64) -> *mut u8 {
     if !check_bounds(arr, index) {
         return std::ptr::null_mut();
@@ -301,6 +308,7 @@ pub extern "C" fn willow_array_reference_owner(arr: *mut u8, index: i64) -> *mut
 
 /// Append `value`, growing the buffer (doubling, min 4) when full.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_array_push(mut arr: *mut u8, mut value: i64) {
     if arr.is_null() {
         raise_with("cannot push to a null array");
@@ -373,6 +381,7 @@ pub extern "C" fn willow_array_push(mut arr: *mut u8, mut value: i64) {
 /// Remove and return the last element. Aborts on an empty array. The freed slot
 /// is nulled so a popped reference can be reclaimed.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_array_pop(arr: *mut u8) -> i64 {
     if arr.is_null() {
         raise_with("cannot pop from a null array");
@@ -441,6 +450,7 @@ pub(crate) fn element_word_to_string(word: i64, kind: i64) -> String {
 /// round-trip). `elem_kind`: 0=i64, 1=f64, 2=bool, 3=String (willow-vwn6).
 /// Returns a newly allocated WillowString.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_array_to_string(arr: *mut u8, elem_kind: i64) -> *mut u8 {
     if arr.is_null() {
         raise_with("cannot convert a null array to String");

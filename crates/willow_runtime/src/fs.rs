@@ -61,6 +61,7 @@ pub(crate) fn alloc_io_err(message: &str) -> *mut u8 {
 /// processes comes from the pid, within the process from the counter — so
 /// parallel test/example runs cannot collide (willow-2s3 review fix).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_fs_temp_path(prefix: *const u8) -> *mut u8 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -89,6 +90,7 @@ pub extern "C" fn willow_fs_temp_path(prefix: *const u8) -> *mut u8 {
 
 /// `fs::read_to_string(path) -> Result<String, IoError>`.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_fs_read_to_string(path: *const u8) -> *mut u8 {
     let path = unsafe { willow_string_as_str(path) };
     match std::fs::read_to_string(path) {
@@ -106,6 +108,7 @@ pub extern "C" fn willow_fs_read_to_string(path: *const u8) -> *mut u8 {
 
 /// `fs::write_string(path, contents) -> Result<void, IoError>`.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_fs_write_string(path: *const u8, contents: *const u8) -> *mut u8 {
     let path = unsafe { willow_string_as_str(path) };
     let contents = unsafe { willow_string_as_str(contents) };
@@ -117,6 +120,7 @@ pub extern "C" fn willow_fs_write_string(path: *const u8, contents: *const u8) -
 
 /// `fs::exists(path) -> bool` (1/0).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_fs_exists(path: *const u8) -> i64 {
     let path = unsafe { willow_string_as_str(path) };
     i64::from(std::path::Path::new(path).exists())
@@ -124,6 +128,7 @@ pub extern "C" fn willow_fs_exists(path: *const u8) -> i64 {
 
 /// `fs::remove_file(path) -> Result<void, IoError>`.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_fs_remove_file(path: *const u8) -> *mut u8 {
     let path = unsafe { willow_string_as_str(path) };
     match std::fs::remove_file(path) {
@@ -221,6 +226,7 @@ unsafe fn blocking_state(frame: *mut c_void) -> Option<Arc<BlockingFsState>> {
     unsafe { raw.as_ref() }.cloned()
 }
 
+#[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn poll_blocking_fs(frame: *mut c_void) -> i32 {
     let Some(state) = (unsafe { blocking_state(frame) }) else {
         return crate::task::RUNTIME_POLL_READY;
@@ -271,6 +277,7 @@ unsafe extern "C" fn poll_blocking_fs(frame: *mut c_void) -> i32 {
     crate::task::RUNTIME_POLL_READY
 }
 
+#[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn cancel_blocking_fs(frame: *mut c_void) {
     unsafe {
         let raw = fs_frame(frame).take_native::<Arc<BlockingFsState>>(FS_TASK_JOB_SLOT);
@@ -356,6 +363,7 @@ fn spawn_blocking_fs_after_publication(
 /// Non-blocking file read. The returned Task parks in `BlockedSyscall` while a
 /// bounded blocking-pool thread performs the OS operation.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_fs_read_to_string_async(path: *const u8) -> *mut c_void {
     let path = unsafe { willow_string_as_str(path) }.to_string();
     spawn_blocking_fs(
@@ -369,6 +377,7 @@ pub extern "C" fn willow_fs_read_to_string_async(path: *const u8) -> *mut c_void
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_fs_write_string_async(
     path: *const u8,
     contents: *const u8,
@@ -386,6 +395,7 @@ pub extern "C" fn willow_fs_write_string_async(
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_fs_exists_async(path: *const u8) -> *mut c_void {
     let path = unsafe { willow_string_as_str(path) }.to_string();
     spawn_blocking_fs(
@@ -395,6 +405,7 @@ pub extern "C" fn willow_fs_exists_async(path: *const u8) -> *mut c_void {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_fs_remove_file_async(path: *const u8) -> *mut c_void {
     let path = unsafe { willow_string_as_str(path) }.to_string();
     spawn_blocking_fs(

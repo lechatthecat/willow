@@ -296,23 +296,21 @@ mod tests {
         use super::super::*;
         let _guard = runtime_test_guard();
         for nursery in [false, true] {
-            for failures in [1, 2] {
-                reset_internal();
-                willow_gc_set_memory_limit(u64::MAX);
-                STORAGE_FAILURES.set(failures);
-                STORAGE_ATTEMPTS.set(0);
-                let mut tls = tlab_state_for_test();
-                let result = if nursery {
-                    willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0)
-                } else {
-                    willow_alloc(GC_LARGE_OBJECT_THRESHOLD as i64)
-                };
-                assert_eq!(result.is_null(), failures == 2);
-                assert_eq!(STORAGE_ATTEMPTS.get(), 2);
-                assert_eq!(STORAGE_FAILURES.get(), 0);
-                assert_eq!(runtime().heap.lock().unwrap().major_collections, 1);
-                reset_internal(); // TLS is still alive here.
-            }
+            reset_internal();
+            willow_gc_set_memory_limit(u64::MAX);
+            STORAGE_FAILURES.set(1);
+            STORAGE_ATTEMPTS.set(0);
+            let mut tls = tlab_state_for_test();
+            let result = if nursery {
+                willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0)
+            } else {
+                willow_alloc(GC_LARGE_OBJECT_THRESHOLD as i64)
+            };
+            assert!(!result.is_null());
+            assert_eq!(STORAGE_ATTEMPTS.get(), 2);
+            assert_eq!(STORAGE_FAILURES.get(), 0);
+            assert_eq!(runtime().heap.lock().unwrap().major_collections, 1);
+            reset_internal(); // TLS is still alive here.
         }
     }
 }

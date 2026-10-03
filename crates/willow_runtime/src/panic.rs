@@ -16,6 +16,7 @@ pub fn abort_message(file: *const u8, line: i32) -> String {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_nil_deref(file: *const u8, line: i32, col: i32, context: *const u8) {
     let ctx = unsafe { willow_string_as_str(context) };
     let message = if ctx.is_empty() {
@@ -45,6 +46,7 @@ fn print_async_chain() {
 /// `RuntimeTaskState::Panicked` variant is reserved for a possible future
 /// recoverable policy; nothing sets it under the abort policy.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_panic(message: *const u8) {
     let msg = unsafe { willow_string_as_str(message) };
     eprintln!("runtime panic: {msg}");
@@ -59,6 +61,7 @@ pub extern "C" fn willow_panic(message: *const u8) {
 /// `message` is a WillowString pointer for `E = String`, or null for other error
 /// types (a generic report is printed).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_main_fail(message: *const u8) {
     if message.is_null() {
         eprintln!("Error: main returned Err");
@@ -73,6 +76,7 @@ pub extern "C" fn willow_main_fail(message: *const u8) {
 /// site (debug builds). Prints `runtime panic: <msg> at <file>:<line>:<col>`
 /// then aborts (willow-4j6).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_panic_at(message: *const u8, file: *const u8, line: i32, col: i32) {
     let msg = unsafe { willow_string_as_str(message) };
     let file = unsafe { willow_string_as_str(file) };
@@ -87,6 +91,7 @@ pub extern "C" fn willow_panic_at(message: *const u8, file: *const u8, line: i32
 /// 0 = division by zero, 1 = `i64::MIN / -1` overflow, 2 = remainder by zero,
 /// 3 = `i64::MIN % -1` overflow. `file` is a WillowString pointer.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_int_div_panic(kind: i64, file: *const u8, line: i32, col: i32) {
     let what = match kind {
         0 => "division by zero",
@@ -98,6 +103,7 @@ pub extern "C" fn willow_int_div_panic(kind: i64, file: *const u8, line: i32, co
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_abort(file: *const u8, line: i32) {
     eprintln!("{}", abort_message(file, line));
     crate::reference_debug::print_current_reference_call_context();

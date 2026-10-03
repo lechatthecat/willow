@@ -73,23 +73,35 @@ fn reset_finalizes_native_owners_in_every_storage_kind() {
 }
 
 #[test]
-fn reset_contains_native_drop_panics_and_continues_cleanup() {
-    static CALLS: AtomicUsize = AtomicUsize::new(0);
-    unsafe fn panic_drop(_: *mut u8) {
-        CALLS.fetch_add(1, Ordering::Relaxed);
-        panic!("reset drop hook test");
+fn native_drop_panics_terminate_reset_and_collection() {
+    use super::failure_policy_tests::{GC_FATAL_CASE, assert_fatal_child};
+    if let Ok(case) = std::env::var(GC_FATAL_CASE) {
+        unsafe fn panic_drop(_: *mut u8) {
+            eprintln!("DROP_HOOK_ENTERED");
+            panic!("injected native destructor panic");
+        }
+        reset_internal();
+        willow_register_drop(OWNER_TYPE, panic_drop);
+        let mut tls = tlab_state_for_test();
+        for _ in 0..4 {
+            willow_alloc_with_layout(GcObjectKind::Class, OWNER_TYPE, 8, 0);
+            willow_gc_alloc_slow(&mut tls, 1, OWNER_TYPE as i64, 8, 0);
+        }
+        if case == "reset" {
+            reset_internal();
+        } else {
+            willow_gc_collect();
+        }
+        eprintln!("GC_PANIC_RETURNED");
+        return;
     }
-    let _guard = runtime_test_guard();
-    reset_internal();
-    CALLS.store(0, Ordering::Relaxed);
-    willow_register_drop(OWNER_TYPE, panic_drop);
-    let mut tls = tlab_state_for_test();
-    for _ in 0..4 {
-        assert!(!willow_alloc_with_layout(GcObjectKind::Class, OWNER_TYPE, 8, 0).is_null());
-        assert!(!willow_gc_alloc_slow(&mut tls, 1, OWNER_TYPE as i64, 8, 0).is_null());
+    for case in ["reset", "collection"] {
+        let stderr = assert_fatal_child(
+            "gc::reset_tests::native_drop_panics_terminate_reset_and_collection",
+            case,
+            "runtime fatal: Rust panic in GC native destructor",
+        );
+        assert_eq!(stderr.matches("DROP_HOOK_ENTERED").count(), 1);
+        assert!(stderr.contains("injected native destructor panic"));
     }
-    reset_internal();
-    assert_eq!(CALLS.load(Ordering::Relaxed), 8);
-    reset_internal();
-    assert_eq!(CALLS.load(Ordering::Relaxed), 8);
 }

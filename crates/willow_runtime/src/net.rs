@@ -119,6 +119,7 @@ fn parse_address(address: *const u8) -> Result<(String, SocketAddr), *mut u8> {
 /// hidden in this operation: v1 accepts numeric `IP:port` strings, avoiding a
 /// DNS lookup on a scheduler worker.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_net_bind(address: *const u8) -> *mut u8 {
     let (address, parsed) = match parse_address(address) {
         Ok(value) => value,
@@ -134,6 +135,7 @@ pub extern "C" fn willow_net_bind(address: *const u8) -> *mut u8 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_net_local_addr(listener: *mut u8) -> *mut u8 {
     let Some(NetworkHandle::Listener(listener)) = (unsafe { handle(listener) }) else {
         return crate::fs::alloc_io_err("net::local_addr: invalid TcpListener");
@@ -145,6 +147,7 @@ pub extern "C" fn willow_net_local_addr(listener: *mut u8) -> *mut u8 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_net_peer_addr(stream: *mut u8) -> *mut u8 {
     let Some(NetworkHandle::Stream(stream)) = (unsafe { handle(stream) }) else {
         return crate::fs::alloc_io_err("net::peer_addr: invalid TcpStream");
@@ -156,6 +159,7 @@ pub extern "C" fn willow_net_peer_addr(stream: *mut u8) -> *mut u8 {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_net_shutdown(stream: *mut u8) -> *mut u8 {
     let Some(NetworkHandle::Stream(stream)) = (unsafe { handle(stream) }) else {
         return crate::fs::alloc_io_err("net::shutdown: invalid TcpStream");
@@ -450,6 +454,7 @@ unsafe fn poll_write(frame: *mut c_void, bytes: &[u8], offset: &mut usize) -> i3
     }
 }
 
+#[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn poll_net_operation(frame: *mut c_void) -> i32 {
     let native_frame = unsafe { net_frame(frame) };
     let raw = native_frame.take_native::<NetOperation>(NET_TASK_OPERATION_SLOT);
@@ -475,6 +480,7 @@ unsafe extern "C" fn poll_net_operation(frame: *mut c_void) -> i32 {
     status
 }
 
+#[willow_runtime_macros::ffi_boundary]
 unsafe extern "C" fn cancel_net_operation(frame: *mut c_void) {
     unsafe {
         let frame = net_frame(frame);
@@ -520,6 +526,7 @@ fn spawn_operation(handle: *mut u8, operation: NetOperation) -> *mut c_void {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_net_connect_async(address: *const u8) -> *mut c_void {
     let address_text = unsafe { willow_string_as_str(address) }.to_string();
     let parsed = match address_text.parse::<SocketAddr>() {
@@ -562,11 +569,13 @@ pub extern "C" fn willow_net_connect_async(address: *const u8) -> *mut c_void {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_net_accept_async(listener: *mut u8) -> *mut c_void {
     spawn_operation(listener, NetOperation::Accept)
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_net_read_async(stream: *mut u8, max_bytes: i64) -> *mut c_void {
     let operation = match usize::try_from(max_bytes) {
         Ok(max_bytes) if (1..=MAX_READ_BYTES).contains(&max_bytes) => NetOperation::Read {
@@ -581,6 +590,7 @@ pub extern "C" fn willow_net_read_async(stream: *mut u8, max_bytes: i64) -> *mut
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_net_write_async(stream: *mut u8, contents: *const u8) -> *mut c_void {
     let bytes = unsafe { willow_string_as_str(contents) }
         .as_bytes()

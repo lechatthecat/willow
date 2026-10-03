@@ -79,6 +79,7 @@ fn c_double_format(format: &[u8], value: f64, capacity: usize) -> String {
 /// WillowString pointer; a negative *literal* exponent is rejected at compile
 /// time (E0204), so only a negative value computed at runtime reaches here.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_pow_negative_exponent(
     exponent: i64,
     file: *const u8,
@@ -91,12 +92,14 @@ pub extern "C" fn willow_pow_negative_exponent(
 
 /// Returns a GC-managed WillowString representation of `value`.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_f64_to_string(value: f64) -> *mut u8 {
     willow_string_from_str(&format_f64_shortest(value))
 }
 
 /// `i64.toString()` — GC-managed WillowString of the decimal representation.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_i64_to_string(value: i64) -> *mut u8 {
     willow_string_from_str(&value.to_string())
 }
@@ -104,12 +107,14 @@ pub extern "C" fn willow_i64_to_string(value: i64) -> *mut u8 {
 /// `bool.toString()` — GC-managed WillowString `"true"` or `"false"`. The value
 /// is the usual nonzero-is-true encoding.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_bool_to_string(value: u8) -> *mut u8 {
     willow_string_from_str(if value != 0 { "true" } else { "false" })
 }
 
 /// Returns `Result<f64, ParseFloatError>`.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_f64_parse(text: *const u8) -> *mut u8 {
     let text = unsafe { willow_string_as_str(text) };
     match text.parse::<f64>() {
@@ -149,18 +154,21 @@ pub extern "C" fn willow_f64_parse(text: *const u8) -> *mut u8 {
 
 /// Returns a GC-managed WillowString formatted with %.17g precision.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_format_f64_17g(value: f64) -> *mut u8 {
     willow_string_from_str(&format_f64_17g(value))
 }
 
 /// Returns a GC-managed WillowString formatted with 16 decimal places.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_format_f64_16f(value: f64) -> *mut u8 {
     willow_string_from_str(&format_f64_16f(value))
 }
 
 /// Returns a GC-managed WillowString formatted with 6 decimal places.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_format_f64_6f(value: f64) -> *mut u8 {
     willow_string_from_str(&format_f64_6f(value))
 }

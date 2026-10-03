@@ -103,6 +103,7 @@ fn current_task() -> Option<RuntimeTaskId> {
 }
 
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_mutex_new(value: i64, is_ref: i64) -> *mut c_void {
     ensure_async_mutex_registered();
     let payload = crate::gc::willow_alloc_with_layout(
@@ -131,6 +132,7 @@ pub extern "C" fn willow_async_mutex_new(value: i64, is_ref: i64) -> *mut c_void
 /// Acquire for the running task. Writes the registration token to `out_token`
 /// on `ACQUIRED` and `PENDING`; leaves it untouched otherwise.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_mutex_acquire(raw: *mut c_void, out_token: *mut i64) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     let (Some(mutex), Some(task)) = (unsafe { mutex_from_raw(raw) }, current_task()) else {
@@ -157,6 +159,7 @@ pub extern "C" fn willow_async_mutex_acquire(raw: *mut c_void, out_token: *mut i
 
 /// Re-poll a pending acquire after a wake.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_mutex_poll(raw: *mut c_void, token: i64) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     let (Some(mutex), Some(task)) = (unsafe { mutex_from_raw(raw) }, current_task()) else {
@@ -173,6 +176,7 @@ pub extern "C" fn willow_async_mutex_poll(raw: *mut c_void, token: i64) -> i32 {
 /// the generated frame only calls this after an `ACQUIRED` status, so a `0` here
 /// means the ABI was misused rather than that the value is zero.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_mutex_load(raw: *mut c_void, token: i64) -> i64 {
     let (Some(mutex), Some(task)) = (unsafe { mutex_from_raw(raw) }, current_task()) else {
         return 0;
@@ -183,6 +187,7 @@ pub extern "C" fn willow_async_mutex_load(raw: *mut c_void, token: i64) -> i64 {
 /// Commit the protected value. Returns 1 on success, 0 if the caller is not the
 /// current owner.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_mutex_commit(raw: *mut c_void, token: i64, value: i64) -> i32 {
     let (Some(mutex), Some(task)) = (unsafe { mutex_from_raw(raw) }, current_task()) else {
         return 0;
@@ -193,6 +198,7 @@ pub extern "C" fn willow_async_mutex_commit(raw: *mut c_void, token: i64, value:
 /// Release ownership and hand off. Returns 1 on success, 0 if the caller was not
 /// the owner (a stale or double release).
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_mutex_release(raw: *mut c_void, token: i64) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     let (Some(mutex), Some(task)) = (unsafe { mutex_from_raw(raw) }, current_task()) else {
@@ -206,6 +212,7 @@ pub extern "C" fn willow_async_mutex_release(raw: *mut c_void, token: i64) -> i3
 
 /// Cancellation cleanup for the running task, whatever phase it is in.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_mutex_cancel() -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     let Some(task) = current_task() else {
@@ -218,6 +225,7 @@ pub extern "C" fn willow_async_mutex_cancel() -> i32 {
 /// from the acquire entry point so the generated code supplies the source
 /// location of the offending `lock` statement.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_mutex_recursive_panic(file: *const u8, line: i32, col: i32) {
     crate::panic_context::raise_language_message_at(
         "recursive lock acquisition on non-reentrant Mutex",
@@ -231,6 +239,7 @@ pub extern "C" fn willow_async_mutex_recursive_panic(file: *const u8, line: i32,
 /// recoverable Willow panic: accepting an unknown state would either read a
 /// value without ownership or retry forever after compiler/runtime drift.
 #[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_async_mutex_invalid_status(status: i32, phase: i32) -> ! {
     crate::panic_context::fatal_invariant(&invalid_status_message(status, phase));
 }
