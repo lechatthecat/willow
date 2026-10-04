@@ -104,7 +104,7 @@ fn brk_10_continue_outside_loop_rejected() {
 #[test]
 fn brk_11_lambda_is_a_loop_boundary() {
     let (ok, stderr) = compile_with_compiler_env(
-        "fn main() { for i in 0..3 { let f = || { break; 1 }; } }",
+        "fn main() { for i in 0..3 { let f = || { break; return 1; }; } }",
         &[],
     );
     assert!(!ok);
