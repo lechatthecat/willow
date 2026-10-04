@@ -1349,10 +1349,12 @@ impl TypeChecker {
             }
             MatchBody::Block(block) => {
                 self.check_block(block);
-                // An arm that always returns diverges — type it `Never` so it
-                // unifies with value arms (`Ok(v) => v, Err(_) => return 0`)
-                // and with statement-position matches (willow-zvkv).
-                if crate::semantic::type_checker::analysis::block_always_returns(block) {
+                // An arm that always leaves — by `return`, or by `break` /
+                // `continue` of an enclosing loop (willow-jz15.46) — diverges:
+                // type it `Never` so it unifies with value arms
+                // (`Ok(v) => v, Err(_) => { continue; }`) and with
+                // statement-position matches (willow-zvkv).
+                if crate::semantic::type_checker::analysis::block_always_leaves_arm(block) {
                     Type::Never
                 } else {
                     Type::Void

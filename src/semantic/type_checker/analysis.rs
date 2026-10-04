@@ -56,8 +56,13 @@ pub(crate) fn reference_place_key(mut expr: &Expr) -> Option<String> {
     }
 }
 
-pub(crate) fn block_always_returns(block: &Block) -> bool {
-    always_returns(ReturnNode::Block(block))
+/// Whether every path through a `match` arm's block leaves the arm without
+/// reaching its end: by `return`, or by a `break`/`continue` of a loop that
+/// encloses the `match` (willow-jz15.46). Such an arm hands no value to the
+/// match, so it is typed `Never`. Loops written inside the arm are not entered,
+/// so their own `break`/`continue` never count.
+pub(crate) fn block_always_leaves_arm(block: &Block) -> bool {
+    always_leaves(ReturnNode::Block(block))
 }
 
 enum ReturnNode<'a> {
@@ -67,7 +72,10 @@ enum ReturnNode<'a> {
 
 /// A small boolean evaluator preserves short-circuit traversal without using
 /// native recursion or the type-erased compiler continuation stack.
-fn always_returns(mut node: ReturnNode<'_>) -> bool {
+///
+/// The evaluator never descends into a nested loop body, so any `break` or
+/// `continue` it reaches targets a loop outside the analysed block.
+fn always_leaves(mut node: ReturnNode<'_>) -> bool {
     enum Frame<'a> {
         Any(std::slice::Iter<'a, Stmt>),
         All(std::slice::Iter<'a, MatchArm>),
@@ -86,7 +94,6 @@ fn always_returns(mut node: ReturnNode<'_>) -> bool {
                 false
             }
             ReturnNode::Stmt(stmt) => match stmt {
-                Stmt::Return(_) => true,
                 Stmt::If(branch) => {
                     if let Some(other) = &branch.else_block {
                         frames.push(Frame::ThenElse(other));
@@ -114,11 +121,9 @@ fn always_returns(mut node: ReturnNode<'_>) -> bool {
                     }
                     false
                 }
-                // Loops need not execute; deferred bodies run later. Neither
-                // break nor continue guarantees a return from the function.
+                Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
+                // Loops need not execute; deferred bodies run later.
                 Stmt::Defer(_)
-                | Stmt::Break(_)
-                | Stmt::Continue(_)
                 | Stmt::Let(_)
                 | Stmt::Assign(_)
                 | Stmt::FieldAssign(_)
@@ -199,12 +204,12 @@ mod tests {
                         span,
                     };
                 }
-                assert!(block_always_returns(&body));
+                assert!(block_always_leaves_arm(&body));
                 // The outer else must also return, even when every then branch does.
                 if let Stmt::If(branch) = &mut body.stmts[0] {
                     branch.else_block.as_mut().unwrap().stmts.clear();
                 }
-                assert!(!block_always_returns(&body));
+                assert!(!block_always_leaves_arm(&body));
             })
             .unwrap()
             .join()

@@ -1,0 +1,101 @@
+// A value `match` arm may skip or stop the enclosing loop instead of producing
+// a value. An arm whose every path ends in `break` or `continue` hands nothing
+// to the `match`, so — like an arm that `return`s — it does not take part in
+// the match's type, and `let v = match ... { Ok(x) => x, Err(e) => { continue; } }`
+// is an `i64`.
+//
+// Only loops OUTSIDE the arm count: a `break` of a loop written inside the arm
+// ends that inner loop, and the arm then falls through to its end with no
+// value (E1201).
+
+import std::collections::Array;
+
+fn parse_digit(s: String) -> Result<i64, String> {
+    if s == "0" { return Result::Ok(0); }
+    if s == "1" { return Result::Ok(1); }
+    if s == "2" { return Result::Ok(2); }
+    if s == "3" { return Result::Ok(3); }
+    if s == "stop" { return Result::Err("stop"); }
+    return Result::Err("bad digit");
+}
+
+// `continue` in a `for` loop: skip inputs that do not parse.
+fn sum_valid(inputs: Array<String>) -> i64 {
+    let mut sum = 0;
+    for s in inputs {
+        let v = match parse_digit(s) {
+            Result::Ok(x) => x,
+            Result::Err(e) => { continue; }
+        };
+        sum = sum + v;
+    }
+    return sum;
+}
+
+// `break` in a `while` loop, and an `if`/`else` whose branches leave
+// differently: `stop` ends the scan, any other error skips one input.
+fn sum_until_stop(inputs: Array<String>) -> i64 {
+    let mut i = 0;
+    let mut sum = 0;
+    while i < inputs.len() {
+        let s = inputs[i];
+        i = i + 1;
+        let v = match parse_digit(s) {
+            Result::Ok(x) => x,
+            Result::Err(e) => {
+                if e == "stop" {
+                    break;
+                } else {
+                    continue;
+                }
+            }
+        };
+        sum = sum + v;
+    }
+    return sum;
+}
+
+// Nested loops: the `continue` belongs to the innermost loop around the
+// `match`, so it skips one pair, not the whole row.
+fn off_diagonal(n: i64) -> i64 {
+    let mut total = 0;
+    for a in 0..n {
+        for b in 0..n {
+            let w = match a == b {
+                true => { continue; }
+                false => a * 10 + b,
+            };
+            total = total + w;
+        }
+    }
+    return total;
+}
+
+// A nested `match` whose arms all leave is itself a leaving arm, and a `defer`
+// registered on the way out still runs.
+fn first_present(xs: Array<Option<i64>>) -> String {
+    let mut skipped = 0;
+    let mut found = -1;
+    for x in xs {
+        let v = match x {
+            Option::Some(n) => n,
+            Option::None => {
+                defer { skipped = skipped + 1; }
+                match skipped < 5 {
+                    true => { continue; }
+                    false => { break; }
+                }
+            }
+        };
+        found = v;
+        break;
+    }
+    return "found " + found.toString() + " after " + skipped.toString();
+}
+
+fn main() {
+    println(sum_valid(["1", "x", "2", "3", "?"]));
+    println(sum_until_stop(["1", "x", "2", "stop", "3"]));
+    println(off_diagonal(3));
+    println(first_present([Option::None, Option::None, Option::Some(7), Option::Some(9)]));
+}

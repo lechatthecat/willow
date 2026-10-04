@@ -2612,7 +2612,8 @@ fn lower_match(
                 (vec![HirStmt::Expr(value)], ty)
             }
             MatchBody::Block(block) => {
-                let ty = if crate::semantic::type_checker::analysis::block_always_returns(block) {
+                let ty = if crate::semantic::type_checker::analysis::block_always_leaves_arm(block)
+                {
                     Type::Never
                 } else {
                     Type::Void

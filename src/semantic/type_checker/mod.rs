@@ -8338,3 +8338,6 @@ mod contextual_values_tests;
 
 #[cfg(test)]
 mod diagnostic_recovery_tests;
+
+#[cfg(test)]
+mod loop_exit_arms_tests;
