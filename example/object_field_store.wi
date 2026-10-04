@@ -1,0 +1,95 @@
+// Reference field stores (willow-8hq4.22).
+//
+// `object.field = value` on a GC reference field compiles to an inline
+// header-flag write-barrier filter and a plain store, the same filter that
+// reference array stores use (willow-8hq4.15). Only stores that may create
+// an unremembered old-to-young edge, or that run while a marking epoch is
+// active, call the runtime barrier. Owners are tenured here first, so the
+// young values stored into them exercise the generational remembered set.
+import std::collections::Array;
+
+interface Shape { fn area() -> i64; }
+class Square implements Shape {
+    pub side: i64;
+    pub fn area() -> i64 { return self.side * self.side; }
+}
+class Node { pub value: i64; }
+enum Slot { Empty, Full(Node) }
+open class Holder {
+    pub node: Node;
+    pub name: String;
+    pub shape: Shape;
+    pub maybe: Option<Node>;
+    pub slot: Slot;
+    pub items: Array<Node>;
+    pub fn replace(self, value: i64) { self.node = new Node(value); }
+}
+class Labeled extends Holder { pub tag: String; }
+
+fn tenure() {
+    let mut i = 0;
+    while i < 4 {
+        gc_minor_collect();
+        i = i + 1;
+    }
+}
+
+fn make_holder() -> Holder {
+    return new Holder(new Node(0), "start", new Square(1), Option::None, Slot::Empty, [new Node(0)]);
+}
+
+fn main() {
+    let h = make_holder();
+    tenure();
+
+    // Young values stored into an old owner survive minor collections.
+    h.node = new Node(11);
+    h.name = "field" + "-store";
+    h.shape = new Square(6);
+    h.maybe = Option::Some(new Node(5));
+    h.slot = Slot::Full(new Node(9));
+    h.items = [new Node(1), new Node(2)];
+    gc_minor_collect();
+    println(h.node.value);
+    println(h.name);
+    println(h.shape.area());
+    match h.maybe { Some(n) => println(n.value), None => println("none") }
+    match h.slot { Slot::Full(n) => println(n.value), Slot::Empty => println("empty") }
+    println(h.items[0].value + h.items[1].value);
+
+    // Repeated stores into an already remembered owner, through a method.
+    h.replace(100);
+    h.replace(200);
+    gc_minor_collect();
+    println(h.node.value);
+
+    // Deletion, old-to-old store and self-aliasing store.
+    h.maybe = Option::None;
+    let keep = h.node;
+    tenure();
+    h.node = keep;
+    h.node = h.node;
+    gc_collect();
+    match h.maybe { Some(n) => println(n.value), None => println("none") }
+    println(h.node.value);
+
+    // Inherited and own fields of a subclass.
+    let l = new Labeled(new Node(0), "a", new Square(2), Option::None, Slot::Empty, [], "t");
+    tenure();
+    l.tag = "sub" + "class";
+    l.node = new Node(42);
+    gc_minor_collect();
+    println(l.tag);
+    println(l.node.value);
+
+    // Many stores while collections run between them.
+    let mut total = 0;
+    let mut i = 0;
+    while i < 2000 {
+        h.node = new Node(i);
+        if i % 500 == 0 { gc_minor_collect(); }
+        total = total + h.node.value;
+        i = i + 1;
+    }
+    println(total);
+}

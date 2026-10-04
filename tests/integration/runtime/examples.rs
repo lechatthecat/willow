@@ -4,6 +4,39 @@ use super::*;
 
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
+        ("example/abi_handshake.wi", "42\n"),
+        ("example/codegen_unit_context/main.wi", "42\n"),
+        ("example/interface_pairs.wi", "7\n11\n7\n11\n"),
+        ("example/leaf_method_calls.wi", "385\n1210\n7\n"),
+        ("example/map_confined.wi", "false\n128\n99\n2.5\ntrue\n"),
+        ("example/map_scalar_aliases.wi", "8192\ntrue\n12288\ntrue\n"),
+        (
+            "example/map_scalar_storage.wi",
+            "-9\n42\n0\n-1\n2\n{0: 0, 7: 42}\ntrue\nfalse\n1\n-2.5\n",
+        ),
+        (
+            "example/native_memory_accounting.wi",
+            "1024\n1024\n523776\n",
+        ),
+        (
+            "example/reference_equality.wi",
+            "true\nfalse\ntrue\ntrue\ntrue\ntrue\ntrue\nfalse\n",
+        ),
+        (
+            "example/relocatable_roots.wi",
+            "42\n7\n1225\n7\n25\n820\n36\n9\n6\n200\n45\n0\n0\ntrue\n",
+        ),
+        (
+            "example/runtime_failure_policy.wi",
+            "explicit recovered\nbounds recovered\nasync recovered\ndone\n",
+        ),
+        (
+            "example/scalar_adt_pairs.wi",
+            "42\ntrue\n43\ntrue\n44\n45\n",
+        ),
+        ("example/session_symbols.wi", "42\n"),
+        ("example/static_atomic.wi", "2\n"),
+        ("example/static_dependency_graph.wi", "42\n"),
         (
             "example/string_methods.wi",
             "18\n日本\n語\n10\ntrue\ntrue\n4\nWillowWillow\n0\n0\n日本語,Willow,,\n",
@@ -391,6 +424,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/nil_nullable.wi", "0\n10\n20\ntrue\n10\n"),
         ("example/nil_safe_chain.wi", "60\n3\n30\n-1\n120\n"),
         ("example/object_argument.wi", "42\n42\n99\n41\n"),
+        (
+            "example/object_field_store.wi",
+            "11\nfield-store\n36\n5\n9\n3\n200\nnone\n200\nsubclass\n42\n1999000\n",
+        ),
         (
             "example/option_result.wi",
             "true\ntrue\n10\n10\n10\n99\n20\ntrue\n2\ntrue\n42\n10\ntrue\ntrue\n8\n8\n8\n99\nsomething failed\n24\ntrue\nprefix: something failed\n8\n2\nnot even\n0\n8\n",

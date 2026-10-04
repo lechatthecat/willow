@@ -498,7 +498,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return;
         }
         let is_reference = is_gc_managed(value_ty, self.enum_infos);
-        self.emit_gc_heap_store_classified(owner, offset, value, is_reference, destination);
+        let value_has_header = self.is_class_pointer(value_ty)
+            || option_repr::option_inner(value_ty).is_some_and(|inner| {
+                self.option_repr(value_ty) == Some(option_repr::OptionRepr::NullableGcPointer)
+                    && self.is_class_pointer(inner)
+            });
+        self.emit_gc_heap_store_inner(
+            owner,
+            offset,
+            value,
+            is_reference,
+            value_has_header,
+            destination,
+        );
+    }
+
+    /// Class instances are always GC heap payloads with a header; a class
+    /// value word is never a tag, box-free pair, or foreign pointer.
+    fn is_class_pointer(&self, ty: &Type) -> bool {
+        matches!(ty, Type::Named(n) | Type::Generic(n, _) if self.classes.is_class(n))
     }
 
     /// Variant for values whose source-level type has already been erased to a
@@ -511,6 +529,45 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         is_reference: bool,
         destination: GcStoreDestination,
     ) {
+        self.emit_gc_heap_store_inner(owner, offset, value, is_reference, false, destination);
+    }
+
+    /// `value_has_header`: a non-null `value` is known to be a GC payload whose
+    /// header generation byte may be read (class instances).
+    fn emit_gc_heap_store_inner(
+        &mut self,
+        owner: Value,
+        offset: i32,
+        value: Value,
+        is_reference: bool,
+        value_has_header: bool,
+        destination: GcStoreDestination,
+    ) {
+        if is_reference && owner_is_object_payload(destination) {
+            let flags = MemFlagsData::new();
+            // Only word zero of an inline interface pair is traced.
+            let (word, vtable) = if self.builder.func.dfg.value_type(value) == types::I128 {
+                let (object, vtable) = self.builder.ins().isplit(value);
+                (object, Some(vtable))
+            } else {
+                (value, None)
+            };
+            let slot = if offset == 0 {
+                owner
+            } else {
+                self.builder.ins().iadd_imm_s(owner, i64::from(offset))
+            };
+            let refinement = if value_has_header && vtable.is_none() {
+                BarrierRefinement::OldValueSkips
+            } else {
+                BarrierRefinement::None
+            };
+            self.emit_filtered_reference_store(owner, slot, word, destination, refinement, flags);
+            if let Some(vtable) = vtable {
+                self.builder.ins().store(flags, vtable, owner, offset + 8);
+            }
+            return;
+        }
         let barrier_id = self.func_id("willow_gc_write_barrier");
         let barrier = self
             .module
@@ -525,6 +582,162 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             MemFlagsData::new(),
         );
     }
+
+    /// Store a reference `word` into `slot` inside the GC object whose payload
+    /// starts at `owner` (willow-8hq4.15, 8hq4.22). The fused
+    /// `willow_gc_write_barrier` call is skipped when it is a no-op: no SATB
+    /// epoch is active and the word is null, the owner is not old, or the
+    /// owner is already remembered (a header flag the runtime keeps equal to
+    /// remembered-set membership). Otherwise a cold block captures the old
+    /// value, calls the barrier, and publishes atomically; see
+    /// [`BarrierRefinement`] for the optional extra conditions.
+    /// Nothing between the phase load and the store reaches a safepoint,
+    /// matching the runtime barrier/store pair. Leaves the builder in the
+    /// continuation block.
+    pub(super) fn emit_filtered_reference_store(
+        &mut self,
+        owner: Value,
+        slot: Value,
+        word: Value,
+        destination: GcStoreDestination,
+        refinement: BarrierRefinement,
+        flags: MemFlagsData,
+    ) {
+        use willow_abi::gc_header;
+        let ptr_ty = reference_type(self.module.target_config());
+        let plain = self.builder.create_block();
+        let barrier = self.builder.create_block();
+        self.builder.set_cold_block(barrier);
+        let done = self.builder.create_block();
+
+        let phase_data = self
+            .module
+            .declare_data(
+                willow_abi::GC_MARK_PHASE_SYMBOL,
+                cranelift_module::Linkage::Import,
+                false,
+                false,
+            )
+            .expect("GC mark phase symbol");
+        let phase_global = self
+            .module
+            .declare_data_in_func(phase_data, self.builder.func);
+        let phase_addr = self.builder.ins().symbol_value(ptr_ty, phase_global);
+        let phase = self
+            .builder
+            .ins()
+            .atomic_load(types::I8, MemFlagsData::trusted(), phase_addr);
+        let marking = self.builder.ins().icmp_imm_s(IntCC::NotEqual, phase, 0);
+        let header = -(gc_header::size(ptr_ty.bytes()) as i32);
+        let generation = self.builder.ins().load(
+            types::I8,
+            flags,
+            owner,
+            header + gc_header::GENERATION_OFFSET as i32,
+        );
+        let remembered = self.builder.ins().load(
+            types::I8,
+            flags,
+            owner,
+            header + gc_header::REMEMBERED_OFFSET as i32,
+        );
+        let old = self.builder.ins().icmp_imm_s(
+            IntCC::Equal,
+            generation,
+            i64::from(gc_header::GENERATION_OLD),
+        );
+        let unremembered = self.builder.ins().icmp_imm_s(IntCC::Equal, remembered, 0);
+        let nonnull = self.builder.ins().icmp_imm_s(IntCC::NotEqual, word, 0);
+        let new_edge = self.builder.ins().band(old, unremembered);
+        let new_edge = self.builder.ins().band(new_edge, nonnull);
+        let needs_barrier = self.builder.ins().bor(marking, new_edge);
+        let needs_barrier = match refinement {
+            BarrierRefinement::BufferIsRef(is_ref) => {
+                self.builder.ins().band(is_ref, needs_barrier)
+            }
+            _ => needs_barrier,
+        };
+        if refinement == BarrierRefinement::OldValueSkips {
+            // Reached only when marking or when `word` is non-null.
+            let check_marking = self.builder.create_block();
+            let check_value = self.builder.create_block();
+            self.builder
+                .ins()
+                .brif(needs_barrier, check_marking, &[], plain, &[]);
+            self.builder.switch_to_block(check_marking);
+            self.builder.seal_block(check_marking);
+            self.builder
+                .ins()
+                .brif(marking, barrier, &[], check_value, &[]);
+            self.builder.switch_to_block(check_value);
+            self.builder.seal_block(check_value);
+            let value_generation = self.builder.ins().load(
+                types::I8,
+                MemFlagsData::trusted(),
+                word,
+                header + gc_header::GENERATION_OFFSET as i32,
+            );
+            let value_old = self.builder.ins().icmp_imm_s(
+                IntCC::Equal,
+                value_generation,
+                i64::from(gc_header::GENERATION_OLD),
+            );
+            self.builder.ins().brif(value_old, plain, &[], barrier, &[]);
+        } else {
+            self.builder
+                .ins()
+                .brif(needs_barrier, barrier, &[], plain, &[]);
+        }
+
+        self.builder.switch_to_block(plain);
+        self.builder.seal_block(plain);
+        self.builder.ins().store(flags, word, slot, 0);
+        self.builder.ins().jump(done, &[]);
+
+        self.builder.switch_to_block(barrier);
+        self.builder.seal_block(barrier);
+        let word_ty = self.builder.func.dfg.value_type(word);
+        let previous = self.builder.ins().atomic_load(word_ty, flags, slot);
+        let destination = self.builder.ins().iconst(types::I64, destination as i64);
+        let barrier_id = self.func_id("willow_gc_write_barrier");
+        let barrier_ref = self
+            .module
+            .declare_func_in_func(barrier_id, self.builder.func);
+        self.builder
+            .ins()
+            .call(barrier_ref, &[owner, previous, word, destination]);
+        self.builder.ins().atomic_store(flags, word, slot);
+        self.builder.ins().jump(done, &[]);
+
+        self.builder.switch_to_block(done);
+        self.builder.seal_block(done);
+    }
+}
+
+/// Extra conditions of [`FuncGen::emit_filtered_reference_store`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum BarrierRefinement {
+    None,
+    /// Dynamically typed buffers: the barrier applies only when this flag
+    /// (the buffer's `H_IS_REF` word, compared non-zero) is set.
+    BufferIsRef(Value),
+    /// Non-null words are GC payloads (class instances): a would-be new edge
+    /// outside marking reads the value's generation byte and skips the call
+    /// for an old value, which records no edge either.
+    OldValueSkips,
+}
+
+/// Destinations whose owner is always the payload start of a GC heap object,
+/// so its header bytes can be read inline. Globals have no header and
+/// `IndirectReference` owners are interior slots; both, like runtime-owned
+/// cells and async frames, keep the unconditional barrier call.
+fn owner_is_object_payload(destination: GcStoreDestination) -> bool {
+    matches!(
+        destination,
+        GcStoreDestination::ObjectField
+            | GcStoreDestination::EnumPayload
+            | GcStoreDestination::InterfaceObject
+    )
 }
 
 #[cfg(test)]
