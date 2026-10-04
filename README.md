@@ -60,7 +60,7 @@ Runtime microbenchmarks measured on 2026-10-04 on an AMD Ryzen 7 7800X3D host.
 Values are wall-time medians in milliseconds across 5 trials; lower is better.
 Willow used 8 workers. Comparison runtimes were Go 1.27.0 and OpenJDK 26.0.2 using virtual threads.
 
-| Case | Willow | Go | Java |
+| Case | Willow (ms) | Go (ms) | Java (ms) |
 | --- | ---: | ---: | ---: |
 | idle_spawn 100k | **106.0** | 119.4 | 91.7 |
 | wake_fanout | 163.4 | **14.2** | 190.6 |
