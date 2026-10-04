@@ -1118,8 +1118,22 @@ impl TypeChecker {
             }
             match &result_type {
                 None => result_type = Some(arm_ty),
+                // Same type, or a subtype of the arms so far: no change.
+                Some(existing) if self.types_compatible(existing, &arm_ty) => {}
                 Some(existing) => {
-                    if !self.types_compatible(existing, &arm_ty) {
+                    if let Some(unified) =
+                        self.unify_to_expected(expected.as_ref(), existing, &arm_ty)
+                    {
+                        // Distinct arm types the destination accepts, e.g. two
+                        // classes implementing the returned interface
+                        // (willow-jz15.47).
+                        result_type = Some(unified);
+                    } else if self.types_compatible(&arm_ty, existing) {
+                        // A later arm of a supertype widens the result, as a
+                        // ternary's branches do.
+                        result_type = Some(arm_ty);
+                    } else {
+                        let help = self.common_supertype_help(existing, &arm_ty);
                         self.push(
                             Diagnostic::new(
                                 Severity::Error,
@@ -1133,7 +1147,8 @@ impl TypeChecker {
                             .with_label(Label::primary(
                                 arm.span,
                                 format!("found `{}`", type_name(&arm_ty)),
-                            )),
+                            ))
+                            .with_help(help),
                         );
                     }
                 }

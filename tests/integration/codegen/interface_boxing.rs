@@ -316,3 +316,23 @@ fn main() {
         &format!("{}{}", "a#9!\n".repeat(10), "a\n".repeat(2)),
     );
 }
+
+const CONTEXTUAL_INTERFACE_VALUES_OUT: &str = "always\ncmp price\nnot cmp deep\nnot always\nalways\ncmp t\ncmp arg\ncmp let\ncmp field\nnot cmp set\n20\ncmp w\nalways\n6999\n";
+
+#[test]
+fn contextual_interface_values_example() {
+    let (out, ok) = compile_and_run(include_str!(
+        "../../../example/contextual_interface_values.wi"
+    ));
+    assert!(ok);
+    assert_eq!(out, CONTEXTUAL_INTERFACE_VALUES_OUT);
+}
+
+#[test]
+fn contextual_interface_values_example_release() {
+    let (out, ok) = compile_and_run_release(include_str!(
+        "../../../example/contextual_interface_values.wi"
+    ));
+    assert!(ok);
+    assert_eq!(out, CONTEXTUAL_INTERFACE_VALUES_OUT);
+}

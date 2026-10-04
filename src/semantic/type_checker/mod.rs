@@ -992,6 +992,57 @@ impl TypeChecker {
         }
     }
 
+    /// Two values of distinct types that both convert to the type their
+    /// expression flows into (return type, `let` annotation, argument) take
+    /// that type, e.g. two classes implementing one interface (willow-jz15.47).
+    fn unify_to_expected(&self, expected: Option<&Type>, a: &Type, b: &Type) -> Option<Type> {
+        let expected = expected?;
+        #[cfg(test)]
+        UNIFY_TO_EXPECTED_CALLS.with(|count| count.set(count.get() + 1));
+        (self.types_compatible(expected, a) && self.types_compatible(expected, b))
+            .then(|| expected.clone())
+    }
+
+    /// Help for a `match`/ternary whose values have incompatible types and no
+    /// expected type: name a base class or interface of `a` that `b` also
+    /// converts to, when one exists. Diagnostic path only (willow-jz15.47).
+    fn common_supertype_help(&self, a: &Type, b: &Type) -> String {
+        let mut current = match a {
+            Type::Named(name) => Some(name.clone()),
+            _ => None,
+        };
+        let mut seen = HashSet::new();
+        let mut common = None;
+        while let Some(name) = current.take() {
+            if !seen.insert(name.clone()) {
+                break;
+            }
+            let Some(info) = self.symbols.lookup_class(&name) else {
+                break;
+            };
+            let base = info.base_class.clone().map(Type::Named);
+            common = info
+                .implements
+                .iter()
+                .chain(base.iter())
+                .find(|candidate| self.types_compatible(candidate, b))
+                .cloned();
+            if common.is_some() {
+                break;
+            }
+            current = info.base_class.clone();
+        }
+        match common {
+            Some(ty) => {
+                let ty = type_name(&ty);
+                format!(
+                    "both values convert to `{ty}`; give the expression that type, e.g. `let value: {ty} = ...;` or a `-> {ty}` return type"
+                )
+            }
+            None => "every value must have one type; annotate the destination (`let value: T = ...;`) with a type all values convert to".to_string(),
+        }
+    }
+
     fn merge_inferred_enum_types(&self, left: &Type, right: &Type) -> Option<Type> {
         if !self.generic_partially_matches(left, right) {
             return None;
@@ -8276,6 +8327,14 @@ mod type_identity_scaling_tests {
 
 #[cfg(test)]
 mod contextual_arrays_tests;
+
+#[cfg(test)]
+thread_local! {
+    static UNIFY_TO_EXPECTED_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod contextual_values_tests;
 
 #[cfg(test)]
 mod diagnostic_recovery_tests;

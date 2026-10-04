@@ -2464,6 +2464,7 @@ impl TypeChecker {
                     self.validate_type(&unified_ty, t.span);
                     unified_ty
                 } else {
+                    let help = self.common_supertype_help(&then_ty, &else_ty);
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -2485,7 +2486,8 @@ impl TypeChecker {
                         .with_label(Label::secondary(
                             t.then_expr.span(),
                             format!("this branch has type `{}`", type_name(&then_ty)),
-                        )),
+                        ))
+                        .with_help(help),
                     );
                     Type::Void
                 }

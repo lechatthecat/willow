@@ -1694,11 +1694,17 @@ fn lower_ternary_expr(t: &TernaryExpr, ctx: &mut LowerCtx) -> Result<HirExpr, Di
     let then_expr = lower_expr(&t.then_expr, ctx)?;
     let else_expr = lower_expr(&t.else_expr, ctx)?;
     // A diverging arm contributes no value to the result. If both diverge,
-    // the result remains Never.
+    // the result remains Never. Otherwise the checker's type is
+    // authoritative: branches of distinct classes flowing into an interface
+    // take that interface (willow-jz15.47).
     let ty = if then_expr.ty == Type::Never {
         else_expr.ty.clone()
     } else {
         then_expr.ty.clone()
+    };
+    let ty = match ctx.tables.expr_type(&t.id) {
+        Some(checked) if ty != Type::Never => checked.into(),
+        _ => ty,
     };
     Ok(HirExpr {
         kind: HirExprKind::Ternary {
@@ -2623,14 +2629,20 @@ fn lower_match(
         });
     }
 
-    // The arms share a type (the checker enforces it); `Never` arms (panic)
-    // coerce to the others.
+    // `Never` arms (panic) coerce to the others; an all-diverging match stays
+    // Never. Otherwise the checker's unified type is authoritative: arms of
+    // distinct classes flowing into an interface take that interface
+    // (willow-jz15.47).
     let ty = arms
         .iter()
         .map(|a| &a.ty)
         .find(|t| **t != Type::Never)
         .cloned()
         .unwrap_or(Type::Never);
+    let ty = match ctx.tables.expr_type(&m.id) {
+        Some(checked) if ty != Type::Never => checked.into(),
+        _ => ty,
+    };
     Ok(HirExpr {
         kind: HirExprKind::Match {
             scrutinee: Box::new(scrutinee),

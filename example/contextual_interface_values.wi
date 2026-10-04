@@ -1,0 +1,72 @@
+// A value `match` or ternary whose arms build different classes takes the
+// interface (or base class) type it flows into: a return type, an annotated
+// `let`, an argument, a field or another arm.
+interface Filter { fn name(self) -> String; }
+class AlwaysF implements Filter { pub fn name(self) -> String { return "always"; } }
+class CmpF implements Filter {
+    pub field: String;
+    pub fn name(self) -> String { return "cmp " + self.field; }
+}
+class NotF implements Filter {
+    pub inner: Filter;
+    pub fn name(self) -> String { return "not " + self.inner.name(); }
+}
+open class Shape { pub open fn area(self) -> i64 { return 0; } }
+class Square extends Shape { pub side: i64; pub override fn area(self) -> i64 { return self.side * self.side; } }
+class Rect extends Shape { pub w: i64; pub h: i64; pub override fn area(self) -> i64 { return self.w * self.h; } }
+enum Expr { Always, Cmp(String), Not(i64) }
+class Holder { pub filter: Filter; }
+
+fn build(e: Expr) -> Filter {
+    return match e {
+        Expr::Always => new AlwaysF(),
+        Expr::Cmp(f) => new CmpF(f),
+        Expr::Not(depth) => new NotF(depth > 0 ? new CmpF("deep") : new AlwaysF()),
+    };
+}
+fn pick(b: bool) -> Filter { return b ? new AlwaysF() : new CmpF("t"); }
+fn describe(f: Filter) -> String { return f.name(); }
+fn shape(n: i64) -> Shape {
+    return match n {
+        0 => new Square(3),
+        1 => new Rect(2, 5),
+        _ => {
+            return new Square(1);
+        }
+    };
+}
+fn widen(f: Filter, b: bool) -> String {
+    // No expected type: an interface-typed arm widens a later class arm.
+    let chosen = match b { true => f, false => new AlwaysF() };
+    return chosen.name();
+}
+
+fn main() {
+    println(build(Expr::Always).name());
+    println(build(Expr::Cmp("price")).name());
+    println(build(Expr::Not(1)).name());
+    let out: Filter = match Expr::Not(0) {
+        Expr::Always => new AlwaysF(),
+        Expr::Cmp(f) => new CmpF(f),
+        Expr::Not(_) => new NotF(new AlwaysF()),
+    };
+    println(out.name());
+    println(pick(true).name());
+    println(describe(pick(false) ));
+    println(describe(match 2 { 1 => new AlwaysF(), _ => new CmpF("arg") }));
+    let t: Filter = false ? new AlwaysF() : new CmpF("let");
+    println(t.name());
+    let holder = new Holder(true ? new CmpF("field") : new AlwaysF());
+    println(holder.filter.name());
+    holder.filter = match 0 { 0 => new NotF(new CmpF("set")), _ => new AlwaysF() };
+    println(holder.filter.name());
+    println(shape(0).area() + shape(1).area() + shape(9).area());
+    println(widen(new CmpF("w"), true));
+    println(widen(new CmpF("w"), false));
+    let mut total = 0;
+    for i in 0..1000 {
+        let f: Filter = match i % 3 { 0 => new AlwaysF(), 1 => new CmpF("x"), _ => new NotF(new AlwaysF()) };
+        total = total + f.name().len();
+    }
+    println(total);
+}

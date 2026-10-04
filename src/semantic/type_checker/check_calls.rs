@@ -336,7 +336,10 @@ impl TypeChecker {
         }
         let then_ty = self.check_expr_expecting(&t.then_expr, expected);
         let else_ty = self.check_expr_expecting(&t.else_expr, expected);
-        if let Some(unified_ty) = self.unify_ternary_types(&then_ty, &else_ty) {
+        if let Some(unified_ty) = self
+            .unify_ternary_types(&then_ty, &else_ty)
+            .or_else(|| self.unify_to_expected(Some(expected), &then_ty, &else_ty))
+        {
             self.validate_type(&unified_ty, t.span);
             unified_ty
         } else {

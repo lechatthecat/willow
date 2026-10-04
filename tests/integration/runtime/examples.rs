@@ -78,6 +78,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/contextual_interface_arrays.wi",
             "30\n30\n30\n30\n30\n30\n",
         ),
+        (
+            "example/contextual_interface_values.wi",
+            "always\ncmp price\nnot cmp deep\nnot always\nalways\ncmp t\ncmp arg\ncmp let\ncmp field\nnot cmp set\n20\ncmp w\nalways\n6999\n",
+        ),
         ("example/reserved_keyword_names.wi", "true\ntrue\n"),
         ("example/semantic_contract_queries.wi", "3\n"),
         ("example/semantic_scope/main.wi", "19\n"),
@@ -952,6 +956,7 @@ fn test_recent_cli_and_language_examples() {
         "example/semantic_cli/src/main.wi",
         "example/semantic_cli_diagnostics.wi",
         "example/contextual_interface_arrays.wi",
+        "example/contextual_interface_values.wi",
         "example/reserved_keyword_names.wi",
         "example/semantic_contract_queries.wi",
         "example/semantic_scope/main.wi",
