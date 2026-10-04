@@ -603,9 +603,12 @@ fn main() {
 fn lir_self_28_the_example_file_compiles_and_runs() {
     let src = std::fs::read_to_string("example/lir_self_statics.wi")
         .expect("example/lir_self_statics.wi must exist");
-    assert_project_output(
-        &src,
-        "1\n2\n2\nseat 2\n12\nseat\nrow\nclosed 2\n2\n42\n4\n3\n103\nseat 9\n",
+    // The example keeps `static mut` state, which requires one worker.
+    let (out, ok) = compile_with_env_and_run_under(&src, &PLAIN, &[("WILLOW_WORKERS", "1")]);
+    assert!(ok, "run failed: {out}");
+    assert_eq!(
+        out, "1\n2\n2\nseat 2\n12\nseat\nrow\nclosed 2\n2\n42\n4\n3\n103\nseat 9\n",
+        "wrong output"
     );
 }
 

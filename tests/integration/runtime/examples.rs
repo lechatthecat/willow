@@ -994,8 +994,14 @@ fn test_constructor_flow_example() {
 #[test]
 fn test_runnable_example_files_compile_and_run() {
     for &(path, expected) in runnable_example_cases() {
-        let (out, ok) = compile_file_and_run(path);
-        assert!(ok, "{path} failed to compile or run");
+        let (out, ok) = if path == "example/lir_self_statics.wi" {
+            // `static mut` state with task execution requires one worker.
+            let source = fs::read_to_string(path).unwrap();
+            compile_and_run_with_env(&source, &[("WILLOW_WORKERS", "1")])
+        } else {
+            compile_file_and_run(path)
+        };
+        assert!(ok, "{path} failed to compile or run: {out}");
         if path == "example/concurrent_counts.wi" {
             let lines = out.lines().collect::<Vec<_>>();
             assert_eq!(lines.len(), 31, "{path} output mismatch: {out}");

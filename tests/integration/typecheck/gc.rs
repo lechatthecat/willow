@@ -1076,7 +1076,8 @@ fn main() {
     assert_eq!(out, "10\n20\n0\n");
 }
 
-// GC-46: enum payload (non-class) — no GC impact expected
+// GC-46: enum payload (non-class) — no GC impact expected: scalar Option
+// values are unboxed, so `Some(42)` allocates nothing.
 #[test]
 fn test_gc_46_i64_enum_payload_no_gc_impact() {
     let (out, ok) = compile_and_run(
@@ -1091,7 +1092,7 @@ fn main() {
 "#,
     );
     assert!(ok);
-    assert_eq!(out, "true\n");
+    assert_eq!(out, "false\n");
 }
 
 // GC-47: gc_collect called with no allocations is safe
