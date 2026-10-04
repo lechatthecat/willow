@@ -231,6 +231,8 @@ mod constructor_flow;
 mod array_fast_paths;
 #[path = "integration/array_reference_store.rs"]
 mod array_reference_store;
+#[path = "integration/async_frame_store.rs"]
+mod async_frame_store;
 #[path = "integration/never_values.rs"]
 mod never_values;
 #[path = "integration/object_field_store.rs"]

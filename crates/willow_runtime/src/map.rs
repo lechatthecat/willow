@@ -15,7 +15,7 @@
 //! returns a Willow `Option<V>` built directly here.
 
 use crate::gc::{
-    GcObjectKind, GcStoreDestination, willow_alloc_with_layout, willow_gc_write_barrier,
+    GcObjectKind, GcStoreDestination, willow_alloc_with_layout, write_barrier_object_owner,
 };
 use crate::native_memory::{Mutex, MutexGuard};
 use crate::string::willow_string_as_str;
@@ -548,7 +548,7 @@ pub extern "C" fn willow_map_insert(
     // Borrowed lookup avoids allocating a duplicate string on replacement.
     if let Some(&index) = data.entries.get(&key as &dyn KeyView) {
         if data.layout.value_is_ref {
-            willow_gc_write_barrier(
+            write_barrier_object_owner(
                 map,
                 data.values[index] as *mut u8,
                 val_word as *mut u8,
@@ -575,7 +575,7 @@ pub extern "C" fn willow_map_insert(
             std::collections::hash_map::Entry::Occupied(slot) => values[*slot.get()],
             std::collections::hash_map::Entry::Vacant(_) => 0,
         };
-        willow_gc_write_barrier(
+        write_barrier_object_owner(
             map,
             old as *mut u8,
             val_word as *mut u8,
@@ -738,7 +738,7 @@ pub extern "C" fn willow_map_copy(map: *mut u8) -> *mut u8 {
     dst.values.reserve(src.values.len());
     for &v in &src.values {
         if layout.value_is_ref {
-            willow_gc_write_barrier(
+            write_barrier_object_owner(
                 copy,
                 std::ptr::null_mut(),
                 v as *mut u8,

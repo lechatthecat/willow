@@ -176,3 +176,34 @@ pub extern "C" fn willow_gc_write_barrier(
         state.write_barrier_hits = state.write_barrier_hits.saturating_add(1);
     }
 }
+
+/// Runtime counterpart of the generated inline barrier filter
+/// (`emit_filtered_reference_store`, `OldValueSkips`) for stores whose owner
+/// is the payload start of a GC object. While marking is inactive, only a
+/// non-null young value stored into an old, unremembered owner needs the
+/// locked barrier; skipping the rest keeps runtime container stores off the
+/// heap lock (willow-jz15.51). Like the generated filter, the phase load and
+/// the caller's store contain no safepoint, and a stale unremembered byte
+/// only takes the conservative locked path.
+pub(crate) fn write_barrier_object_owner(
+    owner: *mut u8,
+    old_value: *mut u8,
+    value: *mut u8,
+    destination_kind: i64,
+) {
+    if GC_MARK_PHASE.load(Ordering::Acquire) == 0 && !may_create_young_edge(owner, value) {
+        return;
+    }
+    willow_gc_write_barrier(owner, old_value, value, destination_kind);
+}
+
+fn may_create_young_edge(owner: *mut u8, value: *mut u8) -> bool {
+    let (Some(owner), Some(value)) = (GcPayload::from_raw(owner), GcPayload::from_raw(value))
+    else {
+        return false;
+    };
+    let owner = HeapObject::from_payload(owner);
+    owner.generation() == GC_GENERATION_OLD
+        && !owner.remembered()
+        && HeapObject::from_payload(value).generation() != GC_GENERATION_OLD
+}

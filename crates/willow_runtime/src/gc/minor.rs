@@ -203,6 +203,7 @@ impl<'a> MinorCollector<'a> {
                 header_offsets: Vec::new(),
             });
             self.state.tlab_reserved_bytes += GC_TLAB_CHUNK_SIZE;
+            super::note_reservation_growth(self.state);
             self.state.survivor_stats.survivor_space_reserved += GC_TLAB_CHUNK_SIZE as u64;
             self.survivor_destination = Some(index);
         }

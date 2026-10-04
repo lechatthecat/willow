@@ -792,7 +792,9 @@ fn allocation_should_minor_collect() -> bool {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_set_memory_limit(bytes: u64) -> u64 {
-    runtime().heap.lock().unwrap().soft_memory.set_limit(bytes)
+    let previous = runtime().heap.lock().unwrap().soft_memory.set_limit(bytes);
+    invalidate_runtime_policy_budgets();
+    previous
 }
 
 /// Initialize the GC runtime.
@@ -1070,11 +1072,63 @@ fn allocate_object(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask:
     if payload_size < 0 {
         crate::failure::fatal_invariant("negative managed allocation size");
     }
-    assist_concurrent_mark((payload_size as u64).saturating_add(GC_HEADER_SIZE as u64));
-    if allocation_should_collect() {
-        automatic_collect(gc_stress_enabled("alloc"));
+    let total_size = (payload_size as u64).saturating_add(GC_HEADER_SIZE as u64);
+    assist_concurrent_mark(total_size);
+    let stress = gc_stress_enabled("alloc");
+    if (stress || runtime_policy_check_due(total_size)) && allocation_should_collect() {
+        automatic_collect(stress);
     }
     allocate_old(layout_id, type_id, payload_size, gc_ref_mask)
+}
+
+/// Bumped when collection-policy inputs change outside allocation, so every
+/// thread's [`RUNTIME_POLICY_DEBT`] budget expires and its next runtime
+/// allocation consults the policy immediately.
+static RUNTIME_POLICY_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+std::thread_local! {
+    /// `(epoch, bytes)` this thread's runtime allocations have made since its
+    /// last collection-policy check (willow-jz15.51).
+    static RUNTIME_POLICY_DEBT: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+fn invalidate_runtime_policy_budgets() {
+    RUNTIME_POLICY_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Record growth of reserved heap storage. Under a hard reservation cap the
+/// pressure trigger depends on reservations rather than allocated bytes, so a
+/// reservation re-arms every thread's next policy check and the trigger fires
+/// at the same allocation as without the per-thread budget. Reservations grow
+/// once per region or chunk, so this costs one check per thread per growth.
+fn note_reservation_growth(state: &GcState) {
+    if state.memory_limit_bytes.is_some() {
+        invalidate_runtime_policy_budgets();
+    }
+}
+
+/// Whether this runtime allocation of `bytes` should consult the collection
+/// policy. Generated code decides only at TLAB refills, once per
+/// `GC_TLAB_CHUNK_SIZE` bytes per thread; runtime containers use the same
+/// per-thread granularity instead of locking the heap for every string or
+/// container allocation. A thread's first allocation, and the first after a
+/// policy-input change or hard-capped reservation growth, always checks.
+/// Reservation limits stay exact because `allocate_old` enforces them under
+/// the heap lock; pacing and soft-limit triggers may fire up to one chunk of
+/// runtime allocation per thread later, as for generated code.
+fn runtime_policy_check_due(bytes: u64) -> bool {
+    let epoch = RUNTIME_POLICY_EPOCH.load(Ordering::Acquire);
+    RUNTIME_POLICY_DEBT.with(|debt| {
+        let (seen, owed) = debt.get();
+        let owed = if seen == epoch {
+            owed.saturating_add(bytes)
+        } else {
+            u64::MAX
+        };
+        let due = owed >= GC_TLAB_CHUNK_SIZE as u64;
+        debt.set((epoch, if due { 0 } else { owed }));
+        due
+    })
 }
 
 /// Add a newly reserved regular region if it still has usable space.
@@ -1148,6 +1202,7 @@ fn allocate_old_region_object_locked(
             .insert(region.base as usize, state.old_regions.len());
         state.old_regions.push(region);
         state.old_reserved_bytes += capacity;
+        note_reservation_growth(state);
         index_old_region(state, state.old_regions.len() - 1);
         allocated
     };
@@ -1171,8 +1226,9 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
         crate::failure::fatal_invariant("negative managed allocation size");
     }
     let payload_size = payload_size as usize;
+    // TLAB byte merging is O(TLABs); the policy checks and TLAB slow path that
+    // read those bytes merge them, so the per-object path does not.
     let mut state = runtime().heap.lock().unwrap();
-    sync_tlab_bytes(&mut state);
     let mut header = allocate_old_region_object_locked(
         &mut state,
         layout_id,
@@ -1876,6 +1932,8 @@ fn reset_internal() {
         let (lock, cv) = &runtime().coord;
         let mut coord = lock.lock().unwrap();
         *coord = GcCoord::default();
+        safepoint::invalidate_mutator_registrations();
+        invalidate_runtime_policy_budgets();
         runtime()
             .stop_requested
             .store(false, std::sync::atomic::Ordering::Release);

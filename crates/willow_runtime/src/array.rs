@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::gc::{
     GcObjectKind, GcStoreDestination, willow_alloc_with_layout, willow_gc_write_barrier,
-    willow_pop_roots, willow_push_root,
+    willow_pop_roots, willow_push_root, write_barrier_object_owner,
 };
 
 use willow_abi::runtime_type_ids::ARRAY_REF_TYPE_ID;
@@ -142,7 +142,7 @@ unsafe fn buf_slot(buffer: *mut u8, index: i64) -> *mut i64 {
 
 unsafe fn store_buffer_slot(buffer: *mut u8, index: i64, value: i64, is_ref: bool) {
     if is_ref {
-        willow_gc_write_barrier(
+        write_barrier_object_owner(
             buffer,
             unsafe { crate::gc::load_gc_reference(buf_slot(buffer, index).cast()) },
             value as *mut u8,
@@ -205,7 +205,7 @@ pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
         set_handle_word(handle, H_LEN, len);
         set_handle_word(handle, H_CAP, len);
         set_handle_word(handle, H_IS_REF, elem_is_ref);
-        willow_gc_write_barrier(
+        write_barrier_object_owner(
             handle,
             std::ptr::null_mut(),
             buffer,
@@ -475,7 +475,7 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool) {
                 );
             }
             set_buffer_len(new_buf, len);
-            willow_gc_write_barrier(
+            write_barrier_object_owner(
                 arr,
                 old_buf,
                 new_buf,

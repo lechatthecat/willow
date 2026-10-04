@@ -511,6 +511,55 @@ fn remembered_header_flag_mirrors_remembered_set_membership() {
 }
 
 #[test]
+fn runtime_object_owner_filter_calls_barrier_only_for_new_young_edges() {
+    // willow-jz15.51: runtime container stores skip the locked barrier
+    // exactly when the generated inline filter would.
+    use crate::gc::*;
+    let _guard = runtime_test_guard();
+    reset_internal();
+    let calls = || {
+        runtime()
+            .write_barrier_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let store = |owner: *mut u8, value: *mut u8| {
+        write_barrier_object_owner(
+            owner,
+            std::ptr::null_mut(),
+            value,
+            GcStoreDestination::MapValue as i64,
+        )
+    };
+    let mut tls = tlab_state_for_test();
+    let young = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
+    let young_owner = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
+    let old_value = willow_alloc_typed(8, 0);
+    let owner = willow_alloc_typed(8, 1);
+    let before = calls();
+    store(owner, old_value);
+    store(owner, std::ptr::null_mut());
+    store(std::ptr::null_mut(), young);
+    store(young_owner, young);
+    assert_eq!(calls(), before, "old, null and young-owner stores skip");
+    assert_eq!(willow_gc_remembered_set_size(), 0);
+    store(owner, young);
+    assert_eq!(
+        calls(),
+        before + 1,
+        "a new old-to-young edge takes the barrier"
+    );
+    assert_eq!(willow_gc_remembered_set_size(), 1);
+    store(owner, young);
+    assert_eq!(calls(), before + 1, "a remembered owner skips");
+    // Active marking always reaches the barrier, even for old values.
+    crate::gc::barrier::GC_MARK_PHASE.store(1, std::sync::atomic::Ordering::Release);
+    store(owner, old_value);
+    crate::gc::barrier::GC_MARK_PHASE.store(0, std::sync::atomic::Ordering::Release);
+    assert_eq!(calls(), before + 2);
+    reset_internal();
+}
+
+#[test]
 fn in_place_promotion_clears_stale_remembered_byte() {
     use crate::gc::*;
     let _guard = runtime_test_guard();

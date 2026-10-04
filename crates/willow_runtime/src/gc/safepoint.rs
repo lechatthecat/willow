@@ -16,7 +16,16 @@ pub(super) fn snapshot_local_roots() -> Vec<usize> {
     })
 }
 
+/// Registration epoch; `reset_internal` advances it when it clears the
+/// mutator registry, invalidating every thread's cached registration.
+static MUTATOR_EPOCH: AtomicU64 = AtomicU64::new(1);
+
 std::thread_local! {
+    /// `MUTATOR_EPOCH` at this thread's registration, or zero when it is not
+    /// registered. Only the owning thread inserts or removes its own registry
+    /// entry, so this cache answers `current_thread_is_registered` without the
+    /// coordination lock that every root push/pop would otherwise contend on.
+    static REGISTERED_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Whether every native frame on this thread that holds a managed pointer
     /// keeps it only in registered root slots and reloads it after a GC point.
     /// Generated code does; runtime Rust frames may keep raw copies, so the
@@ -108,6 +117,19 @@ pub(super) fn snapshot_local_root_slots() -> Vec<usize> {
     })
 }
 
+/// Registered mutators each legitimately own their own thread-local root stack;
+/// cross-thread safety is handled by stop-the-world scanning, so they bypass the
+/// legacy single-mutator `runtime().root_stack_owner` guard.
+pub(super) fn current_thread_is_registered() -> bool {
+    let epoch = REGISTERED_EPOCH.get();
+    epoch != 0 && epoch == MUTATOR_EPOCH.load(Ordering::Acquire)
+}
+
+/// Called with the coordination lock held after the registry is cleared.
+pub(super) fn invalidate_mutator_registrations() {
+    MUTATOR_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
 /// True when at least one mutator OTHER than the current thread is registered,
 /// so a collection must stop the world rather than scan only the local stack.
 #[cfg(test)]
@@ -132,6 +154,7 @@ pub extern "C" fn willow_gc_register_mutator() {
         let mut coord = lock.lock().unwrap();
         let id = std::thread::current().id();
         coord.mutators.entry(id).or_default();
+        REGISTERED_EPOCH.set(MUTATOR_EPOCH.load(Ordering::Acquire));
         if let Some(handshake) = coord.handshake.as_mut() {
             handshake.pending.insert(id);
         }
@@ -155,6 +178,7 @@ pub extern "C" fn willow_gc_unregister_mutator() {
     let mut coord = root_handshake::wait_for_publication_round(cv, coord);
     root_handshake::publish_current(&mut coord);
     coord.mutators.remove(&id);
+    REGISTERED_EPOCH.set(0);
     coord.parked.remove(&id);
     // A legacy owner can register, then empty its stack while registered.
     // Retire that ownership before releasing coord, using coord -> owner order.

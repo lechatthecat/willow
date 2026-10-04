@@ -728,15 +728,17 @@ pub(super) enum BarrierRefinement {
 }
 
 /// Destinations whose owner is always the payload start of a GC heap object,
-/// so its header bytes can be read inline. Globals have no header and
-/// `IndirectReference` owners are interior slots; both, like runtime-owned
-/// cells and async frames, keep the unconditional barrier call.
+/// so its header bytes can be read inline. Async frames are old-region objects
+/// from `willow_async_frame_alloc`, addressed by payload start (willow-jz15.51).
+/// Globals have no header and `IndirectReference` owners are interior slots;
+/// both, like runtime-owned cells, keep the unconditional barrier call.
 fn owner_is_object_payload(destination: GcStoreDestination) -> bool {
     matches!(
         destination,
         GcStoreDestination::ObjectField
             | GcStoreDestination::EnumPayload
             | GcStoreDestination::InterfaceObject
+            | GcStoreDestination::AsyncFrameSlot
     )
 }
 

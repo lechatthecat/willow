@@ -230,15 +230,6 @@ pub extern "C" fn willow_gc_remove_runtime_root_slot(slot: *mut *mut u8) {
     runtime().runtime_root_slots.remove(slot.cast());
 }
 
-/// Registered mutators each legitimately own their own thread-local root stack;
-/// cross-thread safety is handled by stop-the-world scanning, so they bypass the
-/// legacy single-mutator `runtime().root_stack_owner` guard below.
-pub(super) fn current_thread_is_registered() -> bool {
-    let current = std::thread::current().id();
-    let (lock, _) = &runtime().coord;
-    lock.lock().unwrap().mutators.contains_key(&current)
-}
-
 pub(super) fn claim_root_stack_owner() {
     // Registered mutators are coordinated via the registry + STW, not the
     // single-owner guard (willow-6fv.5.6).

@@ -678,6 +678,8 @@ fn reset_gc() {
 
 fn set_threshold(bytes: usize) {
     runtime().heap.lock().unwrap().threshold_bytes = bytes;
+    // A direct policy write must re-arm runtime allocation policy checks.
+    invalidate_runtime_policy_budgets();
 }
 
 fn total_allocs() -> u64 {
@@ -3115,19 +3117,30 @@ fn test_gc_realloc_after_auto_trigger_works() {
     reset_gc();
 }
 
-// 観点33: threshold=1 で毎回 auto-collect がトリガーされる
+// 観点33: threshold=1 でも runtime 確保は TLAB チャンク 1 つ分ごとにだけ
+// ポリシーを確認する (willow-jz15.51)。先頭の確保と予算を超えた確保で
+// auto-collect が走り、確保ごとにヒープロックを取らない。
 #[test]
-fn test_gc_threshold_one_every_alloc_triggers_collect() {
+fn test_gc_threshold_one_triggers_collect_once_per_policy_budget() {
     let _guard = gc_test_guard();
     reset_gc();
     set_threshold(1);
     let before = total_frees();
-    for _ in 0..5 {
+    let collections_before = runtime().heap.lock().unwrap().major_collections;
+    let object_bytes = (header_size() + 8) as u64;
+    let budgets = 3;
+    let count = budgets * GC_TLAB_CHUNK_SIZE as u64 / object_bytes;
+    for _ in 0..count {
         willow_alloc_object(1, 8);
     }
+    let collections = runtime().heap.lock().unwrap().major_collections - collections_before;
     assert!(
         total_frees() > before,
-        "auto-collect must fire at least once"
+        "auto-collect must fire after the policy budget is spent"
+    );
+    assert!(
+        collections <= budgets + 1,
+        "{collections} collections for {count} allocations: policy checked per allocation"
     );
     reset_gc();
 }
@@ -3874,5 +3887,148 @@ fn enum_variant_mixed_pair_words_preserve_offsets_and_gc_edges() {
         }
         willow_pop_roots(1);
     }
+    reset_gc();
+}
+
+// willow-jz15.51: root push/pop asks whether the current thread is a
+// registered mutator. A thread-local epoch cache answers without the
+// coordination lock and must track register, unregister and heap resets.
+#[test]
+fn registration_cache_tracks_register_unregister_and_reset() {
+    let _guard = gc_test_guard();
+    reset_gc();
+    assert!(!current_thread_is_registered());
+    willow_gc_register_mutator();
+    assert!(current_thread_is_registered());
+    willow_gc_unregister_mutator();
+    assert!(!current_thread_is_registered());
+    willow_gc_register_mutator();
+    assert!(current_thread_is_registered());
+    // A reset clears the registry; the cached registration must expire too.
+    reset_gc();
+    assert!(!current_thread_is_registered());
+    assert!(
+        !runtime()
+            .coord
+            .0
+            .lock()
+            .unwrap()
+            .mutators
+            .contains_key(&std::thread::current().id())
+    );
+    willow_gc_register_mutator();
+    assert!(current_thread_is_registered());
+    willow_gc_unregister_mutator();
+    reset_gc();
+}
+
+#[test]
+fn registration_cache_is_per_thread() {
+    let _guard = gc_test_guard();
+    reset_gc();
+    let (registered, release) = (
+        std::sync::Arc::new(std::sync::Barrier::new(2)),
+        std::sync::Arc::new(std::sync::Barrier::new(2)),
+    );
+    let worker = {
+        let (registered, release) = (registered.clone(), release.clone());
+        std::thread::spawn(move || {
+            willow_gc_register_mutator();
+            let seen = current_thread_is_registered();
+            registered.wait();
+            release.wait();
+            willow_gc_unregister_mutator();
+            seen
+        })
+    };
+    registered.wait();
+    // Another thread's registration does not register this one.
+    assert!(!current_thread_is_registered());
+    release.wait();
+    assert!(worker.join().unwrap());
+    assert!(!current_thread_is_registered());
+    reset_gc();
+}
+
+#[test]
+fn registered_root_pushes_match_the_coordination_registry() {
+    // Registered threads keep bypassing the legacy single-owner guard: many
+    // pushes and pops leave no root-stack owner behind.
+    let _guard = gc_test_guard();
+    reset_gc();
+    willow_gc_register_mutator();
+    let mut roots = vec![std::ptr::null_mut::<u8>(); 64];
+    for root in &mut roots {
+        *root = willow_alloc(8);
+        willow_push_root(root);
+    }
+    willow_pop_roots(roots.len() as i32);
+    assert!(current_thread_is_registered());
+    willow_gc_unregister_mutator();
+    reset_gc();
+}
+
+// willow-jz15.51: runtime allocations consult the collection policy (which
+// locks the heap) once per TLAB-chunk budget per thread, not per allocation.
+#[test]
+fn runtime_policy_budget_checks_first_then_once_per_chunk() {
+    let _guard = gc_test_guard();
+    reset_gc();
+    assert!(runtime_policy_check_due(16), "first allocation checks");
+    let step = 64;
+    let mut checks = 0;
+    let rounds = 4 * GC_TLAB_CHUNK_SIZE / step;
+    for _ in 0..rounds {
+        checks += runtime_policy_check_due(step as u64) as usize;
+    }
+    assert_eq!(checks, 4);
+    // A policy input change re-arms the next check at once.
+    willow_gc_set_memory_limit(0);
+    assert!(runtime_policy_check_due(1));
+    assert!(!runtime_policy_check_due(1));
+    // Oversized allocations always check.
+    assert!(runtime_policy_check_due(GC_TLAB_CHUNK_SIZE as u64));
+    reset_gc();
+    assert!(runtime_policy_check_due(1), "reset expires every budget");
+}
+
+#[test]
+fn runtime_policy_budget_rearms_on_reservation_growth_only_under_hard_cap() {
+    let _guard = gc_test_guard();
+    reset_gc();
+    assert!(runtime_policy_check_due(1));
+    {
+        let state = runtime().heap.lock().unwrap();
+        note_reservation_growth(&state);
+    }
+    assert!(
+        !runtime_policy_check_due(1),
+        "no cap: growth is not an input"
+    );
+    runtime().heap.lock().unwrap().memory_limit_bytes = Some(1 << 30);
+    {
+        let state = runtime().heap.lock().unwrap();
+        note_reservation_growth(&state);
+    }
+    assert!(
+        runtime_policy_check_due(1),
+        "capped growth re-arms the check"
+    );
+    reset_gc();
+}
+
+#[test]
+fn runtime_policy_budget_is_per_thread() {
+    let _guard = gc_test_guard();
+    reset_gc();
+    assert!(runtime_policy_check_due(1));
+    assert!(!runtime_policy_check_due(1));
+    // A fresh thread has no budget yet and checks at its first allocation.
+    assert!(
+        std::thread::spawn(|| runtime_policy_check_due(1))
+            .join()
+            .unwrap()
+    );
+    assert!(!runtime_policy_check_due(1));
     reset_gc();
 }

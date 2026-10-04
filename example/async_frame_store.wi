@@ -1,0 +1,119 @@
+// Async frame reference stores (willow-jz15.51).
+//
+// Locals of an async function that live across an `await` are stored in its
+// heap-allocated frame. The frame is an old-generation object, so storing a
+// young reference into it uses the same inline header-flag barrier filter as
+// object field stores (willow-8hq4.22): the first young store remembers the
+// frame, and later stores skip the runtime call until a minor collection
+// clears the remembered set. Parallel workers therefore no longer serialize on
+// the runtime barrier for every frame store.
+import std::collections::Array;
+
+class Square {
+    pub side: i64;
+    pub fn area() -> i64 { return self.side * self.side; }
+}
+class Node { pub value: i64; pub next: Option<Node>; }
+
+// Young stores into one frame slot across awaits: the frame is remembered
+// once per minor cycle and every stored value stays reachable.
+async fn repeated_stores() -> i64 {
+    let mut n = new Node(0, Option::None);
+    let mut i = 1;
+    while i <= 200 {
+        n = new Node(i, Option::Some(n));
+        await sleep(0);
+        if i % 50 == 0 {
+            gc_minor_collect();
+        }
+        i = i + 1;
+    }
+    let mut length = 0;
+    let mut cursor: Option<Node> = Option::Some(n);
+    while true {
+        match cursor {
+            Some(c) => {
+                length = length + 1;
+                cursor = c.next;
+            }
+            None => { return length * 1000 + n.value; }
+        }
+    }
+    return -1;
+}
+
+// Frame slots of every reference shape survive minor collections between
+// awaits, including values stored after the frame was remembered.
+async fn shapes() -> i64 {
+    let mut node = new Node(1, Option::None);
+    let mut text = "a";
+    let mut shape = new Square(2);
+    let mut maybe: Option<Node> = Option::None;
+    let items: Array<Node> = [];
+    await sleep(0);
+    let mut i = 0;
+    while i < 5 {
+        node = new Node(node.value + 1, Option::Some(node));
+        text = text + "b";
+        shape = new Square(i + 3);
+        maybe = Option::Some(new Node(i * 10, Option::None));
+        items.push(node);
+        gc_minor_collect();
+        await sleep(0);
+        i = i + 1;
+    }
+    let tail = match maybe { Some(m) => m.value, None => -1 };
+    return node.value + text.len() + shape.area() + tail + items.len();
+}
+
+// Parallel tasks build linked lists through frame locals while the main task
+// runs major collections, so frame stores also run during concurrent marking.
+async fn build(seed: i64, count: i64) -> i64 {
+    let mut head = new Node(seed, Option::None);
+    let mut i = 0;
+    while i < count {
+        head = new Node(seed + i, Option::Some(head));
+        if i % 500 == 0 {
+            await sleep(0);
+        }
+        i = i + 1;
+    }
+    let mut total = 0;
+    let mut cursor: Option<Node> = Option::Some(head);
+    let mut steps = 0;
+    while steps < 3 {
+        match cursor {
+            Some(c) => {
+                total = total + c.value;
+                cursor = c.next;
+            }
+            None => {}
+        }
+        steps = steps + 1;
+    }
+    return total;
+}
+
+async fn main() {
+    println(await repeated_stores());
+    println(await shapes());
+    let tasks: Array<Task<i64>> = [];
+    let mut w = 0;
+    while w < 4 {
+        tasks.push(build(w * 100000, 3000));
+        w = w + 1;
+    }
+    let mut k = 0;
+    while k < 5 {
+        gc_collect();
+        await sleep(1);
+        k = k + 1;
+    }
+    let mut sum = 0;
+    w = 0;
+    while w < 4 {
+        sum = sum + await tasks[w];
+        w = w + 1;
+    }
+    println(sum);
+}

@@ -299,6 +299,7 @@ pub(super) fn allocate_tlab_chunk(state: &mut GcState, owner_state: usize) -> Op
         Ordering::Release,
     );
     state.tlab_reserved_bytes = state.tlab_reserved_bytes.saturating_add(GC_TLAB_CHUNK_SIZE);
+    note_reservation_growth(state);
     state.tlab_refills = state.tlab_refills.saturating_add(1);
     state
         .tlab_states

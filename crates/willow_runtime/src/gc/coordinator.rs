@@ -169,6 +169,7 @@ mod tests {
         willow_push_root(&mut root);
         willow_gc_register_mutator();
         runtime().heap.lock().unwrap().threshold_bytes = 1;
+        crate::gc::invalidate_runtime_policy_budgets();
         assert!(!willow_alloc(8).is_null());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !ENTERED.load(Ordering::Acquire) {
