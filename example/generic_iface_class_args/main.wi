@@ -1,0 +1,29 @@
+// Cross-module generic interface with a class type argument (willow-jz15.45).
+// `Big` implements `Pred<Item>` in module `preds`; the entry spells the same
+// instantiation through its own item imports. Interface identity AND each type
+// argument are compared by declaration, not by spelling, so the class converts.
+import std::collections::Array;
+import preds::Pred;
+import preds::Big;
+import preds::Small;
+import preds::Named;
+import items::Item;
+import items::Tag;
+
+fn count(ps: Array<Pred<Item>>, x: Item) -> i64 {
+    let mut n = 0;
+    for p in ps {
+        if p.test(x) {
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
+fn main() {
+    let q: Pred<Item> = new Big();
+    println(q.test(new Item(7)));                          // true
+    println(count([new Big(), new Small()], new Item(9)));  // 1
+    let t: Pred<Tag> = new Named();
+    println(t.test(new Tag("ok")));                        // true
+}

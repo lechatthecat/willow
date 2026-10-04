@@ -8323,6 +8323,42 @@ mod type_identity_scaling_tests {
             }
         }
     }
+
+    /// `implements` entries are matched against an alias-spelled generic target
+    /// without allocating canonical copies: each entry costs one visit per node
+    /// up to its first mismatch, so a lookup is linear in the entries' combined
+    /// size (willow-jz15.45).
+    #[test]
+    fn implements_lookup_visits_each_entry_node_once() {
+        let mut checker = TypeChecker::new();
+        let source = "interface P<T> { fn t(self, x: T) -> bool; } class Car {} class K {}";
+        let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
+        let (program, errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(errors.is_empty());
+        checker.check_module_program(&program);
+        let car = checker.symbols.lookup_class("Car").unwrap().clone();
+        checker.symbols.define_class("Alias".into(), car);
+        let nested = |depth: usize, leaf: &str| {
+            let mut ty = Type::Named(leaf.into());
+            for _ in 0..depth {
+                ty = Type::Array(Box::new(ty));
+            }
+            Type::Generic("P".into(), vec![ty])
+        };
+        for (entries, depth) in [(4, 4), (16, 4), (64, 4), (16, 16), (16, 64)] {
+            let mut k = checker.symbols.lookup_class("K").unwrap().clone();
+            k.implements = (0..entries)
+                .map(|i| nested(depth, &format!("Other{i}")))
+                .chain(std::iter::once(nested(depth, "Car")))
+                .collect();
+            checker.symbols.define_class("K".into(), k);
+            TYPE_IDENTITY_VISITS.with(|v| v.set(0));
+            assert!(checker.class_implements_interface("K", &nested(depth, "Alias")));
+            let visits = TYPE_IDENTITY_VISITS.with(|v| v.get());
+            assert_eq!(visits, (entries + 1) * (depth + 2));
+            eprintln!("implements entries={entries} depth={depth} visits={visits}");
+        }
+    }
 }
 
 #[cfg(test)]

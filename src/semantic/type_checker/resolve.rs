@@ -2565,12 +2565,12 @@ impl TypeChecker {
         if self.symbols.lookup_interface(target_name).is_none() {
             return false;
         }
-        // Compare interface identity by the registered (canonical) name so a
-        // directly-imported local alias (`import mod::Iface` -> bare `Iface`)
-        // matches a class's qualified `implements mod::Iface` entry. Without
-        // this, dispatch through a directly-imported interface fails with E0201
-        // (willow-64gs.1).
-        let canon_target = self.canonical_interface_type(target);
+        // Compare by declaration identity, not spelling: a directly-imported
+        // local alias (`import mod::Iface` -> bare `Iface`) must match a class's
+        // qualified `implements mod::Iface` entry (willow-64gs.1), and so must
+        // its type arguments -- `Pred<Item>` written where `Item` is an item
+        // import names the same instantiation as the defining module's
+        // `implements Pred<Item>` (willow-jz15.45).
         let mut current = Some(class.to_string());
         let mut seen = HashSet::new();
         while let Some(name) = current {
@@ -2583,7 +2583,7 @@ impl TypeChecker {
             if info
                 .implements
                 .iter()
-                .any(|i| self.canonical_interface_type(i) == canon_target)
+                .any(|i| self.same_type_identity(i, target))
             {
                 return true;
             }

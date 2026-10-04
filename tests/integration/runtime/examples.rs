@@ -423,6 +423,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/direct_import_iface_enum_demo/main.wi",
             "25\n12\n3\n",
         ),
+        (
+            "example/generic_iface_class_args/main.wi",
+            "true\n1\ntrue\n",
+        ),
         ("example/interface_advanced_demo/main.wi", "11\n10\n42\n"),
         ("example/mutability.wi", "6\n15\ntrue\n"),
         ("example/nested_loops.wi", "30\n"),

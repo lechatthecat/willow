@@ -90,6 +90,8 @@ mod error_conversion;
 mod examples;
 #[path = "runtime/gc_roots.rs"]
 mod gc_roots;
+#[path = "runtime/generic_iface_cross_module.rs"]
+mod generic_iface_cross_module;
 #[path = "runtime/generic_interfaces.rs"]
 mod generic_interfaces;
 #[path = "runtime/imported_types.rs"]

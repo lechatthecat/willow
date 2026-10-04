@@ -1,0 +1,20 @@
+// A generic interface whose implementations take CLASS type arguments
+// imported from another module (willow-jz15.45).
+import items::Item;
+import items::Tag;
+
+pub interface Pred<T> {
+    fn test(self, x: T) -> bool;
+}
+
+pub class Big implements Pred<Item> {
+    pub fn test(self, x: Item) -> bool { return x.n > 5; }
+}
+
+pub class Small implements Pred<Item> {
+    pub fn test(self, x: Item) -> bool { return x.n < 5; }
+}
+
+pub class Named implements Pred<Tag> {
+    pub fn test(self, x: Tag) -> bool { return x.label == "ok"; }
+}
