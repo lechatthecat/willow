@@ -5,6 +5,30 @@ use super::*;
 
 #[willow_continuations::checker]
 impl TypeChecker {
+    /// Whether `==`/`!=` is defined on `ty` (willow-zvnt): by value on
+    /// scalars, strings, and payload-free enums (the value is its tag), and by
+    /// reference identity on class and interface values. Containers, payload
+    /// enums, `Result`, and callables have no equality, so they are rejected
+    /// here rather than reaching lowering without an operand.
+    fn supports_equality(&self, ty: &Type) -> bool {
+        match ty {
+            Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never => true,
+            Type::Named(name) => {
+                self.symbols.lookup_class(name).is_some()
+                    || self.symbols.lookup_interface(name).is_some()
+                    || self.symbols.lookup_enum(name).is_some_and(|info| {
+                        info.type_params.is_empty()
+                            && info
+                                .variants
+                                .iter()
+                                .all(|variant| variant.payload_types.is_empty())
+                    })
+            }
+            Type::Generic(name, _) => self.symbols.lookup_interface(name).is_some(),
+            _ => false,
+        }
+    }
+
     pub(super) fn check_object_literal(&mut self, literal: &ObjectLiteralExpr) -> Type {
         for field in &literal.fields {
             self.check_expr(&field.value);
@@ -269,7 +293,9 @@ impl TypeChecker {
                     self.push(diagnostic);
                     return Type::Bool;
                 }
-                if !self.types_compatible(&lty, &rty) {
+                // Identity comparison is symmetric: `dog == animal` asks the
+                // same question as `animal == dog` (willow-zvnt).
+                if !self.types_compatible(&lty, &rty) && !self.types_compatible(&rty, &lty) {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -288,6 +314,26 @@ impl TypeChecker {
                                 type_name(&rty)
                             ),
                         )),
+                    );
+                } else if let Some(ty) = [&lty, &rty]
+                    .into_iter()
+                    .find(|ty| !self.supports_equality(ty))
+                {
+                    let operator = b.op.symbol();
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!("`{}` does not support `{operator}`", type_name(ty)),
+                        )
+                        .with_label(Label::primary(
+                            b.span,
+                            format!("`{}` values have no defined equality", type_name(ty)),
+                        ))
+                        .with_help(
+                            "`==` and `!=` compare scalars, strings, payload-free enums, \
+                             and class or interface values by reference identity",
+                        ),
                     );
                 }
                 Type::Bool

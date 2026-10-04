@@ -308,6 +308,30 @@ fn argument_types(
     }
 }
 
+/// The one type both sides of a class/interface `==` or `!=` are compared
+/// at (willow-zvnt): the supertype side's, so the subtype side is coerced to
+/// it first. Reference identity is then the object word on either side.
+fn identity_operand_type(
+    lhs: &HirExpr,
+    rhs: &HirExpr,
+    resolution: &crate::ir::typed_ast::HirResolution,
+) -> Option<Type> {
+    let identity = |ty: &Type| {
+        matches!(ty, Type::Named(id) | Type::Generic(id, _)
+            if resolution.classes.contains_key(id) || resolution.interfaces.contains_key(id))
+    };
+    if !identity(&lhs.ty) || !identity(&rhs.ty) {
+        return None;
+    }
+    if resolution.can_coerce(&rhs.ty, &lhs.ty) {
+        Some(lhs.ty.clone())
+    } else if resolution.can_coerce(&lhs.ty, &rhs.ty) {
+        Some(rhs.ty.clone())
+    } else {
+        None
+    }
+}
+
 fn argument_coercible(
     target: &Type,
     arg: &HirExpr,
@@ -350,8 +374,9 @@ fn scalar(
         } else { callables.get(callee).is_some_and(|(params, result)| *result == node.ty
                 && params.len() == args.len() && params.iter().zip(args).all(|(param, arg)| argument_coercible(param, arg, &callables.resolution)))
                 || builtin_call(callee, args, &node.ty, is_async) },
-        HirExprKind::Binary { op, lhs, .. } => !matches!(op, BinOp::And | BinOp::Or)
+        HirExprKind::Binary { op, lhs, rhs } => !matches!(op, BinOp::And | BinOp::Or)
             && (matches!(lhs.ty, Type::I64 | Type::F64 | Type::Bool | Type::String)
+                || (matches!(op, BinOp::Eq | BinOp::Ne) && identity_operand_type(lhs, rhs, &callables.resolution).is_some())
                 || (matches!(op, BinOp::Eq | BinOp::Ne) && matches!(&lhs.ty, Type::Named(name) | Type::Generic(name, _) if callables.resolution.enums.get(name).is_some_and(|info| info.variants.iter().all(|variant| variant.payloads.is_empty()))))),
         _ => false,
     })
@@ -1055,6 +1080,19 @@ fn lower(
                     &node.kind
                 {
                     work.extend(arguments(args, targets.as_deref()));
+                } else if let HirExprKind::Binary { lhs, rhs, .. } = &node.kind
+                    && lhs.ty != rhs.ty
+                    && let Some(target) = identity_operand_type(lhs, rhs, &callables.resolution)
+                {
+                    for child in [&**rhs, &**lhs] {
+                        if child.ty != target {
+                            work.push(Work::Coerce {
+                                child,
+                                target: target.clone(),
+                            });
+                        }
+                        work.push(Work::Enter(child));
+                    }
                 } else if !matches!(node.kind, HirExprKind::Lambda { .. }) {
                     work.extend(node.children().into_iter().rev().map(Work::Enter));
                 }
@@ -1383,11 +1421,19 @@ fn lower(
                 ))
             }
             HirExprKind::Binary { op, lhs, rhs } => {
+                let lhs_value = values[&std::ptr::from_ref(&**lhs)].clone();
                 let value = LirRvalue::Binary {
                     op: op.clone(),
-                    lhs: values[&std::ptr::from_ref(&**lhs)].clone(),
+                    lhs: lhs_value.clone(),
                     rhs: values[&std::ptr::from_ref(&**rhs)].clone(),
-                    operand_ty: lhs.ty.clone(),
+                    // A mixed class/interface identity comparison coerced
+                    // its subtype side on entry, so the left operand already
+                    // carries the shared type.
+                    operand_ty: if lhs.ty == rhs.ty {
+                        lhs.ty.clone()
+                    } else {
+                        lhs_value.ty(locals).unwrap_or_else(|| lhs.ty.clone())
+                    },
                 };
                 LirOperand::Local(emit(
                     value,

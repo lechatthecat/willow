@@ -1,0 +1,38 @@
+// `==` and `!=` on class and interface values compare reference identity
+// (willow-zvnt): two names for one object are equal, two objects with equal
+// fields are not. A class value and an interface view of it are the same
+// object, in either operand order.
+
+interface Shape {
+    fn area(self) -> i64;
+}
+
+open class Square implements Shape {
+    pub side: i64;
+    pub fn area(self) -> i64 { return self.side * self.side; }
+}
+
+class Tile extends Square { }
+
+fn is_same(a: Shape, b: Shape) -> bool {
+    return a == b;
+}
+
+fn main() {
+    let a = new Square(3);
+    let alias = a;
+    let twin = new Square(3);
+    println(a == alias);
+    println(a == twin);
+    println(a != twin);
+
+    let shape: Shape = a;
+    println(shape == a);
+    println(a == shape);
+
+    let tile = new Tile(2);
+    let base: Square = tile;
+    println(base == tile);
+    println(is_same(tile, base));
+    println(is_same(tile, new Tile(2)));
+}

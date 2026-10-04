@@ -259,3 +259,6 @@ mod scalar_adt_pairs;
 
 #[path = "integration/interface_pairs.rs"]
 mod interface_pairs;
+
+#[path = "integration/reference_equality.rs"]
+mod reference_equality;

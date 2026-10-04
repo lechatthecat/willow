@@ -3570,7 +3570,7 @@ mod condition_recovery_tests {
     #[test]
     fn invalid_conditions_do_not_add_type_cascades() {
         for expression in [
-            "\"abc\".starts_with(\"a\")",
+            "\"abc\".missing(\"a\")",
             "missing()",
             "new Empty().missing()",
         ] {

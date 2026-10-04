@@ -4064,8 +4064,9 @@ fn supported_expr_node<'n>(
             {
                 return false;
             }
-            // Class values have no operators: `==` on two objects would be an
-            // identity comparison the walker does not emit. A payload-free enum
+            // Class values have no operators here: `==` on two objects is an
+            // identity comparison that value lowering emits as an LIR `Binary`
+            // (willow-zvnt), never through this walker. A payload-free enum
             // is the exception — the value IS its tag, so `==` and `!=` are the
             // integer comparison below and mean what the program wrote; both
             // sides must be the same enum, which is also what lets an aliased
@@ -7498,6 +7499,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         _ => unreachable!("string operator validated"),
                     };
                 }
+                // An interface value is an (object, vtable) pair; identity is
+                // the object word alone (willow-zvnt).
+                let (lhs, rhs) = if self.builder.func.dfg.value_type(lhs) == types::I128 {
+                    let (lhs, _) = self.builder.ins().isplit(lhs);
+                    let (rhs, _) = self.builder.ins().isplit(rhs);
+                    (lhs, rhs)
+                } else {
+                    (lhs, rhs)
+                };
                 let float = *operand_ty == Type::F64;
                 if !float && !unguarded_divisor && matches!(op, BinOp::Div | BinOp::Rem) {
                     self.emit_int_div_guard(lhs, rhs, matches!(op, BinOp::Rem), span);
@@ -8758,7 +8768,9 @@ fn flat_rvalue_supported(
         }
         V::FormatScalar { ty, format, .. } => matches!(ty, Type::I64 | Type::F64 | Type::Bool | Type::String) && (format.is_none() || *ty == Type::F64),
         V::Panic { message } => ty(message) == Some(Type::String),
-        V::Binary { op, operand_ty, .. } if matches!(operand_ty, Type::Named(_) | Type::Generic(..)) => matches!(op, BinOp::Eq | BinOp::Ne) && ctx.tag_immediate_enum(operand_ty),
+        // A payload-free enum compares its tag; a class or interface value
+        // compares its object word by reference identity (willow-zvnt).
+        V::Binary { op, operand_ty, .. } if matches!(operand_ty, Type::Named(_) | Type::Generic(..)) => matches!(op, BinOp::Eq | BinOp::Ne) && (ctx.tag_immediate_enum(operand_ty) || (ctx.supported_type(operand_ty) && matches!(operand_ty, Type::Named(name) | Type::Generic(name, _) if ctx.is_class(name) || (ctx.is_interface)(name)))),
         V::Recover => true,
         _ => true,
     }

@@ -755,7 +755,7 @@ mod tests {
         );
         assert!(checker.errors.is_empty(), "{:?}", checker.errors);
         let (invalid, _, _) = compare(
-            "class C { pub static first: i64 = C::second; pub static second: i64 = 1; } fn main() {}",
+            "class C { pub static first: i64 = C::second; pub static second: i64 = C::first; } fn main() {}",
         );
         assert!(
             invalid
