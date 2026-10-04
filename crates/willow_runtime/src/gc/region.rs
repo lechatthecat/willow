@@ -30,6 +30,18 @@ impl RegionMarkBitmap {
     pub(super) fn is_marked(&self, offset: usize) -> bool {
         self.bits.contains(offset / GC_REGION_MARK_GRANULE)
     }
+    /// Highest object start in `[floor, offset]`, if any.
+    pub(super) fn last_start_in(&self, floor: usize, offset: usize) -> Option<usize> {
+        if floor > offset {
+            return None;
+        }
+        self.bits
+            .last_set_in(
+                floor.div_ceil(GC_REGION_MARK_GRANULE),
+                offset / GC_REGION_MARK_GRANULE,
+            )
+            .map(|index| index * GC_REGION_MARK_GRANULE)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +70,8 @@ pub(super) struct OldRegion {
     pub(super) largest_free_span: usize,
     pub(super) sweep_pending: bool,
     pub(super) sweep_quarantined: bool,
+    /// Active per-thread old allocation buffers carved from this region.
+    pub(super) active_labs: usize,
     #[cfg(test)]
     pub(super) allocation_attempts: usize,
     pub(super) mark_bitmap: RegionMarkBitmap,
@@ -129,6 +143,7 @@ impl OldRegion {
             largest_free_span: 0,
             sweep_pending: false,
             sweep_quarantined: false,
+            active_labs: 0,
             #[cfg(test)]
             allocation_attempts: 0,
             mark_bitmap: RegionMarkBitmap::new(bitmap_capacity),
@@ -212,13 +227,62 @@ impl OldRegion {
         Some((object, reused))
     }
 
+    /// Reserve `[offset, offset + len)` for a per-thread allocation buffer,
+    /// with `minimum <= len <= maximum`: the first free span of at least
+    /// `minimum` bytes, else the bump tail. Returns `(offset, len, reused)`.
+    pub(super) fn carve(&mut self, minimum: usize, maximum: usize) -> Option<(usize, usize, bool)> {
+        assert!(
+            !self.sweep_quarantined,
+            "reclaimed spans are not reusable before sweep completion"
+        );
+        debug_assert!(minimum.is_multiple_of(GC_REGION_MARK_GRANULE));
+        let maximum = maximum - maximum % GC_REGION_MARK_GRANULE;
+        let carved = if let Some((offset, len)) = self.free_spans.take_up_to(minimum, maximum) {
+            Some((offset, len, true))
+        } else {
+            let tail = self.capacity - self.used;
+            (tail >= minimum).then(|| {
+                let len = maximum.min(tail - tail % GC_REGION_MARK_GRANULE);
+                let offset = self.used;
+                self.used += len;
+                (offset, len, false)
+            })
+        };
+        self.largest_free_span = self.free_spans.largest();
+        carved
+    }
+
+    /// Find the object whose payload starts at `address`, or whose payload
+    /// contains it when `interior`. Exact lookups test the object-start bit in
+    /// O(1); interior lookups use the ordered index and, for an address past
+    /// every indexed object, the start bits of not yet indexed buffer objects.
     pub(super) fn object_for_address(&self, address: usize, interior: bool) -> Option<HeapObject> {
         if !self.contains(address) && (interior || address != self.end()) {
             return None;
         }
         let relative = address - self.start();
-        let (&offset, _) = self.allocations.range(..=relative).next_back()?;
-        // SAFETY: allocation metadata contains a live object at this offset.
+        let offset = if interior {
+            match self.allocations.range(..=relative).next_back() {
+                Some((&offset, &span)) if relative < offset + span => offset,
+                indexed => {
+                    // Only unindexed buffer objects (at most
+                    // GC_TLAB_MAX_OBJECT_SIZE each) lie past the indexed one.
+                    let floor = indexed
+                        .map_or(0, |(&offset, &span)| offset + span)
+                        .max(relative.saturating_sub(GC_TLAB_MAX_OBJECT_SIZE));
+                    let header = relative.checked_sub(GC_HEADER_SIZE)?;
+                    self.mark_bitmap.last_start_in(floor, header)?
+                }
+            }
+        } else {
+            let header = relative.checked_sub(GC_HEADER_SIZE)?;
+            if !header.is_multiple_of(GC_REGION_MARK_GRANULE) || !self.mark_bitmap.is_marked(header)
+            {
+                return None;
+            }
+            header
+        };
+        // SAFETY: a start bit or index entry names a live object at this offset.
         let object = HeapObject::from_raw(unsafe { self.base.add(offset) }.cast())?;
         let payload = object.payload().as_ptr() as usize;
         let payload_end = object.as_ptr() as usize + object.size();

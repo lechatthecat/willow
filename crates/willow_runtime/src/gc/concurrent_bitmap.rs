@@ -47,6 +47,31 @@ impl ConcurrentMarkBits {
             word.fetch_and(!(1u64 << (index % 64)), Ordering::Release);
         }
     }
+    /// Highest set index in `[floor, index]`: O((index - floor) / 64 + 1).
+    pub(super) fn last_set_in(&self, floor: usize, index: usize) -> Option<usize> {
+        if floor > index {
+            return None;
+        }
+        let mut word_index = index / 64;
+        // Keep bits at or below `index` within its word.
+        let mut mask = u64::MAX >> (63 - index % 64);
+        loop {
+            let word = self
+                .words
+                .get(word_index)
+                .map_or(0, |word| word.load(Ordering::Acquire))
+                & mask;
+            if word != 0 {
+                let found = word_index * 64 + 63 - word.leading_zeros() as usize;
+                return (found >= floor).then_some(found);
+            }
+            if word_index == 0 || word_index * 64 <= floor {
+                return None;
+            }
+            word_index -= 1;
+            mask = u64::MAX;
+        }
+    }
     /// Visit set indices in ascending order: O(words + set bits).
     pub(super) fn for_each_set(&self, mut visit: impl FnMut(usize)) {
         for (word_index, word) in self.words.iter().enumerate() {

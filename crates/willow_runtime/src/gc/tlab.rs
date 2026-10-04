@@ -71,6 +71,7 @@ pub(super) fn add_tlab_accounting(state: &mut GcState, allocations: u64, bytes: 
     state.total_allocated_bytes = state.total_allocated_bytes.saturating_add(bytes);
     state.tlab_fast_allocations = state.tlab_fast_allocations.saturating_add(allocations);
     state.tlab_fast_allocated_bytes = state.tlab_fast_allocated_bytes.saturating_add(bytes);
+    consume_headrooms(bytes as usize);
     state.allocated_bytes = state.allocated_bytes.saturating_add(bytes as usize);
     state.young_allocated_bytes = state.young_allocated_bytes.saturating_add(bytes as usize);
 }
@@ -83,6 +84,7 @@ pub(super) fn sync_tlab_bytes(state: &mut GcState) {
         bytes = bytes.saturating_add(read_tlab_bytes_delta(record));
     }
     add_tlab_accounting(state, 0, bytes);
+    old_lab::sync_bytes(state);
 }
 
 /// Merge fast-path bytes and object counts, for telemetry readers.
@@ -103,6 +105,9 @@ pub(super) fn sync_tlab_accounting(state: &mut GcState) {
         ));
     }
     add_tlab_accounting(state, allocations, bytes);
+    // Readers of these counters and every walk of region object indexes
+    // (epoch capture, stopped marking, validation) follow this merge.
+    old_lab::flush_all(state);
 }
 
 thread_local! {

@@ -124,7 +124,9 @@ pub extern "C" fn willow_gc_tlab_fast_allocations() -> i64 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_tlab_slow_allocations() -> i64 {
-    runtime().heap.lock().unwrap().tlab_slow_allocations as i64
+    let mut state = runtime().heap.lock().unwrap();
+    old_lab::flush_all(&mut state);
+    state.tlab_slow_allocations as i64
 }
 
 #[unsafe(no_mangle)]
@@ -210,7 +212,8 @@ pub extern "C" fn willow_gc_old_region_reserved_bytes() -> i64 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_old_region_live_bytes() -> i64 {
-    let state = runtime().heap.lock().unwrap();
+    let mut state = runtime().heap.lock().unwrap();
+    old_lab::flush_all(&mut state);
     let regular: usize = state
         .old_regions
         .iter()
@@ -228,7 +231,8 @@ pub extern "C" fn willow_gc_old_region_live_bytes() -> i64 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_old_region_fragmentation_bytes() -> i64 {
-    let state = runtime().heap.lock().unwrap();
+    let mut state = runtime().heap.lock().unwrap();
+    old_lab::flush_all(&mut state);
     let regular: usize = state
         .old_regions
         .iter()
@@ -272,13 +276,17 @@ pub extern "C" fn willow_gc_pinned_region_count() -> i64 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_old_region_allocations() -> i64 {
-    runtime().heap.lock().unwrap().old_region_allocations as i64
+    let mut state = runtime().heap.lock().unwrap();
+    old_lab::flush_all(&mut state);
+    state.old_region_allocations as i64
 }
 
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_old_region_reuses() -> i64 {
-    runtime().heap.lock().unwrap().old_region_reuses as i64
+    let mut state = runtime().heap.lock().unwrap();
+    old_lab::flush_all(&mut state);
+    state.old_region_reuses as i64
 }
 
 #[unsafe(no_mangle)]

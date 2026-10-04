@@ -498,10 +498,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return;
         }
         let is_reference = is_gc_managed(value_ty, self.enum_infos);
-        let value_has_header = self.is_class_pointer(value_ty)
+        let value_has_header = self.is_header_pointer(value_ty)
             || option_repr::option_inner(value_ty).is_some_and(|inner| {
                 self.option_repr(value_ty) == Some(option_repr::OptionRepr::NullableGcPointer)
-                    && self.is_class_pointer(inner)
+                    && self.is_header_pointer(inner)
             });
         self.emit_gc_heap_store_inner(
             owner,
@@ -513,10 +513,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         );
     }
 
-    /// Class instances are always GC heap payloads with a header; a class
-    /// value word is never a tag, box-free pair, or foreign pointer.
-    fn is_class_pointer(&self, ty: &Type) -> bool {
-        matches!(ty, Type::Named(n) | Type::Generic(n, _) if self.classes.is_class(n))
+    /// Class instances and strings are always GC heap payloads with a header;
+    /// such a value word is never a tag, box-free pair, or foreign pointer
+    /// (string literals are permanently rooted heap strings, willow-jz15.53).
+    fn is_header_pointer(&self, ty: &Type) -> bool {
+        matches!(ty, Type::String)
+            || matches!(ty, Type::Named(n) | Type::Generic(n, _) if self.classes.is_class(n))
     }
 
     /// Variant for values whose source-level type has already been erased to a
@@ -530,6 +532,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         destination: GcStoreDestination,
     ) {
         self.emit_gc_heap_store_inner(owner, offset, value, is_reference, false, destination);
+    }
+
+    /// Store an opaque GC-owner word (a managed allocation base, never a tag
+    /// or interior pointer) into an async frame slot. Old values skip the
+    /// barrier call outside marking, as for class-typed stores (willow-jz15.53).
+    pub(super) fn emit_gc_owner_frame_store(&mut self, frame: Value, offset: i32, value: Value) {
+        self.emit_gc_heap_store_inner(
+            frame,
+            offset,
+            value,
+            true,
+            true,
+            GcStoreDestination::AsyncFrameSlot,
+        );
     }
 
     /// `value_has_header`: a non-null `value` is known to be a GC payload whose
@@ -698,7 +714,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.seal_block(barrier);
         let word_ty = self.builder.func.dfg.value_type(word);
         let previous = self.builder.ins().atomic_load(word_ty, flags, slot);
-        let destination = self.builder.ins().iconst(types::I64, destination as i64);
+        let destination_kind = if refinement == BarrierRefinement::OldValueSkips {
+            destination as i64 | willow_abi::GC_STORE_VALUE_HAS_HEADER
+        } else {
+            destination as i64
+        };
+        let destination = self.builder.ins().iconst(types::I64, destination_kind);
         let barrier_id = self.func_id("willow_gc_write_barrier");
         let barrier_ref = self
             .module

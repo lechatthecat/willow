@@ -71,6 +71,13 @@ pub(super) fn barrier_owner_payload(
 #[unsafe(export_name = "willow_gc_mark_phase")]
 pub(super) static GC_MARK_PHASE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+thread_local! {
+    /// This thread may have entries in the heap-locked `GcState::satb`, so a
+    /// safepoint flush must take the heap lock. Stale `true` only costs one
+    /// redundant locked flush.
+    static LOCKED_SATB_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub(super) fn record_satb_locked(state: &mut GcState, old: *mut u8) {
     let GcState {
         concurrent_cycle,
@@ -82,16 +89,54 @@ pub(super) fn record_satb_locked(state: &mut GcState, old: *mut u8) {
             cycle.enqueue(old);
             return;
         }
+        if !old.is_null() {
+            LOCKED_SATB_PENDING.set(true);
+        }
         satb.record(std::thread::current().id(), old as usize, |value| {
             cycle.enqueue_satb_batch(value)
         });
     }
 }
 
+/// Publish a concurrent-mark deletion (`old`) and new edge (`value`) into the
+/// cached cycle's shard buffers without the heap lock (willow-jz15.53).
+/// Returns false when the caller must use the heap-locked path instead: no
+/// concurrent phase, a stale cache, or shards sealed by closure/remark. The
+/// validity checks run under the shard lock, and so does every queue
+/// publication, so a seal's flush observes all of them.
+fn publish_marking_unlocked(old: *mut u8, value: *mut u8) -> bool {
+    if GC_MARK_PHASE.load(Ordering::Acquire) != 1 {
+        return false;
+    }
+    // May take the heap lock on a cache miss: before any shard lock.
+    let Some((generation, cycle)) = marking::cached_cycle() else {
+        return false;
+    };
+    cycle
+        .satb_shards
+        .with_current(
+            || {
+                GC_MARK_PHASE.load(Ordering::Acquire) == 1
+                    && marking::ASSIST_CYCLE_GENERATION.load(Ordering::Acquire) == generation
+                    && !cycle.closing.load(Ordering::Acquire)
+            },
+            |buffer| {
+                buffer.record(old as usize, |values| cycle.enqueue_satb_batch(values));
+                if !value.is_null() {
+                    cycle.enqueue(value);
+                }
+            },
+        )
+        .is_some()
+}
+
 /// Log a logical reference deletion without a stable physical slot. Does not
 /// reach a safepoint or trace payloads, so callers may hold a container lock.
 pub(crate) fn satb_delete(old: *mut u8) {
-    if !old.is_null() && GC_MARK_PHASE.load(Ordering::Acquire) != 0 {
+    if !old.is_null()
+        && GC_MARK_PHASE.load(Ordering::Acquire) != 0
+        && !publish_marking_unlocked(old, std::ptr::null_mut())
+    {
         record_satb_locked(&mut runtime().heap.lock().unwrap(), old);
     }
 }
@@ -101,6 +146,20 @@ pub(super) fn flush_satb_current(retire: bool) {
         return;
     }
     crate::gc_mark_queue::assert_no_queue_lock_held("SATB buffer flush");
+    if GC_MARK_PHASE.load(Ordering::Acquire) == 1
+        && let Some((generation, cycle)) = marking::cached_cycle()
+    {
+        // Shards are shared, so this publishes neighbours' entries too; the
+        // closure seal publishes whatever no safepoint flushed.
+        cycle.satb_shards.with_current(
+            || marking::ASSIST_CYCLE_GENERATION.load(Ordering::Acquire) == generation,
+            |buffer| buffer.flush(|values| cycle.enqueue_satb_batch(values)),
+        );
+    }
+    if !retire && !LOCKED_SATB_PENDING.get() {
+        return;
+    }
+    LOCKED_SATB_PENDING.set(false);
     let mut state = runtime().heap.lock().unwrap();
     let GcState {
         concurrent_cycle,
@@ -115,18 +174,25 @@ pub(super) fn flush_satb_current(retire: bool) {
     });
 }
 
+/// Publish every pending deletion and seal the cycle's shard buffers, so all
+/// later publications take the heap lock: closure and remark rely on that.
 pub(super) fn flush_satb_all_locked(state: &mut GcState) {
     let GcState {
         concurrent_cycle,
         satb,
         ..
     } = state;
+    let cycle = concurrent_cycle.as_ref();
     satb.flush_all(|value| {
-        concurrent_cycle
-            .as_ref()
+        cycle
             .expect("pending SATB entries require an active epoch")
             .enqueue_satb_batch(value);
     });
+    if let Some(cycle) = cycle {
+        cycle
+            .satb_shards
+            .seal(|values| cycle.enqueue_satb_batch(values));
+    }
 }
 
 /// Fused pre-store barrier: retain the overwritten reference for SATB, publish
@@ -141,6 +207,8 @@ pub extern "C" fn willow_gc_write_barrier(
     value: *mut u8,
     destination_kind: i64,
 ) {
+    let value_has_header = destination_kind & willow_abi::GC_STORE_VALUE_HAS_HEADER != 0;
+    let destination_kind = destination_kind & !willow_abi::GC_STORE_VALUE_HAS_HEADER;
     let marking_active = GC_MARK_PHASE.load(Ordering::Acquire) != 0;
     // A null store creates no generational edge; its deletion is relevant
     // only during SATB marking. Like null/null, an inactive deletion is a
@@ -154,20 +222,32 @@ pub extern "C" fn willow_gc_write_barrier(
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |calls| {
                 Some(calls.saturating_add(1))
             });
-    // With no nursery ever published there are no old-to-young edges.
+    // With no nursery ever published there are no old-to-young edges. A value
+    // flagged as a GC payload start has a readable header; an old one cannot
+    // create such an edge either (the inline filter trusts the same byte).
+    let young_edge_possible = !value.is_null()
+        && runtime().tlab_ever_allocated.load(Ordering::Acquire)
+        && !(value_has_header
+            && GcPayload::from_raw(value).is_some_and(|value| {
+                HeapObject::from_payload(value).generation() == GC_GENERATION_OLD
+            }));
     // The activation handshake crosses pre-activation barrier/store pairs
-    // before root snapshots; active epochs still take the full SATB path.
-    if !marking_active && !runtime().tlab_ever_allocated.load(Ordering::Acquire) {
+    // before root snapshots; active epochs publish under a shard lock, or
+    // under the heap lock once closure or remark sealed the shards.
+    let published = marking_active && publish_marking_unlocked(old_value, value);
+    if !young_edge_possible && (published || !marking_active) {
         return;
     }
     let mut state = runtime().heap.lock().unwrap();
-    if marking_active {
+    if marking_active && !published {
         record_satb_locked(&mut state, old_value);
+        if let Some(cycle) = &state.concurrent_cycle {
+            cycle.enqueue(value);
+        }
     }
-    if let Some(cycle) = &state.concurrent_cycle {
-        cycle.enqueue(value);
-    }
-    if tlab_payload_generation(&state, value as usize) != Some(GC_GENERATION_YOUNG) {
+    if !young_edge_possible
+        || tlab_payload_generation(&state, value as usize) != Some(GC_GENERATION_YOUNG)
+    {
         return;
     }
     if let Some(owner_payload) = barrier_owner_payload(&state, owner, destination_kind)
@@ -194,7 +274,12 @@ pub(crate) fn write_barrier_object_owner(
     if GC_MARK_PHASE.load(Ordering::Acquire) == 0 && !may_create_young_edge(owner, value) {
         return;
     }
-    willow_gc_write_barrier(owner, old_value, value, destination_kind);
+    willow_gc_write_barrier(
+        owner,
+        old_value,
+        value,
+        destination_kind | willow_abi::GC_STORE_VALUE_HAS_HEADER,
+    );
 }
 
 fn may_create_young_edge(owner: *mut u8, value: *mut u8) -> bool {

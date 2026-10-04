@@ -57,6 +57,7 @@ mod mark_workers;
 mod memory_control;
 mod minor;
 mod nursery;
+mod old_lab;
 mod pacer;
 mod root_handshake;
 mod runtime_roots;
@@ -270,6 +271,8 @@ struct GcState {
     /// (largest available span, region index); excludes dedicated/full regions.
     old_region_candidates: BinaryHeap<(usize, usize)>,
     old_reserved_bytes: usize,
+    /// Per-thread old allocation buffers used by runtime-side allocation.
+    old_labs: Vec<old_lab::OldLabRecord>,
     /// Generated TLS states observed on allocation slow paths.
     tlab_states: HashMap<usize, TlabStateRecord>,
     tlab_owners: HashMap<ThreadId, HashSet<usize>>,
@@ -351,10 +354,165 @@ pub(crate) fn external_bytes() -> usize {
     EXTERNAL_BYTES.load(Ordering::Relaxed)
 }
 
+/// Native bytes that may still be charged without the heap lock because no
+/// collection-request decision can change before they are used up. Zero under
+/// a soft memory limit and within a quarter of a hard reservation cap, so those
+/// charges stay exact; recomputed under the heap lock by every slow-path charge and
+/// capped like `POLICY_HEADROOM`. Managed growth consumes it too
+/// (`consume_headrooms`), so native and managed bytes since publication never
+/// cross a trigger unobserved.
+static EXTERNAL_HEADROOM: AtomicUsize = AtomicUsize::new(0);
+
+/// Runtime-allocation bytes whose collection-policy check may skip the heap
+/// lock: no trigger can fire before they are used up. Zero under a hard
+/// reservation cap or a soft memory limit, at or past the pacer trigger, and
+/// after any policy-input change; recomputed by every locked check that finds
+/// nothing to do (willow-jz15.53). Capped so the pacer's allocation-rate
+/// samples, taken by locked checks, stay at most this many bytes apart.
+static POLICY_HEADROOM: AtomicU64 = AtomicU64::new(0);
+const POLICY_HEADROOM_CAP: u64 = 1 << 20;
+
+/// Invalidate both lock-free headrooms; every write that can lower a goal or
+/// trigger calls this.
+fn invalidate_external_headroom() {
+    EXTERNAL_HEADROOM.store(0, Ordering::Release);
+    POLICY_HEADROOM.store(0, Ordering::Release);
+}
+
+/// Charge `bytes` of `occupied` growth against both lock-free headrooms.
+/// Called before the growth becomes visible, by every heap-locked site that
+/// raises `allocated_bytes`, so one headroom's room never ignores growth
+/// through the other path. O(1); a no-op once both are exhausted.
+pub(super) fn consume_headrooms(bytes: usize) {
+    if EXTERNAL_HEADROOM.load(Ordering::Acquire) != 0 {
+        let _ = EXTERNAL_HEADROOM.fetch_update(Ordering::AcqRel, Ordering::Acquire, |room| {
+            Some(room.saturating_sub(bytes))
+        });
+    }
+    consume_policy_room(bytes as u64);
+}
+
+fn consume_policy_room(bytes: u64) {
+    if POLICY_HEADROOM.load(Ordering::Acquire) != 0 {
+        let _ = POLICY_HEADROOM.fetch_update(Ordering::AcqRel, Ordering::Acquire, |room| {
+            Some(room.saturating_sub(bytes))
+        });
+    }
+}
+
+fn policy_headroom(state: &GcState) -> u64 {
+    if state.memory_limit_bytes.is_some() || state.soft_memory.enabled() {
+        return 0;
+    }
+    let input = memory_inputs(state);
+    let mut trigger = input.unlimited_goal.max(input.live);
+    if state.pacer.enabled() {
+        trigger = trigger.min(state.pacer_trigger);
+    }
+    trigger
+        .saturating_sub(input.occupied)
+        .min(POLICY_HEADROOM_CAP)
+}
+
+/// Whether `bytes` of runtime allocation fit the lock-free policy headroom.
+fn consume_policy_headroom(bytes: u64) -> bool {
+    POLICY_HEADROOM
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |room| {
+            room.checked_sub(bytes)
+        })
+        .is_ok()
+}
+
+/// Bytes before the next native charge could cross the unlimited goal, the
+/// pacer trigger, or (under a hard cap) the hard-pressure watermark at 3/4 of
+/// the cap, below which `can_reserve` cannot fail either. Goal and trigger only
+/// move under the heap lock and every write that can lower them invalidates
+/// the headroom; reservation growth quiesces it in `can_reserve`. Zero at or
+/// past the watermark and under a soft limit, whose controller decides on
+/// every charge.
+fn external_headroom(state: &GcState) -> usize {
+    if state.soft_memory.enabled() {
+        return 0;
+    }
+    let input = memory_inputs(state);
+    let below = |trigger: u64| trigger.saturating_sub(input.occupied).saturating_sub(1);
+    let mut room = below(input.unlimited_goal.max(input.live));
+    if let Some(limit) = state.memory_limit_bytes {
+        let watermark = (limit / 4).saturating_mul(3).max(1) as u64;
+        room = room.min(watermark.saturating_sub(input.committed).saturating_sub(1));
+    }
+    if state.pacer.enabled() && input.occupied < state.pacer_trigger {
+        room = room.min(below(state.pacer_trigger));
+    }
+    room.min(POLICY_HEADROOM_CAP) as usize
+}
+
+/// Lock-free native charges between their headroom check and completion.
+/// [`quiesce_external_charges`] waits for zero so `external_bytes()` is exact.
+static EXTERNAL_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// Close the lock-free native path and wait out charges already inside it.
+/// After this, `external_bytes()` holds no transient (rolled-back) bytes and
+/// no new lock-free charge can start until a locked charge republishes the
+/// headroom. SeqCst pairs with the charger's in-flight increment and headroom
+/// load: either the charger sees zero headroom, or this sees it in flight.
+/// O(1) plus a spin over at most a few atomics per in-flight charge.
+fn quiesce_external_charges() {
+    EXTERNAL_HEADROOM.store(0, Ordering::SeqCst);
+    while EXTERNAL_IN_FLIGHT.load(Ordering::SeqCst) != 0 {
+        std::hint::spin_loop();
+    }
+}
+
+/// Lock-free native charge; false (with nothing charged) when the headroom
+/// cannot cover `bytes`.
+fn charge_external_lock_free(bytes: usize) -> bool {
+    EXTERNAL_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+    let charged = EXTERNAL_HEADROOM.load(Ordering::SeqCst) >= bytes && {
+        // Publish the bytes BEFORE claiming headroom: a locked charge that
+        // republishes `EXTERNAL_HEADROOM` in between then already counts them
+        // in `occupied`. A failed claim rolls the add back.
+        EXTERNAL_BYTES
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(bytes)
+            })
+            .unwrap_or_else(|_| {
+                crate::failure::resource_exhausted(format_args!("native byte accounting overflow"))
+            });
+        let claimed = EXTERNAL_HEADROOM
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |room| {
+                room.checked_sub(bytes)
+            })
+            .is_ok();
+        if !claimed {
+            EXTERNAL_BYTES.fetch_sub(bytes, Ordering::AcqRel);
+        }
+        claimed
+    };
+    EXTERNAL_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    if !charged {
+        return false;
+    }
+    // Within the headroom no crossing or cap check can fire: account without
+    // serializing native-heavy pipelines on the heap mutex. The policy
+    // headroom must also see this `occupied` growth.
+    consume_policy_room(bytes as u64);
+    let _ =
+        EXTERNAL_ALLOCATED_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(bytes as u64))
+        });
+    true
+}
+
 pub(crate) fn charge_external(bytes: usize) {
+    if charge_external_lock_free(bytes) {
+        return;
+    }
     // Serialize increases with region reservations. Releases need no heap lock,
     // so finalizers also work during reset and stop-the-world collection.
     let state = runtime().heap.lock().unwrap();
+    // Exact inputs for the crossing checks below.
+    quiesce_external_charges();
     if !can_reserve(&state, bytes) {
         allocation_failure(&state);
     }
@@ -389,6 +547,7 @@ pub(crate) fn charge_external(bytes: usize) {
         && (hard_crossing
             || paced_crossing
             || state.soft_memory.decide(memory_inputs(&state)).collect);
+    EXTERNAL_HEADROOM.store(external_headroom(&state), Ordering::Release);
     drop(state);
     if pressure {
         // Request only; never collect or park while a native guard is held.
@@ -403,6 +562,10 @@ pub(crate) fn release_external(bytes: usize) {
 
 fn can_reserve(state: &GcState, additional: usize) -> bool {
     state.memory_limit_bytes.is_none_or(|limit| {
+        // Every reservation passes here first: stop lock-free native charges
+        // (their headroom predates this reservation) and drop their transient
+        // bytes before the exact cap check.
+        quiesce_external_charges();
         state
             .old_reserved_bytes
             .checked_add(state.tlab_reserved_bytes)
@@ -550,6 +713,7 @@ impl Default for GcState {
             old_addresses: address_index::AddressIndex::default(),
             old_region_candidates: BinaryHeap::new(),
             old_reserved_bytes: 0,
+            old_labs: Vec::new(),
             tlab_states: HashMap::new(),
             tlab_owners: HashMap::new(),
             allocated_bytes: 0,
@@ -744,8 +908,24 @@ fn hard_reservation_pressure(state: &mut GcState) -> bool {
     false
 }
 
+/// Mirror of `concurrent_cycle.is_some() || sweeping.is_some()`, written under
+/// the heap lock by every change to either, so allocation can skip a policy
+/// check that would only report "busy" without contending on the heap lock
+/// (willow-jz15.53). A stale read only shifts the check to the next slow path.
+static COLLECTION_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn publish_collection_busy(state: &GcState) {
+    COLLECTION_BUSY.store(
+        state.concurrent_cycle.is_some() || state.sweeping.is_some(),
+        Ordering::Release,
+    );
+}
+
 fn allocation_should_collect() -> bool {
     let stress = gc_stress_enabled("alloc");
+    if !stress && COLLECTION_BUSY.load(Ordering::Acquire) {
+        return false;
+    }
     let mut state = runtime().heap.lock().unwrap();
     if !stress && (state.concurrent_cycle.is_some() || state.sweeping.is_some()) {
         return false;
@@ -763,6 +943,7 @@ fn allocation_should_collect() -> bool {
             .saturating_sub(decision.runway)
             .max(input.live.saturating_add(256 * 1024))
             .min(state.threshold_bytes as u64);
+        invalidate_external_headroom();
     }
     let hard_pressure = hard_reservation_pressure(&mut state);
     let memory_input = memory_inputs(&state);
@@ -770,7 +951,11 @@ fn allocation_should_collect() -> bool {
     let paced = state.pacer.enabled()
         && memory_input.occupied >= state.pacer_trigger
         && memory.reason != memory_control::Reason::Relief;
-    stress || hard_pressure || paced || memory.collect
+    let collect = stress || hard_pressure || paced || memory.collect;
+    if !collect {
+        POLICY_HEADROOM.store(policy_headroom(&state), Ordering::Release);
+    }
+    collect
 }
 
 fn allocation_should_minor_collect() -> bool {
@@ -972,6 +1157,7 @@ pub extern "C" fn willow_gc_alloc_slow(
         .get_mut(&state_address)
         .expect("TLAB state is registered before refill")
         .chunk_fast_start = base as usize + total_size;
+    consume_headrooms(total_size);
     state.allocated_bytes = state.allocated_bytes.saturating_add(total_size);
     state.young_allocated_bytes = state.young_allocated_bytes.saturating_add(total_size);
     state.total_allocs = state.total_allocs.saturating_add(1);
@@ -1075,7 +1261,13 @@ fn allocate_object(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask:
     let total_size = (payload_size as u64).saturating_add(GC_HEADER_SIZE as u64);
     assist_concurrent_mark(total_size);
     let stress = gc_stress_enabled("alloc");
-    if (stress || runtime_policy_check_due(total_size)) && allocation_should_collect() {
+    // A due check charges the chunk it covers against the lock-free headroom
+    // first; only an exhausted headroom consults the policy under the lock.
+    if (stress
+        || (runtime_policy_check_due(total_size)
+            && !consume_policy_headroom(GC_TLAB_CHUNK_SIZE as u64 + total_size)))
+        && allocation_should_collect()
+    {
         automatic_collect(stress);
     }
     allocate_old(layout_id, type_id, payload_size, gc_ref_mask)
@@ -1094,6 +1286,7 @@ std::thread_local! {
 
 fn invalidate_runtime_policy_budgets() {
     RUNTIME_POLICY_EPOCH.fetch_add(1, Ordering::AcqRel);
+    invalidate_external_headroom();
 }
 
 /// Record growth of reserved heap storage. Under a hard reservation cap the
@@ -1207,6 +1400,7 @@ fn allocate_old_region_object_locked(
         allocated
     };
 
+    consume_headrooms(object.size());
     state.allocated_bytes = state.allocated_bytes.saturating_add(object.size());
     state.old_region_allocations = state.old_region_allocations.saturating_add(1);
     if reused {
@@ -1226,6 +1420,32 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
         crate::failure::fatal_invariant("negative managed allocation size");
     }
     let payload_size = payload_size as usize;
+    if old_lab::enabled()
+        && let Some((total, span)) = old_lab::span_for(payload_size)
+        && total <= GC_TLAB_MAX_OBJECT_SIZE
+        && old_lab::available()
+    {
+        // Small runtime objects bump-allocate in this thread's old buffer and
+        // take the heap mutex only to refill it (willow-jz15.53).
+        if let Some(object) = old_lab::try_allocate(type_id, layout_id, gc_ref_mask, total, span) {
+            return object.payload().as_ptr();
+        }
+        let mut state = runtime().heap.lock().unwrap();
+        let refill = |state: &mut GcState| {
+            old_lab::refill_and_allocate(state, type_id, layout_id, gc_ref_mask, total, span)
+        };
+        let mut object = refill(&mut state);
+        if object.is_none() && (state.memory_limit_bytes.is_some() || state.soft_memory.enabled()) {
+            drop(state);
+            collect_for_budget();
+            state = runtime().heap.lock().unwrap();
+            object = refill(&mut state);
+        }
+        let Some(object) = object else {
+            return allocation_failure(&state);
+        };
+        return object.payload().as_ptr();
+    }
     // TLAB byte merging is O(TLABs); the policy checks and TLAB slow path that
     // read those bytes merge them, so the per-object path does not.
     let mut state = runtime().heap.lock().unwrap();
@@ -1610,8 +1830,12 @@ fn collect_internal() {
                         .root_scan_bytes
                         .saturating_add(roots.len() as u64 * std::mem::size_of::<usize>() as u64);
                     work.mark_ns = crate::gc_telemetry::elapsed_ns(started);
+                    let mut state = runtime().heap.lock().unwrap();
+                    // No buffer may allocate white between phase 0 and sweep_pending.
+                    old_lab::retire_all(&mut state);
                     GC_MARK_PHASE.store(0, Ordering::Release);
-                    runtime().heap.lock().unwrap().concurrent_cycle = None;
+                    marking::set_concurrent_cycle(&mut state, None);
+                    drop(state);
                     let remaining = marking.queue.end_epoch();
                     assert!(
                         fallback || remaining == 0,
@@ -1637,6 +1861,8 @@ fn collect_internal() {
         sync_tlab_bytes(&mut state);
         let after = state.allocated_bytes as u64;
         let previous_goal = state.threshold_bytes as u64;
+        // The goal and pacer trigger may move down below.
+        invalidate_external_headroom();
         state.threshold_bytes = state
             .allocated_bytes
             .saturating_add(external_bytes())
@@ -1695,8 +1921,9 @@ fn collect_internal() {
                 |_, stop_work| {
                     let mut state = runtime().heap.lock().unwrap();
                     flush_satb_all_locked(&mut state);
+                    old_lab::retire_all(&mut state);
                     GC_MARK_PHASE.store(0, Ordering::Release);
-                    state.concurrent_cycle = None;
+                    marking::set_concurrent_cycle(&mut state, None);
                     retire_tlabs_with_work(&mut state, stop_work);
                     for object in epoch_objects(&state, stop_work) {
                         object.clear_mark();
@@ -1819,8 +2046,9 @@ fn reset_internal() {
         .unwrap_or_else(|e| e.into_inner());
     GC_MARK_PHASE.store(0, Ordering::Release);
     let mut state = runtime().heap.lock().unwrap();
-    state.concurrent_cycle = None;
+    marking::set_concurrent_cycle(&mut state, None);
     state.sweeping = None;
+    publish_collection_busy(&state);
     state.satb = satb::SatbBuffers::default();
     {
         let GcState {
@@ -1842,6 +2070,7 @@ fn reset_internal() {
             tls.start_bits.store(0, Ordering::Release);
         }
     }
+    old_lab::reset(&mut state);
     // Reset owns every remaining payload, including rooted objects. Finalize
     // native owners before clearing their registries or freeing region storage.
     // Drain the index so OldRegion::drop does not revisit reclaimed headers.

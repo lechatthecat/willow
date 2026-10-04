@@ -22,6 +22,8 @@ pub(super) struct ConcurrentCycle {
     pub(super) unindexed: Mutex<HashSet<usize>>,
     pub(super) queue: Arc<crate::gc_mark_queue::MarkWorkQueue>,
     pub(super) work: Mutex<crate::gc_telemetry::MarkWork>,
+    /// Deletion buffers filled without the heap mutex while marking.
+    pub(super) satb_shards: satb::SatbShards,
 }
 
 // Publish accounting and legacy/unindexed exceptions once per bounded drain,
@@ -40,11 +42,15 @@ impl Drop for MarkBatch<'_> {
             // may run after queue retirement makes outstanding reach zero.
             self.cycle.worker_failed.store(true, Ordering::Release);
         }
-        let cpu = self
-            .cpu_start
-            .zip(crate::gc_telemetry::workers::thread_cpu_ns())
-            .and_then(|(start, end)| end.checked_sub(start));
-        {
+        // An idle drain (e.g. an assist finding an empty queue) contributes no
+        // mark work, so it must not dilute the pacer's mark-rate sample.
+        let idle = self.work.marked_bytes == 0
+            && self.work.scanned_bytes == 0
+            && self.work.descriptor_bytes == 0;
+        if !idle {
+            let cpu = self.cpu_start.and_then(|start| {
+                crate::gc_telemetry::workers::thread_cpu_ns()?.checked_sub(start)
+            });
             let mut total = self.cycle.work.lock().unwrap();
             total.marked_bytes = total.marked_bytes.saturating_add(self.work.marked_bytes);
             total.scanned_bytes = total.scanned_bytes.saturating_add(self.work.scanned_bytes);
@@ -123,6 +129,7 @@ impl ConcurrentCycle {
             unindexed: Mutex::new(HashSet::new()),
             queue,
             work: Mutex::new(crate::gc_telemetry::MarkWork::roots(roots)),
+            satb_shards: satb::SatbShards::default(),
         }
     }
 
@@ -430,7 +437,8 @@ impl ConcurrentCycle {
             work: Default::default(),
             deferred: Vec::new(),
             unindexed: HashSet::new(),
-            cpu_start: crate::gc_telemetry::workers::thread_cpu_ns(),
+            // Started at the first work item: an empty drain pays no clock read.
+            cpu_start: None,
         };
         while scanned < limit {
             // Always permit one work item, even after descheduling at entry.
@@ -440,6 +448,9 @@ impl ConcurrentCycle {
             let Some(work) = worker.next_work() else {
                 break;
             };
+            if scanned == 0 {
+                batch.cpu_start = crate::gc_telemetry::workers::thread_cpu_ns();
+            }
             match work.item {
                 MarkWorkItem::Object(object) => {
                     self.trace(object.addr(), children, &mut batch);
@@ -539,14 +550,68 @@ pub(super) fn epoch_objects(
     objects
 }
 
+/// Bumped under the heap lock whenever the concurrent cycle is installed or
+/// cleared (`set_concurrent_cycle`), so a thread revalidates its cached cycle
+/// with one atomic load instead of taking the heap lock.
+pub(super) static ASSIST_CYCLE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The only writer of `GcState::concurrent_cycle`. A removed cycle's shard
+/// buffers are sealed (any entries are dropped: every finishing path flushes
+/// them first), so a thread still holding it can no longer publish into it.
+pub(super) fn set_concurrent_cycle(state: &mut GcState, cycle: Option<Arc<ConcurrentCycle>>) {
+    if let Some(previous) = state.concurrent_cycle.take() {
+        previous.satb_shards.seal(|_| {});
+    }
+    state.concurrent_cycle = cycle;
+    publish_collection_busy(state);
+    ASSIST_CYCLE_GENERATION.fetch_add(1, Ordering::Release);
+}
+
+thread_local! {
+    // Weak: a finished cycle's index is freed even if this thread never
+    // allocates again.
+    static ASSIST_CYCLE: std::cell::RefCell<Option<(u64, std::sync::Weak<ConcurrentCycle>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The installed cycle and the generation it was read at; the heap lock is
+/// taken only when the generation moved since this thread last looked.
+pub(super) fn cached_cycle() -> Option<(u64, Arc<ConcurrentCycle>)> {
+    let generation = ASSIST_CYCLE_GENERATION.load(Ordering::Acquire);
+    // The cache holds a `Weak` (a destructor): during TLS teardown, where
+    // runtime allocation and barriers still run, fall back to the locked
+    // lookup instead of panicking across the C ABI.
+    let cached = ASSIST_CYCLE
+        .try_with(|cached| match &*cached.borrow() {
+            Some((cached, cycle)) if *cached == generation => Some(cycle.upgrade()),
+            _ => None,
+        })
+        .ok()
+        .flatten();
+    if let Some(cycle) = cached {
+        return cycle.map(|cycle| (generation, cycle));
+    }
+    let (generation, cycle) = {
+        let state = runtime().heap.lock().unwrap();
+        (
+            ASSIST_CYCLE_GENERATION.load(Ordering::Relaxed),
+            state.concurrent_cycle.clone(),
+        )
+    };
+    let weak = cycle
+        .as_ref()
+        .map_or_else(std::sync::Weak::new, Arc::downgrade);
+    let _ = ASSIST_CYCLE.try_with(|cached| *cached.borrow_mut() = Some((generation, weak)));
+    cycle.map(|cycle| (generation, cycle))
+}
+
 /// Bounded allocation assistance. Only call outside runtime container locks.
 pub(super) fn assist_concurrent_mark(allocated: u64) {
     if GC_MARK_PHASE.load(Ordering::Acquire) != 1 {
         assist::reset();
         return;
     }
-    let cycle = runtime().heap.lock().unwrap().concurrent_cycle.clone();
-    if let Some(cycle) = cycle
+    if let Some((_, cycle)) = cached_cycle()
         && !cycle.closing.load(Ordering::Acquire)
         && cycle.assist_rate != 0
         && assist::charge(cycle.assist_epoch, allocated, cycle.assist_rate)

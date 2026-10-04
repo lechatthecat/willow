@@ -238,6 +238,12 @@ pub enum GcStoreDestination {
     BlockingRwCell = 13,
 }
 
+/// Flag OR-ed into a `GcStoreDestination` barrier argument when the stored
+/// non-null value is known to be a GC payload start whose header may be read
+/// (class instances, strings, GC-owner words). Lets the runtime barrier skip
+/// the generational heap-locked path for old values while marking.
+pub const GC_STORE_VALUE_HAS_HEADER: i64 = 1 << 32;
+
 /// Derive the opaque layout fingerprint used by generated and native objects.
 pub const fn gc_layout_id(
     kind: GcObjectKind,

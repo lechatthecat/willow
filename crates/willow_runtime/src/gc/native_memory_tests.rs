@@ -37,6 +37,8 @@ fn native_growth_requests_collection_without_a_managed_allocation() {
     willow_push_root(&mut map);
     willow_gc_register_mutator();
     runtime().heap.lock().unwrap().threshold_bytes = 1;
+    // A direct policy write must re-arm lock-free native charging.
+    invalidate_runtime_policy_budgets();
     let allocations = runtime().heap.lock().unwrap().total_allocs;
     crate::map::willow_map_insert(map, 42, 0, 7, 0);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -297,5 +299,111 @@ fn reservation_latch_does_not_suppress_occupied_pacer_pressure() {
         "occupancy must still trigger while reservation pressure is latched"
     );
     willow_pop_root();
+    willow_gc_collect();
+}
+
+#[test]
+fn managed_growth_consumes_lock_free_native_headroom_before_pacer_crossing() {
+    let _guard = runtime_test_guard();
+    willow_gc_init();
+    willow_gc_register_mutator();
+    let room = 4096u64;
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        assert!(state.pacer.enabled());
+        state.threshold_bytes = usize::MAX / 2;
+        state.pacer_trigger = memory_inputs(&state).occupied + room;
+    }
+    invalidate_runtime_policy_budgets();
+    // A locked charge publishes headroom just below the trigger.
+    charge_external(1);
+    let published = EXTERNAL_HEADROOM.load(Ordering::Acquire) as u64;
+    assert_eq!(published, room - 2);
+    // Managed growth (a TLAB sync) uses most of that room without a charge.
+    let managed = room - 100;
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        tlab::add_tlab_accounting(&mut state, 1, managed);
+        assert!(memory_inputs(&state).occupied < state.pacer_trigger);
+    }
+    assert_eq!(
+        EXTERNAL_HEADROOM.load(Ordering::Acquire) as u64,
+        published - managed
+    );
+    // This native charge crosses the trigger: it must take the locked path
+    // and request a collection instead of consuming stale headroom.
+    let majors = runtime().heap.lock().unwrap().major_collections;
+    charge_external(200);
+    {
+        let state = runtime().heap.lock().unwrap();
+        assert!(memory_inputs(&state).occupied >= state.pacer_trigger);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while runtime().heap.lock().unwrap().major_collections == majors {
+        willow_gc_safepoint();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mixed managed+native crossing failed to schedule GC"
+        );
+        std::thread::yield_now();
+    }
+    coordinator::shutdown();
+    release_external(201);
+    willow_gc_unregister_mutator();
+    willow_gc_collect();
+}
+
+#[test]
+fn native_charges_far_below_a_hard_cap_skip_the_heap_lock() {
+    let _guard = runtime_test_guard();
+    willow_gc_init();
+    let cap = 1usize << 40;
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        state.memory_limit_bytes = Some(cap);
+        state.threshold_bytes = usize::MAX / 2;
+        state.pacer_trigger = u64::MAX / 2;
+    }
+    invalidate_runtime_policy_budgets();
+    // A locked charge publishes headroom bounded by the cap watermark.
+    charge_external(1);
+    let room = EXTERNAL_HEADROOM.load(Ordering::Acquire);
+    assert!(room > 4096, "far below the cap: headroom {room}");
+    let heap = runtime().heap.lock().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let charger = std::thread::spawn(move || {
+        charge_external(4096);
+        sender.send(()).unwrap();
+    });
+    let lock_free = receiver
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .is_ok();
+    drop(heap);
+    charger.join().unwrap();
+    assert!(
+        lock_free,
+        "charge far below the cap waited for the heap lock"
+    );
+    assert_eq!(EXTERNAL_HEADROOM.load(Ordering::Acquire), room - 4096);
+    {
+        // Near the cap (past the 3/4 watermark) every charge is exact.
+        let mut state = runtime().heap.lock().unwrap();
+        let committed = memory_inputs(&state).committed as usize;
+        state.memory_limit_bytes = Some(committed + committed / 4);
+        assert_eq!(external_headroom(&state), 0);
+        // Exactly one byte below the watermark leaves no room either.
+        let watermark_limit = (committed + 1).div_ceil(3) * 4;
+        state.memory_limit_bytes = Some(watermark_limit);
+        let watermark = (watermark_limit / 4) * 3;
+        assert_eq!(
+            external_headroom(&state),
+            watermark.saturating_sub(committed).saturating_sub(1)
+        );
+        // A reservation check stops lock-free charging until republished.
+        assert!(can_reserve(&state, 0));
+        assert_eq!(EXTERNAL_HEADROOM.load(Ordering::Acquire), 0);
+        state.memory_limit_bytes = None;
+    }
+    release_external(1 + 4096);
     willow_gc_collect();
 }

@@ -167,7 +167,7 @@ pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {
         };
         cycle.tracing_enabled.store(false, Ordering::Relaxed);
         let cycle = Arc::new(cycle);
-        state.concurrent_cycle = Some(cycle.clone());
+        marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
         GC_MARK_PHASE.store(1, Ordering::Release);
         (before, cycle)
     };

@@ -5347,12 +5347,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if function.locals[local.0 as usize].is_gc_owner() {
             match storage {
                 VarStorage::Stack { slot, .. } => self.stack_store(value, slot),
-                VarStorage::Frame { offset, .. } => self.emit_gc_heap_store_classified(
+                VarStorage::Frame { offset, .. } => self.emit_gc_owner_frame_store(
                     self.async_frame.expect("GC owner frame"),
                     offset,
                     value,
-                    true,
-                    GcStoreDestination::AsyncFrameSlot,
                 ),
                 _ => panic!("opaque GC owner must occupy rooted storage"),
             }

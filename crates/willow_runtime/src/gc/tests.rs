@@ -3992,6 +3992,51 @@ fn runtime_policy_budget_checks_first_then_once_per_chunk() {
     assert!(runtime_policy_check_due(1), "reset expires every budget");
 }
 
+// willow-jz15.53: a locked policy check that finds nothing to do publishes a
+// bounded lock-free headroom; it is zero at a trigger, under any memory cap,
+// and after every policy-input change.
+#[test]
+fn runtime_policy_headroom_is_bounded_and_invalidated() {
+    let _guard = gc_test_guard();
+    reset_gc();
+    willow_alloc(64);
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        state.threshold_bytes = usize::MAX / 2;
+        state.pacer_trigger = u64::MAX / 2;
+    }
+    assert!(!allocation_should_collect());
+    assert_eq!(POLICY_HEADROOM.load(Ordering::Acquire), POLICY_HEADROOM_CAP);
+    assert!(consume_policy_headroom(POLICY_HEADROOM_CAP - 1));
+    assert!(!consume_policy_headroom(2), "headroom never goes negative");
+    assert!(consume_policy_headroom(1));
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        let occupied = memory_inputs(&state).occupied;
+        state.pacer_trigger = occupied;
+        let expected = if state.pacer.enabled() {
+            0
+        } else {
+            POLICY_HEADROOM_CAP
+        };
+        assert_eq!(policy_headroom(&state), expected, "at the pacer trigger");
+        state.pacer_trigger = u64::MAX / 2;
+        state.threshold_bytes = occupied as usize;
+        state.last_major_live_bytes = 0;
+        assert_eq!(policy_headroom(&state), 0, "at the heap goal");
+        state.threshold_bytes = usize::MAX / 2;
+        state.memory_limit_bytes = Some(1 << 40);
+        assert_eq!(policy_headroom(&state), 0, "under a hard cap");
+        state.memory_limit_bytes = None;
+    }
+    assert!(!allocation_should_collect());
+    assert!(POLICY_HEADROOM.load(Ordering::Acquire) > 0);
+    invalidate_runtime_policy_budgets();
+    assert_eq!(POLICY_HEADROOM.load(Ordering::Acquire), 0);
+    reset_gc();
+    assert_eq!(POLICY_HEADROOM.load(Ordering::Acquire), 0);
+}
+
 #[test]
 fn runtime_policy_budget_rearms_on_reservation_growth_only_under_hard_cap() {
     let _guard = gc_test_guard();

@@ -259,3 +259,77 @@ fn object_field_store_sites_add_one_cold_barrier_and_phase_load_each() {
         "scalar stores never read the mark phase"
     );
 }
+
+#[test]
+fn old_string_and_array_owner_stores_keep_heap_consistent() {
+    // willow-jz15.53: String values and opaque array-element owners are
+    // headered GC payloads, so their stores into old fields and async frame
+    // slots read the value's generation and skip the barrier call for old
+    // values outside marking. Young values must still remember the owner, and
+    // the snapshot must stay intact while marking.
+    let source = r#"
+import std::collections::Array;
+class Holder { pub text: String; }
+fn bump(x: &mut i64) { x = x + 1; }
+async fn frame_stores(old: String) -> i64 {
+    let mut text = old;
+    let mut counts: Array<i64> = [0, 0, 0];
+    let mut i = 0;
+    while i < 40 {
+        text = old;
+        await sleep(0);
+        bump(&counts[i % 3]);
+        text = text + "!";
+        await sleep(0);
+        if i % 10 == 0 {
+            gc_minor_collect();
+        }
+        if i % 13 == 0 {
+            gc_collect();
+        }
+        i = i + 1;
+    }
+    return text.len() * 1000 + counts[0] * 100 + counts[1] * 10 + counts[2];
+}
+async fn main() {
+    let h = new Holder("seed");
+    let old = "o" + "ld";
+    let mut i = 0;
+    while i < 4 {
+        gc_minor_collect();
+        i = i + 1;
+    }
+    // Old string into an old owner: no edge, inline skip.
+    h.text = old;
+    println(h.text);
+    // A young string still remembers the owner and survives a minor cycle.
+    h.text = old + "-young";
+    gc_minor_collect();
+    println(h.text);
+    println(await frame_stores(old));
+}
+"#;
+    const EXPECTED: &str = "old\nold-young\n5543\n";
+    for (out, ok) in [
+        compile_and_run(source),
+        compile_and_run_release(source),
+        compile_and_run_gc_stress(source),
+        compile_and_run_gc_stress_mode(source, "minor"),
+        compile_and_run_with_runtime_env(
+            source,
+            &[("WILLOW_GC_VERIFY_BARRIER", "1")],
+            Duration::from_secs(60),
+        ),
+        compile_and_run_with_runtime_env(
+            source,
+            &[
+                ("WILLOW_GC_VERIFY_BARRIER", "1"),
+                ("WILLOW_GC_STRESS", "minor"),
+            ],
+            Duration::from_secs(60),
+        ),
+    ] {
+        assert!(ok, "{out}");
+        assert_eq!(out, EXPECTED);
+    }
+}

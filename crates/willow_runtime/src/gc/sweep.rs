@@ -12,7 +12,10 @@ pub(super) struct SweepPlan {
 pub(super) fn prepare(state: &mut GcState, marking: Option<Arc<ConcurrentCycle>>) -> SweepPlan {
     assert!(state.sweeping.is_none());
     state.sweeping = Some(std::thread::current().id());
+    publish_collection_busy(state);
     state.major_collections = state.major_collections.saturating_add(1);
+    // Active buffers copied a clear sweep_pending flag.
+    old_lab::retire_all(state);
     for region in &mut state.old_regions {
         region.sweep_pending = true;
     }
@@ -108,6 +111,8 @@ fn sweep_region(
     marking: Option<&ConcurrentCycle>,
 ) -> usize {
     let mut freed_bytes = 0;
+    // Index buffer objects carved during this sweep before visiting them.
+    old_lab::retire_region(state, index);
     {
         let GcState {
             old_regions,
@@ -278,6 +283,9 @@ fn sweep_chunk(
 }
 
 fn finish(state: &mut GcState, dead_chunks: &[bool]) {
+    // Release decisions read `allocations`, and remapping invalidates the
+    // region indexes of active buffers.
+    old_lab::retire_all(state);
     let regions_before = state.old_regions.len();
     let mut released = 0usize;
     let mut positions = Vec::with_capacity(regions_before);
@@ -347,6 +355,7 @@ fn finish(state: &mut GcState, dead_chunks: &[bool]) {
             .map(|owner| owner / GC_CARD_SIZE),
     );
     state.sweeping = None;
+    publish_collection_busy(state);
     if std::env::var("WILLOW_GC_VERIFY_REGIONS").is_ok()
         && let Err(message) = verify_old_region_metadata(state)
     {

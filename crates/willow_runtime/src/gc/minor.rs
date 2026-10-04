@@ -20,7 +20,7 @@ use super::{
 /// is unnecessary for collector-private address keys and dominated minor
 /// collection time (willow-8hq4.16).
 #[derive(Default)]
-struct AddressHasher(u64);
+pub(super) struct AddressHasher(u64);
 impl Hasher for AddressHasher {
     fn write(&mut self, bytes: &[u8]) {
         for &byte in bytes {
@@ -642,6 +642,9 @@ fn minor_collect_with_roots(
     let trace_registry = type_registry().lock().unwrap().clone();
     let drop_registry = drop_registry().lock().unwrap().clone();
     let mut state = runtime().heap.lock().unwrap();
+    // Promotion raises `occupied` per object; drop the lock-free headrooms
+    // once instead of charging each copy.
+    super::invalidate_external_headroom();
     if should_defer_minor(&mut state, &roots) {
         state.survivor_stats.deferred_minor_collections += 1;
         state.minor_retry_bytes = state

@@ -94,6 +94,27 @@ impl FreeSpans {
         Some(offset)
     }
 
+    /// Take a prefix of the first span holding at least `minimum` bytes:
+    /// `min(maximum, span size)` bytes. Returns `(offset, len)`.
+    pub(super) fn take_up_to(&mut self, minimum: usize, maximum: usize) -> Option<(usize, usize)> {
+        debug_assert!(minimum > 0 && minimum <= maximum);
+        if self.largest() < minimum {
+            return None;
+        }
+        let mut node = 1;
+        while node < self.leaves {
+            node *= 2;
+            if self.maxima[node] < minimum {
+                node += 1;
+            }
+        }
+        let size = self.spans[node - self.leaves]
+            .expect("fitting leaf owns a free span")
+            .size
+            .min(maximum);
+        Some((self.take(size)?, size))
+    }
+
     pub(super) fn iter(&self) -> impl Iterator<Item = &RegionFreeSpan> {
         self.into_iter()
     }

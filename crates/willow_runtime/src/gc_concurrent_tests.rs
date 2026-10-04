@@ -134,7 +134,7 @@ fn assert_satb_mutation_retains(old: *mut u8, mutation: impl FnOnce()) {
             runtime().concurrent_trace_registry.lock().unwrap().clone(),
             0,
         ));
-        state.concurrent_cycle = Some(cycle.clone());
+        marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
         GC_MARK_PHASE.store(1, Ordering::Release);
         cycle
     };
@@ -149,8 +149,145 @@ fn assert_satb_mutation_retains(old: *mut u8, mutation: impl FnOnce()) {
         "equivalent publications must not create duplicate queue jobs"
     );
     GC_MARK_PHASE.store(0, Ordering::Release);
-    runtime().heap.lock().unwrap().concurrent_cycle = None;
+    marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
     assert_eq!(cycle.queue.end_epoch(), 0);
+}
+
+/// willow-jz15.53: while concurrently marking, write barriers and logical
+/// deletions publish into the cycle's shard buffers without the heap lock.
+/// The closure/remark drain seals the shards and enqueues their entries;
+/// later publications take the heap-locked path.
+#[test]
+fn cycle_cache_lookup_survives_thread_local_teardown() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    let cycle = {
+        let mut state = runtime().heap.lock().unwrap();
+        let cycle = Arc::new(ConcurrentCycle::new(
+            std::iter::empty(),
+            type_registry().lock().unwrap().keys().copied().collect(),
+            runtime().concurrent_trace_registry.lock().unwrap().clone(),
+            0,
+        ));
+        marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
+        cycle
+    };
+    static FOUND: AtomicBool = AtomicBool::new(false);
+    FOUND.store(false, Ordering::Relaxed);
+    struct LookupOnDrop;
+    impl Drop for LookupOnDrop {
+        fn drop(&mut self) {
+            // Runs while (or after) the cache's own TLS slot is torn down.
+            FOUND.store(marking::cached_cycle().is_some(), Ordering::Relaxed);
+        }
+    }
+    thread_local! {
+        static LOOKUP: LookupOnDrop = const { LookupOnDrop };
+    }
+    std::thread::spawn(|| {
+        // Register the lookup first so the cache slot, registered second, is
+        // destroyed before it on platforms with LIFO TLS destruction.
+        LOOKUP.with(|_| ());
+        assert!(marking::cached_cycle().is_some());
+    })
+    .join()
+    .expect("lookup during TLS teardown must not panic");
+    assert!(FOUND.load(Ordering::Relaxed));
+    marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
+    drop(cycle);
+    reset_internal_for_test();
+}
+
+#[test]
+fn marking_barriers_publish_without_heap_lock_until_sealed() {
+    let _guard = runtime_test_guard();
+    reset_internal_for_test();
+    let owner = willow_alloc_typed(8, 1);
+    let old = willow_alloc(8);
+    let value = willow_alloc(8);
+    let deleted = willow_alloc(8);
+    let late = willow_alloc(8);
+    let cycle = {
+        let mut state = runtime().heap.lock().unwrap();
+        retire_all_tlabs_locked(&mut state);
+        let cycle = Arc::new(ConcurrentCycle::new(
+            epoch_objects(&state, &mut Default::default())
+                .into_iter()
+                .map(|o| (o.payload().as_ptr() as usize, o.trace_metadata())),
+            type_registry().lock().unwrap().keys().copied().collect(),
+            runtime().concurrent_trace_registry.lock().unwrap().clone(),
+            0,
+        ));
+        marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
+        GC_MARK_PHASE.store(1, Ordering::Release);
+        cycle
+    };
+    let warmed = Arc::new(AtomicBool::new(false));
+    let go = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let worker = {
+        let (warmed, go, done) = (warmed.clone(), go.clone(), done.clone());
+        let (owner, old, value, deleted) = (
+            owner as usize,
+            old as usize,
+            value as usize,
+            deleted as usize,
+        );
+        std::thread::spawn(move || {
+            // A cache miss reads the cycle under the heap lock: warm it first.
+            assert!(marking::cached_cycle().is_some());
+            warmed.store(true, Ordering::Release);
+            while !go.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            willow_gc_write_barrier(
+                owner as *mut u8,
+                old as *mut u8,
+                value as *mut u8,
+                GcStoreDestination::ObjectField as i64 | willow_abi::GC_STORE_VALUE_HAS_HEADER,
+            );
+            satb_delete(deleted as *mut u8);
+            done.store(true, Ordering::Release);
+        })
+    };
+    while !warmed.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+    {
+        let _heap = runtime().heap.lock().unwrap();
+        go.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            done.load(Ordering::Acquire),
+            "marking barrier blocked on the heap lock"
+        );
+    }
+    worker.join().unwrap();
+    // The new edge is enqueued eagerly; deletions wait in the shard buffer.
+    assert!(cycle.is_marked(value as usize));
+    assert!(!cycle.is_marked(old as usize));
+    assert!(!cycle.is_marked(deleted as usize));
+    flush_satb_all_locked(&mut runtime().heap.lock().unwrap());
+    assert!(
+        cycle.is_marked(old as usize),
+        "sealing lost a shard deletion"
+    );
+    assert!(cycle.is_marked(deleted as usize));
+    assert!(cycle.satb_shards.is_empty());
+    // Sealed: the deletion goes to the heap-locked buffers instead.
+    satb_delete(late);
+    assert!(cycle.satb_shards.is_empty());
+    assert!(!runtime().heap.lock().unwrap().satb.is_empty());
+    flush_satb_all_locked(&mut runtime().heap.lock().unwrap());
+    assert!(cycle.is_marked(late as usize));
+    cycle.drain(usize::MAX);
+    GC_MARK_PHASE.store(0, Ordering::Release);
+    marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
+    assert_eq!(cycle.queue.end_epoch(), 0);
+    reset_internal_for_test();
 }
 
 #[test]
@@ -1759,7 +1896,7 @@ fn native_reference_arrays_use_bounded_continuations_in_the_real_engine() {
         assert!(cycle.deferred.lock().unwrap().is_empty());
         drop(consumer);
         assert_eq!(cycle.queue.end_epoch(), 0);
-        runtime().heap.lock().unwrap().concurrent_cycle = None;
+        marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
         GC_MARK_PHASE.store(0, Ordering::Release);
         willow_pop_root();
         println!("native array slots={slots} jobs={jobs} max_slots_per_job=512");
@@ -2421,7 +2558,7 @@ fn concurrent_closure_waits_for_batched_work_exceptions_and_unwind_publication()
                 0,
             ));
             assert!(cycle.objects.claim(object));
-            state.concurrent_cycle = Some(cycle.clone());
+            marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
             GC_MARK_PHASE.store(1, Ordering::Release);
             cycle
         };
@@ -2481,7 +2618,7 @@ fn concurrent_closure_waits_for_batched_work_exceptions_and_unwind_publication()
                 cycle.deferred.lock().unwrap().len(),
                 usize::from(outcome == 1)
             );
-            runtime().heap.lock().unwrap().concurrent_cycle = None;
+            marking::set_concurrent_cycle(&mut runtime().heap.lock().unwrap(), None);
             GC_MARK_PHASE.store(0, Ordering::Release);
             cycle.queue.end_epoch();
         }
@@ -2614,7 +2751,7 @@ fn closing_phase_publishes_deletions_directly_instead_of_hiding_new_buffer_work(
             1,
         ));
         assert!(cycle.objects.claim(parent));
-        state.concurrent_cycle = Some(cycle.clone());
+        marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
         GC_MARK_PHASE.store(1, Ordering::Release);
         cycle
     };
@@ -2772,7 +2909,7 @@ fn concurrent_closure_paces_contention_and_retains_work_until_release() {
             cycle.slices.insert(0xFA79, budget_retry_slice);
             cycle.enqueue(object as *mut u8);
             let cycle = Arc::new(cycle);
-            state.concurrent_cycle = Some(cycle.clone());
+            marking::set_concurrent_cycle(&mut state, Some(cycle.clone()));
             GC_MARK_PHASE.store(1, Ordering::Release);
             cycle
         };

@@ -1,6 +1,7 @@
 //! Concurrent termination under the barrier publication lock. No mutator is
-//! asked to park. The heap mutex excludes external root/barrier publishers;
-//! queue accounting and engine reader accounting exclude tracing publishers.
+//! asked to park. Closure starts by sealing the cycle's SATB shards, after
+//! which the heap mutex excludes external root/barrier publishers; queue
+//! accounting and engine reader accounting exclude tracing publishers.
 use super::*;
 
 #[cfg(test)]
@@ -28,6 +29,8 @@ pub(super) fn finish_with_wait(
         cycle.closing.store(true, Ordering::Release);
         // Switch deletion publishers to immediate enqueue before this one
         // whole-buffer drain. Closure never rescans M buffers for each work wave.
+        // The drain also seals the shard buffers: from here on every barrier
+        // publication takes this heap lock.
         flush_satb_all_locked(&mut state);
     }
     loop {
@@ -81,8 +84,11 @@ pub(super) fn finish_with_wait(
             }
             let mut work = *cycle.work.lock().unwrap();
             work.mark_ns = crate::gc_telemetry::elapsed_ns(started);
+            // Buffers bump without the heap mutex. Retire them first so none
+            // allocates white after phase 0 into a region missing sweep_pending.
+            old_lab::retire_all(&mut state);
             GC_MARK_PHASE.store(0, Ordering::Release);
-            state.concurrent_cycle = None;
+            marking::set_concurrent_cycle(&mut state, None);
             assert_eq!(
                 cycle.queue.end_epoch(),
                 0,
