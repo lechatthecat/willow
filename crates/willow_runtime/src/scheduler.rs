@@ -3315,7 +3315,7 @@ fn willow_sched_run_parallel(
             Ok(pool) => break pool,
             Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
-                crate::gc::willow_gc_safepoint();
+                crate::gc::relocatable_safepoint();
                 std::thread::yield_now();
             }
         }
@@ -3397,7 +3397,7 @@ impl ParallelCompletion {
         loop {
             // The driver remains a registered mutator. Never hold the completion
             // mutex across a safepoint, and bound every wait so GC can stop it.
-            crate::gc::willow_gc_safepoint();
+            crate::gc::relocatable_safepoint();
             let remaining = self.remaining.lock().unwrap_or_else(|e| e.into_inner());
             if *remaining == 0 {
                 return;
@@ -3961,7 +3961,7 @@ fn scheduler_run_loop(
                 if !stopped && !state.has_live_poll() {
                     // Only a claim was in flight. It resolves within a few
                     // instructions, so retry without the poll back-off.
-                    crate::gc::willow_gc_safepoint();
+                    crate::gc::relocatable_safepoint();
                     std::thread::yield_now();
                     continue;
                 }
@@ -3969,7 +3969,7 @@ fn scheduler_run_loop(
                     // Never enter the GC while holding `claim_gate`: a
                     // collector can be waiting for a worker that needs this
                     // gate before it reaches its own safepoint.
-                    crate::gc::willow_gc_safepoint();
+                    crate::gc::relocatable_safepoint();
                     std::thread::sleep(Duration::from_millis(1));
                     continue;
                 }
@@ -3979,7 +3979,7 @@ fn scheduler_run_loop(
         // Cooperative GC safepoint: cheap (one atomic load) when no collection is
         // pending; lets a parallel collector stop this driver between task polls
         // (willow-6fv.5.6).
-        crate::gc::willow_gc_safepoint();
+        crate::gc::relocatable_safepoint();
         // A runnable CPU task can keep the ready queue non-empty forever.
         // Promote expired timers before selecting work so those tasks still get
         // a turn without waiting for the scheduler to become idle. This runs on

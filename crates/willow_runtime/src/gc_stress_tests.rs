@@ -25,14 +25,41 @@ fn new_tlab_state() -> GcTlabState {
     }
 }
 
-// These retention fixtures need real nursery chunks: allocation stress routes
+// Allocation stress runs a full collection inside every allocation. Fixtures
+// that count allocator reuse, or root tens of thousands of objects while
+// allocating, measure something else under it (or become quadratic).
+fn skip_under_alloc_stress(test_name: &str, reason: &str) -> bool {
+    if gc_stress_enabled("alloc") {
+        eprintln!("SKIP {test_name}: WILLOW_GC_STRESS=alloc (including all) {reason}");
+        return true;
+    }
+    false
+}
+
+// These nursery-chunk fixtures need real TLABs: allocation stress routes
 // the slow allocation directly to old regions and leaves no TLAB to fill.
 // Keep stress enabled for the process; skip only these incompatible fixtures.
-fn skip_pinned_tlab_fixture(test_name: &str) -> bool {
+fn skip_nursery_tlab_fixture(test_name: &str) -> bool {
     if gc_stress_enabled("alloc") {
         eprintln!(
             "SKIP {test_name}: WILLOW_GC_STRESS=alloc (including all) bypasses TLABs; \
-             rerun without alloc/all to exercise pinned-retention assertions"
+             rerun without alloc/all to exercise nursery-chunk assertions"
+        );
+        return true;
+    }
+    false
+}
+
+// Fixtures that fill a TLAB chunk by hand also need the chunk's full limit:
+// relocation stress caps every TLAB at one object.
+fn skip_filled_tlab_fixture(test_name: &str) -> bool {
+    if skip_nursery_tlab_fixture(test_name) {
+        return true;
+    }
+    if gc_stress_enabled("relocate") {
+        eprintln!(
+            "SKIP {test_name}: WILLOW_GC_STRESS=relocate limits TLABs to one object; \
+             rerun without relocate/all to exercise filled-chunk assertions"
         );
         return true;
     }
@@ -99,6 +126,12 @@ fn assert_local_region_valid(region: &OldRegion) {
 fn stress_region_01_middle_hole_churn_reuses_one_region() {
     let _guard = stress_guard();
     reset_gc();
+    if skip_under_alloc_stress(
+        "stress_region_01",
+        "reclaims each garbage object before the next allocation, so the reuse count differs",
+    ) {
+        return;
+    }
     let mut left = willow_alloc_object(1, 8);
     willow_push_root(&mut left);
     for _ in 0..1000 {
@@ -177,6 +210,12 @@ fn stress_region_02_randomized_free_span_allocator_preserves_invariants() {
 fn stress_region_03_sparse_survivors_across_many_regions_stay_stable() {
     let _guard = stress_guard();
     reset_gc();
+    if skip_under_alloc_stress(
+        "stress_region_03",
+        "marks up to 50,000 rooted objects at each of 50,000 allocations",
+    ) {
+        return;
+    }
     const OBJECTS: usize = 50_000;
     const ROOT_STRIDE: usize = 5_000;
     let mut objects = Vec::with_capacity(OBJECTS);
@@ -256,6 +295,9 @@ fn stress_region_04_large_and_regular_cycles_release_every_region() {
 fn stress_region_05_minor_major_and_remembered_set_interleave() {
     let _guard = stress_guard();
     reset_gc();
+    if skip_nursery_tlab_fixture("stress_region_05") {
+        return;
+    }
     let mut parent = willow_alloc_typed(8, 0b1);
     willow_push_root(&mut parent);
     let mut tls = new_tlab_state();
@@ -272,7 +314,7 @@ fn stress_region_05_minor_major_and_remembered_set_interleave() {
         unsafe { *(parent as *mut *mut u8) = young };
         assert_eq!(willow_gc_remembered_set_size(), 1);
 
-        willow_gc_minor_collect();
+        crate::gc::minor_collect_internal();
 
         let survivor = unsafe { *(parent as *mut *mut u8) };
         assert_ne!(survivor, young);
@@ -285,7 +327,7 @@ fn stress_region_05_minor_major_and_remembered_set_interleave() {
 
         // No intervening store: the remembered owner must retain the survivor
         // until the second minor collection tenures it.
-        willow_gc_minor_collect();
+        crate::gc::minor_collect_internal();
         let promoted = unsafe { *(parent as *mut *mut u8) };
         assert_ne!(promoted, survivor);
         assert_eq!(unsafe { *(promoted as *mut i64) }, round);
@@ -308,51 +350,77 @@ fn stress_region_05_minor_major_and_remembered_set_interleave() {
     reset_gc();
 }
 
+/// Reserved nursery plus old-region bytes. Without pinning, sparse survivor
+/// chunks are evacuated, so this stays near the live size instead of growing
+/// with the number of source chunks (willow-9tls.9).
+fn reserved_managed_bytes() -> usize {
+    (willow_gc_old_region_reserved_bytes() + willow_gc_tlab_reserved_bytes()) as usize
+}
+
+/// Upper bound for compact survivor storage: one partly filled old region and
+/// one partly filled survivor chunk beyond the live bytes themselves.
+fn compact_reserved_bound(live: usize) -> usize {
+    live.next_multiple_of(GC_TLAB_CHUNK_SIZE) + GC_OLD_REGION_SIZE + GC_TLAB_CHUNK_SIZE
+}
+
+fn assert_no_pinned_retention(context: &str) {
+    assert_eq!(willow_gc_pinned_region_count(), 0, "{context}");
+    assert_eq!(willow_gc_pinned_promotions(), 0, "{context}");
+}
+
 #[test]
 #[ignore = "explicit GC stress suite"]
-fn stress_region_06_many_sparse_pinned_chunks_are_eventually_released() {
+fn stress_region_06_many_sparse_survivor_chunks_relocate_and_release() {
     let _guard = stress_guard();
     reset_gc();
+    if skip_filled_tlab_fixture("stress_region_06") {
+        return;
+    }
     const CHUNKS: usize = 64;
     const OBJECTS_PER_CHUNK: usize = 64;
     let mut states: Vec<Box<GcTlabState>> =
         (0..CHUNKS).map(|_| Box::new(new_tlab_state())).collect();
     let mut survivors = Vec::with_capacity(CHUNKS);
+    let mut originals = Vec::with_capacity(CHUNKS);
 
     for (index, tls) in states.iter_mut().enumerate() {
         let survivor = willow_gc_alloc_slow(&mut **tls, 1, index as i64 + 1, 8, 0);
         unsafe { *(survivor as *mut i64) = index as i64 };
         survivors.push(survivor);
+        // Relocatable slots: a collection inside the slow path may already
+        // move earlier survivors, and every later read reloads the slot.
         willow_push_root(survivors.last_mut().unwrap());
+        originals.push(survivor);
         for object_index in 1..OBJECTS_PER_CHUNK {
             let dead = tlab_fast_alloc(tls, 2, object_index as u32, 8, 0);
             unsafe { *(dead as *mut i64) = object_index as i64 };
         }
     }
+    // The generated-code entry point runs in a relocation-safe scope.
     willow_gc_minor_collect();
     willow_gc_collect();
 
-    assert_eq!(willow_gc_pinned_region_count(), CHUNKS as i64);
-    assert_eq!(
-        willow_gc_old_region_reserved_bytes(),
-        (CHUNKS * GC_TLAB_CHUNK_SIZE) as i64
+    assert_no_pinned_retention("after evacuating sparse chunks");
+    let live = CHUNKS * SMALL_OBJECT_SIZE;
+    let reserved = reserved_managed_bytes();
+    eprintln!(
+        "sparse survivors relocated: chunks={CHUNKS}, live={live}, reserved={reserved}, \
+         pinned_baseline={}",
+        CHUNKS * GC_TLAB_CHUNK_SIZE
     );
-    assert_eq!(
-        willow_gc_old_region_live_bytes(),
-        (CHUNKS * SMALL_OBJECT_SIZE) as i64
+    assert!(
+        reserved <= compact_reserved_bound(live),
+        "reserved {reserved} bytes for {live} live bytes"
     );
-    assert_eq!(
-        willow_gc_old_region_fragmentation_bytes(),
-        (CHUNKS * (OBJECTS_PER_CHUNK - 1) * SMALL_OBJECT_SIZE) as i64
-    );
-    for (index, survivor) in survivors.iter().enumerate() {
+    for (index, (survivor, original)) in survivors.iter().zip(&originals).enumerate() {
+        assert_ne!(survivor, original, "survivor {index} was evacuated");
         assert_eq!(unsafe { *(*survivor as *mut i64) }, index as i64);
     }
     assert_global_regions_valid();
 
     willow_pop_roots(CHUNKS as i32);
     willow_gc_collect();
-    assert_eq!(willow_gc_pinned_region_count(), 0);
+    assert_eq!(willow_gc_allocated_bytes(), 0);
     assert_eq!(willow_gc_old_region_reserved_bytes(), 0);
     reset_gc();
 }
@@ -422,7 +490,7 @@ fn stress_region_11_generated_graph_preserves_edges_through_moving_collection() 
     let _guard = stress_guard();
     // Allocation stress deliberately bypasses the nursery. The runner also
     // runs this test without that mode so relocation cannot pass vacuously.
-    if skip_pinned_tlab_fixture("stress_region_11") {
+    if skip_filled_tlab_fixture("stress_region_11") {
         return;
     }
     for count in [8usize, 64, 512] {
@@ -470,7 +538,7 @@ fn stress_region_11_generated_graph_preserves_edges_through_moving_collection() 
 
             let mut relocated = Vec::with_capacity(live);
             for round in 0..3 {
-                willow_gc_minor_collect();
+                crate::gc::minor_collect_internal();
                 let mut current = unsafe { *parent.cast::<*mut u8>() };
                 relocated.clear();
                 for (index, &original) in objects.iter().take(live).enumerate() {
@@ -541,9 +609,9 @@ fn stress_region_08_five_mutators_allocate_and_collect_concurrently() {
 
 #[test]
 #[ignore = "explicit GC stress suite"]
-fn stress_region_09_sparse_pinned_waves_quantify_retained_capacity() {
+fn stress_region_09_sparse_survivor_waves_do_not_retain_source_capacity() {
     let _guard = stress_guard();
-    if skip_pinned_tlab_fixture("stress_region_09") {
+    if skip_filled_tlab_fixture("stress_region_09") {
         return;
     }
     reset_gc();
@@ -554,14 +622,13 @@ fn stress_region_09_sparse_pinned_waves_quantify_retained_capacity() {
     const SURVIVOR_PAYLOAD_SIZE: usize = SURVIVOR_SIZE - GC_HEADER_SIZE;
     const OBJECTS_PER_CHUNK: usize = GC_TLAB_CHUNK_SIZE / SURVIVOR_SIZE;
     const TOTAL_CHUNKS: usize = WAVES * CHUNKS_PER_WAVE;
-    const EXPECTED_RESERVED: usize = TOTAL_CHUNKS * GC_TLAB_CHUNK_SIZE;
-    const EXPECTED_LIVE: usize = TOTAL_CHUNKS * SURVIVOR_SIZE;
 
     assert_eq!(SURVIVOR_SIZE, 64);
     assert_eq!(GC_TLAB_CHUNK_SIZE % SURVIVOR_SIZE, 0);
 
     let mut states = Vec::<Box<GcTlabState>>::with_capacity(TOTAL_CHUNKS);
     let mut survivors = Vec::<*mut u8>::with_capacity(TOTAL_CHUNKS);
+    let mut max_reserved = 0;
     for wave in 1..=WAVES {
         for chunk_index in 0..CHUNKS_PER_WAVE {
             let mut tls = Box::new(new_tlab_state());
@@ -590,60 +657,44 @@ fn stress_region_09_sparse_pinned_waves_quantify_retained_capacity() {
         willow_gc_minor_collect();
         willow_gc_collect();
 
-        let expected_chunks = wave * CHUNKS_PER_WAVE;
-        let expected_reserved = expected_chunks * GC_TLAB_CHUNK_SIZE;
-        let expected_live = expected_chunks * SURVIVOR_SIZE;
-        assert_eq!(willow_gc_pinned_region_count(), expected_chunks as i64);
-        assert_eq!(
-            willow_gc_old_region_reserved_bytes(),
-            expected_reserved as i64,
-            "each wave must reserve fresh chunks while earlier sparse chunks stay pinned"
+        assert_no_pinned_retention(&format!("wave {wave}"));
+        let live = wave * CHUNKS_PER_WAVE * SURVIVOR_SIZE;
+        let reserved = reserved_managed_bytes();
+        max_reserved = max_reserved.max(reserved);
+        assert!(
+            reserved <= compact_reserved_bound(live),
+            "wave {wave}: reserved {reserved} bytes for {live} live bytes"
         );
-        assert_eq!(willow_gc_old_region_live_bytes(), expected_live as i64);
-        assert_eq!(
-            willow_gc_old_region_fragmentation_bytes(),
-            (expected_reserved - expected_live) as i64
-        );
-        assert_eq!(expected_reserved / expected_live, 512);
+        for (index, survivor) in survivors.iter().enumerate() {
+            let expected = CHUNKS_PER_WAVE + index;
+            assert_eq!(unsafe { *(*survivor as *mut i64) }, expected as i64);
+        }
         assert_global_regions_valid();
     }
 
+    let live = TOTAL_CHUNKS * SURVIVOR_SIZE;
     eprintln!(
-        "sparse pinned retention: chunks={TOTAL_CHUNKS}, reserved={EXPECTED_RESERVED}, \
-         live={EXPECTED_LIVE}, amplification={}x",
-        EXPECTED_RESERVED / EXPECTED_LIVE
+        "sparse survivor waves: chunks={TOTAL_CHUNKS}, live={live}, max_reserved={max_reserved}, \
+         pinned_baseline={}",
+        TOTAL_CHUNKS * GC_TLAB_CHUNK_SIZE
     );
-    assert_eq!(
-        willow_gc_old_region_reserved_bytes(),
-        (16 * 1024 * 1024) as i64
-    );
-    assert_eq!(willow_gc_old_region_live_bytes(), (32 * 1024) as i64);
 
     for remaining_waves in (0..WAVES).rev() {
         willow_pop_roots(CHUNKS_PER_WAVE as i32);
         willow_gc_collect();
-        let remaining_chunks = remaining_waves * CHUNKS_PER_WAVE;
-        let remaining_reserved = remaining_chunks * GC_TLAB_CHUNK_SIZE;
-        let remaining_live = remaining_chunks * SURVIVOR_SIZE;
-        assert_eq!(willow_gc_pinned_region_count(), remaining_chunks as i64);
-        assert_eq!(
-            willow_gc_old_region_reserved_bytes(),
-            remaining_reserved as i64
-        );
-        assert_eq!(willow_gc_old_region_live_bytes(), remaining_live as i64);
-        assert_eq!(
-            willow_gc_old_region_fragmentation_bytes(),
-            (remaining_reserved - remaining_live) as i64
-        );
+        assert_no_pinned_retention(&format!("{remaining_waves} waves remain"));
+        let remaining_live = remaining_waves * CHUNKS_PER_WAVE * SURVIVOR_SIZE;
+        assert!(reserved_managed_bytes() <= compact_reserved_bound(remaining_live));
     }
+    assert_eq!(willow_gc_allocated_bytes(), 0);
     reset_gc();
 }
 
 #[test]
 #[ignore = "explicit GC stress suite"]
-fn stress_region_10_bounded_runtime_root_lifetimes_bound_pinned_retention() {
+fn stress_region_10_runtime_root_slots_relocate_bounded_lifetimes() {
     let _guard = stress_guard();
-    if skip_pinned_tlab_fixture("stress_region_10") {
+    if skip_filled_tlab_fixture("stress_region_10") {
         return;
     }
     reset_gc();
@@ -654,15 +705,14 @@ fn stress_region_10_bounded_runtime_root_lifetimes_bound_pinned_retention() {
     // Keep the fixture at 64 bytes regardless of the runtime header size.
     const SURVIVOR_SIZE: usize = 64;
     const SURVIVOR_PAYLOAD_SIZE: usize = SURVIVOR_SIZE - GC_HEADER_SIZE;
-    const WAVE_RESERVED: usize = CHUNKS_PER_WAVE * GC_TLAB_CHUNK_SIZE;
-    const WAVE_LIVE: usize = CHUNKS_PER_WAVE * SURVIVOR_SIZE;
-    const WAVE_FRAGMENTATION: usize = CHUNKS_PER_WAVE * (OBJECTS_PER_CHUNK - 1) * SURVIVOR_SIZE;
 
     assert_eq!(SURVIVOR_SIZE, 64);
     let mut states = Vec::<Box<GcTlabState>>::with_capacity(WAVES * CHUNKS_PER_WAVE);
+    // Each batch's buffer is allocated once at full capacity, so its slots stay
+    // put while the batch moves through the queue.
     let mut live_batches = std::collections::VecDeque::<Vec<*mut u8>>::new();
 
-    eprintln!("phase,wave,pinned_regions,reserved_bytes,live_bytes,fragmentation_bytes,ratio");
+    eprintln!("phase,wave,live_slots,reserved_bytes,live_bytes,moved_objects");
     for wave in 1..=WAVES {
         let mut batch = Vec::with_capacity(CHUNKS_PER_WAVE);
         for chunk_index in 0..CHUNKS_PER_WAVE {
@@ -675,8 +725,8 @@ fn stress_region_10_bounded_runtime_root_lifetimes_bound_pinned_retention() {
                 0,
             );
             unsafe { *(survivor as *mut i64) = (wave * CHUNKS_PER_WAVE + chunk_index) as i64 };
-            willow_gc_add_runtime_root(survivor);
             batch.push(survivor);
+            willow_gc_add_runtime_root_slot(batch.last_mut().unwrap());
             for object_index in 1..OBJECTS_PER_CHUNK {
                 let dead = tlab_fast_alloc(&tls, 2, object_index as u32, SURVIVOR_PAYLOAD_SIZE, 0);
                 unsafe { *(dead as *mut i64) = object_index as i64 };
@@ -687,60 +737,48 @@ fn stress_region_10_bounded_runtime_root_lifetimes_bound_pinned_retention() {
 
         willow_gc_minor_collect();
         willow_gc_collect();
-        assert_eq!(
-            willow_gc_old_region_reserved_bytes(),
-            (live_batches.len() * WAVE_RESERVED) as i64
-        );
 
         if live_batches.len() > LIVE_WINDOW {
-            let expired = live_batches
+            let mut expired = live_batches
                 .pop_front()
                 .expect("the oldest runtime-root batch exists");
-            for survivor in expired {
-                willow_gc_remove_runtime_root(survivor);
+            for slot in &mut expired {
+                willow_gc_remove_runtime_root_slot(slot);
             }
             willow_gc_collect();
         }
 
-        let live_waves = wave.min(LIVE_WINDOW);
-        let expected_regions = live_waves * CHUNKS_PER_WAVE;
-        let expected_reserved = live_waves * WAVE_RESERVED;
-        let expected_live = live_waves * WAVE_LIVE;
-        let expected_fragmentation = live_waves * WAVE_FRAGMENTATION;
-        assert_eq!(willow_gc_pinned_region_count(), expected_regions as i64);
-        assert_eq!(
-            willow_gc_old_region_reserved_bytes(),
-            expected_reserved as i64
+        assert_no_pinned_retention(&format!("wave {wave}"));
+        for (offset, batch) in live_batches.iter().enumerate() {
+            let batch_wave = wave + 1 + offset - live_batches.len();
+            for (chunk_index, survivor) in batch.iter().enumerate() {
+                let expected = batch_wave * CHUNKS_PER_WAVE + chunk_index;
+                assert_eq!(unsafe { *(*survivor as *mut i64) }, expected as i64);
+            }
+        }
+        let live = live_batches.len() * CHUNKS_PER_WAVE * SURVIVOR_SIZE;
+        let reserved = reserved_managed_bytes();
+        assert!(
+            reserved <= compact_reserved_bound(live),
+            "wave {wave}: reserved {reserved} bytes for {live} live bytes"
         );
-        assert_eq!(willow_gc_old_region_live_bytes(), expected_live as i64);
-        assert_eq!(
-            willow_gc_old_region_fragmentation_bytes(),
-            expected_fragmentation as i64
-        );
-        assert_eq!(expected_reserved / expected_live, 512);
         assert_global_regions_valid();
         eprintln!(
-            "steady,{wave},{expected_regions},{expected_reserved},{expected_live},\
-             {expected_fragmentation},{}",
-            expected_reserved / expected_live
+            "steady,{wave},{},{reserved},{live},{}",
+            live_batches.len() * CHUNKS_PER_WAVE,
+            willow_gc_moved_objects()
         );
     }
+    assert!(willow_gc_moved_objects() > 0, "runtime root slots relocate");
 
-    while let Some(expired) = live_batches.pop_front() {
-        for survivor in expired {
-            willow_gc_remove_runtime_root(survivor);
+    while let Some(mut expired) = live_batches.pop_front() {
+        for slot in &mut expired {
+            willow_gc_remove_runtime_root_slot(slot);
         }
         willow_gc_collect();
-        assert_eq!(
-            willow_gc_pinned_region_count(),
-            (live_batches.len() * CHUNKS_PER_WAVE) as i64
-        );
-        assert_eq!(
-            willow_gc_old_region_reserved_bytes(),
-            (live_batches.len() * WAVE_RESERVED) as i64
-        );
+        assert_no_pinned_retention("draining runtime root slots");
     }
-    assert_eq!(willow_gc_old_region_live_bytes(), 0);
-    assert_eq!(willow_gc_old_region_fragmentation_bytes(), 0);
+    assert_eq!(crate::gc::runtime_root_count(), 0);
+    assert_eq!(willow_gc_allocated_bytes(), 0);
     reset_gc();
 }

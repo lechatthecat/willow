@@ -175,6 +175,10 @@ impl WillowFutureVoid {
                 all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
             ))]
             if crate::native_stack::is_active() {
+                // Only generated code reaches this through
+                // `willow_future_await_void`; no runtime frame holds a managed
+                // pointer, so the parked task's root slots may be rewritten.
+                let _relocation = crate::gc::RelocationSafeScope::enter();
                 while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
                     if crate::native_stack::cancelled() != 0 {
                         return;

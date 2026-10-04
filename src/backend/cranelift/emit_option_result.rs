@@ -223,6 +223,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
+    // The combinators below read `ptr` and `f_val` only before their first GC
+    // point (the callback or an allocation). Their callers root those values
+    // relocatably and do not reload them, so keep that order.
+
     /// Emit Option<T>.map(f) → Option<U>
     pub(super) fn emit_option_map(
         &mut self,
@@ -570,7 +574,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // trigger before we store it into the new enum. Only reference payloads
         // are rooted; rooting a scalar word would make the GC mark it as a
         // bogus object pointer.
-        let payload_root = payload_is_gc.then(|| self.emit_push_root(payload_val));
+        let payload_root = payload_is_gc.then(|| self.emit_push_relocatable_root(payload_val));
         let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
             GcObjectKind::Enum,
             i64::from(layout.payload_bytes(pointer_bytes)),

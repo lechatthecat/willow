@@ -118,7 +118,7 @@ fn actual_baseline_stops_are_visible_even_for_empty_heaps() {
     let _guard = runtime_test_guard();
     reset_internal_for_test();
     willow_gc_collect();
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
     let stats = snapshot_stops();
     assert_eq!(stats.flags, STOP_COUNTERS_VALID);
     assert_eq!(stats.active_sequence, 0);

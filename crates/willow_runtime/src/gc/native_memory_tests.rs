@@ -146,8 +146,13 @@ fn native_growth_is_included_in_allocation_path_pacer_sample() {
         let total = memory_inputs(&state).allocated_total;
         state.pacer.allocation(0, total);
     }
-    for key in 0..1024 {
+    // Grow by native table bytes alone past one 64 KiB sampling step; the
+    // per-entry size depends on the map layout, so do not fix a key count.
+    let mut key = 0;
+    while external_bytes() < 65536 {
         crate::map::willow_map_insert(map, key, 0, key, 0);
+        key += 1;
+        assert!(key < 1 << 20, "map growth was not accounted");
     }
     let total = {
         let state = runtime().heap.lock().unwrap();

@@ -80,6 +80,9 @@ pub struct GcSurvivorStats {
     pub tenured_objects: u64,
     pub tenured_bytes: u64,
     pub pinned_promotions: u64,
+    /// Minor collections skipped because a thread parked inside runtime code
+    /// published a young referent it may still hold as a raw copy.
+    pub deferred_minor_collections: u64,
     pub survivor_space_reserved: u64,
     pub survivor_space_live: u64,
 }

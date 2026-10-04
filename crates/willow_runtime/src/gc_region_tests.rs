@@ -803,7 +803,7 @@ fn pinned_region_01_metrics_include_in_place_survivor() {
     };
     let mut young = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
     willow_push_root(&mut young);
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_pinning_for_test();
     assert_eq!(willow_gc_pinned_region_count(), 1);
     assert_eq!(willow_gc_old_region_count(), 1);
     assert_eq!(
@@ -830,7 +830,7 @@ fn pinned_region_02_major_collection_releases_unrooted_chunk() {
     };
     let mut young = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
     willow_push_root(&mut young);
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_pinning_for_test();
     willow_pop_root();
     willow_gc_collect();
     assert_eq!(willow_gc_pinned_region_count(), 0);
@@ -849,7 +849,7 @@ fn pinned_region_03_verifier_rejects_missing_mark() {
     };
     let mut young = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
     willow_push_root(&mut young);
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_pinning_for_test();
     let mut state = runtime().heap.lock().unwrap();
     let chunk_index = state
         .tlab_chunks
@@ -876,7 +876,7 @@ fn pinned_region_04_verifier_rejects_live_byte_mismatch() {
     };
     let mut young = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
     willow_push_root(&mut young);
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_pinning_for_test();
     let mut state = runtime().heap.lock().unwrap();
     let chunk_index = state
         .tlab_chunks
@@ -911,7 +911,7 @@ fn pinned_region_05_one_survivor_retains_chunk_and_reports_sparse_liveness() {
     }
     willow_push_root(&mut survivor);
 
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_pinning_for_test();
     willow_gc_collect();
 
     let object_size = GC_HEADER_SIZE + 8;
@@ -953,7 +953,7 @@ fn pinned_region_06_dead_holes_are_not_reused_for_new_tlab_allocations() {
     let mut survivor = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0);
     let dead = tlab_fast_alloc_for_test(&tls, 2, 2, 8, 0);
     willow_push_root(&mut survivor);
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_pinning_for_test();
 
     let fresh = willow_gc_alloc_slow(&mut tls, 3, 3, 8, 0);
     assert_ne!(fresh, dead);
@@ -1115,7 +1115,7 @@ fn remembered_region_05_pinned_owner_tracks_new_young_child() {
     };
     let mut owner = willow_gc_alloc_slow(&mut tls, 1, 1, 8, 0b1);
     willow_push_root(&mut owner);
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_pinning_for_test();
     let child = willow_gc_alloc_slow(&mut tls, 2, 2, 8, 0);
     unsafe { *(child as *mut i64) = 77 };
     willow_gc_write_barrier(
@@ -1126,12 +1126,12 @@ fn remembered_region_05_pinned_owner_tracks_new_young_child() {
     );
     unsafe { *(owner as *mut *mut u8) = child };
     assert_eq!(willow_gc_remembered_set_size(), 1);
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_pinning_for_test();
     let moved = unsafe { *(owner as *mut *mut u8) };
     assert_ne!(moved, child);
     assert_eq!(unsafe { *(moved as *mut i64) }, 77);
     assert_eq!(willow_gc_remembered_set_size(), 1);
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_pinning_for_test();
     assert_eq!(willow_gc_remembered_set_size(), 0);
     willow_pop_root();
     willow_gc_collect();
@@ -1578,7 +1578,7 @@ fn barrier_young_test_skips_old_indexes_and_preserves_tlab_classification() {
             if phase == 1 {
                 retire_all_tlabs_locked(&mut runtime().heap.lock().unwrap());
             } else if phase == 2 {
-                willow_gc_minor_collect();
+                crate::gc::minor_collect_pinning_for_test();
             }
             let state = runtime().heap.lock().unwrap();
             for address in [
@@ -1629,7 +1629,7 @@ fn old_region_lookup_bounds_work_for_hits_misses_nursery_and_pinned_pointers() {
         willow_push_root(&mut young);
         for pinned in [false, true] {
             if pinned {
-                willow_gc_minor_collect();
+                crate::gc::minor_collect_pinning_for_test();
             }
             let state = runtime().heap.lock().unwrap();
             assert_eq!(state.old_regions.len(), count);
@@ -1696,7 +1696,7 @@ fn barrier_tlab_range_index_survives_minor_swap_removal() {
         for root in &mut roots {
             willow_push_root(root);
         }
-        willow_gc_minor_collect();
+        crate::gc::minor_collect_pinning_for_test();
         let state = runtime().heap.lock().unwrap();
         assert_eq!(state.tlab_chunks.len(), count / 2);
         for (index, &address) in addresses.iter().enumerate() {

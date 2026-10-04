@@ -46,7 +46,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if !matches!(modes.get(index), Some(ParamMode::Reference { .. }))
                 && is_gc_managed(ty, self.enum_infos)
             {
-                self.emit_push_root(value);
+                self.emit_push_call_root(value);
                 roots += 1;
             }
         }
@@ -77,11 +77,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             self.emit_callstack_push(method, span)
         };
-        // Frame-backed receivers need a direct root to pin their loaded SSA
-        // alias while the user method runs.
+        // Frame-backed receivers need a root until the callee roots `self`;
+        // nothing between here and the call allocates, and the caller never
+        // reuses `self_ptr` afterwards, so the referent may move.
         let receiver_roots = usize::from(!receiver_rooted);
         if !receiver_rooted {
-            self.emit_push_root(self_ptr);
+            self.emit_push_call_root(self_ptr);
         }
         // An indirect call cannot be cleared by one implementation's summary:
         // any reachable target's panic is this call site's panic.
@@ -257,7 +258,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // (willow-8hq4.14).
         let receiver_roots = usize::from(slots.needs_receiver_root);
         if slots.needs_receiver_root {
-            self.emit_push_root(obj);
+            self.emit_push_call_root(obj);
         }
         // The callee is named by its bare method name, and no parameter debug
         // is recorded for it.

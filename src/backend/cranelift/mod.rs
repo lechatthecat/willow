@@ -1597,6 +1597,13 @@ struct FlatReferenceDebug {
     index: usize,
 }
 
+/// Size of the reference cell a `&`/`&mut` argument points to: a managed base
+/// word (null for native stack storage) followed by a byte offset. Passing the
+/// owner and offset instead of an interior pointer lets a moving collection
+/// relocate the owner without pinning it (willow-9tls.9,
+/// docs/decisions/0011-reference-cell-abi.md).
+const REFERENCE_CELL_BYTES: u32 = 16;
+
 #[derive(Clone)]
 enum VarStorage {
     Value {
@@ -1606,6 +1613,8 @@ enum VarStorage {
         slot: cranelift_codegen::ir::StackSlot,
         ty: Type,
     },
+    /// A `&`/`&mut` parameter: `var` holds the address of the caller's
+    /// reference cell, never a raw interior pointer.
     ReferencePtr {
         var: Variable,
         ty: Type,
@@ -1820,7 +1829,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             VarStorage::Value { var, .. } => self.builder.use_var(*var),
             VarStorage::Stack { slot, ty } => self.stack_load(self.clif_type(ty), *slot),
             VarStorage::ReferencePtr { var, ty } => {
-                let ptr = self.builder.use_var(*var);
+                let ptr = self.reference_cell_address(*var);
                 self.builder.ins().load(
                     self.classes
                         .clif_type(reference_type(self.module.target_config()), ty),
@@ -1851,7 +1860,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.stack_store(val, *slot);
             }
             VarStorage::ReferencePtr { var, ty } => {
-                let ptr = self.builder.use_var(*var);
+                let ptr = self.reference_cell_address(*var);
                 self.store_indirect_reference(ptr, val, ty);
             }
             VarStorage::Frame { offset, ty } => {
@@ -1861,6 +1870,24 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_gc_heap_store(base, *offset, val, ty, GcStoreDestination::AsyncFrameSlot);
             }
         }
+    }
+
+    /// Re-derive a reference parameter's address from its caller-owned cell
+    /// (`base + offset`, see [`REFERENCE_CELL_BYTES`]). The caller roots the
+    /// base slot, so a moving collection rewrites it; deriving the address at
+    /// each access means no interior pointer is held across a GC point.
+    fn reference_cell_address(&mut self, cell: Variable) -> cranelift_codegen::ir::Value {
+        let ptr_ty = reference_type(self.module.target_config());
+        let cell = self.builder.use_var(cell);
+        let base = self
+            .builder
+            .ins()
+            .load(ptr_ty, MemFlagsData::new(), cell, 0);
+        let offset = self
+            .builder
+            .ins()
+            .load(ptr_ty, MemFlagsData::new(), cell, 8);
+        self.builder.ins().iadd(base, offset)
     }
 
     fn store_indirect_reference(
@@ -1921,8 +1948,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         value
     }
 
-    /// Whether [`Self::coerce_to_target`] allocates an interface box, the only
-    /// coercion that can reach a GC safepoint.
+    /// Whether [`Self::coerce_to_target`] pairs a class object with a vtable.
+    /// Interface values are inline object/vtable pairs (willow-9tls.12), so
+    /// this builds no heap box: no coercion reaches a GC safepoint, and
+    /// callers may keep using relocatably rooted operands across one.
     fn coercion_boxes(&self, value_ty: &Type, target_ty: &Type) -> bool {
         matches!(target_ty, Type::Named(n) | Type::Generic(n, _) if self.classes.is_interface(n))
             && matches!(value_ty, Type::Named(n) if self.classes.is_class(n))

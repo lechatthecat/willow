@@ -1546,7 +1546,7 @@ mod tests {
         }
         let moved_before = crate::gc::willow_gc_moved_objects();
 
-        let collector = std::thread::spawn(|| crate::gc::willow_gc_minor_collect());
+        let collector = std::thread::spawn(crate::gc::minor_collect_internal);
         // Wait for the COORDINATION flag, not the lock-free gate: the gate is
         // published first, and a safepoint reached between the two returns
         // without parking, which would leave the collector waiting forever.
@@ -1608,7 +1608,7 @@ mod tests {
             "the copy joined the remembered set"
         );
 
-        crate::gc::willow_gc_minor_collect();
+        crate::gc::minor_collect_internal();
 
         let moved = willow_map_get(map, 1, 0, 1);
         assert_ne!(moved, young, "the young value was evacuated");

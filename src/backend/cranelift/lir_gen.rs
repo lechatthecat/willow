@@ -5573,13 +5573,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             channel_runtime_suffix(elem_ty)
                         );
                         let before = self.gc_root_count;
-                        let value = if self.is_inline_pair(elem_ty) {
-                            self.emit_push_root(channel);
+                        let (channel, value) = if self.is_inline_pair(elem_ty) {
+                            let channel_root = self.emit_push_relocatable_root(channel);
                             let word = self.emit_to_storage_word(value, elem_ty);
-                            self.emit_push_root(word);
-                            word
+                            self.emit_push_call_root(word);
+                            (self.emit_reload_root(channel_root, channel), word)
                         } else {
-                            value
+                            (channel, value)
                         };
                         let sent = self.emit_value_runtime_call(&runtime, &[channel, value]);
                         self.emit_pop_roots_n(self.gc_root_count - before);
@@ -6725,18 +6725,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let result = self.emit_lir_operand(function, value);
                     // The `Result` object outlives any allocating defer between
                     // here and the exit that reads its tag.
-                    let rooted = is_gc_managed(return_type, self.enum_infos);
-                    if rooted {
-                        self.emit_push_root(result);
-                    }
+                    let slot = is_gc_managed(return_type, self.enum_infos)
+                        .then(|| self.emit_push_relocatable_root(result));
                     self.emit_flush_defers_from(0);
                     if self.terminated {
                         return;
                     }
-                    if rooted {
-                        self.emit_pop_roots_n(1);
-                        self.gc_root_count -= 1;
-                    }
+                    let result = match slot {
+                        Some(slot) => {
+                            let result = self.emit_reload_root(slot, result);
+                            self.emit_pop_roots_n(1);
+                            self.gc_root_count -= 1;
+                            result
+                        }
+                        None => result,
+                    };
                     // Pops the function's remaining roots on both of its arms.
                     self.emit_callstack_unwind_edge();
                     self.emit_main_result_exit(result);
@@ -6947,8 +6950,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             LirOperand::Int(value) => self.builder.ins().iconst(types::I64, *value),
             LirOperand::Float(value) => self.builder.ins().f64const(*value),
             LirOperand::Bool(value) => self.builder.ins().iconst(types::I8, i64::from(*value)),
-            LirOperand::Reference { place, .. } => {
-                self.emit_flat_reference_address(function, place)
+            LirOperand::Reference { .. } => {
+                unreachable!("reference operands are emitted as call cells")
             }
         }
     }
@@ -7124,6 +7127,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 arg_types,
                 result,
             } => {
+                // The relocatable operand roots stay valid: on every static
+                // call path the operands reach the callee without an
+                // intervening GC point, except heap enum construction, which
+                // roots and reloads its payloads around the allocation.
                 let (args, roots) = self.emit_flat_call_operands(function, args);
                 let result = self.emit_lir_static_call_values(
                     &class.to_string(),
@@ -7228,7 +7235,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             LirRvalue::IntoError { value, source, .. } => {
                 let value = self.emit_lir_operand(function, value);
-                self.emit_push_root(value);
+                self.emit_push_call_root(value);
                 let panic_depth = self.emit_pre_willow_call_panic_depth();
                 let Type::Named(class) = source else {
                     unreachable!("Into error source class validated");
@@ -7390,10 +7397,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             } => {
                 let closure = matches!(callee.ty(&function.locals), Some(Type::Closure(..)));
                 let target = self.emit_lir_operand(function, callee);
-                let mut roots = 0;
+                // Operands are rooted relocatably and reloaded just before the
+                // call, so evaluating a later operand may move earlier ones.
+                let mut slots = Vec::with_capacity(args.len() + usize::from(closure));
                 if closure {
-                    self.emit_push_root(target);
-                    roots += 1;
+                    slots.push(Some(self.emit_push_relocatable_root(target)));
                 }
                 let code = if closure {
                     self.builder.ins().load(
@@ -7411,12 +7419,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 for (argument, ty) in args.iter().zip(params) {
                     let value = self.emit_lir_operand(function, argument);
-                    if is_gc_managed(ty, self.enum_infos) {
-                        self.emit_push_root(value);
-                        roots += 1;
-                    }
+                    slots.push(
+                        is_gc_managed(ty, self.enum_infos)
+                            .then(|| self.emit_push_relocatable_root(value)),
+                    );
                     values.push(value);
                 }
+                let roots = slots.iter().flatten().count();
                 let mut signature = self.module.make_signature();
                 if closure {
                     signature
@@ -7434,6 +7443,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let signature = self.builder.import_signature(signature);
                 let pushed = self.emit_callstack_push(&name.to_string(), span);
                 let panic_depth = self.emit_pre_willow_call_panic_depth();
+                for (value, slot) in values.iter_mut().zip(&slots) {
+                    if let Some(slot) = *slot {
+                        *value = self.emit_reload_root(slot, *value);
+                    }
+                }
                 let call = self.builder.ins().call_indirect(signature, code, &values);
                 let result = self
                     .builder
@@ -7466,8 +7480,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     } else {
                         "willow_string_eq"
                     };
-                    self.emit_push_root(lhs);
-                    self.emit_push_root(rhs);
+                    self.emit_push_call_root(lhs);
+                    self.emit_push_call_root(rhs);
                     let raw = self
                         .emit_runtime_call_with_cleanup(name, &[lhs, rhs], |this| {
                             this.emit_pop_roots_n(2);
@@ -7632,7 +7646,26 @@ fn flat_intrinsic_supported(
     }
 }
 
+/// Relocatable root slots of an intrinsic's GC-managed operands.
+struct OperandRoots {
+    receiver: Option<cranelift_codegen::ir::StackSlot>,
+    args: Vec<Option<cranelift_codegen::ir::StackSlot>>,
+}
+
 impl<'a, 'b> FuncGen<'a, 'b> {
+    /// Reload a possibly rooted operand after a GC point; unrooted (scalar)
+    /// operands are returned unchanged.
+    fn emit_reload_operand(
+        &mut self,
+        slot: Option<cranelift_codegen::ir::StackSlot>,
+        value: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        match slot {
+            Some(slot) => self.emit_reload_root(slot, value),
+            None => value,
+        }
+    }
+
     /// Operands are already evaluated, typed, and rooted by LIR. This emitter
     /// performs one resolved operation; it never walks executable syntax.
     // Keep explicit emission operands aligned with the LIR/runtime ABI.
@@ -7644,7 +7677,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         receiver_ty: &Type,
         args: &[cranelift_codegen::ir::Value],
         arg_types: &[Type],
-        result: &Type,
+        _result: &Type,
         span: Span,
     ) -> cranelift_codegen::ir::Value {
         // Length has no allocating/coercing successful path. Its only runtime
@@ -7661,24 +7694,32 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 return self.emit_scalar_array_push(receiver, word);
             }
         }
-        // Frame-backed references can otherwise move during a coercion or a
-        // blocking runtime call. Direct roots pin every loaded SSA operand.
+        // Frame-backed references can otherwise move during a blocking runtime
+        // call. The operand roots are relocatable: an arm that reaches an
+        // allocation before its runtime call reloads the operands it still
+        // needs from these slots. `coerce_to_target` never allocates (it
+        // builds inline interface pairs), so the only such allocation is
+        // boxing an inline pair into its storage word.
         let roots_before = self.gc_root_count;
-        if is_gc_managed(receiver_ty, self.enum_infos) {
-            self.emit_push_root(receiver);
-        }
-        for (&value, ty) in args.iter().zip(arg_types) {
-            if is_gc_managed(ty, self.enum_infos) {
-                self.emit_push_root(value);
-            }
-        }
+        let roots = OperandRoots {
+            receiver: is_gc_managed(receiver_ty, self.enum_infos)
+                .then(|| self.emit_push_relocatable_root(receiver)),
+            args: args
+                .iter()
+                .zip(arg_types)
+                .map(|(&value, ty)| {
+                    is_gc_managed(ty, self.enum_infos)
+                        .then(|| self.emit_push_relocatable_root(value))
+                })
+                .collect(),
+        };
         let value = self.emit_flat_intrinsic_inner(
             intrinsic,
             receiver,
             receiver_ty,
             args,
             arg_types,
-            result,
+            &roots,
             span,
         );
         self.emit_pop_roots_n(self.gc_root_count - roots_before);
@@ -7695,7 +7736,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         receiver_ty: &Type,
         args: &[cranelift_codegen::ir::Value],
         arg_types: &[Type],
-        _result: &Type,
+        roots: &OperandRoots,
         _span: Span,
     ) -> cranelift_codegen::ir::Value {
         use Intrinsic::*;
@@ -7798,7 +7839,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 if let Some(&value) = args.first() {
                     let word = self.emit_to_storage_word(value, element);
                     if self.is_inline_pair(element) {
-                        self.emit_push_root(word);
+                        self.emit_push_call_root(word);
+                        values[0] = self.emit_reload_operand(roots.receiver, receiver);
                     }
                     values.push(word);
                 }
@@ -7831,17 +7873,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let mut values = vec![receiver];
                 if let Some(&value) = args.first() {
                     let value = self.coerce_to_target(value, &arg_types[0], element);
-                    if is_gc_managed(element, self.enum_infos) {
-                        self.emit_push_root(value);
-                    }
                     let value = if self.is_inline_pair(element) {
-                        self.emit_to_storage_word(value, element)
+                        let word = self.emit_to_storage_word(value, element);
+                        self.emit_push_call_root(word);
+                        values[0] = self.emit_reload_operand(roots.receiver, receiver);
+                        word
                     } else {
                         value
                     };
-                    if self.is_inline_pair(element) {
-                        self.emit_push_root(value);
-                    }
                     values.push(value);
                 }
                 let value = self
@@ -7856,14 +7895,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             ArrayLen | FrozenArrayLen => self.emit_array_access(receiver, None, None),
             ArrayPush => {
                 let element = array_element_type(receiver_ty);
+                // Only boxing an inline-pair element allocates.
                 let value = self.coerce_to_target(args[0], &arg_types[0], &element);
-                if is_gc_managed(&element, self.enum_infos) {
-                    self.emit_push_root(value);
-                }
                 let word = self.emit_to_storage_word(value, &element);
-                if self.is_inline_pair(&element) {
-                    self.emit_push_root(word);
-                }
+                let receiver = if self.is_inline_pair(&element) {
+                    self.emit_push_call_root(word);
+                    self.emit_reload_operand(roots.receiver, receiver)
+                } else {
+                    receiver
+                };
                 let runtime = if self.is_inline_pair(&element) {
                     "willow_array_push_scalar_pairs"
                 } else {
@@ -7912,7 +7952,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             MapContains | FrozenMapContains | MapGet | FrozenMapGet | MapInsert => {
                 let (_, parameters) = lir_collection(receiver_ty).expect("validated map intrinsic");
                 let (key_ty, value_ty) = (&parameters[0], &parameters[1]);
+                // Boxing a pair key or value allocates, so every operand
+                // used after one is reloaded from its root.
                 let key = self.emit_to_storage_word(args[0], key_ty);
+                let key_slot = (self.is_inline_pair(key_ty) && intrinsic == MapInsert)
+                    .then(|| self.emit_push_relocatable_root(key));
+                let receiver = self.emit_reload_operand(roots.receiver, receiver);
                 let key_ref = self.map_is_ref_flag(key_ty);
                 match intrinsic {
                     MapContains | FrozenMapContains => {
@@ -7926,14 +7971,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         self.emit_map_get_value(receiver, key, key_ref, value_ty)
                     }
                     MapInsert => {
-                        let value = self.coerce_to_target(args[1], &arg_types[1], value_ty);
-                        if is_gc_managed(value_ty, self.enum_infos) {
-                            self.emit_push_root(value);
-                        }
+                        // Only boxing an inline-pair value allocates; the
+                        // coercion and a non-pair storage word do not.
+                        let value = self.emit_reload_operand(roots.args[1], args[1]);
+                        let value = self.coerce_to_target(value, &arg_types[1], value_ty);
                         let word = self.emit_to_storage_word(value, value_ty);
-                        if self.is_inline_pair(value_ty) {
-                            self.emit_push_root(word);
-                        }
+                        let (receiver, key) = if self.is_inline_pair(value_ty) {
+                            self.emit_push_call_root(word);
+                            (
+                                self.emit_reload_operand(roots.receiver, receiver),
+                                match key_slot {
+                                    Some(slot) => self.emit_reload_root(slot, key),
+                                    None => self.emit_reload_operand(roots.args[0], key),
+                                },
+                            )
+                        } else {
+                            (receiver, key)
+                        };
                         let value_ref = self.map_is_ref_flag(value_ty);
                         self.emit_void_runtime_call(
                             "willow_map_insert",
@@ -7968,16 +8022,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let (ok_ty, err_ty) = (payload(0), payload(1));
         let recv = receiver;
         let roots_before = self.gc_root_count;
+        // The operands stay rooted for the whole method. Every combinator
+        // reads the receiver and its arguments before its first GC point (the
+        // callback call, an allocation or a panic), never after one, so the
+        // roots may relocate without reloads. A combinator that needs an
+        // operand after a GC point must reload it from a relocatable root;
+        // `option_result_combinators_read_receivers_before_gc_points` runs
+        // every combinator under moving, poisoning stress.
         for (&value, ty) in args.iter().zip(arg_types) {
             if is_gc_managed(ty, self.enum_infos) {
-                self.emit_push_root(value);
+                self.emit_push_relocatable_root(value);
             }
         }
-        // Every branch below either allocates a panic message or evaluates an
-        // argument that may allocate, and the receiver is otherwise live only
-        // in an SSA register — so it is rooted for the whole method.
         if is_gc_managed(receiver_ty, self.enum_infos) {
-            self.emit_push_root(recv);
+            self.emit_push_relocatable_root(recv);
         }
         let value = match (id, method) {
             (B::Option, "is_some") => self.emit_option_is_some(recv, &ok_ty),
@@ -8185,8 +8243,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let mut initial = self.emit_to_storage_word(args[0], &protected);
             let is_ref = super::type_helpers::storage_is_gc_managed(&protected, self.enum_infos);
             if is_ref {
-                let slot = self.emit_push_root(initial);
-                initial = self.stack_load(reference_type(self.module.target_config()), slot);
+                let slot = self.emit_push_relocatable_root(initial);
+                initial = self.emit_reload_root(slot, initial);
             }
             let word = initial;
             let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
@@ -8409,14 +8467,32 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if !layout.is_heap {
             return self.builder.ins().iconst(types::I64, tag);
         }
+        // The payload allocation may move managed arguments: root each in a
+        // relocatable slot and store the reloaded value (willow-9tls.9).
+        let slots: Vec<_> = args
+            .iter()
+            .zip(&layout.fields)
+            .map(|(&value, (ty, _))| {
+                is_gc_managed(ty, self.enum_infos).then(|| self.emit_push_relocatable_root(value))
+            })
+            .collect();
         let ptr = self.emit_gc_alloc(layout.gc_layout.clone());
         let tag_value = self.builder.ins().iconst(types::I64, layout.tag);
         self.builder
             .ins()
             .store(MemFlagsData::new(), tag_value, ptr, 0i32);
-        for (&value, (ty, offset)) in args.iter().zip(&layout.fields) {
+        for ((&value, (ty, offset)), slot) in args.iter().zip(&layout.fields).zip(&slots) {
+            let value = match slot {
+                Some(slot) => self.emit_reload_root(*slot, value),
+                None => value,
+            };
             let word = self.coerce_to_i64(value, ty);
             self.emit_gc_heap_store(ptr, *offset, word, ty, GcStoreDestination::EnumPayload);
+        }
+        let roots = slots.iter().flatten().count();
+        if roots > 0 {
+            self.emit_pop_roots_n(roots);
+            self.gc_root_count -= roots;
         }
         ptr
     }
@@ -8579,12 +8655,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return self.emit_pair(tag, payload);
         }
         let layout = self.enum_payload_layout(class, variant, enum_ty);
+        // No GC point sits between these roots and the store below.
         let before = self.gc_root_count;
         if layout.is_heap {
-            self.emit_push_root(object);
+            self.emit_push_relocatable_root(object);
         }
         if is_gc_managed(source_ty, self.enum_infos) {
-            self.emit_push_root(value);
+            self.emit_push_relocatable_root(value);
         }
         let (target, offset) = &layout.fields[index];
         let value = self.coerce_to_target(value, source_ty, target);

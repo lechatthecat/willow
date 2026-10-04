@@ -453,7 +453,7 @@ fn parked_native_stack_roots_survive_major_and_minor_then_resume() {
     let token = unsafe { park_current_roots(depth) };
     assert_eq!(gc_thread_root_depth(), depth);
     willow_gc_collect();
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
     assert_eq!(willow_gc_allocated_bytes(), (GC_HEADER_SIZE + 8) as i64);
     unsafe {
         resume_parked_roots(token);
@@ -712,7 +712,7 @@ fn minor_collection_pins_children_when_region_budget_prevents_copying() {
         store_gc_reference(parent.cast(), child);
     }
     runtime().heap.lock().unwrap().memory_limit_bytes = Some(2 * GC_TLAB_CHUNK_SIZE);
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
     assert_eq!(unsafe { load_gc_reference(parent.cast()) }, child);
     let state = runtime().heap.lock().unwrap();
     assert_eq!(state.promoted_objects, 2);
@@ -813,7 +813,7 @@ fn captured_array_owner_survives_resize_and_moving_collection() {
         crate::array::willow_array_reference_owner(array, 0),
         captured
     );
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
     let relocated = unsafe { load_gc_reference(frame.cast()) };
     assert_ne!(relocated, captured, "captured owner should have evacuated");
     assert_eq!(unsafe { *relocated.cast::<i64>().add(1) }, 17);
@@ -1886,7 +1886,7 @@ fn nested_scope_remembers_young_frames_without_an_independent_child_root() {
             .remembered_set
             .contains(&(child as usize))
     );
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
     let trace = type_registry().lock().unwrap()[&willow_abi::runtime_type_ids::TASK_SCOPE_TYPE_ID];
     let mut slots = Vec::new();
     unsafe { trace(child, &mut slots) };
@@ -1954,7 +1954,7 @@ fn task_scope_graph_traces_each_scope_and_frame_once() {
             let retained = willow_gc_allocated_bytes();
             willow_pop_roots(count as i32);
             willow_push_root(&mut handles[0]);
-            willow_gc_minor_collect();
+            crate::gc::minor_collect_internal();
             willow_gc_collect();
             assert_eq!(
                 willow_gc_allocated_bytes(),
@@ -2380,7 +2380,7 @@ fn registered_peers_do_not_hide_an_unregistered_foreign_root_owner() {
         let mutator = crate::gc::MutatorRegistration::new();
         assert!(multi_mutator_active());
         willow_gc_collect();
-        willow_gc_minor_collect();
+        crate::gc::minor_collect_internal();
         drop(mutator);
     })
     .join()

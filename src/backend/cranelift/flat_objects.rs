@@ -61,7 +61,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let source_ty = Self::flat_operand_type(function, value);
             let value = self.emit_lir_operand(function, value);
             let value = self.coerce_to_target(value, &source_ty, element_ty);
-            let array_root = self.emit_push_root(array);
+            let array_root = self.emit_push_relocatable_root(array);
             let existing = self.emit_value_runtime_call("willow_array_get", &[array, index]);
             let update = self.builder.create_block();
             let initialize = self.builder.create_block();
@@ -95,21 +95,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let array = self.emit_lir_operand(function, array);
         let source_ty = Self::flat_operand_type(function, value);
         // A frame-backed local is only an interior edge of the rooted frame.
-        // Only an interface-boxing coercion allocates, so only it needs the
-        // loaded owner pinned.
-        let boxes = self.coercion_boxes(&source_ty, element_ty) || self.is_inline_pair(element_ty);
-        if boxes {
-            self.emit_push_root(array);
-        }
+        // Inline pairs, whose storage word allocates a box, returned above.
+        // Neither the coercion (an inline interface pair, willow-9tls.12) nor
+        // a non-pair storage word reaches a GC point, so `array` stays valid.
         let index = self.emit_lir_operand(function, index);
         let value = self.emit_lir_operand(function, value);
         let value = self.coerce_to_target(value, &source_ty, element_ty);
         let value = self.emit_to_storage_word(value, element_ty);
         self.emit_word_array_store(array, index, value);
-        if boxes {
-            self.emit_pop_roots_n(1);
-            self.gc_root_count -= 1;
-        }
         self.builder.ins().iconst(types::I64, 0)
     }
 
@@ -434,8 +427,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(slow);
         self.builder.seal_block(slow);
-        // Also pin frame-backed SSA receivers while runtime growth allocates.
-        self.emit_push_root(array);
+        // Also root frame-backed SSA receivers while runtime growth allocates;
+        // nothing uses `array` after the call.
+        self.emit_push_call_root(array);
         self.emit_void_runtime_call("willow_array_push", &[array, word]);
         self.emit_pop_roots_n(1);
         self.gc_root_count -= 1;
@@ -500,13 +494,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let (offset, target_ty) = layout.field(field).expect("checked field");
         let object = self.emit_lir_operand(function, object);
         let source_ty = Self::flat_operand_type(function, value);
-        // The store and its barrier never reach a safepoint; only an
-        // interface-boxing coercion allocates, so only it needs the owner
-        // rooted (willow-8hq4.16).
-        let boxes = self.coercion_boxes(&source_ty, target_ty);
-        if boxes {
-            self.emit_push_root(object);
-        }
+        // Neither the coercion (an inline interface pair, willow-9tls.12) nor
+        // the store and its barrier reach a safepoint, so `object` stays
+        // valid without a root (willow-8hq4.16).
         let value = self.emit_lir_operand(function, value);
         let value = self.coerce_to_target(value, &source_ty, target_ty);
         self.emit_gc_heap_store(
@@ -516,10 +506,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             target_ty,
             GcStoreDestination::ObjectField,
         );
-        if boxes {
-            self.emit_pop_roots_n(1);
-            self.gc_root_count -= 1;
-        }
         self.builder.ins().iconst(types::I64, 0)
     }
 
@@ -581,7 +567,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         span: Span,
     ) -> Value {
         let ptr = self.emit_lir_operand(function, object);
-        self.emit_push_root(ptr);
+        // Only the `init` call below consumes `ptr`. Operand evaluation and
+        // coercions in between reach no GC point: `coerce_to_target` builds
+        // inline interface pairs without allocating (willow-9tls.12).
+        self.emit_push_call_root(ptr);
         let mangled = class_method_symbol_name(self.known_modules, &class.to_string(), "init");
         let init_fid = self
             .func_ids
@@ -604,10 +593,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             } else {
                 self.coerce_to_target(value, source_ty, target_ty)
             };
-            // Interface coercions can allocate new boxes not held by the source
-            // locals; retain them across later coercions and the constructor.
+            // Coerced values are new SSA values not held by the source locals;
+            // root them for the constructor, which re-roots its parameters.
             if !reference && is_gc_managed(target_ty, self.enum_infos) {
-                self.emit_push_root(value);
+                self.emit_push_call_root(value);
                 roots += 1;
             }
             call_args.push(value);

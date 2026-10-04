@@ -405,6 +405,8 @@ pub extern "C" fn willow_sync_poll_counter() -> *mut i32 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sync_safepoint() -> i32 {
+    // Generated callers reload every managed local from its root slot.
+    let _relocation = crate::gc::RelocationSafeScope::enter();
     #[cfg(any(
         all(
             target_os = "linux",

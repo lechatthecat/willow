@@ -42,12 +42,18 @@ pub(super) fn resolve_vtable_id(
 }
 
 impl<'a, 'b> FuncGen<'a, 'b> {
-    /// Spill a GC pointer or an inline interface pair, rooting only word zero.
-    /// Scalar ADT pairs must not be passed here: their first word is a tag.
-    ///
-    /// The slot is returned so a caller that roots a temporary across a call
-    /// which may collect can reload the pointer from the root afterwards.
-    pub(super) fn emit_push_root(
+    /// Root a value that is only passed to the immediately following call.
+    /// The callee roots its own copy before its first safepoint, and the
+    /// caller does not use `val` after the call, so the referent may move.
+    /// No allocation or other GC point may sit between this push and the call.
+    pub(super) fn emit_push_call_root(&mut self, val: cranelift_codegen::ir::Value) {
+        self.emit_push_relocatable_root(val);
+    }
+
+    /// Spill and root `val` in a relocatable slot. A minor collection may move
+    /// the referent and rewrite the slot, so after any call that can reach a GC
+    /// point the caller must use [`Self::emit_reload_root`] instead of `val`.
+    pub(super) fn emit_push_relocatable_root(
         &mut self,
         val: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::StackSlot {
@@ -62,10 +68,28 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         slot
     }
 
+    /// Reload a value rooted by [`Self::emit_push_relocatable_root`], with the
+    /// type of its original SSA value.
+    pub(super) fn emit_reload_root(
+        &mut self,
+        slot: cranelift_codegen::ir::StackSlot,
+        original: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        let ty = self.builder.func.dfg.value_type(original);
+        self.stack_load(ty, slot)
+    }
+
+    /// Register a relocatable root slot. Every use of the binding must reload
+    /// it from `slot`: a minor collection may move the referent and rewrite
+    /// the slot at any call that can reach a GC point.
     pub(super) fn emit_push_root_slot(&mut self, slot: cranelift_codegen::ir::StackSlot) {
+        self.emit_push_root_entry(slot, "willow_push_root");
+    }
+
+    fn emit_push_root_entry(&mut self, slot: cranelift_codegen::ir::StackSlot, symbol: &str) {
         let ptr_ty = reference_type(self.module.target_config());
         let addr = self.builder.ins().stack_addr(ptr_ty, slot, 0);
-        let push_id = self.func_id("willow_push_root");
+        let push_id = self.func_id(symbol);
         let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
         self.builder.ins().call(push_ref, &[addr]);
         self.gc_root_count += 1;

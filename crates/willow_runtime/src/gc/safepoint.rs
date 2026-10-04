@@ -16,6 +16,83 @@ pub(super) fn snapshot_local_roots() -> Vec<usize> {
     })
 }
 
+std::thread_local! {
+    /// Whether every native frame on this thread that holds a managed pointer
+    /// keeps it only in registered root slots and reloads it after a GC point.
+    /// Generated code does; runtime Rust frames may keep raw copies, so the
+    /// default is false and only generated-code GC entry points set it.
+    static RELOCATION_SAFE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks a runtime entry point called directly by generated code at a GC
+/// point (allocation slow path, poll, collection builtins). Within its extent
+/// this thread's root-slot referents may move; elsewhere a park publishes them
+/// as values that stay in place (willow-9tls.9). Runtime frames that call back
+/// into generated code are scheduler/main trampolines holding no raw pointers.
+pub(crate) struct RelocationSafeScope(bool);
+
+impl RelocationSafeScope {
+    pub(crate) fn enter() -> Self {
+        Self(RELOCATION_SAFE.replace(true))
+    }
+}
+
+impl Drop for RelocationSafeScope {
+    fn drop(&mut self) {
+        RELOCATION_SAFE.set(self.0);
+    }
+}
+
+/// Safepoint for a runtime loop whose own frame, and every runtime frame
+/// between it and generated code, holds no managed pointer outside registered
+/// root slots: scheduler drivers between task polls, and spin-waits entered
+/// directly from generated code. Roots published here are relocatable.
+pub(crate) fn relocatable_safepoint() {
+    let _relocation = RelocationSafeScope::enter();
+    willow_gc_safepoint();
+}
+
+pub(super) fn relocation_safe() -> bool {
+    RELOCATION_SAFE.get()
+}
+
+/// Native stack switches carry the flag with the stack: a parked stack keeps
+/// the value it had, and the scheduler context that takes over is unsafe.
+pub(super) fn set_relocation_safe(value: bool) -> bool {
+    RELOCATION_SAFE.replace(value)
+}
+
+/// Root slots published by a parked mutator or a parked native stack.
+/// `relocatable` records whether the owner may observe moved referents; when
+/// false the collector keeps every referent in place.
+#[derive(Default)]
+pub(super) struct PublishedRoots {
+    pub(super) slots: Vec<usize>,
+    pub(super) relocatable: bool,
+}
+
+impl PublishedRoots {
+    pub(super) fn current(slots: Vec<usize>) -> Self {
+        Self {
+            slots,
+            relocatable: relocation_safe(),
+        }
+    }
+
+    /// Add these roots to `roots` as rewritable slots or as in-place values.
+    pub(super) fn append_to(&self, roots: &mut MinorRoots) {
+        for slot in self.slots.iter().map(|&slot| slot as *mut *mut u8) {
+            if self.relocatable {
+                roots.slots.push(slot);
+            } else if let Some(value) = RootSlot::from_raw(slot).and_then(RootSlot::load) {
+                roots
+                    .values
+                    .push((value.as_ptr(), PinSource::RuntimeCodeStack));
+            }
+        }
+    }
+}
+
 /// Publish live root locations rather than object values. Null-valued slots
 /// need no rewrite; omitting them avoids retaining a snapshot entry for every
 /// dead local. The owning stack cannot mutate until STW ends.
@@ -238,7 +315,7 @@ pub extern "C" fn willow_gc_safepoint() {
     let id = std::thread::current().id();
     // Publish our roots so the collector can scan them while we are parked, then
     // park until the world resumes.
-    let roots = snapshot_local_root_slots();
+    let roots = PublishedRoots::current(snapshot_local_root_slots());
     if let Some(slot) = coord.mutators.get_mut(&id) {
         *slot = roots;
     }
@@ -323,7 +400,21 @@ pub(super) fn all_registered_stack_root_slots(coord: &GcCoord) -> Vec<*mut *mut 
         if id == me {
             continue; // self uses the live snapshot above, not a stale publish
         }
-        roots.extend(published.iter().map(|&a| a as *mut *mut u8));
+        roots.extend(published.slots.iter().map(|&a| a as *mut *mut u8));
+    }
+    roots
+}
+
+/// Stack roots for a relocating minor collection: rewritable slots from
+/// relocation-safe owners, in-place values from the rest.
+pub(super) fn minor_stack_roots(coord: &GcCoord) -> MinorRoots {
+    let me = std::thread::current().id();
+    let mut roots = MinorRoots::default();
+    PublishedRoots::current(snapshot_local_root_slots()).append_to(&mut roots);
+    for (&id, published) in coord.mutators.iter() {
+        if id != me {
+            published.append_to(&mut roots);
+        }
     }
     roots
 }

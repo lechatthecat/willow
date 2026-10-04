@@ -2,6 +2,8 @@ use super::*;
 
 /// Register a root slot.  `slot` must point to a stack location that holds
 /// a GC-managed pointer.  The slot must remain valid until the matching pop.
+/// Generated code reloads the slot after every GC point, so a minor
+/// collection may move its referent and rewrite the slot.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_push_root(slot: *mut *mut u8) {
@@ -92,8 +94,10 @@ pub(crate) unsafe fn park_current_roots(depth: usize) -> u64 {
         retain_transferred_roots(roots[depth..].iter().copied());
         parked.insert(
             token,
-            roots[depth..].iter().map(|slot| *slot as usize).collect(),
+            PublishedRoots::current(roots[depth..].iter().map(|slot| *slot as usize).collect()),
         );
+        // The scheduler context that takes over this thread is runtime code.
+        set_relocation_safe(false);
         roots.truncate(depth);
         ROOT_DEPTH.set(roots.len());
     });
@@ -108,7 +112,9 @@ pub(crate) unsafe fn park_current_roots(depth: usize) -> u64 {
 /// that stack without executing a safepoint against the wrong stack's slots.
 pub(crate) unsafe fn resume_parked_roots(token: u64) {
     let mut parked = runtime().parked_stack_roots.lock().unwrap();
-    let slots = parked.remove(&token).expect("unknown parked native stack");
+    let PublishedRoots { slots, relocatable } =
+        parked.remove(&token).expect("unknown parked native stack");
+    set_relocation_safe(relocatable);
     retain_transferred_roots(slots.iter().map(|&slot| slot as *mut *mut u8));
     if !slots.is_empty() {
         claim_root_stack_owner();
@@ -135,6 +141,14 @@ pub(crate) unsafe fn discard_parked_roots(token: u64) {
 
 /// Keep a GC-managed object alive through a runtime-owned structure such as a
 /// scheduler task, future frame, task handle, or wait queue.
+///
+/// The holder keeps the raw address, which a moving collection cannot rewrite,
+/// so `object` must not be young: register only runtime allocations (always
+/// old) or objects that already survived promotion. Old objects are never
+/// moved, so a minor collection only scans the root for young children
+/// (willow-9tls.9); registering a young object is fatal. A holder of a
+/// possibly young object registers its storage with
+/// [`willow_gc_add_runtime_root_slot`] instead.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
@@ -146,10 +160,19 @@ pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
     // Registry publication cannot safepoint before the insertion finishes.
     // The activation handshake crosses it before taking runtime roots, just
     // as it crosses the corresponding phase-gated SATB deletion below.
-    if GC_MARK_PHASE.load(Ordering::Acquire) != 0
-        && let Some(cycle) = runtime().heap.lock().unwrap().concurrent_cycle.as_ref()
-    {
-        cycle.enqueue(object);
+    let marking = GC_MARK_PHASE.load(Ordering::Acquire) != 0;
+    if marking || runtime().tlab_ever_allocated.load(Ordering::Acquire) {
+        let state = runtime().heap.lock().unwrap();
+        if tlab_payload_generation(&state, object as usize) == Some(GC_GENERATION_YOUNG) {
+            drop(state);
+            crate::failure::fatal_invariant(
+                "young object registered as an address runtime root; \
+                 use willow_gc_add_runtime_root_slot",
+            );
+        }
+        if marking && let Some(cycle) = state.concurrent_cycle.as_ref() {
+            cycle.enqueue(object);
+        }
     }
     runtime().runtime_roots.add(object);
 }
@@ -166,6 +189,45 @@ pub extern "C" fn willow_gc_remove_runtime_root(object: *mut u8) {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     satb_delete(object);
     runtime().runtime_roots.remove(object);
+}
+
+/// Keep the object stored in `*slot` alive through runtime-owned storage that
+/// a moving collection may rewrite (willow-9tls.9). A minor collection
+/// evacuates a young referent and stores its new address in `*slot`; the
+/// holder must reload the slot after any GC point instead of keeping a copy.
+/// `slot` must stay valid and pointer-aligned until the matching
+/// [`willow_gc_remove_runtime_root_slot`]. While registered, only the
+/// collector writes `*slot`. Registration is counted per slot address.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_gc_add_runtime_root_slot(slot: *mut *mut u8) {
+    if slot.is_null() {
+        return;
+    }
+    let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+    // As for address roots: publication cannot cross a safepoint, and an
+    // active cycle must see the referent even if the holder drops it later.
+    if GC_MARK_PHASE.load(Ordering::Acquire) != 0
+        && let Some(cycle) = runtime().heap.lock().unwrap().concurrent_cycle.as_ref()
+    {
+        // SAFETY: the caller guarantees a valid slot.
+        cycle.enqueue(unsafe { *slot });
+    }
+    runtime().runtime_root_slots.add(slot.cast());
+}
+
+/// Stop retaining the referent of a slot registered with
+/// [`willow_gc_add_runtime_root_slot`].
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_gc_remove_runtime_root_slot(slot: *mut *mut u8) {
+    if slot.is_null() {
+        return;
+    }
+    let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+    // SAFETY: the slot stays valid until this removal returns.
+    satb_delete(unsafe { *slot });
+    runtime().runtime_root_slots.remove(slot.cast());
 }
 
 /// Registered mutators each legitimately own their own thread-local root stack;
@@ -230,28 +292,54 @@ pub(super) fn foreign_root_stack_owner_active_locked(coord: &GcCoord) -> bool {
         .is_some_and(|owner| *owner != current && !coord.mutators.contains_key(owner))
 }
 
-/// Number of distinct runtime-rooted objects. Acceptance tests use this to
-/// prove that panic/recover releases every root it took, instead of only
-/// checking that the program printed the right text (willow-s9ej.7).
+/// Number of distinct runtime-rooted objects and registered runtime root
+/// slots. Acceptance tests use this to prove that panic/recover releases every
+/// root it took, instead of only checking that the program printed the right
+/// text (willow-s9ej.7).
 pub fn runtime_root_count() -> usize {
-    runtime().runtime_roots.len()
+    runtime().runtime_roots.len() + runtime().runtime_root_slots.len()
 }
 
+/// Values of every runtime-held root: address-registered runtime roots,
+/// registered runtime root slots, and the slots of parked native stacks.
+/// Marking consumers only need values.
 pub(super) fn runtime_roots_snapshot() -> Vec<*mut u8> {
     let mut roots = runtime().runtime_roots.snapshot();
+    roots.extend(
+        runtime_root_slots()
+            .into_iter()
+            .filter_map(|slot| RootSlot::from_raw(slot).and_then(RootSlot::load))
+            .map(GcPayload::as_ptr),
+    );
     let parked = runtime().parked_stack_roots.lock().unwrap();
-    for slots in parked.values() {
-        for &slot in slots {
-            // SAFETY: the park contract retains these immutable stack slots;
-            // active stack transitions and collection are serialized by STW.
-            if slot == 0 {
-                continue;
-            }
-            let value = unsafe { *(slot as *mut *mut u8) };
-            if !value.is_null() {
-                roots.push(value);
-            }
-        }
-    }
+    roots.extend(
+        parked
+            .values()
+            .flat_map(|published| published.slots.iter())
+            .filter_map(|&slot| RootSlot::from_raw(slot as *mut *mut u8).and_then(RootSlot::load))
+            .map(GcPayload::as_ptr),
+    );
     roots
+}
+
+/// Slots registered with [`willow_gc_add_runtime_root_slot`]. A relocating
+/// collector rewrites them; address-registered roots are never young and are
+/// only scanned in place.
+pub(super) fn runtime_root_slots() -> Vec<*mut *mut u8> {
+    runtime()
+        .runtime_root_slots
+        .snapshot()
+        .into_iter()
+        .map(|slot| slot.cast())
+        .collect()
+}
+
+/// Roots of parked native stacks. The park contract keeps each slot allocated
+/// until its stack resumes or is discarded, and the stack cannot run while a
+/// stop-the-world collection rewrites it.
+pub(super) fn append_parked_roots(roots: &mut MinorRoots) {
+    let parked = runtime().parked_stack_roots.lock().unwrap();
+    for published in parked.values() {
+        published.append_to(roots);
+    }
 }

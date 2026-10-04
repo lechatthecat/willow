@@ -14,9 +14,13 @@
 // Old objects live in non-moving regular/large regions. Region metadata owns
 // allocation enumeration, storage, mark bits, free spans, and liveness accounting.
 // Generated young objects live
-// in nursery TLAB regions; directly rooted survivors retain that storage as
-// pinned old regions. Heap-only survivors copy to collector-owned young chunks
-// once, then tenure into old regions on their second minor survival.
+// in nursery TLAB regions. Survivors reachable through root or heap slots copy
+// to collector-owned young chunks once, then tenure into old regions on their
+// second minor survival; the collector rewrites every such slot, including
+// runtime-owned slots (`willow_gc_add_runtime_root_slot`). Address-registered
+// runtime roots name only old objects. A thread parked inside runtime code
+// outside a `RelocationSafeScope` defers the minor collection while it
+// publishes a young referent; only a hard memory budget pins instead.
 
 mod safepoint;
 pub use safepoint::*;
@@ -60,7 +64,10 @@ mod satb;
 mod sweep;
 
 use free_spans::FreeSpans;
-use minor::minor_collect_internal;
+pub(crate) use minor::minor_collect_internal;
+use minor::{MinorRoots, PinSource};
+#[cfg(test)]
+pub(crate) use minor::{deferred_minor_collections_for_test, minor_collect_pinning_for_test};
 use runtime_roots::RuntimeRootSet;
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
@@ -283,6 +290,12 @@ struct GcState {
     young_allocated_bytes: usize,
     /// Trigger a minor collection at the next TLAB refill after this threshold.
     nursery_threshold_bytes: usize,
+    /// Young bytes when the current run of deferred minor collections began
+    /// (willow-9tls.9); `None` when the last minor attempt collected.
+    minor_deferral_start_bytes: Option<usize>,
+    /// The allocation path retries a deferred minor collection only once the
+    /// young bytes reach this mark, one TLAB chunk past the deferral.
+    minor_retry_bytes: usize,
     nursery_policy: nursery::Policy,
     /// Total objects allocated lifetime.
     total_allocs: u64,
@@ -550,6 +563,8 @@ impl Default for GcState {
             pacer_trigger: 1024 * 1024,
             young_allocated_bytes: 0,
             nursery_threshold_bytes: nursery_policy.initial(memory_limit_bytes),
+            minor_deferral_start_bytes: None,
+            minor_retry_bytes: 0,
             nursery_policy,
             total_allocs: 0,
             total_allocated_bytes: 0,
@@ -616,7 +631,7 @@ std::thread_local! {
 struct GcCoord {
     /// Registered mutators → writable root-slot addresses, valid only while
     /// the owner is parked. Empty until the first stop-the-world publication.
-    mutators: HashMap<ThreadId, Vec<usize>>,
+    mutators: HashMap<ThreadId, PublishedRoots>,
     /// A collector has requested all mutators to reach a safepoint and park.
     stop_requested: bool,
     /// Mutators currently parked at a safepoint.
@@ -640,7 +655,9 @@ struct GcRuntime {
     root_stack_owner: Mutex<Option<ThreadId>>,
     skipped_foreign_owner_collections: std::sync::atomic::AtomicU64,
     runtime_roots: RuntimeRootSet,
-    parked_stack_roots: Mutex<HashMap<u64, Vec<usize>>>,
+    /// Runtime-owned slots a moving collection rewrites (counted per slot).
+    runtime_root_slots: RuntimeRootSet,
+    parked_stack_roots: Mutex<HashMap<u64, PublishedRoots>>,
     next_parked_stack: AtomicU64,
     coord: (Mutex<GcCoord>, Condvar),
     /// Lock-free fast-path mirror of `GcCoord::stop_requested`.
@@ -666,6 +683,7 @@ impl Default for GcRuntime {
             root_stack_owner: Mutex::new(None),
             skipped_foreign_owner_collections: std::sync::atomic::AtomicU64::new(0),
             runtime_roots: RuntimeRootSet::default(),
+            runtime_root_slots: RuntimeRootSet::default(),
             parked_stack_roots: Mutex::new(HashMap::new()),
             next_parked_stack: AtomicU64::new(1),
             coord: (Mutex::new(GcCoord::default()), Condvar::new()),
@@ -756,10 +774,12 @@ fn allocation_should_collect() -> bool {
 }
 
 fn allocation_should_minor_collect() -> bool {
-    let stress = gc_stress_enabled("minor");
+    let stress = gc_stress_enabled("minor") || gc_stress_enabled("relocate");
     let mut state = runtime().heap.lock().unwrap();
     sync_tlab_bytes(&mut state);
-    stress || state.young_allocated_bytes >= state.nursery_threshold_bytes
+    stress
+        || (state.young_allocated_bytes >= state.nursery_threshold_bytes
+            && state.young_allocated_bytes >= state.minor_retry_bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -869,6 +889,7 @@ pub extern "C" fn willow_gc_alloc_slow(
     payload_size: i64,
     gc_ref_mask: u64,
 ) -> *mut u8 {
+    let _relocation = RelocationSafeScope::enter();
     if tlab_state.is_null() || payload_size < 0 {
         crate::failure::fatal_invariant("invalid TLAB allocation arguments");
     }
@@ -933,8 +954,14 @@ pub extern "C" fn willow_gc_alloc_slow(
     // thread. Publish limit before cursor; generated code resumes only after
     // this slow-path call returns.
     let tls = unsafe { tlab_state_at(state_address) };
-    tls.limit
-        .store(base as usize + GC_TLAB_CHUNK_SIZE, Ordering::Release);
+    // Relocation stress closes the TLAB after one object, so every generated
+    // allocation returns here and runs a moving minor collection first.
+    let limit = if gc_stress_enabled("relocate") {
+        total_size
+    } else {
+        GC_TLAB_CHUNK_SIZE
+    };
+    tls.limit.store(base as usize + limit, Ordering::Release);
     tls.cursor
         .store(base as usize + total_size, Ordering::Release);
     // Fast-path bytes in this chunk are measured from here.
@@ -1204,16 +1231,19 @@ fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u6
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_collect() {
+    let _relocation = RelocationSafeScope::enter();
     collect_internal();
 }
 
-/// Trigger a stop-the-world minor collection. Explicit roots are promoted
-/// in-place because current generated SSA aliases are not reloaded after every
-/// allocation. Heap-only survivors copy to young survivor storage at age 1,
-/// then to non-moving old storage at age 2; their reference slots are updated.
+/// Trigger a stop-the-world minor collection. Young objects reachable from
+/// root slots or heap slots copy to young survivor storage at age 1, then to
+/// non-moving old storage at age 2, and every such slot is rewritten. The
+/// collection is deferred while another thread is parked inside runtime code
+/// with a young referent (see `minor_collect_with_roots`).
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_gc_minor_collect() {
+    let _relocation = RelocationSafeScope::enter();
     minor_collect_internal();
 }
 
@@ -1224,6 +1254,9 @@ pub extern "C" fn willow_gc_minor_collect() {
 /// Modes (for local test runs / CI):
 /// - `alloc`     — collect at every heap allocation boundary.
 /// - `minor`     — force a minor collection at every TLAB refill.
+/// - `relocate`  — limit each TLAB to one object, so every generated
+///   allocation runs a moving minor collection. Moved payloads are poisoned,
+///   exposing any holder that kept a pre-move address.
 /// - `await`     — collect around await boundaries: before/after the scheduler
 ///   polls a task (so suspend/resume and task-completion are stressed).
 /// - `scheduler` — collect around scheduler operations: spawn, wake, park,
@@ -1231,6 +1264,11 @@ pub extern "C" fn willow_gc_minor_collect() {
 /// - `all`       — enable all of the above.
 ///
 /// Example: `WILLOW_GC_STRESS=alloc cargo test`, or `WILLOW_GC_STRESS=all`.
+///
+/// `WILLOW_GC_VERIFY_NO_PIN=1` complements these modes: a minor collection
+/// that would pin a young object in place aborts and names the pin source
+/// (willow-9tls.9). Generated code pins only the owners of `&`/`&mut`
+/// arguments that point into an object or array element.
 ///
 /// The variable is read once: every slow-path allocation asks for it several
 /// times, and `std::env::var` costs a `getenv` scan plus, on Windows, a heap
@@ -1800,6 +1838,8 @@ fn reset_internal() {
     state.young_allocated_bytes = 0;
     state.nursery_policy = nursery::Policy::from_env();
     state.nursery_threshold_bytes = state.nursery_policy.initial(state.memory_limit_bytes);
+    state.minor_deferral_start_bytes = None;
+    state.minor_retry_bytes = 0;
     state.total_allocs = 0;
     state.total_allocated_bytes = 0;
     EXTERNAL_ALLOCATED_BYTES.store(0, Ordering::Relaxed);
@@ -1829,6 +1869,7 @@ fn reset_internal() {
     state.old_regions_released = 0;
     state.major_collections = 0;
     runtime().runtime_roots.clear();
+    runtime().runtime_root_slots.clear();
     runtime().parked_stack_roots.lock().unwrap().clear();
     *runtime().root_stack_owner.lock().unwrap() = None;
     {

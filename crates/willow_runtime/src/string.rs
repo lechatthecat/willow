@@ -139,7 +139,8 @@ pub extern "C" fn willow_string_literal_slot(
         }
         // The winning mutator may allocate/collect. Losers must participate in
         // safepoints rather than block a collector waiting for them to park.
-        crate::gc::willow_gc_safepoint();
+        // Only generated code calls this, and the spin holds no managed pointer.
+        crate::gc::relocatable_safepoint();
         std::thread::yield_now();
     }
 }

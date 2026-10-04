@@ -477,7 +477,7 @@ mod tests {
     use super::*;
     use crate::gc::{
         runtime_root_count, runtime_test_guard, willow_gc_allocated_bytes, willow_gc_collect,
-        willow_gc_init, willow_gc_minor_collect,
+        willow_gc_init,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -781,7 +781,7 @@ mod tests {
         willow_gc_init();
         let _context = ContextTestGuard::install(7);
         raise("rooted message", "rooted.wi", 11, 12);
-        willow_gc_minor_collect();
+        crate::gc::minor_collect_internal();
         willow_gc_collect();
         let info = recover_one();
         assert_eq!(unsafe { panic_info_message(info) }, "rooted message");
@@ -1066,7 +1066,7 @@ mod tests {
         let baseline = runtime_root_count();
         for depth in 0..8 {
             raise(&format!("level-{depth}"), "nested.wi", depth + 1, 3);
-            willow_gc_minor_collect();
+            crate::gc::minor_collect_internal();
         }
         willow_gc_collect();
         assert_eq!(runtime_root_count(), baseline + 8);
@@ -1135,7 +1135,7 @@ mod tests {
             snapshot.owner == crate::scheduler::willow_sched_current_task()
         });
         willow_panic_raise(std::ptr::null(), std::ptr::null(), 0, 0);
-        crate::gc::willow_gc_minor_collect();
+        crate::gc::minor_collect_internal();
         let info = recover_one();
         let recovered = !info.is_null() && unsafe { panic_info_message(info) } == "explicit panic";
         if !info.is_null() {
@@ -1240,7 +1240,7 @@ mod tests {
         let file = ws("stress.wi");
         willow_panic_raise(message, file, 41, 42);
         willow_pop_roots(1);
-        willow_gc_minor_collect();
+        crate::gc::minor_collect_internal();
         willow_gc_collect();
         let info = recover_one();
         willow_gc_collect();

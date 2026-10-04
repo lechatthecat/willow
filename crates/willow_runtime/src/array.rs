@@ -511,18 +511,22 @@ fn array_push(mut arr: *mut u8, mut value: i64, copy_pairs: bool) {
         } else {
             store_buffer_slot(buffer, len, value, is_ref);
         }
-        let traced = if copy_pairs {
-            buffer_len(buffer).max(len + 1)
-        } else {
-            len + 1
-        };
-        set_buffer_len(buffer, traced);
+        // The traced prefix is a high-water mark (see `willow_array_pop`).
+        set_buffer_len(buffer, buffer_len(buffer).max(len + 1));
         set_handle_word(arr, H_LEN, len + 1);
     }
 }
 
 /// Remove and return the last element. Aborts on an empty array. The freed slot
 /// is nulled so a popped reference can be reclaimed.
+///
+/// The buffer's traced prefix is not shrunk: it is a high-water mark of
+/// initialized slots. A `&mut` element reference keeps the buffer alive as its
+/// cell base and may store into the slot after the pop (willow-9tls.9); the
+/// store's barrier only remembers the buffer, so the slot must stay inside the
+/// traced prefix for its referent to be kept and relocated. Tracing costs
+/// O(high-water) <= capacity, and a value stored through such a reference is
+/// retained until the slot is overwritten or the buffer dies.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_array_pop(arr: *mut u8) -> i64 {
@@ -542,7 +546,6 @@ pub extern "C" fn willow_array_pop(arr: *mut u8) -> i64 {
         let value = *slot;
         let is_ref = handle_word(arr, H_IS_REF) != 0;
         store_buffer_slot(buffer, last, 0, is_ref); // allow the GC to reclaim it
-        set_buffer_len(buffer, last);
         set_handle_word(arr, H_LEN, last);
         value
     }
@@ -822,8 +825,10 @@ mod tests {
     }
 
     // Deterministic slot counts isolate tracing cost from allocation and GC timing.
+    // The traced prefix is the buffer's high-water mark, bounded by capacity;
+    // popped slots stay traced but hold null (willow-9tls.9).
     #[test]
-    fn array_trace_work_tracks_length_after_pop_and_regrowth() {
+    fn array_trace_work_is_bounded_by_high_water_after_pop_and_regrowth() {
         let _guard = runtime_test_guard();
         willow_gc_init();
         for capacity in [16, 256, 4096] {
@@ -850,8 +855,10 @@ mod tests {
                     trace_array_ref(buffer, &mut slots);
                     snapshot_array_ref(buffer, &mut children);
                 }
-                assert_eq!(slots.len(), length as usize, "capacity={capacity}");
-                assert_eq!(children, vec![value; length as usize]);
+                assert_eq!(slots.len(), capacity as usize, "capacity={capacity}");
+                let (live, popped) = children.split_at(length as usize);
+                assert_eq!(live, vec![value; length as usize]);
+                assert!(popped.iter().all(|child| child.is_null()));
                 println!(
                     "capacity={capacity} length={length} trace_slots={} snapshot_children={}",
                     slots.len(),
@@ -891,7 +898,7 @@ mod tests {
         assert_eq!(unsafe { willow_string_as_str(children[0]) }, "captured");
         children.clear();
         unsafe { snapshot_array_ref(handle_buffer(arr), &mut children) };
-        assert!(children.is_empty());
+        assert!(children.iter().all(|child| child.is_null()));
         willow_pop_roots(2);
     }
 
@@ -936,7 +943,8 @@ mod tests {
             }
             reader.join().unwrap();
         });
-        assert_eq!(unsafe { buffer_len(buffer as *mut u8) }, 0);
+        // Pops clear slots but keep the high-water prefix.
+        assert_eq!(unsafe { buffer_len(buffer as *mut u8) }, 256);
         willow_pop_roots(2);
     }
 

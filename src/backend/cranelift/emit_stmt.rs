@@ -972,9 +972,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         message: cranelift_codegen::ir::Value,
         span: Option<crate::diagnostics::Span>,
     ) {
-        self.emit_push_root(message);
+        let message_root = self.emit_push_relocatable_root(message);
         let source_file = self.source_file.to_string();
         let file = self.emit_string_literal(&source_file);
+        let message = self.emit_reload_root(message_root, message);
         let line = self
             .builder
             .ins()

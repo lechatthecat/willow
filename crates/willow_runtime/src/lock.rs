@@ -165,9 +165,10 @@ fn ensure_blocking_cells_registered() {
 /// The initial word arrives by value. When it is a GC reference the caller may
 /// hold it nowhere else, and the allocation below can collect: a minor
 /// collection would free (or, if it is reachable only through a heap slot,
-/// move) the object. Rooting the local copy makes it a direct root, which the
-/// collector pins in place, so the word written into the payload afterwards is
-/// still the object's address. Returns null when the allocation fails.
+/// move) the object. Rooting the local copy makes it a direct root; runtime
+/// code allocates outside a relocation-safe scope, so the collector pins it in
+/// place and the word written into the payload afterwards is still the
+/// object's address. Returns null when the allocation fails.
 fn alloc_cell_payload(type_id: u32, payload_size: usize, value: &mut i64, is_ref: bool) -> *mut u8 {
     ensure_blocking_cells_registered();
     let rooted = is_ref && *value != 0;
@@ -558,7 +559,7 @@ mod tests {
             remembered + 1,
             "an old cell holding a young value joins the remembered set"
         );
-        crate::gc::willow_gc_minor_collect();
+        crate::gc::minor_collect_internal();
         let relocated = willow_blocking_cell_get(cell as *mut c_void) as *const i64;
         assert_ne!(
             relocated, young as *const i64,
@@ -591,7 +592,7 @@ mod tests {
         let remembered = crate::gc::willow_gc_remembered_set_size();
         willow_blocking_rw_cell_write(cell as *mut c_void, young as i64);
         assert_eq!(crate::gc::willow_gc_remembered_set_size(), remembered + 1);
-        crate::gc::willow_gc_minor_collect();
+        crate::gc::minor_collect_internal();
         let relocated = willow_blocking_rw_cell_read(cell as *mut c_void) as *const i64;
         assert_ne!(relocated, young as *const i64);
         assert_eq!(unsafe { *relocated }, 88);
@@ -641,9 +642,9 @@ mod tests {
         let young = crate::gc::willow_gc_alloc_slow(&mut tls, 42, 0, 8, 0);
         assert!(!young.is_null());
         unsafe { *(young as *mut i64) = 4242 };
-        let promoted_before = crate::gc::willow_gc_promoted_objects();
+        let deferred_before = crate::gc::deferred_minor_collections_for_test();
 
-        let collector = std::thread::spawn(|| crate::gc::willow_gc_minor_collect());
+        let collector = std::thread::spawn(crate::gc::minor_collect_internal);
         let deadline = Instant::now() + Duration::from_secs(30);
         while !crate::gc::stop_pending_for_test() {
             assert!(
@@ -658,16 +659,20 @@ mod tests {
         collector.join().unwrap();
         willow_push_root(&mut cell as *mut *mut u8);
 
+        // `new` holds the young value in a Rust local, so the collection that
+        // stopped it inside runtime code defers rather than pinning
+        // (willow-9tls.9).
         assert!(
-            crate::gc::willow_gc_promoted_objects() > promoted_before,
-            "the collection ran while `new` was allocating"
+            crate::gc::deferred_minor_collections_for_test() > deferred_before,
+            "the collection stopped `new` while it was allocating"
         );
+        assert_eq!(crate::gc::willow_gc_pinned_region_count(), 0);
         let held = willow_blocking_cell_get(cell as *mut c_void) as *const i64;
         assert_eq!(
             held, young as *const i64,
-            "a direct root is pinned in place"
+            "the deferred collection moved nothing"
         );
-        assert_eq!(unsafe { *held }, 4242, "the pinned value is intact");
+        assert_eq!(unsafe { *held }, 4242, "the held value is intact");
         willow_pop_roots(1);
         crate::gc::willow_gc_unregister_mutator();
     }

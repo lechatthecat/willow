@@ -23,6 +23,9 @@ fn reset_finalizes_native_owners_in_every_storage_kind() {
         for count in [1usize, 8, 32] {
             willow_register_drop(OWNER_TYPE, drop_owner);
             let mut tls = tlab_state_for_test();
+            // Young referents need rewritable slots; full capacity keeps the
+            // registered slot addresses stable.
+            let mut young_slots = Vec::<*mut u8>::with_capacity(count);
             for index in 0..count {
                 let payload = if matches!(kind, "young" | "survivor" | "tenured") {
                     willow_gc_alloc_slow(&mut tls, 1, OWNER_TYPE as i64, 8, 0)
@@ -39,15 +42,18 @@ fn reset_finalizes_native_owners_in_every_storage_kind() {
                     let owner = willow_alloc_typed(8, 1);
                     unsafe { *owner.cast::<*mut u8>() = payload };
                     willow_gc_add_runtime_root(owner);
+                } else if kind == "young" {
+                    young_slots.push(payload);
+                    willow_gc_add_runtime_root_slot(young_slots.last_mut().unwrap());
                 } else if kind != "fragmented" || index % 2 == 0 {
                     willow_gc_add_runtime_root(payload);
                 }
             }
             if matches!(kind, "survivor" | "tenured") {
-                willow_gc_minor_collect();
+                crate::gc::minor_collect_internal();
                 assert_eq!(willow_gc_moved_objects(), count as i64);
                 if kind == "tenured" {
-                    willow_gc_minor_collect();
+                    crate::gc::minor_collect_internal();
                     assert_eq!(willow_gc_moved_objects(), 2 * count as i64);
                 }
             }
@@ -65,6 +71,7 @@ fn reset_finalizes_native_owners_in_every_storage_kind() {
                 "{kind}: leaked native owner"
             );
             assert_eq!(willow_gc_allocated_bytes(), 0);
+            drop(young_slots);
             reset_internal();
             assert_eq!(LIVE.load(Ordering::Relaxed), 0);
             eprintln!("reset storage={kind} owners={count} live_owners=0");

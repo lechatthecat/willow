@@ -954,7 +954,7 @@ fn parallel_completion_wakes_promptly() {
 }
 
 unsafe extern "C" fn poll_collect_and_nested_drive(_frame: *mut c_void) -> i32 {
-    crate::gc::willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
     crate::gc::willow_gc_collect();
     let child = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
     willow_sched_run_until(child);
@@ -5397,7 +5397,7 @@ fn vjaf_06_handle_keeps_released_frame_and_result_alive() {
         "the runtime root is gone"
     );
     willow_gc_collect();
-    crate::gc::willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
     let child = unsafe { *(holder.add(async_frame_slot_offset(0)) as *const *mut c_void) };
     assert!(crate::async_frame::frame_is_terminal(child));
     let result = unsafe { *((child as *mut u8).add(async_frame_slot_offset(0)) as *const i64) };

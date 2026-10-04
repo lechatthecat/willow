@@ -156,7 +156,7 @@ fn contract_c2_old_object_address_survives_minor_collection_and_promotion() {
     let mut parent_root = parent;
     willow_push_root(&mut parent_root as *mut *mut u8);
 
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
 
     assert_eq!(
         parent_root, parent_before,
@@ -168,7 +168,7 @@ fn contract_c2_old_object_address_survives_minor_collection_and_promotion() {
         unsafe { (*payload_to_header(survivor)).generation },
         GC_GENERATION_YOUNG
     );
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
     assert_eq!(parent_root, parent_before);
     let promoted = unsafe { *(parent_root as *mut *mut u8) };
     assert_ne!(
@@ -184,7 +184,7 @@ fn contract_c2_old_object_address_survives_minor_collection_and_promotion() {
 
     // Now that the child is old too, a third minor collection must move neither.
     let promoted_before = promoted;
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
     assert_eq!(parent_root, parent_before, "C2: old parent still stable");
     assert_eq!(
         unsafe { *(parent_root as *mut *mut u8) },
@@ -373,7 +373,7 @@ fn panicking_drop_terminates_every_storage_kind() {
         unsafe { *(dead as *mut u64) = 1 };
         willow_push_root(&mut survivor);
         if shape == "tlab_minor" {
-            willow_gc_minor_collect();
+            crate::gc::minor_collect_pinning_for_test();
         } else {
             willow_gc_collect();
         }

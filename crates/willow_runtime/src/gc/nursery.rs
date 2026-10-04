@@ -68,7 +68,8 @@ mod tests {
         for n in [32, 128, 512] {
             reset_internal();
             let mut tls = tlab_state_for_test();
-            let mut roots = Vec::new();
+            // Rewritable runtime-root slots; full capacity keeps them in place.
+            let mut roots = Vec::<*mut u8>::with_capacity(n);
             assert_eq!(
                 telemetry_heap_snapshot().1.minor_trigger_bytes,
                 FLOOR as u64
@@ -76,26 +77,28 @@ mod tests {
             for _ in 0..n {
                 let root = willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0);
                 assert!(!root.is_null());
-                willow_gc_add_runtime_root(root);
                 roots.push(root);
+                willow_gc_add_runtime_root_slot(roots.last_mut().unwrap());
             }
-            willow_gc_minor_collect();
+            crate::gc::minor_collect_internal();
             let (counters, heap) = telemetry_heap_snapshot();
-            assert_eq!(counters.promoted_objects, n as u64);
+            // Every survivor is evacuated: copied to survivor space, not pinned.
+            assert_eq!(counters.moved_objects, n as u64);
+            assert_eq!(counters.promoted_objects, 0);
             assert_eq!(heap.minor_trigger_bytes, (2 * FLOOR) as u64);
-            for root in roots {
-                willow_gc_remove_runtime_root(root);
+            for root in &mut roots {
+                willow_gc_remove_runtime_root_slot(root);
             }
             for _ in 0..n {
                 assert!(!willow_gc_alloc_slow(&mut tls, 0, 0, 8, 0).is_null());
             }
-            willow_gc_minor_collect();
+            crate::gc::minor_collect_internal();
             assert_eq!(
                 telemetry_heap_snapshot().1.minor_trigger_bytes,
                 FLOOR as u64
             );
             // Explicit empty cycles must not repeatedly inflate the threshold.
-            willow_gc_minor_collect();
+            crate::gc::minor_collect_internal();
             assert_eq!(
                 telemetry_heap_snapshot().1.minor_trigger_bytes,
                 FLOOR as u64
@@ -146,7 +149,7 @@ mod tests {
         if gc_stress_enabled("alloc") {
             assert_eq!(runtime().heap.lock().unwrap().major_collections - before, 8);
         }
-        willow_gc_minor_collect();
+        crate::gc::minor_collect_internal();
         assert_eq!(telemetry_heap_snapshot().1.minor_trigger_bytes, 4194304);
         reset_internal();
         assert_eq!(telemetry_heap_snapshot().1.minor_trigger_bytes, 4194304);

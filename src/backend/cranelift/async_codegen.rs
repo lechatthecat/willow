@@ -962,12 +962,61 @@ impl UnitCodegenContext<'_> {
             .output
             .module
             .declare_func_in_func(barrier_fid, builder.func);
+        // Build `args` before the frame: each allocation may collect, and a
+        // frame held only in a register would be unrooted across the second
+        // one. The array is rooted across the frame allocation and reloaded.
+        let ptr_ty = reference_type(self.output.module.target_config());
+        let args_array = if let Some(param) = params.first() {
+            debug_assert_eq!(param.name, "args");
+            let arr_id = self.func_id("willow_runtime_args_array");
+            let arr_ref = self
+                .output
+                .module
+                .declare_func_in_func(arr_id, builder.func);
+            let arr_call = builder.ins().call(arr_ref, &[]);
+            let arr = builder.inst_results(arr_call)[0];
+            let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                ptr_ty.bytes(),
+                0,
+            ));
+            builder.ins().stack_store(ptr_ty, arr, slot, 0);
+            let addr = builder.ins().stack_addr(ptr_ty, slot, 0);
+            let push_fid = self.func_id("willow_push_root");
+            let push_ref = self
+                .output
+                .module
+                .declare_func_in_func(push_fid, builder.func);
+            builder.ins().call(push_ref, &[addr]);
+            Some(slot)
+        } else {
+            None
+        };
         let frame = self.emit_async_frame_alloc(
             &mut builder,
             frame_layout.slot_count,
             frame_layout.mask,
             &frame_layout.bitmap,
         );
+        if let Some(slot) = args_array {
+            let arr = builder.ins().stack_load(ptr_ty, ptr_ty, slot, 0);
+            let pop_fid = self.func_id("willow_pop_roots");
+            let pop_ref = self
+                .output
+                .module
+                .declare_func_in_func(pop_fid, builder.func);
+            let one = builder.ins().iconst(types::I32, 1);
+            builder.ins().call(pop_ref, &[one]);
+            emit_gc_heap_store_raw(
+                &mut builder,
+                Some(barrier_ref),
+                frame,
+                async_frame_slot_offset(frame_layout.first_param_slot, ptr_ty.bytes()),
+                arr,
+                GcStoreDestination::AsyncFrameSlot,
+                MemFlagsData::trusted(),
+            );
+        }
 
         // The scheduler owns a frame root only until the poll task reaches a
         // terminal state. A Result main reads the frame after run_until
@@ -992,29 +1041,6 @@ impl UnitCodegenContext<'_> {
                 .module
                 .declare_func_in_func(push_fid, builder.func);
             builder.ins().call(push_ref, &[addr]);
-        }
-
-        if let Some(param) = params.first() {
-            let arr_id = self.func_id("willow_runtime_args_array");
-            let arr_ref = self
-                .output
-                .module
-                .declare_func_in_func(arr_id, builder.func);
-            let arr_call = builder.ins().call(arr_ref, &[]);
-            let arr = builder.inst_results(arr_call)[0];
-            emit_gc_heap_store_raw(
-                &mut builder,
-                Some(barrier_ref),
-                frame,
-                async_frame_slot_offset(
-                    frame_layout.first_param_slot,
-                    reference_type(self.output.module.target_config()).bytes(),
-                ),
-                arr,
-                GcStoreDestination::AsyncFrameSlot,
-                MemFlagsData::trusted(),
-            );
-            debug_assert_eq!(param.name, "args");
         }
 
         // willow_sched_spawn(poll_addr, frame) -> main's task id.

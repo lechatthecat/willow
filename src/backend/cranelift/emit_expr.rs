@@ -60,9 +60,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // Build file metadata while the message is rooted: creating the
             // file String may collect before the runtime has taken ownership
             // of either argument.
-            self.emit_push_root(msg);
+            let msg_root = self.emit_push_relocatable_root(msg);
             let source_file = self.source_file.to_string();
             let file_ptr = self.emit_string_literal(&source_file);
+            let msg = self.emit_reload_root(msg_root, msg);
             let line = self.builder.ins().iconst(types::I64, span.line as i64);
             let col = self.builder.ins().iconst(types::I64, span.col as i64);
             // Produce the expression's unreachable placeholder before the

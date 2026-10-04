@@ -8,11 +8,12 @@ use std::hash::{BuildHasherDefault, Hasher};
 
 use super::{
     DropFn, GC_GENERATION_OLD, GC_GENERATION_YOUNG, GC_HEADER_SIZE, GC_REGION_MARK_GRANULE,
-    GcHeader, GcPayload, GcState, HeapObject, RegionKind, TraceFn, all_registered_stack_roots,
-    allocate_old_region_object_locked, drop_registry, foreign_root_stack_owner_active,
-    foreign_root_stack_owner_active_locked, object_reference_slots, retire_tlabs_with_work,
-    runtime, runtime_roots_snapshot, type_registry, verify_old_region_metadata,
-    verify_remembered_set, willow_gc_safepoint, with_stw,
+    GcHeader, GcPayload, GcState, HeapObject, RegionKind, TraceFn,
+    allocate_old_region_object_locked, append_parked_roots, drop_registry,
+    foreign_root_stack_owner_active, foreign_root_stack_owner_active_locked, minor_stack_roots,
+    object_reference_slots, retire_tlabs_with_work, runtime, runtime_root_slots,
+    tlab_payload_generation, type_registry, verify_old_region_metadata, verify_remembered_set,
+    willow_gc_safepoint, with_stw,
 };
 
 /// Folded-multiply hash for aligned heap addresses. SipHash's DoS resistance
@@ -122,16 +123,24 @@ impl<'a> MinorCollector<'a> {
         (object.allocated() && object.generation() == GC_GENERATION_YOUNG).then_some(object)
     }
 
-    /// Current generated code can retain an SSA alias after registering a root
-    /// slot. Until precise relocation-aware reloads exist, directly rooted
-    /// young objects are promoted in place. Their children can still move and
-    /// are updated through object/container slots below.
-    fn pin_root(&mut self, payload: *mut u8) {
+    /// Retain a young object in place by promoting it where it lies. Only a
+    /// hard memory budget uses this for young objects: a root published from
+    /// runtime code that cannot be deferred, or a nursery object left without
+    /// evacuation space. Root slots are rewritten instead (`scan_root_slot`).
+    /// Children of a retained object can still move; its reference slots are
+    /// updated when it is scanned.
+    fn pin_root(&mut self, payload: *mut u8, source: PinSource) {
         if payload.is_null() {
             return;
         }
         let address = payload as usize;
         if let Some(object) = self.young_source(address) {
+            if verify_no_pin() {
+                crate::failure::fatal_invariant(&format!(
+                    "WILLOW_GC_VERIFY_NO_PIN: minor collection pinned a young object ({})",
+                    source.describe()
+                ));
+            }
             object.set_generation(GC_GENERATION_OLD);
             self.state.survivor_stats.pinned_promotions += 1;
             let size = object.size();
@@ -228,7 +237,8 @@ impl<'a> MinorCollector<'a> {
             return payload;
         }
         let address = payload as usize;
-        // Direct roots were already promoted in place and are no longer young.
+        // Value roots were already retained in place and are no longer young;
+        // destinations of this cycle are never sources.
         let Some(source) = self.young_source(address) else {
             return payload;
         };
@@ -256,8 +266,8 @@ impl<'a> MinorCollector<'a> {
             if self.state.memory_limit_bytes.is_some() {
                 // A hard region budget must not require extra evacuation
                 // storage. Retain this nursery object in place, using the same
-                // promotion path as SSA-pinned roots, and keep tracing it.
-                self.pin_root(payload);
+                // promotion path as value roots, and keep tracing it.
+                self.pin_root(payload, PinSource::MemoryBudget);
                 return payload;
             }
             std::process::abort();
@@ -300,6 +310,42 @@ impl<'a> MinorCollector<'a> {
         }
     }
 
+    /// Evacuate a root slot's young referent and rewrite the slot (willow-9tls.9).
+    /// The slot is the holder's only copy across this collection, so the
+    /// referent need not stay in place. A slot already rewritten earlier in
+    /// this cycle (an aliased registration) names a destination and is left
+    /// alone; old referents are traced as before.
+    fn scan_root_slot(&mut self, slot: *mut *mut u8) {
+        // SAFETY: published root slots stay valid while their owners are stopped.
+        let value = unsafe { *slot };
+        if value.is_null() {
+            return;
+        }
+        if self.young_source(value as usize).is_some() {
+            self.scan_slot(slot);
+            return;
+        }
+        if !self.is_destination(value as usize) {
+            self.pin_root(value, PinSource::OldOrForeign);
+        }
+    }
+
+    /// Whether `address` names an object copied into survivor storage by this
+    /// cycle. O(log chunks).
+    fn is_destination(&self, address: usize) -> bool {
+        let Some(header) = address.checked_sub(GC_HEADER_SIZE) else {
+            return false;
+        };
+        self.state
+            .tlab_addresses
+            .candidate(header)
+            .filter(|&index| index >= self.source_chunks)
+            .is_some_and(|index| {
+                let chunk = &self.state.tlab_chunks[index];
+                header < chunk.base as usize + chunk.used
+            })
+    }
+
     fn scan_object(&mut self, object: HeapObject) {
         let address = object.payload().as_ptr() as usize;
         if !object.allocated() || !self.scanned.insert(address) {
@@ -332,24 +378,28 @@ impl<'a> MinorCollector<'a> {
 
     fn run(
         mut self,
-        roots: Vec<*mut u8>,
+        roots: MinorRoots,
         remembered: HashSet<usize>,
     ) -> (usize, crate::gc_telemetry::MarkWork) {
         let started = std::time::Instant::now();
-        self.work.root_scan_bytes =
-            crate::gc_telemetry::MarkWork::roots(roots.len()).root_scan_bytes;
-        self.stop_work.root_values += roots.len() as u64;
-        // Pin every direct root before scanning any interior edge so a duplicate
-        // stack/runtime root can never observe a moved stale SSA pointer.
-        for root in roots {
-            self.pin_root(root);
+        let count = roots.slots.len() + roots.values.len();
+        self.work.root_scan_bytes = crate::gc_telemetry::MarkWork::roots(count).root_scan_bytes;
+        self.stop_work.root_values += count as u64;
+        // Value roots cannot be rewritten, so retain them in place before any
+        // slot evacuates: a slot aliasing one of them then observes an old
+        // object and keeps its value.
+        for (root, source) in roots.values {
+            self.pin_root(root, source);
         }
         for owner in remembered {
             // The set was taken; `scan_object` re-remembers owners that keep
             // a young child after this collection.
             HeapObject::from_payload(GcPayload::from_raw(owner as *mut u8).unwrap())
                 .set_remembered(false);
-            self.pin_root(owner as *mut u8);
+            self.pin_root(owner as *mut u8, PinSource::RememberedOwner);
+        }
+        for slot in roots.slots {
+            self.scan_root_slot(slot);
         }
         while let Some(object) = self.worklist.pop() {
             self.scan_object(object);
@@ -360,6 +410,7 @@ impl<'a> MinorCollector<'a> {
         let mut reclaimed_young = 0u64;
         // Nursery runs are usually one type; skip the registry probe for them.
         let mut last_type: Option<(u32, Option<DropFn>)> = None;
+        let poison_moved = cfg!(debug_assertions) || super::gc_stress_enabled("relocate");
         self.state.survivor_stats.survivor_space_reserved = 0;
         self.state.survivor_stats.survivor_space_live = 0;
         let mut chunk_identities: Vec<_> = (0..self.state.tlab_chunks.len()).collect();
@@ -414,13 +465,27 @@ impl<'a> MinorCollector<'a> {
                             drop_fn
                         }
                     };
+                    let forwarded = self
+                        .forwarding
+                        .contains_key(&(object.payload().as_ptr() as usize));
                     if let Some(drop_fn) = drop_fn
-                        && !self
-                            .forwarding
-                            .contains_key(&(object.payload().as_ptr() as usize))
+                        && !forwarded
                     {
                         // SAFETY: unreachable young objects still own their runtime payload.
                         unsafe { super::run_drop_hook(drop_fn, object.payload().as_ptr()) };
+                    }
+                    if poison_moved && forwarded {
+                        // A holder that kept the pre-move address instead of
+                        // reloading its root slot now reads poison, not a
+                        // plausible stale copy.
+                        // SAFETY: the moved source payload is collector-owned.
+                        unsafe {
+                            std::ptr::write_bytes(
+                                object.payload().as_ptr(),
+                                MOVED_PAYLOAD_POISON,
+                                size - GC_HEADER_SIZE,
+                            )
+                        };
                     }
                     object.reclaim_in_place();
                     reclaimed_young += 1;
@@ -484,14 +549,107 @@ impl<'a> MinorCollector<'a> {
     }
 }
 
+/// Fill for the payload a minor collection moved away from, written by debug
+/// runtimes and under `WILLOW_GC_STRESS=relocate`.
+/// Pointer words become non-canonical addresses on every 64-bit target.
+pub(super) const MOVED_PAYLOAD_POISON: u8 = 0xA5;
+
+/// Roots of one minor collection. Slots are rewritten when their referent
+/// moves; values come from owners parked inside runtime code, which cannot
+/// observe a move. A young value defers the collection unless a hard memory
+/// budget forces in-place retention.
+#[derive(Default)]
+pub(super) struct MinorRoots {
+    pub(super) slots: Vec<*mut *mut u8>,
+    pub(super) values: Vec<(*mut u8, PinSource)>,
+}
+
+/// Why a minor collection retained a young object in place. Reported by
+/// `WILLOW_GC_VERIFY_NO_PIN`, which turns any young pin into a fatal error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PinSource {
+    /// A root slot published outside a relocation-safe scope, where runtime
+    /// Rust frames may hold raw copies of the referent. Reaches `pin_root`
+    /// only under a hard memory budget or after the bounded deferral
+    /// (`should_defer_minor`) runs out.
+    RuntimeCodeStack,
+    /// An address-registered runtime root (never young: registration rejects
+    /// young objects).
+    RuntimeAddressRoot,
+    /// A remembered-set owner (always old in a consistent heap).
+    RememberedOwner,
+    /// A root slot naming an object that is neither a live young source nor a
+    /// destination of this cycle.
+    OldOrForeign,
+    /// A hard memory budget left no evacuation space.
+    MemoryBudget,
+}
+
+impl PinSource {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::RuntimeCodeStack => "root slot published from runtime code",
+            Self::RuntimeAddressRoot => "address-registered runtime root",
+            Self::RememberedOwner => "remembered-set owner",
+            Self::OldOrForeign => "root slot outside the young source chunks",
+            Self::MemoryBudget => "memory budget left no evacuation space",
+        }
+    }
+}
+
+/// Whether `WILLOW_GC_VERIFY_NO_PIN` is enabled: set to a non-empty value
+/// other than `0`. Read once; consulted only when a young object is about to
+/// be pinned.
+fn verify_no_pin() -> bool {
+    static VERIFY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        verify_no_pin_enabled(std::env::var_os("WILLOW_GC_VERIFY_NO_PIN").as_deref())
+    });
+    *VERIFY
+}
+
+fn verify_no_pin_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+/// Run one minor collection over `roots`, or return `None` to defer it.
+///
+/// Value roots come from threads parked inside runtime code, whose Rust frames
+/// may keep raw copies of a young referent (willow-9tls.9). Such a park is
+/// normally transient: the frame resumes after this stop and a later
+/// allocation slow path retries, one TLAB chunk later (`minor_retry_bytes`).
+/// Deferring instead of pinning keeps every nursery object movable. The
+/// deferral is bounded: once the young bytes have grown by one nursery
+/// threshold since the first consecutive deferral, or under a hard memory
+/// budget that cannot grow the nursery, the collection runs and promotes only
+/// those runtime-held referents in place.
 fn minor_collect_with_roots(
-    mut roots: Vec<*mut u8>,
+    mut roots: MinorRoots,
     stop_work: &mut crate::gc_telemetry::stops::StopWorkV2,
-) -> (u64, u64, crate::gc_telemetry::MarkWork) {
-    roots.extend(runtime_roots_snapshot());
+) -> Option<(u64, u64, crate::gc_telemetry::MarkWork)> {
+    append_parked_roots(&mut roots);
+    roots.slots.extend(runtime_root_slots());
+    // Address roots are never young (checked at registration), so retaining
+    // them moves nothing; scanning them still finds young children stored by
+    // runtime code, as before this ticket.
+    roots.values.extend(
+        runtime()
+            .runtime_roots
+            .snapshot()
+            .into_iter()
+            .map(|root| (root, PinSource::RuntimeAddressRoot)),
+    );
     let trace_registry = type_registry().lock().unwrap().clone();
     let drop_registry = drop_registry().lock().unwrap().clone();
     let mut state = runtime().heap.lock().unwrap();
+    if should_defer_minor(&mut state, &roots) {
+        state.survivor_stats.deferred_minor_collections += 1;
+        state.minor_retry_bytes = state
+            .young_allocated_bytes
+            .saturating_add(super::GC_TLAB_CHUNK_SIZE);
+        return None;
+    }
+    state.minor_deferral_start_bytes = None;
+    state.minor_retry_bytes = 0;
     if std::env::var("WILLOW_GC_VERIFY_BARRIER").is_ok()
         && let Err(message) = verify_remembered_set(&state, &trace_registry)
     {
@@ -521,10 +679,68 @@ fn minor_collect_with_roots(
     {
         panic!("willow gc: region verification failed after minor collection: {message}");
     }
-    (before, state.allocated_bytes as u64, work)
+    Some((before, state.allocated_bytes as u64, work))
 }
 
-pub(super) fn minor_collect_internal() {
+/// Whether a runtime frame parked outside a relocation-safe scope holds a
+/// young value root and the collection may still wait for it to resume. The
+/// wait is bounded by one nursery threshold of young growth (measured from the
+/// first consecutive deferral), so a park that never ends costs at most one
+/// extra nursery's worth of memory before the in-place fallback.
+fn should_defer_minor(state: &mut super::GcState, roots: &MinorRoots) -> bool {
+    if state.memory_limit_bytes.is_some()
+        || force_pin_fallback()
+        || !roots.values.iter().any(|&(value, source)| {
+            source == PinSource::RuntimeCodeStack
+                && tlab_payload_generation(state, value as usize) == Some(GC_GENERATION_YOUNG)
+        })
+    {
+        return false;
+    }
+    let young = state.young_allocated_bytes;
+    let start = *state.minor_deferral_start_bytes.get_or_insert(young);
+    young.saturating_sub(start) < state.nursery_threshold_bytes
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_PIN_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn force_pin_fallback() -> bool {
+    FORCE_PIN_FALLBACK.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn force_pin_fallback() -> bool {
+    false
+}
+
+#[cfg(test)]
+pub(crate) fn deferred_minor_collections_for_test() -> u64 {
+    runtime()
+        .heap
+        .lock()
+        .unwrap()
+        .survivor_stats
+        .deferred_minor_collections
+}
+
+/// Run a minor collection that promotes young referents of runtime-held value
+/// roots in place, as under a hard memory budget, instead of deferring. Unit
+/// fixtures use it to drive the remaining pinned-region paths without a
+/// budget (willow-9tls.9). The flag is thread-local so concurrently running
+/// tests that expect deferral are unaffected.
+#[cfg(test)]
+pub(crate) fn minor_collect_pinning_for_test() {
+    FORCE_PIN_FALLBACK.with(|force| force.set(true));
+    minor_collect_internal();
+    FORCE_PIN_FALLBACK.with(|force| force.set(false));
+}
+
+pub(crate) fn minor_collect_internal() {
     if runtime()
         .stop_requested
         .load(std::sync::atomic::Ordering::Acquire)
@@ -563,14 +779,17 @@ pub(super) fn minor_collect_internal() {
                 let mut state = runtime().heap.lock().unwrap();
                 retire_tlabs_with_work(&mut state, stop_work);
             }
-            let roots = all_registered_stack_roots(coord);
+            let roots = minor_stack_roots(coord);
             Some(minor_collect_with_roots(roots, stop_work))
         },
     );
-    let Some((before, after, work)) = collected else {
+    let Some(collected) = collected else {
         runtime()
             .skipped_foreign_owner_collections
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    };
+    let Some((before, after, work)) = collected else {
         return;
     };
     let event = cycle.finish(before, after, work);

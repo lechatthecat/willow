@@ -233,6 +233,8 @@ mod array_fast_paths;
 mod array_reference_store;
 #[path = "integration/never_values.rs"]
 mod never_values;
+#[path = "integration/relocatable_roots.rs"]
+mod relocatable_roots;
 
 #[path = "integration/literal_slots.rs"]
 mod literal_slots;

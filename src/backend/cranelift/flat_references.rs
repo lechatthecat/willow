@@ -1,7 +1,7 @@
 //! Storage addresses and debug metadata for flattened reference arguments.
 use super::*;
 use crate::ir::lowered::{LirFunction, LirOperand, LirPlace};
-use cranelift_codegen::ir::{InstBuilder, Value, types};
+use cranelift_codegen::ir::{InstBuilder, StackSlotData, StackSlotKind, Value, types};
 use cranelift_module::Module;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
@@ -12,80 +12,55 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .expect("prepared reference scope");
     }
 
-    /// Pin every captured owner before computing any interior address. The
-    /// owning local may live only in an async frame and thus be movable.
+    /// Pass every reference argument as a pointer to a caller-owned
+    /// [`REFERENCE_CELL_BYTES`] cell `{base, offset}` (willow-9tls.9).
+    ///
+    /// `base` is the managed allocation that owns the referenced storage, or
+    /// null for a native stack slot; `offset` is the byte offset of the storage
+    /// inside `base` (the absolute address when `base` is null). A heap base is
+    /// registered as an ordinary relocatable root slot for the whole call, so a
+    /// moving collection rewrites it in place and the callee re-derives the
+    /// interior address from the cell at every access. Nothing pins the owner.
+    /// A callee forwarding its own reference parameter passes the cell it
+    /// received, whose base stays rooted by the frame that built it.
+    ///
+    /// Plain managed arguments get relocatable bridge roots: every caller
+    /// passes the values straight to a call or runtime call without an
+    /// intervening GC point, and a callee roots its own parameters. A caller
+    /// that allocates before using the values (heap enum construction) roots
+    /// and reloads them itself.
     pub(super) fn emit_flat_call_operands(
         &mut self,
         function: &LirFunction,
         args: &[LirOperand],
     ) -> (Vec<Value>, usize) {
         let before = self.gc_root_count;
-        for argument in args {
-            if let LirOperand::Reference { place, .. } = argument {
-                let owner = match place {
-                    LirPlace::Field { object, .. } => Some(self.load_lir_local(function, *object)),
-                    LirPlace::ArrayElement { owner, .. } => {
-                        Some(self.load_lir_local(function, *owner))
-                    }
-                    LirPlace::Local(id) => {
-                        match self.vars.get(&function.locals[id.0 as usize].name) {
-                            Some(VarStorage::Frame { .. }) => self.async_frame,
-                            _ => None,
-                        }
-                    }
-                };
-                if let Some(owner) = owner {
-                    self.emit_push_root(owner);
-                }
-            }
-        }
         let mut values = Vec::with_capacity(args.len());
         for argument in args {
-            let value = self.emit_lir_operand(function, argument);
-            // Pair buffers retain each initialized box as stable slot storage,
-            // including across pop/reuse while later arguments execute. The
-            // captured owner keeps it traced until this point. Pin the box for
-            // the call as well, keeping its raw scalar address stable.
-            if let LirOperand::Reference {
-                place: LirPlace::ArrayElement { element, .. },
-                ..
-            } = argument
-                && self.is_inline_pair(element)
-            {
-                self.emit_push_root(value);
-            }
-            if let LirOperand::Reference {
-                place: LirPlace::ArrayElement { element, .. },
-                ..
-            } = argument
-                && is_gc_managed(element, self.enum_infos)
-            {
-                let push_id = self.func_id("willow_push_root");
-                let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
-                self.builder.ins().call(push_ref, &[value]);
-                self.gc_root_count += 1;
-            }
-            if !matches!(argument, LirOperand::Reference { .. })
-                && is_gc_managed(
+            let value = if let LirOperand::Reference { place, .. } = argument {
+                self.emit_flat_reference_cell(function, place)
+            } else {
+                let value = self.emit_lir_operand(function, argument);
+                if is_gc_managed(
                     &argument
                         .ty(&function.locals)
                         .expect("checked call argument"),
                     self.enum_infos,
-                )
-            {
-                self.emit_push_root(value);
-            }
+                ) {
+                    self.emit_push_call_root(value);
+                }
+                value
+            };
             values.push(value);
         }
         (values, self.gc_root_count - before)
     }
 
-    pub(super) fn emit_flat_reference_address(
-        &mut self,
-        function: &LirFunction,
-        place: &LirPlace,
-    ) -> Value {
-        match place {
+    /// Build the reference cell for `place` and return its address. A managed
+    /// base is rooted through the cell's base word.
+    fn emit_flat_reference_cell(&mut self, function: &LirFunction, place: &LirPlace) -> Value {
+        let ptr = reference_type(self.module.target_config());
+        let (base, offset) = match place {
             LirPlace::Local(id) => {
                 let storage = self
                     .vars
@@ -94,14 +69,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .expect("checked local place");
                 match storage {
                     VarStorage::Stack { slot, .. } => {
-                        let ptr = reference_type(self.module.target_config());
-                        self.builder.ins().stack_addr(ptr, slot, 0)
+                        let address = self.builder.ins().stack_addr(ptr, slot, 0);
+                        (None, address)
                     }
-                    VarStorage::ReferencePtr { var, .. } => self.builder.use_var(var),
-                    VarStorage::Frame { offset, .. } => self
-                        .builder
-                        .ins()
-                        .iadd_imm_s(self.async_frame.expect("frame place"), offset as i64),
+                    // Forward the caller's cell; its base is rooted there.
+                    VarStorage::ReferencePtr { var, .. } => return self.builder.use_var(var),
+                    // Async frames are runtime allocations the function keeps
+                    // using through its stable `async_frame` value; root the
+                    // frame like any other base so the cell has one contract.
+                    VarStorage::Frame { offset, .. } => {
+                        let frame = self.async_frame.expect("frame place");
+                        let offset = self.builder.ins().iconst(ptr, i64::from(offset));
+                        (Some(frame), offset)
+                    }
                     VarStorage::Value { .. } => {
                         panic!("reference local was not prebound to addressable storage")
                     }
@@ -118,7 +98,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .field(field)
                     .expect("checked reference field");
                 let owner = self.load_lir_local(function, *object);
-                self.builder.ins().iadd_imm_s(owner, offset)
+                let offset = self.builder.ins().iconst(ptr, offset);
+                (Some(owner), offset)
             }
             LirPlace::ArrayElement {
                 owner,
@@ -129,23 +110,37 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let owner = self.load_lir_local(function, *owner);
                 let index = self.load_lir_local(function, *index);
                 let offset = self.builder.ins().imul_imm_s(index, 8);
-                let base = self.builder.ins().iadd_imm_s(owner, 8);
-                let address = self.builder.ins().iadd(base, offset);
+                let offset = self.builder.ins().iadd_imm_s(offset, 8);
                 if self.is_inline_pair(element) {
                     // Pop clears the pair's bits, not this pointer; no-growth
-                    // push overwrites the same box. Capturing buffer + index
-                    // therefore preserves identity throughout argument evaluation.
-                    self.builder.ins().load(
-                        reference_type(self.module.target_config()),
-                        MemFlagsData::new(),
-                        address,
-                        0,
-                    )
+                    // push overwrites the same box. The box itself is the
+                    // referenced storage and becomes the cell's base.
+                    let address = self.builder.ins().iadd(owner, offset);
+                    let pair = self
+                        .builder
+                        .ins()
+                        .load(ptr, MemFlagsData::new(), address, 0);
+                    let zero = self.builder.ins().iconst(ptr, 0);
+                    (Some(pair), zero)
                 } else {
-                    address
+                    // The buffer traces its high-water prefix, so the slot
+                    // stays traced through the rooted base even after a pop.
+                    (Some(owner), offset)
                 }
             }
+        };
+        let cell = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            REFERENCE_CELL_BYTES,
+            3,
+        ));
+        let base_value = base.unwrap_or_else(|| self.builder.ins().iconst(ptr, 0));
+        self.builder.ins().stack_store(ptr, base_value, cell, 0);
+        self.builder.ins().stack_store(ptr, offset, cell, 8);
+        if base.is_some() {
+            self.emit_push_root_slot(cell);
         }
+        self.builder.ins().stack_addr(ptr, cell, 0)
     }
 
     pub(super) fn emit_flat_reference_debug(

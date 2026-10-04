@@ -272,6 +272,9 @@ pub(crate) fn run_owned<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'st
     if !crate::native_stack::is_active() {
         return Some(work());
     }
+    // Callers hold no raw managed pointer across this call (the job owns
+    // native copies), so the parked task's root slots may be rewritten.
+    let _relocation = crate::gc::RelocationSafeScope::enter();
     let task = crate::scheduler::willow_sched_current_task();
     let result = Arc::new(Mutex::new(None));
     let output = Arc::clone(&result);

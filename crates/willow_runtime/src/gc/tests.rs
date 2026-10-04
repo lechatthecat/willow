@@ -139,7 +139,7 @@ fn legacy_root_owner_retained_after_nonempty_unregister() {
     });
     ready_rx.recv().unwrap();
     willow_gc_collect();
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
     let skipped = willow_gc_skipped_collections();
     let retained = willow_gc_allocated_bytes();
     release_tx.send(()).unwrap();
@@ -481,7 +481,7 @@ fn racing_root_worker(rounds: usize, sentinel: i64, minor: bool) {
             std::thread::yield_now();
         }
         if minor {
-            willow_gc_minor_collect();
+            crate::gc::minor_collect_internal();
         }
         assert_stamped_objects_live(&slots, sentinel, &format!("round {round}"));
         willow_pop_roots(PER_ROUND as i32);
@@ -501,7 +501,7 @@ fn run_registration_race(workers: usize, rounds: usize, minor: bool) {
             // This thread never registers, so it is the one that used to
             // take the "I am alone" fast path.
             if minor {
-                willow_gc_minor_collect();
+                crate::gc::minor_collect_internal();
             } else {
                 willow_gc_collect();
             }
@@ -837,7 +837,7 @@ fn telemetry_promotion_is_not_a_second_logical_allocation() {
         *parent.cast::<*mut u8>() = young;
     }
     let before = crate::gc_telemetry::snapshot();
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
     let after = crate::gc_telemetry::snapshot();
     assert_eq!(
         after.counters.allocation_count,
@@ -891,7 +891,7 @@ fn compact_header_descriptors_follow_sweep_copy_and_reset() {
         *parent.cast::<*mut u8>() = young;
     }
     for _ in 0..2 {
-        willow_gc_minor_collect();
+        crate::gc::minor_collect_internal();
         let moved = unsafe { *parent.cast::<*mut u8>() };
         assert_ne!(young, moved);
         young = moved;
@@ -1114,7 +1114,7 @@ fn test_gc_minor_collection_moves_heap_reachable_young_and_updates_slot() {
     unsafe { *(parent as *mut *mut u8) = young };
     willow_push_root(&mut parent as *mut *mut u8);
 
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
 
     let moved = unsafe { *(parent as *mut *mut u8) };
     assert_ne!(moved, young, "heap-only young child should be copied");
@@ -1133,26 +1133,35 @@ fn test_gc_minor_collection_moves_heap_reachable_young_and_updates_slot() {
 }
 
 #[test]
-fn test_gc_minor_collection_pins_direct_young_root_for_ssa_compatibility() {
+fn test_gc_minor_collection_defers_direct_young_root_outside_relocation_scope() {
     let _guard = gc_test_guard();
     reset_gc();
     let mut tls = new_tlab_state();
-    let mut young = willow_gc_alloc_slow(&mut tls, 21, 0, 8, 0);
-    unsafe { *(young as *mut i64) = 77 };
+    let original = willow_gc_alloc_slow(&mut tls, 21, 0, 8, 0);
+    unsafe { *(original as *mut i64) = 77 };
+    let mut young = original;
     willow_push_root(&mut young as *mut *mut u8);
 
-    willow_gc_minor_collect();
+    // Runtime code may hold a raw copy, so the collection waits instead of
+    // pinning the referent's chunk (willow-9tls.9).
+    crate::gc::minor_collect_internal();
 
+    assert_eq!(young, original);
     assert_eq!(unsafe { *(young as *mut i64) }, 77);
     assert_eq!(
         unsafe { (*payload_to_header(young)).generation },
-        GC_GENERATION_OLD
+        GC_GENERATION_YOUNG
     );
-    assert_eq!(willow_gc_moved_objects(), 0);
-    assert_eq!(willow_gc_promoted_objects(), 1);
-    assert!(willow_gc_tlab_reserved_bytes() > 0);
-    assert_eq!(willow_gc_pinned_region_count(), 1);
-    assert_eq!(willow_gc_old_region_count(), 1);
+    assert_eq!(crate::gc::deferred_minor_collections_for_test(), 1);
+    assert_eq!(willow_gc_minor_collections(), 0);
+    assert_eq!(willow_gc_promoted_objects(), 0);
+    assert_eq!(willow_gc_pinned_region_count(), 0);
+
+    // The next relocation-safe collection moves it.
+    willow_gc_minor_collect();
+    assert_ne!(young, original);
+    assert_eq!(unsafe { *(young as *mut i64) }, 77);
+    assert_eq!(willow_gc_pinned_region_count(), 0);
 
     willow_pop_root();
     willow_gc_collect();
@@ -1162,25 +1171,234 @@ fn test_gc_minor_collection_pins_direct_young_root_for_ssa_compatibility() {
 }
 
 #[test]
-fn test_gc_minor_collection_pins_runtime_root_until_owner_releases_it() {
+fn test_gc_minor_collection_pins_runtime_held_root_under_hard_memory_limit() {
     let _guard = gc_test_guard();
     reset_gc();
     let mut tls = new_tlab_state();
-    let young = willow_gc_alloc_slow(&mut tls, 22, 0, 8, 0);
-    unsafe { *(young as *mut i64) = 78 };
-    willow_gc_add_runtime_root(young);
+    let mut young = willow_gc_alloc_slow(&mut tls, 21, 0, 8, 0);
+    unsafe { *(young as *mut i64) = 76 };
+    willow_push_root(&mut young as *mut *mut u8);
+    // A hard budget cannot grow the nursery, so the collection must reclaim
+    // now and promotes the runtime-held referent in place.
+    runtime().heap.lock().unwrap().memory_limit_bytes = Some(64 * GC_OLD_REGION_SIZE);
 
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
 
-    assert_eq!(unsafe { *(young as *mut i64) }, 78);
+    assert_eq!(unsafe { *(young as *mut i64) }, 76);
     assert_eq!(
         unsafe { (*payload_to_header(young)).generation },
         GC_GENERATION_OLD
     );
-    willow_gc_remove_runtime_root(young);
+    assert_eq!(crate::gc::deferred_minor_collections_for_test(), 0);
+    assert_eq!(willow_gc_promoted_objects(), 1);
+    assert_eq!(willow_gc_pinned_region_count(), 1);
+
+    willow_pop_root();
     willow_gc_collect();
     assert_eq!(willow_gc_allocated_bytes(), 0);
     reset_gc();
+}
+
+#[test]
+fn test_gc_minor_collection_relocates_generated_code_root_slots() {
+    let _guard = gc_test_guard();
+    reset_gc();
+    let mut tls = new_tlab_state();
+    let original = willow_gc_alloc_slow(&mut tls, 21, 0, 8, 0);
+    unsafe { *(original as *mut i64) = 77 };
+    let mut slot = original;
+    let mut alias = original;
+    willow_push_root(&mut slot as *mut *mut u8);
+    willow_push_root(&mut alias as *mut *mut u8);
+
+    // The generated-code entry point runs inside a relocation-safe scope.
+    willow_gc_minor_collect();
+
+    assert_ne!(slot, original);
+    assert_eq!(alias, slot, "every slot naming the object is rewritten");
+    assert_eq!(unsafe { *(slot as *mut i64) }, 77);
+    assert_eq!(willow_gc_moved_objects(), 1);
+    assert_eq!(willow_gc_pinned_promotions(), 0);
+    assert_eq!(willow_gc_pinned_region_count(), 0);
+    assert!(!super::safepoint::relocation_safe(), "scope restored");
+
+    willow_pop_roots(2);
+    willow_gc_collect();
+    assert_eq!(willow_gc_allocated_bytes(), 0);
+    reset_gc();
+}
+
+#[test]
+fn test_gc_minor_collection_rewrites_parked_relocatable_stack_roots() {
+    let _guard = gc_test_guard();
+    reset_gc();
+    let mut tls = new_tlab_state();
+    let original = willow_gc_alloc_slow(&mut tls, 21, 0, 8, 0);
+    unsafe { *(original as *mut i64) = 79 };
+    let mut slot = original;
+    let scope = super::safepoint::RelocationSafeScope::enter();
+    willow_push_root(&mut slot as *mut *mut u8);
+    let token = unsafe { park_current_roots(0) };
+    // The scheduler side of the park is runtime code.
+    assert!(!super::safepoint::relocation_safe());
+
+    crate::gc::minor_collect_internal();
+
+    assert_ne!(slot, original);
+    assert_eq!(unsafe { *(slot as *mut i64) }, 79);
+    assert_eq!(willow_gc_pinned_region_count(), 0);
+    unsafe { resume_parked_roots(token) };
+    assert!(
+        super::safepoint::relocation_safe(),
+        "resume restores the scope"
+    );
+    drop(scope);
+    assert!(!super::safepoint::relocation_safe());
+
+    willow_pop_root();
+    willow_gc_collect();
+    reset_gc();
+}
+
+#[test]
+fn test_gc_minor_collection_defers_roots_parked_from_runtime_code() {
+    let _guard = gc_test_guard();
+    reset_gc();
+    let mut tls = new_tlab_state();
+    let original = willow_gc_alloc_slow(&mut tls, 21, 0, 8, 0);
+    let mut slot = original;
+    willow_push_root(&mut slot as *mut *mut u8);
+    let token = unsafe { park_current_roots(0) };
+
+    // Even a generated-code collection cannot rewrite slots whose frames
+    // parked outside a relocation-safe scope; it defers until they resume.
+    willow_gc_minor_collect();
+
+    assert_eq!(slot, original);
+    assert_eq!(willow_gc_moved_objects(), 0);
+    assert_eq!(crate::gc::deferred_minor_collections_for_test(), 1);
+    assert_eq!(willow_gc_pinned_region_count(), 0);
+    unsafe { resume_parked_roots(token) };
+    assert!(!super::safepoint::relocation_safe());
+
+    willow_gc_minor_collect();
+    assert_ne!(slot, original);
+    assert_eq!(willow_gc_pinned_region_count(), 0);
+
+    willow_pop_root();
+    willow_gc_collect();
+    reset_gc();
+}
+
+#[test]
+fn test_gc_minor_deferral_backs_off_and_is_bounded_by_an_indefinite_park() {
+    let _guard = gc_test_guard();
+    reset_gc();
+    let mut tls = new_tlab_state();
+    let original = willow_gc_alloc_slow(&mut tls, 21, 0, 8, 0);
+    unsafe { *(original as *mut i64) = 81 };
+    let mut slot = original;
+    let depth = gc_thread_root_depth();
+    willow_push_root(&mut slot as *mut *mut u8);
+    // A task blocked in runtime code that never resumes during the loop.
+    let token = unsafe { park_current_roots(depth) };
+    let threshold = runtime().heap.lock().unwrap().nursery_threshold_bytes;
+
+    let mut max_young = 0;
+    let mut slow_paths = 0usize;
+    while willow_gc_minor_collections() == 0 {
+        assert!(!willow_gc_alloc_slow(&mut tls, 22, 0, 64, 0).is_null());
+        slow_paths += 1;
+        max_young = max_young.max(runtime().heap.lock().unwrap().young_allocated_bytes);
+        assert!(slow_paths < 1 << 20, "deferral never escalated");
+    }
+
+    // Each deferral waits one TLAB chunk before the next stop-the-world
+    // attempt, so retries scale with the nursery threshold, not with the
+    // number of slow paths.
+    let deferred = crate::gc::deferred_minor_collections_for_test() as usize;
+    eprintln!(
+        "indefinite park: threshold={threshold} slow_paths={slow_paths} deferred={deferred} max_young={max_young}"
+    );
+    assert!(deferred >= 1);
+    assert!(
+        deferred <= threshold / GC_TLAB_CHUNK_SIZE + 2,
+        "deferred={deferred} threshold={threshold} slow_paths={slow_paths}"
+    );
+    assert!(slow_paths > 4 * deferred, "slow_paths={slow_paths}");
+    // Young growth during the park is bounded by about one extra threshold.
+    assert!(
+        max_young <= 2 * threshold + 2 * GC_TLAB_CHUNK_SIZE,
+        "max_young={max_young} threshold={threshold}"
+    );
+    // The escalated collection keeps only the runtime-held referent in place.
+    assert_eq!(slot, original);
+    assert_eq!(unsafe { *(slot as *mut i64) }, 81);
+    assert_eq!(
+        unsafe { (*payload_to_header(slot)).generation },
+        GC_GENERATION_OLD
+    );
+    assert_eq!(willow_gc_pinned_promotions(), 1);
+    let state = runtime().heap.lock().unwrap();
+    assert_eq!(state.minor_deferral_start_bytes, None);
+    assert_eq!(state.minor_retry_bytes, 0);
+    drop(state);
+
+    unsafe { resume_parked_roots(token) };
+    willow_pop_root();
+    willow_gc_collect();
+    assert_eq!(willow_gc_allocated_bytes(), 0);
+    reset_gc();
+}
+
+#[test]
+fn test_gc_runtime_root_slot_relocates_young_referent() {
+    let _guard = gc_test_guard();
+    reset_gc();
+    let mut tls = new_tlab_state();
+    let original = willow_gc_alloc_slow(&mut tls, 22, 0, 8, 0);
+    unsafe { *(original as *mut i64) = 78 };
+    let mut slot = Box::new(original);
+    willow_gc_add_runtime_root_slot(&mut *slot);
+    assert_eq!(crate::gc::runtime_root_count(), 1);
+
+    // Runtime-root slots are rewritable even outside a relocation scope.
+    crate::gc::minor_collect_internal();
+
+    assert_ne!(*slot, original);
+    assert_eq!(unsafe { *(*slot as *mut i64) }, 78);
+    assert_eq!(willow_gc_moved_objects(), 1);
+    assert_eq!(willow_gc_pinned_region_count(), 0);
+    willow_gc_collect();
+    assert_eq!(
+        unsafe { *(*slot as *mut i64) },
+        78,
+        "major keeps slot roots"
+    );
+
+    willow_gc_remove_runtime_root_slot(&mut *slot);
+    assert_eq!(crate::gc::runtime_root_count(), 0);
+    willow_gc_collect();
+    assert_eq!(willow_gc_allocated_bytes(), 0);
+    reset_gc();
+}
+
+#[test]
+fn test_gc_address_runtime_root_rejects_young_object() {
+    use super::failure_policy_tests::{GC_FATAL_CASE, assert_fatal_child};
+    if std::env::var_os(GC_FATAL_CASE).is_some() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let mut tls = new_tlab_state();
+        let young = willow_gc_alloc_slow(&mut tls, 22, 0, 8, 0);
+        willow_gc_add_runtime_root(young);
+        unreachable!("a young address root must abort");
+    }
+    assert_fatal_child(
+        "gc::tests::test_gc_address_runtime_root_rejects_young_object",
+        "young-address-root",
+        "young object registered as an address runtime root",
+    );
 }
 
 #[test]
@@ -1191,7 +1409,7 @@ fn test_gc_minor_collection_reclaims_unreachable_nursery() {
     let young = willow_gc_alloc_slow(&mut tls, 31, 0, 8, 0);
     assert!(!young.is_null());
 
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
 
     assert_eq!(willow_gc_allocated_bytes(), 0);
     assert_eq!(willow_gc_tlab_reserved_bytes(), 0);
@@ -1214,13 +1432,13 @@ fn test_gc_minor_collection_updates_array_reference_slots() {
     assert!(willow_gc_remembered_set_size() > 0);
     assert!(willow_gc_dirty_card_count() > 0);
 
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
 
     let moved = crate::array::willow_array_get(array, 0) as *mut u8;
     assert_ne!(moved, young);
     assert_eq!(unsafe { *(moved as *mut i64) }, 901);
     assert!(willow_gc_dirty_card_count() > 0);
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
     assert_eq!(willow_gc_dirty_card_count(), 0);
     let tenured = crate::array::willow_array_get(array, 0) as *mut u8;
     assert_eq!(unsafe { *tenured.cast::<i64>() }, 901);
@@ -1241,7 +1459,7 @@ fn test_gc_minor_collection_updates_map_reference_slots() {
     crate::map::willow_map_insert(map, 7, 0, young as i64, 1);
     assert!(willow_gc_remembered_set_size() > 0);
 
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
 
     let option = crate::map::willow_map_get(map, 7, 0, 0);
     let moved = unsafe { *((option as *mut *mut u8).add(1)) };
@@ -1264,7 +1482,7 @@ fn test_gc_minor_collection_updates_channel_queue_reference_slots() {
     crate::channel::willow_channel_send_ptr(channel.cast(), young.cast());
     assert!(willow_gc_remembered_set_size() > 0);
 
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
 
     let moved = crate::channel::willow_channel_recv_ptr(channel.cast()).cast::<u8>();
     assert_ne!(moved, young);
@@ -1861,9 +2079,9 @@ fn test_gc_minor_promotion_target_is_old_region_backed() {
     unsafe { *(parent as *mut *mut u8) = young };
     willow_push_root(&mut parent);
 
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
     assert_eq!(willow_gc_survivor_copies(), 1);
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
 
     let promoted = unsafe { *(parent as *mut *mut u8) };
     let state = runtime().heap.lock().unwrap();

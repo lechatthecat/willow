@@ -13,7 +13,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let mut roots = 0;
         for (&value, ty) in args.iter().zip(params) {
             if is_gc_managed(ty, self.enum_infos) {
-                self.emit_push_root(value);
+                // The task constructor alone consumes the arguments.
+                self.emit_push_call_root(value);
                 roots += 1;
             }
         }

@@ -365,20 +365,24 @@ fn main() {
 }
 
 #[test]
-fn gc_region_04_direct_young_root_becomes_pinned_region() {
+fn gc_region_04_direct_young_root_relocates_without_pinned_region() {
+    // A rooted local's slot is rewritten (willow-9tls.9): the survivor is
+    // copied, and no pinned region is created for it.
     let src = r#"
 class Box {
     pub value: i64;
 }
 fn main() {
     let before = gc_pinned_region_count();
+    let moved = gc_moved_objects();
     let b = new Box(73);
     gc_minor_collect();
     println(b.value);
-    println(gc_pinned_region_count() > before);
+    println(gc_pinned_region_count() == before);
+    println(gc_moved_objects() > moved);
 }
 "#;
-    assert_gc_allocation_modes(src, "73\ntrue\n", "73\nfalse\n");
+    assert_gc_allocation_modes(src, "73\ntrue\ntrue\n", "73\ntrue\nfalse\n");
 }
 
 #[test]

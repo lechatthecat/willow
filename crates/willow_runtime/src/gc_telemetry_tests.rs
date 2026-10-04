@@ -218,7 +218,7 @@ fn minor_cycles_do_not_overwrite_the_last_major_live_measurement() {
     willow_push_root(&mut live);
     willow_gc_collect();
     let major = snapshot().last_major_cycle;
-    willow_gc_minor_collect();
+    crate::gc::minor_collect_internal();
     let stats = snapshot();
     assert_consistent(&stats);
     assert_eq!(stats.last_cycle.kind, 1);
@@ -556,7 +556,7 @@ fn stop_trace_probe() {
     }
     willow_gc_collect();
     if std::env::var_os("WILLOW_STOP_TRACE_PROBE_MAJOR_ONLY").is_none() {
-        willow_gc_minor_collect();
+        crate::gc::minor_collect_internal();
     }
     std::fs::write(dir.join("after.json"), endpoint()).unwrap();
 }

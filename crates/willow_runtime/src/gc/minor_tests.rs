@@ -1,6 +1,6 @@
 //! Deterministic tracing-work checks for the minor-collector extraction.
 
-use super::MinorCollector;
+use super::{MinorCollector, MinorRoots, PinSource, verify_no_pin_enabled};
 use crate::gc::{
     GC_HEADER_SIZE, drop_registry, reset_internal, retire_all_tlabs_locked, runtime,
     runtime_test_guard, tlab_state_for_test, type_registry, verify_old_region_metadata,
@@ -46,8 +46,13 @@ fn minor_tracing_work_scales_with_graph_and_roots() {
             let mut state = runtime().heap.lock().unwrap();
             retire_all_tlabs_locked(&mut state);
             let mut stop = crate::gc_telemetry::stops::StopWorkV2::default();
-            let (_, work) = MinorCollector::new(&mut state, trace, drops, &mut stop)
-                .run(vec![nodes[0]; root_count], Default::default());
+            let (_, work) = MinorCollector::new(&mut state, trace, drops, &mut stop).run(
+                MinorRoots {
+                    slots: Vec::new(),
+                    values: vec![(nodes[0], PinSource::RuntimeCodeStack); root_count],
+                },
+                Default::default(),
+            );
             // Existing production telemetry counts objects and reference slots,
             // not elapsed time. Duplicate edges/roots must not rescan objects.
             assert_eq!(work.marked_bytes, (n * (GC_HEADER_SIZE + 16)) as u64);
@@ -104,8 +109,16 @@ fn collect(roots: Vec<*mut u8>) -> crate::gc_telemetry::MarkWork {
     retire_all_tlabs_locked(&mut state);
     let remembered = std::mem::take(&mut state.remembered_set);
     state.dirty_cards.clear();
-    let (_, work) = MinorCollector::new(&mut state, trace, drops, &mut Default::default())
-        .run(roots, remembered);
+    let (_, work) = MinorCollector::new(&mut state, trace, drops, &mut Default::default()).run(
+        MinorRoots {
+            slots: Vec::new(),
+            values: roots
+                .into_iter()
+                .map(|root| (root, PinSource::RuntimeCodeStack))
+                .collect(),
+        },
+        remembered,
+    );
     verify_old_region_metadata(&state).unwrap();
     crate::gc::verify_remembered_set(&state, &type_registry().lock().unwrap()).unwrap();
     work
@@ -285,7 +298,16 @@ fn minor_metadata_skips_pinned_chunks_across_repeated_collections() {
                     Default::default(),
                     &mut stop,
                 )
-                .run(roots, remembered);
+                .run(
+                    MinorRoots {
+                        slots: Vec::new(),
+                        values: roots
+                            .into_iter()
+                            .map(|root| (root, PinSource::RuntimeCodeStack))
+                            .collect(),
+                    },
+                    remembered,
+                );
                 // One sweep walk: sources plus this cycle's survivor copies.
                 let expected = if cycle % 2 == 0 { 3 * young } else { young };
                 assert_eq!(stop.metadata_objects, expected as u64);
@@ -508,4 +530,14 @@ fn in_place_promotion_clears_stale_remembered_byte() {
     assert_eq!(unsafe { (*payload_to_header(pinned)).remembered }, 0);
     assert_eq!(willow_gc_remembered_set_size(), 0);
     reset_internal();
+}
+
+#[test]
+fn verify_no_pin_accepts_only_non_empty_non_zero_values() {
+    use std::ffi::OsStr;
+    assert!(!verify_no_pin_enabled(None));
+    assert!(!verify_no_pin_enabled(Some(OsStr::new(""))));
+    assert!(!verify_no_pin_enabled(Some(OsStr::new("0"))));
+    assert!(verify_no_pin_enabled(Some(OsStr::new("1"))));
+    assert!(verify_no_pin_enabled(Some(OsStr::new("yes"))));
 }

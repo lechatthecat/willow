@@ -60,7 +60,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         if self.is_interface_pair(ty) {
-            let root = self.emit_push_root(value);
+            let root = self.emit_push_relocatable_root(value);
             let ptr =
                 self.emit_gc_alloc(GcLayoutMetadata::new(GcObjectKind::InterfaceBox, 16, 0, 1));
             let value = self.stack_load(types::I128, root);

@@ -1,0 +1,164 @@
+// Relocatable root slots (willow-9tls.9).
+//
+// Generated code keeps every managed local in a registered root slot and
+// reloads it at each use. A minor collection may therefore COPY a young
+// survivor that is held only by locals and rewrite the slots in place,
+// instead of pinning the object's whole nursery chunk. Run with
+// `WILLOW_GC_STRESS=relocate` to move objects at every generated allocation;
+// moved payloads are then poisoned, so any stale pre-move address would print
+// garbage or crash instead of the fixed output below.
+import std::collections::Array;
+
+interface Shape { fn area() -> i64; }
+class Square implements Shape {
+    pub side: i64;
+    pub fn area() -> i64 { return self.side * self.side; }
+}
+class Node {
+    pub value: i64;
+    pub next: Option<Node>;
+
+    // The receiver's slot is rewritten while the method allocates.
+    pub fn grow(n: i64) -> i64 {
+        let mut i = 0;
+        while i < n {
+            let scratch = new Node(i, Option::None);
+            self.value = self.value + scratch.value - i + 1;
+            i = i + 1;
+        }
+        return self.value;
+    }
+}
+enum Slot { Empty, Full(Node) }
+
+// An argument stays valid while the callee allocates.
+fn sum_after_churn(a: Node, b: Node) -> i64 {
+    let mut i = 0;
+    while i < 100 {
+        let garbage = new Node(i, Option::None);
+        i = i + garbage.value - garbage.value + 1;
+    }
+    gc_minor_collect();
+    return a.value + b.value;
+}
+
+// A `&mut` argument is a `{base, offset}` cell; the base is a relocatable root
+// and the callee re-derives the address after its own collections.
+fn bump_after_collect(x: &mut i64, by: i64) {
+    gc_minor_collect();
+    let scratch = new Node(by, Option::None);
+    x = x + scratch.value;
+}
+
+fn replace_after_collect(node: &mut Node, v: i64) {
+    gc_minor_collect();
+    node = new Node(v, Option::None);
+    gc_minor_collect();
+}
+
+// Every frame of a deep recursion holds a young local across a collection.
+fn depth(n: i64) -> i64 {
+    let here = new Node(n, Option::None);
+    if n == 0 {
+        gc_minor_collect();
+        return here.value;
+    }
+    let below = depth(n - 1);
+    return here.value + below;
+}
+
+fn chain(n: i64) -> Node {
+    let mut head = new Node(0, Option::None);
+    let mut i = 1;
+    while i < n {
+        head = new Node(i, Option::Some(head));
+        i = i + 1;
+    }
+    return head;
+}
+
+fn chain_sum(head: Node) -> i64 {
+    let mut total = head.value;
+    let mut cursor = head.next;
+    let mut done = false;
+    while !done {
+        match cursor {
+            Option::Some(node) => {
+                total = total + node.value;
+                cursor = node.next;
+            }
+            Option::None => { done = true; }
+        }
+    }
+    return total;
+}
+
+fn main() {
+    let pinned = gc_pinned_promotions();
+    let regions = gc_pinned_region_count();
+    let moved = gc_moved_objects();
+
+    // A local-only survivor is copied and the slot rewritten.
+    let a = new Node(41, Option::None);
+    gc_minor_collect();
+    println(a.value + 1);
+
+    // Two slots naming the same object both follow the move.
+    let alias = a;
+    gc_minor_collect();
+    alias.value = 7;
+    println(a.value);
+
+    // Heap edges from a moved object move their targets as well.
+    let list = chain(50);
+    gc_minor_collect();
+    gc_minor_collect();
+    gc_minor_collect();
+    println(chain_sum(list));
+
+    // Arguments, receivers and deep frames survive collections in callees.
+    println(sum_after_churn(new Node(3, Option::None), new Node(4, Option::None)));
+    let grower = new Node(0, Option::None);
+    println(grower.grow(25));
+    println(depth(40));
+
+    // Interface pairs, enum payloads and array elements.
+    let shape: Shape = new Square(6);
+    let slot = Slot::Full(new Node(9, Option::None));
+    let nodes: Array<Node> = [new Node(1, Option::None), new Node(2, Option::None)];
+    gc_minor_collect();
+    nodes[1] = new Node(5, Option::None);
+    gc_minor_collect();
+    println(shape.area());
+    match slot {
+        Slot::Full(n) => println(n.value),
+        Slot::Empty => println("empty"),
+    }
+    println(nodes[0].value + nodes[1].value);
+
+    // Reassigned locals in an allocating loop: survivors reach tenure.
+    let mut keep = new Node(0, Option::None);
+    let mut round = 0;
+    while round < 200 {
+        let next = new Node(keep.value + 1, Option::Some(keep));
+        keep = next;
+        if round % 50 == 0 {
+            gc_minor_collect();
+        }
+        round = round + 1;
+    }
+    println(keep.value);
+
+    // Interior references into young objects and array elements: the owner
+    // moves while the callee runs, and the write lands in the moved copy.
+    let holder = new Node(10, Option::None);
+    bump_after_collect(&holder.value, 5);
+    let items: Array<Node> = [new Node(1, Option::None), new Node(2, Option::None)];
+    replace_after_collect(&items[0], 30);
+    println(holder.value + items[0].value);
+
+    // Generated-code roots never leave pinned storage behind.
+    println(gc_pinned_promotions() - pinned);
+    println(gc_pinned_region_count() - regions);
+    println(gc_moved_objects() > moved);
+}
