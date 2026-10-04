@@ -372,24 +372,9 @@ fn backend_emitter_io_errors_propagate_without_panic() {
     }
 }
 
-#[test]
-fn cascaded_diagnostics_follow_their_roots_and_name_them() {
-    let f = Fixture::new(
-        "import util;\nfn step(n: i64) -> i64 {\n    if n > 1 { return 1 } else if { return 2; }\n    return 0;\n}\nfn main() { println(step(1) + util::k()); }",
-    );
-    fs::write(
-        f.0.join("util.wi"),
-        "pub fn k() -> i64 { return missing(); }\npub fn j() -> i64 { return true; }",
-    )
-    .unwrap();
-    let values = events(
-        &f.run(
-            env!("CARGO_BIN_EXE_willow"),
-            &["check", "main.wi", "--format=ndjson"],
-        ),
-        1,
-        "WT2001",
-    );
+/// `(code, path, line, cascade)` per diagnostic, after checking that every
+/// cascade follows the roots and names an earlier emitted root event.
+fn diagnostic_summary(values: &[Value]) -> Vec<(String, String, u64, bool)> {
     let diagnostics: Vec<_> = values
         .iter()
         .filter(|v| v["event"] == "diagnostic")
@@ -398,18 +383,19 @@ fn cascaded_diagnostics_follow_their_roots_and_name_them() {
         .iter()
         .map(|v| {
             (
-                v["code"].as_str().unwrap(),
-                v["data"]["labels"][0]["path"].as_str().unwrap(),
+                v["code"].as_str().unwrap().to_owned(),
+                v["data"]["labels"][0]["path"].as_str().unwrap().to_owned(),
                 v["data"]["labels"][0]["span"]["line"].as_u64().unwrap(),
                 v["data"]["cascade"].as_bool().unwrap(),
             )
         })
         .collect();
-    let first_cascade = summary.iter().position(|d| d.3).unwrap();
-    assert!(
-        summary[first_cascade..].iter().all(|d| d.3),
-        "roots precede cascades: {summary:?}"
-    );
+    if let Some(first_cascade) = summary.iter().position(|d| d.3) {
+        assert!(
+            summary[first_cascade..].iter().all(|d| d.3),
+            "roots precede cascades: {summary:?}"
+        );
+    }
     for diagnostic in &diagnostics {
         let root = &diagnostic["data"]["root_cause"];
         if diagnostic["data"]["cascade"] == true {
@@ -424,13 +410,47 @@ fn cascaded_diagnostics_follow_their_roots_and_name_them() {
             assert!(root.is_null());
         }
     }
-    let root = |code: &str, path: &str| {
+    summary
+}
+
+#[test]
+fn cascaded_diagnostics_follow_their_roots_and_name_them() {
+    let util = "pub fn k() -> i64 { return missing(); }\npub fn j() -> i64 { return true; }";
+    let f = Fixture::new(
+        "import util;\nfn step(n: i64) -> i64 {\n    if n > 1 { return 1 } else if { return 2; }\n    return 0;\n}\nfn main() { println(step(1) + util::k()); }",
+    );
+    fs::write(f.0.join("util.wi"), util).unwrap();
+    let check = |f: &Fixture| {
+        diagnostic_summary(&events(
+            &f.run(
+                env!("CARGO_BIN_EXE_willow"),
+                &["check", "main.wi", "--format=ndjson"],
+            ),
+            1,
+            "WT2001",
+        ))
+    };
+    let has = |summary: &[(String, String, u64, bool)], code: &str, path: &str, cascade: bool| {
         summary
             .iter()
-            .any(|d| d.0 == code && d.1.ends_with(path) && !d.3)
+            .any(|d| d.0 == code && d.1.ends_with(path) && d.3 == cascade)
     };
-    assert!(root("E0101", "main.wi"), "{summary:?}");
-    assert!(root("E0350", "util.wi"), "{summary:?}");
+    // A syntax error anywhere in the project stops semantic analysis: only the
+    // parser root and its recovery noise (cascaded onto it) are reported.
+    let summary = check(&f);
+    assert!(has(&summary, "E0101", "main.wi", false), "{summary:?}");
+    assert!(has(&summary, "E0102", "main.wi", true), "{summary:?}");
+    assert!(
+        summary.iter().all(|d| d.0.starts_with("E01")),
+        "no semantic diagnostics after a syntax error: {summary:?}"
+    );
+    // With syntax repaired, semantic errors in the imported file are roots.
+    let f = Fixture::new(
+        "import util;\nfn step(n: i64) -> i64 {\n    if n > 1 { return 1; } else { return 2; }\n}\nfn main() { println(step(1) + util::k()); }",
+    );
+    fs::write(f.0.join("util.wi"), util).unwrap();
+    let summary = check(&f);
+    assert!(has(&summary, "E0350", "util.wi", false), "{summary:?}");
     // Unrelated type error on another line of util.wi stays a root.
     assert!(
         summary
@@ -438,17 +458,15 @@ fn cascaded_diagnostics_follow_their_roots_and_name_them() {
             .any(|d| d.0 == "E0201" && d.1.ends_with("util.wi") && d.2 == 2 && !d.3),
         "{summary:?}"
     );
-    // Parse recovery noise cascades; an unresolved call must not manufacture a type mismatch.
-    assert!(
-        summary
-            .iter()
-            .any(|d| d.0 == "E0102" && d.1.ends_with("main.wi") && d.3),
-        "{summary:?}"
-    );
+    // An unresolved call must not manufacture a type mismatch.
     assert!(
         !summary
             .iter()
             .any(|d| d.0 == "E0201" && d.1.ends_with("util.wi") && d.2 == 1),
+        "{summary:?}"
+    );
+    assert!(
+        !summary.iter().any(|d| d.1.ends_with("main.wi")),
         "{summary:?}"
     );
 }
@@ -605,30 +623,61 @@ fn independent_cross_file_type_errors_remain_roots_with_recovered_imports() {
         "pub fn price() -> i64 { return false; }",
     )
     .unwrap();
+    // `broken` fails semantically, not syntactically: its declarations are
+    // recovered, so the other files are still checked independently.
+    fs::write(
+        f.0.join("broken.wi"),
+        "pub fn recover() -> i64 { let y = 0; y += 1; return y; }",
+    )
+    .unwrap();
+    let check = |f: &Fixture| {
+        events(
+            &f.run(
+                env!("CARGO_BIN_EXE_willow"),
+                &["check", "main.wi", "--format=ndjson"],
+            ),
+            1,
+            "WT2001",
+        )
+    };
+    let root_in = |values: &[Value], path: &str, code: Option<&str>| {
+        values.iter().any(|v| {
+            v["event"] == "diagnostic"
+                && code.is_none_or(|code| v["code"] == code)
+                && v["data"]["cascade"] == false
+                && v["data"]["labels"][0]["path"]
+                    .as_str()
+                    .is_some_and(|p| p.ends_with(path))
+        })
+    };
+    let values = check(&f);
+    for path in ["main.wi", "market.wi"] {
+        assert!(
+            root_in(&values, path, Some("E0201")),
+            "missing independent type error: {path}: {values:?}"
+        );
+    }
+    assert!(
+        root_in(&values, "broken.wi", None),
+        "missing broken.wi root: {values:?}"
+    );
+    // A syntax error in `broken` stops semantic analysis project-wide: the
+    // parser root is the only diagnostic, not attributed to other files.
     fs::write(
         f.0.join("broken.wi"),
         "pub fn recover() -> i64 { let broken = ; return 0; }",
     )
     .unwrap();
-    let values = events(
-        &f.run(
-            env!("CARGO_BIN_EXE_willow"),
-            &["check", "main.wi", "--format=ndjson"],
-        ),
-        1,
-        "WT2001",
+    let values = check(&f);
+    let diagnostics: Vec<_> = values
+        .iter()
+        .filter(|v| v["event"] == "diagnostic")
+        .collect();
+    assert!(root_in(&values, "broken.wi", Some("E0102")), "{values:?}");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|v| v["code"].as_str().unwrap().starts_with("E01")),
+        "{diagnostics:?}"
     );
-    for path in ["main.wi", "market.wi"] {
-        assert!(
-            values.iter().any(|v| {
-                v["event"] == "diagnostic"
-                    && v["code"] == "E0201"
-                    && v["data"]["cascade"] == false
-                    && v["data"]["labels"][0]["path"]
-                        .as_str()
-                        .is_some_and(|p| p.ends_with(path))
-            }),
-            "missing independent type error: {path}: {values:?}"
-        );
-    }
 }
