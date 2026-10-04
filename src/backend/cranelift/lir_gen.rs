@@ -2270,7 +2270,7 @@ fn lir_suspends_here(expr: &HirExpr) -> bool {
         HirExprKind::Await { .. } | HirExprKind::Select { .. } => true,
         HirExprKind::MethodCall { object, method, .. } => {
             builtin_types::unary_arg(&object.ty, B::Channel).is_some()
-                && matches!(method.as_str(), "send" | "recv")
+                && matches!(method.as_str(), "send" | "recv" | "recv_opt")
         }
         _ => false,
     }
@@ -3724,12 +3724,21 @@ fn supported_select<'n>(
         && cases.iter().all(|case| {
             let mut case_names = names.clone();
             let kind_ok = match &case.kind {
-                HirSelectCaseKind::Recv { binding, channel } => {
+                HirSelectCaseKind::Recv {
+                    binding,
+                    channel,
+                    closed_aware,
+                } => {
                     let Some(elem) = channel_element_type_ref(&channel.ty) else {
                         return false;
                     };
                     if binding != "_" {
-                        case_names.insert(binding.as_str(), Cow::Borrowed(elem));
+                        let bound = if *closed_aware {
+                            Cow::Owned(B::Option.apply(vec![elem.clone()]))
+                        } else {
+                            Cow::Borrowed(elem)
+                        };
+                        case_names.insert(binding.as_str(), bound);
                     }
                     supported_expr(channel, ctx, names)
                 }
@@ -4318,6 +4327,10 @@ fn supported_expr_node<'n>(
                         args.len() == 1 && e.ty == Type::Void && ctx.storable(elem, &args[0].ty)
                     }
                     "recv" => args.is_empty() && ctx.repr_compatible(&e.ty, elem),
+                    "recv_opt" => {
+                        args.is_empty()
+                            && ctx.repr_compatible(&e.ty, &B::Option.apply(vec![elem.clone()]))
+                    }
                     "close" => args.is_empty() && e.ty == Type::Void,
                     _ => false,
                 };
@@ -5545,16 +5558,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         channel,
                         binding,
                         elem_ty,
+                        closed_aware,
                     } => {
                         let channel = self.load_lir_local(function, *channel);
-                        let runtime =
-                            format!("willow_channel_recv_{}", channel_runtime_suffix(elem_ty));
-                        let value = self.emit_value_runtime_call(&runtime, &[channel]);
-                        let value = if self.is_inline_pair(elem_ty) {
-                            self.emit_from_storage_word(value, elem_ty)
-                        } else {
-                            value
-                        };
+                        let value = self.emit_channel_recv(channel, elem_ty, *closed_aware);
                         if let Some(binding) = binding {
                             self.store_lir_local(function, *binding, value);
                         }
@@ -5677,7 +5684,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             SuspendOp::ChannelRecv {
                 channel,
                 result,
-                result_ty,
+                elem_ty,
+                closed_aware,
             } => {
                 let check = self.builder.create_block();
                 self.builder.ins().jump(check, &[]);
@@ -5701,13 +5709,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.ins().return_(&[pending]);
                 self.builder.switch_to_block(receive);
                 let channel_value = self.load_lir_local(function, *channel);
-                let runtime = format!("willow_channel_recv_{}", channel_runtime_suffix(result_ty));
-                let value = self.emit_value_runtime_call(&runtime, &[channel_value]);
-                let value = if self.is_inline_pair(result_ty) {
-                    self.emit_from_storage_word(value, result_ty)
-                } else {
-                    value
-                };
+                let value = self.emit_channel_recv(channel_value, elem_ty, *closed_aware);
                 if let Some(result) = result {
                     self.store_lir_local(function, *result, value);
                 }
@@ -7864,22 +7866,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     None => self.builder.ins().iconst(types::I8, 0),
                 }
             }
-            ChannelSend | ChannelRecv | ChannelClose => {
+            ChannelRecv | ChannelRecvOpt => {
                 let element = builtin_types::unary_arg(receiver_ty, B::Channel)
                     .expect("validated channel intrinsic");
-                let operation = match intrinsic {
-                    ChannelSend => "send",
-                    ChannelRecv => "recv",
-                    ChannelClose => "close",
-                    _ => unreachable!(),
-                };
+                self.emit_channel_recv(receiver, element, intrinsic == ChannelRecvOpt)
+            }
+            ChannelSend | ChannelClose => {
+                let element = builtin_types::unary_arg(receiver_ty, B::Channel)
+                    .expect("validated channel intrinsic");
                 let symbol = if intrinsic == ChannelClose {
                     "willow_channel_close".to_string()
                 } else {
-                    format!(
-                        "willow_channel_{operation}_{}",
-                        channel_runtime_suffix(element)
-                    )
+                    format!("willow_channel_send_{}", channel_runtime_suffix(element))
                 };
                 let mut values = vec![receiver];
                 if let Some(&value) = args.first() {
@@ -7894,14 +7892,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     };
                     values.push(value);
                 }
-                let value = self
-                    .emit_runtime_call_with_cleanup(&symbol, &values, |_| {})
-                    .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0));
-                if intrinsic == ChannelRecv && self.is_inline_pair(element) {
-                    self.emit_from_storage_word(value, element)
-                } else {
-                    value
-                }
+                self.emit_runtime_call_with_cleanup(&symbol, &values, |_| {});
+                self.builder.ins().iconst(types::I8, 0)
             }
             ArrayLen | FrozenArrayLen => self.emit_array_access(receiver, None, None),
             ArrayPush => {

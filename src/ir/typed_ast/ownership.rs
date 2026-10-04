@@ -241,9 +241,14 @@ fn shallow_expr(source: &HirExpr) -> HirExpr {
 
 fn shallow_case(source: &HirSelectCaseKind) -> HirSelectCaseKind {
     match source {
-        HirSelectCaseKind::Recv { binding, .. } => HirSelectCaseKind::Recv {
+        HirSelectCaseKind::Recv {
+            binding,
+            closed_aware,
+            ..
+        } => HirSelectCaseKind::Recv {
             binding: binding.clone(),
             channel: empty_expr(),
+            closed_aware: *closed_aware,
         },
         HirSelectCaseKind::Send { .. } => HirSelectCaseKind::Send {
             channel: empty_expr(),
@@ -863,6 +868,7 @@ mod tests {
                     kind: HirSelectCaseKind::Recv {
                         binding: "v".into(),
                         channel: child,
+                        closed_aware: false,
                     },
                     body: vec![HirStmt::Expr(leaf())],
                     span,

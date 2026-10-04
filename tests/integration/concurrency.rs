@@ -224,6 +224,8 @@ mod cancel_integrity;
 mod cancellation;
 #[path = "concurrency/capture_checking.rs"]
 mod capture_checking;
+#[path = "concurrency/channel_close_aware.rs"]
+mod channel_close_aware;
 #[path = "concurrency/channel_suspension.rs"]
 mod channel_suspension;
 #[path = "concurrency/channel_waiters.rs"]

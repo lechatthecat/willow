@@ -559,9 +559,14 @@ clone_shell_body!(DeferBody);
 impl CloneShell for SelectCaseKind {
     fn clone_shell(&self) -> Self {
         match self {
-            Self::Recv { binding, channel } => Self::Recv {
+            Self::Recv {
+                binding,
+                channel,
+                closed_aware,
+            } => Self::Recv {
                 binding: binding.clone(),
                 channel: channel.clone_shell(),
+                closed_aware: *closed_aware,
             },
             Self::Send { channel, value } => Self::Send {
                 channel: channel.clone_shell(),

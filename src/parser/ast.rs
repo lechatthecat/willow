@@ -991,7 +991,14 @@ pub struct SelectCase {
 pub enum SelectCaseKind {
     /// `v = ch.recv() => { ... }` — ready when the channel has a value or is
     /// closed (closed-empty selection raises when the receive executes).
-    Recv { binding: String, channel: Expr },
+    /// `closed_aware` is the `v = ch.recv_opt()` form: `v: Option<T>`, `None`
+    /// when the case ran because the channel closed (willow-jz15.44).
+    Recv {
+        binding: String,
+        channel: Expr,
+        #[serde(default)]
+        closed_aware: bool,
+    },
     /// `ch.send(x) => { ... }` — ready immediately for an (unbounded) channel.
     Send { channel: Expr, value: Expr },
     /// `sleep(ms) => { ... }` — ready once `ms` milliseconds have elapsed

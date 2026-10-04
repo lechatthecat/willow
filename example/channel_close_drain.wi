@@ -1,0 +1,51 @@
+// channel_close_drain.wi — detect a closed channel with `recv_opt`.
+//
+// `ch.recv()` returns the element and panics with "recv on closed empty
+// channel" once the channel is closed and drained. `ch.recv_opt()` returns
+// `Option<T>` instead: `Some(v)` while values remain (including values sent
+// before `close`), and `None` once the channel is closed AND empty. While the
+// channel is open and empty it waits like `recv` (suspending in an async fn).
+//
+// In `select`, `let v = ch.recv_opt() =>` binds `v: Option<T>`; the case is
+// ready when a value is available or the channel is closed.
+
+async fn producer(ch: Channel<i64>) -> i64 {
+    let mut i = 1;
+    while i <= 3 {
+        await sleep(1);
+        ch.send(i * 10);
+        i = i + 1;
+    }
+    ch.close();
+    return 0;
+}
+
+async fn main() {
+    // Drain until the producer closes the channel — no sentinel value needed.
+    let ch = Channel<i64>::new();
+    let p = producer(ch);
+    let mut total = 0;
+    while true {
+        match ch.recv_opt() {
+            Some(v) => { total = total + v; }
+            None => { break; }
+        }
+    }
+    await p;
+    println(total);
+
+    // Values buffered before `close` are still delivered, then `None` repeats.
+    let words = Channel<String>::new();
+    words.send("last");
+    words.close();
+    println(match words.recv_opt() { Some(w) => w, None => "closed" });
+    println(match words.recv_opt() { Some(w) => w, None => "closed" });
+
+    // `select` observes close through a `recv_opt` binding.
+    select {
+        let v = words.recv_opt() => {
+            println(match v { Some(w) => w, None => "select saw close" });
+        }
+        default => { println("nothing ready"); }
+    }
+}

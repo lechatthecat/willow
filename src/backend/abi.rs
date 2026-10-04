@@ -498,6 +498,7 @@ mod alloc_effects_tests {
         "willow_channel_recv_bool",
         "willow_channel_recv_f64",
         "willow_channel_recv_ptr",
+        "willow_channel_recv_opt_into",
         "willow_channel_new_bounded",
         "willow_nil_deref",
         "willow_int_div_panic",

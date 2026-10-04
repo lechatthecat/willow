@@ -12,9 +12,20 @@ impl TypeChecker {
         for case in &s.cases {
             self.symbols.push_scope();
             match &case.kind {
-                SelectCaseKind::Recv { binding, channel } => {
+                SelectCaseKind::Recv {
+                    binding,
+                    channel,
+                    closed_aware,
+                } => {
                     let ch_ty = self.check_expr(channel);
                     let elem = self.select_channel_elem(&ch_ty, channel.span());
+                    // `recv_opt` binds `Option<T>`: `None` when the case ran
+                    // because the channel closed (willow-jz15.44).
+                    let elem = if *closed_aware && elem != Type::Void {
+                        B::Option.apply(vec![elem])
+                    } else {
+                        elem
+                    };
                     if binding != "_" {
                         // Include the received binding in the task's Send check,
                         // independently of other bindings at the same source span.
@@ -1174,18 +1185,23 @@ impl TypeChecker {
                 }
                 Some(Type::Void)
             }
-            "recv" if !self.class_defines_method(obj_ty, "recv") => {
+            method @ ("recv" | "recv_opt") if !self.class_defines_method(obj_ty, method) => {
                 if !call.args.is_empty() {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0201,
-                            format!("recv expects 0 arguments, got {}", call.args.len()),
+                            format!("{method} expects 0 arguments, got {}", call.args.len()),
                         )
                         .with_label(Label::primary(call.span, "wrong number of arguments")),
                     );
                 }
                 match channel_element_type(obj_ty) {
+                    // `recv_opt` answers `None` once the channel is closed and
+                    // drained instead of raising (willow-jz15.44).
+                    Some(element_ty) if method == "recv_opt" => {
+                        Some(B::Option.apply(vec![element_ty]))
+                    }
                     Some(element_ty) => Some(element_ty),
                     None => {
                         for arg in &call.args {
@@ -1195,7 +1211,7 @@ impl TypeChecker {
                             Diagnostic::new(
                                 Severity::Error,
                                 ErrorCode::E0806,
-                                format!("cannot call `recv` on `{}`", type_name(obj_ty)),
+                                format!("cannot call `{method}` on `{}`", type_name(obj_ty)),
                             )
                             .with_label(Label::primary(call.span, "expected `Channel<T>`")),
                         );

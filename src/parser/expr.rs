@@ -833,10 +833,14 @@ impl Parser {
                     // `recv` takes no arguments. Matching on the method name
                     // alone would silently discard `ch.recv(f())` — both the
                     // arity error and the argument's side effects.
-                    Expr::MethodCall(m) if m.method == "recv" && m.args.is_empty() => {
+                    Expr::MethodCall(m)
+                        if matches!(m.method.as_str(), "recv" | "recv_opt")
+                            && m.args.is_empty() =>
+                    {
                         SelectCaseKind::Recv {
                             binding,
                             channel: m.object.take(),
+                            closed_aware: m.method == "recv_opt",
                         }
                     }
                     Expr::Await(a) => Self::select_await_case(binding, a.expr.take()),
@@ -848,10 +852,14 @@ impl Parser {
             } else {
                 // `ch.recv() => ...` (discarded value) or `ch.send(x) => ...`
                 match &mut self.parse_expr()? {
-                    Expr::MethodCall(m) if m.method == "recv" && m.args.is_empty() => {
+                    Expr::MethodCall(m)
+                        if matches!(m.method.as_str(), "recv" | "recv_opt")
+                            && m.args.is_empty() =>
+                    {
                         SelectCaseKind::Recv {
                             binding: "_".to_string(),
                             channel: m.object.take(),
+                            closed_aware: m.method == "recv_opt",
                         }
                     }
                     Expr::Await(a) => Self::select_await_case("_".to_string(), a.expr.take()),
@@ -923,7 +931,7 @@ impl Parser {
         }
         self.err(
             ErrorCode::E0103,
-            "select `let` case must bind a `ch.recv()` or an `await` (`let v = await t`, `let r = await t.result()`)",
+            "select `let` case must bind a `ch.recv()`, a `ch.recv_opt()` or an `await` (`let v = await t`, `let r = await t.result()`)",
         )
     }
 
@@ -934,7 +942,7 @@ impl Parser {
         }
         self.err(
             ErrorCode::E0103,
-            "select case must be `let v = ch.recv()`, `ch.recv()`, `ch.send(x)`, `let v = await t`, `let r = await t.result()`, `sleep(ms)`, or `default`",
+            "select case must be `let v = ch.recv()`, `let v = ch.recv_opt()`, `ch.recv()`, `ch.send(x)`, `let v = await t`, `let r = await t.result()`, `sleep(ms)`, or `default`",
         )
     }
 

@@ -195,7 +195,9 @@ pub fn walk_expr<V: AstVisitor + ?Sized>(visitor: &mut V, expr: &Expr) {
             for case in &select.cases {
                 visitor.enter_scope();
                 match &case.kind {
-                    SelectCaseKind::Recv { binding, channel } => {
+                    SelectCaseKind::Recv {
+                        binding, channel, ..
+                    } => {
                         visitor.visit_expr(channel);
                         visitor.bind(binding);
                     }

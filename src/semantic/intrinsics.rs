@@ -126,6 +126,9 @@ pub enum Intrinsic {
     ChannelSend,
     /// `Channel<T>::recv()` — a suspension point on an empty channel.
     ChannelRecv,
+    /// `Channel<T>::recv_opt()` → `Option<T>`: `recv` that answers `None`
+    /// once the channel is closed and drained (willow-jz15.44).
+    ChannelRecvOpt,
     /// `Channel<T>::close()`.
     ChannelClose,
 
@@ -256,6 +259,7 @@ impl Intrinsic {
         Intrinsic::RwCellWrite,
         Intrinsic::ChannelSend,
         Intrinsic::ChannelRecv,
+        Intrinsic::ChannelRecvOpt,
         Intrinsic::ChannelClose,
         Intrinsic::ArrayLen,
         Intrinsic::ArrayPush,
@@ -283,7 +287,10 @@ impl Intrinsic {
     /// suspend: the atomics and the blocking cells complete in place, and
     /// `TaskScope::finish` returns a task rather than waiting for one.
     pub fn is_suspension_point(self) -> bool {
-        matches!(self, Intrinsic::ChannelSend | Intrinsic::ChannelRecv)
+        matches!(
+            self,
+            Intrinsic::ChannelSend | Intrinsic::ChannelRecv | Intrinsic::ChannelRecvOpt
+        )
     }
 
     /// Every runtime symbol the lowering of this intrinsic can call, over all
@@ -339,6 +346,7 @@ impl Intrinsic {
                 "willow_channel_recv_f64",
                 "willow_channel_recv_ptr",
             ],
+            ChannelRecvOpt => &["willow_channel_recv_opt_into"],
             ChannelClose => &["willow_channel_close"],
             ArrayLen | FrozenArrayLen => &["willow_array_len"],
             ArrayPush => &["willow_array_push", "willow_array_push_scalar_pairs"],
@@ -642,6 +650,10 @@ pub fn resolve<N: builtin_types::TypeName + Clone + From<&'static str>>(
             ("recv", 0) => Some(ResolvedMethod::fixed(
                 Intrinsic::ChannelRecv,
                 args[0].clone(),
+            )),
+            ("recv_opt", 0) => Some(ResolvedMethod::fixed(
+                Intrinsic::ChannelRecvOpt,
+                B::Option.apply(vec![args[0].clone()]),
             )),
             ("close", 0) => Some(ResolvedMethod::fixed(Intrinsic::ChannelClose, Type::Void)),
             _ => None,
@@ -953,6 +965,11 @@ mod tests {
         assert_eq!(ret_of(&ch, "recv", 0), Some(Type::String));
         assert_eq!(ret_of(&ch, "send", 1), Some(Type::Void));
         assert_eq!(ret_of(&ch, "close", 0), Some(Type::Void));
+        assert_eq!(
+            ret_of(&ch, "recv_opt", 0),
+            Some(generic("Option", vec![Type::String]))
+        );
+        assert_eq!(ret_of(&ch, "recv_opt", 1), None);
     }
 
     /// Perspective 15: only the two channel operations that can park the task
@@ -967,7 +984,11 @@ mod tests {
             .collect();
         assert_eq!(
             suspending,
-            vec![Intrinsic::ChannelSend, Intrinsic::ChannelRecv]
+            vec![
+                Intrinsic::ChannelSend,
+                Intrinsic::ChannelRecv,
+                Intrinsic::ChannelRecvOpt
+            ]
         );
     }
 
@@ -1178,8 +1199,8 @@ mod tests {
     fn user_class_receivers_never_resolve() {
         let user = named("Point");
         for method in [
-            "len", "push", "pop", "get", "set", "send", "recv", "close", "cancel", "toString",
-            "freeze", "child", "finish",
+            "len", "push", "pop", "get", "set", "send", "recv", "recv_opt", "close", "cancel",
+            "toString", "freeze", "child", "finish",
         ] {
             for arity in 0..3 {
                 assert_eq!(resolve(&user, method, arity), None, "Point::{method}");
@@ -1295,6 +1316,7 @@ mod tests {
             "write",
             "send",
             "recv",
+            "recv_opt",
             "close",
             "load",
             "store",
@@ -1336,7 +1358,7 @@ mod tests {
         assert_eq!(unique.len(), Intrinsic::ALL.len(), "duplicate in ALL");
         assert_eq!(
             Intrinsic::ALL.len(),
-            51,
+            52,
             "Intrinsic::ALL must list every variant; update the count when adding one"
         );
     }
@@ -1595,6 +1617,7 @@ async fn f() {
     let ch = Channel<i64>::new();
     ch.send(7);
     let value = ch.recv();
+    let maybe = ch.recv_opt();
     ch.close();
 }
 "#;
@@ -1684,11 +1707,12 @@ async fn f() {
         assert_agrees(CELLS, 4);
     }
 
-    /// Perspective 42: `Channel<T>`. `recv` yields the element type and is a
-    /// suspension point; the other two are void.
+    /// Perspective 42: `Channel<T>`. `recv` yields the element type and
+    /// `recv_opt` yields `Option<T>`; both are suspension points. `send` and
+    /// `close` are void.
     #[test]
     fn p42_channels_agree() {
-        assert_agrees(CHANNELS, 3);
+        assert_agrees(CHANNELS, 4);
     }
 
     /// Perspective 43: `Task<T>`. `result` yields `TaskResult<T>`, which the
@@ -1826,7 +1850,7 @@ fn f() {
             (MAPS, 9),
             (ATOMICS, 8),
             (CELLS, 4),
-            (CHANNELS, 3),
+            (CHANNELS, 4),
             (TASKS, 3),
             (TOKENS, 4),
             (SCOPES, 5),
@@ -1856,7 +1880,11 @@ fn f() {
             .collect();
         assert_eq!(
             suspending,
-            vec![Intrinsic::ChannelSend, Intrinsic::ChannelRecv]
+            vec![
+                Intrinsic::ChannelSend,
+                Intrinsic::ChannelRecv,
+                Intrinsic::ChannelRecvOpt
+            ]
         );
     }
 }

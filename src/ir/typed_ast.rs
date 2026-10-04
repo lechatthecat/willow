@@ -636,10 +636,23 @@ pub struct HirSelectCase {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HirSelectCaseKind {
-    Recv { binding: String, channel: HirExpr },
-    Send { channel: HirExpr, value: HirExpr },
-    Timeout { millis: HirExpr },
-    Join { binding: String, task: HirExpr },
+    /// `closed_aware`: `ch.recv_opt()` binds `Option<T>` (willow-jz15.44).
+    Recv {
+        binding: String,
+        channel: HirExpr,
+        closed_aware: bool,
+    },
+    Send {
+        channel: HirExpr,
+        value: HirExpr,
+    },
+    Timeout {
+        millis: HirExpr,
+    },
+    Join {
+        binding: String,
+        task: HirExpr,
+    },
     Default,
 }
 

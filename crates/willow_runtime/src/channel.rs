@@ -664,9 +664,22 @@ fn take_value(
 }
 
 fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
-    let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
-        return WillowChannelValue::default();
-    };
+    match channel_recv_or_closed(raw) {
+        Some(value) => value,
+        None => {
+            channel_raise_with("recv on closed empty channel");
+            WillowChannelValue::default()
+        }
+    }
+}
+
+/// Receive the next value, blocking while the channel is empty and open.
+/// `None` means the channel is closed AND drained (`Channel<T>::recv_opt()`,
+/// willow-jz15.44); `recv()` turns that into its closed-empty panic. A null
+/// channel also answers `None`. Other failures (a wait that can never be
+/// satisfied) still raise.
+fn channel_recv_or_closed(raw: *mut c_void) -> Option<WillowChannelValue> {
+    let channel = unsafe { channel_from_raw(raw) }?;
     let current = crate::scheduler::willow_sched_current_task();
     let mut no_progress = false;
     loop {
@@ -685,12 +698,10 @@ fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
                 if channel.is_ref {
                     crate::gc::willow_pop_roots(1);
                 }
-                return value;
+                return Some(value);
             }
             if state.closed && state.values.is_empty() {
-                drop(state);
-                channel_raise_with("recv on closed empty channel");
-                return WillowChannelValue::default();
+                return None;
             }
         }
         if no_progress {
@@ -698,7 +709,7 @@ fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
                 crate::scheduler::wait_for_any_wake_briefly();
             } else {
                 channel_raise_with("recv on empty open channel would block");
-                return WillowChannelValue::default();
+                return Some(WillowChannelValue::default());
             }
         }
         no_progress = crate::scheduler::willow_sched_run_until_deadline(

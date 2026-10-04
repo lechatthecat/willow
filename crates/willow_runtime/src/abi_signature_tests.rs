@@ -269,6 +269,8 @@ fn typed_scalar_rows_never_carry_a_word() {
     assert_schema("willow_channel_send_ptr", &[Ptr, Ptr], None);
     assert_schema("willow_channel_recv_i64", &[Ptr], Some(I64));
     assert_schema("willow_channel_recv_ptr", &[Ptr], Some(Ptr));
+    // (channel, out_payload) -> tag: 0 `Some`, 1 closed and drained.
+    assert_schema("willow_channel_recv_opt_into", &[Ptr, Ptr], Some(I64));
     assert_schema("willow_channel_send_bool", &[Ptr, I8], None);
     assert_schema("willow_channel_send_f64", &[Ptr, F64], None);
     assert_schema("willow_atomic_i64_new", &[I64], Some(Ptr));
@@ -346,6 +348,7 @@ fn channel_pointer_and_scalar_payloads_have_distinct_signatures() {
     let _: extern "C" fn(*mut c_void, *mut c_void) -> i32 = channel::willow_channel_try_send_ptr;
     let _: extern "C" fn(*mut c_void, *mut c_void) = channel::willow_channel_send_ptr;
     let _: extern "C" fn(*mut c_void) -> *mut c_void = channel::willow_channel_recv_ptr;
+    let _: extern "C" fn(*mut c_void, *mut i64) -> i64 = channel::willow_channel_recv_opt_into;
     let _: extern "C" fn(*mut c_void, i64) = channel::willow_channel_send_i64;
     let _: extern "C" fn(*mut c_void) -> i64 = channel::willow_channel_recv_i64;
     let _: extern "C" fn(*mut c_void, u8) = channel::willow_channel_send_bool;

@@ -3,6 +3,11 @@
 // `select` probes its cases: a `recv` case is ready when its channel has a
 // value or is closed; a `send` case (unbounded channel) is always ready. The
 // first ready case runs. `default` runs when nothing else is ready.
+//
+// A closed, drained channel makes a `let v = ch.recv()` case ready but its
+// receive then panics ("recv on closed empty channel"). To observe close,
+// use `let v = ch.recv_opt() =>`: `v` is `Option<T>`, `None` once the
+// channel is closed and empty (see channel_close_drain.wi).
 
 async fn producer(ch: Channel<i64>) -> i64 {
     await sleep(1);
@@ -31,5 +36,16 @@ async fn main() {
     let out = Channel<i64>::new();
     select {
         out.send(7) => { println(out.recv()); }
+    }
+
+    // A `recv_opt` case binds `None` when the channel is closed and drained.
+    out.close();
+    select {
+        let v = out.recv_opt() => {
+            match v {
+                Some(x) => { println(x); }
+                None => { println("closed"); }
+            }
+        }
     }
 }

@@ -2507,11 +2507,11 @@ impl TypeChecker {
     fn record_builtin_lock_effect(&mut self, obj_ty: &Type, call: &MethodCallExpr) {
         let family = builtin_types::resolve(obj_ty).map(|resolved| resolved.id);
         let effect = match (family, call.method.as_str()) {
-            (Some(B::Channel), "send" | "recv") => Some((
-                if call.method == "send" {
-                    "Channel.send"
-                } else {
-                    "Channel.recv"
+            (Some(B::Channel), "send" | "recv" | "recv_opt") => Some((
+                match call.method.as_str() {
+                    "send" => "Channel.send",
+                    "recv" => "Channel.recv",
+                    _ => "Channel.recv_opt",
                 },
                 LockEffectKind::Suspend,
             )),
@@ -2755,13 +2755,13 @@ fn defer_scheduler_drive_span(
             let is_channel = expr_types
                 .get(&call.object.id())
                 .is_some_and(|ty| builtin_types::is(ty, B::Channel));
-            if is_channel && matches!(call.method.as_str(), "send" | "recv") {
+            if is_channel && matches!(call.method.as_str(), "send" | "recv" | "recv_opt") {
                 expression = Some((
                     call.span,
-                    if call.method == "send" {
-                        "Channel.send"
-                    } else {
-                        "Channel.recv"
+                    match call.method.as_str() {
+                        "send" => "Channel.send",
+                        "recv" => "Channel.recv",
+                        _ => "Channel.recv_opt",
                     },
                 ));
             }

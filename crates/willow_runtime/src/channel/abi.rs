@@ -57,7 +57,7 @@ pub extern "C" fn willow_channel_try_send_i64(raw: *mut c_void, value: i64) -> i
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_try_send_bool(raw: *mut c_void, value: u8) -> i32 {
-    channel_try_send_value(raw, WillowChannelValue { bool_value: value })
+    channel_try_send_value(raw, bool_channel_value(value))
 }
 
 #[unsafe(no_mangle)]
@@ -102,8 +102,9 @@ pub extern "C" fn willow_channel_send_ready(raw: *mut c_void) -> i32 {
 }
 
 /// Cooperative `recv` readiness probe (willow-dsw): returns 1 if a value is
-/// available OR the channel is closed (the caller then reads the value or
-/// observes the closed-empty language panic via `willow_channel_recv_*`);
+/// available OR the channel is closed (the caller then reads the value, or
+/// observes the closed-empty state: `willow_channel_recv_*` raises it as a
+/// language panic, `willow_channel_recv_opt_into` answers `None`);
 /// returns 0 if the channel is empty and open,
 /// after registering the currently-running task as a waiter — the caller's poll
 /// fn then returns Pending and is woken by a later `send`/`close`.
@@ -226,7 +227,15 @@ pub extern "C" fn willow_channel_send_i64(raw: *mut c_void, value: i64) {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_send_bool(raw: *mut c_void, value: u8) {
-    willow_channel_send_value(raw, WillowChannelValue { bool_value: value });
+    willow_channel_send_value(raw, bool_channel_value(value));
+}
+
+/// A bool payload with every byte initialized: `recv_opt` hands the whole
+/// word out (willow-jz15.44), and the compiler narrows it back to `bool`.
+fn bool_channel_value(value: u8) -> WillowChannelValue {
+    WillowChannelValue {
+        i64_value: i64::from(value),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -263,6 +272,24 @@ pub extern "C" fn willow_channel_recv_f64(raw: *mut c_void) -> f64 {
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_channel_recv_ptr(raw: *mut c_void) -> *mut c_void {
     unsafe { willow_channel_recv_value(raw).ptr_value }
+}
+
+/// `Channel<T>::recv_opt()` (willow-jz15.44): like `recv`, but a closed,
+/// drained channel answers `None` instead of raising. Returns 0 (`Some`) after
+/// writing the received storage word to `out_payload`, or 1 (`None`) — the
+/// same tag/payload protocol as `willow_map_get_into`, so the compiler builds
+/// the `Option<T>` with the same code.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_channel_recv_opt_into(raw: *mut c_void, out_payload: *mut i64) -> i64 {
+    unsafe { out_payload.write(0) };
+    match channel_recv_or_closed(raw) {
+        Some(value) => {
+            unsafe { out_payload.write(value.i64_value) };
+            0
+        }
+        None => 1,
+    }
 }
 
 #[unsafe(no_mangle)]

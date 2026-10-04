@@ -187,6 +187,50 @@ fn channel_unit_14_abi_recv_closed_empty_raises_and_returns_neutral_word() {
     crate::panic_context::replace_current_context(previous);
 }
 
+// willow-jz15.44: `recv_opt` drains buffered values after close, then
+// answers `None` without raising.
+#[test]
+fn channel_unit_15_abi_recv_opt_drains_then_reports_closed() {
+    let _heap = crate::gc::runtime_test_guard();
+    crate::gc::willow_gc_init();
+    let previous = crate::panic_context::replace_current_context(Some(std::sync::Arc::new(
+        crate::panic_context::PanicContext::new(15),
+    )));
+    let ch = willow_channel_new(0);
+    willow_channel_send_i64(ch, 7);
+    willow_channel_send_i64(ch, -3);
+    willow_channel_close(ch);
+    let mut payload = 99;
+    assert_eq!(willow_channel_recv_opt_into(ch, &mut payload), 0);
+    assert_eq!(payload, 7);
+    assert_eq!(willow_channel_recv_opt_into(ch, &mut payload), 0);
+    assert_eq!(payload, -3);
+    for _ in 0..2 {
+        payload = 99;
+        assert_eq!(willow_channel_recv_opt_into(ch, &mut payload), 1);
+        assert_eq!(payload, 0, "None leaves a neutral payload word");
+    }
+    assert_eq!(crate::panic_context::willow_panic_active(), 0);
+    crate::panic_context::replace_current_context(previous);
+}
+
+// A bool payload occupies the whole word, so `recv_opt` never exposes
+// uninitialized upper bytes.
+#[test]
+fn channel_unit_16_abi_recv_opt_bool_payload_is_a_full_word() {
+    let _guard = crate::gc::runtime_test_guard();
+    let ch = willow_channel_new(0);
+    willow_channel_send_bool(ch, 1);
+    assert_eq!(willow_channel_try_send_bool(ch, 0), 1);
+    let mut payload = -1;
+    assert_eq!(willow_channel_recv_opt_into(ch, &mut payload), 0);
+    assert_eq!(payload, 1);
+    assert_eq!(willow_channel_recv_opt_into(ch, &mut payload), 0);
+    assert_eq!(payload, 0);
+    willow_channel_send_bool(ch, 1);
+    assert_eq!(willow_channel_recv_bool(ch), 1);
+}
+
 // willow-vynv.1: send wakes EVERY parked waiter (a cancelled head waiter
 // must not swallow the single wake and starve live consumers).
 #[test]

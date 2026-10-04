@@ -20,6 +20,49 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let tag =
             self.emit_value_runtime_call("willow_map_get_into", &[receiver, key, key_ref, address]);
         let payload = self.stack_load(types::I64, slot);
+        self.emit_option_from_tag_payload(tag, payload, value_ty)
+    }
+
+    /// Receive from a channel. `closed_aware` (`recv_opt`, willow-jz15.44)
+    /// yields `Option<elem_ty>`, `None` once the channel is closed and
+    /// drained; otherwise a closed-empty receive raises in the runtime.
+    pub(super) fn emit_channel_recv(
+        &mut self,
+        channel: cranelift_codegen::ir::Value,
+        elem_ty: &Type,
+        closed_aware: bool,
+    ) -> cranelift_codegen::ir::Value {
+        if closed_aware {
+            let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                0,
+            ));
+            let ptr_ty = reference_type(self.module.target_config());
+            let address = self.builder.ins().stack_addr(ptr_ty, slot, 0);
+            let tag =
+                self.emit_value_runtime_call("willow_channel_recv_opt_into", &[channel, address]);
+            let payload = self.stack_load(types::I64, slot);
+            return self.emit_option_from_tag_payload(tag, payload, elem_ty);
+        }
+        let runtime = format!("willow_channel_recv_{}", channel_runtime_suffix(elem_ty));
+        let value = self.emit_value_runtime_call(&runtime, &[channel]);
+        if self.is_inline_pair(elem_ty) {
+            self.emit_from_storage_word(value, elem_ty)
+        } else {
+            value
+        }
+    }
+
+    /// Build an `Option<value_ty>` from a runtime tag (0 `Some`, nonzero
+    /// `None`) and the `Some` payload's storage word.
+    fn emit_option_from_tag_payload(
+        &mut self,
+        tag: cranelift_codegen::ir::Value,
+        payload: cranelift_codegen::ir::Value,
+        value_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let ptr_ty = reference_type(self.module.target_config());
         let option = Type::Generic("Option".into(), vec![value_ty.clone()]);
         if super::option_repr::is_scalar_pair(&option) {
             return self.emit_pair(tag, payload);

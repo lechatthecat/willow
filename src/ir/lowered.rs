@@ -278,7 +278,10 @@ pub enum SuspendOp {
     ChannelRecv {
         channel: LirLocalId,
         result: Option<LirLocalId>,
-        result_ty: Type,
+        elem_ty: Type,
+        /// `recv_opt()` (willow-jz15.44): `result` is `Option<elem_ty>` and a
+        /// closed, drained channel yields `None` instead of raising.
+        closed_aware: bool,
     },
     SelectWait {
         operations: Vec<LirSelectWaitOp>,
@@ -328,6 +331,9 @@ pub enum LirSelectOp {
         channel: LirLocalId,
         binding: Option<LirLocalId>,
         elem_ty: Type,
+        /// `let v = ch.recv_opt() =>`: `binding` is `Option<elem_ty>`, `None`
+        /// when the case was selected because the channel closed.
+        closed_aware: bool,
     },
     Send {
         channel: LirLocalId,
@@ -1136,7 +1142,7 @@ fn expr_suspends_here(expr: &HirExpr) -> bool {
         HirExprKind::Await { .. } | HirExprKind::Select { .. } => true,
         HirExprKind::MethodCall { object, method, .. } => {
             builtin_types::unary_arg(&object.ty, B::Channel).is_some()
-                && matches!(method.as_str(), "send" | "recv")
+                && matches!(method.as_str(), "send" | "recv" | "recv_opt")
         }
         _ => false,
     }
@@ -1704,10 +1710,13 @@ impl Builder {
                 let channel_name = self.synthetic_name("channel");
                 let channel = self.push_synth_let(&channel_name, false, receiver);
                 match (method.as_str(), args.as_slice()) {
-                    ("recv", []) => SuspendOp::ChannelRecv {
+                    ("recv" | "recv_opt", []) => SuspendOp::ChannelRecv {
                         channel,
                         result: destination,
-                        result_ty: value.ty.clone(),
+                        elem_ty: builtin_types::unary_arg(&object.ty, B::Channel)
+                            .expect("channel receiver has an element type")
+                            .clone(),
+                        closed_aware: method == "recv_opt",
                     },
                     ("send", [sent]) => {
                         let Type::Generic(_, type_args) = &object.ty else {
@@ -3444,16 +3453,25 @@ impl Builder {
         let mut operations = Vec::with_capacity(cases.len());
         for case in cases {
             let operation = match &case.kind {
-                HirSelectCaseKind::Recv { binding, channel } => {
+                HirSelectCaseKind::Recv {
+                    binding,
+                    channel,
+                    closed_aware,
+                } => {
                     let name = self.synthetic_name("select_channel");
                     let channel_local = self.push_synth_let(&name, false, channel.clone());
                     let elem_ty = builtin_types::unary_arg(&channel.ty, B::Channel)
                         .expect("select recv channel was type checked")
                         .clone();
                     let binding = (binding != "_").then(|| {
+                        let binding_ty = if *closed_aware {
+                            B::Option.apply(vec![elem_ty.clone()])
+                        } else {
+                            elem_ty.clone()
+                        };
                         self.declare_local(
                             binding.clone(),
-                            elem_ty.clone(),
+                            binding_ty,
                             Some(case.span),
                             false,
                             false,
@@ -3463,6 +3481,7 @@ impl Builder {
                         channel: channel_local,
                         binding,
                         elem_ty,
+                        closed_aware: *closed_aware,
                     }
                 }
                 HirSelectCaseKind::Send { channel, value } => {

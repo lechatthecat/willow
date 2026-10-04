@@ -177,7 +177,9 @@ fn push_expr<'a>(pending: &mut Vec<AstEvent<'a>>, node: &'a Expr) {
             for case in &select.cases {
                 pending.push(AstEvent::EnterScope);
                 match &case.kind {
-                    SelectCaseKind::Recv { channel, binding } => {
+                    SelectCaseKind::Recv {
+                        channel, binding, ..
+                    } => {
                         pending.push(AstEvent::Expr(channel));
                         pending.push(AstEvent::Bind(binding));
                     }

@@ -306,6 +306,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     PANIC_ALLOC; "willow_channel_recv_bool" => ([Ptr] -> Some(I8));
     PANIC_ALLOC; "willow_channel_recv_f64" => ([Ptr] -> Some(F64));
     PANIC_ALLOC; "willow_channel_recv_ptr" => ([Ptr] -> Some(Ptr));
+    PANIC_ALLOC; "willow_channel_recv_opt_into" => ([Ptr, Ptr] -> Some(I64));
     NONE; "willow_channel_close" => ([Ptr] -> None);
     SUSPEND; "willow_channel_recv_ready" => ([Ptr] -> Some(I32));
     NONE; "willow_channel_unregister_waiter" => ([Ptr] -> None);

@@ -2085,11 +2085,20 @@ fn lower_select_expr(select: &SelectExpr, ctx: &mut LowerCtx) -> Result<HirExpr,
     let mut cases = Vec::with_capacity(select.cases.len());
     for case in &select.cases {
         let kind = match &case.kind {
-            SelectCaseKind::Recv { binding, channel } => {
+            SelectCaseKind::Recv {
+                binding,
+                channel,
+                closed_aware,
+            } => {
                 let channel = lower_expr(channel, ctx)?;
-                let binding_ty = builtin_types::unary_arg(&channel.ty, B::Channel)
+                let elem_ty = builtin_types::unary_arg(&channel.ty, B::Channel)
                     .ok_or_else(|| unsupported(case.span, "select receive channel"))?
                     .clone();
+                let binding_ty = if *closed_aware {
+                    B::Option.apply(vec![elem_ty])
+                } else {
+                    elem_ty
+                };
                 ctx.push_scope();
                 let binding = ctx.bind(binding.clone(), (binding_ty).to_source());
                 let mut body = Vec::with_capacity(case.body.stmts.len());
@@ -2098,7 +2107,11 @@ fn lower_select_expr(select: &SelectExpr, ctx: &mut LowerCtx) -> Result<HirExpr,
                 }
                 ctx.pop_scope();
                 cases.push(HirSelectCase {
-                    kind: HirSelectCaseKind::Recv { binding, channel },
+                    kind: HirSelectCaseKind::Recv {
+                        binding,
+                        channel,
+                        closed_aware: *closed_aware,
+                    },
                     body,
                     span: case.span,
                 });

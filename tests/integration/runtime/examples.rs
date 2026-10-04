@@ -490,6 +490,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         ("example/channel_producer.wi", "10\n20\n30\n"),
         (
+            "example/channel_close_drain.wi",
+            "60\nlast\nclosed\nselect saw close\n",
+        ),
+        (
             "example/channel_element_inference.wi",
             "value 0;value 1;value 2;value 3;\n6 note 0;note 1;note 2;note 3;\n30\n\
              value 0;value 1;value 2;value 3;\n\
@@ -498,7 +502,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/concurrent_counts.wi", "concurrent output"),
         ("example/coop_select.wi", "100\n200\n300\n"),
         ("example/parallel_tasks.wi", "55\n144\n610\n42\nfalse\n"),
-        ("example/select.wi", "0\n42\n7\n"),
+        ("example/select.wi", "0\n42\n7\nclosed\n"),
         (
             "example/select_blocking.wi",
             "got 42\n0\n1\n2\nnothing ready\nrecovered: select would block forever: \

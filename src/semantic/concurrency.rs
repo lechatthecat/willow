@@ -301,7 +301,7 @@ impl ConcurrencyAnalyzer {
                 // original recursive traversal, and precedes its arguments.
                 AstEvent::CallArguments(Expr::MethodCall(method)) => match method.method.as_str() {
                     "result" => self.report.task_result_queries += 1,
-                    "send" | "recv" | "close" => self.report.channel_operations += 1,
+                    "send" | "recv" | "recv_opt" | "close" => self.report.channel_operations += 1,
                     _ => {}
                 },
                 AstEvent::Expr(Expr::StaticCall(static_call)) => {
